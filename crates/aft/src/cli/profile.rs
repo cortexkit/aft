@@ -14,18 +14,12 @@ use std::fmt::Write as FmtWrite;
 use std::fs;
 #[cfg(target_os = "linux")]
 use std::fs::File;
-#[cfg(target_os = "linux")]
-use std::io::Read;
-// The atos stdin write happens only on macOS.
-#[cfg(target_os = "macos")]
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-#[cfg(target_os = "macos")]
-use std::process::Stdio;
-#[cfg(target_os = "linux")]
+use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use subc_client_rs::{CallOptions, CloseRouteOptions, ConsumerOptions};
 use subc_protocol::manifest::ProviderRole;
@@ -35,6 +29,7 @@ use aft::commands::memory_census::MEMORY_CENSUS_OPERATION;
 use aft::commands::writes_census::WRITES_CENSUS_OPERATION;
 
 const DEFAULT_SECONDS: u64 = 4;
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const TOP_THREADS: usize = 5;
 const TOP_SYMBOLS: usize = 10;
 // The macOS `sample` text parsers compile on every platform so the fixture tests
@@ -1332,10 +1327,15 @@ fn raw_sample_path(
 }
 
 fn command_text(command: &mut Command) -> Result<String, ProfileError> {
+    command_text_with_timeout(command, COMMAND_TIMEOUT)
+}
+
+fn command_text_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<String, ProfileError> {
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .map_err(|error| ProfileError::runtime(format!("could not run {rendered}: {error}")))?;
+    let output = profile_command_output(command, Vec::new(), timeout)?;
     if !output.status.success() {
         return Err(ProfileError::runtime(format!(
             "{rendered} failed: {}",
@@ -1343,6 +1343,124 @@ fn command_text(command: &mut Command) -> Result<String, ProfileError> {
         )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+enum ProfilePipeResult {
+    Input(std::io::Result<()>),
+    Stdout(std::io::Result<Vec<u8>>),
+    Stderr(std::io::Result<Vec<u8>>),
+}
+
+fn profile_command_output(
+    command: &mut Command,
+    input: Vec<u8>,
+    timeout: Duration,
+) -> Result<Output, ProfileError> {
+    let tool = command.get_program().to_string_lossy().into_owned();
+    let start = Instant::now();
+    let deadline = start + timeout;
+    // perf can spawn sleep; kill the group on timeout so descendants cannot
+    // retain the pipes. process_group preserves posix_spawn on macOS.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| ProfileError::runtime(format!("could not start {tool}: {error}")))?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let (tx, rx) = mpsc::channel();
+    // Drain both output pipes while writing: atos can produce more than a pipe
+    // buffer of symbols before it has consumed all of the offsets.
+    let input_tx = tx.clone();
+    thread::spawn(move || {
+        let result = stdin.write_all(&input);
+        drop(stdin);
+        let _ = input_tx.send(ProfilePipeResult::Input(result));
+    });
+    let stdout_tx = tx.clone();
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout.read_to_end(&mut bytes).map(|_| bytes);
+        let _ = stdout_tx.send(ProfilePipeResult::Stdout(result));
+    });
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stderr.read_to_end(&mut bytes).map(|_| bytes);
+        let _ = tx.send(ProfilePipeResult::Stderr(result));
+    });
+    let mut status = None;
+    let mut input_done = false;
+    let mut output = None;
+    let mut error_output = None;
+    let result = (|| loop {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "timed out after {:.2}s (budget {:.2}s)",
+                    start.elapsed().as_secs_f64(),
+                    timeout.as_secs_f64()
+                ),
+            ));
+        }
+        if status.is_none() {
+            status = child.try_wait()?;
+        }
+        if status.is_some() && input_done && output.is_some() && error_output.is_some() {
+            return Ok(Output {
+                status: status.unwrap(),
+                stdout: output.take().unwrap(),
+                stderr: error_output.take().unwrap(),
+            });
+        }
+        // The deadline covers EOF and the writer too, not just child exit: an
+        // inherited pipe must not turn output collection into an unbounded wait.
+        match rx.recv_timeout(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(5)),
+        ) {
+            Ok(ProfilePipeResult::Input(result)) => {
+                result?;
+                input_done = true;
+            }
+            Ok(ProfilePipeResult::Stdout(result)) => output = Some(result?),
+            Ok(ProfilePipeResult::Stderr(result)) => error_output = Some(result?),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if !input_done || output.is_none() || error_output.is_none() {
+                    return Err(std::io::Error::other("profile pipe pump disconnected"));
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    })();
+    if result.is_err() {
+        #[cfg(unix)]
+        unsafe {
+            // SAFETY: the child leads the process group created above.
+            libc::killpg(child.id() as i32, libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        // Do not join workers here: descendants outside the group might still
+        // own a pipe. Detached workers release their handles when it closes.
+    }
+    result.map_err(|error| ProfileError::runtime(format!("{tool}: {error}")))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn symbolication_timeout(offset_count: usize) -> Duration {
+    // Allow 30 seconds to load large debug artifacts on a busy runner, plus
+    // 5 ms per distinct offset so large profiles get a proportional budget.
+    COMMAND_TIMEOUT + Duration::from_millis((offset_count as u64).saturating_mul(5))
 }
 
 #[derive(Debug)]
@@ -1359,20 +1477,29 @@ fn capture_sample(pid: u32, seconds: u64) -> Result<CapturedSample, ProfileError
             std::env::temp_dir().join(format!("aft-profile-{pid}-{}.txt", std::process::id()));
         aft::private_storage::create(&path)
             .map_err(|error| ProfileError::runtime(error.to_string()))?;
-        let status = Command::new("sample")
-            .args([
+        let output = profile_command_output(
+            Command::new("sample").args([
                 pid.to_string(),
                 seconds.to_string(),
                 "-file".to_string(),
                 path.display().to_string(),
-            ])
-            .status()
-            .map_err(|error| {
-                ProfileError::runtime(format!("could not start macOS sample: {error}"))
-            })?;
-        if !status.success() {
+            ]),
+            Vec::new(),
+            Duration::from_secs(seconds) + COMMAND_TIMEOUT,
+        );
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = fs::remove_file(&path);
+                return Err(error);
+            }
+        };
+        if !output.status.success() {
+            let _ = fs::remove_file(&path);
             return Err(ProfileError::runtime(format!(
-                "macOS sample exited with {status}; no profile was produced"
+                "macOS sample exited with {}; no profile was produced: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
         let raw = fs::read_to_string(&path).map_err(|error| {
@@ -1417,8 +1544,8 @@ fn capture_linux_sample(pid: u32, seconds: u64) -> Result<CapturedSample, Profil
         let pid_text = pid.to_string();
         let seconds_text = seconds.to_string();
         let perf_data_text = perf_data.display().to_string();
-        let record = Command::new("perf")
-            .args([
+        let record = profile_command_output(
+            Command::new("perf").args([
                 "record",
                 "-g",
                 "-p",
@@ -1428,13 +1555,17 @@ fn capture_linux_sample(pid: u32, seconds: u64) -> Result<CapturedSample, Profil
                 "--",
                 "sleep",
                 &seconds_text,
-            ])
-            .output();
+            ]),
+            Vec::new(),
+            Duration::from_secs(seconds) + COMMAND_TIMEOUT,
+        );
         if let Ok(record) = record {
             if record.status.success() {
-                let script = Command::new("perf")
-                    .args(["script", "-i", &perf_data_text])
-                    .output();
+                let script = profile_command_output(
+                    Command::new("perf").args(["script", "-i", &perf_data_text]),
+                    Vec::new(),
+                    COMMAND_TIMEOUT,
+                );
                 if let Ok(script) = script {
                     if script.status.success() {
                         let raw = String::from_utf8_lossy(&script.stdout).into_owned();
@@ -2241,27 +2372,17 @@ fn symbolicate_macos(
     if unique.is_empty() {
         return Ok(HashMap::new());
     }
-    let mut child = Command::new("atos")
-        .args([
+    let output = profile_command_output(
+        Command::new("atos").args([
             "-o",
             &dwarf.display().to_string(),
             "-arch",
             "arm64",
             "-offset",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|error| ProfileError::runtime(format!("could not start atos: {error}")))?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| ProfileError::runtime("atos did not accept offset input"))?
-        .write_all(unique.join("\n").as_bytes())
-        .map_err(|error| ProfileError::runtime(format!("could not write atos offsets: {error}")))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| ProfileError::runtime(format!("could not wait for atos: {error}")))?;
+        ]),
+        format!("{}\n", unique.join("\n")).into_bytes(),
+        symbolication_timeout(unique.len()),
+    )?;
     if !output.status.success() {
         return Err(ProfileError::runtime(format!(
             "atos failed for {}: {}",
@@ -2290,14 +2411,10 @@ fn symbolicate_linux(
     }
     let debug_path = debug.display().to_string();
     let addresses = unique.join(" ");
-    let output = command_text(Command::new("addr2line").args([
-        "-C",
-        "-f",
-        "-p",
-        "-e",
-        &debug_path,
-        &addresses,
-    ]))?;
+    let output = command_text_with_timeout(
+        Command::new("addr2line").args(["-C", "-f", "-p", "-e", &debug_path, &addresses]),
+        symbolication_timeout(unique.len()),
+    )?;
     Ok(unique
         .into_iter()
         .zip(output.lines().map(ToOwned::to_owned))
@@ -3988,6 +4105,101 @@ mod tests {
         );
     }
 
+    fn profile_pump_child_command(test: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().expect("test binary path"));
+        command.args(["--ignored", "--exact", test, "--nocapture"]);
+        command
+    }
+
+    #[test]
+    #[ignore = "stand-in child for the profile pipe pump"]
+    fn profile_pump_echo_child() {
+        use std::io::BufRead;
+
+        let mut stdout = std::io::stdout().lock();
+        let mut stderr = std::io::stderr().lock();
+        for line in std::io::stdin().lock().lines() {
+            let line = line.expect("read offset");
+            writeln!(stdout, "symbol {line} {}", "s".repeat(128)).unwrap();
+            stdout.flush().unwrap();
+            writeln!(stderr, "diagnostic {line} {}", "e".repeat(128)).unwrap();
+            stderr.flush().unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "stand-in child that never reads stdin or exits on its own"]
+    fn profile_pump_sleep_child() {
+        thread::sleep(Duration::from_secs(60));
+    }
+
+    #[test]
+    fn profile_pump_drains_both_pipes_while_writing_offsets() {
+        // Input and both outputs exceed pipe capacity. A serial write/read pump
+        // will stall before it can send all offsets to this portable stand-in.
+        let offsets = (0..16_384)
+            .map(|index| format!("0x{index:016x}"))
+            .collect::<Vec<_>>();
+        let output = profile_command_output(
+            &mut profile_pump_child_command("cli::profile::tests::profile_pump_echo_child"),
+            format!("{}\n", offsets.join("\n")).into_bytes(),
+            Duration::from_secs(30),
+        )
+        .expect("profile pump must drain output while writing input");
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let symbols = stdout
+            .lines()
+            .filter(|line| line.starts_with("symbol "))
+            .collect::<Vec<_>>();
+        let diagnostics = stderr.lines().collect::<Vec<_>>();
+        assert_eq!(symbols.len(), 16_384);
+        assert_eq!(diagnostics.len(), 16_384);
+        for (index, offset) in offsets.iter().enumerate() {
+            assert_eq!(
+                symbols[index],
+                format!("symbol {offset} {}", "s".repeat(128))
+            );
+            assert_eq!(
+                diagnostics[index],
+                format!("diagnostic {offset} {}", "e".repeat(128))
+            );
+        }
+    }
+
+    #[test]
+    fn profile_pump_deadline_covers_blocked_stdin_and_names_tool() {
+        let mut command =
+            profile_pump_child_command("cli::profile::tests::profile_pump_sleep_child");
+        let tool = command.get_program().to_string_lossy().into_owned();
+        let start = Instant::now();
+        let error = profile_command_output(
+            &mut command,
+            vec![b'x'; 1024 * 1024],
+            Duration::from_millis(200),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(&tool), "{error}");
+        assert!(error.contains("timed out after"), "{error}");
+        assert!(error.contains("budget 0.20s"), "{error}");
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn profile_command_text_has_a_deadline_without_stdin() {
+        let start = Instant::now();
+        let error = command_text_with_timeout(
+            &mut profile_pump_child_command("cli::profile::tests::profile_pump_sleep_child"),
+            Duration::from_millis(200),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("timed out after"), "{error}");
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn atos_symbolication_integration_uses_own_debug_binary_when_available() {
@@ -3996,16 +4208,8 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     fn test_binary_text_load_address(binary: &Path) -> u64 {
-        let output = Command::new("otool")
-            .arg("-l")
-            .arg(binary)
-            .output()
-            .expect("run otool for cargo test binary");
-        assert!(
-            output.status.success(),
-            "otool must inspect the cargo test binary"
-        );
-        let text = String::from_utf8_lossy(&output.stdout);
+        let text = command_text(Command::new("otool").arg("-l").arg(binary))
+            .unwrap_or_else(|error| panic!("otool must inspect the cargo test binary: {error}"));
         let lines = text.lines().collect::<Vec<_>>();
         let text_segment = lines
             .iter()
@@ -4047,13 +4251,13 @@ mod tests {
             }
         }
         let _dsym_cleanup = RemoveBundleOnDrop(dsym.clone());
-        let status = Command::new("dsymutil")
-            .arg(&binary)
-            .arg("-o")
-            .arg(&dsym)
-            .status()
-            .expect("start dsymutil for the cargo test binary");
-        assert!(status.success(), "dsymutil must create a test-binary dSYM");
+        // A debug test binary can be ~400 MB; allow five minutes for dsymutil
+        // on loaded runners, leaving time to diagnose atos before the test cap.
+        command_text_with_timeout(
+            Command::new("dsymutil").arg(&binary).arg("-o").arg(&dsym),
+            Duration::from_secs(300),
+        )
+        .unwrap_or_else(|error| panic!("dsymutil must create a test-binary dSYM: {error}"));
         let dwarf = debug_file_in(&dsym, &binary).expect("test binary dSYM contains DWARF");
         let _ = aft_profile_probe();
         unsafe extern "C" {
@@ -4064,9 +4268,19 @@ mod tests {
         let offset = (aft_profile_probe as *const () as usize as u64)
             .checked_sub(load_address)
             .expect("profile probe belongs to the test binary __TEXT segment");
+        // Thousands of distinct addresses force streaming replies past pipe
+        // capacity; duplicate offsets would be deduplicated before reaching atos.
+        let offsets = (0..8192)
+            .map(|index| format!("0x{:x}", offset + index * 4))
+            .collect::<Vec<_>>();
         let offset = format!("0x{offset:x}");
-        let symbols = symbolicate_macos(&dwarf, &[offset.clone()])
-            .expect("atos symbolicates the cargo test binary dSYM");
+        let symbols = symbolicate_macos(&dwarf, &offsets)
+            .unwrap_or_else(|error| panic!("atos must symbolicate the test-binary dSYM: {error}"));
+        assert_eq!(
+            symbols.len(),
+            offsets.len(),
+            "atos must reply to every offset"
+        );
         assert!(
             symbols
                 .get(&offset)
