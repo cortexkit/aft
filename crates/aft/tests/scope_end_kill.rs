@@ -210,7 +210,10 @@ impl Daemon {
             command.env(variable, path);
         }
         let mut child = command.spawn().unwrap();
-        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        // A module start is a positive wait: on a loaded shared CI Mac, two of
+        // these starts once took over 10 s while the same tests started in
+        // under 2 s natively. 30 s keeps a hung start a failure.
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
             .await
             .unwrap_or_else(|error| {
                 panic!(
