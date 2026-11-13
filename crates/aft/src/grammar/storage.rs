@@ -36,7 +36,7 @@ impl Storage {
     fn directory(&self, create: bool) -> io::Result<PinnedDir> {
         let folder = self.folder();
         crate::cache_location::refuse_durable_cache_write(&folder)?;
-        if create && matches!(self.fault, StorageFault::Admit | StorageFault::Create) {
+        if create && (self.fault == StorageFault::Admit || self.fault == StorageFault::Create) {
             return Err(io::Error::other("injected grammar storage failure"));
         }
         if create {
