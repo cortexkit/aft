@@ -1,0 +1,9 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "note": "Post-0.64 batch 7, on batch 6 (main f75f9c4c): code-mode runs ignore core's lease routes, OpenCode 2 location-scoped routes (#1442), gh shim refusals for --jq on bot posts and Plexus lean-reply decoding with a corrected capability probe, cost-gate harness port and baseline, tool-view digests, a shorter build-server changed-files report, secret proxy refusal reasons, held calls delivered once, Windows replace and consent test fixes, cheaper bash cleanup and task GC, system-text facts acceptance, and runner and plugin guidance text. No ranking-fence file changes; search is untouched."
+}
