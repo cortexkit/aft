@@ -819,6 +819,7 @@ mod tests {
                 metadata.status = crate::bash_background::BgTaskStatus::Completed;
                 let task_dir = session_dir.join(&id);
                 std::fs::create_dir_all(task_dir.join("control")).unwrap();
+                std::fs::create_dir(task_dir.join("io")).unwrap();
                 std::fs::write(
                     task_dir.join("control/metadata.json"),
                     serde_json::to_vec(&metadata).unwrap(),
