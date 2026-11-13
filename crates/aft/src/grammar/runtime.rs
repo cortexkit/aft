@@ -55,6 +55,7 @@ impl Clock for MonotonicClock {
 }
 
 struct Entry {
+    root_generation: u64,
     language: Option<Language>,
     state: GrammarState,
     failures: u8,
@@ -67,6 +68,7 @@ struct Entry {
 impl Default for Entry {
     fn default() -> Self {
         Self {
+            root_generation: 0,
             language: None,
             state: GrammarState::NotDownloaded,
             failures: 0,
@@ -80,7 +82,7 @@ impl Default for Entry {
 
 pub struct GrammarRegistry {
     manifest: GrammarManifest,
-    storage_root: RwLock<std::path::PathBuf>,
+    storage_root: RwLock<Option<std::path::PathBuf>>,
     entry: Mutex<Entry>,
     changed: Condvar,
     clock: Arc<dyn Clock>,
@@ -97,24 +99,21 @@ static REGISTRY: OnceLock<Arc<GrammarRegistry>> = OnceLock::new();
 /// callers using built-in grammars only must not consult grammar storage.
 pub fn configure(config: &crate::config::Config) -> Arc<GrammarRegistry> {
     let root = crate::root_cache::cache_root(config);
-    let registry = REGISTRY.get_or_init(|| GrammarRegistry::new(root.clone()));
-    *registry.storage_root.write() = root;
+    let registry = REGISTRY.get_or_init(|| GrammarRegistry::new(None));
+    registry.set_storage_root(root);
     Arc::clone(registry)
 }
 
 pub fn registry() -> &'static Arc<GrammarRegistry> {
-    REGISTRY.get_or_init(|| {
-        GrammarRegistry::new(crate::root_cache::cache_root(
-            &crate::config::Config::default(),
-        ))
-    })
+    REGISTRY.get_or_init(|| GrammarRegistry::new(None))
 }
 
 impl GrammarRegistry {
-    fn new(root: std::path::PathBuf) -> Arc<Self> {
+    fn new(root: Option<std::path::PathBuf>) -> Arc<Self> {
         #[cfg(feature = "test-hooks")]
         let root = std::env::var_os("AFT_TEST_GRAMMAR_STORAGE")
             .map(std::path::PathBuf::from)
+            .map(Some)
             .unwrap_or(root);
         let registry = Arc::new(Self {
             manifest: manifest().clone(),
@@ -141,11 +140,33 @@ impl GrammarRegistry {
         self.entry.lock().compile_ms
     }
 
-    fn storage(&self) -> storage::Storage {
-        storage::Storage {
-            root: self.storage_root.read().clone(),
-            fault: *self.fault.read(),
+    fn set_storage_root(&self, root: std::path::PathBuf) {
+        let mut entry = self.entry.lock();
+        let mut current = self.storage_root.write();
+        if current.as_ref() != Some(&root) {
+            *current = Some(root);
+            let generation = entry.root_generation.wrapping_add(1);
+            // A compiled language is process-resident and hash-pinned. Only
+            // root-specific attempts and failures are reset on reconfiguration.
+            *entry = Entry {
+                root_generation: generation,
+                language: entry.language.take(),
+                compiles: entry.compiles,
+                compile_ms: entry.compile_ms,
+                ..Entry::default()
+            };
+            self.changed.notify_all();
         }
+    }
+
+    fn storage(&self) -> Option<storage::Storage> {
+        self.storage_root
+            .read()
+            .clone()
+            .map(|root| storage::Storage {
+                root,
+                fault: *self.fault.read(),
+            })
     }
 
     fn unavailable(&self, entry: &Entry) -> GrammarUnavailable {
@@ -174,7 +195,10 @@ impl GrammarRegistry {
                 entry.state,
                 GrammarState::NotDownloaded | GrammarState::VerificationFailed
             ) {
-                match self.storage().read(&self.manifest) {
+                let Some(storage) = self.storage() else {
+                    return Err(self.unavailable(&entry));
+                };
+                match storage.read(&self.manifest) {
                     Ok(Some(bytes)) => self.load(&mut entry, bytes),
                     Ok(None) => {}
                     Err(_) => self.failed_attempt(&mut entry, FailureCause::Storage),
@@ -197,16 +221,20 @@ impl GrammarRegistry {
         if let Some(language) = &entry.language {
             return Ok(language.clone());
         }
+        let Some(storage) = self.storage() else {
+            return Err(self.unavailable(&entry));
+        };
         let retry = matches!(
             entry.state,
             GrammarState::NetworkRetry | GrammarState::StorageRetry
         ) && self.clock.now_ms() >= entry.retry_at;
         if entry.state == GrammarState::NotDownloaded || retry {
             entry.state = GrammarState::Downloading;
+            let generation = entry.root_generation;
             let registry = Arc::clone(self);
             if std::thread::Builder::new()
                 .name("aft-grammar-download".into())
-                .spawn(move || registry.download())
+                .spawn(move || registry.download(storage, generation))
                 .is_err()
             {
                 self.failed_attempt(&mut entry, FailureCause::Network);
@@ -233,7 +261,7 @@ impl GrammarRegistry {
         }
     }
 
-    fn download(&self) {
+    fn download(&self, storage: storage::Storage, generation: u64) {
         let transport = self.transport.get_or_init(|| {
             download::HttpsTransport::new().map(|t| Arc::new(t) as Arc<dyn download::Transport>)
         });
@@ -242,10 +270,14 @@ impl GrammarRegistry {
             Err(_) => Err(download::DownloadFailure::Network),
         };
         let (failure, stored) = match result {
-            Ok(bytes) => (None, Some(self.storage().publish(&self.manifest, &bytes))),
+            Ok(bytes) => (None, Some(storage.publish(&self.manifest, &bytes))),
             Err(error) => (Some(error), None),
         };
         let mut entry = self.entry.lock();
+        if entry.root_generation != generation {
+            self.changed.notify_all();
+            return;
+        }
         match (failure, stored) {
             (Some(download::DownloadFailure::Network), _) => {
                 self.failed_attempt(&mut entry, FailureCause::Network)

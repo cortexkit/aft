@@ -90,7 +90,7 @@ impl GrammarRegistry {
         let _ = transport.set(Ok(options.transport));
         Arc::new(Self {
             manifest: options.manifest,
-            storage_root: RwLock::new(options.storage_root),
+            storage_root: RwLock::new(Some(options.storage_root)),
             entry: Mutex::new(Entry::default()),
             changed: Condvar::new(),
             clock: options.clock,

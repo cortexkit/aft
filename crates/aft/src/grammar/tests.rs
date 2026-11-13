@@ -740,3 +740,53 @@ fn grammar_storage_exhaustion_reports_last_storage_cause() {
     assert_eq!(transport.calls.load(Ordering::SeqCst), 5);
     assert_eq!(registry.compile_count(), 0);
 }
+
+#[test]
+fn grammar_registry_without_configuration_does_not_select_default_storage() {
+    let registry = GrammarRegistry::new(None);
+    assert!(registry.storage_root.read().is_none());
+    assert_eq!(
+        registry.stored().unwrap_err().state,
+        GrammarState::NotDownloaded
+    );
+    assert_eq!(
+        registry.request().unwrap_err().state,
+        GrammarState::NotDownloaded
+    );
+    assert!(registry.storage_root.read().is_none());
+}
+
+#[test]
+fn grammar_root_change_resets_failure_but_keeps_a_verified_compiled_language() {
+    let (_first, registry, _, transport) = setup([Hop::Error]);
+    registry.request().unwrap_err();
+    settled(&registry);
+    assert_eq!(
+        registry.stored().unwrap_err().state,
+        GrammarState::NetworkRetry
+    );
+    let second = tempfile::tempdir().unwrap();
+    stored(second.path());
+    registry.set_storage_root(second.path().into());
+    registry.stored().unwrap();
+    assert_eq!(registry.compile_count(), 1);
+    let third = tempfile::tempdir().unwrap();
+    registry.set_storage_root(third.path().into());
+    registry.stored().unwrap();
+    assert_eq!(registry.compile_count(), 1);
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+    assert!(!third.path().join("grammars").exists());
+}
+
+#[test]
+fn grammar_old_root_attempt_cannot_poison_a_new_root() {
+    let (_first, registry, _, _) = setup([Hop::Error]);
+    let storage = registry.storage().unwrap();
+    let generation = registry.entry.lock().root_generation;
+    let second = tempfile::tempdir().unwrap();
+    registry.set_storage_root(second.path().into());
+    registry.download(storage, generation);
+    let entry = registry.entry.lock();
+    assert_eq!(entry.state, GrammarState::NotDownloaded);
+    assert_eq!(entry.failures, 0);
+}
