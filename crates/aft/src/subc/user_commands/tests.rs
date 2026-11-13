@@ -750,7 +750,10 @@ async fn user_commands_real_management_routes_admit_only_occipital_and_keep_bodi
             },
             "occipital",
             "display-views",
-            Some(BTreeMap::from([("tool-provider".into(), "v1".into())])),
+            Some(std::collections::BTreeMap::from([(
+                "tool-provider".into(),
+                "v1".into(),
+            )])),
         ),
     ] {
         let bind = serde_json::to_value(ModuleControlRequest::RouteBind {
