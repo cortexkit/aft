@@ -65,7 +65,11 @@ fn fixture() -> Fixture {
         storage,
         root,
         ctx,
-        routes: HashMap::from([(route_key(1, 1), carrier), (route_key(9, 1), run)]),
+        routes: HashMap::from([
+            (route_key(1, 1), carrier),
+            (route_key(2, 1), worker.clone()),
+            (route_key(9, 1), run),
+        ]),
         worker,
     }
 }
@@ -85,7 +89,7 @@ fn admit(f: &Fixture) -> codemode::Admission {
 
 fn admit_tool(f: &Fixture, tool: &str) -> codemode::Admission {
     let body = json!({"name":tool,"arguments":{"command":"echo worker-output","background":true}});
-    let candidates = vec![(f.routes[&route_key(1, 1)].clone(), f.ctx.clone())];
+    let candidates = vec![(f.routes[&route_key(2, 1)].clone(), f.ctx.clone())];
     let policies = codemode::SavedPolicies::read_for_call(
         candidates,
         codemode::launches_shell_task(Some(&body)),
@@ -127,7 +131,7 @@ fn codemode_worker_conflicting_catalog_bindings_refuse_with_saved_policy_error()
     };
     assert_eq!(
         reader.task_identity(),
-        f.routes[&route_key(1, 1)].task_identity()
+        f.routes[&route_key(2, 1)].task_identity()
     );
 }
 
@@ -161,7 +165,7 @@ fn codemode_worker_read_without_catalog_binding_runs_with_equivalent_owner_route
     for duplicate_owner in [false, true] {
         if duplicate_owner {
             f.routes
-                .insert(route_key(3, 1), f.routes[&route_key(1, 1)].clone());
+                .insert(route_key(3, 1), f.routes[&route_key(2, 1)].clone());
         }
         let codemode::Admission::Owner(effective) = admit_tool(&f, "read") else {
             panic!("a worker read must not need a shell-task catalog binding");
@@ -215,7 +219,7 @@ async fn codemode_worker_background_task_is_visible_only_to_catalog_binding_and_
     assert_eq!(effective.task_identity(), expected);
     assert_eq!(
         effective.spawn_principal,
-        f.routes[&route_key(1, 1)].spawn_principal,
+        f.routes[&route_key(2, 1)].spawn_principal,
         "catalog binding must not change shell authority"
     );
     let (notice_tx, mut notice_rx) = mpsc::unbounded_channel();
