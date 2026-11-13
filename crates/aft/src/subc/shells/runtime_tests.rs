@@ -38,12 +38,12 @@ fn shells_v1_operation_logs_are_once_per_event_and_content_free() {
                 harness: Some("fed-phone:private-person".into()),
                 ..Default::default()
             };
-            let metrics = DispatchPathMetrics::new();
+            let metrics = Arc::new(DispatchPathMetrics::new());
             let (tx, mut frames) = tokio::sync::mpsc::channel(16);
             let request = |corr| Frame::build(
                 FrameType::Request, subc_protocol::Flags(0), 41, 1, corr, b"{}".to_vec(),
             ).unwrap();
-            fn receive(frames: &mut tokio::sync::mpsc::Receiver<Frame>) -> tokio::time::Timeout<impl std::future::Future<Output = Option<Frame>> + '_> {
+            fn receive<T>(frames: &mut tokio::sync::mpsc::Receiver<T>) -> tokio::time::Timeout<impl std::future::Future<Output = Option<T>> + '_> {
                 tokio::time::timeout(Duration::from_secs(5), frames.recv())
             }
 
