@@ -19,6 +19,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -1045,6 +1046,28 @@ pub(crate) struct DataLayerMemory {
 }
 
 impl DataLayerMemory {
+    /// The age of the oldest checkout walk included in this figure.
+    pub(crate) fn measured_age_ms(&self) -> u64 {
+        self.shared
+            .counts
+            .get("memory_measured_age_ms")
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Keep reuse visible without turning an old estimate into a busy root.
+    pub(crate) fn with_measurement_age(mut self, age: Duration, stale: bool) -> Self {
+        self.shared.counts.insert(
+            "memory_measured_age_ms".into(),
+            u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
+        );
+        if stale {
+            self.shared = self.shared.gap("checkout_memory_stale");
+            self.shared.bytes_status = "partial";
+        }
+        self
+    }
+
     /// A bound checkout another thread is measuring right now.
     pub(crate) fn busy_checkout() -> Self {
         Self {
@@ -1081,6 +1104,18 @@ impl DataLayerMemory {
             (semantic, self.meaning),
         ] {
             plane.counts.insert("data_layer_bytes".into(), bytes);
+            plane
+                .counts
+                .insert("data_layer_measured_age_ms".into(), self.measured_age_ms());
+            if self
+                .shared
+                .not_estimated
+                .iter()
+                .any(|gap| gap == "checkout_memory_stale")
+            {
+                plane.not_estimated.push("checkout_memory_stale".into());
+                plane.bytes_status = "partial";
+            }
             if bytes == 0 {
                 continue;
             }
@@ -1112,18 +1147,24 @@ pub(crate) fn memory_estimate(ctx: &AppContext) -> Option<DataLayerMemory> {
             shared: MemoryEstimate::busy().gap("checkout_binding"),
             ..DataLayerMemory::unbound()
         },
-        DataCheckoutProbe::Bound(checkout) => checkout.memory_figure(|| {
-            let mut seen = aft_store::heap::Seen::new();
-            // aft_inspect's dead-code scan may hold the same snapshot the
-            // checkout's dead-code memo holds; the root's
-            // `callgraph_projection` plane counts it then.
-            if let Some(snapshot) = ctx.inspect_manager().try_callgraph_projection_snapshot() {
-                seen.counted_elsewhere(Arc::as_ptr(&snapshot));
-            }
-            let memory = checkout.checkout().memory(&mut seen);
-            let meaning = checkout.meaning_memory(&mut seen);
-            checkout_estimate(memory, meaning, seen.contended())
-        }),
+        DataCheckoutProbe::Bound(checkout) => {
+            let snapshot = ctx.inspect_manager().try_callgraph_projection_snapshot();
+            let counted_elsewhere = snapshot
+                .as_ref()
+                .map(|snapshot| Arc::as_ptr(snapshot) as usize);
+            checkout.memory_figure(counted_elsewhere, || {
+                let mut seen = aft_store::heap::Seen::new();
+                // aft_inspect's dead-code scan may hold the same snapshot the
+                // checkout's dead-code memo holds; the root's
+                // `callgraph_projection` plane counts it then.
+                if let Some(snapshot) = snapshot {
+                    seen.counted_elsewhere(Arc::as_ptr(&snapshot));
+                }
+                let memory = checkout.checkout().memory(&mut seen);
+                let meaning = checkout.meaning_memory(&mut seen);
+                checkout_estimate(memory, meaning, seen.contended())
+            })
+        }
     })
 }
 
@@ -2825,6 +2866,32 @@ mod tests {
         assert_eq!(busy.shared.status, "busy");
         assert_eq!(busy.shared.not_estimated, ["checkout_state_busy"]);
         assert_eq!((busy.text, busy.callgraph, busy.meaning), (0, 0, 0));
+    }
+
+    #[test]
+    fn memory_figure_staleness_and_age_follow_every_folded_plane() {
+        let memory = DataLayerMemory {
+            shared: MemoryEstimate::estimated(10).gap("existing_gap"),
+            text: 20,
+            callgraph: 30,
+            meaning: 0,
+        }
+        .with_measurement_age(Duration::from_secs(29), true);
+        let mut search = MemoryEstimate::estimated(0);
+        let mut callgraph = MemoryEstimate::estimated(0);
+        let mut semantic = MemoryEstimate::estimated(0);
+        let shared = memory.fold_into(&mut search, &mut callgraph, &mut semantic);
+        assert_eq!(shared.counts["memory_measured_age_ms"], 29_000);
+        assert_eq!(
+            shared.not_estimated,
+            ["existing_gap", "checkout_memory_stale"]
+        );
+        for plane in [search, callgraph, semantic] {
+            assert_eq!(plane.status, "estimated");
+            assert_eq!(plane.bytes_status, "partial");
+            assert_eq!(plane.counts["data_layer_measured_age_ms"], 29_000);
+            assert_eq!(plane.not_estimated, ["checkout_memory_stale"]);
+        }
     }
 
     #[test]

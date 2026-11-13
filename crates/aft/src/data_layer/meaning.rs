@@ -129,6 +129,8 @@ struct Configured {
 /// has made it, and the fill's last outcome.
 #[derive(Default)]
 pub(crate) struct Meaning {
+    /// Plane replacement and fill failures change memory independently of edits.
+    memory_epoch: std::sync::atomic::AtomicU64,
     /// AFT's storage folder, where the plugin downloads ONNX Runtime.
     storage: PathBuf,
     /// The root's semantic configuration as the last configure (or, before
@@ -230,6 +232,8 @@ impl Meaning {
         *lock(&self.times) = FillTimes::default();
         *lock(&self.totals) = FillTotals::default();
         *lock(&self.refreshed_at) = None;
+        self.memory_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         true
     }
 
@@ -441,6 +445,10 @@ impl Meaning {
         Some(plane + self.failure.heap_bytes(seen))
     }
 
+    pub(crate) fn memory_epoch(&self) -> u64 {
+        self.memory_epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Runs one round of the fill for `checkout`: loads the model if no
     /// round of this fill has, makes the plane if no round under this
     /// configuration has, and fills one round of files.
@@ -479,6 +487,8 @@ impl Meaning {
             }
         }
         self.note_round_ended(&outcome);
+        self.memory_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         outcome
     }
 
@@ -595,6 +605,8 @@ impl Meaning {
             config: config.clone(),
             plane: Arc::clone(&plane),
         });
+        self.memory_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.filled
             .store(false, std::sync::atomic::Ordering::Release);
         Ok(plane)

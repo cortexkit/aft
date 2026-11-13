@@ -461,6 +461,8 @@ struct SearchFile {
 
 /// A view's members under one loaded generation.
 struct Members {
+    /// Filtered reads replace the subset cache without changing the text view.
+    memory_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// The view's text generation, and the generation the members were
     /// read from: the cache key.
     view: String,
@@ -515,6 +517,8 @@ impl Members {
             positions,
         });
         *kept = Some((included, Arc::clone(&subset)));
+        self.memory_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok(subset)
     }
 
@@ -528,6 +532,7 @@ impl Members {
                 .join(native_path(path).expect("surveyed paths have a native form"))
         };
         let mut members = Self {
+            memory_epoch: view.memory_epoch_counter(),
             view: view.text_generation(),
             generation: loaded.generation,
             files: Vec::new(),
@@ -1134,6 +1139,7 @@ impl VectorPlane {
         }
         let read = Arc::new(Loaded::read(&parts, &self.producer.model, &loaded)?);
         *loaded = Arc::clone(&read);
+        self.checkout.touch_memory();
         Ok(read)
     }
 
@@ -1150,6 +1156,7 @@ impl VectorPlane {
         }
         let members = Arc::new(Members::build(view, loaded, self.max_files)?);
         *cached = Some(Arc::clone(&members));
+        self.checkout.touch_memory();
         Ok(members)
     }
 
@@ -2450,6 +2457,46 @@ mod tests {
                 rows(&today.search(&query, 10)),
             );
         }
+    }
+
+    #[test]
+    fn memory_figure_vector_read_caches_advance_the_checkout_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        project(&root);
+        let checkout = bind(store.path(), &root);
+        let filled = VectorPlane::new(Arc::clone(&checkout), producer(), 20_000);
+        let mut recorder = Recorder::default();
+        assert_eq!(fill(&filled, &mut recorder, 2).error, None);
+        let plane = VectorPlane::new(Arc::clone(&checkout), producer(), 20_000);
+        let view = checkout.view().unwrap();
+        let epoch = checkout.memory_epoch();
+        plane.coverage(&view).unwrap();
+        assert!(
+            checkout.memory_epoch() > epoch,
+            "generation and member caches were loaded"
+        );
+        let epoch = checkout.memory_epoch();
+        plane.coverage(&view).unwrap();
+        assert_eq!(
+            checkout.memory_epoch(),
+            epoch,
+            "an unchanged cache stays unchanged"
+        );
+        let include = |path: &Path| path.starts_with(root.join("src"));
+        assert!(!plane
+            .search(&view, &vector_of_tie(), 5, &include)
+            .unwrap()
+            .results
+            .is_empty());
+        assert!(
+            checkout.memory_epoch() > epoch,
+            "filtered search cached a subset"
+        );
+        let epoch = checkout.memory_epoch();
+        plane.search(&view, &vector_of_tie(), 5, &include).unwrap();
+        assert_eq!(checkout.memory_epoch(), epoch);
     }
 
     /// Every chunk text of the semantic files under `root`, as a fill cuts

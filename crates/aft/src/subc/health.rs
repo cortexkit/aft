@@ -7909,6 +7909,61 @@ mod tests {
     }
 
     #[test]
+    fn memory_figure_rollup_never_rewalks_an_unchanged_retained_engine() {
+        let (storage, root) = test_root("health-memory-retained");
+        std::fs::write(root.as_path().join("lib.rs"), "pub fn original() {}\n").unwrap();
+        let mut config = crate::config::Config::default();
+        config.storage_dir = Some(storage.path().join("state"));
+        config.project_root = Some(root.as_path().to_path_buf());
+        config.indexes.semantic = false;
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config,
+        ));
+        ctx.set_canonical_cache_root(root.as_path().to_path_buf());
+        let checkout = ctx.data_checkout().unwrap();
+        assert!(matches!(
+            checkout.fresh_view(Duration::from_secs(60)),
+            crate::data_layer::runtime::Fresh::Ready(_)
+        ));
+        std::fs::write(root.as_path().join("extra.rs"), "pub fn extra() {}\n").unwrap();
+        checkout
+            .checkout()
+            .record_paths(&[b"extra.rs".to_vec()])
+            .unwrap();
+        checkout.checkout().refresh_callgraph().unwrap();
+        assert!(checkout.checkout().engine_memory_parts().is_some());
+        let executor = Executor::new();
+        assert!(executor.register_actor(root, ctx));
+        let app = crate::context::App::default_shared();
+        let cache = HealthRollupCache::new();
+        let epoch = Instant::now();
+        let refresh_at = |seconds| {
+            cache.clock_ms.store(seconds * 1000, Ordering::Relaxed);
+            crate::context::with_memory_walk_clock_for_test(
+                epoch + Duration::from_secs(seconds),
+                || cache.refresh_for_test(&executor, &app),
+            );
+        };
+        refresh_at(0);
+        let walks = crate::data_layer::runtime::memory_figure_walks_for_test();
+        for tick in 1..=40 {
+            refresh_at(tick * 3);
+        }
+        assert_eq!(
+            crate::data_layer::runtime::memory_figure_walks_for_test(),
+            walks,
+            "health walked the unchanged engine maps again"
+        );
+        let rollup = cache.snapshot().0;
+        assert_eq!(rollup.metrics["root_count"], 1);
+        assert!(rollup
+            .memory_census
+            .to_string()
+            .contains("memory_measured_age_ms"));
+    }
+
+    #[test]
     fn rollup_resolves_shared_storage_paths_once_per_tick() {
         // One shared App, so every context names the same storage root the way
         // the daemon's contexts do; only the project roots differ.

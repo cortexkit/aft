@@ -12495,6 +12495,13 @@ impl AppContext {
             &mut estimates,
             crate::data_layer::surfaces::memory_estimate(self),
         );
+        let measured_age_ms = measured_age_ms.max(
+            data_layer
+                .as_ref()
+                .and_then(|memory| memory.counts.get("memory_measured_age_ms"))
+                .copied()
+                .unwrap_or(0),
+        );
         let rollup = Self::memory_root_rollup_from(&estimates, data_layer.as_ref())
             .with_measured_age_ms(measured_age_ms);
         (

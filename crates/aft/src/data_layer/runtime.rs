@@ -1136,9 +1136,18 @@ impl Work {
 }
 
 /// One root's checkout in a running AFT.
-/// How old a checkout's memory figure may be before the census walks it
-/// again (see [`DataCheckout::memory_figure`]).
+/// Minimum time between complete checkout memory walks, even during edits.
+/// Reused figures report their age and whether the checkout changed since.
 const MEMORY_FIGURE_MAX_AGE: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MemoryFigureVersion {
+    checkout: u64,
+    meaning: u64,
+    /// Address of the call-graph snapshot counted by the root's inspect plane.
+    /// `Seen` excludes it from checkout bytes, so its identity affects attribution.
+    counted_elsewhere: Option<usize>,
+}
 
 pub(crate) struct DataCheckout {
     work: Arc<Work>,
@@ -1151,7 +1160,13 @@ pub(crate) struct DataCheckout {
     todos_readable: AtomicBool,
     /// The last memory figure the census walked for this checkout, and when
     /// (see [`Self::memory_figure`]).
-    memory_figure: std::sync::Mutex<Option<(Instant, u64, super::surfaces::DataLayerMemory)>>,
+    memory_figure: std::sync::Mutex<
+        Option<(
+            Instant,
+            MemoryFigureVersion,
+            super::surfaces::DataLayerMemory,
+        )>,
+    >,
     disk_measurement: Arc<super::surfaces::DiskMeasurement>,
     /// Kept so the edit-intent listener lives as long as the checkout.
     _listener: Arc<dyn WriteIntentListener>,
@@ -1927,16 +1942,15 @@ impl DataCheckout {
         self.work.meaning.configure(config);
     }
 
-    /// What meaning search holds in memory for this checkout; see
-    /// [`super::meaning::Meaning::memory`].
-    /// This checkout's memory as the census reports it, walked again only
-    /// when the checkout changed what it holds since the last walk, or the
-    /// last figure is older than [`MEMORY_FIGURE_MAX_AGE`]. The health
-    /// rollup asks for every bound root every few seconds, and the walk
-    /// visits each decoded parse and resolution an edited checkout's engine
-    /// holds: walked on every ask, it kept a core busy.
+    /// This checkout's memory as the census reports it. Reuse a complete walk
+    /// indefinitely while its version is unchanged. After a change, walk at
+    /// most once per [`MEMORY_FIGURE_MAX_AGE`]: scanning each engine's maps on
+    /// every health tick is too expensive, even for idle bound checkouts.
+    /// An older figure names its age; one invalidated by a change is partial.
+    /// Contended walks do not replace a complete figure or prolong `busy`.
     pub(crate) fn memory_figure(
         &self,
+        counted_elsewhere: Option<usize>,
         walk: impl FnOnce() -> super::surfaces::DataLayerMemory,
     ) -> super::surfaces::DataLayerMemory {
         // Another thread walking it now holds the slot: report it busy
@@ -1944,25 +1958,51 @@ impl DataCheckout {
         let Ok(mut slot) = self.memory_figure.try_lock() else {
             return super::surfaces::DataLayerMemory::busy_checkout();
         };
-        // Read before the walk: a change during it moves the epoch, so the
-        // next ask walks again.
-        let epoch = self.checkout().memory_epoch();
+        // Read before the walk so a change during it is reported as stale too.
+        let version = || MemoryFigureVersion {
+            checkout: self.checkout().memory_epoch(),
+            meaning: self.work.meaning.memory_epoch(),
+            counted_elsewhere,
+        };
+        let epoch = version();
         #[cfg(not(test))]
         let now = Instant::now();
         #[cfg(test)]
         let now = crate::context::memory_walk_now_for_test();
         if let Some((at, walked_at, figure)) = slot.as_ref() {
-            if *walked_at == epoch && now.saturating_duration_since(*at) < MEMORY_FIGURE_MAX_AGE {
-                return figure.clone();
+            let age = now.saturating_duration_since(*at);
+            let reuse = *walked_at == epoch || age < MEMORY_FIGURE_MAX_AGE;
+            #[cfg(all(test, target_os = "linux"))]
+            let reuse = if MEMORY_FIGURE_BASELINE.with(std::cell::Cell::get) {
+                *walked_at == epoch && age < MEMORY_FIGURE_MAX_AGE
+            } else {
+                reuse
+            };
+            if reuse {
+                return figure
+                    .clone()
+                    .with_measurement_age(age, *walked_at != epoch);
             }
         }
         #[cfg(test)]
         MEMORY_FIGURE_WALKS.with(|walks| walks.set(walks.get() + 1));
         let figure = walk();
+        if figure.shared.status == "busy" || !figure.shared.not_estimated.is_empty() {
+            // Retry next time instead of caching a lock gap for thirty seconds.
+            // A prior complete walk is more useful than dropping its bytes;
+            // its age and stale gap disclose that this attempt was incomplete.
+            return slot.as_ref().map_or(figure.clone(), |(at, _, previous)| {
+                previous
+                    .clone()
+                    .with_measurement_age(now.saturating_duration_since(*at), true)
+            });
+        }
         *slot = Some((now, epoch, figure.clone()));
-        figure
+        figure.with_measurement_age(Duration::ZERO, version() != epoch)
     }
 
+    /// What meaning search holds in memory for this checkout; see
+    /// [`super::meaning::Meaning::memory`].
     pub(crate) fn meaning_memory(&self, seen: &mut aft_store::heap::Seen) -> Option<usize> {
         self.work.meaning.memory(seen)
     }
@@ -1971,6 +2011,29 @@ impl DataCheckout {
 #[cfg(test)]
 thread_local! {
     static MEMORY_FIGURE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    #[cfg(target_os = "linux")]
+    static MEMORY_FIGURE_BASELINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Compare the former epoch-or-age refresh policy on the same retained engines.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn with_memory_figure_baseline_for_test<T>(
+    baseline: bool,
+    measure: impl FnOnce() -> T,
+) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            MEMORY_FIGURE_BASELINE.with(|flag| flag.set(self.0));
+        }
+    }
+    let _reset = Reset(MEMORY_FIGURE_BASELINE.with(|flag| flag.replace(baseline)));
+    measure()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn memory_profile_layer_for_test() -> Arc<DataLayer> {
+    layer()
 }
 
 #[cfg(test)]
@@ -2495,33 +2558,152 @@ mod tests {
         assert_eq!(fixture.handle.checkout().changed_paths(), 0);
     }
 
-    /// A process published a checkout's text index and stopped before its
-    /// call graph. The next process to bind it builds the call graph, and
-    /// its refresh thread does not spin while it waits.
     #[test]
-    fn the_memory_figure_is_walked_again_only_after_a_change() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(dir.path()).unwrap();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
-        std::fs::write(root.join("src/lib.rs"), "pub fn caller() {}\n").unwrap();
-        let handle = DataCheckout::open(&root, storage.path(), None).unwrap();
-        let walks = std::cell::Cell::new(0);
+    fn memory_figure_tracks_real_engine_growth_within_thirty_seconds() {
+        let fixture = PublicationFixture::new(Duration::from_secs(3600), Duration::from_secs(3600));
+        fixture.add("seed", 1);
+        fixture.refresh();
+        let handle = &fixture.handle;
         let walk = || {
-            walks.set(walks.get() + 1);
-            super::super::surfaces::DataLayerMemory::busy_checkout()
+            let mut seen = aft_store::heap::Seen::new();
+            let memory = handle.checkout().memory(&mut seen);
+            super::super::surfaces::checkout_estimate(memory, Some(0), seen.contended())
         };
-        handle.memory_figure(walk);
-        handle.memory_figure(walk);
-        assert_eq!(walks.get(), 1, "an unchanged checkout is not walked again");
-        std::fs::write(root.join("src/extra.rs"), "pub fn other() {}\n").unwrap();
+        let epoch = Instant::now();
+        let read_at = |seconds| {
+            crate::context::with_memory_walk_clock_for_test(
+                epoch + Duration::from_secs(seconds),
+                || handle.memory_figure(None, walk),
+            )
+        };
+        let before = read_at(0);
+        assert_eq!(before.shared.counts["callgraph_engine_started"], 1);
+        assert_eq!(before.shared.bytes_status, "estimated");
+        let walks = memory_figure_walks_for_test();
+        // An idle engine stays unchanged for minutes, not just one health tick.
+        for seconds in [3, 30, 60, 120] {
+            let reused = read_at(seconds);
+            assert_eq!(reused.callgraph, before.callgraph);
+            assert_eq!(reused.measured_age_ms(), seconds * 1000);
+        }
+        assert_eq!(memory_figure_walks_for_test(), walks);
+
+        let big = handle.root().join("src/growth.rs");
+        let source = (0..2000)
+            .map(|n| format!("pub fn grown_{n}() {{}}\n"))
+            .collect::<String>();
+        std::fs::write(big, source).unwrap();
         handle
             .checkout()
-            .record_paths(&[b"src/extra.rs".to_vec()])
+            .record_paths(&[b"src/growth.rs".to_vec()])
             .unwrap();
-        handle.memory_figure(walk);
-        assert_eq!(walks.get(), 2, "a recorded change is measured at once");
+        handle.checkout().refresh_callgraph().unwrap();
+        // The last idle read did not reset the measurement time. This change
+        // is already past the thirty-second budget and must show immediately.
+        let grown = read_at(123);
+        assert!(
+            grown.callgraph > before.callgraph + 64_000,
+            "the real engine grew: {before:?} -> {grown:?}"
+        );
+        assert_eq!(grown.measured_age_ms(), 0);
+        assert_eq!(memory_figure_walks_for_test(), walks + 1);
+
+        let extra = handle.root().join("src/another.rs");
+        std::fs::write(extra, "pub fn another() {}\n").unwrap();
+        handle
+            .checkout()
+            .record_paths(&[b"src/another.rs".to_vec()])
+            .unwrap();
+        handle.checkout().refresh_callgraph().unwrap();
+        let aged = read_at(152);
+        assert_eq!(aged.callgraph, grown.callgraph);
+        assert_eq!(aged.measured_age_ms(), 29_000);
+        assert_eq!(aged.shared.bytes_status, "partial");
+        assert!(aged
+            .shared
+            .not_estimated
+            .iter()
+            .any(|gap| gap == "checkout_memory_stale"));
+        assert_eq!(memory_figure_walks_for_test(), walks + 1);
+        let current = read_at(153);
+        assert!(current.callgraph > grown.callgraph);
+        assert_eq!(current.measured_age_ms(), 0);
+        assert_eq!(current.shared.bytes_status, "estimated");
+        assert_eq!(memory_figure_walks_for_test(), walks + 2);
+    }
+
+    #[test]
+    fn memory_figure_version_includes_meaning_and_seen_exclusions() {
+        let fixture = PublicationFixture::new(Duration::from_secs(3600), Duration::from_secs(3600));
+        let handle = &fixture.handle;
+        let complete = || super::super::surfaces::DataLayerMemory {
+            shared: crate::memory::MemoryEstimate::estimated(100),
+            text: 0,
+            callgraph: 0,
+            meaning: 0,
+        };
+        let epoch = Instant::now();
+        crate::context::with_memory_walk_clock_for_test(epoch, || {
+            handle.memory_figure(None, complete)
+        });
+        let walks = memory_figure_walks_for_test();
+        let checkout_epoch = handle.checkout().memory_epoch();
+        handle
+            .work
+            .meaning
+            .configure(Some(&crate::config::SemanticBackendConfig::default()));
+        assert_eq!(handle.checkout().memory_epoch(), checkout_epoch);
+        let aged =
+            crate::context::with_memory_walk_clock_for_test(epoch + Duration::from_secs(3), || {
+                handle.memory_figure(None, complete)
+            });
+        assert_eq!(aged.shared.bytes_status, "partial");
+        crate::context::with_memory_walk_clock_for_test(epoch + Duration::from_secs(30), || {
+            handle.memory_figure(None, complete)
+        });
+        assert_eq!(memory_figure_walks_for_test(), walks + 1);
+        let aged = crate::context::with_memory_walk_clock_for_test(
+            epoch + Duration::from_secs(33),
+            || handle.memory_figure(Some(1), complete),
+        );
+        assert_eq!(aged.shared.bytes_status, "partial");
+        crate::context::with_memory_walk_clock_for_test(epoch + Duration::from_secs(60), || {
+            handle.memory_figure(Some(1), complete)
+        });
+        assert_eq!(memory_figure_walks_for_test(), walks + 2);
+    }
+
+    #[test]
+    fn memory_figure_retries_contention_without_extending_busy() {
+        let fixture = PublicationFixture::new(Duration::from_secs(3600), Duration::from_secs(3600));
+        let handle = &fixture.handle;
+        let complete = || super::super::surfaces::DataLayerMemory {
+            shared: crate::memory::MemoryEstimate::estimated(100),
+            text: 0,
+            callgraph: 1000,
+            meaning: 0,
+        };
+        let epoch = Instant::now();
+        crate::context::with_memory_walk_clock_for_test(epoch, || {
+            handle.memory_figure(None, complete)
+        });
+        fixture.add("invalidate", 1);
+        let busy = crate::context::with_memory_walk_clock_for_test(
+            epoch + Duration::from_secs(30),
+            || handle.memory_figure(None, super::super::surfaces::DataLayerMemory::busy_checkout),
+        );
+        assert_eq!(busy.shared.status, "estimated");
+        assert_eq!(busy.shared.bytes_status, "partial");
+        assert_eq!(busy.callgraph, 1000);
+        assert_eq!(busy.measured_age_ms(), 30_000);
+        let walks = memory_figure_walks_for_test();
+        let retried = crate::context::with_memory_walk_clock_for_test(
+            epoch + Duration::from_secs(33),
+            || handle.memory_figure(None, complete),
+        );
+        assert_eq!(memory_figure_walks_for_test(), walks + 1);
+        assert_eq!(retried.shared.bytes_status, "estimated");
+        assert_eq!(retried.measured_age_ms(), 0);
     }
 
     #[test]
