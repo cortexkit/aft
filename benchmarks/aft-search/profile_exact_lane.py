@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Release exact-lane replay on one frozen tree, with opt-in source instrumentation.
+"""Release-optimized exact-lane replay on one frozen tree, with opt-in source instrumentation.
 
 The generated sources and targets are private to this experiment. Instrumentation
 uses otherwise idle wait slots (semantic/rerank are disabled); production sources
@@ -144,6 +144,8 @@ def run(argv, **kwargs):
 
 
 def archive(ref, destination):
+    if destination.exists():
+        shutil.rmtree(destination)
     destination.mkdir(parents=True)
     tar = destination.parent / (destination.name + ".tar")
     with tar.open("wb") as out:
@@ -156,11 +158,11 @@ def build(args, name, ref):
     source = args.out / (name + "-source")
     archive(ref, source)
     instrument(source)
-    env = {**os.environ, "CARGO_TARGET_DIR": str(args.out / "build-target")}
+    env = {**os.environ, "CARGO_TARGET_DIR": str(args.out / "build-target"), "RUSTC_WRAPPER": ""}
     # This target belongs only to the generated sources, never the shared cache.
-    run(["cargo", "build", "--release", "--locked", "--offline", "-p", "agent-file-tools", "--example", "exact_bench"], cwd=source, env=env)
+    run(["timeout", "1800", "cargo", "build", "--profile", "ci-storm", "--locked", "--offline", "-p", "agent-file-tools", "--example", "exact_bench"], cwd=source, env=env)
     binary = args.out / (name + "-exact-bench")
-    shutil.copy2(args.out / "build-target/release/examples/exact_bench", binary)
+    shutil.copy2(args.out / "build-target/ci-storm/examples/exact_bench", binary)
     return binary
 
 
@@ -199,7 +201,7 @@ def compare(args):
         reports[label] = summary
     result = {"base":args.base,"candidate":args.candidate,
               "queries_sha256":hashlib.sha256(args.queries.read_bytes()).hexdigest(),
-              "profile":"release; default features; temporary identical instrumentation",
+              "profile":"ci-storm; default features; temporary identical instrumentation",
               "order":["baseline","candidate","candidate","baseline"],
               "runs":reports}
     (args.out / "comparison.json").write_text(json.dumps(result,indent=2)+"\n")
