@@ -10,7 +10,10 @@ import * as bootstrap from "../bridge-bootstrap.js";
 import * as reload from "../config-live-reload.js";
 import * as updater from "../hooks/auto-update-checker/index.js";
 import { AftRpcServer } from "../shared/rpc-server.js";
-import { _resetSessionDirectoryCacheForTest } from "../shared/session-directory.js";
+import {
+  _resetSessionDirectoryCacheForTest,
+  getSessionDirectory,
+} from "../shared/session-directory.js";
 import * as registration from "../tool-registration.js";
 import type { PluginContext } from "../types.js";
 import { registerV2SessionLifecycle } from "../v2-session-lifecycle.js";
@@ -66,7 +69,7 @@ async function setup() {
   spyOn(AftRpcServer.prototype, "start").mockResolvedValue(undefined);
 
   const plugin = (await import(`../index.js?session-events=${importCounter++}`)).default as Plugin;
-  async function instance(directory: string, client: unknown) {
+  async function instance(directory: string, client: unknown, ownedTaskIds: string[] = []) {
     let nextChannel = 0;
     const routeOpen = mock(async (_target: unknown, _identity: { project_root: string }) => ({
       channel: ++nextChannel,
@@ -84,6 +87,7 @@ async function setup() {
       markSubscribed();
       return { unsubscribe: () => close(), closed };
     });
+    const requests: Array<Record<string, unknown>> = [];
     const pool = new bridge.SubcTransportPool({
       connectionFile: "/unused/session-events.json",
       harness: "opencode",
@@ -91,7 +95,16 @@ async function setup() {
         ({
           routeOpen,
           subscribe,
-          request: async () => ({ structuredContent: { success: true, bg_completions: [] } }),
+          request: async (_route: unknown, body: Record<string, unknown>) => {
+            requests.push(body);
+            return {
+              structuredContent: {
+                success: true,
+                bg_completions: [],
+                ...(body.name === "bash_owned_tasks" ? { task_ids: ownedTaskIds } : {}),
+              },
+            };
+          },
           closeRouteChannel: async () => {},
           close() {},
         }) as SubcClient,
@@ -103,28 +116,41 @@ async function setup() {
     spyOn(bridge, "createAftTransportPool").mockResolvedValue(pool);
     const instanceHooks = (await plugin({ directory, client } as Parameters<Plugin>[0])) as Hooks;
     hooks.push(instanceHooks);
-    return { hooks: instanceHooks, routeOpen, subscribe, subscribed, pool };
+    return { hooks: instanceHooks, routeOpen, subscribe, subscribed, pool, requests };
   }
-  async function nativeInstance(directory: string, session: unknown) {
+  async function nativeInstance(
+    directory: string,
+    session: unknown,
+    options?: { ownedTaskIds?: string[]; get?: () => Effect.Effect<unknown, unknown> },
+  ) {
     const bus = await Effect.runPromise(
-      PubSub.unbounded<{ type: string; data: { sessionID: string } }>(),
+      PubSub.unbounded<{
+        type: string;
+        location?: { directory: string; workspaceID?: string };
+        data: { sessionID: string };
+      }>(),
     );
     const scope = await Effect.runPromise(Scope.make());
     scopes.push(scope);
     const host = {
       location: { directory },
-      session: { get: () => Effect.succeed(session) },
+      session: { get: options?.get ?? (() => Effect.succeed(session)) },
       event: { subscribe: () => Stream.fromPubSub(bus) },
     };
-    const entry = await instance(directory, host);
+    const entry = await instance(directory, host, options?.ownedTaskIds);
     const ctx = { pool: entry.pool, client: host, config: {} } as unknown as PluginContext;
     await Effect.runPromise(
       registerV2SessionLifecycle(host, ctx).pipe(Effect.provideService(Scope.Scope, scope)),
     );
     return {
       ...entry,
-      async event(type: string, sessionID: string) {
-        await Effect.runPromise(PubSub.publish(bus, { type, data: { sessionID } }));
+      host,
+      async event(
+        type: string,
+        sessionID: string,
+        location?: { directory: string; workspaceID?: string },
+      ) {
+        await Effect.runPromise(PubSub.publish(bus, { type, location, data: { sessionID } }));
         await Bun.sleep(20);
       },
     };
@@ -220,14 +246,21 @@ describe.serial("session events route only to their owning location", () => {
     expect(otherStart).not.toHaveBeenCalled();
   });
 
-  test("native V2 deletion cleanup binds only the session's owning Location", async () => {
+  test("native V2 deletion cleans up its payload's owner even when the session lookup fails", async () => {
     const { first, second, nativeInstance } = await setup();
-    const session = { location: { directory: first }, parentID: "parent" };
-    const owner = await nativeInstance(first, session);
-    const other = await nativeInstance(second, session);
+    const get = () => Effect.fail(new Error("session already deleted"));
+    const owner = await nativeInstance(first, undefined, {
+      get,
+      ownedTaskIds: ["owned-background-task"],
+    });
+    const other = await nativeInstance(second, undefined, {
+      get,
+      ownedTaskIds: ["foreign-background-task"],
+    });
+    const location = { directory: first };
 
-    await other.event("session.deleted", "native-owned");
-    await owner.event("session.deleted", "native-owned");
+    await other.event("session.deleted", "native-owned", location);
+    await owner.event("session.deleted", "native-owned", location);
     await owner.subscribed;
 
     expect(other.routeOpen).not.toHaveBeenCalled();
@@ -235,6 +268,34 @@ describe.serial("session events route only to their owning location", () => {
     expect(owner.routeOpen).toHaveBeenCalledTimes(2);
     expect(owner.routeOpen.mock.calls.every((call) => call[1].project_root === first)).toBe(true);
     expect(owner.subscribe).toHaveBeenCalledTimes(1);
+    expect(owner.requests.map((request) => request.name)).toEqual([
+      "bash_owned_tasks",
+      "bash_kill",
+    ]);
+    expect(owner.requests.at(-1)?.arguments).toMatchObject({ task_id: "owned-background-task" });
+  });
+
+  test("native V2 location-less deletion uses cached ownership after the session disappears", async () => {
+    const { first, second, nativeInstance } = await setup();
+    const session = { location: { directory: first } };
+    const owner = await nativeInstance(first, session, {
+      ownedTaskIds: ["cached-background-task"],
+    });
+    const other = await nativeInstance(second, undefined);
+    await getSessionDirectory(owner.host, "native-cached-owner", first);
+    owner.host.session.get = () => Effect.fail(new Error("session already deleted"));
+
+    await other.event("session.deleted", "native-cached-owner");
+    await owner.event("session.deleted", "native-cached-owner");
+    await owner.subscribed;
+
+    expect(other.routeOpen).not.toHaveBeenCalled();
+    expect(other.subscribe).not.toHaveBeenCalled();
+    expect(owner.requests.map((request) => request.name)).toEqual([
+      "bash_owned_tasks",
+      "bash_kill",
+    ]);
+    expect(owner.requests.at(-1)?.arguments).toMatchObject({ task_id: "cached-background-task" });
   });
 
   test("native V2 cleanup opens nothing for a removed child whose lookup has no answer", async () => {

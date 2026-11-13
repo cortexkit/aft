@@ -53,8 +53,13 @@ interface V2SessionInfo {
   location?: { directory?: unknown; workspaceID?: string };
 }
 
+interface SessionLocation {
+  directory: string;
+  workspaceID?: string;
+}
+
 interface V2PluginContextShape {
-  location: { directory: string; workspaceID?: string };
+  location: SessionLocation;
   session: {
     get(input: { sessionID: string }): Effect.Effect<V2SessionInfo | undefined, unknown>;
   };
@@ -93,7 +98,7 @@ interface CacheEntry {
   /** Resolved directory, or `null` while a failed lookup is cooling down. */
   directory: string | null;
   /** V2 Location refs distinguish workspaces that share a directory. */
-  location?: { directory: string; workspaceID?: string };
+  location?: SessionLocation;
   /** When the answer was recorded; failed lookups become retryable after 30 seconds. */
   recordedAt: number;
 }
@@ -156,6 +161,39 @@ export async function getSessionDirectoryForEvent(
   )
     return null;
   return directory;
+}
+
+/** Deleted records cannot be queried: prefer the event's Location, then a previously resolved ref. */
+export function getSessionDirectoryForDeletedEvent(
+  client: unknown,
+  sessionId: string,
+  eventLocation: unknown,
+): string | null {
+  if (!sessionId || !isV2PluginContext(client)) return null;
+  let location: SessionLocation | undefined;
+  if (eventLocation === undefined) {
+    location = cache.get(sessionId)?.location;
+  } else {
+    if (!eventLocation || typeof eventLocation !== "object") return null;
+    const ref = eventLocation as { directory?: unknown; workspaceID?: unknown };
+    if (
+      typeof ref.directory !== "string" ||
+      !ref.directory ||
+      (ref.workspaceID !== undefined && typeof ref.workspaceID !== "string")
+    )
+      return null;
+    location = { directory: ref.directory, workspaceID: ref.workspaceID };
+    // The cleanup's bridge call also consults this cache. Preserve the event's
+    // ownership proof there instead of asking the host for an already-deleted record.
+    setCache(sessionId, location.directory, location);
+  }
+  if (
+    !location ||
+    location.directory !== client.location.directory ||
+    location.workspaceID !== client.location.workspaceID
+  )
+    return null;
+  return location.directory;
 }
 
 /** A late success may repair its provisional answer, but never overwrite a newer lookup. */
