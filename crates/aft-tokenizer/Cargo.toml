@@ -1,6 +1,6 @@
 [package]
 name = "aft-tokenizer"
-version = "0.64.0"
+version = "0.65.0"
 edition = "2021"
 description = "Claude lookup-encoding tokenizer for Agent Foundational Toolkit"
 license = "MIT"
