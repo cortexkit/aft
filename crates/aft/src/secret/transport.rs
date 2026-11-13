@@ -1,7 +1,7 @@
 //! Bounded `secret.use` calls over the daemon's attested consumer routes.
 
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -14,6 +14,10 @@ use subc_protocol::{BindIdentity, RouteTarget};
 use zeroize::Zeroizing;
 
 use super::vault::SecretUseTransport;
+
+#[path = "transport_diagnostics.rs"]
+mod diagnostics;
+use diagnostics::{Failure, Stage};
 
 const UNAVAILABLE: &str = "secret.use transport unavailable";
 static CONNECTION_FILE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
@@ -56,7 +60,8 @@ struct Work {
     params: Value,
     principal: ConsumerIdentity,
     deadline: tokio::time::Instant,
-    reply: std::sync::mpsc::Sender<Result<Zeroizing<Vec<u8>>, String>>,
+    reply: std::sync::mpsc::Sender<Result<Zeroizing<Vec<u8>>, Failure>>,
+    failure: Arc<Mutex<Option<Failure>>>,
 }
 
 struct ConnectionConfig {
@@ -212,30 +217,31 @@ impl SubcSecretUseTransport {
         consumer: &subc_client_rs::SubcConsumer,
         params: Value,
         principal: ConsumerIdentity,
-    ) -> Result<Zeroizing<Vec<u8>>, String> {
+    ) -> Result<Zeroizing<Vec<u8>>, Failure> {
         let target = &params["target"];
         if target["scheme"] != "https"
             || target
                 .get("port")
                 .is_some_and(|port| port.as_u64() != Some(443))
         {
-            return Err(UNAVAILABLE.to_owned());
+            return Err(Failure::local(Stage::TargetRefused));
         }
         let stamp: ScopeStamp =
             serde_json::from_value(params.get("stamp").cloned().unwrap_or_default())
-                .map_err(|_| UNAVAILABLE.to_owned())?;
+                .map_err(|_| Failure::local(Stage::StampDecode))?;
+        let kind = stamp.kind;
         let scope = ScopeSelector::new(stamp.owner, stamp.scope_ref, Some(stamp.scope_epoch));
         let body = serde_json::to_vec(&json!({"method": "secret.use", "params": params}))
-            .map_err(|_| UNAVAILABLE.to_owned())?;
+            .map_err(|_| Failure::local(Stage::Encode))?;
         let route = open_vault_route(
             consumer,
             config.identity.clone(),
             principal,
-            Some(scope),
+            Some(scope.clone()),
             config.timeout,
         )
         .await
-        .map_err(|_| UNAVAILABLE.to_owned())?;
+        .map_err(|error| Failure::call(Stage::RouteOpen, &error).under_scope(kind, &scope))?;
         let reply = consumer
             .request(
                 &route,
@@ -252,9 +258,13 @@ impl SubcSecretUseTransport {
                 Ok(bytes)
             }
             // Preserve the distinction between a module Error frame and a
-            // result refusal. Do not include SDK errors or reply bytes in
-            // transport diagnostics: either could carry released material.
-            Err(CallError::Module(error)) => {
+            // result refusal. Only allowlisted codes enter diagnostics: SDK
+            // messages, detail and reply bytes could carry released material.
+            Err(error @ CallError::Module(_)) => {
+                let failure = Failure::call(Stage::ModuleError, &error);
+                let CallError::Module(error) = error else {
+                    unreachable!();
+                };
                 let code = Zeroizing::new(error.code);
                 let _message = Zeroizing::new(error.message);
                 // Retain only the classified sender error. Peer detail may
@@ -264,10 +274,10 @@ impl SubcSecretUseTransport {
                         br#"{"code":"invalid_params","message":""}"#.to_vec(),
                     ))
                 } else {
-                    Err(UNAVAILABLE.to_owned())
+                    Err(failure)
                 }
             }
-            Err(_) => Err(UNAVAILABLE.to_owned()),
+            Err(error) => Err(Failure::call(Stage::Request, &error)),
         }
     }
 
@@ -276,6 +286,15 @@ impl SubcSecretUseTransport {
         params: Value,
         principal: ConsumerIdentity,
     ) -> Result<Zeroizing<Vec<u8>>, String> {
+        self.dispatch_work(params, principal)
+            .map_err(Failure::unavailable)
+    }
+
+    fn dispatch_work(
+        &self,
+        params: Value,
+        principal: ConsumerIdentity,
+    ) -> Result<Zeroizing<Vec<u8>>, Failure> {
         let sender = self.worker.get_or_init(|| {
             let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
             let config = ConnectionConfig {
@@ -294,17 +313,31 @@ impl SubcSecretUseTransport {
             sender
         });
         let (reply, answer) = std::sync::mpsc::channel();
+        let failure = Arc::new(Mutex::new(None));
         sender
             .send(Work {
                 params,
                 principal,
                 deadline: tokio::time::Instant::now() + self.timeout,
                 reply,
+                failure: Arc::clone(&failure),
             })
-            .map_err(|_| UNAVAILABLE.to_owned())?;
-        answer
-            .recv_timeout(self.timeout)
-            .map_err(|_| UNAVAILABLE.to_owned())?
+            .map_err(|_| Failure::local(Stage::Worker))?;
+        answer.recv_timeout(self.timeout).unwrap_or_else(|error| {
+            // The worker can be closing a failed connection when the caller's
+            // deadline expires. Preserve that failure and log only at the caller,
+            // so cleanup and deadline races never emit two warnings for one call.
+            Err(failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .unwrap_or_else(|| {
+                    Failure::local(match error {
+                        std::sync::mpsc::RecvTimeoutError::Timeout => Stage::Deadline,
+                        std::sync::mpsc::RecvTimeoutError::Disconnected => Stage::Worker,
+                    })
+                }))
+        })
     }
 
     async fn serve(
@@ -321,7 +354,7 @@ impl SubcSecretUseTransport {
                             ConsumerOptions::default(),
                         )
                         .await
-                        .map_err(|_| UNAVAILABLE.to_owned())?,
+                        .map_err(|error| Failure::connect(&error))?,
                     );
                 }
                 Self::send(
@@ -333,8 +366,12 @@ impl SubcSecretUseTransport {
                 .await
             })
             .await
-            .unwrap_or_else(|_| Err(UNAVAILABLE.to_owned()));
-            if result.is_err() {
+            .unwrap_or_else(|_| Err(Failure::local(Stage::Deadline)));
+            if let Err(error) = &result {
+                *work
+                    .failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.clone());
                 if let Some(failed) = consumer.take() {
                     let _ = tokio::time::timeout(Duration::from_secs(1), failed.close()).await;
                 }
@@ -357,7 +394,8 @@ impl SecretUseTransport for SubcSecretUseTransport {
         if let Some(principal) = &self.test_principal {
             return self.dispatch(params, principal.clone());
         }
-        let principal = aft_identity().ok_or_else(|| UNAVAILABLE.to_owned())?;
+        let principal =
+            aft_identity().ok_or_else(|| Failure::local(Stage::IdentityMissing).unavailable())?;
         self.dispatch(params, principal)
     }
 }

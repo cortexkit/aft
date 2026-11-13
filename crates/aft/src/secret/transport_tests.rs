@@ -348,3 +348,180 @@ fn fake_live_expiry_uses_the_documented_statement_field_and_matches_the_pending_
     assert_eq!(statement["request_expires_at_ms"], expires);
     assert!(statement.get("expires_at_ms").is_none());
 }
+
+const PRIVATE_MESSAGE: &str = "sk-message-must-not-be-logged";
+const PRIVATE_DETAIL: &str = "sk-detail-must-not-be-logged";
+const PRIVATE_PATH: &str = "/target-path-must-not-be-logged";
+
+fn private_params() -> Value {
+    let mut params = golden(0);
+    params["target"]["path"] = json!(PRIVATE_PATH);
+    params
+}
+
+fn peer_error(code: &str) -> Value {
+    json!({"code": code, "message": PRIVATE_MESSAGE, "detail": {"credential": PRIVATE_DETAIL}})
+}
+
+fn assert_failure_log(
+    call: impl FnOnce() -> Result<Zeroizing<Vec<u8>>, String>,
+    expected: &str,
+) -> String {
+    let (result, lines) = crate::logging::capture_log_lines(call);
+    assert_eq!(result.unwrap_err(), UNAVAILABLE);
+    assert_eq!(lines.len(), 1, "one WARN per failed call: {lines:?}");
+    let line = &lines[0];
+    assert!(
+        line.starts_with("WARN secret.use transport failed stage="),
+        "{line}"
+    );
+    assert!(line.contains(expected), "{line}");
+    for private in [
+        PRIVATE_MESSAGE,
+        PRIVATE_DETAIL,
+        PRIVATE_PATH,
+        "sk-example",
+        "c2stZXhhbXBsZQ",
+    ] {
+        assert!(
+            !line.contains(private),
+            "private material in diagnostic: {line}"
+        );
+    }
+    assert!(!line.contains("message="), "{line}");
+    assert!(!line.contains("detail="), "{line}");
+    assert!(!line.contains("stamp="), "{line}");
+    assert!(!line.contains("params="), "{line}");
+    lines.into_iter().next().unwrap()
+}
+
+#[test]
+fn secret_use_logs_refused_scoped_open_code_and_route_identifiers_only() {
+    let daemon = FakeClaustrum::start();
+    daemon.state.lock().unwrap().open_error = Some(peer_error("scope_not_carrier"));
+    let transport = transport(&daemon);
+    let mut params = private_params();
+    params["stamp"]["ref"] = json!("98abc73e7203356c1a394ae8239006c4");
+    let stamp: ScopeStamp = serde_json::from_value(params["stamp"].clone()).unwrap();
+    let line = assert_failure_log(
+        || transport.dispatch(params, principal("aft")),
+        "stage=route_open variant=NotSent code=scope_not_carrier",
+    );
+    assert_eq!(line, format!(
+        "WARN secret.use transport failed stage=route_open variant=NotSent code=scope_not_carrier scope_kind=head scope_owner=\"reserved:prefrontal-core\" scope_ref=\"98abc73e7203356c1a394ae8239006c4\" scope_epoch={}",
+        stamp.scope_epoch
+    ));
+    assert_eq!(daemon.state.lock().unwrap().calls, 0);
+}
+
+#[test]
+fn secret_use_logs_module_error_code_without_peer_message_or_detail() {
+    let daemon = FakeClaustrum::start();
+    daemon.state.lock().unwrap().request_error = Some(peer_error("transient"));
+    let transport = transport(&daemon);
+    assert_failure_log(
+        || transport.dispatch(private_params(), principal("aft")),
+        "stage=module_error variant=Module code=transient",
+    );
+}
+
+#[test]
+fn secret_use_logs_unlisted_instead_of_secret_shaped_peer_code() {
+    let daemon = FakeClaustrum::start();
+    const PRIVATE_CODE: &str = "sk-code-must-not-be-logged";
+    daemon.state.lock().unwrap().request_error = Some(peer_error(PRIVATE_CODE));
+    let transport = transport(&daemon);
+    let line = assert_failure_log(
+        || transport.dispatch(private_params(), principal("aft")),
+        "stage=module_error variant=Module code=unlisted",
+    );
+    assert!(!line.contains(PRIVATE_CODE));
+}
+
+#[test]
+fn secret_use_logs_target_refused_without_the_target() {
+    let daemon = FakeClaustrum::start();
+    let transport = transport(&daemon);
+    let mut params = private_params();
+    params["target"]["scheme"] = json!("http");
+    assert_failure_log(
+        || transport.dispatch(params, principal("aft")),
+        "stage=target_refused",
+    );
+    assert!(daemon.state.lock().unwrap().opens.is_empty());
+}
+
+#[test]
+fn secret_use_logs_stamp_decode_without_the_stamp_or_decode_error() {
+    let daemon = FakeClaustrum::start();
+    let transport = transport(&daemon);
+    let mut params = private_params();
+    params["stamp"] = json!(PRIVATE_DETAIL);
+    assert_failure_log(
+        || transport.dispatch(params, principal("aft")),
+        "stage=stamp_decode",
+    );
+    assert!(daemon.state.lock().unwrap().opens.is_empty());
+}
+
+#[test]
+fn secret_use_logs_connect_variant_without_the_connection_file_path() {
+    let daemon = FakeClaustrum::start();
+    let mut transport = transport(&daemon);
+    transport.connection_file = daemon.path.with_file_name(PRIVATE_MESSAGE);
+    assert_failure_log(
+        || transport.dispatch(private_params(), principal("aft")),
+        "stage=connect variant=ConnectionFile",
+    );
+}
+
+#[test]
+fn secret_use_logs_request_variant_without_free_text() {
+    let daemon = FakeClaustrum::start();
+    daemon.state.lock().unwrap().disconnect = true;
+    let transport = transport(&daemon);
+    let line = assert_failure_log(
+        || transport.dispatch(private_params(), principal("aft")),
+        "stage=request variant=OutcomeUnknown",
+    );
+    assert!(
+        !line.contains("code="),
+        "a free-text-only error has no code"
+    );
+}
+
+#[test]
+fn secret_use_logs_deadline_once_when_scoped_open_never_replies() {
+    let daemon = FakeClaustrum::start();
+    daemon.state.lock().unwrap().hold_open = true;
+    let mut transport = transport(&daemon);
+    transport.timeout = Duration::from_millis(150);
+    assert_failure_log(
+        || transport.dispatch(private_params(), principal("aft")),
+        "stage=deadline",
+    );
+}
+
+#[test]
+fn secret_use_logs_worker_failure_when_the_channel_is_closed() {
+    let daemon = FakeClaustrum::start();
+    let transport = transport(&daemon);
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    drop(receiver);
+    assert!(transport.worker.set(sender).is_ok());
+    assert_failure_log(
+        || transport.dispatch(private_params(), principal("aft")),
+        "stage=worker",
+    );
+}
+
+#[test]
+fn secret_use_logs_missing_attested_identity_without_request_data() {
+    let _nonce = crate::launch_nonce::install_for_tests(None);
+    let daemon = FakeClaustrum::start();
+    let transport = transport(&daemon);
+    assert_failure_log(
+        || transport.secret_use(private_params()),
+        "stage=identity_missing",
+    );
+}

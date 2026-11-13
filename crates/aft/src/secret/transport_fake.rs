@@ -52,6 +52,8 @@ pub(crate) struct State {
     pub next_request: usize,
     pub pending_expires_at_ms: Option<u64>,
     pub module_error_message: Option<String>,
+    pub open_error: Option<Value>,
+    pub request_error: Option<Value>,
     approved: HashSet<PendingKey>,
     pub(super) pending: HashMap<PendingKey, Value>,
 }
@@ -394,16 +396,19 @@ impl FakeClaustrum {
                                     let (reply, error) = if value["op"] == "route.open" {
                                         assert_eq!(value["target"], json!({"kind":"management_surface","module_id":"claustrum"}));
                                         assert!(value.get("scope").is_some());
-                                        let hold = {
+                                        let (hold, error) = {
                                             let mut state = state.lock().unwrap();
                                             state.opens.push(value.clone());
-                                            state.hold_open
+                                            (state.hold_open, state.open_error.clone())
                                         };
                                         if hold { continue; }
                                         if value["consumer_identity"]["launch_nonce"] == NONCE {
                                             principal = value["consumer_identity"]["module_id"].as_str().unwrap().into();
                                         }
-                                        (json!({"op":"route.open","route_channel":7,"route_epoch":1}), false)
+                                        match error {
+                                            Some(error) => (error, true),
+                                            None => (json!({"op":"route.open","route_channel":7,"route_epoch":1}), false),
+                                        }
                                     } else {
                                         assert_eq!(value["method"], "secret.use");
                                         let mut state = state.lock().unwrap();
@@ -411,7 +416,7 @@ impl FakeClaustrum {
                                          state.params.push(value["params"].clone());
                                         if state.disconnect { break; }
                                         if state.hold_reply { continue; }
-                                        let mut reply = state.serve(&principal, value["params"].clone());
+                                        let mut reply = state.request_error.clone().unwrap_or_else(|| state.serve(&principal, value["params"].clone()));
                                         let error = reply.get("code").is_some();
                                         if error {
                                             if let Some(message) = &state.module_error_message {
