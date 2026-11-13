@@ -6,6 +6,23 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const sourceRoot = join(pluginRoot, "src/tui");
 const outputRoot = join(pluginRoot, "src/tui-compiled");
+const sharedSidebarSource = fileURLToPath(import.meta.resolve("@cortexkit/opencode-sidebar"));
+const sharedSidebarHost = join(outputRoot, "shared-sidebar-host.tsx");
+const sharedSidebarLocal = join(outputRoot, "shared-sidebar-local.tsx");
+const lockfile = Bun.JSONC.parse(await readFile(join(pluginRoot, "../../bun.lock"), "utf8")) as {
+  packages: Record<string, string[]>;
+};
+const sharedSidebarVersion = (
+  JSON.parse(await readFile(join(dirname(sharedSidebarSource), "../package.json"), "utf8")) as {
+    version: string;
+  }
+).version;
+if (
+  lockfile.packages["@cortexkit/opencode-sidebar"]?.[0] !==
+  `@cortexkit/opencode-sidebar@${sharedSidebarVersion}`
+) {
+  throw new Error("The installed shared sidebar differs from bun.lock; run `bun install` first.");
+}
 const runtimeSpecifiers = new Set([
   "@opentui/core",
   "@opentui/core/testing",
@@ -113,17 +130,24 @@ async function compileTsx(
   transformSolidSource: TransformSolidSource,
   sourceFile: string,
   outputFile: string,
+  hostRuntime = true,
 ): Promise<void> {
   const code = await readFile(sourceFile, "utf8");
   const compiled = await transformSolidSource(code, {
     filename: sourceFile,
-    moduleName: runtimeModuleId("@opentui/solid"),
-    resolvePath: (specifier: string) =>
-      runtimeSpecifiers.has(specifier) ? runtimeModuleId(specifier) : null,
+    moduleName: hostRuntime ? runtimeModuleId("@opentui/solid") : "@opentui/solid",
+    resolvePath: (specifier: string) => {
+      if (!hostRuntime) return null;
+      if (specifier === "./shared-sidebar") {
+        const path = relative(dirname(outputFile), sharedSidebarHost).replaceAll("\\", "/");
+        return path.startsWith(".") ? path : `./${path}`;
+      }
+      return runtimeSpecifiers.has(specifier) ? runtimeModuleId(specifier) : null;
+    },
   });
 
   await mkdir(dirname(outputFile), { recursive: true });
-  await writeFile(outputFile, compiled);
+  await writeFile(outputFile, `// @ts-nocheck\n${compiled}`);
 }
 
 const transformSolidSource = await loadTransformSolidSource();
@@ -148,4 +172,16 @@ for (const sourceFile of files) {
   }
 }
 
-console.log(`build-tui: wrote ${files.length} file(s) to ${relative(pluginRoot, outputRoot)}`);
+// Both outputs come from the installed, lockfile-pinned package on every build.
+// Neither transform bundles a runtime: one imports OpenTUI's virtual runtime
+// module IDs, the other imports the raw-source TUI's ordinary Solid/OpenTUI modules.
+await compileTsx(transformSolidSource, sharedSidebarSource, sharedSidebarHost);
+await compileTsx(transformSolidSource, sharedSidebarSource, sharedSidebarLocal, false);
+await copyFile(
+  join(dirname(sharedSidebarSource), "../LICENSE"),
+  join(outputRoot, "shared-sidebar.LICENSE"),
+);
+
+console.log(
+  `build-tui: wrote ${files.length + 3} file(s) to ${relative(pluginRoot, outputRoot)}, including @cortexkit/opencode-sidebar@${sharedSidebarVersion} in both runtime paths and its license`,
+);

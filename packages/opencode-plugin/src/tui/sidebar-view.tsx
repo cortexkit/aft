@@ -11,7 +11,6 @@
 // identically by both. Without this split the second host drifts into a
 // smaller, differently-worded panel, which is exactly what happened before.
 
-import { SidebarFrame, type SidebarTheme } from "@cortexkit/opencode-sidebar";
 import { createMemo, createSignal, onCleanup } from "solid-js";
 import {
   type AftStatusSnapshot,
@@ -34,6 +33,7 @@ import {
   seedCollapsedFromPrefs,
   watchTuiPreferences,
 } from "./preferences";
+import { SidebarFrame, type SidebarTheme } from "./shared-sidebar";
 
 const SINGLE_BORDER = { type: "single" } as any;
 

@@ -10,10 +10,21 @@
 // the compact view, and AFT_SIDEBAR_PALETTE overrides the default theme roles.
 // AFT_SIDEBAR_CAPTURE=spans includes cell colors alongside the character frame.
 // AFT_SIDEBAR_PANEL_MODULE optionally selects a candidate module for comparisons.
+// AFT_SIDEBAR_ENTRY_CHECK verifies the source TUI entry selected without a host
+// virtual-runtime registry, then renders the same panel that entry imports.
 
 import { testRender } from "@opentui/solid";
 import { DEFAULT_PREFS } from "../../tui/preferences.ts";
 import { AftSidebarPanel } from "../../tui/sidebar-view.tsx";
+
+if (process.env.AFT_SIDEBAR_ENTRY_CHECK === "true") {
+  const raw = (await import("../../tui/index.tsx")).default;
+  const legacy = (await import("../../tui/entry.mjs")).default;
+  const hybrid = (await import("../../entry/tui.mjs")).default;
+  if (legacy !== raw || hybrid.tui !== raw.tui || typeof hybrid.setup !== "function") {
+    throw new Error("The V1/V2 TUI entries did not select the raw-source fallback");
+  }
+}
 
 const Panel = process.env.AFT_SIDEBAR_PANEL_MODULE
   ? (await import(process.env.AFT_SIDEBAR_PANEL_MODULE)).AftSidebarPanel

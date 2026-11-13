@@ -33,7 +33,7 @@
     "schema": "bun scripts/build-schema.ts",
     "build:tool-schemas": "bun run scripts/build-tool-schemas.ts",
     "prepublishOnly": "bun run build",
-    "test:unit": "bun test src/__tests__ ./test/ ./__tests__/ --path-ignore-patterns 'src/__tests__/e2e/**'",
+    "test:unit": "bun run build:tui && bun test src/__tests__ ./test/ ./__tests__/ --path-ignore-patterns 'src/__tests__/e2e/**'",
     "build:tui": "bun scripts/build-tui.ts",
     "smoke:tui": "bun test ./scripts/smoke-tui-pack-install.ts"
   },
