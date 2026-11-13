@@ -40,6 +40,7 @@
   "dependencies": {
     "@clack/prompts": "^1.6.0",
     "@cortexkit/aft-bridge": "0.64.0",
+    "@cortexkit/opencode-sidebar": "0.3.0",
     "@opentui/core": "0.4.5",
     "@opentui/solid": "0.4.5",
     "comment-json": "^4.6.2",

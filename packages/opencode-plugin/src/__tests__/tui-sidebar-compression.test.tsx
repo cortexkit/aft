@@ -32,7 +32,10 @@ mock.module("@opentui/solid/jsx-runtime", () => ({
   jsx: renderComponent,
   jsxs: renderComponent,
 }));
+// Preserve SidebarFrame's Solid context APIs while stubbing renderer lifecycles.
+const solid = await import("solid-js");
 mock.module("solid-js", () => ({
+  ...solid,
   createEffect: () => undefined,
   createMemo: (fn: () => unknown) => fn,
   createSignal: (initial: unknown) => [() => initial, () => undefined],

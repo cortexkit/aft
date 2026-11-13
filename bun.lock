@@ -53,6 +53,7 @@
       "dependencies": {
         "@clack/prompts": "^1.6.0",
         "@cortexkit/aft-bridge": "0.64.0",
+        "@cortexkit/opencode-sidebar": "0.3.0",
         "@opentui/core": "0.4.5",
         "@opentui/solid": "0.4.5",
         "comment-json": "^4.6.2",
@@ -285,6 +286,8 @@
     "@cortexkit/aft-pi": ["@cortexkit/aft-pi@workspace:packages/pi-plugin"],
 
     "@cortexkit/aft-pi-rpc-e2e": ["@cortexkit/aft-pi-rpc-e2e@workspace:tests/pi-rpc"],
+
+    "@cortexkit/opencode-sidebar": ["@cortexkit/opencode-sidebar@0.3.0", "", { "peerDependencies": { "@opentui/core": ">=0.4.5", "@opentui/solid": ">=0.4.5", "solid-js": ">=1.9.12 <2" } }, "sha512-jyVL2kKOS2IXEdJYrmKhNpNMyKgf3WRske5sbzPkVhzYJ53vFFV0CAqvect9JTR2pG4gTmKJIOU+WcRC9Qiruw=="],
 
     "@cortexkit/subc-client": ["@cortexkit/subc-client@0.21.2", "", {}, "sha512-xQLfwFBOigFRF1VMgta7Dr/640H34EHexRtFLDkH42yAAMvtXJFmQ4bsjin6CDmfXiKeItsuQqjYFRMEZs4Aaw=="],
 
