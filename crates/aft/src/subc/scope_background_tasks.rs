@@ -364,15 +364,15 @@ fn registry_snapshot(
     Ok((registries.values().cloned().collect(), expected.sessions))
 }
 
-// Match the existing non-terminal partial index before inspecting scope JSON.
+// Use the existing status index before inspecting scope JSON.
 // Only matching rows consume the management observation's iterator budget.
 const SCOPED_TASKS_SQL: &str = "SELECT task_id, metadata FROM bash_tasks
-    WHERE status NOT IN ('completed', 'failed', 'killed', 'timed_out')
+    WHERE status IN ('starting', 'running', 'killing')
       AND completed_at IS NULL
       AND CASE WHEN json_valid(metadata) THEN
           json_extract(metadata, '$.scope.owner') = json(?1)
           AND json_extract(metadata, '$.scope.ref') = ?2
-          AND json_extract(metadata, '$.scope.epoch') = json_extract(?3, '$')
+          AND json_extract(metadata, '$.scope.scope_epoch') = json_extract(?3, '$')
           ELSE 0 END
     LIMIT ?4";
 
@@ -1032,7 +1032,7 @@ mod tests {
         eprintln!("scope task query plan: {plan:?}");
         assert!(
             plan.iter()
-                .any(|line| line.contains("idx_bash_tasks_non_terminal_pid")),
+                .any(|line| line.contains("idx_bash_tasks_status")),
             "{plan:?}"
         );
         let mut remaining = 1;

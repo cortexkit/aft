@@ -25723,32 +25723,58 @@ mod tests {
 
     #[test]
     fn scope_background_tasks_store_coalesced_writes_release_tickets() {
-        let (storage, registry, _db, task) = scope_task_store_fixture();
-        let metadata = task.lock_state().unwrap().metadata.clone();
+        let (storage, registry, db, task) = scope_task_store_fixture();
+        let mut metadata = task.lock_state().unwrap().metadata.clone();
         let mut older = DeferredDbWrites::new(&registry, &task);
         older.capture(&metadata);
         assert_eq!(super::super::store_writes::outstanding(storage.path()), 1);
         let mut newer = DeferredDbWrites::new(&registry, &task);
+        metadata.command = "newer snapshot".into();
         newer.capture(&metadata);
         assert_eq!(super::super::store_writes::outstanding(storage.path()), 1);
         drop(newer);
         drop(older);
         assert_eq!(super::super::store_writes::outstanding(storage.path()), 0);
         assert!(super::super::store_writes::authoritative(storage.path()));
+        assert_eq!(
+            crate::db::bash_tasks::get_bash_task(
+                &db.lock().unwrap(),
+                "opencode",
+                "session",
+                &task.task_id
+            )
+            .unwrap()
+            .unwrap()
+            .command,
+            "newer snapshot"
+        );
     }
 
     #[test]
     fn scope_background_tasks_store_deferred_until_attach_releases_tickets() {
         let (storage, registry, db, task) = scope_task_store_fixture();
+        task.lock_state().unwrap().metadata.command = "attach landed".into();
         let metadata = task.lock_state().unwrap().metadata.clone();
         registry.clear_db_pool();
         registry.dual_write_task(&task.paths, &metadata);
         registry.dual_write_task(&task.paths, &metadata);
         assert_eq!(super::super::store_writes::outstanding(storage.path()), 1);
         assert!(!super::super::store_writes::authoritative(storage.path()));
-        registry.set_db_pool(db);
+        registry.set_db_pool(db.clone());
         assert_eq!(super::super::store_writes::outstanding(storage.path()), 0);
         assert!(super::super::store_writes::authoritative(storage.path()));
+        assert_eq!(
+            crate::db::bash_tasks::get_bash_task(
+                &db.lock().unwrap(),
+                "opencode",
+                "session",
+                &task.task_id
+            )
+            .unwrap()
+            .unwrap()
+            .command,
+            "attach landed"
+        );
     }
 
     #[test]
@@ -25765,9 +25791,28 @@ mod tests {
     }
 
     #[test]
+    fn scope_background_tasks_store_harness_layout_counts_against_database_root() {
+        let (storage, registry, db, task) = scope_task_store_fixture();
+        let harness_root = storage.path().join("opencode");
+        let layout =
+            super::super::persistence::allocate_task_layout(&harness_root, "other-session")
+                .unwrap();
+        let mut metadata = task.lock_state().unwrap().metadata.clone();
+        metadata.task_id = layout.paths.task_id.clone();
+        metadata.session_id = "other-session".into();
+        registry.clear_db_pool();
+        registry.dual_write_task(&layout.paths, &metadata);
+        assert_eq!(super::super::store_writes::outstanding(storage.path()), 1);
+        assert_eq!(super::super::store_writes::outstanding(&harness_root), 0);
+        registry.set_db_pool(db);
+        assert_eq!(super::super::store_writes::outstanding(storage.path()), 0);
+        assert!(!super::super::store_writes::authoritative(storage.path()));
+    }
+
+    #[test]
     fn scope_background_tasks_store_successful_retry_releases_tickets_and_failure_stays_sticky() {
         let (storage, registry, db, task) = scope_task_store_fixture();
-        let metadata = task.lock_state().unwrap().metadata.clone();
+        let mut metadata = task.lock_state().unwrap().metadata.clone();
         db.lock()
             .unwrap()
             .execute_batch("ALTER TABLE bash_tasks RENAME TO hidden_bash_tasks")
@@ -25779,9 +25824,22 @@ mod tests {
             .unwrap()
             .execute_batch("ALTER TABLE hidden_bash_tasks RENAME TO bash_tasks")
             .unwrap();
+        metadata.command = "retry landed".into();
         registry.dual_write_task(&task.paths, &metadata);
         assert_eq!(super::super::store_writes::outstanding(storage.path()), 0);
         assert!(!super::super::store_writes::authoritative(storage.path()));
+        assert_eq!(
+            crate::db::bash_tasks::get_bash_task(
+                &db.lock().unwrap(),
+                "opencode",
+                "session",
+                &task.task_id
+            )
+            .unwrap()
+            .unwrap()
+            .command,
+            "retry landed"
+        );
     }
 
     /// A deferred aft.db write that reaches the database after a newer one
