@@ -1,10 +1,11 @@
 /// <reference path="../bun-test.d.ts" />
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, mock, test } from "bun:test";
 import { Effect } from "effect";
 import {
   _resetSessionDirectoryCacheForTest,
   getSessionDirectory,
   getSessionDirectoryCached,
+  getSessionDirectoryForDeletedEvent,
   getSessionDirectoryForEvent,
   verifySessionDirectory,
   warmSessionDirectory,
@@ -66,6 +67,54 @@ describe("session event directories", () => {
   test("V1 also leaves an unresolved session unassigned", async () => {
     const client = { session: { get: async () => undefined } };
     expect(await getSessionDirectoryForEvent(client, "ses_unknown", "/instance/cwd")).toBeNull();
+  });
+});
+
+describe("deleted session event directories", () => {
+  test("the event Location overrides stale cached ownership without querying the deleted record", async () => {
+    await getSessionDirectory(
+      {
+        location: { directory: "/old" },
+        session: { get: () => Effect.succeed({ location: { directory: "/old" } }) },
+      },
+      "deleted-moved",
+      "/old",
+    );
+    const location = { directory: "/new", workspaceID: "workspace-new" };
+    const get = mock(() => Effect.fail(new Error("session removed")));
+    const client = { location, session: { get } };
+    expect(getSessionDirectoryForDeletedEvent(client, "deleted-moved", location)).toBe("/new");
+    expect(getSessionDirectoryCached("deleted-moved")).toBe("/new");
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  test("a foreign event Location overrides a matching cache rather than falling back to it", async () => {
+    const location = { directory: "/own", workspaceID: "own-workspace" };
+    const client = { location, session: { get: () => Effect.succeed({ location }) } };
+    await getSessionDirectory(client, "deleted-foreign", "/own");
+    expect(
+      getSessionDirectoryForDeletedEvent(client, "deleted-foreign", {
+        directory: "/own",
+        workspaceID: "foreign-workspace",
+      }),
+    ).toBeNull();
+    expect(getSessionDirectoryForDeletedEvent(client, "deleted-foreign", undefined)).toBeNull();
+  });
+
+  test("a location-less deletion can use its previously resolved Location without a new lookup", async () => {
+    const location = { directory: "/own", workspaceID: "workspace" };
+    const get = mock(() => Effect.succeed({ location }));
+    const client = { location, session: { get } };
+    await getSessionDirectory(client, "deleted-cached", "/own");
+    expect(getSessionDirectoryForDeletedEvent(client, "deleted-cached", undefined)).toBe("/own");
+    expect(get).toHaveBeenCalledTimes(1);
+  });
+
+  test("a location-less deletion with no cached ownership never queries the missing record", () => {
+    const get = mock(() => Effect.fail(new Error("session removed")));
+    const client = { location: { directory: "/own" }, session: { get } };
+    expect(getSessionDirectoryForDeletedEvent(client, "deleted-unknown", undefined)).toBeNull();
+    expect(get).not.toHaveBeenCalled();
   });
 });
 
