@@ -197,11 +197,12 @@ assert(solid.createSignal === ordinarySolid.createSignal && solid.createContext 
 const compiledSidebar = await readFile(join(packageRoot, "src/tui-compiled/sidebar.tsx"), "utf8");
 const rawSidebar = await readFile(join(packageRoot, "src/tui/sidebar.tsx"), "utf8");
 assert(
-  compiledSidebar.includes("_$effect(") || compiledSidebar.includes("_$insert("),
-  "compiled sidebar lacks OpenTUI reactive wrapper calls",
+  compiledSidebar.includes("_$createComponent(") &&
+    compiledSidebar.includes("get snapshot()") && compiledSidebar.includes("get collapsed()"),
+  "compiled sidebar must pass live snapshot and collapse getters to its panel component",
 );
 assert(
-  !rawSidebar.includes("_$effect(") && !rawSidebar.includes("_$insert("),
+  !rawSidebar.includes("_$effect(") && !rawSidebar.includes("_$insert(") && !rawSidebar.includes("_$createComponent("),
   "raw sidebar unexpectedly contains compiled wrapper calls",
 );
 
