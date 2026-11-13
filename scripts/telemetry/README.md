@@ -75,8 +75,78 @@ measure and print, but it will not gate, because it cannot.
 
 ## What is measured
 
-All compared numbers come from the runner sampler or structured telemetry; no
-human-readable log message is used as a gate input.
+The current profile is `index-store-no-inspect-refresh-v4`, introduced for the
+repository-wide index store in AFT 0.64. The older store's trigram build,
+SQLite callgraph resolution, and ready-to-first-query lifecycle events no
+longer exist on the production path. Their measurements are retired, not
+filled with zero or inferred from unrelated log messages. Historical CSV
+reading remains available for diagnosis, but those columns cannot be blessed
+into the new baseline.
+
+- `index_store_build_ready_ms` measures configure to the text plane becoming
+  ready; `callgraph_store_build_ready_ms` measures configure to the call graph becoming
+  ready. The harness uses a monotonic clock and polls the structured status
+  surface every 50 ms. Both require `data_store` in status. These are externally
+  observed readiness times, including binding/configuration and up to one poll
+  of observation error, not the removed stores' internal build durations.
+- `search_first_query_latency_ms` and `callgraph_first_query_latency_ms` measure
+  monotonic request/response latency for the first grep and callers probes after
+  readiness. Grep must return the known literal, and the graph probe must return
+  the known original call edge. These
+  are not the retired `*_first_query_ms` metrics, which measured the gap between
+  readiness and the first query, including harness polling and intentional waits.
+  Their new names prevent that gap from being mistaken for query latency; the
+  existing 25% tolerance and 3,000 ms floor carry forward, not the old values.
+- `callgraph_refresh_ms` measures one real source edit through AFT's edit tool
+  and an exact call-graph read. Before configure, the harness creates an isolated
+  Rust probe containing two targets and one caller. The edit moves the call
+  from the first target to the second. Both the new edge's presence and the old
+  edge's absence must be verified before a duration is accepted. The probe is
+  removed after AFT exits; pinned source files are never edited. Each corpus
+  therefore contains its pinned files plus this same small probe during capture.
+- `peak_rss_mb` now uses the Linux kernel's `VmHWM` for the same AFT process
+  sampled by `ps` and `/proc/<pid>/stat`. A final read before AFT shuts down is
+  required; a missing kernel peak is missing data, never zero or a fallback to
+  the polled value. `peak_rss_sampled_mb` retains the two-second sampled maximum
+  as a diagnostic. The 20% tolerance and 128 MB floor are unchanged.
+- This fixes sampling aliasing exposed by the first new-store capture
+  (workflow run 43083077307). Jupyterlab's graph-build peak moved from about
+  6.0 seconds to 5.5 seconds between passes. Two-second polling caught the first
+  spike but missed the second: 292.4/227.1 MB looked 29% apart. The kernel
+  recorded 292.4/289.8 MB, only 0.9% apart, while both passes built the full
+  graph and verified the refresh. The failed capture is not blessed or
+  relabelled; this profile requires a fresh capture.
+- `waiting_on.<cause>` counts structured slow tool calls (over two seconds)
+  attributed to build, limiter, artifact-load or resolver waits. Its budgets
+  limit call counts, not milliseconds; zero observed calls is a real zero.
+- Semantic and inspect remain disabled. Every pass has fresh storage. CPU,
+  waiting-on budgets, pinned corpus revisions, two-pass per-metric minimum
+  selection and the comparator's limit formula are unchanged. Memory phase
+  labels now describe externally observed
+  building/ready/refresh phases rather than obsolete internal stages.
+- Readiness retains the 25% tolerance and 3,000 ms floor. Refresh inherits the
+  former resolution budget's 20% tolerance and 500 ms floor. Resource and
+  waiting-on thresholds are preserved verbatim by the baseline writer.
+- Baseline generation requires two ready passes with every core metric and
+  refuses a pair whose maximum exceeds the minimum's tolerance/floor budget.
+  A noisy capture is a failed capture, not permission to widen a threshold.
+- The committed legacy baseline is incompatible with this profile. A fresh
+  GitHub-hosted capture with `write_baseline: true` is required; no old timing or
+  sampled-memory number is relabelled. That dispatch also gates two independent
+  fresh-storage passes in the same job against the new candidate, with logs/CSVs
+  under `verification/`. The baseline candidate is uploaded for review, not
+  automatically committed. Offline blessing must select the capture's two CSVs,
+  not a directory containing both the capture and verification passes.
+
+The pure probe controls run without a corpus or AFT binary:
+
+```bash
+scripts/telemetry/oss-matrix.sh --self-test-store
+```
+
+The following describes the **retired profile**, retained to explain historical
+nightly results and the investigations below. It is not the current capture
+contract. No human-readable log message is a gate input in either profile.
 
 - The measurement profile is `cold-index-no-inspect-v1`: trigram and callgraph
   build together with semantic and inspect disabled. Inspect's opportunistic
