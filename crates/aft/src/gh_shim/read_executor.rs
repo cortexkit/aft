@@ -108,10 +108,21 @@ fn malformed(code: &str, reason: impl std::fmt::Display) -> ReadError {
     ))
 }
 
+/// Whether a Plexus `github_read` reply is a refusal. The tool reply wraps the
+/// facade object with `isError`; Plexus's lean replies are the bare facade
+/// object, where the `error` member alone marks a refusal. A reply carrying
+/// both `result` and `error` is still refused as ambiguous by the caller.
+fn reply_is_error(value: &Value) -> Result<bool, ReadError> {
+    match value.get("isError") {
+        Some(flag) => flag
+            .as_bool()
+            .ok_or_else(|| malformed("missing", "isError must be a boolean")),
+        None => Ok(value.get("error").is_some()),
+    }
+}
+
 pub(super) fn decode_reply(request: &WireRequest, value: &Value) -> Result<ReadReply, ReadError> {
-    let is_error = value["isError"]
-        .as_bool()
-        .ok_or_else(|| malformed("missing", "isError must be a boolean"))?;
+    let is_error = reply_is_error(value)?;
     if is_error {
         if value.get("result").is_some() {
             return Err(malformed("ambiguous", "error reply also contains result"));

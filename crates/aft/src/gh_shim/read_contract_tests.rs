@@ -859,6 +859,37 @@ fn job_log_reply_matches_plexus_display_text_vector() {
     );
 }
 
+// Plexus's lean replies are the bare facade object without `isError`: an
+// `error` member alone is a refusal, and a reply with neither member is still
+// malformed rather than an empty success.
+#[test]
+fn lean_replies_decode_by_their_facade_member() {
+    let request = log_request(Some((0, 1_048_576)));
+    let error = executor::decode_reply(
+        &request,
+        &json!({"error":{"code":"repository_not_visible","transmission":"not_sent","message":"hidden"}}),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, ReadError::Refused(message) if message.contains("repository is not visible")),
+        "{error:?}"
+    );
+    let error = executor::decode_reply(&request, &json!({})).unwrap_err();
+    assert!(
+        matches!(&error, ReadError::Refused(message) if message.contains("result member is absent")),
+        "{error:?}"
+    );
+    let error = executor::decode_reply(
+        &request,
+        &json!({"result":{"body":"ab","offset":0,"length":2,"total_bytes":2},"error":{"code":"vendor_error"}}),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, ReadError::Refused(message) if message.contains("ambiguous")),
+        "{error:?}"
+    );
+}
+
 // Every remaining raw-range rule still rejects its own violation. The bodies
 // deliberately differ from `length`, so no case passes or fails on body size.
 #[test]
