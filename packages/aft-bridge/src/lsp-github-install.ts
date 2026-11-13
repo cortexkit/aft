@@ -104,6 +104,13 @@ export interface GithubAutoInstallOptions {
   /** Shorter lock waits let shared tests cover timeout behavior without waiting minutes. */
   __lockWaitTimeoutMsForTests?: number;
   __lockPollIntervalMsForTests?: number;
+  /**
+   * Smoke budget for validating an already-cached server. Tests that must see
+   * the smoke run to completion set it high, so a loaded machine that takes
+   * longer than the production budget to start a process cannot turn the run
+   * into an inconclusive timeout.
+   */
+  __smokeTimeoutMsForTests?: number;
 }
 
 export interface GithubInstallerHost {
@@ -169,6 +176,9 @@ export function createGithubInstaller(services: GithubInstallerHost) {
   const INSTALL_LOCK_WAIT_MS = 10 * 60 * 1000;
   const INSTALL_LOCK_POLL_INTERVAL_MS = 1_000;
   const INSTALL_LOCK_WAIT_TIMEOUT_REASON = "install lock held by another process for 10 minutes";
+  // How long a server's startup check may run before its result counts as
+  // inconclusive (the install is kept, see smokeGithubBinary).
+  const SMOKE_TIMEOUT_MS = 2_000;
 
   interface GithubInstallFailureMarker {
     release: string;
@@ -1073,6 +1083,7 @@ export function createGithubInstaller(services: GithubInstallerHost) {
   async function smokeGithubBinary(
     spec: GithubServerSpec,
     binaryPath: string,
+    timeoutMs = SMOKE_TIMEOUT_MS,
   ): Promise<"passed" | "timeout" | "failed"> {
     return new Promise((resolveSmoke) => {
       let child: ReturnType<typeof spawn> | undefined;
@@ -1094,8 +1105,8 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       const timer = setTimeout(() => {
         child?.kill("SIGKILL");
         child?.unref();
-        finish("timeout", "exceeded 2000 ms; keeping install");
-      }, 2_000);
+        finish("timeout", `exceeded ${timeoutMs} ms; keeping install`);
+      }, timeoutMs);
       const capture = (chunk: Buffer | string) => {
         const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         const available = 64 * 1024 - output.length;
@@ -1139,11 +1150,12 @@ export function createGithubInstaller(services: GithubInstallerHost) {
   function validateCachedGithubInstall(
     spec: GithubServerSpec,
     platform: Platform,
+    smokeTimeoutMs = SMOKE_TIMEOUT_MS,
   ): boolean | null | Promise<boolean> {
     const lease = acquireInstallLock(spec.githubRepo);
     if (!lease) return null;
     try {
-      const validation = validateCachedGithubInstallUnderLock(spec, platform);
+      const validation = validateCachedGithubInstallUnderLock(spec, platform, smokeTimeoutMs);
       if (typeof validation !== "boolean") return validation.finally(() => lease.release());
       lease.release();
       return validation;
@@ -1156,6 +1168,7 @@ export function createGithubInstaller(services: GithubInstallerHost) {
   function validateCachedGithubInstallUnderLock(
     spec: GithubServerSpec,
     platform: Platform,
+    smokeTimeoutMs = SMOKE_TIMEOUT_MS,
   ): boolean | Promise<boolean> {
     const packageDir = ghPackageDir(spec);
     const meta = readGithubInstalledMetaIn(packageDir);
@@ -1200,7 +1213,7 @@ export function createGithubInstaller(services: GithubInstallerHost) {
         quarantineCachedGithubInstall(spec, "missing required runtime files");
         return false;
       }
-      const verdict = await smokeGithubBinary(spec, binaryPath);
+      const verdict = await smokeGithubBinary(spec, binaryPath, smokeTimeoutMs);
       if (verdict === "failed") {
         quarantineCachedGithubInstall(spec, "cached binary failed runtime smoke check");
         return false;
@@ -1593,6 +1606,7 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       1,
       options.__lockPollIntervalMsForTests ?? INSTALL_LOCK_POLL_INTERVAL_MS,
     );
+    const smokeTimeoutMs = Math.max(1, options.__smokeTimeoutMsForTests ?? SMOKE_TIMEOUT_MS);
 
     function notifyCachedBinDirsChanged(directory?: string): void {
       try {
@@ -1618,7 +1632,7 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       while (true) {
         if (signal.aborted) return null;
         const validation = await withInstallLock(spec.githubRepo, async () =>
-          validateCachedGithubInstallUnderLock(spec, platform),
+          validateCachedGithubInstallUnderLock(spec, platform, smokeTimeoutMs),
         );
         if (validation !== null) return validation;
         if (signal.aborted) return null;
@@ -1653,7 +1667,7 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       // the install that follows it, so shutdown can cancel either one.
       const controller = new AbortController();
       const validation = isGithubInstalled(spec, host.platform)
-        ? validateCachedGithubInstall(spec, host.platform)
+        ? validateCachedGithubInstall(spec, host.platform, smokeTimeoutMs)
         : false;
       if (validation === true) cachedBinDirs.push(ghBinDir(spec));
       const cacheReady = (
@@ -1740,7 +1754,7 @@ export function createGithubInstaller(services: GithubInstallerHost) {
         const directories = await Promise.all(
           GITHUB_LSP_TABLE.map(async (spec) =>
             isGithubInstalled(spec, currentHost.platform) &&
-            (await validateCachedGithubInstall(spec, currentHost.platform))
+            (await validateCachedGithubInstall(spec, currentHost.platform, smokeTimeoutMs))
               ? ghBinDir(spec)
               : null,
           ),
