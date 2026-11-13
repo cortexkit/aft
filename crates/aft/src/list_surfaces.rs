@@ -791,6 +791,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "supplemental execution note names at most ten filtered environment variables and explicitly counts the rest with +N more; the complete executor report remains in persisted task metadata, not a paginated tool-result list",
     },
     ExclusionEntry {
+        file: "bash_background/remote.rs",
+        enclosing_item: "render_terminal_report",
+        location_or_primitive: "workspace changes preview PATH_LIMIT and folder summary GROUP_LIMIT",
+        reason: "supplemental remote execution report names at most twenty paths and summarizes the remainder in at most five folder groups with exact counts; the complete list remains in the build server's terminal record, not a paginated tool-result list",
+    },
+    ExclusionEntry {
         file: "subc/bind_log.rs",
         location_or_primitive: "consumer_capabilities preview (eight-entry slice cap)",
         reason: "Bounds RouteBind INFO logging only; does not cut a product result list.",
