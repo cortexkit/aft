@@ -21,6 +21,8 @@ use super::manifest;
 use crate::hashline::integration::RegistrationRequest;
 
 mod guidance;
+#[cfg(test)]
+mod guidance_text_tests;
 
 #[cfg(test)]
 thread_local! {
@@ -1471,7 +1473,7 @@ fn render_catalog(
         let served = |bare: &str| {
             names
                 .iter()
-                .find(|name| **name == bare || (runner_head.is_some() && same_tool(name, bare)))
+                .find(|name| **name == bare || same_tool(name, bare))
                 .map(|name| name.to_string())
         };
         let text = guidance::render(
@@ -5532,7 +5534,7 @@ mod tests {
                 system_text_digest(text)
             );
             assert!(text.contains("bash_watch"), "{text}");
-            assert!(text.contains("`bash.worker_wait_max_ms`, 30 minutes by default"));
+            assert!(text.contains("bash.worker_wait_max_ms, 30 minutes by default"));
             for phrase in HEAD_ONLY_WORDING {
                 assert!(!text.to_lowercase().contains(phrase), "{phrase:?}: {text}");
             }
@@ -5946,24 +5948,21 @@ mod tests {
                 assert_eq!(unresolved_references(&reply), Vec::<String>::new());
                 let text = reply["system_text"]["text"].as_str().unwrap();
                 for line in [
-                    "Use aft_search to locate code",
-                    "Use aft_outline to map source structure",
-                    "Use aft_zoom to inspect named symbols, with callgraph: true",
-                    "Use aft_callgraph for callers",
-                    "Use aft_inspect after editing",
-                    "Use read for files",
-                    "Use bash with wait: true",
+                    "start with aft_search;",
+                    "Then aft_outline for structure, aft_zoom for named symbols, read for line ranges.",
+                    "**Relationships**: aft_callgraph for callers",
+                    "**After edits**: run aft_inspect for diagnostics;",
+                    "Pass wait: true when you need a long command's result before anything else.",
                 ] {
                     assert!(text.contains(line), "{model}: {text}");
                 }
-                // Respelled tool names are all that differ from the model-less text.
+                // Runner heads also get the watch sentence, which a model-less
+                // head cannot use because its catalog has no bash_watch.
                 let mut bare_text = text.to_string();
                 for bare in &renamed {
-                    bare_text = bare_text.replace(
-                        &format!("Use {} ", plugin_name(bare)),
-                        &format!("Use {bare} "),
-                    );
+                    bare_text = bare_text.replace(&plugin_name(bare), bare);
                 }
+                bare_text = bare_text.replace(" Block on it with bash_watch only when nothing else is left, and never loop bash_status.", "");
                 assert_eq!(bare_text, without["system_text"]["text"].as_str().unwrap());
                 let mut sorted = expected.clone();
                 sorted.sort();

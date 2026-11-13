@@ -1,7 +1,7 @@
-{% if tools.search %}Use {{ tools.search }} to locate code by concept, identifier, or literal before reading it.
-{% endif %}{% if tools.outline %}Use {{ tools.outline }} to map source structure before reading specific sections.
-{% endif %}{% if tools.zoom %}Use {{ tools.zoom }} to inspect named symbols, with callgraph: true for one-level calls.
-{% endif %}{% if tools.callgraph %}Use {{ tools.callgraph }} for callers, impact, and multi-level execution or data-flow traces.
-{% endif %}{% if tools.inspect %}Use {{ tools.inspect }} after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.
-{% endif %}{% if tools.read %}Use {{ tools.read }} for files and bounded line ranges, not shell commands to explore source.
-{% endif %}
+{% if tools.search or (tools.outline and tools.zoom and tools.read) or (preset != 'reader' and tools.bash) %}**Finding code**: {% if tools.search %}start with {{ tools.search }}; it takes concepts, identifiers, regex and literals.{% endif %}{% if tools.outline and tools.zoom and tools.read %}{% if tools.search %} Then {% endif %}{{ tools.outline }} for structure, {{ tools.zoom }} for named symbols, {{ tools.read }} for line ranges.{% endif %}{% if preset != 'reader' and tools.bash %}{% if tools.search or (tools.outline and tools.zoom and tools.read) %} {% endif %}Don't find or read code with grep, find, sed or cat in {{ tools.bash }}.{% endif %}
+{% endif %}{% if tools.callgraph %}**Relationships**: {{ tools.callgraph }} for callers, impact, and execution or data-flow traces.
+{% endif %}{% if tools.outline and tools.zoom %}**Web pages**: {{ tools.outline }} with a URL as target, then {{ tools.zoom }} on a heading.
+{% endif %}**Parallel calls**: send independent read-only calls in one response.
+{% if tools.inspect %}{% if preset == 'reader' %}Use {{ tools.inspect }} for diagnostics.
+{% else %}**After edits**: run {{ tools.inspect }} for diagnostics; the project's typecheck and tests are the final check.
+{% endif %}{% endif %}

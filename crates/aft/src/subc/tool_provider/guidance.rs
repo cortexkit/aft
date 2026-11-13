@@ -24,6 +24,7 @@ static GUIDANCE: LazyLock<GuidanceSet> = LazyLock::new(|| {
     checked_set([
         ("main", include_str!("guidance/main.j2")),
         ("code", include_str!("guidance/code.j2")),
+        ("commands", include_str!("guidance/commands.j2")),
         ("scope", include_str!("guidance/scope.j2")),
     ])
     .expect("embedded AFT runner guidance must use only declared facts")
