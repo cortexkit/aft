@@ -1,0 +1,9 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "note": "Post-0.64 batch 6, on batch 5 (main 04da2d72): scope.background_tasks answers from an indexed query, health metrics fit the 12 KiB budget with whole/streamed large-read counters, the apps' status command finds a working head's project, profiler child processes are pumped with a deadline, shell waits and request deadlines count time asleep (#1439) with subc-client 0.24.5, language-server void requests omit params, and a bridge test gets a longer smoke budget. No ranking-fence file changes; search is untouched."
+}
