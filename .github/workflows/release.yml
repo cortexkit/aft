@@ -431,10 +431,6 @@ jobs:
         with:
           targets: aarch64-unknown-linux-gnu
 
-      - name: Check CMake for wasm-grammars
-        shell: bash
-        run: bash scripts/check-cmake.sh
-
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: release-linux-arm64
@@ -458,6 +454,10 @@ jobs:
         # Keep line tables only until objcopy detaches them below; shipped code
         # and optimization settings are unchanged.
         run: cross build --release --target aarch64-unknown-linux-gnu --config 'profile.release.strip=false' --config 'profile.release.split-debuginfo="off"' --features wasm-grammars
+        env:
+          # Cross runs this script inside the target build image, before Cargo.
+          CROSS_TARGET_AARCH64_UNKNOWN_LINUX_GNU_PRE_BUILD: scripts/check-cmake.sh
+          CROSS_BUILD_OPTS: --no-cache
 
       - name: Install ARM64 debug extraction tools
         run: |
@@ -495,10 +495,6 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Check CMake for wasm-grammars
-        shell: bash
-        run: bash scripts/check-cmake.sh
-
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: release-linux-x64
@@ -518,6 +514,9 @@ jobs:
       # musl produces static binaries where dlopen is a stub that always fails.
       - name: Build
         run: cross build --release --target x86_64-unknown-linux-gnu --config 'profile.release.strip=false' --config 'profile.release.split-debuginfo="off"' --features wasm-grammars
+        env:
+          CROSS_TARGET_X86_64_UNKNOWN_LINUX_GNU_PRE_BUILD: scripts/check-cmake.sh
+          CROSS_BUILD_OPTS: --no-cache
 
       - name: Split and verify Linux debug symbols
         run: python3 scripts/release-debug-symbols.py linux --binary target/x86_64-unknown-linux-gnu/release/aft --archive release-debug/aft-linux-x64-debug.zip

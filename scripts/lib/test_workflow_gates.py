@@ -276,6 +276,17 @@ class LightPREventGateTests(unittest.TestCase):
 
 
 class CISpeedWorkflowTests(unittest.TestCase):
+    def test_cross_checks_cmake_in_its_build_image_and_dev_rebuild_enables_grammars(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        workflow = workflow_gates.parse_workflow(str(root / ".github/workflows/release.yml"))
+        for arch, target in (("arm64", "AARCH64"), ("x64", "X86_64")):
+            job = workflow["jobs"][f"build-linux-{arch}"]
+            build = next(step for step in job["steps"] if step.get("run", "").startswith("cross build"))
+            self.assertEqual(build["env"][f"CROSS_TARGET_{target}_UNKNOWN_LINUX_GNU_PRE_BUILD"], "scripts/check-cmake.sh")
+            self.assertEqual(build["env"]["CROSS_BUILD_OPTS"], "--no-cache")
+            self.assertFalse(any(step.get("name") == "Check CMake for wasm-grammars" for step in job["steps"]))
+        self.assertIn("cargo build --release -p agent-file-tools --features wasm-grammars", (root / "scripts/dev-rebuild.sh").read_text())
+
     def test_default_build_guard_executes_refusals_with_cmake_unavailable(self) -> None:
         path = Path(__file__).resolve().parents[2] / ".github/workflows/grammar-loader.yml"
         workflow = workflow_gates.parse_workflow(str(path))

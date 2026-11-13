@@ -52,7 +52,8 @@ echo
 # 1. Rust release binary
 if [[ "$SKIP_RUST" -eq 0 ]]; then
   echo "==> building Rust release binary"
-  cargo build --release -p agent-file-tools
+  bash scripts/check-cmake.sh
+  cargo build --release -p agent-file-tools --features wasm-grammars
   echo
 else
   echo "==> skipping Rust build (--skip-rust)"
