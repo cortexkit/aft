@@ -30,6 +30,12 @@ use aft::commands::writes_census::WRITES_CENSUS_OPERATION;
 
 const DEFAULT_SECONDS: u64 = 4;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+/// After its sampling window, macOS `sample` walks and symbolizes every
+/// thread of the target. For a daemon with ~550 threads on a heavily loaded
+/// machine that took over 30 s, and the 30 s allowance killed the profile the
+/// performance sweep needs. The deadline only has to stop a hung `sample`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const SAMPLE_GRACE: Duration = Duration::from_secs(180);
 const TOP_THREADS: usize = 5;
 const TOP_SYMBOLS: usize = 10;
 // The macOS `sample` text parsers compile on every platform so the fixture tests
@@ -1478,7 +1484,7 @@ fn capture_sample(pid: u32, seconds: u64) -> Result<CapturedSample, ProfileError
                 path.display().to_string(),
             ]),
             Vec::new(),
-            Duration::from_secs(seconds) + COMMAND_TIMEOUT,
+            Duration::from_secs(seconds) + SAMPLE_GRACE,
         );
         let output = match output {
             Ok(output) => output,
