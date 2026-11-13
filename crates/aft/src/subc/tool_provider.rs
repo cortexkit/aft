@@ -20,6 +20,8 @@ use subc_protocol::ErrorBody;
 use super::manifest;
 use crate::hashline::integration::RegistrationRequest;
 
+mod guidance;
+
 #[cfg(test)]
 thread_local! {
     static ADMISSION_WORK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
@@ -650,101 +652,6 @@ static RUNNER_HEAD_TOOLS: LazyLock<RunnerHeadTools> = LazyLock::new(|| {
         )),
     }
 });
-
-/// The lines every preset's system text shares, one per served code tool.
-/// `spell` gives the name a bare catalog tool is served under, or `None` when
-/// the catalog does not serve it.
-fn code_tool_lines(text: &mut String, spell: &dyn Fn(&str) -> Option<String>) {
-    if let Some(search) = spell("search") {
-        text.push_str(&format!(
-            "Use {search} to locate code by concept, identifier, or literal before reading it.\n"
-        ));
-    }
-    if let Some(outline) = spell("outline") {
-        text.push_str(&format!(
-            "Use {outline} to map source structure before reading specific sections.\n"
-        ));
-    }
-    if let Some(zoom) = spell("zoom") {
-        text.push_str(&format!(
-            "Use {zoom} to inspect named symbols, with callgraph: true for one-level calls.\n"
-        ));
-    }
-    if let Some(callgraph) = spell("callgraph") {
-        text.push_str(&format!(
-            "Use {callgraph} for callers, impact, and multi-level execution or data-flow traces.\n"
-        ));
-    }
-    if let Some(inspect) = spell("inspect") {
-        text.push_str(&format!("Use {inspect} after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\n"));
-    }
-    if let Some(read) = spell("read") {
-        text.push_str(&format!(
-            "Use {read} for files and bounded line ranges, not shell commands to explore source.\n"
-        ));
-    }
-}
-
-/// `spell` for a catalog that serves every tool under its bare name.
-fn bare_spelling<'a>(names: &'a [&'a str]) -> impl Fn(&str) -> Option<String> + 'a {
-    move |bare| names.contains(&bare).then(|| bare.to_string())
-}
-
-/// System instructions for the primary (`head`) session. The legacy `broca`
-/// text request can set `worker` to append a reminder to stay in scope.
-pub(super) fn broca_text(names: &[&str], worker: bool) -> String {
-    head_text(&bare_spelling(names), worker, None)
-}
-
-/// [`broca_text`] with each tool spelled by `spell`, and the line a hashline
-/// session is given about which calls mint the tags its patches address.
-fn head_text(
-    spell: &dyn Fn(&str) -> Option<String>,
-    worker: bool,
-    hashline_tags: Option<&str>,
-) -> String {
-    let mut text = String::from("# Agent File Tools\n\n");
-    code_tool_lines(&mut text, spell);
-    if spell("bash").is_some() {
-        text.push_str("Use bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (30 minutes by default), then hands back a still-running task; no completion subscriber is required.\n");
-    }
-    if let Some(sentence) = hashline_tags {
-        text.push_str(&format!("**Hashline edit tags**: {sentence}\n"));
-    }
-    if worker {
-        text.push_str(WORKER_SCOPE_LINE);
-    }
-    text
-}
-
-const WORKER_SCOPE_LINE: &str = "As a worker, keep changes within your assigned scope, verify them, and report the result to your parent.\n";
-
-/// The `worker` preset's system text. A delegated worker is never woken once
-/// its turn ends, so it is told how to wait on a command and never to end its
-/// turn on one. The wait limit is named by its setting with its default,
-/// because the live value is the project's to configure.
-pub(super) fn worker_text(names: &[&str]) -> String {
-    let has = |name: &str| names.contains(&name);
-    let mut text = String::from("# Agent File Tools\n\n");
-    code_tool_lines(&mut text, &bare_spelling(names));
-    if has("bash") {
-        text.push_str("Use bash with wait: true when you need a long command's result before anything else; a blocking wait returns after the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default) and reports that the command is still running.\n");
-    }
-    if has("bash_watch") {
-        text.push_str("A command in the background never wakes you: wait on it with bash_watch before you report a result, and watch again while it is still running. Don't poll bash_status or sleep to wait.\n");
-    }
-    text.push_str(WORKER_SCOPE_LINE);
-    text
-}
-
-/// The `reader` preset's system text: what the session can and cannot do,
-/// then the shared line for each code tool it has.
-pub(super) fn reader_text(names: &[&str]) -> String {
-    let mut text = String::from("# Agent File Tools\n\n");
-    text.push_str("This session is read-only: it can read and search code, but it has no tool that runs commands or changes, moves or deletes files.\n");
-    code_tool_lines(&mut text, &bare_spelling(names));
-    text
-}
 
 #[cfg(test)]
 pub(super) fn catalog(
@@ -1564,19 +1471,16 @@ fn render_catalog(
         let served = |bare: &str| {
             names
                 .iter()
-                .find(|name| **name == bare || same_tool(name, bare))
+                .find(|name| **name == bare || (runner_head.is_some() && same_tool(name, bare)))
                 .map(|name| name.to_string())
         };
-        // `request.facts` is available to this builder, but accepting facts
-        // does not yet change the preset-based text or its digests.
-        let text = match preset {
-            CatalogPreset::Head if runner_head.is_some() => {
-                head_text(&served, worker, hashline_tags.as_deref())
-            }
-            CatalogPreset::Head => broca_text(&names, worker),
-            CatalogPreset::Worker => worker_text(&names),
-            CatalogPreset::Reader => reader_text(&names),
-        };
+        let text = guidance::render(
+            preset,
+            request.facts.as_ref(),
+            &served,
+            worker,
+            hashline_tags.as_deref(),
+        );
         // The item digest is the SHA-256 hex of the exact UTF-8 text returned,
         // so a runner can check the text against it from this reply alone. The
         // protocol crate owns that definition; the preflight digest reuses it
@@ -4904,6 +4808,23 @@ mod tests {
             "tools": ["other_tool", "read", "write"],
             "idle_start": ["another-sender", "sender"]
         })
+    }
+
+    #[test]
+    fn runner_guidance_token_counts() {
+        for preset in CatalogPreset::ALL {
+            let mut request = json!({
+                "preset": preset.name(), "system_text": {"preset": preset.name()}
+            });
+            if preset == CatalogPreset::Head {
+                request["params"] = json!({"model": {"provider": "vendor", "model": "gpt-5"}});
+            }
+            let reply = catalog(request, &[], true).unwrap();
+            let text = reply["system_text"]["text"].as_str().unwrap();
+            let tokens = aft_tokenizer::count_tokens(text).unwrap();
+            assert!(tokens > 0);
+            println!("runner guidance {}: {tokens} Claude tokens", preset.name());
+        }
     }
 
     #[test]

@@ -1,0 +1,7 @@
+{% if tools.search %}Use {{ tools.search }} to locate code by concept, identifier, or literal before reading it.
+{% endif %}{% if tools.outline %}Use {{ tools.outline }} to map source structure before reading specific sections.
+{% endif %}{% if tools.zoom %}Use {{ tools.zoom }} to inspect named symbols, with callgraph: true for one-level calls.
+{% endif %}{% if tools.callgraph %}Use {{ tools.callgraph }} for callers, impact, and multi-level execution or data-flow traces.
+{% endif %}{% if tools.inspect %}Use {{ tools.inspect }} after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.
+{% endif %}{% if tools.read %}Use {{ tools.read }} for files and bounded line ranges, not shell commands to explore source.
+{% endif %}
