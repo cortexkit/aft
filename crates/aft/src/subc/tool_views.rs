@@ -121,7 +121,10 @@ mod tests {
                     expected_template[slot]["catalog"]["digest"] =
                         fetched.template[slot]["catalog"]["digest"].clone();
                 }
-                assert_eq!(fetched.template, expected_template, "template changed: {pin}");
+                assert_eq!(
+                    fetched.template, expected_template,
+                    "template changed: {pin}"
+                );
             }
         }
     }
