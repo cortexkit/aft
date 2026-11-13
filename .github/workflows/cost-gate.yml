@@ -18,7 +18,7 @@ on:
           - hugo
           - synthetic-24k
       write_baseline:
-        description: "Bless this run's numbers: upload a regenerated baseline instead of gating"
+        description: "Capture a fresh baseline, then gate independent passes on the same runner"
         required: false
         default: false
         type: boolean
@@ -106,6 +106,22 @@ jobs:
             mkdir -p "$AFT_COST_GATE_RESULTS_DIR"
             cp scripts/telemetry/cost-baselines.json "$AFT_COST_GATE_RESULTS_DIR/cost-baselines.candidate.json"
           fi
+
+      - name: Verify fresh baseline with independent passes
+        if: ${{ inputs.write_baseline == true }}
+        env:
+          REPO_INPUT: ${{ inputs.repo }}
+          AFT_COST_GATE_CACHE_DIR: ${{ runner.temp }}/aft-cost-gate-cache
+          AFT_COST_GATE_RESULTS_DIR: ${{ github.workspace }}/cost-gate-results/verification
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ -n "${REPO_INPUT:-}" && "$REPO_INPUT" != "all" ]]; then
+            args+=(--repo "$REPO_INPUT")
+          fi
+          # Use fresh storage and two new passes, not the observations that
+          # defined the baseline. Both captures stay in the uploaded artifact.
+          scripts/telemetry/cost-gate.sh "${args[@]}"
 
       - name: Gate exact lexical recall
         if: ${{ inputs.write_baseline != true }}
