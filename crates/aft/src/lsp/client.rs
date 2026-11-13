@@ -2513,10 +2513,22 @@ impl LspClient {
             return Ok(());
         }
 
-        if let Err(err) =
-            self.send_request_with_timeout::<lsp_types::request::Shutdown>((), request_timeout)
-        {
+        let request = match self.start_request::<lsp_types::request::Shutdown>(()) {
+            Ok(request) => request,
+            Err(err) => return self.abort_live_child_after_shutdown_error(err),
+        };
+        if let Err(err) = request.wait(request_timeout) {
             self.state = ServerState::ShuttingDown;
+            if matches!(err, LspError::ServerDisconnected(_)) {
+                return self.abort_live_child_after_shutdown_error(err);
+            }
+            if matches!(err, LspError::Timeout(_)) && self.child.try_wait()?.is_some() {
+                self.state = ServerState::Exited;
+                self.child_registry.untrack(self.child_pid);
+                return Err(LspError::ServerDisconnected(
+                    "server exited during shutdown".into(),
+                ));
+            }
             return self.abort_live_child_after_shutdown_error(err);
         }
 
@@ -2661,7 +2673,7 @@ impl LspClient {
         if self.child.try_wait()?.is_some() {
             self.state = ServerState::Exited;
             self.child_registry.untrack(self.child_pid);
-            return Ok(());
+            return Err(err);
         }
         kill_lsp_child_group(&mut self.child);
         self.wait_for_child_exit_bounded();
@@ -2860,10 +2872,15 @@ impl PendingLspRequest {
             }
             Err(RecvTimeoutError::Disconnected) => {
                 self.remove_pending();
-                return Err(LspError::ServerNotReady(format!(
+                let message = format!(
                     "language server {:?} disconnected while waiting for '{}'",
                     self.kind, self.method
-                )));
+                );
+                return Err(if self.method == "shutdown" {
+                    LspError::ServerDisconnected(message)
+                } else {
+                    LspError::ServerNotReady(message)
+                });
             }
         };
 
