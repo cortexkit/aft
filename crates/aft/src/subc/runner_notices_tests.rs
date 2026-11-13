@@ -442,6 +442,7 @@ impl HeldCompletion {
         });
         let paths =
             crate::bash_background::persistence::resolve_task(task.storage.path(), id, id).unwrap();
+        crate::bash_background::persistence::write_task_at(&paths, &state.metadata).unwrap();
         std::fs::write(&paths.paths.stdout, "recovered held output\n").unwrap();
         let conn = db.lock().unwrap();
         crate::db::bash_tasks::upsert_bash_task(
