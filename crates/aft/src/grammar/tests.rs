@@ -536,6 +536,22 @@ fn grammar_load_and_query_failures_are_terminal_without_readiness() {
 }
 
 #[test]
+fn grammar_verified_sibling_artifact_recovers_after_a_failed_download_verification() {
+    let (directory, registry, _, transport) =
+        setup([Hop::Response(200, None, vec![0; WASM.len()])]);
+    registry.request().unwrap_err();
+    settled(&registry);
+    assert_eq!(
+        registry.stored().unwrap_err().state,
+        GrammarState::VerificationFailed
+    );
+    stored(directory.path());
+    registry.request().unwrap();
+    assert_eq!(registry.compile_count(), 1);
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn grammar_engine_is_fixed_to_pulley_on_every_platform() {
     assert_eq!(engine_target().unwrap(), "pulley");
     assert!(ENGINE

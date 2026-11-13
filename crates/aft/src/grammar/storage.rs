@@ -142,7 +142,7 @@ impl Storage {
             }
             // A valid artifact at this hash-named entry is byte-identical to
             // these verified bytes. Replacing the entry is therefore safe even
-            // if a sibling published first, and never follows a symlink target.
+            // if another process published first, and never follows a symlink target.
             crate::bash_background::persistence::randomized_atomic_replace(
                 &dir,
                 OsStr::new(&dest),

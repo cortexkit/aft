@@ -167,7 +167,10 @@ impl GrammarRegistry {
             return Ok(language.clone());
         }
         {
-            if entry.state == GrammarState::NotDownloaded {
+            if matches!(
+                entry.state,
+                GrammarState::NotDownloaded | GrammarState::VerificationFailed
+            ) {
                 match self.storage().read(&self.manifest) {
                     Ok(Some(bytes)) => self.load(&mut entry, bytes),
                     Ok(None) => {}
