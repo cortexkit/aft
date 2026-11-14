@@ -80,10 +80,10 @@ fn class_field_receivers_walk_each_class_once_and_match_the_unmemoized_extractio
         source.push_str("    }\n}\n");
 
         let (memoized, memoized_work) =
-            crate::callgraph_store::extraction_work::measure(|| parse(&source, language));
+            super::super::extraction_work::measure(|| parse(&source, language));
         UNMEMOIZED_CLASS_FIELDS.with(|mode| mode.set(true));
         let (walked, walked_work) =
-            crate::callgraph_store::extraction_work::measure(|| parse(&source, language));
+            super::super::extraction_work::measure(|| parse(&source, language));
         UNMEMOIZED_CLASS_FIELDS.with(|mode| mode.set(false));
 
         assert_eq!(
