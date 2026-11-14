@@ -456,6 +456,71 @@ fn vector_plane(checkout: &Arc<Checkout>) -> super::vectors::VectorPlane {
     feature = "test-hooks",
     not(all(target_os = "windows", target_arch = "aarch64"))
 ))]
+#[test]
+fn luau_s4_callgraph_off_skips_luau_without_blocking_meaning_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    write(
+        &root,
+        "plain.ts",
+        "export function searchable() {\n return 1;\n}\n",
+    );
+    write(
+        &root,
+        "source.luau",
+        "local function luau_function()\n return 1\nend\n",
+    );
+    let mut config = crate::config::Config::default();
+    config.indexes.callgraph = false;
+    config.indexes.semantic = true;
+    let checkout = Arc::new(
+        Checkout::bind_planes(
+            Arc::new(DataLayer::new(8 << 20, 1)),
+            &dir.path().join("store"),
+            FamilyId::from_digest(Digest128::of(b"callgraph-off")),
+            &root,
+            super::checkout::Planes {
+                text: config.indexes.trigram,
+                callgraph: config.indexes.callgraph,
+            },
+        )
+        .unwrap(),
+    );
+    checkout.build().unwrap();
+    let plane = vector_plane(&checkout);
+    assert!(config.indexes.semantic);
+    plane
+        .fill(
+            &mut |texts| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
+            super::vectors::FillBudget::default(),
+            &mut |_| {},
+        )
+        .unwrap();
+    let result = plane
+        .search(&checkout.view().unwrap(), &[1.0, 0.0], 10, &|_| true)
+        .unwrap();
+    assert!(result
+        .results
+        .iter()
+        .any(|row| row.file.ends_with("plain.ts") && row.name == "searchable"));
+    assert!(
+        !super::meaning::waiting(&result.coverage),
+        "{:?}",
+        result.coverage
+    );
+    assert!(result.coverage.pending.is_empty());
+    assert!(result.coverage.files_failed.is_empty());
+    assert_eq!(result.coverage.skipped_parses.len(), 1);
+    assert!(result.coverage.skipped_parses[0].0.ends_with("source.luau"));
+    let reason: Value = serde_json::from_str(&result.coverage.skipped_parses[0].1).unwrap();
+    assert_eq!(reason["code"], "callgraph_off");
+}
+
+#[cfg(all(
+    feature = "wasm-grammars",
+    feature = "test-hooks",
+    not(all(target_os = "windows", target_arch = "aarch64"))
+))]
 fn ready_tools_and_resolver(ctx: &AppContext, root: &Path, dir: &Path) {
     let outline = ask(ctx, "outline", json!({"file": root.join("b.luau")}));
     assert!(outline.success, "{:?}", outline.data);
