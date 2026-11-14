@@ -2014,7 +2014,7 @@ fn ordinary_ready_health_root(root: &Value) -> bool {
                 )
             })
         && root["data_store"]["failure"].is_null()
-        && root["data_store"]["reason"].is_null()
+        && matches!(root["data_store"]["reason"].as_str(), None | Some("not_bound"))
         && root["data_store"]["skipped_folders"].as_u64().unwrap_or(0) == 0
         && root["suspended_domains"]
             .as_array()
@@ -4068,7 +4068,7 @@ fn build_health_diagnostic_rollup_from_actors(
             && candidate.health.data_store.as_ref().is_none_or(|store| {
                 store.failure.is_none()
                     && store.error.is_none()
-                    && store.reason.is_none()
+                    && store.reason.is_none_or(|reason| reason == "not_bound")
                     && store.skipped_folders == 0
             })
             && candidate
@@ -5427,7 +5427,7 @@ mod tests {
     }
 
     #[test]
-    fn health_live_shaped_lsp_fleet_gaps_telemetry_before_semantic_failure_detail() {
+    fn health_live_shaped_lsp_fleet_yields_preview_before_semantic_failure_detail() {
         let (_, mut metrics) =
             largest_meaning_fill_health_metrics(seventeen_active_large_read_sites());
         let mut failed = metrics["roots"][0].clone();
@@ -5486,9 +5486,13 @@ mod tests {
             metrics["roots"][0]["semantic_index"]["reason"],
             "connection refused by embedding backend"
         );
-        let omitted = metrics["metrics_fields_omitted"].as_array().unwrap();
-        assert!(!omitted.is_empty());
-        for field in omitted {
+        assert_eq!(metrics["lsp"]["applicability_roots_omitted"], 68);
+        for field in metrics
+            .get("metrics_fields_omitted")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             let field = field.as_str().unwrap();
             assert_eq!(metrics[field]["omitted"], true);
             assert_eq!(
@@ -6106,7 +6110,7 @@ mod tests {
         assert!(ordinary_ready_health_root(&root), "not bound is settled");
         root["callgraph_store"]["status"] = json!("ready");
         root["data_store"]["failure"] =
-            json!({"stage": "build", "error": "x", "busy": false, "at_ms": 1});
+            json!({"stage": "build", "error": "x".repeat(13000), "busy": false, "at_ms": 1});
         assert!(
             !ordinary_ready_health_root(&root),
             "a recorded failure stays in detail"
@@ -6822,8 +6826,8 @@ mod tests {
         // Drop other tests' rows before the budget decides what fits.
         if let Some(Value::Object(metrics)) = report.metrics.as_mut() {
             retain_fixture_process_rows(metrics, &roots);
-            budget_health_metrics(metrics);
         }
+        budget_health_report(&mut report);
         report
     }
 
@@ -8208,6 +8212,14 @@ mod tests {
         let executor = Executor::new();
         let app = App::default_shared();
         let context = test_ctx();
+        // Settled roots exercise optional-detail trimming; warming roots must
+        // now retain their evidence before the byte budget is applied.
+        context.update_config(|config| {
+            config.indexes.trigram = false;
+            config.indexes.semantic = false;
+            config.indexes.callgraph = false;
+            config.inspect.enabled = false;
+        });
         let roots = (0..200)
             .map(|index| test_root(&format!("diagnostics-root-{index:03}")))
             .collect::<Vec<_>>();
@@ -10349,7 +10361,8 @@ mod tests {
                 metrics["roots"][0]["project_root"] = json!(path);
                 let before = refresh_metrics_bytes(&mut metrics);
                 assert!(before > HEALTH_METRICS_BUDGET_BYTES);
-                let original_root = metrics["roots"][0].clone();
+                let mut original_root = metrics["roots"][0].clone();
+                compact_health_root(&mut original_root);
                 budget_health_metrics(&mut metrics);
                 let encoded = serde_json::to_vec(&metrics).unwrap();
                 eprintln!(
@@ -10385,6 +10398,7 @@ mod tests {
             for target_bytes in [12_127, HEALTH_METRICS_BUDGET_BYTES] {
                 let mut root = fixture["roots"][0].clone();
                 root["project_root"] = json!(path);
+                compact_health_root(&mut root);
                 assert_eq!(root["semantic_index"]["files_pending"], 20_988);
                 assert_eq!(root["semantic_index"]["filling"], true);
                 assert!(root.get("abbreviated").is_none());
@@ -10486,18 +10500,18 @@ mod tests {
             "manifest_sync": sync,
             "roots": (0..100).map(|i| json!({
                 "project_root": format!("/workspace/{i}/{}", "long-path".repeat(20)),
-                "health": "ready"
+                "state": "ready", "search_index": {"status": "ready"},
+                "semantic_index": {"status": "ready"}, "callgraph_store": {"status": "ready"},
+                "tier2": {"status": "ready"}
             })).collect::<Vec<_>>()
         })
         .as_object()
         .unwrap()
         .clone();
         budget_health_metrics(&mut metrics);
-        // Ancillary manifest telemetry yields before any of the hundred root rows.
-        assert_eq!(
-            metrics["manifest_sync"],
-            json!({"omitted": true, "bytes": serde_json::to_vec(&sync).unwrap().len()})
-        );
+        // Manifest freshness precedes optional detail for healthy roots.
+        assert_eq!(metrics["manifest_sync"], sync);
+        assert!(metrics["root_details_omitted"].as_u64().unwrap() > 0);
         assert!(encoded_health_metrics_len(&metrics) <= HEALTH_METRICS_BUDGET_BYTES);
     }
 
@@ -10511,6 +10525,7 @@ mod tests {
                     "state": "ready",
                     "search_index": { "status": "ready", "since_ms": 1, "last_progress_at_ms": 1 },
                     "semantic_index": { "status": "ready", "since_ms": 1, "last_progress_at_ms": 1 },
+                    "callgraph_store": { "status": "ready", "since_ms": 1, "last_progress_at_ms": 1 },
                     "tier2": { "status": "ready", "since_ms": 1, "last_progress_at_ms": 1 },
                 })
             })
