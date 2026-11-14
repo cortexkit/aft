@@ -5194,6 +5194,7 @@ mod tests {
             .collect();
         let census = crate::lifecycle_census::LifecycleCensusSnapshot {
             lsp: crate::lifecycle_census::LspCensus {
+                capacity_refusals: 3,
                 applicability_by_root,
                 ..Default::default()
             },
@@ -5204,6 +5205,7 @@ mod tests {
         // Other consumers must still be able to look up any of the roots.
         assert_eq!(census.lsp.applicability_by_root.len(), 72);
         let lsp = metrics["lsp"].clone();
+        assert_eq!(lsp["capacity_refusals"], 3);
         assert_eq!(lsp["applicability_roots_total"], 72);
         assert_eq!(lsp["applicability_roots_omitted"], 66);
         let roots = lsp["applicability_by_root"].as_object().unwrap();

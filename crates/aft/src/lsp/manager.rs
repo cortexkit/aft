@@ -23,7 +23,9 @@ use crate::lsp::client::{
 use crate::lsp::diagnostics::{
     from_lsp_diagnostics, DiagnosticEntry, DiagnosticsStore, StoredDiagnostic,
 };
-use crate::lsp::document::{file_content_hash, DiskSnapshot, DocumentEntry, DocumentStore};
+use crate::lsp::document::{
+    file_content_hash, read_file_content, DiskSnapshot, DocumentEntry, DocumentStore,
+};
 use crate::lsp::position::{uri_for_path, uri_to_path};
 use crate::lsp::pull_params::{
     AftDocumentDiagnosticParams, AftWorkspaceDiagnosticParams, AftWorkspaceDiagnosticRequest,
@@ -1309,6 +1311,9 @@ const TRANSIENT_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FailureDurability {
     Capacity,
+    /// A project toolchain or tool-manager startup error is a named
+    /// environment gap, not a server crash. Replay it until configuration changes.
+    Environment,
     /// Only a change to the environment fixes it: a binary that is missing or
     /// cannot be executed, a server that exited naming a configuration error
     /// AFT recognises, or a server AFT's own checks refused. Replayed until
@@ -1339,7 +1344,7 @@ pub(crate) struct ServerCapacity {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CachedStartReason {
     Other,
-    TypeScriptSdkUnavailable,
+    EnvironmentUnavailable,
 }
 
 /// A failed start remembered for one server and workspace root.
@@ -1640,7 +1645,7 @@ impl LspManager {
             // broken executable recovers. Recheck on the next request instead
             // of hiding an available slot behind the normal startup backoff.
             FailureDurability::Capacity => return result,
-            FailureDurability::Permanent => {
+            FailureDurability::Permanent | FailureDurability::Environment => {
                 self.transient_backoff.remove(key);
                 None
             }
@@ -1659,7 +1664,11 @@ impl LspManager {
         let failed = FailedSpawn {
             result,
             retry_at,
-            reason: CachedStartReason::Other,
+            reason: if durability == FailureDurability::Environment {
+                CachedStartReason::EnvironmentUnavailable
+            } else {
+                CachedStartReason::Other
+            },
         };
         let reported = failed.reported_result(now);
         self.failed_spawns.insert(key.clone(), failed);
@@ -1790,7 +1799,8 @@ impl LspManager {
     /// Count currently replayable failed server/root starts without starting a server.
     /// Files outside every TypeScript project remain named in status, but their
     /// cached not-applicable outcome is not a start failure. Missing TypeScript
-    /// SDKs are likewise environment gaps rather than AFT failures.
+    /// SDKs, rustup toolchain components, and mise startup errors are likewise
+    /// environment gaps rather than AFT failures.
     pub(crate) fn cached_start_failure_counts(&self) -> std::collections::BTreeMap<String, u64> {
         let now = self.retry_clock.now();
         let mut counts = std::collections::BTreeMap::new();
@@ -1798,7 +1808,7 @@ impl LspManager {
             if failure.retry_at.is_some_and(|at| now >= at) {
                 continue;
             }
-            if failure.reason == CachedStartReason::TypeScriptSdkUnavailable {
+            if failure.reason == CachedStartReason::EnvironmentUnavailable {
                 continue;
             }
             if matches!(
@@ -2524,7 +2534,7 @@ impl LspManager {
         let result = self.record_failed_spawn(key, result, failure.durability);
         if sdk_unavailable {
             if let Some(failure) = self.failed_spawns.get_mut(key) {
-                failure.reason = CachedStartReason::TypeScriptSdkUnavailable;
+                failure.reason = CachedStartReason::EnvironmentUnavailable;
             }
         }
         result
@@ -2727,7 +2737,7 @@ impl LspManager {
         // reading and hashing it per server cost one full read each.
         let disk = DiskSnapshot::read(&canonical_path);
         let initial_content = needs_content
-            .then(|| std::fs::read_to_string(&canonical_path).map_err(LspError::Io))
+            .then(|| read_file_content(&canonical_path).map_err(LspError::Io))
             .transpose()?;
         let mut drift_content: Option<String> = None;
         let mut newly_opened = Vec::new();
@@ -2807,7 +2817,7 @@ impl LspManager {
             if drifted {
                 self.invalidate_diagnostic_content(key, &canonical_path);
                 if drift_content.is_none() {
-                    match std::fs::read_to_string(&canonical_path) {
+                    match read_file_content(&canonical_path) {
                         Ok(content) => drift_content = Some(content),
                         Err(err) => {
                             let _ = self.close_file_for_servers(&canonical_path, &newly_opened);
@@ -3094,7 +3104,7 @@ impl LspManager {
         for key in &drifted {
             self.invalidate_diagnostic_content(key, &canonical_path);
         }
-        std::fs::read_to_string(&canonical_path)
+        read_file_content(&canonical_path)
             .map_err(LspError::Io)
             .and_then(|content| {
                 self.notify_file_changed_for_server_keys(canonical_path.clone(), &content, drifted)
@@ -3125,7 +3135,7 @@ impl LspManager {
             .collect::<Vec<_>>();
         let mut resynced = 0;
         for path in drifted {
-            let Ok(content) = std::fs::read_to_string(&path) else {
+            let Ok(content) = read_file_content(&path) else {
                 continue;
             };
             match self.notify_file_changed_if_running(&path, &content, config) {
@@ -3896,7 +3906,7 @@ impl LspManager {
             return Ok(Vec::new());
         }
         let uri = uri_for_path(&canonical_path)?;
-        let content = std::fs::read_to_string(&canonical_path).map_err(LspError::Io)?;
+        let content = read_file_content(&canonical_path).map_err(LspError::Io)?;
         let language_id = language_id_for_path(&canonical_path, Some(&content)).to_string();
         let mut opened = Vec::with_capacity(targets.len());
         for key in targets {
@@ -4071,7 +4081,7 @@ impl LspManager {
     /// content. Until the check begins, [`Self::rust_check_state`] reports
     /// it as running. Returns whether the save was sent.
     pub(crate) fn request_rust_check(&mut self, server_key: &ServerKey, file_path: &Path) -> bool {
-        let Ok(content) = std::fs::read_to_string(file_path) else {
+        let Ok(content) = read_file_content(file_path) else {
             return false;
         };
         let Ok(uri) = uri_for_path(file_path) else {
@@ -4572,7 +4582,7 @@ impl LspManager {
                 continue;
             };
             let text = (save == SaveNotification::IncludeText)
-                .then(|| uri_to_path(&uri).and_then(|path| std::fs::read_to_string(path).ok()))
+                .then(|| uri_to_path(&uri).and_then(|path| read_file_content(&path).ok()))
                 .flatten();
             let sent = client.send_notification::<DidSaveTextDocument>(DidSaveTextDocumentParams {
                 text_document: TextDocumentIdentifier::new(uri.clone()),
@@ -8230,7 +8240,7 @@ fn typescript_runtime_options(
             (lib, true)
         }
     };
-    let version = std::fs::read(lib.parent().unwrap().join("package.json"))
+    let version = crate::bounded_io::read(&lib.parent().unwrap().join("package.json"), None)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .and_then(|json| {
@@ -8702,6 +8712,36 @@ fn rustup_missing_component(stderr_tail: &str) -> Option<String> {
         return None;
     }
     Some(name.to_string())
+}
+
+/// Recognize rustup's missing-component exits without rewriting their named
+/// gap text. rustup can name the component instead of the proxy command.
+fn rustup_component_unavailable(stderr_tail: &str) -> bool {
+    if rustup_missing_component(stderr_tail).is_some() {
+        return true;
+    }
+    stderr_tail.lines().any(|line| {
+        let Some(message) = line.trim().strip_prefix("error: ") else {
+            return false;
+        };
+        if let Some(rest) = message.strip_prefix("component '") {
+            let Some((component, detail)) = rest.split_once('\'') else {
+                return false;
+            };
+            return !component.is_empty()
+                && (detail == " is not installed"
+                    || detail == " is not installed."
+                    || (detail.starts_with(" for target '")
+                        && detail.trim_end_matches('.').ends_with("' is not installed"))
+                    || detail.starts_with(" is not installed for toolchain '")
+                    || detail.starts_with(" is not installed for the toolchain '"));
+        }
+        message.strip_prefix('\'').is_some_and(|rest| {
+            rest.split_once('\'').is_some_and(|(component, detail)| {
+                !component.is_empty() && detail.starts_with(" is not installed for the toolchain '")
+            })
+        })
+    })
 }
 
 fn infer_package_manager(stderr_tail: &str) -> &'static str {
@@ -9293,7 +9333,7 @@ fn replay_startup_notifications(
         let mut write_attempted = false;
         let mut document_written = false;
         let sent = (|| -> Result<(DiskSnapshot, Option<(Instant, u64)>), LspError> {
-            let content = std::fs::read_to_string(&path)?;
+            let content = read_file_content(&path)?;
             let disk = DiskSnapshot::for_content(&path, &content);
             let uri = uri_for_path(&path)?;
             #[cfg(test)]
@@ -10610,17 +10650,19 @@ fn log_spawn_failure(def: &ServerDef, key: &ServerKey, error: &LspError, now: In
 
 /// Classify a server that died or failed during or after `initialize` from
 /// its failure text and stderr. Only configuration errors AFT recognises are
-/// permanent: typescript-language-server finding no usable TypeScript SDK,
-/// and a rustup proxy whose component is not installed. Anything else is
-/// transient, because wrongly calling a failure permanent leaves the server
-/// off for the whole session while a needless retry costs seconds.
+/// permanent: typescript-language-server finding no usable TypeScript SDK.
+/// Missing rustup components and mise's own startup errors are environment gaps.
+/// Anything else is transient: wrongly calling a failure permanent leaves
+/// the server off for the whole session while a needless retry costs seconds.
 fn exit_durability(reason: &str, stderr_tail: &str) -> FailureDurability {
     use super::environmental::{TS_LS5_NO_INSTALLATION, TS_LS6_NO_TSSERVER};
 
     let names_typescript_sdk_error = [reason, stderr_tail]
         .iter()
         .any(|text| text.contains(TS_LS5_NO_INSTALLATION) || text.contains(TS_LS6_NO_TSSERVER));
-    if names_typescript_sdk_error || rustup_missing_component(stderr_tail).is_some() {
+    if stderr_tail.starts_with("mise ERROR ") || rustup_component_unavailable(stderr_tail) {
+        FailureDurability::Environment
+    } else if names_typescript_sdk_error {
         FailureDurability::Permanent
     } else {
         FailureDurability::Transient
@@ -10930,7 +10972,10 @@ mod windows_server_key_tests {
 
 #[cfg(test)]
 mod failure_hint_tests {
-    use super::{failure_hint, rust_failure_with_root_cause, rustup_missing_component};
+    use super::{
+        failure_hint, rust_failure_with_root_cause, rustup_component_unavailable,
+        rustup_missing_component,
+    };
 
     #[test]
     fn typescript_server_temp_roots_are_private_distinct_and_owned() {
@@ -11024,6 +11069,36 @@ mod failure_hint_tests {
     }
 
     #[test]
+    fn rustup_component_gap_keeps_existing_hints() {
+        let unknown_binary = "error: Unknown binary 'rust-analyzer' in official toolchain '1.100.0-aarch64-apple-darwin'";
+        assert!(rustup_component_unavailable(unknown_binary));
+        assert_eq!(
+            failure_hint("rust-analyzer", unknown_binary),
+            "'rust-analyzer' is a rustup proxy but the component is not installed. Install it: rustup component add rust-analyzer"
+        );
+        for stderr in [
+            "error: component 'rust-analyzer' is not installed",
+            "error: component 'rust-analyzer' for target 'aarch64-apple-darwin' is not installed",
+            "error: component 'rust-analyzer' is not installed for toolchain '1.100.0-aarch64-apple-darwin'",
+            "error: 'rust-analyzer' is not installed for the toolchain '1.100.0-aarch64-apple-darwin'.",
+        ] {
+            assert!(rustup_component_unavailable(stderr), "{stderr}");
+            assert_eq!(
+                failure_hint("rust-analyzer", stderr),
+                "Hint: see stderr above for 'rust-analyzer' failure details."
+            );
+        }
+        for stderr in [
+            "fatal: Unknown binary 'foo' was requested by the linker.",
+            "error: component resolver crashed during initialize",
+            "error: component '' is not installed",
+            "error: dependency 'openssl' is not installed",
+        ] {
+            assert!(!rustup_component_unavailable(stderr), "{stderr}");
+        }
+    }
+
+    #[test]
     fn ignores_unknown_binary_without_toolchain_phrasing() {
         // "Unknown binary" without the rustup toolchain phrasing must not be
         // misattributed to a rustup component issue.
@@ -11109,9 +11184,12 @@ mod transient_retry_tests {
             std::io::ErrorKind::WouldBlock,
             super::super::client::RustAnalyzerCapacityExhausted { cap: 2, current: 2 },
         ));
-        let durability = process_start_durability(&error);
-        let result =
-            manager.record_file_start_failure(&def, &key, StartFailure { error, durability });
+        let failure = manager.absorb_spawn_failure(SpawnFailure::NotStarted {
+            error,
+            exit_log_line: "capacity refusal before initialize".into(),
+        });
+        assert_eq!(failure.durability, FailureDurability::Capacity);
+        let result = manager.record_file_start_failure(&def, &key, failure);
 
         assert!(reason(&result).contains("rust_analyzer_capacity_exhausted"));
         assert!(manager.cached_start_failure_counts().is_empty());
@@ -11180,6 +11258,71 @@ mod transient_retry_tests {
     }
 
     #[test]
+    fn diagnostics_findings_lsp_snapshot_ignores_rustup_component_gap_but_keeps_status() {
+        for stderr in [
+            "error: Unknown binary 'rust-analyzer' in official toolchain '1.100.0-aarch64-apple-darwin'",
+            "error: component 'rust-analyzer' is not installed",
+            "error: component 'rust-analyzer' for target 'aarch64-apple-darwin' is not installed",
+            "error: 'rust-analyzer' is not installed for the toolchain '1.100.0-aarch64-apple-darwin'.",
+        ] {
+            for after_initialize in [false, true] {
+                let (mut manager, offset) = manager_with_clock();
+                let key = key();
+                let def = crate::lsp::registry::builtin_servers()
+                    .into_iter()
+                    .find(|def| def.kind == key.kind)
+                    .unwrap();
+                let report = ServerExitReport {
+                    kind: key.kind.clone(),
+                    root: key.root.clone(),
+                    pid: 42,
+                    phase: if after_initialize {
+                        ServerPhase::Running
+                    } else {
+                        ServerPhase::Initialize
+                    },
+                    status: None,
+                    killed_by_aft: false,
+                    elapsed: Duration::from_millis(300),
+                    command: "~/.cargo/bin/rust-analyzer".into(),
+                    stderr_tail: stderr.into(),
+                };
+                let err = LspError::ServerDisconnected("initialize response stream closed".into());
+                let formatted = if after_initialize {
+                    format_post_initialize_exit_reason(&def.binary, &report, &err)
+                } else {
+                    format_initialize_failure_reason(&def.binary, &report, &err)
+                };
+                assert!(formatted.contains(stderr));
+                let error = LspError::ServerNotReady(formatted);
+                let shown = error.to_string();
+                let durability = exit_durability(&shown, stderr);
+                assert_eq!(durability, FailureDurability::Environment);
+                if after_initialize {
+                    manager.record_failed_spawn(
+                        &key,
+                        classify_spawn_error(&def.binary, &error),
+                        durability,
+                    );
+                } else {
+                    manager.record_file_start_failure(&def, &key, StartFailure { error, durability });
+                }
+                assert!(manager.cached_start_failure_counts().is_empty());
+                assert_eq!(
+                    manager.failed_spawns[&key].reason,
+                    CachedStartReason::EnvironmentUnavailable
+                );
+                assert!(manager.transient_backoff.is_empty());
+                assert_eq!(reason(&manager.failure_to_replay(&key).unwrap()), shown);
+                offset.store(3_600_000, Ordering::SeqCst);
+                assert_eq!(reason(&manager.failure_to_replay(&key).unwrap()), shown);
+                assert_eq!(manager.clear_failed_spawns(), 1);
+                assert!(manager.failure_to_replay(&key).is_none());
+            }
+        }
+    }
+
+    #[test]
     fn diagnostics_findings_lsp_snapshot_counts_real_spawn_and_environment_failures() {
         let cases = [
             (ServerKind::Rust, LspError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied))),
@@ -11203,6 +11346,76 @@ mod transient_retry_tests {
                 Some(&1)
             );
             manager.clear_failed_spawns();
+        }
+    }
+
+    #[test]
+    fn diagnostics_findings_lsp_snapshot_ignores_mise_environment_gap_but_keeps_status() {
+        let stderr = "mise ERROR error parsing config file: ~/.local/share/cortexkit/alfonso/worktrees/.../mise.toml";
+        let (mut manager, offset) = manager_with_clock();
+        let key = ServerKey {
+            kind: ServerKind::TypeScript(None),
+            ..key()
+        };
+        let def = crate::lsp::registry::builtin_servers()
+            .into_iter()
+            .find(|def| def.kind == key.kind)
+            .unwrap();
+        let report = ServerExitReport {
+            kind: key.kind.clone(),
+            root: key.root.clone(),
+            pid: 42,
+            phase: ServerPhase::Initialize,
+            status: None,
+            killed_by_aft: false,
+            elapsed: Duration::from_millis(200),
+            command: "~/.local/share/mise/shims/typescript-language-server".into(),
+            stderr_tail: stderr.into(),
+        };
+        let err = LspError::ServerDisconnected("initialize response stream closed".into());
+        let formatted = format_initialize_failure_reason(&def.binary, &report, &err);
+        assert!(formatted.contains(stderr));
+        let error = typescript_initialize_failure(formatted, None, || {
+            panic!("a mise startup error must not trigger a TypeScript project scan")
+        });
+        let shown = error.to_string();
+        let durability = exit_durability(&shown, stderr);
+        assert_eq!(durability, FailureDurability::Environment);
+        manager.record_file_start_failure(&def, &key, StartFailure { error, durability });
+        assert!(manager.cached_start_failure_counts().is_empty());
+        assert_eq!(
+            manager.failed_spawns[&key].reason,
+            CachedStartReason::EnvironmentUnavailable
+        );
+        assert!(manager.transient_backoff.is_empty());
+        assert_eq!(reason(&manager.failure_to_replay(&key).unwrap()), shown);
+        offset.store(3_600_000, Ordering::SeqCst);
+        assert_eq!(reason(&manager.failure_to_replay(&key).unwrap()), shown);
+        assert_eq!(manager.clear_failed_spawns(), 1);
+        assert!(manager.failure_to_replay(&key).is_none());
+    }
+
+    #[test]
+    fn mise_environment_classification_requires_its_own_stderr_prefix() {
+        let mise_error = "mise ERROR error parsing config file: ~/.local/share/cortexkit/alfonso/worktrees/.../mise.toml";
+        assert_eq!(
+            exit_durability("server crashed during initialize (exit 1)", mise_error),
+            FailureDurability::Environment
+        );
+        for stderr in [
+            "",
+            "fatal: mise ERROR error parsing config file: mise.toml",
+            "server error: the mise configuration could not be parsed",
+            "mise DEBUG reading config\nmise ERROR error parsing config file: mise.toml",
+            " mise ERROR error parsing config file: mise.toml",
+            "mise ERRORISH unrelated server failure",
+            "mise error parsing config file: mise.toml",
+        ] {
+            assert_eq!(
+                exit_durability(mise_error, stderr),
+                FailureDurability::Transient,
+                "only mise's own stderr prefix is an environment gap: {stderr:?}"
+            );
         }
     }
 
@@ -11365,7 +11578,7 @@ mod transient_retry_tests {
 
     #[test]
     fn failure_durability_classification() {
-        use FailureDurability::{Permanent, Transient};
+        use FailureDurability::{Environment, Permanent, Transient};
 
         // Before any process starts.
         let not_found = LspError::NotFound("rust-analyzer".into());
@@ -11408,7 +11621,7 @@ mod transient_retry_tests {
                 "server crashed during initialize (exit 1)",
                 "error: Unknown binary 'rust-analyzer' in official toolchain 'stable-x86_64'"
             ),
-            Permanent
+            Environment
         );
         assert_eq!(
             exit_durability("server crashed during initialize (exit 3)", "fatal: oops"),

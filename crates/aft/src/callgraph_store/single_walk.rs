@@ -74,6 +74,29 @@ pub(super) fn extract_tree(
     let mut symbols = blob_symbols(&data);
     let mut imports = blob_imports(&data);
     let mut refs = blob_refs(&line_index, &data);
+    if lang == LangId::Luau {
+        refs.extend(
+            crate::luau::exports(source, root)
+                .into_iter()
+                .map(|(name, export)| BlobRef {
+                    ordinal: 0,
+                    kind: BlobRefKind::ExportAlias,
+                    caller_symbol: None,
+                    short_name: None,
+                    full_ref: Some(name.clone()),
+                    module_path: None,
+                    line: 1,
+                    byte_start: 0,
+                    byte_end: source.len(),
+                    path_override: None,
+                    local_name: Some(name),
+                    requested_name: Some(export.symbol),
+                    namespace_alias: None,
+                    wildcard: false,
+                    import_kind: Some("export_alias".to_string()),
+                }),
+        );
+    }
     if lang == LangId::Rust {
         refs.extend(rust_module_refs(source, &index));
     }
@@ -239,11 +262,13 @@ fn rust_module_refs(source: &str, index: &SyntaxIndex<'_>) -> Vec<BlobRef> {
 }
 
 /// Parses `source` as `lang` for extraction, reusing a header's tree when
-/// its language was chosen by parsing it.
+/// its language was chosen by parsing it. Markdown nested too deeply for its
+/// grammar is refused (see [`crate::parser::markdown_too_deep_to_parse`]).
 pub(crate) fn parse_source(
     source: &str,
     lang: LangId,
 ) -> Result<tree_sitter::Tree, ManifestJoinError> {
+    refuse_unsafe_markdown(source, lang)?;
     if let Some(tree) = crate::parser::cached_header_tree(source, lang) {
         return Ok(tree);
     }
@@ -259,6 +284,17 @@ pub(crate) fn parse_source(
     })
 }
 
+/// Fails for Markdown the Markdown grammar cannot parse without aborting
+/// the process.
+fn refuse_unsafe_markdown(source: &str, lang: LangId) -> Result<(), ManifestJoinError> {
+    if crate::parser::markdown_too_deep_to_parse(lang, source) {
+        return Err(ManifestJoinError::Parse(
+            crate::parser::MARKDOWN_TOO_DEEP.to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Parses `source` as `lang` after an edit from `previous_source`, whose
 /// tree in the same language is `previous`. The edit given to tree-sitter is
 /// the span between the texts' common prefix and common suffix; tree-sitter
@@ -270,6 +306,7 @@ pub(crate) fn reparse_source(
     source: &str,
     lang: LangId,
 ) -> Result<tree_sitter::Tree, ManifestJoinError> {
+    refuse_unsafe_markdown(source, lang)?;
     let Some(edit) = text_edit(previous_source.as_bytes(), source.as_bytes()) else {
         return Ok(previous.clone());
     };

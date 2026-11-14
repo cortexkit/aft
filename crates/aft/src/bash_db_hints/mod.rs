@@ -17,6 +17,27 @@ use crate::bash_rewrite::parser::{parse, ParsedCommand};
 use crate::sandbox_spawn::SpawnPlan;
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+
+#[cfg(test)]
+thread_local! {
+    /// Probe budget for unit tests. Tests that run a real sqlite3 (one of them
+    /// through a shell launcher) share loaded CI machines where a cold start
+    /// alone can pass 1.5 s, and a timed-out probe makes them fail on timing,
+    /// not on what they check. They get 30 s; tests of the timeout path set
+    /// `PROBE_TIMEOUT` back explicitly.
+    pub(crate) static TEST_PROBE_TIMEOUT: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(Duration::from_secs(30)) };
+}
+
+#[cfg(not(test))]
+fn probe_timeout() -> Duration {
+    PROBE_TIMEOUT
+}
+
+#[cfg(test)]
+fn probe_timeout() -> Duration {
+    TEST_PROBE_TIMEOUT.with(std::cell::Cell::get)
+}
 const PROBE_OUTPUT_CAP: usize = 256 * 1024;
 const BLOCK_CAP: usize = 2048;
 
@@ -179,7 +200,7 @@ impl HintJob {
                 cli.candidates(target, &mut miss);
                 let probe = cli.probe(target, &miss);
                 let (plan, env) = launch?;
-                match run_probe(target, &probe, &plan, &env, PROBE_TIMEOUT) {
+                match run_probe(target, &probe, &plan, &env, probe_timeout()) {
                     Ok(output) => {
                         let rendered = cli.render(target, &miss, &output);
                         if rendered.is_some() {

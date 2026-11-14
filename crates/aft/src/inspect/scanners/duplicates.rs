@@ -339,6 +339,13 @@ fn scan_file(job: &InspectJob, path: &Path) -> Result<Option<FileScan>, String> 
 }
 
 fn parse_source(path: &Path, lang: LangId, source: &str) -> Result<Tree, String> {
+    if crate::parser::markdown_too_deep_to_parse(lang, source) {
+        return Err(format!(
+            "{}: {}",
+            path.display(),
+            crate::parser::MARKDOWN_TOO_DEEP
+        ));
+    }
     if path.extension().and_then(|ext| ext.to_str()) == Some("h") {
         return crate::parser::parse_source_with_cached_parser(path, source, lang)
             .map_err(|error| error.to_string());

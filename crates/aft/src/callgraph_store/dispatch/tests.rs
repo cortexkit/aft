@@ -42,6 +42,75 @@ fn rust_receiver_index_slices_preserve_local_preorder() {
 }
 use crate::callgraph_store::join::CallgraphBlob;
 
+/// Receiver typing in Java, C# and Kotlin reads a class's field and
+/// property declarations at every call whose receiver is a plain name. The
+/// memo walks each class once per file instead of once per call, and the
+/// extraction it gives equals the one walking the class at every call.
+#[test]
+fn class_field_receivers_walk_each_class_once_and_match_the_unmemoized_extraction() {
+    const FIELDS: usize = 120;
+    let cases: [(&str, fn(usize) -> String, fn(usize) -> String, &str, &str); 3] = [
+        (
+            "csharp",
+            |i| format!("    private Widget w{i} = new Widget();\n"),
+            |i| format!("        w{i}.Run();\n"),
+            "class Owner {\n",
+            "    void Call() {\n",
+        ),
+        (
+            "java",
+            |i| format!("    private Widget w{i} = new Widget();\n"),
+            |i| format!("        w{i}.run();\n"),
+            "class Owner {\n",
+            "    void call() {\n",
+        ),
+        (
+            "kotlin",
+            |i| format!("    private val w{i}: Widget = Widget()\n"),
+            |i| format!("        w{i}.run()\n"),
+            "class Owner {\n",
+            "    fun call() {\n",
+        ),
+    ];
+    for (language, field, call, open_class, open_method) in cases {
+        let mut source = String::from(open_class);
+        (0..FIELDS).for_each(|i| source.push_str(&field(i)));
+        source.push_str(open_method);
+        (0..FIELDS).for_each(|i| source.push_str(&call(i)));
+        source.push_str("    }\n}\n");
+
+        let (memoized, memoized_work) =
+            super::super::extraction_work::measure(|| parse(&source, language));
+        UNMEMOIZED_CLASS_FIELDS.with(|mode| mode.set(true));
+        let (walked, walked_work) =
+            super::super::extraction_work::measure(|| parse(&source, language));
+        UNMEMOIZED_CLASS_FIELDS.with(|mode| mode.set(false));
+
+        assert_eq!(
+            memoized, walked,
+            "{language}: the memo changed the extraction"
+        );
+        assert!(
+            walked_work.receiver_class_walks >= FIELDS,
+            "{language}: the fixture must type receivers through the class, walked {}",
+            walked_work.receiver_class_walks
+        );
+        assert_eq!(
+            memoized_work.receiver_class_walks, 1,
+            "{language}: one class must be walked once"
+        );
+        if language != "kotlin" {
+            let typed = memoized
+                .dispatch
+                .sites
+                .iter()
+                .filter(|site| site.receiver.as_deref() == Some("Widget"))
+                .count();
+            assert_eq!(typed, FIELDS, "{language}: every field receiver is typed");
+        }
+    }
+}
+
 fn parse(source: &str, language: &str) -> ParseBlob {
     match CallgraphBlob::extract(source, language, "ruled-dispatch-1").unwrap() {
         CallgraphBlob::Parse(parse) => parse,

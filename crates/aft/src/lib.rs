@@ -151,6 +151,7 @@ pub mod log_redact;
 pub mod logging;
 pub mod lsp;
 pub mod lsp_hints;
+mod luau;
 pub mod memory;
 pub mod migrate_storage;
 pub(crate) mod native_stat;

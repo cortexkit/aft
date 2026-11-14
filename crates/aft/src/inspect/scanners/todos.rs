@@ -126,7 +126,7 @@ pub(crate) fn markers_from_tree(source: &[u8], language: LangId, tree: &Tree) ->
         comment_nodes.sort_by_key(|node| node.start_byte());
         let mut items = Vec::new();
         for node in comment_nodes {
-            scan_comment_node(node, text, &mut items);
+            scan_comment_node(node, text, language, &mut items);
         }
         items.sort_by_key(|item| item.line);
         items.dedup_by_key(|item| item.line);
@@ -425,6 +425,9 @@ fn collect_comment_nodes<'tree>(
 
 fn is_comment_node(node: Node<'_>, language: LangId, source: &str) -> bool {
     let kind = node.kind();
+    if language == LangId::Luau {
+        return crate::luau::COMMENT_KINDS.contains(&kind);
+    }
     if kind == "comment" || kind.ends_with("_comment") {
         return true;
     }
@@ -436,7 +439,20 @@ fn is_comment_node(node: Node<'_>, language: LangId, source: &str) -> bool {
             .is_ok_and(|text| text.trim_start().starts_with("<!--"))
 }
 
-fn scan_comment_node(node: Node<'_>, source: &str, items: &mut Vec<TodoMarker>) {
+fn scan_comment_node(
+    mut node: Node<'_>,
+    source: &str,
+    language: LangId,
+    items: &mut Vec<TodoMarker>,
+) {
+    if language == LangId::Luau {
+        // The grammar removes Luau's variable-length long-comment delimiters.
+        // Scan its content directly, including lines without a repeated `--`.
+        let Some(content) = node.child_by_field_name("content") else {
+            return;
+        };
+        node = content;
+    }
     let Ok(comment) = node.utf8_text(source.as_bytes()) else {
         return;
     };
@@ -447,7 +463,12 @@ fn scan_comment_node(node: Node<'_>, source: &str, items: &mut Vec<TodoMarker>) 
         if line_number > MAX_LINES_PER_FILE {
             break;
         }
-        if let Some(item) = scan_line(line, line_number, &mut in_block_comment) {
+        let item = if language == LangId::Luau {
+            parse_todo_body(strip_block_comment_prefix(line), line_number)
+        } else {
+            scan_line(line, line_number, &mut in_block_comment)
+        };
+        if let Some(item) = item {
             items.push(item);
         }
     }

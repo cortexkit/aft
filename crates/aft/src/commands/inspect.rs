@@ -462,7 +462,7 @@ fn capture_inspect_root_stats_while(
         if !has_work_budget() {
             return Err(timeout_detail());
         }
-        let contents = std::fs::read(manifest).map_err(|error| {
+        let contents = crate::bounded_io::read(manifest, None).map_err(|error| {
             format!(
                 "failed to stat {} during inspect verification: {error}",
                 manifest.display()
@@ -8791,6 +8791,50 @@ mod deferred_terminal_tests {
             .is_some_and(|phases| phases
                 .iter()
                 .all(|phase| phase["id"] != "stat_verification")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspect_freshness_progress_rejects_manifest_fifo_replacements() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("source.ts"), "let value = 1;").unwrap();
+        let manifest = root.path().join("package.json");
+        std::fs::write(&manifest, "{}").unwrap();
+        let (finished, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            INSPECT_STAT_CALLS.with(|count| count.set(0));
+            let replaced = std::sync::atomic::AtomicBool::new(false);
+            let snapshot = capture_inspect_root_stats_while(
+                root.path(),
+                None,
+                move || {
+                    // Replace only after inventory collection and source stats,
+                    // so the manifest's old regular-file admission cannot help.
+                    if INSPECT_STAT_CALLS.with(|count| count.get() > 0)
+                        && !replaced.swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        std::fs::remove_file(&manifest).unwrap();
+                        let name = std::ffi::CString::new(manifest.as_os_str().as_bytes()).unwrap();
+                        // SAFETY: name is a live, NUL-terminated path and the mode is valid.
+                        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                    }
+                    true
+                },
+                || "unexpected verification timeout".into(),
+            );
+            let _ = finished.send(snapshot.map(|_| ()));
+        });
+        // An unscoped worker lets a regressed FIFO open fail this bounded wait
+        // rather than hanging an implicit join during assertion unwinding.
+        let error = result
+            .recv_timeout(Duration::from_secs(5))
+            .expect("manifest verification waited for a FIFO writer")
+            .unwrap_err();
+        worker.join().unwrap();
+        assert!(error.contains("failed to stat"), "{error}");
+        assert!(error.contains("not a regular file"), "{error}");
     }
 
     #[test]
