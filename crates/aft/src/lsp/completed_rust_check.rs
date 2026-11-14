@@ -2349,6 +2349,9 @@ mod tests {
     #[test]
     fn toolchain_version_change_invalidates_completed_check() {
         let (temp, mut cache) = fixture();
+        // Hashing runs the two fixture scripts; a loaded CI machine can take
+        // longer than the production budget to start them, and a timeout here
+        // would read as "no runtime" rather than test the invalidation.
         let binary = temp.path().join("compiler");
         crate::executable_cache::write_executable(&binary, b"#!/bin/sh\nprintf 'compiler 1\\n'\n")
             .unwrap();
@@ -2367,14 +2370,24 @@ mod tests {
         cache.runtime.launch_env = Some(cache.runtime.effective_env().unwrap());
         let runtime = cache
             .runtime
-            .hash(&cache.root, Instant::now() + BUDGET)
+            .hash(&cache.root, Instant::now() + LIVE_FIXTURE_CAPTURE_BUDGET)
             .unwrap();
-        cache.saved_mut().fingerprint =
-            fingerprint(&cache.root, runtime, None, Instant::now() + BUDGET, None).unwrap();
-        assert!(cache.validated(Instant::now() + BUDGET).is_some());
+        cache.saved_mut().fingerprint = fingerprint(
+            &cache.root,
+            runtime,
+            None,
+            Instant::now() + LIVE_FIXTURE_CAPTURE_BUDGET,
+            None,
+        )
+        .unwrap();
+        assert!(cache
+            .validated(Instant::now() + LIVE_FIXTURE_CAPTURE_BUDGET)
+            .is_some());
         crate::executable_cache::write_executable(&binary, b"#!/bin/sh\nprintf 'compiler 2\\n'\n")
             .unwrap();
-        assert!(cache.validated(Instant::now() + BUDGET).is_none());
+        assert!(cache
+            .validated(Instant::now() + LIVE_FIXTURE_CAPTURE_BUDGET)
+            .is_none());
     }
     #[test]
     fn unrelated_markdown_and_typescript_do_not_invalidate_completed_check() {
