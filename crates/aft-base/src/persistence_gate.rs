@@ -1,6 +1,6 @@
-test_support_visibility! {
 //! Which commands require the root's aft.db runtime before they may execute.
 
+test_support_visibility! {
 /// `None` means an unclassified command. Callers fail closed for unknown
 /// commands; the manifest coverage test requires an explicit decision for new
 /// mutating tools instead of silently depending on that fallback.
