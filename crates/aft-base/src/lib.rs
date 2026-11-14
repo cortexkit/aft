@@ -31,6 +31,19 @@
     clippy::unnecessary_map_or
 )]
 
+// Keep one item body and its original production visibility while sharing it with higher-layer tests.
+macro_rules! test_support_visibility {
+    ($(#[$attribute:meta])* $visibility:vis $($item:tt)*) => {
+        #[cfg(any(test, feature = "test-support"))]
+        $(#[$attribute])*
+        pub $($item)*
+
+        #[cfg(not(any(test, feature = "test-support")))]
+        $(#[$attribute])*
+        $visibility $($item)*
+    };
+}
+
 pub mod agent_commands;
 pub mod alert_records;
 pub mod alloc_trace;

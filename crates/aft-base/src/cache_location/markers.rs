@@ -204,7 +204,7 @@ fn read_marker_dir(cache_dir: &Path, generation_label: &str) -> PathBuf {
 
 /// Sweep generation markers through pinned handles without following links.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn sweep_all_read_markers(cache_dir: &Path) -> ReadMarkerSweep {
+pub fn sweep_all_read_markers(cache_dir: &Path) -> ReadMarkerSweep {
     let result = crate::pinned_dir::PinnedDir::open(cache_dir).and_then(|dir| {
         sweep_all_read_markers_pinned(&dir, &mut crate::pinned_dir::RepairBudget::new(), true)
     });

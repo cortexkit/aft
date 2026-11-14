@@ -32,7 +32,7 @@ const IO_POOL_SIZE: usize = 8;
 static NEXT_BUDGET: AtomicU64 = AtomicU64::new(1);
 static HELPERS: OnceLock<Arc<Limiter>> = OnceLock::new();
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) static THREAD_SPAWNS: AtomicUsize = AtomicUsize::new(0);
+pub static THREAD_SPAWNS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub(crate) struct Measurements {
@@ -154,7 +154,7 @@ pub struct Budget {
     /// Set once the end of the budget has been kept back for the reply.
     reply_margin_kept: bool,
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) measurements: Arc<Measurements>,
+    pub measurements: Arc<Measurements>,
     #[cfg(any(test, feature = "test-support"))]
     access_budget: Duration,
     #[cfg(any(test, feature = "test-support"))]
@@ -215,14 +215,14 @@ impl Budget {
             .clone()
     }
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn measurements(&self) -> (usize, usize) {
+    pub fn measurements(&self) -> (usize, usize) {
         (
             self.measurements.dispatches.load(Ordering::Relaxed),
             self.measurements.round_trips.load(Ordering::Relaxed),
         )
     }
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn with_access_budget(mut self, duration: Duration) -> Self {
+    pub fn with_access_budget(mut self, duration: Duration) -> Self {
         self.access_budget = duration;
         self
     }
@@ -230,7 +230,7 @@ impl Budget {
         any(test, feature = "test-support"),
         any(target_os = "macos", target_os = "linux")
     ))]
-    pub(crate) fn with_path_access_budget(mut self, path: &Path, duration: Duration) -> Self {
+    pub fn with_path_access_budget(mut self, path: &Path, duration: Duration) -> Self {
         Arc::make_mut(&mut self.access_budget_by_path).insert(path.to_path_buf(), duration);
         self
     }
@@ -802,7 +802,7 @@ pub fn has_carry_factory() -> bool {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn dirty_helper_job_state() {
+pub fn dirty_helper_job_state() {
     MUTATION_ADMISSION.with(|flag| flag.set(true));
     DIRECTORIES.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -814,7 +814,7 @@ pub(crate) fn dirty_helper_job_state() {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn helper_job_state() -> (bool, bool) {
+pub fn helper_job_state() -> (bool, bool) {
     (
         DIRECTORIES.with(|cache| cache.borrow().1.is_empty()),
         MUTATION_ADMISSION.with(|flag| flag.get()),
@@ -1527,7 +1527,7 @@ pub struct IsolatedPool(Arc<Limiter>);
 
 impl IsolatedPool {
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn with_test_scope(thread_cap: usize, scope: fn() -> Box<dyn Any>) -> Self {
+    pub fn with_test_scope(thread_cap: usize, scope: fn() -> Box<dyn Any>) -> Self {
         Self(Limiter::with_options(thread_cap, thread_cap, Some(scope)))
     }
     pub fn new(thread_cap: usize) -> Self {

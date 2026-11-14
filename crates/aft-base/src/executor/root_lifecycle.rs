@@ -61,6 +61,9 @@ impl Drop for LifecycleLockMarker {
 /// call sites must not wait for worker completion or run a scan while holding it.
 #[derive(Clone, Debug)]
 pub struct SubcLifecycleAdmission {
+    #[cfg(any(test, feature = "test-support"))]
+    pub unbound: Arc<parking_lot::Mutex<bool>>,
+    #[cfg(not(any(test, feature = "test-support")))]
     pub(crate) unbound: Arc<parking_lot::Mutex<bool>>,
     /// Mirrors `unbound` for cancellation checkpoints. A bound root takes the
     /// atomic fast path; an unbound root still confirms grace and rebind under
@@ -151,7 +154,7 @@ impl SubcLifecycleAdmission {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn set_abandon_grace_for_test(&self, grace: Duration) {
+    pub fn set_abandon_grace_for_test(&self, grace: Duration) {
         self.abandon_grace_ms
             .store(grace.as_millis() as u64, Ordering::SeqCst);
     }

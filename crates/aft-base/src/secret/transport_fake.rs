@@ -33,7 +33,7 @@ pub const NONCE: &str = "fake-aft-launch-nonce";
 
 type PendingKey = (String, String, String, String, String);
 
-pub(crate) fn golden(index: usize) -> Value {
+pub fn golden(index: usize) -> Value {
     serde_json::from_str(GOLDENS.lines().nth(index).unwrap()).unwrap()
 }
 

@@ -13,11 +13,11 @@ pub mod usage;
 #[cfg(any(test, feature = "test-support"))]
 pub use usage::Usage;
 
-const RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
-const PRESSURE_RETENTION: Duration = Duration::from_secs(30 * 60);
-const LEASE_RETENTION: Duration = Duration::from_secs(3 * 60 * 60);
-const FREE_FLOOR: u64 = 40 * 1024 * 1024 * 1024;
-const KEEP_UNUSED: usize = 4;
+pub const RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+pub const PRESSURE_RETENTION: Duration = Duration::from_secs(30 * 60);
+pub const LEASE_RETENTION: Duration = Duration::from_secs(3 * 60 * 60);
+pub const FREE_FLOOR: u64 = 40 * 1024 * 1024 * 1024;
+pub const KEEP_UNUSED: usize = 4;
 
 /// Refresh under the publication lock so pruning cannot race a cache hit.
 pub fn refresh(directory: &Path) -> io::Result<()> {
@@ -97,7 +97,7 @@ fn legacy_pid(name: &str) -> Option<Option<u32>> {
     (number > 0 && number.to_string() == pid).then_some(Some(number))
 }
 
-fn last_used(directory: &Path) -> io::Result<SystemTime> {
+pub fn last_used(directory: &Path) -> io::Result<SystemTime> {
     let mut modified = fs::metadata(directory)?.modified()?;
     for child in fs::read_dir(directory)? {
         let child = child?;
@@ -179,7 +179,7 @@ fn cache_entries(root: &Path, legacy: bool) -> io::Result<Vec<(PathBuf, SystemTi
     Ok(entries)
 }
 
-fn prune_with(
+pub fn prune_with(
     root: &Path,
     current: &Path,
     now: SystemTime,
@@ -212,7 +212,7 @@ fn prune_with(
     Ok(())
 }
 
-fn prune_stale(
+pub fn prune_stale(
     directory: &Path,
     observed: SystemTime,
     pid: Option<u32>,

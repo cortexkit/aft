@@ -267,7 +267,7 @@ struct SharedCard {
     waiters: std::sync::atomic::AtomicUsize,
 }
 
-pub(crate) fn record_outcome_code(scope: &SecretScope, request_id: &str, code: &str) {
+pub fn record_outcome_code(scope: &SecretScope, request_id: &str, code: &str) {
     let cards = CARDS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -306,11 +306,13 @@ impl Drop for Waiter {
 #[cfg(test)]
 #[path = "consent_cancel_tests.rs"]
 mod cancellation_cache_tests;
+test_support_visibility! {
 /// Every HTTP request joins the same recorded card outcome without locking
 /// another request's vault lookup or charging it another waiter's queue time.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn wait_consent(request: SecretConsentRequest) -> ConsentOutcome {
     wait_consent_with_code(request).await.0
+}
 }
 
 pub(crate) async fn wait_consent_with_code(

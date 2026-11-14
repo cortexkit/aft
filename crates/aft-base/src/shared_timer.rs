@@ -91,12 +91,12 @@ pub struct Timer {
 
 impl Timer {
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn registration_for_test(&self) -> u64 {
+    pub fn registration_for_test(&self) -> u64 {
         self.id
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn registered_for_test(id: u64) -> bool {
+    pub fn registered_for_test(id: u64) -> bool {
         service()
             .unwrap()
             .queue
@@ -107,7 +107,7 @@ impl Timer {
     }
 
     #[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
-    pub(crate) fn deadline_for_test(id: u64) -> Option<Instant> {
+    pub fn deadline_for_test(id: u64) -> Option<Instant> {
         service()
             .unwrap()
             .queue

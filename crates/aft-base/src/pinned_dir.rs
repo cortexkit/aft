@@ -128,47 +128,49 @@ impl PinnedDir {
         Self::repair_walk(&canonical_root_path(path)?)
     }
 
+    test_support_visibility! {
     /// Open an absolute directory one component at a time without following
-    /// a symlink an unprivileged process could retarget.
-    ///
-    /// Two kinds of symlinked ancestor are accepted. A system symlink such as
-    /// macOS `/var` or `/tmp` (owned by root, in a directory only root can
-    /// rename it in) is resolved during the walk. A configured storage or
-    /// cache root whose own path runs through a user symlink is resolved once
-    /// by [`resolve_configured_root`] when AFT opens it; a later walk under
-    /// that spelling opens the resolved directory and refuses if its device
-    /// and inode are no longer the ones recorded then. Every component below
-    /// such a root is still opened without following symlinks.
-    pub(crate) fn repair_open_path(path: &Path) -> io::Result<Self> {
-        if !path.is_absolute() {
-            return Err(io::Error::other("repair requires an absolute directory"));
-        }
-        if let Some(root) = resolved_root_for(path) {
-            // The configured spelling must still name the directory recorded
-            // when the root was opened: same resolved path, same identity.
-            let pinned = Self::repair_walk(&root.resolved)?;
-            if fs::canonicalize(&root.configured).ok().as_ref() != Some(&root.resolved)
-                || pinned.directory_identity()? != root.identity
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "configured root {} no longer resolves to the directory it was opened as",
-                        root.configured.display()
-                    ),
-                ));
+        /// a symlink an unprivileged process could retarget.
+        ///
+        /// Two kinds of symlinked ancestor are accepted. A system symlink such as
+        /// macOS `/var` or `/tmp` (owned by root, in a directory only root can
+        /// rename it in) is resolved during the walk. A configured storage or
+        /// cache root whose own path runs through a user symlink is resolved once
+        /// by [`resolve_configured_root`] when AFT opens it; a later walk under
+        /// that spelling opens the resolved directory and refuses if its device
+        /// and inode are no longer the ones recorded then. Every component below
+        /// such a root is still opened without following symlinks.
+        pub(crate) fn repair_open_path(path: &Path) -> io::Result<Self> {
+            if !path.is_absolute() {
+                return Err(io::Error::other("repair requires an absolute directory"));
             }
-            let mut pinned = pinned;
-            for component in path
-                .strip_prefix(&root.configured)
-                .map_err(io::Error::other)?
-                .components()
-            {
-                pinned = pinned.repair_child(component.as_os_str())?;
+            if let Some(root) = resolved_root_for(path) {
+                // The configured spelling must still name the directory recorded
+                // when the root was opened: same resolved path, same identity.
+                let pinned = Self::repair_walk(&root.resolved)?;
+                if fs::canonicalize(&root.configured).ok().as_ref() != Some(&root.resolved)
+                    || pinned.directory_identity()? != root.identity
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "configured root {} no longer resolves to the directory it was opened as",
+                            root.configured.display()
+                        ),
+                    ));
+                }
+                let mut pinned = pinned;
+                for component in path
+                    .strip_prefix(&root.configured)
+                    .map_err(io::Error::other)?
+                    .components()
+                {
+                    pinned = pinned.repair_child(component.as_os_str())?;
+                }
+                return Ok(pinned);
             }
-            return Ok(pinned);
+            Self::repair_walk(path)
         }
-        Self::repair_walk(path)
     }
 
     #[cfg(not(unix))]
@@ -1491,15 +1493,15 @@ pub fn with_repair_failure_after_for_test<T>(entries: usize, work: impl FnOnce()
 #[cfg(any(test, feature = "test-support"))]
 thread_local! { pub(crate) static REPAIR_CENSUS_AFTER_NAMES: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> = const { std::cell::RefCell::new(None) }; }
 #[cfg(any(test, feature = "test-support"))]
-thread_local! { pub(crate) static REPAIR_IDENTITIES: std::cell::RefCell<std::collections::HashMap<PathBuf, (u64,u64)>> = std::cell::RefCell::new(std::collections::HashMap::new()); }
+thread_local! { pub static REPAIR_IDENTITIES: std::cell::RefCell<std::collections::HashMap<PathBuf, (u64,u64)>> = std::cell::RefCell::new(std::collections::HashMap::new()); }
 #[cfg(any(test, feature = "test-support"))]
 thread_local! { pub(crate) static REPAIR_MOUNTS: std::cell::RefCell<std::collections::HashMap<PathBuf, u64>> = std::cell::RefCell::new(std::collections::HashMap::new()); }
 #[cfg(any(test, feature = "test-support"))]
-thread_local! { pub(crate) static BEFORE_REPAIR_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
+thread_local! { pub static BEFORE_REPAIR_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
 // Symlinks a test treats as system-owned, since tests cannot create
 // root-owned links.
 #[cfg(all(unix, any(test, feature = "test-support")))]
-thread_local! { pub(crate) static TRUSTED_TEST_SYMLINKS: std::cell::RefCell<std::collections::HashSet<PathBuf>> = std::cell::RefCell::new(Default::default()); }
+thread_local! { pub static TRUSTED_TEST_SYMLINKS: std::cell::RefCell<std::collections::HashSet<PathBuf>> = std::cell::RefCell::new(Default::default()); }
 
 /// A configured root whose spelling runs through a user symlink, resolved
 /// once when AFT opened it.
@@ -1527,6 +1529,7 @@ fn resolved_root_for(path: &Path) -> Option<ResolvedRoot> {
         .cloned()
 }
 
+test_support_visibility! {
 /// `fs::canonicalize` for a storage or cache root whose resolved path is kept
 /// and handed on (to SQLite, to cache keys, to path comparisons). On Windows
 /// `fs::canonicalize` returns a verbatim `\\?\C:\...` path, a spelling no
@@ -1539,7 +1542,9 @@ pub(crate) fn canonical_root_path(path: &Path) -> io::Result<PathBuf> {
     let resolved = crate::windows_path::normalize_windows_path(&resolved);
     Ok(resolved)
 }
+}
 
+test_support_visibility! {
 /// Resolve a configured storage or cache root once, when AFT opens it, and
 /// record the directory it names by device and inode. Later pinned walks
 /// under the configured spelling open that directory and refuse if it has
@@ -1573,10 +1578,11 @@ pub(crate) fn resolve_configured_root(configured: &Path) -> io::Result<PathBuf> 
         Ok(resolved)
     }
 }
+}
 #[cfg(all(unix, any(test, feature = "test-support")))]
 thread_local! { pub(crate) static REPAIR_READDIR_FAIL_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
 #[cfg(all(unix, any(test, feature = "test-support")))]
-thread_local! { pub(crate) static REPAIR_SYMLINK_ELOOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+thread_local! { pub static REPAIR_SYMLINK_ELOOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[cfg(all(unix, any(test, feature = "test-support")))]
 type OpenatFileHook = Box<dyn FnMut(RawFd, &OsStr, i32) -> Option<io::Result<File>>>;
 #[cfg(all(unix, any(test, feature = "test-support")))]
@@ -2201,10 +2207,12 @@ fn removal_device(path: &Path, actual: u64) -> u64 {
     actual
 }
 
+test_support_visibility! {
 /// A removal walk met a directory on another filesystem (a mount point) and
 /// kept it, with everything below it and the tree that contains it.
 #[derive(Debug)]
 pub(crate) struct ForeignFilesystemRetained(pub(crate) PathBuf);
+}
 
 impl std::fmt::Display for ForeignFilesystemRetained {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2251,7 +2259,7 @@ pub fn remove_directory_tree_at(parent: &PinnedDir, name: &OsStr) -> io::Result<
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) mod work_counts {
+pub mod work_counts {
     use std::cell::Cell;
 
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2562,11 +2570,11 @@ pub const ARTIFACT_CONCURRENTLY_REPLACED: &str = "task artifact was concurrently
 
 #[cfg(all(any(test, feature = "test-support"), unix))]
 std::thread_local! {
-    pub(crate) static BEFORE_ARTIFACT_VALIDATION: std::cell::RefCell<Option<Box<dyn FnMut(&File)>>> = const { std::cell::RefCell::new(None) };
+    pub static BEFORE_ARTIFACT_VALIDATION: std::cell::RefCell<Option<Box<dyn FnMut(&File)>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(all(any(test, feature = "test-support"), unix))]
-pub(crate) fn with_artifact_validation_hook_for_test<T>(
+pub fn with_artifact_validation_hook_for_test<T>(
     hook: impl FnMut(&File) + 'static,
     read: impl FnOnce() -> T,
 ) -> T {

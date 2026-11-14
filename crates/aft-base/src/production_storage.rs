@@ -9,7 +9,9 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+test_support_visibility! {
 pub(crate) const CODE: &str = "dev_build_refused_production_migration";
+}
 
 // Resolve an existing ancestor as well as the leaf, which may not exist yet.
 pub fn canonicalized_with(

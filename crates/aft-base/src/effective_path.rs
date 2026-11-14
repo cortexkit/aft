@@ -327,10 +327,12 @@ pub fn effective_path() -> &'static OsStr {
         .as_os_str()
 }
 
+test_support_visibility! {
 /// Where the probed login-shell PATH is cached between processes.
 #[cfg(unix)]
 pub(crate) fn effective_path_cache_path() -> PathBuf {
     crate::storage_path::storage_dir(None).join("effective-path.json")
+}
 }
 
 #[cfg(unix)]
@@ -1057,7 +1059,7 @@ pub mod fork_counter {
 
     /// Run `body` and return its result with the number of forks this thread
     /// made meanwhile.
-    pub(crate) fn forks_during<T>(body: impl FnOnce() -> T) -> (T, usize) {
+    pub fn forks_during<T>(body: impl FnOnce() -> T) -> (T, usize) {
         static REGISTER: Once = Once::new();
         REGISTER.call_once(|| {
             // SAFETY: the handler only touches a const-initialized thread-local.

@@ -20,7 +20,9 @@ struct PinState {
     source: std::fs::File,
 }
 
+test_support_visibility! {
 static PINNED: OnceLock<PinnedExecutable> = OnceLock::new();
+}
 
 thread_local! {
     static TASK_IMAGE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
@@ -62,6 +64,7 @@ pub fn initialize() -> io::Result<()> {
         .map_err(|_| io::Error::other("executable pin was initialized concurrently"))
 }
 
+test_support_visibility! {
 fn prepare(storage: &Path) -> io::Result<PinnedExecutable> {
     // Resolve the image before touching storage. Keep an open source when a
     // copy is needed so a concurrent placement cannot change the copied bytes.
@@ -135,6 +138,7 @@ fn prepare(storage: &Path) -> io::Result<PinnedExecutable> {
         let _ = std::fs::remove_dir_all(directory);
     }
     result
+}
 }
 
 fn cleanup(run: &Path) -> io::Result<()> {

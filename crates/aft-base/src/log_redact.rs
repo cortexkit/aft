@@ -941,7 +941,7 @@ pub fn redact_ticket_digest<'a>(
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    pub(crate) static TICKET_HASH_PROBE: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+    pub static TICKET_HASH_PROBE: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Range-aware form used when a watch match is anchored in captured output.

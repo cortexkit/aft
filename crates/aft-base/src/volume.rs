@@ -182,8 +182,11 @@ pub fn volume_anchor(root: &Path) -> Option<(PathBuf, u64)> {
         Some((anchor.to_path_buf(), dev))
     }
 }
+test_support_visibility! {
 /// The identity of the filesystem holding `root`, where the platform
 /// reports one.
 pub(crate) fn cache_volume_uuid(root: &Path) -> Option<String> {
     volume_uuid(root)
+}
+
 }

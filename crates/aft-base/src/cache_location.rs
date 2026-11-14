@@ -107,8 +107,12 @@ fn paths_overlap(a: &Path, b: &Path) -> bool {
             .any(|b| a.starts_with(b) || b.starts_with(a))
     })
 }
+test_support_visibility! {
 const OWNER: &str = ".aft-owner.json";
+}
+test_support_visibility! {
 const IN_USE: &str = ".aft-in-use.lock";
+}
 const DAEMON_USE: &str = "daemon-use.lock";
 static EPOCH: AtomicU64 = AtomicU64::new(1);
 #[derive(Default)]
@@ -215,6 +219,7 @@ struct Identity {
     device: u64,
     inode: u64,
 }
+test_support_visibility! {
 fn identity(path: &Path) -> io::Result<Identity> {
     #[cfg(any(test, feature = "test-support"))]
     if let Some((device, inode)) =
@@ -225,6 +230,7 @@ fn identity(path: &Path) -> io::Result<Identity> {
     crate::dir_identity::dir_identity(path)
         .map(|(device, inode)| Identity { device, inode })
         .ok_or_else(|| io::Error::other(format!("cannot identify directory {}", path.display())))
+}
 }
 fn real_directory(path: &Path) -> io::Result<Identity> {
     let metadata = fs::symlink_metadata(path)?;
@@ -237,6 +243,7 @@ fn real_directory(path: &Path) -> io::Result<Identity> {
     identity(path)
 }
 
+test_support_visibility! {
 #[derive(Serialize, Deserialize)]
 struct ParentIdentity {
     path: PathBuf,
@@ -248,14 +255,20 @@ struct ParentIdentity {
     #[serde(default)]
     volume_uuid: Option<String>,
 }
+}
+test_support_visibility! {
 #[derive(Serialize, Deserialize)]
 struct ParentState {
     version: u32,
     parents: Vec<ParentIdentity>,
 }
+}
+test_support_visibility! {
 fn parent_state_path(storage: &Path) -> PathBuf {
     storage.join("retention/cache-parents.json")
 }
+}
+test_support_visibility! {
 fn read_parent_state(storage: &Path) -> io::Result<ParentState> {
     match fs::read(parent_state_path(storage)) {
         Ok(bytes) => {
@@ -271,6 +284,7 @@ fn read_parent_state(storage: &Path) -> io::Result<ParentState> {
         }),
         Err(error) => Err(error),
     }
+}
 }
 fn validate_saved_parent(
     storage: &Path,
@@ -508,6 +522,7 @@ fn mirror_status(configured: Option<&Path>, root: &Path) {
         roots.locations.insert(configured.to_path_buf(), entry);
     }
 }
+test_support_visibility! {
 fn set_status(root: &Path, reason: Option<String>, identity: Option<Identity>) -> u64 {
     let mut roots = STATUS
         .get_or_init(Default::default)
@@ -532,6 +547,7 @@ fn set_status(root: &Path, reason: Option<String>, identity: Option<Identity>) -
         }
     }
     roots.locations[root].1
+}
 }
 
 /// Creation below a configured artifact root must use non-recursive mkdirs:
@@ -645,6 +661,7 @@ impl CachePath {
     }
 }
 
+test_support_visibility! {
 pub(crate) fn pin_cache_path(path: &Path) -> io::Result<Option<CachePath>> {
     // A nested alias must not replace the enclosing registered namespace as
     // the admission boundary. The pathname selects a candidate; its open
@@ -685,6 +702,7 @@ pub(crate) fn pin_cache_path(path: &Path) -> io::Result<Option<CachePath>> {
         .map_err(io::Error::other)?
         .to_path_buf();
     Ok(Some(CachePath { root, relative }))
+}
 }
 
 pub fn check_cache_access(path: &Path) -> io::Result<Option<PathBuf>> {
@@ -830,19 +848,25 @@ pub fn unavailable_warning(path: &Path, reason: &str) -> crate::config_resolve::
     }
 }
 
+test_support_visibility! {
 fn open_use_lock(root: &PinnedDir) -> io::Result<File> {
     root.repair_coordination_file(std::ffi::OsStr::new(IN_USE))
 }
+}
+test_support_visibility! {
 fn pinned_identity(root: &PinnedDir) -> io::Result<Identity> {
     let (device, inode) = root.directory_identity()?;
     Ok(Identity { device, inode })
 }
+}
+test_support_visibility! {
 /// A configured durable root may be a symlink. Resolve it at the operation's
 /// boundary and retain the directory handle for every ownership comparison.
 /// Artifact descendants still use no-follow walks, not this resolver.
 fn pin_storage_root(storage: &Path) -> io::Result<PinnedDir> {
     let resolved = crate::pinned_dir::resolve_configured_root(storage)?;
     PinnedDir::repair_open_path(&resolved)
+}
 }
 /// How long preparation waits for a conflicting exclusive hold on a root's
 /// use lock (cache cleanup takes one briefly) before reporting the root busy.
@@ -1340,10 +1364,12 @@ struct RecordedRoot {
     #[serde(default)]
     registration: Option<String>,
 }
+test_support_visibility! {
 #[derive(Serialize, Deserialize)]
 struct OwnerMarker {
     owner: Identity,
     registration: String,
+}
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct History {
@@ -1357,8 +1383,10 @@ struct PendingRoot {
     root: RecordedRoot,
     staging: PathBuf,
 }
+test_support_visibility! {
 fn history_path(storage: &Path) -> PathBuf {
     storage.join("retention/cache-roots.json")
+}
 }
 /// The cache parent this storage root last used, from its durable records
 /// (enrolled cache parents, then recorded artifact roots); None when it has
@@ -1434,6 +1462,7 @@ fn lock_root_history(storage: &Path) -> io::Result<crate::fs_lock::LockGuard> {
     .map_err(io::Error::other)
 }
 
+test_support_visibility! {
 fn read_root_history(storage: &Path) -> io::Result<History> {
     Ok(match fs::read(history_path(storage)) {
         Ok(bytes) => match serde_json::from_slice::<History>(&bytes) {
@@ -1459,6 +1488,7 @@ fn read_root_history(storage: &Path) -> io::Result<History> {
         },
         Err(error) => return Err(error),
     })
+}
 }
 
 fn add_published_root(history: &mut History, record: RecordedRoot) {
@@ -1578,6 +1608,7 @@ fn read_marker_identity(file: File) -> io::Result<OwnerMarker> {
     }
     serde_json::from_reader(file).map_err(io::Error::other)
 }
+test_support_visibility! {
 fn marker_matches_pinned(root: &PinnedDir, storage: &PinnedDir) -> io::Result<String> {
     let recorded = read_marker_identity(root.repair_read_file(std::ffi::OsStr::new(OWNER))?)?;
     if recorded.owner != pinned_identity(storage)? {
@@ -1596,11 +1627,14 @@ fn marker_matches_pinned(root: &PinnedDir, storage: &PinnedDir) -> io::Result<St
     }
     Ok(recorded.registration)
 }
+}
 fn known_harness(name: &str) -> bool {
     crate::engram_catalog::harness_label(name).is_some()
 }
+test_support_visibility! {
 fn candidates_and_durable(storage: &Path) -> io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     candidates_and_durable_with_budget(storage, &mut RepairBudget::new())
+}
 }
 
 fn candidates_and_durable_with_budget(
@@ -2033,12 +2067,14 @@ fn cleanup_roots(
     Ok(())
 }
 
+test_support_visibility! {
 pub(crate) fn remove_inactive_cache_roots(storage: &Path, active: &[PathBuf]) -> CleanupReport {
     let mut report = CleanupReport::default();
     if let Err(error) = cleanup_roots(storage, active, &mut report, None, None) {
         report.error = Some(error.to_string());
     }
     report
+}
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -2072,6 +2108,7 @@ pub fn clean_old(
     )
 }
 
+test_support_visibility! {
 pub(crate) fn clean_old_resolved(
     tiers: &[crate::config_resolve::ConfigTier],
     storage: &Path,
@@ -2143,6 +2180,7 @@ pub(crate) fn clean_old_resolved(
         report.error = Some(error.to_string());
     }
     report
+}
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -2342,6 +2380,7 @@ pub fn prepare_process_cache_root(
     prepare_cache_root(config)
 }
 
+test_support_visibility! {
 /// Hold exclusion across inventory, confirmation and deletion. A host-wide
 /// process or connection-file check cannot identify which storage a daemon uses.
 pub(crate) fn acquire_cache_cleanup_lease(storage: &Path) -> io::Result<File> {
@@ -2359,6 +2398,7 @@ pub(crate) fn acquire_cache_cleanup_lease(storage: &Path) -> io::Result<File> {
         )
     })?;
     Ok(file)
+}
 }
 
 fn storage_lock_error(error: std::fs::TryLockError) -> io::Error {

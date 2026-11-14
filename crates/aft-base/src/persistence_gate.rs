@@ -1,3 +1,4 @@
+test_support_visibility! {
 //! Which commands require the root's aft.db runtime before they may execute.
 
 /// `None` means an unclassified command. Callers fail closed for unknown
@@ -66,6 +67,7 @@ pub(crate) fn classification(name: &str) -> Option<bool> {
         | "tool_call" => Some(false),
         _ => None,
     }
+}
 }
 
 pub fn requires_database(name: &str) -> bool {

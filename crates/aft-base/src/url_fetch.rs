@@ -774,11 +774,13 @@ pub const SECRET_FETCH_DIR: &str = "url_secret_fetch";
 pub const SECRET_FETCH_REFUSED: &str =
     "Secret placeholder fetch refused; no request carrying the secret was sent";
 
+test_support_visibility! {
 /// The start of the same refusals once a request carrying a key has been sent:
 /// the response (or a later hop) was refused, so the claim above would be
 /// false.
 pub(crate) const SECRET_FETCH_REFUSED_AFTER_SEND: &str =
     "Secret placeholder fetch stopped after a request carrying the secret was sent; its response was not used";
+}
 
 /// A stand-in key used only to plan where a placeholder fetch would
 /// substitute. Real vault bytes are asked for only once a rule matches.
@@ -929,6 +931,7 @@ impl SecretFetchCancellation {
     }
 }
 
+test_support_visibility! {
 /// Keys the vault released during one placeholder fetch. They are kept, wiped
 /// on drop, only until the fetch returns, so every header and body read after
 /// a key was sent is scrubbed of it.
@@ -936,6 +939,7 @@ impl SecretFetchCancellation {
 /// for another send; every request obtains its own release from the vault.
 #[derive(Default)]
 pub(crate) struct HeldKeys(Vec<(String, Zeroizing<Vec<u8>>)>);
+}
 
 impl HeldKeys {
     fn matchers(&self) -> Result<Vec<MatcherSet>, ScrubError> {
@@ -1505,6 +1509,7 @@ fn drain_decoder(
     }
 }
 
+test_support_visibility! {
 /// Decide one hop of a placeholder fetch; every hop, redirects included, is
 /// evaluated as a new request.
 ///
@@ -1683,6 +1688,7 @@ fn secret_hop(
     secret_outbound_url(current, wire_path, substituted)
         .map(Some)
         .ok_or_else(|| refused(held, "malformed_query"))
+}
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -2845,6 +2851,7 @@ fn resolve_fetch_extension(url: &Url, content_type: &str) -> Option<(&'static st
     resolve_extension_from_content_type(content_type).map(|ext| (ext, false))
 }
 
+test_support_visibility! {
 fn extension_from_url_path(url: &Url) -> Option<&'static str> {
     let path = url.path();
     if path.is_empty() || path == "/" {
@@ -2863,6 +2870,7 @@ fn extension_from_url_path(url: &Url) -> Option<&'static str> {
     } else {
         None
     }
+}
 }
 
 fn percent_decode_path_segment(segment: &str) -> String {
@@ -2892,6 +2900,7 @@ fn from_hex(byte: u8) -> Option<u8> {
     }
 }
 
+test_support_visibility! {
 /// Dotted cache extension for a path extension that `detect_language` accepts.
 fn static_extension_for_lang_ext(ext: &str) -> Option<&'static str> {
     match ext.to_ascii_lowercase().as_str() {
@@ -2927,6 +2936,7 @@ fn static_extension_for_lang_ext(ext: &str) -> Option<&'static str> {
         "yaml" | "yml" => Some(".yaml"),
         _ => None,
     }
+}
 }
 
 fn resolve_extension_from_content_type(content_type: &str) -> Option<&'static str> {

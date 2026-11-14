@@ -432,6 +432,7 @@ pub fn authorize_with(
     open_authorized_with(policy, candidate).map(|library| library.authorization)
 }
 
+test_support_visibility! {
 /// [`authorize_with`], keeping a pinned library's file open so it can be
 /// loaded through the same open file it was hashed through.
 pub(crate) fn open_authorized_with(
@@ -517,6 +518,7 @@ pub(crate) fn open_authorized_with(
          ORT_DYLIB_PATH in the environment AFT is started with.",
         path.display()
     ))
+}
 }
 
 /// True when `path` lies inside one of `roots`, comparing both the spelling

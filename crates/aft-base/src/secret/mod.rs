@@ -14,7 +14,9 @@
 pub mod consent;
 pub mod eligibility;
 pub mod outcome;
+test_support_visibility! {
 pub(crate) mod requests;
+}
 pub mod scope;
 pub mod transport;
 pub mod vault;
@@ -46,7 +48,9 @@ pub use wire::{
 pub use vault::fake::{approval, granted, FakeReply, FakeVault, FakeVaultScript};
 
 pub mod call_context;
+test_support_visibility! {
 pub(crate) mod fetch;
+}
 
 #[cfg(test)]
 #[path = "tests.rs"]

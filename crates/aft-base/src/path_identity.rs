@@ -107,6 +107,7 @@ fn directory_is_system_tree(directory: &Path) -> bool {
         })
 }
 
+test_support_visibility! {
 /// Decide whether a canonical project root admits watching and indexing.
 /// A volume's direct children can be ordinary projects, unlike permission-card
 /// directory scopes, which also exclude root-level containers.
@@ -118,6 +119,7 @@ pub(crate) fn project_root_is_narrow(directory: &Path, home: &Path, volume: &Pat
         return Some(false);
     }
     protected_directory_alias(directory, home, volume).map(|protected| !protected)
+}
 }
 
 /// Shared temporary roots hold other applications' files on any mount layout.

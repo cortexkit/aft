@@ -197,7 +197,7 @@ impl Drop for TempCleanup {
 type BeforeTempCreate = Box<dyn FnOnce(&Path)>;
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    pub(crate) static BEFORE_TEMP_CREATE: std::cell::RefCell<Option<BeforeTempCreate>> = const { std::cell::RefCell::new(None) };
+    pub static BEFORE_TEMP_CREATE: std::cell::RefCell<Option<BeforeTempCreate>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -257,14 +257,14 @@ pub enum EventKind {
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
     #[cfg(unix)]
-    pub(crate) static FAIL_GROUP_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub static FAIL_GROUP_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FULL_SYNCS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
-    pub(crate) static FAIL_DIRECTORY_SYNC: std::cell::RefCell<Option<PathBuf>> = const {
+    pub static FAIL_DIRECTORY_SYNC: std::cell::RefCell<Option<PathBuf>> = const {
         std::cell::RefCell::new(None)
     };
     // Optional errno for FAIL_DIRECTORY_SYNC; leaving it unset injects the
     // existing generic I/O error, so path-only callers need no change.
-    pub(crate) static FAIL_DIRECTORY_SYNC_ERRNO: std::cell::Cell<Option<i32>> = const {
+    pub static FAIL_DIRECTORY_SYNC_ERRNO: std::cell::Cell<Option<i32>> = const {
         std::cell::Cell::new(None)
     };
     static EVENTS: std::cell::RefCell<Vec<(EventKind, std::path::PathBuf)>> = const {

@@ -137,7 +137,7 @@ async fn an_unfiled_proxy_card_uses_the_exact_approved_line_and_never_sends() {
 }
 
 impl Clock {
-    fn new() -> Arc<Self> {
+    pub fn new() -> Arc<Self> {
         let (ticks, _) = tokio::sync::watch::channel(1_700_000_000_000);
         Arc::new(Self {
             now: Arc::new(AtomicU64::new(1_700_000_000_000)),
@@ -274,12 +274,12 @@ impl SecretConsentTransport for Phone {
 }
 
 pub struct PhoneGuard {
-    phone: Arc<Phone>,
+    pub phone: Arc<Phone>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl PhoneGuard {
-    fn install() -> Self {
+    pub fn install() -> Self {
         let lock = crate::secret::consent::TEST_TRANSPORT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);

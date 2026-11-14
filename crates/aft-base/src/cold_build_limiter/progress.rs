@@ -340,8 +340,10 @@ pub(crate) fn admitted(root: &str, kind: &str) -> Option<Job> {
     Some(REGISTRY.register(root, kind, false, true))
 }
 
+test_support_visibility! {
 pub(crate) fn queued(root: &str, kind: &str) -> Job {
     REGISTRY.register(root, kind, true, false)
+}
 }
 
 /// Thread-local scope routes embedding counters to the caller's file job even
@@ -467,14 +469,14 @@ pub fn snapshot(warming_roots: u64) -> Snapshot {
 /// Test fixtures observe only their unique root. The production census keeps
 /// its cap, so a parallel test with many older jobs cannot hide a fixture's row.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn snapshot_for_root(root: &Path, warming_roots: u64) -> Snapshot {
+pub fn snapshot_for_root(root: &Path, warming_roots: u64) -> Snapshot {
     snapshot_for_roots(&[root], warming_roots)
 }
 
 /// Every running and queued job of the given roots, uncapped, and none of the
 /// jobs other tests in the process registered for their own roots.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn snapshot_for_roots(roots: &[&Path], warming_roots: u64) -> Snapshot {
+pub fn snapshot_for_roots(roots: &[&Path], warming_roots: u64) -> Snapshot {
     let roots = roots
         .iter()
         .map(|root| root.to_string_lossy())

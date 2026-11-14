@@ -16,7 +16,7 @@ fn cache_root() -> PathBuf {
     std::env::temp_dir().join(CACHE_ROOT)
 }
 
-fn cache_path(root: &Path, bytes: &[u8], name: &str) -> PathBuf {
+pub fn cache_path(root: &Path, bytes: &[u8], name: &str) -> PathBuf {
     let mut digest = Sha256::new();
     digest.update(b"mode:755\0");
     digest.update(bytes);
@@ -84,7 +84,7 @@ fn publish_executable(root: &Path, bytes: &[u8], name: &str) -> io::Result<PathB
     publish_with_pruner(root, bytes, name, image_cache::prune)
 }
 
-fn publish_with_pruner(
+pub fn publish_with_pruner(
     root: &Path,
     bytes: &[u8],
     name: &str,
@@ -161,7 +161,7 @@ pub fn link_cached_executable(destination: &Path, bytes: &[u8]) -> io::Result<Pa
     link_cached_executable_with(destination, bytes, cached_executable, link_cached_path)
 }
 
-fn link_cached_executable_with(
+pub fn link_cached_executable_with(
     destination: &Path,
     bytes: &[u8],
     mut lookup: impl FnMut(&[u8]) -> io::Result<PathBuf>,

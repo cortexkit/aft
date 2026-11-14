@@ -118,7 +118,7 @@ fn file_key(path: &Path) -> io::Result<FileKey> {
 }
 
 #[cfg(unix)]
-fn pid_alive(pid: u32) -> bool {
+pub fn pid_alive(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
         return false;
     };
@@ -129,7 +129,7 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn pid_alive(pid: u32) -> bool {
+pub fn pid_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_INVALID_PARAMETER};
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
     // SAFETY: the query-only handle is closed here and never used to alter a process.
@@ -145,7 +145,7 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn scan_process(
+pub fn scan_process(
     mut scan: impl FnMut() -> io::Result<()>,
     alive: impl Fn() -> bool,
 ) -> io::Result<()> {
@@ -206,7 +206,7 @@ fn procfs_restriction(mountinfo: Option<&str>) -> Option<String> {
 type ProbeFailures = Vec<(std::path::PathBuf, io::Error)>;
 
 #[cfg(target_os = "linux")]
-fn snapshot_with_processes(
+pub fn snapshot_with_processes(
     processes: impl IntoIterator<Item = std::path::PathBuf>,
     mountinfo: Option<&str>,
     mut probe: impl FnMut(&mut Usage, u32, &Path) -> ProbeFailures,
@@ -241,7 +241,7 @@ fn snapshot_with_processes(
 }
 
 #[cfg(target_os = "linux")]
-fn probe_process(usage: &mut Usage, pid: u32, process: &Path) -> ProbeFailures {
+pub fn probe_process(usage: &mut Usage, pid: u32, process: &Path) -> ProbeFailures {
     use std::os::unix::fs::MetadataExt;
     let metadata = match process.metadata() {
         Ok(metadata) => metadata,

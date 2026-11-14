@@ -441,6 +441,7 @@ impl ContentChecks {
     }
 }
 
+test_support_visibility! {
 /// A source-language file whose header may mark it generated. Docs and
 /// config formats are excluded: their text is what a reader searches.
 fn is_source_file_name(file_name: &str) -> bool {
@@ -449,6 +450,7 @@ fn is_source_file_name(file_name: &str) -> bool {
         crate::lang_id::language_by_extension(Path::new(file_name)),
         Some(lang) if !matches!(lang, LangId::Markdown | LangId::Html | LangId::Yaml | LangId::Toml)
     )
+}
 }
 
 /// At least 2 KiB of head with at most one newline per KiB of it: lines
@@ -636,6 +638,7 @@ fn test_role(relative: &Path) -> TestRole {
     }
 }
 
+test_support_visibility! {
 /// Byte accounting for content reads, so tests can prove a read stayed
 /// within its bound. Outside tests the wrapper only forwards.
 pub(crate) mod read_probe {
@@ -689,6 +692,7 @@ pub(crate) mod read_probe {
             .map(|bytes| bytes.get(path).copied().unwrap_or(0))
             .unwrap_or(0)
     }
+}
 }
 
 /// Whether a project-relative path is a test-support / standalone file that

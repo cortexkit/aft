@@ -49,7 +49,7 @@ impl DeviceBoundary {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn from_device_for_test(root_device: u64) -> Self {
+    pub fn from_device_for_test(root_device: u64) -> Self {
         Self {
             root_device: Some(root_device),
         }
@@ -179,7 +179,7 @@ pub mod simulated_volumes {
 
     /// Removes its registration when dropped.
     #[must_use]
-    pub(crate) struct SimulatedVolume {
+    pub struct SimulatedVolume {
         paths: Vec<PathBuf>,
     }
 
@@ -193,7 +193,7 @@ pub mod simulated_volumes {
     }
 
     /// Report `path` and everything below it as device `device`.
-    pub(crate) fn simulate(path: &Path, device: u64) -> SimulatedVolume {
+    pub fn simulate(path: &Path, device: u64) -> SimulatedVolume {
         let mut paths = vec![path.to_path_buf()];
         // Register every resolved spelling too, so a caller that resolved the
         // path before asking for its device still matches: macOS `/var` is

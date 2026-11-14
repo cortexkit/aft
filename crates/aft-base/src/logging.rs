@@ -44,7 +44,9 @@ const LOG_DIRECTORY_BUDGET_BYTES: u64 = 200 * 1024 * 1024;
 const LOG_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_PERF_TICK_INTERVAL: Duration = Duration::from_secs(60);
 const PERF_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+test_support_visibility! {
 pub(crate) const SLOW_TOOL_CALL_THRESHOLD: Duration = Duration::from_millis(50);
+}
 const TOOL_CALL_SAMPLE_CAPACITY: usize = 256;
 /// Census lines stay greppable and short; extra fields are dropped past this.
 const INDEX_EVENT_MAX_BYTES: usize = 300;
@@ -682,6 +684,7 @@ pub fn reset_tool_call_wait() {
     TOOL_CALL_WAIT.with(|slot| *slot.borrow_mut() = ToolCallWaitState::default());
 }
 
+test_support_visibility! {
 /// Record what the current tool-call thread waited on.
 pub(crate) fn note_tool_call_wait(waiting_on: WaitingOn, build_id: Option<&str>, wait_ms: u64) {
     TOOL_CALL_WAIT.with(|slot| {
@@ -690,6 +693,7 @@ pub(crate) fn note_tool_call_wait(waiting_on: WaitingOn, build_id: Option<&str>,
         state.waiting_on_build_id = build_id.map(str::to_string);
         state.wait_ms = state.wait_ms.saturating_add(wait_ms);
     });
+}
 }
 
 pub fn note_tool_call_queue_ms(queue_ms: u64) {

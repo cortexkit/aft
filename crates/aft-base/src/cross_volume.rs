@@ -543,7 +543,7 @@ thread_local! {
     static UNSUPPORTED_RENAME: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     static UNSUPPORTED_LINK: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
-    pub(crate) static BEFORE_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = const {
+    pub static BEFORE_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = const {
         std::cell::RefCell::new(None)
     };
     static BEFORE_STAGING_REMOVAL: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> = const {

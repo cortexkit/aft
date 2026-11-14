@@ -68,6 +68,7 @@ fn native_identity(identity: crate::file_identity::FileIdentity) -> Option<FileI
     }
 }
 
+test_support_visibility! {
 fn metadata_identity(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
     #[cfg(unix)]
     {
@@ -83,7 +84,9 @@ fn metadata_identity(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
         None
     }
 }
+}
 
+test_support_visibility! {
 // Cached sidecar identities outlive unlinks while a database remains open.
 // Include birth time where available to distinguish recycled inodes from live
 // SQLite aliases. Unlike ctime, birth time survives renames.
@@ -91,6 +94,7 @@ fn metadata_identity(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
 struct LiveFileIdentity {
     file: FileIdentity,
     created: Option<std::time::SystemTime>,
+}
 }
 
 impl LiveFileIdentity {
@@ -182,9 +186,11 @@ struct OpenDatabase {
     identities: HashSet<LiveFileIdentity>,
 }
 
+test_support_visibility! {
 fn open_databases() -> &'static Mutex<BTreeMap<PathBuf, OpenDatabase>> {
     static DATABASES: OnceLock<Mutex<BTreeMap<PathBuf, OpenDatabase>>> = OnceLock::new();
     DATABASES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
 }
 
 #[derive(Default)]
@@ -198,6 +204,7 @@ fn live_files() -> &'static RwLock<LiveFiles> {
     FILES.get_or_init(RwLock::default)
 }
 
+test_support_visibility! {
 fn database_files(key: &Path) -> [PathBuf; 4] {
     let sidecar = |suffix| {
         let mut path = key.as_os_str().to_os_string();
@@ -211,7 +218,9 @@ fn database_files(key: &Path) -> [PathBuf; 4] {
         sidecar("-journal"),
     ]
 }
+}
 
+test_support_visibility! {
 fn retain_identities(
     database: &mut OpenDatabase,
     identities: impl IntoIterator<Item = LiveFileIdentity>,
@@ -222,6 +231,7 @@ fn retain_identities(
             *files.identities.entry(identity).or_default() += 1;
         }
     }
+}
 }
 
 fn reported() -> &'static Mutex<Vec<DatabaseHazard>> {
@@ -439,6 +449,7 @@ pub fn open_connections(path: &Path) -> usize {
         .sum()
 }
 
+test_support_visibility! {
 /// Cheap name check for project walkers whose roots are already canonical.
 pub(crate) fn is_registered_file_path(path: &Path) -> bool {
     live_files()
@@ -446,6 +457,7 @@ pub(crate) fn is_registered_file_path(path: &Path) -> bool {
         .unwrap_or_else(|p| p.into_inner())
         .names
         .contains_key(path)
+}
 }
 
 /// Source readers must also reject aliases to live databases and their

@@ -30,18 +30,22 @@ static WATCHED_HASH_FILE: OnceLock<Mutex<Option<(PathBuf, usize)>>> = OnceLock::
 const VERIFY_MEMO_TTL: Duration = Duration::from_secs(10 * 60);
 static VERIFY_MEMO: OnceLock<Mutex<VerifyMemo>> = OnceLock::new();
 
+test_support_visibility! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum VerifyArtifact {
     Search,
     #[cfg(any(test, feature = "test-support"))]
     Semantic,
 }
+}
 
+test_support_visibility! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WarmVerifyPlan {
     Skip,
     StatFirst,
     Strict,
+}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +165,7 @@ pub fn zero_hash() -> blake3::Hash {
     blake3::Hash::from_bytes([0u8; 32])
 }
 
+test_support_visibility! {
 pub(crate) fn artifact_generation(path: &Path) -> Option<ArtifactGeneration> {
     let metadata = fs::metadata(path).ok()?;
     let modified_nanos = metadata
@@ -173,11 +178,13 @@ pub(crate) fn artifact_generation(path: &Path) -> Option<ArtifactGeneration> {
         modified_nanos,
     })
 }
+}
 
 fn verify_memo() -> &'static Mutex<VerifyMemo> {
     VERIFY_MEMO.get_or_init(|| Mutex::new(VerifyMemo::default()))
 }
 
+test_support_visibility! {
 pub(crate) fn warm_verify_plan(
     root: &Path,
     artifact: VerifyArtifact,
@@ -201,7 +208,9 @@ pub(crate) fn warm_verify_plan(
         WarmVerifyPlan::Skip
     }
 }
+}
 
+test_support_visibility! {
 pub(crate) fn capture_verify_ticket(root: &Path) -> u64 {
     verify_memo()
         .lock()
@@ -211,7 +220,9 @@ pub(crate) fn capture_verify_ticket(root: &Path) -> u64 {
         .copied()
         .unwrap_or(0)
 }
+}
 
+test_support_visibility! {
 pub(crate) fn record_verify_completed_if_unchanged(
     root: &Path,
     artifact: VerifyArtifact,
@@ -237,6 +248,7 @@ pub(crate) fn record_verify_completed_if_unchanged(
         },
     );
     true
+}
 }
 
 /// Seed the search-index verification memo for integration lifecycle tests.

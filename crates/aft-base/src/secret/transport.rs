@@ -228,7 +228,7 @@ impl SubcSecretUseTransport {
     }
 
     #[cfg(all(any(test, feature = "test-support"), unix))]
-    pub(crate) fn for_test(
+    pub fn for_test(
         connection_file: PathBuf,
         identity: BindIdentity,
         timeout: Duration,

@@ -42,10 +42,12 @@ const JOB_COST: isize = 1;
 /// updates; a few milliseconds rides out an ordinary holder that was
 /// preempted, while a holder stuck for longer cannot stall the loop.
 const SCHEDULER_PROBE_WAIT: Duration = Duration::from_millis(5);
+test_support_visibility! {
 /// Continuous wake producers must not keep the scheduler mutex across an
 /// unbounded receiver drain; health probes and submitters get a lock turn
 /// between batches.
 const SCHEDULER_EVENT_BATCH_CAP: usize = 64;
+}
 pub const MAINTENANCE_QUEUE_CAP: usize = 512;
 const CALLGRAPH_ACQUISITION_REQUEST_ID: &str = "callgraph-view-acquire";
 
@@ -132,6 +134,7 @@ pub enum MaintenanceCoalesceKey {
 
 pub type ExecutorJob<C> = Box<dyn FnOnce(&C) -> Response + Send + 'static>;
 
+test_support_visibility! {
 /// Age at which a queued interactive mutating job (route binds, edits) jumps
 /// ahead of pure reads in interactive admission. Reads-first admission would
 /// otherwise let a sustained read stream starve queued writers; this bounds
@@ -139,25 +142,34 @@ pub type ExecutorJob<C> = Box<dyn FnOnce(&C) -> Response + Send + 'static>;
 /// daemon rejects binds at 12s, so promotion at 6s leaves half the budget for
 /// draining readers and running the configure itself.
 const INTERACTIVE_WRITER_PROMOTION_AGE: Duration = Duration::from_secs(6);
+}
+test_support_visibility! {
 /// Age at which a queued route-bind configure stops new same-root pure reads
 /// from being admitted ahead of it. Much shorter than the general writer
 /// promotion: a bind is a short configure, and after a daemon restart dozens
 /// arrive together, so reads-first admission must not spend the relay budget.
 const BIND_PROMOTION_AGE: Duration = Duration::from_millis(500);
+}
+test_support_visibility! {
 /// Worker threads reserved for route-bind configures, on top of `pool_size`.
 /// General interactive and maintenance jobs never occupy them, so a bind never
 /// waits for another session's long read, bash call, or maintenance tail to
 /// release a worker. Two, so a cold root's slower full configure does not
 /// serialize every other bind behind it.
 const BIND_RESERVE_WORKERS: usize = 2;
+}
+test_support_visibility! {
 /// Provider metadata (tool catalogs, role descriptions, grants) has reserved
 /// workers, so these short requests never wait for an index builder,
 /// configure writer or maintenance job to free a worker. Callers such as a
 /// worker launch check ask for them under a deadline of a few seconds.
 const PROVIDER_RESERVE_WORKERS: usize = 2;
+}
+test_support_visibility! {
 /// Readers older than this still block queued writer jobs; report their job
 /// metadata instead of only the generic `waiting_on_readers` diagnosis.
 const READER_STUCK_CENSUS_AGE: Duration = Duration::from_secs(60);
+}
 /// Stack for executor worker threads: the standalone main thread's size, so a
 /// request that fits there cannot overflow only under the daemon. Stack pages
 /// are committed on touch, so idle workers cost nothing extra.
@@ -215,36 +227,39 @@ impl EffectiveConfig {
 }
 
 impl ExecutorConfig {
+    test_support_visibility! {
     fn effective(&self) -> EffectiveConfig {
-        let pool_size = self.pool_size.clamp(2, 8);
-        let max_actor_cap = pool_size.saturating_sub(1).max(1);
-        let actor_cap = self.actor_cap.max(1).min(max_actor_cap);
-        let read_cap = self.read_cap.max(1).min(actor_cap).min(4);
-        // HeavyInit jobs share workers with RouteBind/configure. Keep one worker
-        // available even in a two-worker pool so a heavy-init storm cannot hold
-        // a fresh bind behind every executor worker.
-        let heavy_permits = self
-            .heavy_permits
-            .max(1)
-            .min(pool_size.saturating_sub(1).max(1))
-            .min(3);
-        let drr_quantum = self.drr_quantum.max(1);
-        let deficit_cap = (actor_cap.max(1) as isize) * 4;
-        let interactive_reserve = if pool_size >= 4 { 2 } else { 1 };
-        let maintenance_cap = pool_size.saturating_sub(interactive_reserve).max(1);
+            let pool_size = self.pool_size.clamp(2, 8);
+            let max_actor_cap = pool_size.saturating_sub(1).max(1);
+            let actor_cap = self.actor_cap.max(1).min(max_actor_cap);
+            let read_cap = self.read_cap.max(1).min(actor_cap).min(4);
+            // HeavyInit jobs share workers with RouteBind/configure. Keep one worker
+            // available even in a two-worker pool so a heavy-init storm cannot hold
+            // a fresh bind behind every executor worker.
+            let heavy_permits = self
+                .heavy_permits
+                .max(1)
+                .min(pool_size.saturating_sub(1).max(1))
+                .min(3);
+            let drr_quantum = self.drr_quantum.max(1);
+            let deficit_cap = (actor_cap.max(1) as isize) * 4;
+            let interactive_reserve = if pool_size >= 4 { 2 } else { 1 };
+            let maintenance_cap = pool_size.saturating_sub(interactive_reserve).max(1);
 
-        EffectiveConfig {
-            pool_size,
-            read_cap,
-            actor_cap,
-            heavy_permits,
-            drr_quantum,
-            deficit_cap,
-            interactive_reserve,
-            maintenance_cap,
-            bind_reserve: BIND_RESERVE_WORKERS,
-            provider_reserve: PROVIDER_RESERVE_WORKERS,
+            EffectiveConfig {
+                pool_size,
+                read_cap,
+                actor_cap,
+                heavy_permits,
+                drr_quantum,
+                deficit_cap,
+                interactive_reserve,
+                maintenance_cap,
+                bind_reserve: BIND_RESERVE_WORKERS,
+                provider_reserve: PROVIDER_RESERVE_WORKERS,
+            }
         }
+
     }
 }
 
@@ -458,12 +473,14 @@ pub struct DispatchLoopLiveness<C: ExecutorContext> {
 }
 
 impl<C: ExecutorContext> DispatchLoopLiveness<C> {
+    test_support_visibility! {
     fn new(event_rx: Receiver<SchedulerEvent<C>>) -> Self {
-        Self {
-            origin: Instant::now(),
-            last_progress_ms: AtomicU64::new(0),
-            in_event: AtomicBool::new(false),
-            event_rx,
+            Self {
+                origin: Instant::now(),
+                last_progress_ms: AtomicU64::new(0),
+                in_event: AtomicBool::new(false),
+                event_rx,
+            }
         }
     }
 
@@ -471,22 +488,24 @@ impl<C: ExecutorContext> DispatchLoopLiveness<C> {
         duration_millis_u64(self.origin.elapsed())
     }
 
+    test_support_visibility! {
     fn wait_for_event(&self, next_retry_at: Option<Instant>) -> bool {
-        let mut select = crossbeam_channel::Select::new();
-        select.recv(&self.event_rx);
-        let ready = match next_retry_at {
-            Some(at) => select
-                .ready_timeout(at.saturating_duration_since(Instant::now()))
-                .is_ok(),
-            None => {
-                select.ready();
-                true
-            }
-        };
-        // Readiness does not dequeue. Publish the active marker first so the
-        // watchdog cannot see an empty queue with an unmarked received event.
-        self.begin_event();
-        ready
+            let mut select = crossbeam_channel::Select::new();
+            select.recv(&self.event_rx);
+            let ready = match next_retry_at {
+                Some(at) => select
+                    .ready_timeout(at.saturating_duration_since(Instant::now()))
+                    .is_ok(),
+                None => {
+                    select.ready();
+                    true
+                }
+            };
+            // Readiness does not dequeue. Publish the active marker first so the
+            // watchdog cannot see an empty queue with an unmarked received event.
+            self.begin_event();
+            ready
+        }
     }
 
     fn begin_event(&self) {
@@ -495,10 +514,12 @@ impl<C: ExecutorContext> DispatchLoopLiveness<C> {
         self.in_event.store(true, Ordering::Release);
     }
 
+    test_support_visibility! {
     fn end_event(&self) {
-        self.last_progress_ms
-            .store(self.now_ms(), Ordering::Relaxed);
-        self.in_event.store(false, Ordering::Release);
+            self.last_progress_ms
+                .store(self.now_ms(), Ordering::Relaxed);
+            self.in_event.store(false, Ordering::Release);
+        }
     }
 
     /// Time since the loop last became ready to receive or finished an event.
@@ -1623,7 +1644,7 @@ impl<C: ExecutorContext> Executor<C> {
     /// Hold the scheduler state lock for the duration of `while_held`, so a
     /// test can prove a caller does not wait for it.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn hold_state_lock_for_test(&self, while_held: impl FnOnce()) {
+    pub fn hold_state_lock_for_test(&self, while_held: impl FnOnce()) {
         let _held = self.inner.state.lock();
         while_held();
     }
@@ -1969,7 +1990,7 @@ impl<C: ExecutorContext> Executor<C> {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    fn submit_maintenance_cancellable_async(
+    pub fn submit_maintenance_cancellable_async(
         &self,
         root_id: ProjectRootId,
         lane: Lane,
@@ -2249,14 +2270,14 @@ impl<C: ExecutorContext> Executor<C> {
     /// Workers not running a job right now, for tests that assert nothing
     /// holds a worker while it waits.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn idle_workers_for_test(&self) -> usize {
+    pub fn idle_workers_for_test(&self) -> usize {
         self.inner.state.lock().idle_workers
     }
 
     /// Number of workers reserved for provider metadata, so tests can distinguish
     /// those idle workers from the separate bind reservation.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn provider_reserve_for_test(&self) -> usize {
+    pub fn provider_reserve_for_test(&self) -> usize {
         self.inner.config.provider_reserve
     }
 
@@ -2353,11 +2374,7 @@ impl<C: ExecutorContext> Executor<C> {
     /// The lane in which a job with this request id is queued on `root_id`,
     /// for tests that hold a lane and must see the job wait behind it.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn queued_lane_for_test(
-        &self,
-        root_id: &ProjectRootId,
-        request_id: &str,
-    ) -> Option<Lane> {
+    pub fn queued_lane_for_test(&self, root_id: &ProjectRootId, request_id: &str) -> Option<Lane> {
         let state = self.inner.state.lock();
         let actor = state.actors.get(root_id)?;
         for queues in [&actor.interactive, &actor.maintenance] {
@@ -2453,7 +2470,7 @@ impl<C: ExecutorContext> Executor<C> {
     /// the lock: a stalled dispatch loop with pending work. The hold ends when
     /// `release` receives a message or its sender is dropped.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn hold_dispatch_loop_for_test(&self, release: Receiver<()>) -> JoinHandle<()> {
+    pub fn hold_dispatch_loop_for_test(&self, release: Receiver<()>) -> JoinHandle<()> {
         let state = Arc::clone(&self.inner.state);
         let event_tx = self.inner.event_tx.clone();
         let (held_tx, held_rx) = crossbeam_channel::bounded(1);
@@ -2550,6 +2567,7 @@ impl<C: ExecutorContext> Drop for ExecutorInner<C> {
     }
 }
 
+test_support_visibility! {
 struct SchedulerState<C: ExecutorContext> {
     actors: HashMap<ProjectRootId, ActorState<C>>,
     actor_order: Vec<ProjectRootId>,
@@ -2565,6 +2583,7 @@ struct SchedulerState<C: ExecutorContext> {
     /// Set when a bind was queued again with a retry time, so the loop knows
     /// to look for the earliest one and wake for it.
     bind_retry_pending: bool,
+}
 }
 
 impl<C: ExecutorContext> SchedulerState<C> {
@@ -2955,10 +2974,13 @@ impl QueueSnapshotAccumulator {
     }
 }
 
+test_support_visibility! {
 fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
+}
 
+test_support_visibility! {
 struct ActorState<C: ExecutorContext> {
     ctx: Arc<C>,
     epoch: Arc<RwLock<()>>,
@@ -2989,6 +3011,7 @@ struct ActorState<C: ExecutorContext> {
     /// this actor's epoch gate. Reported through
     /// [`current_actor_writer_waiting`].
     detached_writers: Arc<AtomicUsize>,
+}
 }
 
 impl<C: ExecutorContext> ActorState<C> {
@@ -3434,6 +3457,7 @@ impl<C: ExecutorContext> ClassQueues<C> {
     }
 }
 
+test_support_visibility! {
 struct QueuedJob<C: ExecutorContext> {
     job: ExecutorJob<C>,
     completion: CompletionSender,
@@ -3456,6 +3480,7 @@ struct QueuedJob<C: ExecutorContext> {
     /// Checked before metadata starts, so unbind or reconfiguration rejects
     /// queued or dispatched work from an older configure generation.
     provider_generation: Option<u64>,
+}
 }
 
 fn lane_index(lane: Lane) -> usize {
@@ -3548,9 +3573,11 @@ fn panic_response(
     )
 }
 
+test_support_visibility! {
 enum CompletionSender {
     Sync(Sender<Response>),
     Async(oneshot::Sender<Response>),
+}
 }
 
 impl CompletionSender {
@@ -3600,11 +3627,13 @@ struct RunJob<C: ExecutorContext> {
 
 struct JobCompletionOwnership;
 
+test_support_visibility! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JobCompletionOutcome {
     Completed,
     Panicked,
     Abandoned,
+}
 }
 
 struct CompletionEvent<C: ExecutorContext> {
@@ -3656,10 +3685,12 @@ impl<C: ExecutorContext> Drop for JobCompletionGuard<C> {
     }
 }
 
+test_support_visibility! {
 enum SchedulerEvent<C: ExecutorContext> {
     Wake,
     Completed(CompletionEvent<C>),
     Shutdown,
+}
 }
 
 fn scheduler_loop<C: ExecutorContext>(
@@ -3726,6 +3757,7 @@ fn scheduler_loop<C: ExecutorContext>(
     }
 }
 
+test_support_visibility! {
 fn process_scheduler_event_batch<C: ExecutorContext>(
     first: SchedulerEvent<C>,
     event_rx: &Receiver<SchedulerEvent<C>>,
@@ -3743,6 +3775,7 @@ fn process_scheduler_event_batch<C: ExecutorContext>(
         }
     }
     false
+}
 }
 
 fn note_completed_class(
@@ -3778,6 +3811,7 @@ fn process_scheduler_event<C: ExecutorContext>(
     }
 }
 
+test_support_visibility! {
 fn complete_job<C: ExecutorContext>(
     state: &mut SchedulerState<C>,
     event: CompletionEvent<C>,
@@ -3903,7 +3937,9 @@ fn complete_job<C: ExecutorContext>(
     state.assert_running_invariants();
     Some(job_class)
 }
+}
 
+test_support_visibility! {
 fn dispatch_runnable<C: ExecutorContext>(
     state: &mut SchedulerState<C>,
     heavy: &Arc<HeavySemaphore>,
@@ -3986,6 +4022,7 @@ fn dispatch_runnable<C: ExecutorContext>(
             break;
         }
     }
+}
 }
 
 fn dispatch_runnable_class<C: ExecutorContext>(
@@ -4298,6 +4335,7 @@ fn can_dispatch_class<C: ExecutorContext>(state: &SchedulerState<C>, job_class: 
     }
 }
 
+test_support_visibility! {
 /// Which dispatch pass is asking an actor for a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdmissionPass {
@@ -4314,7 +4352,9 @@ enum AdmissionPass {
     /// The ordinary DRR pass for one job class.
     Class(JobClass),
 }
+}
 
+test_support_visibility! {
 fn try_admit_actor<C: ExecutorContext>(
     root_id: &ProjectRootId,
     actor: &mut ActorState<C>,
@@ -4542,6 +4582,7 @@ fn try_admit_actor<C: ExecutorContext>(
         provider_generation: queued.provider_generation,
     })
 }
+}
 
 thread_local! {
     static IS_EXECUTOR_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -4721,6 +4762,7 @@ fn requeue_after_probe_hook_for_test(request_id: &str) {
     }
 }
 
+test_support_visibility! {
 /// How one dispatched job ended on its worker.
 enum LaneRun {
     Finished(Response),
@@ -4730,6 +4772,7 @@ enum LaneRun {
     RerunExclusive {
         retry_after: Option<Duration>,
     },
+}
 }
 
 /// Delay before a repeatable bind that found the epoch gate held by a
@@ -4741,6 +4784,7 @@ fn detached_writer_backoff(attempts: u32) -> Duration {
 /// Poll interval for epoch waits that must stay responsive to cancellation.
 const EPOCH_WAIT_POLL: Duration = Duration::from_millis(25);
 
+test_support_visibility! {
 fn run_lane_job<C: ExecutorContext>(run_job: &mut RunJob<C>) -> LaneRun {
     let _cancellation_ctx = JobCancellationContextGuard::install(run_job.cancellation.clone());
     let _waiting_writers_ctx = ActorWaitingWritersGuard::install(ActorWriterDemand {
@@ -4901,11 +4945,14 @@ fn run_lane_job<C: ExecutorContext>(run_job: &mut RunJob<C>) -> LaneRun {
     };
     LaneRun::Finished(response)
 }
+}
 
+test_support_visibility! {
 #[derive(Debug)]
 struct HeavySemaphore {
     available: AtomicUsize,
     max: usize,
+}
 }
 
 impl HeavySemaphore {

@@ -24,9 +24,9 @@ use crate::secret::ApiKeyTarget;
 use crate::secret::ReleasedApiKey;
 use secret_rules::location::LabelRule;
 
-const K1: &[u8] = b"test-key-12345678";
+pub const K1: &[u8] = b"test-key-12345678";
 const K2: &[u8] = b"rotated-key-987654321";
-const MARKER: &str = "{{ck-secret:test}}";
+pub const MARKER: &str = "{{ck-secret:test}}";
 const SPECIAL: &[u8] = b"alpha&percent%quote\"slash\\\r\nkey";
 
 struct Vault {
@@ -148,7 +148,7 @@ fn config(vault: Arc<Vault>, port: u16, locations: &[(&str, Location)]) -> Proxy
     }
 }
 
-struct Server {
+pub struct Server {
     address: SocketAddr,
     root_pem: String,
     client_tls: rustls::ClientConfig,
@@ -510,7 +510,7 @@ fn representations(key: &[u8]) -> Vec<u8> {
     payload
 }
 
-struct Client {
+pub struct Client {
     process: Child,
     input: ChildStdin,
     output: std::io::BufReader<ChildStdout>,

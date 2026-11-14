@@ -51,7 +51,7 @@ impl Child {
         self.agent_root = crate::agent_commands::started(self.id());
     }
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn kill(&mut self) -> io::Result<()> {
+    pub fn kill(&mut self) -> io::Result<()> {
         if self.reaped.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -206,7 +206,7 @@ pub fn initialize() {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-thread_local! { pub(crate) static FORCE_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+thread_local! { pub static FORCE_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 fn missing_capability() -> Option<String> {
     #[cfg(any(test, feature = "test-support"))]
     if FORCE_FALLBACK.get() {

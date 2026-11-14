@@ -393,59 +393,62 @@ impl LockGuard {
             Err(ReadLockError::Malformed(_)) => Ok(false),
         }
     }
+    test_support_visibility! {
     /// Stop and join the heartbeat, closing its kept descriptor without
-    /// unlinking the lease. Retention uses this immediately before moving or
-    /// removing a cache tree: Windows cannot rename a directory containing an
-    /// open lease file. The lease remains on disk and excludes other writers
-    /// during the move; the guard must be dropped after the operation, even on
-    /// error. Do not stop it early: remote hosts still rely on heartbeat age.
-    pub(crate) fn stop_heartbeat_for_removal(&mut self) {
-        // Signal shutdown then unconditionally join the heartbeat thread
-        // BEFORE removing the lockfile. The earlier `recv_timeout(100ms)`
-        // implementation could let `remove_lock_if_owned` race with a
-        // still-alive heartbeat:
-        //
-        //   1. Drop signals shutdown, ack times out under CI load.
-        //   2. Drop calls `remove_lock_if_owned` → file removed.
-        //   3. Another caller acquires the lock → writes its metadata.
-        //   4. Our heartbeat (still alive, mid-rewrite
-        //      from before shutdown was checked) overwrites the new
-        //      owner's file with our stale metadata. heartbeat_once's
-        //      ownership check happens BEFORE the write, so it can race
-        //      with a concurrent acquire that flips ownership in between.
-        //   5. The new owner's heartbeat sees foreign metadata, exits
-        //      `NotOwner`. The new owner's drop sees foreign metadata,
-        //      `remove_lock_if_owned` returns `Ok(false)`, file persists.
-        //
-        // Always-joining bounds drop latency to one `park_timeout`
-        // iteration (~25ms) plus the current `heartbeat_once` IO —
-        // typically <500ms under CI load. The unused `heartbeat_done`
-        // channel is kept for backward compatibility with any external
-        // code that may still construct LockGuard manually, but Drop no
-        // longer relies on it.
-        self.shutdown.store(true, Ordering::Release);
-        if let Some(handle) = self.heartbeat.take() {
-            handle.thread().unpark();
-            let _ = handle.join();
-        }
-        // Drain any pending ack so the receiver doesn't carry stale state
-        // if this LockGuard is somehow re-used (it isn't today, but be
-        // defensive).
-        while self.heartbeat_done.try_recv().is_ok() {}
+        /// unlinking the lease. Retention uses this immediately before moving or
+        /// removing a cache tree: Windows cannot rename a directory containing an
+        /// open lease file. The lease remains on disk and excludes other writers
+        /// during the move; the guard must be dropped after the operation, even on
+        /// error. Do not stop it early: remote hosts still rely on heartbeat age.
+        pub(crate) fn stop_heartbeat_for_removal(&mut self) {
+            // Signal shutdown then unconditionally join the heartbeat thread
+            // BEFORE removing the lockfile. The earlier `recv_timeout(100ms)`
+            // implementation could let `remove_lock_if_owned` race with a
+            // still-alive heartbeat:
+            //
+            //   1. Drop signals shutdown, ack times out under CI load.
+            //   2. Drop calls `remove_lock_if_owned` → file removed.
+            //   3. Another caller acquires the lock → writes its metadata.
+            //   4. Our heartbeat (still alive, mid-rewrite
+            //      from before shutdown was checked) overwrites the new
+            //      owner's file with our stale metadata. heartbeat_once's
+            //      ownership check happens BEFORE the write, so it can race
+            //      with a concurrent acquire that flips ownership in between.
+            //   5. The new owner's heartbeat sees foreign metadata, exits
+            //      `NotOwner`. The new owner's drop sees foreign metadata,
+            //      `remove_lock_if_owned` returns `Ok(false)`, file persists.
+            //
+            // Always-joining bounds drop latency to one `park_timeout`
+            // iteration (~25ms) plus the current `heartbeat_once` IO —
+            // typically <500ms under CI load. The unused `heartbeat_done`
+            // channel is kept for backward compatibility with any external
+            // code that may still construct LockGuard manually, but Drop no
+            // longer relies on it.
+            self.shutdown.store(true, Ordering::Release);
+            if let Some(handle) = self.heartbeat.take() {
+                handle.thread().unpark();
+                let _ = handle.join();
+            }
+            // Drain any pending ack so the receiver doesn't carry stale state
+            // if this LockGuard is somehow re-used (it isn't today, but be
+            // defensive).
+            while self.heartbeat_done.try_recv().is_ok() {}
 
-        // Release the heartbeat handle before the lease file: closing any other
-        // descriptor to it now would drop the advisory locks this process holds
-        // on it, so the unlink and any concurrent replacement wait for this.
-        let mut handle = self
-            .heartbeat_file
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *handle = None;
-        drop(handle);
-        // Stop publishing the slot so a later replacement for this path never
-        // waits on this guard's closed handle.
-        unregister_lease_slot(self.pump.slot, &self.path);
-        self.pump.visible.store(false, Ordering::Release);
+            // Release the heartbeat handle before the lease file: closing any other
+            // descriptor to it now would drop the advisory locks this process holds
+            // on it, so the unlink and any concurrent replacement wait for this.
+            let mut handle = self
+                .heartbeat_file
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *handle = None;
+            drop(handle);
+            // Stop publishing the slot so a later replacement for this path never
+            // waits on this guard's closed handle.
+            unregister_lease_slot(self.pump.slot, &self.path);
+            self.pump.visible.store(false, Ordering::Release);
+        }
+
     }
 }
 
@@ -1565,6 +1568,7 @@ enum ReadLockError {
     Malformed(serde_json::Error),
 }
 
+test_support_visibility! {
 /// Read a lease file, re-reading until two consecutive reads agree.
 ///
 /// Heartbeats overwrite lease files in place, and a read that overlaps such a
@@ -1583,6 +1587,7 @@ pub(crate) fn read_lease_settled(path: &Path) -> io::Result<Vec<u8>> {
         previous = next;
     }
     Ok(previous)
+}
 }
 
 /// Parse a lease. An empty or partial file (for example one left by a crash

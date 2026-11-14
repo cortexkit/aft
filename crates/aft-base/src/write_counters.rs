@@ -230,11 +230,13 @@ pub struct Registry {
     pub recent_top: Mutex<Vec<WriterRow>>,
 }
 
+test_support_visibility! {
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
+}
 }
 
 pub fn registry() -> &'static Registry {

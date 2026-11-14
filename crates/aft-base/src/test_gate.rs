@@ -20,7 +20,7 @@ pub fn powershell_gate(file: &str, millis: u32) -> String {
     format!("$aftGateFile = '{file}'; $aftGateParent = Split-Path -Parent $aftGateFile; $aftGateDeadline = [DateTime]::UtcNow.AddSeconds(600); while (-not (Test-Path -LiteralPath $aftGateFile) -and (Test-Path -LiteralPath $aftGateParent -PathType Container) -and [DateTime]::UtcNow -lt $aftGateDeadline) {{ Start-Sleep -Milliseconds {millis} }}")
 }
 
-fn gate_with_limit(file: &str, sleep: &str, seconds: u64, predicate: &str) -> String {
+pub fn gate_with_limit(file: &str, sleep: &str, seconds: u64, predicate: &str) -> String {
     format!(
         "(aft_gate_file={file}; \
          aft_gate_parent=$(cd \"$(dirname \"$aft_gate_file\")\" 2>/dev/null && pwd -P) || exit 0; \
