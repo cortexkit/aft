@@ -718,6 +718,18 @@ async fn runner_notice_real_daemon_scoped_carrier_authority() {
         );
     }
     assert_eq!(result["allowed"]["outcome"], "accepted", "{result}");
+    let invalid_members = result["allowed"]["invalid_members"].as_array().unwrap();
+    assert_eq!(invalid_members.len(), 5, "{result}");
+    for (refusal, field) in invalid_members.iter().zip([
+        "dedupe_key",
+        "dedupe_key",
+        "expires_at_ms",
+        "expires_at_ms",
+        "dedupe_key",
+    ]) {
+        assert_eq!(refusal["error"]["code"], "invalid_params", "{refusal}");
+        assert_eq!(refusal["error"]["detail"]["field"], field, "{refusal}");
+    }
     let received = std::fs::read_to_string(home.join("runner-received.jsonl")).unwrap();
     assert_eq!(
         received.lines().count(),
@@ -730,6 +742,8 @@ async fn runner_notice_real_daemon_scoped_carrier_authority() {
     assert_eq!(body["method"], "session.send");
     assert_eq!(body["params"]["send_id"], "aft:bash:notice-allowed");
     assert_eq!(body["params"]["notice"], true);
+    assert_eq!(body["params"]["dedupe_key"], "aft:bash-task:notice-allowed");
+    assert!(body["params"].get("expires_at_ms").is_none());
     let log = std::fs::read_to_string(home.join("runner-transport.log")).unwrap();
     let refusals: Vec<_> = log
         .lines()
@@ -817,7 +831,17 @@ async fn runner_notice_real_daemon_recovers_concrete_harnesses_without_model() {
             .collect();
         assert_eq!(
             keys,
-            std::collections::BTreeSet::from(["prompt", "send_id", "notice", "delivery"])
+            std::collections::BTreeSet::from([
+                "prompt",
+                "send_id",
+                "notice",
+                "delivery",
+                "dedupe_key"
+            ])
+        );
+        assert_eq!(
+            record["request"]["params"]["dedupe_key"],
+            format!("aft:bash-task:{task}")
         );
         let delivered = format!("INFO runner notice aft:bash:{task} delivered to {module} harness={harness} session={task}");
         assert_eq!(
@@ -826,5 +850,5 @@ async fn runner_notice_real_daemon_recovers_concrete_harnesses_without_model() {
             "each accepted send logs once: {log}"
         );
     }
-    println!("real daemon: adopted broca runner -> broca; thalamus runner waited for opencode2 bind; stored pi unchanged; 3 accepted sends, 3 success logs, exactly prompt/send_id/notice/delivery (no model or plan)");
+    println!("real daemon: adopted broca runner -> broca; thalamus runner waited for opencode2 bind; stored pi unchanged; 3 accepted sends, 3 success logs, completion dedupe keys (no model or plan)");
 }

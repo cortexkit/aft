@@ -89,6 +89,17 @@ impl Completion {
             .into_push_frame()
     }
 
+    fn reminder(&self, elapsed_ms: u64) -> PushFrame {
+        let mut frame = crate::protocol::BashLongRunningFrame::new(
+            &self.task,
+            &self.task,
+            "echo durable",
+            elapsed_ms,
+        );
+        frame.launching_identity = Some(self.route.task_identity());
+        PushFrame::BashLongRunning(frame)
+    }
+
     fn delivered(&self) -> bool {
         use crate::bash_background::persistence::{read_task_at, resolve_task};
         let paths = resolve_task(self.storage.path(), &self.task, &self.task).unwrap();
@@ -1304,6 +1315,257 @@ fn runner_notices_wire_params_have_no_model_or_plan() {
         assert_eq!(
             keys,
             std::collections::BTreeSet::from(["prompt", "send_id", "notice", "delivery"])
+        );
+    }
+}
+
+#[test]
+fn runner_notices_delivery_order_capability_cache_is_incarnation_scoped() {
+    let mut cache = RunnerCapabilities::default();
+    let first = RunnerIncarnation {
+        daemon: "daemon-1".into(),
+        generation: 1,
+    };
+    let restarted = RunnerIncarnation {
+        generation: 2,
+        ..first.clone()
+    };
+    let daemon_restarted = RunnerIncarnation {
+        daemon: "daemon-2".into(),
+        generation: 1,
+    };
+    let path = Path::new("connection.json");
+    assert_eq!(cache.get(path, "broca", &first), None);
+    cache.insert(path, "broca", first.clone(), true);
+    assert_eq!(cache.get(path, "broca", &first), Some(true));
+    assert_eq!(cache.get(path, "thalamus-harness", &first), None);
+    assert_eq!(cache.get(Path::new("other.json"), "broca", &first), None);
+    assert_eq!(cache.get(path, "broca", &restarted), None);
+    assert_eq!(cache.get(path, "broca", &daemon_restarted), None);
+    cache.insert(path, "broca", restarted.clone(), false);
+    assert_eq!(cache.get(path, "broca", &restarted), Some(false));
+    assert_eq!(cache.get(path, "broca", &first), None);
+    for (reply, expected) in [
+        (
+            json!({"capabilities":["steer","delivery_order"]}),
+            Some(true),
+        ),
+        (json!({"capabilities":["steer"]}), Some(false)),
+        (json!({"capabilities":"delivery_order"}), None),
+        (json!({"capabilities":["delivery_order", 1]}), None),
+        (json!({"error":{"code":"unavailable"}}), None),
+        (json!({}), None),
+    ] {
+        assert_eq!(
+            described_delivery_order(&serde_json::to_vec(&reply).unwrap()),
+            expected
+        );
+    }
+}
+
+#[test]
+fn runner_notices_optional_members_are_gated_and_task_choice_is_frozen() {
+    for (index, capability) in [None, Some(false), Some(true)].into_iter().enumerate() {
+        let task = Completion::new(&format!("bash-00000000000e000{index}"), 0);
+        let capture = test_endpoint::capture(&task.task, false);
+        capture.delivery_order(capability);
+        let scheduler = Scheduler::default();
+        assert!(offer(
+            &scheduler,
+            task.registry.clone(),
+            task.reminder(600_321),
+            PathBuf::new(),
+            false,
+            || 0
+        ));
+        assert!(matches!(
+            step(&scheduler, std::time::Instant::now()),
+            Next::Done
+        ));
+        let reminder = capture.receiver.try_recv().unwrap();
+        let metadata = task.registry.notice_metadata(&task.task).unwrap();
+        let policy = metadata.runner_notice_policy.unwrap();
+        assert_eq!(policy.dedupe, capability == Some(true));
+        assert_eq!(policy.reminder_interval_ms, 600_000);
+        assert_eq!(metadata.runner_reminder_elapsed_ms, Some(600_321));
+        let mut expected = json!({"method":"session.send","params":{
+            "prompt":super::super::bash_notice_text::long_running(&serde_json::to_value(match task.reminder(600_321) { PushFrame::BashLongRunning(frame) => frame, _ => unreachable!() }).unwrap()),
+            "send_id":format!("aft:bash-reminder:{}:600321", task.task),
+            "notice":true,"delivery":["tool_result","steer"]
+        }});
+        if capability == Some(true) {
+            expected["params"]["dedupe_key"] = json!(format!("aft:bash-task:{}", task.task));
+            expected["params"]["expires_at_ms"] = json!(metadata.started_at + 1_200_321);
+        }
+        assert_eq!(reminder.request, expected);
+        // Later discovery and configuration cannot change an accepted send's identity.
+        capture.delivery_order(if capability == Some(true) {
+            None
+        } else {
+            Some(true)
+        });
+        task.registry.configure_long_running_reminders(true, 1_000);
+        let completion_text = super::super::bash_notice_text::completion(
+            &serde_json::to_value(task.frame()).unwrap(),
+        );
+        task.offer(&scheduler, Arc::new(AtomicU64::new(task.finished)));
+        assert!(matches!(
+            step(&scheduler, std::time::Instant::now()),
+            Next::Done
+        ));
+        let completion = capture.receiver.try_recv().unwrap();
+        let mut expected = json!({"prompt":completion_text,"send_id":format!("aft:bash:{}", task.task),
+            "notice":true,"delivery":["tool_result","steer"]});
+        if capability == Some(true) {
+            expected["dedupe_key"] = json!(format!("aft:bash-task:{}", task.task));
+        }
+        assert_eq!(
+            completion.request,
+            json!({"method":"session.send","params":expected})
+        );
+        assert!(completion.request["params"].get("expires_at_ms").is_none());
+        assert_eq!(
+            completion.request["params"].get("dedupe_key"),
+            reminder.request["params"].get("dedupe_key")
+        );
+        assert_eq!(
+            task.registry
+                .notice_metadata(&task.task)
+                .unwrap()
+                .runner_notice_policy
+                .unwrap()
+                .reminder_interval_ms,
+            600_000
+        );
+    }
+}
+
+#[test]
+fn runner_notices_reminder_retry_and_restart_replay_preserve_bytes() {
+    let task = Completion::new("bash-00000000000e0010", 0);
+    let capture = test_endpoint::capture(&task.task, false);
+    capture.delivery_order(Some(true));
+    capture.retry(1);
+    let scheduler = Scheduler::default();
+    assert!(offer(
+        &scheduler,
+        task.registry.clone(),
+        task.reminder(600_123),
+        PathBuf::new(),
+        false,
+        || 0
+    ));
+    let now = std::time::Instant::now();
+    let Next::Retry(delay) = step(&scheduler, now) else {
+        panic!("must retry")
+    };
+    let first = capture.receiver.try_recv().unwrap();
+    capture.delivery_order(None);
+    task.registry.configure_long_running_reminders(true, 1);
+    assert!(matches!(step(&scheduler, now + delay), Next::Done));
+    let second = capture.receiver.try_recv().unwrap();
+    assert_eq!(first.bytes, second.bytes);
+    assert_eq!(capture.effects.load(Ordering::Relaxed), 1);
+
+    task.registry.detach();
+    let restarted = crate::bash_background::BgTaskRegistry::default();
+    restarted
+        .replay_session(task.storage.path(), &task.task)
+        .unwrap();
+    let metadata = restarted.notice_metadata(&task.task).unwrap();
+    let id = format!(
+        "aft:bash-reminder:{}:{}",
+        task.task,
+        metadata.runner_reminder_elapsed_ms.unwrap()
+    );
+    // The saved identity, not time since restart, supplies the replay's elapsed value.
+    let elapsed = id.rsplit(':').next().unwrap().parse().unwrap();
+    assert!(offer(
+        &scheduler,
+        restarted.clone(),
+        task.reminder(elapsed),
+        PathBuf::new(),
+        false,
+        || u64::MAX
+    ));
+    assert!(matches!(
+        step(&scheduler, std::time::Instant::now()),
+        Next::Done
+    ));
+    let replay = capture.receiver.try_recv().unwrap();
+    assert_eq!(first.bytes, replay.bytes);
+    assert_eq!(capture.effects.load(Ordering::Relaxed), 1);
+    restarted.detach();
+}
+
+#[test]
+fn runner_notices_member_refusal_drops_reminder_and_freezes_completion_fallback() {
+    for (index, field) in ["dedupe_key", "expires_at_ms"].into_iter().enumerate() {
+        let task = Completion::new(&format!("bash-00000000000e002{index}"), 0);
+        let capture = test_endpoint::capture(&task.task, true);
+        capture.delivery_order(Some(true));
+        capture.refuse("invalid_params", Some(field));
+        let scheduler = Scheduler::default();
+        assert!(offer(
+            &scheduler,
+            task.registry.clone(),
+            task.reminder(600_000),
+            PathBuf::new(),
+            false,
+            || 0
+        ));
+        assert!(matches!(
+            step(&scheduler, std::time::Instant::now()),
+            Next::Done
+        ));
+        let reminder = capture.receiver.try_recv().unwrap();
+        assert!(reminder.request["params"].get("dedupe_key").is_some());
+        assert!(
+            capture.receiver.try_recv().is_err(),
+            "a refused reminder must not be resent"
+        );
+        assert_eq!(capture.effects.load(Ordering::Relaxed), 0);
+        assert!(
+            task.registry
+                .notice_metadata(&task.task)
+                .unwrap()
+                .runner_notice_policy
+                .unwrap()
+                .dedupe
+        );
+
+        capture.refuse("invalid_params", Some(field));
+        task.offer(&scheduler, Arc::new(AtomicU64::new(task.finished)));
+        let now = std::time::Instant::now();
+        let Next::Retry(delay) = step(&scheduler, now) else {
+            panic!("lost resend response must retry")
+        };
+        let first = capture.receiver.try_recv().unwrap();
+        let resend = capture.receiver.try_recv().unwrap();
+        let mut expected = first.request;
+        expected["params"]
+            .as_object_mut()
+            .unwrap()
+            .remove("dedupe_key");
+        expected["params"]
+            .as_object_mut()
+            .unwrap()
+            .remove("expires_at_ms");
+        assert_eq!(resend.request, expected);
+        assert_eq!(envelope(&task.frozen()), resend.bytes);
+        assert!(capture.receiver.try_recv().is_err());
+        assert_eq!(capture.effects.load(Ordering::Relaxed), 1);
+        assert!(matches!(step(&scheduler, now + delay), Next::Done));
+        assert_eq!(capture.receiver.try_recv().unwrap().bytes, resend.bytes);
+        assert_eq!(capture.effects.load(Ordering::Relaxed), 1);
+        assert!(task.delivered());
+        assert!(
+            task.registry
+                .notice_metadata(&task.task)
+                .unwrap()
+                .runner_notice_policy
+                .unwrap()
+                .dedupe
         );
     }
 }

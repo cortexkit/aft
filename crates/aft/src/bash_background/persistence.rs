@@ -1942,6 +1942,14 @@ pub struct PersistedTask {
     /// so retry backoff survives daemon restarts; it is not a delivery limit.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) runner_completion_offers: usize,
+    /// The first notice fixes optional wire members and reminder timing for
+    /// this task. Discovery or config changes must not change a send's identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runner_notice_policy: Option<RunnerNoticePolicy>,
+    /// Scheduled elapsed time of the latest reminder, also embedded in its
+    /// send_id. Replay must reuse it rather than measure elapsed time again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runner_reminder_elapsed_ms: Option<u64>,
     /// Freeze the exact runner send before its first attempt. A restart must
     /// reuse the same text and delivery list even if task observations change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1950,6 +1958,12 @@ pub struct PersistedTask {
     /// one can stop it. Persisted so a restarted AFT still knows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) folder_grants: Option<super::registry::folder_grants::TaskFolderGrants>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub(crate) struct RunnerNoticePolicy {
+    pub dedupe: bool,
+    pub reminder_interval_ms: u64,
 }
 
 fn default_notify_on_completion() -> bool {
@@ -2064,6 +2078,8 @@ impl PersistedTask {
             local_fallback_started: false,
             cancelled_call_unannounced: false,
             runner_completion_offers: 0,
+            runner_notice_policy: None,
+            runner_reminder_elapsed_ms: None,
             runner_completion_notice: None,
             folder_grants: super::registry::folder_grants::for_spawn(),
         };
@@ -3345,10 +3361,18 @@ where
             .runner_completion_notice
             .clone()
             .or(metadata.runner_completion_notice);
+        let runner_notice_policy = original
+            .runner_notice_policy
+            .or(metadata.runner_notice_policy);
+        let runner_reminder_elapsed_ms = original
+            .runner_reminder_elapsed_ms
+            .max(metadata.runner_reminder_elapsed_ms);
         metadata = original;
         metadata.completion_delivered = completion_delivered;
         metadata.runner_completion_offers = runner_completion_offers;
         metadata.runner_completion_notice = runner_completion_notice;
+        metadata.runner_notice_policy = runner_notice_policy;
+        metadata.runner_reminder_elapsed_ms = runner_reminder_elapsed_ms;
         metadata.schema_version = SCHEMA_VERSION;
     }
     write_task_at(task, &metadata)?;

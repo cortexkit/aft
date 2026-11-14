@@ -63,6 +63,14 @@ impl ModuleHandler for Peer {
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         assert!(self.records, "only the runner receives data requests");
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        if body["method"] == "role.describe" {
+            return HandlerOutcome::Response(
+                cortexkit_role_llm_runner::wire::reply_body(
+                    &json!({"capabilities":["delivery_order"]}),
+                )
+                .unwrap(),
+            );
+        }
         if body["method"] == "session.head" {
             return HandlerOutcome::Response(
                 cortexkit_role_llm_runner::wire::reply_body(
@@ -72,6 +80,22 @@ impl ModuleHandler for Peer {
             );
         }
         assert_eq!(body["method"], "session.send");
+        let invalid = |field: &str| {
+            HandlerOutcome::Response(serde_json::to_vec(&json!({
+            "error":{"code":"invalid_params","message":"malformed notice member","detail":{"field":field}}
+        })).unwrap())
+        };
+        let decoded: cortexkit_role_llm_runner::send::SendRequest =
+            match serde_json::from_value(body["params"].clone()) {
+                Ok(request) => request,
+                Err(_) => return invalid("delivery"),
+            };
+        if let Err(field) = decoded
+            .check_prompt()
+            .and_then(|_| decoded.delivery_order().map(|_| ()))
+        {
+            return invalid(field);
+        }
         assert_eq!(body["params"]["notice"], true);
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -111,11 +135,18 @@ pub(super) async fn run() {
     if module == "broca" || module == "thalamus-harness" || (aliases && module == "aft") {
         manifest = manifest
             .provides(vec![ProviderRole::ManagementSurface {
-                operations: vec![ManagementOperation {
-                    name: "session.send".into(),
-                    kind: ManagementOperationKind::Mutate,
-                    description: None,
-                }],
+                operations: vec![
+                    ManagementOperation {
+                        name: "session.send".into(),
+                        kind: ManagementOperationKind::Mutate,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: "role.describe".into(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                ],
                 config_schema: json!({}),
                 observability: vec![],
                 identity_scope: vec![],

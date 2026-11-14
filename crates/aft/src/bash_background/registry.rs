@@ -12293,6 +12293,50 @@ impl BgTaskRegistry {
         Ok(())
     }
 
+    pub(crate) fn freeze_runner_notice_policy(
+        &self,
+        session: &str,
+        task_id: &str,
+        dedupe: bool,
+        reminder_elapsed_ms: Option<u64>,
+    ) -> std::io::Result<super::persistence::RunnerNoticePolicy> {
+        let task = self
+            .task_for_session(task_id, session)
+            .ok_or_else(|| std::io::Error::other("notice task is not owned by this session"))?;
+        self.retry_terminal_persist(&task)?;
+        let mut db = DeferredDbWrites::new(self, &task);
+        let mut state = task
+            .lock_state()
+            .map_err(|_| std::io::Error::other("background task lock poisoned"))?;
+        state.metadata = self.update_task_metadata_locked(&task, &mut db, |metadata| {
+            let dedupe = metadata
+                .runner_completion_notice
+                .as_ref()
+                .map_or(dedupe, |request| {
+                    request
+                        .delivery_order()
+                        .ok()
+                        .flatten()
+                        .is_some_and(|order| order.dedupe_key.is_some())
+                });
+            metadata
+                .runner_notice_policy
+                .get_or_insert(super::persistence::RunnerNoticePolicy {
+                    dedupe,
+                    reminder_interval_ms: self
+                        .inner
+                        .long_running_reminder_interval_ms
+                        .load(Ordering::SeqCst),
+                });
+            metadata.runner_reminder_elapsed_ms =
+                metadata.runner_reminder_elapsed_ms.max(reminder_elapsed_ms);
+        })?;
+        Ok(state
+            .metadata
+            .runner_notice_policy
+            .expect("notice policy was frozen"))
+    }
+
     pub(crate) fn freeze_runner_completion_notice(
         &self,
         session: &str,
@@ -12308,6 +12352,19 @@ impl BgTaskRegistry {
             .lock_state()
             .map_err(|_| std::io::Error::other("background task lock poisoned"))?;
         state.metadata = self.update_task_metadata_locked(&task, &mut db, |metadata| {
+            metadata
+                .runner_notice_policy
+                .get_or_insert(super::persistence::RunnerNoticePolicy {
+                    dedupe: request
+                        .delivery_order()
+                        .ok()
+                        .flatten()
+                        .is_some_and(|order| order.dedupe_key.is_some()),
+                    reminder_interval_ms: self
+                        .inner
+                        .long_running_reminder_interval_ms
+                        .load(Ordering::SeqCst),
+                });
             metadata.runner_completion_notice.get_or_insert(request);
         })?;
         Ok(state
@@ -15740,10 +15797,16 @@ impl BgTaskRegistry {
         {
             return;
         }
-        let interval_ms = self
-            .inner
-            .long_running_reminder_interval_ms
-            .load(Ordering::SeqCst);
+        let interval_ms = task
+            .lock_state()
+            .ok()
+            .and_then(|state| state.metadata.runner_notice_policy)
+            .map(|policy| policy.reminder_interval_ms)
+            .unwrap_or_else(|| {
+                self.inner
+                    .long_running_reminder_interval_ms
+                    .load(Ordering::SeqCst)
+            });
         if interval_ms == 0 {
             return;
         }
