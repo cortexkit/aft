@@ -2737,6 +2737,7 @@ mod tests {
         use crate::data_layer::meaning::FillTimes;
         let coverage = MeaningCoverage {
             files: 40,
+            files_skipped: 0,
             files_embedded: 30,
             files_too_large: 1,
             files_failed: 2,

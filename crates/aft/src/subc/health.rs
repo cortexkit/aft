@@ -10652,6 +10652,7 @@ mod tests {
                 refreshing: false,
                 coverage: MeaningCoverage {
                     files: 123_456,
+                    files_skipped: 0,
                     files_embedded: 100_000,
                     files_too_large: 1_234,
                     files_failed: 1_234,
