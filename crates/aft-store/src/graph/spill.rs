@@ -57,8 +57,8 @@ struct Placed {
     slice: (u8, u32, u32),
 }
 
-/// Private scratch is removed on drop; checkout startup reaps abandoned builds
-/// without removing another active builder's files.
+/// Private scratch is removed on drop. AFT calls `LocalScratch::sweep` when
+/// binding a checkout to its store, reaping abandoned builds but not live ones.
 #[derive(Debug)]
 pub struct GraphSectionsSpill {
     data: Option<BufWriter<File>>,

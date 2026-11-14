@@ -731,7 +731,8 @@ impl Drop for SortedRecords {
     }
 }
 
-/// Deletes only marked spill children for which the caller confirms no process
+/// Deletes only children with a valid spill `owner` marker file for which the
+/// caller confirms no process
 /// will use the directory again. The predicate must exclude live builders and
 /// retained checkpoints: age or a PID alone is not a safe ownership test.
 pub fn sweep_abandoned(root: &Path, abandoned: impl FnMut(&Path) -> bool) -> Result<usize, Error> {

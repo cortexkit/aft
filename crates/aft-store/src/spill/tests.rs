@@ -326,7 +326,7 @@ fn spill_large_variable_records_cross_blocks_and_owned_outputs_fit() {
 #[test]
 fn spill_insufficient_merge_budget_fails_instead_of_exceeding_limit() {
     let root = tempfile::tempdir().unwrap();
-    // Keep the arena unchanged when the durable run descriptor gains fields.
+    // Keep the payload/entry arena's allowance unchanged as run metadata grows.
     let cfg = config(128 * std::mem::size_of::<run::RunMeta>() + 6 * 1024);
     let mut sorter = Sorter::new(root.path(), cfg).unwrap();
     // One large record fits the arena, but two heads plus readers do not fit
