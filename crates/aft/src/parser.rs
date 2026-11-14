@@ -9788,9 +9788,10 @@ impl crate::language::LanguageProvider for TreeSitterProvider {
 // helpers only they use read as dead in release-profile test builds.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 mod tests {
-    /// The reason a too deeply nested Markdown file is not parsed is text
-    /// agents read, so it is pinned here, and it names the limit the guard
-    /// applies.
+    /// The reason a too deeply nested Markdown file is not parsed reaches
+    /// the coding agents that call AFT's tools, in the error for that file.
+    /// Its wording is a reviewed interface, so it is pinned here, and it
+    /// must name the limit the guard applies.
     #[test]
     fn the_markdown_too_deep_reason_is_pinned() {
         assert_eq!(
