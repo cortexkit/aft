@@ -256,11 +256,18 @@ test_support_visibility! {
 #[derive(Serialize, Deserialize)]
 struct ParentIdentity {
     path: PathBuf,
+    #[cfg(any(test, feature = "test-support"))]
+    pub identity: Identity,
+    #[cfg(not(any(test, feature = "test-support")))]
     identity: Identity,
     /// The spelling the user configured, when it differs from `path` because
     /// it runs through a symlink. It must keep naming the same directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     configured: Option<PathBuf>,
+    #[cfg(any(test, feature = "test-support"))]
+    #[serde(default)]
+    pub volume_uuid: Option<String>,
+    #[cfg(not(any(test, feature = "test-support")))]
     #[serde(default)]
     volume_uuid: Option<String>,
 }
@@ -1375,6 +1382,9 @@ fn prepare_cache_root_with_floor_hooks(
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RecordedRoot {
     path: PathBuf,
+    #[cfg(any(test, feature = "test-support"))]
+    pub identity: Option<Identity>,
+    #[cfg(not(any(test, feature = "test-support")))]
     identity: Option<Identity>,
     #[serde(default)]
     registration: Option<String>,
@@ -1405,7 +1415,13 @@ struct History {
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct PendingRoot {
+    #[cfg(any(test, feature = "test-support"))]
+    pub root: RecordedRoot,
+    #[cfg(not(any(test, feature = "test-support")))]
     root: RecordedRoot,
+    #[cfg(any(test, feature = "test-support"))]
+    pub staging: PathBuf,
+    #[cfg(not(any(test, feature = "test-support")))]
     staging: PathBuf,
 }
 test_support_visibility! {

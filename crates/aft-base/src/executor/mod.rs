@@ -636,7 +636,7 @@ struct JobCancellationInner {
     wait_lock: Mutex<()>,
     wake: Condvar,
     #[cfg(any(test, feature = "test-support"))]
-    root_probe_barrier: Mutex<Option<(Sender<()>, Receiver<()>)>>,
+    pub root_probe_barrier: Mutex<Option<(Sender<()>, Receiver<()>)>>,
 }
 
 const JOB_CANCEL_STATE_PENDING: u8 = 0;
@@ -2550,10 +2550,16 @@ impl<C: ExecutorContext> Default for Executor<C> {
 }
 
 struct ExecutorInner<C: ExecutorContext> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub state: Arc<TrackedMutex<SchedulerState<C>>>,
+    #[cfg(not(any(test, feature = "test-support")))]
     state: Arc<TrackedMutex<SchedulerState<C>>>,
     event_tx: Sender<SchedulerEvent<C>>,
     scheduler_handle: Mutex<Option<JoinHandle<()>>>,
     worker_handles: Mutex<Vec<JoinHandle<()>>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub config: EffectiveConfig,
+    #[cfg(not(any(test, feature = "test-support")))]
     config: EffectiveConfig,
     nonrunnable_dispatches: Arc<AtomicUsize>,
     completed_interactive: Arc<AtomicU64>,
@@ -2561,7 +2567,7 @@ struct ExecutorInner<C: ExecutorContext> {
     dispatch_liveness: Arc<DispatchLivenessAtomics>,
     dispatch_loop_liveness: Arc<DispatchLoopLiveness<C>>,
     #[cfg(any(test, feature = "test-support"))]
-    maintenance_root_check_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    pub maintenance_root_check_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl<C: ExecutorContext> Drop for ExecutorInner<C> {
@@ -3736,9 +3742,11 @@ impl<C: ExecutorContext> JobCompletionGuard<C> {
         }
     }
 
+    test_support_visibility! {
     fn set_outcome(&mut self, outcome: JobCompletionOutcome) {
-        if let Some(event) = self.event.as_mut() {
-            event.outcome = outcome;
+            if let Some(event) = self.event.as_mut() {
+                event.outcome = outcome;
+            }
         }
     }
 
