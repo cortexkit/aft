@@ -528,6 +528,10 @@ impl DeadCodeFileAnalyzer {
     }
 
     fn parse_source(&mut self, lang: LangId, source: &str) -> Option<tree_sitter::Tree> {
+        // Markdown nested too deeply would abort the process in its grammar.
+        if crate::parser::markdown_too_deep_to_parse(lang, source) {
+            return None;
+        }
         let parser = match self.parsers.entry(lang) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {

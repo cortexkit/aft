@@ -144,6 +144,13 @@ fn markers_record(source: &[u8], language: &str) -> Result<ContentRecord, Manife
     let name = language.strip_prefix(MARKERS_PREFIX).unwrap_or(language);
     let todos = match TodoLanguage::from_name(name) {
         Some(TodoLanguage::Lexical) => todos::markers_lexical(source),
+        Some(TodoLanguage::Tree(lang))
+            if crate::parser::markdown_too_deep_to_parse(lang, parsed_text(source)) =>
+        {
+            // The Markdown grammar would abort the process on this file;
+            // its markers are read without parsing it instead.
+            todos::markers_lexical(source)
+        }
         Some(TodoLanguage::Tree(lang)) => {
             let tree = parse(source, lang)?;
             todos::markers_from_tree(source, lang, &tree)
@@ -1148,6 +1155,31 @@ mod tests {
         let (record, tree) = extract_with_tree(b"[package]\n", "config").unwrap();
         assert!(tree.is_none());
         assert_eq!(record, extract(b"[package]\n", "config").unwrap());
+    }
+
+    /// A Markdown file nested too deeply for its grammar, which would abort
+    /// the whole process, is never parsed by the store: its TODO markers are
+    /// read without a syntax tree instead. One block fewer is parsed as
+    /// usual.
+    #[test]
+    fn too_deeply_nested_markdown_keeps_its_markers_without_a_parse() {
+        let limit = crate::parser::MARKDOWN_MAX_OPEN_BLOCKS;
+        let source =
+            |blocks: usize| format!("// TODO: unwind the nesting\n{}x\n", "> ".repeat(blocks));
+        let over = source(limit);
+        let language = language_for("deep.md", over.as_bytes()).unwrap();
+        let record = extract(over.as_bytes(), &language).unwrap();
+        assert_eq!(record.todos, Some(todos::markers_lexical(over.as_bytes())));
+        assert_ne!(
+            record.todos,
+            Some(todos::markers_lexical(b"")),
+            "the lexical read finds the marker"
+        );
+        assert_eq!(parses_of_for_test(over.as_bytes()), 0);
+
+        let under = source(limit - 1);
+        extract(under.as_bytes(), &language).unwrap();
+        assert_eq!(parses_of_for_test(under.as_bytes()), 1);
     }
 
     /// How deep the deeply nested inputs below nest. The Swift compiler's

@@ -847,6 +847,84 @@ pub(crate) fn language_for_extension(path: &Path) -> Option<LangId> {
     }
 }
 
+/// The most container blocks (block quotes and list items) a Markdown file
+/// may hold open at once and still be parsed. The Markdown grammar's block
+/// scanner saves its open blocks into tree-sitter's fixed 1024-byte state
+/// buffer without a bounds check, 4 bytes per block after a 5-byte header,
+/// so 255 open blocks overrun it and tree-sitter aborts the whole process
+/// (`tree-sitter-md` 0.5.3 under tree-sitter 0.26). Half that leaves room
+/// for the overestimate [`markdown_too_deep_to_parse`] makes.
+pub(crate) const MARKDOWN_MAX_OPEN_BLOCKS: usize = 128;
+
+/// Why a Markdown file over [`MARKDOWN_MAX_OPEN_BLOCKS`] is not parsed. Tools
+/// report it after the file's path, as `<path>: <reason>`.
+pub(crate) const MARKDOWN_TOO_DEEP: &str =
+    "markdown is nested too deeply to parse safely (more than 128 open blocks); not parsed";
+
+/// Whether `source`, to be parsed as `lang`, is Markdown that could hold
+/// more than [`MARKDOWN_MAX_OPEN_BLOCKS`] container blocks open at once, and
+/// so must not reach the Markdown grammar. Every place that parses
+/// Markdown checks this first.
+///
+/// A linear scan over each line's container prefix (the run of `>`, list
+/// markers and whitespace before the line's text) bounds the blocks open on
+/// that line from above: each block a line opens or continues takes a `>`
+/// or a list marker on it, or, for a list item continued by indentation, at
+/// least two columns of whitespace. A block cannot open on a line without
+/// such a mark, so the most blocks ever open is at most the largest line's
+/// count, plus one for a code block or other block of the scanner's own.
+pub(crate) fn markdown_too_deep_to_parse(lang: LangId, source: &str) -> bool {
+    lang == LangId::Markdown
+        && source
+            .split('\n')
+            .any(|line| markdown_line_block_bound(line.as_bytes()) > MARKDOWN_MAX_OPEN_BLOCKS)
+}
+
+/// An upper bound on the container blocks open on one Markdown line: its
+/// markers, half its other whitespace columns, and one more (see
+/// [`markdown_too_deep_to_parse`]).
+fn markdown_line_block_bound(line: &[u8]) -> usize {
+    let space_at = |index: usize| matches!(line.get(index), Some(b' ' | b'\t'));
+    let ends_marker = |index: usize| index >= line.len() || space_at(index);
+    let (mut markers, mut columns, mut index) = (0, 0, 0);
+    while let Some(&byte) = line.get(index) {
+        index = match byte {
+            b' ' => {
+                columns += 1;
+                index + 1
+            }
+            b'\t' => {
+                columns += 4;
+                index + 1
+            }
+            // A block quote marker, with the one space that belongs to it.
+            b'>' => {
+                markers += 1;
+                index + 1 + usize::from(space_at(index + 1))
+            }
+            b'-' | b'+' | b'*' if ends_marker(index + 1) => {
+                markers += 1;
+                index + 1 + usize::from(space_at(index + 1))
+            }
+            b'0'..=b'9' => {
+                let digits = line[index..]
+                    .iter()
+                    .take_while(|byte| byte.is_ascii_digit())
+                    .count();
+                let delimiter = index + digits;
+                if !matches!(line.get(delimiter), Some(b'.' | b')')) || !ends_marker(delimiter + 1)
+                {
+                    break;
+                }
+                markers += 1;
+                delimiter + 1 + usize::from(space_at(delimiter + 1))
+            }
+            _ => break,
+        };
+    }
+    markers + columns / 2 + 1
+}
+
 /// Returns the tree-sitter Language grammar for a given LangId.
 pub fn grammar_for(lang: LangId) -> Result<Language, AftError> {
     Ok(match lang {
@@ -1163,6 +1241,11 @@ pub(crate) fn parse_resolved_source(
 }
 
 fn parse_source_with_parser(path: &Path, source: &str, lang: LangId) -> Result<Tree, AftError> {
+    if markdown_too_deep_to_parse(lang, source) {
+        return Err(AftError::ParseError {
+            message: format!("{}: {MARKDOWN_TOO_DEEP}", path.display()),
+        });
+    }
     #[cfg(feature = "test-hooks")]
     SEARCH_PARSE_COUNT.with(|count| count.set(count.get() + 1));
     #[cfg(test)]
@@ -9705,6 +9788,80 @@ impl crate::language::LanguageProvider for TreeSitterProvider {
 // helpers only they use read as dead in release-profile test builds.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 mod tests {
+    /// The reason a too deeply nested Markdown file is not parsed is text
+    /// agents read, so it is pinned here, and it names the limit the guard
+    /// applies.
+    #[test]
+    fn the_markdown_too_deep_reason_is_pinned() {
+        assert_eq!(
+            super::MARKDOWN_TOO_DEEP,
+            "markdown is nested too deeply to parse safely (more than 128 open blocks); not parsed"
+        );
+        assert!(super::MARKDOWN_TOO_DEEP.contains(&format!(
+            "more than {} open blocks",
+            super::MARKDOWN_MAX_OPEN_BLOCKS
+        )));
+    }
+
+    /// Markdown one block past the limit is refused with the pinned reason
+    /// before it reaches the grammar, which would abort the whole process
+    /// at 255 open blocks; one block fewer parses. Block quotes on one line
+    /// and lists nested by indentation across lines are both counted.
+    #[test]
+    fn markdown_just_over_the_nesting_limit_is_refused_and_just_under_parses() {
+        use super::{markdown_too_deep_to_parse, LangId, MARKDOWN_MAX_OPEN_BLOCKS};
+        let path = std::path::Path::new("deep.md");
+        // A line of n quote markers opens n blocks.
+        let quotes = |n: usize| format!("# Title\n\n{}x\n", "> ".repeat(n));
+        let over = quotes(MARKDOWN_MAX_OPEN_BLOCKS);
+        match super::parse_source_with_parser(path, &over, LangId::Markdown) {
+            Err(crate::error::AftError::ParseError { message }) => {
+                assert_eq!(message, format!("deep.md: {}", super::MARKDOWN_TOO_DEEP));
+            }
+            other => panic!("expected the nesting refusal, got {other:?}"),
+        }
+        let under = quotes(MARKDOWN_MAX_OPEN_BLOCKS - 1);
+        assert!(super::parse_source_with_parser(path, &under, LangId::Markdown).is_ok());
+
+        // Line k nests k + 1 list items.
+        let list = |n: usize| {
+            (0..n)
+                .map(|k| format!("{}- x\n", "  ".repeat(k)))
+                .collect::<String>()
+        };
+        assert!(markdown_too_deep_to_parse(
+            LangId::Markdown,
+            &list(MARKDOWN_MAX_OPEN_BLOCKS)
+        ));
+        assert!(!markdown_too_deep_to_parse(
+            LangId::Markdown,
+            &list(MARKDOWN_MAX_OPEN_BLOCKS - 1)
+        ));
+        assert!(super::parse_source_with_parser(
+            path,
+            &list(MARKDOWN_MAX_OPEN_BLOCKS - 1),
+            LangId::Markdown
+        )
+        .is_ok());
+        // Only Markdown goes through the Markdown grammar.
+        assert!(!markdown_too_deep_to_parse(LangId::Python, &over));
+    }
+
+    /// The limit leaves headroom: the Markdown grammar itself still parses
+    /// 254 open block quotes, one short of the 255 that abort it, while the
+    /// guard refuses such a file long before.
+    #[test]
+    fn the_markdown_grammar_parses_254_open_blocks_which_the_guard_refuses() {
+        use super::LangId;
+        let source = format!("{}x\n", "> ".repeat(254));
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&super::grammar_for(LangId::Markdown))
+            .unwrap();
+        assert!(parser.parse(&source, None).is_some());
+        assert!(super::markdown_too_deep_to_parse(LangId::Markdown, &source));
+    }
+
     #[test]
     fn grammar_builtin_only_parser_rejects_dynamic_shared_cache_hits() {
         let directory = tempfile::tempdir().unwrap();

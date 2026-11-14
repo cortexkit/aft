@@ -307,6 +307,11 @@ impl CallgraphBlob {
         let extractor_version = extractor_version.into();
         let tree = match crate::parser::cached_header_tree(source, lang) {
             Some(tree) => tree,
+            None if crate::parser::markdown_too_deep_to_parse(lang, source) => {
+                return Err(ManifestJoinError::Parse(
+                    crate::parser::MARKDOWN_TOO_DEEP.to_string(),
+                ));
+            }
             None => {
                 let mut parser = Parser::new();
                 crate::parser::initialize_parser(&mut parser, lang).map_err(extraction_error)?;
