@@ -366,8 +366,8 @@ mod tests {
         assert!(matches!(error, DataError::DiskFloor(_)));
         assert_eq!(
             std::fs::read_dir(bounded.scratch.path()).unwrap().count(),
-            1,
-            "only the owner file exists"
+            0,
+            "a refused run leaves the workspace empty"
         );
     }
 }

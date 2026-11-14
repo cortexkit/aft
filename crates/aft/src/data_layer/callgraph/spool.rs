@@ -139,7 +139,6 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let workspace = workspace(root.path(), |_| Ok(()));
         let dir = workspace.path().to_path_buf();
-        assert!(dir.join("owner").is_file());
         let mut spool = ResolutionSpool::new(&workspace).unwrap();
         let first = spool
             .write_range(&[b"one".to_vec(), Vec::new(), b"three".to_vec()])
