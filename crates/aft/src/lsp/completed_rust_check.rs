@@ -3264,11 +3264,19 @@ mod tests {
             .env
             .insert("RUSTC".into(), compiler.to_string_lossy().into_owned());
         // The fixture writes its own build-script output here; an inherited
-        // Cargo target directory must not redirect that input discovery.
-        cache.runtime.env.insert(
-            "CARGO_TARGET_DIR".into(),
-            cache.root.join("target").to_string_lossy().into_owned(),
-        );
+        // Cargo target or build directory must not redirect that input
+        // discovery. A build server may export CARGO_BUILD_BUILD_DIR with an
+        // unresolved Cargo template, which input discovery rightly refuses, so
+        // pin it to the same folder too.
+        let target = cache.root.join("target").to_string_lossy().into_owned();
+        cache
+            .runtime
+            .env
+            .insert("CARGO_TARGET_DIR".into(), target.clone());
+        cache
+            .runtime
+            .env
+            .insert("CARGO_BUILD_BUILD_DIR".into(), target);
         cache.runtime.launch_env = Some(cache.runtime.effective_env().unwrap());
         write(
             &cache.root,
