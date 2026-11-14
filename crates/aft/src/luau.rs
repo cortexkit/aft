@@ -575,7 +575,7 @@ pub(crate) mod tests {
             let root = directory.path().join("grammars");
             crate::private_storage::create_dir_all(&root).unwrap();
             let manifest = crate::grammar::manifest();
-            let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            let fixture = crate::test_support::manifest_dir()
                 .join("tests/fixtures/grammars")
                 .join(format!("{}.wasm", manifest.sha256));
             crate::private_storage::write(
