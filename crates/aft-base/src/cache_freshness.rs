@@ -45,7 +45,7 @@ pub(crate) enum WarmVerifyPlan {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum VerifyStrategy {
+pub enum VerifyStrategy {
     StatFirst,
     Strict,
 }
@@ -344,13 +344,13 @@ pub fn verify_file_strict(path: &Path, cached: &FileFreshness) -> FreshnessVerdi
 /// indexed file, and the semantic load/build already runs beside the bridge's
 /// single dispatch thread. Match the half-cores/cap-8 policy used by the search
 /// and callgraph cold-build pools.
-pub(crate) fn verify_files_strict_bounded<K: Send>(
+pub fn verify_files_strict_bounded<K: Send>(
     files: Vec<(K, PathBuf, FileFreshness)>,
 ) -> Vec<(K, PathBuf, FreshnessVerdict)> {
     verify_files_bounded(files, VerifyStrategy::Strict)
 }
 
-pub(crate) fn verify_files_bounded<K: Send>(
+pub fn verify_files_bounded<K: Send>(
     files: Vec<(K, PathBuf, FileFreshness)>,
     strategy: VerifyStrategy,
 ) -> Vec<(K, PathBuf, FreshnessVerdict)> {

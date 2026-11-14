@@ -74,7 +74,7 @@ pub(crate) struct Queued {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct Snapshot {
+pub struct Snapshot {
     pub running: Vec<Running>,
     pub queued: Vec<Queued>,
     pub warming_roots: u64,
@@ -355,7 +355,7 @@ pub(crate) struct Scope {
 /// Cold builds and full fills announce their start. Incremental maintenance
 /// selects Quiet explicitly because it can run every second on a busy root.
 #[derive(Clone, Copy)]
-pub(crate) enum StartLog {
+pub enum StartLog {
     Info,
     #[cfg(any(test, feature = "test-support"))]
     Quiet,
@@ -374,7 +374,7 @@ fn start_message(root: &Path, kind: &str, total: Option<usize>, log: StartLog) -
     }
 }
 
-pub(crate) fn start(root: &Path, kind: &str, total: Option<usize>, log: StartLog) -> Scope {
+pub fn start(root: &Path, kind: &str, total: Option<usize>, log: StartLog) -> Scope {
     let job = REGISTRY.register(&root.to_string_lossy(), kind, false, false);
     lock(&job.entry).total = total.map(|n| n as u64);
     if let Some(message) = start_message(root, kind, total, log) {
@@ -394,7 +394,7 @@ impl Drop for Scope {
     }
 }
 
-pub(crate) fn phase(phase: &'static str, total: Option<usize>) {
+pub fn phase(phase: &'static str, total: Option<usize>) {
     CURRENT.with(|current| {
         if let Some(entry) = current.borrow().as_ref() {
             let mut entry = lock(entry);
@@ -412,7 +412,7 @@ pub(crate) fn phase(phase: &'static str, total: Option<usize>) {
     });
 }
 
-pub(crate) fn advance(files: usize) {
+pub fn advance(files: usize) {
     CURRENT.with(|current| {
         if let Some(entry) = current.borrow().as_ref() {
             let mut entry = lock(entry);
@@ -431,7 +431,7 @@ impl Counter {
     }
 }
 
-pub(crate) fn counter() -> Option<Counter> {
+pub fn counter() -> Option<Counter> {
     CURRENT.with(|current| {
         current
             .borrow()
@@ -440,7 +440,7 @@ pub(crate) fn counter() -> Option<Counter> {
     })
 }
 
-pub(crate) fn embedded(chunks: usize) {
+pub fn embedded(chunks: usize) {
     CURRENT.with(|current| {
         if let Some(entry) = current.borrow().as_ref() {
             let mut entry = lock(entry);
@@ -454,13 +454,13 @@ pub(crate) fn embedded(chunks: usize) {
     });
 }
 
-pub(crate) fn cancel_root(root: &Path) {
+pub fn cancel_root(root: &Path) {
     REGISTRY.cancel_root(&root.to_string_lossy());
 }
 pub(crate) fn cancel_token(key: usize) {
     REGISTRY.cancel_token(key);
 }
-pub(crate) fn snapshot(warming_roots: u64) -> Snapshot {
+pub fn snapshot(warming_roots: u64) -> Snapshot {
     REGISTRY.snapshot(warming_roots, Instant::now())
 }
 

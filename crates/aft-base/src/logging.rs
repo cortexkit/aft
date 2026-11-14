@@ -76,7 +76,7 @@ impl IndexPlane {
 
 /// Lifecycle kind recorded on every `index_event` line.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum IndexEventKind {
+pub enum IndexEventKind {
     BuildStarted,
     BuildProgress,
     BuildReady,
@@ -110,7 +110,7 @@ impl IndexEventKind {
 
 /// One structured standing-index lifecycle record.
 #[derive(Clone, Debug)]
-pub(crate) struct IndexEvent {
+pub struct IndexEvent {
     pub kind: IndexEventKind,
     pub plane: IndexPlane,
     pub build_id: String,
@@ -705,7 +705,7 @@ pub fn take_tool_call_wait() -> (WaitingOn, Option<String>, u64) {
 
 /// A step of the shared edit pipeline whose time a slow tool call reports.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum EditPhase {
+pub enum EditPhase {
     /// Writing the undo snapshot under the backup store's lock.
     Backup,
     /// Atomic writes of the new content (and of a rollback).

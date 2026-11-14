@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
-pub(crate) mod markers;
+pub mod markers;
 use crate::pinned_dir::{PinnedDir, RepairBudget};
 
 pub struct ReaderFloorHooks {
@@ -44,7 +44,7 @@ pub const CACHE_DIR_BUSY: &str = "cache_dir_busy";
 /// The project keeps working and AFT retries with backoff while it stays bound.
 pub const CACHE_DIR_BUSY_MESSAGE: &str =
     "cache folder busy: another project was creating it at the same moment; AFT retries automatically";
-pub(crate) fn cache_status_code(reason: &str) -> &'static str {
+pub fn cache_status_code(reason: &str) -> &'static str {
     if reason.starts_with(CACHE_DIR_BUSY) {
         CACHE_DIR_BUSY
     } else {
@@ -54,7 +54,7 @@ pub(crate) fn cache_status_code(reason: &str) -> &'static str {
 pub const CACHE_DIR_ON_STORAGE_DEVICE: &str = "cache_dir_on_storage_device";
 /// `storage.cache_dir` contains the durable storage root or sits inside it.
 pub const CACHE_DIR_OVERLAPS_STORAGE: &str = "cache_dir_overlaps_storage";
-pub(crate) fn unavailable_code(reason: &str) -> &'static str {
+pub fn unavailable_code(reason: &str) -> &'static str {
     if reason.starts_with(CACHE_DIR_BUSY) {
         CACHE_DIR_BUSY
     } else if reason.starts_with(CACHE_DIR_ON_STORAGE_DEVICE) {
@@ -687,7 +687,7 @@ pub(crate) fn pin_cache_path(path: &Path) -> io::Result<Option<CachePath>> {
     Ok(Some(CachePath { root, relative }))
 }
 
-pub(crate) fn check_cache_access(path: &Path) -> io::Result<Option<PathBuf>> {
+pub fn check_cache_access(path: &Path) -> io::Result<Option<PathBuf>> {
     let Some(access) = pin_cache_path(path)? else {
         return Ok(None);
     };
@@ -708,7 +708,7 @@ pub(crate) fn check_cache_access(path: &Path) -> io::Result<Option<PathBuf>> {
 /// pinned root, never recreating the root itself. Outside a cache root, a write
 /// on durable storage whose caches were moved to `storage.cache_dir` is
 /// refused. A refused root reports the `cache_dir_unavailable` reason.
-pub(crate) fn prepare_third_party_cache_dir(path: &Path) -> Result<(), String> {
+pub fn prepare_third_party_cache_dir(path: &Path) -> Result<(), String> {
     let checked = (|| -> io::Result<()> {
         if let Some(access) = pin_cache_path(path)? {
             access.directory(true)?;
@@ -815,10 +815,7 @@ pub(crate) fn refuse_durable_cache_write(path: &Path) -> io::Result<()> {
     }
     Ok(())
 }
-pub(crate) fn unavailable_warning(
-    path: &Path,
-    reason: &str,
-) -> crate::config_resolve::ConfigWarning {
+pub fn unavailable_warning(path: &Path, reason: &str) -> crate::config_resolve::ConfigWarning {
     let code = unavailable_code(reason);
     crate::config_resolve::ConfigWarning {
         code,
@@ -2316,7 +2313,7 @@ fn acquire_pinned_storage_lease(root: PinnedDir) -> io::Result<Arc<ProcessStorag
     Ok(lease)
 }
 
-pub(crate) fn ensure_config_storage_lease(config: &mut crate::config::Config) -> io::Result<()> {
+pub fn ensure_config_storage_lease(config: &mut crate::config::Config) -> io::Result<()> {
     let storage = crate::storage_path::storage_dir(config.storage_dir.as_deref());
     crate::private_storage::open_root(&storage)?;
     let root = pin_storage_root(&storage)?;
@@ -2332,7 +2329,7 @@ pub(crate) fn ensure_config_storage_lease(config: &mut crate::config::Config) ->
     Ok(())
 }
 
-pub(crate) fn prepare_process_cache_root(
+pub fn prepare_process_cache_root(
     config: &mut crate::config::Config,
 ) -> Option<crate::config_resolve::ConfigWarning> {
     if let Err(error) = ensure_config_storage_lease(config) {
@@ -3388,7 +3385,7 @@ pub fn canonical_root(project_root: &Path) -> PathBuf {
     canonical_process_lease_dir(project_root)
 }
 
-pub(crate) fn canonical_process_lease_dir(path: &Path) -> PathBuf {
+pub fn canonical_process_lease_dir(path: &Path) -> PathBuf {
     if let Ok(canonical) = std::fs::canonicalize(path) {
         return canonical;
     }
@@ -3428,7 +3425,7 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     normalized
 }
 
-pub(crate) fn existing_ancestor(path: &Path) -> PathBuf {
+pub fn existing_ancestor(path: &Path) -> PathBuf {
     let mut current = path;
     loop {
         if current.exists() {

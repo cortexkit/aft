@@ -29,21 +29,17 @@ pub fn is_generated_file(project_root: &Path, path: &Path) -> bool {
     crate::file_kind::file_head_has_generated_marker(&absolute)
 }
 
-pub(crate) fn is_generated_file_from_source(
-    project_root: &Path,
-    path: &Path,
-    source: &str,
-) -> bool {
+pub fn is_generated_file_from_source(project_root: &Path, path: &Path, source: &str) -> bool {
     relative_shape_is_generated(project_root, path) || source_has_generated_marker(source)
 }
 
 /// Only the part of `path` below `project_root` decides a generated shape;
 /// folders above the project (a checkout under `~/gen/`) must not.
-pub(crate) fn relative_shape_is_generated(project_root: &Path, path: &Path) -> bool {
+pub fn relative_shape_is_generated(project_root: &Path, path: &Path) -> bool {
     crate::file_kind::relative_shape_is_generated(project_root, path)
 }
 
-pub(crate) fn is_generated_file_with_cached_hint(
+pub fn is_generated_file_with_cached_hint(
     project_root: &Path,
     relative_file: &str,
     cached_hint: Option<bool>,
@@ -51,7 +47,7 @@ pub(crate) fn is_generated_file_with_cached_hint(
     cached_hint.unwrap_or_else(|| is_generated_file(project_root, Path::new(relative_file)))
 }
 
-pub(crate) fn path_has_generated_shape(path: &Path) -> bool {
+pub fn path_has_generated_shape(path: &Path) -> bool {
     crate::file_kind::path_has_generated_shape(path)
 }
 

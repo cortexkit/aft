@@ -29,7 +29,7 @@ impl std::fmt::Display for ConfigObservationError {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PreparedBindConfig {
+pub struct PreparedBindConfig {
     snapshot_id: u64,
     root: PathBuf,
     harness: Harness,
@@ -188,7 +188,7 @@ fn observe(path: &Path, tier: &str) -> Result<ConfigObservation, ConfigObservati
 
 /// Bound I/O itself, including migration's locked reread, rather than reading
 /// the entire file and checking its size after allocation.
-pub(crate) fn read_bounded_config(reader: impl Read, limit: usize) -> std::io::Result<String> {
+pub fn read_bounded_config(reader: impl Read, limit: usize) -> std::io::Result<String> {
     let detection_limit = limit
         .checked_add(1)
         .ok_or_else(|| std::io::Error::other("invalid config byte limit"))?;
@@ -207,11 +207,11 @@ thread_local! {
     static PREPARED: RefCell<Option<Arc<PreparedBindConfig>>> = const { RefCell::new(None) };
 }
 
-pub(crate) fn current_prepared_bind_config() -> Option<Arc<PreparedBindConfig>> {
+pub fn current_prepared_bind_config() -> Option<Arc<PreparedBindConfig>> {
     PREPARED.with(|slot| slot.borrow().clone())
 }
 
-pub(crate) fn with_prepared_bind_config<T>(
+pub fn with_prepared_bind_config<T>(
     prepared: Arc<PreparedBindConfig>,
     run: impl FnOnce() -> T,
 ) -> T {

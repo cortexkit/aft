@@ -277,7 +277,7 @@ pub fn try_acquire_once(path: &Path) -> Result<LockGuard, AcquireError> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LockAvailability {
+pub enum LockAvailability {
     Available,
     LiveOwner,
     Stale,
@@ -2074,7 +2074,7 @@ pub fn acquisition_now() -> Instant {
     Instant::now()
 }
 
-pub(crate) fn sleep_until_retry(
+pub fn sleep_until_retry(
     deadline: Option<Instant>,
     poll_interval_ms: u64,
 ) -> Result<(), AcquireError> {
@@ -2488,7 +2488,7 @@ unsafe extern "C" {
 }
 
 #[cfg(unix)]
-pub(crate) fn process_alive(pid: u32) -> bool {
+pub fn process_alive(pid: u32) -> bool {
     if pid == 0 || pid > i32::MAX as u32 {
         return false;
     }
@@ -2502,7 +2502,7 @@ pub(crate) fn process_alive(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-pub(crate) fn process_alive(pid: u32) -> bool {
+pub fn process_alive(pid: u32) -> bool {
     // A denied or inconclusive probe must not permit reclaiming a live owner.
     windows_process_creation_time(pid).map_or(true, |created| created.is_some())
 }
@@ -2581,7 +2581,7 @@ fn windows_creation_ticks_to_unix_ms(ticks: u64) -> Option<u64> {
 }
 
 #[cfg(not(any(unix, windows)))]
-pub(crate) fn process_alive(_pid: u32) -> bool {
+pub fn process_alive(_pid: u32) -> bool {
     true
 }
 

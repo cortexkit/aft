@@ -313,7 +313,7 @@ fn filesystem_gate() -> &'static parking_lot::ReentrantMutex<()> {
     &GATE
 }
 
-pub(crate) fn filesystem_guard() -> parking_lot::ReentrantMutexGuard<'static, ()> {
+pub fn filesystem_guard() -> parking_lot::ReentrantMutexGuard<'static, ()> {
     filesystem_gate().lock()
 }
 
@@ -323,7 +323,7 @@ pub(crate) fn filesystem_guard() -> parking_lot::ReentrantMutexGuard<'static, ()
 /// The key is returned rather than recomputed at close time because the
 /// database file may be gone by then, and a path that no longer resolves would
 /// otherwise file the close under a different key than the open.
-pub(crate) fn note_open(path: &Path, store: &'static str) -> PathBuf {
+pub fn note_open(path: &Path, store: &'static str) -> PathBuf {
     let key = registry_key(path);
     let paths = database_files(&key);
     let identities = paths.each_ref().map(|path| LiveFileIdentity::of(path));
@@ -355,7 +355,7 @@ pub(crate) fn note_open(path: &Path, store: &'static str) -> PathBuf {
 }
 
 /// Record that a tracked connection opened under `key` has closed.
-pub(crate) fn note_close(key: &Path, store: &'static str) {
+pub fn note_close(key: &Path, store: &'static str) {
     let mut databases = open_databases()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -412,7 +412,7 @@ fn replacement_hazard(key: &Path, entry: &OpenDatabase, opener: &Opener) -> Opti
 /// Number of registered connections at `path` or at another name for its inode.
 /// Hold [`filesystem_guard`] across this query and any file-set mutation so an
 /// opener cannot appear between checking the registry and changing the files.
-pub(crate) fn registered_connections_for_key(key: &Path) -> usize {
+pub fn registered_connections_for_key(key: &Path) -> usize {
     open_databases()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -451,7 +451,7 @@ pub(crate) fn is_registered_file_path(path: &Path) -> bool {
 /// Source readers must also reject aliases to live databases and their
 /// sidecars. `stat` inspects the inode without opening a descriptor, so it does
 /// not release SQLite's process-wide file locks.
-pub(crate) fn is_live_sqlite_file(path: &Path) -> bool {
+pub fn is_live_sqlite_file(path: &Path) -> bool {
     if is_registered_file_path(path) {
         return true;
     }
@@ -491,7 +491,7 @@ fn is_live_identity(identity: LiveFileIdentity, links: u64) -> bool {
     known()
 }
 
-pub(crate) fn is_live_sqlite_file_with_metadata(
+pub fn is_live_sqlite_file_with_metadata(
     path: &Path,
     metadata: Option<&std::fs::Metadata>,
 ) -> bool {
@@ -567,7 +567,7 @@ fn refresh_sidecar_identities() {
 ///
 /// On Windows, std::fs::Metadata omits the file index. Use is_live_sqlite_file
 /// there to obtain the identity through a metadata-only handle.
-pub(crate) fn is_live_sqlite_handle(metadata: &std::fs::Metadata) -> bool {
+pub fn is_live_sqlite_handle(metadata: &std::fs::Metadata) -> bool {
     let Some(identity) = LiveFileIdentity::from_metadata(metadata) else {
         return false;
     };

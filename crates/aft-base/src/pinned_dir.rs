@@ -59,13 +59,13 @@ impl PinnedEntry {
 /// A directory's identity without an open handle. Historical read permissions
 /// reopen the directory and compare identities instead of pinning it forever.
 #[derive(Debug, Clone)]
-pub(crate) struct DirectorySnapshot {
+pub struct DirectorySnapshot {
     path: PathBuf,
     identity: DirectoryIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DirectoryIdentity {
+pub struct DirectoryIdentity {
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
@@ -2105,7 +2105,7 @@ fn repair_remove_contents(
 /// permissions on, or delete, anything outside the tree. On Windows the
 /// read-only attribute of each deleted file is cleared through its pinned
 /// handle instead (see `windows_delete_pinned_handle_outcome`).
-pub(crate) fn remove_tree_contents(dir: &PinnedDir) -> io::Result<()> {
+pub fn remove_tree_contents(dir: &PinnedDir) -> io::Result<()> {
     #[cfg(unix)]
     dir.restore_owner_access()
         .map_err(|error| removal_error(error, dir.path()))?;
@@ -2224,7 +2224,7 @@ impl std::error::Error for ForeignFilesystemRetained {}
 /// [`remove_tree_contents`]). The directory must belong to the current user:
 /// AFT only force-removes trees it created for its own tasks.
 #[cfg(unix)]
-pub(crate) fn remove_directory_tree_at(parent: &PinnedDir, name: &OsStr) -> io::Result<()> {
+pub fn remove_directory_tree_at(parent: &PinnedDir, name: &OsStr) -> io::Result<()> {
     let child = open_dir_for_removal(parent, name)?;
     if child.file.metadata()?.uid() != unsafe { libc::geteuid() } {
         return Err(io::Error::new(
@@ -2360,7 +2360,7 @@ pub(crate) mod work_counts {
     }
 }
 
-pub(crate) fn random_temp_name() -> io::Result<OsString> {
+pub fn random_temp_name() -> io::Result<OsString> {
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes).map_err(io::Error::other)?;
     Ok(OsString::from(format!(
@@ -2483,7 +2483,7 @@ fn openat_file_once(
 }
 
 #[cfg(unix)]
-pub(crate) fn os_cstring(value: &OsStr) -> io::Result<CString> {
+pub fn os_cstring(value: &OsStr) -> io::Result<CString> {
     CString::new(value.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))
 }
@@ -2512,7 +2512,7 @@ pub(crate) fn validate_directory_handle(file: &File) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn validate_regular_handle(file: &File) -> io::Result<()> {
+pub fn validate_regular_handle(file: &File) -> io::Result<()> {
     #[cfg(all(any(test, feature = "test-support"), unix))]
     BEFORE_ARTIFACT_VALIDATION.with(|slot| {
         if let Some(mut hook) = slot.take() {
@@ -2558,7 +2558,7 @@ pub(crate) fn validate_regular_handle(file: &File) -> io::Result<()> {
 
 /// Marker message for a validated-open that lost a race against an atomic
 /// replacement of the same artifact (see link-count semantics above).
-pub(crate) const ARTIFACT_CONCURRENTLY_REPLACED: &str = "task artifact was concurrently replaced";
+pub const ARTIFACT_CONCURRENTLY_REPLACED: &str = "task artifact was concurrently replaced";
 
 #[cfg(all(any(test, feature = "test-support"), unix))]
 std::thread_local! {
