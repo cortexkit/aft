@@ -1411,6 +1411,8 @@ pub(crate) fn resolve_checkout_into(
                             .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
                         file.sites = sites;
                         file.site_dependencies = dependencies;
+                        #[cfg(feature = "test-hooks")]
+                        super::checkout::exactness::flip_site_for_control(&path, &mut file);
                         Ok((path, file))
                     })
                     .collect::<Result<Vec<_>, ManifestJoinError>>()?;

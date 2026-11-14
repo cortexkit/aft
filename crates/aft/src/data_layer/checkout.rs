@@ -42,6 +42,8 @@ use super::slice::FileSlice;
 use crate::callgraph_store::join::{CallgraphBlob, ParseBlob};
 
 mod engines;
+#[cfg(feature = "test-hooks")]
+pub mod exactness;
 mod fold;
 #[cfg(test)]
 pub(super) mod publication_tests;
