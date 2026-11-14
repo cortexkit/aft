@@ -726,8 +726,8 @@ mod tests {
             let other = actual.section(info.id).unwrap();
             assert_eq!(info.item_count, actual.info(other).item_count);
             assert_eq!(
-                expected.read_range(section, 0, info.len as usize).unwrap(),
-                actual.read_range(other, 0, info.len as usize).unwrap(),
+                expected.read_range(section, 0..info.len).unwrap(),
+                actual.read_range(other, 0..info.len).unwrap(),
                 "section {:?}",
                 info.id
             );
