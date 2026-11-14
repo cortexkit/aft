@@ -53,6 +53,8 @@ pub(crate) mod staged_records;
 mod text_build;
 use text_build::TextBuild;
 #[cfg(test)]
+mod grammar_parity_tests;
+#[cfg(test)]
 pub(super) mod publication_tests;
 #[cfg(test)]
 mod resume_tests;
