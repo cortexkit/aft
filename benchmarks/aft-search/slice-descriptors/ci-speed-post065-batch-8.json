@@ -7,5 +7,97 @@
     "crates/aft/src/parser.rs",
     "crates/aft/src/lib.rs"
   ],
-  "note": "Post-0.65 batch 8, on main: the downloaded-grammar loader behind the optional wasm-grammars feature (no language is switched to it yet, so every parsed language keeps its built-in grammar), cheaper health rollups, fallback-walk logging, per-server TypeScript temp folders and a profiler test probe. The ranking-fenced parser.rs and lib.rs changes only add the loader's module and availability states; no scoring, candidate selection or routing changes, so search results are unchanged."
+  "note": "Post-0.65 batch 8, on main: the downloaded-grammar loader behind the optional wasm-grammars feature (no built-in language is switched to it, so every previously parsed language keeps its built-in grammar), cheaper health rollups, fallback-walk logging, per-server TypeScript temp folders and a profiler test probe. The ranking-fenced parser.rs and lib.rs changes add the loader's module, availability states and bounded Luau parsing without changing existing-language search scoring, candidate selection or routing. Copied the exact pattern_counts from ci-speed-post064-batch-4.json, as inherited by batch 5: these are the pre-0.64 reference transitions from land-index-store-0.64.json, not new batch-8 differences or a readiness waiver. The index-store planner admits a different false-positive candidate set before exact matching; files_matched, ranked paths, summaries and metrics stay unchanged. CI run 43555232202's 108-row replay reproduced precisely these nine transitions. Its only other difference, unavailable views_work telemetry, was made unconditional by the already-landed harness change 134e444c46; it is now logged outside the score. No new count or ranking difference is authorized.",
+  "pattern_counts": {
+    "followup-census:910002": {
+      "candidate_files": {
+        "before": 3,
+        "after": 6
+      },
+      "files_examined": {
+        "before": 3,
+        "after": 6
+      }
+    },
+    "followup-census:910003": {
+      "candidate_files": {
+        "before": 972,
+        "after": 860
+      },
+      "files_examined": {
+        "before": 972,
+        "after": 860
+      }
+    },
+    "followup-census:910004": {
+      "candidate_files": {
+        "before": 972,
+        "after": 860
+      },
+      "files_examined": {
+        "before": 972,
+        "after": 860
+      }
+    },
+    "followup-census:910005": {
+      "candidate_files": {
+        "before": 194,
+        "after": 141
+      },
+      "files_examined": {
+        "before": 194,
+        "after": 141
+      }
+    },
+    "followup-census:910010": {
+      "candidate_files": {
+        "before": 6,
+        "after": 19
+      },
+      "files_examined": {
+        "before": 6,
+        "after": 19
+      }
+    },
+    "followup-census:910011": {
+      "candidate_files": {
+        "before": 942,
+        "after": 729
+      },
+      "files_examined": {
+        "before": 942,
+        "after": 729
+      }
+    },
+    "followup-census:910012": {
+      "candidate_files": {
+        "before": 1031,
+        "after": 730
+      },
+      "files_examined": {
+        "before": 1031,
+        "after": 730
+      }
+    },
+    "followup-census:910013": {
+      "candidate_files": {
+        "before": 908,
+        "after": 45
+      },
+      "files_examined": {
+        "before": 908,
+        "after": 45
+      }
+    },
+    "followup-census:910014": {
+      "candidate_files": {
+        "before": 1011,
+        "after": 24
+      },
+      "files_examined": {
+        "before": 1011,
+        "after": 24
+      }
+    }
+  }
 }
