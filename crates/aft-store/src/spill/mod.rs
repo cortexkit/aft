@@ -184,6 +184,8 @@ pub struct Sorter {
     tail: Option<Tail>,
     sequence: u64,
     fixed_key_bytes: usize,
+    source_range: u64,
+    tail_ranges: Option<(u64, u64)>,
 }
 
 impl Sorter {
@@ -232,6 +234,8 @@ impl Sorter {
             tail: None,
             sequence: 0,
             fixed_key_bytes,
+            source_range: 0,
+            tail_ranges: None,
         })
     }
 
@@ -253,6 +257,8 @@ impl Sorter {
             tail: None,
             sequence: 0,
             fixed_key_bytes: 0,
+            source_range: 0,
+            tail_ranges: None,
         };
         let result = this
             .workspace
@@ -285,6 +291,8 @@ impl Sorter {
     /// returned path is caller-owned and excluded from the buffer budget.
     pub fn finished_runs(&self) -> impl Iterator<Item = FinishedRun> + '_ {
         self.runs.iter().map(|meta| FinishedRun {
+            first_source_range: meta.first_source_range,
+            last_source_range: meta.last_source_range,
             path: meta.path(&self.workspace.as_ref().expect("workspace").path),
             records: meta.records,
             max_record_bytes: meta.max_record,
@@ -296,6 +304,12 @@ impl Sorter {
     pub fn push(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error> {
         let result = self.push_inner(key, value);
         self.checked(result)
+    }
+
+    /// Label subsequent input records with their fragment range. Labels affect
+    /// run metadata only, never key order or spill scheduling.
+    pub fn set_source_range(&mut self, range: u64) {
+        self.source_range = range;
     }
 
     fn push_inner(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error> {
@@ -339,6 +353,12 @@ impl Sorter {
             sequence: self.sequence,
         });
         self.sequence = next;
+        self.tail_ranges = Some(
+            self.tail_ranges
+                .map_or((self.source_range, self.source_range), |(first, last)| {
+                    (first.min(self.source_range), last.max(self.source_range))
+                }),
+        );
         Ok(())
     }
 
@@ -373,7 +393,12 @@ impl Sorter {
                 entry.sequence,
             )?;
         }
-        let meta = writer.finish(0)?;
+        let meta = writer.finish(
+            0,
+            self.tail_ranges
+                .take()
+                .expect("nonempty tail has source ranges"),
+        )?;
         drop(tail);
         self.runs.push(meta);
         self.publish()?;
@@ -441,7 +466,19 @@ impl Sorter {
             while let Some(record) = merge.next_record()? {
                 writer.record(record.key, record.value, record.sequence)?;
             }
-            let meta = writer.finish(level)?;
+            let ranges = (
+                chosen
+                    .iter()
+                    .map(|meta| meta.first_source_range)
+                    .min()
+                    .expect("merge inputs"),
+                chosen
+                    .iter()
+                    .map(|meta| meta.last_source_range)
+                    .max()
+                    .expect("merge inputs"),
+            );
+            let meta = writer.finish(level, ranges)?;
             drop(merge);
             self.memory.update(|s| s.merge_passes += 1);
             // Publish replacements before removing inputs. A crash sees either
@@ -572,6 +609,8 @@ pub struct Checkpoint {
 /// One durable, immutable run named by the current manifest.
 #[derive(Debug)]
 pub struct FinishedRun {
+    pub first_source_range: u64,
+    pub last_source_range: u64,
     pub path: PathBuf,
     pub records: u64,
     pub max_record_bytes: u64,

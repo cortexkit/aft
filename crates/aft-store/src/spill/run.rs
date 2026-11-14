@@ -15,7 +15,7 @@ use super::manifest::Workspace;
 use super::memory::{Buffer, Memory};
 use super::{Error, RecordRef, corrupt};
 
-const HEADER: usize = 72;
+const HEADER: usize = 88;
 const MAGIC: &[u8; 8] = b"AFTSPIL2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,6 +27,8 @@ pub(super) struct RunMeta {
     pub(super) records: u64,
     pub(super) max_record: u64,
     pub(super) fixed_key_bytes: u64,
+    pub(super) first_source_range: u64,
+    pub(super) last_source_range: u64,
 }
 
 impl RunMeta {
@@ -49,8 +51,8 @@ impl RunMeta {
             .ok_or(Error::Overflow)
     }
 
-    pub(super) fn encode(self) -> [u8; 56] {
-        let mut bytes = [0; 56];
+    pub(super) fn encode(self) -> [u8; 72] {
+        let mut bytes = [0; 72];
         for (chunk, field) in bytes.chunks_exact_mut(8).zip([
             self.id,
             self.level,
@@ -59,13 +61,15 @@ impl RunMeta {
             self.records,
             self.max_record,
             self.fixed_key_bytes,
+            self.first_source_range,
+            self.last_source_range,
         ]) {
             chunk.copy_from_slice(&field.to_le_bytes());
         }
         bytes
     }
 
-    pub(super) fn decode(bytes: &[u8; 56]) -> Self {
+    pub(super) fn decode(bytes: &[u8; 72]) -> Self {
         Self {
             id: u64_at(bytes, 0),
             level: u64_at(bytes, 8),
@@ -74,6 +78,8 @@ impl RunMeta {
             records: u64_at(bytes, 32),
             max_record: u64_at(bytes, 40),
             fixed_key_bytes: u64_at(bytes, 48),
+            first_source_range: u64_at(bytes, 56),
+            last_source_range: u64_at(bytes, 64),
         }
     }
 
@@ -86,8 +92,10 @@ impl RunMeta {
         header[32..40].copy_from_slice(&self.max_record.to_le_bytes());
         header[40..48].copy_from_slice(&self.id.to_le_bytes());
         header[48..56].copy_from_slice(&self.fixed_key_bytes.to_le_bytes());
-        let digest = Digest128::of(&header[..56]);
-        header[56..].copy_from_slice(digest.as_bytes());
+        header[56..64].copy_from_slice(&self.first_source_range.to_le_bytes());
+        header[64..72].copy_from_slice(&self.last_source_range.to_le_bytes());
+        let digest = Digest128::of(&header[..72]);
+        header[72..].copy_from_slice(digest.as_bytes());
         header
     }
 }
@@ -146,6 +154,8 @@ impl Writer {
             records: 0,
             max_record: 0,
             fixed_key_bytes: fixed_key_bytes as u64,
+            first_source_range: 0,
+            last_source_range: 0,
         };
         let final_path = meta.path(&workspace.path);
         let partial = final_path.with_extension("part");
@@ -233,9 +243,11 @@ impl Writer {
         Ok(())
     }
 
-    pub(super) fn finish(mut self, level: u64) -> Result<RunMeta, Error> {
+    pub(super) fn finish(mut self, level: u64, ranges: (u64, u64)) -> Result<RunMeta, Error> {
         self.flush_block()?;
         self.meta.level = level;
+        self.meta.first_source_range = ranges.0;
+        self.meta.last_source_range = ranges.1;
         let file = self.file.as_mut().expect("writer file");
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&self.meta.header())?;

@@ -197,7 +197,7 @@ impl Workspace {
             });
         }
         let expected_len = (count as u64)
-            .checked_mul(56)
+            .checked_mul(72)
             .and_then(|n| n.checked_add(64))
             .ok_or(Error::Overflow)?;
         if file.metadata()?.len() != expected_len {
@@ -209,7 +209,7 @@ impl Workspace {
         *sequence = u64_at(&header, 8);
         self.fixed_key_bytes = u64_at(&header, 40);
         for _ in 0..count {
-            let mut bytes = [0; 56];
+            let mut bytes = [0; 72];
             exact(&mut file, &mut bytes, &path)?;
             hash.update(&bytes);
             let run = RunMeta::decode(&bytes);
@@ -219,6 +219,7 @@ impl Workspace {
                 || run.records == 0
                 || run.max_record > run.payload
                 || run.fixed_key_bytes != self.fixed_key_bytes
+                || run.first_source_range > run.last_source_range
                 || runs.iter().any(|r| r.id == run.id)
             {
                 return Err(corrupt(&path, "invalid manifest run metadata"));

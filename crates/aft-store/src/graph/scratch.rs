@@ -44,7 +44,7 @@ fn lock_file(path: &Path) -> io::Result<File> {
 }
 
 fn registry(store: &Path) -> io::Result<(PathBuf, File)> {
-    let root = store.join("graph-build-scratch");
+    let root = store.join("builds");
     directory(&root)?;
     let registry = lock_file(&root.join("registry.lock"))?;
     registry.lock()?;
@@ -52,31 +52,37 @@ fn registry(store: &Path) -> io::Result<(PathBuf, File)> {
 }
 
 fn sweep_locked(root: &Path) -> io::Result<()> {
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        if !entry.file_name().to_string_lossy().starts_with("build-")
-            || !entry.file_type()?.is_dir()
-        {
+    for checkout in fs::read_dir(root)? {
+        let checkout = checkout?;
+        if !checkout.file_type()?.is_dir() {
             continue;
         }
-        let owner = entry.path().join("owner");
-        let file = match fs::OpenOptions::new().read(true).write(true).open(&owner) {
-            Ok(file) => Some(file),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e),
-        };
-        if let Some(file) = &file {
-            match file.try_lock() {
-                Ok(()) => {}
-                Err(fs::TryLockError::WouldBlock) => continue,
-                Err(fs::TryLockError::Error(e)) => return Err(e),
+        for entry in fs::read_dir(checkout.path())? {
+            let entry = entry?;
+            if !entry.file_name().to_string_lossy().starts_with("build-")
+                || !entry.file_type()?.is_dir()
+            {
+                continue;
             }
-        }
-        drop(file);
-        match fs::remove_dir_all(entry.path()) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+            let owner = entry.path().join("owner");
+            let file = match fs::OpenOptions::new().read(true).write(true).open(&owner) {
+                Ok(file) => Some(file),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e),
+            };
+            if let Some(file) = &file {
+                match file.try_lock() {
+                    Ok(()) => {}
+                    Err(fs::TryLockError::WouldBlock) => continue,
+                    Err(fs::TryLockError::Error(e)) => return Err(e),
+                }
+            }
+            drop(file);
+            match fs::remove_dir_all(entry.path()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
     }
     Ok(())
@@ -91,9 +97,20 @@ impl LocalScratch {
     pub fn create(store: &Path, checkout: &str) -> io::Result<Self> {
         let (root, _registry) = registry(store)?;
         sweep_locked(&root)?;
-        // Checkout IDs are hashed rather than trusted as path components.
-        let identity = crate::Digest128::of(checkout.as_bytes());
-        let checkout = lock_file(&root.join(format!("checkout-{identity}.lock")))?;
+        if checkout.is_empty()
+            || !checkout
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid checkout identity",
+            ));
+        }
+        let identity = checkout;
+        let checkout_root = root.join(identity.to_string());
+        directory(&checkout_root)?;
+        let checkout = lock_file(&checkout_root.join("checkout.lock"))?;
         checkout.try_lock().map_err(|e| match e {
             fs::TryLockError::WouldBlock => io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -105,7 +122,7 @@ impl LocalScratch {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(io::Error::other)?
             .as_nanos();
-        let path = root.join(format!("build-{identity}-{}-{nonce}", std::process::id()));
+        let path = checkout_root.join(format!("build-{}-{nonce}", std::process::id()));
         directory(&path)?;
         let mut scratch = Self {
             owner: None,

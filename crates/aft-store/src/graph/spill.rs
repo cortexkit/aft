@@ -51,16 +51,21 @@ impl PackedFragment {
 
 #[derive(Clone, Copy, Debug)]
 struct Placed {
+    range: usize,
     offset: u64,
     data: (u8, u32, u32),
     slice: (u8, u32, u32),
 }
 
-/// Private scratch is removed on drop; the family reaps crash-left scratch on
-/// its next writer session without removing another active builder's files.
+/// Private scratch is removed on drop; checkout startup reaps abandoned builds
+/// without removing another active builder's files.
 #[derive(Debug)]
 pub struct GraphSectionsSpill {
-    data: BufWriter<File>,
+    data: Option<BufWriter<File>>,
+    range_hash: blake3::Hasher,
+    range_bytes: u64,
+    ranges: Vec<u64>,
+    range_files: usize,
     terms: Option<Sorter>,
     units: BTreeMap<FragmentKey, Placed>,
     len: u64,
@@ -84,13 +89,14 @@ impl GraphSectionsSpill {
         guard: WriteGuard,
     ) -> Result<Self, crate::spill::Error> {
         guard.check()?;
-        let data = BufWriter::new(crate::fs::create_new_private(
-            &workspace.path().join("fragments"),
-        )?);
         let mut terms = Sorter::ephemeral_fixed_keys(workspace.path(), config, 25)?;
         terms.set_write_guard(guard.clone())?;
         Ok(Self {
-            data,
+            data: None,
+            range_hash: blake3::Hasher::new(),
+            range_bytes: 0,
+            ranges: Vec::new(),
+            range_files: 0,
             terms: Some(terms),
             units: BTreeMap::new(),
             len: 0,
@@ -187,16 +193,23 @@ impl GraphSectionsSpill {
             );
         }
         self.guard.check()?;
+        if self.data.is_none() {
+            self.data = Some(BufWriter::new(crate::fs::create_new_private(
+                &self.range_path(self.ranges.len()),
+            )?));
+        }
         for bytes in [data, slice] {
             for chunk in bytes.chunks(1 << 20) {
                 self.guard.check()?;
-                self.data.write_all(chunk)?;
+                self.data.as_mut().expect("range writer").write_all(chunk)?;
+                self.range_hash.update(chunk);
             }
         }
         self.units.insert(
             key,
             Placed {
-                offset: self.len,
+                range: self.ranges.len(),
+                offset: self.range_bytes,
                 data: (
                     dc,
                     du,
@@ -210,6 +223,11 @@ impl GraphSectionsSpill {
             },
         );
         self.len += (data.len() + slice.len()) as u64;
+        self.range_bytes += (data.len() + slice.len()) as u64;
+        self.terms
+            .as_mut()
+            .expect("sorter")
+            .set_source_range(self.ranges.len() as u64);
         for (kind, hash) in fragment.terms {
             let mut record = [0; 25];
             record[0] = u8::try_from(
@@ -223,6 +241,55 @@ impl GraphSectionsSpill {
             record[9..].copy_from_slice(key.digest().as_bytes());
             self.terms.as_mut().expect("sorter").push(&record, &[])?;
         }
+        self.range_files += 1;
+        if self.range_files == 64 {
+            self.close_range()?;
+        }
+        Ok(())
+    }
+
+    fn range_path(&self, index: usize) -> std::path::PathBuf {
+        self.workspace
+            .path()
+            .join(format!("fragments-{index:020}.bin"))
+    }
+
+    fn close_range(&mut self) -> io::Result<()> {
+        if let Some(mut file) = self.data.take() {
+            self.guard.check()?;
+            file.write_all(self.range_hash.finalize().as_bytes())?;
+            file.flush()?;
+            drop(file);
+            // Only closed, checksummed ranges enter the completed range list.
+            self.ranges.push(self.range_bytes);
+            self.range_hash = blake3::Hasher::new();
+            self.range_bytes = 0;
+            self.range_files = 0;
+        }
+        Ok(())
+    }
+
+    fn verify_ranges(&self) -> io::Result<()> {
+        let mut buffer = [0; 64 * 1024];
+        for (index, len) in self.ranges.iter().enumerate() {
+            let mut file = crate::fs::open_read(&self.range_path(index))?;
+            if file.metadata()?.len() != len + 32 {
+                return Err(io::Error::other("fragment range length mismatch"));
+            }
+            let mut left = *len;
+            let mut hash = blake3::Hasher::new();
+            while left != 0 {
+                let count = left.min(buffer.len() as u64) as usize;
+                file.read_exact(&mut buffer[..count])?;
+                hash.update(&buffer[..count]);
+                left -= count as u64;
+            }
+            let mut expected = [0; 32];
+            file.read_exact(&mut expected)?;
+            if hash.finalize().as_bytes() != &expected {
+                return Err(io::Error::other("fragment range checksum mismatch"));
+            }
+        }
         Ok(())
     }
 
@@ -232,7 +299,8 @@ impl GraphSectionsSpill {
     }
 
     fn write_inner(&mut self, writer: &mut SegmentWriter) -> io::Result<()> {
-        self.data.flush()?;
+        self.close_range()?;
+        self.verify_ranges()?;
         let keys = self.units.keys().copied().collect::<Vec<_>>();
         let count = keys.len() as u64;
         let mut table = UnitTableBuilder::new(Digest128::LEN);
@@ -244,9 +312,6 @@ impl GraphSectionsSpill {
         writer
             .write_section(spec(UNITS, UNIT_KEY_SPACE), &table, units)
             .map_err(io::Error::other)?;
-        let mut source = BufReader::new(crate::fs::open_read(
-            &self.workspace.path().join("fragments"),
-        )?);
         for slices in [false, true] {
             writer
                 .begin_section(if slices {
@@ -260,6 +325,8 @@ impl GraphSectionsSpill {
                 self.guard.check()?;
                 let (codec, unpacked, len) = if slices { placed.slice } else { placed.data };
                 let offset = placed.offset + if slices { u64::from(placed.data.2) } else { 0 };
+                let mut source =
+                    BufReader::new(crate::fs::open_read(&self.range_path(placed.range))?);
                 source.seek(SeekFrom::Start(offset))?;
                 let mut bytes = vec![0; len as usize];
                 source.read_exact(&mut bytes)?;
@@ -296,13 +363,15 @@ impl GraphSectionsSpill {
                 .map(|record| record.key.try_into().map_err(io::Error::other))
                 .transpose()
         };
-        let postings_path = self.workspace.path().join("postings");
-        let mut postings_file = BufWriter::new(crate::fs::create_new_private(&postings_path)?);
         let mut record = next(&mut sorted)?;
         let mut ordinals = Vec::new();
         for (index, kind) in TermKind::ALL.into_iter().enumerate() {
-            postings_file.get_mut().set_len(0)?;
-            postings_file.seek(SeekFrom::Start(0))?;
+            let postings_path = self
+                .workspace
+                .path()
+                .join(format!("postings-{index:020}.bin"));
+            let mut postings_file = BufWriter::new(crate::fs::create_new_private(&postings_path)?);
+            let mut postings_hash = blake3::Hasher::new();
             let mut postings = PostingsBuilder::new(layout());
             let mut lookup = LookupTableBuilder::new();
             let mut current = None;
@@ -333,7 +402,9 @@ impl GraphSectionsSpill {
                         }
                         if postings.held() >= 64 * 1024 {
                             self.guard.check()?;
-                            postings_file.write_all(&postings.drain())?;
+                            let bytes = postings.drain();
+                            postings_hash.update(&bytes);
+                            postings_file.write_all(&bytes)?;
                         }
                         ordinals.clear();
                     }
@@ -347,26 +418,90 @@ impl GraphSectionsSpill {
                 ordinals.clear();
             }
             let (rest, entries) = postings.finish();
+            postings_hash.update(&rest);
             postings_file.write_all(&rest)?;
+            postings_file.write_all(postings_hash.finalize().as_bytes())?;
             postings_file.flush()?;
+            drop(postings_file);
             let (rest, terms) = lookup.finish();
             writer.write(&rest).map_err(io::Error::other)?;
             writer.end_section(terms).map_err(io::Error::other)?;
             let mut source = BufReader::new(crate::fs::open_read(&postings_path)?);
+            let mut left = source
+                .get_ref()
+                .metadata()?
+                .len()
+                .checked_sub(32)
+                .ok_or_else(|| io::Error::other("truncated postings checksum"))?;
+            let mut copied_hash = blake3::Hasher::new();
             writer
                 .begin_section(spec(TERM_POSTINGS, kind.key_space()))
                 .map_err(io::Error::other)?;
             let mut buffer = [0; 64 * 1024];
             loop {
-                let n = source.read(&mut buffer)?;
-                if n == 0 {
+                if left == 0 {
                     break;
                 }
+                let n = left.min(buffer.len() as u64) as usize;
+                source.read_exact(&mut buffer[..n])?;
+                copied_hash.update(&buffer[..n]);
+                left -= n as u64;
                 self.guard.check()?;
                 writer.write(&buffer[..n]).map_err(io::Error::other)?;
             }
+            let mut expected = [0; 32];
+            source.read_exact(&mut expected)?;
+            if copied_hash.finalize().as_bytes() != &expected {
+                return Err(io::Error::other("postings checksum mismatch"));
+            }
             writer.end_section(entries).map_err(io::Error::other)?;
+            drop(source);
+            std::fs::remove_file(postings_path)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn fragment_ranges_close_before_listing_and_refuse_corruption() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = super::super::LocalScratch::create(root.path(), "fixture").unwrap();
+        let path = workspace.path().to_path_buf();
+        let mut spill = GraphSectionsSpill::new(
+            Box::new(workspace),
+            Config::new(1 << 20),
+            WriteGuard::new(|| Ok(())),
+        )
+        .unwrap();
+        for n in 0..65u32 {
+            spill
+                .add(
+                    FragmentKey::from_digest(Digest128::of(&n.to_le_bytes())),
+                    PackedFragment::new(b"fragment", b"slice", []),
+                )
+                .unwrap();
+        }
+        assert_eq!(spill.ranges.len(), 1);
+        assert!(spill.data.is_some());
+        spill.close_range().unwrap();
+        assert_eq!(spill.ranges.len(), 2);
+        assert!(spill.data.is_none());
+        spill.verify_ranges().unwrap();
+        let range = spill.range_path(0);
+        let mut file = std::fs::OpenOptions::new().write(true).open(range).unwrap();
+        file.write_all(b"X").unwrap();
+        drop(file);
+        assert!(
+            spill
+                .verify_ranges()
+                .unwrap_err()
+                .to_string()
+                .contains("checksum")
+        );
+        drop(spill);
+        assert!(!path.exists());
     }
 }

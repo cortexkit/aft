@@ -456,7 +456,7 @@ fn fixed_keys_are_compact_checked_and_resumable() {
         let payload = run.records * 25;
         assert_eq!(
             std::fs::metadata(run.path).unwrap().len(),
-            72 + payload + payload.div_ceil(1024) * 16
+            88 + payload + payload.div_ceil(1024) * 16
         );
     }
     expected.sort();
@@ -519,4 +519,34 @@ fn ephemeral_fixed_runs_skip_manifests_and_check_space_at_run_writes() {
             .contains("disk floor")
     );
     assert!(!directory.exists());
+}
+
+#[test]
+fn run_source_ranges_survive_compaction_and_resume() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config(16 * 1024);
+    let mut sorter = Sorter::fixed_keys(root.path(), config, 25).unwrap();
+    for n in 0..1200u64 {
+        sorter.set_source_range(4 + n / 300);
+        let mut key = [0; 25];
+        key[..8].copy_from_slice(&n.to_be_bytes());
+        sorter.push(&key, &[]).unwrap();
+    }
+    let checkpoint = sorter.checkpoint().unwrap();
+    let sorter = Sorter::resume(&checkpoint.directory, config).unwrap();
+    let runs = sorter.finished_runs().collect::<Vec<_>>();
+    assert_eq!(runs.iter().map(|run| run.first_source_range).min(), Some(4));
+    assert_eq!(runs.iter().map(|run| run.last_source_range).max(), Some(7));
+    assert!(
+        runs.iter()
+            .all(|run| run.first_source_range <= run.last_source_range)
+    );
+    let mut records = sorter.finish().unwrap();
+    for n in 0..1200u64 {
+        assert_eq!(
+            &records.next_record().unwrap().unwrap().key[..8],
+            &n.to_be_bytes()
+        );
+    }
+    assert!(records.next_record().unwrap().is_none());
 }
