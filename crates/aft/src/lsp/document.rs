@@ -3,6 +3,8 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::bounded_io::open_content_file;
+
 /// Per-document state tracked for LSP synchronization.
 ///
 /// We track `mtime`, `size`, and a content hash so we can
@@ -268,26 +270,6 @@ impl DiskSnapshot {
             file_content_hash(path)
         })
     }
-}
-
-/// Open first, then judge the handle so a path replacement cannot admit a FIFO.
-fn open_content_file(path: &Path) -> io::Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    // A blocking open can wait for a FIFO writer before metadata is available.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
-    }
-    let file = options.open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "not a regular file",
-        ));
-    }
-    Ok(file)
 }
 
 /// Read document text with the same regular-file requirement as its hash proof.

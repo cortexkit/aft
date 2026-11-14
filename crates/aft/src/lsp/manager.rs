@@ -8240,7 +8240,7 @@ fn typescript_runtime_options(
             (lib, true)
         }
     };
-    let version = std::fs::read(lib.parent().unwrap().join("package.json"))
+    let version = crate::bounded_io::read(&lib.parent().unwrap().join("package.json"), None)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .and_then(|json| {

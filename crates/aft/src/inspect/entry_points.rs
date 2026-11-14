@@ -244,7 +244,7 @@ pub(super) fn should_skip_manifest_dir(path: &Path) -> bool {
 
 fn collect_cargo_manifest_entry_points(manifest: &Path, entry_points: &mut EntryPointSet) {
     let package_dir = manifest.parent().unwrap_or_else(|| Path::new("."));
-    let source = match fs::read_to_string(manifest) {
+    let source = match crate::bounded_io::read_content_to_string(manifest) {
         Ok(source) => source,
         Err(error) => {
             entry_points.warn(format!("failed to read {}: {error}", manifest.display()));
@@ -439,7 +439,7 @@ fn collect_cargo_src_bin_targets(package_dir: &Path, entry_points: &mut EntryPoi
 
 fn collect_package_manifest_entry_points(manifest: &Path, entry_points: &mut EntryPointSet) {
     let package_dir = manifest.parent().unwrap_or_else(|| Path::new("."));
-    let source = match fs::read_to_string(manifest) {
+    let source = match crate::bounded_io::read_content_to_string(manifest) {
         Ok(source) => source,
         Err(error) => {
             entry_points.warn(format!("failed to read {}: {error}", manifest.display()));
@@ -525,7 +525,7 @@ fn collect_package_manifest_entry_points(manifest: &Path, entry_points: &mut Ent
 }
 
 fn package_source_root(package_dir: &Path) -> PathBuf {
-    let root_dir = fs::read_to_string(package_dir.join("tsconfig.json"))
+    let root_dir = crate::bounded_io::read_content_to_string(package_dir.join("tsconfig.json"))
         .ok()
         .and_then(|source| serde_json::from_str::<Value>(&crate::jsonc::strip_jsonc(&source)).ok())
         .and_then(|config| {
@@ -1115,7 +1115,7 @@ fn fallback_role_by_name(norm: &str) -> SignalTier {
 }
 
 fn classify_package_json(manifest: &Path) -> Option<bool> {
-    let value = fs::read_to_string(manifest)
+    let value = crate::bounded_io::read_content_to_string(manifest)
         .ok()
         .and_then(|source| serde_json::from_str::<Value>(&source).ok())?;
     let has_public_api = value.get("main").is_some()
@@ -1126,7 +1126,7 @@ fn classify_package_json(manifest: &Path) -> Option<bool> {
 }
 
 fn cargo_manifest_is_package(manifest: &Path) -> bool {
-    fs::read_to_string(manifest)
+    crate::bounded_io::read_content_to_string(manifest)
         .ok()
         .and_then(|source| source.parse::<toml::Value>().ok())
         .is_some_and(|value| value.get("package").is_some_and(toml::Value::is_table))
@@ -1171,6 +1171,39 @@ pub(crate) fn top_preview_symbols(items: &[Value]) -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_entry_point_reads_do_not_wait_for_fifo_writers() {
+        let directory = tempfile::tempdir().unwrap();
+        for name in ["Cargo.toml", "package.json", "tsconfig.json"] {
+            crate::bounded_io::tests::fifo(&directory.path().join(name));
+        }
+        let root = directory.path().to_path_buf();
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut entries = super::EntryPointSet::default();
+            super::collect_cargo_manifest_entry_points(&root.join("Cargo.toml"), &mut entries);
+            super::collect_package_manifest_entry_points(&root.join("package.json"), &mut entries);
+            assert_eq!(entries.warnings().len(), 2);
+            assert!(entries
+                .warnings()
+                .iter()
+                .all(|warning| warning.starts_with("failed to read ")));
+            assert!(!entries.has_liveness_roots());
+            assert_eq!(super::package_source_root(&root), root);
+            assert_eq!(
+                super::classify_package_json(&root.join("package.json")),
+                None
+            );
+            assert!(!super::cargo_manifest_is_package(&root.join("Cargo.toml")));
+            sent.send(()).unwrap();
+        });
+        received
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("entry point reads waited for a FIFO writer");
+        worker.join().unwrap();
+    }
+
     use super::*;
 
     #[test]

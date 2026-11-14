@@ -2511,7 +2511,7 @@ fn update_resolver_config_fingerprint_hash(
             .unwrap_or(config.as_path())
             .to_string_lossy()
             .replace('\\', "/");
-        let content_hash = blake3::hash(&fs::read(&config)?);
+        let content_hash = blake3::hash(&crate::bounded_io::read(&config, None)?);
         hasher.update(relative_path.as_bytes());
         hasher.update(b"\0");
         hasher.update(content_hash.as_bytes());
@@ -2622,7 +2622,7 @@ fn resolver_config_extends_targets(
     config: &Path,
     project_root: &Path,
 ) -> Vec<ResolverConfigDependency> {
-    let Ok(source) = fs::read_to_string(config) else {
+    let Ok(source) = crate::bounded_io::read_content_to_string(config) else {
         return Vec::new();
     };
     let Ok(value) = parse_resolver_config_json(&source) else {
@@ -2721,7 +2721,7 @@ fn package_json_resolver_config_dependencies(
         .unwrap_or_else(|| package_dir.to_path_buf());
     let mut dependencies = vec![ResolverConfigDependency::hashed_file(package_json.clone())];
 
-    let Ok(source) = fs::read_to_string(&package_json) else {
+    let Ok(source) = crate::bounded_io::read_content_to_string(&package_json) else {
         return Some(dependencies);
     };
     let Ok(value) = parse_resolver_config_json(&source) else {
@@ -2792,7 +2792,7 @@ fn update_manifest_fingerprint_hash(
             .unwrap_or(manifest.as_path())
             .to_string_lossy()
             .replace('\\', "/");
-        let content_hash = blake3::hash(&fs::read(&manifest)?);
+        let content_hash = blake3::hash(&crate::bounded_io::read(&manifest, None)?);
         hasher.update(relative_path.as_bytes());
         hasher.update(b"\0");
         hasher.update(content_hash.as_bytes());
@@ -2864,6 +2864,28 @@ fn now_nanos() -> u128 {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_manifest_config_reads_do_not_wait_for_fifo_writers() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("tsconfig.json");
+        let manifest = directory.path().join("package.json");
+        crate::bounded_io::tests::fifo(&config);
+        crate::bounded_io::tests::fifo(&manifest);
+        let root = directory.path().to_path_buf();
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            assert!(super::resolver_config_extends_targets(&config, &root).is_empty());
+            assert!(crate::cache_freshness::hash_file_if_small(&manifest, 0).is_err());
+            assert!(crate::cache_freshness::collect(&manifest).is_err());
+            sent.send(()).unwrap();
+        });
+        received
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("manifest/config reads waited for a FIFO writer");
+        worker.join().unwrap();
+    }
+
     use super::*;
 
     #[test]

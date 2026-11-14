@@ -1289,7 +1289,7 @@ impl DecoratorFrameworkCache {
         if let Some(frameworks) = self.by_manifest.get(&manifest) {
             return frameworks.clone();
         }
-        let frameworks = fs::read(&manifest)
+        let frameworks = crate::bounded_io::read(&manifest, None)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .map(|manifest| detected_decorator_frameworks(&manifest))

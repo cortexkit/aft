@@ -6623,7 +6623,7 @@ fn package_name_for_file(file: &Path) -> Option<String> {
     while let Some(dir) = current {
         let manifest = dir.join("package.json");
         if manifest.is_file() {
-            if let Ok(source) = fs::read_to_string(&manifest) {
+            if let Ok(source) = crate::bounded_io::read_content_to_string(&manifest) {
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(&source) {
                     if let Some(name) = value.get("name").and_then(serde_json::Value::as_str) {
                         return Some(name.to_string());
