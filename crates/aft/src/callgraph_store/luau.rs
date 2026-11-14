@@ -52,6 +52,8 @@ pub(super) fn module<I: ResolverIndex>(
         current = parent(current);
     }
     let mut aliases = HashMap::new();
+    let reads_aliases =
+        module.starts_with('@') && module != "@self" && !module.starts_with("@self/");
     for directory in ancestors.into_iter().rev() {
         let path = if directory.is_empty() {
             ".luaurc".to_string()
@@ -59,6 +61,11 @@ pub(super) fn module<I: ResolverIndex>(
             format!("{directory}/.luaurc")
         };
         probe(dependencies, &path);
+        // Relative, script and @self requires do not read alias values. Keep
+        // their path probes, but do not invalidate them for an alias edit.
+        if !reads_aliases {
+            continue;
+        }
         let Some(bytes) = index.luau_config(&path) else {
             continue;
         };

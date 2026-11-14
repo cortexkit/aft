@@ -81,14 +81,49 @@ fn callers(view: &CheckoutView, file: &str) -> Value {
 #[test]
 fn luau_s4_keyed_language_preserves_every_builtin_key() {
     let content = ContentKey::of(b"unchanged");
-    for language in ["typescript", "rust", "lua", "markers-lexical", "config"] {
+    const ORIGINAL_EXTRACTOR: &str = "ruled-callgraph-v14-resolver-precision+record-13";
+    assert_eq!(super::content::EXTRACTOR_VERSION, ORIGINAL_EXTRACTOR);
+    for language in [
+        "typescript",
+        "tsx",
+        "javascript",
+        "python",
+        "rust",
+        "go",
+        "c",
+        "cpp",
+        "cuda",
+        "metal",
+        "zig",
+        "csharp",
+        "bash",
+        "html",
+        "markdown",
+        "solidity",
+        "scss",
+        "vue",
+        "json",
+        "scala",
+        "java",
+        "ruby",
+        "kotlin",
+        "swift",
+        "php",
+        "lua",
+        "perl",
+        "yaml",
+        "pascal",
+        "r",
+        "groovy",
+        "objc",
+        "toml",
+        "markers-lexical",
+        "markers-markdown",
+        "config",
+    ] {
         assert_eq!(
             super::content::record_key(content, language),
-            aft_store::content::RecordKey::new(
-                content,
-                language,
-                super::content::EXTRACTOR_VERSION
-            )
+            aft_store::content::RecordKey::new(content, language, ORIGINAL_EXTRACTOR)
         );
     }
     assert_ne!(
