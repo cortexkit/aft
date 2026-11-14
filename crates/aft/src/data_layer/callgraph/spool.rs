@@ -185,3 +185,33 @@ impl<'w> ResolutionSpool<'w> {
             .sum()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_spooled_range_reads_back_as_written_and_a_changed_one_fails() {
+        let workspace = BuildWorkspace::temporary().unwrap();
+        let dir = workspace.dir.clone();
+        assert!(dir.join("owner").is_file());
+        let mut spool = ResolutionSpool::new(&workspace);
+        let first = spool
+            .write_range(&[b"one".to_vec(), Vec::new(), b"three".to_vec()])
+            .unwrap();
+        let second = spool.write_range(&[b"four".to_vec()]).unwrap();
+        assert_eq!(
+            spool.read_range(first).unwrap(),
+            [b"one".to_vec(), Vec::new(), b"three".to_vec()]
+        );
+        assert_eq!(spool.read_range(second).unwrap(), [b"four".to_vec()]);
+        assert_eq!(spool.bytes(), 12);
+        std::fs::write(&spool.ranges[second].path, b"fous").unwrap();
+        assert!(spool.read_range(second).is_err());
+        std::fs::write(&spool.ranges[second].path, b"four!").unwrap();
+        assert!(spool.read_range(second).is_err());
+        drop(spool);
+        drop(workspace);
+        assert!(!dir.exists());
+    }
+}
