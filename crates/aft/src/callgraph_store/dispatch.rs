@@ -650,6 +650,7 @@ pub(crate) fn extract_with<'tree>(
     let receiver_index = index_receivers
         .then(|| RustReceiverIndex::new(&all, source, rust_bindings.as_ref().unwrap(), nav));
     let rust_bindings = rust_bindings.as_ref();
+    let class_fields = ClassFieldMemo::default();
     let go_index = (language == "go")
         .then(|| crate::callgraph_store::go_dispatch::SourceIndex::new(root, source, false));
     let callers = symbol_callers(parse);
@@ -1189,6 +1190,7 @@ pub(crate) fn extract_with<'tree>(
                     language,
                     &facts,
                     receiver_index.as_ref(),
+                    &class_fields,
                     nav,
                 )
             })
@@ -1519,6 +1521,38 @@ impl<'nodes, 'tree> RustReceiverIndex<'nodes, 'tree> {
 #[cfg(test)]
 thread_local! {
     static UNINDEXED_RECEIVERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Makes [`receiver_type`] walk a class for its declarations at every
+    /// call, as it did before [`ClassFieldMemo`], so tests can compare.
+    static UNMEMOIZED_CLASS_FIELDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The field and property declarations of each class in one file, keyed by
+/// the class node's id, each list as [`class_field_declarations`] gives it.
+/// Receiver typing for Java, C# and Kotlin reads them at every call whose
+/// receiver is a plain name. Walking a large class once per such call made
+/// one generated C# file of dotnet/runtime take most of an hour; with the
+/// memo each class is walked once. A memo lives for one file's extraction,
+/// so it never outlives its syntax tree or leaves its thread.
+type ClassFieldMemo<'tree> = std::cell::RefCell<HashMap<usize, Vec<Node<'tree>>>>;
+
+/// The declarations directly in `class` (outside its functions) that can
+/// type a receiver: fields, their declarators and properties, in reverse
+/// named preorder.
+fn class_field_declarations<'tree, N: Nav<'tree>>(class: Node<'tree>, nav: N) -> Vec<Node<'tree>> {
+    #[cfg(test)]
+    super::extraction_work::note(|work| work.receiver_class_walks += 1);
+    nav.reverse_named_preorder(class)
+        .into_iter()
+        .filter(|n| {
+            [
+                "field_declaration",
+                "variable_declarator",
+                "property_declaration",
+            ]
+            .contains(&nav.kind(*n))
+                && nav.enclosing(*n, FUNCTIONS).is_none()
+        })
+        .collect()
 }
 
 fn unindexed_constructor_present(
@@ -1550,6 +1584,7 @@ fn receiver_type<'tree, N: Nav<'tree>>(
     language: &str,
     facts: &DispatchFacts,
     rust_index: Option<&RustReceiverIndex<'_, 'tree>>,
+    class_fields: &ClassFieldMemo<'tree>,
     nav: N,
 ) -> Option<String> {
     #[cfg(test)]
@@ -1594,7 +1629,16 @@ fn receiver_type<'tree, N: Nav<'tree>>(
                 members.push(field(base, &["field"]));
                 base = field(base, &["value"])?;
             }
-            let mut typed = receiver_type(base, call, source, language, facts, rust_index, nav)?;
+            let mut typed = receiver_type(
+                base,
+                call,
+                source,
+                language,
+                facts,
+                rust_index,
+                class_fields,
+                nav,
+            )?;
             for member in members.into_iter().rev() {
                 let member = text(member?, source);
                 typed = format!("@field:{typed}|{member}");
@@ -1721,17 +1765,15 @@ fn receiver_type<'tree, N: Nav<'tree>>(
     };
     if ["java", "csharp", "kotlin"].contains(&language) {
         if let Some(class) = nav.enclosing(function, TYPES) {
-            nodes
-                .to_mut()
-                .extend(nav.reverse_named_preorder(class).into_iter().filter(|n| {
-                    nav.enclosing(*n, FUNCTIONS).is_none()
-                        && [
-                            "field_declaration",
-                            "variable_declarator",
-                            "property_declaration",
-                        ]
-                        .contains(&nav.kind(*n))
-                }));
+            #[cfg(test)]
+            if UNMEMOIZED_CLASS_FIELDS.with(std::cell::Cell::get) {
+                class_fields.borrow_mut().remove(&class.id());
+            }
+            let mut memo = class_fields.borrow_mut();
+            let fields = memo
+                .entry(class.id())
+                .or_insert_with(|| class_field_declarations(class, nav));
+            nodes.to_mut().extend(fields.iter().copied());
         }
     }
     #[cfg(test)]
