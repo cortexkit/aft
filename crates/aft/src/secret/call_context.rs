@@ -126,3 +126,23 @@ mod tests {
         assert_eq!(current_call_scopes(), Err(Ineligibility::NoScope));
     }
 }
+
+thread_local! {
+    static FETCH_REPLY_DEADLINE: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// The caller's reply deadline is independent of a fetch's network budget.
+pub(crate) struct FetchReplyDeadline(Option<std::time::Instant>);
+impl FetchReplyDeadline {
+    pub(crate) fn enter(deadline: std::time::Instant) -> Self {
+        Self(FETCH_REPLY_DEADLINE.with(|slot| slot.replace(Some(deadline))))
+    }
+}
+impl Drop for FetchReplyDeadline {
+    fn drop(&mut self) {
+        FETCH_REPLY_DEADLINE.with(|slot| slot.set(self.0));
+    }
+}
+pub(crate) fn current_fetch_reply_deadline() -> Option<std::time::Instant> {
+    FETCH_REPLY_DEADLINE.with(std::cell::Cell::get)
+}

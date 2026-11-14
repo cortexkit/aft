@@ -16,9 +16,9 @@ pub enum AftError {
     },
     GrammarUnavailable {
         language: String,
-        state: crate::grammar::GrammarState,
+        state: crate::grammar_state::GrammarState,
         message: String,
-        cause: Option<crate::grammar::FailureCause>,
+        cause: Option<crate::grammar_state::FailureCause>,
         retry_after_ms: Option<u64>,
     },
     SymbolNotFound {
@@ -143,7 +143,7 @@ impl fmt::Display for AftError {
             AftError::GrammarParseTimeout { path, timeout_ms, .. } => write!(f, "Luau parsing exceeded the {timeout_ms} ms time limit for {path}; no syntax tree was returned."),
             AftError::GrammarUnavailable { message, .. } => f.write_str(message),
             AftError::DeniedFloor { path } => {
-                f.write_str(&crate::access_policy::aft_storage_denial_message(path))
+                f.write_str(&aft_storage_denial_message(path))
             }
             AftError::SymbolNotFound { name, file } => {
                 write!(f, "symbol '{}' not found in {}", name, file)
@@ -222,3 +222,7 @@ impl fmt::Display for AftError {
 }
 
 impl std::error::Error for AftError {}
+
+pub(crate) fn aft_storage_denial_message(path: impl std::fmt::Display) -> String {
+    format!("path '{path}' is in AFT's own storage, which file tools never open. For a shell task's output, use bash_status.")
+}

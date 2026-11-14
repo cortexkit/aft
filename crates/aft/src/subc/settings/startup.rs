@@ -299,7 +299,7 @@ pub(super) async fn pre_ready_reply(
 }
 
 pub(in crate::subc) fn initialize_storage(app: Arc<App>, storage_dir: &Path) {
-    crate::db::runner_harness_keys::start(app, storage_dir.join("aft.db"));
+    crate::context::start_runner_harness_copy(app, storage_dir.join("aft.db"));
     crate::bash_background::note_storage_root(storage_dir);
     crate::page_collect::snapshot::SnapshotStore::for_storage(storage_dir);
 }

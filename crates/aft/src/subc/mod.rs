@@ -253,10 +253,6 @@ mod views_idle_checkout_tests;
 pub(crate) use secret_consent::with_secret_bound_identity_for_test;
 #[cfg(test)]
 pub(crate) use secret_consent::with_secret_identity_for_test;
-pub(crate) use secret_consent::{
-    current_fetch_reply_deadline, current_secret_consent_context, use_current_secret_labels,
-    LaunchDecision,
-};
 mod standalone;
 #[doc(hidden)]
 pub use self::health::SubcTestHealthRollupProbe;

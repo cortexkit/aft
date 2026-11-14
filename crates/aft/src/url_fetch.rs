@@ -853,7 +853,7 @@ impl SecretFetchCancellation {
     pub(crate) fn for_current_call(_options: &UrlFetchOptions) -> Self {
         Self {
             job: crate::executor::current_job_cancellation(),
-            deadline: crate::subc::current_fetch_reply_deadline(),
+            deadline: crate::secret::call_context::current_fetch_reply_deadline(),
             #[cfg(all(test, unix))]
             clock: _options.reply_clock_for_test.clone(),
         }
@@ -1539,7 +1539,7 @@ fn secret_hop(
         }
         eligible.push(label.clone());
     }
-    let answers = crate::subc::use_current_secret_labels(
+    let answers = crate::secret::fetch::use_current_secret_labels(
         secrets.vault.clone(),
         &eligible,
         &addressed,
@@ -1548,17 +1548,12 @@ fn secret_hop(
     );
     for (label, answer) in eligible.iter().zip(answers) {
         let answer = match answer {
-            crate::subc::LaunchDecision::InvalidPlan(reason) => return Err(refused(held, reason)),
-            crate::subc::LaunchDecision::Proceed(answer) => answer,
-            #[cfg(test)]
-            crate::subc::LaunchDecision::Pending(pending) => {
-                let _ = refused(held, "missing_material");
-                return Err(UrlFetchError::secret(
-                    crate::secret::SECRET_ACCESS_PENDING,
-                    pending.message,
-                ));
+            crate::secret::fetch::FetchDecision::InvalidPlan(reason) => {
+                return Err(refused(held, reason))
             }
-            crate::subc::LaunchDecision::Refuse(crate::secret::LabelOutcome::Refuse {
+            crate::secret::fetch::FetchDecision::Proceed(answer) => answer,
+
+            crate::secret::fetch::FetchDecision::Refuse(crate::secret::LabelOutcome::Refuse {
                 code,
                 message,
             }) => {

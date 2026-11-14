@@ -1,4 +1,4 @@
-pub(crate) mod call_context;
+pub(crate) use crate::secret::call_context;
 
 pub use crate::callgraph_store::access::CallgraphStoreAccess;
 pub(crate) use crate::data_layer::status::EmbeddingBackendHealthSnapshot;
@@ -16285,5 +16285,31 @@ mod data_layer_health_tests {
                 .into_snapshot(Path::new("/r"))
                 .is_fully_ready());
         }
+    }
+}
+
+/// Run once from daemon startup, never from a route or a short-lived database
+/// opener. Copy failures must not make the shared persistence store unavailable.
+pub(crate) fn start_runner_harness_copy(
+    app: std::sync::Arc<crate::context::App>,
+    path: std::path::PathBuf,
+) {
+    if let Err(error) = std::thread::Builder::new()
+        .name("aft-runner-key-copy".into())
+        .spawn(move || {
+            let db = match app.open_db(&path) {
+                Ok(db) => db,
+                Err(error) => {
+                    log::warn!("canonical runner harness key copy skipped: {error}");
+                    return;
+                }
+            };
+            match db.lock() {
+                Ok(conn) => crate::db::runner_harness_keys::initialize(&conn),
+                Err(error) => log::warn!("canonical runner harness key copy skipped: {error}"),
+            };
+        })
+    {
+        log::warn!("canonical runner harness key copy could not start: {error}");
     }
 }

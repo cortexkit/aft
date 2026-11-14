@@ -557,9 +557,7 @@ pub(crate) struct PolicyFloor {
     pub(crate) rule: FloorRule,
 }
 
-pub(crate) fn aft_storage_denial_message(path: impl std::fmt::Display) -> String {
-    format!("path '{path}' is in AFT's own storage, which file tools never open. For a shell task's output, use bash_status.")
-}
+pub(crate) use crate::error::aft_storage_denial_message;
 
 #[derive(Debug, Clone)]
 pub struct AccessPolicy {

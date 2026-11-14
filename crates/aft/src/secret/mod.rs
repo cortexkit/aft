@@ -52,3 +52,6 @@ mod tests;
 #[cfg(test)]
 #[path = "wire_tests.rs"]
 mod wire_tests;
+
+pub(crate) mod call_context;
+pub(crate) mod fetch;

@@ -33,7 +33,7 @@ pub(crate) fn for_current_command() -> Option<SubcSecretUseTransport> {
     if !path.is_file() {
         return None;
     }
-    let (_, session) = crate::subc::current_secret_consent_context()?;
+    let (_, session) = crate::secret::call_context::current_secret_consent_context()?;
     SubcSecretUseTransport::new(
         path,
         BindIdentity::new("aft-secret-use", session),

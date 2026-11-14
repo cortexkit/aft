@@ -95,32 +95,9 @@ fn copy_aliases_with_limit(conn: &Connection, source_limit: usize) -> rusqlite::
     Ok(copied)
 }
 
-fn initialize(conn: &Connection) {
+pub(crate) fn initialize(conn: &Connection) {
     if let Err(error) = copy_aliases(conn) {
         log::warn!("canonical runner harness key copy skipped; raw rows remain readable: {error}");
-    }
-}
-
-/// Run once from daemon startup, never from a route or a short-lived database
-/// opener. Copy failures must not make the shared persistence store unavailable.
-pub(crate) fn start(app: std::sync::Arc<crate::context::App>, path: std::path::PathBuf) {
-    if let Err(error) = std::thread::Builder::new()
-        .name("aft-runner-key-copy".into())
-        .spawn(move || {
-            let db = match app.open_db(&path) {
-                Ok(db) => db,
-                Err(error) => {
-                    log::warn!("canonical runner harness key copy skipped: {error}");
-                    return;
-                }
-            };
-            match db.lock() {
-                Ok(conn) => initialize(&conn),
-                Err(error) => log::warn!("canonical runner harness key copy skipped: {error}"),
-            };
-        })
-    {
-        log::warn!("canonical runner harness key copy could not start: {error}");
     }
 }
 
