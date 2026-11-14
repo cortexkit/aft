@@ -54,7 +54,7 @@ pub fn call_node_kinds(lang: LangId) -> &'static [&'static str] {
             "scoped_call_expression",
         ],
         LangId::Perl => &["function_call_expression", "method_call_expression"],
-        LangId::Lua => &["function_call"],
+        LangId::Lua | LangId::Luau => &["function_call"],
         LangId::C | LangId::Cpp | LangId::Cuda | LangId::Metal | LangId::Zig => {
             &["call_expression"]
         }
@@ -70,8 +70,7 @@ pub fn call_node_kinds(lang: LangId) -> &'static [&'static str] {
         | LangId::R
         | LangId::Groovy
         | LangId::ObjC
-        | LangId::Toml
-        | LangId::Luau => &[],
+        | LangId::Toml => &[],
     }
 }
 
@@ -1279,6 +1278,13 @@ pub(crate) fn extract_calls_full_with<'tree>(
         &mut results,
         nav,
     );
+    if lang == LangId::Luau {
+        for (full, short, _, _, _) in &mut results {
+            if let Some(name) = full.rsplit(['.', ':']).next() {
+                *short = name.to_string();
+            }
+        }
+    }
     results
 }
 

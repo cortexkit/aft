@@ -74,6 +74,29 @@ pub(super) fn extract_tree(
     let mut symbols = blob_symbols(&data);
     let mut imports = blob_imports(&data);
     let mut refs = blob_refs(&line_index, &data);
+    if lang == LangId::Luau {
+        refs.extend(
+            crate::luau::exports(source, root)
+                .into_iter()
+                .map(|(name, export)| super::join::BlobRef {
+                    ordinal: 0,
+                    kind: super::join::BlobRefKind::ExportAlias,
+                    caller_symbol: None,
+                    short_name: None,
+                    full_ref: Some(name.clone()),
+                    module_path: None,
+                    line: 1,
+                    byte_start: 0,
+                    byte_end: source.len(),
+                    path_override: None,
+                    local_name: Some(name),
+                    requested_name: Some(export.symbol),
+                    namespace_alias: None,
+                    wildcard: false,
+                    import_kind: Some("export_alias".to_string()),
+                }),
+        );
+    }
     if lang == LangId::Rust {
         refs.extend(rust_module_refs(source, &index));
     }

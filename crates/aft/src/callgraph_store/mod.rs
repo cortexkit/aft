@@ -9,6 +9,7 @@ pub(crate) mod fact_answers;
 pub(crate) mod facts;
 mod go_dispatch;
 pub mod join;
+mod luau;
 pub(crate) mod method_call_facts;
 #[cfg(target_os = "macos")]
 mod readiness_watch_macos;
@@ -1163,6 +1164,7 @@ impl CrateScanMemo {
 /// refreshes use the in-memory index, while cold builds query only the rows
 /// needed by the active caller from SQLite.
 pub(crate) trait ResolverIndex {
+    fn luau_config(&self, file: &str) -> Option<Arc<[u8]>>;
     fn macro_use_modules(&self, file: &str) -> Vec<String>;
     fn go_package_files(&self, caller_file: &str, module: Option<&str>) -> Vec<String>;
     // Enumerate package files without building or reading a cached package
@@ -1211,6 +1213,9 @@ pub(crate) trait ResolverIndex {
 }
 
 impl ResolverIndex for ProjectIndex<'_> {
+    fn luau_config(&self, file: &str) -> Option<Arc<[u8]>> {
+        luau::config(self, file)
+    }
     fn macro_use_modules(&self, file: &str) -> Vec<String> {
         self.file_index(file)
             .map(|index| index.macro_use_module_targets.iter().cloned().collect())
@@ -2711,6 +2716,18 @@ fn resolve_ref<I: ResolverIndex>(raw: RawRef, index: &I) -> Result<ResolvedRef> 
         work.resolved_refs += 1;
         work.resolved_files.insert(raw.caller_file.clone());
     });
+    if raw.kind == "import" && index.lang_for(&raw.caller_file) == Some(LangId::Luau) {
+        let mut dependencies = raw.dependencies.clone();
+        let target_file = raw
+            .module_path
+            .as_deref()
+            .and_then(|path| luau::module(index, &raw.caller_file, path, &mut dependencies));
+        return Ok(ResolvedRef {
+            target_file,
+            target_symbol: None,
+            dependencies,
+        });
+    }
     if raw.kind == "import" && index.lang_for(&raw.caller_file) == Some(LangId::Go) {
         let files = raw
             .module_path
@@ -2749,6 +2766,14 @@ fn resolve_ref<I: ResolverIndex>(raw: RawRef, index: &I) -> Result<ResolvedRef> 
     let mut dependencies = raw.dependencies.clone();
 
     let resolved = match index.lang_for(&caller_file) {
+        Some(LangId::Luau) => luau::call(
+            index,
+            &caller_file,
+            full_ref,
+            short_name,
+            caller_data,
+            &mut dependencies,
+        ),
         Some(LangId::Rust) => {
             resolve_rust_target(index, &caller_file, full_ref, short_name, caller_data, &raw)
         }

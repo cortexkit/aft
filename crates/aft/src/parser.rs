@@ -2760,6 +2760,12 @@ fn extract_symbols_from_tree_unbounded<'tree>(
     if lang == LangId::Toml {
         return extract_toml_symbols(source, &root);
     }
+    if lang == LangId::Luau {
+        return Ok(crate::luau::declarations(source, root)
+            .into_iter()
+            .map(|declaration| luau_symbol(source, declaration))
+            .collect());
+    }
 
     let query = cached_query_for(lang)?.ok_or_else(|| AftError::InvalidRequest {
         message: format!("no query patterns implemented for {:?} yet", lang),
@@ -8515,6 +8521,21 @@ fn lua_scope_chain(node: &Node, source: &str) -> Vec<String> {
     }
 
     chain
+}
+
+pub(crate) fn luau_symbol(source: &str, declaration: crate::luau::Declaration<'_>) -> Symbol {
+    let mut symbols = Vec::new();
+    push_captured_symbol(
+        &mut symbols,
+        source,
+        LangId::Luau,
+        declaration.name,
+        declaration.definition,
+        declaration.kind,
+        declaration.parent.into_iter().collect(),
+        declaration.exported,
+    );
+    symbols.remove(0)
 }
 
 fn extract_lua_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {

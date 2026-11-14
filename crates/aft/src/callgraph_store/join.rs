@@ -2833,6 +2833,11 @@ impl<I> ViewSurfaceIndex<'_, I> {
 }
 
 impl<I: super::ResolverIndex> super::ResolverIndex for ViewSurfaceIndex<'_, I> {
+    fn luau_config(&self, file: &str) -> Option<Arc<[u8]>> {
+        // ProjectFacts records configuration bytes and missing paths directly;
+        // these are checkout inputs, not parsed symbol data.
+        self.inner.luau_config(file)
+    }
     fn macro_use_modules(&self, file: &str) -> Vec<String> {
         let value = self.inner.macro_use_modules(file);
         self.record(ViewSurfaceQuery::MacroUse(file.into()), &value);

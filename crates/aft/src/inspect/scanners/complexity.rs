@@ -298,6 +298,23 @@ fn language_spec(language: LangId) -> Option<LanguageSpec> {
             function_nodes: &["function_declaration", "function_definition"],
             decisions: GENERIC,
         },
+        LangId::Luau => LanguageSpec {
+            function_nodes: &[
+                "function_declaration",
+                "local_function_declaration",
+                "function_definition",
+            ],
+            decisions: DecisionSpec {
+                if_nodes: &[
+                    "if_statement",
+                    "if_else_expression",
+                    "elseif_statement",
+                    "elseif_expression",
+                ],
+                loop_nodes: &["for_statement", "while_statement", "repeat_statement"],
+                ..GENERIC
+            },
+        },
         LangId::Perl => LanguageSpec {
             function_nodes: &[
                 "subroutine_declaration_statement",
@@ -324,10 +341,32 @@ fn language_spec(language: LangId) -> Option<LanguageSpec> {
         | LangId::Json
         | LangId::Yaml
         | LangId::Toml
-        | LangId::Pascal
-        | LangId::Luau => return None,
+        | LangId::Pascal => return None,
     };
     Some(spec)
+}
+
+#[cfg(all(
+    test,
+    feature = "wasm-grammars",
+    feature = "test-hooks",
+    not(all(target_os = "windows", target_arch = "aarch64"))
+))]
+#[test]
+fn luau_s3_complexity_spec_scores_the_fixture() {
+    let source = crate::luau::tests::FIXTURE;
+    let tree = crate::luau::tests::tree(source);
+    let functions = collect_functions(
+        tree.root_node(),
+        source,
+        language_spec(LangId::Luau).unwrap(),
+    );
+    let complex = functions.iter().find(|f| f.name == "complex").unwrap();
+    assert_eq!(complex.complexity, 12);
+    assert!(functions
+        .iter()
+        .filter(|f| f.name != "complex")
+        .all(|f| f.complexity == 1));
 }
 
 pub fn run_complexity_scan(job: &InspectJob) -> InspectResult {

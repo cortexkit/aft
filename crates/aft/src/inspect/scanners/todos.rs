@@ -425,6 +425,9 @@ fn collect_comment_nodes<'tree>(
 
 fn is_comment_node(node: Node<'_>, language: LangId, source: &str) -> bool {
     let kind = node.kind();
+    if language == LangId::Luau {
+        return crate::luau::COMMENT_KINDS.contains(&kind);
+    }
     if kind == "comment" || kind.ends_with("_comment") {
         return true;
     }

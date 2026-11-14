@@ -19,7 +19,7 @@ pub static PRODUCTION_MANIFEST: LazyLock<GrammarManifest> = LazyLock::new(|| {
     serde_json::from_str(include_str!("manifest.json")).expect("compiled grammar manifest")
 });
 
-pub const LUAU_EXTRACTOR_VERSION: u32 = 1;
+pub const LUAU_EXTRACTOR_VERSION: u32 = 2;
 
 pub fn manifest() -> &'static GrammarManifest {
     #[cfg(feature = "test-hooks")]

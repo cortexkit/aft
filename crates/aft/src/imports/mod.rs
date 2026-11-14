@@ -637,6 +637,9 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
 
 /// Parse imports from source using the provided tree-sitter tree.
 pub fn parse_imports(source: &str, tree: &Tree, lang: LangId) -> ImportBlock {
+    if lang == LangId::Luau {
+        return crate::luau::imports(source, tree.root_node());
+    }
     match syntax_for(lang) {
         Some(engine) => engine.parse(source, tree),
         None => ImportBlock::empty(),
