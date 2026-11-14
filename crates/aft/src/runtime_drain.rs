@@ -1668,6 +1668,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                         crate::cache_freshness::invalidate_verify_memo_strict(&root);
                     }
                     state.rescan_required = true;
+                    ctx.watcher_counters().start_rescan();
                     state.rescan_ignore_checked = false;
                     state.rescan_reason = reason;
                     state.pending_paths.clear();
@@ -1858,7 +1859,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         let watcher_counters = ctx.watcher_counters();
         watcher_counters.start_rescan();
         let rescan_reason = state.rescan_reason;
-        let deferred_rescan = {
+        let rescan_completed = {
             let interval = watcher_counters.begin_rescan(rescan_reason);
             wait_on_watcher_rescan_gate_for_test(ctx);
             let app = ctx.app();
@@ -1870,7 +1871,8 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
             );
             let rss_before = watcher_rescan_rss_bytes();
             let rescan_started = Instant::now();
-            state.status_changed |= refresh_project_after_watcher_rescan(ctx);
+            let refreshed = refresh_project_after_watcher_rescan(ctx);
+            state.status_changed |= refreshed;
             let cost_ms = rescan_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
             let rss_delta_bytes = watcher_rescan_rss_delta(rss_before, watcher_rescan_rss_bytes());
             watcher_counters.finish_rescan(cost_ms, rss_delta_bytes);
@@ -1881,9 +1883,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 rss_delta_bytes,
                 interval.raw_events,
             );
-            // At most one pass per dispatch slice. A loss during this pass is
-            // retained for the next slice, including its ignore-path evidence.
-            watcher_counters.finish_rescan_walk()
+            refreshed
         };
         state.scheduler_changed_path_count =
             aft::inspect::tier2_scheduler::TIER2_REFRESH_STORM_PATH_THRESHOLD + 1;
@@ -1896,19 +1896,21 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         // generation, and the internal admission gates then made parts of the
         // sequence no-ops. Keeping the flag parks the rescan for the
         // post-rebind replay instead of acknowledging a partial one.
-        if ctx
-            .run_if_subc_bound_generation(configure_generation, || ())
-            .is_some()
-        {
-            state.rescan_required = deferred_rescan.is_some();
-            state.rescan_ignore_checked = false;
-            if let Some(reason) = deferred_rescan {
-                state.rescan_reason = reason;
-            }
-            state.ignore_changed = false;
-            state.ignore_refresh_due = None;
-            state.ignore_changed_paths.clear();
-            state.ignore_changed_path_count = 0;
+        if rescan_completed {
+            let _ = ctx.run_if_subc_bound_generation(configure_generation, || {
+                // At most one pass per dispatch slice. Event loss during this
+                // pass leaves rescan_required set for the next slice.
+                let deferred_rescan = watcher_counters.finish_rescan_walk();
+                state.rescan_required = deferred_rescan.is_some();
+                state.rescan_ignore_checked = false;
+                if let Some(reason) = deferred_rescan {
+                    state.rescan_reason = reason;
+                }
+                state.ignore_changed = false;
+                state.ignore_refresh_due = None;
+                state.ignore_changed_paths.clear();
+                state.ignore_changed_path_count = 0;
+            });
         }
         state.status_changed = false;
         state.scheduler_changed_path_count = 0;
@@ -3288,6 +3290,42 @@ mod tests {
                 .is_some_and(|state| state.rescan_required),
             "a fully-bound rescan must be acknowledged"
         );
+    }
+
+    #[test]
+    fn watcher_loss_recovery_unbound_mid_rescan_does_not_acknowledge_partial_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let (ctx, watcher_tx) = watcher_context(&root);
+        let ctx = Arc::new(ctx);
+        let counters = ctx.watcher_counters();
+        counters.note_overflow(RescanReason::UserDropped, Vec::new());
+        watcher_tx
+            .send(WatcherDispatchEvent::RescanRequired(
+                RescanReason::UserDropped,
+            ))
+            .unwrap();
+        let (reached, release) = install_watcher_rescan_gate_for_test(&ctx);
+        let drain_ctx = Arc::clone(&ctx);
+        let drain =
+            std::thread::spawn(move || drain_watcher_events_bounded(&drain_ctx, usize::MAX));
+        reached
+            .recv_timeout(Duration::from_secs(2))
+            .expect("rescan did not reach gate");
+        ctx.mark_subc_unbound();
+        release.send(()).unwrap();
+        drain.join().unwrap();
+        assert!(
+            counters.snapshot().loss_unrecovered,
+            "a lifecycle-cancelled rescan did not cover the loss"
+        );
+        ctx.mark_subc_bound();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while drain_watcher_events_bounded(&ctx, usize::MAX).has_more {
+            assert!(Instant::now() < deadline, "rescan replay must converge");
+            std::thread::yield_now();
+        }
+        assert!(!counters.snapshot().loss_unrecovered);
     }
 
     #[test]
