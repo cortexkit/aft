@@ -155,7 +155,10 @@ fn zoom_parse_source(
         return FileParser::new().parse_cloned(path);
     }
     let lang = crate::parser::detect_language_from_source(path, source)
-        .or_else(|| crate::parser::detect_language_any(path, cfg!(feature = "wasm-grammars")))
+        .or_else(|| {
+            crate::parser::detect_language_any(path, cfg!(feature = "wasm-grammars"))
+                .filter(|language| *language == LangId::Luau)
+        })
         .ok_or_else(|| crate::error::AftError::InvalidRequest {
             message: format!("unsupported file extension: {}", path.display()),
         })?;

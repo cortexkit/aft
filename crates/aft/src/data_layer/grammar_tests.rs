@@ -141,6 +141,7 @@ fn luau_s4_feature_matrix() {
         ("seed", "manifest-a.json"),
         ("gap", "manifest-a.json"),
         ("identity", "manifest-b.json"),
+        ("timeout", "manifest-a.json"),
     ] {
         let result = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -149,6 +150,10 @@ fn luau_s4_feature_matrix() {
                 "--nocapture",
             ])
             .env("AFT_S4_PHASE", phase)
+            .env(
+                "AFT_TEST_GRAMMAR_PARSE_DEADLINE_MS",
+                if phase == "timeout" { "1" } else { "30000" },
+            )
             .env("AFT_S4_ROOT", dir.path())
             .env("AFT_TEST_GRAMMAR_MANIFEST", manifest_dir.join(manifest))
             .env(
@@ -188,6 +193,32 @@ fn scenario(phase: &str) {
             .join(format!("{}.wasm", manifest.sha256)),
     )
     .unwrap();
+    if phase == "timeout" {
+        registry.stored().unwrap();
+        write(
+            &root,
+            "slow.luau",
+            "local function slow(x) if x then return x + 1 else return 0 end end\n".repeat(500),
+        );
+        let checkout = bind(&root, &dir.join("timeout-store"));
+        let report = checkout.build().unwrap();
+        assert_eq!(report.extract_failures, 0);
+        let view = checkout.view().unwrap();
+        assert_eq!(view.current_state().skipped_parses().len(), 1);
+        let reason: Value =
+            serde_json::from_str(&view.current_state().skipped_parses()[b"slow.luau".as_slice()])
+                .unwrap();
+        assert_eq!(reason["code"], "grammar_parse_timeout");
+        assert_eq!(reason["state"], "parse_timeout");
+        assert!(view.callgraph_has_file("b.luau"));
+        assert!(!view.callgraph_has_file("slow.luau"));
+        assert!(
+            !checkout.retry_grammar_gaps().unwrap(),
+            "a timeout is per-file, not grammar readiness work"
+        );
+        assert_eq!(registry.request_count(), 0);
+        return;
+    }
     if phase == "seed" {
         write(&root, "plain.ts", ts);
         let plain = bind(&root, &dir.join("plain-store"));
@@ -305,6 +336,15 @@ fn scenario(phase: &str) {
     assert_eq!(pending.data["skipped_files"], json!([]));
     assert_eq!(pending.data["gaps"][0]["code"], "grammar_unavailable");
     assert!(pending.data["text"].as_str().unwrap().contains("builtin"));
+    let pending_zoom = ask(
+        &ctx,
+        "zoom",
+        json!({"targets": [{"file": root.join("plain.ts"), "symbols": "builtin"}, {"file": root.join("a.luau"), "symbols": "caller"}]}),
+    );
+    assert!(pending_zoom.success, "{:?}", pending_zoom.data);
+    assert_eq!(pending_zoom.data["complete"], false);
+    assert_eq!(pending_zoom.data["targets"].as_array().unwrap().len(), 1);
+    assert_eq!(pending_zoom.data["gaps"][0]["code"], "grammar_unavailable");
     let runtime = super::runtime::DataCheckout::open(&root, &storage, None).unwrap();
     let wait = Instant::now();
     while !runtime
@@ -396,7 +436,7 @@ fn ready_tools_and_resolver(ctx: &AppContext, root: &Path, dir: &Path) {
     assert_eq!(batch.data["targets"].as_array().unwrap().len(), 2);
 
     let matrix = dir.join("matrix");
-    let module = "local T = {}\nfunction T.target() return 1 end\nreturn T\n";
+    let module = "local T = {}\nfunction T.target()\n    return 1\nend\nreturn T\n";
     write(&matrix, "b.luau", module);
     write(&matrix, "other/b.luau", module);
     write(&matrix, "a/x.luau", module);
@@ -483,10 +523,14 @@ fn ready_tools_and_resolver(ctx: &AppContext, root: &Path, dir: &Path) {
     let result = plane.search(&view, &[1.0, 0.0], 100, &|_| true).unwrap();
     assert!(result.coverage.pending.is_empty(), "{:?}", result.coverage);
     assert!(result.coverage.files_failed.is_empty());
-    assert!(result
-        .results
-        .iter()
-        .any(|row| row.file.ends_with("b.luau") && row.name == "target"));
+    assert!(
+        result
+            .results
+            .iter()
+            .any(|row| row.file.ends_with("b.luau") && row.name == "target"),
+        "{:?}",
+        result.results
+    );
 
     write(&matrix, ".luaurc", r#"{"aliases":{"Root":"other"}}"#);
     checkout.record_paths(&[b".luaurc".to_vec()]).unwrap();
@@ -514,5 +558,26 @@ fn ready_tools_and_resolver(ctx: &AppContext, root: &Path, dir: &Path) {
     assert_eq!(
         callers(&checkout.view().unwrap(), "other/b.luau")["total_callers"],
         0
+    );
+    write(&matrix, ".luaurc", "not json");
+    checkout.record_paths(&[b".luaurc".to_vec()]).unwrap();
+    checkout.refresh_callgraph().unwrap();
+    assert_eq!(
+        callers(&checkout.view().unwrap(), "other/b.luau")["total_callers"],
+        0
+    );
+    write(&matrix, "b/init.luau", module);
+    checkout.record_paths(&[b"b/init.luau".to_vec()]).unwrap();
+    checkout.refresh_callgraph().unwrap();
+    assert_eq!(
+        callers(&checkout.view().unwrap(), "b.luau")["total_callers"],
+        0
+    );
+    std::fs::remove_file(matrix.join("b/init.luau")).unwrap();
+    checkout.record_paths(&[b"b/init.luau".to_vec()]).unwrap();
+    checkout.refresh_callgraph().unwrap();
+    assert_eq!(
+        callers(&checkout.view().unwrap(), "b.luau")["total_callers"],
+        7
     );
 }

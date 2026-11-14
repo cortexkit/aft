@@ -302,7 +302,7 @@ fn outline_single_file(req: &RawRequest, ctx: &AppContext, path: PathBuf, file: 
     ) {
         Ok(s) => s,
         Err(e) => {
-            return Response::error(&req.id, e.code(), e.to_string());
+            return crate::data_layer::grammar::error_response(&req.id, &e);
         }
     };
 
@@ -1718,7 +1718,7 @@ fn handle_outline_files_mode(
         &file_entries,
         max_output_bytes.saturating_sub(empty_targets.iter().map(String::len).sum::<usize>()),
     );
-    populate_rendered_file_symbols(&rows, &mut file_entries, ctx);
+    let grammar_gaps = populate_rendered_file_symbols(&rows, &mut file_entries, ctx);
     let table = format_files_table(&rows, &directory_nodes, &file_entries, max_output_bytes);
     let mut text = table.into_string();
     for explanation in empty_targets {
@@ -1805,6 +1805,22 @@ fn handle_outline_files_mode(
     });
     if !skipped_files.is_empty() {
         response_data["skipped_files"] = serde_json::json!(skipped_files);
+    }
+    if !grammar_gaps.is_empty() {
+        let messages = grammar_gaps
+            .iter()
+            .filter_map(|gap| gap["message"].as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join("\n");
+        response_data["text"] = format!(
+            "{messages}\n\n{}",
+            response_data["text"].as_str().unwrap_or_default()
+        )
+        .into();
+        response_data["gaps"] = serde_json::json!(grammar_gaps);
+        response_data["complete"] = false.into();
     }
     if let Some(env) = envelope {
         response_data["files_list_envelope"] = serde_json::to_value(&env).unwrap();
@@ -2197,7 +2213,8 @@ fn populate_rendered_file_symbols(
     rows: &[OutlineTableRow],
     file_entries: &mut [OutlineFileEntry],
     ctx: &AppContext,
-) {
+) -> Vec<serde_json::Value> {
+    let mut gaps = Vec::new();
     for file_id in rows.iter().filter_map(|row| match row {
         OutlineTableRow::File(file_id) => Some(*file_id),
         OutlineTableRow::Rollup(_) => None,
@@ -2211,6 +2228,19 @@ fn populate_rendered_file_symbols(
             continue;
         }
         let path = entry.absolute_path.clone();
+        if detect_language(&path) == Some(LangId::Luau) {
+            let symbols = crate::data_layer::grammar::prepare(ctx, &path)
+                .and_then(|_| crate::parser::list_symbols_shared(ctx.provider(), &path, true));
+            match symbols {
+                Ok(symbols) => entry.symbols = Some(symbols.len()),
+                Err(error) => {
+                    let mut gap = error.to_error_json();
+                    gap["path"] = serde_json::json!(path);
+                    gaps.push(gap);
+                }
+            }
+            continue;
+        }
         if detect_language(&path).is_none() {
             entry.symbols = Some(0);
             continue;
@@ -2234,6 +2264,7 @@ fn populate_rendered_file_symbols(
         });
         entry.symbols = Some(symbols);
     }
+    gaps
 }
 
 fn relative_path_from_root(path: &Path, root: &Path) -> Option<String> {
@@ -2759,7 +2790,14 @@ fn outline_many_files(
         }
 
         if detect_language(&path) == Some(LangId::Luau) {
-            if let Err(error) = crate::data_layer::grammar::prepare(ctx, &path) {
+            let parsed = crate::data_layer::grammar::prepare(ctx, &path).and_then(|_| {
+                batch_parser
+                    .as_mut()
+                    .unwrap_or(&mut fallback_parser)
+                    .parse(&path)
+                    .map(|_| ())
+            });
+            if let Err(error) = parsed {
                 writer.content_incomplete = true;
                 if !writer.push_text(
                     format!("{rel_path}\n{}", error),
@@ -5158,7 +5196,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
             .map(OutlineTableRow::File)
             .collect::<Vec<_>>();
         let before = crate::parser::work_counters::OWNED_SYMBOL_COPIES.with(|count| count.get());
-        populate_rendered_file_symbols(&rows, &mut entries, &ctx);
+        let _ = populate_rendered_file_symbols(&rows, &mut entries, &ctx);
         assert!(entries.iter().all(|entry| entry.symbols == Some(2)));
         assert_eq!(
             crate::parser::work_counters::OWNED_SYMBOL_COPIES.with(|count| count.get()) - before,

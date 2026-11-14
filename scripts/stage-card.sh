@@ -206,7 +206,9 @@ if [ "$(uname -s)" = "Darwin" ]; then
       python3 - "$TMP" "$GRAMMAR_SMOKE" <<'PY'
 import json, pathlib, signal, subprocess, sys
 binary, root = sys.argv[1], pathlib.Path(sys.argv[2]).resolve()
-signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError("signed outline smoke timed out")))
+def timed_out(*_):
+    raise TimeoutError("signed outline smoke timed out")
+signal.signal(signal.SIGALRM, timed_out)
 signal.alarm(45)
 with open(root / "outline-stderr.log", "w") as stderr:
     process = subprocess.Popen(["sandbox-exec", "-p", "(version 1) (allow default) (deny network*)", binary],
