@@ -1940,9 +1940,8 @@ impl WatcherCounters {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         recovery.loss_seq = recovery.loss_seq.saturating_add(1);
         recovery.covers_seq = recovery.loss_seq;
-        if recovery.rescan_state == WATCHER_RESCAN_IDLE {
-            recovery.rescan_state = WATCHER_RESCAN_RUNNING;
-        }
+        // Metric bookkeeping does not own a drain walk. Only start_rescan
+        // enters the lifecycle that can retain overflows for a follow-up pass.
         match reason {
             crate::watcher_filter::RescanReason::BufferOverflow => {
                 &self.rescans_buffer_overflow_total
@@ -2124,6 +2123,19 @@ mod watcher_loss_recovery_tests {
         assert!(!counters.snapshot().loss_unrecovered);
         assert_eq!(counters.snapshot().rescans_user_dropped_total, 1);
         assert_eq!(counters.snapshot().overflows_total, 0);
+    }
+
+    #[test]
+    fn watcher_loss_recovery_metric_rescan_does_not_coalesce_next_overflow() {
+        let counters = WatcherCounters::default();
+        for _ in 0..2 {
+            assert!(!counters.note_overflow(RescanReason::UserDropped, Vec::new()));
+            counters.begin_rescan(RescanReason::UserDropped);
+            counters.finish_rescan(0, None);
+            assert!(!counters.rescan_in_progress());
+        }
+        assert_eq!(counters.snapshot().overflows_total, 2);
+        assert_eq!(counters.snapshot().overflows_during_rescan, 0);
     }
 }
 

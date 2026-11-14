@@ -1859,7 +1859,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         let watcher_counters = ctx.watcher_counters();
         watcher_counters.start_rescan();
         let rescan_reason = state.rescan_reason;
-        let rescan_completed = {
+        {
             let interval = watcher_counters.begin_rescan(rescan_reason);
             wait_on_watcher_rescan_gate_for_test(ctx);
             let app = ctx.app();
@@ -1871,8 +1871,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
             );
             let rss_before = watcher_rescan_rss_bytes();
             let rescan_started = Instant::now();
-            let refreshed = refresh_project_after_watcher_rescan(ctx);
-            state.status_changed |= refreshed;
+            state.status_changed |= refresh_project_after_watcher_rescan(ctx);
             let cost_ms = rescan_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
             let rss_delta_bytes = watcher_rescan_rss_delta(rss_before, watcher_rescan_rss_bytes());
             watcher_counters.finish_rescan(cost_ms, rss_delta_bytes);
@@ -1883,8 +1882,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 rss_delta_bytes,
                 interval.raw_events,
             );
-            refreshed
-        };
+        }
         state.scheduler_changed_path_count =
             aft::inspect::tier2_scheduler::TIER2_REFRESH_STORM_PATH_THRESHOLD + 1;
         if state.status_changed {
@@ -1896,22 +1894,22 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         // generation, and the internal admission gates then made parts of the
         // sequence no-ops. Keeping the flag parks the rescan for the
         // post-rebind replay instead of acknowledging a partial one.
-        if rescan_completed {
-            let _ = ctx.run_if_subc_bound_generation(configure_generation, || {
-                // At most one pass per dispatch slice. Event loss during this
-                // pass leaves rescan_required set for the next slice.
-                let deferred_rescan = watcher_counters.finish_rescan_walk();
-                state.rescan_required = deferred_rescan.is_some();
-                state.rescan_ignore_checked = false;
-                if let Some(reason) = deferred_rescan {
-                    state.rescan_reason = reason;
-                }
-                state.ignore_changed = false;
-                state.ignore_refresh_due = None;
-                state.ignore_changed_paths.clear();
-                state.ignore_changed_path_count = 0;
-            });
-        }
+        // The refresh boolean reports status changes, not completion: a root
+        // with no cache-backed work also returns false and must be acknowledged.
+        let _ = ctx.run_if_subc_bound_generation(configure_generation, || {
+            // At most one pass per dispatch slice. Event loss during this
+            // pass leaves rescan_required set for the next slice.
+            let deferred_rescan = watcher_counters.finish_rescan_walk();
+            state.rescan_required = deferred_rescan.is_some();
+            state.rescan_ignore_checked = false;
+            if let Some(reason) = deferred_rescan {
+                state.rescan_reason = reason;
+            }
+            state.ignore_changed = false;
+            state.ignore_refresh_due = None;
+            state.ignore_changed_paths.clear();
+            state.ignore_changed_path_count = 0;
+        });
         state.status_changed = false;
         state.scheduler_changed_path_count = 0;
     } else if matches!(state.phase, WatcherDrainPhase::Collect) {
