@@ -101,6 +101,13 @@ fn spill_checkpoint_resumes_and_discards_unpublished_files() {
     let partial = saved.directory.join("manifest-99999999999999999999.part");
     crate::fs::write_new_durable(&partial, b"torn").unwrap();
     let mut resumed = Sorter::resume(&saved.directory, cfg).unwrap();
+    let runs: Vec<_> = resumed.finished_runs().collect();
+    assert_eq!(runs.len(), saved.finished_runs);
+    assert_eq!(runs.iter().map(|run| run.records).sum::<u64>(), 1300);
+    assert!(
+        runs.iter()
+            .all(|run| run.path.is_file() && run.max_record_bytes == 17)
+    );
     assert!(!garbage.exists());
     assert!(!partial.exists());
     for i in 1300..2600u64 {
@@ -267,6 +274,11 @@ fn spill_merge_memory_is_capacity_counted_and_independent_of_output_count() {
     let mut records = sorter.finish().unwrap();
     let before = records.stats();
     assert!(before.peak_merge_readers <= cfg.fan_in);
+    assert_eq!(
+        before.peak_merge_io_bytes,
+        before.peak_merge_readers * cfg.buffer_bytes
+    );
+    assert_eq!(before.peak_merge_head_bytes, before.peak_merge_readers * 16);
     let mut count = 0;
     let mut previous = [0; 8];
     while let Some(record) = records.next_record().unwrap() {
@@ -285,6 +297,30 @@ fn spill_merge_memory_is_capacity_counted_and_independent_of_output_count() {
     assert_eq!(after.buffered_bytes, 0);
     assert_eq!(after.disk_bytes, 0);
     assert!(after.peak_buffered_bytes <= cfg.memory_budget);
+}
+
+#[test]
+fn spill_large_variable_records_cross_blocks_and_owned_outputs_fit() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = config(24 * 1024);
+    let mut sorter = Sorter::new(root.path(), cfg).unwrap();
+    sorter.push(b"large", &vec![3; 3000]).unwrap();
+    let mut records = sorter.finish().unwrap();
+    let record = records.next().unwrap().unwrap();
+    assert_eq!(record.key(), b"large");
+    assert_eq!(record.value(), vec![3; 3000]);
+    assert!(records.next().is_none());
+    assert!(records.stats().peak_buffered_bytes <= cfg.memory_budget);
+
+    let mut sorter = Sorter::new(root.path(), cfg).unwrap();
+    let mut expected = Vec::new();
+    for i in (0..500u64).rev() {
+        let value = vec![(i % 256) as u8; (i % 900 + 300) as usize];
+        sorter.push(&i.to_be_bytes(), &value).unwrap();
+        expected.push((i.to_be_bytes().to_vec(), value));
+    }
+    expected.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(output(sorter), expected);
 }
 
 #[test]

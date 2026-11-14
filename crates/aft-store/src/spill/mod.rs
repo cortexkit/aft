@@ -80,6 +80,11 @@ pub struct Stats {
     pub runs_written: u64,
     pub merge_passes: u64,
     pub peak_merge_readers: usize,
+    /// High-water sum of allocated I/O buffer capacities across merge inputs.
+    pub peak_merge_io_bytes: usize,
+    /// High-water sum of allocated capacities for the current input records
+    /// held for merging (one record per run).
+    pub peak_merge_head_bytes: usize,
     pub allocations: u64,
 }
 
@@ -213,6 +218,17 @@ impl Sorter {
 
     pub fn directory(&self) -> Option<&Path> {
         self.workspace.as_ref().map(|w| w.path.as_path())
+    }
+
+    /// Lists the currently published run names without reading their contents.
+    /// Resume a checkpoint first to list/reuse its last committed run set. Each
+    /// returned path is caller-owned and excluded from the buffer budget.
+    pub fn finished_runs(&self) -> impl Iterator<Item = FinishedRun> + '_ {
+        self.runs.iter().map(|meta| FinishedRun {
+            path: meta.path(&self.workspace.as_ref().expect("workspace").path),
+            records: meta.records,
+            max_record_bytes: meta.max_record,
+        })
     }
 
     /// Copies one key/value into the budgeted arena. Any error invalidates the
@@ -403,14 +419,25 @@ impl Sorter {
             return Err(Error::Failed);
         }
         if self.runs.is_empty() {
-            if let Some(tail) = &mut self.tail {
-                tail.sort();
-            }
-            return Ok(SortedRecords {
-                workspace: self.workspace.take(),
-                memory: self.memory.clone(),
-                source: Some(Source::Tail(self.tail.take(), 0)),
+            let max_record = self.tail.as_ref().map_or(0, |tail| {
+                tail.entries
+                    .iter()
+                    .map(|entry| entry.end - entry.start)
+                    .max()
+                    .unwrap_or(0)
             });
+            if max_record <= self.memory.available() {
+                if let Some(tail) = &mut self.tail {
+                    tail.sort();
+                }
+                return Ok(SortedRecords {
+                    workspace: self.workspace.take(),
+                    memory: self.memory.clone(),
+                    source: Some(Source::Tail(self.tail.take(), 0)),
+                });
+            }
+            // Write the in-memory tail to a run when an owned output copy would
+            // not fit alongside it. Then check that merge records and output fit.
         }
         let result = self.spill();
         self.checked(result)?;
@@ -457,6 +484,14 @@ pub struct Checkpoint {
     pub directory: PathBuf,
     pub finished_runs: usize,
     pub stats: Stats,
+}
+
+/// One durable, immutable run named by the current manifest.
+#[derive(Debug)]
+pub struct FinishedRun {
+    pub path: PathBuf,
+    pub records: u64,
+    pub max_record_bytes: u64,
 }
 
 /// Borrowed output, valid until the next call to the iterator.

@@ -469,7 +469,21 @@ impl Merge {
                 this.insert(index);
             }
         }
-        memory.update(|s| s.peak_merge_readers = s.peak_merge_readers.max(inputs.len()));
+        let io_bytes = this
+            .readers
+            .iter()
+            .map(|reader| reader.buffer.capacity())
+            .sum();
+        let head_bytes = this
+            .readers
+            .iter()
+            .map(|reader| reader.head.capacity())
+            .sum();
+        memory.update(|s| {
+            s.peak_merge_readers = s.peak_merge_readers.max(this.readers.len());
+            s.peak_merge_io_bytes = s.peak_merge_io_bytes.max(io_bytes);
+            s.peak_merge_head_bytes = s.peak_merge_head_bytes.max(head_bytes);
+        });
         Ok(this)
     }
 
