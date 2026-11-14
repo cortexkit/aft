@@ -434,3 +434,39 @@ fn spill_throughput_50m_24byte_256mib() {
         stats.peak_merge_readers
     );
 }
+#[test]
+fn fixed_keys_are_compact_checked_and_resumable() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = Config::new(128 * 1024);
+    config.buffer_bytes = 1024;
+    config.fan_in = 2;
+    let mut sorter = Sorter::fixed_keys(root.path(), config, 25).unwrap();
+    let mut expected = Vec::new();
+    for n in (0..10000u64).rev() {
+        let mut key = [0; 25];
+        key[..8].copy_from_slice(&(n % 991).to_be_bytes());
+        expected.push(key.to_vec());
+        sorter.push(&key, &[]).unwrap();
+    }
+    let checkpoint = sorter.checkpoint().unwrap();
+    // One fixed run contains only its keys plus block checksums and a header.
+    let sorter = Sorter::resume(&checkpoint.directory, config).unwrap();
+    for run in sorter.finished_runs() {
+        let payload = run.records * 25;
+        assert_eq!(
+            std::fs::metadata(run.path).unwrap().len(),
+            72 + payload + payload.div_ceil(1024) * 16
+        );
+    }
+    expected.sort();
+    let actual = sorter
+        .finish()
+        .unwrap()
+        .map(|record| record.unwrap().key().to_vec())
+        .collect::<Vec<_>>();
+    assert_eq!(expected, actual);
+    assert!(!checkpoint.directory.exists());
+    let mut sorter = Sorter::fixed_keys(root.path(), config, 25).unwrap();
+    assert!(sorter.push(&[0; 24], &[]).is_err());
+    assert!(sorter.directory().is_none());
+}

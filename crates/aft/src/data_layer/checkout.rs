@@ -1746,6 +1746,27 @@ impl Checkout {
             true,
             Some(encoded),
         );
+        let workspace = self
+            .writer()?
+            .create_build_workspace()
+            .map_err(DataError::store)?;
+        let dir = self.family.dir().to_path_buf();
+        let guard = aft_store::spill::WriteGuard::new(move || {
+            check_disk_floor_at(&dir).map_err(std::io::Error::other)
+        });
+        let mut config = aft_store::spill::Config::new(256 << 20);
+        // A wide merge keeps ordinary large builds at one 25-byte run copy
+        // per term while its readers still fit well inside the fixed budget.
+        config.fan_in = 128;
+        sections.stream(
+            aft_store::graph::GraphSectionsSpill::new(workspace, config, guard).map_err(
+                |error| {
+                    self.check_disk_floor()
+                        .err()
+                        .unwrap_or_else(|| DataError::Store(error.to_string()))
+                },
+            )?,
+        );
         let _census = super::callgraph::resolve_checkout_into(
             &mut inputs,
             self.layer.threads,
@@ -1756,7 +1777,11 @@ impl Checkout {
                     .map_err(crate::callgraph_store::join::ManifestJoinError::Parse)
             },
         )
-        .map_err(|error| DataError::Resolve(error.to_string()))?;
+        .map_err(|error| {
+            self.check_disk_floor()
+                .err()
+                .unwrap_or_else(|| DataError::Resolve(error.to_string()))
+        })?;
         report.resolve_ms = elapsed_ms(started);
         checkpoint()?;
 
@@ -1786,7 +1811,11 @@ impl Checkout {
             .map_err(DataError::store)?;
         let fragments = sections
             .finish(pending.writer(), measure.then_some(&mut report.memory))
-            .map_err(DataError::Store)?;
+            .map_err(|error| {
+                self.check_disk_floor()
+                    .err()
+                    .unwrap_or(DataError::Store(error))
+            })?;
         let segment = session.finish_segment(pending).map_err(DataError::store)?;
         report.write_ms = elapsed_ms(started);
 
@@ -2089,22 +2118,27 @@ impl Checkout {
     /// at most 32 GiB. A disk whose free space cannot be measured is refused
     /// too, as an error rather than a pause.
     fn check_disk_floor(&self) -> Result<(), DataError> {
-        let dir = self.family.dir();
-        let Some((free, capacity)) = crate::disk_floor::free_space(dir) else {
-            return Err(DataError::Store(format!(
-                "the free space on the disk holding {} could not be measured",
-                dir.display()
-            )));
-        };
-        let floor = crate::disk_floor::free_disk_floor(capacity);
-        if free >= floor {
-            return Ok(());
-        }
-        Err(DataError::DiskFloor(crate::view_storage_reserve::message(
-            free, floor,
-        )))
+        check_disk_floor_at(self.family.dir())
     }
+}
 
+fn check_disk_floor_at(dir: &Path) -> Result<(), DataError> {
+    let Some((free, capacity)) = crate::disk_floor::free_space(dir) else {
+        return Err(DataError::Store(format!(
+            "the free space on the disk holding {} could not be measured",
+            dir.display()
+        )));
+    };
+    let floor = crate::disk_floor::free_disk_floor(capacity);
+    if free >= floor {
+        return Ok(());
+    }
+    Err(DataError::DiskFloor(crate::view_storage_reserve::message(
+        free, floor,
+    )))
+}
+
+impl Checkout {
     /// Scans the checkout's text only, then publishes and serves a state
     /// that names no call-graph fragments, so text queries can start while
     /// the call graph builds. Returns `false` when another process published

@@ -12,11 +12,12 @@ use super::{Error, corrupt};
 use crate::Digest128;
 
 const MARKER: &[u8; 8] = b"AFTSPILL";
-const MANIFEST: &[u8; 8] = b"AFTSPMF1";
+const MANIFEST: &[u8; 8] = b"AFTSPMF2";
 const PREFIX: &str = "aft-spill-";
 
 #[derive(Debug)]
 pub(super) struct Workspace {
+    pub(super) guard: Option<super::WriteGuard>,
     pub(super) path: PathBuf,
     pub(super) next_id: u64,
     pub(super) retain: bool,
@@ -52,6 +53,7 @@ impl Workspace {
             }
         };
         let mut this = Self {
+            guard: None,
             path,
             next_id: 0,
             retain: false,
@@ -71,6 +73,7 @@ impl Workspace {
             return Err(corrupt(path, "not a spill workspace"));
         }
         let this = Self {
+            guard: None,
             path: path.to_owned(),
             next_id: 0,
             retain: false,
@@ -94,6 +97,9 @@ impl Workspace {
     }
 
     pub(super) fn publish(&mut self, runs: &[RunMeta], sequence: u64) -> Result<(), Error> {
+        if let Some(guard) = &self.guard {
+            guard.check()?;
+        }
         let next = self.generation.checked_add(1).ok_or(Error::Overflow)?;
         let final_path = self.path.join(format!("manifest-{next:020}.ready"));
         let partial = final_path.with_extension("part");
@@ -177,7 +183,7 @@ impl Workspace {
             });
         }
         let expected_len = (count as u64)
-            .checked_mul(48)
+            .checked_mul(56)
             .and_then(|n| n.checked_add(56))
             .ok_or(Error::Overflow)?;
         if file.metadata()?.len() != expected_len {
@@ -188,7 +194,7 @@ impl Workspace {
         self.next_id = u64_at(&header, 16);
         *sequence = u64_at(&header, 8);
         for _ in 0..count {
-            let mut bytes = [0; 48];
+            let mut bytes = [0; 56];
             exact(&mut file, &mut bytes, &path)?;
             hash.update(&bytes);
             let run = RunMeta::decode(&bytes);

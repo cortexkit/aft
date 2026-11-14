@@ -33,6 +33,26 @@ use manifest::Workspace;
 use memory::{Buffer, Memory};
 use run::{Merge, RunMeta, Writer};
 
+/// Caller policy checked before disk writes, including intermediate merges.
+#[derive(Clone)]
+pub struct WriteGuard(std::sync::Arc<dyn Fn() -> io::Result<()> + Send + Sync>);
+
+impl std::fmt::Debug for WriteGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WriteGuard")
+    }
+}
+
+impl WriteGuard {
+    pub fn new(check: impl Fn() -> io::Result<()> + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(check))
+    }
+
+    pub fn check(&self) -> io::Result<()> {
+        (self.0)()
+    }
+}
+
 /// Resource limits for one sort. Buffers are not shared between sorts.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
@@ -163,10 +183,24 @@ pub struct Sorter {
     runs: Buffer<RunMeta>,
     tail: Option<Tail>,
     sequence: u64,
+    fixed_key_bytes: usize,
 }
 
 impl Sorter {
     pub fn new(root: &Path, config: Config) -> Result<Self, Error> {
+        Self::create(root, config, 0)
+    }
+
+    /// Sort fixed-width keys without values or per-record disk framing. Equal
+    /// keys are identical records; checksummed blocks still detect torn writes.
+    pub fn fixed_keys(root: &Path, config: Config, bytes: usize) -> Result<Self, Error> {
+        if bytes == 0 {
+            return Err(Error::Config("fixed key width must be nonzero"));
+        }
+        Self::create(root, config, bytes)
+    }
+
+    fn create(root: &Path, config: Config, fixed_key_bytes: usize) -> Result<Self, Error> {
         let config = config.validate()?;
         let memory = Memory::new(config.memory_budget);
         // A u64 sequence has at most 64 levels in any radix >= 2.
@@ -182,6 +216,7 @@ impl Sorter {
             runs,
             tail: None,
             sequence: 0,
+            fixed_key_bytes,
         })
     }
 
@@ -202,6 +237,7 @@ impl Sorter {
             runs,
             tail: None,
             sequence: 0,
+            fixed_key_bytes: 0,
         };
         let result = this
             .workspace
@@ -209,11 +245,28 @@ impl Sorter {
             .expect("workspace")
             .load(&mut this.runs, &mut this.sequence);
         this.checked(result)?;
+        if let Some(run) = this.runs.first() {
+            this.fixed_key_bytes =
+                usize::try_from(run.fixed_key_bytes).map_err(|_| Error::Overflow)?;
+            if this
+                .runs
+                .iter()
+                .any(|run| run.fixed_key_bytes as usize != this.fixed_key_bytes)
+            {
+                return Err(Error::Config("mixed record formats in spill"));
+            }
+        }
         Ok(this)
     }
 
     pub fn stats(&self) -> Stats {
         self.memory.stats()
+    }
+
+    pub fn set_write_guard(&mut self, guard: WriteGuard) -> Result<(), Error> {
+        guard.check()?;
+        self.workspace.as_mut().ok_or(Error::Failed)?.guard = Some(guard);
+        Ok(())
     }
 
     pub fn directory(&self) -> Option<&Path> {
@@ -241,6 +294,11 @@ impl Sorter {
     fn push_inner(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error> {
         if self.workspace.is_none() {
             return Err(Error::Failed);
+        }
+        if self.fixed_key_bytes != 0 && (key.len() != self.fixed_key_bytes || !value.is_empty()) {
+            return Err(Error::Config(
+                "fixed records require exactly one fixed-width key",
+            ));
         }
         let len = key.len().checked_add(value.len()).ok_or(Error::Overflow)?;
         if self.tail.is_none() {
@@ -295,7 +353,12 @@ impl Sorter {
         }
         tail.sort();
         let workspace = self.workspace.as_mut().ok_or(Error::Failed)?;
-        let mut writer = Writer::new(workspace, self.config.buffer_bytes, &self.memory)?;
+        let mut writer = Writer::new(
+            workspace,
+            self.config.buffer_bytes,
+            &self.memory,
+            self.fixed_key_bytes,
+        )?;
         for entry in tail.entries.iter() {
             writer.record(
                 &tail.bytes[entry.start..entry.start + entry.key_len],
@@ -362,7 +425,12 @@ impl Sorter {
                 self.config.buffer_bytes,
                 &self.memory,
             )?;
-            let mut writer = Writer::new(workspace, self.config.buffer_bytes, &self.memory)?;
+            let mut writer = Writer::new(
+                workspace,
+                self.config.buffer_bytes,
+                &self.memory,
+                self.fixed_key_bytes,
+            )?;
             while let Some(record) = merge.next_record()? {
                 writer.record(record.key, record.value, record.sequence)?;
             }

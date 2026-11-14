@@ -26,6 +26,9 @@
 
 use std::collections::BTreeMap;
 
+mod spill;
+pub use spill::{GraphSectionsSpill, PackedFragment};
+
 use crate::ids::Digest128;
 use crate::packed::{self, PackedBuilder};
 use crate::postings::{BLOCK_ENTRIES, PostingCursor, PostingLayout, PostingList, PostingsBuilder};
@@ -652,6 +655,131 @@ mod tests {
         }
         writer.finish().unwrap();
         open(path)
+    }
+
+    #[test]
+    fn streamed_sections_equal_buffered_with_ordering_and_leave_out() {
+        use crate::family::Family;
+        use crate::spill::{Config, WriteGuard};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Family::open(&dir.path().join("store"), family()).unwrap();
+        let workspace = store
+            .try_write()
+            .unwrap()
+            .unwrap()
+            .create_build_workspace()
+            .unwrap();
+        let scratch = workspace.path().to_path_buf();
+        let mut config = Config::new(128 * 1024);
+        config.buffer_bytes = 1024;
+        config.fan_in = 2;
+        let mut streamed =
+            GraphSectionsSpill::new(workspace, config, WriteGuard::new(|| Ok(()))).unwrap();
+        let mut buffered = GraphSectionsBuilder::new();
+        for n in (0..100u8).rev() {
+            let bytes = vec![n; 16000 + usize::from(n)];
+            let slice = if n % 2 == 0 { vec![n; 1000] } else { vec![] };
+            let terms = TermKind::ALL
+                .into_iter()
+                .flat_map(|kind| {
+                    [
+                        (kind, b"shared".as_slice()),
+                        (kind, bytes.as_slice()),
+                        (kind, bytes.as_slice()),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            streamed
+                .add(
+                    key(n),
+                    PackedFragment::new(&bytes, &slice, terms.iter().copied()),
+                )
+                .unwrap();
+            buffered.add_with_slice(key(n), bytes.clone(), slice.clone(), terms.iter().copied());
+            // Duplicate pushes must keep the original bytes and term set.
+            streamed
+                .add(
+                    key(n),
+                    PackedFragment::new(
+                        b"wrong",
+                        b"wrong",
+                        [(TermKind::CallTarget, b"wrong".as_slice())],
+                    ),
+                )
+                .unwrap();
+        }
+        streamed.retain(|fragment| fragment != key(19));
+        buffered.retain(|fragment| fragment != key(19));
+        let expected = write(&dir.path().join("buffered"), Some(buffered));
+        let path = dir.path().join("streamed");
+        let mut writer = create(&path);
+        streamed.write(&mut writer).unwrap();
+        writer.finish().unwrap();
+        assert!(
+            !scratch.exists(),
+            "successful writes remove all spill files"
+        );
+        let actual = open(&path);
+        actual.verify().unwrap();
+        assert_eq!(expected.sections().count(), actual.sections().count());
+        for (section, info) in expected.sections() {
+            let other = actual.section(info.id).unwrap();
+            assert_eq!(info.item_count, actual.info(other).item_count);
+            assert_eq!(
+                expected.read_range(section, 0, info.len as usize).unwrap(),
+                actual.read_range(other, 0, info.len as usize).unwrap(),
+                "section {:?}",
+                info.id
+            );
+        }
+        let graph = GraphSegment::open(&actual).unwrap().unwrap();
+        assert!(graph.find(key(19)).unwrap().is_none());
+        assert!(
+            graph
+                .candidates(TermKind::CallTarget, b"wrong")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn streamed_output_refuses_disk_floor_and_cleans_up_on_error() {
+        use crate::family::Family;
+        use crate::spill::{Config, WriteGuard};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Family::open(&dir.path().join("store"), family()).unwrap();
+        let workspace = store
+            .try_write()
+            .unwrap()
+            .unwrap()
+            .create_build_workspace()
+            .unwrap();
+        let scratch = workspace.path().to_path_buf();
+        let low = Arc::new(AtomicBool::new(false));
+        let check = low.clone();
+        let guard = WriteGuard::new(move || {
+            if check.load(Ordering::Relaxed) {
+                Err(std::io::Error::other("disk floor"))
+            } else {
+                Ok(())
+            }
+        });
+        let mut spill = GraphSectionsSpill::new(workspace, Config::new(1 << 20), guard).unwrap();
+        low.store(true, Ordering::Relaxed);
+        assert!(
+            spill
+                .add(key(1), PackedFragment::new(b"data", b"slice", []))
+                .unwrap_err()
+                .to_string()
+                .contains("disk floor")
+        );
+        assert_eq!(
+            std::fs::metadata(scratch.join("fragments")).unwrap().len(),
+            0
+        );
+        drop(spill);
+        assert!(!scratch.exists());
     }
 
     /// Graph sections holding one fragment and one call-target term, `t`,

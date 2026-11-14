@@ -1,0 +1,302 @@
+//! Stream immutable graph output; only the file table and sort budget grow
+//! resident. Terms use the shared checksummed external sorter.
+
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+
+use super::{
+    DATA, FragmentKey, INDEX, SLICE_DATA, SLICE_INDEX, TERM_LOOKUP, TERM_POSTINGS, TermKind,
+    UNIT_KEY_SPACE, UNITS, layout, slice_spec, spec, term_hash,
+};
+use crate::family::BuildWorkspace;
+use crate::ids::Digest128;
+use crate::packed::{PackedCopy, StoredUnit};
+use crate::postings::PostingsBuilder;
+use crate::segment::{ErrorKind, SegmentError, SegmentWriter};
+use crate::spill::{Config, Sorter, WriteGuard};
+use crate::table::{LookupTableBuilder, UnitLocation, UnitTableBuilder};
+
+/// Packed on the resolver thread, before the append lock is taken.
+pub struct PackedFragment {
+    data: StoredUnit,
+    slice: StoredUnit,
+    terms: Vec<(TermKind, u64)>,
+}
+
+impl PackedFragment {
+    pub fn new<'a>(
+        bytes: &[u8],
+        slice: &[u8],
+        terms: impl IntoIterator<Item = (TermKind, &'a [u8])>,
+    ) -> Self {
+        let mut terms = terms
+            .into_iter()
+            .map(|(kind, term)| (kind, term_hash(term)))
+            .collect::<Vec<_>>();
+        terms.sort_unstable();
+        terms.dedup();
+        Self {
+            data: StoredUnit::packed(bytes),
+            slice: StoredUnit::packed(slice),
+            terms,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Placed {
+    offset: u64,
+    data: (u8, u32, u32),
+    slice: (u8, u32, u32),
+}
+
+/// Private scratch is removed on drop; the family reaps crash-left scratch on
+/// its next writer session without removing another active builder's files.
+pub struct GraphSectionsSpill {
+    data: BufWriter<File>,
+    terms: Option<Sorter>,
+    units: BTreeMap<FragmentKey, Placed>,
+    len: u64,
+    guard: WriteGuard,
+    workspace: BuildWorkspace,
+}
+
+impl GraphSectionsSpill {
+    pub fn new(
+        workspace: BuildWorkspace,
+        config: Config,
+        guard: WriteGuard,
+    ) -> Result<Self, crate::spill::Error> {
+        guard.check()?;
+        let data = BufWriter::new(crate::fs::create_new_private(
+            &workspace.path().join("fragments"),
+        )?);
+        let mut terms = Sorter::fixed_keys(workspace.path(), config, 25)?;
+        terms.set_write_guard(guard.clone())?;
+        Ok(Self {
+            data,
+            terms: Some(terms),
+            units: BTreeMap::new(),
+            len: 0,
+            guard,
+            workspace,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.units.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.units.is_empty()
+    }
+
+    pub fn held_bytes(&self) -> usize {
+        crate::heap::btree_bytes(
+            self.units.len(),
+            std::mem::size_of::<(FragmentKey, Placed)>(),
+        ) + self
+            .terms
+            .as_ref()
+            .map_or(0, |terms| terms.stats().buffered_bytes)
+    }
+
+    /// Keys omitted after resolution are also filtered out of the term merge.
+    /// The packed bytes need not be rewritten or retained in memory.
+    pub fn retain(&mut self, mut keep: impl FnMut(FragmentKey) -> bool) {
+        self.units.retain(|key, _| keep(*key));
+    }
+
+    pub fn add(
+        &mut self,
+        key: FragmentKey,
+        fragment: PackedFragment,
+    ) -> Result<(), crate::spill::Error> {
+        if self.units.contains_key(&key) {
+            return Ok(());
+        }
+        let (dc, du, data) = fragment.data.parts();
+        let (sc, su, slice) = fragment.slice.parts();
+        self.guard.check()?;
+        for bytes in [data, slice] {
+            for chunk in bytes.chunks(1 << 20) {
+                self.guard.check()?;
+                self.data.write_all(chunk)?;
+            }
+        }
+        self.units.insert(
+            key,
+            Placed {
+                offset: self.len,
+                data: (
+                    dc,
+                    du,
+                    u32::try_from(data.len()).map_err(|_| crate::spill::Error::Overflow)?,
+                ),
+                slice: (
+                    sc,
+                    su,
+                    u32::try_from(slice.len()).map_err(|_| crate::spill::Error::Overflow)?,
+                ),
+            },
+        );
+        self.len += (data.len() + slice.len()) as u64;
+        for (kind, hash) in fragment.terms {
+            let mut record = [0; 25];
+            record[0] = u8::try_from(
+                TermKind::ALL
+                    .iter()
+                    .position(|k| *k == kind)
+                    .expect("known kind"),
+            )
+            .expect("few kinds");
+            record[1..9].copy_from_slice(&hash.to_be_bytes());
+            record[9..].copy_from_slice(key.digest().as_bytes());
+            self.terms.as_mut().expect("sorter").push(&record, &[])?;
+        }
+        Ok(())
+    }
+
+    pub fn write(mut self, writer: &mut SegmentWriter) -> Result<(), SegmentError> {
+        self.write_inner(writer)
+            .map_err(|e| SegmentError::new(self.workspace.path(), ErrorKind::Io(e)))
+    }
+
+    fn write_inner(&mut self, writer: &mut SegmentWriter) -> io::Result<()> {
+        self.data.flush()?;
+        let keys = self.units.keys().copied().collect::<Vec<_>>();
+        let count = keys.len() as u64;
+        let mut table = UnitTableBuilder::new(Digest128::LEN);
+        for key in &keys {
+            table.push(key.digest().as_bytes(), UnitLocation { offset: 0, len: 0 });
+        }
+        let (table, units) = table.finish();
+        self.guard.check()?;
+        writer
+            .write_section(spec(UNITS, UNIT_KEY_SPACE), &table, units)
+            .map_err(io::Error::other)?;
+        let mut source = BufReader::new(crate::fs::open_read(
+            &self.workspace.path().join("fragments"),
+        )?);
+        for slices in [false, true] {
+            writer
+                .begin_section(if slices {
+                    slice_spec(SLICE_DATA)
+                } else {
+                    spec(DATA, UNIT_KEY_SPACE)
+                })
+                .map_err(io::Error::other)?;
+            let mut copy = PackedCopy::with_capacity(keys.len());
+            for placed in self.units.values() {
+                self.guard.check()?;
+                let (codec, unpacked, len) = if slices { placed.slice } else { placed.data };
+                let offset = placed.offset + if slices { u64::from(placed.data.2) } else { 0 };
+                source.seek(SeekFrom::Start(offset))?;
+                let mut bytes = vec![0; len as usize];
+                source.read_exact(&mut bytes)?;
+                copy.push(writer, &StoredUnit::from_parts(codec, unpacked, bytes))
+                    .map_err(io::Error::other)?;
+            }
+            writer.end_section(count).map_err(io::Error::other)?;
+            writer
+                .write_section(
+                    if slices {
+                        slice_spec(SLICE_INDEX)
+                    } else {
+                        spec(INDEX, UNIT_KEY_SPACE)
+                    },
+                    &copy.finish(),
+                    count,
+                )
+                .map_err(io::Error::other)?;
+        }
+        self.write_terms(writer, &keys)
+    }
+
+    fn write_terms(&mut self, writer: &mut SegmentWriter, keys: &[FragmentKey]) -> io::Result<()> {
+        let mut sorted = self
+            .terms
+            .take()
+            .expect("sorter")
+            .finish()
+            .map_err(io::Error::other)?;
+        let next = |sorted: &mut crate::spill::SortedRecords| -> io::Result<Option<[u8; 25]>> {
+            sorted
+                .next_record()
+                .map_err(io::Error::other)?
+                .map(|record| record.key.try_into().map_err(io::Error::other))
+                .transpose()
+        };
+        let lookup_path = self.workspace.path().join("lookup");
+        let mut lookup_file = BufWriter::new(crate::fs::create_new_private(&lookup_path)?);
+        let mut record = next(&mut sorted)?;
+        let mut ordinals = Vec::new();
+        for (index, kind) in TermKind::ALL.into_iter().enumerate() {
+            lookup_file.get_mut().set_len(0)?;
+            lookup_file.seek(SeekFrom::Start(0))?;
+            let mut postings = PostingsBuilder::new(layout());
+            let mut lookup = LookupTableBuilder::new();
+            let mut current = None;
+            self.guard.check()?;
+            writer
+                .begin_section(spec(TERM_POSTINGS, kind.key_space()))
+                .map_err(io::Error::other)?;
+            while let Some(bytes) = record {
+                if usize::from(bytes[0]) != index {
+                    break;
+                }
+                let hash = u64::from_be_bytes(bytes[1..9].try_into().expect("hash"));
+                let key = FragmentKey::from_digest(Digest128::from_bytes(
+                    bytes[9..].try_into().expect("key"),
+                ));
+                record = next(&mut sorted)?;
+                // Shared fragments remain in the checkout's key map, but not
+                // this segment's unit table or any of its posting lists.
+                let Ok(ordinal) = keys.binary_search(&key) else {
+                    continue;
+                };
+                if current != Some(hash) {
+                    if let Some(term) = current {
+                        self.guard.check()?;
+                        lookup.push(term, postings.add_list(&ordinals, &[]));
+                        if lookup.held() >= 64 * 1024 {
+                            lookup_file.write_all(&lookup.drain())?;
+                        }
+                        if postings.held() >= 64 * 1024 {
+                            writer.write(&postings.drain()).map_err(io::Error::other)?;
+                        }
+                        ordinals.clear();
+                    }
+                    current = Some(hash);
+                }
+                ordinals.push(u32::try_from(ordinal).map_err(io::Error::other)?);
+            }
+            if let Some(term) = current {
+                self.guard.check()?;
+                lookup.push(term, postings.add_list(&ordinals, &[]));
+                ordinals.clear();
+            }
+            let (rest, entries) = postings.finish();
+            writer.write(&rest).map_err(io::Error::other)?;
+            writer.end_section(entries).map_err(io::Error::other)?;
+            let (rest, terms) = lookup.finish();
+            lookup_file.write_all(&rest)?;
+            lookup_file.flush()?;
+            let mut source = BufReader::new(crate::fs::open_read(&lookup_path)?);
+            writer
+                .begin_section(spec(TERM_LOOKUP, kind.key_space()))
+                .map_err(io::Error::other)?;
+            let mut buffer = [0; 64 * 1024];
+            loop {
+                let n = source.read(&mut buffer)?;
+                if n == 0 {
+                    break;
+                }
+                self.guard.check()?;
+                writer.write(&buffer[..n]).map_err(io::Error::other)?;
+            }
+            writer.end_section(terms).map_err(io::Error::other)?;
+        }
+        Ok(())
+    }
+}

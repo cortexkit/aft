@@ -275,6 +275,15 @@ impl LookupTableBuilder {
     pub fn finish(self) -> (Vec<u8>, u64) {
         (self.bytes, self.count)
     }
+
+    /// Hands off completed entries while preserving key ordering and count.
+    pub fn drain(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.bytes)
+    }
+
+    pub fn held(&self) -> usize {
+        self.bytes.len()
+    }
 }
 
 /// A lookup table in an open segment.
