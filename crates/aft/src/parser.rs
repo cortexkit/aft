@@ -10159,7 +10159,7 @@ mod tests {
                 std::thread::spawn(move || {
                     HEADER_PARSE_ON_MISS.with(|hook| {
                         *hook.borrow_mut() = Some(Box::new(move || {
-                            ready.send(HEADER_PARSE_CACHE.try_lock().is_ok()).unwrap();
+                            ready.send(()).unwrap();
                             wait.recv_timeout(std::time::Duration::from_secs(10))
                                 .unwrap();
                         }));
@@ -10172,6 +10172,8 @@ mod tests {
                 })
             })
             .collect();
+        // Both cold misses must reach this rendezvous before either parses. A
+        // retained cache lock would prevent the second worker from getting here.
         let unlocked: Vec<_> = (0..2)
             .map(|_| started.recv_timeout(std::time::Duration::from_secs(5)))
             .collect();
@@ -10182,7 +10184,7 @@ mod tests {
             .into_iter()
             .map(|worker| worker.join().unwrap())
             .collect();
-        assert!(unlocked.into_iter().all(|result| result == Ok(true)));
+        assert!(unlocked.into_iter().all(|result| result == Ok(())));
         assert_eq!(results[0], results[1]);
         assert_eq!(results[0].1, LangId::ObjC);
     }
