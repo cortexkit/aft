@@ -208,7 +208,8 @@ impl Sorter {
             config.fan_in.checked_mul(64).ok_or(Error::Overflow)?,
             &memory,
         )?;
-        let workspace = Workspace::create(root, &memory)?;
+        let mut workspace = Workspace::create(root, &memory)?;
+        workspace.fixed_key_bytes = fixed_key_bytes as u64;
         Ok(Self {
             workspace: Some(workspace),
             config,
@@ -245,17 +246,9 @@ impl Sorter {
             .expect("workspace")
             .load(&mut this.runs, &mut this.sequence);
         this.checked(result)?;
-        if let Some(run) = this.runs.first() {
-            this.fixed_key_bytes =
-                usize::try_from(run.fixed_key_bytes).map_err(|_| Error::Overflow)?;
-            if this
-                .runs
-                .iter()
-                .any(|run| run.fixed_key_bytes as usize != this.fixed_key_bytes)
-            {
-                return Err(Error::Config("mixed record formats in spill"));
-            }
-        }
+        this.fixed_key_bytes =
+            usize::try_from(this.workspace.as_ref().expect("workspace").fixed_key_bytes)
+                .map_err(|_| Error::Overflow)?;
         Ok(this)
     }
 

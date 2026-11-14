@@ -25,12 +25,12 @@ impl BuildWorkspace {
             builder
         };
         builder.create(&path)?;
-        let lock = crate::fs::create_new_private(&path.join("owner"))?;
-        lock.lock()?;
-        Ok(Self {
-            lock: Some(lock),
-            path,
-        })
+        let mut workspace = Self { lock: None, path };
+        workspace.lock = Some(crate::fs::create_new_private(
+            &workspace.path.join("owner"),
+        )?);
+        workspace.lock.as_ref().expect("owner").lock()?;
+        Ok(workspace)
     }
 
     pub fn path(&self) -> &Path {

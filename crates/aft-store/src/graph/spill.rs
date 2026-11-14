@@ -18,6 +18,7 @@ use crate::spill::{Config, Sorter, WriteGuard};
 use crate::table::{LookupTableBuilder, UnitLocation, UnitTableBuilder};
 
 /// Packed on the resolver thread, before the append lock is taken.
+#[derive(Debug)]
 pub struct PackedFragment {
     data: StoredUnit,
     slice: StoredUnit,
@@ -44,7 +45,7 @@ impl PackedFragment {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct Placed {
     offset: u64,
     data: (u8, u32, u32),
@@ -53,6 +54,7 @@ struct Placed {
 
 /// Private scratch is removed on drop; the family reaps crash-left scratch on
 /// its next writer session without removing another active builder's files.
+#[derive(Debug)]
 pub struct GraphSectionsSpill {
     data: BufWriter<File>,
     terms: Option<Sorter>,
@@ -257,12 +259,13 @@ impl GraphSectionsSpill {
                 };
                 if current != Some(hash) {
                     if let Some(term) = current {
-                        self.guard.check()?;
                         lookup.push(term, postings.add_list(&ordinals, &[]));
                         if lookup.held() >= 64 * 1024 {
+                            self.guard.check()?;
                             lookup_file.write_all(&lookup.drain())?;
                         }
                         if postings.held() >= 64 * 1024 {
+                            self.guard.check()?;
                             writer.write(&postings.drain()).map_err(io::Error::other)?;
                         }
                         ordinals.clear();

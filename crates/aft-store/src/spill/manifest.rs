@@ -18,6 +18,7 @@ const PREFIX: &str = "aft-spill-";
 #[derive(Debug)]
 pub(super) struct Workspace {
     pub(super) guard: Option<super::WriteGuard>,
+    pub(super) fixed_key_bytes: u64,
     pub(super) path: PathBuf,
     pub(super) next_id: u64,
     pub(super) retain: bool,
@@ -54,6 +55,7 @@ impl Workspace {
         };
         let mut this = Self {
             guard: None,
+            fixed_key_bytes: 0,
             path,
             next_id: 0,
             retain: false,
@@ -74,6 +76,7 @@ impl Workspace {
         }
         let this = Self {
             guard: None,
+            fixed_key_bytes: 0,
             path: path.to_owned(),
             next_id: 0,
             retain: false,
@@ -104,12 +107,13 @@ impl Workspace {
         let final_path = self.path.join(format!("manifest-{next:020}.ready"));
         let partial = final_path.with_extension("part");
         let mut file = crate::fs::create_new_private(&partial)?;
-        let mut header = [0; 40];
+        let mut header = [0; 48];
         header[..8].copy_from_slice(MANIFEST);
         header[8..16].copy_from_slice(&sequence.to_le_bytes());
         header[16..24].copy_from_slice(&self.next_id.to_le_bytes());
         header[24..32].copy_from_slice(&(runs.len() as u64).to_le_bytes());
         header[32..40].copy_from_slice(&next.to_le_bytes());
+        header[40..48].copy_from_slice(&self.fixed_key_bytes.to_le_bytes());
         let mut hash = blake3::Hasher::new();
         self.write(&mut file, &mut hash, &header)?;
         for run in runs {
@@ -169,7 +173,7 @@ impl Workspace {
         }
         let path = self.path.join(format!("manifest-{latest:020}.ready"));
         let mut file = crate::fs::open_read(&path)?;
-        let mut header = [0; 40];
+        let mut header = [0; 48];
         exact(&mut file, &mut header, &path)?;
         if &header[..8] != MANIFEST || u64_at(&header, 32) != latest {
             return Err(corrupt(&path, "manifest header mismatch"));
@@ -184,7 +188,7 @@ impl Workspace {
         }
         let expected_len = (count as u64)
             .checked_mul(56)
-            .and_then(|n| n.checked_add(56))
+            .and_then(|n| n.checked_add(64))
             .ok_or(Error::Overflow)?;
         if file.metadata()?.len() != expected_len {
             return Err(corrupt(&path, "manifest length mismatch"));
@@ -193,6 +197,7 @@ impl Workspace {
         hash.update(&header);
         self.next_id = u64_at(&header, 16);
         *sequence = u64_at(&header, 8);
+        self.fixed_key_bytes = u64_at(&header, 40);
         for _ in 0..count {
             let mut bytes = [0; 56];
             exact(&mut file, &mut bytes, &path)?;
@@ -203,6 +208,7 @@ impl Workspace {
                 || run.block_bytes == 0
                 || run.records == 0
                 || run.max_record > run.payload
+                || run.fixed_key_bytes != self.fixed_key_bytes
                 || runs.iter().any(|r| r.id == run.id)
             {
                 return Err(corrupt(&path, "invalid manifest run metadata"));

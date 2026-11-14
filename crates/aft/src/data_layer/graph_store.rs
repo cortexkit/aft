@@ -276,6 +276,10 @@ impl GraphOutput {
 }
 
 impl<'i> SectionsWriter<'i> {
+    #[cfg(test)]
+    pub(super) fn keys_for_test(&self) -> &BTreeMap<String, FragmentKey> {
+        &self.keys
+    }
     /// A writer for the files of a checkout in `state`, taking their content
     /// records from `records`, or from `encoded` when given (see
     /// [`write_sections`]).

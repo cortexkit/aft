@@ -326,7 +326,8 @@ fn spill_large_variable_records_cross_blocks_and_owned_outputs_fit() {
 #[test]
 fn spill_insufficient_merge_budget_fails_instead_of_exceeding_limit() {
     let root = tempfile::tempdir().unwrap();
-    let cfg = config(12 * 1024);
+    // Keep the arena unchanged when the durable run descriptor gains fields.
+    let cfg = config(128 * std::mem::size_of::<run::RunMeta>() + 6 * 1024);
     let mut sorter = Sorter::new(root.path(), cfg).unwrap();
     // One large record fits the arena, but two heads plus readers do not fit
     // alongside metadata. Neither intermediate passes nor finish may overshoot.
@@ -469,4 +470,10 @@ fn fixed_keys_are_compact_checked_and_resumable() {
     let mut sorter = Sorter::fixed_keys(root.path(), config, 25).unwrap();
     assert!(sorter.push(&[0; 24], &[]).is_err());
     assert!(sorter.directory().is_none());
+    let empty = Sorter::fixed_keys(root.path(), config, 25)
+        .unwrap()
+        .checkpoint()
+        .unwrap();
+    let mut sorter = Sorter::resume(&empty.directory, config).unwrap();
+    assert!(sorter.push(&[0; 24], &[]).is_err());
 }
