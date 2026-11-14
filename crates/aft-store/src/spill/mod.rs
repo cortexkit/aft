@@ -219,7 +219,8 @@ impl Sorter {
     ) -> Result<Self, Error> {
         let config = config.validate()?;
         let memory = Memory::new(config.memory_budget);
-        // A u64 sequence has at most 64 levels in any radix >= 2.
+        // The merge fan-in is at least 2, so the u64 input sequence bounds
+        // the number of run levels to 64.
         let runs = Buffer::new(
             config.fan_in.checked_mul(64).ok_or(Error::Overflow)?,
             &memory,
