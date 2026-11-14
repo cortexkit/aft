@@ -403,9 +403,6 @@ pub(crate) fn disclose_index_gaps(
         return;
     };
     let fence = crate::context::confinement::capture();
-    for view in &views {
-        disclose_parse_gaps(view, roots, response);
-    }
     let mut count = 0;
     let mut gaps = Vec::new();
     let mut lines = Vec::new();

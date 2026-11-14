@@ -3,6 +3,12 @@
 use crate::callgraph_store::join::ManifestJoinError;
 use crate::error::AftError;
 
+const CALLGRAPH_OFF_MEANING: &str = "Luau files are skipped by meaning search because the call-graph index is off (indexes.callgraph: false).";
+
+pub(crate) fn meaning_callgraph_off_reason() -> String {
+    serde_json::json!({"code": "callgraph_off", "language": "luau", "state": "callgraph_off", "message": CALLGRAPH_OFF_MEANING}).to_string()
+}
+
 pub(crate) fn prepare(
     ctx: &crate::context::AppContext,
     path: &std::path::Path,
@@ -84,6 +90,14 @@ pub(super) fn current_reason(stored: &str) -> String {
         }
     }
     stored.to_string()
+}
+
+pub(crate) fn gap_value(stored: &str, path: &std::path::Path) -> Option<serde_json::Value> {
+    let reason = current_reason(stored);
+    let mut value: serde_json::Value = serde_json::from_str(&reason).ok()?;
+    value["message"] = message(&reason, path)?.into();
+    value["path"] = serde_json::json!(path);
+    Some(value)
 }
 
 pub(super) fn extract(

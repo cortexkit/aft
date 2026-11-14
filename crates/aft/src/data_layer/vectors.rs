@@ -311,11 +311,10 @@ fn store_error(error: impl std::fmt::Display + 'static) -> DataError {
 /// search applies to is in exactly one of the file counts.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Coverage {
-    /// Files whose grammar or per-file parse is unavailable, not fill failures.
+    /// Files excluded by parsing availability or configuration, not fill failures.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped_parses: Vec<(PathBuf, String)>,
-    /// Member files meaning search applies to (today's semantic file
-    /// names and extensions).
+    /// Member files considered for meaning search, including named exclusions.
     pub files: usize,
     /// Files whose every chunk has a vector or a recorded failure,
     /// files with no chunks included.
@@ -338,8 +337,8 @@ pub struct Coverage {
 }
 
 impl Coverage {
-    /// Whether every file meaning search applies to is accounted for:
-    /// embedded, too large, or failed with a reason.
+    /// Whether every source is accounted for without excluded parse paths or
+    /// unfilled work: embedded, too large, or failed with a reason.
     #[must_use]
     pub fn complete(&self) -> bool {
         self.pending.is_empty() && self.past_cap == 0 && self.skipped_parses.is_empty()
@@ -375,25 +374,37 @@ impl Surveyed {
 /// The member files of `state` meaning search applies to, in path order,
 /// each with its chunk map under `loaded`.
 fn survey(
-    state: &CheckoutState,
+    view: &CheckoutView,
     loaded: &Loaded,
     index: Option<&VectorIndex<'_>>,
     max_files: usize,
 ) -> Result<Vec<Surveyed>, DataError> {
+    let state = view.current_state();
     let mut files = Vec::new();
+    let mut applicable = 0;
     for record in state.paths() {
         if record.kind == PathKind::Symlink || !is_semantic_path(&record.path) {
             continue;
         }
-        let admitted = files.len() < max_files;
-        let map = match index {
+        let gap = if !view.planes().callgraph
+            && native_path(&record.path).is_some_and(|path| is_luau(&path))
+        {
+            Some(super::grammar::meaning_callgraph_off_reason())
+        } else {
+            state.skipped_parses().get(&record.path).cloned()
+        };
+        let admitted = gap.is_none() && applicable < max_files;
+        if gap.is_none() {
+            applicable += 1;
+        }
+        let map = match index.filter(|_| gap.is_none()) {
             Some(index) if record.kind.has_content() => {
                 loaded.chunk_map(index, record.content, &record.path)?
             }
             _ => None,
         };
         files.push(Surveyed {
-            gap: state.skipped_parses().get(&record.path).cloned(),
+            gap,
             path: record.path.clone(),
             kind: record.kind,
             content: record.content,
@@ -598,7 +609,7 @@ impl Members {
         #[cfg(test)]
         STATUS_MEMBER_BUILDS.with(|count| count.set(count.get() + 1));
         let index = loaded.shared.as_ref().map(SharedVectorIndex::index);
-        let surveyed = survey(view.current_state(), loaded, index.as_ref(), max_files)?;
+        let surveyed = survey(view, loaded, index.as_ref(), max_files)?;
         let absolute = |path: &[u8]| {
             view.root()
                 .join(native_path(path).expect("surveyed paths have a native form"))
@@ -1406,12 +1417,7 @@ impl VectorPlane {
         let mut loaded = self.load()?;
         let queue = {
             let index = loaded.shared.as_ref().map(SharedVectorIndex::index);
-            let surveyed = survey(
-                view.current_state(),
-                &loaded,
-                index.as_ref(),
-                self.max_files,
-            )?;
+            let surveyed = survey(&view, &loaded, index.as_ref(), self.max_files)?;
             report.files = surveyed.len();
             let mut queue = Vec::new();
             for file in surveyed {

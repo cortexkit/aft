@@ -514,6 +514,7 @@ fn luau_s4_callgraph_off_skips_luau_without_blocking_meaning_search() {
     assert!(result.coverage.skipped_parses[0].0.ends_with("source.luau"));
     let reason: Value = serde_json::from_str(&result.coverage.skipped_parses[0].1).unwrap();
     assert_eq!(reason["code"], "callgraph_off");
+    assert_eq!(reason["message"], "Luau files are skipped by meaning search because the call-graph index is off (indexes.callgraph: false).");
 }
 
 #[cfg(all(
