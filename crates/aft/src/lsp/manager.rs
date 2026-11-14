@@ -12924,7 +12924,7 @@ mod rust_initialization_options_tests {
         for (target, expected) in [
             (
                 serde_json::json!(true),
-                Some(root.join("base/rust-analyzer")),
+                Some(root.join("base").join("rust-analyzer")),
             ),
             (
                 serde_json::json!("custom-target"),
@@ -12960,7 +12960,10 @@ mod rust_initialization_options_tests {
         assert_eq!(options["cargo"]["targetDir"], true);
         assert_eq!(
             options["cargo"]["extraEnv"]["CARGO_BUILD_BUILD_DIR"],
-            root.join("base/rust-analyzer").to_string_lossy().as_ref()
+            root.join("base")
+                .join("rust-analyzer")
+                .to_string_lossy()
+                .as_ref()
         );
     }
 }
