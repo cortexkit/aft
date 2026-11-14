@@ -648,6 +648,9 @@ export function githubLayoutTests(installer: Installer): void {
               ...withoutInstall,
               autoInstall: true,
               versions: { "LuaLS/lua-language-server": version },
+              // The failed-smoke case needs the staged smoke to finish, not
+              // time out on a loaded machine and keep the bad install.
+              __smokeTimeoutMsForTests: 30_000,
             },
             fetchImpl,
           );
