@@ -27,6 +27,11 @@ pub(super) enum Reason {
     ProxyAuth,
     ConnectAuthority,
     TlsConfiguration,
+    ApprovalExpired,
+    ApprovalDeclined,
+    ApprovalWithdrawn,
+    ApprovalNotGranted,
+    ApprovalPendingAtDeadline,
 }
 
 impl Reason {
@@ -55,6 +60,11 @@ impl Reason {
             Self::ProxyAuth => "proxy_auth",
             Self::ConnectAuthority => "connect_authority",
             Self::TlsConfiguration => "tls_configuration",
+            Self::ApprovalExpired => "approval_expired",
+            Self::ApprovalDeclined => "approval_declined",
+            Self::ApprovalWithdrawn => "approval_withdrawn",
+            Self::ApprovalNotGranted => "approval_not_granted",
+            Self::ApprovalPendingAtDeadline => "approval_pending_at_deadline",
         }
     }
 }
@@ -62,6 +72,7 @@ impl Reason {
 pub(super) struct Refusal {
     pub(super) reason: Reason,
     pub(super) label: String,
+    pub(super) approval: Option<crate::secret::requests::ApprovalMetadata>,
 }
 
 impl Refusal {
@@ -73,11 +84,23 @@ impl Refusal {
         Self {
             reason,
             label: label.to_owned(),
+            approval: None,
         }
     }
 }
 
 pub(super) fn log_refusal(state: &State, reason: Reason, label: &str, host: &str) {
+    log_approval_refusal(state, reason, label, host, None, None);
+}
+
+pub(super) fn log_approval_refusal(
+    state: &State,
+    reason: Reason,
+    label: &str,
+    host: &str,
+    approval: Option<&crate::secret::requests::ApprovalMetadata>,
+    outcome: Option<&str>,
+) {
     // Even a syntactically valid label or host can spell an installed key.
     // Scrub the two permitted metadata fields and quote them to keep one line.
     let safe = |value: &str| {
@@ -87,12 +110,24 @@ pub(super) fn log_refusal(state: &State, reason: Reason, label: &str, host: &str
             .and_then(|bytes| String::from_utf8(bytes).ok())
             .unwrap_or_else(|| "[redacted]".into())
     };
-    let line = format!(
+    let mut line = format!(
         "secret proxy refused reason={} label={:?} host={:?}",
         reason.code(),
         safe(label),
         safe(host),
     );
+    if let Some(outcome) = outcome {
+        line.push_str(&format!(
+            " request_id={:?} outcome={} ",
+            safe(approval.map(|a| a.request_id.as_str()).unwrap_or("")),
+            outcome
+        ));
+        if let Some(code) = approval.and_then(|a| a.outcome_code) {
+            line.push_str(&format!("code={code}"));
+        } else {
+            line.pop();
+        }
+    }
     #[cfg(test)]
     state.test_refusals.lock().push(line.clone());
     crate::slog_warn!("{line}");

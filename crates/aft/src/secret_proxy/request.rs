@@ -13,7 +13,7 @@ use secret_rules::material::{check_admissible, encode_for_location};
 use secret_rules::target::{authority_matches_connect, normalize_request_target, ConnectAuthority};
 use zeroize::Zeroizing;
 
-use super::diagnostics::{log_refusal, Reason, Refusal};
+use super::diagnostics::{log_approval_refusal, log_refusal, Reason, Refusal};
 use super::{full, refusal, Body, State};
 
 pub(super) async fn forward(
@@ -49,7 +49,18 @@ pub(super) async fn forward(
         } else {
             &error.label
         };
-        log_refusal(&state, error.reason, label, &authority.host);
+        if let Some(approval) = &error.approval {
+            log_approval_refusal(
+                &state,
+                error.reason,
+                label,
+                &authority.host,
+                Some(approval),
+                Some("not_granted"),
+            );
+        } else {
+            log_refusal(&state, error.reason, label, &authority.host);
+        }
         audit.refused_for(&error.label);
     }
     let response = result.unwrap_or_else(|error| {
@@ -234,17 +245,19 @@ async fn prepare_and_send(
     let reconnected = tokio::sync::Mutex::new(Vec::new());
     use futures_util::StreamExt;
     let mut pending = futures_util::stream::FuturesUnordered::new();
+    let approval_metadata = std::sync::Mutex::new(std::collections::HashMap::new());
     for label in &labels {
         audit.mention(label);
         let addressed = &addressed;
         let reconnected = &reconnected;
+        let approval_metadata = &approval_metadata;
         let expires = budget.expires_at_ms;
         let (target, headers, body) = (&target, &parts.headers, &body);
         pending.push(async move {
             let answer = if state.is_https_port(authority.port) {
                 state
                     .approvals
-                    .use_planned_in_request(
+                    .use_planned_with_metadata(
                         label,
                         addressed,
                         expires,
@@ -266,6 +279,12 @@ async fn prepare_and_send(
                             reconnected.lock().await.push(connection);
                             Ok(())
                         },
+                        |metadata| {
+                            approval_metadata
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .insert(label.clone(), metadata);
+                        },
                     )
                     .await
             } else {
@@ -280,7 +299,11 @@ async fn prepare_and_send(
     while !pending.is_empty() {
         let (label, answer) = tokio::select! {
             biased;
-            () = budget.expired() => return Ok(not_approved(unsettled.first().map(String::as_str).unwrap_or(""), &authority.host, state, crate::secret::requests::UseError::Expired)),
+            () = budget.expired() => {
+                let metadata = approval_metadata.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let label = unsettled.first().map(String::as_str).unwrap_or("");
+                return Ok(not_approved(label, &authority.host, state, crate::secret::requests::UseError::Expired, Reason::ApprovalPendingAtDeadline, "pending_at_deadline", metadata.get(label)));
+            },
             result = pending.next() => result.ok_or_else(fail)?,
         };
         unsettled.retain(|name| name != label);
@@ -291,11 +314,48 @@ async fn prepare_and_send(
                 | crate::secret::requests::UseError::Expired
                 | crate::secret::requests::UseError::Cancelled
                 | crate::secret::requests::UseError::Unavailable),
-            ) => return Ok(not_approved(label, &authority.host, state, reason)),
+            ) => {
+                let metadata = approval_metadata
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let (log_reason, outcome) = match reason {
+                    crate::secret::requests::UseError::Declined => {
+                        (Reason::ApprovalDeclined, "declined")
+                    }
+                    crate::secret::requests::UseError::Expired => {
+                        (Reason::ApprovalExpired, "expired")
+                    }
+                    crate::secret::requests::UseError::Cancelled => {
+                        (Reason::ApprovalWithdrawn, "withdrawn")
+                    }
+                    _ => (Reason::ApprovalNotGranted, "not_granted"),
+                };
+                return Ok(not_approved(
+                    label,
+                    &authority.host,
+                    state,
+                    reason,
+                    log_reason,
+                    outcome,
+                    metadata.get(label),
+                ));
+            }
             Err(crate::secret::requests::UseError::InvalidPlan(_)) => {
                 return Err(Refusal::for_label(Reason::LocationMismatch, label))
             }
-            Err(_) => return Err(Refusal::for_label(Reason::VaultUnavailable, label)),
+            Err(_) => {
+                let metadata = approval_metadata
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(label)
+                    .cloned();
+                if let Some(approval) = metadata {
+                    let mut refusal = Refusal::for_label(Reason::ApprovalNotGranted, label);
+                    refusal.approval = Some(approval);
+                    return Err(refusal);
+                }
+                return Err(Refusal::for_label(Reason::VaultUnavailable, label));
+            }
         };
         match answer {
             crate::secret::UseAnswer::NotFound => continue,
@@ -509,16 +569,24 @@ fn not_approved(
     host: &str,
     state: &State,
     reason: crate::secret::requests::UseError,
+    log_reason: Reason,
+    outcome: &str,
+    approval: Option<&crate::secret::requests::ApprovalMetadata>,
 ) -> Response<Body> {
     let body = Zeroizing::new(crate::secret::requests::consent_failure_message(
         label, host, reason,
     ));
-    let mut response = Response::new(full(Bytes::from(
-        state.scrub(body.as_bytes()).unwrap_or_else(|_| {
+    let bytes = match state.scrub(body.as_bytes()) {
+        Ok(bytes) => {
+            log_approval_refusal(state, log_reason, label, host, approval, Some(outcome));
+            bytes
+        }
+        Err(_) => {
             log_refusal(state, Reason::ScrubFailed, label, host);
             super::PROXY_REFUSAL.as_bytes().to_vec()
-        }),
-    )));
+        }
+    };
+    let mut response = Response::new(full(Bytes::from(bytes)));
     *response.status_mut() = hyper::StatusCode::FORBIDDEN;
     response
 }

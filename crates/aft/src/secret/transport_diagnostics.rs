@@ -142,7 +142,7 @@ impl fmt::Display for Failure {
     }
 }
 
-fn safe_code(code: &str) -> &'static str {
+pub(crate) fn safe_code(code: &str) -> &'static str {
     // ErrorBody.code is an unconstrained peer string in subc-protocol 0.35.0.
     // Return only known literals so even a credential in that field is discarded.
     const CODES: &[&str] = &[
