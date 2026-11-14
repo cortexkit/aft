@@ -119,6 +119,26 @@ impl Drop for ClearOnDrop {
     }
 }
 
+/// Keeps test waits aware of a build until its follow-up work has been queued,
+/// including the handoff after the production `building` flag is cleared.
+#[cfg(test)]
+struct BuildTaskGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(test)]
+impl BuildTaskGuard {
+    fn new(tasks: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        tasks.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(tasks))
+    }
+}
+
+#[cfg(test)]
+impl Drop for BuildTaskGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
 /// What a reader that needs exact call-graph answers gets.
 pub(crate) enum Fresh {
     /// A view whose call graph covers every recorded change.
@@ -434,6 +454,10 @@ struct Work {
     stopped: AtomicBool,
     /// A build is queued or running.
     building: Arc<AtomicBool>,
+    /// Counts build tasks through their final follow-up scheduling, including
+    /// tasks that overlap after clearing their `building` flags.
+    #[cfg(test)]
+    build_tasks: Arc<std::sync::atomic::AtomicUsize>,
     /// A fold of the checkout's segments is queued or running.
     folding: Arc<AtomicBool>,
     /// A call-graph refresh is queued or running.
@@ -515,12 +539,16 @@ impl Work {
         if self.building.swap(true, Ordering::AcqRel) {
             return false;
         }
+        #[cfg(test)]
+        let build_task = BuildTaskGuard::new(&self.build_tasks);
         let flag = ClearOnDrop(Arc::clone(&self.building));
         let Some(reservation) = self.checkout.reserve_build() else {
             return false;
         };
         let work = Arc::clone(self);
         self.runner.run(BUILD_REQUEST, Pool::Build, move || {
+            #[cfg(test)]
+            let _build_task = build_task;
             if work.stopped.load(Ordering::Acquire) {
                 return;
             }
@@ -1307,6 +1335,8 @@ impl DataCheckout {
             },
             checkout,
             building: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            build_tasks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             folding: Arc::new(AtomicBool::new(false)),
             refreshing: Arc::new(AtomicBool::new(false)),
             publish_requested: parking_lot::Mutex::new(Publish::WhenMany),
@@ -1395,7 +1425,9 @@ impl DataCheckout {
     #[cfg(test)]
     pub(crate) fn wait_for_memory_profile_idle_for_test(&self) {
         let deadline = Instant::now() + Duration::from_secs(300);
-        while self.work.running() {
+        // Read the task count first: observing its release publishes the flags
+        // set by the build's follow-up work before `running` is checked.
+        while self.work.build_tasks.load(Ordering::Acquire) != 0 || self.work.running() {
             assert!(
                 Instant::now() < deadline,
                 "background build/refresh did not finish"

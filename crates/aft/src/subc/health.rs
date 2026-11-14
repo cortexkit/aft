@@ -8515,11 +8515,52 @@ mod tests {
             .checkout()
             .record_paths(&[b"extra.rs".to_vec()])
             .unwrap();
-        checkout.checkout().refresh_callgraph().unwrap();
+        let refresh = checkout.checkout().refresh_callgraph().unwrap();
         // Drain any refresh queued by the build before probing the engine's
         // nonblocking lock or taking the baseline memory walk count.
         checkout.wait_for_memory_profile_idle_for_test();
-        assert!(checkout.checkout().engine_memory_parts().is_some());
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while checkout.checkout().engine_memory_parts().is_none() {
+            // The thread that evicts idle engines can briefly take the engine lock
+            // after checkout work ends. Retry contention, but never accept an absent engine.
+            let engine = checkout
+                .checkout()
+                .memory(&mut aft_store::heap::Seen::new())
+                .engine;
+            assert!(
+                !matches!(
+                    engine,
+                    crate::data_layer::checkout::EngineMemory::NotStarted
+                ),
+                "the fixture has no retained engine after refresh (cold build: {:?})",
+                refresh.as_ref().map(|stats| stats.cold_build)
+            );
+            assert!(
+                Instant::now() < deadline,
+                "retained engine probe stayed busy: {engine:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Seed a complete current figure before measuring reuse. Lock contention
+        // must not turn the baseline into an incomplete census scheduled for retry.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let memory = crate::data_layer::surfaces::memory_estimate(&ctx).unwrap();
+            assert_ne!(
+                memory.shared.counts.get("callgraph_engine_started"),
+                Some(&0),
+                "the retained engine disappeared before the baseline census"
+            );
+            if memory.shared.bytes_status == "estimated" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "baseline census stayed incomplete: {:?}",
+                memory.shared
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let executor = Executor::new();
         assert!(executor.register_actor(root, ctx));
         let app = crate::context::App::default_shared();
