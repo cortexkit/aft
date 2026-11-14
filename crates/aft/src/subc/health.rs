@@ -1,8 +1,9 @@
 //! Dispatch-path metrics and health-report helpers for the subc transport loop.
 //!
-//! Root rows omit zero counters, false activity flags, nulls and empty collections;
-//! an absent counter means zero. Statuses, non-default values and failure evidence
-//! remain explicit, including false readiness flags such as `pinned`.
+//! Root rows omit optional zero counters, false activity flags, nulls and empty
+//! collections; an absent optional counter means zero. Identity, readiness,
+//! actor_count and bash running/pending_completions remain explicit for health
+//! consumers, as do non-default values, failures and false readiness flags.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -2067,8 +2068,29 @@ fn health_nondefault(value: &Value) -> bool {
 }
 
 fn compact_health_root(value: &mut Value) {
+    compact_health_root_fields(value, "");
+}
+
+fn compact_health_root_fields(value: &mut Value, path: &str) {
     let Value::Object(fields) = value else { return };
     fields.retain(|key, value| {
+        let field_path = format!("{path}/{key}");
+        // These scalars are read directly by health consumers. Zero is a
+        // valid observation, not permission to remove their contract fields.
+        if matches!(
+            field_path.as_str(),
+            "/project_root"
+                | "/state"
+                | "/actor_count"
+                | "/search_index/status"
+                | "/semantic_index/status"
+                | "/callgraph_store/status"
+                | "/tier2/status"
+                | "/bash/running"
+                | "/bash/pending_completions"
+        ) {
+            return true;
+        }
         // A failure record can contain meaningful zero/false values (for
         // example retry_after_ms or retryable). Keep the complete record.
         if (key.contains("fail") || key.contains("error") || key.contains("refusal"))
@@ -2076,7 +2098,7 @@ fn compact_health_root(value: &mut Value) {
         {
             return true;
         }
-        compact_health_root(value);
+        compact_health_root_fields(value, &field_path);
         match value {
             Value::Bool(false) => matches!(
                 key.as_str(),
@@ -5278,7 +5300,7 @@ mod tests {
             json!({
                 "project_root": "/project", "actor_count": 1, "state": "busy",
                 "watcher": {"directory_arrivals_total": 7, "last_rescan_rss_delta_bytes": -4096},
-                "bash": {"pending_completions": 2, "disclaim_privacy": false, "project_replay_failures": [{
+                "bash": {"running": 0, "pending_completions": 2, "disclaim_privacy": false, "project_replay_failures": [{
                     "reason": "session_directory_open_failed", "error": "permission denied",
                     "attempts": 1, "retry_after_ms": 0, "retryable": false}]},
                 "views": {"pinned": false},
@@ -5288,6 +5310,27 @@ mod tests {
         let compact = root.clone();
         compact_health_root(&mut root);
         assert_eq!(root, compact);
+    }
+
+    #[test]
+    fn health_root_compaction_preserves_required_scalars_at_zero() {
+        let required = json!({
+            "project_root": "/project", "state": "ready", "actor_count": 0,
+            "search_index": {"status": "off"}, "semantic_index": {"status": "disabled"},
+            "callgraph_store": {"status": "off"}, "tier2": {"status": "disabled"},
+            "bash": {"running": 0, "pending_completions": 0},
+        });
+        let mut root = required.clone();
+        root["watcher"] = json!({"raw_events_total": 0, "last_overflow_prefixes": []});
+        compact_health_root(&mut root);
+        assert_eq!(root, required, "only optional zero counters may disappear");
+        for path in ["/actor_count", "/bash/running", "/bash/pending_completions"] {
+            assert_eq!(
+                root.pointer(path).and_then(Value::as_u64),
+                Some(0),
+                "{path}"
+            );
+        }
     }
 
     #[test]
@@ -5882,7 +5925,11 @@ mod tests {
         assert!(root.get("abbreviated").is_none());
         assert_eq!(root["state"], "ready");
         assert_eq!(root["actor_count"], 1);
-        assert!(root.get("bash").is_none(), "zero counters are implicit");
+        assert_eq!(
+            root["bash"],
+            json!({"running": 0, "pending_completions": 0}),
+            "health consumers require these counters even at zero"
+        );
         for component in ["search_index", "semantic_index", "callgraph_store", "tier2"] {
             assert_eq!(root[component]["status"], "disabled");
         }
