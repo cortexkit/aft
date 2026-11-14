@@ -545,7 +545,7 @@ pub(crate) mod tests {
         static DIRECTORY: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
         DIRECTORY.get_or_init(|| {
             let directory = tempfile::tempdir().unwrap();
-            let root = directory.path().join("aft/grammars");
+            let root = directory.path().join("cache/aft/grammars");
             crate::private_storage::create_dir_all(&root).unwrap();
             let manifest = crate::grammar::manifest();
             let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -557,7 +557,7 @@ pub(crate) mod tests {
             )
             .unwrap();
             let mut config = crate::config::Config::default();
-            config.cache_dir = Some(directory.path().to_path_buf());
+            config.cache_dir = Some(directory.path().join("cache"));
             config.storage_dir = Some(directory.path().join("durable"));
             assert_eq!(crate::cache_location::prepare_cache_root(&mut config), None);
             crate::grammar::configure(&config).stored().unwrap();
