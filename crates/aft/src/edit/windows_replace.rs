@@ -219,13 +219,14 @@ fn copy_named_streams(
         // different stream when a name is not valid Unicode.
         let copy = (|| {
             let mut source = File::open(named_stream_path(destination, name)?)?;
+            let target_path = named_stream_path(replacement, name)?;
             let mut target = OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
-                .open(named_stream_path(replacement, name)?)?;
+                .open(&target_path)?;
             io::copy(&mut source, &mut target)?;
-            target.sync_all()
+            aft_store::sync::sync_all(&target, &target_path)
         })();
         copy.map_err(|error| {
             io::Error::new(
@@ -317,7 +318,7 @@ fn prepare_metadata(destination: &Path, source: &File, replacement: &File) -> io
     {
         return Err(io::Error::last_os_error());
     }
-    replacement.sync_all().map_err(|error| {
+    aft_store::sync::sync_all(replacement, destination).map_err(|error| {
         io::Error::new(
             error.kind(),
             format!("syncing replacement metadata: {error}"),

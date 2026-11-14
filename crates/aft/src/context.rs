@@ -7551,6 +7551,10 @@ impl AppContext {
             let changed = guard.project_root.as_ref().map(|root| root.as_os_str())
                 != next.project_root.as_ref().map(|root| root.as_os_str());
             *guard = Arc::clone(&next);
+            // This policy is process-wide and user-only. Constructors must not
+            // reset it when another root starts with a default config. Before
+            // the first configure publishes, syncs use the plain fsync default.
+            aft_store::sync::set_macos_full_sync(next.durability.macos_full_sync);
             (next, changed)
         };
         if replace_pin {

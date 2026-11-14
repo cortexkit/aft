@@ -135,7 +135,7 @@ impl Storage {
                 return Err(io::Error::other("injected grammar write failure"));
             }
             file.write_all(bytes)?;
-            file.sync_all()?;
+            aft_store::sync::sync_all(&file, &dir.path().join(&temp))?;
             drop(file);
             if self.fault == StorageFault::Publish {
                 return Err(io::Error::other("injected grammar publication failure"));

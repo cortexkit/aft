@@ -514,7 +514,7 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
             let synced = fs::OpenOptions::new()
                 .write(true)
                 .open(to)
-                .and_then(|file| file.sync_all());
+                .and_then(|file| aft_store::sync::sync_all(&file, to));
             if permissions.readonly() {
                 fs::set_permissions(to, permissions)?;
             }

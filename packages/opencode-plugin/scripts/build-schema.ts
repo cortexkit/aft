@@ -112,6 +112,20 @@ function buildSchema(): Record<string, unknown> {
         },
       },
 
+      durability: {
+        type: "object",
+        additionalProperties: false,
+        description: "User-only file flush policy. Project values have no effect.",
+        properties: {
+          macos_full_sync: {
+            type: "boolean",
+            default: false,
+            description:
+              "On macOS, restore F_FULLFSYNC drive-cache flushes instead of faster plain fsync. Plain fsync can lose recent writes on power loss, but adds no loss on daemon kill or OS crash. Applies to AFT files and directories, not SQLite; ignored on Linux and Windows. Takes effect on the next sync.",
+          },
+        },
+      },
+
       edit_mode: {
         type: "string",
         enum: ["default", "hashline"],

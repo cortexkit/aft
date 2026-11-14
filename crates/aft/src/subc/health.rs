@@ -4753,6 +4753,7 @@ fn assemble_health_report(
         "full_sync_fallbacks".to_string(),
         json!(aft_store::sync::full_sync_fallbacks()),
     );
+    metrics.insert("sync_mode".to_string(), json!(aft_store::sync::mode()));
     metrics.insert(
         "runtime".to_string(),
         json!({
@@ -9686,6 +9687,7 @@ mod tests {
             .as_u64()
             .expect("fallback count");
         assert!(fallbacks >= before);
+        assert_eq!(metrics["sync_mode"], aft_store::sync::mode());
         #[cfg(not(target_os = "macos"))]
         assert_eq!(fallbacks, 0);
     }

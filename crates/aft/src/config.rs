@@ -899,9 +899,18 @@ impl BashConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DurabilityConfig {
+    /// Flush the drive's volatile cache on macOS; plain fsync is the default.
+    pub macos_full_sync: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// User-selected file flush policy; only macOS has a full drive-flush option.
+    pub durability: DurabilityConfig,
     /// Existing cache parent; AFT owns only its `aft` namespace. None preserves the storage-root layout.
     #[serde(skip_deserializing)]
     pub cache_dir: Option<PathBuf>,
@@ -1082,6 +1091,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            durability: DurabilityConfig::default(),
             cache_dir: None,
             cache_dir_configured: None,
             cache_unavailable: None,

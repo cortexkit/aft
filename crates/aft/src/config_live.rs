@@ -926,6 +926,7 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     }
 
     // Edit pipeline.
+    live!("durability.macos_full_sync", durability.macos_full_sync);
     live!("format_on_edit", format_on_edit);
     live!("revision_reads", revision_reads);
     live!("formatter_timeout_secs", formatter_timeout_secs);
@@ -1072,6 +1073,7 @@ fn classification_is_exhaustive(config: &Config) {
         diagnostic_cache_size: _,
         aft_search_registered: _,
         // Classified in `apply_live_config`.
+        durability: _,
         cache_dir: _,
         cache_dir_opt_out: _,
         formatter_timeout_secs: _,

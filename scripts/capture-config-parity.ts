@@ -245,6 +245,12 @@ const CASES: ParityCase[] = [
   { name: "privacy_user_on_project_bool", user: { bash: { disclaim_privacy: true } }, project: { bash: false } },
   { name: "privacy_pi_project_on", harness: "pi", project: { bash: { disclaim_privacy: true } } },
   { name: "privacy_pi_user_on_project_off", harness: "pi", user: { bash: { disclaim_privacy: true } }, project: { bash: { disclaim_privacy: false } } },
+  ...(["opencode", "pi"] as const).flatMap((harness) => [
+    { name: `durability_user_full_sync_${harness}`, harness, user: { durability: { macos_full_sync: true } } },
+    { name: `durability_project_dropped_${harness}`, harness, user: { durability: { macos_full_sync: true } }, project: { durability: { macos_full_sync: false } } },
+    { name: `durability_project_only_dropped_${harness}`, harness, project: { durability: { macos_full_sync: true } } },
+    { name: `durability_user_fsync_${harness}`, harness, user: { durability: { macos_full_sync: false } }, project: { durability: { macos_full_sync: true } } },
+  ]),
   { name: "lsp_idle_default", user: {} },
   { name: "lsp_max_servers_user", user: { lsp: { max_servers: 16 } } },
   { name: "lsp_max_servers_project_tighten", user: { lsp: { max_servers: 8 } }, project: { lsp: { max_servers: 3 } } },
