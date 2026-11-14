@@ -169,7 +169,7 @@ impl crate::secret::requests::ApprovalClock for Clock {
 
 #[derive(Default)]
 struct PhoneState {
-    requests: Vec<SecretConsentRequest>,
+    pub requests: Vec<SecretConsentRequest>,
     answers: HashMap<String, ConsentOutcome>,
     closed: bool,
     withdrawn: Vec<String>,

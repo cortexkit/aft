@@ -152,7 +152,7 @@ impl ManagementSession {
     }
 
     #[cfg(all(any(test, feature = "test-support"), unix))]
-    pub(crate) async fn for_test(connection_file: &std::path::Path) -> Result<Self, ()> {
+    pub async fn for_test(connection_file: &std::path::Path) -> Result<Self, ()> {
         Self::connect_as(
             connection_file,
             Some(ConsumerIdentity {

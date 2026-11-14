@@ -169,6 +169,9 @@ impl StoragePaths {
 /// snapshot using this root is dropped, including snapshots held by workers.
 #[derive(Debug)]
 pub struct CacheLease {
+    #[cfg(any(test, feature = "test-support"))]
+    pub _file: File,
+    #[cfg(not(any(test, feature = "test-support")))]
     _file: File,
     root: PinnedDir,
     root_identity: Identity,
@@ -216,7 +219,13 @@ impl Eq for CacheLease {}
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(deny_unknown_fields)]
 struct Identity {
+    #[cfg(any(test, feature = "test-support"))]
+    pub device: u64,
+    #[cfg(not(any(test, feature = "test-support")))]
     device: u64,
+    #[cfg(any(test, feature = "test-support"))]
+    pub inode: u64,
+    #[cfg(not(any(test, feature = "test-support")))]
     inode: u64,
 }
 test_support_visibility! {
@@ -260,6 +269,9 @@ test_support_visibility! {
 #[derive(Serialize, Deserialize)]
 struct ParentState {
     version: u32,
+    #[cfg(any(test, feature = "test-support"))]
+    pub parents: Vec<ParentIdentity>,
+    #[cfg(not(any(test, feature = "test-support")))]
     parents: Vec<ParentIdentity>,
 }
 }
@@ -1370,6 +1382,9 @@ struct RecordedRoot {
 test_support_visibility! {
 #[derive(Serialize, Deserialize)]
 struct OwnerMarker {
+    #[cfg(any(test, feature = "test-support"))]
+    pub owner: Identity,
+    #[cfg(not(any(test, feature = "test-support")))]
     owner: Identity,
     registration: String,
 }
@@ -1377,7 +1392,14 @@ struct OwnerMarker {
 #[derive(Debug, Serialize, Deserialize)]
 struct History {
     version: u32,
+    #[cfg(any(test, feature = "test-support"))]
+    pub roots: Vec<RecordedRoot>,
+    #[cfg(not(any(test, feature = "test-support")))]
     roots: Vec<RecordedRoot>,
+    #[cfg(any(test, feature = "test-support"))]
+    #[serde(default)]
+    pub pending: Vec<PendingRoot>,
+    #[cfg(not(any(test, feature = "test-support")))]
     #[serde(default)]
     pending: Vec<PendingRoot>,
 }

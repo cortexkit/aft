@@ -475,13 +475,15 @@ impl PinnedDir {
         Ok(())
     }
 
+    test_support_visibility! {
     pub(crate) fn repair_create_file(&self, name: &OsStr) -> io::Result<File> {
-        let file = self.repair_coordination_file(name)?;
-        if file_mount_identity(&file)? != file_mount_identity(&self.file)? {
-            return Err(io::Error::other("cache file crosses a mount"));
+            let file = self.repair_coordination_file(name)?;
+            if file_mount_identity(&file)? != file_mount_identity(&self.file)? {
+                return Err(io::Error::other("cache file crosses a mount"));
+            }
+            file.set_len(0)?;
+            Ok(file)
         }
-        file.set_len(0)?;
-        Ok(file)
     }
 
     pub(crate) fn repair_replace_file(&self, name: &OsStr, contents: &[u8]) -> io::Result<()> {

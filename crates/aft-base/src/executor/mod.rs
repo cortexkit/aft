@@ -209,6 +209,9 @@ struct EffectiveConfig {
     pool_size: usize,
     read_cap: usize,
     actor_cap: usize,
+    #[cfg(any(test, feature = "test-support"))]
+    pub heavy_permits: usize,
+    #[cfg(not(any(test, feature = "test-support")))]
     heavy_permits: usize,
     drr_quantum: isize,
     deficit_cap: isize,
@@ -216,6 +219,9 @@ struct EffectiveConfig {
     maintenance_cap: usize,
     /// Workers beyond `pool_size` that only route-bind configures may use.
     bind_reserve: usize,
+    #[cfg(any(test, feature = "test-support"))]
+    pub provider_reserve: usize,
+    #[cfg(not(any(test, feature = "test-support")))]
     provider_reserve: usize,
 }
 
@@ -463,13 +469,31 @@ impl DispatchLivenessAtomics {
 /// length read, so reading it never waits on the scheduler state mutex that a
 /// stalled loop may be blocked on or holding.
 pub struct DispatchLoopLiveness<C: ExecutorContext> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub origin: Instant,
+    #[cfg(not(any(test, feature = "test-support")))]
     origin: Instant,
+    #[cfg(any(test, feature = "test-support"))]
+    /// Milliseconds since `origin` when the loop last became ready to receive
+    /// or finished an event.
+    pub last_progress_ms: AtomicU64,
+    #[cfg(not(any(test, feature = "test-support")))]
     /// Milliseconds since `origin` when the loop last became ready to receive
     /// or finished an event.
     last_progress_ms: AtomicU64,
+    #[cfg(any(test, feature = "test-support"))]
+    /// True from channel readiness (or a due retry) until the loop has
+    /// processed the event and released the scheduler lock.
+    pub in_event: AtomicBool,
+    #[cfg(not(any(test, feature = "test-support")))]
     /// True from channel readiness (or a due retry) until the loop has
     /// processed the event and released the scheduler lock.
     in_event: AtomicBool,
+    #[cfg(any(test, feature = "test-support"))]
+    /// Clone of the scheduler's event receiver. Readiness waits and watchdog
+    /// queue checks never dequeue; only the scheduler consumes events.
+    pub event_rx: Receiver<SchedulerEvent<C>>,
+    #[cfg(not(any(test, feature = "test-support")))]
     /// Clone of the scheduler's event receiver. Readiness waits and watchdog
     /// queue checks never dequeue; only the scheduler consumes events.
     event_rx: Receiver<SchedulerEvent<C>>,
@@ -597,6 +621,9 @@ pub struct BindBlockerSnapshot {
 /// ([`JobCancellation::cancel_requested_before_commit`]).
 #[derive(Debug, Clone)]
 pub struct JobCancellation {
+    #[cfg(any(test, feature = "test-support"))]
+    pub inner: Arc<JobCancellationInner>,
+    #[cfg(not(any(test, feature = "test-support")))]
     inner: Arc<JobCancellationInner>,
     root: Option<Arc<std::path::PathBuf>>,
     lifecycle: Option<crate::executor::root_lifecycle::SubcLifecycleAdmission>,
@@ -1177,6 +1204,9 @@ struct RunningMutatingJob {
 
 /// Concurrent scheduler-dispatch executor.
 pub struct Executor<C: ExecutorContext> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub inner: Arc<ExecutorInner<C>>,
+    #[cfg(not(any(test, feature = "test-support")))]
     inner: Arc<ExecutorInner<C>>,
 }
 
@@ -2572,13 +2602,25 @@ impl<C: ExecutorContext> Drop for ExecutorInner<C> {
 
 test_support_visibility! {
 struct SchedulerState<C: ExecutorContext> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub actors: HashMap<ProjectRootId, ActorState<C>>,
+    #[cfg(not(any(test, feature = "test-support")))]
     actors: HashMap<ProjectRootId, ActorState<C>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub actor_order: Vec<ProjectRootId>,
+    #[cfg(not(any(test, feature = "test-support")))]
     actor_order: Vec<ProjectRootId>,
     cursor: usize,
+    #[cfg(any(test, feature = "test-support"))]
+    pub idle_workers: usize,
+    #[cfg(not(any(test, feature = "test-support")))]
     idle_workers: usize,
     interactive_inflight: usize,
     maintenance_inflight: usize,
     provider_inflight: usize,
+    #[cfg(any(test, feature = "test-support"))]
+    pub binds_inflight: usize,
+    #[cfg(not(any(test, feature = "test-support")))]
     binds_inflight: usize,
     config: EffectiveConfig,
     running_jobs: HashMap<u64, RunningJob>,
@@ -3218,69 +3260,77 @@ impl<C: ExecutorContext> ClassQueues<C> {
         self.first_bind_job().is_some_and(|job| job.force_exclusive)
     }
 
+    test_support_visibility! {
     fn has_queued_jobs(&self) -> bool {
-        !self.order.is_empty()
+            !self.order.is_empty()
+        }
     }
 
+    test_support_visibility! {
     fn front_lane(&self) -> Option<Lane> {
-        self.order.front().copied()
+            self.order.front().copied()
+        }
     }
 
+    test_support_visibility! {
     /// Interactive admission order: a starved writer preempts everything so
-    /// its deadline survives. A queued RouteBind configure counts as starved
-    /// after `BIND_PROMOTION_AGE`, any other writer after
-    /// `INTERACTIVE_WRITER_PROMOTION_AGE`. Otherwise pure reads go first (they
-    /// overlap each other and never barrier the actor), then remaining lanes
-    /// in arrival order. Maintenance keeps strict arrival order via
-    /// `front_lane`.
-    ///
-    /// `newest_reader_started_at` is when the most recently admitted reader
-    /// still running on this actor started. A writer is not promoted while
-    /// every running reader started before it queued and has run for
-    /// `READER_STUCK_CENSUS_AGE`: the writer cannot run until those readers
-    /// end, which may be never, so holding back new reads would only add an
-    /// outage of every read on the root to the writer's own wait.
-    fn next_interactive_lane(
-        &self,
-        now: Instant,
-        newest_reader_started_at: Option<Instant>,
-    ) -> Option<Lane> {
-        let stuck_readers_started_by = newest_reader_started_at
-            .filter(|started| now.saturating_duration_since(*started) >= READER_STUCK_CENSUS_AGE);
-        let starved_writer = self.mutating.iter().any(|job| {
-            let promotion_age = if is_configure_request(&job.request_id) {
-                BIND_PROMOTION_AGE
-            } else {
-                INTERACTIVE_WRITER_PROMOTION_AGE
-            };
-            let waits_only_on_stuck_readers =
-                stuck_readers_started_by.is_some_and(|newest| newest <= job.queued_at);
-            now.saturating_duration_since(job.queued_at) >= promotion_age
-                && !waits_only_on_stuck_readers
-        });
-        if starved_writer {
-            // Also stops NEW readers from being admitted on this actor while
-            // the promoted writer waits for in-flight readers to drain.
-            return Some(Lane::Mutating);
+        /// its deadline survives. A queued RouteBind configure counts as starved
+        /// after `BIND_PROMOTION_AGE`, any other writer after
+        /// `INTERACTIVE_WRITER_PROMOTION_AGE`. Otherwise pure reads go first (they
+        /// overlap each other and never barrier the actor), then remaining lanes
+        /// in arrival order. Maintenance keeps strict arrival order via
+        /// `front_lane`.
+        ///
+        /// `newest_reader_started_at` is when the most recently admitted reader
+        /// still running on this actor started. A writer is not promoted while
+        /// every running reader started before it queued and has run for
+        /// `READER_STUCK_CENSUS_AGE`: the writer cannot run until those readers
+        /// end, which may be never, so holding back new reads would only add an
+        /// outage of every read on the root to the writer's own wait.
+        fn next_interactive_lane(
+            &self,
+            now: Instant,
+            newest_reader_started_at: Option<Instant>,
+        ) -> Option<Lane> {
+            let stuck_readers_started_by = newest_reader_started_at
+                .filter(|started| now.saturating_duration_since(*started) >= READER_STUCK_CENSUS_AGE);
+            let starved_writer = self.mutating.iter().any(|job| {
+                let promotion_age = if is_configure_request(&job.request_id) {
+                    BIND_PROMOTION_AGE
+                } else {
+                    INTERACTIVE_WRITER_PROMOTION_AGE
+                };
+                let waits_only_on_stuck_readers =
+                    stuck_readers_started_by.is_some_and(|newest| newest <= job.queued_at);
+                now.saturating_duration_since(job.queued_at) >= promotion_age
+                    && !waits_only_on_stuck_readers
+            });
+            if starved_writer {
+                // Also stops NEW readers from being admitted on this actor while
+                // the promoted writer waits for in-flight readers to drain.
+                return Some(Lane::Mutating);
+            }
+            if !self.pure_reads.is_empty() {
+                return Some(Lane::PureRead);
+            }
+            self.order.iter().copied().find(|lane| {
+                !matches!(
+                    lane,
+                    Lane::PureRead | Lane::ProviderMetadata | Lane::CallLedger
+                )
+            })
         }
-        if !self.pure_reads.is_empty() {
-            return Some(Lane::PureRead);
-        }
-        self.order.iter().copied().find(|lane| {
-            !matches!(
-                lane,
-                Lane::PureRead | Lane::ProviderMetadata | Lane::CallLedger
-            )
-        })
     }
 
+    test_support_visibility! {
     fn pop_front_job(&mut self, lane: Lane) -> Option<QueuedJob<C>> {
-        // Keep `order` consistent with per-lane queues when admission picks a
-        // lane other than the arrival-order head: remove the FIRST occurrence
-        // of the chosen lane from `order`, not necessarily the front.
-        let position = self.order.iter().position(|queued| *queued == lane)?;
-        self.order.remove(position);
-        self.queue_mut(lane).pop_front()
+            // Keep `order` consistent with per-lane queues when admission picks a
+            // lane other than the arrival-order head: remove the FIRST occurrence
+            // of the chosen lane from `order`, not necessarily the front.
+            let position = self.order.iter().position(|queued| *queued == lane)?;
+            self.order.remove(position);
+            self.queue_mut(lane).pop_front()
+        }
     }
 
     fn queued_count(&self) -> usize {
@@ -3478,6 +3528,9 @@ test_support_visibility! {
 struct QueuedJob<C: ExecutorContext> {
     job: ExecutorJob<C>,
     completion: CompletionSender,
+    #[cfg(any(test, feature = "test-support"))]
+    pub request_id: String,
+    #[cfg(not(any(test, feature = "test-support")))]
     request_id: String,
     command: String,
     queued_at: Instant,
@@ -3618,11 +3671,17 @@ struct RunJob<C: ExecutorContext> {
     epoch: Arc<RwLock<()>>,
     job: ExecutorJob<C>,
     completion: Option<CompletionSender>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub request_id: String,
+    #[cfg(not(any(test, feature = "test-support")))]
     request_id: String,
     command: String,
     heavy_permit: Option<HeavyPermit>,
     cancellation: Option<JobCancellation>,
     execution_started: Arc<AtomicBool>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub completion_guard: Option<JobCompletionGuard<C>>,
+    #[cfg(not(any(test, feature = "test-support")))]
     completion_guard: Option<JobCompletionGuard<C>>,
     /// The actor's queued-interactive-writer counter, exposed to the running
     /// job through [`current_actor_writer_waiting`].

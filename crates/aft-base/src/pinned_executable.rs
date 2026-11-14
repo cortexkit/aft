@@ -9,7 +9,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 struct PinnedExecutable {
+    #[cfg(any(test, feature = "test-support"))]
+    pub executable: PathBuf,
+    #[cfg(not(any(test, feature = "test-support")))]
     executable: PathBuf,
+    #[cfg(any(test, feature = "test-support"))]
+    pub directory: PathBuf,
+    #[cfg(not(any(test, feature = "test-support")))]
     directory: PathBuf,
     state: Mutex<PinState>,
 }
