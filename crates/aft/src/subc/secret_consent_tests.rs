@@ -1362,7 +1362,9 @@ async fn production_secret_cards_reawait_the_same_id_at_the_service_cap_and_keep
         assert_eq!(call.params["elicitation_id"], "el_held");
         assert!(call.params["timeout_ms"].as_u64().unwrap() <= 120_000);
     }
-    assert_eq!(calls[0].params["expires_at_ms"].as_u64(), Some(end));
+    // The filing body is exactly what Cingulate's secret-use decoder accepts;
+    // the card's expiry comes from the statement, not from a filing field.
+    assert!(calls[0].params.get("expires_at_ms").is_none());
     assert!(calls.iter().all(|call| call.scope == calls[0].scope));
 }
 
