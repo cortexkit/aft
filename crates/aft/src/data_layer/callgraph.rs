@@ -1378,6 +1378,17 @@ pub(crate) fn resolve_checkout_into(
         // in parallel, and the sink builds their fragments in parallel too;
         // a whole batch decoded and built at once held about 750 MB more.
         let mut sites_ms = 0u128;
+        // Batch relief is experimental and opt-in: returning free pages can
+        // reduce the resident set size while making later batches fault those
+        // pages back in.
+        let trim_cadence = batch_trim_cadence(
+            std::env::var("AFT_INTERNAL_GRAPH_BATCH_TRIM")
+                .ok()
+                .as_deref(),
+        );
+        let mut trim_batches = 0usize;
+        let mut trim_calls = 0usize;
+        let mut trim_time = std::time::Duration::ZERO;
         #[cfg(feature = "test-hooks")]
         super::refresh_probe::stage("sites");
         for batch in paths.chunks(BATCH) {
@@ -1419,6 +1430,16 @@ pub(crate) fn resolve_checkout_into(
                 sink(&*inputs, files)?;
             }
             inputs.parses.release_decoded();
+            trim_batches += 1;
+            if trim_cadence != 0 && trim_batches % trim_cadence == 0 {
+                let started = std::time::Instant::now();
+                relieve_allocator();
+                trim_time += started.elapsed();
+                trim_calls += 1;
+            }
+        }
+        if trim_cadence != 0 {
+            log::info!("pass-4 allocator relief: cadence={trim_cadence} batches={trim_batches} calls={trim_calls} elapsed_us={}", trim_time.as_micros());
         }
         #[cfg(feature = "callgraph-shape-census")]
         let census = std::mem::take(&mut *calls.census.lock().unwrap_or_else(|e| e.into_inner()));
@@ -1444,6 +1465,25 @@ pub(crate) fn resolve_checkout_into(
 fn relieve_allocator() {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let _ = crate::memory::relieve_allocator_pressure();
+}
+
+fn batch_trim_cadence(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod batch_trim_tests {
+    #[test]
+    fn batch_trim_is_off_without_a_positive_internal_cadence() {
+        use super::batch_trim_cadence;
+        for value in [None, Some(""), Some("true"), Some("-1"), Some("0")] {
+            assert_eq!(batch_trim_cadence(value), 0);
+        }
+        assert_eq!(batch_trim_cadence(Some("1")), 1);
+        assert_eq!(batch_trim_cadence(Some("4")), 4);
+    }
 }
 
 /// A [`ResolutionLookup`] with nothing in it, for pass 4 when every file's
