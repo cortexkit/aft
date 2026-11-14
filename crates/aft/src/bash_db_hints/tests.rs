@@ -175,6 +175,8 @@ fn real_readonly_database_and_quoted_identifiers() {
 
 #[test]
 fn real_probe_timeout_is_counted_and_once_only() {
+    // This test is about the production budget, not the longer test default.
+    super::TEST_PROBE_TIMEOUT.with(|budget| budget.set(super::PROBE_TIMEOUT));
     let dir = database("CREATE TABLE tasks(id TEXT);");
     let binary = dir.path().join("sqlite3");
     crate::executable_cache::write_executable(&binary, b"#!/bin/sh\nsleep 5\n").unwrap();
@@ -202,10 +204,10 @@ fn real_probe_timeout_is_counted_and_once_only() {
 #[test]
 fn real_probe_error_is_counted_and_does_not_create_database() {
     let dir = tempfile::tempdir().unwrap();
-    // The probe has a fixed 1.5 s budget. On a loaded CI runner starting the
-    // real sqlite3 can take longer, and that attempt counts as a timeout, not
-    // an error. A timeout proves nothing here, so try again with a fresh job;
-    // only an attempt that finishes in time decides the test.
+    // Tests give the probe a 30 s budget (`TEST_PROBE_TIMEOUT`), but an attempt
+    // that still times out counts as a timeout, not an error, and proves
+    // nothing here. So try again with a fresh job; only an attempt that
+    // finishes in time decides the test.
     for _ in 0..5 {
         let errors = METRICS.probe_error.load(Ordering::Relaxed);
         let timeouts = METRICS.probe_timeout.load(Ordering::Relaxed);
