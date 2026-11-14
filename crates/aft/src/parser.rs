@@ -1257,9 +1257,10 @@ pub(crate) fn parse_resolved_source(
     // Racing misses may both parse; return the first inserted verdict to both
     // callers, including when one of their fallback attempts was cancelled.
     // Wall deadlines are load-sensitive: a near-budget clean alternative could
-    // finish in only one racing thread. The 1,900 ms budget leaves over 10x the
-    // largest measured corpus 99.9th percentile (189.362 ms) as a margin, while
-    // returning the stored verdict keeps callers consistent at that boundary.
+    // finish in only one racing thread. The 1,900 ms budget leaves over 10x Zig's
+    // measured 189.362 ms 99.9th-percentile Objective-C header parse time as a
+    // margin (see the deadline constant below). Returning the stored verdict
+    // keeps callers consistent at that boundary.
     let mut cache = HEADER_PARSE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(parsed) = cache.entries.get(&hash) {
         return Ok(parsed.clone());
