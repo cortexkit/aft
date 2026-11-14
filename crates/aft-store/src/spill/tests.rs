@@ -477,3 +477,46 @@ fn fixed_keys_are_compact_checked_and_resumable() {
     let mut sorter = Sorter::resume(&empty.directory, config).unwrap();
     assert!(sorter.push(&[0; 24], &[]).is_err());
 }
+
+#[test]
+fn ephemeral_fixed_runs_skip_manifests_and_check_space_at_run_writes() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut sorter = Sorter::ephemeral_fixed_keys(root.path(), config(16 * 1024), 25).unwrap();
+    let directory = sorter.directory().unwrap().to_path_buf();
+    let low = Arc::new(AtomicBool::new(false));
+    let check = low.clone();
+    sorter
+        .set_write_guard(WriteGuard::new(move || {
+            if check.load(Ordering::Relaxed) {
+                Err(std::io::Error::other("disk floor"))
+            } else {
+                Ok(())
+            }
+        }))
+        .unwrap();
+    for n in 0..600u64 {
+        let mut key = [0; 25];
+        key[..8].copy_from_slice(&n.to_be_bytes());
+        sorter.push(&key, &[]).unwrap();
+    }
+    assert!(!std::fs::read_dir(&directory).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("manifest-")
+    }));
+    low.store(true, Ordering::Relaxed);
+    assert!(
+        sorter
+            .finish()
+            .unwrap_err()
+            .to_string()
+            .contains("disk floor")
+    );
+    assert!(!directory.exists());
+}

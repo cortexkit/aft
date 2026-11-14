@@ -188,19 +188,23 @@ fn streamed_fixture_segment_equals_buffered_including_shared_fragments() {
     let resolved = resolve_checkout(&fixture.inputs, 2).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let family_store = Family::open(&dir.path().join("store"), family()).unwrap();
-    for shared in [false, true] {
+    for (shared, threads, budget) in [
+        (false, 1, 16 * 1024),
+        (true, 1, 16 * 1024),
+        (false, 2, 1 << 20),
+        (true, 2, 1 << 20),
+    ] {
         let mut buffered = SectionsWriter::new(&fixture.inputs.state, &fixture.records, true, None);
         let mut streamed = SectionsWriter::new(&fixture.inputs.state, &fixture.records, true, None);
-        let workspace = family_store
-            .try_write()
-            .unwrap()
-            .unwrap()
-            .create_build_workspace()
-            .unwrap();
+        let workspace: Box<dyn aft_store::graph::Scratch> = Box::new(
+            aft_store::graph::LocalScratch::create(family_store.dir(), "fixture").unwrap(),
+        );
         let scratch = workspace.path().to_path_buf();
+        let mut config = Config::new(budget);
+        config.buffer_bytes = 128;
+        config.fan_in = 2;
         streamed.stream(
-            GraphSectionsSpill::new(workspace, Config::new(1 << 20), WriteGuard::new(|| Ok(())))
-                .unwrap(),
+            GraphSectionsSpill::new(workspace, config, WriteGuard::new(|| Ok(()))).unwrap(),
         );
         for (file, resolution) in &resolved {
             buffered.add(&fixture.inputs, file, resolution).unwrap();
@@ -208,7 +212,8 @@ fn streamed_fixture_segment_equals_buffered_including_shared_fragments() {
         streamed
             .add_batch(
                 &fixture.inputs,
-                resolved
+                resolve_checkout(&fixture.inputs, threads)
+                    .unwrap()
                     .iter()
                     .map(|(file, resolution)| (file.clone(), resolution.clone()))
                     .rev()
@@ -223,12 +228,12 @@ fn streamed_fixture_segment_equals_buffered_including_shared_fragments() {
         let mut segments = Vec::new();
         let mut maps = Vec::new();
         for (index, sections) in [buffered, streamed].into_iter().enumerate() {
-            let path = dir.path().join(format!("{shared}-{index}.seg"));
+            let path = dir.path().join(format!("{shared}-{threads}-{index}.seg"));
             let mut writer = SegmentWriter::create(
                 &path,
                 SegmentMeta {
                     family: family(),
-                    segment: SegmentId::new(index as u64 + 1),
+                    segment: SegmentId::new(1),
                     incarnation: WriterIncarnation::new(1),
                     created_unix_ms: 0,
                 },
@@ -251,6 +256,10 @@ fn streamed_fixture_segment_equals_buffered_including_shared_fragments() {
             "even omitted fragments keep their checkout keys"
         );
         assert!(!scratch.exists());
+        assert_eq!(
+            std::fs::read(segments[0].path()).unwrap(),
+            std::fs::read(segments[1].path()).unwrap()
+        );
         for (section, info) in segments[0].sections() {
             let other = segments[1].section(info.id).unwrap();
             assert_eq!(

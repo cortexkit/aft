@@ -4,12 +4,16 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
+use super::Scratch;
 use super::{
     DATA, FragmentKey, INDEX, SLICE_DATA, SLICE_INDEX, TERM_LOOKUP, TERM_POSTINGS, TermKind,
     UNIT_KEY_SPACE, UNITS, layout, slice_spec, spec, term_hash,
 };
-use crate::family::BuildWorkspace;
 use crate::ids::Digest128;
 use crate::packed::{PackedCopy, StoredUnit};
 use crate::postings::PostingsBuilder;
@@ -61,12 +65,21 @@ pub struct GraphSectionsSpill {
     units: BTreeMap<FragmentKey, Placed>,
     len: u64,
     guard: WriteGuard,
-    workspace: BuildWorkspace,
+    workspace: Box<dyn Scratch>,
+    space: Option<SpaceEstimate>,
+    term_count: u64,
+}
+
+#[derive(Debug)]
+struct SpaceEstimate {
+    files: u64,
+    baseline: u64,
+    remaining: Arc<AtomicU64>,
 }
 
 impl GraphSectionsSpill {
     pub fn new(
-        workspace: BuildWorkspace,
+        workspace: Box<dyn Scratch>,
         config: Config,
         guard: WriteGuard,
     ) -> Result<Self, crate::spill::Error> {
@@ -74,7 +87,7 @@ impl GraphSectionsSpill {
         let data = BufWriter::new(crate::fs::create_new_private(
             &workspace.path().join("fragments"),
         )?);
-        let mut terms = Sorter::fixed_keys(workspace.path(), config, 25)?;
+        let mut terms = Sorter::ephemeral_fixed_keys(workspace.path(), config, 25)?;
         terms.set_write_guard(guard.clone())?;
         Ok(Self {
             data,
@@ -83,7 +96,35 @@ impl GraphSectionsSpill {
             len: 0,
             guard,
             workspace,
+            space: None,
+            term_count: 0,
         })
+    }
+
+    /// Reserve both scratch and the final segment while both coexist. The
+    /// initial source-size estimate is refined from completed files as output
+    /// arrives; every run write checks the caller's updated disk policy.
+    pub fn estimate_space(&mut self, files: usize, baseline: u64, remaining: Arc<AtomicU64>) {
+        self.space = Some(SpaceEstimate {
+            files: files as u64,
+            baseline,
+            remaining,
+        });
+    }
+
+    pub fn prepare_finish(&self) -> io::Result<()> {
+        if let Some(space) = &self.space {
+            // Packed units plus a conservative allowance for postings, lookup
+            // tables and a temporary posting section: the lookup section must
+            // precede its postings to preserve the existing segment bytes.
+            space.remaining.store(
+                self.len
+                    .saturating_add(self.term_count.saturating_mul(25))
+                    .saturating_mul(2),
+                Ordering::Relaxed,
+            );
+        }
+        self.guard.check()
     }
 
     pub fn len(&self) -> usize {
@@ -119,6 +160,25 @@ impl GraphSectionsSpill {
         }
         let (dc, du, data) = fragment.data.parts();
         let (sc, su, slice) = fragment.slice.parts();
+        self.term_count = self.term_count.saturating_add(fragment.terms.len() as u64);
+        if let Some(space) = &self.space {
+            let completed = self.units.len() as u64 + 1;
+            let output = self
+                .len
+                .saturating_add((data.len() + slice.len()) as u64)
+                .saturating_add(self.term_count.saturating_mul(25));
+            let projected = output.saturating_mul(space.files).div_ceil(completed);
+            let written = self
+                .len
+                .saturating_add(self.terms.as_ref().expect("sorter").stats().disk_bytes);
+            space.remaining.store(
+                space
+                    .baseline
+                    .max(projected.saturating_mul(3))
+                    .saturating_sub(written),
+                Ordering::Relaxed,
+            );
+        }
         self.guard.check()?;
         for bytes in [data, slice] {
             for chunk in bytes.chunks(1 << 20) {
@@ -229,19 +289,19 @@ impl GraphSectionsSpill {
                 .map(|record| record.key.try_into().map_err(io::Error::other))
                 .transpose()
         };
-        let lookup_path = self.workspace.path().join("lookup");
-        let mut lookup_file = BufWriter::new(crate::fs::create_new_private(&lookup_path)?);
+        let postings_path = self.workspace.path().join("postings");
+        let mut postings_file = BufWriter::new(crate::fs::create_new_private(&postings_path)?);
         let mut record = next(&mut sorted)?;
         let mut ordinals = Vec::new();
         for (index, kind) in TermKind::ALL.into_iter().enumerate() {
-            lookup_file.get_mut().set_len(0)?;
-            lookup_file.seek(SeekFrom::Start(0))?;
+            postings_file.get_mut().set_len(0)?;
+            postings_file.seek(SeekFrom::Start(0))?;
             let mut postings = PostingsBuilder::new(layout());
             let mut lookup = LookupTableBuilder::new();
             let mut current = None;
             self.guard.check()?;
             writer
-                .begin_section(spec(TERM_POSTINGS, kind.key_space()))
+                .begin_section(spec(TERM_LOOKUP, kind.key_space()))
                 .map_err(io::Error::other)?;
             while let Some(bytes) = record {
                 if usize::from(bytes[0]) != index {
@@ -262,11 +322,11 @@ impl GraphSectionsSpill {
                         lookup.push(term, postings.add_list(&ordinals, &[]));
                         if lookup.held() >= 64 * 1024 {
                             self.guard.check()?;
-                            lookup_file.write_all(&lookup.drain())?;
+                            writer.write(&lookup.drain()).map_err(io::Error::other)?;
                         }
                         if postings.held() >= 64 * 1024 {
                             self.guard.check()?;
-                            writer.write(&postings.drain()).map_err(io::Error::other)?;
+                            postings_file.write_all(&postings.drain())?;
                         }
                         ordinals.clear();
                     }
@@ -280,14 +340,14 @@ impl GraphSectionsSpill {
                 ordinals.clear();
             }
             let (rest, entries) = postings.finish();
-            writer.write(&rest).map_err(io::Error::other)?;
-            writer.end_section(entries).map_err(io::Error::other)?;
+            postings_file.write_all(&rest)?;
+            postings_file.flush()?;
             let (rest, terms) = lookup.finish();
-            lookup_file.write_all(&rest)?;
-            lookup_file.flush()?;
-            let mut source = BufReader::new(crate::fs::open_read(&lookup_path)?);
+            writer.write(&rest).map_err(io::Error::other)?;
+            writer.end_section(terms).map_err(io::Error::other)?;
+            let mut source = BufReader::new(crate::fs::open_read(&postings_path)?);
             writer
-                .begin_section(spec(TERM_LOOKUP, kind.key_space()))
+                .begin_section(spec(TERM_POSTINGS, kind.key_space()))
                 .map_err(io::Error::other)?;
             let mut buffer = [0; 64 * 1024];
             loop {
@@ -298,7 +358,7 @@ impl GraphSectionsSpill {
                 self.guard.check()?;
                 writer.write(&buffer[..n]).map_err(io::Error::other)?;
             }
-            writer.end_section(terms).map_err(io::Error::other)?;
+            writer.end_section(entries).map_err(io::Error::other)?;
         }
         Ok(())
     }

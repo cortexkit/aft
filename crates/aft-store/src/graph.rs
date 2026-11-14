@@ -26,7 +26,9 @@
 
 use std::collections::BTreeMap;
 
+mod scratch;
 mod spill;
+pub use scratch::{LocalScratch, Scratch};
 pub use spill::{GraphSectionsSpill, PackedFragment};
 
 use crate::ids::Digest128;
@@ -663,12 +665,8 @@ mod tests {
         use crate::spill::{Config, WriteGuard};
         let dir = tempfile::tempdir().unwrap();
         let store = Family::open(&dir.path().join("store"), family()).unwrap();
-        let workspace = store
-            .try_write()
-            .unwrap()
-            .unwrap()
-            .create_build_workspace()
-            .unwrap();
+        let workspace: Box<dyn Scratch> =
+            Box::new(LocalScratch::create(store.dir(), "fixture").unwrap());
         let scratch = workspace.path().to_path_buf();
         let mut config = Config::new(128 * 1024);
         config.buffer_bytes = 1024;
@@ -719,6 +717,11 @@ mod tests {
             !scratch.exists(),
             "successful writes remove all spill files"
         );
+        assert_eq!(
+            std::fs::read(dir.path().join("buffered")).unwrap(),
+            std::fs::read(&path).unwrap(),
+            "identical metadata produces byte-identical segments"
+        );
         let actual = open(&path);
         actual.verify().unwrap();
         assert_eq!(expected.sections().count(), actual.sections().count());
@@ -749,12 +752,8 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let dir = tempfile::tempdir().unwrap();
         let store = Family::open(&dir.path().join("store"), family()).unwrap();
-        let workspace = store
-            .try_write()
-            .unwrap()
-            .unwrap()
-            .create_build_workspace()
-            .unwrap();
+        let workspace: Box<dyn Scratch> =
+            Box::new(LocalScratch::create(store.dir(), "fixture").unwrap());
         let scratch = workspace.path().to_path_buf();
         let low = Arc::new(AtomicBool::new(false));
         let check = low.clone();

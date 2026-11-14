@@ -325,6 +325,17 @@ impl<'i> SectionsWriter<'i> {
         self.graph = GraphOutput::Streamed(std::sync::Mutex::new(spill));
     }
 
+    pub(crate) fn prepare_finish(&self) -> Result<(), String> {
+        if let GraphOutput::Streamed(spill) = &self.graph {
+            spill
+                .lock()
+                .expect("graph spill lock")
+                .prepare_finish()
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     /// Adds `file`'s record and fragment, reading its parse and the
     /// checkout's facts from `inputs`.
     ///

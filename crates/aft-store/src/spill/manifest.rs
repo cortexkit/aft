@@ -19,6 +19,7 @@ const PREFIX: &str = "aft-spill-";
 pub(super) struct Workspace {
     pub(super) guard: Option<super::WriteGuard>,
     pub(super) fixed_key_bytes: u64,
+    pub(super) durable: bool,
     pub(super) path: PathBuf,
     pub(super) next_id: u64,
     pub(super) retain: bool,
@@ -27,7 +28,7 @@ pub(super) struct Workspace {
 }
 
 impl Workspace {
-    pub(super) fn create(root: &Path, memory: &Memory) -> Result<Self, Error> {
+    pub(super) fn create(root: &Path, memory: &Memory, durable: bool) -> Result<Self, Error> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -56,15 +57,20 @@ impl Workspace {
         let mut this = Self {
             guard: None,
             fixed_key_bytes: 0,
+            durable,
             path,
             next_id: 0,
             retain: false,
             generation: 0,
             memory: memory.clone(),
         };
-        crate::fs::sync_parent(&this.path)?;
         let marker = this.path.join("owner");
-        crate::fs::write_new_durable(&marker, MARKER)?;
+        if durable {
+            crate::fs::sync_parent(&this.path)?;
+            crate::fs::write_new_durable(&marker, MARKER)?;
+        } else {
+            crate::fs::create_new_private(&marker)?.write_all(MARKER)?;
+        }
         disk_add(memory, MARKER.len() as u64);
         this.publish(&[], 0)?;
         Ok(this)
@@ -77,6 +83,7 @@ impl Workspace {
         let this = Self {
             guard: None,
             fixed_key_bytes: 0,
+            durable: true,
             path: path.to_owned(),
             next_id: 0,
             retain: false,
@@ -100,6 +107,9 @@ impl Workspace {
     }
 
     pub(super) fn publish(&mut self, runs: &[RunMeta], sequence: u64) -> Result<(), Error> {
+        if !self.durable {
+            return Ok(());
+        }
         if let Some(guard) = &self.guard {
             guard.check()?;
         }

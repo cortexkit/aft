@@ -106,13 +106,10 @@ impl<'f> WriteSession<'f> {
         // build must never change what a newer one left.
         let (base, _) = family.newest_manifest()?;
         family.check_named_formats(&base)?;
-        // Segment files belong to the writer. Resolution workspaces have
-        // independent locks so active builders survive another publication.
+        // Only the lock holder writes `tmp/`, so whatever is there was left
+        // by an earlier writer that ended before publishing it.
         let mut next_segment = 1;
         for entry in read_dir(&layout.tmp_dir())? {
-            if super::workspace::sweep(&entry).map_err(FamilyError::io(&entry))? {
-                continue;
-            }
             if let Some(id) = segment_id_of(&entry) {
                 next_segment = next_segment.max(id + 1);
             }
@@ -169,12 +166,6 @@ impl<'f> WriteSession<'f> {
     #[must_use]
     pub const fn incarnation(&self) -> WriterIncarnation {
         self.incarnation
-    }
-
-    /// Registers scratch space that can outlive this short writer session.
-    pub fn create_build_workspace(&self) -> Result<super::BuildWorkspace, FamilyError> {
-        super::BuildWorkspace::create(&self.family.layout.tmp_dir())
-            .map_err(FamilyError::io(&self.family.layout.tmp_dir()))
     }
 
     /// Starts a new segment in `tmp/`.

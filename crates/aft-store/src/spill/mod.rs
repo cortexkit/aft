@@ -188,7 +188,7 @@ pub struct Sorter {
 
 impl Sorter {
     pub fn new(root: &Path, config: Config) -> Result<Self, Error> {
-        Self::create(root, config, 0)
+        Self::create(root, config, 0, true)
     }
 
     /// Sort fixed-width keys without values or per-record disk framing. Equal
@@ -197,10 +197,24 @@ impl Sorter {
         if bytes == 0 {
             return Err(Error::Config("fixed key width must be nonzero"));
         }
-        Self::create(root, config, bytes)
+        Self::create(root, config, bytes, true)
     }
 
-    fn create(root: &Path, config: Config, fixed_key_bytes: usize) -> Result<Self, Error> {
+    /// Disposable fixed runs: checksummed but without manifests, fsync or
+    /// durable renames. A build restarts rather than resuming these runs.
+    pub fn ephemeral_fixed_keys(root: &Path, config: Config, bytes: usize) -> Result<Self, Error> {
+        if bytes == 0 {
+            return Err(Error::Config("fixed key width must be nonzero"));
+        }
+        Self::create(root, config, bytes, false)
+    }
+
+    fn create(
+        root: &Path,
+        config: Config,
+        fixed_key_bytes: usize,
+        durable: bool,
+    ) -> Result<Self, Error> {
         let config = config.validate()?;
         let memory = Memory::new(config.memory_budget);
         // A u64 sequence has at most 64 levels in any radix >= 2.
@@ -208,7 +222,7 @@ impl Sorter {
             config.fan_in.checked_mul(64).ok_or(Error::Overflow)?,
             &memory,
         )?;
-        let mut workspace = Workspace::create(root, &memory)?;
+        let mut workspace = Workspace::create(root, &memory, durable)?;
         workspace.fixed_key_bytes = fixed_key_bytes as u64;
         Ok(Self {
             workspace: Some(workspace),
@@ -461,6 +475,13 @@ impl Sorter {
     /// Retains durable named runs and their manifest instead of cleaning up on
     /// drop. The returned directory can be passed to `resume` in another process.
     pub fn checkpoint(mut self) -> Result<Checkpoint, Error> {
+        if !self
+            .workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.durable)
+        {
+            return Err(Error::Config("ephemeral sorts cannot checkpoint"));
+        }
         let result = self.spill().and_then(|()| self.publish());
         self.checked(result)?;
         let mut workspace = self.workspace.take().ok_or(Error::Failed)?;

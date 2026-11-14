@@ -116,6 +116,7 @@ fn read_exact(file: &File, bytes: &mut [u8], offset: u64, path: &Path) -> Result
 #[derive(Debug)]
 pub(super) struct Writer {
     guard: Option<super::WriteGuard>,
+    durable: bool,
     file: Option<File>,
     partial: PathBuf,
     final_path: PathBuf,
@@ -151,6 +152,7 @@ impl Writer {
         let file = crate::fs::create_new_private(&partial)?;
         let mut this = Self {
             guard: workspace.guard.clone(),
+            durable: workspace.durable,
             file: Some(file),
             partial,
             final_path,
@@ -238,9 +240,15 @@ impl Writer {
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&self.meta.header())?;
         self.memory.update(|s| s.bytes_written += HEADER as u64);
-        crate::sync::sync_all(file, &self.partial)?;
+        if self.durable {
+            crate::sync::sync_all(file, &self.partial)?;
+        }
         self.file = None;
-        crate::fs::rename_new_durable(&self.partial, &self.final_path)?;
+        if self.durable {
+            crate::fs::rename_new_durable(&self.partial, &self.final_path)?;
+        } else {
+            std::fs::rename(&self.partial, &self.final_path)?;
+        }
         self.committed = true;
         self.memory.update(|s| s.runs_written += 1);
         Ok(self.meta)
