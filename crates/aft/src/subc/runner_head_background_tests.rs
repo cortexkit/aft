@@ -264,7 +264,7 @@ fn delivered_channels(
     channels
 }
 
-/// A background launch on a Thalamus runner's head route answers at once;
+/// A background launch on a head route of a runner that hosts heads answers at once;
 /// its task survives the call's route closing and its connection dropping,
 /// finishes on its own, and its completion is sent once as a runner notice,
 /// without a completion frame on the tool route.
@@ -375,6 +375,14 @@ async fn thalamus_harness_pi_head_background_answers_at_once_and_sends_a_notice(
     assert_runner_head_background_hands_back("reserved:thalamus-harness", "pi").await;
 }
 
+/// Heads also run on Broca. A background launch there must not hold the head
+/// until the command ends (up to the worker wait cap); Broca wakes the idle
+/// head with the completion notice.
+#[tokio::test]
+async fn broca_head_background_answers_at_once_and_sends_a_notice() {
+    assert_runner_head_background_hands_back("reserved:broca", "broca").await;
+}
+
 async fn assert_pty_launch_hands_back(principal: &str, harness: &str, kind: &str, worker: bool) {
     let fixture = Fixture::new("pty-launch-handback");
     let route = v1_route(&fixture.root, principal, harness, kind);
@@ -475,16 +483,14 @@ async fn runner_head_completion_skips_same_session_routes_of_other_identities() 
     assert!(delivered_channels(&fixture.root, &routes, &completion).is_empty());
 }
 
-/// A server-owned call that is not a Thalamus runner's head keeps owning its
-/// command: a `background` launch still holds the call until the command
-/// ends and answers with its finished result, never a launch reply.
+/// A server-owned call that is not a head on a runner that hosts heads keeps
+/// owning its command: a `background` launch still holds the call until the
+/// command ends and answers with its finished result, never a launch reply.
 #[tokio::test]
 async fn other_v1_carriers_and_workers_still_hold_background_launches() {
     for (principal, harness, kind, worker) in [
         // A Broca worker.
         ("reserved:broca", "broca", "worker", true),
-        // A Broca head.
-        ("reserved:broca", "broca", "head", false),
         // A worker on a Thalamus runner.
         ("reserved:thalamus-harness", "opencode2", "worker", true),
         // A carrier whose name only resembles a Thalamus runner.
