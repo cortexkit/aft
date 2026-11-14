@@ -309,7 +309,7 @@ fn shells_v1_production_task_store_writers_are_generation_tracked() {
     let writer = regex::Regex::new(r"(?i)\b(?:INSERT\s+(?:OR\s+\w+\s+)?INTO|REPLACE\s+INTO|UPDATE|DELETE\s+FROM)\s+bash_tasks\b").unwrap();
     let mut files = Vec::new();
     sources(
-        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &crate::test_support::manifest_dir().join("src"),
         &mut files,
     );
     let mut count = 0;

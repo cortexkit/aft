@@ -4,7 +4,7 @@ use std::process::{Command, Output};
 const HASH: &str = "56b2a562244e6f35f7b320bce59099126185389df1277a93e450ba4156c0e039";
 
 fn fixture() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    crate::test_helpers::manifest_dir()
         .join("tests/fixtures/grammars")
         .join(format!("{HASH}.wasm"))
 }
