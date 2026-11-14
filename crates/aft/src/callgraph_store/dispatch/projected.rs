@@ -349,6 +349,7 @@ impl<'a> Resolver<'a> {
     ) -> Option<FileRecord> {
         let parse = self.lookup(path)?;
         let mut projections = BTreeMap::new();
+        let inserted = std::cell::Cell::new(0u32);
         let mut project = |name: &str| -> Option<(String, u32)> {
             if let Some(found) = projections.get(name) {
                 let found: &ProjectedType = found;
@@ -357,6 +358,7 @@ impl<'a> Resolver<'a> {
             let projected = self.record_projection(path, name);
             let found = projected.found.clone();
             projections.insert(name.to_string(), projected);
+            inserted.set(inserted.get() + 1);
             found
         };
         for ty in &parse.dispatch.types {
@@ -424,15 +426,14 @@ impl<'a> Resolver<'a> {
             records.push(record);
         }
         let mut complete_names = false;
-        let before = projections.len();
+        let before = inserted.get();
         if typed_rust {
             for name in rust_resolvable_names(parse, type_target_names) {
                 project(&name);
             }
             complete_names = true;
         }
-        let resolvable_name_projections =
-            u32::try_from(projections.len() - before).unwrap_or(u32::MAX);
+        let resolvable_name_projections = inserted.get() - before;
         associated_ordinals.sort_unstable();
         associated_ordinals.dedup();
         Some(FileRecord {
