@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn tee_and_process_diagnostics_cannot_bypass_transport_stderr_policy() {
-        let source = include_str!("logging.rs");
+        let source = include_str!("../../aft-base/src/logging.rs");
         let tee = source
             .split_once("impl Write for TeeWriter {")
             .unwrap()

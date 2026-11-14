@@ -12,6 +12,10 @@ fn aft_src_dir() -> PathBuf {
     crate::test_helpers::manifest_dir().join("src")
 }
 
+fn base_src_dir() -> PathBuf {
+    crate::test_helpers::manifest_dir().join("../aft-base/src")
+}
+
 /// Recursively collect all `.rs` files under a directory.
 fn collect_rs_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -63,6 +67,7 @@ pub(crate) fn find_enclosing_item(lines: &[&str], target_idx: usize) -> String {
 /// Scans governed response surfaces and explicitly registered internal bounds.
 pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     let src_dir = aft_src_dir();
+    let base_dir = base_src_dir();
     let mut files_to_scan = Vec::new();
 
     // 1. crates/aft/src/commands/**
@@ -87,8 +92,8 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     files_to_scan.push(src_dir.join("parser/dead_code_facts.rs"));
     files_to_scan.push(src_dir.join("edit.rs"));
     files_to_scan.push(src_dir.join("bash_permissions/scan.rs"));
-    // 4. crates/aft/src/compress/**
-    files_to_scan.extend(collect_rs_files(&src_dir.join("compress")));
+    // 4. crates/aft-base/src/compress/**
+    files_to_scan.extend(collect_rs_files(&base_dir.join("compress")));
 
     let primitives: &[&'static str] = &[
         "budget.exhausted()",
@@ -110,11 +115,20 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     let mut discovered = Vec::new();
 
     for file in files_to_scan {
+        let relocated = file
+            .strip_prefix(&src_dir)
+            .ok()
+            .map(|relative| base_dir.join(relative));
+        let file = relocated.filter(|path| path.exists()).unwrap_or(file);
         if !file.exists() {
             continue;
         }
         let content = fs::read_to_string(&file).unwrap_or_default();
-        let rel_path = registry_file_key(file.strip_prefix(&src_dir).unwrap_or(&file));
+        let rel_path = registry_file_key(
+            file.strip_prefix(&src_dir)
+                .or_else(|_| file.strip_prefix(&base_dir))
+                .unwrap_or(&file),
+        );
 
         let raw_lines: Vec<&str> = content.lines().collect();
 

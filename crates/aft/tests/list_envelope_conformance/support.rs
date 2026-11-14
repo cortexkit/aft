@@ -2481,6 +2481,10 @@ fn aft_src_dir() -> PathBuf {
     manifest_path("src")
 }
 
+fn base_src_dir() -> PathBuf {
+    manifest_path("../aft-base/src")
+}
+
 fn collect_rs_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {
@@ -2506,9 +2510,15 @@ fn registry_file_key(relative: &Path) -> String {
 }
 
 pub fn find_call_sites(function: &str) -> Vec<CallSite> {
-    let source_dir = aft_src_dir();
     let mut sites = Vec::new();
-    for path in collect_rs_files(&source_dir) {
+    for (source_dir, path) in [aft_src_dir(), base_src_dir()]
+        .into_iter()
+        .flat_map(|root| {
+            collect_rs_files(&root)
+                .into_iter()
+                .map(move |path| (root.clone(), path))
+        })
+    {
         let source = fs::read_to_string(&path).unwrap_or_default();
         let file = registry_file_key(path.strip_prefix(&source_dir).unwrap_or(&path));
         let mut in_test_module = false;
@@ -2590,6 +2600,7 @@ pub(super) fn enclosing_item(lines: &[&str], target: usize) -> String {
 
 pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     let source_dir = aft_src_dir();
+    let base_dir = base_src_dir();
     let mut paths = collect_rs_files(&source_dir.join("commands"));
     paths.extend(collect_rs_files(&source_dir.join("search_state")));
     paths.push(source_dir.join("bash_changed_files.rs"));
@@ -2604,7 +2615,7 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     paths.push(source_dir.join("parser/todo_markers.rs"));
     paths.push(source_dir.join("parser/dead_code_facts.rs"));
     paths.push(source_dir.join("bash_permissions/scan.rs"));
-    paths.extend(collect_rs_files(&source_dir.join("compress")));
+    paths.extend(collect_rs_files(&base_dir.join("compress")));
     let primitives = [
         "budget.exhausted()",
         ".take(",
@@ -2623,11 +2634,20 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     ];
     let mut discovered = Vec::new();
     for path in paths {
+        let relocated = path
+            .strip_prefix(&source_dir)
+            .ok()
+            .map(|relative| base_dir.join(relative));
+        let path = relocated.filter(|file| file.exists()).unwrap_or(path);
         if !path.exists() {
             continue;
         }
         let source = fs::read_to_string(&path).unwrap_or_default();
-        let file = registry_file_key(path.strip_prefix(&source_dir).unwrap_or(&path));
+        let file = registry_file_key(
+            path.strip_prefix(&source_dir)
+                .or_else(|_| path.strip_prefix(&base_dir))
+                .unwrap_or(&path),
+        );
         let lines = source.lines().collect::<Vec<_>>();
         for (index, line) in lines.iter().enumerate() {
             let trimmed = line.trim();

@@ -604,6 +604,7 @@ class ToolSchemaFenceTests(unittest.TestCase):
     def test_other_ranking_files_still_fence_a_zoom_only_schema_change(self) -> None:
         blobs = (json.dumps(self.base).encode(), json.dumps(self.base).encode())
         self.assertEqual(derive_slice_class([self.path, "crates/aft/src/query_shape.rs"], schema_blobs=blobs), "ranking")
+        self.assertEqual(derive_slice_class([self.path, "crates/aft-base/src/query_shape.rs"], schema_blobs=blobs), "ranking")
 
     def test_unknown_shapes_and_missing_blobs_fail_closed(self) -> None:
         valid = json.dumps(self.base).encode()

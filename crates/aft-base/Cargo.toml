@@ -12,7 +12,7 @@ autotests = false
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)', 'cfg(aft_fake_lsp_helper)'] }
 
 [features]
-test-support = ["dep:tempfile", "dep:cortexkit-test-support"]
+test-support = ["dep:tempfile", "dep:filetime"]
 callgraph-shape-census = []
 test-hooks = []
 test-timing-hooks = []
@@ -20,7 +20,6 @@ secret-test-fake = []
 
 [dependencies]
 aft-store = { path = "../aft-store", version = "0.65.0" }
-aft-tokenizer = { path = "../aft-tokenizer", version = "0.65.0" }
 secret-rules = { path = "../secret-rules", version = "0.65.0", package = "aft-secret-rules" }
 log = "0.4"
 env_logger = "0.11"
@@ -31,19 +30,14 @@ parking_lot = "0.12"
 portable-pty = "0.9"
 libc = "0.2"
 getrandom = "0.3"
-tree-sitter = "=0.26.7"
 ignore = "0.4"
 regex = "1"
-regex-syntax = "0.8"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
-globset = "0.4"
-sha1 = "0.10"
 sha2 = { version = "0.10", features = ["compress"] }
 blake3 = "1"
-rustc-hash = "2"
 rustc-demangle = "0.1"
 tempfile = { version = "3", optional = true }
-cortexkit-test-support = { version = "=0.1.14", optional = true }
+filetime = { version = "0.2", optional = true }
 rusqlite = { version = "0.32", features = ["bundled", "backup", "trace", "functions"] }
 zeroize = "1"
 bytes = "1"
@@ -54,15 +48,11 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 tokio-util = { version = "0.7", features = ["io"] }
 futures-util = "0.3"
 async-compression = { version = "0.4", features = ["tokio", "gzip", "zlib", "brotli"] }
-flate2 = "1.1"
 rcgen = "0.13"
 cortexkit-paths = "0.1"
-cortexkit-exec-remote-types = "=0.2.21"
 glob = "0.3"
 which = "7"
 url = "2"
-unicode-normalization = "0.1"
-content_inspector = "0.2.4"
 base64 = "0.22"
 memchr = "2"
 rayon = "1"
@@ -71,35 +61,19 @@ tower-layer = "0.3"
 tower-service = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rustls-platform-verifier = "0.6"
-ring = "0.17"
-ort = { version = "=2.0.0-rc.11", default-features = false, features = ["ndarray", "load-dynamic", "half"] }
-hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
 htmd = "0.5.4"
 markup5ever_rcdom = "0.38"
-cortexkit-persona = "=0.3.0"
 cortexkit-role-tool-provider = "=0.15.7"
-cortexkit-role-llm-runner = "=0.8.36"
-cortexkit-role-tool-display = "=0.1.5"
-cortexkit-role-agent-data = "=0.2.4"
-cortexkit-role-user-commands = "=0.1.0"
-cortexkit-project-identity = "=0.1.4"
-cortexkit-agent-identity = "=0.1.1"
-jsonschema = { version = "0.33", default-features = false }
 subc-protocol = "=0.35.0"
-subc-transport = "=0.16.0"
 subc-client-rs = "=0.35.0"
 subc-os = "=0.1.30"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 vt100 = "0.16"
 jsonc-parser = { version = "0.33", features = ["cst"] }
 
-[target.'cfg(unix)'.dependencies]
-signal-hook = "0.3"
-
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemalloc-ctl = { version = "=0.6.1", features = ["stats"] }
 tikv-jemalloc-sys = "=0.6.1"
-landlock = "=0.4.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libproc = "0.14"
@@ -120,8 +94,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-cortexkit-test-support = "=0.1.14"
 tempfile = "3"
 filetime = "0.2"
-async-trait = "0.1"
+subc-transport = "=0.16.0"
 tokio = { version = "1", features = ["test-util"] }

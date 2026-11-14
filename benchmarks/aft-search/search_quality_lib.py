@@ -58,6 +58,7 @@ RANKING_FENCE_PREFIXES = (
     "crates/aft/src/commands/semantic_search/",
     "crates/aft/src/search_index.rs",
     "crates/aft/src/query_shape.rs",
+    "crates/aft-base/src/query_shape.rs",
     "crates/aft/src/semantic_index.rs",
     "crates/aft/src/embed/",
     "crates/aft/src/lib.rs",

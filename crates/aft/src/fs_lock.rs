@@ -481,7 +481,7 @@ mod tests {
 
     #[test]
     fn lock_operation_trace_lines_are_debug_not_info() {
-        let source = include_str!("fs_lock.rs");
+        let source = include_str!("../../aft-base/src/fs_lock.rs");
         assert!(source.contains("slog_debug!(\"acquired filesystem lock at {}\", path.display())"));
         assert!(
             source.contains("slog_debug!(\"released filesystem lock at {}\", self.path.display())")

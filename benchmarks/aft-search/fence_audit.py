@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[2]
 SCRIPTS={"scripts/telemetry/cost-gate.sh","scripts/telemetry/imports-resolve.sh","scripts/telemetry/postA-remeasure.sh"}
 WORKFLOW=".github/workflows/tests.yml"
-EXCLUDED=("benchmarks/aft-search/engine-fixtures/","crates/aft/src/query_shape.rs","crates/aft/src/semantic_index.rs","crates/aft/src/embed/","crates/aft/src/lib.rs","crates/aft/src/commands/semantic_search.rs","crates/aft/src/commands/semantic_search/")
+EXCLUDED=("benchmarks/aft-search/engine-fixtures/","crates/aft/src/query_shape.rs","crates/aft-base/src/query_shape.rs","crates/aft/src/semantic_index.rs","crates/aft/src/embed/","crates/aft/src/lib.rs","crates/aft/src/commands/semantic_search.rs","crates/aft/src/commands/semantic_search/")
 
 def in_benchmark(path:str)->bool: return path.startswith("benchmarks/aft-search/") and not path.startswith("benchmarks/aft-search/engine-fixtures/")
 def in_slice(path:str)->bool: return (in_benchmark(path) and path not in {"benchmarks/aft-search/real-query-baseline.json","benchmarks/aft-search/manifest.sha256"}) or path in SCRIPTS or path==WORKFLOW

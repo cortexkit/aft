@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 #[path = "image_cache_usage.rs"]
-mod usage;
+pub mod usage;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use usage::Usage;
