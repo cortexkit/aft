@@ -32,7 +32,7 @@
 
 mod error;
 mod format;
-mod open_files;
+pub(crate) mod open_files;
 mod reader;
 mod writer;
 
