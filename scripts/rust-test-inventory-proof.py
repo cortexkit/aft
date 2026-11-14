@@ -76,6 +76,11 @@ def run_command(command: list[str], merge_stderr: bool = True) -> str:
         # otherwise precede the JSON document.
         stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
         text=True,
+        # Cargo and test binaries write UTF-8. Without an explicit encoding,
+        # Windows decodes with the locale code page (cp1252), which has no
+        # mapping for some UTF-8 bytes and aborts the whole inventory.
+        encoding="utf-8",
+        errors="replace",
         check=False,
         # ANSI color wraps cargo's output and silently breaks the line parsers
         # below when a CI environment exports CARGO_TERM_COLOR=always.
