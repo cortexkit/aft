@@ -5633,26 +5633,47 @@ fn rust_api_type_path(text: &str) -> String {
     text.split('<').next().unwrap_or(text).trim().to_string()
 }
 
+/// How deep [`rust_api_use_paths`] follows nested `{...}` groups of one
+/// `use` declaration. Real code nests a few; deeper groups are dropped
+/// rather than recursed into, because each level costs a stack frame (a
+/// stack overflow aborts the process) and copies the path prefix and the
+/// group's text, so thousands of levels would take quadratic time and
+/// memory.
+const MAX_RUST_USE_GROUP_NESTING: usize = 64;
+
 fn rust_api_use_paths(text: &str, prefix: &[String], emit: &mut impl FnMut(Vec<String>, String)) {
+    rust_api_use_paths_at(text, prefix, emit, 0);
+}
+
+/// [`rust_api_use_paths`] for `text`, nested `depth` groups deep.
+fn rust_api_use_paths_at(
+    text: &str,
+    prefix: &[String],
+    emit: &mut impl FnMut(Vec<String>, String),
+    depth: usize,
+) {
     let text = text.trim();
     if let Some(open) = text.find('{') {
+        if depth >= MAX_RUST_USE_GROUP_NESTING {
+            return;
+        }
         let mut prefix = prefix.to_vec();
         prefix.extend(rust_path_segments(text[..open].trim_end_matches(':')));
         let inner = text[open + 1..].trim_end_matches('}');
-        let mut depth = 0;
+        let mut depth_in_group = 0;
         let mut start = 0;
         for (index, ch) in inner.char_indices() {
             match ch {
-                '{' => depth += 1,
-                '}' => depth -= 1,
-                ',' if depth == 0 => {
-                    rust_api_use_paths(&inner[start..index], &prefix, emit);
+                '{' => depth_in_group += 1,
+                '}' => depth_in_group -= 1,
+                ',' if depth_in_group == 0 => {
+                    rust_api_use_paths_at(&inner[start..index], &prefix, emit, depth + 1);
                     start = index + 1;
                 }
                 _ => {}
             }
         }
-        rust_api_use_paths(&inner[start..], &prefix, emit);
+        rust_api_use_paths_at(&inner[start..], &prefix, emit, depth + 1);
     } else if !text.is_empty() {
         let (path, alias) = text
             .split_once(" as ")
