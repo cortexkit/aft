@@ -238,9 +238,32 @@ pub fn write_folded(
         .iter()
         .map(|source| vec![crate::fold::NOT_COPIED; source.len() as usize])
         .collect::<Vec<_>>();
-    let mut table = UnitTableBuilder::new(Digest128::LEN);
-    let mut data = Vec::with_capacity(units.len() * UNIT_DATA_LEN);
-    for (key, copy) in units {
+    let count = u32::try_from(units.len()).expect("a text table holds fewer than 2^32 units");
+    writer.begin_section(spec(UNITS))?;
+    writer.write(&(Digest128::LEN as u16).to_le_bytes())?;
+    writer.write(&[0, 0])?;
+    writer.write(&count.to_le_bytes())?;
+    let mut previous = None;
+    for (ordinal, (key, copy)) in units.iter().enumerate() {
+        assert!(
+            previous.is_none_or(|old| old < *key),
+            "unit keys must be strictly ascending"
+        );
+        previous = Some(*key);
+        writer.write(key.digest().as_bytes())?;
+        writer.write(&((ordinal * UNIT_DATA_LEN) as u64).to_le_bytes())?;
+        writer.write(&UNIT_DATA_LEN_U32.to_le_bytes())?;
+        if let TextCopy::Stored {
+            source,
+            ordinal: old,
+        } = *copy
+        {
+            renumbered[source][old as usize] = ordinal as u32;
+        }
+    }
+    writer.end_section(u64::from(count))?;
+    writer.begin_section(spec(UNIT_DATA))?;
+    for (_, copy) in units {
         let unit = match *copy {
             TextCopy::Stored { source, ordinal } => sources[source].unit(ordinal)?,
             TextCopy::Unindexed { len, status } => {
@@ -252,26 +275,11 @@ pub fn write_folded(
                 }
             }
         };
-        let ordinal = table.push(
-            key.digest().as_bytes(),
-            UnitLocation {
-                offset: data.len() as u64,
-                len: UNIT_DATA_LEN_U32,
-            },
-        );
-        if let TextCopy::Stored {
-            source,
-            ordinal: old,
-        } = *copy
-        {
-            renumbered[source][old as usize] = ordinal;
-        }
+        let mut data = Vec::with_capacity(UNIT_DATA_LEN);
         push_unit_data(&mut data, unit);
+        writer.write(&data)?;
     }
-    let (table, count) = table.finish();
-    writer.write_section(spec(UNITS), &table, count)?;
-    writer.write_section(spec(UNIT_DATA), &data, count)?;
-    drop(data);
+    writer.end_section(u64::from(count))?;
     let postings = sources
         .iter()
         .zip(&renumbered)

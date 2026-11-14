@@ -45,6 +45,8 @@ mod engines;
 #[cfg(feature = "test-hooks")]
 pub mod exactness;
 mod fold;
+mod text_build;
+use text_build::TextBuild;
 #[cfg(test)]
 pub(super) mod publication_tests;
 #[cfg(test)]
@@ -1641,13 +1643,13 @@ impl Checkout {
         let sink = BuildSink {
             skip_text: !self.planes.text,
             stored: self.stored_records()?,
-            ..BuildSink::default()
+            ..BuildSink::new(self.text_build()?)
         };
         #[cfg(feature = "test-hooks")]
         super::refresh_probe::stage("extraction");
         let scanned = scan(&self.root, &self.layer.policy, None, &sink)
             .map_err(|error| DataError::Scan(error.to_string()))?;
-        let mut collected = sink.finish();
+        let mut collected = sink.finish()?;
         // Contents too large to read are members whose text is not
         // indexed; record them so grep reports them rather than walking
         // them.
@@ -1661,7 +1663,7 @@ impl Checkout {
                     record.content,
                     record.stat.size,
                     TextStatus::Oversize,
-                );
+                )?;
             }
         }
         report.files = scanned.state.paths().len();
@@ -1669,6 +1671,8 @@ impl Checkout {
         report.extract_failures = collected.failures;
         report.stored_records = collected.reused;
         report.scan_ms = elapsed_ms(started);
+
+        collected.text.spill()?;
 
         // The state, with each parsed path's language.
         let records = scanned
@@ -1846,10 +1850,7 @@ impl Checkout {
             .prepare_finish()
             .map_err(|error| graph_spill_error(DataError::Store(error), &paused))?;
         let mut pending = session.create_segment().map_err(DataError::store)?;
-        collected
-            .text
-            .write(pending.writer())
-            .map_err(DataError::store)?;
+        collected.text.write(pending.writer())?;
         let fragments = sections
             .finish(pending.writer(), measure.then_some(&mut report.memory))
             .map_err(|error| {
@@ -2192,6 +2193,19 @@ fn graph_spill_error(error: DataError, paused: &Mutex<Option<String>>) -> DataEr
 }
 
 impl Checkout {
+    pub(super) fn build_scratch(
+        &self,
+    ) -> Result<aft_store::family::BuildScratch<DataError>, DataError> {
+        let dir = self.family.dir().to_path_buf();
+        self.writer()?
+            .create_scratch(move |bytes| check_disk_floor_at(&dir, bytes))
+            .map_err(DataError::store)
+    }
+
+    fn text_build(&self) -> Result<TextBuild, DataError> {
+        Ok(TextBuild::new(self.build_scratch()?, self.family.id()))
+    }
+
     /// Scans the checkout's text only, then publishes and serves a state
     /// that names no call-graph fragments, so text queries can start while
     /// the call graph builds. Returns `false` when another process published
@@ -2215,10 +2229,13 @@ impl Checkout {
             .checkout(self.checkout)
             .cloned();
         let started = Instant::now();
-        let sink = BuildSink::text_only();
+        let sink = BuildSink {
+            text_only: true,
+            ..BuildSink::new(self.text_build()?)
+        };
         let scanned = scan(&self.root, &self.layer.policy, None, &sink)
             .map_err(|error| DataError::Scan(error.to_string()))?;
-        let mut collected = sink.finish();
+        let mut collected = sink.finish()?;
         for record in scanned.state.paths() {
             if record.kind == PathKind::Text
                 && record.stat.size > self.layer.policy.max_indexed_len
@@ -2228,12 +2245,13 @@ impl Checkout {
                     record.content,
                     record.stat.size,
                     TextStatus::Oversize,
-                );
+                )?;
             }
         }
         report.files = scanned.state.paths().len();
         report.text_units = collected.text.len();
         report.scan_ms = elapsed_ms(started);
+        collected.text.spill()?;
         let mut session = self.writer()?;
         if session.base().checkout(self.checkout) != started_from.as_ref() {
             drop(session);
@@ -2243,10 +2261,7 @@ impl Checkout {
         let snapshot = self.family.snapshot().map_err(DataError::store)?;
         report.shared = self.leave_out_shared(&snapshot, &mut collected.text, None)?;
         let mut pending = session.create_segment().map_err(DataError::store)?;
-        collected
-            .text
-            .write(pending.writer())
-            .map_err(DataError::store)?;
+        collected.text.write(pending.writer())?;
         let segment = session.finish_segment(pending).map_err(DataError::store)?;
         let written = session
             .write_checkout_state(self.checkout, &scanned.state)
@@ -2699,7 +2714,7 @@ impl Checkout {
     fn leave_out_shared(
         &self,
         snapshot: &Snapshot,
-        text: &mut TextSectionsBuilder,
+        text: &mut TextBuild,
         mut sections: Option<&mut super::graph_store::SectionsWriter<'_>>,
     ) -> Result<SharedUnits, DataError> {
         let Some(read) = self.read_by_others(snapshot)? else {
@@ -2726,7 +2741,15 @@ impl Checkout {
             );
         }
         let kept = fold::shared_holders(&read, units.into_iter().chain(fragments));
-        Ok(read.leave_out(Some(text), sections, |holder| kept.contains(&holder)))
+        let before = text.len();
+        text.retain(|key| {
+            !read
+                .holder(ReadUnit::Text(key))
+                .is_some_and(|holder| kept.contains(&holder))
+        });
+        let mut shared = read.leave_out(None, sections, |holder| kept.contains(&holder));
+        shared.text_units = before - text.len();
+        Ok(shared)
     }
 
     /// Resolves the call graph again for the paths changed since the
@@ -4956,13 +4979,13 @@ fn folder_is_gone(root: &Path) -> bool {
 }
 
 /// What a build's scan collects from the files it reads.
-#[derive(Default)]
 struct BuildSink {
     /// Whether parsed files are extracted, or only text is indexed.
     text_only: bool,
     /// Whether the text index is off, so no text is indexed.
     skip_text: bool,
-    text: Mutex<TextSectionsBuilder>,
+    text: Mutex<TextBuild>,
+    text_error: Mutex<Option<DataError>>,
     seen_text: Mutex<HashSet<ContentKey>>,
     /// Each parsed path's language.
     languages: Mutex<HashMap<Vec<u8>, String>>,
@@ -5009,7 +5032,7 @@ impl StoredRecords {
 
 /// A build sink's results, after the scan.
 struct Collected {
-    text: TextSectionsBuilder,
+    text: TextBuild,
     seen_text: HashSet<ContentKey>,
     languages: HashMap<Vec<u8>, String>,
     records: HashMap<String, (RecordKey, Arc<ContentRecord>)>,
@@ -5019,15 +5042,30 @@ struct Collected {
 }
 
 impl BuildSink {
-    fn text_only() -> Self {
+    fn new(text: TextBuild) -> Self {
         Self {
-            text_only: true,
-            ..Self::default()
+            text_only: false,
+            skip_text: false,
+            text: Mutex::new(text),
+            text_error: Mutex::new(None),
+            seen_text: Mutex::default(),
+            languages: Mutex::default(),
+            records: Mutex::default(),
+            failures: std::sync::atomic::AtomicUsize::default(),
+            stored: StoredRecords::default(),
+            reused: std::sync::atomic::AtomicUsize::default(),
         }
     }
 
-    fn finish(self) -> Collected {
-        Collected {
+    fn finish(self) -> Result<Collected, DataError> {
+        if let Some(error) = self
+            .text_error
+            .into_inner()
+            .expect("no panics while holding it")
+        {
+            return Err(error);
+        }
+        Ok(Collected {
             text: self.text.into_inner().expect("no panics while holding it"),
             seen_text: self
                 .seen_text
@@ -5043,7 +5081,7 @@ impl BuildSink {
                 .expect("no panics while holding it"),
             failures: self.failures.into_inner(),
             reused: self.reused.into_inner(),
-        }
+        })
     }
 }
 
@@ -5055,15 +5093,26 @@ impl ContentSink for BuildSink {
             .expect("no panics while holding it")
             .insert(key);
         if first && !self.skip_text {
+            if self
+                .text_error
+                .lock()
+                .expect("no panics while holding it")
+                .is_some()
+            {
+                return;
+            }
+            let trigrams = (kind == ContentKind::Text).then(|| ContentTrigrams::of(bytes));
+            let mut error = self.text_error.lock().expect("no panics while holding it");
+            if error.is_some() {
+                return;
+            }
             let len = bytes.len() as u64;
-            match kind {
-                ContentKind::Text => {
-                    let trigrams = ContentTrigrams::of(bytes);
-                    self.text
-                        .lock()
-                        .expect("no panics while holding it")
-                        .add_indexed(key, len, &trigrams);
-                }
+            let result = match kind {
+                ContentKind::Text => self
+                    .text
+                    .lock()
+                    .expect("no panics while holding it")
+                    .add_indexed(key, len, trigrams.as_ref().expect("text has trigrams")),
                 ContentKind::Binary => self
                     .text
                     .lock()
@@ -5075,6 +5124,10 @@ impl ContentSink for BuildSink {
                     .lock()
                     .expect("no panics while holding it")
                     .add_unindexed(key, len, TextStatus::Oversize),
+            };
+            if let Err(failure) = result {
+                *error = Some(failure);
+                return;
             }
         }
         if kind == ContentKind::Binary || self.text_only {
@@ -6863,9 +6916,9 @@ pub fn other() { callee(); }
         use crate::callgraph_store::join::CallgraphBlob;
         use aft_store::content::ContentSectionsBuilder;
         let version = "ruled-callgraph-v14-resolver-precision+record-12";
-        let sink = BuildSink::default();
+        let sink = BuildSink::new(checkout.text_build().unwrap());
         let scanned = scan(&checkout.root, &checkout.layer.policy, None, &sink).unwrap();
-        let collected = sink.finish();
+        let collected = sink.finish().unwrap();
         let mut state = scanned.state;
         let mut parses = BTreeMap::new();
         let mut configs = HashMap::new();

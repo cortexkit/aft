@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::lease::{self, LeaseScan};
@@ -41,6 +41,143 @@ pub struct WriteSession<'f> {
 pub struct PendingSegment {
     id: SegmentId,
     writer: SegmentWriter,
+}
+
+/// Private build files that outlive a write session, but never a build.
+/// The owner lock lets a later writer distinguish live work from a crash.
+pub struct BuildScratch<E> {
+    path: PathBuf,
+    owner: Option<File>,
+    admit: Box<dyn Fn(u64) -> Result<(), E> + Send + Sync>,
+}
+
+impl<E> std::fmt::Debug for BuildScratch<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuildScratch")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<E> BuildScratch<E> {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Asks the caller's storage admission policy before writing a run.
+    ///
+    /// # Errors
+    ///
+    /// Returns the policy's refusal without writing anything.
+    pub fn check_space(&self, additional_bytes: u64) -> Result<(), E> {
+        (self.admit)(additional_bytes)
+    }
+}
+
+impl<E> Drop for BuildScratch<E> {
+    fn drop(&mut self) {
+        // Close the lock before deleting its file, including on Windows.
+        self.owner.take();
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod build_scratch_tests {
+    use super::*;
+    use crate::ids::FamilyId;
+
+    #[test]
+    fn build_scratch_live_abandoned_and_torn_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        let family =
+            Family::open(dir.path(), FamilyId::from_digest(Digest128::of(b"scratch"))).unwrap();
+        let mut scratch = family
+            .try_write()
+            .unwrap()
+            .unwrap()
+            .create_scratch(|bytes| {
+                if bytes <= 100 {
+                    Ok(())
+                } else {
+                    Err("disk floor")
+                }
+            })
+            .unwrap();
+        assert!(scratch.check_space(100).is_ok());
+        assert_eq!(scratch.check_space(101), Err("disk floor"));
+        let path = scratch.path().to_path_buf();
+        std::fs::write(path.join("partial.seg"), b"unfinished").unwrap();
+        drop(family.try_write().unwrap().unwrap());
+        assert!(
+            path.join("partial.seg").exists(),
+            "startup preserves a live build"
+        );
+        scratch.owner.take();
+        drop(family.try_write().unwrap().unwrap());
+        assert!(!path.exists(), "startup removes an abandoned build");
+        let torn = family.dir().join("tmp/build-torn");
+        std::fs::create_dir(&torn).unwrap();
+        drop(family.try_write().unwrap().unwrap());
+        assert!(
+            !torn.exists(),
+            "startup removes a directory left before its owner was created"
+        );
+    }
+
+    #[test]
+    fn build_scratch_drop_removes_files_on_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let family =
+            Family::open(dir.path(), FamilyId::from_digest(Digest128::of(b"drop"))).unwrap();
+        let mut path = PathBuf::new();
+        let result = (|| -> Result<(), &str> {
+            let scratch = family
+                .try_write()
+                .unwrap()
+                .unwrap()
+                .create_scratch(|_| Ok::<_, &str>(()))
+                .unwrap();
+            path = scratch.path().to_path_buf();
+            std::fs::write(path.join("partial.seg"), b"unfinished").unwrap();
+            Err("cancelled")
+        })();
+        assert!(result.is_err());
+        assert!(!path.exists());
+    }
+}
+
+fn clean_build_scratch(path: &Path) -> Result<(), FamilyError> {
+    let owner = path.join("owner");
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&owner)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A crash can occur between directory creation and owner creation.
+            return match std::fs::remove_dir_all(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(FamilyError::io(path)(error)),
+            };
+        }
+        Err(error) => return Err(FamilyError::io(&owner)(error)),
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            drop(file);
+            match std::fs::remove_dir_all(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(FamilyError::io(path)(error)),
+            }
+        }
+        Err(std::fs::TryLockError::WouldBlock) => Ok(()),
+        Err(std::fs::TryLockError::Error(error)) => Err(FamilyError::io(&owner)(error)),
+    }
 }
 
 impl PendingSegment {
@@ -106,10 +243,18 @@ impl<'f> WriteSession<'f> {
         // build must never change what a newer one left.
         let (base, _) = family.newest_manifest()?;
         family.check_named_formats(&base)?;
-        // Only the lock holder writes `tmp/`, so whatever is there was left
-        // by an earlier writer that ended before publishing it.
+        // Segment files belong to the writer; build directories have their
+        // own owner locks because a scan releases the writer between spills.
         let mut next_segment = 1;
         for entry in read_dir(&layout.tmp_dir())? {
+            if entry
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("build-"))
+                && entry.is_dir()
+            {
+                clean_build_scratch(&entry)?;
+                continue;
+            }
             if let Some(id) = segment_id_of(&entry) {
                 next_segment = next_segment.max(id + 1);
             }
@@ -189,6 +334,41 @@ impl<'f> WriteSession<'f> {
         )?;
         self.open_segments.insert(id);
         Ok(PendingSegment { id, writer })
+    }
+
+    /// Allocates a private temporary workspace, cleaned on drop or by the
+    /// next writer after its process ends. Creation is under `writer.lock`.
+    ///
+    /// # Errors
+    ///
+    /// When the directory or its owner lock cannot be created.
+    pub fn create_scratch<E>(
+        &mut self,
+        admit: impl Fn(u64) -> Result<(), E> + Send + Sync + 'static,
+    ) -> Result<BuildScratch<E>, FamilyError> {
+        let path = self
+            .family
+            .layout
+            .tmp_dir()
+            .join(format!("build-{}", lease::fresh_id()));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&path).map_err(FamilyError::io(&path))?;
+        let mut scratch = BuildScratch {
+            path,
+            owner: None,
+            admit: Box::new(admit),
+        };
+        let owner_path = scratch.path.join("owner");
+        let owner =
+            crate::fs::create_new_private(&owner_path).map_err(FamilyError::io(&owner_path))?;
+        owner.lock().map_err(FamilyError::io(&owner_path))?;
+        scratch.owner = Some(owner);
+        Ok(scratch)
     }
 
     /// Finishes a segment and stages it for publication.
