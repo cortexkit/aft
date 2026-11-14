@@ -191,6 +191,7 @@ struct Census {
     out_dir: Option<PathBuf>,
     daemon_pid: u32,
     verify_counts: bool,
+    macos_full_sync: bool,
 }
 
 impl Census {
@@ -224,6 +225,13 @@ impl Census {
             self.daemon_pid,
         );
         if self.verify_counts {
+            if !self.macos_full_sync {
+                let full = events
+                    .iter()
+                    .filter(|event| event.op == "F_FULLFSYNC")
+                    .count();
+                assert_eq!(full, 0, "{label}: default mode full drive flushes");
+            }
             if label.starts_with("configure + startup") {
                 // SQLite keeps its own fsync policy. These stores' extra drive
                 // flushes are different calls and must not creep back in.
@@ -248,22 +256,21 @@ impl Census {
             let (store, expected) = if label.starts_with("bash ") {
                 ("storage: opencode/bash-tasks", 0)
             } else if label.starts_with("edit 1:") {
-                // Three directory flushes for the new backup folders, then the
-                // snapshot: its content file takes a full flush, the undo index
-                // file and its folder take ordinary fsyncs, and meta.json's
-                // full flush then commits all of them to the drive.
+                // Full-sync mode flushes the three new backup directories,
+                // snapshot content and meta.json. The undo index and its folder
+                // always take ordinary fsyncs. Default mode keeps all seven
+                // syncs but uses ordinary fsync for every one of them.
                 self.assert_full_flushes(&events, &roots, label, 5);
                 ("storage: opencode/backups", 7)
             } else if label.starts_with("edit ") {
-                // The snapshot alone: two full flushes (content, meta.json)
-                // and two ordinary fsyncs ordered before the last one.
+                // Full-sync mode flushes content and meta.json to the drive;
+                // default mode uses fsync. Both modes keep four total syncs.
                 self.assert_full_flushes(&events, &roots, label, 2);
                 ("storage: opencode/backups", 4)
             } else if label.starts_with("undo ") {
-                // Include the user-file sync, not just stack metadata. The
-                // restored file and meta.json take full flushes; the undo
-                // index file and its folder take ordinary fsyncs that
-                // meta.json's full flush commits.
+                // Include the user-file sync, not just stack metadata. In
+                // full-sync mode, the restored file and meta.json flush the
+                // drive; the undo index and its folder use ordinary fsync.
                 let in_scope = |event: &Event| {
                     let store = store_of(&event.path, &roots, &self.project);
                     store == "storage: opencode/backups" || store == "project (user files)"
@@ -274,7 +281,8 @@ impl Census {
                     .iter()
                     .filter(|event| in_scope(event) && event.op == "F_FULLFSYNC")
                     .count();
-                assert_eq!(full, 2, "{label}: undo full drive flushes");
+                let expected_full = if self.macos_full_sync { 2 } else { 0 };
+                assert_eq!(full, expected_full, "{label}: undo full drive flushes");
                 return;
             } else if label.starts_with("checkpoint create") {
                 ("storage: opencode/checkpoints", 8)
@@ -295,8 +303,7 @@ impl Census {
 }
 
 impl Census {
-    /// Full drive flushes (`F_FULLFSYNC`) an edit makes under the backup store:
-    /// the expensive kind on macOS, which an edit must not add back.
+    /// Pin the opt-in full-drive-flush budget; default mode must use only fsync.
     fn assert_full_flushes(
         &self,
         events: &[Event],
@@ -313,6 +320,7 @@ impl Census {
                     && event.op == "F_FULLFSYNC"
             })
             .count() as u64;
+        let expected = if self.macos_full_sync { expected } else { 0 };
         assert_eq!(full, expected, "{label}: backup full drive flushes");
     }
 }
@@ -463,7 +471,7 @@ fn wait_terminal(aft: &mut AftProcess, task_id: &str) -> Value {
 /// Run every measured operation once against one daemon. With `trace` set the
 /// daemon carries the tracer and the report lists per-store counts; without it
 /// only response times are reported, as an uninstrumented baseline.
-fn run_scenario(trace: bool, verify_counts: bool) -> String {
+fn run_scenario(trace: bool, verify_counts: bool, macos_full_sync: bool) -> String {
     let scratch = tempfile::tempdir().unwrap();
     let project_dir = tempfile::tempdir().unwrap();
     let storage_dir = tempfile::tempdir().unwrap();
@@ -492,8 +500,14 @@ fn run_scenario(trace: bool, verify_counts: bool) -> String {
         envs.push(("AFT_SYNC_TRACE", trace_path.as_os_str()));
     }
     let mut aft = AftProcess::spawn_with_env(&envs);
+    let scenario = match (trace, macos_full_sync) {
+        (true, false) => "traced",
+        (false, false) => "untraced",
+        (true, true) => "traced-full-sync",
+        (false, true) => "untraced-full-sync",
+    };
     let out_dir = std::env::var_os("AFT_DURABILITY_CENSUS_OUT").map(|dir| {
-        let dir = PathBuf::from(dir).join(if trace { "traced" } else { "untraced" });
+        let dir = PathBuf::from(dir).join(scenario);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     });
@@ -512,16 +526,19 @@ fn run_scenario(trace: bool, verify_counts: bool) -> String {
         out_dir,
         daemon_pid: aft.pid(),
         verify_counts,
+        macos_full_sync,
     };
     let _ = writeln!(
         census.report,
-        "# durability census ({})\nstorage={}\nproject={}",
-        if trace { "traced" } else { "untraced" },
-        census.storage,
-        census.project
+        "# durability census ({scenario})\nstorage={}\nproject={}",
+        census.storage, census.project
     );
 
     // Configure and let the startup work (index build, cache write) finish.
+    let mut config = json!({ "bash": { "rewrite": false, "compress": false, "background": true } });
+    if macos_full_sync {
+        config["durability"] = json!({ "macos_full_sync": true });
+    }
     census.mark();
     let (configured, elapsed) = send(
         &mut aft,
@@ -532,7 +549,7 @@ fn run_scenario(trace: bool, verify_counts: bool) -> String {
             "harness": "opencode",
             "project_root": project,
             "storage_dir": storage,
-            "config": user_config(json!({ "bash": { "rewrite": false, "compress": false, "background": true } })),
+            "config": user_config(config),
         }),
     );
     assert_eq!(configured["success"], true, "{configured:?}");
@@ -684,7 +701,7 @@ fn run_scenario(trace: bool, verify_counts: bool) -> String {
     assert!(status.success());
 
     if let Some(dir) = std::env::var_os("AFT_DURABILITY_CENSUS_OUT") {
-        let dir = PathBuf::from(dir).join(if trace { "traced" } else { "untraced" });
+        let dir = PathBuf::from(dir).join(scenario);
         if trace {
             std::fs::copy(&trace_path, dir.join("full.trace")).unwrap();
         }
@@ -696,15 +713,20 @@ fn run_scenario(trace: bool, verify_counts: bool) -> String {
 #[test]
 #[ignore = "measurement: counts fsyncs per store operation; run alone with --nocapture"]
 fn durability_census_per_operation() {
-    let traced = run_scenario(true, false);
+    let traced = run_scenario(true, false, false);
     println!("{traced}");
-    let untraced = run_scenario(false, false);
+    let untraced = run_scenario(false, false, false);
     println!("{untraced}");
 }
 
 #[test]
 fn durability_syscall_operation_counts() {
-    println!("{}", run_scenario(true, true));
+    println!("{}", run_scenario(true, true, false));
+}
+
+#[test]
+fn durability_syscall_operation_counts_full_sync() {
+    println!("{}", run_scenario(true, true, true));
 }
 
 /// Cost of one sync of a small freshly written file on this disk, for each
