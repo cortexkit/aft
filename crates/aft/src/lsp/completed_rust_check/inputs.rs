@@ -163,7 +163,7 @@ fn include_path(
     Some(path)
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Parameter {
     name: String,
     kind: String,
@@ -948,7 +948,10 @@ mod tests {
         let tokens = tokens(left, bytes, deadline).unwrap();
         assert_eq!(
             parameters(&tokens, deadline),
-            Some(vec!["$fixture".into()]),
+            Some(vec![Parameter {
+                name: "$fixture".into(),
+                kind: "literal".into(),
+            }]),
             "{}: {tokens:?}",
             left.to_sexp()
         );
