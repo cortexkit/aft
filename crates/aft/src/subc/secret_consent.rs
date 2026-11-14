@@ -286,8 +286,22 @@ impl SubcSecretConsent {
                         .recover_lost_filing(request, params, &mut card, cancel)
                         .await
                 }
-                Err(_) => {
-                    return consent_unavailable("Cingulate could not file the secret-use card")
+                Err(error) => {
+                    // Cingulate stores nothing for a refused filing, so this
+                    // line is the only record of why no card reached the phone.
+                    // Log the code alone: a refusal message can quote request
+                    // fields, and the label, host and scope identify the call.
+                    let code = match &error {
+                        super::consent::ConsentError::Refused { code, .. } => code.as_str(),
+                        super::consent::ConsentError::ScopeGone(_) => "scope_gone",
+                        super::consent::ConsentError::Unavailable(_) => "unavailable",
+                    };
+                    crate::slog_warn!(
+                        "secret consent filing refused: code={code} request_id={} scope={:?}",
+                        request.request_id,
+                        request.scope
+                    );
+                    return consent_unavailable("Cingulate could not file the secret-use card");
                 }
             };
             let Some(id) = decode_secret_elicitation(&filed) else {
