@@ -34,7 +34,7 @@ pub(crate) const COMPLEXITY_QUERY: &str = r#"
     feature = "wasm-grammars",
     not(all(target_os = "windows", target_arch = "aarch64"))
 ))]
-pub(crate) const COMMENT_QUERY: &str = "(comment) @comment";
+pub(crate) const COMMENT_QUERY: &str = "(comment content: (comment_content) @content) @comment";
 pub(crate) const COMMENT_KINDS: &[&str] = &["comment"];
 
 pub(crate) fn nodes(root: Node<'_>) -> Vec<Node<'_>> {
