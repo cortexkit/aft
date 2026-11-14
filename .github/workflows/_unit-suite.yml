@@ -917,7 +917,7 @@ jobs:
       - name: Run the serial backtrace probe with local debug objects
         run: |
           unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
-          cargo test --features wasm-grammars -p agent-file-tools --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists --config "$LIBTEST_CARGO_CONFIG" --target-dir "$AFT_CI_TARGET_DIR"
+          cargo test --features wasm-grammars -p agent-file-tools -p aft-base --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists --config "$LIBTEST_CARGO_CONFIG" --target-dir "$AFT_CI_TARGET_DIR"
 
       - name: Capture lib source inventory
         run: cargo nextest list --features wasm-grammars --workspace --lib --features test-hooks --profile gate -T json --cargo-quiet --config "$LIBTEST_CARGO_CONFIG" > "$AFT_CI_ARCHIVE_DIR/macos-libtest-inventory.json"

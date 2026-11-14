@@ -44,9 +44,15 @@ if os.environ.get("FAKE_PROBE_HANG"):
 sys.exit(int(os.environ.get("FAKE_PROBE_EXIT", "0")))
 ''')
         self.binary.chmod(0o755)
+        self.base_binary = self.folder / "aft-base-current.exe"
+        self.base_binary.write_bytes(self.binary.read_bytes())
+        self.base_binary.chmod(0o755)
         self.metadata = {"rust-binaries": {
             "agent-file-tools": {
                 "binary-name": "aft", "kind": "lib", "binary-path": str(self.binary),
+            },
+            "aft-base": {
+                "binary-name": "aft_base", "kind": "lib", "binary-path": str(self.base_binary),
             },
             "agent-file-tools::bin/aft": {
                 "binary-name": "aft", "kind": "bin", "binary-path": str(self.folder / "aft-bin.exe"),
@@ -58,6 +64,10 @@ sys.exit(int(os.environ.get("FAKE_PROBE_EXIT", "0")))
 
     def calls(self):
         path = self.binary.with_suffix(".calls")
+        return [json.loads(row) for row in path.read_text().splitlines()] if path.exists() else []
+
+    def base_calls(self):
+        path = self.base_binary.with_suffix(".calls")
         return [json.loads(row) for row in path.read_text().splitlines()] if path.exists() else []
 
     def archive(self, name="target/nextest/binaries-metadata.json", compressed=False):
@@ -90,26 +100,30 @@ sys.exit(int(os.environ.get("FAKE_PROBE_EXIT", "0")))
         (self.folder / "aft-stale.exe").write_text("stale")
         self.assertEqual(probes.library_harness(self.metadata), self.binary)
 
-    def test_tls_cli_selects_the_base_harness_without_replacing_the_aft_harness(self):
-        base_binary = self.folder / "aft-base-current.exe"
-        base_binary.write_bytes(self.binary.read_bytes())
-        base_binary.chmod(0o755)
-        self.metadata["rust-binaries"]["aft-base"] = {
-            "binary-name": "aft_base", "kind": "lib", "binary-path": str(base_binary),
-        }
-        result = subprocess.run(
-            [sys.executable, str(ROOT / "scripts/ci-windows-probes.py"),
-             "--archive-file", str(self.archive()), "--probe", "tls"],
-            capture_output=True, text=True, check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertFalse(self.calls())
-        calls = [json.loads(row) for row in base_binary.with_suffix(".calls").read_text().splitlines()]
-        self.assertEqual([call["args"] for call in calls], [
-            ["--list", "--exact", probes.PROBES["tls"]],
-            ["--exact", probes.PROBES["tls"]],
-        ])
+    def test_cli_routes_tls_to_aft_and_the_moved_backtrace_to_base(self):
+        archive = self.archive()
+        for probe in ("tls", "backtrace"):
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/ci-windows-probes.py"),
+                 "--archive-file", str(archive), "--probe", probe],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for calls, probe in ((self.calls(), "tls"), (self.base_calls(), "backtrace")):
+            self.assertEqual([call["args"] for call in calls], [
+                ["--list", "--exact", probes.PROBES[probe]],
+                ["--exact", probes.PROBES[probe]],
+            ])
         self.assertEqual(probes.library_harness(self.metadata), self.binary)
+
+    def test_probe_filters_are_defined_in_the_expected_crate_sources(self):
+        owners = {
+            "tls": ROOT / "crates/aft/src/semantic_index.rs",
+            "backtrace": ROOT / "crates/aft-base/src/logging.rs",
+        }
+        for probe, source in owners.items():
+            name = probes.PROBES[probe].split("::")[-1]
+            self.assertRegex(source.read_text(), r"\bfn\s+" + name + r"\s*\(")
 
     def test_missing_or_ambiguous_library_metadata_is_refused(self):
         del self.metadata["rust-binaries"]["agent-file-tools"]
@@ -139,7 +153,8 @@ sys.exit(int(os.environ.get("FAKE_PROBE_EXIT", "0")))
             ["--list", "--exact", probes.PROBES["backtrace"]],
             ["--exact", probes.PROBES["backtrace"]],
         ])
-        self.assertTrue(all(Path(call["cwd"]) == ROOT / "crates/aft" for call in calls), calls)
+        self.assertEqual([Path(call["cwd"]) for call in calls],
+                         [ROOT / "crates/aft"] * 2 + [ROOT / "crates/aft-base"] * 2)
 
     def test_child_failure_is_not_treated_as_probe_success(self):
         with patch.dict(os.environ, {"FAKE_PROBE_EXIT": "17"}), contextlib.redirect_stdout(io.StringIO()):
@@ -189,7 +204,8 @@ sys.exit(int(os.environ.get("FAKE_PROBE_EXIT", "0")))
         self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
         self.assertIn("Running serial Windows probe logging::tests::", result.stdout)
         self.assertIn("Windows serial probe runner: Python", result.stdout)
-        self.assertEqual(len(self.calls()), 2)
+        self.assertEqual(len(self.base_calls()), 2)
+        self.assertFalse(self.calls())
 
 
 if __name__ == "__main__":

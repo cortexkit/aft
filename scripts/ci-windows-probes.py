@@ -85,7 +85,7 @@ def run_probe(binary: Path, probe: str, timeout_s: float = PROBE_TIMEOUT_S) -> i
     name = PROBES[probe]
     # Cargo normally runs library tests from their package directory. Preserve
     # that working directory while using nextest's exact already-linked binary.
-    cwd = ROOT / "crates/aft"
+    cwd = ROOT / ("crates/aft-base" if probe == "backtrace" else "crates/aft")
     listing = subprocess.run(
         [str(binary), "--list", "--exact", name], cwd=cwd,
         capture_output=True, text=True, check=True, timeout=LIST_TIMEOUT_S,
@@ -102,7 +102,7 @@ def main() -> int:
     parser.add_argument("--probe", choices=PROBES, required=True)
     args = parser.parse_args()
     print(f"Windows serial probe runner: Python {platform.python_version()}", flush=True)
-    binary = archive_library_harness(args.archive_file, "aft_base" if args.probe == "tls" else "aft")
+    binary = archive_library_harness(args.archive_file, "aft_base" if args.probe == "backtrace" else "aft")
     return run_probe(binary, args.probe)
 
 

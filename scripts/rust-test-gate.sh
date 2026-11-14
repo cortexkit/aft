@@ -538,16 +538,16 @@ if phase_enabled lib; then
       gate_cargo nextest run "${lib_archive_args[@]}" --profile gate \
         -E 'kind(lib)' -- platform_verifier_tls_client_subprocess
   else
-    run_phase "cargo test --features wasm-grammars -p agent-file-tools -p aft-base --lib platform_verifier_tls_client_subprocess --quiet (serial: keychain-latency-sensitive)" \
-      gate_cargo test --features wasm-grammars -p agent-file-tools -p aft-base --lib platform_verifier_tls_client_subprocess --quiet
+    run_phase "cargo test --features wasm-grammars -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet (serial: keychain-latency-sensitive)" \
+      gate_cargo test --features wasm-grammars -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet
   fi
 
   if phase_enabled lib-shard \
     && [[ -n "${AFT_NEXTEST_ARCHIVE_FILE:-}" && "$(uname)" != "Darwin" ]]; then
     # Windows needs its local PDB for the child backtrace; the macOS archive job
     # runs this probe before upload while its linked debug objects are present.
-    run_phase "cargo test --features wasm-grammars -p agent-file-tools --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists --quiet (serial: child backtrace needs the local PDB)" \
-      gate_cargo test --features wasm-grammars -p agent-file-tools --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists --quiet
+    run_phase "cargo test --features wasm-grammars -p agent-file-tools -p aft-base --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists --quiet (serial: child backtrace needs the local PDB)" \
+      gate_cargo test --features wasm-grammars -p agent-file-tools -p aft-base --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists --quiet
   fi
 
   # When lib-shard is selected, the archive-backed command below owns the rest
