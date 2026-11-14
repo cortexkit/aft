@@ -1,0 +1,102 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/data_layer/grammar_tests.rs"
+  ],
+  "note": "Luau S4 index-store wiring. semantic_index.rs changes only symbols_to_chunks_with_caps visibility; its body, built-in chunking and built-in record and chunk-map keys are unchanged. Dynamic grammar identity and stored-record chunking apply only to .luau. Built-in rows cannot move because no benchmark repository contains Luau. pattern_counts are copied unchanged from ci-speed-post065-batch-9.json: inherited pre-0.64 reference transitions, not newly authorized differences. No new count or ranking difference is authorized.",
+  "pattern_counts": {
+    "followup-census:910002": {
+      "candidate_files": {
+        "before": 3,
+        "after": 6
+      },
+      "files_examined": {
+        "before": 3,
+        "after": 6
+      }
+    },
+    "followup-census:910003": {
+      "candidate_files": {
+        "before": 972,
+        "after": 860
+      },
+      "files_examined": {
+        "before": 972,
+        "after": 860
+      }
+    },
+    "followup-census:910004": {
+      "candidate_files": {
+        "before": 972,
+        "after": 860
+      },
+      "files_examined": {
+        "before": 972,
+        "after": 860
+      }
+    },
+    "followup-census:910005": {
+      "candidate_files": {
+        "before": 194,
+        "after": 141
+      },
+      "files_examined": {
+        "before": 194,
+        "after": 141
+      }
+    },
+    "followup-census:910010": {
+      "candidate_files": {
+        "before": 6,
+        "after": 19
+      },
+      "files_examined": {
+        "before": 6,
+        "after": 19
+      }
+    },
+    "followup-census:910011": {
+      "candidate_files": {
+        "before": 942,
+        "after": 729
+      },
+      "files_examined": {
+        "before": 942,
+        "after": 729
+      }
+    },
+    "followup-census:910012": {
+      "candidate_files": {
+        "before": 1031,
+        "after": 730
+      },
+      "files_examined": {
+        "before": 1031,
+        "after": 730
+      }
+    },
+    "followup-census:910013": {
+      "candidate_files": {
+        "before": 908,
+        "after": 45
+      },
+      "files_examined": {
+        "before": 908,
+        "after": 45
+      }
+    },
+    "followup-census:910014": {
+      "candidate_files": {
+        "before": 1011,
+        "after": 24
+      },
+      "files_examined": {
+        "before": 1011,
+        "after": 24
+      }
+    }
+  }
+}

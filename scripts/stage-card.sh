@@ -193,6 +193,52 @@ if [ "$(uname -s)" = "Darwin" ]; then
     echo "stage-card: grammar smoke did not verify the production grammar" >&2
     exit 2
   fi
+  echo "==> smoke: Luau outline under the signed card (offline)"
+  mkdir -p "$GRAMMAR_SMOKE/project"
+  cp "crates/aft/tests/fixtures/grammars/smoke.luau" "$GRAMMAR_SMOKE/project/smoke.luau"
+  if ! env -u AFT_STORAGE_DIR -u AFT_CACHE_DIR -u AFT_TEST_GRAMMAR_MANIFEST \
+      -u AFT_TEST_GRAMMAR_STORAGE -u AFT_TEST_GRAMMAR_QUERIES -u AFT_TEST_GRAMMAR_FAULT \
+      -u AFT_TEST_GRAMMAR_TRANSPORT_FILE -u AFT_TEST_GRAMMAR_CLOCK_FILE \
+      -u AFT_TEST_GRAMMAR_EXTRACTOR_VERSION -u AFT_TEST_GRAMMAR_PARSE_DEADLINE_MS \
+      HOME="$GRAMMAR_SMOKE/home" XDG_CONFIG_HOME="$GRAMMAR_SMOKE/config" \
+      XDG_CACHE_HOME="$GRAMMAR_SMOKE/cache" XDG_STATE_HOME="$GRAMMAR_SMOKE/state" \
+      XDG_DATA_HOME="$GRAMMAR_SMOKE/data" TMPDIR="$GRAMMAR_SMOKE/tmp" \
+      python3 - "$TMP" "$GRAMMAR_SMOKE" <<'PY'
+import json, pathlib, signal, subprocess, sys
+binary, root = sys.argv[1], pathlib.Path(sys.argv[2]).resolve()
+signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError("signed outline smoke timed out")))
+signal.alarm(45)
+with open(root / "outline-stderr.log", "w") as stderr:
+    process = subprocess.Popen(["sandbox-exec", "-p", "(version 1) (allow default) (deny network*)", binary],
+                               cwd=root / "project", stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr, text=True)
+    try:
+        def request(value):
+            process.stdin.write(json.dumps(value) + "\n")
+            process.stdin.flush()
+            for line in process.stdout:
+                reply = json.loads(line)
+                if reply.get("id") == value["id"]:
+                    assert reply.get("success"), reply
+                    return reply
+            raise RuntimeError("signed card exited before replying")
+        request({"id": "signed-configure", "command": "configure", "harness": "runner",
+                 "project_root": str(root / "project"), "storage_dir": str(root / "storage"),
+                 "config": [{"tier": "user", "source": str(root / "config" / "aft.jsonc"),
+                             "doc": json.dumps({"storage": {"cache_dir": None}, "indexes": {"semantic": False}})}]})
+        reply = request({"id": "signed-outline", "command": "outline", "file": str(root / "project" / "smoke.luau")})
+        assert "signed_outline_fixture" in reply.get("text", ""), reply
+        (root / "outline-result.json").write_text(json.dumps(reply))
+    finally:
+        process.kill()
+        process.wait()
+signal.alarm(0)
+PY
+  then
+    rm -rf "$GRAMMAR_SMOKE"
+    rm -f "$TMP"
+    echo "stage-card: signed Luau outline failed; refusing to stage" >&2
+    exit 2
+  fi
   rm -rf "$GRAMMAR_SMOKE"
 
   IMAGE_UUID="$(dwarfdump --uuid "$TMP" | awk 'NR == 1 { gsub(/-/, "", $2); print toupper($2) }')"

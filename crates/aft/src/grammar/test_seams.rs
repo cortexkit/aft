@@ -106,6 +106,10 @@ impl GrammarRegistry {
         self.entry.lock().compiles
     }
 
+    pub fn request_count(&self) -> usize {
+        self.entry.lock().attempts_started
+    }
+
     pub fn set_storage_fault(&self, fault: StorageFault) {
         *self.fault.write() = fault;
     }

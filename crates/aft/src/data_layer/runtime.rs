@@ -959,6 +959,19 @@ impl Work {
     /// Builds the checkout if it needs it, and refreshes its call graph
     /// otherwise.
     fn catch_up(self: &Arc<Self>, publish: Publish) {
+        #[cfg(feature = "wasm-grammars")]
+        if self.checkout.view().is_some_and(|view| {
+            view.current_state()
+                .skipped_parses()
+                .values()
+                .any(|reason| {
+                    serde_json::from_str::<serde_json::Value>(reason)
+                        .is_ok_and(|value| value["code"] == "grammar_unavailable")
+                })
+        }) {
+            let _ = crate::grammar::registry().request();
+            let _ = self.checkout.retry_grammar_gaps();
+        }
         if self.checkout.needs_build() {
             // Nothing published, or only the text index: a build that
             // published it first stopped before the call graph.

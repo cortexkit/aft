@@ -652,6 +652,7 @@ pub(crate) enum MeaningPlane {
 /// The meaning plane's coverage counts (see [`super::vectors::Coverage`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct MeaningCoverage {
+    pub(crate) files_skipped: usize,
     pub(crate) files: usize,
     pub(crate) files_embedded: usize,
     pub(crate) files_too_large: usize,
@@ -667,6 +668,7 @@ impl MeaningCoverage {
     fn of(coverage: &super::vectors::Coverage) -> Self {
         Self {
             files: coverage.files,
+            files_skipped: coverage.skipped_parses.len(),
             files_embedded: coverage.files_embedded,
             files_too_large: coverage.files_too_large,
             files_failed: coverage.files_failed.len(),
@@ -706,6 +708,10 @@ impl MeaningReport {
                 });
                 if !ready {
                     value["stage"] = json!(super::meaning::FILLING_STAGE);
+                }
+                if coverage.files_skipped > 0 {
+                    value["files_skipped"] = json!(coverage.files_skipped);
+                    value["complete"] = false.into();
                 }
                 if let Some(error) = error {
                     value["error"] = json!(error);

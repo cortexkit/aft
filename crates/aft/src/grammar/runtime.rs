@@ -55,6 +55,8 @@ impl Clock for MonotonicClock {
 }
 
 struct Entry {
+    #[cfg(feature = "test-hooks")]
+    attempts_started: usize,
     root_generation: u64,
     loading: bool,
     language: Option<Language>,
@@ -69,6 +71,8 @@ struct Entry {
 impl Default for Entry {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "test-hooks")]
+            attempts_started: 0,
             root_generation: 0,
             loading: false,
             language: None,
@@ -282,6 +286,10 @@ impl GrammarRegistry {
             GrammarState::NetworkRetry | GrammarState::StorageRetry
         ) && self.clock.now_ms() >= entry.retry_at;
         if entry.state == GrammarState::NotDownloaded || retry {
+            #[cfg(feature = "test-hooks")]
+            {
+                entry.attempts_started += 1;
+            }
             entry.state = GrammarState::Downloading;
             let generation = entry.root_generation;
             let registry = Arc::clone(self);

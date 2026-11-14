@@ -32,7 +32,9 @@ use aft_store::text::{
 };
 
 use super::callgraph::{CheckoutInputs, EncodedResolution, FileResolution};
-use super::content::{blob_from_record, extract, language_for, EXTRACTOR_VERSION};
+#[cfg(test)]
+use super::content::EXTRACTOR_VERSION;
+use super::content::{blob_from_record, language_for};
 use super::graph_store::{Held, SectionsWriter, StoredSlices};
 use super::incremental::{LiveCheckout, UpdateError, UpdateStats};
 use super::overlay::{CacheKey, OverlaySlices, PreparedSlice};
@@ -2242,11 +2244,25 @@ impl Checkout {
         let fragments = (0..records.len())
             .map(|index| sibling.fragment(index))
             .collect();
+        let gaps = sibling
+            .skipped_parses()
+            .iter()
+            .filter(|(path, _)| {
+                scanned.state.get(path).is_some_and(|record| {
+                    sibling
+                        .get(path)
+                        .is_some_and(|before| same_member(before, record))
+                })
+            })
+            .map(|(path, reason)| (path.clone(), reason.clone()))
+            .collect();
         let start =
             CheckoutState::new(scanned.state.git.clone(), scanned.state.conversion, records)
                 .map_err(DataError::store)?
                 .with_root_of(&scanned.state)
-                .with_fragments_for(fragments, &super::content::graph_version(sibling))
+                .with_skipped_parses(gaps)
+                .map_err(DataError::store)?
+                .with_fragments_for(fragments, &super::content::graph_version(&sibling))
                 .map_err(DataError::store)?;
         let scan_ms = elapsed_ms(started);
         checkpoint()?;
@@ -5973,6 +5989,7 @@ impl aft_store::heap::HeapBytes for Extracted {
     fn heap_bytes(&self, seen: &mut aft_store::heap::Seen) -> usize {
         match self {
             Self::Nothing => 0,
+            Self::GrammarGap(reason) => reason.heap_bytes(seen),
             Self::Parse(key, parse, record) => {
                 key.heap_bytes(seen) + parse.heap_bytes(seen) + record.heap_bytes(seen)
             }
@@ -6480,10 +6497,9 @@ impl Checkout {
                             return None;
                         }
                     }
-                    Some(RecordKey::new(
+                    Some(crate::data_layer::content::record_key(
                         record.content,
                         &record.language,
-                        EXTRACTOR_VERSION,
                     ))
                 })
                 .collect::<Vec<_>>()
