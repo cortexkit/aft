@@ -69,10 +69,12 @@ impl Reason {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct Refusal {
     pub(super) reason: Reason,
     pub(super) label: String,
     pub(super) approval: Option<crate::secret::requests::ApprovalMetadata>,
+    pub(super) outcome: Option<&'static str>,
 }
 
 impl Refusal {
@@ -85,6 +87,7 @@ impl Refusal {
             reason,
             label: label.to_owned(),
             approval: None,
+            outcome: None,
         }
     }
 }

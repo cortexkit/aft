@@ -43,25 +43,31 @@ pub(super) async fn forward(
     } else {
         Err(Refusal::new(Reason::RequestLimit))
     };
-    if let Err(error) = &result {
+    let diagnostic = match &result {
+        Ok(response) => response.extensions().get::<Refusal>(),
+        Err(error) => Some(error),
+    };
+    if let Some(error) = diagnostic {
         let label = if error.label.is_empty() {
             fallback
         } else {
             &error.label
         };
-        if let Some(approval) = &error.approval {
+        if let Some(outcome) = error.outcome {
             log_approval_refusal(
                 &state,
                 error.reason,
                 label,
                 &authority.host,
-                Some(approval),
-                Some("not_granted"),
+                error.approval.as_ref(),
+                Some(outcome),
             );
         } else {
             log_refusal(&state, error.reason, label, &authority.host);
         }
-        audit.refused_for(&error.label);
+        if result.is_err() {
+            audit.refused_for(&error.label);
+        }
     }
     let response = result.unwrap_or_else(|error| {
         let label = if error.label.is_empty() {
@@ -356,6 +362,7 @@ async fn prepare_and_send(
                 if let Some(approval) = metadata {
                     let mut refusal = Refusal::for_label(Reason::ApprovalNotGranted, label);
                     refusal.approval = Some(approval);
+                    refusal.outcome = Some("not_granted");
                     return Err(refusal);
                 }
                 return Err(Refusal::for_label(Reason::VaultUnavailable, label));
@@ -574,23 +581,26 @@ fn not_approved(
     state: &State,
     reason: crate::secret::requests::UseError,
     log_reason: Reason,
-    outcome: &str,
+    outcome: &'static str,
     approval: Option<&crate::secret::requests::ApprovalMetadata>,
 ) -> Response<Body> {
     let body = Zeroizing::new(crate::secret::requests::consent_failure_message(
         label, host, reason,
     ));
-    let bytes = match state.scrub(body.as_bytes()) {
+    let (bytes, refusal) = match state.scrub(body.as_bytes()) {
         Ok(bytes) => {
-            log_approval_refusal(state, log_reason, label, host, approval, Some(outcome));
-            bytes
+            let mut refusal = Refusal::for_label(log_reason, label);
+            refusal.approval = approval.cloned();
+            refusal.outcome = Some(outcome);
+            (bytes, refusal)
         }
-        Err(_) => {
-            log_refusal(state, Reason::ScrubFailed, label, host);
-            super::PROXY_REFUSAL.as_bytes().to_vec()
-        }
+        Err(_) => (
+            super::PROXY_REFUSAL.as_bytes().to_vec(),
+            Refusal::for_label(Reason::ScrubFailed, label),
+        ),
     };
     let mut response = Response::new(full(Bytes::from(bytes)));
+    response.extensions_mut().insert(refusal);
     *response.status_mut() = hyper::StatusCode::FORBIDDEN;
     response
 }
