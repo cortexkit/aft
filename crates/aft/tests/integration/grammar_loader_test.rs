@@ -10,7 +10,7 @@ fn fixture() -> PathBuf {
 }
 
 fn command(root: &Path, download: bool) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_aft"));
+    let mut command = Command::new(crate::test_helpers::aft_binary::source_binary());
     command
         .arg("grammar-smoke")
         .arg("--storage-dir")

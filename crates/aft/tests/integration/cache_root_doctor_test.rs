@@ -247,7 +247,7 @@ fn cache_root_doctor_process_scan_timeout_is_reported() {
     let ps = bin.join("ps");
     fs::write(&ps, "#!/bin/sh\nexec /bin/sleep 12\n").unwrap();
     fs::set_permissions(ps, fs::Permissions::from_mode(0o700)).unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_aft"));
+    let mut command = Command::new(crate::test_helpers::aft_binary::source_binary());
     command
         .arg("fix-config")
         .current_dir(temp.path())
@@ -301,7 +301,7 @@ fn cache_root_doctor_fresh_install_without_storage_succeeds_and_creates_nothing(
     // No daemon is listed, so a scan (if one ran) could not refuse.
     let path = process_snapshot_fixture(temp.path(), "");
     let before = tree(temp.path());
-    let mut command = Command::new(env!("CARGO_BIN_EXE_aft"));
+    let mut command = Command::new(crate::test_helpers::aft_binary::source_binary());
     command
         .arg("fix-config")
         .current_dir(&home)
@@ -335,7 +335,7 @@ fn cache_root_doctor_prelease_process_snapshot_refuses_cleanup() {
         temp.path(),
         "999999 /opt/ck-aft --subc /run/connection.json\n",
     );
-    let mut command = Command::new(env!("CARGO_BIN_EXE_aft"));
+    let mut command = Command::new(crate::test_helpers::aft_binary::source_binary());
     command
         .arg("fix-config")
         .current_dir(temp.path())
@@ -489,7 +489,7 @@ fn cache_root_doctor_body_child() {
     let run = |args: &[&str]| {
         let label = format!("aft {}", args.join(" "));
         eprintln!("cache-root doctor: waiting for {label}");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_aft"));
+        let mut command = Command::new(crate::test_helpers::aft_binary::source_binary());
         command
             .args(args)
             .current_dir(temp.path())

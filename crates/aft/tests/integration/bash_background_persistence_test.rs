@@ -3273,7 +3273,7 @@ fn unacked_once_watch_replays_after_unread_rearm_crash_until_ack() {
 
     let phase_two_cache = tempfile::tempdir().unwrap();
     let phase_two_ready = project.path().join("phase-two-configured");
-    let mut phase_two_command = Command::new(env!("CARGO_BIN_EXE_aft"));
+    let mut phase_two_command = Command::new(crate::test_helpers::aft_binary::source_binary());
     phase_two_command
         .env_remove("AFT_STORAGE_DIR")
         .env("AFT_CACHE_DIR", phase_two_cache.path())

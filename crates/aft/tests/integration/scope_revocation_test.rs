@@ -2469,7 +2469,7 @@ fn worker_codemode_background_task_is_private_to_its_catalog_bound_route() {
             let mut daemon = open_scope_daemon_session(input).await;
             let _launcher = aft::sandbox_spawn::install_sandbox_launcher_for_test(
                 &daemon.root2,
-                std::path::PathBuf::from(env!("CARGO_BIN_EXE_aft")),
+                crate::test_helpers::aft_binary::source_binary(),
             );
             bind_head(&mut daemon.stream, &daemon.root1, 1, "head-session").await;
             for (channel, principal) in [(2, "broca"), (3, PREFRONTAL)] {
