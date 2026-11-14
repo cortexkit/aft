@@ -187,7 +187,7 @@ fn luau_s4_feature_matrix() {
             .env("AFT_S4_PHASE", phase)
             .env(
                 "AFT_TEST_GRAMMAR_PARSE_DEADLINE_MS",
-                if phase == "timeout" { "1" } else { "30000" },
+                if phase == "timeout" { "100" } else { "30000" },
             )
             .env("AFT_S4_ROOT", dir.path())
             .env("AFT_TEST_GRAMMAR_MANIFEST", manifest_dir.join(manifest))
