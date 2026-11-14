@@ -26,6 +26,8 @@ impl ImageCleanupPass {
 }
 
 fn image_present(io: &Path) -> bool {
+    #[cfg(test)]
+    super::super::persistence::work_counts::record_stat();
     !matches!(
         fs::symlink_metadata(io.join(TASK_IMAGE_DIR)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
@@ -221,6 +223,37 @@ mod tests {
         assert!(!task.paths.io_dir.join(TASK_IMAGE_DIR).exists());
         assert_eq!(fs::read(&task.paths.stdout).unwrap(), b"result\n");
         assert_eq!(fs::read(&task.paths.json).unwrap(), saved);
+    }
+
+    #[test]
+    fn terminal_images_are_not_reprobed_after_replay_cleanup() {
+        use super::super::super::persistence::work_counts;
+
+        let storage = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::default();
+        let mut tasks = Vec::new();
+        for index in 0..4 {
+            let (task, metadata) = saved_image(storage.path(), index);
+            if index % 2 == 0 {
+                fs::remove_dir_all(task.paths.io_dir.join(TASK_IMAGE_DIR)).unwrap();
+            }
+            registry
+                .insert_rehydrated_task(metadata, task.paths.clone(), true)
+                .unwrap();
+            tasks.push(registry.task(&task.paths.task_id).unwrap());
+        }
+        work_counts::reset();
+        registry.cleanup_finished(super::super::super::watchdog::FINISHED_RETENTION);
+        registry.cleanup_finished(super::super::super::watchdog::FINISHED_RETENTION);
+        assert_eq!(
+            work_counts::get().stats,
+            0,
+            "terminal images already removed or absent were probed again"
+        );
+        let _ban = forbid_task_state_locks_for_test();
+        for task in tasks {
+            assert_eq!(registry.cleanup_terminal_task_image(&task).remaining, 0);
+        }
     }
 
     #[test]
