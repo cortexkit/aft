@@ -246,6 +246,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+
       - uses: ./.github/actions/native-ci-state
         with:
           phase: python
@@ -260,6 +261,10 @@ jobs:
           python-version: "3.14"
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         continue-on-error: true
@@ -281,9 +286,9 @@ jobs:
         run: node scripts/version-sync.mjs --from-tag
 
       - name: Release library codegen (shipped profile)
-        run: cargo build --release --lib -p agent-file-tools --timings
+        run: cargo build --release --lib -p agent-file-tools --timings --features wasm-grammars
       - name: Build
-        run: cargo build --release --bin aft -p agent-file-tools --timings
+        run: cargo build --release --bin aft -p agent-file-tools --timings --features wasm-grammars
       # Strip BEFORE signing, never after: v0.51.1 shipped a SIGKILL-on-load
       # arm64 binary (#238) because strip ran after signing, and strip's
       # automatic re-sign produced a corrupt signature.
@@ -331,6 +336,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+
       - uses: ./.github/actions/native-ci-state
         with:
           phase: python
@@ -347,6 +353,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-apple-darwin
+
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         continue-on-error: true
@@ -366,7 +376,7 @@ jobs:
         run: node scripts/version-sync.mjs --from-tag
 
       - name: Build
-        run: cargo build --release --target x86_64-apple-darwin
+        run: cargo build --release --target x86_64-apple-darwin --features wasm-grammars
 
       - name: Strip binary
         run: strip target/x86_64-apple-darwin/release/aft
@@ -443,7 +453,11 @@ jobs:
       - name: Build
         # Keep line tables only until objcopy detaches them below; shipped code
         # and optimization settings are unchanged.
-        run: cross build --release --target aarch64-unknown-linux-gnu --config 'profile.release.strip=false' --config 'profile.release.split-debuginfo="off"'
+        run: cross build --release --target aarch64-unknown-linux-gnu --config 'profile.release.strip=false' --config 'profile.release.split-debuginfo="off"' --features wasm-grammars
+        env:
+          # Cross runs this script inside the target build image, before Cargo.
+          CROSS_TARGET_AARCH64_UNKNOWN_LINUX_GNU_PRE_BUILD: scripts/check-cmake.sh
+          CROSS_BUILD_OPTS: --no-cache
 
       - name: Install ARM64 debug extraction tools
         run: |
@@ -499,7 +513,10 @@ jobs:
       # Use gnu target (not musl) so dlopen works for ONNX Runtime loading.
       # musl produces static binaries where dlopen is a stub that always fails.
       - name: Build
-        run: cross build --release --target x86_64-unknown-linux-gnu --config 'profile.release.strip=false' --config 'profile.release.split-debuginfo="off"'
+        run: cross build --release --target x86_64-unknown-linux-gnu --config 'profile.release.strip=false' --config 'profile.release.split-debuginfo="off"' --features wasm-grammars
+        env:
+          CROSS_TARGET_X86_64_UNKNOWN_LINUX_GNU_PRE_BUILD: scripts/check-cmake.sh
+          CROSS_BUILD_OPTS: --no-cache
 
       - name: Split and verify Linux debug symbols
         run: python3 scripts/release-debug-symbols.py linux --binary target/x86_64-unknown-linux-gnu/release/aft --archive release-debug/aft-linux-x64-debug.zip
@@ -533,6 +550,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
@@ -553,6 +571,10 @@ jobs:
         if: runner.environment == 'github-hosted'
         with:
           targets: aarch64-pc-windows-msvc
+
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         if: runner.environment == 'github-hosted'
@@ -626,7 +648,7 @@ jobs:
 
       - name: Build
         # MSVC keeps debug info in a PDB, not in the shipped executable.
-        run: cargo build --release --target aarch64-pc-windows-msvc --config 'profile.release.strip=false'
+        run: cargo build --release --target aarch64-pc-windows-msvc --config 'profile.release.strip=false' --features wasm-grammars
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
@@ -678,6 +700,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
@@ -698,6 +721,10 @@ jobs:
         if: runner.environment == 'github-hosted'
         with:
           targets: x86_64-pc-windows-msvc
+
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         if: runner.environment == 'github-hosted'
@@ -720,13 +747,13 @@ jobs:
         shell: pwsh
 
       - name: Release library codegen (shipped profile)
-        run: cargo build --release --lib --target x86_64-pc-windows-msvc -p agent-file-tools --timings --config 'profile.release.strip=false'
+        run: cargo build --release --lib --target x86_64-pc-windows-msvc -p agent-file-tools --timings --config 'profile.release.strip=false' --features wasm-grammars
         shell: pwsh
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
       - name: Build
-        run: cargo build --release --bin aft --target x86_64-pc-windows-msvc -p agent-file-tools --timings --config 'profile.release.strip=false'
+        run: cargo build --release --bin aft --target x86_64-pc-windows-msvc -p agent-file-tools --timings --config 'profile.release.strip=false' --features wasm-grammars
         shell: pwsh
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}

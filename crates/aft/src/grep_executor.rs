@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use ignore::WalkBuilder;
@@ -157,9 +157,112 @@ pub struct FallbackWalkOutcome {
     pub walk_truncated: bool,
     /// True only when the iterator stopped because its walk deadline expired.
     pub walk_time_limit_reached: bool,
+    pub walk_entry_limit_reached: bool,
     /// Foreign filesystem mounts skipped before a recursive fallback could open them.
     pub skipped_foreign_mounts: usize,
     pub entries_visited: usize,
+}
+
+#[derive(Clone)]
+struct WalkLog {
+    reason: &'static str,
+    root: PathBuf,
+    tool: &'static str,
+    entries: usize,
+    files: usize,
+    elapsed_ms: u128,
+    entry_limit: bool,
+    time_limit: bool,
+    count: usize,
+}
+
+impl WalkLog {
+    fn emit(&self) {
+        crate::slog_info!(
+            "fallback walk: reason={} root={:?} tool={} entries_visited={} files_kept={} elapsed_ms={} entry_limit={} time_budget={} count={}",
+            self.reason, self.root, self.tool, self.entries, self.files, self.elapsed_ms,
+            self.entry_limit, self.time_limit, self.count
+        );
+    }
+}
+
+// Emit the first walk immediately; sum subsequent walks for the same reason
+// and root over the next minute. A waiting worker flushes even if traffic stops.
+// Counts, entries, files and elapsed milliseconds in a summary are totals.
+type WalkLogMap = HashMap<(&'static str, PathBuf), (Instant, Option<WalkLog>)>;
+
+fn log_fallback_walk(log: WalkLog) {
+    if !crate::logging::slog_info_enabled(module_path!()) {
+        return;
+    }
+    static COALESCER: OnceLock<Option<Arc<(Mutex<WalkLogMap>, Condvar)>>> = OnceLock::new();
+    let coalescer = COALESCER.get_or_init(|| {
+        let shared = Arc::new((Mutex::new(WalkLogMap::new()), Condvar::new()));
+        let worker = Arc::clone(&shared);
+        let spawned = std::thread::Builder::new()
+            .name("aft-walk-log".into())
+            .spawn(move || {
+                let (lock, wake) = &*worker;
+                let mut pending = lock.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    let now = Instant::now();
+                    let mut expired = Vec::new();
+                    pending.retain(|_, (deadline, summary)| {
+                        if *deadline <= now {
+                            if let Some(summary) = summary.take() {
+                                expired.push(summary);
+                            }
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    if !expired.is_empty() {
+                        drop(pending);
+                        for summary in expired {
+                            summary.emit();
+                        }
+                        pending = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        continue;
+                    }
+                    if let Some(deadline) = pending.values().map(|(deadline, _)| *deadline).min() {
+                        pending = wake
+                            .wait_timeout(pending, deadline.saturating_duration_since(now))
+                            .unwrap_or_else(|e| e.into_inner())
+                            .0;
+                    } else {
+                        pending = wake.wait(pending).unwrap_or_else(|e| e.into_inner());
+                    }
+                }
+            });
+        spawned.ok().map(|_| shared)
+    });
+    let Some(coalescer) = coalescer else {
+        log.emit();
+        return;
+    };
+    let (lock, wake) = &**coalescer;
+    let mut pending = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (log.reason, log.root.clone());
+    if let Some((_, summary)) = pending.get_mut(&key) {
+        if let Some(summary) = summary {
+            summary.count += 1;
+            summary.entries += log.entries;
+            summary.files += log.files;
+            summary.elapsed_ms += log.elapsed_ms;
+            summary.entry_limit |= log.entry_limit;
+            summary.time_limit |= log.time_limit;
+            if summary.tool != log.tool {
+                summary.tool = "mixed";
+            }
+        } else {
+            *summary = Some(log);
+        }
+    } else {
+        log.emit();
+        pending.insert(key, (Instant::now() + Duration::from_secs(60), None));
+        wake.notify_one();
+    }
 }
 
 /// Counts are updated before include/exclude filtering. Empty-scope probes count
@@ -1560,13 +1663,18 @@ pub(crate) fn bounded_fallback_walk_files(
     filter_root: &Path,
     search_root: &Path,
     filters: &PathFilters,
+    tool: &'static str,
 ) -> FallbackWalkOutcome {
-    bounded_fallback_walk_files_with_limits(
+    bounded_fallback_walk_files_with_limits_target(
         filter_root,
         search_root,
         filters,
         fallback_walk_limit(),
         fallback_walk_budget(),
+        false,
+        false,
+        "index_unavailable",
+        tool,
     )
 }
 
@@ -1575,6 +1683,7 @@ pub(crate) fn bounded_fallback_walk_files_for_target(
     search_root: &Path,
     filters: &PathFilters,
     ignored_target: bool,
+    tool: &'static str,
 ) -> FallbackWalkOutcome {
     bounded_fallback_walk_files_with_limits_target(
         filter_root,
@@ -1584,6 +1693,8 @@ pub(crate) fn bounded_fallback_walk_files_for_target(
         fallback_walk_budget(),
         ignored_target,
         false,
+        "target",
+        tool,
     )
 }
 
@@ -1600,6 +1711,8 @@ pub(crate) fn bounded_glob_walk_in_named_ignored_folder(
         fallback_walk_budget(),
         true,
         true,
+        "named_ignored",
+        "glob",
     )
 }
 
@@ -1607,6 +1720,7 @@ pub(crate) fn source_first_fallback_walk_files(
     root: &Path,
     deadline: Instant,
 ) -> FallbackWalkOutcome {
+    let started = Instant::now();
     let mut files = Vec::new();
     let mut entries_visited = 0;
     let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
@@ -1634,14 +1748,17 @@ pub(crate) fn source_first_fallback_walk_files(
             }
         }
     }
-    FallbackWalkOutcome {
+    let outcome = FallbackWalkOutcome {
         error: None,
         files,
         walk_truncated,
         walk_time_limit_reached,
+        walk_entry_limit_reached: false,
         skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
         entries_visited,
-    }
+    };
+    log_walk_outcome("source_first", "unknown", root, started, &outcome);
+    outcome
 }
 
 pub(crate) fn is_fallback_source_path(path: &Path) -> bool {
@@ -1669,6 +1786,8 @@ pub(crate) fn bounded_fallback_walk_files_with_limits(
         budget,
         false,
         false,
+        "bounded",
+        "unknown",
     )
 }
 
@@ -1680,7 +1799,10 @@ fn bounded_fallback_walk_files_with_limits_target(
     budget: Duration,
     ignored_target: bool,
     ignore_ancestors: bool,
+    reason: &'static str,
+    tool: &'static str,
 ) -> FallbackWalkOutcome {
+    let started = Instant::now();
     let filter_root = filter_root.to_path_buf();
     let filters = filters.clone();
     let entry_delay = fallback_walk_entry_delay();
@@ -1700,6 +1822,7 @@ fn bounded_fallback_walk_files_with_limits_target(
             files: Vec::new(),
             walk_truncated: false,
             walk_time_limit_reached: false,
+            walk_entry_limit_reached: false,
             skipped_foreign_mounts: 0,
             entries_visited: 0,
         },
@@ -1722,7 +1845,28 @@ fn bounded_fallback_walk_files_with_limits_target(
         outcome.walk_truncated = true;
         outcome.walk_time_limit_reached = partial.time_limit;
     }
+    log_walk_outcome(reason, tool, search_root, started, &outcome);
     outcome
+}
+
+fn log_walk_outcome(
+    reason: &'static str,
+    tool: &'static str,
+    root: &Path,
+    started: Instant,
+    outcome: &FallbackWalkOutcome,
+) {
+    log_fallback_walk(WalkLog {
+        reason,
+        root: root.to_path_buf(),
+        tool,
+        entries: outcome.entries_visited,
+        files: outcome.files.len(),
+        elapsed_ms: started.elapsed().as_millis(),
+        entry_limit: outcome.walk_entry_limit_reached,
+        time_limit: outcome.walk_time_limit_reached,
+        count: 1,
+    });
 }
 
 fn walk_files_unbounded(
@@ -1751,6 +1895,7 @@ fn walk_files_unbounded(
             files: Vec::new(),
             walk_truncated: false,
             walk_time_limit_reached: false,
+            walk_entry_limit_reached: false,
             skipped_foreign_mounts: 0,
             entries_visited: 0,
         };
@@ -1763,6 +1908,7 @@ fn walk_files_unbounded(
     let mut files = Vec::new();
     let mut walk_truncated = false;
     let mut walk_time_limit_reached = false;
+    let mut walk_entry_limit_reached = false;
     let mut entries_visited = 0usize;
     let mut walker = builder.build();
     let mut error = None;
@@ -1785,6 +1931,7 @@ fn walk_files_unbounded(
         });
         if entries_visited > max_files.saturating_mul(8).max(1024) {
             walk_truncated = true;
+            walk_entry_limit_reached = true;
             break;
         }
         let entry = match entry {
@@ -1828,6 +1975,7 @@ fn walk_files_unbounded(
         files,
         walk_truncated,
         walk_time_limit_reached,
+        walk_entry_limit_reached,
         skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
         entries_visited,
     }
@@ -1847,6 +1995,7 @@ fn for_each_bounded_fallback_walk_file_with_limits<F>(
 where
     F: FnMut(&PathBuf),
 {
+    let started = Instant::now();
     let filter_root = filter_root.to_path_buf();
     let project_root = project_root.to_path_buf();
     let filters = filters.clone();
@@ -1881,11 +2030,22 @@ where
         },
     );
     let (files, mut progress) = walked;
-    for file in files {
-        on_file(&file);
-    }
     if partial.incomplete {
         progress.bound = Some(WalkBound::TimeBudget);
+    }
+    log_fallback_walk(WalkLog {
+        reason: "streaming_grep",
+        root: search_root.to_path_buf(),
+        tool: "grep",
+        entries: progress.counts.entries_visited,
+        files: files.len(),
+        elapsed_ms: started.elapsed().as_millis(),
+        entry_limit: false,
+        time_limit: progress.bound == Some(WalkBound::TimeBudget),
+        count: 1,
+    });
+    for file in files {
+        on_file(&file);
     }
     progress
 }
@@ -2876,7 +3036,7 @@ pub(crate) fn ripgrep_glob(
     max_results: usize,
 ) -> Option<FallbackWalkOutcome> {
     let filters = build_path_filters(&[pattern.to_string()], &[]).ok()?;
-    let mut outcome = bounded_fallback_walk_files(search_root, search_root, &filters);
+    let mut outcome = bounded_fallback_walk_files(search_root, search_root, &filters, "glob");
     outcome.files.truncate(max_results);
     Some(outcome)
 }
@@ -2956,6 +3116,42 @@ fn line_details_with_next(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn observability_fallback_walk_logs_entry_point_once() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "hello").unwrap();
+        let filters = PathFilters::default();
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            bounded_fallback_walk_files(dir.path(), dir.path(), &filters, "grep");
+            bounded_glob_walk_in_named_ignored_folder(dir.path(), dir.path(), &filters);
+        });
+        let lines: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains("fallback walk:"))
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].contains("INFO fallback walk: reason=index_unavailable"),
+            "{:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("INFO fallback walk: reason=named_ignored"),
+            "{:?}",
+            lines[1]
+        );
+        for line in &lines {
+            assert!(line.contains("entries_visited=2"), "{line}");
+            assert!(line.contains("files_kept=1"), "{line}");
+            assert!(
+                line.contains("entry_limit=false time_budget=false count=1"),
+                "{line}"
+            );
+            assert!(line.contains(&format!("root={:?}", dir.path())), "{line}");
+        }
+        assert!(lines[1].contains("tool=glob"));
+    }
+
     #[test]
     fn walk_deadline_keeps_every_path_already_found() {
         let dir = tempfile::tempdir().unwrap();
@@ -3856,7 +4052,7 @@ mod tests {
         std::fs::write(root.join("a.txt"), "x\n").expect("write");
         std::fs::write(root.join("b.txt"), "x\n").expect("write");
         let filters = build_path_filters(&["**/*.txt".to_string()], &[]).expect("filters");
-        let outcome = bounded_fallback_walk_files(root, root, &filters);
+        let outcome = bounded_fallback_walk_files(root, root, &filters, "grep");
         assert!(!outcome.walk_truncated);
         assert_eq!(outcome.files.len(), 2);
     }
@@ -3908,7 +4104,7 @@ mod tests {
                 "{ignored_directory}: grep visited {} entries",
                 counts.entries_visited
             );
-            let outcome = bounded_fallback_walk_files(root, root, &filters);
+            let outcome = bounded_fallback_walk_files(root, root, &filters, "grep");
             assert_eq!(outcome.files.len(), 5);
             assert!(!outcome.walk_truncated, "{ignored_directory}: {outcome:?}");
             assert!(
@@ -4011,7 +4207,7 @@ mod tests {
     }
 
     fn fallback_walk_set(root: &Path) -> std::collections::BTreeSet<String> {
-        let outcome = bounded_fallback_walk_files(root, root, &PathFilters::default());
+        let outcome = bounded_fallback_walk_files(root, root, &PathFilters::default(), "grep");
         assert!(!outcome.walk_truncated, "fixture walk must not truncate");
         crate::context::ignore_rules_fixture::relative_set(root, &outcome.files)
     }
@@ -4041,7 +4237,7 @@ mod tests {
             std::fs::write(dir.path().join(name), content).unwrap();
         }
         let filters = build_path_filters(&["*.log".to_string()], &[]).unwrap();
-        let outcome = bounded_fallback_walk_files(dir.path(), dir.path(), &filters);
+        let outcome = bounded_fallback_walk_files(dir.path(), dir.path(), &filters, "grep");
         assert_eq!(outcome.files, vec![dir.path().join("b.log")]);
         let counts = diagnose_scope_counts(dir.path(), dir.path(), &filters, false).unwrap();
         assert_eq!(counts.examined, 5);
@@ -4077,7 +4273,7 @@ mod tests {
             std::fs::write(skipped.join("keep.log"), "default skip\n").unwrap();
         }
         let filters = build_path_filters(&["*.log".to_string()], &[]).unwrap();
-        let outcome = bounded_fallback_walk_files_for_target(&root, &root, &filters, true);
+        let outcome = bounded_fallback_walk_files_for_target(&root, &root, &filters, true, "grep");
         assert_eq!(outcome.files.len(), 2, "{:?}", outcome.files);
         assert!(outcome.files.contains(&root.join("keep.log")));
         assert!(outcome.files.contains(&root.join("nested/child.log")));

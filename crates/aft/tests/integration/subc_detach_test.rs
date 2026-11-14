@@ -449,7 +449,7 @@ fn standalone_and_index_take_storage_lease_before_cache_access() {
             .open(storage.join("retention/daemon-use.lock"))
             .unwrap();
         lock.try_lock().unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_aft"));
+        let mut command = Command::new(crate::test_helpers::aft_binary::source_binary());
         if index {
             command.arg("index");
         }

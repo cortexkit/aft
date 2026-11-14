@@ -26,6 +26,9 @@ impl ImageCleanupPass {
 }
 
 fn image_present(io: &Path) -> bool {
+    super::super::watchdog::record_cleanup_work(|work| work.image_probes += 1);
+    #[cfg(test)]
+    super::super::persistence::work_counts::record_stat();
     !matches!(
         fs::symlink_metadata(io.join(TASK_IMAGE_DIR)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
@@ -132,6 +135,9 @@ fn cleanup_image(
 
 impl BgTaskRegistry {
     pub(super) fn cleanup_terminal_task_image(&self, task: &BgTask) -> ImageCleanupPass {
+        if task.terminal_image_cleaned.load(Ordering::Acquire) {
+            return ImageCleanupPass::default();
+        }
         #[cfg(unix)]
         let probe_running = self
             .db_hint_job(&task.task_id)
@@ -141,9 +147,18 @@ impl BgTaskRegistry {
         let Ok(state) = task.lock_state() else {
             return ImageCleanupPass::default();
         };
-        cleanup_image(&task.paths, &state.metadata, || {
+        // A running launch can still create its image after an absent probe.
+        // Remember absence only after the task has irreversibly finished.
+        if !state.metadata.is_terminal() {
+            return ImageCleanupPass::default();
+        }
+        let result = cleanup_image(&task.paths, &state.metadata, || {
             !state.kill_in_flight && !state.descendant_sample_pending && !probe_running
-        })
+        });
+        if result.remaining == 0 {
+            task.terminal_image_cleaned.store(true, Ordering::Release);
+        }
+        result
     }
 
     pub(super) fn cleanup_saved_task_image(
@@ -221,6 +236,105 @@ mod tests {
         assert!(!task.paths.io_dir.join(TASK_IMAGE_DIR).exists());
         assert_eq!(fs::read(&task.paths.stdout).unwrap(), b"result\n");
         assert_eq!(fs::read(&task.paths.json).unwrap(), saved);
+    }
+
+    #[test]
+    fn terminal_images_are_not_reprobed_after_replay_cleanup() {
+        use super::super::super::persistence::work_counts;
+
+        let storage = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::default();
+        let mut tasks = Vec::new();
+        for index in 0..4 {
+            let (task, metadata) = saved_image(storage.path(), index);
+            if index % 2 == 0 {
+                fs::remove_dir_all(task.paths.io_dir.join(TASK_IMAGE_DIR)).unwrap();
+            }
+            registry
+                .insert_rehydrated_task(metadata, task.paths.clone(), true)
+                .unwrap();
+            tasks.push(registry.task(&task.paths.task_id).unwrap());
+        }
+        work_counts::reset();
+        registry.cleanup_finished(super::super::super::watchdog::FINISHED_RETENTION);
+        registry.cleanup_finished(super::super::super::watchdog::FINISHED_RETENTION);
+        assert_eq!(
+            work_counts::get().stats,
+            0,
+            "terminal images already removed or absent were probed again"
+        );
+        let _ban = forbid_task_state_locks_for_test();
+        for task in tasks {
+            assert_eq!(registry.cleanup_terminal_task_image(&task).remaining, 0);
+        }
+    }
+
+    #[test]
+    fn running_absence_is_not_cached_and_terminal_cleanup_retries_until_permitted() {
+        use super::super::super::persistence::work_counts;
+
+        let storage = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::default();
+        let (resolved, mut metadata) = saved_image(storage.path(), 1);
+        let image = resolved.paths.io_dir.join(TASK_IMAGE_DIR);
+        fs::remove_dir_all(&image).unwrap();
+        metadata.status = BgTaskStatus::Running;
+        registry
+            .insert_rehydrated_task(metadata, resolved.paths.clone(), true)
+            .unwrap();
+        let task = registry.task(&resolved.paths.task_id).unwrap();
+        assert_eq!(registry.cleanup_terminal_task_image(&task).remaining, 0);
+        assert!(!task.terminal_image_cleaned.load(Ordering::Acquire));
+        // The launch creates its image after the earlier running-state probe.
+        fs::create_dir(&image).unwrap();
+        fs::write(image.join("launcher"), b"image").unwrap();
+        {
+            let mut state = task.lock_state().unwrap();
+            state
+                .metadata
+                .mark_terminal(BgTaskStatus::Completed, Some(0), None);
+            state.kill_in_flight = true;
+        }
+        assert_eq!(registry.cleanup_terminal_task_image(&task).remaining, 1);
+        assert!(image.is_dir());
+        assert!(!task.terminal_image_cleaned.load(Ordering::Acquire));
+        {
+            let mut state = task.lock_state().unwrap();
+            state.kill_in_flight = false;
+            state.descendant_sample_pending = true;
+        }
+        assert_eq!(registry.cleanup_terminal_task_image(&task).remaining, 1);
+        assert!(image.is_dir());
+        task.lock_state().unwrap().descendant_sample_pending = false;
+        let result = registry.cleanup_terminal_task_image(&task);
+        assert_eq!((result.removed, result.remaining), (1, 0));
+        assert!(!image.exists());
+        work_counts::reset();
+        let _ban = forbid_task_state_locks_for_test();
+        assert_eq!(registry.cleanup_terminal_task_image(&task).remaining, 0);
+        assert_eq!(work_counts::get().stats, 0);
+        assert_eq!(fs::read(&resolved.paths.stdout).unwrap(), b"result\n");
+    }
+
+    #[test]
+    fn saved_image_cleanup_does_not_bypass_a_live_db_write_order() {
+        let storage = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::default();
+        let (resolved, mut metadata) = saved_image(storage.path(), 1);
+        metadata.status = BgTaskStatus::Running;
+        registry
+            .insert_rehydrated_task(metadata.clone(), resolved.paths.clone(), true)
+            .unwrap();
+        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        write_task_at(&resolved, &metadata).unwrap();
+        let result = registry.cleanup_saved_task_image(
+            &resolved.paths.session_dir,
+            &metadata.task_id,
+            || true,
+        );
+        assert_eq!((result.removed, result.remaining), (0, 1));
+        assert!(resolved.paths.io_dir.join(TASK_IMAGE_DIR).is_dir());
+        assert_eq!(fs::read(&resolved.paths.stdout).unwrap(), b"result\n");
     }
 
     #[test]

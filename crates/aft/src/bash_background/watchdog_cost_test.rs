@@ -2172,3 +2172,191 @@ fn watchdog_cost_large_store_maintenance_measurement() {
     // These fixtures use the harness PID for read-only liveness checks only.
     registry.detach();
 }
+
+#[cfg(unix)]
+fn cleanup_cpu_ns() -> u64 {
+    let mut time: libc::timespec = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+        0
+    );
+    time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
+}
+
+#[cfg(unix)]
+thread_local! {
+    static CLEANUP_PHASES: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(unix)]
+pub(super) struct CleanupPhaseTimer(Option<(bool, u64)>);
+
+#[cfg(unix)]
+impl CleanupPhaseTimer {
+    pub(super) fn start(image: bool) -> Self {
+        Self(CLEANUP_PHASES.with(|phases| phases.get().map(|_| (image, cleanup_cpu_ns()))))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CleanupPhaseTimer {
+    fn drop(&mut self) {
+        if let Some((image, start)) = self.0 {
+            let elapsed = cleanup_cpu_ns() - start;
+            CLEANUP_PHASES.with(|phases| {
+                let (mut queue, mut images) = phases.get().unwrap();
+                if image {
+                    images += elapsed;
+                } else {
+                    queue += elapsed;
+                }
+                phases.set(Some((queue, images)));
+            });
+        }
+    }
+}
+
+/// One scheduled minute has one cleanup pass. Measure that pass's calling-thread
+/// CPU, excluding fixture setup and the separate persisted-GC worker. Run alone
+/// with --ignored --nocapture --test-threads=1.
+#[cfg(unix)]
+#[test]
+#[ignore = "measurement: 154,000 terminal rows/tasks, 1,200 saved bundles"]
+fn watchdog_cost_live_shaped_cleanup_measurement() {
+    const TASKS: usize = 154_000;
+    const SAVED: usize = 1_200;
+    let base = tempfile::tempdir().unwrap();
+    let storage = base.path().join("opencode");
+    fs::create_dir(&storage).unwrap();
+    let registry = BgTaskRegistry::default();
+    let mut db = crate::db::open(&base.path().join("aft.db")).unwrap();
+    let transaction = db.transaction().unwrap();
+    for index in 0..TASKS {
+        let session = format!("history-{}", index % SAVED);
+        let (metadata, paths) = if index < SAVED {
+            fixture(&storage, &session, false, 0)
+        } else {
+            // Model bundles already collected from disk while terminal history
+            // remains in a long-lived registry and its DB mirror.
+            let task_id = format!("bash-{:016x}", index);
+            let mut paths =
+                super::super::persistence::task_paths(&storage, &session, &task_id).unwrap();
+            paths.layout = super::super::persistence::TaskLayout::Directory;
+            paths.dir = paths.session_dir.join(&task_id);
+            paths.io_dir = paths.dir.join("io");
+            paths.control_dir = paths.dir.join("control");
+            paths.json = paths.control_dir.join("metadata.json");
+            paths.stdout = paths.io_dir.join("stdout");
+            paths.stderr = paths.io_dir.join("stderr");
+            paths.exit = paths.io_dir.join("exit");
+            paths.pipeline_status = paths.io_dir.join("pipeline-status");
+            paths.pty = paths.io_dir.join("pty");
+            paths.sandbox_unavailable = paths.io_dir.join("sandbox-unavailable");
+            paths.command = paths.control_dir.join("command.sh");
+            paths.wrapper = paths.control_dir.join("wrapper.sh");
+            paths.environment = paths.control_dir.join("environment");
+            paths.manifest = paths.control_dir.join("manifest");
+            paths.sandbox_profile = paths.control_dir.join("sandbox-profile");
+            let mut metadata = PersistedTask::starting(
+                task_id,
+                session.clone(),
+                "cleanup-fixture".into(),
+                base.path().into(),
+                Some(base.path().into()),
+                None,
+                true,
+                false,
+            );
+            metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+            (metadata, paths)
+        };
+        crate::db::bash_tasks::upsert_bash_task(
+            &transaction,
+            &metadata.to_bash_task_row("opencode", &paths).unwrap(),
+        )
+        .unwrap();
+        registry
+            .insert_rehydrated_task(metadata, paths, true)
+            .unwrap();
+        if index < SAVED {
+            let scratch = base.path().join("scratch").join(index.to_string());
+            fs::create_dir_all(&scratch).unwrap();
+            registry.retain_scratch(
+                &format!("retained-{index}"),
+                scratch,
+                unix_millis() + 3_600_000,
+            );
+        }
+        if index % 10_000 == 0 {
+            eprintln!("cleanup fixture: {index}/{TASKS}");
+        }
+    }
+    transaction.commit().unwrap();
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM bash_tasks", [], |row| row
+            .get::<_, usize>(0))
+            .unwrap(),
+        TASKS
+    );
+    registry.set_harness(Harness::Opencode);
+    registry.set_db_pool(Arc::new(Mutex::new(db)));
+    registry
+        .inner
+        .persisted_gc_storage
+        .lock()
+        .unwrap()
+        .insert(storage.clone());
+    // Finish scratch size discovery before measuring an idle pass.
+    for _ in 0..(SAVED / 64 + 1) {
+        registry.sweep_retained_scratch();
+    }
+    assert_eq!(registry.inner.tasks.lock().unwrap().len(), TASKS);
+    let worker = std::thread::Builder::new().name("aft-bash-cleanup".into()).spawn(move || {
+        fn phase(label: &str, work: impl FnOnce()) -> u64 {
+            let cpu = cleanup_cpu_ns();
+            let wall = Instant::now();
+            work();
+            let ns = cleanup_cpu_ns() - cpu;
+            eprintln!("CLEANUP {label} cpu_us={:.3} wall_us={:.3}", ns as f64 / 1_000.0, wall.elapsed().as_secs_f64() * 1_000_000.0);
+            ns
+        }
+        work_counts::reset();
+        CLEANUP_PHASES.with(|phases| phases.set(Some((0, 0))));
+        let speech = phase("speech_sweep", crate::gh_shim_speech::start_view::sweep_queued);
+        let scratch = phase("scratch_sweep", || registry.sweep_retained_scratch());
+        let finished = phase("finished_total", || registry.cleanup_finished(super::super::watchdog::FINISHED_RETENTION));
+        let gc = phase("gc_request", || registry.request_recurring_persisted_gc());
+        let total = speech + scratch + finished + gc;
+        let (queue, images) = CLEANUP_PHASES.with(|phases| phases.take().unwrap());
+        eprintln!("CLEANUP tasks={TASKS} saved={SAVED} rows={TASKS} queue_drain_us={:.3} images_us={:.3} retention_and_lookup_us={:.3} image_stats={} total_cpu_us/min={:.3}", queue as f64 / 1_000.0, images as f64 / 1_000.0, (finished - queue - images) as f64 / 1_000.0, work_counts::get().stats, total as f64 / 1_000.0);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while persisted_gc_slots().lock().unwrap().values().any(|slot| slot.running) {
+            assert!(Instant::now() < deadline, "persisted GC did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Real scheduler time, not a shortened timer: terminal events and their
+        // wake sends must not turn the 60-second cleanup into per-event work.
+        let before = super::super::watchdog::cleanup_pass_counts_for_test();
+        registry.start_watchdog();
+        let wall = Instant::now();
+        for _ in 0..33 {
+            std::thread::sleep(Duration::from_secs(2));
+            let task = metadata_persistence_running_task(&storage, &registry);
+            registry.finalize_from_marker(&task, ExitMarker::Code(0), None).unwrap();
+            let _ = registry.inner.wake_tx.try_send(());
+        }
+        let after = super::super::watchdog::cleanup_pass_counts_for_test();
+        eprintln!("CLEANUP frequency elapsed_s={:.3} finishing_tasks=33 started={} completed={}", wall.elapsed().as_secs_f64(), after.0 - before.0, after.1 - before.1);
+        assert_eq!(after.0 - before.0, 1);
+        assert_eq!(after.1 - before.1, 1);
+        phase("detach", || registry.detach());
+        while persisted_gc_slots().lock().unwrap().values().any(|slot| slot.running) {
+            assert!(Instant::now() < deadline + Duration::from_secs(120), "persisted GC did not finish after frequency measurement");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The cleanup worker can be the last owner after a project detaches.
+        // Keep full-history destruction separate from periodic pass CPU.
+        phase("last_registry_drop", || drop(registry));
+    }).unwrap();
+    worker.join().unwrap();
+}

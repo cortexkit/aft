@@ -1,0 +1,508 @@
+{
+  "schema_version": 1,
+  "pin_method": "git ls-remote HEAD; shallow blobless clone; complete git ls-tree -r at pinned SHA",
+  "checkout_size_definition": "pending until measurement: du -sb checkout excluding .git, including tracked symlinks; submodules and LFS payloads not populated",
+  "file_count_definition": "tracked blob paths by extension (case-sensitive), including tests/vendors; .h separate; not AFT's ignore-filtered corpus",
+  "repositories": [
+    {
+      "repository": "elastic/elasticsearch",
+      "commit": "4c2752cfec2d2c1d7053b190b63e8ca9ea673d76",
+      "default_branch": "main",
+      "pinned_at": "2026-11-13T20:50:51.344265+00:00",
+      "languages": [
+        "Java"
+      ],
+      "file_counts_by_language": {
+        "C++": 37,
+        "C/C++ header": 8,
+        "Java": 33774,
+        "JavaScript": 2,
+        "Python": 4,
+        "TypeScript": 46
+      },
+      "tracked_files": 51960,
+      "checkout_bytes": null,
+      "checkout_size_status": "measured by runner after checkout",
+      "submodule_count": 0,
+      "clone_url": "https://github.com/elastic/elasticsearch.git"
+    },
+    {
+      "repository": "apache/spark",
+      "commit": "a61393e569683c886b84121e3a64b484673fd923",
+      "default_branch": "master",
+      "pinned_at": "2026-11-13T20:50:54.346788+00:00",
+      "languages": [
+        "Scala",
+        "Java"
+      ],
+      "file_counts_by_language": {
+        "C": 1,
+        "C++": 1,
+        "C/C++ header": 1,
+        "Java": 1394,
+        "JavaScript": 52,
+        "Python": 1537,
+        "Ruby": 4,
+        "Scala": 6589
+      },
+      "tracked_files": 27605,
+      "checkout_bytes": null,
+      "checkout_size_status": "measured by runner after checkout",
+      "submodule_count": 0,
+      "clone_url": "https://github.com/apache/spark.git"
+    },
+    {
+      "repository": "microsoft/vscode",
+      "commit": "6a9a85f819185c4a8fa9f61acdf174e4088cf077",
+      "default_branch": "main",
+      "pinned_at": "2026-11-13T20:50:57.619364+00:00",
+      "languages": [
+        "TypeScript"
+      ],
+      "file_counts_by_language": {
+        "C": 1,
+        "C#": 6,
+        "C++": 15,
+        "C/C++ header": 2,
+        "CUDA": 1,
+        "Go": 3,
+        "Java": 2,
+        "JavaScript": 134,
+        "Lua": 1,
+        "PHP": 3,
+        "Perl": 2,
+        "Python": 10,
+        "Ruby": 2,
+        "Rust": 122,
+        "Swift": 1,
+        "TSX": 257,
+        "TypeScript": 15910
+      },
+      "tracked_files": 21423,
+      "checkout_bytes": null,
+      "checkout_size_status": "measured by runner after checkout",
+      "submodule_count": 0,
+      "clone_url": "https://github.com/microsoft/vscode.git"
+    },
+    {
+      "repository": "apache/superset",
+      "commit": "a0f120285ad416a8bbb7d9367c354986ffea40f7",
+      "default_branch": "master",
+      "pinned_at": "2026-11-13T20:51:00.630205+00:00",
+      "languages": [
+        "TSX",
+        "JavaScript",
+        "Python"
+      ],
+      "file_counts_by_language": {
+        "JavaScript": 85,
+        "Python": 3124,
+        "TSX": 1896,
+        "TypeScript": 2392
+      },
+      "tracked_files": 11610,
+      "checkout_bytes": null,
+      "checkout_size_status": "measured by runner after checkout",
+      "submodule_count": 3,
+      "clone_url": "https://github.com/apache/superset.git"
+    },
+    {
+      "repository": "nodejs/node",
+      "commit": "dadf02907ad08339728019070f4b86afb82130d0",
+      "default_branch": "main",
+      "pinned_at": "2026-11-13T20:51:03.061837+00:00",
+      "languages": [
+        "JavaScript",
+        "C",
+        "C++"
+      ],
+      "file_counts_by_language": {
+        "C": 3123,
+        "C#": 1,
+        "C++": 4769,
+        "C/C++ header": 9732,
+        "JavaScript": 24802,
+        "Perl": 414,
+        "Python": 632,
+        "Ruby": 1,
+        "Rust": 1132,
+        "TypeScript": 292
+      },
+      "tracked_files": 56893,
+      "checkout_bytes": null,
+      "checkout_size_status": "measured by runner after checkout",
+      "submodule_count": 0,
+      "clone_url": "https://github.com/nodejs/node.git"
+    },
+    {
+      "repository": "kubernetes/kubernetes",
+      "commit": "580d59da88720e9740829730531c28f6d5ba7ddf",
+      "default_branch": "master",
+      "pinned_at": "2026-11-13T20:51:06.001900+00:00",
+      "languages": [
+        "Go"
+      ],
+      "file_counts_by_language": {
+        "C": 6,
+        "Go": 18221,
+        "JavaScript": 2,
+        "Python": 7
+      },
+      "tracked_files": 31780,
+      "checkout_bytes": null,
+      "checkout_size_status": "measured by runner after checkout",
+      "submodule_count": 0,
+      "clone_url": "https://github.com/kubernetes/kubernetes.git"
+    },
+    {
+      "repository": "home-assistant/core",
+      "commit": "a0f0cf28fea4e1dfea7937305808a3b5414111fd",
+      "default_branch": "dev",
+      "pinned_at": "2026-11-13T20:51:09.112060+00:00",
+      "languages": [
+        "Python"
+      ],
+      "file_counts_by_language": {
+        "JavaScript": 5,
+        "Python": 20476,
+        "TypeScript": 2
+      },
+      "tracked_files": 30502,
+      "checkout_bytes": null,
+      "checkout_size_status": "measured by runner after checkout",
+      "submodule_count": 0,
+      "clone_url": "https://github.com/home-assistant/core.git"
+    },
+    {
+      "repository": "rust-lang/rust",
+      "commit": "6ca2b34602bf2f3591ffa7359c166b6409a44b0a",
+      "default_branch": "main",
+      "pinned_at": "2026-11-13T20:51:13.002895+00:00",
+      "languages": [
+        "Rust"
+      ],
+      "file_counts_by_language": {
+        "C": 123,
+        "C++": 18,
+        "C/C++ header": 9,
+        "JavaScript": 169,
+        "Perl": 1,
+        "Python": 44,
+        "Rust": 39675,
+        "TypeScript": 31
+      },
+      "tracked_files": 64458,
+      "checkout_bytes": null,
+      "checkout_size_status": "measured by runner after checkout",
+      "submodule_count": 13,
+      "clone_url": "https://github.com/rust-lang/rust.git"
+    },
+    {
+      "repository": "ethereum/solidity",
+      "commit": "6b98a66f1363d484e7fc76b0e698442ea171fdf0",
+      "default_branch": "develop",
+      "pinned_at": "2026-11-13T20:51:16.244621+00:00",
+      "languages": [
+        "Solidity",
+        "C++"
+      ],
+      "file_counts_by_language": {
+        "C": 1,
+        "C++": 427,
+        "C/C++ header": 409,
+        "Java": 1,
+        "JavaScript": 9,
+        "Python": 83,
+        "Solidity": 7394
+      },
+      "tracked_files": 11774,
+      "checkout_bytes": null,
+      "checkout_size_status": "measured by runner after checkout",
+      "submodule_count": 5,
+      "clone_url": "https://github.com/ethereum/solidity.git"
+    },
+    {
+      "repository": "gitlab-org/gitlab",
+      "clone_url": "https://gitlab.com/gitlab-org/gitlab.git",
+      "commit": "7bffc6fc72c976f703bd59b880dcc414295dc065",
+      "default_branch": "master",
+      "pinned_at": "2026-11-13T20:54:57.138572+00:00",
+      "languages": [
+        "Ruby"
+      ],
+      "file_counts_by_language": {
+        "Go": 363,
+        "Java": 1,
+        "JavaScript": 12421,
+        "Python": 2,
+        "Ruby": 56955
+      },
+      "tracked_files": 118187,
+      "checkout_bytes": null,
+      "checkout_size_status": "measured by runner after checkout",
+      "submodule_count": 0
+    },
+    {
+      "repository": "JetBrains/kotlin",
+      "clone_url": "https://github.com/JetBrains/kotlin.git",
+      "commit": "b7d8fae81f218f2f4048d62b37fde2c3dc5f84be",
+      "default_branch": "master",
+      "pinned_at": "2026-11-13T20:55:03.916279+00:00",
+      "languages": [
+        "Kotlin",
+        "Java"
+      ],
+      "file_counts_by_language": {
+        "C": 40,
+        "C++": 347,
+        "C/C++ header": 588,
+        "Java": 4249,
+        "JavaScript": 366,
+        "Kotlin": 70525,
+        "Python": 6,
+        "Scala": 1,
+        "Swift": 418,
+        "TypeScript": 263
+      },
+      "tracked_files": 114762,
+      "checkout_bytes": null,
+      "checkout_size_status": "measured by runner after checkout",
+      "submodule_count": 0
+    },
+    {
+      "repository": "swiftlang/swift",
+      "clone_url": "https://github.com/swiftlang/swift.git",
+      "commit": "7e6333beb51b8917633c5c708d1a2f7fd4a89795",
+      "default_branch": "main",
+      "pinned_at": "2026-11-13T20:55:07.615464+00:00",
+      "languages": [
+        "Swift",
+        "C++"
+      ],
+      "file_counts_by_language": {
+        "C": 54,
+        "C++": 1408,
+        "C/C++ header": 2704,
+        "JavaScript": 1,
+        "Perl": 1,
+        "Python": 293,
+        "Ruby": 1,
+        "Swift": 24594
+      },
+      "tracked_files": 34056,
+      "checkout_bytes": null,
+      "checkout_size_status": "measured by runner after checkout",
+      "submodule_count": 0
+    },
+    {
+      "repository": "magento/magento2",
+      "clone_url": "https://github.com/magento/magento2.git",
+      "commit": "542a11c7b680d1bece1e7d86065ac939e130438c",
+      "default_branch": "2.4-develop",
+      "pinned_at": "2026-11-13T20:55:10.329002+00:00",
+      "languages": [
+        "PHP"
+      ],
+      "file_counts_by_language": {
+        "JavaScript": 1559,
+        "PHP": 25635,
+        "Python": 1,
+        "TypeScript": 1
+      },
+      "tracked_files": 41891,
+      "checkout_bytes": null,
+      "checkout_size_status": "measured by runner after checkout",
+      "submodule_count": 0
+    },
+    {
+      "repository": "Perl/perl5",
+      "clone_url": "https://github.com/Perl/perl5.git",
+      "commit": "473d38e4f1c7bbfd4931956c443d6d0cf084a923",
+      "default_branch": "blead",
+      "pinned_at": "2026-11-13T20:55:12.138111+00:00",
+      "languages": [
+        "Perl",
+        "C"
+      ],
+      "file_counts_by_language": {
+        "C": 116,
+        "C/C++ header": 136,
+        "Perl": 4354
+      },
+      "tracked_files": 7045,
+      "checkout_bytes": null,
+      "checkout_size_status": "measured by runner after checkout",
+      "submodule_count": 0
+    },
+    {
+      "repository": "neovim/neovim",
+      "clone_url": "https://github.com/neovim/neovim.git",
+      "commit": "49b853fb327f5f6b5c1bdb38d2e3b8026a4124eb",
+      "default_branch": "master",
+      "pinned_at": "2026-11-13T20:55:16.304960+00:00",
+      "languages": [
+        "Lua",
+        "C"
+      ],
+      "file_counts_by_language": {
+        "C": 227,
+        "C/C++ header": 304,
+        "JavaScript": 7,
+        "Lua": 861,
+        "Python": 9,
+        "Ruby": 1,
+        "Zig": 8
+      },
+      "tracked_files": 3952,
+      "checkout_bytes": null,
+      "checkout_size_status": "measured by runner after checkout",
+      "submodule_count": 0
+    },
+    {
+      "repository": "torvalds/linux",
+      "clone_url": "https://github.com/torvalds/linux.git",
+      "commit": "2800868f63227c8237d70c41e70d441c919620d6",
+      "default_branch": "master",
+      "pinned_at": "2026-11-13T20:55:19.808057+00:00",
+      "languages": [
+        "C"
+      ],
+      "file_counts_by_language": {
+        "C": 37772,
+        "C++": 8,
+        "C/C++ header": 27308,
+        "Perl": 54,
+        "Python": 456,
+        "Ruby": 1,
+        "Rust": 568
+      },
+      "tracked_files": 97371,
+      "checkout_bytes": null,
+      "checkout_size_status": "measured by runner after checkout",
+      "submodule_count": 0
+    },
+    {
+      "repository": "chromium/chromium",
+      "clone_url": "https://github.com/chromium/chromium.git",
+      "commit": "0835bd4f05c3b3f6479fa98a6223ebaf13f3d1af",
+      "default_branch": "main",
+      "pinned_at": "2026-11-13T21:58:47.387210+00:00",
+      "languages": [
+        "C++"
+      ],
+      "file_counts_by_language": {
+        "C": 1499,
+        "C#": 223,
+        "C++": 72150,
+        "C/C++ header": 63051,
+        "Go": 6,
+        "Java": 13629,
+        "JavaScript": 20154,
+        "Kotlin": 41,
+        "Lua": 2,
+        "PHP": 805,
+        "Perl": 128,
+        "Python": 7987,
+        "Ruby": 52,
+        "Rust": 8114,
+        "Swift": 147,
+        "TypeScript": 8354
+      },
+      "tracked_files": 518808,
+      "checkout_bytes": null,
+      "checkout_size_status": "measured by runner after checkout",
+      "submodule_count": 272
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "clone_url": "https://github.com/NVIDIA/TensorRT-LLM.git",
+      "commit": "eb6d868356bc3e03fd20acf00aa8657516d588cd",
+      "default_branch": "main",
+      "pinned_at": "2026-11-13T20:55:25.435947+00:00",
+      "languages": [
+        "CUDA"
+      ],
+      "file_counts_by_language": {
+        "C++": 537,
+        "C/C++ header": 802,
+        "CUDA": 488,
+        "JavaScript": 8,
+        "Python": 6703
+      },
+      "tracked_files": 20870,
+      "checkout_bytes": null,
+      "checkout_size_status": "measured by runner after checkout",
+      "submodule_count": 0
+    },
+    {
+      "repository": "ml-explore/mlx",
+      "clone_url": "https://github.com/ml-explore/mlx.git",
+      "commit": "fc344c986c4169d99f76b5d95ae6b4a58a359a63",
+      "default_branch": "main",
+      "pinned_at": "2026-11-13T20:55:27.397505+00:00",
+      "languages": [
+        "Metal"
+      ],
+      "file_counts_by_language": {
+        "C++": 238,
+        "C/C++ header": 261,
+        "CUDA": 139,
+        "JavaScript": 2,
+        "Metal": 52,
+        "Python": 135
+      },
+      "tracked_files": 991,
+      "checkout_bytes": null,
+      "checkout_size_status": "measured by runner after checkout",
+      "submodule_count": 0
+    },
+    {
+      "repository": "ziglang/zig",
+      "clone_url": "https://github.com/ziglang/zig.git",
+      "commit": "738d2be9d6b6ef3ff3559130c05159ef53336224",
+      "default_branch": "master",
+      "pinned_at": "2026-11-13T20:55:29.374918+00:00",
+      "languages": [
+        "Zig"
+      ],
+      "file_counts_by_language": {
+        "C": 2322,
+        "C++": 220,
+        "C/C++ header": 11492,
+        "JavaScript": 2,
+        "Python": 5,
+        "Zig": 2950
+      },
+      "tracked_files": 20545,
+      "checkout_bytes": null,
+      "checkout_size_status": "measured by runner after checkout",
+      "submodule_count": 0
+    },
+    {
+      "repository": "dotnet/runtime",
+      "clone_url": "https://github.com/dotnet/runtime.git",
+      "commit": "50a0c6423336dfa9f887e9aac74686070cfe6775",
+      "default_branch": "main",
+      "pinned_at": "2026-11-13T20:55:32.066427+00:00",
+      "languages": [
+        "C#"
+      ],
+      "file_counts_by_language": {
+        "C": 1435,
+        "C#": 33311,
+        "C++": 1643,
+        "C/C++ header": 2220,
+        "Java": 5,
+        "JavaScript": 51,
+        "Perl": 4,
+        "Python": 62,
+        "Swift": 10,
+        "TypeScript": 188
+      },
+      "tracked_files": 58593,
+      "checkout_bytes": null,
+      "checkout_size_status": "measured by runner after checkout",
+      "submodule_count": 0
+    }
+  ]
+}

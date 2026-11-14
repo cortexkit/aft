@@ -16,6 +16,42 @@ fn method(body: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+// Only log known operation names, never request-supplied strings.
+pub(super) fn operation(body: &Value) -> &'static str {
+    match method(body) {
+        Some("shells.list") => "shells.list",
+        Some("shells.watch") => "shells.watch",
+        Some("shells.output") => "shells.output",
+        Some("aft.status") => "aft.status",
+        _ => "unknown",
+    }
+}
+
+pub(super) fn caller_kind(
+    principal: Option<&Principal>,
+    harness: Option<&str>,
+    scoped: bool,
+) -> &'static str {
+    if !operator(principal, harness, scoped) {
+        return "other";
+    }
+    match harness {
+        Some(harness) if harness.starts_with("fed-phone:") => "phone",
+        Some(harness) if harness.starts_with("fed-sim:") => "simulator",
+        _ => "desktop",
+    }
+}
+
+pub(super) fn log_refusal(op: &'static str, error: &ErrorBody) {
+    crate::slog_info!("shells/v1 refusal: op={} code={}", op, error.code);
+}
+
+pub(in crate::subc) fn operator_refusal(body: &Value) -> ErrorBody {
+    let error = operator_required();
+    log_refusal(operation(body), &error);
+    error
+}
+
 /// Federated agent routes must never inherit the phone operator's authority.
 /// Keep this predicate shared by route admission and request dispatch.
 pub(in crate::subc) fn operator(

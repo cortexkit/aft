@@ -84,6 +84,7 @@ SHA="$(git rev-parse --short=12 HEAD)"
 # comes from a release download, not this checkout's HEAD, so there is nothing
 # to compare it against here.
 if [ "$SKIP_BUILD" -eq 0 ]; then
+  bash "$REPO_ROOT/scripts/check-cmake.sh"
   echo "==> running card's changes"
   ck_aft_check_card_source "$DEPLOY" "$STAGING" stage-card || exit 2
 fi
@@ -91,8 +92,8 @@ fi
 BUILD_START="$(date +%s)"
 if [ "$SKIP_BUILD" -eq 0 ]; then
   export AFT_BUILD_GIT_SHA="$(git rev-parse HEAD)"
-  echo "==> cargo build --release -p agent-file-tools (sha $SHA)"
-  cargo build --release -p agent-file-tools --bin aft
+  echo "==> cargo build --features wasm-grammars --release -p agent-file-tools (sha $SHA)"
+  cargo build --features wasm-grammars --release -p agent-file-tools --bin aft
 fi
 BIN="target/release/aft"
 # Never write the dSYM to "$BIN.dSYM": cargo owns that name as a symlink
@@ -163,6 +164,36 @@ if [ "$(uname -s)" = "Darwin" ]; then
     rm -f "$TMP"
     exit 2
   fi
+
+  # Use the production stored-load path, offline and without test seams. A
+  # throwaway whole storage root works even without a second cache volume.
+  echo "==> smoke: pinned grammar compile under the signed card (offline)"
+  mkdir -p "$REPO_ROOT/target/scratch"
+  GRAMMAR_SMOKE="$(mktemp -d "$REPO_ROOT/target/scratch/grammar-smoke.XXXXXX")"
+  GRAMMAR_HASH="$(python3 -c 'import json; print(json.load(open("crates/aft/src/grammar/manifest.json"))["sha256"])')"
+  mkdir -p "$GRAMMAR_SMOKE/storage/grammars" "$GRAMMAR_SMOKE/home" "$GRAMMAR_SMOKE/config" "$GRAMMAR_SMOKE/cache" "$GRAMMAR_SMOKE/state" "$GRAMMAR_SMOKE/data" "$GRAMMAR_SMOKE/tmp"
+  cp "crates/aft/tests/fixtures/grammars/$GRAMMAR_HASH.wasm" "$GRAMMAR_SMOKE/storage/grammars/$GRAMMAR_HASH.wasm"
+  if ! sandbox-exec -p '(version 1) (allow default) (deny network*)' env \
+      -u AFT_STORAGE_DIR -u AFT_CACHE_DIR -u AFT_TEST_GRAMMAR_MANIFEST \
+      -u AFT_TEST_GRAMMAR_STORAGE -u AFT_TEST_GRAMMAR_QUERIES -u AFT_TEST_GRAMMAR_FAULT \
+      -u AFT_TEST_GRAMMAR_TRANSPORT_FILE -u AFT_TEST_GRAMMAR_CLOCK_FILE \
+      -u AFT_TEST_GRAMMAR_EXTRACTOR_VERSION \
+      HOME="$GRAMMAR_SMOKE/home" XDG_CONFIG_HOME="$GRAMMAR_SMOKE/config" \
+      XDG_CACHE_HOME="$GRAMMAR_SMOKE/cache" XDG_STATE_HOME="$GRAMMAR_SMOKE/state" \
+      XDG_DATA_HOME="$GRAMMAR_SMOKE/data" TMPDIR="$GRAMMAR_SMOKE/tmp" \
+      "$TMP" grammar-smoke --storage-dir "$GRAMMAR_SMOKE/storage" > "$GRAMMAR_SMOKE/result.json"; then
+    rm -rf "$GRAMMAR_SMOKE"
+    rm -f "$TMP"
+    echo "stage-card: signed grammar load failed; refusing to stage" >&2
+    exit 2
+  fi
+  if ! python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert not v["test_seams"]; assert v["engine_target"] == "pulley"; assert v["hash"] == sys.argv[2]; assert v["tree"].startswith("(chunk ")' "$GRAMMAR_SMOKE/result.json" "$GRAMMAR_HASH"; then
+    rm -rf "$GRAMMAR_SMOKE"
+    rm -f "$TMP"
+    echo "stage-card: grammar smoke did not verify the production grammar" >&2
+    exit 2
+  fi
+  rm -rf "$GRAMMAR_SMOKE"
 
   IMAGE_UUID="$(dwarfdump --uuid "$TMP" | awk 'NR == 1 { gsub(/-/, "", $2); print toupper($2) }')"
   DSYM_UUID="$(dwarfdump --uuid "$DSYM" | awk 'NR == 1 { gsub(/-/, "", $2); print toupper($2) }')"

@@ -275,6 +275,12 @@ pub(crate) fn file_content_hash(path: &Path) -> Option<[u8; 32]> {
     #[cfg(test)]
     CONTENT_HASH_READS.with(|reads| reads.set(reads.get() + 1));
     let mut file = std::fs::File::open(path).ok()?;
+    #[cfg(test)]
+    CONTENT_HASH_BEFORE_READ.with(|hook| {
+        if let Some(hook) = hook.take() {
+            hook();
+        }
+    });
     let mut hasher = blake3::Hasher::new();
     std::io::copy(&mut file, &mut hasher).ok()?;
     Some(*hasher.finalize().as_bytes())
@@ -283,6 +289,8 @@ pub(crate) fn file_content_hash(path: &Path) -> Option<[u8; 32]> {
 #[cfg(test)]
 thread_local! {
     pub(crate) static CONTENT_HASH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// One-shot pause after opening a hash input, isolated to the installing test thread.
+    pub(crate) static CONTENT_HASH_BEFORE_READ: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
     /// Files read for a content hash on this thread.
     pub(crate) static CONTENT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

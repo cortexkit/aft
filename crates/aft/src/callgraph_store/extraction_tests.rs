@@ -68,7 +68,7 @@ fn extraction_walk_has_no_child_vectors() {
     let source = synthetic(128);
     let mut parser = Parser::new();
     parser
-        .set_language(&grammar_for(LangId::TypeScript))
+        .set_language(&grammar_for(LangId::TypeScript).unwrap())
         .unwrap();
     let tree = parser.parse(&source, None).unwrap();
     let (nodes, allocations) =

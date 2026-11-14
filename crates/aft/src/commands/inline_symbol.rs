@@ -8,13 +8,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use tree_sitter::Parser;
-
 use crate::context::AppContext;
 use crate::edit;
 use crate::extract::{detect_scope_conflicts, substitute_params, validate_single_return};
 use crate::lsp_hints;
-use crate::parser::{detect_language, grammar_for, node_text, LangId};
+use crate::parser::{detect_language, node_text, LangId};
 use crate::protocol::{RawRequest, Response};
 use crate::symbols::{SymbolKind, SymbolMatch};
 
@@ -130,23 +128,15 @@ pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    let grammar = grammar_for(lang);
-    let mut parser = Parser::new();
-    if parser.set_language(&grammar).is_err() {
-        return Response::error(
-            &req.id,
-            "parse_error",
-            "inline_symbol: failed to initialize parser",
-        );
-    }
-    let tree = match parser.parse(source.as_bytes(), None) {
-        Some(t) => t,
-        None => {
-            return Response::error(
+    let tree = match crate::parser::FileParser::parse_source(&path, &source, lang) {
+        Ok(tree) => tree,
+        Err(error) => {
+            return Response::error_with_data(
                 &req.id,
-                "parse_error",
-                "inline_symbol: failed to parse file",
-            );
+                error.code(),
+                error.to_string(),
+                error.to_error_json(),
+            )
         }
     };
 
@@ -334,14 +324,24 @@ pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     // --- Check scope conflicts (D103) ---
-    let conflicts = detect_scope_conflicts(
+    let conflicts = match detect_scope_conflicts(
         &source,
         &tree,
         replacement_node.start_byte(),
         &param_names,
         &body_text,
         lang,
-    );
+    ) {
+        Ok(conflicts) => conflicts,
+        Err(error) => {
+            return Response::error_with_data(
+                &req.id,
+                error.code(),
+                error.to_string(),
+                error.to_error_json(),
+            )
+        }
+    };
 
     if !conflicts.is_empty() {
         let conflicting_names: Vec<&str> = conflicts.iter().map(|c| c.name.as_str()).collect();
@@ -372,7 +372,17 @@ pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // --- Substitute params in body ---
-    let substituted_body = substitute_params(&body_text, &param_to_arg, lang);
+    let substituted_body = match substitute_params(&body_text, &param_to_arg, lang) {
+        Ok(body) => body,
+        Err(error) => {
+            return Response::error_with_data(
+                &req.id,
+                error.code(),
+                error.to_string(),
+                error.to_error_json(),
+            )
+        }
+    };
     let substitution_count = param_to_arg.len();
     // A body node that starts its own line (a Python block) begins at its
     // first statement, so the text's first line has lost the indentation

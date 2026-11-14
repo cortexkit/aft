@@ -509,6 +509,8 @@ struct Located {
 /// [`StoredSlices::failures`] and the file is treated as absent, because the
 /// slice source answers with options; callers fail on any recorded failure.
 pub(crate) struct StoredSlices {
+    /// Failed reads append counted strings after publication, without an edit.
+    memory_epoch: std::sync::OnceLock<Arc<std::sync::atomic::AtomicU64>>,
     segments: Vec<Arc<Segment>>,
     paths: BTreeMap<String, Located>,
     by_fragment: HashMap<(u32, u32), String>,
@@ -645,6 +647,7 @@ impl StoredSlices {
             paths,
             by_fragment,
             token: super::slice_cache::SourceToken::next(),
+            memory_epoch: std::sync::OnceLock::new(),
             failures: Mutex::new(Vec::new()),
         }))
     }
@@ -662,6 +665,13 @@ impl StoredSlices {
             .lock()
             .expect("no panics while holding it")
             .push(what);
+        if let Some(epoch) = self.memory_epoch.get() {
+            epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    pub(crate) fn track_memory(&self, epoch: Arc<std::sync::atomic::AtomicU64>) {
+        let _ = self.memory_epoch.set(epoch);
     }
 
     fn content(&self, index: u32) -> Result<ContentSegment<'_>, String> {
@@ -1028,9 +1038,27 @@ aft_store::heap_bytes_of_fields!(Located {
     fragment_key,
 });
 aft_store::heap_bytes_of_fields!(StoredSlices {
+    memory_epoch,
     segments,
     paths,
     by_fragment,
     token,
     failures,
 });
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+
+    #[test]
+    fn memory_figure_stored_read_failures_advance_the_epoch() {
+        let Held::All(slices) = StoredSlices::open_files_if_held(Vec::new(), &[]).unwrap() else {
+            panic!("empty slices need no stored records");
+        };
+        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        slices.track_memory(Arc::clone(&epoch));
+        slices.fail("a stored record could not be decoded".into());
+        assert_eq!(epoch.load(std::sync::atomic::Ordering::Acquire), 1);
+        assert_eq!(slices.failures().len(), 1);
+    }
+}

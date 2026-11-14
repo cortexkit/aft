@@ -81,13 +81,33 @@ fn rust_worker_config_disables_all_compilation_and_head_config_is_unchanged() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(rows.len(), 2);
+    let metadata = std::process::Command::new("cargo")
+        .args([
+            "metadata",
+            "--offline",
+            "--no-deps",
+            "--format-version=1",
+            "--locked",
+        ])
+        .current_dir(file.parent().unwrap().parent().unwrap())
+        .output()
+        .expect("fixture Cargo metadata");
+    assert!(metadata.status.success(), "{metadata:?}");
+    let metadata: Value = serde_json::from_slice(&metadata.stdout).unwrap();
+    let analyzer_target =
+        PathBuf::from(metadata["target_directory"].as_str().unwrap()).join("rust-analyzer");
     assert_eq!(
         rows[0],
         json!({
             "checkOnSave": false,
-            "cargo": {"targetDir": true, "extraArgs": ["--locked"], "metadataExtraArgs": ["--locked"]}
+            "cargo": {
+                "targetDir": true,
+                "extraArgs": ["--locked"],
+                "metadataExtraArgs": ["--locked"],
+                "extraEnv": {"CARGO_BUILD_BUILD_DIR": analyzer_target}
+            }
         }),
-        "head options must stay byte-for-value compatible"
+        "head options must differ only by the isolated Cargo build directory"
     );
     for pointer in [
         "/checkOnSave",

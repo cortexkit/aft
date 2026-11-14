@@ -1385,7 +1385,7 @@ pub(crate) fn with_memory_walk_clock_for_test<T>(now: Instant, refresh: impl FnO
 }
 
 #[cfg(test)]
-fn memory_walk_now_for_test() -> Instant {
+pub(crate) fn memory_walk_now_for_test() -> Instant {
     MEMORY_WALK_CLOCK.with(|clock| clock.get().unwrap_or_else(Instant::now))
 }
 
@@ -12493,7 +12493,14 @@ impl AppContext {
         let mut estimates = self.memory_estimates_from(walked);
         let data_layer = Self::fold_data_layer_memory(
             &mut estimates,
-            crate::data_layer::surfaces::memory_estimate(self),
+            crate::data_layer::surfaces::memory_estimate_for_rollup(self),
+        );
+        let measured_age_ms = measured_age_ms.max(
+            data_layer
+                .as_ref()
+                .and_then(|memory| memory.counts.get("memory_measured_age_ms"))
+                .copied()
+                .unwrap_or(0),
         );
         let rollup = Self::memory_root_rollup_from(&estimates, data_layer.as_ref())
             .with_measured_age_ms(measured_age_ms);

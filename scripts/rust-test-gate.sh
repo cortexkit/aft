@@ -232,7 +232,7 @@ gate_cargo() {
     cargo nextest run --no-fail-fast "$@"
   elif [[ -n "${CI:-}" && "${1:-}" == "test" ]]; then
     shift
-    cargo test --no-fail-fast "$@"
+    cargo test --features wasm-grammars --no-fail-fast "$@"
   else
     cargo "$@"
   fi
@@ -370,7 +370,7 @@ warm_macos_test_binaries() {
   # field in the build JSON — not the incremental fragments under deps/). $@ =
   # the cargo build arguments that define the profile and scope.
   local bins
-  bins="$(gate_cargo test --features test-hooks "$@" --no-run --message-format=json 2>/dev/null | python3 -c "
+  bins="$(gate_cargo test --features wasm-grammars --features test-hooks "$@" --no-run --message-format=json 2>/dev/null | python3 -c "
 import sys, json
 seen = set()
 for line in sys.stdin:
@@ -414,7 +414,7 @@ if [[ "$runner" == "cargo" ]]; then
     run_phase "warm macOS Gatekeeper assessment: sign + exec debug test binaries and target/debug/aft" \
       warm_macos_test_binaries --workspace
   fi
-  run_phase "cargo test --features test-hooks --workspace --quiet" gate_cargo test --features test-hooks --workspace --quiet
+  run_phase "cargo test --features wasm-grammars --features test-hooks --workspace --quiet" gate_cargo test --features wasm-grammars --features test-hooks --workspace --quiet
   finish_gate
   exit 0
 fi
@@ -450,9 +450,9 @@ extract_nextest_archive_for_prewarm() {
     --no-pager >/dev/null
 }
 
-# `cargo test --features test-hooks --workspace -- --list` currently reports zero doctests for both
+# `cargo test --features wasm-grammars --features test-hooks --workspace -- --list` currently reports zero doctests for both
 # workspace crates (`aft` and `aft_tokenizer`), so the split gate omits
-# `cargo test --workspace --doc` until doctests actually exist.
+# `cargo test --features wasm-grammars --workspace --doc` until doctests actually exist.
 #
 # A CI lane can set AFT_UNIT_TEST_RUNNER=nextest so a nonterminating unit test
 # is named and bounded by the gate profile instead of leaving one silent libtest
@@ -538,28 +538,28 @@ if phase_enabled lib; then
       gate_cargo nextest run "${lib_archive_args[@]}" --profile gate \
         -E 'kind(lib)' -- platform_verifier_tls_client_subprocess
   else
-    run_phase "cargo test -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet (serial: keychain-latency-sensitive)" \
-      gate_cargo test -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet
+    run_phase "cargo test --features wasm-grammars -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet (serial: keychain-latency-sensitive)" \
+      gate_cargo test --features wasm-grammars -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet
   fi
 
   if phase_enabled lib-shard \
     && [[ -n "${AFT_NEXTEST_ARCHIVE_FILE:-}" && "$(uname)" != "Darwin" ]]; then
     # Windows needs its local PDB for the child backtrace; the macOS archive job
     # runs this probe before upload while its linked debug objects are present.
-    run_phase "cargo test -p agent-file-tools --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists --quiet (serial: child backtrace needs the local PDB)" \
-      gate_cargo test -p agent-file-tools --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists --quiet
+    run_phase "cargo test --features wasm-grammars -p agent-file-tools --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists --quiet (serial: child backtrace needs the local PDB)" \
+      gate_cargo test --features wasm-grammars -p agent-file-tools --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists --quiet
   fi
 
   # When lib-shard is selected, the archive-backed command below owns the rest
   # of the unit inventory. Other callers keep the original whole-suite command.
   if ! phase_enabled lib-shard; then
     if [[ "$unit_runner" == "nextest" ]]; then
-      run_phase "cargo nextest run --workspace --lib --bins --profile gate" \
-        gate_cargo nextest run --workspace --lib --bins --profile gate -- \
+      run_phase "cargo nextest run --features wasm-grammars --workspace --lib --bins --profile gate" \
+        gate_cargo nextest run --features wasm-grammars --workspace --lib --bins --profile gate -- \
           --skip platform_verifier_tls_client_subprocess
     else
-      run_phase "cargo test --workspace --lib --bins --quiet" \
-        gate_cargo test --workspace --lib --bins --quiet -- \
+      run_phase "cargo test --features wasm-grammars --workspace --lib --bins --quiet" \
+        gate_cargo test --features wasm-grammars --workspace --lib --bins --quiet -- \
           --skip platform_verifier_tls_client_subprocess
     fi
   fi
@@ -630,8 +630,8 @@ if phase_enabled nextest; then
     nextest_label="cargo nextest run --archive-file $AFT_NEXTEST_ARCHIVE_FILE -E kind(test) - binary(=watcher_integration)"
     nextest_args+=(--archive-file "$AFT_NEXTEST_ARCHIVE_FILE")
   else
-    nextest_label="cargo nextest run --features test-hooks --workspace -E kind(test) - binary(=watcher_integration)"
-    nextest_args+=(--workspace --features test-hooks)
+    nextest_label="cargo nextest run --features wasm-grammars,test-hooks --workspace -E kind(test) - binary(=watcher_integration)"
+    nextest_args+=(--workspace --features wasm-grammars,test-hooks)
   fi
   nextest_args+=(-E 'kind(test) - binary(=watcher_integration)')
   if [[ -n "${AFT_NEXTEST_PARTITION:-}" ]]; then
@@ -644,21 +644,21 @@ fi
 if phase_enabled watcher; then
   # test-timing-hooks compiles in the test-only gates the linked-worktree
   # semantic quiet-window test holds; without the feature that test is not built.
-  run_phase "cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test watcher_integration --quiet -- --test-threads=1" \
-    gate_cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test watcher_integration --quiet -- --test-threads=1
+  run_phase "cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --features test-timing-hooks --test watcher_integration --quiet -- --test-threads=1" \
+    gate_cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --features test-timing-hooks --test watcher_integration --quiet -- --test-threads=1
 fi
 
 if phase_enabled conformance; then
-  run_phase "cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test rest -- scope_end_kill" \
-    gate_cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test rest -- scope_end_kill
-  run_phase "cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test integration -- scope_revocation" \
-    gate_cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test integration -- scope_revocation
-  run_phase "cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test rest -- tool_provider_conformance" \
-    gate_cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test rest -- tool_provider_conformance
+  run_phase "cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --features test-timing-hooks --test rest -- scope_end_kill" \
+    gate_cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --features test-timing-hooks --test rest -- scope_end_kill
+  run_phase "cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --features test-timing-hooks --test integration -- scope_revocation" \
+    gate_cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --features test-timing-hooks --test integration -- scope_revocation
+  run_phase "cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --features test-timing-hooks --test rest -- tool_provider_conformance" \
+    gate_cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --features test-timing-hooks --test rest -- tool_provider_conformance
   # Keep promotion failure, deadline handoff, and elicitation TTL coverage in
   # the hook-enabled phase; ordinary production builds cannot inject them.
-  run_phase "cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test integration -- subc_bridge_bash_promote subc_bridge_bash_started_promotion subc_bridge_bash_late_promote subc_bridge_untrusted_bash_elicitation_ttl" \
-    gate_cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test integration -- subc_bridge_bash_promote subc_bridge_bash_started_promotion subc_bridge_bash_late_promote subc_bridge_untrusted_bash_elicitation_ttl
+  run_phase "cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --features test-timing-hooks --test integration -- subc_bridge_bash_promote subc_bridge_bash_started_promotion subc_bridge_bash_late_promote subc_bridge_untrusted_bash_elicitation_ttl" \
+    gate_cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --features test-timing-hooks --test integration -- subc_bridge_bash_promote subc_bridge_bash_started_promotion subc_bridge_bash_late_promote subc_bridge_untrusted_bash_elicitation_ttl
 fi
 
 # The main subc storm test asserts production-calibrated absolute latencies
@@ -675,8 +675,8 @@ if phase_enabled storm; then
   else
     # Storm is intentionally on the retry-free default nextest profile: a retry
     # would hide a real latency regression behind a second warm attempt.
-    run_phase "cargo nextest run --features test-hooks --profile default --cargo-profile release -E 'test(subc_storm)' (release-calibrated latency bounds)" \
-      gate_cargo nextest run --features test-hooks --profile default --cargo-profile release -p agent-file-tools --test integration -E 'test(subc_storm)'
+    run_phase "cargo nextest run --features wasm-grammars,test-hooks --profile default --cargo-profile release -E 'test(subc_storm)' (release-calibrated latency bounds)" \
+      gate_cargo nextest run --features wasm-grammars,test-hooks --profile default --cargo-profile release -p agent-file-tools --test integration -E 'test(subc_storm)'
   fi
 fi
 

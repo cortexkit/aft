@@ -70,7 +70,8 @@ pub fn call_node_kinds(lang: LangId) -> &'static [&'static str] {
         | LangId::R
         | LangId::Groovy
         | LangId::ObjC
-        | LangId::Toml => &[],
+        | LangId::Toml
+        | LangId::Luau => &[],
     }
 }
 
@@ -1484,7 +1485,7 @@ fn parse_rust_macro_fragment(fragment: &str) -> Option<tree_sitter::Tree> {
         if cached.is_none() {
             let mut parser = tree_sitter::Parser::new();
             parser
-                .set_language(&crate::parser::grammar_for(LangId::Rust))
+                .set_language(&crate::parser::grammar_for(LangId::Rust).ok()?)
                 .ok()?;
             #[cfg(test)]
             RUST_FRAGMENT_PARSER_INITIALIZATIONS.with(|count| count.set(count.get() + 1));
@@ -1760,7 +1761,7 @@ mod tests {
     }
 
     fn parse_source(lang: LangId, source: &str) -> tree_sitter::Tree {
-        let grammar = grammar_for(lang);
+        let grammar = grammar_for(lang).unwrap();
         let mut parser = tree_sitter::Parser::new();
         parser
             .set_language(&grammar)

@@ -1245,6 +1245,11 @@ const BATCH: usize = 1024;
 /// at once: enough to keep every thread busy building their fragments.
 const SINK_CHUNK: usize = 128;
 
+#[cfg(feature = "callgraph-shape-census")]
+pub(crate) type BuildCensus = super::shape_census::Census;
+#[cfg(not(feature = "callgraph-shape-census"))]
+pub(crate) type BuildCensus = ();
+
 /// [`resolve_checkout`], handing finished resolutions to `sink` a batch at a
 /// time, in path order, instead of keeping them all, and adding to `memory`,
 /// when given, the heap bytes and times of its stages. `sink` runs inside
@@ -1269,7 +1274,7 @@ pub(crate) fn resolve_checkout_into(
     mut memory: Option<&mut Vec<(String, usize)>>,
     sink: &mut (dyn FnMut(&CheckoutInputs, Vec<(String, FileResolution)>) -> Result<(), ManifestJoinError>
               + Send),
-) -> Result<(), ManifestJoinError> {
+) -> Result<BuildCensus, ManifestJoinError> {
     fn refs(batch: &[String]) -> Vec<&String> {
         batch.iter().collect()
     }
@@ -1413,6 +1418,8 @@ pub(crate) fn resolve_checkout_into(
             }
             inputs.parses.release_decoded();
         }
+        #[cfg(feature = "callgraph-shape-census")]
+        let census = std::mem::take(&mut *calls.census.lock().unwrap_or_else(|e| e.into_inner()));
         drop(calls);
         relieve_allocator();
         if let Some(memory) = memory.as_deref_mut() {
@@ -1422,6 +1429,9 @@ pub(crate) fn resolve_checkout_into(
             ));
         }
         lap(&mut memory, "sites_and_fragments");
+        #[cfg(feature = "callgraph-shape-census")]
+        return Ok(census);
+        #[cfg(not(feature = "callgraph-shape-census"))]
         Ok(())
     })
 }
@@ -1725,6 +1735,8 @@ impl SiteFile {
 /// inputs changed since is filed in memory instead.
 #[derive(Default)]
 pub(crate) struct MethodCallInputs {
+    #[cfg(feature = "callgraph-shape-census")]
+    census: Mutex<super::shape_census::Census>,
     /// Each file's inputs computed so far, for the current checkout.
     files: HashMap<String, Arc<SiteFile>>,
     /// The publication whose terms find every file not in `own`.
@@ -2146,7 +2158,9 @@ fn resolve_chunk(
 ) -> Result<Vec<(String, Vec<SiteResolution>, BTreeSet<String>)>, ManifestJoinError> {
     let memoized = MemoizedResolver::new(resolver);
     resolver.take_dependencies();
-    paths
+    #[cfg(feature = "callgraph-shape-census")]
+    let mut census = super::shape_census::Census::default();
+    let result = paths
         .iter()
         .map(|path| {
             let (_, parse) = inputs
@@ -2162,6 +2176,15 @@ fn resolve_chunk(
             let mut sites = Vec::new();
             for site in parse.bound_dispatch_sites() {
                 let resolution = memoized.resolve(path, &site);
+                // This runs for memo hits too, and before Rust's ordinary-edge
+                // preservation can omit a supplemental method-call row.
+                #[cfg(feature = "callgraph-shape-census")]
+                census.record(
+                    &parse.language,
+                    &site,
+                    resolver.census_exit.get(),
+                    &resolution,
+                );
                 // Keep proven self-call and scoped module-function bindings
                 // when dispatch facts do not identify a project receiver type.
                 if parse.language == "rust"
@@ -2183,7 +2206,15 @@ fn resolve_chunk(
             dependencies.insert(dependency::file(path));
             Ok(((*path).clone(), sites, dependencies))
         })
-        .collect()
+        .collect();
+    #[cfg(feature = "callgraph-shape-census")]
+    source
+        .calls
+        .census
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .merge(census);
+    result
 }
 
 /// The target file of each module a file imports, from its pass-2 rows.
@@ -2443,6 +2474,17 @@ aft_store::heap_bytes_of_fields!(SiteFile {
     parse,
     ordinary,
 });
+#[cfg(feature = "callgraph-shape-census")]
+aft_store::heap_bytes_of_fields!(MethodCallInputs {
+    census,
+    files,
+    stored,
+    own,
+    methods,
+    go_required,
+    computed_while_resolving,
+});
+#[cfg(not(feature = "callgraph-shape-census"))]
 aft_store::heap_bytes_of_fields!(MethodCallInputs {
     files,
     stored,

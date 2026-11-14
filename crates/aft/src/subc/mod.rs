@@ -1676,8 +1676,9 @@ enum ManagementAdmission {
     PermissionsOnly,
     /// Phone and simulator operator routes have read-only shell authority only.
     ShellsOnly,
-    /// Occipital relays person commands, not general AFT management authority.
-    UserCommandsOnly,
+    /// Occipital relays person commands and reads provider metadata, but has no
+    /// general management authority or project-tool access on this route.
+    Occipital,
     /// Tool-provider metadata and custodian feeds without a project root;
     /// grants no management authority or project-tool access.
     ProjectFree {
@@ -6119,6 +6120,7 @@ where
                         if let Some(identity) = management_routes.get(&route) {
                             if identity.admission == ManagementAdmission::FlowOnly {
                                 if let Err(error) = admit_management_flow_request(identity, decoded.body().ok()) {
+                                    log_management_refusal(identity, &decoded.frame, &error);
                                     if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await {
                                         break Err(error);
                                     }
@@ -6131,7 +6133,7 @@ where
                                 let result = if let Some(identity) = management_routes.get(&route) {
                                     shells_service.dispatch(&writer_tx, &dispatch_path_metrics, &decoded.frame, identity, body).await
                                 } else {
-                                    send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, shells::operator_required()).await
+                                    send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, shells::operator_refusal(body)).await
                                 };
                                 if let Err(error) = result { break Err(error); }
                                 continue;
@@ -6142,14 +6144,15 @@ where
                         // before any store, provider, or general tool dispatch.
                         // Tool routes retain their separate call-mode contract.
                         if let Some(identity) = management_routes.get(&route) {
-                            if let ManagementAdmission::ProjectFree { .. } = &identity.admission {
-                                if let Err(error) = handle_project_free_request(&writer_tx, &decoded.frame, &dispatch_path_metrics, identity, &shared_app, storage_dir).await {
+                            if let Err(error) = admit_management_flow_request(identity, decoded.body().ok()) {
+                                log_management_refusal(identity, &decoded.frame, &error);
+                                if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await {
                                     break Err(error);
                                 }
                                 continue;
                             }
-                            if let Err(error) = admit_management_flow_request(identity, decoded.body().ok()) {
-                                if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await {
+                            if matches!(&identity.admission, ManagementAdmission::ProjectFree { .. } | ManagementAdmission::Occipital) {
+                                if let Err(error) = handle_metadata_route_request(&writer_tx, &decoded.frame, &dispatch_path_metrics, identity, &shared_app, storage_dir).await {
                                     break Err(error);
                                 }
                                 continue;
@@ -8697,9 +8700,7 @@ async fn handle_control_request(
                     )
                     .await;
                 }
-                let admission = if user_commands::is_occipital(principal.as_ref()) {
-                    ManagementAdmission::UserCommandsOnly
-                } else if project_free {
+                let admission = if project_free {
                     ManagementAdmission::ProjectFree {
                         workdir: scope.as_ref().and_then(|stamp| stamp.workdir.clone()),
                         legacy_root: legacy_root.clone(),
@@ -8713,6 +8714,8 @@ async fn handle_control_request(
                             consumer_capabilities.as_deref(),
                         ),
                     }
+                } else if user_commands::is_occipital(principal.as_ref()) {
+                    ManagementAdmission::Occipital
                 } else if scope
                     .as_ref()
                     .is_some_and(diagnostics_findings::is_flow_scope)
@@ -9260,9 +9263,9 @@ async fn handle_control_request(
     }
 }
 
-/// Metadata and the custodian's late-result feed need no project. Task handles,
-/// including those used to read bash status, still require a project registry.
-async fn handle_project_free_request(
+/// Metadata needs no project. Only rootless provider routes also retain the
+/// custodian feed; Occipital's explicit management route has no custody access.
+async fn handle_metadata_route_request(
     tx: &WriterSender,
     frame: &Frame,
     metrics: &Arc<DispatchPathMetrics>,
@@ -9270,15 +9273,6 @@ async fn handle_project_free_request(
     shared_app: &Arc<App>,
     storage_dir: &Path,
 ) -> Result<(), SubcError> {
-    let ManagementAdmission::ProjectFree {
-        workdir,
-        legacy_root,
-        model_only,
-        held_updates,
-    } = &identity.admission
-    else {
-        unreachable!()
-    };
     let mut body = serde_json::from_slice::<Value>(&frame.body).unwrap_or(Value::Null);
     let operation = body
         .get("op")
@@ -9292,19 +9286,26 @@ async fn handle_project_free_request(
         body.get("arguments").cloned().unwrap_or_else(|| json!({}))
     };
     if let Some(op @ ("late_results" | "late_results.ack")) = operation.as_deref() {
-        tool_provider::project_free_custody(
-            tx,
-            frame,
-            metrics,
-            shared_app.clone(),
-            storage_dir.join("aft.db"),
-            op,
-            arguments,
-            principal_label(&identity.principal),
-            *model_only,
-            *held_updates,
-        );
-        return Ok(());
+        if let ManagementAdmission::ProjectFree {
+            model_only,
+            held_updates,
+            ..
+        } = &identity.admission
+        {
+            tool_provider::project_free_custody(
+                tx,
+                frame,
+                metrics,
+                shared_app.clone(),
+                storage_dir.join("aft.db"),
+                op,
+                arguments,
+                principal_label(&identity.principal),
+                *model_only,
+                *held_updates,
+            );
+            return Ok(());
+        }
     }
     let result = match operation.as_deref() {
         Some("role.describe") => Ok(tool_provider::describe()),
@@ -9322,16 +9323,29 @@ async fn handle_project_free_request(
                 )
             })
         }
-        _ => Err(project_folder_refusal(
-            PROJECT_REQUIRED_CODE,
-            workdir.as_deref(),
-            legacy_root.as_deref(),
-            route_key(frame.header.channel, frame.header.epoch),
-            frame.header.corr,
-        )),
+        _ => match &identity.admission {
+            ManagementAdmission::ProjectFree {
+                workdir,
+                legacy_root,
+                ..
+            } => Err(project_folder_refusal(
+                PROJECT_REQUIRED_CODE,
+                workdir.as_deref(),
+                legacy_root.as_deref(),
+                route_key(frame.header.channel, frame.header.epoch),
+                frame.header.corr,
+            )),
+            _ => Err(ErrorBody::new(
+                "route_not_admitted",
+                "not a metadata operation",
+            )),
+        },
     };
     match result {
-        Err(error) => send_provider_error(tx, metrics, frame, error).await,
+        Err(error) => {
+            log_management_refusal(identity, frame, &error);
+            send_provider_error(tx, metrics, frame, error).await
+        }
         Ok(answer) => {
             let response = Frame::build_with_version(
                 frame.header.ver,
@@ -9343,7 +9357,7 @@ async fn handle_project_free_request(
                 serde_json::to_vec(&answer).map_err(SubcError::Json)?,
             )
             .map_err(SubcError::FrameBuild)?;
-            send_reliable_writer_frame(tx, metrics, response, "project-free metadata").await
+            send_reliable_writer_frame(tx, metrics, response, "provider metadata").await
         }
     }
 }
@@ -10381,17 +10395,49 @@ fn occipital_carrier_route(identity: &RouteIdentity) -> bool {
         })
 }
 
+fn log_management_refusal(identity: &ManagementIdentity, frame: &Frame, error: &ErrorBody) {
+    let body = serde_json::from_slice::<Value>(&frame.body).ok();
+    let operation = body.as_ref().and_then(|body| {
+        body.get("method")
+            .or_else(|| body.get("op"))
+            .or_else(|| body.get("name"))
+            .and_then(Value::as_str)
+    });
+    let admission = match &identity.admission {
+        ManagementAdmission::FirstParty => "FirstParty",
+        ManagementAdmission::FlowOnly => "FlowOnly",
+        ManagementAdmission::PermissionsOnly => "PermissionsOnly",
+        ManagementAdmission::ShellsOnly => "ShellsOnly",
+        ManagementAdmission::Occipital => "Occipital",
+        ManagementAdmission::ProjectFree { .. } => "ProjectFree",
+    };
+    log::warn!(
+        "subc management request refused: operation={operation:?} admission={admission} channel={} epoch={} code={}",
+        frame.header.channel,
+        frame.header.epoch,
+        error.code,
+    );
+}
+
 fn admit_management_flow_request(
     identity: &ManagementIdentity,
     body: Option<&Value>,
 ) -> Result<(), ErrorBody> {
-    if identity.admission == ManagementAdmission::UserCommandsOnly {
-        return if body.is_some_and(user_commands::is_request) {
+    if identity.admission == ManagementAdmission::Occipital {
+        return if body.is_some_and(|body| {
+            user_commands::is_request(body)
+                || matches!(
+                    body.get("op")
+                        .or_else(|| body.get("name"))
+                        .and_then(Value::as_str),
+                    Some("role.describe" | "tool.views" | "tool.catalog")
+                )
+        }) {
             Ok(())
         } else {
             Err(ErrorBody::new(
                 "route_not_admitted",
-                "Occipital's AFT management route serves only user-commands/v1",
+                "Occipital's AFT management route serves only user-commands/v1 and provider metadata",
             ))
         };
     }

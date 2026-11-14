@@ -1587,10 +1587,10 @@ pub fn observe_task_with_tool_result_source(
             if delivered_held_result {
                 // Commit the late call result and its completion acknowledgement
                 // together, so restart cannot replay a second delivery lane.
-                tx.execute(
+                super::bash_tasks::record_store_write(tx.execute(
                     "UPDATE bash_tasks SET completion_delivered=1 WHERE task_id=?1",
                     [task_id],
-                )?;
+                ))?;
             }
             tx.commit()?;
             return Ok(TaskObservation {

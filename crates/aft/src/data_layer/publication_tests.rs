@@ -919,3 +919,109 @@ fn go_edits_from_a_publication_match_cold() {
     let problems = run("go edits", &steps, Some(&["symlink retargeted"]));
     assert!(problems.is_empty(), "{problems:#?}");
 }
+
+/// The same test runs with and without the measurement feature. Set
+/// AFT_CENSUS_TEST_SEGMENT to retain its segment for a byte-for-byte comparison
+/// between those two builds; fixed segment metadata excludes writer identities.
+#[test]
+fn shape_census_published_graph_bytes() {
+    if std::env::var_os("AFT_SHAPE_CENSUS_FIXTURE_CHILD").is_none() {
+        // Isolate the process-wide output setting from concurrently running tests.
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("census.json");
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "data_layer::publication_tests::shape_census_published_graph_bytes",
+                "--nocapture",
+            ])
+            .env("AFT_SHAPE_CENSUS_FIXTURE_CHILD", "1")
+            .env("AFT_CALLGRAPH_SHAPE_CENSUS_JSON", &output)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        #[cfg(not(feature = "callgraph-shape-census"))]
+        assert!(
+            !output.exists(),
+            "default builds must not write census output"
+        );
+        #[cfg(feature = "callgraph-shape-census")]
+        {
+            let document: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+            assert_eq!(document["schema_version"], 1);
+            assert_eq!(
+                document["groups"],
+                serde_json::json!([
+                    {"language":"python", "member":"run", "sites":1, "targets":0},
+                    {"language":"typescript", "member":"run", "sites":2, "targets":0}
+                ])
+            );
+            assert_eq!(
+                document["language_totals"],
+                serde_json::json!([
+                    {"language":"go", "sites":1, "exits":{"exact":1}},
+                    {"language":"python", "sites":1, "exits":{"unknown":1}},
+                    {"language":"rust", "sites":1, "exits":{"exact":1}},
+                    {"language":"typescript", "sites":5, "exits":{"open_type":3,"unknown":2}}
+                ])
+            );
+            let top = document["top_callers"].as_array().unwrap();
+            assert_eq!(top.len(), 10);
+            assert_eq!(
+                top[0],
+                serde_json::json!({"path":"web.ts", "symbol":"A::run", "callers":2})
+            );
+            assert_eq!(top.iter().filter(|row| row["callers"] == 1).count(), 2);
+            eprintln!(
+                "fixture census: {}",
+                serde_json::to_string_pretty(&document).unwrap()
+            );
+        }
+        return;
+    }
+
+    let mut files = vec![
+        ("web.ts".to_string(), "export class A { run() {} }\nexport function first(x: A) { x.run(); x.run(); }\nexport function second(x: A) { x.run(); }\nexport function unknown(x) { x.run(); x.run(); }\n".to_string()),
+        ("code.py".to_string(), "class A:\n    def run(self): pass\ndef caller(x):\n    x.run()\n".to_string()),
+        ("lib.rs".to_string(), "pub struct A; impl A { pub fn run(&self) {} } pub fn caller(x: &A) { x.run(); }".to_string()),
+        ("code.go".to_string(), "package p\ntype A struct{}\nfunc (a A) run() {}\nfunc caller(x A) { x.run() }".to_string()),
+    ];
+    // Cross the parallel-chunk threshold without adding any method-call sites.
+    for index in 0..64 {
+        files.push((
+            format!("z-empty-{index:02}.ts"),
+            "export const value = 1;".to_string(),
+        ));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    for (path, text) in &files {
+        std::fs::write(root.join(path), text).unwrap();
+    }
+    let layer = Arc::new(super::checkout::DataLayer::new(8 << 20, 2));
+    let checkout =
+        super::checkout::Checkout::bind(layer, &dir.path().join("store"), family(), &root).unwrap();
+    let report = checkout.build().unwrap();
+    assert!(!report.superseded);
+    assert!(checkout.view().unwrap().status().callgraph_published);
+
+    let sources = files
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect::<Vec<_>>();
+    let fixture = self::checkout(&sources, &[]);
+    write(&fixture, dir.path(), 41);
+    let bytes = std::fs::read(dir.path().join("41.seg")).unwrap();
+    assert!(!bytes.is_empty());
+    if let Some(path) = std::env::var_os("AFT_CENSUS_TEST_SEGMENT") {
+        assert!(Path::new(&path).is_absolute());
+        std::fs::write(path, bytes).unwrap();
+    }
+}

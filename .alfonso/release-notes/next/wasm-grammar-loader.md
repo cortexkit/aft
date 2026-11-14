@@ -1,0 +1,1 @@
+Added the optional `wasm-grammars` feature for verified, on-demand Luau grammars and explicit availability states, using Pulley interpretation without native JIT execution. Released binaries enable it; default from-source builds omit it and need no CMake. Tool and index-store integration follows separately.

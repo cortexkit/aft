@@ -259,7 +259,7 @@ mod tests {
     use tree_sitter::Parser;
 
     fn parse_perl(source: &str) -> (Tree, ImportBlock) {
-        let grammar = grammar_for(LangId::Perl);
+        let grammar = grammar_for(LangId::Perl).unwrap();
         let mut parser = Parser::new();
         parser.set_language(&grammar).unwrap();
         let tree = parser.parse(source, None).unwrap();

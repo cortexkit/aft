@@ -277,6 +277,7 @@ fn language_key(path: &Path) -> &'static str {
         Some(LangId::Swift) => "swift",
         Some(LangId::Php) => "php",
         Some(LangId::Lua) => "lua",
+        Some(LangId::Luau) => "luau",
         Some(LangId::Perl) => "perl",
         Some(LangId::Pascal) => "pascal",
         Some(LangId::R) => "r",

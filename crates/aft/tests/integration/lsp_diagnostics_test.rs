@@ -4263,7 +4263,7 @@ fn contended_watcher_drains_past_the_backlog_cap_forward_only_config_files() {
 
 /// A sleeping build script holds Cargo's target lock without consuming CPU.
 /// After a save starts a real analyzer check, an ordinary build must use a
-/// different lock, even when Cargo's base target directory is overridden.
+/// different lock, even when Cargo's target or intermediate build directory is overridden.
 #[test]
 fn real_rust_analyzer_checks_do_not_block_cargo_build() {
     if !crate::helpers::real_rust_analyzer_available(
@@ -4271,7 +4271,14 @@ fn real_rust_analyzer_checks_do_not_block_cargo_build() {
     ) {
         return;
     }
-    for mode in ["default", "config", "environment"] {
+    for mode in [
+        "default",
+        "config",
+        "environment",
+        "build-config",
+        "build-config-target",
+        "build-environment",
+    ] {
         let temp = tempdir().expect("tempdir");
         let root = temp.path().join("workspace");
         fs::create_dir_all(root.join("src")).unwrap();
@@ -4307,11 +4314,43 @@ fn main() {
                 root.join("configured-target")
             }
             "environment" => root.join("environment-target"),
+            "build-config" => {
+                fs::create_dir_all(root.join(".cargo")).unwrap();
+                fs::write(
+                    root.join(".cargo/config.toml"),
+                    "[build]\nbuild-dir = \"{workspace-root}/shared/{workspace-path-hash}\"\n",
+                )
+                .unwrap();
+                root.join("target")
+            }
+            "build-config-target" => {
+                fs::create_dir_all(root.join(".cargo")).unwrap();
+                fs::write(
+                    root.join(".cargo/config.toml"),
+                    "[build]\nbuild-dir = \"target\"\n",
+                )
+                .unwrap();
+                root.join("target")
+            }
             _ => root.join("target"),
         };
+        // Cargo's environment overrides its target-dir config. An explicit
+        // fixture environment wins instead in the environment-target mode.
+        let base_target = if mode == "environment" {
+            base_target
+        } else {
+            std::env::var_os("CARGO_TARGET_DIR")
+                .or_else(|| std::env::var_os("CARGO_BUILD_TARGET_DIR"))
+                .map_or(base_target, |target| root.join(target))
+        };
+        let shared_build = "{workspace-root}/shared/{workspace-path-hash}";
         let lsp = if mode == "environment" {
             serde_json::json!({"servers": {"rust": {"env": {
                 "CARGO_TARGET_DIR": base_target.to_string_lossy()
+            }}}})
+        } else if mode == "build-environment" {
+            serde_json::json!({"servers": {"rust": {"env": {
+                "CARGO_BUILD_BUILD_DIR": shared_build
             }}}})
         } else {
             serde_json::json!({})
@@ -4352,6 +4391,9 @@ fn main() {
             .current_dir(&root);
         if mode == "environment" {
             build.env("CARGO_TARGET_DIR", &base_target);
+        }
+        if mode == "build-environment" {
+            build.env("CARGO_BUILD_BUILD_DIR", shared_build);
         }
         let output = build.output().expect("cargo build");
         let stderr = String::from_utf8_lossy(&output.stderr);

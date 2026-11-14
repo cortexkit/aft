@@ -3851,7 +3851,8 @@ mod prune_legacy_tests {
     }
 }
 
-pub const CACHE_DOMAINS: [&str; 7] = [
+pub const CACHE_DOMAINS: [&str; 8] = [
+    "grammars",
     "views",
     "blobs",
     "callgraph",

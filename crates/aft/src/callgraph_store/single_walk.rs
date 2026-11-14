@@ -21,7 +21,7 @@ use super::{
 };
 use crate::callgraph;
 use crate::callgraph_store::facts::{FactPaths, NoProjectFacts};
-use crate::parser::{grammar_for, LangId};
+use crate::parser::LangId;
 
 /// Parses `source` as `language` and extracts its parse output.
 pub(super) fn extract(
@@ -247,7 +247,16 @@ pub(crate) fn parse_source(
     if let Some(tree) = crate::parser::cached_header_tree(source, lang) {
         return Ok(tree);
     }
-    with_parser(lang, |parser| parser.parse(source, None))
+    with_parser(lang, |parser| {
+        crate::parser::parse_with_parser(
+            parser,
+            std::path::Path::new("<index-content>"),
+            source,
+            lang,
+            None,
+        )
+        .map_err(super::extraction_error)
+    })
 }
 
 /// Parses `source` as `lang` after an edit from `previous_source`, whose
@@ -266,7 +275,16 @@ pub(crate) fn reparse_source(
     };
     let mut tree = previous.clone();
     tree.edit(&edit);
-    with_parser(lang, |parser| parser.parse(source, Some(&tree)))
+    with_parser(lang, |parser| {
+        crate::parser::parse_with_parser(
+            parser,
+            std::path::Path::new("<index-content>"),
+            source,
+            lang,
+            Some(&tree),
+        )
+        .map_err(super::extraction_error)
+    })
 }
 
 /// The single edit that turns `old` into `new`: everything between their
@@ -311,24 +329,40 @@ thread_local! {
         std::cell::RefCell::new(HashMap::new());
 }
 
+#[cfg(all(test, feature = "test-hooks", feature = "wasm-grammars"))]
+pub(crate) fn install_luau_parser_for_test(parser: Parser) {
+    EXTRACTION_PARSERS.with(|parsers| {
+        parsers.borrow_mut().insert(LangId::Luau, parser);
+    });
+}
+
+#[cfg(all(test, feature = "test-hooks", feature = "wasm-grammars"))]
+pub(crate) fn retains_luau_parser_for_test() -> bool {
+    EXTRACTION_PARSERS.with(|parsers| parsers.borrow().contains_key(&LangId::Luau))
+}
+
 fn with_parser(
     lang: LangId,
-    parse: impl FnOnce(&mut Parser) -> Option<tree_sitter::Tree>,
+    parse: impl FnOnce(&mut Parser) -> Result<tree_sitter::Tree, ManifestJoinError>,
 ) -> Result<tree_sitter::Tree, ManifestJoinError> {
     EXTRACTION_PARSERS.with(|parsers| {
         let mut parsers = parsers.borrow_mut();
-        let parser = match parsers.entry(lang) {
-            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
+        let mut parser = match parsers.remove(&lang) {
+            Some(parser) => parser,
+            None => {
                 let mut parser = Parser::new();
+                crate::parser::initialize_parser(&mut parser, lang)
+                    .map_err(super::extraction_error)?;
                 parser
-                    .set_language(&grammar_for(lang))
-                    .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
-                entry.insert(parser)
             }
         };
-        parse(parser)
-            .ok_or_else(|| ManifestJoinError::Parse("tree-sitter returned no tree".to_string()))
+        #[cfg(test)]
+        parser.note_parse();
+        let result = parse(&mut parser);
+        if result.is_ok() {
+            parsers.insert(lang, parser);
+        }
+        result
     })
 }
 

@@ -11,6 +11,11 @@ use super::persistence::{
 #[cfg(test)]
 static TAIL_READS: OnceLock<Mutex<std::collections::HashMap<PathBuf, usize>>> = OnceLock::new();
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ARTIFACT_OPENS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 pub const DISK_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
 
 struct RecoveredReadDiagnostics {
@@ -91,6 +96,8 @@ impl ArtifactSource {
     }
 
     fn open_once(&self) -> io::Result<ValidatedArtifact> {
+        #[cfg(test)]
+        ARTIFACT_OPENS.with(|count| count.set(count.get() + 1));
         #[cfg(feature = "test-timing-hooks")]
         if matches!(
             self,

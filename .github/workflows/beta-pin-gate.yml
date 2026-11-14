@@ -34,6 +34,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
+
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: beta-pin-gate
@@ -61,7 +65,7 @@ jobs:
           echo "wire_version=$(./scripts/fetch-subc-core.sh --print-wire-version)" >> "$GITHUB_OUTPUT"
 
       - name: Build aft binary (load matrix probe requirement)
-        run: cargo build --bin aft
+        run: cargo build --features wasm-grammars --bin aft
 
       - name: Build bridge and plugin packages
         run: |

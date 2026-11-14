@@ -23,7 +23,7 @@ fn repo_root() -> PathBuf {
 }
 
 fn card() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_aft"))
+    crate::test_helpers::aft_binary::source_binary()
 }
 
 fn check(candidate: &Path, storage_root: &Path) -> Output {

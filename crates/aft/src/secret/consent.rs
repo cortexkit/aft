@@ -34,7 +34,8 @@ pub struct SecretConsentRequest {
     pub request_id: String,
     /// The vault's statement bytes, base64url without padding.
     pub statement_b64url: String,
-    /// Bound the card by the HTTP request as well as the vault statement.
+    /// When the local hold for this HTTP request ends. Not sent to Cingulate,
+    /// which bounds the card by the vault statement's own request expiry.
     pub expires_at_ms: Option<u64>,
 }
 
@@ -396,8 +397,13 @@ pub fn withhold_consent(request: &SecretConsentRequest) -> ConsentOutcome {
 /// Cingulate renders the vault's statement, not filer-authored prose. Forward
 /// exactly one item without decoding or re-encoding the statement; the daemon
 /// carries the authorization stamp outside this body.
+///
+/// The body is exactly `{kind, secret_use}`: Cingulate decodes secret-use
+/// filings with unknown fields refused (`envelope_invalid`), and sets the
+/// card's expiry itself from the statements' `request_expires_at_ms`. The
+/// local hold still ends at `expires_at_ms`, and an abandoned card is withdrawn.
 pub fn request_params(request: &SecretConsentRequest) -> serde_json::Value {
-    let mut params = serde_json::json!({
+    serde_json::json!({
         "kind": SECRET_CONSENT_KIND,
         "secret_use": {
             "items": [{
@@ -405,11 +411,7 @@ pub fn request_params(request: &SecretConsentRequest) -> serde_json::Value {
                 "statement_b64url": request.statement_b64url,
             }],
         },
-    });
-    if let Some(expires) = request.expires_at_ms {
-        params["expires_at_ms"] = serde_json::json!(expires);
-    }
-    params
+    })
 }
 
 #[cfg(test)]

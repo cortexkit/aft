@@ -1367,13 +1367,23 @@ impl LiveCheckout {
             reverse,
             pool: _,
         } = self;
-        let state = state.heap_bytes(seen);
-        let rest = parses.heap_bytes(seen)
-            + configs.heap_bytes(seen)
-            + bound.heap_bytes(seen)
-            + resolved.heap_bytes(seen)
-            + calls.heap_bytes(seen)
-            + reverse.heap_bytes(seen);
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        let mut timer = crate::test_allocations::profile::Timer::new();
+        macro_rules! part {
+            ($value:expr, $label:literal) => {{
+                let bytes = $value.heap_bytes(seen);
+                #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+                timer.mark($label);
+                bytes
+            }};
+        }
+        let state = part!(state, "engine / state");
+        let rest = part!(parses, "engine / parses")
+            + part!(configs, "engine / configs")
+            + part!(bound, "engine / bound")
+            + part!(resolved, "engine / resolutions")
+            + part!(calls, "engine / method calls")
+            + part!(reverse, "engine / reverse inputs");
         (state, rest)
     }
 

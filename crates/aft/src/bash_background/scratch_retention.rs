@@ -183,18 +183,22 @@ impl BgTaskRegistry {
                 .retained_scratch
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut examined = 0;
             let due: Vec<String> = retained
                 .iter()
+                .inspect(|_| examined += 1)
                 .filter(|(_, entry)| entry.delete_at <= now_ms)
                 .map(|(task_id, _)| task_id.clone())
                 .take(RELEASE_BUDGET)
                 .collect();
             let unmeasured: Vec<(String, PathBuf)> = retained
                 .iter()
+                .inspect(|_| examined += 1)
                 .filter(|(_, entry)| entry.size.is_none() && entry.delete_at > now_ms)
                 .map(|(task_id, entry)| (task_id.clone(), entry.root.clone()))
                 .take(RELEASE_BUDGET)
                 .collect();
+            super::super::watchdog::record_cleanup_work(|work| work.scratch_entries += examined);
             (due, unmeasured)
         };
         for task_id in due {

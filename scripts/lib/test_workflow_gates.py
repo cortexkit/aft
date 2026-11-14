@@ -276,6 +276,29 @@ class LightPREventGateTests(unittest.TestCase):
 
 
 class CISpeedWorkflowTests(unittest.TestCase):
+    def test_cross_checks_cmake_in_its_build_image_and_dev_rebuild_enables_grammars(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        workflow = workflow_gates.parse_workflow(str(root / ".github/workflows/release.yml"))
+        for arch, target in (("arm64", "AARCH64"), ("x64", "X86_64")):
+            job = workflow["jobs"][f"build-linux-{arch}"]
+            build = next(step for step in job["steps"] if step.get("run", "").startswith("cross build"))
+            self.assertEqual(build["env"][f"CROSS_TARGET_{target}_UNKNOWN_LINUX_GNU_PRE_BUILD"], "scripts/check-cmake.sh")
+            self.assertEqual(build["env"]["CROSS_BUILD_OPTS"], "--no-cache")
+            self.assertFalse(any(step.get("name") == "Check CMake for wasm-grammars" for step in job["steps"]))
+        self.assertIn("cargo build --release -p agent-file-tools --features wasm-grammars", (root / "scripts/dev-rebuild.sh").read_text())
+
+    def test_default_build_guard_executes_refusals_with_cmake_unavailable(self) -> None:
+        path = Path(__file__).resolve().parents[2] / ".github/workflows/grammar-loader.yml"
+        workflow = workflow_gates.parse_workflow(str(path))
+        job = workflow["jobs"]["default-build"]
+        command = next(step["run"] for step in job["steps"] if "Default build" in step.get("name", ""))
+        self.assertIn("exit 127", command)
+        self.assertLess(command.index('export PATH="$absent:$PATH"'), command.index("cargo check"))
+        self.assertIn("--lib -- grammar_disabled_", command)
+        self.assertIn("grammar_unavailable_survives_the_content_record_boundary --exact", command)
+        self.assertIn('test ! -e "$AFT_NO_CMAKE_MARKER"', command)
+        self.assertNotIn("--features wasm-grammars", command)
+
     def test_release_binary_cache_requires_exact_commit_and_compiler(self) -> None:
         path = Path(__file__).resolve().parents[2] / ".github/workflows/tests.yml"
         workflow = workflow_gates.parse_workflow(str(path))
@@ -290,7 +313,7 @@ class CISpeedWorkflowTests(unittest.TestCase):
         self.assertNotIn("restore-keys", cache["with"])
         build = next(step for step in producer["steps"] if step.get("name") == "Build shared search-quality AFT")
         self.assertIn("release-binary.outputs.cache-hit", build["if"])
-        self.assertEqual(build["run"], "cargo build --profile ci-storm --locked -p agent-file-tools --bin aft")
+        self.assertEqual(build["run"], "cargo build --features wasm-grammars --profile ci-storm --locked -p agent-file-tools --bin aft")
         # The gate must read the same profile's binary it downloads, and its
         # fallback build must produce it, or the benchmark would score a
         # binary of a different build than the producer measured.
@@ -422,7 +445,7 @@ class CISpeedWorkflowTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         stage_card = (root / "scripts/stage-card.sh").read_text()
         export = 'export AFT_BUILD_GIT_SHA="$(git rev-parse HEAD)"'
-        build = "cargo build --release -p agent-file-tools --bin aft"
+        build = "cargo build --features wasm-grammars --release -p agent-file-tools --bin aft"
         self.assertIn(export, stage_card)
         self.assertLess(stage_card.index(export), stage_card.index(build))
 
@@ -537,7 +560,7 @@ class LinuxUnitWorkflowTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         script = (root / "scripts/ci-real-daemon-tests.sh").read_text()
         for required in (
-            "timeout 15m cargo nextest run -p agent-file-tools --test rest",
+            "timeout 15m cargo nextest run --features wasm-grammars -p agent-file-tools --test rest",
             "--features test-hooks,test-scope-owner", "--run-ignored only",
             "--no-fail-fast", "--failure-output final", "--status-level pass", "--final-status-level fail",
             "-E 'test(/^tool_provider_subc_e2e::/)'",
@@ -817,6 +840,40 @@ class UnitShardPartitionCountTests(unittest.TestCase):
         proof["partition_nextest_entries"](["cargo", "nextest", "list"])
         self.assertEqual([call[-1] for call in calls], ["hash:1/3", "hash:2/3", "hash:3/3"])
 
+    def test_proof_cargo_list_ignores_msvc_linker_warnings(self) -> None:
+        import ast
+
+        # The wasm-grammars build makes MSVC print LNK4217 warnings for the Wasm
+        # runtime's C API between cargo's `Running` line and the test names.
+        wanted_functions = {"parse_cargo_list", "suite_name_from_artifact"}
+        nodes = [
+            node
+            for node in ast.parse(PROOF_TEXT).body
+            if isinstance(node, (ast.Import, ast.ImportFrom, ast.ClassDef))
+            # Module constants only; the script's main flow also assigns at top level.
+            or (isinstance(node, ast.Assign) and all(
+                isinstance(target, ast.Name) and target.id.isupper() for target in node.targets
+            ))
+            or (isinstance(node, ast.FunctionDef) and node.name in wanted_functions)
+        ]
+        import types
+
+        # dataclasses look up their defining module in sys.modules.
+        module = types.ModuleType("rust_test_inventory_proof_under_test")
+        module.__file__ = str(Path(__file__).resolve().parents[2] / "scripts/rust-test-inventory-proof.py")
+        with unittest.mock.patch.dict(sys.modules, {module.__name__: module}):
+            exec(compile(ast.Module(body=nodes, type_ignores=[]), "rust-test-inventory-proof.py", "exec"), module.__dict__)
+        namespace = module.__dict__
+        output = (
+            "     Running unittests src\\lib.rs (target\\debug\\deps\\agent_file_tools-0123abcd.exe)\n"
+            "         LINK : warning LNK4217: symbol 'wasm_engine_delete' defined in 'libwasmtime_c_api.rlib' is imported\n"
+            "parser::tests::parses: test\n"
+            "\n"
+            "1 test, 0 benchmarks\n"
+        )
+        entries = namespace["parse_cargo_list"](output)
+        self.assertEqual([(entry.kind, entry.name) for entry in entries], [("lib", "parser::tests::parses")])
+
     def test_proof_remaps_every_archive_list_and_partition_to_the_consumer(self) -> None:
         import ast
 
@@ -1063,7 +1120,7 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertIn('"$test_name" --target-dir "$AFT_CI_TARGET_DIR" -- --exact', timeout_step)
         self.assertIn("expected test missing from integration inventory", timeout_step)
         self.assertIn(
-            "cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test integration -- scope_revocation",
+            "cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --features test-timing-hooks --test integration -- scope_revocation",
             GATE_TEXT,
         )
 
@@ -1129,7 +1186,7 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
                     self.assertLess(steps.index(download), consumer)
 
     def test_macos_backtrace_probe_runs_once_in_archive_builder_not_shards(self) -> None:
-        probe = "cargo test -p agent-file-tools --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists"
+        probe = "cargo test --features wasm-grammars -p agent-file-tools --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists"
         archive = workflow_job("unit-macos-libtest-archive")
         shard = workflow_job("unit-macos-libtest-shard")
 
@@ -1182,7 +1239,7 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertNotIn("needs:", dependencies)
         self.assertNotIn("actions/download-artifact", conformance)
         self.assertIn("python3 scripts/check-path-deps.py", conformance)
-        self.assertIn("cargo build -p agent-file-tools", conformance)
+        self.assertIn("cargo build --features wasm-grammars -p agent-file-tools", conformance)
         self.assertIn("AFT_BINARY_PATH: ${{ env.AFT_CI_TARGET_DIR }}/debug/aft", conformance)
 
 

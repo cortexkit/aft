@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use tree_sitter::{Node, Tree};
 
 use crate::indent::IndentStyle;
-use crate::parser::{grammar_for, node_text, LangId};
+use crate::parser::{node_text, LangId};
 
 // ---------------------------------------------------------------------------
 // Free variable detection
@@ -1432,7 +1432,7 @@ pub fn detect_scope_conflicts(
     _param_names: &[String],
     body_text: &str,
     lang: LangId,
-) -> Vec<ScopeConflict> {
+) -> Result<Vec<ScopeConflict>, crate::error::AftError> {
     let root = tree.root_node();
 
     // 1. Find the enclosing function at the call site
@@ -1464,21 +1464,20 @@ pub fn detect_scope_conflicts(
 
     // 3. Collect declarations in the body being inlined
     let mut body_decls: HashSet<String> = HashSet::new();
-    let body_grammar = grammar_for(lang);
-    let mut body_parser = tree_sitter::Parser::new();
-    if body_parser.set_language(&body_grammar).is_ok() {
-        if let Some(body_tree) = body_parser.parse(body_text.as_bytes(), None) {
-            let body_root = body_tree.root_node();
-            collect_declarations_in_range(
-                &body_root,
-                body_text,
-                0,
-                body_text.len(),
-                lang,
-                &mut body_decls,
-            );
-        }
-    }
+    let body_tree = crate::parser::FileParser::parse_source(
+        std::path::Path::new("<inline-body>"),
+        body_text,
+        lang,
+    )?;
+    let body_root = body_tree.root_node();
+    collect_declarations_in_range(
+        &body_root,
+        body_text,
+        0,
+        body_text.len(),
+        lang,
+        &mut body_decls,
+    );
 
     // 4. Find collisions
     let mut conflicts = Vec::new();
@@ -1493,7 +1492,7 @@ pub fn detect_scope_conflicts(
 
     // Sort for deterministic output
     conflicts.sort_by(|a, b| a.name.cmp(&b.name));
-    conflicts
+    Ok(conflicts)
 }
 
 /// Validate that a function has at most one return statement (suitable for inlining).
@@ -1567,21 +1566,16 @@ pub fn substitute_params(
     body_text: &str,
     param_to_arg: &std::collections::HashMap<String, String>,
     lang: LangId,
-) -> String {
-    if param_to_arg.is_empty() {
-        return body_text.to_string();
+) -> Result<String, crate::error::AftError> {
+    if param_to_arg.is_empty() && lang != LangId::Luau {
+        return Ok(body_text.to_string());
     }
 
-    let grammar = grammar_for(lang);
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&grammar).is_err() {
-        return body_text.to_string();
-    }
-
-    let tree = match parser.parse(body_text.as_bytes(), None) {
-        Some(t) => t,
-        None => return body_text.to_string(),
-    };
+    let tree = crate::parser::FileParser::parse_source(
+        std::path::Path::new("<substitution-body>"),
+        body_text,
+        lang,
+    )?;
 
     // Collect identifier references that are still bound to the inlined function's
     // parameters. Nested functions and local shadowing declarations are skipped.
@@ -1605,7 +1599,7 @@ pub fn substitute_params(
         result = format!("{}{}{}", &result[..start], replacement, &result[end..]);
     }
 
-    result
+    Ok(result)
 }
 
 /// Collect identifier nodes that match parameter names for substitution.
@@ -1811,6 +1805,39 @@ fn node_is_inside(container: &Node, node: &Node) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn grammar_refactor_body_failures_are_not_silently_unchanged_or_conflict_free() {
+        let source = "local function f() return 1 end";
+        let tree = crate::parser::FileParser::parse_source(
+            std::path::Path::new("f.lua"),
+            source,
+            crate::parser::LangId::Lua,
+        )
+        .unwrap();
+        let conflict = super::detect_scope_conflicts(
+            source,
+            &tree,
+            0,
+            &[],
+            source,
+            crate::parser::LangId::Luau,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            conflict,
+            crate::error::AftError::GrammarUnavailable { .. }
+        ));
+        let substitute = super::substitute_params(
+            source,
+            &std::collections::HashMap::new(),
+            crate::parser::LangId::Luau,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            substitute,
+            crate::error::AftError::GrammarUnavailable { .. }
+        ));
+    }
     use super::*;
     use crate::parser::grammar_for;
     use std::path::PathBuf;
@@ -1825,7 +1852,7 @@ mod tests {
     }
 
     fn parse_source(source: &str, lang: LangId) -> Tree {
-        let grammar = grammar_for(lang);
+        let grammar = grammar_for(lang).unwrap();
         let mut parser = Parser::new();
         parser.set_language(&grammar).unwrap();
         parser.parse(source.as_bytes(), None).unwrap()
@@ -2344,7 +2371,8 @@ class UserService:
         let body_text = "const sum = a + b;";
         let call_byte = crate::edit::line_col_to_byte(source, 2, 0);
         let conflicts =
-            detect_scope_conflicts(source, &tree, call_byte, &[], body_text, LangId::TypeScript);
+            detect_scope_conflicts(source, &tree, call_byte, &[], body_text, LangId::TypeScript)
+                .unwrap();
         assert!(
             conflicts.is_empty(),
             "expected no conflicts, got: {:?}",
@@ -2360,7 +2388,8 @@ class UserService:
         let body_text = "const temp = x * 2;\nconst result2 = temp + 10;";
         let call_byte = crate::edit::line_col_to_byte(source, 2, 0);
         let conflicts =
-            detect_scope_conflicts(source, &tree, call_byte, &[], body_text, LangId::TypeScript);
+            detect_scope_conflicts(source, &tree, call_byte, &[], body_text, LangId::TypeScript)
+                .unwrap();
         assert!(!conflicts.is_empty(), "expected conflict for 'temp'");
         assert!(
             conflicts.iter().any(|c| c.name == "temp"),
@@ -2381,7 +2410,7 @@ class UserService:
         let mut map = std::collections::HashMap::new();
         map.insert("a".to_string(), "x".to_string());
         map.insert("b".to_string(), "y".to_string());
-        let result = substitute_params(body, &map, LangId::TypeScript);
+        let result = substitute_params(body, &map, LangId::TypeScript).unwrap();
         assert_eq!(result, "const sum = x + y;");
     }
 
@@ -2391,7 +2420,7 @@ class UserService:
         let body = "const result = items.filter(i => i > 0);";
         let mut map = std::collections::HashMap::new();
         map.insert("i".to_string(), "index".to_string());
-        let result = substitute_params(body, &map, LangId::TypeScript);
+        let result = substitute_params(body, &map, LangId::TypeScript).unwrap();
         // `items` should be untouched, and the nested arrow's shadowing `i`
         // parameter/reference pair should also be left alone.
         assert_eq!(result, body);
@@ -2402,7 +2431,7 @@ class UserService:
         let body = "return x + items.map(x => x + 1)[0];";
         let mut map = std::collections::HashMap::new();
         map.insert("x".to_string(), "5".to_string());
-        let result = substitute_params(body, &map, LangId::TypeScript);
+        let result = substitute_params(body, &map, LangId::TypeScript).unwrap();
         assert_eq!(result, "return 5 + items.map(x => x + 1)[0];");
     }
 
@@ -2411,7 +2440,7 @@ class UserService:
         let body = "const sum = x + y;";
         let mut map = std::collections::HashMap::new();
         map.insert("x".to_string(), "x".to_string());
-        let result = substitute_params(body, &map, LangId::TypeScript);
+        let result = substitute_params(body, &map, LangId::TypeScript).unwrap();
         assert_eq!(result, "const sum = x + y;");
     }
 
@@ -2419,7 +2448,7 @@ class UserService:
     fn substitute_params_empty_map() {
         let body = "const sum = a + b;";
         let map = std::collections::HashMap::new();
-        let result = substitute_params(body, &map, LangId::TypeScript);
+        let result = substitute_params(body, &map, LangId::TypeScript).unwrap();
         assert_eq!(result, body);
     }
 }

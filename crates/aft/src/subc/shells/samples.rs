@@ -12,7 +12,7 @@ struct Case<T> {
     reply: T,
 }
 
-fn row(task_id: &str, kind: &str, worker: bool) -> Row {
+pub(super) fn row(task_id: &str, kind: &str, worker: bool) -> Row {
     let command =
         crate::log_redact::redact_command("TOKEN=fixture-secret-value cargo test").into_owned();
     assert!(!command.contains("fixture-secret-value"));

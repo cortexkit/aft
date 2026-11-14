@@ -30,6 +30,13 @@ use aft::commands::writes_census::WRITES_CENSUS_OPERATION;
 
 const DEFAULT_SECONDS: u64 = 4;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long macOS `sample` may run past its sampling window. Keep it short: a
+/// stuck `sample` can hold the target process suspended, and every thread of
+/// the target stays frozen until the deadline kills it. On a heavily loaded
+/// machine a 15 s profile of the live daemon froze it for 44.7 s and ended at
+/// the moment this deadline fired; a longer allowance only lengthens that.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const SAMPLE_GRACE: Duration = COMMAND_TIMEOUT;
 const TOP_THREADS: usize = 5;
 const TOP_SYMBOLS: usize = 10;
 // The macOS `sample` text parsers compile on every platform so the fixture tests
@@ -1478,7 +1485,7 @@ fn capture_sample(pid: u32, seconds: u64) -> Result<CapturedSample, ProfileError
                 path.display().to_string(),
             ]),
             Vec::new(),
-            Duration::from_secs(seconds) + COMMAND_TIMEOUT,
+            Duration::from_secs(seconds) + SAMPLE_GRACE,
         );
         let output = match output {
             Ok(output) => output,

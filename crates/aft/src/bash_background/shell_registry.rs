@@ -15,11 +15,86 @@ struct FormatScan {
     private_key: bool,
 }
 
+#[derive(Clone)]
 pub(crate) struct ShellSnapshot {
     pub metadata: PersistedTask,
     pub stdout: u64,
     pub stderr: u64,
     pub last_output_at_ms: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+    created: Option<SystemTime>,
+    regular: bool,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+}
+
+impl FileStamp {
+    fn read(path: &Path) -> Option<Self> {
+        let metadata = fs::symlink_metadata(path).ok()?;
+        Some(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+            regular: metadata.is_file(),
+            #[cfg(unix)]
+            identity: {
+                use std::os::unix::fs::MetadataExt;
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec(),
+                )
+            },
+        })
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ShellSnapshotCache {
+    live: HashMap<String, (Vec<u8>, Vec<Option<FileStamp>>, ShellSnapshot)>,
+    saved: HashMap<
+        String,
+        (
+            BashTaskRow,
+            Vec<Option<FileStamp>>,
+            ShellSnapshot,
+            ShellReader,
+        ),
+    >,
+}
+
+impl ShellSnapshotCache {
+    pub(crate) fn retain(&mut self, ids: &HashMap<String, ShellReader>) {
+        self.live
+            .retain(|id, _| ids.get(id).is_some_and(|reader| !reader.is_persisted()));
+        self.saved
+            .retain(|id, _| ids.get(id).is_some_and(ShellReader::is_persisted));
+    }
+}
+
+fn output_stamps(paths: &TaskPaths, mode: &BgMode) -> Vec<Option<FileStamp>> {
+    let output = if *mode == BgMode::Pty {
+        &paths.pty
+    } else {
+        &paths.stdout
+    };
+    [output, &paths.stderr]
+        .into_iter()
+        .map(|path| FileStamp::read(path))
+        .collect()
+}
+
+fn saved_stamps(paths: &TaskPaths, mode: &BgMode) -> Vec<Option<FileStamp>> {
+    let mut stamps = output_stamps(paths, mode);
+    stamps.push(FileStamp::read(&paths.json));
+    stamps.push(FileStamp::read(&paths.exit));
+    stamps
 }
 
 #[derive(Clone)]
@@ -30,9 +105,34 @@ pub(crate) struct ShellReader {
     order: Arc<DbWriteOrder>,
     format_scans: Arc<Mutex<HashMap<TaskArtifact, FormatScan>>>,
     stop: Option<tokio_util::sync::CancellationToken>,
+    persisted_terminal: bool,
 }
 
 impl ShellReader {
+    pub(crate) fn persisted_cached(
+        row: BashTaskRow,
+        cache: &mut ShellSnapshotCache,
+    ) -> Option<(ShellSnapshot, Self)> {
+        if let Some((saved, stamps, snapshot, reader)) = cache.saved.get(&row.task_id) {
+            if saved == &row && *stamps == saved_stamps(&reader.paths, &reader.metadata.mode) {
+                return Some((snapshot.clone(), reader.clone()));
+            }
+        }
+        let (snapshot, reader, stamps) = Self::persisted_observed(row.clone())?;
+        // A running process can disappear without writing an exit marker. Its
+        // liveness still needs the recovery checks on every observation.
+        if snapshot.metadata.is_terminal()
+            && stamps == saved_stamps(&reader.paths, &reader.metadata.mode)
+        {
+            cache.saved.insert(
+                row.task_id.clone(),
+                (row, stamps, snapshot.clone(), reader.clone()),
+            );
+        } else {
+            cache.saved.remove(&row.task_id);
+        }
+        Some((snapshot, reader))
+    }
     pub(crate) fn with_stop(mut self, stop: tokio_util::sync::CancellationToken) -> Self {
         self.stop = Some(stop);
         self
@@ -45,7 +145,14 @@ impl ShellReader {
         self.live.is_none()
     }
 
+    #[cfg(test)]
     pub(crate) fn persisted(row: BashTaskRow) -> Option<(ShellSnapshot, Self)> {
+        Self::persisted_observed(row).map(|(snapshot, reader, _)| (snapshot, reader))
+    }
+
+    fn persisted_observed(
+        row: BashTaskRow,
+    ) -> Option<(ShellSnapshot, Self, Vec<Option<FileStamp>>)> {
         let output = Path::new(row.stdout_path.as_deref()?);
         let parent = output.parent()?;
         let session_dir = if parent.file_name()? == "io" {
@@ -67,6 +174,7 @@ impl ShellReader {
         {
             return None;
         }
+        let persisted_terminal = metadata.is_terminal();
         #[cfg(unix)]
         if !metadata.is_terminal() {
             let _ = super::remote::terminal_metadata_from_proof(&mut metadata);
@@ -81,6 +189,7 @@ impl ShellReader {
                 metadata.mark_terminal(BgTaskStatus::FateUnknown, None, Some(reason));
             }
         }
+        let stamps = saved_stamps(&task.paths, &metadata.mode);
         let buffer = BgBuffer::registered(&task.paths, metadata.mode.clone());
         let stdout = buffer.stream_len(StreamKind::Stdout);
         let stderr = if metadata.mode == BgMode::Pty {
@@ -108,6 +217,7 @@ impl ShellReader {
             paths: task.paths,
             format_scans: Default::default(),
             stop: None,
+            persisted_terminal,
         };
         metadata.command = if metadata.has_safe_completion_redaction_after_restart() {
             crate::log_redact::redact_command(&metadata.command).into_owned()
@@ -122,6 +232,7 @@ impl ShellReader {
                 last_output_at_ms,
             },
             reader,
+            stamps,
         ))
     }
 
@@ -153,6 +264,19 @@ impl ShellReader {
         write_task_at(&layout, &updated).map_err(|error| error.to_string())?;
         *order += 1;
         Ok(updated.shell_revision)
+    }
+
+    pub(crate) fn shell_revision_if_changed(
+        &self,
+        task_id: &str,
+        fingerprint: &str,
+    ) -> Result<u64, String> {
+        if self.persisted_terminal
+            && self.metadata.shell_fingerprint.as_deref() == Some(fingerprint)
+        {
+            return Ok(self.metadata.shell_revision);
+        }
+        self.shell_revision(task_id, fingerprint)
     }
 
     pub(crate) fn shell_read(
@@ -309,6 +433,22 @@ impl BgTaskRegistry {
         self.insert_rehydrated_task(metadata, paths, false)
     }
 
+    #[cfg(test)]
+    pub(crate) fn update_shell_fixture(
+        &self,
+        task_id: &str,
+        update: impl FnOnce(&mut PersistedTask),
+    ) -> Result<(), String> {
+        let task = self
+            .task(task_id)
+            .ok_or("shell fixture is not registered")?;
+        let mut db = DeferredDbWrites::new(self, &task);
+        let mut state = task.lock_state().map_err(|_| "task lock poisoned")?;
+        update(&mut state.metadata);
+        self.persist_task_locked(&task, &state.metadata, &mut db)
+            .map_err(|error| error.to_string())
+    }
+
     pub(crate) fn shell_reader(&self, task_id: &str) -> Option<ShellReader> {
         let task = self.task(task_id)?;
         let state = task.lock_state().ok()?;
@@ -319,8 +459,10 @@ impl BgTaskRegistry {
             order: task.db_write_order.clone(),
             format_scans: Default::default(),
             stop: None,
+            persisted_terminal: false,
         })
     }
+    #[cfg(test)]
     pub(crate) fn shell_snapshots(&self) -> Vec<ShellSnapshot> {
         let tasks: Vec<_> = self
             .inner
@@ -382,6 +524,97 @@ impl BgTaskRegistry {
                     stderr,
                     last_output_at_ms,
                 })
+            })
+            .collect()
+    }
+
+    pub(crate) fn shell_snapshots_cached(
+        &self,
+        cache: &mut ShellSnapshotCache,
+    ) -> Vec<ShellSnapshot> {
+        let tasks: Vec<_> = self
+            .inner
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        tasks
+            .into_iter()
+            .filter_map(|task| {
+                let state = task.lock_state().ok()?;
+                let mut metadata = state.metadata.clone();
+                let secrets = task
+                    .completion_secrets
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                metadata.command = match secrets.as_ref() {
+                    Some(secrets) => {
+                        crate::log_redact::redact_command(&secrets.redact(&metadata.command))
+                            .into_owned()
+                    }
+                    None if metadata.has_safe_completion_redaction_after_restart() => {
+                        crate::log_redact::redact_command(&metadata.command).into_owned()
+                    }
+                    None => crate::log_redact::SECRET_PLACEHOLDER.into(),
+                };
+                drop(secrets);
+                let revision = metadata.shell_revision;
+                let fingerprint = metadata.shell_fingerprint.take();
+                metadata.shell_revision = 0;
+                let key = serde_json::to_vec(&metadata).expect("task metadata serializes");
+                metadata.shell_revision = revision;
+                metadata.shell_fingerprint = fingerprint;
+                // Children write directly to capture handles, without updating
+                // task metadata. File stamps are the output part of a task's
+                // sampling revision; unchanged tasks need no validated opens.
+                let stamps = output_stamps(&task.paths, &metadata.mode);
+                if let Some((old_key, old_stamps, snapshot)) = cache.live.get(&metadata.task_id) {
+                    if *old_key == key && *old_stamps == stamps {
+                        let mut snapshot = snapshot.clone();
+                        snapshot.metadata = metadata;
+                        return Some(snapshot);
+                    }
+                }
+                let stdout = state.buffer.stream_len(StreamKind::Stdout);
+                let stderr = if state.metadata.mode == BgMode::Pty {
+                    0
+                } else {
+                    state.buffer.stream_len(StreamKind::Stderr)
+                };
+                let path = if state.metadata.mode == BgMode::Pty {
+                    &task.paths.pty
+                } else {
+                    &task.paths.stdout
+                };
+                let last_output_at_ms = (stdout + stderr > 0)
+                    .then(|| {
+                        [path, &task.paths.stderr]
+                            .iter()
+                            .filter_map(|path| {
+                                std::fs::metadata(path)
+                                    .ok()?
+                                    .modified()
+                                    .ok()?
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .ok()
+                                    .map(|duration| duration.as_millis() as u64)
+                            })
+                            .max()
+                    })
+                    .flatten();
+                let snapshot = ShellSnapshot {
+                    metadata,
+                    stdout,
+                    stderr,
+                    last_output_at_ms,
+                };
+                cache.live.insert(
+                    snapshot.metadata.task_id.clone(),
+                    (key, stamps, snapshot.clone()),
+                );
+                Some(snapshot)
             })
             .collect()
     }

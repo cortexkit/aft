@@ -502,6 +502,7 @@ pub(crate) fn glob_fan_out(
                     child_root,
                     &filters,
                     false,
+                    "glob",
                 );
                 if let Some(reason) = outcome.error {
                     gaps.child(&child, reason);

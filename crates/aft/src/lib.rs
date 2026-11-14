@@ -124,6 +124,7 @@ pub mod git_index_reader;
 pub(crate) mod git_probe;
 pub(crate) mod git_root_resolution;
 pub mod github_read;
+pub mod grammar;
 pub mod grep_executor;
 pub mod harness;
 pub mod harness_partition_guard;

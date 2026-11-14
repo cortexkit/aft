@@ -186,10 +186,11 @@ async fn cancellation_after_a_lost_or_garbled_filing_never_creates_a_recovery_ca
             1,
             "cancellation must not create an identical replay, even to recover an unknown id"
         );
-        assert!(
-            calls[0].params["expires_at_ms"].as_u64().unwrap() <= deadline,
-            "the unknown-id card must expire by the original request deadline"
-        );
+        // Cingulate refuses any field beyond {kind, secret_use} and bounds the
+        // card by the vault statement's own request expiry instead.
+        let mut keys: Vec<_> = calls[0].params.as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["kind", "secret_use"]);
     }
 }
 

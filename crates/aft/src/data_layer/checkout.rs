@@ -453,7 +453,7 @@ impl GraphEngine {
                 replaced: BTreeMap::new(),
                 removed: BTreeSet::new(),
                 records: BTreeMap::new(),
-                dead_code: DeadCodeMemo::default(),
+                dead_code: DeadCodeMemo::new(Arc::clone(&to.dead_code.memory_epoch)),
             },
         })
     }
@@ -623,37 +623,54 @@ impl PathTextMemo {
 /// every stored record and fragment, so concurrent first requests wait for
 /// one build rather than each starting their own. A copy starts empty: a
 /// memo belongs to the call graph it was built for.
-#[derive(Default)]
-struct DeadCodeMemo(Mutex<Option<Arc<crate::inspect::job::CallgraphSnapshot>>>);
+struct DeadCodeMemo {
+    snapshot: Mutex<Option<Arc<crate::inspect::job::CallgraphSnapshot>>>,
+    memory_epoch: Arc<std::sync::atomic::AtomicU64>,
+}
 
 impl Clone for DeadCodeMemo {
     fn clone(&self) -> Self {
-        Self::default()
+        Self::new(Arc::clone(&self.memory_epoch))
     }
 }
 
 impl DeadCodeMemo {
+    fn new(memory_epoch: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self {
+            snapshot: Mutex::default(),
+            memory_epoch,
+        }
+    }
+
     fn get_or_build(
         &self,
         build: impl FnOnce() -> Result<crate::inspect::job::CallgraphSnapshot, DataError>,
     ) -> Result<Arc<crate::inspect::job::CallgraphSnapshot>, DataError> {
-        let mut slot = self.0.lock().expect("no panics while holding it");
+        let mut slot = self.snapshot.lock().expect("no panics while holding it");
         if let Some(snapshot) = slot.as_ref() {
             return Ok(Arc::clone(snapshot));
         }
         let snapshot = Arc::new(build()?);
         *slot = Some(Arc::clone(&snapshot));
+        self.memory_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok(snapshot)
     }
 
     /// Drops the built snapshot, if any, so the next request builds it
     /// again. True when one was held.
     fn release(&self) -> bool {
-        self.0
+        let released = self
+            .snapshot
             .lock()
             .expect("no panics while holding it")
             .take()
-            .is_some()
+            .is_some();
+        if released {
+            self.memory_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        released
     }
 }
 
@@ -993,6 +1010,7 @@ impl Checkout {
             live.graph = None;
             live.refreshed = None;
             live.generation += 1;
+            self.touch_memory();
             live.generation
         };
         let applied = self.apply_scan(
@@ -1074,6 +1092,7 @@ impl Checkout {
             graph
         });
         Some(CheckoutView {
+            memory_epoch: Arc::clone(&self.memory_epoch),
             published,
             planes: self.planes,
             text: Arc::clone(&live.text),
@@ -1158,6 +1177,7 @@ impl Checkout {
         match result {
             Err(DataError::Cancelled) => {}
             Err(error) => {
+                self.touch_memory();
                 live.failure = Some(Failure {
                     stage,
                     error: error.to_string(),
@@ -1177,7 +1197,9 @@ impl Checkout {
                         .as_ref()
                         .is_some_and(|failure| failure.stage == stage)
                 {
-                    live.failure = None;
+                    if live.failure.take().is_some() {
+                        self.touch_memory();
+                    }
                 }
             }
         }
@@ -1406,6 +1428,7 @@ impl Checkout {
                 return false;
             }
             live.state = Some(Arc::new(state));
+            self.touch_memory();
             return true;
         }
         let mut entries = Vec::with_capacity(changed.len());
@@ -1517,18 +1540,29 @@ impl Checkout {
     ) -> Result<BuildReport, DataError> {
         // A refresh already inside the engine finishes first. The reservation
         // blocks new refreshes, so no decoded engine overlaps the cold scan.
-        let mut engine = self
-            .engine
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *engine = None;
-        drop(engine);
+        self.clear_engine_for_build();
         let _alloc_label =
             crate::alloc_trace::scope(crate::alloc_trace::Label::INDEX_BUILD, Some(&self.root));
         let result = self.build_inner(measure);
         drop(reservation);
         self.note_outcome("build", &result);
         result
+    }
+
+    fn clear_engine_for_build(&self) {
+        let mut engine = self
+            .engine
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.clear_engine_slot(&mut engine);
+    }
+
+    fn clear_engine_slot(&self, engine: &mut Option<GraphEngine>) {
+        if engine.take().is_some() {
+            // A refresh or cold scan can run long before its next publication;
+            // released engine bytes must invalidate the census immediately.
+            self.touch_memory();
+        }
     }
 
     fn build_inner(&self, measure: bool) -> Result<BuildReport, DataError> {
@@ -1710,7 +1744,7 @@ impl Checkout {
             true,
             Some(encoded),
         );
-        super::callgraph::resolve_checkout_into(
+        let _census = super::callgraph::resolve_checkout_into(
             &mut inputs,
             self.layer.threads,
             measure.then_some(&mut report.memory),
@@ -1807,6 +1841,15 @@ impl Checkout {
             .map(|entry| entry.len)
             .sum();
         self.serve_new(snapshot, covered)?;
+        #[cfg(feature = "callgraph-shape-census")]
+        _census
+            .write_if_requested(
+                self.view()
+                    .expect("build published a checkout")
+                    .graph
+                    .as_ref(),
+            )
+            .map_err(DataError::Store)?;
         Ok(report)
     }
 
@@ -2628,7 +2671,7 @@ impl Checkout {
         self.memory_epoch.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    fn touch_memory(&self) {
+    pub(crate) fn touch_memory(&self) {
         self.memory_epoch
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
@@ -2676,7 +2719,7 @@ impl Checkout {
         let mut slot = self.engine.lock().unwrap_or_else(|poisoned| {
             self.engine.clear_poison();
             let mut slot = poisoned.into_inner();
-            *slot = None;
+            self.clear_engine_slot(&mut slot);
             slot
         });
         if self.is_building() && !by_build {
@@ -2699,7 +2742,7 @@ impl Checkout {
             Ok(Ok(EngineUpdate::Cold(limit))) => {
                 // No incremental engine or its decoded state overlaps the cold
                 // builder. Watcher events keep recording over the publication.
-                *slot = None;
+                self.clear_engine_slot(&mut slot);
                 let reservation = if by_build { None } else { self.reserve_build() };
                 drop(slot);
                 drop(changes);
@@ -2731,11 +2774,11 @@ impl Checkout {
                 }));
             }
             Ok(Err(error)) => {
-                *slot = None;
+                self.clear_engine_slot(&mut slot);
                 return Err(error);
             }
             Err(panic) => {
-                *slot = None;
+                self.clear_engine_slot(&mut slot);
                 let message = panic
                     .downcast_ref::<&str>()
                     .map(|message| (*message).to_string())
@@ -2831,16 +2874,7 @@ impl Checkout {
         if let Err(limit) = budget.include(&changed_members) {
             return Ok(EngineUpdate::Cold(limit));
         }
-        if slot
-            .as_ref()
-            .is_some_and(|engine| !Arc::ptr_eq(&engine.published, &published))
-        {
-            *slot = None;
-        }
-        if slot.is_none() {
-            *slot = Some(self.start_engine(published)?);
-            self.engine.note_start();
-        }
+        self.ensure_engine(slot, published)?;
         let engine = slot.as_mut().expect("started");
         let changed = changes
             .iter()
@@ -3419,6 +3453,25 @@ impl Checkout {
             })
     }
 
+    fn ensure_engine(
+        &self,
+        slot: &mut Option<GraphEngine>,
+        published: &Arc<Published>,
+    ) -> Result<(), DataError> {
+        if slot
+            .as_ref()
+            .is_some_and(|engine| !Arc::ptr_eq(&engine.published, published))
+        {
+            self.clear_engine_slot(slot);
+        }
+        if slot.is_none() {
+            *slot = Some(self.start_engine(published)?);
+            self.touch_memory();
+            self.engine.note_start();
+        }
+        Ok(())
+    }
+
     /// The incremental state for `published`: every stored resolution, and
     /// the parses and configuration the publication was built from.
     fn start_engine(&self, published: &Arc<Published>) -> Result<GraphEngine, DataError> {
@@ -3632,7 +3685,7 @@ impl Checkout {
                 replaced: BTreeMap::new(),
                 removed: BTreeSet::new(),
                 records: BTreeMap::new(),
-                dead_code: DeadCodeMemo::default(),
+                dead_code: DeadCodeMemo::new(Arc::clone(&self.memory_epoch)),
             },
         })
     }
@@ -3662,7 +3715,14 @@ impl Checkout {
             snapshot.generation(),
             Digest128::of(&state.encode())
         );
-        let published = Published::open(self.root.clone(), identity, state, segments, snapshot);
+        let published = Published::open(
+            self.root.clone(),
+            identity,
+            state,
+            segments,
+            snapshot,
+            Arc::clone(&self.memory_epoch),
+        );
         if unusable.is_empty() {
             return published.map(Some);
         }
@@ -3785,6 +3845,7 @@ pub struct CheckoutStatus {
 /// open until it drops, so a query never sees a half-applied change.
 #[derive(Clone)]
 pub struct CheckoutView {
+    memory_epoch: Arc<std::sync::atomic::AtomicU64>,
     published: Arc<Published>,
     planes: Planes,
     text: Arc<TextOverlay>,
@@ -3813,6 +3874,7 @@ impl Published {
         state: CheckoutState,
         segments: Vec<Arc<Segment>>,
         snapshot: Snapshot,
+        memory_epoch: Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<Self, DataError> {
         let mut sections = Vec::new();
         let mut texts = Vec::new();
@@ -3875,6 +3937,7 @@ impl Published {
             }
         };
         let path_texts = PathTextMemo::new(state.paths().len());
+        graph.track_memory(Arc::clone(&memory_epoch));
         Ok(Self {
             root,
             identity,
@@ -3885,7 +3948,7 @@ impl Published {
             graph: Arc::new(graph),
             graph_built,
             unparsed,
-            dead_code: DeadCodeMemo::default(),
+            dead_code: DeadCodeMemo::new(memory_epoch),
             path_texts,
             _snapshot: snapshot,
         })
@@ -3902,6 +3965,15 @@ impl Published {
 }
 
 impl CheckoutView {
+    pub(crate) fn memory_changed(&self) {
+        self.memory_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    pub(crate) fn memory_epoch_counter(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.memory_epoch)
+    }
+
     /// The checkout's root folder.
     #[must_use]
     pub fn root(&self) -> &Path {
@@ -4102,12 +4174,14 @@ impl CheckoutView {
     /// by segment, built on the first trigram lookup.
     fn members(&self, texts: &[TextSegment<'_>]) -> &aft_store::text::TextMembers {
         self.text_members.get_or_init(|| {
-            aft_store::text::TextMembers::build(
+            let members = aft_store::text::TextMembers::build(
                 &self.published.state,
                 &self.published.membership,
                 texts.len(),
                 &self.text,
-            )
+            );
+            self.memory_changed();
+            members
         })
     }
 
@@ -5125,14 +5199,14 @@ impl DeadCodeMemo {
     /// The built snapshot's file count; `None` when none is built or the
     /// memo is being built.
     fn try_files(&self) -> Option<usize> {
-        let slot = self.0.try_lock().ok()?;
+        let slot = self.snapshot.try_lock().ok()?;
         slot.as_ref().map(|snapshot| snapshot.files.len())
     }
 }
 
 impl aft_store::heap::HeapBytes for DeadCodeMemo {
     fn heap_bytes(&self, seen: &mut aft_store::heap::Seen) -> usize {
-        self.0.heap_bytes(seen)
+        self.snapshot.heap_bytes(seen)
     }
 }
 
@@ -5342,6 +5416,14 @@ impl Checkout {
                 dead_code_files,
             }
         });
+        // No live state means the estimate is busy as a whole. Do not walk a
+        // large engine whose bytes cannot be attributed in that estimate.
+        if live.is_none() {
+            return CheckoutMemory {
+                live,
+                engine: EngineMemory::Busy,
+            };
+        }
         let engine = match self.engine.try_lock() {
             Ok(engine) => match engine.as_ref() {
                 Some(engine) => {
@@ -5969,6 +6051,107 @@ impl Checkout {
 mod tests {
     use super::*;
     use aft_store::text::plan_pattern;
+
+    #[test]
+    fn memory_figure_engine_start_and_cold_reset_invalidate_before_work_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        write(root.path(), "src/lib.rs", "pub fn original() {}\n");
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        let published = Arc::clone(checkout.live.read().unwrap().published.as_ref().unwrap());
+        let epoch = checkout.memory_epoch();
+        {
+            let mut engine = checkout.engine.lock().unwrap();
+            checkout.ensure_engine(&mut engine, &published).unwrap();
+        }
+        assert!(
+            checkout.memory_epoch() > epoch,
+            "starting the engine invalidates before refresh returns"
+        );
+        assert!(checkout.engine_memory_parts().is_some());
+        let reservation = checkout.reserve_build().unwrap();
+        let epoch = checkout.memory_epoch();
+        checkout.clear_engine_for_build();
+        assert!(
+            checkout.memory_epoch() > epoch,
+            "the engine was released before any new publication"
+        );
+        let mut seen = aft_store::heap::Seen::new();
+        assert_eq!(checkout.memory(&mut seen).engine, EngineMemory::NotStarted);
+        let epoch = checkout.memory_epoch();
+        checkout.clear_engine_for_build();
+        assert_eq!(
+            checkout.memory_epoch(),
+            epoch,
+            "an empty slot changed no memory"
+        );
+        drop(reservation);
+    }
+
+    #[test]
+    fn memory_figure_unchanged_scan_and_adoption_invalidate_replaced_state() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        write(root.path(), "src/lib.rs", "pub fn original() {}\n");
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        let epoch = checkout.memory_epoch();
+        checkout.record_paths(&[b"src/lib.rs".to_vec()]).unwrap();
+        assert!(
+            checkout.memory_epoch() > epoch,
+            "even an unchanged scan replaces the counted state"
+        );
+        assert!(checkout.live.read().unwrap().changes.is_empty());
+        let epoch = checkout.memory_epoch();
+        checkout.adopt_newest().unwrap();
+        assert!(
+            checkout.memory_epoch() > epoch,
+            "adopting a publication replaces counted state and overlays"
+        );
+        assert!(checkout.live.read().unwrap().changes.is_empty());
+    }
+
+    #[test]
+    fn memory_figure_read_side_allocations_advance_the_checkout_epoch() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        write(
+            root.path(),
+            "src/lib.rs",
+            "pub fn used() {}\npub fn unused() {}\n",
+        );
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        let view = checkout.view().unwrap();
+        let epoch = checkout.memory_epoch();
+        view.members(&view.published.texts().unwrap());
+        assert!(
+            checkout.memory_epoch() > epoch,
+            "lazy text members changed heap size"
+        );
+        let epoch = checkout.memory_epoch();
+        view.members(&view.published.texts().unwrap());
+        assert_eq!(
+            checkout.memory_epoch(),
+            epoch,
+            "reusing members allocates nothing"
+        );
+        view.dead_code_snapshot_shared().unwrap();
+        assert!(
+            checkout.memory_epoch() > epoch,
+            "the dead-code memo was populated"
+        );
+        let epoch = checkout.memory_epoch();
+        assert!(view.release_dead_code_snapshot());
+        assert!(
+            checkout.memory_epoch() > epoch,
+            "the dead-code memo was dropped"
+        );
+    }
 
     fn write(root: &Path, path: &str, text: &str) {
         let path = root.join(path);

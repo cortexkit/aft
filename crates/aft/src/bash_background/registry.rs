@@ -1268,7 +1268,9 @@ pub(crate) struct ScopeKillReport {
 mod scratch_retention;
 #[path = "shell_registry.rs"]
 mod shell_registry;
-pub(crate) use shell_registry::{ShellReader, ShellSnapshot, SHELL_MASK_WITHHELD};
+pub(crate) use shell_registry::{
+    ShellReader, ShellSnapshot, ShellSnapshotCache, SHELL_MASK_WITHHELD,
+};
 #[path = "task_image_cleanup.rs"]
 mod task_image_cleanup;
 
@@ -1704,6 +1706,9 @@ pub(crate) struct BgTask {
     persisted_hard_kill_ms: AtomicU64,
     pub(crate) last_reminder_at: Mutex<Option<Instant>>,
     pub(crate) terminal_at: Mutex<Option<Instant>>,
+    /// Terminal launcher images cannot be created again. Once removal or an
+    /// absent image is confirmed, later cleanup passes need no task/IO probes.
+    terminal_image_cleaned: AtomicBool,
     /// Serialize terminal notification routing, including watch safety nets.
     /// Delivery acknowledgement remains separate so pending results can replay.
     terminal_notification_routed: Mutex<bool>,
@@ -6101,6 +6106,7 @@ impl BgTaskRegistry {
             persisted_hard_kill_ms: AtomicU64::new(timeout_ms.unwrap_or(0)),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
+            terminal_image_cleaned: AtomicBool::new(false),
             terminal_notification_routed: Mutex::new(false),
             notice_registry: Mutex::new(None),
             exit_marker_probe: Mutex::new(Default::default()),
@@ -6555,6 +6561,7 @@ impl BgTaskRegistry {
             persisted_hard_kill_ms: AtomicU64::new(timeout_ms.unwrap_or(0)),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
+            terminal_image_cleaned: AtomicBool::new(false),
             terminal_notification_routed: Mutex::new(false),
             notice_registry: Mutex::new(None),
             exit_marker_probe: Mutex::new(Default::default()),
@@ -6927,6 +6934,7 @@ impl BgTaskRegistry {
             persisted_hard_kill_ms: AtomicU64::new(timeout_ms.unwrap_or(0)),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
+            terminal_image_cleaned: AtomicBool::new(false),
             terminal_notification_routed: Mutex::new(false),
             notice_registry: Mutex::new(None),
             exit_marker_probe: Mutex::new(Default::default()),
@@ -10351,6 +10359,7 @@ impl BgTaskRegistry {
                 }
             }
         }
+        super::watchdog::record_cleanup_work(|work| work.gc_requests += requested.len());
         for root in requested {
             crate::tool_output::cleanup_expired(&root, super::watchdog::FINISHED_RETENTION);
             self.request_persisted_gc(&root);
@@ -11175,11 +11184,11 @@ impl BgTaskRegistry {
                 // only this explicit transition may lower the durable bit.
                 if let Some((harness, pool)) = self.db_harness_and_pool_for_task(&task) {
                     let conn = pool.lock().map_err(|_| "db mutex poisoned".to_string())?;
-                    conn.execute(
+                    crate::db::bash_tasks::record_store_write(conn.execute(
                         "UPDATE bash_tasks SET completion_delivered = 0
                          WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3",
                         rusqlite::params![harness, session_id, task_id],
-                    )
+                    ))
                     .map_err(|e| format!("failed to reset promoted task delivery: {e}"))?;
                 }
                 // SQLite is unlocked before taking task state. Keep the fence
@@ -11610,6 +11619,8 @@ impl BgTaskRegistry {
     ) {
         let cutoff = now.checked_sub(older_than);
         let candidates: Vec<_> = {
+            #[cfg(all(test, unix))]
+            let _timer = watchdog_cost_tests::CleanupPhaseTimer::start(false);
             let mut queue = self
                 .inner
                 .cleanup_queue
@@ -11618,12 +11629,17 @@ impl BgTaskRegistry {
             let budget = queue.len().min(super::gc_cursor::GC_ENTRY_BUDGET);
             (0..budget).filter_map(|_| queue.pop_front()).collect()
         };
+        super::watchdog::record_cleanup_work(|work| work.queue_entries += candidates.len());
         let mut image_cleanup = task_image_cleanup::ImageCleanupPass::default();
         for task_id in candidates {
             let Some(task) = self.task(&task_id) else {
                 continue;
             };
-            image_cleanup.record(self.cleanup_terminal_task_image(&task));
+            {
+                #[cfg(all(test, unix))]
+                let _timer = watchdog_cost_tests::CleanupPhaseTimer::start(true);
+                image_cleanup.record(self.cleanup_terminal_task_image(&task));
+            }
             let delivered_terminal = !task.terminal_persist_dirty.load(Ordering::SeqCst)
                 && task.lock_state().is_ok_and(|state| {
                     state.metadata.status.is_terminal() && state.metadata.completion_delivered
@@ -12161,12 +12177,12 @@ impl BgTaskRegistry {
             let Ok(conn) = pool.lock() else {
                 return;
             };
-            let _ = conn.execute(
+            let _ = crate::db::bash_tasks::record_store_write(conn.execute(
                 "UPDATE bash_tasks SET completion_delivered = 1
                  WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3
                    AND status IN ('completed', 'failed', 'killed', 'timed_out', 'fate_unknown')",
                 rusqlite::params![harness, session_id, task_id],
-            );
+            ));
         });
     }
 
@@ -13937,6 +13953,7 @@ impl BgTaskRegistry {
             persisted_hard_kill_ms: AtomicU64::new(persisted_hard_kill_ms),
             last_reminder_at: Mutex::new(suppress_replayed_running_reminder.then(Instant::now)),
             terminal_at: Mutex::new(metadata.finished_at.map(started_instant_from_unix_millis)),
+            terminal_image_cleaned: AtomicBool::new(false),
             terminal_notification_routed: Mutex::new(terminal_already_delivered),
             notice_registry: Mutex::new(None),
             exit_marker_probe: Mutex::new(Default::default()),

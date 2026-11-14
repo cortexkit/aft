@@ -1,0 +1,161 @@
+name: Grammar loader
+
+on:
+  pull_request:
+    paths:
+      - Cargo.toml
+      - crates/**
+      - crates/aft/**
+      - Cargo.lock
+      - scripts/stage-card.sh
+      - scripts/ck-aft.entitlements.plist
+      - .github/workflows/grammar-loader.yml
+      - .github/workflows/release.yml
+      - .github/workflows/tests.yml
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  default-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Default build needs neither Wasmtime nor CMake
+        run: |
+          absent="$RUNNER_TEMP/aft-no-cmake"
+          mkdir -p "$absent"
+          export AFT_NO_CMAKE_MARKER="$absent/invoked"
+          printf '#!/bin/sh\nprintf "CMake is intentionally unavailable in the default-build guard\\n" >&2\n: > "$AFT_NO_CMAKE_MARKER"\nexit 127\n' > "$absent/cmake"
+          chmod +x "$absent/cmake"
+          export PATH="$absent:$PATH"
+          if cmake --version; then exit 1; fi
+          rm -f "$AFT_NO_CMAKE_MARKER"
+          cargo check --locked -p agent-file-tools
+          cargo test --locked -p agent-file-tools --features test-hooks --lib -- grammar_disabled_
+          cargo test --locked -p agent-file-tools --features test-hooks --lib -- data_layer::content::tests::grammar_unavailable_survives_the_content_record_boundary --exact
+          test ! -e "$AFT_NO_CMAKE_MARKER"
+          cargo tree --locked -p agent-file-tools -e features > default-features.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          assert 'wasmtime' not in Path('default-features.txt').read_text()
+          print('Default build: no Wasmtime crates or Tree-sitter Wasm runtime')
+          PY
+
+  published-asset:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Check production hash and size against immutable release bytes
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, urllib.request
+          from pathlib import Path
+          manifest = json.loads(Path('crates/aft/src/grammar/manifest.json').read_text())
+          assert manifest['url'].startswith('https://github.com/cortexkit/aft/releases/download/grammars-')
+          with urllib.request.urlopen(manifest['url'], timeout=60) as response:
+              body = response.read(manifest['size'] + 1)
+          assert len(body) == manifest['size'], (len(body), manifest['size'])
+          assert hashlib.sha256(body).hexdigest() == manifest['sha256']
+          assert body == Path('crates/aft/tests/fixtures/grammars', manifest['sha256'] + '.wasm').read_bytes()
+          print('Published production grammar: SHA-256, size and checked-in bytes match')
+          PY
+
+  loader:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2025, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: rustup update stable && rustup default stable
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
+
+      - name: Loader state and compile tests
+        run: |
+          cargo test --features wasm-grammars --locked -p agent-file-tools --features test-hooks --lib -- grammar_
+      - name: Process restart and concurrent publication
+        run: cargo test --features wasm-grammars --locked -p agent-file-tools --features test-hooks --test integration -- grammar_loader
+      - name: Native Windows ARM64 load-and-parse smoke
+        if: matrix.os == 'windows-11-arm'
+        run: |
+          cargo build --locked -p agent-file-tools --bin aft --target aarch64-pc-windows-msvc --features wasm-grammars
+          smoke="$PWD/target/grammar-arm64-smoke"
+          mkdir -p "$smoke/storage/grammars" "$smoke/home" "$smoke/config" "$smoke/cache" "$smoke/state" "$smoke/data"
+          hash="$(python -c 'import json; print(json.load(open("crates/aft/src/grammar/manifest.json"))["sha256"])')"
+          cp "crates/aft/tests/fixtures/grammars/$hash.wasm" "$smoke/storage/grammars/"
+          env -u AFT_STORAGE_DIR -u AFT_CACHE_DIR HOME="$smoke/home" XDG_CONFIG_HOME="$smoke/config" XDG_CACHE_HOME="$smoke/cache" XDG_STATE_HOME="$smoke/state" XDG_DATA_HOME="$smoke/data" target/aarch64-pc-windows-msvc/debug/aft.exe grammar-smoke --storage-dir "$smoke/storage" --file "$PWD/grammars/corpus/features.luau" > "$smoke/result.json"
+          python -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["engine_target"] == "pulley"; assert not v["test_seams"]; assert v["tree"].startswith("(chunk ")' "$smoke/result.json"
+      - name: Hardened Pulley smoke without executable-memory entitlements
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --features wasm-grammars --locked -p agent-file-tools --bin aft
+          smoke="$PWD/target/grammar-hardened-smoke"
+          mkdir -p "$smoke/storage/grammars" "$smoke/home" "$smoke/config" "$smoke/cache" "$smoke/state" "$smoke/data" "$smoke/tmp"
+          hash="$(python3 -c 'import json; print(json.load(open("crates/aft/src/grammar/manifest.json"))["sha256"])')"
+          cp "crates/aft/tests/fixtures/grammars/$hash.wasm" "$smoke/storage/grammars/"
+          cp target/debug/aft "$smoke/aft"
+          codesign --force --sign - --identifier ck-aft -o runtime --entitlements scripts/ck-aft.entitlements.plist "$smoke/aft"
+          sandbox-exec -p '(version 1) (allow default) (deny network*)' env -u AFT_STORAGE_DIR -u AFT_CACHE_DIR HOME="$smoke/home" XDG_CONFIG_HOME="$smoke/config" XDG_CACHE_HOME="$smoke/cache" XDG_STATE_HOME="$smoke/state" XDG_DATA_HOME="$smoke/data" TMPDIR="$smoke/tmp" "$smoke/aft" grammar-smoke --storage-dir "$smoke/storage" --file "$PWD/grammars/corpus/features.luau" > "$smoke/result.json"
+          python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["engine_target"] == "pulley"; assert not v["test_seams"]; assert v["tree"].startswith("(chunk ")' "$smoke/result.json"
+      - name: Fixed Pulley engine and no native cache
+        run: |
+          cargo tree --features wasm-grammars --locked -p agent-file-tools -e features > grammar-features.txt
+          cargo tree --features wasm-grammars --locked -p agent-file-tools --prefix none > grammar-dependencies.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          features = Path('grammar-features.txt').read_text()
+          assert 'wasmtime feature "cache"' not in features
+          assert 'wasmtime feature "component-model"' not in features
+          dependencies = Path('grammar-dependencies.txt').read_text()
+          assert set(re.findall(r'^wasmtime v(\S+)', dependencies, re.M)) == {'36.0.20'}
+          print('Wasmtime 36.0.20 only; cache and component-model features absent')
+          PY
+
+  windows-arm64:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Target toolchain
+        run: rustup target add aarch64-pc-windows-msvc
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
+
+      - name: ARM64 compile with Pulley
+        run: |
+          cargo check --features wasm-grammars --locked -p agent-file-tools --features test-hooks --tests --target aarch64-pc-windows-msvc
+          cargo tree --features wasm-grammars --locked -p agent-file-tools --target aarch64-pc-windows-msvc --edges normal,build --prefix none > grammar-arm-dependencies.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          dependencies = Path('grammar-arm-dependencies.txt').read_text()
+          assert 'wasmtime v36.0.20' in dependencies
+          print('Windows ARM64 dependency compile checked; native execution is covered on windows-11-arm')
+          PY

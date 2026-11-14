@@ -4,7 +4,7 @@ use super::super::{
 };
 use super::{admission, state, wire::*};
 use crate::bash_background::persistence::BgMode;
-use crate::bash_background::registry::ShellReader;
+use crate::bash_background::registry::{ShellReader, ShellSnapshotCache};
 use crate::bash_background::BgTaskStatus;
 use crate::db::access_grant_rows::GrantHolder;
 use crate::db::access_grants::ScopeKey;
@@ -15,13 +15,74 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{watch, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 struct Subscription {
     cancel: CancellationToken,
     done: watch::Receiver<bool>,
+}
+
+#[derive(Clone, Copy)]
+struct OperationLog {
+    op: &'static str,
+    caller: &'static str,
+    channel: u16,
+    started: Instant,
+}
+
+impl OperationLog {
+    fn open(&self, task_id: Option<&str>) {
+        if let Some(task_id) = task_id {
+            crate::slog_info!(
+                "shells/v1 open: op={} caller={} channel={} elapsed_ms={} task_id={:?}",
+                self.op,
+                self.caller,
+                self.channel,
+                self.started.elapsed().as_millis(),
+                task_id
+            );
+        } else {
+            crate::slog_info!(
+                "shells/v1 open: op={} caller={} channel={} elapsed_ms={}",
+                self.op,
+                self.caller,
+                self.channel,
+                self.started.elapsed().as_millis()
+            );
+        }
+    }
+
+    fn end(&self, reason: EndReason) {
+        crate::slog_info!(
+            "shells/v1 end: op={} caller={} channel={} reason={} elapsed_ms={}",
+            self.op,
+            self.caller,
+            self.channel,
+            reason.as_str(),
+            self.started.elapsed().as_millis()
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EndReason {
+    ClientCancel,
+    RouteClosed,
+    TaskFinished,
+    Error,
+}
+
+impl EndReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientCancel => "client_cancel",
+            Self::RouteClosed => "route_closed",
+            Self::TaskFinished => "task_finished",
+            Self::Error => "error",
+        }
+    }
 }
 
 pub(in crate::subc) struct Service {
@@ -34,8 +95,11 @@ pub(in crate::subc) struct Service {
     refresh_gate: Mutex<()>,
     subscriptions: Mutex<HashMap<(RouteChannel, u64), Subscription>>,
     draining: AtomicBool,
-    enabled: AtomicBool,
     stop: CancellationToken,
+    #[cfg(test)]
+    collect_calls: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    driver_done: CancellationToken,
 }
 
 fn now() -> u64 {
@@ -60,12 +124,19 @@ impl Service {
             subscriptions: Mutex::new(HashMap::new()),
             draining: AtomicBool::new(false),
             stop: CancellationToken::new(),
-            enabled: AtomicBool::new(false),
+            #[cfg(test)]
+            collect_calls: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            driver_done: CancellationToken::new(),
         });
         let weak = Arc::downgrade(&service);
         let stop = service.stop.clone();
         let mut changes = crate::bash_background::shell_metadata::subscribe();
+        #[cfg(test)]
+        let driver_done = service.driver_done.clone();
         tokio::spawn(async move {
+            #[cfg(test)]
+            let _driver_done = driver_done.drop_guard();
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             loop {
                 let rows = tokio::select! {
@@ -76,7 +147,7 @@ impl Service {
                 let Some(service) = weak.upgrade() else {
                     break;
                 };
-                if !service.enabled.load(Ordering::Acquire) {
+                if service.subscriptions.lock().await.is_empty() {
                     continue;
                 }
                 let rows = rows
@@ -86,7 +157,7 @@ impl Service {
                         .await
                         .values()
                         .any(ShellReader::is_persisted);
-                service.refresh(rows).await;
+                service.refresh_if_subscribed(rows).await;
                 if rows {
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
@@ -96,10 +167,26 @@ impl Service {
     }
 
     async fn refresh(&self, rows: bool) {
+        self.refresh_inner(rows, false).await;
+    }
+
+    async fn refresh_if_subscribed(&self, rows: bool) {
+        self.refresh_inner(rows, true).await;
+    }
+
+    async fn refresh_inner(&self, rows: bool, require_subscription: bool) {
         let _refresh = self.refresh_gate.lock().await;
+        // A viewer may leave while a background refresh waits for a direct
+        // request's refresh. Recheck after acquiring the collection gate so
+        // queued background work cannot restart collection without a viewer.
+        if require_subscription && self.subscriptions.lock().await.is_empty() {
+            return;
+        }
         let executor = self.executor.clone();
         let db = self.app.db();
         let previous = self.db_facts.read().await.clone();
+        #[cfg(test)]
+        self.collect_calls.fetch_add(1, Ordering::Relaxed);
         let collected =
             tokio::task::spawn_blocking(move || collect(&executor, db.as_deref(), rows, previous))
                 .await;
@@ -119,7 +206,7 @@ impl Service {
             }
         }
         let before = state.sequence;
-        if rows && collected.db_available {
+        if collected.rows_refreshed && collected.db_available {
             state.replace(collected.rows, collected.status);
             *self.sources.write().await = collected.sources;
         } else {
@@ -139,11 +226,22 @@ impl Service {
         identity: &ManagementIdentity,
         body: &Value,
     ) -> Result<(), SubcError> {
+        let started = Instant::now();
         let scoped = identity.scope.is_some()
             || matches!(
                 identity.admission,
                 super::super::ManagementAdmission::ProjectFree { .. }
             );
+        let operation = OperationLog {
+            op: admission::operation(body),
+            caller: admission::caller_kind(
+                identity.principal.as_ref(),
+                identity.harness.as_deref(),
+                scoped,
+            ),
+            channel: frame.header.channel,
+            started,
+        };
         let request = match admission::admit(
             identity.principal.as_ref(),
             identity.harness.as_deref(),
@@ -151,9 +249,11 @@ impl Service {
             body,
         ) {
             Ok(request) => request,
-            Err(error) => return send_provider_error(tx, metrics, frame, error).await,
+            Err(error) => {
+                admission::log_refusal(operation.op, &error);
+                return send_provider_error(tx, metrics, frame, error).await;
+            }
         };
-        self.enabled.store(true, Ordering::Release);
         match request {
             admission::Request::List(params) => {
                 let service = self.clone();
@@ -166,19 +266,34 @@ impl Service {
                     service.refresh(true).await;
                     let result = match service.list(params).await {
                         Ok(reply) => {
-                            send(
+                            let rows = reply.rows.len();
+                            let result = send(
                                 &tx,
                                 &metrics,
                                 &frame,
                                 FrameType::Response,
                                 &json!({"result":reply}),
                             )
-                            .await
+                            .await;
+                            crate::slog_info!(
+                                "shells/v1 list: caller={} channel={} rows={} elapsed_ms={}",
+                                operation.caller,
+                                operation.channel,
+                                rows,
+                                operation.started.elapsed().as_millis()
+                            );
+                            result
                         }
-                        Err(error) => send_provider_error(&tx, &metrics, &frame, error).await,
+                        Err(error) => {
+                            admission::log_refusal(operation.op, &error);
+                            send_provider_error(&tx, &metrics, &frame, error).await
+                        }
                     };
-                    if let Err(error) = result {
-                        log::warn!("shells/v1 list: {error}");
+                    if result.is_err() {
+                        crate::slog_warn!(
+                            "shells/v1 send failed: op=shells.list channel={}",
+                            operation.channel
+                        );
                     }
                 });
                 Ok(())
@@ -212,7 +327,13 @@ impl Service {
             }
             request => {
                 if self.draining.load(Ordering::Acquire) {
-                    return stream_end(tx, metrics, frame).await;
+                    let result = stream_end(tx, metrics, frame).await;
+                    operation.end(if result.is_ok() {
+                        EndReason::RouteClosed
+                    } else {
+                        EndReason::Error
+                    });
+                    return result;
                 }
                 let key = (
                     route_key(frame.header.channel, frame.header.epoch),
@@ -223,13 +344,9 @@ impl Service {
                 let mut subscriptions = self.subscriptions.lock().await;
                 if subscriptions.contains_key(&key) {
                     drop(subscriptions);
-                    return send_provider_error(
-                        tx,
-                        metrics,
-                        frame,
-                        admission::invalid("request correlation is already active"),
-                    )
-                    .await;
+                    let error = admission::invalid("request correlation is already active");
+                    admission::log_refusal(operation.op, &error);
+                    return send_provider_error(tx, metrics, frame, error).await;
                 }
                 subscriptions.insert(
                     key,
@@ -249,18 +366,34 @@ impl Service {
                     let _response = response_guard;
                     let result = std::panic::AssertUnwindSafe(async {
                         tokio::select! {
-                            _ = cancel.cancelled() => return Ok(true),
-                            _ = route_cancel.cancelled() => return Ok(true),
+                            _ = cancel.cancelled() => return Ok(Some(EndReason::ClientCancel)),
+                            _ = route_cancel.cancelled() => return Ok(Some(EndReason::RouteClosed)),
                             _ = service.refresh(true) => {},
                         }
                         match request {
                             admission::Request::Watch(params) => service
-                                .watch(&tx, &metrics, &frame, params, &cancel, &route_cancel)
+                                .watch(
+                                    &tx,
+                                    &metrics,
+                                    &frame,
+                                    params,
+                                    &cancel,
+                                    &route_cancel,
+                                    &operation,
+                                )
                                 .await
-                                .map(|_| true),
+                                .map(Some),
                             admission::Request::Output(params) => {
                                 service
-                                    .output(&tx, &metrics, &frame, params, &cancel, &route_cancel)
+                                    .output(
+                                        &tx,
+                                        &metrics,
+                                        &frame,
+                                        params,
+                                        &cancel,
+                                        &route_cancel,
+                                        &operation,
+                                    )
                                     .await
                             }
                             _ => unreachable!(),
@@ -268,18 +401,22 @@ impl Service {
                     })
                     .catch_unwind()
                     .await
-                    .unwrap_or_else(|_| {
-                        log::warn!("shells/v1 stream panicked; ending its request");
-                        Ok(true)
-                    });
-                    let end = !matches!(result, Ok(false));
-                    if let Err(error) = result {
-                        log::warn!("shells/v1 stream: {error}");
-                    }
-                    if end {
-                        if let Err(error) = stream_end(&tx, &metrics, &frame).await {
-                            log::warn!("shells/v1 terminal: {error}");
+                    .unwrap_or_else(|_| Ok(Some(EndReason::Error)));
+                    let reason = match result {
+                        Ok(Some(EndReason::ClientCancel))
+                            if service.draining.load(Ordering::Acquire) =>
+                        {
+                            Some(EndReason::RouteClosed)
                         }
+                        Ok(reason) => reason,
+                        Err(_) if route_cancel.is_cancelled() => Some(EndReason::RouteClosed),
+                        Err(_) => Some(EndReason::Error),
+                    };
+                    if let Some(mut reason) = reason {
+                        if stream_end(&tx, &metrics, &frame).await.is_err() {
+                            reason = EndReason::Error;
+                        }
+                        operation.end(reason);
                     }
                     done.send_replace(true);
                     service.subscriptions.lock().await.remove(&key);
@@ -348,7 +485,8 @@ impl Service {
         params: WatchParams,
         cancel: &CancellationToken,
         route: &CancellationToken,
-    ) -> Result<(), SubcError> {
+        operation: &OperationLog,
+    ) -> Result<EndReason, SubcError> {
         let mut changed = self.changed.subscribe();
         let filter = Filter {
             agent_ids: params.agent_ids,
@@ -378,25 +516,40 @@ impl Service {
             position = Some(state.sequence);
             frames
         };
+        let mut opened = false;
         for data in initial {
             send(tx, metrics, frame, FrameType::StreamData, &data).await?;
+            if !opened {
+                operation.open(None);
+                opened = true;
+            }
         }
         loop {
             tokio::select! {
-                _ = cancel.cancelled() => return Ok(()),
-                _ = route.cancelled() => return Ok(()),
-                result = changed.changed() => if result.is_err() { return Ok(()); },
+                _ = cancel.cancelled() => return Ok(EndReason::ClientCancel),
+                _ = route.cancelled() => return Ok(EndReason::RouteClosed),
+                result = changed.changed() => if result.is_err() { return Ok(EndReason::Error); },
             }
             let frames = {
                 let state = self.state.read().await;
                 let frames = state
                     .replay(&filter, status, position.unwrap())
-                    .unwrap_or_else(|| state.resync(&filter, status, "lagged"));
+                    .unwrap_or_else(|| {
+                        crate::slog_info!(
+                            "shells/v1 resync: op=shells.watch caller={} channel={} reason=lag_resync elapsed_ms={}",
+                            operation.caller, operation.channel, operation.started.elapsed().as_millis()
+                        );
+                        state.resync(&filter, status, "lagged")
+                    });
                 position = Some(state.sequence);
                 frames
             };
             for data in frames {
                 send(tx, metrics, frame, FrameType::StreamData, &data).await?;
+                if !opened {
+                    operation.open(None);
+                    opened = true;
+                }
             }
         }
     }
@@ -444,18 +597,15 @@ impl Service {
         params: OutputParams,
         cancel: &CancellationToken,
         route: &CancellationToken,
-    ) -> Result<bool, SubcError> {
+        operation: &OperationLog,
+    ) -> Result<Option<EndReason>, SubcError> {
         let initial = self.state.read().await.rows.get(&params.task_id).cloned();
         let reader = self.sources.read().await.get(&params.task_id).cloned();
         let (Some(row), Some(reader)) = (initial, reader) else {
-            send_provider_error(
-                tx,
-                metrics,
-                frame,
-                subc_protocol::ErrorBody::new("shell_not_found", "shell is not listed"),
-            )
-            .await?;
-            return Ok(false);
+            let error = subc_protocol::ErrorBody::new("shell_not_found", "shell is not listed");
+            admission::log_refusal(operation.op, &error);
+            send_provider_error(tx, metrics, frame, error).await?;
+            return Ok(None);
         };
         let stop = CancellationToken::new();
         let _stop = stop.clone().drop_guard();
@@ -464,31 +614,33 @@ impl Service {
             super::capture::Capture::open(reader.with_stop(stop), &row, params)
         });
         let opened = tokio::select! {
-            _ = cancel.cancelled() => return Ok(true),
-            _ = route.cancelled() => return Ok(true),
+            _ = cancel.cancelled() => return Ok(Some(EndReason::ClientCancel)),
+            _ = route.cancelled() => return Ok(Some(EndReason::RouteClosed)),
             result = open => result.expect("shell capture reader panicked"),
         };
         let (mut capture, start) = match opened {
             Ok(capture) => capture,
             Err(error) => {
+                admission::log_refusal(operation.op, &error);
                 send_provider_error(tx, metrics, frame, error).await?;
-                return Ok(false);
+                return Ok(None);
             }
         };
         send(tx, metrics, frame, FrameType::StreamData, &start).await?;
+        operation.open(Some(&task_id));
         loop {
             tokio::select! {
-                _ = cancel.cancelled() => return Ok(true),
-                _ = route.cancelled() => return Ok(true),
+                _ = cancel.cancelled() => return Ok(Some(EndReason::ClientCancel)),
+                _ = route.cancelled() => return Ok(Some(EndReason::RouteClosed)),
                 _ = tokio::time::sleep(Duration::from_millis(250)) => {},
             }
             let Some(row) = self.state.read().await.rows.get(&task_id).cloned() else {
-                return Ok(true);
+                return Ok(Some(EndReason::TaskFinished));
             };
             let read = tokio::task::spawn_blocking(move || capture.read(row));
             let (next, frames, finished) = tokio::select! {
-                _ = cancel.cancelled() => return Ok(true),
-                _ = route.cancelled() => return Ok(true),
+                _ = cancel.cancelled() => return Ok(Some(EndReason::ClientCancel)),
+                _ = route.cancelled() => return Ok(Some(EndReason::RouteClosed)),
                 result = read => result.expect("shell capture reader panicked"),
             };
             capture = next;
@@ -496,7 +648,7 @@ impl Service {
                 send(tx, metrics, frame, FrameType::StreamData, &data).await?;
             }
             if finished {
-                return Ok(true);
+                return Ok(Some(EndReason::TaskFinished));
             }
         }
     }
@@ -711,6 +863,8 @@ struct DbFacts {
     truncated_roots: std::collections::BTreeSet<String>,
     holders: HashMap<ScopeKey, GrantHolder>,
     saved: Vec<crate::db::bash_tasks::BashTaskRow>,
+    saved_key: Option<(usize, u64, i64)>,
+    samples: ShellSnapshotCache,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -730,6 +884,7 @@ struct Collected {
     sources: HashMap<String, ShellReader>,
     db: DbFacts,
     db_available: bool,
+    rows_refreshed: bool,
 }
 
 #[cfg(test)]
@@ -741,6 +896,9 @@ thread_local! {
 thread_local! {
     static DB_LOCK_DURATIONS: std::cell::RefCell<Vec<std::time::Duration>> = const {std::cell::RefCell::new(Vec::new())};
 }
+
+#[cfg(test)]
+static COLLECT_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn with_db_read<T>(
     db: &std::sync::Mutex<crate::db::TrackedConnection>,
@@ -831,6 +989,8 @@ fn read_db_facts(
     });
     if let Some(mut facts) = loaded {
         facts.saved = std::mem::take(&mut previous.saved);
+        facts.saved_key = previous.saved_key;
+        facts.samples = previous.samples;
         (facts, true)
     } else {
         (previous, false)
@@ -870,6 +1030,26 @@ fn collect_at_revision(
     previous: DbFacts,
     revision: u64,
 ) -> Collected {
+    collect_at_store_revision(
+        executor,
+        db,
+        include_rows,
+        previous,
+        revision,
+        crate::db::bash_tasks::store_revision(),
+    )
+}
+
+fn collect_at_store_revision(
+    executor: &Executor,
+    db: Option<&std::sync::Mutex<crate::db::TrackedConnection>>,
+    include_rows: bool,
+    previous: DbFacts,
+    revision: u64,
+    generation: u64,
+) -> Collected {
+    #[cfg(test)]
+    COLLECT_CALLS.fetch_add(1, Ordering::Relaxed);
     let contexts = executor.actor_contexts();
     let bound_roots: std::collections::BTreeSet<_> = contexts
         .iter()
@@ -885,18 +1065,33 @@ fn collect_at_revision(
         roots: bound_roots.clone(),
         db_identity: db.map(|db| std::ptr::from_ref(db) as usize),
     };
-    let dirty = previous.key.as_ref() != Some(&key);
+    let mut dirty = previous.key.as_ref() != Some(&key);
     let mut facts = previous;
     let mut db_available = true;
-    if dirty {
-        if let Some(db) = db {
-            if let Some(saved) = with_db_read(db, |conn| {
-                crate::db::bash_tasks::operator_shell_rows(conn, now().saturating_sub(RETENTION_MS))
-            }) {
-                facts.saved = saved;
+    if let Some(db) = db {
+        if let Some((saved_key, saved)) = with_db_read(db, |conn| {
+            // data_version catches committed writes from other connections
+            // and processes; the process generation covers this connection's
+            // own writes, which SQLite excludes from data_version.
+            let version: i64 = conn.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+            let saved_key = (std::ptr::from_ref(db) as usize, generation, version);
+            let saved = if facts.saved_key == Some(saved_key) {
+                None
             } else {
-                db_available = false;
+                Some(crate::db::bash_tasks::operator_shell_rows(
+                    conn,
+                    now().saturating_sub(RETENTION_MS),
+                )?)
+            };
+            Ok((saved_key, saved))
+        }) {
+            if let Some(saved) = saved {
+                facts.saved = saved;
+                dirty = true;
             }
+            facts.saved_key = Some(saved_key);
+        } else {
+            db_available = false;
         }
     }
     let observe = db_available && (include_rows || dirty);
@@ -905,7 +1100,7 @@ fn collect_at_revision(
     for ctx in &contexts {
         if observe {
             let registry = ctx.bash_background();
-            for snapshot in registry.shell_snapshots() {
+            for snapshot in registry.shell_snapshots_cached(&mut facts.samples) {
                 if !state::retained(&project_row(&snapshot, None), now()) {
                     continue;
                 }
@@ -921,7 +1116,9 @@ fn collect_at_revision(
             if sources.contains_key(&saved.task_id) {
                 continue;
             }
-            if let Some((snapshot, reader)) = ShellReader::persisted(saved) {
+            if let Some((snapshot, reader)) =
+                ShellReader::persisted_cached(saved, &mut facts.samples)
+            {
                 if !state::retained(&project_row(&snapshot, None), now()) {
                     continue;
                 }
@@ -929,6 +1126,9 @@ fn collect_at_revision(
                 observations.push(snapshot);
             }
         }
+    }
+    if observe {
+        facts.samples.retain(&sources);
     }
     if dirty && db_available {
         let scopes = observations
@@ -947,7 +1147,7 @@ fn collect_at_revision(
         }
     });
     let mut rows = Vec::new();
-    if include_rows && db_available {
+    if observe && db_available {
         for snapshot in observations {
             let mut row = project_row(&snapshot, None);
             row.revision = snapshot.metadata.shell_revision;
@@ -973,7 +1173,7 @@ fn collect_at_revision(
             .to_string();
         if let Some(registry) = sources.get(&row.task_id) {
             row.revision = registry
-                .shell_revision(&row.task_id, &fingerprint)
+                .shell_revision_if_changed(&row.task_id, &fingerprint)
                 .unwrap_or(row.revision);
         }
     }
@@ -1102,6 +1302,7 @@ fn collect_at_revision(
         sources,
         db: facts,
         db_available,
+        rows_refreshed: observe,
     }
 }
 

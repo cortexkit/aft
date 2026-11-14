@@ -201,6 +201,8 @@ mod rayon_thread_tests {
 }
 
 fn main() {
+    #[cfg(feature = "test-hooks")]
+    aft::grammar::initialize_test_identity();
     // The subc daemon hands a supervised module its launch nonce through an
     // inherited pipe (and, for now, an environment copy). Take it before
     // anything else can run: this is the only moment the process has one
@@ -330,6 +332,16 @@ fn main() {
         match cli::index::run(args) {
             Ok(cli::index::IndexExit::Success) => return,
             Ok(exit) => std::process::exit(exit.code()),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if std::env::args().nth(1).as_deref() == Some("grammar-smoke") {
+        match cli::grammar_smoke::run(std::env::args_os().skip(2).collect()) {
+            Ok(()) => return,
             Err(error) => {
                 eprintln!("{error}");
                 std::process::exit(1);

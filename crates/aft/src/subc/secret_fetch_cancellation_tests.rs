@@ -33,6 +33,16 @@ impl ConsentTransport for Phone {
     fn call(&self, call: ConsentCall) -> ConsentFuture {
         match call.method {
             "consent.request" => {
+                // Like the real Cingulate, accept a secret-use filing only as
+                // exactly {kind, secret_use}; it refuses any other field as
+                // envelope_invalid.
+                let mut keys: Vec<_> = call.params.as_object().unwrap().keys().cloned().collect();
+                keys.sort();
+                assert_eq!(
+                    keys,
+                    ["kind", "secret_use"],
+                    "Cingulate refuses unknown filing fields"
+                );
                 let mut requests = self.requests.lock().unwrap();
                 requests.push(call.params.clone());
                 let id = format!("el_{}", requests.len());
@@ -354,14 +364,10 @@ async fn held_foreground_fetch_late_allow(expire: bool) {
         "one initial approval-required ask per label"
     );
     assert_eq!(sends.load(Ordering::SeqCst), 0);
-    if expire {
-        assert!(phone
-            .requests
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|request| request["expires_at_ms"].as_u64().unwrap() <= reply_deadline_ms));
-    } else {
+    // Cingulate bounds each card by its vault statement, so the filing carries
+    // no expiry of its own; the reply deadline ends the local hold, and the
+    // abandoned cards are withdrawn below.
+    if !expire {
         assert!(cancel_active_tool_call(
             &f.active,
             &f.executor,

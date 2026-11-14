@@ -8,6 +8,23 @@ use crate::bash_background::persistence::{
     resolve_task_layout, session_tasks_dir, uninitialized_layout_is_recent,
 };
 
+static STORE_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn store_revision() -> u64 {
+    STORE_REVISION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub(crate) fn record_store_write(result: rusqlite::Result<usize>) -> rusqlite::Result<usize> {
+    if matches!(result, Ok(changed) if changed > 0) {
+        // Transaction callers hold their connection until commit. A rollback
+        // can advance the generation too: one extra rescan is safer than a
+        // missed write. data_version also detects commits on other connections.
+        STORE_REVISION.fetch_add(1, std::sync::atomic::Ordering::Release);
+        crate::bash_background::shell_metadata::changed();
+    }
+    result
+}
+
 #[cfg(test)]
 #[path = "retention_query_plan_tests.rs"]
 mod query_plan_tests;
@@ -71,7 +88,7 @@ pub(crate) struct PreparedTerminalPrune {
     cutoff: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BashTaskRow {
     pub harness: String,
     pub session_id: String,
@@ -101,7 +118,7 @@ pub fn upsert_bash_task(conn: &Connection, row: &BashTaskRow) -> rusqlite::Resul
     // while this snapshot is queued. Snapshots cannot undo it. Only promotion
     // may reset completion_delivered to false under the task DB fence, creating
     // a new completion notification.
-    conn.execute(
+    record_store_write(conn.execute(
         "INSERT INTO bash_tasks (
             harness, session_id, task_id, project_key, command, cwd, status,
             exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,
@@ -149,13 +166,13 @@ pub fn upsert_bash_task(conn: &Connection, row: &BashTaskRow) -> rusqlite::Resul
             row.output_bytes,
             row.metadata,
         ],
-    )?;
+    ))?;
     Ok(())
 }
 
 /// Backfill a disk-only task without replacing a row committed after discovery.
 pub fn insert_bash_task_if_missing(conn: &Connection, row: &BashTaskRow) -> rusqlite::Result<()> {
-    conn.execute(
+    record_store_write(conn.execute(
         "INSERT INTO bash_tasks (
             harness, session_id, task_id, project_key, command, cwd, status,
             exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,
@@ -186,7 +203,7 @@ pub fn insert_bash_task_if_missing(conn: &Connection, row: &BashTaskRow) -> rusq
             row.output_bytes,
             row.metadata,
         ],
-    )?;
+    ))?;
     Ok(())
 }
 
@@ -216,13 +233,13 @@ pub fn delete_delivered_terminal_bash_task(
     task_id: &str,
     reason: &str,
 ) -> rusqlite::Result<usize> {
-    let deleted = conn.execute(
+    let deleted = record_store_write(conn.execute(
         "DELETE FROM bash_tasks
          WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3
            AND completion_delivered = 1
            AND status IN ('completed', 'failed', 'killed', 'timed_out', 'fate_unknown')",
         params![harness, session_id, task_id],
-    )?;
+    ))?;
     // Retries affect zero rows after the first successful DELETE.
     if deleted > 0 {
         crate::slog_debug!("bash task row deleted: task_id={task_id} reason={reason}");
@@ -236,11 +253,11 @@ pub fn delete_bash_task(
     session_id: &str,
     task_id: &str,
 ) -> rusqlite::Result<usize> {
-    conn.execute(
+    record_store_write(conn.execute(
         "DELETE FROM bash_tasks
          WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3",
         params![harness, session_id, task_id],
-    )
+    ))
 }
 
 /// Remove acknowledged terminal rows only after the retention age has passed
@@ -408,12 +425,12 @@ pub(crate) fn delete_prepared_terminal_rows(
         ))?;
         let mut removed = 0;
         for candidate in prepared.identities {
-            removed += delete.execute(params![
+            removed += record_store_write(delete.execute(params![
                 prepared.cutoff,
                 candidate.harness,
                 candidate.session_id,
                 candidate.task_id,
-            ])?;
+            ]))?;
         }
         removed
     };
@@ -671,7 +688,7 @@ pub(crate) fn checkpoint_bash_task_acknowledgement(
     session_id: &str,
     task_id: &str,
 ) -> rusqlite::Result<()> {
-    conn.execute(
+    record_store_write(conn.execute(
         "UPDATE bash_tasks
          SET metadata = json_set(metadata, '$.completion_delivered', json('true'))
          WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3
@@ -680,7 +697,7 @@ pub(crate) fn checkpoint_bash_task_acknowledgement(
                     THEN json_type(metadata, '$.completion_delivered') = 'false'
                     ELSE 0 END",
         params![harness, session_id, task_id],
-    )?;
+    ))?;
     Ok(())
 }
 

@@ -327,6 +327,13 @@ async function makeIsolation(label: string): Promise<HostIsolation> {
     TMPDIR: temp,
     NODE_ENV: "test",
     AFT_LOG_STDERR: "1",
+    // Every host runs this tree's build. Without it the plugin looks up the
+    // published binary for its own version, so the matrix tested a release
+    // instead of the change, and failed outright after a version bump until
+    // that version was published.
+    AFT_BINARY_PATH:
+      process.env.AFT_BINARY_PATH?.trim() ||
+      join(repoRoot, "target", "debug", process.platform === "win32" ? "aft.exe" : "aft"),
     OPENCODE_DISABLE_DEFAULT_PLUGINS: "true",
     OPENCODE_DB: "opencode2.db",
   };

@@ -1123,7 +1123,8 @@ def run(args: argparse.Namespace) -> int:
         binary,
         Path(args.reference).resolve(),
     )
-    score["views_work"] = views_work
+    # Work telemetry is printed above, not scored: its availability describes
+    # the recorder's transport, not the engine's search behavior.
     if not_applicable_building_rows:
         score["rows"].extend(not_applicable_building_rows)
         manifest_order = {

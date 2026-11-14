@@ -43,6 +43,8 @@ class MacOSIntegrationArchiveTests(unittest.TestCase):
             self.assertNotIn("--all-targets", args)
             self.assertIn("--workspace", args)
             self.assertEqual(args[args.index("--features") + 1], "test-hooks")
+            features = [args[i + 1] for i, arg in enumerate(args[:-1]) if arg == "--features"]
+            self.assertIn("wasm-grammars", features)
             self.assertIn(plan.FILTER, args)
 
     def test_future_integration_targets_are_not_silently_dropped(self):

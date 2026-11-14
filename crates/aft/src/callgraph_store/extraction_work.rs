@@ -61,6 +61,11 @@ impl CountingParser {
         source: T,
         old_tree: Option<&tree_sitter::Tree>,
     ) -> Option<tree_sitter::Tree> {
+        self.note_parse();
+        self.0.parse(source, old_tree)
+    }
+
+    pub(crate) fn note_parse(&self) {
         note(|work| {
             let ranges = self.0.included_ranges();
             if ranges.is_empty()
@@ -74,7 +79,6 @@ impl CountingParser {
                     .extend(ranges.iter().map(|r| (r.start_byte, r.end_byte)));
             }
         });
-        self.0.parse(source, old_tree)
     }
 }
 

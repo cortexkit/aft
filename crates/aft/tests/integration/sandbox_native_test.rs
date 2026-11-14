@@ -18,7 +18,7 @@ fn quote(path: &Path) -> String {
 fn landlock_available() -> bool {
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *AVAILABLE.get_or_init(|| {
-        Command::new(env!("CARGO_BIN_EXE_aft"))
+        Command::new(crate::test_helpers::aft_binary::source_binary())
             .args(["sandbox-launch", "--support"])
             .output()
             .is_ok_and(|output| output.status.success())

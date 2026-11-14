@@ -43,6 +43,7 @@ log="$run_root/real-daemon-tests.log"
 export AFT_REAL_DAEMON_RUN_ROOT="$TMPDIR/real-daemon-homes"
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="bash $repo/scripts/ci-real-daemon-test-runner.sh"
 
+bash "$repo/scripts/check-cmake.sh"
 cargo nextest --version
 printf '==> Building and running ignored real-daemon tool-provider tests\n'
 : > "$log"
@@ -60,7 +61,7 @@ heartbeat=$!
 # ignored test there needs the real daemon, and a prefix silently skips tests
 # named differently (the runner_notice_real_daemon_* tests).
 rc=0
-timeout 15m cargo nextest run -p agent-file-tools --test rest \
+timeout 15m cargo nextest run --features wasm-grammars -p agent-file-tools --test rest \
   --features test-hooks,test-scope-owner --profile gate --no-fail-fast \
   --run-ignored only --test-threads 2 --failure-output final \
   --status-level pass --final-status-level fail \

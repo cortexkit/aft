@@ -50,7 +50,12 @@ jobs:
       AFT_STRESS: "1"
     steps:
       - uses: actions/checkout@v5
+
       - uses: dtolnay/rust-toolchain@stable
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
+
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: nightly-stress
@@ -58,7 +63,7 @@ jobs:
       - name: Run original stress volumes
         shell: bash
         run: >-
-          cargo test -p agent-file-tools --features test-hooks --lib --
+          cargo test --features wasm-grammars -p agent-file-tools --features test-hooks --lib --
           views_incremental_random_sequences_equal_full_rebuild
           tool_result_fixtures_release_descriptors
           bash_changed_files_flush_native_no_false_complete_during_50k_activity
@@ -75,6 +80,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
+
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: nightly-cost-gate
@@ -82,7 +91,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build release binary
-        run: cargo build --release -p agent-file-tools --quiet
+        run: cargo build --features wasm-grammars --release -p agent-file-tools --quiet
 
       - name: Compare fixed OSS matrix
         env:

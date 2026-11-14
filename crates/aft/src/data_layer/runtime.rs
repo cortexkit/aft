@@ -119,6 +119,26 @@ impl Drop for ClearOnDrop {
     }
 }
 
+/// Keeps test waits aware of a build until its follow-up work has been queued,
+/// including the handoff after the production `building` flag is cleared.
+#[cfg(test)]
+struct BuildTaskGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(test)]
+impl BuildTaskGuard {
+    fn new(tasks: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        tasks.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(tasks))
+    }
+}
+
+#[cfg(test)]
+impl Drop for BuildTaskGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
 /// What a reader that needs exact call-graph answers gets.
 pub(crate) enum Fresh {
     /// A view whose call graph covers every recorded change.
@@ -434,6 +454,10 @@ struct Work {
     stopped: AtomicBool,
     /// A build is queued or running.
     building: Arc<AtomicBool>,
+    /// Counts build tasks through their final follow-up scheduling, including
+    /// tasks that overlap after clearing their `building` flags.
+    #[cfg(test)]
+    build_tasks: Arc<std::sync::atomic::AtomicUsize>,
     /// A fold of the checkout's segments is queued or running.
     folding: Arc<AtomicBool>,
     /// A call-graph refresh is queued or running.
@@ -515,12 +539,16 @@ impl Work {
         if self.building.swap(true, Ordering::AcqRel) {
             return false;
         }
+        #[cfg(test)]
+        let build_task = BuildTaskGuard::new(&self.build_tasks);
         let flag = ClearOnDrop(Arc::clone(&self.building));
         let Some(reservation) = self.checkout.reserve_build() else {
             return false;
         };
         let work = Arc::clone(self);
         self.runner.run(BUILD_REQUEST, Pool::Build, move || {
+            #[cfg(test)]
+            let _build_task = build_task;
             if work.stopped.load(Ordering::Acquire) {
                 return;
             }
@@ -1136,9 +1164,26 @@ impl Work {
 }
 
 /// One root's checkout in a running AFT.
-/// How old a checkout's memory figure may be before the census walks it
-/// again (see [`DataCheckout::memory_figure`]).
+/// Minimum time between complete checkout memory walks, even during edits.
+/// Reused figures report their age and whether the checkout changed since.
 const MEMORY_FIGURE_MAX_AGE: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MemoryFigureVersion {
+    checkout: u64,
+    meaning: u64,
+    /// Address of the call-graph snapshot counted by the root's inspect plane.
+    /// `Seen` excludes it from checkout bytes, so its identity affects attribution.
+    counted_elsewhere: Option<usize>,
+}
+
+struct CachedMemoryFigure {
+    measured_at: Instant,
+    attempted_at: Instant,
+    version: MemoryFigureVersion,
+    figure: super::surfaces::DataLayerMemory,
+    incomplete_attempt: bool,
+}
 
 pub(crate) struct DataCheckout {
     work: Arc<Work>,
@@ -1151,7 +1196,7 @@ pub(crate) struct DataCheckout {
     todos_readable: AtomicBool,
     /// The last memory figure the census walked for this checkout, and when
     /// (see [`Self::memory_figure`]).
-    memory_figure: std::sync::Mutex<Option<(Instant, u64, super::surfaces::DataLayerMemory)>>,
+    memory_figure: std::sync::Mutex<Option<CachedMemoryFigure>>,
     disk_measurement: Arc<super::surfaces::DiskMeasurement>,
     /// Kept so the edit-intent listener lives as long as the checkout.
     _listener: Arc<dyn WriteIntentListener>,
@@ -1290,6 +1335,8 @@ impl DataCheckout {
             },
             checkout,
             building: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            build_tasks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             folding: Arc::new(AtomicBool::new(false)),
             refreshing: Arc::new(AtomicBool::new(false)),
             publish_requested: parking_lot::Mutex::new(Publish::WhenMany),
@@ -1370,6 +1417,23 @@ impl DataCheckout {
     #[cfg(test)]
     pub(crate) fn checkout_arc_for_test(&self) -> Arc<Checkout> {
         Arc::clone(&self.work.checkout)
+    }
+
+    /// A checkout reusing another checkout's published call graph can serve a
+    /// ready view before its background build ends.
+    /// Profiles must wait before applying the edits that populate an engine.
+    #[cfg(test)]
+    pub(crate) fn wait_for_memory_profile_idle_for_test(&self) {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        // Read the task count first: observing its release publishes the flags
+        // set by the build's follow-up work before `running` is checked.
+        while self.work.build_tasks.load(Ordering::Acquire) != 0 || self.work.running() {
+            assert!(
+                Instant::now() < deadline,
+                "background build/refresh did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// Only a queued or running first text build warrants waiting. An old
@@ -1927,16 +1991,34 @@ impl DataCheckout {
         self.work.meaning.configure(config);
     }
 
-    /// What meaning search holds in memory for this checkout; see
-    /// [`super::meaning::Meaning::memory`].
-    /// This checkout's memory as the census reports it, walked again only
-    /// when the checkout changed what it holds since the last walk, or the
-    /// last figure is older than [`MEMORY_FIGURE_MAX_AGE`]. The health
-    /// rollup asks for every bound root every few seconds, and the walk
-    /// visits each decoded parse and resolution an edited checkout's engine
-    /// holds: walked on every ask, it kept a core busy.
+    /// This checkout's memory as the census reports it. Reuse a complete walk
+    /// indefinitely while its version is unchanged. After a change, walk at
+    /// most once per [`MEMORY_FIGURE_MAX_AGE`]: scanning each engine's maps on
+    /// every health tick is too expensive, even for idle bound checkouts.
+    /// An older figure names its age; one invalidated by a change is partial.
+    /// Contended walks do not replace a complete figure or prolong `busy`.
     pub(crate) fn memory_figure(
         &self,
+        counted_elsewhere: Option<usize>,
+        walk: impl FnOnce() -> super::surfaces::DataLayerMemory,
+    ) -> super::surfaces::DataLayerMemory {
+        self.memory_figure_with(counted_elsewhere, true, walk)
+    }
+
+    /// Explicit censuses refresh invalidated figures immediately. Only the
+    /// background health rollup may defer a dirty walk to protect its CPU budget.
+    pub(crate) fn current_memory_figure(
+        &self,
+        counted_elsewhere: Option<usize>,
+        walk: impl FnOnce() -> super::surfaces::DataLayerMemory,
+    ) -> super::surfaces::DataLayerMemory {
+        self.memory_figure_with(counted_elsewhere, false, walk)
+    }
+
+    fn memory_figure_with(
+        &self,
+        counted_elsewhere: Option<usize>,
+        reuse_dirty: bool,
         walk: impl FnOnce() -> super::surfaces::DataLayerMemory,
     ) -> super::surfaces::DataLayerMemory {
         // Another thread walking it now holds the slot: report it busy
@@ -1944,22 +2026,105 @@ impl DataCheckout {
         let Ok(mut slot) = self.memory_figure.try_lock() else {
             return super::surfaces::DataLayerMemory::busy_checkout();
         };
-        // Read before the walk: a change during it moves the epoch, so the
-        // next ask walks again.
-        let epoch = self.checkout().memory_epoch();
-        if let Some((at, walked_at, figure)) = slot.as_ref() {
-            if *walked_at == epoch && at.elapsed() < MEMORY_FIGURE_MAX_AGE {
-                return figure.clone();
+        // Read before the walk so a change during it is reported as stale too.
+        let version = || MemoryFigureVersion {
+            checkout: self.checkout().memory_epoch(),
+            meaning: self.work.meaning.memory_epoch(),
+            counted_elsewhere,
+        };
+        let epoch = version();
+        #[cfg(not(test))]
+        let now = Instant::now();
+        #[cfg(test)]
+        let now = crate::context::memory_walk_now_for_test();
+        if let Some(previous) = slot.as_ref() {
+            let age = now.saturating_duration_since(previous.measured_at);
+            let complete =
+                !previous.incomplete_attempt && previous.figure.shared.not_estimated.is_empty();
+            let reuse = (previous.version == epoch && complete)
+                || (reuse_dirty
+                    && now.saturating_duration_since(previous.attempted_at)
+                        < MEMORY_FIGURE_MAX_AGE);
+            #[cfg(all(test, target_os = "linux"))]
+            let reuse = if reuse_dirty && MEMORY_FIGURE_BASELINE.with(std::cell::Cell::get) {
+                previous.version == epoch && age < MEMORY_FIGURE_MAX_AGE
+            } else {
+                reuse
+            };
+            if reuse {
+                return previous.figure.clone().with_measurement_age(
+                    age,
+                    previous.version != epoch || previous.incomplete_attempt,
+                );
             }
         }
+        #[cfg(test)]
+        MEMORY_FIGURE_WALKS.with(|walks| walks.set(walks.get() + 1));
         let figure = walk();
-        *slot = Some((Instant::now(), epoch, figure.clone()));
-        figure
+        if figure.shared.status == "busy" || !figure.shared.not_estimated.is_empty() {
+            // Keep a prior complete figure instead of discarding its bytes or
+            // extending busy. Rate-limit incomplete map walks too; their age
+            // and gaps remain visible until the next attempt can measure more.
+            if let Some(previous) = slot.as_mut() {
+                previous.attempted_at = now;
+                previous.incomplete_attempt = true;
+                return previous.figure.clone().with_measurement_age(
+                    now.saturating_duration_since(previous.measured_at),
+                    true,
+                );
+            }
+            if figure.shared.status == "busy" {
+                return figure;
+            }
+        }
+        *slot = Some(CachedMemoryFigure {
+            measured_at: now,
+            attempted_at: now,
+            version: epoch,
+            figure: figure.clone(),
+            incomplete_attempt: false,
+        });
+        figure.with_measurement_age(Duration::ZERO, version() != epoch)
     }
 
+    /// What meaning search holds in memory for this checkout; see
+    /// [`super::meaning::Meaning::memory`].
     pub(crate) fn meaning_memory(&self, seen: &mut aft_store::heap::Seen) -> Option<usize> {
         self.work.meaning.memory(seen)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static MEMORY_FIGURE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    #[cfg(target_os = "linux")]
+    static MEMORY_FIGURE_BASELINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Compare the former epoch-or-age refresh policy on the same retained engines.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn with_memory_figure_baseline_for_test<T>(
+    baseline: bool,
+    measure: impl FnOnce() -> T,
+) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            MEMORY_FIGURE_BASELINE.with(|flag| flag.set(self.0));
+        }
+    }
+    let _reset = Reset(MEMORY_FIGURE_BASELINE.with(|flag| flag.replace(baseline)));
+    measure()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn memory_profile_layer_for_test() -> Arc<DataLayer> {
+    layer()
+}
+
+#[cfg(test)]
+pub(crate) fn memory_figure_walks_for_test() -> usize {
+    MEMORY_FIGURE_WALKS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -2479,33 +2644,240 @@ mod tests {
         assert_eq!(fixture.handle.checkout().changed_paths(), 0);
     }
 
-    /// A process published a checkout's text index and stopped before its
-    /// call graph. The next process to bind it builds the call graph, and
-    /// its refresh thread does not spin while it waits.
     #[test]
-    fn the_memory_figure_is_walked_again_only_after_a_change() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(dir.path()).unwrap();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
-        std::fs::write(root.join("src/lib.rs"), "pub fn caller() {}\n").unwrap();
-        let handle = DataCheckout::open(&root, storage.path(), None).unwrap();
-        let walks = std::cell::Cell::new(0);
+    fn memory_figure_explicit_census_refreshes_edits_inside_the_health_window() {
+        let fixture = PublicationFixture::new(Duration::from_secs(3600), Duration::from_secs(3600));
+        let handle = &fixture.handle;
         let walk = || {
-            walks.set(walks.get() + 1);
-            super::super::surfaces::DataLayerMemory::busy_checkout()
+            let mut seen = aft_store::heap::Seen::new();
+            let memory = handle.checkout().memory(&mut seen);
+            super::super::surfaces::checkout_estimate(memory, Some(0), seen.contended())
         };
-        handle.memory_figure(walk);
-        handle.memory_figure(walk);
-        assert_eq!(walks.get(), 1, "an unchanged checkout is not walked again");
-        std::fs::write(root.join("src/extra.rs"), "pub fn other() {}\n").unwrap();
+        let now = Instant::now();
+        crate::context::with_memory_walk_clock_for_test(now, || {
+            let original = handle.memory_figure(None, walk);
+            assert_eq!(original.shared.counts["changed_paths"], 0);
+            assert_eq!(original.shared.counts["callgraph_engine_started"], 0);
+            let epoch = handle.checkout().memory_epoch();
+            fixture.add("edited", 1);
+            let noted_epoch = handle.checkout().memory_epoch();
+            assert!(
+                noted_epoch > epoch,
+                "noted paths and their text overlay invalidate memory"
+            );
+            fixture.refresh();
+            assert!(
+                handle.checkout().memory_epoch() > noted_epoch,
+                "the refreshed engine invalidates memory"
+            );
+            let aged = handle.memory_figure(None, walk);
+            assert_eq!(aged.shared.counts["changed_paths"], 0);
+            assert_eq!(aged.shared.bytes_status, "partial");
+            let walks = memory_figure_walks_for_test();
+            let current = handle.current_memory_figure(None, walk);
+            assert_eq!(memory_figure_walks_for_test(), walks + 1);
+            assert_eq!(current.shared.counts["changed_paths"], 1);
+            assert!(current.shared.counts["text_overlay_bytes"] > 0);
+            assert_eq!(current.shared.counts["callgraph_engine_started"], 1);
+            assert!(current.shared.counts["callgraph_engine_bytes"] > 0);
+            assert_eq!(current.shared.bytes_status, "estimated");
+            let reused = handle.memory_figure(None, walk);
+            assert_eq!(reused, current);
+            assert_eq!(
+                memory_figure_walks_for_test(),
+                walks + 1,
+                "health reuses the current census"
+            );
+        });
+    }
+
+    #[test]
+    fn memory_figure_tracks_real_engine_growth_within_thirty_seconds() {
+        let fixture = PublicationFixture::new(Duration::from_secs(3600), Duration::from_secs(3600));
+        fixture.add("seed", 1);
+        fixture.refresh();
+        let handle = &fixture.handle;
+        let walk = || {
+            let mut seen = aft_store::heap::Seen::new();
+            let memory = handle.checkout().memory(&mut seen);
+            super::super::surfaces::checkout_estimate(memory, Some(0), seen.contended())
+        };
+        let epoch = Instant::now();
+        let read_at = |seconds| {
+            crate::context::with_memory_walk_clock_for_test(
+                epoch + Duration::from_secs(seconds),
+                || handle.memory_figure(None, walk),
+            )
+        };
+        let before = read_at(0);
+        assert_eq!(before.shared.counts["callgraph_engine_started"], 1);
+        assert_eq!(before.shared.bytes_status, "estimated");
+        let walks = memory_figure_walks_for_test();
+        // An idle engine stays unchanged for minutes, not just one health tick.
+        for seconds in [3, 30, 60, 120] {
+            let reused = read_at(seconds);
+            assert_eq!(reused.callgraph, before.callgraph);
+            assert_eq!(reused.measured_age_ms(), seconds * 1000);
+        }
+        assert_eq!(memory_figure_walks_for_test(), walks);
+
+        let big = handle.root().join("src/growth.rs");
+        let source = (0..2000)
+            .map(|n| format!("pub fn grown_{n}() {{}}\n"))
+            .collect::<String>();
+        std::fs::write(big, source).unwrap();
         handle
             .checkout()
-            .record_paths(&[b"src/extra.rs".to_vec()])
+            .record_paths(&[b"src/growth.rs".to_vec()])
             .unwrap();
-        handle.memory_figure(walk);
-        assert_eq!(walks.get(), 2, "a recorded change is measured at once");
+        handle.checkout().refresh_callgraph().unwrap();
+        // The last idle read did not reset the measurement time. This change
+        // is already past the thirty-second budget and must show immediately.
+        let grown = read_at(123);
+        assert!(
+            grown.callgraph > before.callgraph + 64_000,
+            "the real engine grew: {before:?} -> {grown:?}"
+        );
+        assert_eq!(grown.measured_age_ms(), 0);
+        assert_eq!(memory_figure_walks_for_test(), walks + 1);
+
+        let extra = handle.root().join("src/another.rs");
+        std::fs::write(extra, "pub fn another() {}\n").unwrap();
+        handle
+            .checkout()
+            .record_paths(&[b"src/another.rs".to_vec()])
+            .unwrap();
+        handle.checkout().refresh_callgraph().unwrap();
+        let aged = read_at(152);
+        assert_eq!(aged.callgraph, grown.callgraph);
+        assert_eq!(aged.measured_age_ms(), 29_000);
+        assert_eq!(aged.shared.bytes_status, "partial");
+        assert!(aged
+            .shared
+            .not_estimated
+            .iter()
+            .any(|gap| gap == "checkout_memory_stale"));
+        assert_eq!(memory_figure_walks_for_test(), walks + 1);
+        let current = read_at(153);
+        assert!(current.callgraph > grown.callgraph);
+        assert_eq!(current.measured_age_ms(), 0);
+        assert_eq!(current.shared.bytes_status, "estimated");
+        assert_eq!(memory_figure_walks_for_test(), walks + 2);
+    }
+
+    #[test]
+    fn memory_figure_version_includes_meaning_and_seen_exclusions() {
+        let fixture = PublicationFixture::new(Duration::from_secs(3600), Duration::from_secs(3600));
+        let handle = &fixture.handle;
+        let complete = || super::super::surfaces::DataLayerMemory {
+            shared: crate::memory::MemoryEstimate::estimated(100),
+            text: 0,
+            callgraph: 0,
+            meaning: 0,
+        };
+        let epoch = Instant::now();
+        crate::context::with_memory_walk_clock_for_test(epoch, || {
+            handle.memory_figure(None, complete)
+        });
+        let walks = memory_figure_walks_for_test();
+        let checkout_epoch = handle.checkout().memory_epoch();
+        handle
+            .work
+            .meaning
+            .configure(Some(&crate::config::SemanticBackendConfig::default()));
+        assert_eq!(handle.checkout().memory_epoch(), checkout_epoch);
+        let aged =
+            crate::context::with_memory_walk_clock_for_test(epoch + Duration::from_secs(3), || {
+                handle.memory_figure(None, complete)
+            });
+        assert_eq!(aged.shared.bytes_status, "partial");
+        crate::context::with_memory_walk_clock_for_test(epoch + Duration::from_secs(30), || {
+            handle.memory_figure(None, complete)
+        });
+        assert_eq!(memory_figure_walks_for_test(), walks + 1);
+        let aged = crate::context::with_memory_walk_clock_for_test(
+            epoch + Duration::from_secs(33),
+            || handle.memory_figure(Some(1), complete),
+        );
+        assert_eq!(aged.shared.bytes_status, "partial");
+        crate::context::with_memory_walk_clock_for_test(epoch + Duration::from_secs(60), || {
+            handle.memory_figure(Some(1), complete)
+        });
+        assert_eq!(memory_figure_walks_for_test(), walks + 2);
+    }
+
+    #[test]
+    fn memory_figure_partial_walk_is_retried_even_without_an_epoch_change() {
+        let fixture = PublicationFixture::new(Duration::from_secs(3600), Duration::from_secs(3600));
+        let handle = &fixture.handle;
+        let estimate = || super::super::surfaces::DataLayerMemory {
+            shared: crate::memory::MemoryEstimate::estimated(100),
+            text: 0,
+            callgraph: 0,
+            meaning: 0,
+        };
+        let epoch = Instant::now();
+        crate::context::with_memory_walk_clock_for_test(epoch, || {
+            handle.memory_figure(None, || {
+                let mut partial = estimate();
+                partial.shared = partial.shared.gap("locked_parts");
+                partial.shared.bytes_status = "partial";
+                partial
+            })
+        });
+        let walks = memory_figure_walks_for_test();
+        crate::context::with_memory_walk_clock_for_test(epoch + Duration::from_secs(3), || {
+            handle.memory_figure(None, || {
+                panic!("a partial map walk must also be rate-limited")
+            })
+        });
+        let complete = crate::context::with_memory_walk_clock_for_test(
+            epoch + Duration::from_secs(30),
+            || handle.memory_figure(None, estimate),
+        );
+        assert_eq!(memory_figure_walks_for_test(), walks + 1);
+        assert_eq!(complete.shared.bytes_status, "estimated");
+        assert!(complete.shared.not_estimated.is_empty());
+    }
+
+    #[test]
+    fn memory_figure_throttles_contention_without_extending_busy() {
+        let fixture = PublicationFixture::new(Duration::from_secs(3600), Duration::from_secs(3600));
+        let handle = &fixture.handle;
+        let complete = || super::super::surfaces::DataLayerMemory {
+            shared: crate::memory::MemoryEstimate::estimated(100),
+            text: 0,
+            callgraph: 1000,
+            meaning: 0,
+        };
+        let epoch = Instant::now();
+        crate::context::with_memory_walk_clock_for_test(epoch, || {
+            handle.memory_figure(None, complete)
+        });
+        fixture.add("invalidate", 1);
+        let busy = crate::context::with_memory_walk_clock_for_test(
+            epoch + Duration::from_secs(30),
+            || handle.memory_figure(None, super::super::surfaces::DataLayerMemory::busy_checkout),
+        );
+        assert_eq!(busy.shared.status, "ready");
+        assert_eq!(busy.shared.bytes_status, "partial");
+        assert_eq!(busy.callgraph, 1000);
+        assert_eq!(busy.measured_age_ms(), 30_000);
+        let walks = memory_figure_walks_for_test();
+        let held = crate::context::with_memory_walk_clock_for_test(
+            epoch + Duration::from_secs(33),
+            || handle.memory_figure(None, complete),
+        );
+        assert_eq!(memory_figure_walks_for_test(), walks);
+        assert_eq!(held.measured_age_ms(), 33_000);
+        assert_eq!(held.shared.bytes_status, "partial");
+        let retried = crate::context::with_memory_walk_clock_for_test(
+            epoch + Duration::from_secs(60),
+            || handle.memory_figure(None, complete),
+        );
+        assert_eq!(memory_figure_walks_for_test(), walks + 1);
+        assert_eq!(retried.shared.bytes_status, "estimated");
+        assert_eq!(retried.measured_age_ms(), 0);
     }
 
     #[test]

@@ -129,6 +129,8 @@ struct Configured {
 /// has made it, and the fill's last outcome.
 #[derive(Default)]
 pub(crate) struct Meaning {
+    /// Plane replacement and fill failures change memory independently of edits.
+    memory_epoch: std::sync::atomic::AtomicU64,
     /// AFT's storage folder, where the plugin downloads ONNX Runtime.
     storage: PathBuf,
     /// The root's semantic configuration as the last configure (or, before
@@ -230,6 +232,8 @@ impl Meaning {
         *lock(&self.times) = FillTimes::default();
         *lock(&self.totals) = FillTotals::default();
         *lock(&self.refreshed_at) = None;
+        self.memory_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         true
     }
 
@@ -281,10 +285,20 @@ impl Meaning {
             }
             *refreshed_at = Some(std::time::Instant::now());
         }
-        *lock(&self.failure) = plane
+        let failure = plane
             .refresh()
             .err()
             .map(|error| FillFailure::Failed(error.to_string()));
+        self.set_read_only_failure(failure);
+    }
+
+    fn set_read_only_failure(&self, failure: Option<FillFailure>) {
+        let mut current = lock(&self.failure);
+        if *current != failure {
+            *current = failure;
+            self.memory_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
     }
 
     /// Takes `config()` as the root's semantic configuration unless one was
@@ -441,6 +455,10 @@ impl Meaning {
         Some(plane + self.failure.heap_bytes(seen))
     }
 
+    pub(crate) fn memory_epoch(&self) -> u64 {
+        self.memory_epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Runs one round of the fill for `checkout`: loads the model if no
     /// round of this fill has, makes the plane if no round under this
     /// configuration has, and fills one round of files.
@@ -479,6 +497,8 @@ impl Meaning {
             }
         }
         self.note_round_ended(&outcome);
+        self.memory_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         outcome
     }
 
@@ -595,6 +615,8 @@ impl Meaning {
             config: config.clone(),
             plane: Arc::clone(&plane),
         });
+        self.memory_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.filled
             .store(false, std::sync::atomic::Ordering::Release);
         Ok(plane)
@@ -685,6 +707,33 @@ pub(crate) fn hold_model_loads_for_test(root: &Path) -> impl Drop {
     }
     lock(model_holds_for_test()).insert(root.to_path_buf());
     Release(root.to_path_buf())
+}
+
+#[cfg(test)]
+#[test]
+fn memory_figure_read_only_failure_changes_invalidate_the_meaning_version() {
+    let meaning = Meaning::default();
+    let initial = meaning.memory(&mut aft_store::heap::Seen::new()).unwrap();
+    let epoch = meaning.memory_epoch();
+    let failure = Some(FillFailure::Failed(
+        "the vector generation could not be read".into(),
+    ));
+    meaning.set_read_only_failure(failure.clone());
+    assert!(meaning.memory_epoch() > epoch);
+    assert!(meaning.memory(&mut aft_store::heap::Seen::new()).unwrap() > initial);
+    let epoch = meaning.memory_epoch();
+    meaning.set_read_only_failure(failure);
+    assert_eq!(
+        meaning.memory_epoch(),
+        epoch,
+        "identical failures retain their allocation"
+    );
+    meaning.set_read_only_failure(None);
+    assert!(meaning.memory_epoch() > epoch);
+    assert_eq!(
+        meaning.memory(&mut aft_store::heap::Seen::new()).unwrap(),
+        initial
+    );
 }
 
 /// Errors the next model load under a root fails with, for tests of how a

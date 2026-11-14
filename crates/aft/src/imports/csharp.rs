@@ -191,7 +191,7 @@ mod tests {
     use tree_sitter::Parser;
 
     fn parse_csharp(source: &str) -> ImportBlock {
-        let grammar = grammar_for(LangId::CSharp);
+        let grammar = grammar_for(LangId::CSharp).unwrap();
         let mut parser = Parser::new();
         parser.set_language(&grammar).unwrap();
         let tree = parser.parse(source, None).unwrap();
@@ -204,7 +204,7 @@ mod tests {
     /// and path nodes (`identifier` / `qualified_name`).
     #[test]
     fn csharp_grammar_node_kinds_are_stable() {
-        let grammar = grammar_for(LangId::CSharp);
+        let grammar = grammar_for(LangId::CSharp).unwrap();
         let mut parser = Parser::new();
         parser.set_language(&grammar).unwrap();
         let src = "using System;\nusing static System.Math;\nusing unsafe System.Buffer;\nusing Con = System.Console;\nusing unsafe Ptr = System.IntPtr;\nglobal using System;\nglobal using static unsafe System.Math;\nnamespace App;\nclass C {}\n";

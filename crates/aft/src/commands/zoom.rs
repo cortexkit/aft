@@ -1567,7 +1567,7 @@ fn zoom_one_symbol_inner(
     }
 
     if matches.is_empty() {
-        let msg = match crate::parser::list_symbols_shared(ctx.provider(), path) {
+        let msg = match crate::parser::list_symbols_shared(ctx.provider(), path, false) {
             Ok(all_symbols) => symbol_not_found_message(symbol_name, &all_symbols, is_heading),
             Err(_) => deterministic_zoom_refusal(
                 format!("symbol '{symbol_name}' not found"),
@@ -1690,7 +1690,8 @@ fn zoom_one_symbol_inner(
             #[cfg(test)]
             ZOOM_ENRICHMENT_BUILDS.with(|count| count.set(count.get() + 1));
             let symbols =
-                match crate::parser::list_symbols_shared(ctx.provider(), resolved_file_path) {
+                match crate::parser::list_symbols_shared(ctx.provider(), resolved_file_path, false)
+                {
                     Ok(symbols) => symbols,
                     Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
                 };
@@ -2454,7 +2455,7 @@ fn render_json_zoom(
         None
     };
     let (calls_out, called_by) = if include_callgraph {
-        let all_symbols = match crate::parser::list_symbols_shared(ctx.provider(), path) {
+        let all_symbols = match crate::parser::list_symbols_shared(ctx.provider(), path, false) {
             Ok(s) => s,
             Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
         };
@@ -2584,7 +2585,7 @@ fn resolve_heading_symbols(
     path: &Path,
     query: &str,
 ) -> Result<Vec<SymbolMatch>, crate::error::AftError> {
-    let headings: Vec<SymbolMatch> = crate::parser::list_symbols_shared(provider, path)?
+    let headings: Vec<SymbolMatch> = crate::parser::list_symbols_shared(provider, path, false)?
         .iter()
         .filter(|symbol| symbol.kind == SymbolKind::Heading)
         .cloned()
@@ -3638,7 +3639,7 @@ function helper(value: number): number {
   return value * 2;
 }
 "#;
-        let grammar = crate::parser::grammar_for(LangId::TypeScript);
+        let grammar = crate::parser::grammar_for(LangId::TypeScript).unwrap();
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&grammar).unwrap();
         let tree = parser.parse(source, None).unwrap();

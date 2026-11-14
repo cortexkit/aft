@@ -758,6 +758,7 @@ pub enum LangId {
     Groovy,
     ObjC,
     Toml,
+    Luau,
 }
 
 /// Detect a file's language, resolving ambiguous headers from their contents.
@@ -769,6 +770,22 @@ pub fn detect_language(path: &Path) -> Option<LangId> {
             .or(Some(LangId::C));
     }
     language_for_extension(path)
+}
+
+/// Dynamic extensions are opt-in per handling context. Detection never reads
+/// stored grammars and never starts a download.
+pub fn detect_language_any(path: &Path, dynamic_languages: bool) -> Option<LangId> {
+    detect_language(path).or_else(|| {
+        if !dynamic_languages {
+            return None;
+        }
+        let extension = path.extension()?.to_str()?;
+        crate::grammar::manifest()
+            .extensions
+            .iter()
+            .any(|ext| ext == extension)
+            .then_some(LangId::Luau)
+    })
 }
 
 /// Detect against the caller's source snapshot rather than reopening the file.
@@ -831,8 +848,9 @@ pub(crate) fn language_for_extension(path: &Path) -> Option<LangId> {
 }
 
 /// Returns the tree-sitter Language grammar for a given LangId.
-pub fn grammar_for(lang: LangId) -> Language {
-    match lang {
+pub fn grammar_for(lang: LangId) -> Result<Language, AftError> {
+    Ok(match lang {
+        LangId::Luau => return crate::grammar::registry().stored().map_err(Into::into),
         LangId::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         LangId::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
         LangId::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
@@ -866,7 +884,7 @@ pub fn grammar_for(lang: LangId) -> Language {
         LangId::Groovy => dekobon_tree_sitter_groovy::LANGUAGE.into(),
         LangId::ObjC => tree_sitter_objc::LANGUAGE.into(),
         LangId::Toml => tree_sitter_toml::LANGUAGE.into(),
-    }
+    })
 }
 
 /// Returns the query pattern string for a given LangId, if implemented.
@@ -902,6 +920,7 @@ fn query_for(lang: LangId) -> Option<&'static str> {
         LangId::Groovy => Some(GROOVY_QUERY),
         LangId::ObjC => Some(OBJC_QUERY),
         LangId::Toml => None,
+        LangId::Luau => None,
     }
 }
 
@@ -956,12 +975,16 @@ static OBJC_QUERY_CACHE: LazyLock<Result<Query, String>> =
 
 fn compile_query(lang: LangId) -> Result<Query, String> {
     let query_src = query_for(lang).ok_or_else(|| format!("missing query for {lang:?}"))?;
-    let grammar = grammar_for(lang);
+    let grammar = grammar_for(lang).map_err(|error| error.to_string())?;
     Query::new(&grammar, query_src)
         .map_err(|error| format!("query compile error for {lang:?}: {error}"))
 }
 
 fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
+    if lang == LangId::Luau {
+        grammar_for(lang)?;
+        return Ok(None);
+    }
     let query = match lang {
         LangId::TypeScript => Some(&*TS_QUERY_CACHE),
         LangId::Tsx => Some(&*TSX_QUERY_CACHE),
@@ -995,7 +1018,8 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
         | LangId::Vue
         | LangId::Json
         | LangId::Yaml
-        | LangId::Toml => None,
+        | LangId::Toml
+        | LangId::Luau => None,
     };
 
     query
@@ -1145,28 +1169,146 @@ fn parse_source_with_parser(path: &Path, source: &str, lang: LangId) -> Result<T
     work_counters::CACHED_PARSER_PARSES.with(|count| count.set(count.get() + 1));
     REUSABLE_PARSERS.with(|parsers| {
         let mut parsers = parsers.borrow_mut();
-        if let std::collections::hash_map::Entry::Vacant(entry) = parsers.entry(lang) {
-            #[cfg(test)]
-            work_counters::GRAMMAR_LOADS.with(|count| count.set(count.get() + 1));
-            let grammar = grammar_for(lang);
-            let mut parser = Parser::new();
-            parser.set_language(&grammar).map_err(|error| {
-                crate::slog_error!("grammar init failed for {:?}: {}", lang, error);
-                AftError::ParseError {
-                    message: format!("grammar init failed for {:?}: {}", lang, error),
-                }
-            })?;
-            entry.insert(parser);
+        let mut parser = match parsers.remove(&lang) {
+            Some(parser) => parser,
+            None => {
+                #[cfg(test)]
+                work_counters::GRAMMAR_LOADS.with(|count| count.set(count.get() + 1));
+                let mut parser = Parser::new();
+                initialize_parser(&mut parser, lang)?;
+                parser
+            }
+        };
+        #[cfg(test)]
+        parser.note_parse();
+        let result = parse_with_parser(&mut parser, path, source, lang, None);
+        if result.is_ok() {
+            parsers.insert(lang, parser);
         }
-
-        parsers
-            .get_mut(&lang)
-            .expect("parser inserted for language")
-            .parse(source, None)
-            .ok_or_else(|| AftError::ParseError {
-                message: format!("tree-sitter parse returned None for {}", path.display()),
-            })
+        result
     })
+}
+
+// The five largest react-lua runtime modules took 3.4-7.3 s each on an
+// unoptimized build using Wasmtime's Pulley bytecode interpreter. Release
+// builds are faster; 30 s leaves about fourfold margin over the slowest
+// measured file while bounding host parsing.
+const LUAU_PARSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[doc(hidden)]
+pub fn parse_luau_source(path: &Path, source: &str) -> Result<Tree, AftError> {
+    parse_source_with_cached_parser(path, source, LangId::Luau)
+}
+
+#[cfg(feature = "test-hooks")]
+thread_local! {
+    static LUAU_TEST_DEADLINE: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn with_luau_parse_deadline_for_test<T>(
+    deadline: std::time::Duration,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<std::time::Duration>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LUAU_TEST_DEADLINE.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(LUAU_TEST_DEADLINE.with(|slot| slot.replace(Some(deadline))));
+    run()
+}
+
+#[cfg(all(test, feature = "test-hooks", feature = "wasm-grammars"))]
+pub(crate) fn install_luau_parser_for_test(parser: Parser) {
+    REUSABLE_PARSERS.with(|parsers| {
+        parsers.borrow_mut().insert(LangId::Luau, parser);
+    });
+}
+
+#[cfg(all(test, feature = "test-hooks", feature = "wasm-grammars"))]
+pub(crate) fn retains_luau_parser_for_test() -> bool {
+    REUSABLE_PARSERS.with(|parsers| parsers.borrow().contains_key(&LangId::Luau))
+}
+
+/// One parsing boundary for fresh and reused dynamic-language parsers.
+pub(crate) fn parse_with_parser(
+    parser: &mut tree_sitter::Parser,
+    path: &Path,
+    source: &str,
+    lang: LangId,
+    old_tree: Option<&Tree>,
+) -> Result<Tree, AftError> {
+    let no_tree = || AftError::ParseError {
+        message: format!("tree-sitter parse returned None for {}", path.display()),
+    };
+    if lang != LangId::Luau {
+        return parser.parse(source, old_tree).ok_or_else(no_tree);
+    }
+    #[cfg(feature = "test-hooks")]
+    let deadline = {
+        static FROM_ENV: std::sync::LazyLock<Option<std::time::Duration>> =
+            std::sync::LazyLock::new(|| {
+                std::env::var("AFT_TEST_GRAMMAR_PARSE_DEADLINE_MS")
+                    .ok()
+                    .map(|value| {
+                        std::time::Duration::from_millis(
+                            value.parse().expect("test parse deadline milliseconds"),
+                        )
+                    })
+            });
+        LUAU_TEST_DEADLINE
+            .with(|slot| slot.get())
+            .or(*FROM_ENV)
+            .unwrap_or(LUAU_PARSE_DEADLINE)
+    };
+    #[cfg(not(feature = "test-hooks"))]
+    let deadline = LUAU_PARSE_DEADLINE;
+    let start = std::time::Instant::now();
+    let mut expired = false;
+    // This bounds host parsing, but cannot interrupt one lex or scanner call
+    // that never returns: Tree-sitter exposes no Wasmtime store-budget hook.
+    // Built-in native grammars have the same single-call interruption gap.
+    let mut progress = |_: &tree_sitter::ParseState| {
+        if start.elapsed() >= deadline {
+            expired = true;
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    };
+    let bytes = source.as_bytes();
+    let tree = parser.parse_with_options(
+        &mut |offset, _| bytes.get(offset..).unwrap_or_default(),
+        old_tree,
+        Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
+    );
+    if expired || start.elapsed() >= deadline {
+        return Err(AftError::GrammarParseTimeout {
+            path: path.display().to_string(),
+            language: "luau".into(),
+            timeout_ms: deadline.as_millis().min(u64::MAX as u128) as u64,
+        });
+    }
+    tree.ok_or_else(no_tree)
+}
+
+/// A Wasm language must have a store attached before set_language can run it.
+pub(crate) fn initialize_parser(
+    parser: &mut tree_sitter::Parser,
+    lang: LangId,
+) -> Result<(), AftError> {
+    let grammar = grammar_for(lang)?;
+    if lang == LangId::Luau {
+        crate::grammar::prepare_parser(parser)?;
+    }
+    parser
+        .set_language(&grammar)
+        .map_err(|error| AftError::ParseError {
+            message: format!("grammar init failed for {lang:?}: {error}"),
+        })
 }
 
 #[cfg(feature = "test-hooks")]
@@ -1797,6 +1939,7 @@ pub struct FileParser {
     symbol_cache: SharedSymbolCache,
     symbol_cache_generation: Option<u64>,
     capture_source: bool,
+    dynamic_languages: bool,
 }
 
 impl FileParser {
@@ -1820,6 +1963,7 @@ impl FileParser {
             symbol_cache,
             symbol_cache_generation,
             capture_source: false,
+            dynamic_languages: false,
         }
     }
 
@@ -1827,6 +1971,11 @@ impl FileParser {
     /// other parser consumers do not need a second resident copy of each file.
     pub(crate) fn with_source_capture(mut self) -> Self {
         self.capture_source = true;
+        self
+    }
+
+    pub fn with_dynamic_languages(mut self, dynamic_languages: bool) -> Self {
+        self.dynamic_languages = dynamic_languages;
         self
     }
 
@@ -1864,14 +2013,20 @@ impl FileParser {
     /// Parse a file, returning the tree and detected language. Uses cache if
     /// the file hasn't been modified since last parse.
     pub fn parse(&mut self, path: &Path) -> Result<(&Tree, LangId), AftError> {
-        let lang = language_for_extension(path).ok_or_else(|| AftError::InvalidRequest {
-            message: format!(
-                "unsupported file extension: {}",
-                path.extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("<none>")
-            ),
-        })?;
+        let lang = language_for_extension(path)
+            .or_else(|| {
+                self.dynamic_languages
+                    .then(|| detect_language_any(path, true))
+                    .flatten()
+            })
+            .ok_or_else(|| AftError::InvalidRequest {
+                message: format!(
+                    "unsupported file extension: {}",
+                    path.extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("<none>")
+                ),
+            })?;
 
         let canon = path.to_path_buf();
         let current_mtime = crate::bounded_io::metadata(path)
@@ -2201,14 +2356,20 @@ impl FileParser {
         size: u64,
         content_hash: blake3::Hash,
     ) -> Result<(&Tree, LangId), AftError> {
-        let lang = language_for_extension(path).ok_or_else(|| AftError::InvalidRequest {
-            message: format!(
-                "unsupported file extension: {}",
-                path.extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("<none>")
-            ),
-        })?;
+        let lang = language_for_extension(path)
+            .or_else(|| {
+                self.dynamic_languages
+                    .then(|| detect_language_any(path, true))
+                    .flatten()
+            })
+            .ok_or_else(|| AftError::InvalidRequest {
+                message: format!(
+                    "unsupported file extension: {}",
+                    path.extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("<none>")
+                ),
+            })?;
 
         let canon = path.to_path_buf();
         let needs_reparse = match self.cache.get(&canon) {
@@ -2292,6 +2453,18 @@ impl FileParser {
                 .map_err(|e| AftError::FileNotFound {
                     path: format!("{}: {}", path.display(), e),
                 })?;
+            // A shared symbol cache cannot opt a built-in-only context into a
+            // dynamic language after another context has populated that cache.
+            if !self.dynamic_languages && language_for_extension(path).is_none() {
+                return Err(AftError::InvalidRequest {
+                    message: format!(
+                        "unsupported file extension: {}",
+                        path.extension()
+                            .and_then(|ext| ext.to_str())
+                            .unwrap_or("<none>")
+                    ),
+                });
+            }
 
             // Snapshot the entry before checking the file: hashing a touched file must
             // not block cache writers. Refresh metadata only if the entry is unchanged.
@@ -2535,6 +2708,9 @@ fn extract_symbols_from_tree_unbounded<'tree>(
         LangId::R => extract_r_symbols(source, &root, query),
         LangId::Groovy => extract_groovy_symbols(source, &root, query),
         LangId::ObjC => extract_objc_symbols(source, &root, query),
+        LangId::Luau => Err(AftError::InvalidRequest {
+            message: format!("no query patterns implemented for {:?} yet", lang),
+        }),
         LangId::Rust
         | LangId::Html
         | LangId::Markdown
@@ -2668,7 +2844,7 @@ fn node_range_with_decorators_inner<'tree>(
                     && (text.starts_with('#') || text.starts_with("---"))
                     && is_adjacent_line(&prev, &current, source)
             }
-            LangId::Perl => false,
+            LangId::Perl | LangId::Luau => false,
             LangId::Python => {
                 // Decorators are handled by decorated_definition capture
                 false
@@ -4145,7 +4321,7 @@ fn parse_rust_macro_body(source: &str, body: tree_sitter::Range) -> Option<Tree>
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
             let mut parser = Parser::new();
-            parser.set_language(&grammar_for(LangId::Rust)).ok()?;
+            parser.set_language(&grammar_for(LangId::Rust).ok()?).ok()?;
             *slot = Some(parser);
         }
         let parser = slot.as_mut()?;
@@ -8931,9 +9107,12 @@ pub struct TreeSitterProvider {
 pub(crate) fn list_symbols_shared(
     provider: &dyn crate::language::LanguageProvider,
     file: &Path,
+    dynamic_languages: bool,
 ) -> Result<Arc<Vec<Symbol>>, AftError> {
     if let Some(provider) = provider.as_any().downcast_ref::<TreeSitterProvider>() {
-        FileParser::with_symbol_cache(provider.symbol_cache()).extract_symbols_shared(file)
+        FileParser::with_symbol_cache(provider.symbol_cache())
+            .with_dynamic_languages(dynamic_languages)
+            .extract_symbols_shared(file)
     } else {
         provider.list_symbols(file).map(Arc::new)
     }
@@ -9483,6 +9662,35 @@ impl crate::language::LanguageProvider for TreeSitterProvider {
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 mod tests {
     #[test]
+    fn grammar_builtin_only_parser_rejects_dynamic_shared_cache_hits() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            FileParser::new().extract_symbols_shared(&directory.path().join("missing.luau")),
+            Err(AftError::FileNotFound { .. })
+        ));
+        let path = directory.path().join("cached.luau");
+        let source = "local function f() end";
+        std::fs::write(&path, source).unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut parser = FileParser::new();
+        parser.symbol_cache.write().unwrap().insert(
+            path.clone(),
+            mtime,
+            source.len() as u64,
+            blake3::hash(source.as_bytes()),
+            Vec::new(),
+        );
+        assert!(matches!(
+            parser.extract_symbols_shared(&path),
+            Err(AftError::InvalidRequest { .. })
+        ));
+        assert!(matches!(
+            parser.parse(&path),
+            Err(AftError::InvalidRequest { .. })
+        ));
+    }
+
+    #[test]
     fn captured_source_keeps_the_owned_read_buffer() {
         let source = "// padding\n".repeat(10_000);
         let pointer = source.as_bytes().as_ptr();
@@ -9565,7 +9773,7 @@ mod tests {
     }
 
     fn symbols_from_source(source: &str, lang: LangId) -> Vec<Symbol> {
-        let grammar = grammar_for(lang);
+        let grammar = grammar_for(lang).unwrap();
         let mut parser = Parser::new();
         parser.set_language(&grammar).unwrap();
         let tree = parser.parse(source, None).unwrap();
@@ -9750,11 +9958,11 @@ mod tests {
             .collect();
         std::fs::write(&file, source).unwrap();
         let provider = TreeSitterProvider::new();
-        let original = list_symbols_shared(&provider, &file).unwrap();
+        let original = list_symbols_shared(&provider, &file, false).unwrap();
         let serialized = serde_json::to_vec(original.as_ref()).unwrap();
         let before = work_counters::CACHED_SYMBOL_COPIES.with(|count| count.get());
         for _ in 0..10 {
-            let hit = list_symbols_shared(&provider, &file).unwrap();
+            let hit = list_symbols_shared(&provider, &file, false).unwrap();
             assert!(
                 Arc::ptr_eq(&original, &hit),
                 "a cache hit must share the table allocation"
@@ -9818,7 +10026,7 @@ mod tests {
         ));
         for (source, lang) in &sources {
             let mut parser = Parser::new();
-            parser.set_language(&grammar_for(*lang)).unwrap();
+            parser.set_language(&grammar_for(*lang).unwrap()).unwrap();
             let tree = parser.parse(source, None).unwrap();
             let root = tree.root_node();
             let query = cached_query_for(*lang).unwrap().unwrap();
@@ -10044,7 +10252,7 @@ mod tests {
         let exported = std::thread::Builder::new()
             .stack_size(256 * 1024)
             .spawn(move || {
-                let grammar = grammar_for(LangId::TypeScript);
+                let grammar = grammar_for(LangId::TypeScript).unwrap();
                 let mut parser = Parser::new();
                 parser.set_language(&grammar).unwrap();
                 let tree = parser.parse(&source, None).unwrap();
@@ -10091,7 +10299,7 @@ mod tests {
         let source = "pub fn tiny() -> bool {\n    true\n}\n";
 
         let grammar_started = std::time::Instant::now();
-        let grammar = grammar_for(LangId::Rust);
+        let grammar = grammar_for(LangId::Rust).unwrap();
         let grammar_elapsed = grammar_started.elapsed();
 
         let parser_init_started = std::time::Instant::now();
@@ -10129,7 +10337,7 @@ mod tests {
     }
 
     fn extract_rs_symbols_with_query_oracle(source: &str, root: Node<'_>) -> Vec<Symbol> {
-        let grammar = grammar_for(LangId::Rust);
+        let grammar = grammar_for(LangId::Rust).unwrap();
         let query = Query::new(&grammar, RS_QUERY).expect("compile Rust parity query");
         let capture_names = query.capture_names();
         let is_pub = |node: &Node<'_>| {
@@ -10313,7 +10521,7 @@ pub(crate) mod outer {
     }
 }
 "#;
-        let grammar = grammar_for(LangId::Rust);
+        let grammar = grammar_for(LangId::Rust).unwrap();
         let mut parser = Parser::new();
         parser.set_language(&grammar).unwrap();
         let tree = parser.parse(source, None).unwrap();

@@ -409,7 +409,7 @@ mod tests {
         };
         let mut parser = tree_sitter::Parser::new();
         parser
-            .set_language(&crate::parser::grammar_for(language_id))
+            .set_language(&crate::parser::grammar_for(language_id).unwrap())
             .unwrap();
         let in_use = || {
             crate::memory::AllocatorObservation::measure()

@@ -8,6 +8,8 @@ mod context_storage_test;
 #[path = "../helpers/mod.rs"]
 mod test_helpers;
 
+#[cfg(all(feature = "test-hooks", feature = "wasm-grammars"))]
+mod grammar_loader_test;
 mod helpers;
 
 mod aft_search_contract_test;

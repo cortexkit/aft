@@ -282,7 +282,7 @@ fn outline_single_target(req: &RawRequest, ctx: &AppContext, file: &str) -> Resp
 /// Outline one file already resolved to a readable local `path`; `file` is
 /// the caller's spelling (a URL for a downloaded document).
 fn outline_single_file(req: &RawRequest, ctx: &AppContext, path: PathBuf, file: &str) -> Response {
-    let symbols = match crate::parser::list_symbols_shared(ctx.provider(), &path) {
+    let symbols = match crate::parser::list_symbols_shared(ctx.provider(), &path, false) {
         Ok(s) => s,
         Err(e) => {
             return Response::error(&req.id, e.code(), e.to_string());
@@ -2205,7 +2205,7 @@ fn populate_rendered_file_symbols(
             if metadata.len() > MAX_OUTLINE_FILE_BYTES {
                 0
             } else {
-                crate::parser::list_symbols_shared(ctx.provider(), &path)
+                crate::parser::list_symbols_shared(ctx.provider(), &path, false)
                     .map(|symbols| symbols.len())
                     .unwrap_or(0)
             }
@@ -2361,6 +2361,7 @@ fn language_id(lang: LangId) -> &'static str {
         LangId::Swift => "swift",
         LangId::Php => "php",
         LangId::Lua => "lua",
+        LangId::Luau => "luau",
         LangId::Perl => "perl",
         LangId::Pascal => "pascal",
         LangId::R => "r",
@@ -2864,7 +2865,7 @@ fn fallback_file_structure(
     req_id: &str,
     session_id: &str,
 ) -> Result<Vec<OutlineEntry>, AftError> {
-    let symbols = crate::parser::list_symbols_shared(ctx.provider(), path)?;
+    let symbols = crate::parser::list_symbols_shared(ctx.provider(), path, false)?;
     let mut entries =
         outline_structure_entries(path, &symbols, parser, ctx, req_id, session_id, true, None)?;
     if detect_language(path) == Some(LangId::Rust) {

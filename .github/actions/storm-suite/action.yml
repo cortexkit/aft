@@ -3,19 +3,22 @@ description: Measure optimized compilation and retain all 19 normal storm cases
 runs:
   using: composite
   steps:
+    - name: Check CMake for wasm-grammars
+      shell: bash
+      run: bash scripts/check-cmake.sh
     - name: Build calibrated storm harness with compiler timings
       shell: bash
-      run: cargo test --features test-hooks --profile ci-storm --locked -p agent-file-tools --test integration --no-run --timings
+      run: cargo test --features wasm-grammars,test-hooks --profile ci-storm --locked -p agent-file-tools --test integration --no-run --timings
 
     - name: Require every calibrated storm case
       shell: bash
       run: |
-        cargo nextest list --features test-hooks --profile default --cargo-profile ci-storm --locked -p agent-file-tools --test integration -E 'test(subc_storm)' -T json > target/storm-inventory.json
+        cargo nextest list --features wasm-grammars,test-hooks --profile default --cargo-profile ci-storm --locked -p agent-file-tools --test integration -E 'test(subc_storm)' -T json > target/storm-inventory.json
         python3 scripts/ci-storm-inventory.py --check-inventory target/storm-inventory.json
 
     - name: Run all calibrated storm tests
       shell: bash
-      run: cargo nextest run --no-fail-fast --features test-hooks --profile default --cargo-profile ci-storm --locked -p agent-file-tools --test integration -E 'test(subc_storm)'
+      run: cargo nextest run --no-fail-fast --features wasm-grammars,test-hooks --profile default --cargo-profile ci-storm --locked -p agent-file-tools --test integration -E 'test(subc_storm)'
 
     - name: Retain storm compiler timings and inventory
       if: always()

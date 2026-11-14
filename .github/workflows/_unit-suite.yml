@@ -59,6 +59,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
+
       - name: Refuse dependency paths outside the repository
         run: |
           python3 scripts/check-path-deps.py
@@ -79,7 +83,7 @@ jobs:
       - uses: ./.github/actions/setup-nextest
 
       - name: Build nextest archive (Linux Rust suite)
-        run: cargo nextest archive --features test-hooks --workspace -E '(kind(lib) | kind(bin) | kind(test)) - binary(=watcher_integration)' --archive-file "$LINUX_NEXTEST_ARCHIVE"
+        run: cargo nextest archive --features wasm-grammars --features test-hooks --workspace -E '(kind(lib) | kind(bin) | kind(test)) - binary(=watcher_integration)' --archive-file "$LINUX_NEXTEST_ARCHIVE"
         env:
           LINUX_NEXTEST_ARCHIVE: ${{ runner.temp }}/linux-nextest.tar.zst
 
@@ -153,7 +157,12 @@ jobs:
         shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v5
+
       - uses: dtolnay/rust-toolchain@stable
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
+
       - uses: ./.github/actions/setup-nextest
       - uses: ./.github/actions/download-artifact-retry
         with:
@@ -188,6 +197,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         continue-on-error: true
@@ -293,7 +306,7 @@ jobs:
           node scripts/release-gate-v049.mjs --check-inputs
 
       - name: Cargo build (debug — needed by plugin e2e tests)
-        run: cargo build -p agent-file-tools
+        run: cargo build --features wasm-grammars -p agent-file-tools
 
       # release-gate --check-inputs validates JS artifacts without Cargo.
       # This full check also compares the committed hashline schema to its Rust
@@ -388,7 +401,12 @@ jobs:
             args: ""
     steps:
       - uses: actions/checkout@v5
+
       - uses: dtolnay/rust-toolchain@stable
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
+
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: unit-linux
@@ -407,7 +425,7 @@ jobs:
       - name: Build aft-bridge dist
         run: bun run --cwd packages/aft-bridge build
       - name: Build aft before running e2e
-        run: cargo build -p agent-file-tools --bin aft
+        run: cargo build --features wasm-grammars -p agent-file-tools --bin aft
       - name: Fetch pinned subc-core
         id: subc_core
         env:
@@ -487,26 +505,31 @@ jobs:
       AFT_REQUIRE_LANDLOCK: "1"
     steps:
       - uses: actions/checkout@v5
+
       - uses: dtolnay/rust-toolchain@stable
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
+
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build real AFT for the worker-read jail gate
-        run: cargo build -p agent-file-tools --bin aft
+        run: cargo build --features wasm-grammars -p agent-file-tools --bin aft
       - name: Run worker broker host policy and rendered socket rule regressions
         run: |
-          cargo test -p agent-file-tools --features test-hooks --lib -- gh_shim --test-threads=1
-          binary_listing="$(cargo test -p agent-file-tools --features test-hooks --bin aft -- --list)"
+          cargo test --features wasm-grammars -p agent-file-tools --features test-hooks --lib -- gh_shim --test-threads=1
+          binary_listing="$(cargo test --features wasm-grammars -p agent-file-tools --features test-hooks --bin aft -- --list)"
           [[ "$binary_listing" == *"gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition: test"* ]]
-          cargo test -p agent-file-tools --features test-hooks --bin aft -- gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition --test-threads=1
+          cargo test --features wasm-grammars -p agent-file-tools --features test-hooks --bin aft -- gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition --test-threads=1
       - name: Require worker-read test inventory and run the native gate
         shell: bash
         run: |
           set -euo pipefail
           unset AFT_TEST_AFT_BINARY NEXTEST_BIN_EXE_aft CARGO_BIN_EXE_aft
           cargo --version
-          listing="$(cargo test --features test-hooks -p agent-file-tools --test worker_jail -- --list)"
+          listing="$(cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --test worker_jail -- --list)"
           printf '%s\n' "$listing"
           for test in \
             gh_shim_router_host_read_uses_served_catalog_arguments \
@@ -526,16 +549,16 @@ jobs:
             worker_jail_temp_denies_other_task_directory; do
             [[ "$listing" == *"$test: test"* ]] || { printf 'missing native test: %s\n' "$test" >&2; exit 1; }
           done
-          cargo test --features test-hooks -p agent-file-tools --test worker_jail -- gh_shim_router_host --test-threads=1 --nocapture
-          cargo test --features test-hooks -p agent-file-tools --test worker_jail -- worker_gh_read --test-threads=1 --nocapture
-          cargo test --features test-hooks -p agent-file-tools --test worker_jail -- worker_jail_temp_denies_other_task_directory --exact --test-threads=1 --nocapture
-          probe_listing="$(cargo test --features test-hooks -p agent-file-tools --test sandbox_launch_probe -- --list)"
+          cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --test worker_jail -- gh_shim_router_host --test-threads=1 --nocapture
+          cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --test worker_jail -- worker_gh_read --test-threads=1 --nocapture
+          cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --test worker_jail -- worker_jail_temp_denies_other_task_directory --exact --test-threads=1 --nocapture
+          probe_listing="$(cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --test sandbox_launch_probe -- --list)"
           [[ "$probe_listing" == *"launcher_closes_late_inherited_listener_above_marker_slots: test"* ]]
           [[ "$probe_listing" == *"launcher_fd_probe_required_mode_cannot_silently_skip: test"* ]]
           [[ "$probe_listing" == *"launcher_failure_marker_cannot_be_forged_by_jailed_exec: test"* ]]
-          cargo test --features test-hooks -p agent-file-tools --test sandbox_launch_probe -- launcher_closes_late_inherited_listener_above_marker_slots --exact --test-threads=1 --nocapture
-          cargo test --features test-hooks -p agent-file-tools --test sandbox_launch_probe -- launcher_fd_probe_required_mode_cannot_silently_skip --exact --test-threads=1 --nocapture
-          cargo test --features test-hooks -p agent-file-tools --test sandbox_launch_probe -- launcher_failure_marker_cannot_be_forged_by_jailed_exec --exact --test-threads=1 --nocapture
+          cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --test sandbox_launch_probe -- launcher_closes_late_inherited_listener_above_marker_slots --exact --test-threads=1 --nocapture
+          cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --test sandbox_launch_probe -- launcher_fd_probe_required_mode_cannot_silently_skip --exact --test-threads=1 --nocapture
+          cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --test sandbox_launch_probe -- launcher_failure_marker_cannot_be_forged_by_jailed_exec --exact --test-threads=1 --nocapture
 
   # ---------------------------------------------------------------------------
   # Real-kernel Landlock probes. This stays separate from the general unit lane
@@ -552,16 +575,20 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
+
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build aft binary for sandbox probes
-        run: cargo build -p agent-file-tools --bin aft
+        run: cargo build --features wasm-grammars -p agent-file-tools --bin aft
 
       - name: Run sandbox launch probes
-        run: cargo test --features test-hooks -p agent-file-tools --test sandbox_launch_probe -- --test-threads=1 --nocapture
+        run: cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --test sandbox_launch_probe -- --test-threads=1 --nocapture
         env:
           AFT_REQUIRE_LANDLOCK: "1"
 
@@ -571,7 +598,7 @@ jobs:
           set -euo pipefail
           cargo --version
           test_name="bash_reply_timing_contract_test::subc_promoted_foreground_is_killed_at_its_timeout"
-          if ! listing="$(cargo test --features test-hooks --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" -- --list 2>&1)"; then
+          if ! listing="$(cargo test --features wasm-grammars --features test-hooks --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" -- --list 2>&1)"; then
             printf '%s\n' "$listing" >&2
             exit 1
           fi
@@ -580,7 +607,7 @@ jobs:
             printf 'expected test missing from integration inventory: %s\n' "$test_name" >&2
             exit 1
           fi
-          cargo test --features test-hooks --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" -- --exact
+          cargo test --features wasm-grammars --features test-hooks --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" -- --exact
 
   # ---------------------------------------------------------------------------
   # Release-calibrated storm latency on a dedicated free Linux runner. The
@@ -669,6 +696,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@1.92
 
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
+
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         continue-on-error: true
       - name: Start compiler cache (fall back to uncached)
@@ -685,8 +716,8 @@ jobs:
       # with the hooks the test suites need.
       - name: Cargo check (locked, MSRV floor)
         run: |
-          cargo check --workspace --lib --bins --locked
-          cargo check --workspace --all-targets --features test-hooks --locked
+          cargo check --features wasm-grammars --workspace --lib --bins --locked
+          cargo check --features wasm-grammars --workspace --all-targets --features test-hooks --locked
 
   # ---------------------------------------------------------------------------
   # Rust + plugin tests on macOS
@@ -714,6 +745,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
@@ -732,6 +764,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy, rust-analyzer
+
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         if: runner.environment == 'github-hosted'
@@ -765,7 +801,7 @@ jobs:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
       - name: Capture doctest inventory
-        run: cargo test --workspace --doc -- --list > "$AFT_CI_ARCHIVE_DIR/macos-doctest-inventory.txt" 2>&1
+        run: cargo test --features wasm-grammars --workspace --doc -- --list > "$AFT_CI_ARCHIVE_DIR/macos-doctest-inventory.txt" 2>&1
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
           CARGO_TERM_COLOR: never
@@ -810,6 +846,7 @@ jobs:
       LIBTEST_CARGO_CONFIG: profile.test.package.agent-file-tools.codegen-units=256
     steps:
       - uses: actions/checkout@v5
+
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
@@ -828,6 +865,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy, rust-analyzer
+
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         if: runner.environment == 'github-hosted'
@@ -858,7 +899,7 @@ jobs:
           }
           trap report_timing EXIT
           # Native time reports resident-memory and paging counters for the build.
-          /usr/bin/time -l cargo nextest archive --features test-hooks --workspace --lib --test sandbox_launch_probe -E 'kind(lib)' --config "$LIBTEST_CARGO_CONFIG" --timings --archive-file "$MACOS_LIBTEST_ARCHIVE"
+          /usr/bin/time -l cargo nextest archive --features wasm-grammars --features test-hooks --workspace --lib --test sandbox_launch_probe -E 'kind(lib)' --config "$LIBTEST_CARGO_CONFIG" --timings --archive-file "$MACOS_LIBTEST_ARCHIVE"
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
           MACOS_LIBTEST_ARCHIVE: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-libtest-nextest.tar.zst
@@ -876,10 +917,10 @@ jobs:
       - name: Run the serial backtrace probe with local debug objects
         run: |
           unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
-          cargo test -p agent-file-tools --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists --config "$LIBTEST_CARGO_CONFIG" --target-dir "$AFT_CI_TARGET_DIR"
+          cargo test --features wasm-grammars -p agent-file-tools --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists --config "$LIBTEST_CARGO_CONFIG" --target-dir "$AFT_CI_TARGET_DIR"
 
       - name: Capture lib source inventory
-        run: cargo nextest list --workspace --lib --features test-hooks --profile gate -T json --cargo-quiet --config "$LIBTEST_CARGO_CONFIG" > "$AFT_CI_ARCHIVE_DIR/macos-libtest-inventory.json"
+        run: cargo nextest list --features wasm-grammars --workspace --lib --features test-hooks --profile gate -T json --cargo-quiet --config "$LIBTEST_CARGO_CONFIG" > "$AFT_CI_ARCHIVE_DIR/macos-libtest-inventory.json"
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
@@ -916,6 +957,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
@@ -934,6 +976,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy, rust-analyzer
+
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         if: runner.environment == 'github-hosted'
@@ -956,13 +1002,13 @@ jobs:
       - name: Build nextest archive (macOS bin tests)
         # Keep the real CLI alongside the binary test harness without compiling
         # the unrelated library harnesses and integration suite.
-        run: cargo nextest archive --features test-hooks --workspace --bins --test sandbox_launch_probe -E 'kind(bin)' --archive-file "$MACOS_BIN_ARCHIVE"
+        run: cargo nextest archive --features wasm-grammars --features test-hooks --workspace --bins --test sandbox_launch_probe -E 'kind(bin)' --archive-file "$MACOS_BIN_ARCHIVE"
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
           MACOS_BIN_ARCHIVE: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-bin-nextest.tar.zst
 
       - name: Capture bin source inventory
-        run: cargo nextest list --workspace --bins --features test-hooks --profile gate -T json --cargo-quiet > "$AFT_CI_ARCHIVE_DIR/macos-bin-inventory.json"
+        run: cargo nextest list --features wasm-grammars --workspace --bins --features test-hooks --profile gate -T json --cargo-quiet > "$AFT_CI_ARCHIVE_DIR/macos-bin-inventory.json"
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
@@ -1227,6 +1273,7 @@ jobs:
         shard: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v5
+
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
@@ -1245,6 +1292,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy, rust-analyzer
+
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         if: runner.environment == 'github-hosted'
@@ -1329,6 +1380,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
@@ -1347,6 +1399,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy, rust-analyzer
+
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         if: runner.environment == 'github-hosted'
@@ -1367,7 +1423,7 @@ jobs:
       - uses: ./.github/actions/setup-nextest
 
       - name: Capture watcher inventory for the split proof
-        run: cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test watcher_integration -- --list > "$AFT_CI_ARCHIVE_DIR/macos-watcher-inventory.txt" 2>&1
+        run: cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --features test-timing-hooks --test watcher_integration -- --list > "$AFT_CI_ARCHIVE_DIR/macos-watcher-inventory.txt" 2>&1
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
           CARGO_TERM_COLOR: never
@@ -1425,6 +1481,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
@@ -1443,6 +1500,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy, rust-analyzer
+
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
 
       - name: Refuse dependency paths outside the repository
         run: |
@@ -1483,7 +1544,7 @@ jobs:
         run: bun run typecheck
 
       - name: Cargo build (debug — needed by plugin tests)
-        run: cargo build -p agent-file-tools
+        run: cargo build --features wasm-grammars -p agent-file-tools
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
@@ -1503,7 +1564,7 @@ jobs:
           set -euo pipefail
           cargo --version
           test_name="bash_reply_timing_contract_test::subc_promoted_foreground_is_killed_at_its_timeout"
-          if ! listing="$(cargo test --features test-hooks --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" --target-dir "$AFT_CI_TARGET_DIR" -- --list 2>&1)"; then
+          if ! listing="$(cargo test --features wasm-grammars --features test-hooks --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" --target-dir "$AFT_CI_TARGET_DIR" -- --list 2>&1)"; then
             printf '%s\n' "$listing" >&2
             exit 1
           fi
@@ -1512,7 +1573,7 @@ jobs:
             printf 'expected test missing from integration inventory: %s\n' "$test_name" >&2
             exit 1
           fi
-          cargo test --features test-hooks --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" --target-dir "$AFT_CI_TARGET_DIR" -- --exact
+          cargo test --features wasm-grammars --features test-hooks --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" --target-dir "$AFT_CI_TARGET_DIR" -- --exact
 
       - name: Install GitHub CLI for pinned helper downloads
         shell: bash
@@ -1577,6 +1638,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
+
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
@@ -1600,6 +1662,10 @@ jobs:
           components: rustfmt, clippy, rust-analyzer
           targets: x86_64-pc-windows-msvc
 
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
+
       # Both the archive builder and the libtest job use the established
       # unit-windows-cargo cache key. Keeping that key stable preserves the
       # existing hot MSVC dependency cache while the jobs run independently.
@@ -1613,14 +1679,14 @@ jobs:
       - uses: ./.github/actions/setup-nextest
 
       - name: Build nextest archive (Windows Rust suite)
-        run: cargo nextest archive --features test-hooks --workspace -E "(kind(lib) | kind(bin) | kind(test)) - binary(=watcher_integration)" --archive-file "$env:WINDOWS_NEXTEST_ARCHIVE"
+        run: cargo nextest archive --features wasm-grammars --features test-hooks --workspace -E "(kind(lib) | kind(bin) | kind(test)) - binary(=watcher_integration)" --archive-file "$env:WINDOWS_NEXTEST_ARCHIVE"
         shell: pwsh
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
           WINDOWS_NEXTEST_ARCHIVE: ${{ env.AFT_CI_ARCHIVE_DIR }}/windows-nextest.tar.zst
 
       # Run the exact archive-built harness while its local PDB still exists.
-      # A package-scoped cargo test changes workspace feature unification and
+      # A package-scoped cargo test --features wasm-grammars changes workspace feature unification and
       # recompiles it; direct execution preserves both symbols and build reuse.
       - name: Run the serial TLS probe from the archive build
         run: |
@@ -1709,6 +1775,7 @@ jobs:
         shard: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@v5
+
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
@@ -1731,6 +1798,10 @@ jobs:
         with:
           components: rustfmt, clippy, rust-analyzer
           targets: x86_64-pc-windows-msvc
+
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: runner.environment == 'github-hosted'
@@ -1794,6 +1865,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
+
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
@@ -1816,6 +1888,10 @@ jobs:
         with:
           components: rustfmt, clippy, rust-analyzer
           targets: x86_64-pc-windows-msvc
+
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: runner.environment == 'github-hosted'
@@ -1974,6 +2050,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
@@ -1997,6 +2074,10 @@ jobs:
           components: rustfmt, clippy, rust-analyzer
           targets: x86_64-pc-windows-msvc
 
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
+
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: runner.environment == 'github-hosted'
         with:
@@ -2008,9 +2089,9 @@ jobs:
       # native command, so each one checks its own exit code.
       - name: Cargo check (deny warnings)
         run: |
-          cargo check --workspace --lib --bins
+          cargo check --features wasm-grammars --workspace --lib --bins
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo check --workspace --all-targets --features test-hooks
+          cargo check --features wasm-grammars --workspace --all-targets --features test-hooks
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         shell: pwsh
         env:
@@ -2018,7 +2099,7 @@ jobs:
           RUSTFLAGS: "-D warnings"
 
       - name: Check feature-enabled provider conformance (deny warnings)
-        run: cargo check -p agent-file-tools --features test-hooks --features test-timing-hooks --test rest
+        run: cargo check --features wasm-grammars -p agent-file-tools --features test-hooks --features test-timing-hooks --test rest
         shell: pwsh
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
@@ -2064,6 +2145,7 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v5
+
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
@@ -2086,6 +2168,10 @@ jobs:
         with:
           components: rustfmt, clippy, rust-analyzer
 
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
+
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: runner.environment == 'github-hosted'
         with:
@@ -2104,7 +2190,7 @@ jobs:
         shell: pwsh
 
       - name: Cargo build (debug — bash.test.ts spawns the real aft binary)
-        run: cargo build -p agent-file-tools
+        run: cargo build --features wasm-grammars -p agent-file-tools
         shell: pwsh
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}

@@ -253,7 +253,7 @@ mod tests {
     use tree_sitter::Parser;
 
     fn parse_ruby(source: &str) -> (Tree, ImportBlock) {
-        let grammar = grammar_for(LangId::Ruby);
+        let grammar = grammar_for(LangId::Ruby).unwrap();
         let mut parser = Parser::new();
         parser.set_language(&grammar).unwrap();
         let tree = parser.parse(source, None).unwrap();

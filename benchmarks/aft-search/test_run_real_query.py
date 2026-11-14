@@ -22,6 +22,7 @@ from evidence_tree import evidence_tree_sha256
 from provision_evidence import provision
 from run_exact_recall import CorpusMissing, validate_corpus
 import bench_rerank
+import run_real_query
 from run_real_query import ROOT, NdjsonClient, assemble_score, attach_pinned_git_metadata, load_capability, load_inputs, parser as real_query_parser, score_manifest_rows, probe_pattern_capability
 from run_real_query import building_views_lexical_ready, full_views_coverage, make_readiness_request
 from search_quality_lib import (
@@ -538,6 +539,53 @@ class CheckoutRuntimeTests(unittest.TestCase):
 
 
 class RealQueryRunnerTests(unittest.TestCase):
+    def test_run_logs_unavailable_work_telemetry_without_adding_it_to_score(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "manifest.json"
+            binary = root / "aft"
+            output = root / "score.json"
+            exact = root / "exact.json"
+            concept = root / "concept.json"
+            document = manifest()
+            manifest_path.write_bytes(canonical_json(document))
+            binary.write_bytes(b"fake-aft-binary")
+            exact.write_bytes(canonical_json(exact_report()))
+            concept.write_bytes(canonical_json(concept_report()))
+            args = real_query_parser().parse_args([
+                "--manifest", str(manifest_path), "--binary", str(binary),
+                "--exact-score", str(exact), "--concept-score", str(concept),
+                "--reference", str(root / "missing-reference.json"), "--output", str(output),
+            ])
+            unavailable = NdjsonClient.views_work(object.__new__(NdjsonClient))
+            client = mock.Mock()
+            client.search.side_effect = FakeClient().search
+            client.views_work.return_value = unavailable
+            capability = {
+                "schema_path": "fixture.json", "schema_sha256": "0" * 64,
+                "offset_declared": False, "pattern_declared": True,
+            }
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(run_real_query, "load_inputs", return_value=(document, root, None, {"model_id": "fixture-model"})),
+                mock.patch.object(run_real_query, "load_capability", return_value=capability),
+                mock.patch.object(run_real_query, "runtime_evidence_tree", return_value=contextlib.nullcontext(root)),
+                mock.patch.object(run_real_query, "fixture_endpoint", return_value=contextlib.nullcontext(None)),
+                mock.patch.object(run_real_query, "NdjsonClient", return_value=client),
+                mock.patch.object(run_real_query, "probe_pattern_capability", return_value={"pattern_declared": True}),
+                mock.patch.object(run_real_query, "validate_scored_population"),
+                mock.patch.object(bench_rerank, "warm_up"),
+                mock.patch.object(bench_rerank, "report_warm_up"),
+                contextlib.redirect_stdout(stdout),
+            ):
+                self.assertEqual(run_real_query.run(args), 0)
+            score = json.loads(output.read_text())
+            self.assertNotIn("views_work", score)
+            self.assertEqual(score["rows"][0]["ranked_paths"][0], "tests/recorded_true_test.py")
+            telemetry = next(line for line in stdout.getvalue().splitlines() if line.startswith("views_work:"))
+            self.assertEqual(json.loads(telemetry.removeprefix("views_work:")), {"primary": unavailable})
+            client.close.assert_called_once()
+
     def test_missing_checkout_is_provisioned_from_local_repository_with_manifest_digest(self) -> None:
         manifest_path = Path(__file__).with_name("real-query-manifest.json")
         document = json.loads(manifest_path.read_text())

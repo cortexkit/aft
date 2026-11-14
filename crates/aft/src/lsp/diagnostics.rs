@@ -1485,16 +1485,14 @@ mod tests {
         assert!(store.verified_content.lock().entries.is_empty());
     }
 
-    #[cfg(unix)]
     #[test]
     fn inspect_freshness_progress_does_not_lock_memo_during_content_reads() {
-        use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
 
         let temp = tempfile::tempdir().unwrap();
         let file = temp.path().join("held.ts");
-        let path = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
-        // SAFETY: path is a live, NUL-terminated string and mode is valid.
-        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        std::fs::write(&file, "content").unwrap();
         let mut store = DiagnosticsStore::new();
         store.publish(
             server_key(ServerKind::TypeScript(None)),
@@ -1502,14 +1500,32 @@ mod tests {
             Vec::new(),
         );
 
+        let (reading, read_started) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        let timeout = Duration::from_secs(5);
         let unlocked = std::thread::scope(|scope| {
-            let reader = scope.spawn(|| store.verified_content_hash(&file));
-            // Opening the writer pairs with the reader's open. Keeping it open
-            // without data holds the content read without a timer or sleep.
-            let writer = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+            let reader = scope.spawn(|| {
+                super::super::document::CONTENT_HASH_BEFORE_READ.with(|hook| {
+                    hook.set(Some(Box::new(move || {
+                        reading.send(()).unwrap();
+                        resumed
+                            .recv_timeout(timeout)
+                            .expect("content read was not released");
+                    })));
+                });
+                store.verified_content_hash(&file)
+            });
+            // Pause an ordinary-file read explicitly instead of relying on FIFO
+            // open/EOF scheduling. Both sides of the handoff have a deadline.
+            read_started
+                .recv_timeout(timeout)
+                .expect("content read did not start");
             let unlocked = store.verified_content.try_lock().is_some();
-            drop(writer);
-            assert_eq!(reader.join().unwrap(), Some(*blake3::hash(b"").as_bytes()));
+            resume.send(()).unwrap();
+            assert_eq!(
+                reader.join().unwrap(),
+                Some(*blake3::hash(b"content").as_bytes())
+            );
             unlocked
         });
         assert!(

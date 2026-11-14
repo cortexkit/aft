@@ -457,11 +457,81 @@ fn user_commands_bound_startup_keeps_five_facts_without_inventing_diagnostics() 
         ]
     );
     for fact in &facts[2..4] {
-        assert_eq!(fact.data.state.as_deref(), Some("unavailable"));
+        assert_eq!(fact.data.state.as_deref(), Some("building"));
         assert_eq!(fact.data.value, None);
     }
     assert_eq!(facts[4].data.value, Some(0.0));
     assert_eq!(facts[4].data.unit.as_deref(), Some("count"));
+}
+
+#[test]
+fn user_commands_diagnostics_count_states() {
+    for (values, expected) in [
+        (
+            json!({"errors":null,"warnings":null,"diagnostics":"no_language_server"}),
+            "off",
+        ),
+        (
+            json!({"errors":null,"warnings":null,"diagnostics":"pending","disabled_categories":["diagnostics"]}),
+            "off",
+        ),
+        (
+            json!({"errors":null,"warnings":null,"diagnostics":"pending"}),
+            "building",
+        ),
+        (
+            json!({"errors":null,"warnings":null,"diagnostics":null}),
+            "building",
+        ),
+        (Value::Null, "unavailable"),
+        (json!({"diagnostics":null}), "unavailable"),
+    ] {
+        let mut input = snapshot(false);
+        input["status_bar_values"] = values;
+        let result = preview(&input, None);
+        result.check().unwrap();
+        for fact in &result.facts.unwrap()[2..4] {
+            assert_eq!(fact.data.state.as_deref(), Some(expected), "{input}");
+            assert_eq!(fact.data.value, None);
+        }
+    }
+
+    let mut input = snapshot(false);
+    input["status_bar_values"] = json!({"errors":2,"warnings":0,"diagnostics":"pending"});
+    let result = preview(&input, None);
+    let facts = result.facts.unwrap();
+    assert_eq!(facts[2].data.value, Some(2.0));
+    assert_eq!(facts[2].data.tone.as_deref(), Some("danger"));
+    assert_eq!(facts[3].data.value, Some(0.0));
+    assert_eq!(facts[3].data.unit.as_deref(), Some("count"));
+}
+
+#[test]
+fn user_commands_index_file_count_states() {
+    for (index, expected, count) in [
+        (json!({"status":"off"}), Some("off"), None),
+        (json!({"status":"off","files":10}), Some("off"), None),
+        (json!({"status":"building"}), Some("building"), None),
+        (json!({"status":"building","files":10}), None, Some(10.0)),
+        (json!({"status":"ready"}), Some("unavailable"), None),
+        (json!({"status":"stale"}), Some("unavailable"), None),
+        (json!({"status":"paused"}), Some("unavailable"), None),
+        (json!({"status":"ready","files":10}), None, Some(10.0)),
+    ] {
+        for (row, key) in ["search_index", "callgraph_store", "semantic_index"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut input = snapshot(false);
+            input[key] = index.clone();
+            let result = preview(&input, None);
+            result.check().unwrap();
+            let table = result.table.unwrap();
+            let files = &table.rows[row].cells[1];
+            assert_eq!(files.state.as_deref(), expected, "{key}: {index}");
+            assert_eq!(files.value, count, "{key}: {index}");
+        }
+    }
 }
 
 #[test]
@@ -721,19 +791,51 @@ async fn user_commands_real_management_routes_admit_only_occipital_and_keep_bodi
     )
     .unwrap();
     write_frame(&mut daemon, &ack).await.unwrap();
-    for (channel, principal) in [(41, occipital()), (42, Principal::Direct)] {
+    for (channel, principal, target, harness, session, role_versions) in [
+        (
+            41,
+            occipital(),
+            RouteTarget::ManagementSurface {
+                module_id: "aft".into(),
+            },
+            "operator",
+            "commands:41",
+            None,
+        ),
+        (
+            42,
+            Principal::Direct,
+            RouteTarget::ManagementSurface {
+                module_id: "aft".into(),
+            },
+            "operator",
+            "commands:42",
+            None,
+        ),
+        (
+            43,
+            occipital(),
+            RouteTarget::ToolProvider {
+                module_id: "aft".into(),
+            },
+            "occipital",
+            "display-views",
+            Some(std::collections::BTreeMap::from([(
+                "tool-provider".into(),
+                "v1".into(),
+            )])),
+        ),
+    ] {
         let bind = serde_json::to_value(ModuleControlRequest::RouteBind {
             route_channel: channel,
             epoch: 1,
-            target: RouteTarget::ManagementSurface {
-                module_id: "aft".into(),
-            },
-            identity: subc_protocol::BindIdentity::new("operator", format!("commands:{channel}")),
+            target,
+            identity: subc_protocol::BindIdentity::new(harness, session),
             principal: Some(principal),
             consumer_capabilities: None,
             admission_facts: Default::default(),
             scope: None,
-            role_versions: None,
+            role_versions,
             call_mode: None,
         })
         .unwrap();
@@ -824,6 +926,86 @@ async fn user_commands_real_management_routes_admit_only_occipital_and_keep_bodi
             .unwrap()
             .code,
         "route_not_admitted"
+    );
+    let pins: Vec<_> = tool_views::SHIPPED.keys().cloned().collect();
+    for channel in [41, 43] {
+        for body in [
+            json!({"op":"role.describe"}),
+            json!({"op":"tool.catalog","preset":"reader"}),
+            json!({"op":"tool.views","pins":pins}),
+            request("commands.describe"),
+        ] {
+            let reply = exchange(&mut daemon, FrameType::Request, channel, 7, body.clone()).await;
+            assert_eq!(
+                reply.header.ty,
+                FrameType::Response,
+                "{channel}: {body}: {:?}",
+                reply.body
+            );
+            let answer: Value = serde_json::from_slice(&reply.body).unwrap();
+            match body["op"].as_str() {
+                Some("role.describe") => assert_eq!(answer, tool_provider::describe()),
+                Some("tool.views") => {
+                    assert_eq!(answer["views"].as_object().unwrap().len(), pins.len());
+                    for pin in &pins {
+                        assert_eq!(answer["views"][pin]["template_revision"], 1);
+                    }
+                }
+                Some("tool.catalog") => assert!(answer["tools"].is_array()),
+                _ => assert_eq!(answer["commands"][0]["id"], "status"),
+            }
+        }
+        for body in [
+            json!({"op":"health.digest","params":{}}),
+            json!({"op":"tool.call","name":"read","arguments":{"path":"Cargo.toml"}}),
+            json!({"op":"tool.withdraw","call_key":"not-a-call"}),
+        ] {
+            let refused = exchange(&mut daemon, FrameType::Request, channel, 8, body.clone()).await;
+            assert_eq!(refused.header.ty, FrameType::Error, "{channel}: {body}");
+            let error: ErrorBody = serde_json::from_slice(&refused.body).unwrap();
+            assert_eq!(
+                error.code,
+                if channel == 41 {
+                    "route_not_admitted"
+                } else {
+                    PROJECT_REQUIRED_CODE
+                }
+            );
+        }
+    }
+    for op in ["late_results", "late_results.ack"] {
+        let refused = exchange(&mut daemon, FrameType::Request, 41, 9, json!({"op":op})).await;
+        assert_eq!(refused.header.ty, FrameType::Error);
+        assert_eq!(
+            serde_json::from_slice::<ErrorBody>(&refused.body)
+                .unwrap()
+                .code,
+            "route_not_admitted"
+        );
+    }
+    let custody = exchange(
+        &mut daemon,
+        FrameType::Request,
+        43,
+        10,
+        json!({"op":"late_results","since":null}),
+    )
+    .await;
+    assert_eq!(custody.header.ty, FrameType::Response, "{:?}", custody.body);
+    let invalid_ack = exchange(
+        &mut daemon,
+        FrameType::Request,
+        43,
+        11,
+        json!({"op":"late_results.ack"}),
+    )
+    .await;
+    assert_eq!(invalid_ack.header.ty, FrameType::Error);
+    assert_eq!(
+        serde_json::from_slice::<ErrorBody>(&invalid_ack.body)
+            .unwrap()
+            .code,
+        "invalid_request"
     );
     drop(daemon);
     thread.join().unwrap().unwrap();

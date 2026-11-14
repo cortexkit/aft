@@ -76,6 +76,11 @@ def run_command(command: list[str], merge_stderr: bool = True) -> str:
         # otherwise precede the JSON document.
         stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
         text=True,
+        # Cargo and test binaries write UTF-8. Without an explicit encoding,
+        # Windows decodes with the locale code page (cp1252), which has no
+        # mapping for some UTF-8 bytes and aborts the whole inventory.
+        encoding="utf-8",
+        errors="replace",
         check=False,
         # ANSI color wraps cargo's output and silently breaks the line parsers
         # below when a CI environment exports CARGO_TERM_COLOR=always.
@@ -123,9 +128,11 @@ def parse_cargo_list(output: str) -> list[CargoEntry]:
         # a `warning:` line plus `-->`, source-excerpt, `|` and `= note:`
         # continuation lines before the listing. sccache prints its own
         # `sccache: warning:` lines when its server restarts mid-build. None of
-        # them carry test entries.
+        # them carry test entries. The MSVC linker also prints `LINK : warning
+        # LNK4217` lines for the Wasm runtime's C API when the wasm-grammars
+        # feature is on.
         if (
-            stripped.startswith(("warning:", "= note:", "= help:", "sccache: ", "--> ", "..."))
+            stripped.startswith(("warning:", "= note:", "= help:", "sccache: ", "--> ", "...", "LINK : warning "))
             or stripped == "|"
             or WARNING_EXCERPT_RE.match(stripped)
         ):
@@ -624,7 +631,8 @@ if any(
     sys.exit(0)
 
 
-baseline_output = run_command(["cargo", "test", "--workspace", "--features", "test-hooks", "--", "--list"])
+run_command(["bash", str(ROOT / "scripts/check-cmake.sh")])
+baseline_output = run_command(["cargo", "test", "--workspace", "--features", "wasm-grammars,test-hooks", "--", "--list"])
 baseline_entries = parse_cargo_list(baseline_output)
 
 unit_bin_command = [
@@ -636,7 +644,7 @@ unit_bin_command = [
     # The same features the CI archive builds with, so listing reuses its
     # compiled library instead of building a second copy without the hooks.
     "--features",
-    "test-hooks",
+    "wasm-grammars,test-hooks",
     "--workspace",
     "--lib",
     "--bins",
@@ -682,7 +690,7 @@ doc_baseline_entries = [entry for entry in baseline_entries if entry.kind == "do
 doc_entries: list[CargoEntry] = []
 if doc_baseline_entries:
     doc_output = run_command(
-        ["cargo", "test", "--workspace", "--features", "test-hooks", "--doc", "--", "--list"]
+        ["cargo", "test", "--workspace", "--features", "wasm-grammars,test-hooks", "--doc", "--", "--list"]
     )
     doc_entries = [entry for entry in parse_cargo_list(doc_output) if entry.kind == "doc"]
 
@@ -691,7 +699,7 @@ nextest_command = [
     "nextest",
     "list",
     "--features",
-    "test-hooks",
+    "wasm-grammars,test-hooks",
     "--profile",
     "gate",
     "--workspace",
@@ -731,7 +739,7 @@ watcher_output = run_command([
     "cargo",
     "test",
     "--features",
-    "test-hooks",
+    "wasm-grammars,test-hooks",
     "-p",
     "agent-file-tools",
     "--test",

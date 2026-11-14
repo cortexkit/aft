@@ -8383,6 +8383,7 @@ fn initialization_options_for_spawn(
         if let Some(configured) = def.initialization_options.clone() {
             merge_json_override(&mut options, configured);
         }
+        isolate_rust_build_dir(def, server_root, &mut options);
         return Ok(Some(options));
     }
     if def.kind != ServerKind::Astro {
@@ -8419,6 +8420,113 @@ fn initialization_options_for_spawn(
         merge_json_override(&mut options, configured);
     }
     Ok(Some(options))
+}
+
+fn isolate_rust_build_dir(def: &ServerDef, root: &Path, options: &mut serde_json::Value) {
+    let target = match options.pointer("/cargo/targetDir") {
+        Some(serde_json::Value::Bool(true)) => None,
+        Some(serde_json::Value::String(path)) => Some(root.join(path)),
+        _ => return,
+    };
+    if !root.join("Cargo.toml").is_file() {
+        return;
+    }
+    let mut env = def.env.clone();
+    if let Some(extra) = options
+        .pointer("/cargo/extraEnv")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (key, value) in extra {
+            if let Some(value) = value.as_str() {
+                env.insert(key.clone(), value.to_string());
+            }
+        }
+    }
+    let environment_build_dir = env
+        .get("CARGO_BUILD_BUILD_DIR")
+        .cloned()
+        .or_else(|| std::env::var("CARGO_BUILD_BUILD_DIR").ok())
+        .is_some()
+        || options
+            .pointer("/check/extraEnv/CARGO_BUILD_BUILD_DIR")
+            .is_some();
+    let analyzer_target = match rust_cargo_target_directory(root, &env) {
+        Ok(cargo_target) => target.unwrap_or_else(|| cargo_target.join("rust-analyzer")),
+        Err(reason) => {
+            slog_info!("rust-analyzer Cargo directory lookup failed: {reason}");
+            if !environment_build_dir {
+                return;
+            }
+            target.unwrap_or_else(|| {
+                root.join(
+                    env.get("CARGO_TARGET_DIR")
+                        .cloned()
+                        .or_else(|| std::env::var("CARGO_TARGET_DIR").ok())
+                        .or_else(|| env.get("CARGO_BUILD_TARGET_DIR").cloned())
+                        .or_else(|| std::env::var("CARGO_BUILD_TARGET_DIR").ok())
+                        .unwrap_or_else(|| "target".into()),
+                )
+                .join("rust-analyzer")
+            })
+        }
+    };
+    // Changing targetDir alone leaves a configured build-dir (and its lock)
+    // shared with the user's cargo build. Keep intermediates in the analyzer's
+    // target directory, just as Cargo does when no build-dir is configured.
+    let build = analyzer_target.to_string_lossy().into_owned();
+    merge_json_override(
+        options,
+        serde_json::json!({"cargo": {"extraEnv": {"CARGO_BUILD_BUILD_DIR": build}}}),
+    );
+    if options
+        .pointer("/check/extraEnv/CARGO_BUILD_BUILD_DIR")
+        .is_some()
+    {
+        options["check"]["extraEnv"]["CARGO_BUILD_BUILD_DIR"] = build.into();
+    }
+}
+
+fn rust_cargo_target_directory(
+    root: &Path,
+    env: &HashMap<String, String>,
+) -> Result<PathBuf, String> {
+    let binary = env
+        .get("CARGO")
+        .cloned()
+        .or_else(|| std::env::var("CARGO").ok())
+        .unwrap_or_else(|| "cargo".into());
+    let mut command = crate::effective_path::new_command(&binary)
+        .envs(env)
+        .build();
+    command
+        .args([
+            "metadata",
+            "--offline",
+            "--no-deps",
+            "--format-version=1",
+            "--locked",
+        ])
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    crate::format::isolate_in_process_group(&mut command);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let child = command.spawn().map_err(|error| error.to_string())?;
+    let output = crate::format::wait_with_deadline(child, "cargo metadata", deadline, || false)
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() || output.truncated {
+        return Err(format!(
+            "cargo metadata exited {} or exceeded output limit",
+            output.status
+        ));
+    }
+    let metadata: serde_json::Value =
+        serde_json::from_str(&output.stdout).map_err(|error| error.to_string())?;
+    let target = metadata["target_directory"]
+        .as_str()
+        .ok_or_else(|| "cargo metadata omitted target_directory".to_string())?;
+    Ok(PathBuf::from(target))
 }
 
 fn find_project_typescript_sdk(source_file: &Path, project_root: &Path) -> Option<PathBuf> {
@@ -12742,7 +12850,8 @@ mod rust_initialization_options_tests {
     fn rust_target_dir_default_preserves_configured_options() {
         let config = Config::default();
         let source = Path::new("src/lib.rs");
-        let root = Path::new(".");
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
         let mut def = super::super::registry::servers_for_file(source, &config)
             .into_iter()
             .find(|def| def.kind == ServerKind::Rust)
@@ -12775,6 +12884,86 @@ mod rust_initialization_options_tests {
         assert_eq!(
             initialization_options_for_spawn(&def, source, root, &config).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn rust_build_dir_isolation_preserves_target_choices() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "").unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"build-isolation\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Cargo.lock"),
+            "version = 4\n[[package]]\nname = \"build-isolation\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let config = Config::default();
+        let source = root.join("src/lib.rs");
+        let mut def = super::super::registry::servers_for_file(&source, &config)
+            .into_iter()
+            .find(|def| def.kind == ServerKind::Rust)
+            .unwrap();
+        def.env.insert(
+            "CARGO_TARGET_DIR".into(),
+            root.join("base").to_string_lossy().into_owned(),
+        );
+        def.env.insert(
+            "CARGO_BUILD_BUILD_DIR".into(),
+            "{workspace-root}/shared/{workspace-path-hash}".into(),
+        );
+        assert_eq!(
+            rust_cargo_target_directory(root, &def.env).unwrap(),
+            root.join("base")
+        );
+        for (target, expected) in [
+            (
+                serde_json::json!(true),
+                Some(root.join("base").join("rust-analyzer")),
+            ),
+            (
+                serde_json::json!("custom-target"),
+                Some(root.join("custom-target")),
+            ),
+            (serde_json::json!(false), None),
+        ] {
+            def.initialization_options = Some(serde_json::json!({"cargo": {
+                "targetDir": target, "extraEnv": {"KEEP": "value"}
+            }}));
+            let options = initialization_options_for_spawn(&def, &source, root, &config)
+                .unwrap()
+                .unwrap();
+            assert_eq!(options["cargo"]["targetDir"], target);
+            assert_eq!(options["cargo"]["extraEnv"]["KEEP"], "value");
+            assert_eq!(
+                options
+                    .pointer("/cargo/extraEnv/CARGO_BUILD_BUILD_DIR")
+                    .and_then(serde_json::Value::as_str),
+                expected.as_ref().and_then(|p| p.to_str())
+            );
+        }
+        // A failed metadata command still isolates an explicitly inherited
+        // build directory without changing the caller's targetDir setting.
+        def.env.insert(
+            "CARGO".into(),
+            root.join("missing-cargo").to_string_lossy().into_owned(),
+        );
+        def.initialization_options = Some(serde_json::json!({"cargo": {"targetDir": true}}));
+        let options = initialization_options_for_spawn(&def, &source, root, &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(options["cargo"]["targetDir"], true);
+        assert_eq!(
+            options["cargo"]["extraEnv"]["CARGO_BUILD_BUILD_DIR"],
+            root.join("base")
+                .join("rust-analyzer")
+                .to_string_lossy()
+                .as_ref()
         );
     }
 }
