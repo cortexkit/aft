@@ -7313,6 +7313,39 @@ thread_local! {
 mod tests {
     use super::*;
 
+    /// Thousands of nested modules and `use` groups are described down to
+    /// the nesting bounds and no further, on a stack as small as the store's
+    /// file walker threads have: past the bounds the walk stops instead of
+    /// recursing until the stack overflows, which aborts the process.
+    #[test]
+    fn rust_api_facts_stop_at_the_nesting_bounds_on_a_small_stack() {
+        const DEPTH: usize = 20_000;
+        let source = format!(
+            "use {}b{};\n{}pub fn f() {{}}{}\n",
+            "a::{".repeat(DEPTH),
+            "}".repeat(DEPTH),
+            "pub mod a { ".repeat(DEPTH),
+            " }".repeat(DEPTH)
+        );
+        let (modules, uses) = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || {
+                let mut parser = tree_sitter::Parser::new();
+                parser
+                    .set_language(&crate::parser::grammar_for(LangId::Rust))
+                    .unwrap();
+                let tree = parser.parse(&source, None).unwrap();
+                let mut facts = RustApiFacts::default();
+                rust_collect_api_facts(&source, tree.root_node(), "lib.rs", &[], &mut facts, 0);
+                (facts.modules.len(), facts.uses.len())
+            })
+            .unwrap()
+            .join()
+            .expect("the facts thread panicked");
+        assert_eq!(modules, MAX_RUST_API_NESTING + 1);
+        assert_eq!(uses, 0, "the use leaf lies past the group bound");
+    }
+
     #[test]
     fn test_origin_bulk_union_matches_set_union() {
         // Exhaustive small subsets cover equality, subset, overlap, empty and

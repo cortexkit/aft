@@ -1151,8 +1151,13 @@ mod tests {
     }
 
     /// How deep the deeply nested inputs below nest. The Swift compiler's
-    /// own test suite holds a file of about 50,000 nested parentheses.
-    const NESTING: usize = 20_000;
+    /// own test suite holds a file of about 50,000 nested parentheses. Ten
+    /// thousand levels overflow a 2 MiB stack for any walk that spends more
+    /// than about 200 bytes of stack per level, which every recursive walk
+    /// found here did, while keeping the work that grows faster than the
+    /// depth (some outline passes look up a node's parent, which tree-sitter
+    /// answers by descending from the root) to seconds.
+    const NESTING: usize = 10_000;
 
     /// `open`, then `inner`, then `close`, each of the brackets repeated
     /// [`NESTING`] times.
@@ -1212,7 +1217,6 @@ mod tests {
             python: "deep.py" => format!("import os\nx = {}\n", nested("(", "1", ")"));
             rust: "deep.rs" => format!("use std::fmt;\nfn f() {{ let x = {}; }}\n", nested("(", "1", ")"));
             rust_macro_tokens: "deep_macro.rs" => format!("fn f() {{ m!{}; }}\n", nested("(", "x", ")"));
-            rust_modules: "deep_mod.rs" => nested("pub mod a { ", "pub fn f() {}", " }");
             rust_field_chain: "deep_field.rs" => format!("fn f(a: A) {{ a{}.g(); }}\n", ".b".repeat(NESTING));
             rust_use_tree: "deep_use.rs" => format!("use {};\n", nested("a::{", "b", "}"));
             cpp_qualified_name: "deep_name.cpp" => format!("int x = {}f();\n", "a::".repeat(NESTING));
@@ -1235,7 +1239,6 @@ mod tests {
             java: "deep.java" => format!("import a.b;\nclass C {{ int x = {}; }}\n", nested("(", "1", ")"));
             ruby: "deep.rb" => format!("require 'a'\nx = {}\n", nested("(", "1", ")"));
             php_expression: "deep.php" => format!("<?php\nuse A\\B;\n$x = {};\n", nested("(", "1", ")"));
-            php_namespaces: "deep_ns.php" => format!("<?php\n{}\n", nested("namespace A { ", "use A\\B;", " }"));
             lua: "deep.lua" => format!("local a = require('a')\nlocal x = {}\n", nested("(", "1", ")"));
             perl: "deep.pl" => format!("use strict;\nmy $x = {};\n", nested("(", "1", ")"));
             yaml: "deep.yaml" => format!("x: {}\n", nested("[", "1", "]"));
@@ -1243,6 +1246,10 @@ mod tests {
             r: "deep.R" => format!("library(a)\nx <- {}\n", nested("(", "1", ")"));
             groovy: "deep.groovy" => format!("import a.b\ndef x = {}\n", nested("(", "1", ")"));
             toml: "deep.toml" => format!("x = {}\n", nested("[", "1", "]"));
+            // Nested Rust modules and PHP namespace blocks have narrower tests
+            // next to their walks (in the dead-code scanner and the PHP import
+            // collector): a whole file of them spends minutes in outline
+            // passes whose cost grows with the square of the depth.
         }
     }
 }

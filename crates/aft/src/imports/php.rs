@@ -635,6 +635,28 @@ use const App\VERSION;
         }
     }
 
+    /// Namespace blocks nested thousands deep (error recovery accepts them)
+    /// are collected on a small stack, in source order: the collector keeps
+    /// its pending nodes on the heap, where a recursive one overflowed the
+    /// stack and aborted the process.
+    #[test]
+    fn deeply_nested_namespace_blocks_collect_on_a_small_stack() {
+        const DEPTH: usize = 3_000;
+        let source = format!(
+            "<?php\n{}use App\\Inner;{}\nuse App\\Outer;\n",
+            "namespace A { ".repeat(DEPTH),
+            " }".repeat(DEPTH)
+        );
+        let imports = std::thread::Builder::new()
+            .stack_size(256 << 10)
+            .spawn(move || parse_php(&source).1.imports)
+            .unwrap()
+            .join()
+            .expect("the collector thread panicked");
+        let modules: Vec<_> = imports.iter().map(|i| i.module_path.as_str()).collect();
+        assert_eq!(modules, [r"App\Inner", r"App\Outer"]);
+    }
+
     #[test]
     fn pruned_php_collector_does_not_visit_method_bodies() {
         let mut source = String::from("<?php\nuse App\\Keep;\nclass Huge {\n");
