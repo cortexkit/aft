@@ -3307,8 +3307,23 @@ mod tests {
             .unwrap();
         let (reached, release) = install_watcher_rescan_gate_for_test(&ctx);
         let drain_ctx = Arc::clone(&ctx);
-        let drain =
-            std::thread::spawn(move || drain_watcher_events_bounded(&drain_ctx, usize::MAX));
+        let drain = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while drain_watcher_events_bounded(&drain_ctx, usize::MAX).has_more {
+                // Ignore-file preparation may need earlier slices. Stop once
+                // the first rescan attempt returns, leaving its replay parked.
+                if drain_ctx
+                    .watcher_counters()
+                    .snapshot()
+                    .last_rescan_at_ms
+                    .is_some()
+                {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "first rescan must start");
+                std::thread::yield_now();
+            }
+        });
         reached
             .recv_timeout(Duration::from_secs(2))
             .expect("rescan did not reach gate");
