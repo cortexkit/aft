@@ -4334,6 +4334,15 @@ fn main() {
             }
             _ => root.join("target"),
         };
+        // Cargo's environment overrides its target-dir config. An explicit
+        // fixture environment wins instead in the environment-target mode.
+        let base_target = if mode == "environment" {
+            base_target
+        } else {
+            std::env::var_os("CARGO_TARGET_DIR")
+                .or_else(|| std::env::var_os("CARGO_BUILD_TARGET_DIR"))
+                .map_or(base_target, |target| root.join(target))
+        };
         let shared_build = "{workspace-root}/shared/{workspace-path-hash}";
         let lsp = if mode == "environment" {
             serde_json::json!({"servers": {"rust": {"env": {
