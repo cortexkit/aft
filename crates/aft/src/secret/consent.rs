@@ -244,7 +244,7 @@ pub(crate) fn record_outcome_code(scope: &SecretScope, request_id: &str, code: &
             .outcome_code
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(super::transport_diagnostics::safe_code(code));
+            Some(super::transport::diagnostics::safe_code(code));
     }
 }
 static CARDS: std::sync::LazyLock<

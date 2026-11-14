@@ -244,8 +244,8 @@ async fn prepare_and_send(
     let initial = connect_upstream(authority, state, ws).await?;
     let reconnected = tokio::sync::Mutex::new(Vec::new());
     use futures_util::StreamExt;
-    let mut pending = futures_util::stream::FuturesUnordered::new();
     let approval_metadata = std::sync::Mutex::new(std::collections::HashMap::new());
+    let mut pending = futures_util::stream::FuturesUnordered::new();
     for label in &labels {
         audit.mention(label);
         let addressed = &addressed;
