@@ -491,15 +491,19 @@ fn secret_use_logs_request_variant_without_free_text() {
 }
 
 #[test]
-fn secret_use_logs_deadline_once_when_scoped_open_never_replies() {
+fn secret_use_logs_deadline_once_when_worker_does_not_reply() {
     let daemon = FakeClaustrum::start();
-    daemon.state.lock().unwrap().hold_open = true;
     let mut transport = transport(&daemon);
     transport.timeout = Duration::from_millis(150);
+    // Keep the work queued so only the caller's receive deadline can expire.
+    // A live scoped open also has an SDK timer that can win with OutcomeUnknown.
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    assert!(transport.worker.set(sender).is_ok());
     assert_failure_log(
         || transport.dispatch(private_params(), principal("aft")),
         "stage=deadline",
     );
+    assert!(receiver.try_recv().is_ok());
 }
 
 #[test]
