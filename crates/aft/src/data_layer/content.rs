@@ -352,6 +352,11 @@ pub fn extract_parsed(
             tree.language
         )));
     }
+    // The call graph and stored dead-code facts reparse the same opaque macro
+    // tokens. Share their trees for this extraction without retaining them in
+    // the content record or after the file has been processed.
+    let _macro_fragments =
+        (tree.language == LangId::Rust).then(crate::calls::cache_rust_macro_fragments);
     let (blob, outline) = CallgraphBlob::extract_tree_with_outline(
         parsed_text(source),
         language,
