@@ -4434,88 +4434,110 @@ fn rust_token_tree_invokes_metavariable_macro(token_tree: tree_sitter::Node<'_>)
     false
 }
 
+/// Adds to `refs` the references the macro invocations under `root` make
+/// through their tokens, each attributed to the function around it (the
+/// innermost of `scope_stack` and the function items above the invocation).
+///
+/// The walk keeps its pending nodes on the heap rather than recursing: a
+/// file can nest tens of thousands of levels deep, and a stack overflow
+/// aborts the process. Leaving a node is queued as a step of its own, so
+/// the function a node opened is popped off `scope_stack` after its
+/// subtree, as a recursive walk would.
 fn collect_rust_macro_token_refs(
     source: &str,
-    node: tree_sitter::Node,
+    root: tree_sitter::Node,
     scope_stack: &mut Vec<String>,
     refs: &mut BTreeSet<MacroTokenRefContribution>,
 ) {
-    let scope_len = scope_stack.len();
-    if node.kind() == "function_item" {
-        if let Some(symbol) = rust_function_symbol_name(source, &node) {
-            scope_stack.push(symbol);
-        }
+    enum Step<'tree> {
+        Enter(tree_sitter::Node<'tree>),
+        /// Restore `scope_stack` to this length.
+        Leave(usize),
     }
+    let mut pending = vec![Step::Enter(root)];
+    while let Some(step) = pending.pop() {
+        let node = match step {
+            Step::Enter(node) => node,
+            Step::Leave(scope_len) => {
+                scope_stack.truncate(scope_len);
+                continue;
+            }
+        };
+        pending.push(Step::Leave(scope_stack.len()));
+        if node.kind() == "function_item" {
+            if let Some(symbol) = rust_function_symbol_name(source, &node) {
+                scope_stack.push(symbol);
+            }
+        }
 
-    if node.kind() == "macro_invocation" {
-        if let Some(token_tree) = find_child_by_kind(node, "token_tree") {
-            let caller_symbol = scope_stack
-                .last()
-                .cloned()
-                .unwrap_or_else(|| TOP_LEVEL_SYMBOL.to_string());
-            let mut tokens = Vec::new();
-            collect_rust_macro_tokens(source, token_tree, &mut tokens);
-            let mut shadowed = BTreeSet::new();
-            for token in &tokens {
-                if rust_macro_token_is_identifier(token)
-                    && crate::calls::rust_name_is_shadowed_at(node, source, token.text)
-                {
-                    shadowed.insert(token.text.to_string());
+        if node.kind() == "macro_invocation" {
+            if let Some(token_tree) = find_child_by_kind(node, "token_tree") {
+                let caller_symbol = scope_stack
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| TOP_LEVEL_SYMBOL.to_string());
+                let mut tokens = Vec::new();
+                collect_rust_macro_tokens(source, token_tree, &mut tokens);
+                let mut shadowed = BTreeSet::new();
+                for token in &tokens {
+                    if rust_macro_token_is_identifier(token)
+                        && crate::calls::rust_name_is_shadowed_at(node, source, token.text)
+                    {
+                        shadowed.insert(token.text.to_string());
+                    }
                 }
-            }
-            let mut binding = false;
-            for token in &tokens {
-                if token.text == "let" {
-                    binding = true;
-                } else if token.text == "=" {
-                    binding = false;
-                } else if binding && rust_macro_token_is_identifier(token) {
-                    shadowed.insert(token.text.to_string());
+                let mut binding = false;
+                for token in &tokens {
+                    if token.text == "let" {
+                        binding = true;
+                    } else if token.text == "=" {
+                        binding = false;
+                    } else if binding && rust_macro_token_is_identifier(token) {
+                        shadowed.insert(token.text.to_string());
+                    }
                 }
+                extract_rust_macro_token_refs(&tokens, &caller_symbol, &shadowed, refs);
             }
-            extract_rust_macro_token_refs(&tokens, &caller_symbol, &shadowed, refs);
         }
-    }
 
-    let mut cursor = node.walk();
-    if cursor.goto_first_child() {
-        loop {
-            collect_rust_macro_token_refs(source, cursor.node(), scope_stack, refs);
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
+        let start = pending.len();
+        let mut cursor = node.walk();
+        pending.extend(node.children(&mut cursor).map(Step::Enter));
+        pending[start..].reverse();
     }
-    scope_stack.truncate(scope_len);
 }
 
+/// Appends the leaf tokens under `root` to `tokens`, in source order,
+/// skipping the subtrees [`rust_macro_token_node_is_opaque`] names. The
+/// walk keeps its place in a tree cursor rather than recursing, so deeply
+/// nested token trees cannot overflow the stack.
 fn collect_rust_macro_tokens<'a>(
     source: &'a str,
-    node: tree_sitter::Node,
+    root: tree_sitter::Node,
     tokens: &mut Vec<RustMacroToken<'a>>,
 ) {
-    if rust_macro_token_node_is_opaque(node.kind()) {
-        return;
-    }
-
-    if node.child_count() == 0 {
-        let text = node_text(source, node).trim();
-        if !text.is_empty() {
-            tokens.push(RustMacroToken {
-                text,
-                kind: node.kind(),
-                line: node.start_position().row as u32 + 1,
-            });
+    let mut cursor = root.walk();
+    loop {
+        let node = cursor.node();
+        if !rust_macro_token_node_is_opaque(node.kind()) {
+            if node.child_count() == 0 {
+                let text = node_text(source, node).trim();
+                if !text.is_empty() {
+                    tokens.push(RustMacroToken {
+                        text,
+                        kind: node.kind(),
+                        line: node.start_position().row as u32 + 1,
+                    });
+                }
+            } else if cursor.goto_first_child() {
+                continue;
+            }
         }
-        return;
-    }
-
-    let mut cursor = node.walk();
-    if cursor.goto_first_child() {
-        loop {
-            collect_rust_macro_tokens(source, cursor.node(), tokens);
-            if !cursor.goto_next_sibling() {
-                break;
+        // Move past this subtree: to the next sibling, or up until an
+        // ancestor has one. The cursor cannot climb above `root`.
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return;
             }
         }
     }
@@ -5272,7 +5294,7 @@ fn rust_unrestricted_pub(source: &str, node: tree_sitter::Node) -> bool {
 
 fn rust_api_facts(source: &str, root: tree_sitter::Node, file: &str) -> RustApiFacts {
     let mut facts = RustApiFacts::default();
-    rust_collect_api_facts(source, root, file, &[], &mut facts);
+    rust_collect_api_facts(source, root, file, &[], &mut facts, 0);
     let mut owners = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
@@ -5324,13 +5346,28 @@ fn rust_api_facts(source: &str, root: tree_sitter::Node, file: &str) -> RustApiF
     facts
 }
 
+/// How many modules and item macros [`rust_collect_api_facts`] descends
+/// through, counted together. Real code nests a handful; past the bound the
+/// items are left undescribed rather than recursing further, because each
+/// level costs a stack frame (a stack overflow aborts the process) and
+/// copies the module path, so a file of thousands of nested modules would
+/// otherwise take quadratic time and memory.
+const MAX_RUST_API_NESTING: usize = 64;
+
+/// Adds to `facts` the modules, uses and items declared directly in `root`
+/// and, through module bodies and item macros, below it. `depth` is how many
+/// modules and item macros enclose `root`.
 fn rust_collect_api_facts(
     source: &str,
     root: tree_sitter::Node,
     file: &str,
     scope: &[String],
     facts: &mut RustApiFacts,
+    depth: usize,
 ) {
+    if depth > MAX_RUST_API_NESTING {
+        return;
+    }
     let gated = rust_children_cfg_test_gated(source, root);
     for (node, gated) in gated {
         if gated {
@@ -5367,7 +5404,7 @@ fn rust_collect_api_facts(
                     path_override,
                 });
                 if let Some(body) = body {
-                    rust_collect_api_facts(source, body, file, &nested, facts);
+                    rust_collect_api_facts(source, body, file, &nested, facts, depth + 1);
                 }
             }
             "use_declaration" => {
@@ -5436,7 +5473,7 @@ fn rust_collect_api_facts(
                 // Declarative item macros often pass Rust items as their input.
                 // Parse those items rather than making the whole module public.
                 if let Some(tokens) = find_child_by_kind(node, "token_tree") {
-                    rust_collect_api_macro_items(source, tokens, file, scope, facts);
+                    rust_collect_api_macro_items(source, tokens, file, scope, facts, depth + 1);
                 }
                 if let Some(name) = node.child_by_field_name("macro") {
                     let mut cursor = root.walk();
@@ -5469,6 +5506,7 @@ fn rust_collect_api_facts(
                                             file,
                                             scope,
                                             facts,
+                                            depth + 1,
                                         );
                                     }
                                 }
@@ -5516,6 +5554,7 @@ fn rust_collect_api_macro_items(
     file: &str,
     scope: &[String],
     facts: &mut RustApiFacts,
+    depth: usize,
 ) {
     let text = node_text(source, tokens);
     if text.len() < 2 {
@@ -5527,6 +5566,7 @@ fn rust_collect_api_macro_items(
         file,
         scope,
         facts,
+        depth,
     );
 }
 
@@ -5575,6 +5615,7 @@ fn rust_collect_api_macro_text(
     file: &str,
     scope: &[String],
     facts: &mut RustApiFacts,
+    depth: usize,
 ) {
     if interior.contains('$') {
         return;
@@ -5583,7 +5624,7 @@ fn rust_collect_api_macro_text(
     let mut analyzer = DeadCodeFileAnalyzer::default();
     if let Some(tree) = analyzer.parse_source(LangId::Rust, &padded) {
         if !tree.root_node().has_error() {
-            rust_collect_api_facts(&padded, tree.root_node(), file, scope, facts);
+            rust_collect_api_facts(&padded, tree.root_node(), file, scope, facts, depth);
         }
     }
 }
@@ -6429,6 +6470,10 @@ fn export_source_module(source: &str, node: tree_sitter::Node) -> Option<String>
         .and_then(|source_node| string_literal_content(source, source_node))
 }
 
+/// The first node of kind `kind` below `node`, in source order (`node`
+/// itself excluded). The search keeps its place in a tree cursor rather than
+/// recursing, so a deeply nested file cannot overflow the stack, which
+/// would abort the process.
 fn find_child_by_kind<'tree>(
     node: tree_sitter::Node<'tree>,
     kind: &str,
@@ -6438,18 +6483,20 @@ fn find_child_by_kind<'tree>(
         return None;
     }
     loop {
-        let child = cursor.node();
-        if child.kind() == kind {
-            return Some(child);
+        if cursor.node().kind() == kind {
+            return Some(cursor.node());
         }
-        if let Some(descendant) = find_child_by_kind(child, kind) {
-            return Some(descendant);
+        if cursor.goto_first_child() {
+            continue;
         }
-        if !cursor.goto_next_sibling() {
-            break;
+        // Move past this subtree: to the next sibling, or up until an
+        // ancestor has one. The cursor cannot climb above `node`.
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() || cursor.node().id() == node.id() {
+                return None;
+            }
         }
     }
-    None
 }
 
 fn string_literal_content(source: &str, node: tree_sitter::Node) -> Option<String> {

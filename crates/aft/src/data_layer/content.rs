@@ -1194,7 +1194,7 @@ mod tests {
     }
 
     mod deeply_nested_files_extract_on_a_small_stack {
-        use super::{extract_on_a_small_stack, nested};
+        use super::{extract_on_a_small_stack, nested, NESTING};
 
         deep_nesting_tests! {
             swift: "deep.swift" => format!("import Foundation\nlet x = {}\n", nested("(", "1", ")"));
@@ -1211,6 +1211,13 @@ mod tests {
             javascript: "deep.js" => format!("import {{ a }} from './a';\nconst x = {};\n", nested("(", "1", ")"));
             python: "deep.py" => format!("import os\nx = {}\n", nested("(", "1", ")"));
             rust: "deep.rs" => format!("use std::fmt;\nfn f() {{ let x = {}; }}\n", nested("(", "1", ")"));
+            rust_macro_tokens: "deep_macro.rs" => format!("fn f() {{ m!{}; }}\n", nested("(", "x", ")"));
+            rust_modules: "deep_mod.rs" => nested("pub mod a { ", "pub fn f() {}", " }");
+            rust_field_chain: "deep_field.rs" => format!("fn f(a: A) {{ a{}.g(); }}\n", ".b".repeat(NESTING));
+            rust_use_tree: "deep_use.rs" => format!("use {};\n", nested("a::{", "b", "}"));
+            cpp_qualified_name: "deep_name.cpp" => format!("int x = {}f();\n", "a::".repeat(NESTING));
+            javascript_closures: "deep_closures.js" => format!("const f = {};\n", nested("() => (", "g()", ")"));
+            yaml_mappings: "deep_map.yaml" => format!("image: {}\n", nested("{a: ", "1", "}"));
             go: "deep.go" => format!("package p\nimport \"fmt\"\nvar x = {}\n", nested("(", "1", ")"));
             zig: "deep.zig" => format!("const std = @import(\"std\");\nconst x = {};\n", nested("(", "1", ")"));
             bash: "deep.sh" => format!("source ./a.sh\n{}\n", nested("( ", "true", " )"));

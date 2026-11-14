@@ -1584,17 +1584,22 @@ fn receiver_type<'tree, N: Nav<'tree>>(
             return field(receiver, &["function"]).map(|n| format!("@return:{}", text(n, source)));
         }
         if receiver.kind() == "field_expression" {
-            let base = receiver_type(
-                field(receiver, &["value"])?,
-                call,
-                source,
-                language,
-                facts,
-                rust_index,
-                nav,
-            )?;
-            let member = text(field(receiver, &["field"])?, source);
-            return Some(format!("@field:{base}|{member}"));
+            // `a.b.c` nests to the left. Collect the members from the outer
+            // field inward and type the innermost receiver once, rather
+            // than recursing per field: a chain can be as long as the
+            // source writes it, and a stack overflow aborts the process.
+            let mut members = Vec::new();
+            let mut base = receiver;
+            while base.kind() == "field_expression" {
+                members.push(field(base, &["field"]));
+                base = field(base, &["value"])?;
+            }
+            let mut typed = receiver_type(base, call, source, language, facts, rust_index, nav)?;
+            for member in members.into_iter().rev() {
+                let member = text(member?, source);
+                typed = format!("@field:{typed}|{member}");
+            }
+            return Some(typed);
         }
     }
     match language {

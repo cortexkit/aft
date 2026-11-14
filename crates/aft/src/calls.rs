@@ -272,34 +272,43 @@ fn computed_member_literal(text: &str) -> Option<String> {
 }
 
 /// Extract the last segment of a member expression (the method/property name).
+///
+/// A name can nest in a name, as in C++'s right-nested `a::b::c`, as deep as
+/// the source writes it, so the descent is a loop rather than recursion: a
+/// stack overflow would abort the process. Every step of the descent ends
+/// in a result (the fallback always yields a segment), so following the
+/// `name` field or a generic wrapper is final, as a recursive call
+/// returning its result would be.
 fn extract_last_segment(node: &tree_sitter::Node, source: &str) -> Option<String> {
-    let node = strip_generic_callee_wrapper(*node);
-    if let Some(name) = node.child_by_field_name("name") {
-        if let Some(segment) = extract_last_segment(&name, source) {
-            return Some(segment);
+    let mut node = *node;
+    'descend: loop {
+        node = strip_generic_callee_wrapper(node);
+        if let Some(name) = node.child_by_field_name("name") {
+            node = name;
+            continue;
         }
-    }
 
-    let child_count = node.child_count();
-    // Walk children from the end looking for an identifier-like node
-    for i in (0..child_count).rev() {
-        if let Some(child) = node.child(i as u32) {
-            match child.kind() {
-                "property_identifier" | "field_identifier" | "identifier" => {
-                    return Some(source[child.byte_range()].to_string());
-                }
-                "generic_function" | "generic_name" | "template_function" | "template_method" => {
-                    if let Some(segment) = extract_last_segment(&child, source) {
-                        return Some(segment);
+        let child_count = node.child_count();
+        // Walk children from the end looking for an identifier-like node
+        for i in (0..child_count).rev() {
+            if let Some(child) = node.child(i as u32) {
+                match child.kind() {
+                    "property_identifier" | "field_identifier" | "identifier" => {
+                        return Some(source[child.byte_range()].to_string());
                     }
+                    "generic_function" | "generic_name" | "template_function"
+                    | "template_method" => {
+                        node = child;
+                        continue 'descend;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
+        // Fallback: full text, last dot segment
+        let text = &source[node.byte_range()];
+        return text.rsplit('.').next().map(|s| s.trim().to_string());
     }
-    // Fallback: full text, last dot segment
-    let text = &source[node.byte_range()];
-    text.rsplit('.').next().map(|s| s.trim().to_string())
 }
 
 /// Extract type-reference names within a byte range of the AST.
@@ -1157,49 +1166,39 @@ pub(crate) fn rust_name_is_shadowed_at(
     false
 }
 
+/// Whether a `let` condition anywhere in `condition` (itself included) binds
+/// `name`. The search keeps its pending nodes on the heap rather than
+/// recursing, so a deeply nested condition cannot overflow the stack.
 fn rust_let_condition_binds_name(
     condition: tree_sitter::Node<'_>,
     source: &str,
     name: &str,
 ) -> bool {
-    if condition.kind() == "let_condition"
-        && condition
-            .child_by_field_name("pattern")
-            .or_else(|| condition.named_child(0))
-            .is_some_and(|pattern| rust_pattern_binds_name(pattern, source, name))
-    {
-        return true;
-    }
-
-    let mut cursor = condition.walk();
-    if cursor.goto_first_child() {
-        loop {
-            if rust_let_condition_binds_name(cursor.node(), source, name) {
-                return true;
-            }
-            if !cursor.goto_next_sibling() {
-                break;
-            }
+    let mut pending = vec![condition];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "let_condition"
+            && node
+                .child_by_field_name("pattern")
+                .or_else(|| node.named_child(0))
+                .is_some_and(|pattern| rust_pattern_binds_name(pattern, source, name))
+        {
+            return true;
         }
+        pending.extend(node.children(&mut node.walk()));
     }
     false
 }
 
+/// Whether an identifier `name` occurs anywhere in `node` (itself
+/// included). The search keeps its pending nodes on the heap rather than
+/// recursing, so a deeply nested pattern cannot overflow the stack.
 fn rust_pattern_binds_name(node: tree_sitter::Node<'_>, source: &str, name: &str) -> bool {
-    if node.kind() == "identifier" && &source[node.byte_range()] == name {
-        return true;
-    }
-
-    let mut cursor = node.walk();
-    if cursor.goto_first_child() {
-        loop {
-            if rust_pattern_binds_name(cursor.node(), source, name) {
-                return true;
-            }
-            if !cursor.goto_next_sibling() {
-                break;
-            }
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "identifier" && &source[node.byte_range()] == name {
+            return true;
         }
+        pending.extend(node.children(&mut node.walk()));
     }
     false
 }

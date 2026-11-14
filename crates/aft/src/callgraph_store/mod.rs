@@ -2152,28 +2152,41 @@ fn rust_import_from_use_node(source: &str, node: Node<'_>) -> Option<ImportState
     })
 }
 
+/// The leaf paths a `use` tree imports, each with the byte range of its
+/// leaf. Paths and nested lists can be as deep as the source writes them, so
+/// both walks are loops over heap state rather than recursion: a stack
+/// overflow would abort the process.
 fn rust_use_leaf_paths(source: &str, root: Node<'_>) -> Vec<(String, std::ops::Range<usize>)> {
+    /// The text of a path, its segments joined by `::`; a segment the
+    /// syntax tree lacks reads as empty.
     fn path_text(source: &str, node: Node<'_>) -> String {
-        if node.kind() == "scoped_identifier" {
-            let prefix = node
-                .child_by_field_name("path")
-                .map(|path| path_text(source, path))
-                .unwrap_or_default();
-            let name = node
-                .child_by_field_name("name")
-                .map(|name| node_text(name, source))
-                .unwrap_or_default();
-            format!("{prefix}::{name}")
-        } else {
-            node_text(node, source).to_string()
+        // `a::b::c` nests to the left: collect the names from the last
+        // segment inward, then join them from the innermost path out.
+        let mut names = Vec::new();
+        let mut current = Some(node);
+        while let Some(path) = current.filter(|path| path.kind() == "scoped_identifier") {
+            names.push(
+                path.child_by_field_name("name")
+                    .map(|name| node_text(name, source))
+                    .unwrap_or_default(),
+            );
+            current = path.child_by_field_name("path");
         }
+        let mut text = current
+            .map(|innermost| node_text(innermost, source).to_string())
+            .unwrap_or_default();
+        for name in names.iter().rev() {
+            text.push_str("::");
+            text.push_str(name);
+        }
+        text
     }
-    fn walk(
-        source: &str,
-        node: Node<'_>,
-        prefix: &str,
-        paths: &mut Vec<(String, std::ops::Range<usize>)>,
-    ) {
+    let mut paths = Vec::new();
+    // Use trees still to visit, each with the path prefix of the lists
+    // around it. Children are pushed in reverse so paths come out in
+    // source order.
+    let mut pending = vec![(root, String::new())];
+    while let Some((node, prefix)) = pending.pop() {
         if node.kind() == "scoped_use_list" {
             let path = node
                 .child_by_field_name("path")
@@ -2185,14 +2198,16 @@ fn rust_use_leaf_paths(source: &str, root: Node<'_>) -> Vec<(String, std::ops::R
                 format!("{prefix}::{path}")
             };
             if let Some(list) = node.child_by_field_name("list") {
-                walk(source, list, &joined, paths);
+                pending.push((list, joined));
             }
         } else if node.kind() == "use_list" {
+            let start = pending.len();
             for child in node.named_children(&mut node.walk()) {
                 if !matches!(child.kind(), "line_comment" | "block_comment") {
-                    walk(source, child, prefix, paths);
+                    pending.push((child, prefix.clone()));
                 }
             }
+            pending[start..].reverse();
         } else {
             let (path, alias) = if node.kind() == "use_as_clause" {
                 (
@@ -2206,7 +2221,7 @@ fn rust_use_leaf_paths(source: &str, root: Node<'_>) -> Vec<(String, std::ops::R
                 (path_text(source, node), None)
             };
             let mut joined = if path == "self" && !prefix.is_empty() {
-                prefix.to_string()
+                prefix
             } else if prefix.is_empty() {
                 path
             } else {
@@ -2221,8 +2236,6 @@ fn rust_use_leaf_paths(source: &str, root: Node<'_>) -> Vec<(String, std::ops::R
             }
         }
     }
-    let mut paths = Vec::new();
-    walk(source, root, "", &mut paths);
     paths
 }
 
