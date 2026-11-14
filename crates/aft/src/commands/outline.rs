@@ -17,8 +17,8 @@ use crate::edit;
 use crate::error::AftError;
 use crate::inspect::job::is_test_file;
 use crate::parser::{
-    detect_language, node_range_with_decorators, node_text, FileParser, LangId, ParsedFile,
-    RustModule, TreeSitterProvider,
+    node_range_with_decorators, node_text, FileParser, LangId, ParsedFile, RustModule,
+    TreeSitterProvider,
 };
 use crate::protocol::{RawRequest, Response};
 use crate::symbols::{Range, Symbol};
@@ -29,6 +29,10 @@ const BINARY_SAMPLE_BYTES: usize = 4 * 1024;
 const OUTLINE_FILE_WALK_CAP: usize = 200;
 const OUTLINE_FILE_COLLECTION_CAP: usize = 10_000;
 const TYPE_MEMBER_PREVIEW_CAP: usize = 3;
+
+fn detect_language(path: &Path) -> Option<LangId> {
+    crate::parser::detect_language_any(path, cfg!(feature = "wasm-grammars"))
+}
 
 #[cfg(test)]
 thread_local! {
@@ -161,6 +165,9 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             "skipped_files": skipped_files,
             "content_files": rendered.content_files,
         });
+        if !rendered.gaps.is_empty() {
+            body["gaps"] = serde_json::json!(rendered.gaps);
+        }
         if rendered.deadline_reached {
             body["deadline_reached"] = serde_json::json!(true);
         }
@@ -204,6 +211,9 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             "skipped_files": skipped_files,
             "content_files": rendered.content_files,
         });
+        if !rendered.gaps.is_empty() {
+            body["gaps"] = serde_json::json!(rendered.gaps);
+        }
         if rendered.deadline_reached {
             body["deadline_reached"] = serde_json::json!(true);
         }
@@ -282,7 +292,14 @@ fn outline_single_target(req: &RawRequest, ctx: &AppContext, file: &str) -> Resp
 /// Outline one file already resolved to a readable local `path`; `file` is
 /// the caller's spelling (a URL for a downloaded document).
 fn outline_single_file(req: &RawRequest, ctx: &AppContext, path: PathBuf, file: &str) -> Response {
-    let symbols = match crate::parser::list_symbols_shared(ctx.provider(), &path, false) {
+    if let Err(error) = crate::data_layer::grammar::prepare(ctx, &path) {
+        return crate::data_layer::grammar::error_response(&req.id, &error);
+    }
+    let symbols = match crate::parser::list_symbols_shared(
+        ctx.provider(),
+        &path,
+        cfg!(feature = "wasm-grammars"),
+    ) {
         Ok(s) => s,
         Err(e) => {
             return Response::error(&req.id, e.code(), e.to_string());
@@ -294,7 +311,8 @@ fn outline_single_file(req: &RawRequest, ctx: &AppContext, path: PathBuf, file: 
         .as_any()
         .downcast_ref::<TreeSitterProvider>()
         .map(|provider| FileParser::with_symbol_cache(provider.symbol_cache()))
-        .unwrap_or_else(FileParser::new);
+        .unwrap_or_else(FileParser::new)
+        .with_dynamic_languages(cfg!(feature = "wasm-grammars"));
     let structure = if detect_language(&path) == Some(LangId::Rust)
         && ctx.provider().as_any().is::<TreeSitterProvider>()
     {
@@ -2205,9 +2223,13 @@ fn populate_rendered_file_symbols(
             if metadata.len() > MAX_OUTLINE_FILE_BYTES {
                 0
             } else {
-                crate::parser::list_symbols_shared(ctx.provider(), &path, false)
-                    .map(|symbols| symbols.len())
-                    .unwrap_or(0)
+                crate::parser::list_symbols_shared(
+                    ctx.provider(),
+                    &path,
+                    cfg!(feature = "wasm-grammars"),
+                )
+                .map(|symbols| symbols.len())
+                .unwrap_or(0)
             }
         });
         entry.symbols = Some(symbols);
@@ -2689,9 +2711,12 @@ fn outline_many_files(
         .as_any()
         .downcast_ref::<TreeSitterProvider>()
         .map(|provider| {
-            FileParser::with_symbol_cache(provider.symbol_cache()).with_source_capture()
+            FileParser::with_symbol_cache(provider.symbol_cache())
+                .with_source_capture()
+                .with_dynamic_languages(cfg!(feature = "wasm-grammars"))
         });
-    let mut fallback_parser = FileParser::new();
+    let mut fallback_parser =
+        FileParser::new().with_dynamic_languages(cfg!(feature = "wasm-grammars"));
 
     for (examined, (index, file, path, rel_path)) in ordered.into_iter().enumerate() {
         if path
@@ -2733,6 +2758,22 @@ fn outline_many_files(
             continue;
         }
 
+        if detect_language(&path) == Some(LangId::Luau) {
+            if let Err(error) = crate::data_layer::grammar::prepare(ctx, &path) {
+                writer.content_incomplete = true;
+                if !writer.push_text(
+                    format!("{rel_path}\n{}", error),
+                    Vec::new(),
+                    Some(path.clone()),
+                ) {
+                    break;
+                }
+                let mut gap = error.to_error_json();
+                gap["path"] = serde_json::json!(path);
+                writer.gaps.push(gap);
+                continue;
+            }
+        }
         if let Some(reason) = outline_skip_reason(&path, batch_parser.as_mut()) {
             if let Some(parser) = batch_parser.as_mut() {
                 parser.evict_parse_tree(&path);
@@ -2865,7 +2906,8 @@ fn fallback_file_structure(
     req_id: &str,
     session_id: &str,
 ) -> Result<Vec<OutlineEntry>, AftError> {
-    let symbols = crate::parser::list_symbols_shared(ctx.provider(), path, false)?;
+    let symbols =
+        crate::parser::list_symbols_shared(ctx.provider(), path, cfg!(feature = "wasm-grammars"))?;
     let mut entries =
         outline_structure_entries(path, &symbols, parser, ctx, req_id, session_id, true, None)?;
     if detect_language(path) == Some(LangId::Rust) {
@@ -3716,6 +3758,7 @@ fn format_single_file_tree(filename: &str, entries: &[OutlineEntry]) -> String {
 /// The rendered structure map for a batch of files, built incrementally by
 /// [`MultiFileTreeWriter`] in path order.
 struct RenderedOutline {
+    gaps: Vec<serde_json::Value>,
     text: String,
     /// The output byte budget cut the map.
     truncated: bool,
@@ -3757,6 +3800,7 @@ fn outline_structure_footer(
 /// that the budget is spent. The files never offered count toward the total
 /// in the footer but are not shown.
 struct MultiFileTreeWriter {
+    gaps: Vec<serde_json::Value>,
     output: String,
     truncated: bool,
     /// The request's file list was cut before outlining.
@@ -3794,6 +3838,7 @@ impl MultiFileTreeWriter {
             + 2;
         Self {
             output: String::new(),
+            gaps: Vec::new(),
             truncated: false,
             files_capped: budget.files_capped,
             deadline_reached: false,
@@ -3962,6 +4007,7 @@ impl MultiFileTreeWriter {
             output.push_str(&footer);
         }
         RenderedOutline {
+            gaps: self.gaps,
             text: output,
             truncated: self.truncated,
             cut_short: self.files_capped || self.deadline_reached,

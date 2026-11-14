@@ -2511,6 +2511,43 @@ pub fn serialized_response<T: Serialize>(req_id: &str, operation: &str, value: &
     }
 }
 
+pub(crate) fn serialized_response_with_view<T: Serialize>(
+    req_id: &str,
+    operation: &str,
+    value: &T,
+    view: Option<&crate::data_layer::checkout::CheckoutView>,
+) -> Response {
+    response_with_view(serialized_response(req_id, operation, value), view)
+}
+
+pub(crate) fn response_with_view(
+    mut response: Response,
+    view: Option<&crate::data_layer::checkout::CheckoutView>,
+) -> Response {
+    fn touches_luau(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
+                (key.contains("file") && value.as_str().is_some_and(|path| path.ends_with(".luau")))
+                    || touches_luau(value)
+            }),
+            serde_json::Value::Array(values) => values.iter().any(touches_luau),
+            _ => false,
+        }
+    }
+    // Luau requires cannot cross into built-in languages. A missing Luau
+    // caller can affect a Luau traversal, but not a built-in-only answer.
+    if response.success && touches_luau(&response.data) {
+        if let Some(view) = view {
+            crate::data_layer::surfaces::disclose_parse_gaps(
+                view,
+                &[view.root().to_path_buf()],
+                &mut response,
+            );
+        }
+    }
+    response
+}
+
 pub fn serialization_error_response(
     req_id: &str,
     operation: &str,
@@ -3431,7 +3468,7 @@ fn content_matches_store(
 /// derived for each language it can be parsed as: any of them matching still
 /// proves the record was extracted from these bytes.
 fn data_layer_record_keys(file: &str, current: blake3::Hash) -> Vec<String> {
-    use crate::data_layer::content::{language_for, EXTRACTOR_VERSION};
+    use crate::data_layer::content::{language_for, record_key};
     let content =
         aft_store::ids::ContentKey::from_digest(aft_store::ids::Digest128::from_hash(&current));
     let languages = if Path::new(file)
@@ -3444,11 +3481,7 @@ fn data_layer_record_keys(file: &str, current: blake3::Hash) -> Vec<String> {
     };
     languages
         .iter()
-        .map(|language| {
-            aft_store::content::RecordKey::new(content, language, EXTRACTOR_VERSION)
-                .digest()
-                .to_string()
-        })
+        .map(|language| record_key(content, language).digest().to_string())
         .collect()
 }
 

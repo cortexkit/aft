@@ -568,6 +568,7 @@ impl Work {
             }
             match result {
                 Ok(report) => {
+                    let _ = work.checkout.retry_grammar_gaps();
                     *work
                         .retry
                         .lock()
@@ -684,6 +685,10 @@ impl Work {
                     work.notify_status_change();
                 }
                 if matches!(result, Ok(Some(_))) {
+                    let retried_grammar = work.checkout.retry_grammar_gaps().unwrap_or(false);
+                    if retried_grammar {
+                        *work.publish_requested.lock() = Publish::Always;
+                    }
                     if result
                         .as_ref()
                         .is_ok_and(|stats| stats.as_ref().is_some_and(|stats| stats.cold_build))
@@ -691,6 +696,18 @@ impl Work {
                         // A cold fallback already published its content, just
                         // as start_build does, so semantic search can embed and
                         // index the newly published content.
+                        work.start_fill();
+                    }
+                    // Grammar readiness can race the scan or refresh that
+                    // records its gap. Retry after extraction too, and fill
+                    // once the refreshed records have become visible.
+                    #[cfg(feature = "wasm-grammars")]
+                    if work.checkout.view().is_some_and(|view| {
+                        view.current_state()
+                            .paths()
+                            .iter()
+                            .any(|record| record.language == "luau")
+                    }) {
                         work.start_fill();
                     }
                     continue;
@@ -1382,6 +1399,29 @@ impl DataCheckout {
             settle: Arc::clone(&work.settle),
         });
         crate::write_intent::register_listener(&listener);
+        #[cfg(feature = "wasm-grammars")]
+        {
+            let ready = crate::grammar::registry().subscribe();
+            let weak = Arc::downgrade(&work);
+            let _ = std::thread::Builder::new()
+                .name("aft-grammar-refresh".into())
+                .spawn(move || loop {
+                    match ready.recv_timeout(Duration::from_secs(1)) {
+                        Ok(_) => {
+                            let Some(work) = weak.upgrade() else {
+                                break;
+                            };
+                            if work.checkout.retry_grammar_gaps().unwrap_or(false) {
+                                work.start_refresh(Publish::Always);
+                                work.start_fill();
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                            if weak.strong_count() != 0 => {}
+                        _ => break,
+                    }
+                });
+        }
         // A bind may have recorded what changed while nothing watched.
         work.catch_up(Publish::WhenMany);
         let checkout = Arc::new(Self {
@@ -1705,6 +1745,8 @@ pub(crate) fn rebind_configured(ctx: &crate::context::AppContext) {
 /// root is unbound and nothing watches it, or just before a configure whose
 /// watcher event has not arrived yet.
 pub(crate) fn root_bound(ctx: &crate::context::AppContext) {
+    #[cfg(feature = "wasm-grammars")]
+    crate::grammar::configure(&ctx.config());
     use super::tools::inspect::{note_root, RootKind};
     if let Some(root) = ctx.canonical_cache_root_opt() {
         // A folder of repositories is checked first: configure switches its

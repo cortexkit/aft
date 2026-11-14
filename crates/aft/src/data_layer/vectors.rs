@@ -144,7 +144,72 @@ fn native_path(path: &[u8]) -> Option<PathBuf> {
 /// Whether meaning search covers the file at `path`: today's semantic
 /// index embeds files with its name or extension.
 fn is_semantic_path(path: &[u8]) -> bool {
-    native_path(path).is_some_and(|path| is_semantic_indexed_extension(&path))
+    native_path(path).is_some_and(|path| is_semantic_indexed_extension(&path) || is_luau(&path))
+}
+
+fn is_luau(path: &Path) -> bool {
+    crate::parser::detect_language_any(path, cfg!(feature = "wasm-grammars"))
+        == Some(crate::parser::LangId::Luau)
+}
+
+/// Only Luau chunk maps carry grammar identity. Vector text digests and every
+/// built-in map keep their existing inputs, so unchanged text stays reusable.
+fn map_content(content: ContentKey, path: &[u8]) -> ContentKey {
+    if !native_path(path).is_some_and(|path| is_luau(&path)) {
+        return content;
+    }
+    let mut hash = blake3::Hasher::new_derive_key("aft Luau grammar chunk map");
+    hash.update(content.digest().as_bytes());
+    hash.update(super::content::keyed_language("luau").as_bytes());
+    ContentKey::from_digest(aft_store::ids::Digest128::from_hash(&hash.finalize()))
+}
+
+fn cut_stored(
+    view: &CheckoutView,
+    path: &[u8],
+    bytes: &[u8],
+    caps: EmbedTextCaps,
+) -> Result<Option<Cut>, DataError> {
+    let Some(relative) = native_path(path).filter(|path| is_luau(path)) else {
+        return Ok(None);
+    };
+    let Some(outline) = view.outline_symbols(path)? else {
+        return Ok(None);
+    };
+    let symbols = outline
+        .symbols
+        .iter()
+        .filter_map(super::content::symbol_from_outline)
+        .collect::<Vec<_>>();
+    let source = match std::str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => return Ok(Some(Cut::Failed(error.to_string()))),
+    };
+    let chunks = crate::semantic_index::symbols_to_chunks_with_caps(
+        &view.root().join(relative),
+        &symbols,
+        source,
+        view.root(),
+        caps,
+    );
+    Ok(Some(Cut::Chunks(
+        chunks
+            .into_iter()
+            .map(|chunk| CutChunk {
+                exported: chunk.exported,
+                detail: ChunkDetail {
+                    kind: kind_code(&chunk.kind),
+                    start_line: chunk.start_line,
+                    end_line: chunk.end_line,
+                    name: chunk.name,
+                    qualified_name: chunk.qualified_name,
+                    snippet: chunk.snippet,
+                    failure: None,
+                },
+                text: chunk.embed_text,
+            })
+            .collect(),
+    )))
 }
 
 /// The code a chunk's kind is stored as.
@@ -246,6 +311,9 @@ fn store_error(error: impl std::fmt::Display + 'static) -> DataError {
 /// search applies to is in exactly one of the file counts.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Coverage {
+    /// Files whose grammar or per-file parse is unavailable, not fill failures.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped_parses: Vec<(PathBuf, String)>,
     /// Member files meaning search applies to (today's semantic file
     /// names and extensions).
     pub files: usize,
@@ -274,13 +342,14 @@ impl Coverage {
     /// embedded, too large, or failed with a reason.
     #[must_use]
     pub fn complete(&self) -> bool {
-        self.pending.is_empty() && self.past_cap == 0
+        self.pending.is_empty() && self.past_cap == 0 && self.skipped_parses.is_empty()
     }
 }
 
 /// One member file of a checkout state that meaning search applies to, as
 /// the store holds it.
 struct Surveyed {
+    gap: Option<String>,
     path: Vec<u8>,
     kind: PathKind,
     content: ContentKey,
@@ -324,6 +393,7 @@ fn survey(
             _ => None,
         };
         files.push(Surveyed {
+            gap: state.skipped_parses().get(&record.path).cloned(),
             path: record.path.clone(),
             kind: record.kind,
             content: record.content,
@@ -427,6 +497,7 @@ impl Loaded {
         content: ContentKey,
         path: &[u8],
     ) -> Result<Option<(u32, Vec<Chunk>)>, DataError> {
+        let content = map_content(content, path);
         let Some(&holder) = self.maps.get(&ChunkMapKey::new(content, path)) else {
             return Ok(None);
         };
@@ -444,6 +515,7 @@ impl Loaded {
         content: ContentKey,
         path: &[u8],
     ) -> Result<FileDetails, DataError> {
+        let content = map_content(content, path);
         index.segments()[holder as usize]
             .chunk_details(content, path)
             .map_err(store_error)?
@@ -548,6 +620,12 @@ impl Members {
         };
         for file in &surveyed {
             let coverage = &mut members.coverage;
+            if let Some(reason) = &file.gap {
+                coverage
+                    .skipped_parses
+                    .push((absolute(&file.path), reason.clone()));
+                continue;
+            }
             match file.kind {
                 PathKind::Oversize => {
                     coverage.files_too_large += 1;
@@ -1337,6 +1415,9 @@ impl VectorPlane {
             report.files = surveyed.len();
             let mut queue = Vec::new();
             for file in surveyed {
+                if file.gap.is_some() {
+                    continue;
+                }
                 if !file.admitted {
                     continue;
                 }
@@ -1399,7 +1480,16 @@ impl VectorPlane {
                         }
                     };
                     let started = Instant::now();
-                    let cut = cut_file(parts.root, &path, &bytes, self.producer.caps);
+                    let cut = if native_path(&path).is_some_and(|path| is_luau(&path)) {
+                        let Some(cut) = cut_stored(&view, &path, &bytes, self.producer.caps)?
+                        else {
+                            files_done += 1;
+                            continue;
+                        };
+                        cut
+                    } else {
+                        cut_file(parts.root, &path, &bytes, self.producer.caps)
+                    };
                     report.chunk_ms += elapsed_ms(started);
                     let chunks = match cut {
                         Cut::Failed(reason) => Err(reason),
@@ -1553,7 +1643,7 @@ impl VectorPlane {
                         report.files_failed += 1;
                         builder
                             .add_chunk_map_with_details(
-                                file.content,
+                                map_content(file.content, &file.path),
                                 &file.path,
                                 &[],
                                 FileDetails {
@@ -1591,7 +1681,7 @@ impl VectorPlane {
                 }
                 builder
                     .add_chunk_map_with_details(
-                        file.content,
+                        map_content(file.content, &file.path),
                         &file.path,
                         &map,
                         FileDetails {
@@ -1822,7 +1912,7 @@ pub(crate) fn merge_vector_segments(
             if !record.kind.has_content() {
                 continue;
             }
-            let key = ChunkMapKey::new(record.content, &record.path);
+            let key = ChunkMapKey::new(map_content(record.content, &record.path), &record.path);
             if !asked.insert(key) {
                 continue;
             }
@@ -1830,13 +1920,13 @@ pub(crate) fn merge_vector_segments(
                 continue;
             };
             let chunks = ours_at(holder)
-                .chunk_map(record.content, &record.path)
+                .chunk_map(map_content(record.content, &record.path), &record.path)
                 .map_err(store_error)?
                 .unwrap_or_default();
-            reached_maps
-                .entry(holder)
-                .or_default()
-                .push((record.content, record.path.clone()));
+            reached_maps.entry(holder).or_default().push((
+                map_content(record.content, &record.path),
+                record.path.clone(),
+            ));
             for chunk in chunks {
                 if let Some(&text_holder) = texts.get(&chunk.text) {
                     reached_texts
@@ -1994,7 +2084,7 @@ pub(crate) fn needed_vector_segments(
             if !record.kind.has_content() {
                 continue;
             }
-            let key = ChunkMapKey::new(record.content, &record.path);
+            let key = ChunkMapKey::new(map_content(record.content, &record.path), &record.path);
             if !asked.insert(key) {
                 continue;
             }
@@ -2006,7 +2096,7 @@ pub(crate) fn needed_vector_segments(
                 let chunks = opened[holder]
                     .as_ref()
                     .expect("a map holder has vector sections")
-                    .chunk_map(record.content, &record.path)
+                    .chunk_map(map_content(record.content, &record.path), &record.path)
                     .map_err(store_error)?
                     .unwrap_or_default();
                 for chunk in chunks {
@@ -2021,6 +2111,7 @@ pub(crate) fn needed_vector_segments(
 }
 
 aft_store::heap_bytes_of_fields!(Coverage {
+    skipped_parses,
     files,
     files_embedded,
     files_too_large,

@@ -805,6 +805,8 @@ impl ChangeContent {
 enum Extracted {
     /// Nothing: not a parsed language, not text, or gone.
     Nothing,
+    /// Text is available, but the dynamic parse has a typed, rebuildable gap.
+    GrammarGap(String),
     /// A parsed file: its parse key and parse, and the content record
     /// they came from, encoded, which a publication of the change stores.
     /// Decoded, a large file's record takes about as much as its parse,
@@ -1301,6 +1303,40 @@ impl Checkout {
     ///
     /// When a path's folder cannot be walked. Nothing is recorded then.
     pub fn record_paths(&self, paths: &[Vec<u8>]) -> Result<(), DataError> {
+        self.record_paths_inner(paths, false)
+    }
+
+    /// Re-read only unavailable grammar members, even when stat and content
+    /// are unchanged. A ready event is not a filesystem edit.
+    pub(crate) fn retry_grammar_gaps(&self) -> Result<bool, DataError> {
+        let paths = {
+            let live = self.live.read().expect("no panics while holding it");
+            let state = live
+                .state
+                .as_deref()
+                .or_else(|| live.published.as_ref().map(|p| &p.state));
+            state
+                .map(|state| {
+                    state
+                        .skipped_parses()
+                        .iter()
+                        .filter(|(_, reason)| {
+                            serde_json::from_str::<serde_json::Value>(reason)
+                                .is_ok_and(|v| v["code"] == "grammar_unavailable")
+                        })
+                        .map(|(path, _)| path.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        if paths.is_empty() || crate::grammar::registry().stored().is_err() {
+            return Ok(false);
+        }
+        self.record_paths_inner(&paths, true)?;
+        Ok(true)
+    }
+
+    fn record_paths_inner(&self, paths: &[Vec<u8>], retry_grammar: bool) -> Result<(), DataError> {
         if paths.is_empty() {
             return Ok(());
         }
@@ -1345,7 +1381,7 @@ impl Checkout {
                 return Ok(());
             };
             let sink = ChangeSink::default();
-            let (state, changed) = if whole {
+            let (state, mut changed) = if whole {
                 let scanned = scan(&self.root, &self.layer.policy, Some(&base), &sink)
                     .map_err(|error| DataError::Scan(error.to_string()))?;
                 let changed = changed_members(&base, &scanned.state);
@@ -1355,7 +1391,27 @@ impl Checkout {
                     .map_err(|error| DataError::Scan(error.to_string()))?;
                 (scanned.state, scanned.changed)
             };
-            if self.apply_scan(&base, generation, state, &changed, sink.finish()) {
+            let mut read = sink.finish()?;
+            if retry_grammar {
+                for path in paths {
+                    let Some(record) = state.get(path) else {
+                        continue;
+                    };
+                    let Ok(relative) = std::str::from_utf8(path) else {
+                        continue;
+                    };
+                    let Ok(bytes) = crate::project_content::read(self.root.join(relative)) else {
+                        continue;
+                    };
+                    if ContentKey::of(&bytes) == record.content {
+                        read.insert(path.clone(), bytes);
+                        changed.push(path.clone());
+                    }
+                }
+                changed.sort_unstable();
+                changed.dedup();
+            }
+            if self.apply_scan(&base, generation, state, &changed, read) {
                 return Ok(());
             }
         }
@@ -1442,6 +1498,22 @@ impl Checkout {
                 .set_language(index, language)
                 .expect("a language a state stores");
         }
+        let gaps = base
+            .skipped_parses()
+            .iter()
+            .filter(|(path, _)| {
+                !changed.contains(path)
+                    && state.get(path).is_some_and(|now| {
+                        base.get(path).is_some_and(|before| {
+                            same_member(before, now) && before.language == now.language
+                        })
+                    })
+            })
+            .map(|(path, reason)| (path.clone(), reason.clone()))
+            .collect();
+        state = state
+            .with_skipped_parses(gaps)
+            .expect("unchanged gap members");
         if changed.is_empty() {
             let mut live = self.write_live();
             if live.generation != generation {
@@ -1774,7 +1846,9 @@ impl Checkout {
         let state =
             CheckoutState::new(scanned.state.git.clone(), scanned.state.conversion, records)
                 .map_err(DataError::store)?
-                .with_root_of(&scanned.state);
+                .with_root_of(&scanned.state)
+                .with_skipped_parses(collected.gaps.clone())
+                .map_err(DataError::store)?;
         if measure {
             use aft_store::heap::HeapBytes as _;
             let mut seen = aft_store::heap::Seen::new();
@@ -2017,8 +2091,9 @@ impl Checkout {
                     .map(|key| key.digest())
             })
             .collect();
+        let version = super::content::graph_version(&state);
         let state = state
-            .with_fragments_for(per_path, EXTRACTOR_VERSION)
+            .with_fragments_for(per_path, &version)
             .map_err(DataError::store)?;
         let written = session
             .write_checkout_state(self.checkout, &state)
@@ -2116,7 +2191,7 @@ impl Checkout {
             }
             match snapshot.checkout_state(state_ref.checkout) {
                 Ok(Some(state))
-                    if state.has_fragments_for(EXTRACTOR_VERSION)
+                    if state.has_fragments_for(&super::content::graph_version(&state))
                         && !state.root().is_some_and(folder_is_gone) =>
                 {
                     siblings.push((*state_ref, state));
@@ -2171,7 +2246,7 @@ impl Checkout {
             CheckoutState::new(scanned.state.git.clone(), scanned.state.conversion, records)
                 .map_err(DataError::store)?
                 .with_root_of(&scanned.state)
-                .with_fragments_for(fragments, EXTRACTOR_VERSION)
+                .with_fragments_for(fragments, &super::content::graph_version(sibling))
                 .map_err(DataError::store)?;
         let scan_ms = elapsed_ms(started);
         checkpoint()?;
@@ -2817,8 +2892,10 @@ impl Checkout {
                         None => {}
                     }
                     if !record.language.is_empty() {
-                        let key =
-                            RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
+                        let key = crate::data_layer::content::record_key(
+                            record.content,
+                            &record.language,
+                        );
                         let holder = if reuse {
                             *match record_holders.entry(key) {
                                 std::collections::hash_map::Entry::Occupied(entry) => {
@@ -3225,6 +3302,22 @@ impl Checkout {
                 .filter(|(_, change)| change.sequence <= covered)
                 .map(|(path, _)| path.clone())
                 .collect::<BTreeSet<_>>();
+            if let Some(state) = &live.state {
+                let mut gaps = state.skipped_parses().clone();
+                for path in &resolved {
+                    gaps.remove(path);
+                    if let Extracted::GrammarGap(reason) = live.changes[path].content.get() {
+                        gaps.insert(path.clone(), reason.clone());
+                    }
+                }
+                live.state = Some(Arc::new(
+                    state
+                        .as_ref()
+                        .clone()
+                        .with_skipped_parses(gaps)
+                        .expect("current change gaps"),
+                ));
+            }
             // The refresh extracted these changes, so each one whose
             // extraction failed now counts as unparsed. The set is copied
             // only when that changes it and a view still holds it.
@@ -3392,7 +3485,10 @@ impl Checkout {
                             .records
                             .insert(name.to_string(), Arc::clone(record));
                     }
-                    Extracted::Config(..) | Extracted::Markers(_) | Extracted::Nothing => {
+                    Extracted::Config(..)
+                    | Extracted::Markers(_)
+                    | Extracted::GrammarGap(_)
+                    | Extracted::Nothing => {
                         engine.refreshed.records.remove(name);
                     }
                 }
@@ -3517,14 +3613,14 @@ impl Checkout {
             let Some(record) = &change.record else {
                 continue;
             };
-            let key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
+            let key = crate::data_layer::content::record_key(record.content, &record.language);
             match change.content.get() {
                 Extracted::Parse(_, _, stored)
                 | Extracted::Config(_, stored)
                 | Extracted::Markers(stored) => {
                     records.add_encoded(key, Arc::clone(stored));
                 }
-                Extracted::Nothing => {}
+                Extracted::GrammarGap(_) | Extracted::Nothing => {}
             }
             if !seen.insert(record.content) {
                 continue;
@@ -3656,7 +3752,7 @@ impl Checkout {
         let state = inputs
             .state
             .clone()
-            .with_fragments_for(per_path, EXTRACTOR_VERSION)
+            .with_fragments_for(per_path, &super::content::graph_version(&inputs.state))
             .map_err(DataError::store)?;
         let written = session
             .write_checkout_state(self.checkout, &state)
@@ -4048,7 +4144,11 @@ impl Checkout {
         published: &Arc<Published>,
         timings: &mut Vec<(&'static str, f64)>,
     ) -> Result<GraphEngine, DataError> {
-        if !published.state.has_fragments_for(EXTRACTOR_VERSION) || !published.graph_built {
+        if !published
+            .state
+            .has_fragments_for(&super::content::graph_version(&published.state))
+            || !published.graph_built
+        {
             return Err(DataError::Damaged(
                 "the call graph was not built by this extractor".to_string(),
             ));
@@ -4293,13 +4393,16 @@ impl Published {
         // supply current records while this publication names old fragments.
         let mut files = Vec::new();
         let mut unparsed = BTreeSet::new();
-        let graph_built = state.has_fragments_for(EXTRACTOR_VERSION);
+        let graph_built = state.has_fragments_for(&super::content::graph_version(&state));
         for (index, record) in state.paths().iter().enumerate() {
             if !graph_built {
                 break;
             }
             let Some(fragment) = state.fragment(index) else {
-                if graph_built && is_unparsed(record) {
+                if graph_built
+                    && is_unparsed(record)
+                    && !state.skipped_parses().contains_key(&record.path)
+                {
                     unparsed.insert(record.path.clone());
                 }
                 continue;
@@ -4307,7 +4410,7 @@ impl Published {
             let Ok(path) = std::str::from_utf8(&record.path) else {
                 continue;
             };
-            let key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
+            let key = crate::data_layer::content::record_key(record.content, &record.language);
             files.push((
                 path.to_string(),
                 key.digest().to_string(),
@@ -4990,7 +5093,9 @@ fn next_inputs(
 ) -> CheckoutInputs {
     let mut parses = previous.parses.clone();
     let mut configs = previous.configs.clone();
+    let mut gaps = state.skipped_parses().clone();
     for path in changed {
+        gaps.remove(path);
         let Ok(name) = std::str::from_utf8(path) else {
             continue;
         };
@@ -5003,11 +5108,17 @@ fn next_inputs(
             Some(Extracted::Config(source, _)) => {
                 configs.insert(path.clone(), Arc::clone(source));
             }
+            Some(Extracted::GrammarGap(reason)) => {
+                gaps.insert(path.clone(), reason.clone());
+            }
             Some(Extracted::Markers(_) | Extracted::Nothing) | None => {}
         }
     }
     CheckoutInputs {
-        state: state.clone(),
+        state: state
+            .clone()
+            .with_skipped_parses(gaps)
+            .expect("typed gaps name current members"),
         parses,
         configs,
     }
@@ -5087,8 +5198,11 @@ fn changed_language(record: &PathRecord, bytes: &[u8]) -> String {
 /// in a build, a file the extractor fails on is not parsed.
 fn extract_recorded(source: &RecordedSource) -> Extracted {
     let language = &source.language;
-    let Ok(mut extracted) = extract(&source.bytes, language) else {
-        return Extracted::Nothing;
+    let mut extracted = match super::grammar::extract(&source.bytes, language) {
+        Ok(record) => record,
+        Err(error) => {
+            return super::grammar::reason(&error).map_or(Extracted::Nothing, Extracted::GrammarGap)
+        }
     };
     if let Ok(path) = std::str::from_utf8(&source.path) {
         // Without them a configuration file's TODOs are reported unread.
@@ -5102,7 +5216,7 @@ fn extract_recorded(source: &RecordedSource) -> Extracted {
         RecordBody::Markers => Extracted::Markers(Arc::new(EncodedRecord::of(&extracted))),
         RecordBody::Parsed { .. } => match blob_from_record(&extracted) {
             Ok(CallgraphBlob::Parse(parse)) => {
-                let key = RecordKey::new(source.content, language, EXTRACTOR_VERSION);
+                let key = crate::data_layer::content::record_key(source.content, language);
                 Extracted::Parse(
                     key.digest().to_string(),
                     Arc::new(parse),
@@ -5278,6 +5392,7 @@ struct BuildSink {
     seen_text: Mutex<HashSet<ContentKey>>,
     /// Each parsed path's language.
     languages: Mutex<HashMap<Vec<u8>, String>>,
+    gaps: Mutex<BTreeMap<Vec<u8>, String>>,
     /// Each extracted record, by the parse key the resolver uses, when the
     /// sink holds records in memory.
     records: Mutex<HashMap<String, (RecordKey, Arc<ContentRecord>)>>,
@@ -5342,6 +5457,7 @@ struct Collected {
     text: TextBuild,
     seen_text: HashSet<ContentKey>,
     languages: HashMap<Vec<u8>, String>,
+    gaps: BTreeMap<Vec<u8>, String>,
     records: HashMap<String, (RecordKey, Arc<ContentRecord>)>,
     /// The staged records, when the scan staged them, and each one's entry
     /// by parse key.
@@ -5365,6 +5481,7 @@ impl BuildSink {
             text_error: Mutex::new(None),
             seen_text: Mutex::default(),
             languages: Mutex::default(),
+            gaps: Mutex::default(),
             records: Mutex::default(),
             stage: None,
             staged: Mutex::default(),
@@ -5401,6 +5518,7 @@ impl BuildSink {
             None => None,
         };
         Ok(Collected {
+            gaps: self.gaps.into_inner().expect("no panics while holding it"),
             text: self.text.into_inner().expect("no panics while holding it"),
             seen_text: self
                 .seen_text
@@ -5480,7 +5598,7 @@ impl ContentSink for BuildSink {
             .lock()
             .expect("no panics while holding it")
             .insert(path.to_vec(), language.clone());
-        let record_key = RecordKey::new(key, &language, EXTRACTOR_VERSION);
+        let record_key = crate::data_layer::content::record_key(key, &language);
         let parse_key = record_key.digest().to_string();
         let held = if self.stage.is_some() {
             self.staged
@@ -5520,7 +5638,7 @@ impl ContentSink for BuildSink {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(record)
             }
-            None => extract(bytes, &language).map(|mut record| {
+            None => super::grammar::extract(bytes, &language).map(|mut record| {
                 // Without them a configuration file's TODOs are reported
                 // unread; the resolver still reads its bytes.
                 let _ = super::content::add_config_markers(&mut record, path_text, bytes);
@@ -5565,7 +5683,14 @@ impl ContentSink for BuildSink {
                     .expect("no panics while holding it")
                     .insert(parse_key, (record_key, Arc::new(record)));
             }
-            Err(_) => {
+            Err(error) => {
+                if let Some(reason) = super::grammar::reason(&error) {
+                    self.gaps
+                        .lock()
+                        .expect("no panics while holding it")
+                        .insert(path.to_vec(), reason);
+                    return;
+                }
                 self.failures
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -5592,7 +5717,8 @@ impl Collected {
             if record.language.is_empty() {
                 continue;
             }
-            let record_key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
+            let record_key =
+                crate::data_layer::content::record_key(record.content, &record.language);
             let parse_key = record_key.digest().to_string();
             let Some((_, stored)) = self.records.get(&parse_key) else {
                 continue;
@@ -5618,7 +5744,8 @@ impl Collected {
             let Ok(path) = std::str::from_utf8(&record.path) else {
                 continue;
             };
-            let record_key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
+            let record_key =
+                crate::data_layer::content::record_key(record.content, &record.language);
             let parse_key = record_key.digest().to_string();
             if converts.get(&parse_key) != Some(&true) {
                 continue;
@@ -6191,7 +6318,7 @@ impl CheckoutView {
         let Some(published) = self.unchanged_record(path) else {
             return Ok(None);
         };
-        let key = RecordKey::new(published.content, &published.language, EXTRACTOR_VERSION);
+        let key = crate::data_layer::content::record_key(published.content, &published.language);
         for segment in self.published.segments.iter().rev() {
             let Some(content) = ContentSegment::open(segment).map_err(DataError::store)? else {
                 continue;
@@ -6459,7 +6586,8 @@ impl Checkout {
                     if view.unparsed.contains(path) {
                         return Ok(PathTodos::Unextracted);
                     }
-                    let key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
+                    let key =
+                        crate::data_layer::content::record_key(record.content, &record.language);
                     for content in &contents {
                         if let Some(ordinal) = content.find(key).map_err(DataError::store)? {
                             note_source_work(&self.root, |work| work.todo_decodes += 1);
@@ -6482,7 +6610,7 @@ impl Checkout {
                         note_source_work(&self.root, |work| work.todo_decodes += 1);
                         PathTodos::Recorded(stored.todos().map_err(DataError::store)?)
                     }
-                    Extracted::Nothing => PathTodos::Unextracted,
+                    Extracted::GrammarGap(_) | Extracted::Nothing => PathTodos::Unextracted,
                 })
             })
             .collect()
@@ -6620,7 +6748,7 @@ impl Checkout {
             .iter()
             .find(|path| path.path == file.as_bytes())
             .unwrap();
-        let key = RecordKey::new(path.content, &path.language, EXTRACTOR_VERSION);
+        let key = crate::data_layer::content::record_key(path.content, &path.language);
         let mut damaged = false;
         for segment in &published.segments {
             let Some(content) = ContentSegment::open(segment).unwrap() else {
@@ -7417,7 +7545,7 @@ pub fn other() { callee(); }
             };
             state.set_language(index, language.clone()).unwrap();
             let content = state.paths()[index].content;
-            let current = RecordKey::new(content, language, EXTRACTOR_VERSION);
+            let current = crate::data_layer::content::record_key(content, language);
             let mut record = (*collected.records[&current.digest().to_string()].1).clone();
             record.extractor_version = version.to_string();
             let key = RecordKey::new(content, language, version);

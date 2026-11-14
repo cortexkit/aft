@@ -403,6 +403,9 @@ pub(crate) fn disclose_index_gaps(
         return;
     };
     let fence = crate::context::confinement::capture();
+    for view in &views {
+        disclose_parse_gaps(view, roots, response);
+    }
     let mut count = 0;
     let mut gaps = Vec::new();
     let mut lines = Vec::new();
@@ -457,6 +460,48 @@ pub(crate) fn disclose_index_gaps(
     } else {
         format!("{note}\n\n{text}")
     });
+}
+
+/// Adds only host-owned grammar diagnostics, preserving gap-free responses.
+pub(crate) fn disclose_parse_gaps(
+    view: &super::checkout::CheckoutView,
+    roots: &[PathBuf],
+    response: &mut crate::protocol::Response,
+) {
+    let fence = crate::context::confinement::capture();
+    let mut gaps = Vec::new();
+    let mut messages = std::collections::BTreeSet::new();
+    for (relative, reason) in view.current_state().skipped_parses() {
+        let path = view.root().join(String::from_utf8_lossy(relative).as_ref());
+        if !roots
+            .iter()
+            .any(|scope| path.starts_with(scope) || scope.starts_with(&path))
+            || !fence.admits_walk_entry(&path)
+        {
+            continue;
+        }
+        if let (Ok(mut gap), Some(message)) = (
+            serde_json::from_str::<Value>(reason),
+            super::grammar::message(reason, &path),
+        ) {
+            gap["path"] = serde_json::json!(path);
+            gap["kind"] = "grammar_unavailable".into();
+            gap["message"] = message.clone().into();
+            gaps.push(gap);
+            messages.insert(message);
+        }
+    }
+    if gaps.is_empty() {
+        return;
+    }
+    response.data["complete"] = false.into();
+    response.data["gaps"] = serde_json::json!(gaps);
+    let text = response.data["text"].as_str().unwrap_or_default();
+    response.data["text"] = format!(
+        "{}\n\n{text}",
+        messages.into_iter().collect::<Vec<_>>().join("\n")
+    )
+    .into();
 }
 
 pub(crate) fn report(ctx: &AppContext) -> Option<DataStoreReport> {

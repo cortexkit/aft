@@ -105,7 +105,10 @@ fn answer_trace_to(req: &RawRequest, ctx: &AppContext) -> Response {
             match serialized_value(&req.id, "trace_to", &result) {
                 Ok(mut value) => {
                     trace::attach_trace_to_envelope(&mut value, envelope.as_ref());
-                    Response::success(&req.id, value)
+                    crate::commands::callgraph_store_adapter::response_with_view(
+                        Response::success(&req.id, value),
+                        data_view.as_ref(),
+                    )
                 }
                 Err(response) => response,
             }

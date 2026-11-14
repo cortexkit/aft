@@ -154,11 +154,11 @@ fn zoom_parse_source(
     if LEGACY_ZOOM_PARSE.with(|legacy| legacy.get()) {
         return FileParser::new().parse_cloned(path);
     }
-    let lang = crate::parser::detect_language_from_source(path, source).ok_or_else(|| {
-        crate::error::AftError::InvalidRequest {
+    let lang = crate::parser::detect_language_from_source(path, source)
+        .or_else(|| crate::parser::detect_language_any(path, cfg!(feature = "wasm-grammars")))
+        .ok_or_else(|| crate::error::AftError::InvalidRequest {
             message: format!("unsupported file extension: {}", path.display()),
-        }
-    })?;
+        })?;
     // Zoom already read these bytes. Parse the displayed source, not a second
     // disk snapshot that can differ if an editor saves during the request.
     Ok((FileParser::parse_source(path, source, lang)?, lang))
@@ -462,6 +462,7 @@ fn handle_zoom_targets(
     // the rest of the batch still answers. The whole call is refused only
     // when no entry is usable, because then there is nothing to return.
     let mut entries = Vec::with_capacity(targets.len());
+    let mut gaps = Vec::new();
     let mut first_refusal: Option<String> = None;
     let mut any_usable = false;
     let mut memo = ZoomTargetMemo {
@@ -485,6 +486,15 @@ fn handle_zoom_targets(
                                 &mut memo,
                             );
                             crate::run_tool_call::progress::report();
+                            if matches!(
+                                response.data["code"].as_str(),
+                                Some("grammar_unavailable" | "grammar_parse_timeout")
+                            ) {
+                                let mut gap = response.data;
+                                gap["path"] = file.into();
+                                gaps.push(gap);
+                                continue;
+                            }
                             // An access ask must reach the host unchanged so it
                             // can ask and retry; inside one batch entry nobody
                             // would see it.
@@ -502,6 +512,15 @@ fn handle_zoom_targets(
                         }
                     }
                     Err(response) => {
+                        if matches!(
+                            response.data["code"].as_str(),
+                            Some("grammar_unavailable" | "grammar_parse_timeout")
+                        ) {
+                            let mut gap = response.data;
+                            gap["path"] = file.into();
+                            gaps.push(gap);
+                            continue;
+                        }
                         if crate::access_policy::is_access_request(&response)
                             || (targets.len() == 1 && response.data["code"] == "denied_floor")
                         {
@@ -542,12 +561,23 @@ fn handle_zoom_targets(
         }
     }
 
-    Response::success(
+    let mut response = Response::success(
         &req.id,
         serde_json::json!({
             "targets": entries,
         }),
-    )
+    );
+    if !gaps.is_empty() {
+        response.data["complete"] = false.into();
+        response.data["text"] = gaps
+            .iter()
+            .filter_map(|gap| gap["message"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into();
+        response.data["gaps"] = serde_json::json!(gaps);
+    }
+    response
 }
 
 /// Merge a top-level file lookup into the target batch without parsing it yet.
@@ -1513,9 +1543,12 @@ fn zoom_one_symbol_inner(
         );
     }
 
+    if let Err(error) = crate::data_layer::grammar::prepare(ctx, path) {
+        return crate::data_layer::grammar::error_response(&req.id, &error);
+    }
     let matches = match resolve_zoom_symbol(ctx.provider(), path, symbol_name, is_heading) {
         Ok(matches) => matches,
-        Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+        Err(e) => return crate::data_layer::grammar::error_response(&req.id, &e),
     };
 
     // LSP-enhanced disambiguation (S03)
@@ -2031,6 +2064,24 @@ fn resolve_zoom_symbol(
     let (name, anchor_line) = split_zoom_line_anchor(query);
     let matches = if is_heading {
         resolve_heading_symbols(provider, path, name)?
+    } else if crate::parser::detect_language_any(path, cfg!(feature = "wasm-grammars"))
+        == Some(LangId::Luau)
+    {
+        crate::parser::list_symbols_shared(provider, path, true)?
+            .iter()
+            .filter(|symbol| {
+                symbol.name == name
+                    || symbol.parent.as_ref().is_some_and(|parent| {
+                        format!("{parent}.{}", symbol.name) == name
+                            || format!("{parent}:{}", symbol.name) == name
+                    })
+            })
+            .cloned()
+            .map(|symbol| SymbolMatch {
+                file: path.display().to_string(),
+                symbol,
+            })
+            .collect()
     } else {
         match provider.resolve_symbol(path, name) {
             Err(crate::error::AftError::SymbolNotFound { .. }) => Vec::new(),

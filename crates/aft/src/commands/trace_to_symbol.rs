@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::commands::callgraph_store_adapter::{
-    ensure_symbol_resolves, note_callgraph_served, serialized_response, serialized_value,
+    ensure_symbol_resolves, note_callgraph_served, serialized_response_with_view, serialized_value,
     store_error_response, trace_to_symbol_candidates, trace_to_symbol_result,
 };
 use crate::context::AppContext;
@@ -181,7 +181,7 @@ fn answer_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     match outcome {
         Ok(result) => {
             note_callgraph_served(ctx, "trace_to_symbol", 0, "ok");
-            serialized_response(&req.id, "trace_to_symbol", &result)
+            serialized_response_with_view(&req.id, "trace_to_symbol", &result, data_view.as_ref())
         }
         Err(error) => store_error_response(&req.id, "trace_to_symbol", error),
     }

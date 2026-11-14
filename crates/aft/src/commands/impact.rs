@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::commands::callgraph_store_adapter::serialized_response;
+use crate::commands::callgraph_store_adapter::serialized_response_with_view;
 use crate::commands::callgraph_store_adapter::{
     impact_result, note_callgraph_served, store_error_response,
 };
@@ -94,7 +94,7 @@ fn answer_impact(req: &RawRequest, ctx: &AppContext) -> Response {
     match outcome {
         Ok(result) => {
             note_callgraph_served(ctx, "impact", 0, "ok");
-            serialized_response(&req.id, "impact", &result)
+            serialized_response_with_view(&req.id, "impact", &result, data_view.as_ref())
         }
         Err(error) => store_error_response(&req.id, "impact", error),
     }

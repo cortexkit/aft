@@ -92,6 +92,53 @@ fn config_language(path: &Path) -> String {
 /// [`TodoLanguage::name`]), such as `markers-markdown`.
 pub const MARKERS_PREFIX: &str = "markers-";
 
+/// Record identity is language-local: changing Luau never invalidates a
+/// built-in language's records. Extraction always receives the bare name.
+pub fn keyed_language(language: &str) -> std::borrow::Cow<'_, str> {
+    if language == "luau" {
+        format!(
+            "luau@{}:{}",
+            crate::grammar::manifest().sha256,
+            crate::grammar::extractor_version()
+        )
+        .into()
+    } else {
+        language.into()
+    }
+}
+
+/// The single key builder for extracted content, including dynamic identity.
+pub fn record_key(
+    content: aft_store::ids::ContentKey,
+    language: &str,
+) -> aft_store::content::RecordKey {
+    aft_store::content::RecordKey::new(content, &keyed_language(language), EXTRACTOR_VERSION)
+}
+
+/// A publication containing Luau cannot pair an older grammar's fragments
+/// with newer records another checkout wrote to the shared store.
+pub(super) fn graph_version(
+    state: &aft_store::checkout::CheckoutState,
+) -> std::borrow::Cow<'static, str> {
+    if state.paths().iter().any(|record| {
+        std::str::from_utf8(&record.path).is_ok_and(|path| {
+            crate::parser::detect_language_any(Path::new(path), cfg!(feature = "wasm-grammars"))
+                == Some(LangId::Luau)
+        })
+    }) {
+        format!("{EXTRACTOR_VERSION}+{}", keyed_language("luau")).into()
+    } else {
+        EXTRACTOR_VERSION.into()
+    }
+}
+
+fn source_language(path: &Path) -> Option<LangId> {
+    crate::callgraph_extractor::source_language(path).or_else(|| {
+        crate::parser::detect_language_any(path, cfg!(feature = "wasm-grammars"))
+            .filter(|language| *language == LangId::Luau)
+    })
+}
+
 /// Whether `language` (as [`language_for`] chose it) is one the call graph
 /// parses: not a configuration file read raw, nor a file whose record holds
 /// only its TODO markers.
@@ -126,7 +173,7 @@ fn parsed_or_embedded_path(path: &[u8]) -> bool {
     };
     let path = Path::new(path);
     path.extension().is_some_and(|extension| extension == "h")
-        || crate::callgraph_extractor::source_language(path).is_some()
+        || source_language(path).is_some()
         || crate::semantic_index::is_semantic_indexed_extension(path)
 }
 
@@ -155,7 +202,7 @@ pub fn language_for(path: &str, source: &[u8]) -> Option<String> {
             None => return Some(format!("{MARKERS_PREFIX}{}", TodoLanguage::Lexical.name())),
         }
     } else {
-        match crate::callgraph_extractor::source_language(path) {
+        match source_language(path) {
             Some(language) => language,
             None => return markers_language(path),
         }
@@ -229,8 +276,8 @@ pub fn add_config_markers(
 ///
 /// When the extractor fails on the source.
 /// A missing dynamic grammar is a typed `GrammarUnavailable` error, not a
-/// successful empty record. Discovery and persisted record identities remain
-/// unchanged until dynamic-language indexing is enabled.
+/// successful empty record. The scan owns download requests; extraction alone
+/// consults only the stored grammar.
 pub fn extract(source: &[u8], language: &str) -> Result<ContentRecord, ManifestJoinError> {
     extract_with_tree(source, language).map(|(record, _)| record)
 }
@@ -911,10 +958,9 @@ mod tests {
         let registry = crate::grammar::configure(&config);
         let source = b"local function f() return 1 end";
         let classified = super::language_for("f.luau", source);
-        assert_ne!(
-            classified.as_deref(),
-            Some("luau"),
-            "S2 must not enable dynamic discovery"
+        assert_eq!(
+            classified.as_deref() == Some("luau"),
+            cfg!(feature = "wasm-grammars")
         );
         let error = super::extract_with_tree(source, "luau")
             .err()
