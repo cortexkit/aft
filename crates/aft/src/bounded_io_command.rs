@@ -21,6 +21,8 @@ pub(crate) fn command(
     ctx: &AppContext,
     work: impl FnOnce(&RawRequest, &AppContext) -> Response,
 ) -> Response {
+    #[cfg(test)]
+    crate::bounded_io::register_test_helper_scope(test_helper_scope);
     let duration = if req.command == "grep" {
         FALLBACK_WALK_BUDGET
     } else {

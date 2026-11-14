@@ -745,6 +745,16 @@ pub(crate) type Carry = Box<dyn FnOnce() -> io::Result<Box<dyn Any + Send>> + Se
 pub(crate) type CarryFactory = Arc<dyn Fn() -> io::Result<Carry> + Send + Sync>;
 type CarryRestore = Box<dyn FnOnce() + Send>;
 
+#[cfg(test)]
+static TEST_HELPER_SCOPE: std::sync::OnceLock<fn() -> Box<dyn Any>> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn register_test_helper_scope(scope: fn() -> Box<dyn Any>) {
+    // Tool-owned counters live above this module. Their owner supplies the
+    // reset scope so reused helpers start each test job with clean counters.
+    let _ = TEST_HELPER_SCOPE.set(scope);
+}
+
 /// Updated alongside the higher layer's thread-local state, including restores.
 /// A helper also restores state first installed by its work, even if the
 /// helper was entered with no carried state at all.
@@ -1285,7 +1295,9 @@ impl Limiter {
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let _state = HelperJobScope::enter();
                         #[cfg(test)]
-                        let _test_state = test_scope.map(|scope| scope());
+                        let _test_state = test_scope
+                            .or_else(|| TEST_HELPER_SCOPE.get().copied())
+                            .map(|scope| scope());
                         job();
                     }));
                 }

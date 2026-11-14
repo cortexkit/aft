@@ -2057,6 +2057,7 @@ struct HeldCompletion {
 
 impl HeldCompletion {
     fn new(id: &str) -> Self {
+        crate::subc::lower_hooks::register();
         use crate::db::call_ledger as ledger;
         let task = Completion::new_runner(id, 0, "reserved:thalamus-harness", "opencode2");
         let db = Arc::new(std::sync::Mutex::new(

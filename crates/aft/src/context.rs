@@ -13894,6 +13894,7 @@ mod configure_applicability_tests {
 
     #[test]
     fn applicability_walk_does_not_retain_released_storage_leases() {
+        crate::reader_floor::register_cache_hooks();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("project");
         let storage = temp.path().join("storage");

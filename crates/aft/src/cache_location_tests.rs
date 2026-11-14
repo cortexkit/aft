@@ -144,6 +144,7 @@ fn legacy_cleanup_requires_the_active_namespace_on_its_own_device() {
 
 #[test]
 fn enrollment_device_comparison_uses_the_pinned_creation_parent() {
+    crate::reader_floor::register_cache_hooks();
     let temp = tempfile::tempdir().unwrap();
     let parent = temp.path().join("cache-parent");
     fs::create_dir(&parent).unwrap();
@@ -741,6 +742,7 @@ use crate::config::Config;
 
 #[test]
 fn first_enrollment_refuses_the_durable_storage_device() {
+    crate::reader_floor::register_cache_hooks();
     let temp = tempfile::tempdir().unwrap();
     let parent = temp.path().join("unmounted-cache");
     fs::create_dir(&parent).unwrap();
