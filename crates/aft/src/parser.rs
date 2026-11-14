@@ -8763,7 +8763,10 @@ struct HtmlHeading {
     anchor_id: Option<String>,
 }
 
-/// Recursively collect h1-h6 elements from the HTML tree.
+/// Collect h1-h6 elements from the HTML tree under `node`, in document
+/// order, nested headings included. The walk keeps its place in a tree
+/// cursor rather than recursing, so a deeply nested document cannot
+/// overflow the stack, which would abort the process.
 fn collect_html_headings(source: &str, node: &Node, headings: &mut Vec<HtmlHeading>) {
     let mut cursor = node.walk();
     if !cursor.goto_first_child() {
@@ -8814,15 +8817,18 @@ fn collect_html_headings(source: &str, node: &Node, headings: &mut Vec<HtmlHeadi
                     }
                 }
             }
-            // Recurse into element children (nested headings)
-            collect_html_headings(source, &child, headings);
-        } else {
-            // Recurse into other node types (document, body, etc.)
-            collect_html_headings(source, &child, headings);
         }
-
-        if !cursor.goto_next_sibling() {
-            break;
+        // Every node's children are searched too: headings nest in
+        // elements and in the document's other nodes alike.
+        if cursor.goto_first_child() {
+            continue;
+        }
+        // Move past this subtree: to the next sibling, or up until an
+        // ancestor has one. The cursor cannot climb above `node`.
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() || cursor.node().id() == node.id() {
+                return;
+            }
         }
     }
 }
@@ -8884,7 +8890,10 @@ fn html_heading_anchor_id(source: &str, start_tag: &Node) -> Option<String> {
     None
 }
 
-/// Extract text content from an HTML element, stripping tags.
+/// Extract text content from an HTML element, stripping tags. Text inside
+/// nested elements (e.g., <strong>, <em>, <a>) is included, in document
+/// order; the walk uses a tree cursor rather than recursion, so deep
+/// nesting cannot overflow the stack.
 fn extract_element_text(source: &str, node: &Node) -> String {
     let mut text = String::new();
     let mut cursor = node.walk();
@@ -8897,17 +8906,17 @@ fn extract_element_text(source: &str, node: &Node) -> String {
             "text" => {
                 text.push_str(node_text(source, &child));
             }
-            "element" => {
-                // Recurse into nested elements (e.g., <strong>, <em>, <a>)
-                text.push_str(&extract_element_text(source, &child));
-            }
+            "element" if cursor.goto_first_child() => continue,
             _ => {}
         }
-        if !cursor.goto_next_sibling() {
-            break;
+        // Move past this subtree: to the next sibling, or up until an
+        // ancestor has one. The cursor cannot climb above `node`.
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() || cursor.node().id() == node.id() {
+                return text;
+            }
         }
     }
-    text
 }
 
 struct RawHeading {

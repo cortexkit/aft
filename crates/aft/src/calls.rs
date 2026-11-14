@@ -535,8 +535,14 @@ fn clean_type_reference_name(name: &str) -> Option<String> {
 /// Extract Go expression references, including callbacks and package variables.
 /// Resolution rejects identifiers that do not name indexed package symbols.
 pub fn extract_go_value_references(source: &str, root: tree_sitter::Node) -> Vec<CallTuple> {
-    fn visit(node: tree_sitter::Node, source: &str, results: &mut Vec<CallTuple>) {
-        let parent = node.parent();
+    // A work stack of (node, its parent) instead of recursion: an expression
+    // can nest tens of thousands of levels deep, and a stack overflow aborts
+    // the process. Carrying the parent also spares a `parent()` lookup per
+    // node, which tree-sitter answers by descending from the root. Children
+    // are pushed in reverse, so references come out in source order.
+    let mut results = Vec::new();
+    let mut pending = vec![(root, root.parent())];
+    while let Some((node, parent)) = pending.pop() {
         let is_callee = parent.is_some_and(|p| {
             p.kind() == "call_expression" && p.child_by_field_name("function") == Some(node)
         });
@@ -570,25 +576,28 @@ pub fn extract_go_value_references(source: &str, root: tree_sitter::Node) -> Vec
         // contain calls with callback arguments. Walk that computed receiver
         // without inventing extra references to the names in a pure dotted path.
         if node.kind() == "selector_expression" {
+            let mut selector = node;
             let mut operand = node.child_by_field_name("operand");
             while let Some(base) = operand {
                 if base.kind() == "selector_expression" {
+                    selector = base;
                     operand = base.child_by_field_name("operand");
                 } else {
                     if !matches!(base.kind(), "identifier" | "package_identifier") {
-                        visit(base, source, results);
+                        pending.push((base, Some(selector)));
                     }
                     break;
                 }
             }
         } else {
-            for child in node.named_children(&mut node.walk()) {
-                visit(child, source, results);
-            }
+            let start = pending.len();
+            pending.extend(
+                node.named_children(&mut node.walk())
+                    .map(|child| (child, Some(node))),
+            );
+            pending[start..].reverse();
         }
     }
-    let mut results = Vec::new();
-    visit(root, source, &mut results);
     results
 }
 

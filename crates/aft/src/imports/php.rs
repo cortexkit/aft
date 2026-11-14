@@ -23,53 +23,57 @@ fn collect_php_imports(source: &str, root: Node, imports: &mut Vec<ImportStateme
     collect_php_imports_in_scope(source, root, imports);
 }
 
+/// Collects the `use` declarations of `scope` and of the namespace blocks in
+/// it, in source order, and returns how many nodes it looked at. Only the
+/// children of scopes and of namespaces are looked at, so the walk skips
+/// function bodies and expressions.
+///
+/// The walk keeps its pending nodes on the heap rather than recursing:
+/// namespace blocks can nest (error recovery accepts them) arbitrarily
+/// deep, and a stack overflow aborts the process. Children are pushed in
+/// reverse, so a nested namespace's imports still come before those of the
+/// declarations after it.
 fn collect_php_imports_in_scope(
     source: &str,
     scope: Node,
     imports: &mut Vec<ImportStatement>,
 ) -> usize {
-    let mut visited = 0;
-    let mut cursor = scope.walk();
-    if cursor.goto_first_child() {
-        loop {
-            let child = cursor.node();
-            visited += 1;
-            match child.kind() {
-                "namespace_use_declaration" => {
-                    if let Some(imp) = parse_php_namespace_use_declaration(source, &child) {
-                        imports.push(imp);
-                    }
-                }
-                "namespace_definition" => {
-                    visited += collect_php_imports_in_namespace(source, child, imports);
-                }
-                _ => {}
-            }
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
+    /// Where a pending node sits: directly in a scope, or directly in a
+    /// namespace definition.
+    #[derive(Clone, Copy)]
+    enum Within {
+        Scope,
+        Namespace,
     }
-    visited
-}
+    fn push_children<'tree>(
+        pending: &mut Vec<(Node<'tree>, Within)>,
+        node: Node<'tree>,
+        within: Within,
+    ) {
+        let start = pending.len();
+        let mut cursor = node.walk();
+        pending.extend(node.children(&mut cursor).map(|child| (child, within)));
+        pending[start..].reverse();
+    }
 
-fn collect_php_imports_in_namespace(
-    source: &str,
-    namespace: Node,
-    imports: &mut Vec<ImportStatement>,
-) -> usize {
     let mut visited = 0;
-    let mut cursor = namespace.walk();
-    if cursor.goto_first_child() {
-        loop {
-            let child = cursor.node();
-            visited += 1;
-            if child.kind() == "compound_statement" {
-                visited += collect_php_imports_in_scope(source, child, imports);
+    let mut pending = Vec::new();
+    push_children(&mut pending, scope, Within::Scope);
+    while let Some((child, within)) = pending.pop() {
+        visited += 1;
+        match (within, child.kind()) {
+            (Within::Scope, "namespace_use_declaration") => {
+                if let Some(imp) = parse_php_namespace_use_declaration(source, &child) {
+                    imports.push(imp);
+                }
             }
-            if !cursor.goto_next_sibling() {
-                break;
+            (Within::Scope, "namespace_definition") => {
+                push_children(&mut pending, child, Within::Namespace);
             }
+            (Within::Namespace, "compound_statement") => {
+                push_children(&mut pending, child, Within::Scope);
+            }
+            _ => {}
         }
     }
     visited

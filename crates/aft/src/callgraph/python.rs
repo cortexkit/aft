@@ -216,7 +216,25 @@ impl<'a> Extractor<'a> {
         None
     }
 
-    fn visit(&mut self, node: Node<'a>, scope: usize) {
+    /// Visits the tree under `root`, which runs in `scope`, node by node in
+    /// source order. Pending nodes wait on a heap work stack rather than in
+    /// recursive calls: a file can nest tens of thousands of levels deep,
+    /// and a stack overflow aborts the process. Each node's children are
+    /// queued in reverse, so the next one popped is its first child, and
+    /// nodes are visited in the same order a recursive walk would.
+    fn visit(&mut self, root: Node<'a>, scope: usize) {
+        let mut pending = vec![(root, scope)];
+        while let Some((node, scope)) = pending.pop() {
+            let start = pending.len();
+            self.visit_node(node, scope, &mut pending);
+            pending[start..].reverse();
+        }
+    }
+
+    /// Records what `node`, running in `scope`, binds, imports or calls, and
+    /// queues the children to visit after it, in source order, each with the
+    /// scope it runs in.
+    fn visit_node(&mut self, node: Node<'a>, scope: usize, pending: &mut Vec<(Node<'a>, usize)>) {
         if matches!(
             node.kind(),
             "function_definition" | "class_definition" | "lambda"
@@ -244,7 +262,7 @@ impl<'a> Extractor<'a> {
                 let body = node.child_by_field_name("body");
                 for child in node.named_children(&mut node.walk()) {
                     if Some(child) != body {
-                        self.visit(child, scope);
+                        pending.push((child, scope));
                     }
                 }
                 return;
@@ -287,7 +305,7 @@ impl<'a> Extractor<'a> {
             // declaration is defined; only its body sees the new local scope.
             let body = node.child_by_field_name("body");
             for child in node.named_children(&mut node.walk()) {
-                self.visit(child, if Some(child) == body { id } else { scope });
+                pending.push((child, if Some(child) == body { id } else { scope }));
             }
             return;
         }
@@ -319,20 +337,25 @@ impl<'a> Extractor<'a> {
         if node.kind() == "call" && !self.module_only {
             self.calls.push((node, scope));
         }
-        for child in node.named_children(&mut node.walk()) {
-            self.visit(child, scope);
-        }
+        pending.extend(
+            node.named_children(&mut node.walk())
+                .map(|child| (child, scope)),
+        );
     }
 
-    fn shadow_pattern(&mut self, node: Node<'a>, scope: usize) {
-        if node.kind() == "identifier" {
-            self.bind(scope, &self.source[node.byte_range()], Binding::Shadowed);
-        } else if matches!(
-            node.kind(),
-            "pattern_list" | "tuple_pattern" | "list_pattern" | "as_pattern_target"
-        ) {
-            for child in node.named_children(&mut node.walk()) {
-                self.shadow_pattern(child, scope);
+    /// Marks the names the target pattern `root` binds as shadowed in
+    /// `scope`. Patterns can nest arbitrarily deep, so the walk keeps its
+    /// pending nodes on the heap rather than recursing.
+    fn shadow_pattern(&mut self, root: Node<'a>, scope: usize) {
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            if node.kind() == "identifier" {
+                self.bind(scope, &self.source[node.byte_range()], Binding::Shadowed);
+            } else if matches!(
+                node.kind(),
+                "pattern_list" | "tuple_pattern" | "list_pattern" | "as_pattern_target"
+            ) {
+                pending.extend(node.named_children(&mut node.walk()));
             }
         }
     }

@@ -33,12 +33,16 @@ pub(crate) fn parse_c_imports(source: &str, tree: &Tree) -> ImportBlock {
     let root = tree.root_node();
     let mut imports = Vec::new();
 
-    fn collect(source: &str, node: Node<'_>, imports: &mut Vec<ImportStatement>) {
+    // An explicit work stack instead of recursion: conditional blocks can
+    // nest arbitrarily deep, and a stack overflow aborts the process.
+    // Children are pushed in reverse so includes come out in source order.
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
         if node.kind() == "preproc_include" {
             if let Some(import) = parse_c_include(source, &node) {
                 imports.push(import);
             }
-        } else if node.parent().is_none()
+        } else if node.id() == root.id()
             || matches!(
                 node.kind(),
                 "preproc_if"
@@ -49,12 +53,11 @@ pub(crate) fn parse_c_imports(source: &str, tree: &Tree) -> ImportBlock {
             )
         {
             let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                collect(source, child, imports);
-            }
+            let start = pending.len();
+            pending.extend(node.named_children(&mut cursor));
+            pending[start..].reverse();
         }
     }
-    collect(source, root, &mut imports);
 
     let byte_range = import_byte_range(&imports);
     ImportBlock {

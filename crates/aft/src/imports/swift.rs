@@ -53,23 +53,17 @@ pub(crate) fn parse_swift_imports(source: &str, tree: &Tree) -> ImportBlock {
     }
 }
 
-fn collect_swift_imports(source: &str, node: Node, imports: &mut Vec<ImportStatement>) {
-    if node.kind() == "import_declaration" {
+/// Collects the import declarations under `root` in source order. The walk
+/// keeps its position in a tree cursor rather than on the call stack: a
+/// file can nest tens of thousands of levels deep (the Swift compiler's own
+/// tests hold one of ~50,000 nested parentheses), and a recursive walk
+/// overflowed the thread's stack on it, which aborts the whole process.
+fn collect_swift_imports(source: &str, root: Node, imports: &mut Vec<ImportStatement>) {
+    super::for_each_preorder_until(root, "import_declaration", |node| {
         if let Some(imp) = parse_swift_import_declaration(source, &node) {
             imports.push(imp);
         }
-        return;
-    }
-
-    let mut cursor = node.walk();
-    if cursor.goto_first_child() {
-        loop {
-            collect_swift_imports(source, cursor.node(), imports);
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-    }
+    });
 }
 
 fn parse_swift_import_declaration(source: &str, node: &Node) -> Option<ImportStatement> {

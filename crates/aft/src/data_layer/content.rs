@@ -1149,4 +1149,93 @@ mod tests {
         assert!(tree.is_none());
         assert_eq!(record, extract(b"[package]\n", "config").unwrap());
     }
+
+    /// How deep the deeply nested inputs below nest. The Swift compiler's
+    /// own test suite holds a file of about 50,000 nested parentheses.
+    const NESTING: usize = 20_000;
+
+    /// `open`, then `inner`, then `close`, each of the brackets repeated
+    /// [`NESTING`] times.
+    fn nested(open: &str, inner: &str, close: &str) -> String {
+        format!("{}{inner}{}", open.repeat(NESTING), close.repeat(NESTING))
+    }
+
+    /// Extracts `source`, named `path`, on a thread with a 2 MiB stack, and
+    /// fails the test if extraction errs. Store scans extract on the file
+    /// walker's threads, whose stacks are 2 MiB; a walk that recursed once
+    /// per tree level overflowed one on a deeply nested file, and a stack
+    /// overflow aborts the whole process rather than failing one file.
+    /// Extraction must hold its depth on the heap (or stop descending at a
+    /// fixed bound), so a stack this small still copes with any nesting.
+    fn extract_on_a_small_stack(path: &'static str, source: String) {
+        let language =
+            language_for(path, source.as_bytes()).unwrap_or_else(|| panic!("{path}: no language"));
+        std::thread::Builder::new()
+            .name(format!("deep-{path}"))
+            .stack_size(2 << 20)
+            .spawn(move || {
+                extract(source.as_bytes(), &language)
+                    .unwrap_or_else(|error| panic!("{path}: {error}"));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// One test per language, so a stack overflow names the language that
+    /// caused it.
+    macro_rules! deep_nesting_tests {
+        ($($name:ident: $path:literal => $source:expr;)*) => {$(
+            #[test]
+            fn $name() {
+                extract_on_a_small_stack($path, $source);
+            }
+        )*};
+    }
+
+    mod deeply_nested_files_extract_on_a_small_stack {
+        use super::{extract_on_a_small_stack, nested};
+
+        deep_nesting_tests! {
+            swift: "deep.swift" => format!("import Foundation\nlet x = {}\n", nested("(", "1", ")"));
+            kotlin: "deep.kt" => format!("import a.b\nval x = {}\n", nested("(", "1", ")"));
+            csharp: "deep.cs" => format!("using System;\nclass C {{ int x = {}; }}\n", nested("(", "1", ")"));
+            c_expression: "deep.c" => format!("#include <stdio.h>\nint x = {};\n", nested("(", "1", ")"));
+            c_preprocessor: "deep_if.c" => nested("#ifdef A\n", "#include <stdio.h>\n", "#endif\n");
+            cpp: "deep.cpp" => format!("#include <vector>\nint x = {};\n", nested("(", "1", ")"));
+            cuda: "deep.cu" => format!("#include <cuda.h>\nint x = {};\n", nested("(", "1", ")"));
+            metal: "deep.metal" => format!("#include <metal_stdlib>\nint x = {};\n", nested("(", "1", ")"));
+            objc: "deep.m" => format!("#import <Foundation/Foundation.h>\nint x = {};\n", nested("(", "1", ")"));
+            typescript: "deep.ts" => format!("import {{ a }} from './a';\nconst x = {};\n", nested("(", "1", ")"));
+            tsx: "deep.tsx" => format!("import {{ a }} from './a';\nconst x = {};\n", nested("(", "1", ")"));
+            javascript: "deep.js" => format!("import {{ a }} from './a';\nconst x = {};\n", nested("(", "1", ")"));
+            python: "deep.py" => format!("import os\nx = {}\n", nested("(", "1", ")"));
+            rust: "deep.rs" => format!("use std::fmt;\nfn f() {{ let x = {}; }}\n", nested("(", "1", ")"));
+            go: "deep.go" => format!("package p\nimport \"fmt\"\nvar x = {}\n", nested("(", "1", ")"));
+            zig: "deep.zig" => format!("const std = @import(\"std\");\nconst x = {};\n", nested("(", "1", ")"));
+            bash: "deep.sh" => format!("source ./a.sh\n{}\n", nested("( ", "true", " )"));
+            html: "deep.html" => nested("<div>", "<h1>x</h1>", "</div>");
+            html_heading: "deep_heading.html" => format!("<h1>{}</h1>\n", nested("<b>", "x", "</b>"));
+            // No Markdown case: the Markdown grammar's external scanner
+            // aborts on deeply nested block quotes while parsing, because
+            // its saved state outgrows tree-sitter's fixed buffer. That is a
+            // parser limit, separate from the walks this test covers.
+            solidity: "deep.sol" => format!("import \"./a.sol\";\ncontract C {{ function f() public {{ uint x = {}; }} }}\n", nested("(", "1", ")"));
+            scss: "deep.scss" => format!("@use 'a';\n{}\n", nested("a { ", "color: red;", " }"));
+            vue: "deep.vue" => format!("<template>{}</template>\n<script>\nimport a from './a';\nconst x = {};\n</script>\n", nested("<div>", "x", "</div>"), nested("(", "1", ")"));
+            json: "deep.json" => nested("[", "1", "]");
+            scala: "deep.scala" => format!("import a.b\nobject O {{ val x = {} }}\n", nested("(", "1", ")"));
+            java: "deep.java" => format!("import a.b;\nclass C {{ int x = {}; }}\n", nested("(", "1", ")"));
+            ruby: "deep.rb" => format!("require 'a'\nx = {}\n", nested("(", "1", ")"));
+            php_expression: "deep.php" => format!("<?php\nuse A\\B;\n$x = {};\n", nested("(", "1", ")"));
+            php_namespaces: "deep_ns.php" => format!("<?php\n{}\n", nested("namespace A { ", "use A\\B;", " }"));
+            lua: "deep.lua" => format!("local a = require('a')\nlocal x = {}\n", nested("(", "1", ")"));
+            perl: "deep.pl" => format!("use strict;\nmy $x = {};\n", nested("(", "1", ")"));
+            yaml: "deep.yaml" => format!("x: {}\n", nested("[", "1", "]"));
+            pascal: "deep.pas" => format!("program P;\nuses SysUtils;\nbegin\n  x := {};\nend.\n", nested("(", "1", ")"));
+            r: "deep.R" => format!("library(a)\nx <- {}\n", nested("(", "1", ")"));
+            groovy: "deep.groovy" => format!("import a.b\ndef x = {}\n", nested("(", "1", ")"));
+            toml: "deep.toml" => format!("x = {}\n", nested("[", "1", "]"));
+        }
+    }
 }
