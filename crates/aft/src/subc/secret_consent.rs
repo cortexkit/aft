@@ -232,7 +232,8 @@ impl SubcSecretConsent {
         hold: Duration,
         cancel: Option<&crate::secret::consent::Cancellation>,
     ) -> ConsentOutcome {
-        let card = {
+        let key = (request.scope.clone(), request.request_id.clone());
+        let entry = {
             let mut cards = self.cards.lock().await;
             cards.retain(|_, card| {
                 Arc::strong_count(card) > 1
@@ -241,7 +242,7 @@ impl SubcSecretConsent {
                         .is_ok_and(|card| card.created.elapsed() < Duration::from_secs(600))
             });
             cards
-                .entry((request.scope.clone(), request.request_id.clone()))
+                .entry(key.clone())
                 .or_insert_with(|| {
                     Arc::new(tokio::sync::Mutex::new(Card {
                         created: std::time::Instant::now(),
@@ -253,7 +254,7 @@ impl SubcSecretConsent {
                 })
                 .clone()
         };
-        let mut card = card.lock().await;
+        let mut card = entry.lock().await;
         if card.statement != request.statement_b64url {
             return consent_unavailable("Cingulate could not file the secret-use card");
         }
@@ -301,6 +302,19 @@ impl SubcSecretConsent {
                         request.request_id,
                         request.scope
                     );
+                    // A named refusal leaves no card behind, so nothing can be
+                    // waited on or withdrawn. Drop the reserved failure: callers
+                    // already waiting on this entry still share it, but the next
+                    // request files again instead of reading this failure for
+                    // the rest of the cache's ten minutes. (A lost reply keeps
+                    // its entry, because a card may exist that recovery owns.)
+                    let mut cards = self.cards.lock().await;
+                    if cards
+                        .get(&key)
+                        .is_some_and(|cached| Arc::ptr_eq(cached, &entry))
+                    {
+                        cards.remove(&key);
+                    }
                     return consent_unavailable("Cingulate could not file the secret-use card");
                 }
             };

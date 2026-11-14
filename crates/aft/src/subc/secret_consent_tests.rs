@@ -1617,6 +1617,47 @@ async fn lost_or_garbled_secret_filing_is_refiled_identically_once_then_withdraw
     }
 }
 
+#[tokio::test]
+async fn a_named_filing_refusal_is_not_cached_so_the_next_request_files_again() {
+    // Cingulate's published refusal for a statement it cannot decode.
+    let refusal = filer_vector("refusals")["cases"][0]["reply"].clone();
+    let endpoint = Arc::new(SecretCards {
+        record: "pending",
+        refusal: Some(refusal),
+        ..Default::default()
+    });
+    let transport = SubcSecretConsent {
+        transport: endpoint.clone(),
+        runtime: tokio::runtime::Handle::current(),
+        cards: Default::default(),
+    };
+    let request = held_request(crate::secret::vault::now_ms() + 600_000);
+    for attempt in 1..=2 {
+        let answer = transport
+            .file_cancellable(&request, SECRET_AWAIT_CAP, None)
+            .await;
+        assert!(
+            matches!(answer, ConsentOutcome::Unavailable { .. }),
+            "attempt {attempt}: {answer:?}"
+        );
+        let filings = endpoint
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.method == "consent.request")
+            .count();
+        assert_eq!(
+            filings, attempt,
+            "each request after a named refusal reaches Cingulate again"
+        );
+    }
+    assert!(
+        transport.cards.lock().await.is_empty(),
+        "a refused filing leaves no cached entry"
+    );
+}
+
 #[test]
 fn handler_refusal_samples_are_named_module_errors_not_lost_filing_replies() {
     let vectors = filer_vector("refusals");
