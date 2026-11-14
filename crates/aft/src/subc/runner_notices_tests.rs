@@ -1361,7 +1361,10 @@ fn runner_notices_delivery_order_capability_cache_is_incarnation_scoped() {
             expected
         );
     }
-    assert_eq!(described_delivery_order(br#"{"capabilities":["delivery_order"]}"#), None);
+    assert_eq!(
+        described_delivery_order(br#"{"capabilities":["delivery_order"]}"#),
+        None
+    );
 }
 
 #[test]
@@ -1406,6 +1409,15 @@ fn runner_notices_optional_members_are_gated_and_task_choice_is_frozen() {
             Some(true)
         });
         task.registry.configure_long_running_reminders(true, 1_000);
+        let registered = task.registry.task_for_test(&task.task).unwrap();
+        let recent = std::time::Instant::now() - Duration::from_secs(10);
+        *registered.last_reminder_at.lock().unwrap() = Some(recent);
+        task.registry.maybe_emit_long_running_reminder(&registered);
+        assert_eq!(
+            *registered.last_reminder_at.lock().unwrap(),
+            Some(recent),
+            "the frozen interval must also govern actual scheduling"
+        );
         let completion_text = super::super::bash_notice_text::completion(
             &serde_json::to_value(task.frame()).unwrap(),
         );
@@ -1515,10 +1527,10 @@ fn runner_notices_member_refusal_drops_reminder_and_freezes_completion_fallback(
             false,
             || 0
         ));
-        assert!(matches!(
-            step(&scheduler, std::time::Instant::now()),
-            Next::Done
-        ));
+        let (next, logs) =
+            crate::logging::capture_log_lines(|| step(&scheduler, std::time::Instant::now()));
+        assert!(matches!(next, Next::Done));
+        assert_eq!(logs, vec![format!("INFO runner reminder task={} send_id=aft:bash-reminder:{}:600000 dropped after optional member refusal", task.task, task.task)]);
         let reminder = capture.receiver.try_recv().unwrap();
         assert!(reminder.request["params"].get("dedupe_key").is_some());
         assert!(
@@ -1538,9 +1550,11 @@ fn runner_notices_member_refusal_drops_reminder_and_freezes_completion_fallback(
         capture.refuse("invalid_params", Some(field));
         task.offer(&scheduler, Arc::new(AtomicU64::new(task.finished)));
         let now = std::time::Instant::now();
-        let Next::Retry(delay) = step(&scheduler, now) else {
+        let (next, logs) = crate::logging::capture_log_lines(|| step(&scheduler, now));
+        let Next::Retry(delay) = next else {
             panic!("lost resend response must retry")
         };
+        assert_eq!(logs, vec![format!("INFO runner notice task={} send_id=aft:bash:{} session={} retrying without dedupe_key/expires_at_ms after invalid_params refusal", task.task, task.task, task.task)]);
         let first = capture.receiver.try_recv().unwrap();
         let resend = capture.receiver.try_recv().unwrap();
         let mut expected = first.request;

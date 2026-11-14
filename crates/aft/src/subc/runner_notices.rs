@@ -1038,7 +1038,9 @@ pub(super) async fn transport_for_test(path: &Path, session: &str, scope: ScopeS
             let reply = call(path, &address, serde_json::to_vec(&body).unwrap()).await;
             let refusal = match reply {
                 Ok(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
-                Err(Outcome::Final(failure)) => json!({"error":{"code":failure.code,"detail":{"field":failure.field}}}),
+                Err(Outcome::Final(failure)) => {
+                    json!({"error":{"code":failure.code,"detail":{"field":failure.field}}})
+                }
                 Err(_) => json!({"transport_error":true}),
             };
             refusals.push(refusal);
@@ -1433,7 +1435,7 @@ fn offer(
                             if reason == "idle_start" {
                                 IDLE_START_FALLBACK.fetch_add(1, Ordering::Relaxed);
                             }
-                            log::info!(
+                            crate::slog_info!(
                                 "runner notice task={task_id} send_id={id} session={} retrying without {reason} after invalid_params refusal",
                                 owner.session
                             );
@@ -1441,7 +1443,7 @@ fn offer(
                             outcome = send_request(&request);
                         }
                     } else if reminder_elapsed_ms.is_some() && refused_notice_members(&outcome) {
-                        log::info!("runner reminder task={task_id} send_id={id} dropped after optional member refusal");
+                        crate::slog_info!("runner reminder task={task_id} send_id={id} dropped after optional member refusal");
                     }
                     outcome
                 })();
