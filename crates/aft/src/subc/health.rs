@@ -5438,8 +5438,8 @@ mod tests {
         metrics.insert(
             "lsp".into(),
             health_lsp_metrics(crate::lifecycle_census::LspCensus {
-                applicability_by_root: roots
-                    .iter()
+                applicability_by_root: [&roots[0], &roots[1]]
+                    .into_iter()
                     .map(|root| {
                         (
                             root["project_root"].as_str().unwrap().to_owned(),
@@ -6355,7 +6355,10 @@ mod tests {
                 "diagnostics_evidence",
                 json!({"database_open_failed": true}),
             ),
-            ("watcher", json!({"overflows_total": 1})),
+            (
+                "watcher",
+                json!({"overflows_total": 1, "loss_unrecovered": true}),
+            ),
             ("data_store", json!({"reason": "bind_failed"})),
         ] {
             let mut root = ready.clone();
