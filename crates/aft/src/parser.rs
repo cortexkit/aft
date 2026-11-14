@@ -9857,7 +9857,7 @@ mod tests {
         let source = format!("{}x\n", "> ".repeat(254));
         let mut parser = tree_sitter::Parser::new();
         parser
-            .set_language(&super::grammar_for(LangId::Markdown))
+            .set_language(&super::grammar_for(LangId::Markdown).unwrap())
             .unwrap();
         assert!(parser.parse(&source, None).is_some());
         assert!(super::markdown_too_deep_to_parse(LangId::Markdown, &source));

@@ -7336,7 +7336,7 @@ mod tests {
             .spawn(move || {
                 let mut parser = tree_sitter::Parser::new();
                 parser
-                    .set_language(&crate::parser::grammar_for(LangId::Rust))
+                    .set_language(&crate::parser::grammar_for(LangId::Rust).unwrap())
                     .unwrap();
                 let tree = parser.parse(&source, None).unwrap();
                 let mut facts = RustApiFacts::default();
