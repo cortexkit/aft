@@ -2680,6 +2680,7 @@ pub mod retry_clock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufRead as _;
     use std::io::Write;
     use std::process::Child;
     use std::process::ChildStdin;

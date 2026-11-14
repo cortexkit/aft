@@ -512,6 +512,7 @@ fn verify_file_inner(
 #[cfg_attr(not(test), allow(dead_code, unused_imports))]
 pub mod tests {
     use super::*;
+    use std::io::Write as _;
 
     #[test]
     fn audit10_freshness_hash_streams_bounded_buffers() {

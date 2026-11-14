@@ -5,10 +5,16 @@ pub use aft_base::pinned_executable::*;
 use std::io;
 #[cfg(test)]
 #[allow(unused_imports)]
-use std::path::{Path, PathBuf};
+use std::path::Path;
 #[cfg(test)]
 #[allow(unused_imports)]
-use std::sync::{Mutex, OnceLock};
+use std::path::PathBuf;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::Mutex;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::OnceLock;
 
 #[cfg(test)]
 mod tests {

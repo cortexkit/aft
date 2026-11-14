@@ -8,7 +8,13 @@ use std::ffi::OsString;
 use std::io;
 #[cfg(test)]
 #[allow(unused_imports)]
-use std::path::{Component, Path, PathBuf};
+use std::path::Component;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::Path;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::PathBuf;
 
 #[cfg(test)]
 mod tests {

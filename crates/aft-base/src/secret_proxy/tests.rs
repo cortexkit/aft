@@ -1,4 +1,5 @@
 use super::*;
+use rustls::pki_types::pem::PemObject as _;
 use std::collections::HashMap;
 use std::io::{BufRead as _, Write as _};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};

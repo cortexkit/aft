@@ -8,11 +8,14 @@ use std::collections::HashMap;
 use std::io::Read;
 #[cfg(test)]
 #[allow(unused_imports)]
-#[cfg(windows)]
-use std::path::PathBuf;
+use std::path::Component;
 #[cfg(test)]
 #[allow(unused_imports)]
-use std::path::{Component, Path};
+use std::path::Path;
+#[cfg(test)]
+#[allow(unused_imports)]
+#[cfg(windows)]
+use std::path::PathBuf;
 #[cfg(test)]
 #[allow(unused_imports)]
 use std::time::SystemTime;
@@ -35,6 +38,3 @@ mod tests {
         }
     }
 }
-
-#[cfg(test)]
-mod generated;

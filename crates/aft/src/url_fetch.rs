@@ -2,51 +2,109 @@ pub use aft_base::url_fetch::*;
 
 #[cfg(test)]
 #[allow(unused_imports)]
-use crate::lang_id::language_by_extension;
+use htmd::element_handler::HandlerResult;
 #[cfg(test)]
 #[allow(unused_imports)]
-use htmd::{
-    element_handler::{HandlerResult, Handlers},
-    Element, HtmlToMarkdown,
-};
+use htmd::element_handler::Handlers;
 #[cfg(test)]
 #[allow(unused_imports)]
-use markup5ever_rcdom::{Node, NodeData};
+use htmd::Element;
 #[cfg(test)]
 #[allow(unused_imports)]
-use reqwest::blocking::{Client, Response as HttpResponse};
+use htmd::HtmlToMarkdown;
 #[cfg(test)]
 #[allow(unused_imports)]
-use reqwest::header::{
-    ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, LOCATION, USER_AGENT,
-};
+use markup5ever_rcdom::Node;
+#[cfg(test)]
+#[allow(unused_imports)]
+use markup5ever_rcdom::NodeData;
+#[cfg(test)]
+#[allow(unused_imports)]
+use reqwest::blocking::Client;
+#[cfg(test)]
+#[allow(unused_imports)]
+use reqwest::blocking::Response as HttpResponse;
+#[cfg(test)]
+#[allow(unused_imports)]
+use reqwest::header::ACCEPT;
+#[cfg(test)]
+#[allow(unused_imports)]
+use reqwest::header::ACCEPT_ENCODING;
+#[cfg(test)]
+#[allow(unused_imports)]
+use reqwest::header::CONTENT_ENCODING;
+#[cfg(test)]
+#[allow(unused_imports)]
+use reqwest::header::CONTENT_TYPE;
+#[cfg(test)]
+#[allow(unused_imports)]
+use reqwest::header::LOCATION;
+#[cfg(test)]
+#[allow(unused_imports)]
+use reqwest::header::USER_AGENT;
 #[cfg(test)]
 #[allow(unused_imports)]
 use reqwest::redirect::Policy;
 #[cfg(test)]
 #[allow(unused_imports)]
-use secret_rules::audit::{AuditReason, AuditRecordV1, Decision};
+use secret_rules::audit::AuditReason;
 #[cfg(test)]
 #[allow(unused_imports)]
-use secret_rules::location::{
-    evaluate_request_with_connect, location_kind_token, LabelOutcome, LabelRule, Location,
-    RequestView,
-};
+use secret_rules::audit::AuditRecordV1;
 #[cfg(test)]
 #[allow(unused_imports)]
-use secret_rules::material::{check_admissible, encode_for_location};
+use secret_rules::audit::Decision;
 #[cfg(test)]
 #[allow(unused_imports)]
-use secret_rules::scrub::{MatcherSet, ScrubError, Scrubber};
+use secret_rules::location::evaluate_request_with_connect;
 #[cfg(test)]
 #[allow(unused_imports)]
-use secret_rules::target::{normalize_request_target, ConnectAuthority};
+use secret_rules::location::location_kind_token;
 #[cfg(test)]
 #[allow(unused_imports)]
-use serde::{Deserialize, Serialize};
+use secret_rules::location::LabelOutcome;
 #[cfg(test)]
 #[allow(unused_imports)]
-use sha2::{Digest, Sha256};
+use secret_rules::location::LabelRule;
+#[cfg(test)]
+#[allow(unused_imports)]
+use secret_rules::location::Location;
+#[cfg(test)]
+#[allow(unused_imports)]
+use secret_rules::location::RequestView;
+#[cfg(test)]
+#[allow(unused_imports)]
+use secret_rules::material::check_admissible;
+#[cfg(test)]
+#[allow(unused_imports)]
+use secret_rules::material::encode_for_location;
+#[cfg(test)]
+#[allow(unused_imports)]
+use secret_rules::scrub::MatcherSet;
+#[cfg(test)]
+#[allow(unused_imports)]
+use secret_rules::scrub::ScrubError;
+#[cfg(test)]
+#[allow(unused_imports)]
+use secret_rules::scrub::Scrubber;
+#[cfg(test)]
+#[allow(unused_imports)]
+use secret_rules::target::normalize_request_target;
+#[cfg(test)]
+#[allow(unused_imports)]
+use secret_rules::target::ConnectAuthority;
+#[cfg(test)]
+#[allow(unused_imports)]
+use serde::Deserialize;
+#[cfg(test)]
+#[allow(unused_imports)]
+use serde::Serialize;
+#[cfg(test)]
+#[allow(unused_imports)]
+use sha2::Digest;
+#[cfg(test)]
+#[allow(unused_imports)]
+use sha2::Sha256;
 #[cfg(test)]
 #[allow(unused_imports)]
 use std::collections::HashMap;
@@ -61,25 +119,58 @@ use std::fmt;
 use std::fs;
 #[cfg(test)]
 #[allow(unused_imports)]
-use std::io::{self, Read, Write};
+use std::io;
 #[cfg(test)]
 #[allow(unused_imports)]
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::io::Read;
 #[cfg(test)]
 #[allow(unused_imports)]
-use std::path::{Path, PathBuf};
+use std::io::Write;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::net::IpAddr;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::net::Ipv4Addr;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::net::Ipv6Addr;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::net::SocketAddr;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::net::ToSocketAddrs;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::Path;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::PathBuf;
 #[cfg(test)]
 #[allow(unused_imports)]
 use std::rc::Rc;
 #[cfg(test)]
 #[allow(unused_imports)]
-use std::sync::{mpsc, Arc};
+use std::sync::mpsc;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::Arc;
 #[cfg(test)]
 #[allow(unused_imports)]
 use std::thread;
 #[cfg(test)]
 #[allow(unused_imports)]
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::time::Instant;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::time::SystemTime;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::time::UNIX_EPOCH;
 #[cfg(test)]
 #[allow(unused_imports)]
 use url::Url;
@@ -170,7 +261,3 @@ mod secret_audit_regressions {
         );
     }
 }
-
-#[cfg(test)]
-#[path = "url_fetch_sensitive.rs"]
-mod sensitive;

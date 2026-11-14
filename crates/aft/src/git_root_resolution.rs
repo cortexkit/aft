@@ -2,7 +2,10 @@ pub use aft_base::git_root_resolution::*;
 
 #[cfg(test)]
 #[allow(unused_imports)]
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::PathBuf;
 
 #[cfg(test)]
 mod tests {

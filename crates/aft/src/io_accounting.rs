@@ -2,7 +2,13 @@ pub use aft_base::io_accounting::*;
 
 #[cfg(test)]
 #[allow(unused_imports)]
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicU64;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::atomic::AtomicUsize;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::atomic::Ordering;
 
 #[cfg(test)]
 mod tests {

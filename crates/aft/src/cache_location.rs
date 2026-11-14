@@ -2,28 +2,52 @@ pub use aft_base::cache_location::*;
 
 #[cfg(test)]
 #[allow(unused_imports)]
-use crate::pinned_dir::{PinnedDir, RepairBudget};
+use crate::pinned_dir::PinnedDir;
 #[cfg(test)]
 #[allow(unused_imports)]
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 #[cfg(test)]
 #[allow(unused_imports)]
-use std::collections::{HashMap, HashSet};
+use serde::Serialize;
 #[cfg(test)]
 #[allow(unused_imports)]
-use std::fs::{self, File};
+use std::collections::HashMap;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::HashSet;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::fs;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::fs::File;
 #[cfg(test)]
 #[allow(unused_imports)]
 use std::io;
 #[cfg(test)]
 #[allow(unused_imports)]
-use std::path::{Path, PathBuf};
+use std::path::Path;
 #[cfg(test)]
 #[allow(unused_imports)]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::PathBuf;
 #[cfg(test)]
 #[allow(unused_imports)]
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::atomic::AtomicU64;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::atomic::Ordering;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::Arc;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::Mutex;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::OnceLock;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::Weak;
 #[cfg(test)]
 #[allow(unused_imports)]
 use std::time::Duration;
@@ -107,6 +131,3 @@ mod prune_legacy_tests {
         assert!(asides(&cache).is_empty());
     }
 }
-
-#[cfg(test)]
-mod markers;

@@ -2,10 +2,16 @@ pub use aft_base::engram_catalog::*;
 
 #[cfg(test)]
 #[allow(unused_imports)]
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 #[cfg(test)]
 #[allow(unused_imports)]
-use std::collections::{BTreeMap, BTreeSet};
+use serde::Serialize;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::BTreeMap;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::BTreeSet;
 #[cfg(test)]
 #[allow(unused_imports)]
 use std::fs;

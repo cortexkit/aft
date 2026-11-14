@@ -14,4 +14,8 @@ use std::path::PathBuf;
 #[cfg(test)]
 #[allow(unused_imports)]
 #[cfg(test)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
+#[cfg(test)]
+#[allow(unused_imports)]
+#[cfg(test)]
+use std::sync::OnceLock;
