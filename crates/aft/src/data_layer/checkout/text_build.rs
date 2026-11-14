@@ -9,7 +9,9 @@ use aft_store::segment::{SegmentMeta, SegmentWriter};
 /// Caps retained postings and unit overhead, not source bytes. One content
 /// may exceed the cap; it is flushed immediately, so the overshoot is at
 /// most one indexed content (itself bounded by the scan's file-size limit).
-const BATCH_BYTES: usize = 32 * 1024 * 1024;
+// Very small batches open enough posting streams to thrash the merge cache.
+// Keep the batch bounded while avoiding that high-fan-in merge on large trees.
+const BATCH_BYTES: usize = 256 * 1024 * 1024;
 const UNIT_BYTES: usize = 128;
 
 pub(super) struct TextBuild {
