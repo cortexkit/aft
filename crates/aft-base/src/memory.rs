@@ -388,7 +388,7 @@ pub enum AllocatorSource {
 /// One allocator reading shared by all memory surfaces in a health refresh.
 #[derive(Clone)]
 pub struct AllocatorObservation {
-    pub(crate) snapshot: AllocatorMemorySnapshot,
+    pub snapshot: AllocatorMemorySnapshot,
     pub age_ms: Option<u64>,
 }
 

@@ -1103,7 +1103,7 @@ pub struct PipelineInfo {
 
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PipelineSegment {
+pub struct PipelineSegment {
     pub label: String,
 }
 
