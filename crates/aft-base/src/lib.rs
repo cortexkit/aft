@@ -33,14 +33,14 @@
 
 // Keep one item body and its original production visibility while sharing it with higher-layer tests.
 macro_rules! test_support_visibility {
-    ($(#[$attribute:meta])* $visibility:vis $($item:tt)*) => {
+    ($(#[$attribute:meta])* $visibility:vis $keyword:ident $($item:tt)*) => {
         #[cfg(any(test, feature = "test-support"))]
         $(#[$attribute])*
-        pub $($item)*
+        pub $keyword $($item)*
 
         #[cfg(not(any(test, feature = "test-support")))]
         $(#[$attribute])*
-        $visibility $($item)*
+        $visibility $keyword $($item)*
     };
 }
 
