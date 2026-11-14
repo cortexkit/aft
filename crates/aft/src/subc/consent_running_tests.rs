@@ -286,7 +286,14 @@ async fn drained_head_shell(f: &Fixture, extra: Value, corr: u64) -> (String, Va
     f.ctx
         .update_config(|config| config.sandbox.profile.head = crate::config::SandboxMode::Off);
     let mut head = identity(&f.head_root, f.head.scope.clone());
-    Arc::get_mut(&mut head.0).unwrap().held_reply = true;
+    let data = Arc::get_mut(&mut head.0).unwrap();
+    data.held_reply = true;
+    // Bound by core rather than a runner that hosts heads: a runner head's
+    // `background` launch is answered with its task at once (see
+    // `runner_head_route`), so only another head route still holds it.
+    if let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut data.spawn_principal {
+        *principal_id = Some("reserved:prefrontal-core".into());
+    }
     let (command, _) = gated_command(&head.project_root);
     let mut arguments = json!({"command":command,"timeout":30_000});
     for (name, value) in extra.as_object().unwrap() {
