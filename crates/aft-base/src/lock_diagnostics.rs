@@ -51,7 +51,7 @@ impl LockDiagnostics {
     }
 }
 
-pub(crate) struct LockHold<'a>(&'a LockDiagnostics);
+pub struct LockHold<'a>(&'a LockDiagnostics);
 
 impl Drop for LockHold<'_> {
     fn drop(&mut self) {

@@ -529,7 +529,7 @@ pub struct MutatingLaneSnapshot {
 /// their callback. Each call has a unique cancellation token, which distinguishes
 /// it from an older job that reused the same transport request ID.
 #[derive(Debug, Clone)]
-pub(crate) struct RootJobSnapshot {
+pub struct RootJobSnapshot {
     pub job_id: u64,
     pub request_id: String,
     pub command: String,
@@ -1135,7 +1135,7 @@ struct RunningJob {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct LongRunningInteractiveJobSnapshot {
+pub struct LongRunningInteractiveJobSnapshot {
     pub root_id: ProjectRootId,
     pub request_id: String,
     pub command: String,

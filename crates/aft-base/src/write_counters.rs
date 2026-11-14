@@ -220,7 +220,7 @@ pub struct RecentRow {
 }
 
 #[derive(Debug)]
-pub(crate) struct Registry {
+pub struct Registry {
     pub started_ms: u64,
     pub entries: Mutex<BTreeMap<(Domain, String), Arc<Entry>>>,
     pub unmeasurable_entries: Mutex<BTreeMap<(String, String), Arc<UnmeasurableEntry>>>,

@@ -102,7 +102,7 @@ impl FileProgress {
     }
 }
 
-pub(crate) struct FileProgressGuard {
+pub struct FileProgressGuard {
     previous: Option<FileProgress>,
     _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
 }

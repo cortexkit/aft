@@ -268,7 +268,7 @@ fn declarations() -> &'static Arc<Declarations> {
 }
 
 /// Dropping the connection stops retries before another supervised launch takes over.
-pub(crate) struct Connection {
+pub struct Connection {
     cancel: CancellationToken,
     task: Option<tokio::task::JoinHandle<()>>,
 }

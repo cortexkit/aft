@@ -751,7 +751,7 @@ fn trim_trailing_lines(input: &str) -> String {
 /// test results. Names and totals are never capped; priority protection covers
 /// the first twenty distinct panic locations so backtraces cannot consume the
 /// reply. Already bounded panic sections also retain their message lines.
-pub(crate) struct TestVerdict {
+pub struct TestVerdict {
     pub required: Vec<usize>,
     pub empty_results: Vec<usize>,
 }

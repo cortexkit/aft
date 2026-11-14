@@ -851,7 +851,7 @@ fn enter_carry(path: &Path, carry: Option<Carry>) -> io::Result<Option<Box<dyn A
         })
         .transpose()
 }
-pub(crate) struct Scope(Option<Budget>);
+pub struct Scope(Option<Budget>);
 impl Drop for Scope {
     fn drop(&mut self) {
         CURRENT.with(|current| *current.borrow_mut() = self.0.take());
@@ -891,7 +891,7 @@ pub fn enter_if_absent(duration: Duration) -> Scope {
 /// instead of the per-access cap. Once the helper starts, the usual access
 /// cap applies unchanged, so a blocked filesystem still fails as
 /// `read_blocked` within that cap.
-pub(crate) struct MutationScope {
+pub struct MutationScope {
     previous: bool,
     _scope: Scope,
 }
@@ -1003,7 +1003,7 @@ pub struct WalkProgress<T> {
     deadline: Instant,
     published: Arc<AtomicBool>,
 }
-pub(crate) struct WalkCompletion {
+pub struct WalkCompletion {
     pub incomplete: bool,
     pub time_limit: bool,
 }

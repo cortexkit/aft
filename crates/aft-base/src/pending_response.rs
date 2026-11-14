@@ -15,7 +15,7 @@ thread_local! {
     static DEFERRED_WAKE: std::cell::RefCell<Option<DeferredResponseWake>> = const { std::cell::RefCell::new(None) };
 }
 
-pub(crate) struct DeferredWakeScope(Option<DeferredResponseWake>);
+pub struct DeferredWakeScope(Option<DeferredResponseWake>);
 
 impl Drop for DeferredWakeScope {
     fn drop(&mut self) {

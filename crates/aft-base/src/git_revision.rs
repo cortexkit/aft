@@ -29,7 +29,7 @@ impl Sink {
     }
 }
 
-pub(crate) struct GitOutput {
+pub struct GitOutput {
     pub status: ExitStatus,
     /// Captured standard output; empty when it was written to a file.
     pub stdout: Vec<u8>,

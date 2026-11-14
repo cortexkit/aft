@@ -44,7 +44,7 @@ impl std::error::Error for PathIoError {
 /// Lifetime totals for measured work sites, shared by every root in this process.
 /// Relaxed loads are intentionally not a transactional snapshot; difference them
 /// only within one daemon lifetime, never sum overlapping per-root intervals.
-pub(crate) struct WorkCounters {
+pub struct WorkCounters {
     pub source_hashes: AtomicU64,
     pub source_hash_bytes: AtomicU64,
     pub content_reads: AtomicU64,

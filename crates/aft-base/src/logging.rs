@@ -771,7 +771,7 @@ thread_local! {
 
 /// Adds the time until it is dropped to one [`EditPhase`] of this thread's
 /// tool call. Only the outermost open timer of a phase counts.
-pub(crate) struct EditPhaseTimer {
+pub struct EditPhaseTimer {
     phase: EditPhase,
     started: Instant,
 }

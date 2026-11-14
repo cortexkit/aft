@@ -84,7 +84,7 @@ pub fn active() -> bool {
     CURRENT.with(|slot| slot.borrow().result_body)
 }
 
-pub(crate) struct Guard(bool);
+pub struct Guard(bool);
 
 pub fn enter(enabled: bool) -> Guard {
     Guard(CURRENT.with(|slot| std::mem::replace(&mut slot.borrow_mut().result_body, enabled)))

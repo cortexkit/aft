@@ -199,7 +199,7 @@ pub fn acquire_blocking_while_cancellable_with_limiter(
 /// same epoch into the next attempt, so an obsolete build cannot become current
 /// merely by waiting for a slot.
 #[derive(Debug)]
-pub(crate) struct StandingColdBuildPermit {
+pub struct StandingColdBuildPermit {
     _permit: ColdBuildPermit,
     pub admission_epoch: u64,
 }

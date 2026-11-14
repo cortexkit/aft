@@ -17,7 +17,7 @@ pub(crate) enum ConfigObservation {
 }
 
 #[derive(Debug)]
-pub(crate) struct ConfigObservationError {
+pub struct ConfigObservationError {
     pub code: &'static str,
     detail: String,
 }

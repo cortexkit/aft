@@ -51,7 +51,7 @@ struct Entry {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct Running {
+pub struct Running {
     pub root: String,
     pub root_label: String,
     pub kind: String,
@@ -67,7 +67,7 @@ pub(crate) struct Running {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct Queued {
+pub struct Queued {
     pub root: String,
     pub kind: String,
     pub waited_seconds: f64,
@@ -83,7 +83,7 @@ pub struct Snapshot {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct Omitted {
+pub struct Omitted {
     pub running: usize,
     pub queued: usize,
 }
@@ -346,7 +346,7 @@ pub(crate) fn queued(root: &str, kind: &str) -> Job {
 
 /// Thread-local scope routes embedding counters to the caller's file job even
 /// through retry/bisection helpers. It is never sent to a worker pool.
-pub(crate) struct Scope {
+pub struct Scope {
     _job: Job,
     previous: Option<Arc<Mutex<Entry>>>,
     _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
@@ -422,7 +422,7 @@ pub fn advance(files: usize) {
     });
 }
 
-pub(crate) struct Counter(Arc<Mutex<Entry>>);
+pub struct Counter(Arc<Mutex<Entry>>);
 impl Counter {
     pub fn advance(&self, files: usize) {
         let mut entry = lock(&self.0);

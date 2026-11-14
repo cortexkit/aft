@@ -1097,7 +1097,7 @@ enum PipeSplit {
 /// perform a second, less-capable parse of the user's command.
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PipelineInfo {
+pub struct PipelineInfo {
     pub segments: Vec<PipelineSegment>,
 }
 
