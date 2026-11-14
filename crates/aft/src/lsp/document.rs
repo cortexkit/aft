@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -270,11 +270,38 @@ impl DiskSnapshot {
     }
 }
 
-/// Stream large files rather than allocating another full document buffer.
+/// Open first, then judge the handle so a path replacement cannot admit a FIFO.
+fn open_content_file(path: &Path) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // A blocking open can wait for a FIFO writer before metadata is available.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// Read document text with the same regular-file requirement as its hash proof.
+pub(crate) fn read_file_content(path: &Path) -> io::Result<String> {
+    let mut content = String::new();
+    open_content_file(path)?.read_to_string(&mut content)?;
+    Ok(content)
+}
+
+/// Stream large regular files rather than allocating another full document buffer.
 pub(crate) fn file_content_hash(path: &Path) -> Option<[u8; 32]> {
     #[cfg(test)]
     CONTENT_HASH_READS.with(|reads| reads.set(reads.get() + 1));
-    let mut file = std::fs::File::open(path).ok()?;
+    let mut file = open_content_file(path).ok()?;
     #[cfg(test)]
     CONTENT_HASH_BEFORE_READ.with(|hook| {
         if let Some(hook) = hook.take() {
@@ -328,6 +355,56 @@ mod tests {
 
     fn content_reads() -> usize {
         CONTENT_READS.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn content_reads_require_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("regular.ts");
+        fs::write(&file, "content").unwrap();
+        assert_eq!(read_file_content(&file).unwrap(), "content");
+        assert_eq!(
+            file_content_hash(&file),
+            Some(*blake3::hash(b"content").as_bytes())
+        );
+        assert!(read_file_content(dir.path()).is_err());
+        assert_eq!(file_content_hash(dir.path()), None);
+        fs::write(&file, [0xff]).unwrap();
+        assert_eq!(
+            read_file_content(&file).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            file_content_hash(&file),
+            Some(*blake3::hash(&[0xff]).as_bytes())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_content_reads_do_not_wait_for_fifo_writers() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("held.ts");
+        let name = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+        // SAFETY: name is a live, NUL-terminated path and the mode is valid.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (finished, result) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let hash = file_content_hash(&file);
+            let text = read_file_content(&file);
+            let _ = finished.send((hash, text));
+        });
+        // Do not scope this worker: a regressed blocking open must fail the
+        // deadline assertion, not strand the test in an implicit thread join.
+        let (hash, text) = result
+            .recv_timeout(Duration::from_secs(5))
+            .expect("content readers waited for a FIFO writer");
+        reader.join().unwrap();
+        assert_eq!(hash, None);
+        assert_eq!(text.unwrap_err().kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

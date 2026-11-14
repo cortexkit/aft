@@ -23,7 +23,9 @@ use crate::lsp::client::{
 use crate::lsp::diagnostics::{
     from_lsp_diagnostics, DiagnosticEntry, DiagnosticsStore, StoredDiagnostic,
 };
-use crate::lsp::document::{file_content_hash, DiskSnapshot, DocumentEntry, DocumentStore};
+use crate::lsp::document::{
+    file_content_hash, read_file_content, DiskSnapshot, DocumentEntry, DocumentStore,
+};
 use crate::lsp::position::{uri_for_path, uri_to_path};
 use crate::lsp::pull_params::{
     AftDocumentDiagnosticParams, AftWorkspaceDiagnosticParams, AftWorkspaceDiagnosticRequest,
@@ -2735,7 +2737,7 @@ impl LspManager {
         // reading and hashing it per server cost one full read each.
         let disk = DiskSnapshot::read(&canonical_path);
         let initial_content = needs_content
-            .then(|| std::fs::read_to_string(&canonical_path).map_err(LspError::Io))
+            .then(|| read_file_content(&canonical_path).map_err(LspError::Io))
             .transpose()?;
         let mut drift_content: Option<String> = None;
         let mut newly_opened = Vec::new();
@@ -2815,7 +2817,7 @@ impl LspManager {
             if drifted {
                 self.invalidate_diagnostic_content(key, &canonical_path);
                 if drift_content.is_none() {
-                    match std::fs::read_to_string(&canonical_path) {
+                    match read_file_content(&canonical_path) {
                         Ok(content) => drift_content = Some(content),
                         Err(err) => {
                             let _ = self.close_file_for_servers(&canonical_path, &newly_opened);
@@ -3102,7 +3104,7 @@ impl LspManager {
         for key in &drifted {
             self.invalidate_diagnostic_content(key, &canonical_path);
         }
-        std::fs::read_to_string(&canonical_path)
+        read_file_content(&canonical_path)
             .map_err(LspError::Io)
             .and_then(|content| {
                 self.notify_file_changed_for_server_keys(canonical_path.clone(), &content, drifted)
@@ -3133,7 +3135,7 @@ impl LspManager {
             .collect::<Vec<_>>();
         let mut resynced = 0;
         for path in drifted {
-            let Ok(content) = std::fs::read_to_string(&path) else {
+            let Ok(content) = read_file_content(&path) else {
                 continue;
             };
             match self.notify_file_changed_if_running(&path, &content, config) {
@@ -3904,7 +3906,7 @@ impl LspManager {
             return Ok(Vec::new());
         }
         let uri = uri_for_path(&canonical_path)?;
-        let content = std::fs::read_to_string(&canonical_path).map_err(LspError::Io)?;
+        let content = read_file_content(&canonical_path).map_err(LspError::Io)?;
         let language_id = language_id_for_path(&canonical_path, Some(&content)).to_string();
         let mut opened = Vec::with_capacity(targets.len());
         for key in targets {
@@ -4079,7 +4081,7 @@ impl LspManager {
     /// content. Until the check begins, [`Self::rust_check_state`] reports
     /// it as running. Returns whether the save was sent.
     pub(crate) fn request_rust_check(&mut self, server_key: &ServerKey, file_path: &Path) -> bool {
-        let Ok(content) = std::fs::read_to_string(file_path) else {
+        let Ok(content) = read_file_content(file_path) else {
             return false;
         };
         let Ok(uri) = uri_for_path(file_path) else {
@@ -4580,7 +4582,7 @@ impl LspManager {
                 continue;
             };
             let text = (save == SaveNotification::IncludeText)
-                .then(|| uri_to_path(&uri).and_then(|path| std::fs::read_to_string(path).ok()))
+                .then(|| uri_to_path(&uri).and_then(|path| read_file_content(&path).ok()))
                 .flatten();
             let sent = client.send_notification::<DidSaveTextDocument>(DidSaveTextDocumentParams {
                 text_document: TextDocumentIdentifier::new(uri.clone()),
@@ -9331,7 +9333,7 @@ fn replay_startup_notifications(
         let mut write_attempted = false;
         let mut document_written = false;
         let sent = (|| -> Result<(DiskSnapshot, Option<(Instant, u64)>), LspError> {
-            let content = std::fs::read_to_string(&path)?;
+            let content = read_file_content(&path)?;
             let disk = DiskSnapshot::for_content(&path, &content);
             let uri = uri_for_path(&path)?;
             #[cfg(test)]
