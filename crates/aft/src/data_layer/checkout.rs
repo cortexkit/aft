@@ -1831,6 +1831,9 @@ impl Checkout {
             // down: it serves that publication and records what differs from
             // the files now on disk, as a bind does.
             drop(session);
+            // The graph spill's files close before its folder is deleted.
+            drop(sections);
+            remove_workspace(&scratch);
             report.superseded = true;
             self.adopt_newest()?;
             return Ok(report);
@@ -1888,6 +1891,9 @@ impl Checkout {
                 retire_checkouts: unneeded.checkouts,
             })
             .map_err(DataError::store)?;
+        // The publication is in the manifest, so nothing in the workspace is
+        // needed any more; every builder closed its files when it finished.
+        remove_workspace(&scratch);
         // Removes what no generation at or above the horizon names. A view
         // still reading an older generation holds a lease on it, so its
         // files stay until the view drops.
@@ -2176,6 +2182,14 @@ fn check_disk_floor_at(dir: &Path, additional: u64) -> Result<(), DataError> {
     )))
 }
 
+/// Deletes a build's workspace once the build published or stood down. A
+/// workspace that cannot be deleted now (on Windows, a file another process
+/// still has open) is left to the next writer's sweep, which deletes it
+/// once this build has let go of the checkout's build lock.
+fn remove_workspace(scratch: &aft_store::family::BuildScratch<DataError>) {
+    let _ = scratch.remove();
+}
+
 /// The disk-floor refusal a build workspace's admission last made, if any.
 type DiskPause = Arc<Mutex<Option<String>>>;
 
@@ -2215,6 +2229,7 @@ impl Checkout {
             .map_err(DataError::store)
     }
 
+    #[cfg(test)]
     fn text_build(&self) -> Result<TextBuild, DataError> {
         Ok(TextBuild::new(self.build_scratch()?, self.family.id()))
     }
@@ -2242,9 +2257,10 @@ impl Checkout {
             .checkout(self.checkout)
             .cloned();
         let started = Instant::now();
+        let scratch = self.build_scratch()?;
         let sink = BuildSink {
             text_only: true,
-            ..BuildSink::new(self.text_build()?)
+            ..BuildSink::new(TextBuild::new(Arc::clone(&scratch), self.family.id()))
         };
         let scanned = scan(&self.root, &self.layer.policy, None, &sink)
             .map_err(|error| DataError::Scan(error.to_string()))?;
@@ -2268,6 +2284,7 @@ impl Checkout {
         let mut session = self.writer()?;
         if session.base().checkout(self.checkout) != started_from.as_ref() {
             drop(session);
+            remove_workspace(&scratch);
             self.adopt_newest()?;
             return Ok(false);
         }
@@ -2293,6 +2310,7 @@ impl Checkout {
                 retire_checkouts: unneeded.checkouts,
             })
             .map_err(DataError::store)?;
+        remove_workspace(&scratch);
         // As in a full build: the publication stands whether or not
         // reclamation runs, and the next one tries again.
         match session.reclaim() {
@@ -8952,6 +8970,42 @@ pub fn other() { callee(); }
 
         drop(low);
         checkout.build().unwrap();
+    }
+
+    #[test]
+    fn a_build_deletes_its_workspace_after_publishing_but_not_on_a_disk_floor_pause() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        let builds = checkout
+            .family
+            .dir()
+            .join("builds")
+            .join(checkout.checkout.to_string());
+        checkout.build().unwrap();
+        assert_eq!(listing(&builds), ["checkout.lock"]);
+
+        // One byte above the floor: the build starts, and the text index's
+        // first run is refused once the workspace exists.
+        let low = crate::disk_floor::set_free_space_for_test(
+            store.path(),
+            crate::disk_floor::MIN_FREE_BYTES + 1,
+            10 * 1024 * 1024 * 1024,
+        );
+        let error = checkout.build().unwrap_err();
+        assert!(matches!(error, DataError::DiskFloor(_)), "{error}");
+        assert_eq!(
+            listing(&builds).len(),
+            2,
+            "a paused build keeps its workspace: {:?}",
+            listing(&builds)
+        );
+
+        drop(low);
+        checkout.build().unwrap();
+        assert_eq!(listing(&builds), ["checkout.lock"]);
     }
 
     /// Rewrites the segment format version of every segment the newest

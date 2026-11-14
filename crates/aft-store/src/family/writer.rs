@@ -44,11 +44,20 @@ pub struct PendingSegment {
     writer: SegmentWriter,
 }
 
-/// Private build files that outlive a write session, but never a build.
-/// The owner lock lets a later writer distinguish live work from a crash.
+/// Private build files that outlive a write session and, when the build
+/// fails or pauses, the build too: dropping the workspace never deletes it.
+/// The build deletes it with [`BuildScratch::remove`] once it published or
+/// stood down; a later writer's sweep deletes a workspace whose build is no
+/// longer live.
+///
+/// A build is live while it holds its checkout's `checkout.lock`, which sits
+/// beside the workspace, never inside it: the lock file must outlive every
+/// folder that may be deleted, and Windows deletes no file held open.
 pub struct BuildScratch<E> {
     path: PathBuf,
-    owner: Option<File>,
+    /// The checkout's `checkout.lock`, locked for the workspace's life;
+    /// `None` for a workspace no family sweeps.
+    _lock: Option<File>,
     admit: Box<dyn Fn(u64) -> Result<(), E> + Send + Sync>,
 }
 
@@ -62,13 +71,13 @@ impl<E> std::fmt::Debug for BuildScratch<E> {
 
 impl<E> BuildScratch<E> {
     /// A workspace for a build that has no family to publish into, such as
-    /// a gate's or a test's, made under `parent` (created if missing). No
-    /// writer sweeps `parent`, so a workspace whose process ends without
-    /// dropping it stays there.
+    /// a gate's or a test's, made under `parent` (created if missing). It
+    /// takes no lock and no writer sweeps `parent`, so its builder must
+    /// [`remove`](Self::remove) it whether the build succeeds or fails.
     ///
     /// # Errors
     ///
-    /// When the directory or its owner lock cannot be created.
+    /// When the directory cannot be created.
     pub fn create_unattached(
         parent: &Path,
         admit: impl Fn(u64) -> Result<(), E> + Send + Sync + 'static,
@@ -77,32 +86,24 @@ impl<E> BuildScratch<E> {
             .recursive(true)
             .create(parent)
             .map_err(FamilyError::io(parent))?;
-        Self::create_in(parent, admit)
+        Self::create_in(parent, None, admit)
     }
 
-    /// Makes a fresh workspace folder under `parent`, which must exist, and
-    /// takes its owner lock.
+    /// Makes a fresh workspace folder under `parent`, which must exist.
     fn create_in(
         parent: &Path,
+        lock: Option<File>,
         admit: impl Fn(u64) -> Result<(), E> + Send + Sync + 'static,
     ) -> Result<Self, FamilyError> {
         let path = parent.join(lease::fresh_id().to_string());
         private_dir_builder()
             .create(&path)
             .map_err(FamilyError::io(&path))?;
-        // Built before the owner file, so a failure below still removes the
-        // folder when `scratch` drops.
-        let mut scratch = BuildScratch {
+        Ok(BuildScratch {
             path,
-            owner: None,
+            _lock: lock,
             admit: Box::new(admit),
-        };
-        let owner_path = scratch.path.join("owner");
-        let owner =
-            crate::fs::create_new_private(&owner_path).map_err(FamilyError::io(&owner_path))?;
-        owner.lock().map_err(FamilyError::io(&owner_path))?;
-        scratch.owner = Some(owner);
-        Ok(scratch)
+        })
     }
 
     #[must_use]
@@ -111,9 +112,8 @@ impl<E> BuildScratch<E> {
     }
 
     /// Makes `name`, a folder of the workspace that one builder of the build
-    /// keeps its files in. The folder is removed with the rest of the
-    /// workspace, when the last holder of the workspace drops it, and the
-    /// returned handle is one such holder.
+    /// keeps its files in. The returned handle keeps the workspace, and so
+    /// its lock, alive.
     ///
     /// # Errors
     ///
@@ -135,6 +135,22 @@ impl<E> BuildScratch<E> {
     /// Returns the policy's refusal without writing anything.
     pub fn check_space(&self, additional_bytes: u64) -> Result<(), E> {
         (self.admit)(additional_bytes)
+    }
+
+    /// Deletes the workspace with everything in it. A build calls this once
+    /// its publication is in the manifest, or when it stands down; every
+    /// builder must have closed its files first, since Windows deletes no
+    /// file held open. The checkout's lock stays held until the last
+    /// holder drops the workspace.
+    ///
+    /// # Errors
+    ///
+    /// When the folder exists and cannot be deleted.
+    pub fn remove(&self) -> std::io::Result<()> {
+        match std::fs::remove_dir_all(&self.path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -179,60 +195,52 @@ fn private_dir_builder() -> std::fs::DirBuilder {
     builder
 }
 
-impl<E> Drop for BuildScratch<E> {
-    fn drop(&mut self) {
-        // Close the lock before deleting its file, including on Windows.
-        self.owner.take();
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
 #[cfg(test)]
 mod build_scratch_tests {
     use super::*;
     use crate::ids::FamilyId;
 
+    fn checkout(name: &[u8]) -> CheckoutId {
+        CheckoutId::from_digest(Digest128::of(name))
+    }
+
     #[test]
-    fn build_scratch_live_abandoned_and_torn_owners() {
+    fn build_scratch_live_abandoned_and_torn_workspaces() {
         let dir = tempfile::tempdir().unwrap();
         let family =
             Family::open(dir.path(), FamilyId::from_digest(Digest128::of(b"scratch"))).unwrap();
-        let mut scratch = family
+        let scratch = family
             .try_write()
             .unwrap()
             .unwrap()
-            .create_scratch(
-                CheckoutId::from_digest(Digest128::of(b"checkout")),
-                |bytes| {
-                    if bytes <= 100 {
-                        Ok(())
-                    } else {
-                        Err("disk floor")
-                    }
-                },
-            )
+            .create_scratch(checkout(b"checkout"), |bytes| {
+                if bytes <= 100 {
+                    Ok(())
+                } else {
+                    Err("disk floor")
+                }
+            })
             .unwrap();
         assert!(scratch.check_space(100).is_ok());
         assert_eq!(scratch.check_space(101), Err("disk floor"));
         let path = scratch.path().to_path_buf();
+        let checkout_dir = path.parent().unwrap().to_path_buf();
+        assert_eq!(checkout_dir.parent().unwrap(), family.dir().join("builds"));
         assert_eq!(
-            path.parent().unwrap().parent().unwrap(),
-            family.dir().join("builds")
+            std::fs::read_dir(&path).unwrap().count(),
+            0,
+            "the lock is beside the workspace, not inside it"
         );
+        assert!(checkout_dir.join("checkout.lock").is_file());
         std::fs::write(path.join("partial.seg"), b"unfinished").unwrap();
         let mut session = family.try_write().unwrap().unwrap();
         assert!(
             session
-                .create_scratch(
-                    CheckoutId::from_digest(Digest128::of(b"checkout")),
-                    |_| Ok::<_, ()>(())
-                )
+                .create_scratch(checkout(b"checkout"), |_| Ok::<_, ()>(()))
                 .is_err()
         );
         let other = session
-            .create_scratch(CheckoutId::from_digest(Digest128::of(b"other")), |_| {
-                Ok::<_, ()>(())
-            })
+            .create_scratch(checkout(b"other"), |_| Ok::<_, ()>(()))
             .unwrap();
         drop(session);
         assert!(
@@ -243,20 +251,25 @@ mod build_scratch_tests {
             path.join("partial.seg").exists(),
             "startup preserves a live build"
         );
-        scratch.owner.take();
+        drop(scratch);
+        assert!(
+            path.join("partial.seg").exists(),
+            "dropping a workspace does not delete it"
+        );
         drop(family.try_write().unwrap().unwrap());
         assert!(!path.exists(), "startup removes an abandoned build");
-        let torn = path.parent().unwrap().join("torn");
+        assert!(
+            checkout_dir.join("checkout.lock").is_file(),
+            "the sweep keeps the lock file"
+        );
+        let torn = checkout_dir.join("torn");
         std::fs::create_dir(&torn).unwrap();
         drop(family.try_write().unwrap().unwrap());
-        assert!(
-            !torn.exists(),
-            "startup removes a directory left before its owner was created"
-        );
+        assert!(!torn.exists(), "startup removes a half-made workspace");
     }
 
     #[test]
-    fn build_scratch_drop_removes_files_on_error() {
+    fn build_scratch_survives_an_error_until_removed() {
         let dir = tempfile::tempdir().unwrap();
         let family =
             Family::open(dir.path(), FamilyId::from_digest(Digest128::of(b"drop"))).unwrap();
@@ -266,20 +279,32 @@ mod build_scratch_tests {
                 .try_write()
                 .unwrap()
                 .unwrap()
-                .create_scratch(CheckoutId::from_digest(Digest128::of(b"checkout")), |_| {
-                    Ok::<_, &str>(())
-                })
+                .create_scratch(checkout(b"checkout"), |_| Ok::<_, &str>(()))
                 .unwrap();
             path = scratch.path().to_path_buf();
             std::fs::write(path.join("partial.seg"), b"unfinished").unwrap();
             Err("cancelled")
         })();
         assert!(result.is_err());
-        assert!(!path.exists());
+        assert!(
+            path.join("partial.seg").exists(),
+            "an error or pause leaves the build's work on disk"
+        );
+        let scratch = family
+            .try_write()
+            .unwrap()
+            .unwrap()
+            .create_scratch(checkout(b"checkout"), |_| Ok::<_, &str>(()))
+            .unwrap();
+        assert!(!path.exists(), "the next build of the checkout clears it");
+        let next = scratch.path().to_path_buf();
+        scratch.remove().unwrap();
+        assert!(!next.exists());
+        scratch.remove().unwrap();
     }
 
     #[test]
-    fn build_scratch_subdirs_share_one_workspace_until_the_last_holder_drops() {
+    fn build_scratch_subdirs_share_one_workspace() {
         let dir = tempfile::tempdir().unwrap();
         let scratch = Arc::new(
             BuildScratch::create_unattached(&dir.path().join("builds"), |bytes| {
@@ -292,7 +317,6 @@ mod build_scratch_tests {
             .unwrap(),
         );
         let root = scratch.path().to_path_buf();
-        assert!(root.join("owner").is_file());
         let text = scratch.subdir("text").unwrap();
         let graph = scratch.subdir("graph").unwrap();
         assert_eq!(text.path(), root.join("text"));
@@ -303,47 +327,49 @@ mod build_scratch_tests {
         );
         assert_eq!(graph.workspace().check_space(11), Err("disk floor"));
         std::fs::write(text.path().join("run"), b"partial").unwrap();
-        drop(scratch);
         drop(text);
-        assert!(
-            root.join("text").join("run").exists(),
-            "a remaining holder keeps every folder of the workspace"
-        );
         drop(graph);
+        assert!(root.join("text").join("run").exists());
+        scratch.remove().unwrap();
         assert!(!root.exists());
     }
 }
 
-fn clean_build_scratch(path: &Path) -> Result<(), FamilyError> {
-    let owner = path.join("owner");
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&owner)
+/// Opens `dir`'s `checkout.lock`, creating it, and takes it if no live
+/// build holds it. `None` means a live build does.
+fn try_checkout_lock(dir: &Path) -> Result<Option<File>, FamilyError> {
+    let path = dir.join("checkout.lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
     {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // A crash can occur between directory creation and owner creation.
-            return match std::fs::remove_dir_all(path) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(FamilyError::io(path)(error)),
-            };
-        }
-        Err(error) => return Err(FamilyError::io(&owner)(error)),
-    };
-    match file.try_lock() {
-        Ok(()) => {
-            drop(file);
-            match std::fs::remove_dir_all(path) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(FamilyError::io(path)(error)),
-            }
-        }
-        Err(std::fs::TryLockError::WouldBlock) => Ok(()),
-        Err(std::fs::TryLockError::Error(error)) => Err(FamilyError::io(&owner)(error)),
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let file = options.open(&path).map_err(FamilyError::io(&path))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(FamilyError::io(&path)(error)),
+    }
+}
+
+/// Deletes every workspace folder of a checkout whose `checkout.lock` the
+/// caller holds, so none of them belongs to a live build. The lock file
+/// itself stays: another process may be about to open it.
+fn remove_dead_workspaces(dir: &Path) -> Result<(), FamilyError> {
+    for workspace in read_dir(dir)? {
+        if !workspace.is_dir() {
+            continue;
+        }
+        match std::fs::remove_dir_all(&workspace) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(FamilyError::io(&workspace)(error));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn sweep_build_scratch(builds: &Path) -> Result<(), FamilyError> {
@@ -351,8 +377,11 @@ fn sweep_build_scratch(builds: &Path) -> Result<(), FamilyError> {
         return Ok(());
     }
     for checkout in read_dir(builds)? {
-        for workspace in read_dir(&checkout)? {
-            clean_build_scratch(&workspace)?;
+        if !checkout.is_dir() {
+            continue;
+        }
+        if let Some(_lock) = try_checkout_lock(&checkout)? {
+            remove_dead_workspaces(&checkout)?;
         }
     }
     Ok(())
@@ -507,13 +536,16 @@ impl<'f> WriteSession<'f> {
         Ok(PendingSegment { id, writer })
     }
 
-    /// Allocates `builds/<checkout>/<build-id>/`, cleaned on drop or by the
-    /// next writer after its process ends. Creation is under `writer.lock`;
-    /// a checkout can have only one live workspace, shared by its builders.
+    /// Allocates `builds/<checkout>/<build-id>/` and takes the checkout's
+    /// `builds/<checkout>/checkout.lock`, first deleting any workspace an
+    /// earlier build of the checkout left. The build deletes the new one with
+    /// [`BuildScratch::remove`]; one it leaves is deleted by the next writer
+    /// that finds the lock free. Creation is under `writer.lock`; a checkout
+    /// can have only one live workspace, shared by its builders.
     ///
     /// # Errors
     ///
-    /// When the directory or its owner lock cannot be created, or the
+    /// When the directory or the lock file cannot be created, or the
     /// checkout already has a live workspace.
     pub fn create_scratch<E>(
         &mut self,
@@ -530,15 +562,14 @@ impl<'f> WriteSession<'f> {
             .recursive(true)
             .create(&parent)
             .map_err(FamilyError::io(&parent))?;
-        for workspace in read_dir(&parent)? {
-            clean_build_scratch(&workspace)?;
-            if workspace.exists() {
-                return Err(FamilyError::Misuse(
-                    "this checkout already has a live build workspace",
-                ));
-            }
-        }
-        BuildScratch::create_in(&parent, admit)
+        let Some(lock) = try_checkout_lock(&parent)? else {
+            return Err(FamilyError::Misuse(
+                "this checkout already has a live build workspace",
+            ));
+        };
+        // Holding the lock, no workspace left here belongs to a live build.
+        remove_dead_workspaces(&parent)?;
+        BuildScratch::create_in(&parent, Some(lock), admit)
     }
 
     /// Finishes a segment and stages it for publication.

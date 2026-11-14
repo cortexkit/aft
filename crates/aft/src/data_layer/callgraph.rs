@@ -1234,7 +1234,8 @@ pub(crate) fn resolve_checkout(
     let mut copy = inputs.clone();
     let mut resolved = BTreeMap::new();
     // With no store to build into, the spool's workspace goes in the
-    // system's temporary folder.
+    // system's temporary folder. Nothing sweeps it there, so it is deleted
+    // whether or not resolution succeeds.
     let workspace = Arc::new(
         aft_store::family::BuildScratch::create_unattached(
             &std::env::temp_dir().join("aft-callgraph-builds"),
@@ -1242,10 +1243,13 @@ pub(crate) fn resolve_checkout(
         )
         .map_err(|error| ManifestJoinError::Parse(format!("spooled resolutions: {error}")))?,
     );
-    resolve_checkout_into(&mut copy, threads, None, &workspace, &mut |_, files| {
+    let result = resolve_checkout_into(&mut copy, threads, None, &workspace, &mut |_, files| {
         resolved.extend(files);
         Ok(())
-    })?;
+    });
+    let removed = workspace.remove();
+    result?;
+    removed.map_err(spool_error)?;
     Ok(resolved)
 }
 

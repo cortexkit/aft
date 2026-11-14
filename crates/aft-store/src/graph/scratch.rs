@@ -1,7 +1,7 @@
 //! The folder the graph writer spills into. It is one builder's folder in
 //! the build's shared workspace ([`crate::family::BuildScratch`]), which
-//! owns the folder's cleanup, owner lock, disk admission and the sweep of
-//! workspaces whose build died.
+//! owns the folder's deletion, the checkout's build lock, disk admission and
+//! the sweep of workspaces whose build is no longer live.
 
 use std::path::Path;
 

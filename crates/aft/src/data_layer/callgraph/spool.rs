@@ -2,8 +2,8 @@
 //! has read every file's.
 //!
 //! It writes into its own `runs/` folder of the build's shared workspace
-//! ([`BuildScratch`]), which owns the folder's cleanup, owner lock and disk
-//! admission. Each spooled file is written once under a new name, closed
+//! ([`BuildScratch`]), which owns the folder's deletion, the checkout's build
+//! lock and disk admission. Each spooled file is written once under a new name, closed
 //! before anything refers to it, and checked against its length and
 //! checksum when read back.
 
@@ -141,7 +141,6 @@ mod tests {
         let dir = workspace.path().to_path_buf();
         assert!(dir.join("owner").is_file());
         let mut spool = ResolutionSpool::new(&workspace).unwrap();
-        drop(workspace);
         let first = spool
             .write_range(&[b"one".to_vec(), Vec::new(), b"three".to_vec()])
             .unwrap();
@@ -162,9 +161,11 @@ mod tests {
         assert!(spool.read_range(second).is_err());
         drop(spool);
         assert!(
-            !dir.exists(),
-            "the spool held the last handle on the workspace"
+            dir.join("runs").exists(),
+            "dropping the spool leaves its files to the workspace's owner"
         );
+        workspace.remove().unwrap();
+        assert!(!dir.exists());
     }
 
     #[test]
@@ -189,5 +190,6 @@ mod tests {
             1,
             "only the admitted range is on disk"
         );
+        workspace.remove().unwrap();
     }
 }

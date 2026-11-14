@@ -278,7 +278,10 @@ mod tests {
         let mut out = writer(&actual, family);
         bounded.write(&mut out).unwrap();
         out.finish().unwrap();
-        assert!(!scratch.exists(), "successful merge removes every partial");
+        assert!(
+            scratch.join("text").join("text-0.seg").exists(),
+            "the runs stay until the build deletes its workspace after publication"
+        );
         let baseline = dir.path().join("baseline.seg");
         let mut out = writer(&baseline, family);
         expected.write(&mut out).unwrap();
@@ -316,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn text_build_spill_error_cleans_partial_files() {
+    fn text_build_spill_error_leaves_its_runs_to_the_workspace() {
         let dir = tempfile::tempdir().unwrap();
         let mut bounded = build(&dir.path().join("family"), 1);
         let scratch = bounded.scratch.path().to_path_buf();
@@ -329,7 +332,10 @@ mod tests {
             .add_unindexed(ContentKey::of(b"x"), 1, TextStatus::Binary)
             .is_err());
         drop(bounded);
-        assert!(!scratch.exists());
+        assert!(
+            scratch.join("text").join("text-0.seg").exists(),
+            "an error deletes nothing; the workspace's owner or the sweep does"
+        );
     }
 
     #[test]

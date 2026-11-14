@@ -268,7 +268,10 @@ fn streamed_fixture_segment_equals_buffered_including_shared_fragments() {
             maps[0], maps[1],
             "even omitted fragments keep their checkout keys"
         );
-        assert!(!scratch.exists());
+        assert!(
+            scratch.exists(),
+            "finishing the sections leaves the workspace for the build to delete"
+        );
         assert_eq!(
             std::fs::read(segments[0].path()).unwrap(),
             std::fs::read(segments[1].path()).unwrap()

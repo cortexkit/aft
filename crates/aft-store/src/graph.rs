@@ -713,8 +713,8 @@ mod tests {
         streamed.write(&mut writer).unwrap();
         writer.finish().unwrap();
         assert!(
-            !scratch.exists(),
-            "successful writes remove all spill files"
+            scratch.exists(),
+            "the spill leaves its folder to the build workspace, which is deleted after publication"
         );
         assert_eq!(
             std::fs::read(dir.path().join("buffered")).unwrap(),
@@ -745,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn streamed_output_refuses_disk_floor_and_cleans_up_on_error() {
+    fn streamed_output_refuses_disk_floor_and_keeps_its_folder_on_error() {
         use crate::family::Family;
         use crate::spill::{Config, WriteGuard};
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -776,7 +776,10 @@ mod tests {
             "a refused append must not create a fragment range"
         );
         drop(spill);
-        assert!(!scratch.exists());
+        assert!(
+            scratch.exists(),
+            "a disk-floor pause leaves the build's work for the workspace's owner to delete"
+        );
     }
 
     /// Graph sections holding one fragment and one call-target term, `t`,

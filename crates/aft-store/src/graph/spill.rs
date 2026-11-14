@@ -57,9 +57,10 @@ struct Placed {
     slice: (u8, u32, u32),
 }
 
-/// Writes into one folder of the build's shared workspace, which is removed
-/// once every builder holding it has dropped it. The family writer's startup
-/// sweep reaps the workspaces of builds whose process died, but not live ones.
+/// Writes into one folder of the build's shared workspace. Dropping the spill,
+/// even on an error or a disk-floor pause, deletes nothing: the build deletes
+/// the workspace after publication, and the family writer's sweep deletes
+/// those of builds that are no longer live.
 #[derive(Debug)]
 pub struct GraphSectionsSpill {
     data: Option<BufWriter<File>>,
@@ -500,6 +501,6 @@ mod tests {
                 .contains("checksum")
         );
         drop(spill);
-        assert!(!path.exists());
+        assert!(path.exists(), "dropping the spill never deletes its folder");
     }
 }
