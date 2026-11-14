@@ -64,7 +64,7 @@ fn checked_failures(view: &CheckoutView) -> GateResult<()> {
 
 fn export(checkout: &Checkout, out: &Path, reference: Option<&Path>) -> GateResult<usize> {
     std::fs::create_dir_all(out.join("sections"))?;
-    let view = checkout.view()?;
+    let view = checkout.view().ok_or("no published view")?;
     let published = &view.published;
     if !published.graph_built {
         return Err("publication has no call graph".into());
@@ -302,7 +302,7 @@ fn native_plan(view: &CheckoutView, out: &Path) -> GateResult<()> {
                 declarations
                     .entry(method.name.clone())
                     .or_default()
-                    .push(json!({"file": path, "language": parse.language, "symbol": symbol}));
+                    .push(json!({"file": path, "language": parse.language, "owner": method.owner, "symbol": symbol}));
             }
         }
         if let Some(slice) = view.graph.slice(path) {
@@ -363,7 +363,7 @@ fn queries(
     sample: usize,
 ) -> GateResult<()> {
     use crate::commands::callgraph_store_adapter as adapter;
-    let view = checkout.view()?;
+    let view = checkout.view().ok_or("no published view")?;
     let plan: Vec<QuerySpec> = if let Some(reference) = reference {
         serde_json::from_slice(&std::fs::read(reference.join("plan.json"))?)?
     } else {
@@ -453,6 +453,10 @@ fn queries(
     // Preserve every dead-code input row, including initializer groups and
     // protected roots. The timestamp is deliberately outside the comparison.
     let dead = view.rows_dead_code_snapshot()?;
+    save(
+        &out.join("dead-code-findings.json"),
+        &super::super::dead_code_gate::exactness_rows(&view, &out.join("dead-code-work"))?,
+    )?;
     let initializers = dead.go_initializers.iter().map(|group| json!({"caller_file": group.caller_file, "callers": group.callers, "targets": group.targets.iter().map(|(file, symbol)| (file.as_ref(), symbol.as_ref())).collect::<Vec<_>>()})).collect::<Vec<_>>();
     save(
         &out.join("dead-code.json"),
@@ -520,7 +524,7 @@ pub fn run(args: Vec<String>) -> GateResult<()> {
                     .collect::<Vec<_>>(),
             )?;
             checkout.refresh_callgraph()?;
-            checked_failures(&checkout.view()?)?;
+            checked_failures(&checkout.view().ok_or("no published view")?)?;
             save(
                 &out.join("prepublish-health.json"),
                 &json!({"stored_slices_failures": []}),
@@ -529,6 +533,9 @@ pub fn run(args: Vec<String>) -> GateResult<()> {
         }
         "snapshot" => {}
         _ => return Err("unknown exactness mode".into()),
+    }
+    if mode == "cold" {
+        export(&checkout, &out.join("raw"), None)?;
     }
     // Fold copies active stored units and their term postings without
     // resolving again. Apply it to both cold and refreshed publications so
@@ -539,7 +546,7 @@ pub fn run(args: Vec<String>) -> GateResult<()> {
     }
     let count = export(&checkout, out, reference)?;
     if reference.is_none() {
-        native_plan(&checkout.view()?, out)?;
+        native_plan(&checkout.view().ok_or("no published view")?, out)?;
     }
     queries(&checkout, out, reference, sample)?;
     println!("EXACTNESS snapshot: {count} full FileResolutions; StoredSlices::failures()=[]");
