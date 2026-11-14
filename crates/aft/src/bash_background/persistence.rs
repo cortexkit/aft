@@ -2261,6 +2261,8 @@ impl From<BashTaskRow> for PersistedTask {
             cancelled_call_unannounced: false,
             runner_completion_offers: 0,
             runner_completion_notice: None,
+            runner_notice_policy: None,
+            runner_reminder_elapsed_ms: None,
             folder_grants: None,
         }
     }
