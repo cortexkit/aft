@@ -4,7 +4,7 @@ use std::thread::ThreadId;
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ThreadCpuSample {
+pub struct ThreadCpuSample {
     thread: ThreadId,
     cpu: Duration,
 }

@@ -1,6 +1,19 @@
 pub use aft_base::executable_cache::*;
 
 #[cfg(test)]
+#[allow(unused_imports)]
+use sha2::{Digest, Sha256};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::fs::{self, OpenOptions};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::io::{self, Write};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::{Path, PathBuf};
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};

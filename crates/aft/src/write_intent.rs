@@ -10,45 +10,8 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    type Events = Arc<Mutex<Vec<(WriteIntent, WritePhase, Vec<u8>)>>>;
-    struct Listener {
-        root: PathBuf,
-        events: Events,
-    }
-    impl WriteIntentListener for Listener {
-        fn record_change(&self, change: &WriteIntent, phase: WritePhase) {
-            let paths = match change {
-                WriteIntent::Paths(paths) => paths.clone(),
-                WriteIntent::Directory(path) => vec![path.clone()],
-            };
-            if paths.iter().any(|path| path.starts_with(&self.root)) {
-                let bytes = paths
-                    .first()
-                    .and_then(|path| std::fs::read(path).ok())
-                    .unwrap_or_default();
-                self.events
-                    .lock()
-                    .unwrap()
-                    .push((change.clone(), phase, bytes));
-            }
-        }
-    }
-
-    #[test]
-    fn intent_paths_are_classified_once() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("new.rs");
-        let listener: Arc<dyn WriteIntentListener> = Arc::new(Listener {
-            root: root.path().to_path_buf(),
-            events: Arc::new(Mutex::new(Vec::new())),
-        });
-        register_listener(&listener);
-        CLASSIFICATION_STATS.with(|count| count.set(0));
-        let guard = record_paths([path.as_path()]);
-        assert_eq!(CLASSIFICATION_STATS.with(|count| count.get()), 1);
-        drop(guard);
-    }
+    #[allow(unused_imports)]
+    pub(crate) use aft_base::write_intent::tests::*;
 
     #[test]
     fn composite_listener_sees_before_after_directory_and_unregisters_on_drop() {

@@ -1,4 +1,10 @@
 use super::*;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::time::Duration;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_default_wait_passes_cancellation_to_hold_and_withdraws_a_failed_await() {
@@ -82,11 +88,6 @@ async fn the_default_wait_passes_cancellation_to_hold_and_withdraws_a_failed_awa
         );
     }
 }
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc, Condvar, Mutex,
-};
-use std::time::Duration;
 
 #[derive(Default)]
 struct Held {

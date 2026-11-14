@@ -47,3 +47,11 @@ pub use vault::fake::{approval, granted, FakeReply, FakeVault, FakeVaultScript};
 
 pub mod call_context;
 pub(crate) mod fetch;
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "wire_tests.rs"]
+mod wire_tests;

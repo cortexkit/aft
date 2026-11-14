@@ -49,3 +49,8 @@ pub fn is_os_metadata_file_name(name: &OsStr) -> bool {
 pub fn is_os_metadata_path(path: &Path) -> bool {
     path.file_name().is_some_and(is_os_metadata_file_name)
 }
+
+#[cfg(any(test, feature = "test-support"))]
+#[path = "os_metadata_tests.rs"]
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
+pub mod tests;

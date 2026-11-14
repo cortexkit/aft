@@ -434,3 +434,12 @@ impl SecretUseTransport for SubcSecretUseTransport {
             .map_err(Failure::unavailable)
     }
 }
+
+#[cfg(any(test, feature = "test-support"))]
+#[path = "transport_tests.rs"]
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
+pub mod tests;
+
+#[cfg(test)]
+#[path = "transport_fake.rs"]
+pub(crate) mod fake;

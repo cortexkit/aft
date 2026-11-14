@@ -887,10 +887,10 @@ pub fn allocator_reuse_window_ms(floor_ms: u64, walk_ms: u64) -> u64 {
         .clamp(floor_ms, ALLOCATOR_WALK_MAX_REUSE_MS.max(floor_ms))
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-/// The module loop ticks every 250ms. Sampling at this cadence would repeatedly
-/// take allocator-zone locks, so cache a process-wide observation for at least
-/// 60s, longer when walks are expensive (see `allocator_reuse_window_ms`).
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+/// The Linux module loop ticks every 250ms. Reuse its process-wide jemalloc
+/// observation for at least 60s to bound telemetry work, longer when walks
+/// are expensive (see `allocator_reuse_window_ms`).
 /// This bounds allocator statistics walks to one per idle minute, or two for a
 /// relief pass that uses its before/after snapshots.
 const ALLOCATOR_SLACK_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -1019,7 +1019,7 @@ fn allocator_slack_elapsed_ms(now: std::time::Instant) -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn cached_allocator_slack() -> Option<u64> {
     let slack = LAST_OBSERVED_ALLOCATOR_SLACK_BYTES.load(std::sync::atomic::Ordering::Acquire);
     (slack != UNKNOWN_ALLOCATOR_SLACK).then_some(slack)
@@ -1156,7 +1156,7 @@ fn publish_allocator_slack(snapshot: &AllocatorMemorySnapshot, sampled_at_ms: u6
     LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS.store(sampled_at_ms, std::sync::atomic::Ordering::Release);
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn sample_is_stale(now_ms: u64) -> bool {
     sample_is_stale_after(
         LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS.load(std::sync::atomic::Ordering::Acquire),
@@ -1167,7 +1167,7 @@ fn sample_is_stale(now_ms: u64) -> bool {
 
 /// Whether a sample taken at `sampled_at` is due for replacement at `now_ms`
 /// when the last walk took `walk_ms`.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 fn sample_is_stale_after(sampled_at: u64, now_ms: u64, walk_ms: u64) -> bool {
     sampled_at == UNSAMPLED_AT_MS
         || now_ms.saturating_sub(sampled_at)
@@ -1177,7 +1177,7 @@ fn sample_is_stale_after(sampled_at: u64, now_ms: u64, walk_ms: u64) -> bool {
             )
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn reserve_sample(now_ms: u64) -> Option<u64> {
     let previous = LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS.load(std::sync::atomic::Ordering::Acquire);
     if !sample_is_stale(now_ms) {
@@ -1193,7 +1193,7 @@ fn reserve_sample(now_ms: u64) -> Option<u64> {
         .ok()
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn reserve_relief(now_ms: u64) -> Option<u64> {
     let previous = LAST_ALLOCATOR_SLACK_RELIEF_AT_MS.load(std::sync::atomic::Ordering::Acquire);
     let due = cached_allocator_slack().is_some_and(|slack| {
@@ -1214,7 +1214,7 @@ fn reserve_relief(now_ms: u64) -> Option<u64> {
     })?
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn log_allocator_relief(relief: AllocatorPressureRelief) {
     log::info!(
         "allocator slack relief: allocator_accounting_bytes={} allocator_accounting_source={} rss_drop_bytes={:?} phys_footprint_drop_bytes={:?} rss_bytes_before={:?} rss_bytes_after={:?} address_space_slack_bytes_before={:?} address_space_slack_bytes_after={:?}",
@@ -1230,7 +1230,7 @@ fn log_allocator_relief(relief: AllocatorPressureRelief) {
 }
 
 /// Record the latest periodic relief pass for the memory census.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn record_last_allocator_relief(relief: &AllocatorPressureRelief) {
     let ordering = std::sync::atomic::Ordering::Release;
     LAST_ALLOCATOR_SLACK_RELIEF_ACCOUNTING_BYTES.store(relief.allocator_accounting_bytes, ordering);
@@ -1338,7 +1338,7 @@ pub fn allocator_slack_relief_due(
     }
 }
 
-/// Opportunistically return unused allocator pages without reading allocator
+/// On Linux, opportunistically return unused allocator pages without reading allocator
 /// statistics on the module loop. The loop only reads cached atomics. When the
 /// cached observation is stale, one sampler takes an initial snapshot; if it
 /// finds enough slack, the page-return operation reuses it and takes only one
@@ -1347,7 +1347,7 @@ pub fn allocator_slack_relief_due(
 /// `phys_footprint_bytes` cannot make this decision: it includes file mappings
 /// and other resident memory, so it cannot identify mapped-but-unused allocator
 /// arenas without allocator-zone statistics.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub fn spawn_allocator_slack_relief_if_due(now: std::time::Instant) -> bool {
     let now_ms = allocator_slack_elapsed_ms(now);
     if sample_is_stale(now_ms) {
@@ -1407,9 +1407,9 @@ pub fn spawn_allocator_slack_relief_if_due(now: std::time::Instant) -> bool {
     spawned
 }
 
-/// No allocator-statistics API is wired on this target; the loop-side decision
-/// is a no-op and the cache statics above stay at their unsampled sentinels.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// macOS statistics take every allocator-zone lock; sampling and relief there
+/// are explicit-only. Other non-Linux targets have no automatic sampler.
+#[cfg(not(target_os = "linux"))]
 pub fn spawn_allocator_slack_relief_if_due(_now: std::time::Instant) -> bool {
     false
 }
@@ -1539,4 +1539,419 @@ pub fn process_rss_bytes() -> Option<u64> {
 
 pub fn rss_bytes() -> Option<u64> {
     process_rss_bytes()
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
+pub mod snapshot_cap_tests {
+    use super::*;
+
+    pub fn root_with_bytes(bytes: u64) -> RootMemorySnapshot {
+        let estimate = MemoryEstimate::estimated;
+        RootMemorySnapshot::new(
+            estimate(bytes),
+            estimate(0),
+            estimate(0),
+            estimate(0),
+            estimate(0),
+            estimate(0),
+            estimate(0),
+            estimate(0),
+            estimate(0),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_snapshot_preserves_negative_residuals() {
+        assert_eq!(signed_difference(5, 8), -3);
+    }
+
+    #[test]
+    fn allocator_reuse_window_stretches_with_walk_cost() {
+        // A cheap walk keeps the floor.
+        assert_eq!(allocator_reuse_window_ms(30_000, 0), 30_000);
+        assert_eq!(allocator_reuse_window_ms(30_000, 150), 30_000);
+        // An expensive walk waits 200 times its own duration...
+        assert_eq!(allocator_reuse_window_ms(30_000, 1_000), 200_000);
+        // ...but never more than ten minutes.
+        assert_eq!(allocator_reuse_window_ms(30_000, 6_500), 600_000);
+        assert_eq!(allocator_reuse_window_ms(30_000, u64::MAX), 600_000);
+        // A floor above the cap still wins.
+        assert_eq!(allocator_reuse_window_ms(900_000, 6_500), 900_000);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn slack_sample_waits_longer_after_an_expensive_walk() {
+        assert!(sample_is_stale_after(UNSAMPLED_AT_MS, 0, 0));
+        // A cheap walk: due once a minute.
+        assert!(!sample_is_stale_after(0, 59_999, 20));
+        assert!(sample_is_stale_after(0, 60_000, 20));
+        // A one-second walk: due after 200 seconds, not after one minute.
+        assert!(!sample_is_stale_after(0, 60_000, 1_000));
+        assert!(!sample_is_stale_after(0, 199_999, 1_000));
+        assert!(sample_is_stale_after(0, 200_000, 1_000));
+        // A multi-second glibc walk: capped at ten minutes.
+        assert!(!sample_is_stale_after(0, 599_999, 6_500));
+        assert!(sample_is_stale_after(0, 600_000, 6_500));
+    }
+
+    #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+    #[test]
+    fn cached_allocator_before_first_publication_is_unavailable_not_unsupported() {
+        let _test_guard = allocator_observation_test_lock();
+        let publish_guard = ALLOCATOR_OBSERVATION_PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_allocator_observation_for_test();
+        let calls_before = allocator_snapshot_calls_for_test();
+
+        // Hold publication at startup: a request can arrive before the sampler
+        // publishes its first reading, even on a measurable allocator.
+        let (allocator, age_ms) = allocator_observation(AllocatorSource::Cached);
+        assert_eq!(allocator.status, "unavailable");
+        assert_eq!(
+            allocator.not_estimated,
+            Some("allocator_observation_unavailable")
+        );
+        assert_eq!(allocator.bytes_in_use, None);
+        assert_eq!(allocator.size_allocated, None);
+        assert_eq!(allocator.retained_slack_bytes, None);
+        assert_eq!(age_ms, None);
+        assert_eq!(allocator_snapshot_calls_for_test(), calls_before);
+
+        drop(publish_guard);
+        publish_allocator_slack(&measured_allocator(100, 140), 0);
+        let (allocator, age_ms) = allocator_observation(AllocatorSource::Cached);
+        assert_eq!(allocator.status, "measured");
+        assert_eq!(allocator.not_estimated, None);
+        assert_eq!(allocator.bytes_in_use, Some(100));
+        assert_eq!(allocator.retained_slack_bytes, Some(40));
+        assert!(age_ms.is_some());
+        assert_eq!(allocator_snapshot_calls_for_test(), calls_before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn loop_slack_decision_never_reads_allocator_statistics() {
+        LAST_OBSERVED_ALLOCATOR_SLACK_BYTES.store(
+            UNKNOWN_ALLOCATOR_SLACK,
+            std::sync::atomic::Ordering::Release,
+        );
+        LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS
+            .store(UNSAMPLED_AT_MS, std::sync::atomic::Ordering::Release);
+        LAST_ALLOCATOR_SLACK_RELIEF_AT_MS
+            .store(UNSAMPLED_AT_MS, std::sync::atomic::Ordering::Release);
+        ALLOCATOR_SNAPSHOT_THREADS
+            .lock()
+            .expect("clear allocator snapshot thread log")
+            .clear();
+
+        for _ in 0..1_000 {
+            assert!(!spawn_allocator_slack_relief_if_due(
+                std::time::Instant::now()
+            ));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let sampler_ran = || {
+            ALLOCATOR_SNAPSHOT_THREADS
+                .lock()
+                .expect("read allocator snapshot thread log")
+                .iter()
+                .any(|name| name == "aft-mem-slack-sample")
+        };
+        while !sampler_ran() {
+            assert!(std::time::Instant::now() < deadline, "sampler did not run");
+            std::thread::yield_now();
+        }
+        // The thread log is process-global and other tests in the parallel suite
+        // read allocator statistics on their own threads; the property under
+        // test is only that THIS thread (the loop stand-in) never did.
+        let loop_thread = std::thread::current()
+            .name()
+            .unwrap_or("unnamed")
+            .to_string();
+        let threads = ALLOCATOR_SNAPSHOT_THREADS
+            .lock()
+            .expect("read allocator snapshot thread log")
+            .clone();
+        assert!(
+            !threads.iter().any(|name| *name == loop_thread),
+            "the loop-side decision must never read allocator statistics: {threads:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_automatic_slack_sampling_and_relief_are_explicit_only() {
+        let before = allocator_snapshot_calls_for_test();
+        for seconds in [0, 30, 300, 3_600] {
+            assert!(!spawn_allocator_slack_relief_if_due(
+                std::time::Instant::now() + std::time::Duration::from_secs(seconds)
+            ));
+        }
+        assert_eq!(allocator_snapshot_calls_for_test(), before);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn slack_relief_fires_on_large_slack_and_respects_spacing() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let big = Some(ALLOCATOR_SLACK_RELIEF_THRESHOLD_BYTES);
+        // Unknown slack (allocator stats unavailable) never fires.
+        assert!(!allocator_slack_relief_due(None, None, now));
+        // Below threshold never fires.
+        assert!(!allocator_slack_relief_due(
+            Some(ALLOCATOR_SLACK_RELIEF_THRESHOLD_BYTES - 1),
+            None,
+            now
+        ));
+        // At threshold with no prior pass fires.
+        assert!(allocator_slack_relief_due(big, None, now));
+        // A recent pass suppresses the next one...
+        let recent = now - Duration::from_secs(10);
+        assert!(!allocator_slack_relief_due(big, Some(recent), now));
+        // ...until the minimum spacing has elapsed.
+        let stale = now - ALLOCATOR_SLACK_RELIEF_MIN_INTERVAL;
+        assert!(allocator_slack_relief_due(big, Some(stale), now));
+    }
+
+    #[test]
+    fn json_estimator_scales_with_payload_content() {
+        let empty = estimated_json_bytes(&serde_json::json!({}));
+        let populated = estimated_json_bytes(&serde_json::json!({"message": "hello"}));
+        assert_eq!(empty, 0);
+        assert!(populated >= 12);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn allocator_snapshot_reports_measured_slack() {
+        let allocator = allocator_memory_snapshot();
+        if allocator.status == "measured" {
+            let in_use = allocator.bytes_in_use.expect("allocator bytes in use");
+            let allocated = allocator.size_allocated.expect("allocator size allocated");
+            assert_eq!(
+                allocator.retained_slack_bytes,
+                Some(allocated.saturating_sub(in_use))
+            );
+        } else {
+            assert_eq!(allocator.status, "not_estimated_on_this_platform");
+            assert_eq!(allocator.bytes_in_use, None);
+            assert_eq!(allocator.size_allocated, None);
+            assert_eq!(allocator.retained_slack_bytes, None);
+            assert_eq!(
+                allocator.not_estimated,
+                Some("jemalloc_statistics_unavailable")
+            );
+        }
+    }
+
+    fn measured_allocator(bytes_in_use: u64, size_allocated: u64) -> AllocatorMemorySnapshot {
+        AllocatorMemorySnapshot {
+            status: "measured",
+            bytes_in_use: Some(bytes_in_use),
+            size_allocated: Some(size_allocated),
+            retained_slack_bytes: Some(size_allocated.saturating_sub(bytes_in_use)),
+            retained_slack_label: ALLOCATOR_SLACK_LABEL,
+            not_estimated: None,
+            #[cfg(target_os = "linux")]
+            jemalloc: Some(JemallocMemorySnapshot {
+                accounting_source: "jemalloc",
+                allocated: bytes_in_use,
+                active: bytes_in_use,
+                resident: size_allocated,
+                retained: 0,
+            }),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+
+    /// Kernel RSS can fall independently of the allocator's resident estimate.
+    /// The record must carry both figures, each labelled.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relief_reports_rss_drop_when_allocator_accounting_is_unchanged() {
+        let in_use = 2 * GIB;
+        let size_allocated = in_use + 7560 * MIB;
+        let before = ResidentReading {
+            rss_bytes: Some(6440 * MIB),
+            phys_footprint_bytes: None,
+        };
+        let after = ResidentReading {
+            rss_bytes: Some(4910 * MIB),
+            phys_footprint_bytes: None,
+        };
+        let relief = AllocatorPressureRelief::from_jemalloc_resident_drop(
+            before,
+            after,
+            measured_allocator(in_use, size_allocated),
+            measured_allocator(in_use, size_allocated),
+        );
+        assert_eq!(relief.allocator_accounting_bytes, 0);
+        assert_eq!(
+            relief.allocator_accounting_source,
+            RELIEF_ACCOUNTING_SOURCE_JEMALLOC
+        );
+        assert_eq!(relief.rss_drop_bytes, Some(1530 * MIB));
+        assert_eq!(relief.rss_before_bytes, Some(6440 * MIB));
+        assert_eq!(relief.rss_after_bytes, Some(4910 * MIB));
+        assert_eq!(relief.phys_footprint_drop_bytes, None);
+        // Slack is unchanged even though memory went back to the OS: it is
+        // address space, not residency.
+        assert_eq!(
+            relief.allocator_before.retained_slack_bytes,
+            relief.allocator_after.retained_slack_bytes
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relief_keeps_allocator_accounting_and_resident_drops_independent() {
+        // jemalloc's resident estimate fell by 64 MiB while RSS fell by 300 MiB.
+        let relief = AllocatorPressureRelief::from_jemalloc_resident_drop(
+            ResidentReading {
+                rss_bytes: Some(1000 * MIB),
+                phys_footprint_bytes: None,
+            },
+            ResidentReading {
+                rss_bytes: Some(700 * MIB),
+                phys_footprint_bytes: None,
+            },
+            measured_allocator(100 * MIB, 500 * MIB),
+            measured_allocator(100 * MIB, 436 * MIB),
+        );
+        assert_eq!(relief.allocator_accounting_bytes, 64 * MIB);
+        assert_eq!(relief.rss_drop_bytes, Some(300 * MIB));
+
+        // RSS growth during the pass floors the drop at zero; a missing
+        // reading yields no drop rather than a guessed one.
+        let grew = AllocatorPressureRelief::from_jemalloc_resident_drop(
+            ResidentReading {
+                rss_bytes: Some(700 * MIB),
+                phys_footprint_bytes: Some(500 * MIB),
+            },
+            ResidentReading {
+                rss_bytes: Some(900 * MIB),
+                phys_footprint_bytes: None,
+            },
+            measured_allocator(100 * MIB, 500 * MIB),
+            measured_allocator(100 * MIB, 500 * MIB),
+        );
+        assert_eq!(grew.rss_drop_bytes, Some(0));
+        assert_eq!(grew.phys_footprint_drop_bytes, None);
+    }
+
+    #[test]
+    fn macos_style_relief_reports_allocator_return_and_footprint_drop() {
+        let relief = AllocatorPressureRelief::from_observations(
+            40 * MIB,
+            RELIEF_ACCOUNTING_SOURCE_MACOS,
+            ResidentReading {
+                rss_bytes: Some(900 * MIB),
+                phys_footprint_bytes: Some(600 * MIB),
+            },
+            ResidentReading {
+                rss_bytes: Some(900 * MIB),
+                phys_footprint_bytes: Some(520 * MIB),
+            },
+            measured_allocator(100 * MIB, 500 * MIB),
+            measured_allocator(100 * MIB, 500 * MIB),
+        );
+        assert_eq!(relief.allocator_accounting_bytes, 40 * MIB);
+        assert_eq!(
+            relief.allocator_accounting_source,
+            RELIEF_ACCOUNTING_SOURCE_MACOS
+        );
+        assert_eq!(relief.rss_drop_bytes, Some(0));
+        assert_eq!(relief.phys_footprint_drop_bytes, Some(80 * MIB));
+    }
+
+    #[test]
+    fn allocator_snapshot_labels_slack_as_address_space() {
+        let value = serde_json::to_value(measured_allocator(1, 3)).unwrap();
+        assert_eq!(value["retained_slack_bytes"], 2);
+        assert_eq!(value["retained_slack_label"], ALLOCATOR_SLACK_LABEL);
+        assert!(ALLOCATOR_SLACK_LABEL.starts_with("address-space slack"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_allocator_pressure_relief_smoke() {
+        let mut allocation = vec![0u8; 32 * 1024 * 1024];
+        for byte in allocation.iter_mut().step_by(4096) {
+            *byte = 1;
+        }
+        std::hint::black_box(&allocation);
+        drop(allocation);
+
+        let relief = relieve_allocator_pressure();
+        assert_eq!(
+            relief.allocator_accounting_source,
+            RELIEF_ACCOUNTING_SOURCE_JEMALLOC
+        );
+        assert!(relief.allocator_before.jemalloc.is_some());
+        assert!(relief.allocator_after.jemalloc.is_some());
+        purge_allocator().expect("jemalloc all-arena purge must succeed");
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn allocator_snapshot_is_honest_when_platform_counters_are_unavailable() {
+        let allocator = allocator_memory_snapshot();
+        assert_eq!(allocator.status, "not_estimated_on_this_platform");
+        assert_eq!(allocator.bytes_in_use, None);
+        assert_eq!(allocator.size_allocated, None);
+        assert_eq!(allocator.retained_slack_bytes, None);
+        assert_eq!(
+            allocator.not_estimated,
+            Some("platform_allocator_statistics_unavailable")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "bounded live RSS experiment; run explicitly after allocator changes"]
+    fn allocator_pressure_relief_warm_then_idle_measurement() {
+        let warm_pages = (0..16 * 1024)
+            .map(|seed| {
+                let mut page = Box::new([0u8; 4096]);
+                page[0] = seed as u8;
+                page
+            })
+            .collect::<Vec<_>>();
+        std::hint::black_box(&warm_pages);
+        drop(warm_pages);
+
+        let relief = relieve_allocator_pressure();
+        let sqlite = SqliteMemorySnapshot::measure();
+        eprintln!(
+            "warm-then-idle pressure relief: rss_before={:?} rss_after={:?} footprint_before={:?} footprint_after={:?} allocator_in_use_before={:?} allocator_in_use_after={:?} allocator_allocated_before={:?} allocator_allocated_after={:?} address_space_slack_before={:?} address_space_slack_after={:?} allocator_accounting={} ({}) sqlite_used={} sqlite_highwater={}",
+            relief.rss_before_bytes,
+            relief.rss_after_bytes,
+            relief.phys_footprint_before_bytes,
+            relief.phys_footprint_after_bytes,
+            relief.allocator_before.bytes_in_use,
+            relief.allocator_after.bytes_in_use,
+            relief.allocator_before.size_allocated,
+            relief.allocator_after.size_allocated,
+            relief.allocator_before.retained_slack_bytes,
+            relief.allocator_after.retained_slack_bytes,
+            relief.allocator_accounting_bytes,
+            relief.allocator_accounting_source,
+            sqlite.memory_used_bytes,
+            sqlite.memory_highwater_bytes,
+        );
+        assert_eq!(relief.allocator_before.status, "measured");
+        assert_eq!(relief.allocator_after.status, "measured");
+    }
 }

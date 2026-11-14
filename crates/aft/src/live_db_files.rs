@@ -16,10 +16,9 @@ use std::sync::{Mutex, OnceLock, RwLock};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{SqliteStore, TrackedConnection};
+    use crate::db::SqliteStore;
+    use crate::db::TrackedConnection;
     // Only the POSIX-only tests below open raw connections.
-    #[cfg(unix)]
-    use rusqlite::Connection;
 
     #[cfg(unix)]
     #[test]
@@ -127,117 +126,6 @@ mod tests {
         assert!(is_live_sqlite_file(&alias));
         note_close(&second_key, SqliteStore::BlobStore.label());
         assert!(!is_live_sqlite_file(&alias));
-    }
-
-    #[cfg(unix)]
-    fn shm_path(path: &Path) -> PathBuf {
-        PathBuf::from(format!("{}-shm", path.display()))
-    }
-
-    /// The mechanism, stated as an executable fact about SQLite rather than as
-    /// prose: replace the database file at a path while a connection still has
-    /// that path's WAL-index mapped, and the next connection truncates the
-    /// WAL-index under the first one.
-    ///
-    /// SQLite maps a WAL-index in 32 KiB regions and re-extends the file to
-    /// cover region 0 immediately after truncating it, so the visible damage is
-    /// the file shrinking back to one region while the first connection still
-    /// holds pointers into region 1. Reading through those pointers is a read
-    /// past the end of a file-backed mapping, which the kernel answers with a
-    /// page-aligned SIGBUS. That is why the fixture first grows the WAL past
-    /// the 4062 frames region 0 can index: with only region 0 mapped, the
-    /// re-extension hides the truncation behind a page of zeroes instead.
-    ///
-    /// The first connection is deliberately never used or dropped after the
-    /// truncation: touching it is the fault. Leaking one handle for the rest of
-    /// the test binary is the price of observing the state safely.
-    // Windows refuses to unlink or rename a database while a connection holds
-    // it open, so the replaced-under-a-live-connection precondition cannot form
-    // there; the hazard this registry reports is a POSIX one.
-    #[cfg(unix)]
-    #[test]
-    fn replacing_the_database_file_truncates_the_wal_index_under_a_live_mapping() {
-        /// SQLite maps the WAL-index one 32 KiB region at a time.
-        const WAL_INDEX_REGION_BYTES: u64 = 32 * 1024;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("replaced.sqlite");
-
-        let first = Connection::open(&path).expect("open first connection");
-        // A small page size keeps the WAL small in bytes while still producing
-        // the thousands of frames needed to reach the second WAL-index region.
-        first
-            .pragma_update(None, "page_size", 512)
-            .expect("small pages");
-        first
-            .pragma_update(None, "journal_mode", "WAL")
-            .expect("first connection WAL");
-        first
-            .pragma_update(None, "synchronous", "OFF")
-            .expect("unsynced fixture writes");
-        first
-            .pragma_update(None, "wal_autocheckpoint", 0)
-            .expect("no autocheckpoint");
-        first
-            .execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB);")
-            .expect("seed");
-
-        // One transaction per row, so every commit appends WAL frames and the
-        // log grows past what a single WAL-index region can address.
-        let mut mapped_bytes = 0;
-        for id in 0..20_000_i64 {
-            first
-                .execute(
-                    "INSERT INTO t(id, payload) VALUES (?1, zeroblob(400))",
-                    [id],
-                )
-                .expect("append a WAL frame");
-            if id % 256 == 0 {
-                mapped_bytes = std::fs::metadata(shm_path(&path))
-                    .expect("WAL-index exists")
-                    .len();
-                if mapped_bytes > WAL_INDEX_REGION_BYTES {
-                    break;
-                }
-            }
-        }
-        assert!(
-            mapped_bytes > WAL_INDEX_REGION_BYTES,
-            "fixture never mapped a second WAL-index region (got {mapped_bytes} bytes); \
-             without one the truncation is hidden by SQLite re-extending region 0"
-        );
-        let first_identity = identity_of(&path).expect("first database identity");
-
-        // Replace the database file at the same path, leaving the WAL-index
-        // exactly where it is. This is the shape being hunted: a new database
-        // file inode under an unchanged `-shm` inode.
-        std::fs::remove_file(&path).expect("remove the database file");
-        let second = Connection::open(&path).expect("open second connection");
-        second
-            .pragma_update(None, "journal_mode", "WAL")
-            .expect("second connection WAL");
-        second
-            .execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY);")
-            .expect("write through the replacement");
-        let second_identity = identity_of(&path).expect("second database identity");
-        assert_ne!(
-            first_identity, second_identity,
-            "fixture did not actually replace the database file"
-        );
-
-        let after_bytes = std::fs::metadata(shm_path(&path))
-            .expect("WAL-index still exists")
-            .len();
-        assert!(
-            after_bytes < mapped_bytes,
-            "the second connection did not truncate the WAL-index the first one has mapped \
-             (before={mapped_bytes} bytes, after={after_bytes} bytes)"
-        );
-
-        drop(second);
-        // Dropping `first` would make SQLite read the truncated mapping during
-        // its close-time checkpoint, so the handle is deliberately leaked.
-        std::mem::forget(first);
     }
 
     // Windows refuses to unlink or rename a database while a connection holds

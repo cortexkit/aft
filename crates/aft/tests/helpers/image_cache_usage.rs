@@ -1,5 +1,22 @@
 pub use aft_base::executable_cache::image_cache::usage::*;
 
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::HashSet;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::fs;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::io;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::Path;
+#[cfg(test)]
+#[allow(unused_imports)]
+#[cfg(windows)]
+use std::path::PathBuf;
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;

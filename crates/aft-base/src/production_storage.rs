@@ -432,3 +432,228 @@ fn resolve_windows_profile_dir() -> std::io::Result<PathBuf> {
     let units = unsafe { std::slice::from_raw_parts(path.0, len) };
     Ok(PathBuf::from(std::ffi::OsString::from_wide(units)))
 }
+
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
+pub mod tests {
+    use super::*;
+
+    pub fn old_database(root: &Path) -> PathBuf {
+        std::fs::create_dir_all(root).unwrap();
+        let path = root.join("aft.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY); INSERT INTO schema_version VALUES (0);").unwrap();
+        drop(conn);
+        path
+    }
+
+    #[test]
+    fn windows_root_union_keeps_profile_and_redirected_local_data() {
+        let fixture = tempfile::tempdir().unwrap();
+        let profile = fixture.path().join("profile");
+        let redirected = fixture.path().join("redirected-local");
+        let roots = combine_windows_roots(Ok(profile.clone()), Ok(redirected.clone())).unwrap();
+        assert_eq!(
+            roots,
+            vec![
+                profile.join("AppData/Local/cortexkit/aft"),
+                redirected.join("cortexkit/aft")
+            ]
+        );
+        let fallback = combine_windows_roots(
+            Ok(profile.clone()),
+            Err(io::Error::other("SHGetKnownFolderPath unavailable")),
+        )
+        .unwrap();
+        assert_eq!(fallback, vec![profile.join("AppData/Local/cortexkit/aft")]);
+        let shell_only = combine_windows_roots(
+            Err(io::Error::other("GetUserProfileDirectoryW unavailable")),
+            Ok(redirected.clone()),
+        )
+        .unwrap();
+        assert_eq!(shell_only, vec![redirected.join("cortexkit/aft")]);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn unresolved_account_roots_refuse_writes_without_panicking() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("never-created");
+        let roots = combine_windows_roots(
+            Err(io::Error::other("GetUserProfileDirectoryW lookup failed")),
+            Err(io::Error::other("SHGetKnownFolderPath lookup failed")),
+        );
+        let status = protection_status_with(&path, || roots);
+        let error = refuse_write_for_status(&path, status).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let reason = error.to_string();
+        assert!(reason.contains(CODE), "{reason}");
+        assert!(reason.contains("GetUserProfileDirectoryW"), "{reason}");
+        assert!(reason.contains("SHGetKnownFolderPath"), "{reason}");
+        assert!(!path.exists());
+    }
+
+    #[cfg(debug_assertions)]
+    struct RestoreEnvironment(Vec<(&'static str, Option<OsString>)>);
+    #[cfg(debug_assertions)]
+    impl RestoreEnvironment {
+        fn replace(values: &[(&'static str, &Path)]) -> Self {
+            let restore = Self(
+                values
+                    .iter()
+                    .map(|(name, _)| (*name, std::env::var_os(name)))
+                    .collect(),
+            );
+            for (name, path) in values {
+                std::env::set_var(name, path);
+            }
+            restore
+        }
+    }
+    #[cfg(debug_assertions)]
+    impl Drop for RestoreEnvironment {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    #[cfg(all(windows, debug_assertions))]
+    #[test]
+    fn windows_token_profile_is_protected_with_missing_home_environment() {
+        use windows_sys::Win32::UI::Shell::{
+            SHGetFolderPathW, CSIDL_LOCAL_APPDATA, SHGFP_TYPE_CURRENT,
+        };
+        let _env = crate::test_env::process_env_lock();
+        let profile = account_home().expect("process token supplies the real account profile");
+        let fixture = tempfile::tempdir().unwrap();
+        let missing_home = fixture.path().join("nonexistent-profile");
+        let missing_local = fixture.path().join("nonexistent-local-appdata");
+        let _restore = RestoreEnvironment::replace(&[
+            ("HOME", &missing_home),
+            ("USERPROFILE", &missing_home),
+            ("LOCALAPPDATA", &missing_local),
+        ]);
+        assert_eq!(
+            account_home().unwrap(),
+            profile,
+            "token lookup must ignore substituted environment homes"
+        );
+        let roots = account_storage_roots()
+            .expect("token root must survive failed or redirected shell lookup");
+        let expected = profile.join("AppData/Local/cortexkit/aft");
+        assert!(
+            roots.contains(&expected),
+            "token profile root missing: {roots:?}"
+        );
+        assert!(protected(&expected.join("aft.db")));
+        assert!(refuse_write(&expected.join("aft.db"))
+            .unwrap_err()
+            .to_string()
+            .contains(CODE));
+        assert!(refuse_write(&fixture.path().join("disposable-storage/aft.db")).is_ok());
+        assert!(!missing_home.exists());
+        assert!(!missing_local.exists());
+
+        let mut old_buffer = [0u16; 260];
+        // SAFETY: the legacy API's MAX_PATH-sized buffer is writable. This probe
+        // records its verification failure, never uses it as the fence's root.
+        let old_status = unsafe {
+            SHGetFolderPathW(
+                std::ptr::null_mut(),
+                CSIDL_LOCAL_APPDATA as i32,
+                std::ptr::null_mut(),
+                SHGFP_TYPE_CURRENT as u32,
+                old_buffer.as_mut_ptr(),
+            )
+        };
+        eprintln!("legacy SHGetFolderPathW without DONT_VERIFY: HRESULT=0x{:08x}; token-profile roots={roots:?}", old_status as u32);
+    }
+
+    #[cfg(all(unix, debug_assertions))]
+    #[test]
+    fn unix_account_root_is_protected_with_missing_home_environment() {
+        let _env = crate::test_env::process_env_lock();
+        let home = account_home().expect("passwd supplies the effective account home");
+        let fixture = tempfile::tempdir().unwrap();
+        let missing = fixture.path().join("nonexistent-home");
+        let _restore =
+            RestoreEnvironment::replace(&[("HOME", &missing), ("XDG_DATA_HOME", &missing)]);
+        assert_eq!(account_home().unwrap(), home);
+        let root = home.join(".local/share/cortexkit/aft");
+        assert_eq!(account_storage_roots().unwrap(), vec![root.clone()]);
+        assert!(protected(&root.join("aft.db")));
+        assert!(refuse_write(&root.join("aft.db"))
+            .unwrap_err()
+            .to_string()
+            .contains(CODE));
+        assert!(refuse_write(&fixture.path().join("disposable-storage/aft.db")).is_ok());
+        assert!(!missing.exists());
+    }
+
+    #[cfg(all(unix, debug_assertions))]
+    #[test]
+    fn production_alias_and_relative_tail_cannot_bypass_fence() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("production");
+        std::fs::create_dir_all(&root).unwrap();
+        let alias = fixture.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        with_test_account(&root, false, || {
+            assert!(refuse_write(&alias.join("uncreated/../aft.db")).is_err());
+            assert!(refuse_write(&fixture.path().join("production-sibling/aft.db")).is_ok());
+        });
+    }
+
+    #[cfg(all(unix, debug_assertions))]
+    #[test]
+    fn unix_account_config_root_ignores_home_and_xdg() {
+        let _env = crate::test_env::process_env_lock();
+        let home = account_home().expect("passwd supplies the effective account home");
+        let fixture = tempfile::tempdir().unwrap();
+        let missing = fixture.path().join("nonexistent-home");
+        let _restore =
+            RestoreEnvironment::replace(&[("HOME", &missing), ("XDG_CONFIG_HOME", &missing)]);
+        let root = home.join(".config/cortexkit");
+        assert_eq!(account_config_roots().unwrap(), vec![root.clone()]);
+        // Only computes the verdict; nothing under the real directory is touched.
+        assert!(config_write_refusal(&root.join("aft.jsonc"))
+            .unwrap()
+            .contains(CODE));
+        assert!(config_write_refusal(&missing.join(".config/cortexkit/aft.jsonc")).is_none());
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn config_write_fence_matches_build_debug_assertions() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("aft.jsonc");
+        with_test_account(fixture.path(), false, || {
+            assert_eq!(
+                config_write_refusal(&path).is_some(),
+                cfg!(debug_assertions)
+            );
+        });
+        with_test_account(fixture.path(), true, || {
+            assert!(
+                config_write_refusal(&path).is_none(),
+                "the opt-in allows it"
+            );
+        });
+    }
+
+    #[test]
+    fn production_write_fence_matches_build_debug_assertions() {
+        let fixture = tempfile::tempdir().unwrap();
+        with_test_account(fixture.path(), false, || {
+            assert_eq!(
+                protected(&fixture.path().join("aft.db")),
+                cfg!(debug_assertions)
+            );
+        });
+    }
+}

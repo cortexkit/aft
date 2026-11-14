@@ -1,6 +1,19 @@
 pub use aft_base::executable_cache::image_cache::*;
 
 #[cfg(test)]
+#[allow(unused_imports)]
+use std::fs;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::io;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::time::{Duration, SystemTime};
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

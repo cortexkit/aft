@@ -617,3 +617,268 @@ fn linux_image_path() -> PathBuf {
     // not AFT's. Use the serving PID for both the supervisor and the gh link.
     PathBuf::from(format!("/proc/{}/exe", std::process::id()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pinned_executable_unpinned_path_is_current_exe() {
+        assert!(PINNED.get().is_none());
+        assert_eq!(path().unwrap(), std::env::current_exe().unwrap());
+    }
+
+    #[test]
+    fn pinned_executable_unpinned_shims_use_storage() {
+        assert!(PINNED.get().is_none());
+        let storage = tempfile::tempdir().unwrap();
+        assert_eq!(
+            shims_dir(storage.path()),
+            storage.path().join(crate::gh_shim_paths::SHIMS_DIR_NAME)
+        );
+    }
+
+    #[test]
+    fn pinned_executable_cleanup_preserves_live_owner_and_unrelated_entries() {
+        let storage = tempfile::tempdir().unwrap();
+        let run = storage.path();
+        let pid = std::process::id();
+        let start = crate::process_identity::process_start_time_ms(pid).unwrap();
+        let live = run.join(format!("aft-pinned-{pid}-{start}"));
+        let reused = run.join(format!("aft-pinned-{pid}-{}", start - 1));
+        let unrelated = run.join("operator-state");
+        for directory in [&live, &reused, &unrelated] {
+            std::fs::create_dir(directory).unwrap();
+            std::fs::write(directory.join("aft"), b"image").unwrap();
+        }
+        cleanup(run).unwrap();
+        assert!(live.join("aft").exists());
+        assert!(!reused.exists(), "a reused PID must not retain an old pin");
+        assert!(unrelated.join("aft").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_executable_cleanup_preserves_another_live_process() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let pid = child.id();
+        let start = crate::process_identity::process_start_time_ms(pid).unwrap();
+        let directory = storage.path().join(format!("aft-pinned-{pid}-{start}"));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("aft"), b"live image").unwrap();
+        let result = cleanup(storage.path());
+        let retained = directory.join("aft").exists();
+        let alive = child.try_wait().unwrap().is_none();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        result.unwrap();
+        assert!(
+            alive && retained,
+            "cleanup removed a live process's executable"
+        );
+        cleanup(storage.path()).unwrap();
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn pinned_executable_cleanup_lease_overrides_mismatched_process_clock() {
+        let storage = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let start = crate::process_identity::process_start_time_ms(pid).unwrap();
+        let directory = storage
+            .path()
+            .join(format!("aft-pinned-{pid}-{}", start - 1));
+        std::fs::create_dir(&directory).unwrap();
+        let lease = owner_lock(&directory).unwrap();
+        cleanup(storage.path()).unwrap();
+        assert!(
+            directory.exists(),
+            "a held lease must override an apparent PID reuse"
+        );
+        drop(lease);
+        cleanup(storage.path()).unwrap();
+        assert!(!directory.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_executable_task_image_and_shim_outlive_daemon_pin() {
+        let storage = tempfile::tempdir().unwrap();
+        let task = tempfile::tempdir().unwrap();
+        let pin = prepare(storage.path()).unwrap();
+        std::fs::create_dir(pin.directory.join("shims")).unwrap();
+        std::os::unix::fs::symlink(&pin.executable, pin.directory.join("shims/gh")).unwrap();
+        let image = pin.task_image(task.path()).unwrap();
+        pin.cleanup_at_exit();
+        assert!(!pin.directory.exists());
+        assert_eq!(
+            std::fs::read_link(image.join("shims/gh")).unwrap(),
+            image.join("aft")
+        );
+        let output = std::process::Command::new(image.join("shims/gh"))
+            .args(["--list", "pinned_executable_cleanup_preserves_live_owner"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 test"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pinned_executable_windows_task_wrapper_outlives_daemon_pin() {
+        let storage = tempfile::tempdir().unwrap();
+        let task = tempfile::tempdir().unwrap();
+        let pin = prepare(storage.path()).unwrap();
+        std::fs::create_dir(pin.directory.join("shims")).unwrap();
+        std::fs::write(
+            pin.directory.join("shims/gh.cmd"),
+            crate::gh_shim_paths::windows_gh_cmd(&pin.executable),
+        )
+        .unwrap();
+        let image = pin.task_image(task.path()).unwrap();
+        pin.cleanup_at_exit();
+        assert!(!pin.directory.exists());
+        assert_eq!(
+            std::fs::read(image.join("shims/gh.cmd")).unwrap(),
+            crate::gh_shim_paths::windows_gh_cmd(&image.join("aft.exe"))
+        );
+        assert!(image.join("aft.exe").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_executable_missing_pin_is_repaired_from_complete_held_image() {
+        use sha2::{Digest, Sha256};
+        use std::io::Seek;
+        let storage = tempfile::tempdir().unwrap();
+        let pin = prepare(storage.path()).unwrap();
+        let digest = |path: &Path| {
+            let mut hash = Sha256::new();
+            io::copy(&mut std::fs::File::open(path).unwrap(), &mut hash).unwrap();
+            hash.finalize()
+        };
+        let original = digest(&pin.executable);
+        pin.state
+            .lock()
+            .unwrap()
+            .source
+            .seek(io::SeekFrom::End(0))
+            .unwrap();
+        std::fs::remove_dir_all(&pin.directory).unwrap();
+        assert_eq!(pin.path().unwrap(), pin.executable);
+        assert_eq!(original, digest(&pin.executable));
+        assert!(pin.directory.join(OWNER_LOCK).exists());
+        pin.cleanup_at_exit();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_executable_cleanup_does_not_follow_symlinks() {
+        let storage = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let name = format!("aft-pinned-{}-1", std::process::id());
+        let link = storage.path().join(name);
+        std::fs::write(outside.path().join("aft"), b"keep").unwrap();
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        cleanup(storage.path()).unwrap();
+        assert!(link.is_symlink());
+        assert_eq!(std::fs::read(outside.path().join("aft")).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_executable_refuses_redirected_run_directory() {
+        let storage = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), storage.path().join("run")).unwrap();
+        assert!(prepare(storage.path()).is_err());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_executable_cross_volume_fallback_preserves_signed_bytes_and_executes() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let storage = tempfile::tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut source = std::fs::File::open(&executable).unwrap();
+        let destination = storage.path().join("aft");
+        materialize(&executable, &mut source, &destination, |_, _| {
+            Err(io::Error::from_raw_os_error(libc::EXDEV))
+        })
+        .unwrap();
+        let digest = |path: &Path| {
+            let mut file = std::fs::File::open(path).unwrap();
+            let mut hash = Sha256::new();
+            io::copy(&mut file, &mut hash).unwrap();
+            hash.finalize()
+        };
+        assert_eq!(digest(&executable), digest(&destination));
+        let copied = std::fs::metadata(&destination).unwrap();
+        assert_ne!(source.metadata().unwrap().ino(), copied.ino());
+        assert_eq!(copied.permissions().mode() & 0o777, 0o500);
+        let output = std::process::Command::new(&destination)
+            .args(["--list", "pinned_executable_cleanup_preserves_live_owner"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 test"));
+    }
+
+    /// The daemon's own executable keeps exactly one name: its pin is a separate
+    /// file, so macOS cannot report the daemon by a pin or task-image path.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pinned_executable_macos_pin_is_a_separate_file_from_the_running_image() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let storage = tempfile::tempdir().unwrap();
+        let executable = storage.path().join("deploy");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let mut source = std::fs::File::open(&executable).unwrap();
+        let destination = storage.path().join("aft");
+        materialize(&executable, &mut source, &destination, link_image).unwrap();
+        let held = source.metadata().unwrap();
+        let pinned = std::fs::metadata(&destination).unwrap();
+        assert_ne!(held.ino(), pinned.ino(), "the pin is a hard link");
+        assert_eq!(held.nlink(), 1, "the running image gained a second name");
+        assert_eq!(pinned.permissions().mode() & 0o777, 0o500);
+        assert_eq!(
+            std::fs::read(&executable).unwrap(),
+            std::fs::read(&destination).unwrap()
+        );
+        let output = std::process::Command::new(&destination)
+            .args(["--list", "pinned_executable_cleanup_preserves_live_owner"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_executable_hard_link_holds_original_inode_after_replacement() {
+        use std::os::unix::fs::MetadataExt;
+        let storage = tempfile::tempdir().unwrap();
+        let source_path = storage.path().join("deploy");
+        let destination = storage.path().join("aft");
+        std::fs::write(&source_path, b"original image").unwrap();
+        let mut source = std::fs::File::open(&source_path).unwrap();
+        materialize(&source_path, &mut source, &destination, |from, to| {
+            std::fs::hard_link(from, to)
+        })
+        .unwrap();
+        assert_eq!(
+            source.metadata().unwrap().ino(),
+            destination.metadata().unwrap().ino()
+        );
+        let replacement = storage.path().join("new-build");
+        std::fs::write(&replacement, b"replacement image").unwrap();
+        std::fs::rename(replacement, &source_path).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original image");
+        assert_eq!(std::fs::read(&source_path).unwrap(), b"replacement image");
+    }
+}

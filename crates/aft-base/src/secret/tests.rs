@@ -2,7 +2,9 @@
 //! buffer, the fake, and the consent adapter's request shape.
 
 use super::*;
-use secret_rules::audit::{AuditReason, AuditRecordV1, Decision};
+use secret_rules::audit::AuditReason;
+use secret_rules::audit::AuditRecordV1;
+use secret_rules::audit::Decision;
 use secret_rules::location::Location;
 
 fn production_scope() -> SecretScope {
@@ -231,7 +233,7 @@ fn the_fake_collects_audit_records_in_order() {
 #[test]
 fn a_secret_consent_files_exactly_the_single_phone_item() {
     use sha2::{Digest, Sha256};
-    let vector = include_str!("../../tests/fixtures/secret/single-phone-get.json");
+    let vector = include_str!("../../../aft/tests/fixtures/secret/single-phone-get.json");
     assert_eq!(
         format!("{:x}", Sha256::digest(vector.as_bytes())),
         "81794c4c98c77fb57813d8cb4c396c52da17bab4c1e8e7f56c113f4a521cb4a8"

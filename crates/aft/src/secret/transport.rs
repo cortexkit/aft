@@ -37,7 +37,3 @@ use zeroize::Zeroizing;
 #[cfg(test)]
 #[path = "transport_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "transport_fake.rs"]
-pub(crate) mod fake;

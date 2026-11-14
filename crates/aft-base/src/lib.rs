@@ -331,3 +331,15 @@ mod tests {
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod search_hot_path_measurements;
+
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
+pub mod nested_worktree_tests;
+
+#[cfg(all(any(test, feature = "test-support"), unix))]
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
+pub mod storage_permissions_tests;
+
+#[cfg(all(any(test, feature = "test-support"), target_os = "macos"))]
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
+pub mod disk_write_hunt;

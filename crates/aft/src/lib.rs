@@ -289,7 +289,8 @@ pub(crate) mod search_hot_path_measurements;
 #[cfg(test)]
 pub(crate) use aft_base::test_allocations;
 #[cfg(test)]
-pub(crate) use aft_base::test_env;
+#[path = "base_tests/test_env.rs"]
+pub(crate) mod test_env;
 #[cfg(test)]
 pub(crate) use aft_base::test_gate;
 #[cfg(all(test, windows))]

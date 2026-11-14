@@ -728,3 +728,7 @@ pub mod test_hardening {
         HARDENED.with(Cell::get)
     }
 }
+
+#[cfg(all(any(test, feature = "test-support"), unix))]
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
+pub mod tests;

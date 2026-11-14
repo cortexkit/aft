@@ -563,3 +563,148 @@ pub mod open_probe {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_root_lookup_uses_supplied_identity_and_containment() {
+        struct Policy {
+            original: PathBuf,
+            identity: PathBuf,
+            storage: PathBuf,
+            allow: bool,
+            compared: std::cell::Cell<bool>,
+        }
+        impl crate::read_policy::StoragePathPolicy for Policy {
+            fn identity(&self, path: &Path) -> PathBuf {
+                assert_eq!(path, self.original);
+                self.identity.clone()
+            }
+
+            fn contains(&self, path: &Path, prefix: &Path) -> bool {
+                assert_eq!(path, self.identity);
+                if prefix == self.storage {
+                    self.compared.set(true);
+                    self.allow
+                } else {
+                    false
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let storage = root.join("storage");
+        register_storage_root(&storage);
+        let mut policy = Policy {
+            original: root.join("alias"),
+            identity: root.join("opaque-identity"),
+            storage: storage.clone(),
+            allow: true,
+            compared: std::cell::Cell::new(false),
+        };
+        assert_eq!(
+            storage_root_for_path(&policy.original, &policy),
+            Some(storage)
+        );
+        assert!(policy.compared.get());
+        policy.allow = false;
+        policy.compared.set(false);
+        assert_eq!(storage_root_for_path(&policy.original, &policy), None);
+        assert!(policy.compared.get());
+    }
+
+    #[test]
+    fn gitdir_lines_parse_absolute_relative_and_malformed() {
+        // Absolute, relative, and CRLF-terminated lines resolve; anything else
+        // is not a worktree marker and must not prune.
+        assert_eq!(
+            parse_gitdir_bytes(b"gitdir: /repo/.git/worktrees/wt\n"),
+            Some(PathBuf::from("/repo/.git/worktrees/wt"))
+        );
+        assert_eq!(
+            parse_gitdir_bytes(b"  gitdir:  ../.git/worktrees/wt  \r\n"),
+            Some(PathBuf::from("../.git/worktrees/wt"))
+        );
+        for malformed in [
+            b"gitdir:".as_slice(),
+            b"gitdir:   \n",
+            b"not a gitdir\n",
+            b"",
+            b"gitdir : /repo/.git/worktrees/wt\n",
+        ] {
+            assert_eq!(parse_gitdir_bytes(malformed), None, "{malformed:?}");
+        }
+    }
+
+    #[test]
+    fn windows_gitdir_lines_name_a_worktrees_admin_dir() {
+        // Worktree gitdir lines on Windows use forward slashes or drive paths.
+        // Pure path logic, so this runs on every platform without git.
+        for line in [
+            "gitdir: C:/repo/.git/worktrees/wt\n",
+            "gitdir: C:/repo/.git/worktrees/wt",
+        ] {
+            let target =
+                parse_gitdir_bytes(line.as_bytes()).expect("Windows gitdir line must parse");
+            assert_eq!(
+                target.parent().and_then(|parent| parent.file_name()),
+                Some(std::ffi::OsStr::new("worktrees"))
+            );
+            assert_eq!(
+                target.parent().and_then(|parent| parent.parent()),
+                Some(std::path::Path::new("C:/repo/.git"))
+            );
+        }
+        // A submodule-style gitdir never names `worktrees/`.
+        let target = parse_gitdir_bytes(b"gitdir: ../.git/modules/sub\n").unwrap();
+        assert_ne!(
+            target.parent().and_then(|parent| parent.file_name()),
+            Some(std::ffi::OsStr::new("worktrees"))
+        );
+    }
+
+    #[test]
+    fn commondir_points_at_the_shared_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let common = root.join(".git");
+        let admin = common.join("worktrees").join("wt");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::write(admin.join("commondir"), "../../\n").unwrap();
+        assert_eq!(read_commondir_target(&admin), Some(PathBuf::from("../../")));
+        assert_eq!(read_commondir_target(&common), None);
+    }
+
+    #[test]
+    fn hand_rolled_worktree_layout_resolves_without_git() {
+        // The same layout `git worktree add` creates, without needing git:
+        // main/.git is the common dir, main/linked/.git names its admin entry.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let main = root.join("main");
+        let linked = main.join("linked");
+        let admin = main.join(".git").join("worktrees").join("linked");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", admin.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            admin.join("gitdir"),
+            format!("{}\n", linked.join(".git").display()),
+        )
+        .unwrap();
+        std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+        let boundary = NestedWorktreeBoundary::for_root(&main);
+        assert!(boundary.is_nested_worktree_root(&linked));
+        assert!(!boundary.is_nested_worktree_root(&main));
+        assert!(!boundary.is_nested_worktree_root(&root));
+        assert!(boundary.is_under_nested_worktree(&linked.join("file.rs")));
+        assert!(!boundary.is_under_nested_worktree(&main.join("file.rs")));
+    }
+}

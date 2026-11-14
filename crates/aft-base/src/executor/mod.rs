@@ -4953,3 +4953,7 @@ impl Drop for HeavyPermit {
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod audit;
+
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
+pub mod tests;

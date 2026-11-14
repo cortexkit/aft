@@ -1,5 +1,6 @@
 use super::*;
-use crate::secret_proxy::diagnostics::{log_refusal, Reason};
+use crate::secret_proxy::diagnostics::log_refusal;
+use crate::secret_proxy::diagnostics::Reason;
 
 const PRIVATE_HEADER: &str = "private-header-value-do-not-log";
 

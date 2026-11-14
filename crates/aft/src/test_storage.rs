@@ -16,96 +16,8 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn windows_storage_comparison_ignores_verbatim_prefix_case_and_separators() {
-        let parent = comparison_key(
-            Path::new(r"C:\Users\RunnerAdmin\AppData\Local\cortexkit\aft"),
-            true,
-        );
-        for root in [
-            r"\\?\c:\users\runneradmin\appdata\LOCAL\CORTEXKIT\AFT\aft.db",
-            "c:/Users/RunnerAdmin/AppData/Local/cortexkit/aft/aft.db",
-        ] {
-            assert!(
-                comparison_key(Path::new(root), true).starts_with(&parent),
-                "{root}"
-            );
-        }
-        assert_eq!(
-            comparison_key(Path::new(r"\\?\UNC\SERVER\Share\aft"), true),
-            comparison_key(Path::new(r"\\server\share\AFT"), true)
-        );
-        assert!(!comparison_key(
-            Path::new(r"C:\Users\RunnerAdmin\AppData\Local\cortexkit\aft-other"),
-            true
-        )
-        .starts_with(&parent));
-    }
-
-    #[test]
-    fn storage_comparison_expands_short_name_ancestors_before_appending_missing_tail() {
-        // 8.3 aliases are filesystem assignments, not a string substitution.
-        // Inject that assignment so this check also runs on Unix hosts.
-        let short = Path::new("C:/Users/RUNNER~1/AppData/Local/cortexkit/aft/aft.db");
-        let canonical = canonicalized_with(short, &|path| {
-            (path == Path::new("C:/Users/RUNNER~1")).then(|| PathBuf::from("C:/Users/RunnerAdmin"))
-        });
-        assert_eq!(
-            comparison_key(&canonical, true),
-            comparison_key(
-                Path::new(r"\\?\c:\users\RunnerAdmin\AppData\Local\cortexkit\aft\aft.db"),
-                true
-            )
-        );
-    }
-
-    #[test]
-    fn temporary_home_and_xdg_do_not_redefine_the_live_storage_root() {
-        let home = tempfile::tempdir().unwrap();
-        let fixture = tempfile::tempdir().unwrap();
-        let live_data = home.path().join("data");
-        let temporary = [fixture.path().to_path_buf()];
-        let live = live_storage_root_from(home.path(), None, &temporary, &|name| {
-            (name == "XDG_DATA_HOME").then(|| live_data.as_os_str().into())
-        });
-        assert_eq!(live, live_data.join("cortexkit").join("aft"));
-        let with_override = |name: &str| match name {
-            "HOME" | "USERPROFILE" => Some(fixture.path().as_os_str().into()),
-            "XDG_DATA_HOME" | "LOCALAPPDATA" => Some(fixture.path().join("data").into_os_string()),
-            "AFT_STORAGE_DIR" | "AFT_CACHE_DIR" => {
-                Some(fixture.path().join("cache").into_os_string())
-            }
-            _ => None,
-        };
-        let sandbox_default =
-            crate::storage_path::storage_dir_from_test_environment(&with_override);
-        let forbidden = live_storage_root_from(home.path(), None, &temporary, &with_override);
-        assert!(!is_within(&sandbox_default, &forbidden));
-        let expected = if cfg!(windows) {
-            home.path().join("AppData").join("Local")
-        } else {
-            home.path().join(".local").join("share")
-        };
-        assert_eq!(forbidden, expected.join("cortexkit").join("aft"));
-    }
-
-    fn with_temporary_xdg(test: impl FnOnce(&Path)) {
-        let _env = crate::test_env::process_env_lock();
-        let fixture = tempfile::tempdir().unwrap();
-        struct Restore(Option<OsString>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                match &self.0 {
-                    Some(value) => std::env::set_var("XDG_DATA_HOME", value),
-                    None => std::env::remove_var("XDG_DATA_HOME"),
-                }
-            }
-        }
-        let _restore = Restore(std::env::var_os("XDG_DATA_HOME"));
-        std::env::set_var("XDG_DATA_HOME", fixture.path());
-        test(fixture.path());
-    }
+    #[allow(unused_imports)]
+    pub(crate) use aft_base::test_storage::tests::*;
 
     #[test]
     fn test_database_allows_a_temporary_xdg_default() {
@@ -116,18 +28,6 @@ mod tests {
             let _db = crate::db::open(&root.join("aft.db")).unwrap();
             assert!(root.join("aft.db").is_file());
         });
-    }
-
-    #[test]
-    #[should_panic(expected = "test context cannot use the live default AFT storage root")]
-    fn test_root_rejects_account_default_even_with_a_temporary_xdg_home() {
-        // Derive the expected root independently of the guard's resolver. This
-        // assertion performs no I/O even if the fence is accidentally removed.
-        #[cfg(windows)]
-        let data = account_home().unwrap().join("AppData/Local");
-        #[cfg(not(windows))]
-        let data = account_home().unwrap().join(".local").join("share");
-        with_temporary_xdg(|_| assert_root(&data.join("cortexkit").join("aft")));
     }
 
     fn context(config: Config) -> crate::context::AppContext {

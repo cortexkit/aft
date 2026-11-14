@@ -2,21 +2,32 @@
 //! Approval is an explicit test action representing a verified phone signature;
 //! neither retrying a request nor opening another route grants access.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
-use base64::Engine;
 use serde::Deserialize;
-use serde_json::{json, Value};
-use subc_protocol::scope::{ParentState, ScopeKind, ScopeStamp};
-use subc_protocol::{Flags, Frame, FrameType, Priority};
-use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
+use serde_json::json;
+use serde_json::Value;
+use subc_protocol::scope::ParentState;
+use subc_protocol::scope::ScopeKind;
+use subc_protocol::scope::ScopeStamp;
+use subc_protocol::Flags;
+use subc_protocol::Frame;
+use subc_protocol::FrameType;
+use subc_protocol::Priority;
+use subc_transport::connection_file;
+use subc_transport::connection_file::ConnectionInfo;
+use subc_transport::connection_file::Endpoint;
+use subc_transport::connection_file::SCHEMA_VERSION;
 
-use super::super::wire::{Coverage, Target};
+use super::super::wire::Coverage;
+use super::super::wire::Target;
 
-const GOLDENS: &str = include_str!("../../tests/fixtures/secret/secret-use-v1.jsonl");
+const GOLDENS: &str = include_str!("../../../aft/tests/fixtures/secret/secret-use-v1.jsonl");
 pub(crate) const NONCE: &str = "fake-aft-launch-nonce";
 
 type PendingKey = (String, String, String, String, String);

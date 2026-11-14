@@ -6,42 +6,6 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn path_context_preserves_absence_and_retry_kinds() {
-        for kind in [std::io::ErrorKind::NotFound, std::io::ErrorKind::WouldBlock] {
-            let error = super::at(
-                "reading",
-                std::path::Path::new("missing-input"),
-                std::io::Error::new(kind, "original failure"),
-            );
-            assert_eq!(error.kind(), kind);
-            assert_eq!(error.to_string(), "reading missing-input: original failure");
-        }
-    }
-
-    #[test]
-    fn path_context_preserves_native_error_sources() {
-        let error = super::at(
-            "opening",
-            std::path::Path::new("busy-database"),
-            std::io::Error::from_raw_os_error(32),
-        );
-        let context = error
-            .get_ref()
-            .unwrap()
-            .downcast_ref::<super::PathIoError>()
-            .unwrap();
-        assert_eq!(context.source.raw_os_error(), Some(32));
-        assert_eq!(
-            std::error::Error::source(context)
-                .unwrap()
-                .downcast_ref::<std::io::Error>()
-                .unwrap()
-                .raw_os_error(),
-            Some(32)
-        );
-        assert!(error.to_string().starts_with("opening busy-database: "));
-    }
 
     use super::*;
     #[test]
