@@ -34,7 +34,8 @@ pub struct SecretConsentRequest {
     pub request_id: String,
     /// The vault's statement bytes, base64url without padding.
     pub statement_b64url: String,
-    /// Bound the card by the HTTP request as well as the vault statement.
+    /// When the local hold for this HTTP request ends. Not sent to Cingulate,
+    /// which bounds the card by the vault statement's own request expiry.
     pub expires_at_ms: Option<u64>,
 }
 
