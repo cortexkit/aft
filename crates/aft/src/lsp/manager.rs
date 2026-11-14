@@ -1309,8 +1309,8 @@ const TRANSIENT_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FailureDurability {
     Capacity,
-    /// A missing project toolchain component is a named environment gap,
-    /// not a server crash. Replay it until the configuration changes.
+    /// A project toolchain or tool-manager startup error is a named
+    /// environment gap, not a server crash. Replay it until configuration changes.
     Environment,
     /// Only a change to the environment fixes it: a binary that is missing or
     /// cannot be executed, a server that exited naming a configuration error
@@ -1797,8 +1797,8 @@ impl LspManager {
     /// Count currently replayable failed server/root starts without starting a server.
     /// Files outside every TypeScript project remain named in status, but their
     /// cached not-applicable outcome is not a start failure. Missing TypeScript
-    /// SDKs and rustup toolchain components are likewise environment gaps
-    /// rather than AFT failures.
+    /// SDKs, rustup toolchain components, and mise startup errors are likewise
+    /// environment gaps rather than AFT failures.
     pub(crate) fn cached_start_failure_counts(&self) -> std::collections::BTreeMap<String, u64> {
         let now = self.retry_clock.now();
         let mut counts = std::collections::BTreeMap::new();
@@ -10649,7 +10649,7 @@ fn log_spawn_failure(def: &ServerDef, key: &ServerKey, error: &LspError, now: In
 /// Classify a server that died or failed during or after `initialize` from
 /// its failure text and stderr. Only configuration errors AFT recognises are
 /// permanent: typescript-language-server finding no usable TypeScript SDK.
-/// A rustup proxy whose component is not installed is an environment gap.
+/// Missing rustup components and mise's own startup errors are environment gaps.
 /// Anything else is transient: wrongly calling a failure permanent leaves
 /// the server off for the whole session while a needless retry costs seconds.
 fn exit_durability(reason: &str, stderr_tail: &str) -> FailureDurability {
@@ -10658,7 +10658,7 @@ fn exit_durability(reason: &str, stderr_tail: &str) -> FailureDurability {
     let names_typescript_sdk_error = [reason, stderr_tail]
         .iter()
         .any(|text| text.contains(TS_LS5_NO_INSTALLATION) || text.contains(TS_LS6_NO_TSSERVER));
-    if rustup_component_unavailable(stderr_tail) {
+    if stderr_tail.starts_with("mise ERROR ") || rustup_component_unavailable(stderr_tail) {
         FailureDurability::Environment
     } else if names_typescript_sdk_error {
         FailureDurability::Permanent
@@ -11344,6 +11344,76 @@ mod transient_retry_tests {
                 Some(&1)
             );
             manager.clear_failed_spawns();
+        }
+    }
+
+    #[test]
+    fn diagnostics_findings_lsp_snapshot_ignores_mise_environment_gap_but_keeps_status() {
+        let stderr = "mise ERROR error parsing config file: ~/.local/share/cortexkit/alfonso/worktrees/.../mise.toml";
+        let (mut manager, offset) = manager_with_clock();
+        let key = ServerKey {
+            kind: ServerKind::TypeScript(None),
+            ..key()
+        };
+        let def = crate::lsp::registry::builtin_servers()
+            .into_iter()
+            .find(|def| def.kind == key.kind)
+            .unwrap();
+        let report = ServerExitReport {
+            kind: key.kind.clone(),
+            root: key.root.clone(),
+            pid: 42,
+            phase: ServerPhase::Initialize,
+            status: None,
+            killed_by_aft: false,
+            elapsed: Duration::from_millis(200),
+            command: "~/.local/share/mise/shims/typescript-language-server".into(),
+            stderr_tail: stderr.into(),
+        };
+        let err = LspError::ServerDisconnected("initialize response stream closed".into());
+        let formatted = format_initialize_failure_reason(&def.binary, &report, &err);
+        assert!(formatted.contains(stderr));
+        let error = typescript_initialize_failure(formatted, None, || {
+            panic!("a mise startup error must not trigger a TypeScript project scan")
+        });
+        let shown = error.to_string();
+        let durability = exit_durability(&shown, stderr);
+        assert_eq!(durability, FailureDurability::Environment);
+        manager.record_file_start_failure(&def, &key, StartFailure { error, durability });
+        assert!(manager.cached_start_failure_counts().is_empty());
+        assert_eq!(
+            manager.failed_spawns[&key].reason,
+            CachedStartReason::EnvironmentUnavailable
+        );
+        assert!(manager.transient_backoff.is_empty());
+        assert_eq!(reason(&manager.failure_to_replay(&key).unwrap()), shown);
+        offset.store(3_600_000, Ordering::SeqCst);
+        assert_eq!(reason(&manager.failure_to_replay(&key).unwrap()), shown);
+        assert_eq!(manager.clear_failed_spawns(), 1);
+        assert!(manager.failure_to_replay(&key).is_none());
+    }
+
+    #[test]
+    fn mise_environment_classification_requires_its_own_stderr_prefix() {
+        let mise_error = "mise ERROR error parsing config file: ~/.local/share/cortexkit/alfonso/worktrees/.../mise.toml";
+        assert_eq!(
+            exit_durability("server crashed during initialize (exit 1)", mise_error),
+            FailureDurability::Environment
+        );
+        for stderr in [
+            "",
+            "fatal: mise ERROR error parsing config file: mise.toml",
+            "server error: the mise configuration could not be parsed",
+            "mise DEBUG reading config\nmise ERROR error parsing config file: mise.toml",
+            " mise ERROR error parsing config file: mise.toml",
+            "mise ERRORISH unrelated server failure",
+            "mise error parsing config file: mise.toml",
+        ] {
+            assert_eq!(
+                exit_durability(mise_error, stderr),
+                FailureDurability::Transient,
+                "only mise's own stderr prefix is an environment gap: {stderr:?}"
+            );
         }
     }
 
