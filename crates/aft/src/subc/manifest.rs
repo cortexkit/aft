@@ -521,10 +521,6 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                 super::permissions::CAPABILITY.to_string(),
                 super::shells::CAPABILITY.to_string(),
                 cortexkit_role_user_commands::PROVIDES.to_string(),
-                // Core attaches plan facts to a provider's system-text item
-                // only when this manifest list names the token; declaring it
-                // in role.describe alone leaves core sending no facts.
-                cortexkit_role_tool_provider::SYSTEM_TEXT_FACTS_V1.to_string(),
             ],
             requires: Vec::new(),
             must_never_reach: Vec::new(),
@@ -995,7 +991,6 @@ mod tests {
                 "permissions/v1".to_string(),
                 "shells/v1".to_string(),
                 "user-commands/v1".to_string(),
-                "system-text-facts/v1".to_string(),
             ]
         );
         assert!(capabilities.requires.is_empty());
@@ -1017,8 +1012,7 @@ mod tests {
                 "page-collect/v1",
                 "permissions/v1",
                 "shells/v1",
-                "user-commands/v1",
-                "system-text-facts/v1"
+                "user-commands/v1"
             ]))
         );
     }
@@ -1350,7 +1344,7 @@ mod tests {
         assert_eq!(
             top.insert(
                 "capabilities".to_string(),
-                json!({"provides": ["call-keepalive/v1", "tool-provider/v1", "call-modes/v1", "tool-views/v1", "session-notices/v1", "scope-background-tasks/v1", "call-yield/v1", "flow-scopes/v1", "worker-runs/v1", "scope-on-behalf-of/v1", "scope-workdir/v1", "page-collect/v1", "permissions/v1", "shells/v1", "user-commands/v1", "system-text-facts/v1"], "requires": [], "must_never_reach": []}),
+                json!({"provides": ["call-keepalive/v1", "tool-provider/v1", "call-modes/v1", "tool-views/v1", "session-notices/v1", "scope-background-tasks/v1", "call-yield/v1", "flow-scopes/v1", "worker-runs/v1", "scope-on-behalf-of/v1", "scope-workdir/v1", "page-collect/v1", "permissions/v1", "shells/v1", "user-commands/v1"], "requires": [], "must_never_reach": []}),
             ),
             None
         );
