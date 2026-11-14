@@ -1378,9 +1378,12 @@ pub(crate) fn resolve_checkout_into(
         // in parallel, and the sink builds their fragments in parallel too;
         // a whole batch decoded and built at once held about 750 MB more.
         let mut sites_ms = 0u128;
-        // Batch relief is experimental and opt-in: returning free pages can
-        // reduce the resident set size while making later batches fault those
-        // pages back in.
+        // On glibc, trimming every four batches saved 1.3 GiB on VS Code and
+        // 1.2 GiB on Kotlin versus streaming alone. Cold builds still beat the
+        // builder that held every fragment until output: 229.6 vs 234.8 seconds
+        // and 251.8 vs 277.6 seconds, respectively.
+        // Other allocators keep their existing stage-boundary relief. The
+        // internal cadence accepts 0 to disable the extra trims.
         let trim_cadence = batch_trim_cadence(
             std::env::var("AFT_INTERNAL_GRAPH_BATCH_TRIM")
                 .ok()
@@ -1468,17 +1471,27 @@ fn relieve_allocator() {
 }
 
 fn batch_trim_cadence(value: Option<&str>) -> usize {
-    value
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0)
+    match value {
+        None if cfg!(all(target_os = "linux", target_env = "gnu")) => 4,
+        Some(value) => value.parse::<usize>().unwrap_or(0),
+        None => 0,
+    }
 }
 
 #[cfg(test)]
 mod batch_trim_tests {
     #[test]
-    fn batch_trim_is_off_without_a_positive_internal_cadence() {
+    fn batch_trim_defaults_to_four_on_glibc_and_can_be_disabled() {
         use super::batch_trim_cadence;
-        for value in [None, Some(""), Some("true"), Some("-1"), Some("0")] {
+        assert_eq!(
+            batch_trim_cadence(None),
+            if cfg!(all(target_os = "linux", target_env = "gnu")) {
+                4
+            } else {
+                0
+            }
+        );
+        for value in [Some(""), Some("true"), Some("-1"), Some("0")] {
             assert_eq!(batch_trim_cadence(value), 0);
         }
         assert_eq!(batch_trim_cadence(Some("1")), 1);
