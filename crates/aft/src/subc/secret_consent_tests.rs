@@ -1027,7 +1027,7 @@ fn secret_allow_and_allowed_partial_retry_but_decline_never_retries() {
             }
             match expected_code {
                 None => assert!(
-                    matches!(decision, LaunchDecision::Proceed { .. }),
+                    matches!(decision, LaunchDecision::Proceed(_answer)),
                     "{state}: {decision:?}"
                 ),
                 Some(code) => match decision {
