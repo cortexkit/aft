@@ -97,19 +97,44 @@ mod build_scratch_tests {
             .try_write()
             .unwrap()
             .unwrap()
-            .create_scratch(|bytes| {
-                if bytes <= 100 {
-                    Ok(())
-                } else {
-                    Err("disk floor")
-                }
-            })
+            .create_scratch(
+                CheckoutId::from_digest(Digest128::of(b"checkout")),
+                |bytes| {
+                    if bytes <= 100 {
+                        Ok(())
+                    } else {
+                        Err("disk floor")
+                    }
+                },
+            )
             .unwrap();
         assert!(scratch.check_space(100).is_ok());
         assert_eq!(scratch.check_space(101), Err("disk floor"));
         let path = scratch.path().to_path_buf();
+        assert_eq!(
+            path.parent().unwrap().parent().unwrap(),
+            family.dir().join("builds")
+        );
         std::fs::write(path.join("partial.seg"), b"unfinished").unwrap();
-        drop(family.try_write().unwrap().unwrap());
+        let mut session = family.try_write().unwrap().unwrap();
+        assert!(
+            session
+                .create_scratch(
+                    CheckoutId::from_digest(Digest128::of(b"checkout")),
+                    |_| Ok::<_, ()>(())
+                )
+                .is_err()
+        );
+        let other = session
+            .create_scratch(CheckoutId::from_digest(Digest128::of(b"other")), |_| {
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        drop(session);
+        assert!(
+            other.path().exists(),
+            "a different checkout can build concurrently"
+        );
         assert!(
             path.join("partial.seg").exists(),
             "startup preserves a live build"
@@ -117,7 +142,7 @@ mod build_scratch_tests {
         scratch.owner.take();
         drop(family.try_write().unwrap().unwrap());
         assert!(!path.exists(), "startup removes an abandoned build");
-        let torn = family.dir().join("tmp/build-torn");
+        let torn = path.parent().unwrap().join("torn");
         std::fs::create_dir(&torn).unwrap();
         drop(family.try_write().unwrap().unwrap());
         assert!(
@@ -137,7 +162,9 @@ mod build_scratch_tests {
                 .try_write()
                 .unwrap()
                 .unwrap()
-                .create_scratch(|_| Ok::<_, &str>(()))
+                .create_scratch(CheckoutId::from_digest(Digest128::of(b"checkout")), |_| {
+                    Ok::<_, &str>(())
+                })
                 .unwrap();
             path = scratch.path().to_path_buf();
             std::fs::write(path.join("partial.seg"), b"unfinished").unwrap();
@@ -178,6 +205,18 @@ fn clean_build_scratch(path: &Path) -> Result<(), FamilyError> {
         Err(std::fs::TryLockError::WouldBlock) => Ok(()),
         Err(std::fs::TryLockError::Error(error)) => Err(FamilyError::io(&owner)(error)),
     }
+}
+
+fn sweep_build_scratch(builds: &Path) -> Result<(), FamilyError> {
+    if !builds.exists() {
+        return Ok(());
+    }
+    for checkout in read_dir(builds)? {
+        for workspace in read_dir(&checkout)? {
+            clean_build_scratch(&workspace)?;
+        }
+    }
+    Ok(())
 }
 
 impl PendingSegment {
@@ -243,18 +282,11 @@ impl<'f> WriteSession<'f> {
         // build must never change what a newer one left.
         let (base, _) = family.newest_manifest()?;
         family.check_named_formats(&base)?;
-        // Segment files belong to the writer; build directories have their
-        // own owner locks because a scan releases the writer between spills.
+        sweep_build_scratch(&layout.dir.join("builds"))?;
+        // Only the lock holder writes `tmp/`, so whatever is there was left
+        // by an earlier writer that ended before publishing it.
         let mut next_segment = 1;
         for entry in read_dir(&layout.tmp_dir())? {
-            if entry
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with("build-"))
-                && entry.is_dir()
-            {
-                clean_build_scratch(&entry)?;
-                continue;
-            }
             if let Some(id) = segment_id_of(&entry) {
                 next_segment = next_segment.max(id + 1);
             }
@@ -336,21 +368,25 @@ impl<'f> WriteSession<'f> {
         Ok(PendingSegment { id, writer })
     }
 
-    /// Allocates a private temporary workspace, cleaned on drop or by the
-    /// next writer after its process ends. Creation is under `writer.lock`.
+    /// Allocates `builds/<checkout>/<build-id>/`, cleaned on drop or by the
+    /// next writer after its process ends. Creation is under `writer.lock`;
+    /// a checkout can have only one live workspace, shared by its builders.
     ///
     /// # Errors
     ///
-    /// When the directory or its owner lock cannot be created.
+    /// When the directory or its owner lock cannot be created, or the
+    /// checkout already has a live workspace.
     pub fn create_scratch<E>(
         &mut self,
+        checkout: CheckoutId,
         admit: impl Fn(u64) -> Result<(), E> + Send + Sync + 'static,
     ) -> Result<BuildScratch<E>, FamilyError> {
-        let path = self
+        let parent = self
             .family
             .layout
-            .tmp_dir()
-            .join(format!("build-{}", lease::fresh_id()));
+            .dir
+            .join("builds")
+            .join(checkout.to_string());
         let builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         let builder = {
@@ -359,7 +395,24 @@ impl<'f> WriteSession<'f> {
             builder.mode(0o700);
             builder
         };
-        builder.create(&path).map_err(FamilyError::io(&path))?;
+        let mut parents = builder;
+        parents
+            .recursive(true)
+            .create(&parent)
+            .map_err(FamilyError::io(&parent))?;
+        for workspace in read_dir(&parent)? {
+            clean_build_scratch(&workspace)?;
+            if workspace.exists() {
+                return Err(FamilyError::Misuse(
+                    "this checkout already has a live build workspace",
+                ));
+            }
+        }
+        let path = parent.join(lease::fresh_id().to_string());
+        parents
+            .recursive(false)
+            .create(&path)
+            .map_err(FamilyError::io(&path))?;
         let mut scratch = BuildScratch {
             path,
             owner: None,

@@ -2195,10 +2195,13 @@ fn graph_spill_error(error: DataError, paused: &Mutex<Option<String>>) -> DataEr
 impl Checkout {
     pub(super) fn build_scratch(
         &self,
-    ) -> Result<aft_store::family::BuildScratch<DataError>, DataError> {
+    ) -> Result<Arc<aft_store::family::BuildScratch<DataError>>, DataError> {
         let dir = self.family.dir().to_path_buf();
         self.writer()?
-            .create_scratch(move |bytes| check_disk_floor_at(&dir, bytes))
+            .create_scratch(self.checkout, move |bytes| {
+                check_disk_floor_at(&dir, bytes)
+            })
+            .map(Arc::new)
             .map_err(DataError::store)
     }
 

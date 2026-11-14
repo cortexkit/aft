@@ -13,7 +13,7 @@ const BATCH_BYTES: usize = 32 * 1024 * 1024;
 const UNIT_BYTES: usize = 128;
 
 pub(super) struct TextBuild {
-    scratch: BuildScratch<DataError>,
+    scratch: Arc<BuildScratch<DataError>>,
     family: FamilyId,
     current: TextSectionsBuilder,
     held: usize,
@@ -23,7 +23,7 @@ pub(super) struct TextBuild {
 }
 
 impl TextBuild {
-    pub(super) fn new(scratch: BuildScratch<DataError>, family: FamilyId) -> Self {
+    pub(super) fn new(scratch: Arc<BuildScratch<DataError>>, family: FamilyId) -> Self {
         Self {
             scratch,
             family,
@@ -177,9 +177,11 @@ mod tests {
             .try_write()
             .unwrap()
             .unwrap()
-            .create_scratch(|_| Ok(()))
+            .create_scratch(CheckoutId::from_digest(Digest128::of(b"checkout")), |_| {
+                Ok(())
+            })
             .unwrap();
-        let mut build = TextBuild::new(scratch, family.id());
+        let mut build = TextBuild::new(Arc::new(scratch), family.id());
         build.cap = cap;
         build
     }
@@ -323,9 +325,12 @@ mod tests {
             .try_write()
             .unwrap()
             .unwrap()
-            .create_scratch(move |bytes| Checkout::check_disk_space(&path, bytes))
+            .create_scratch(
+                CheckoutId::from_digest(Digest128::of(b"checkout")),
+                move |bytes| Checkout::check_disk_space(&path, bytes),
+            )
             .unwrap();
-        let mut bounded = TextBuild::new(scratch, family.id());
+        let mut bounded = TextBuild::new(Arc::new(scratch), family.id());
         bounded.cap = 1;
         let _free = crate::disk_floor::set_free_space_for_test(
             family.dir(),
