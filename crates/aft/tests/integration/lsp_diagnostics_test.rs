@@ -4276,6 +4276,7 @@ fn real_rust_analyzer_checks_do_not_block_cargo_build() {
         "config",
         "environment",
         "build-config",
+        "build-config-target",
         "build-environment",
     ] {
         let temp = tempdir().expect("tempdir");
@@ -4318,6 +4319,15 @@ fn main() {
                 fs::write(
                     root.join(".cargo/config.toml"),
                     "[build]\nbuild-dir = \"{workspace-root}/shared/{workspace-path-hash}\"\n",
+                )
+                .unwrap();
+                root.join("target")
+            }
+            "build-config-target" => {
+                fs::create_dir_all(root.join(".cargo")).unwrap();
+                fs::write(
+                    root.join(".cargo/config.toml"),
+                    "[build]\nbuild-dir = \"target\"\n",
                 )
                 .unwrap();
                 root.join("target")

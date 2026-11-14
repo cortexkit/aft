@@ -8450,14 +8450,8 @@ fn isolate_rust_build_dir(def: &ServerDef, root: &Path, options: &mut serde_json
         || options
             .pointer("/check/extraEnv/CARGO_BUILD_BUILD_DIR")
             .is_some();
-    let directories = rust_cargo_directories(root, &env);
-    let analyzer_target = match directories {
-        Ok((cargo_target, build)) => {
-            if !environment_build_dir && build.as_ref().is_none_or(|build| build == &cargo_target) {
-                return;
-            }
-            target.unwrap_or_else(|| cargo_target.join("rust-analyzer"))
-        }
+    let analyzer_target = match rust_cargo_target_directory(root, &env) {
+        Ok(cargo_target) => target.unwrap_or_else(|| cargo_target.join("rust-analyzer")),
         Err(reason) => {
             slog_info!("rust-analyzer Cargo directory lookup failed: {reason}");
             if !environment_build_dir {
@@ -8476,11 +8470,10 @@ fn isolate_rust_build_dir(def: &ServerDef, root: &Path, options: &mut serde_json
             })
         }
     };
-    // Cargo's build-dir templates have no target-dir variable. Resolve the
-    // target once, then override the inherited intermediate directory for both
-    // build-script discovery and flycheck. Changing targetDir alone leaves a
-    // configured build-dir (and its lock) shared with the user's cargo build.
-    let build = analyzer_target.join("build").to_string_lossy().into_owned();
+    // Changing targetDir alone leaves a configured build-dir (and its lock)
+    // shared with the user's cargo build. Keep intermediates in the analyzer's
+    // target directory, just as Cargo does when no build-dir is configured.
+    let build = analyzer_target.to_string_lossy().into_owned();
     merge_json_override(
         options,
         serde_json::json!({"cargo": {"extraEnv": {"CARGO_BUILD_BUILD_DIR": build}}}),
@@ -8493,10 +8486,10 @@ fn isolate_rust_build_dir(def: &ServerDef, root: &Path, options: &mut serde_json
     }
 }
 
-fn rust_cargo_directories(
+fn rust_cargo_target_directory(
     root: &Path,
     env: &HashMap<String, String>,
-) -> Result<(PathBuf, Option<PathBuf>), String> {
+) -> Result<PathBuf, String> {
     let binary = env
         .get("CARGO")
         .cloned()
@@ -8533,10 +8526,7 @@ fn rust_cargo_directories(
     let target = metadata["target_directory"]
         .as_str()
         .ok_or_else(|| "cargo metadata omitted target_directory".to_string())?;
-    Ok((
-        PathBuf::from(target),
-        metadata["build_directory"].as_str().map(PathBuf::from),
-    ))
+    Ok(PathBuf::from(target))
 }
 
 fn find_project_typescript_sdk(source_file: &Path, project_root: &Path) -> Option<PathBuf> {
@@ -12908,6 +12898,11 @@ mod rust_initialization_options_tests {
             "[package]\nname = \"build-isolation\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
+        std::fs::write(
+            root.join("Cargo.lock"),
+            "version = 4\n[[package]]\nname = \"build-isolation\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
         let config = Config::default();
         let source = root.join("src/lib.rs");
         let mut def = super::super::registry::servers_for_file(&source, &config)
@@ -12922,14 +12917,18 @@ mod rust_initialization_options_tests {
             "CARGO_BUILD_BUILD_DIR".into(),
             "{workspace-root}/shared/{workspace-path-hash}".into(),
         );
+        assert_eq!(
+            rust_cargo_target_directory(root, &def.env).unwrap(),
+            root.join("base")
+        );
         for (target, expected) in [
             (
                 serde_json::json!(true),
-                Some(root.join("base/rust-analyzer/build")),
+                Some(root.join("base/rust-analyzer")),
             ),
             (
                 serde_json::json!("custom-target"),
-                Some(root.join("custom-target/build")),
+                Some(root.join("custom-target")),
             ),
             (serde_json::json!(false), None),
         ] {
@@ -12961,9 +12960,7 @@ mod rust_initialization_options_tests {
         assert_eq!(options["cargo"]["targetDir"], true);
         assert_eq!(
             options["cargo"]["extraEnv"]["CARGO_BUILD_BUILD_DIR"],
-            root.join("base/rust-analyzer/build")
-                .to_string_lossy()
-                .as_ref()
+            root.join("base/rust-analyzer").to_string_lossy().as_ref()
         );
     }
 }
