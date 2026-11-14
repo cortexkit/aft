@@ -78,9 +78,9 @@ pub(super) fn extract_tree(
         refs.extend(
             crate::luau::exports(source, root)
                 .into_iter()
-                .map(|(name, export)| super::join::BlobRef {
+                .map(|(name, export)| BlobRef {
                     ordinal: 0,
-                    kind: super::join::BlobRefKind::ExportAlias,
+                    kind: BlobRefKind::ExportAlias,
                     caller_symbol: None,
                     short_name: None,
                     full_ref: Some(name.clone()),

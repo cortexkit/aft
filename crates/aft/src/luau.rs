@@ -297,7 +297,7 @@ pub(crate) fn imports(source: &str, root: Node<'_>) -> ImportBlock {
             } else {
                 ImportKind::SideEffect
             },
-            group: ImportGroup::Relative,
+            group: ImportGroup::Internal,
             byte_range: span.byte_range(),
             raw_text: text(source, span).to_string(),
             form: ImportForm::Structured {
@@ -557,7 +557,7 @@ pub(crate) mod tests {
             )
             .unwrap();
             let mut config = crate::config::Config::default();
-            config.storage.cache_dir = Some(directory.path().to_path_buf());
+            config.cache_dir = Some(directory.path().to_path_buf());
             crate::grammar::configure(&config).stored().unwrap();
             directory
         });
