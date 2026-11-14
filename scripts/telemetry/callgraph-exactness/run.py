@@ -144,7 +144,8 @@ def native_edits(binary, root, plan, seed):
             source = path.read_text()
             lines = source.splitlines(keepends=True)
             symbol = row["symbol"]
-            start, end = symbol["start_line"] - 1, symbol["end_line"]
+            # BlobSymbol spans are zero-based with an inclusive end row.
+            start, end = symbol["start_line"], symbol["end_line"] + 1
             declaration = "".join(lines[start:end])
             language = row["language"]
             if language in ("typescript", "tsx", "javascript"):
@@ -176,7 +177,7 @@ def native_edits(binary, root, plan, seed):
         path = root / row["file"]
         source = path.read_text()
         lines = source.splitlines(keepends=True)
-        line = row["symbol"]["start_line"] - 1
+        line = row["symbol"]["start_line"]
         signature = lines[line]
         # Rename a parameter, not the callee: body references may become
         # unresolved, which is intentional and must refresh identically.
@@ -187,6 +188,10 @@ def native_edits(binary, root, plan, seed):
             match = re.search(r"\(\s*([A-Za-z_][A-Za-z_0-9]*)\s+[A-Za-z_*\[\]]", signature[offset:])
             if match:
                 begin, finish = offset + match.start(1), offset + match.end(1)
+        elif row["language"] in ("c", "cpp"):
+            match = re.search(r"\((?:const\s+)?[A-Za-z_][A-Za-z_0-9]*(?:\s+|\s*\*\s*)([A-Za-z_][A-Za-z_0-9]*)\s*(?=[,)\[])", signature)
+            if match:
+                begin, finish = match.start(1), match.end(1)
         else:
             match = re.search(pattern, signature)
             if match:
@@ -246,6 +251,19 @@ def probe(args, binary, mode, root, store, out, threads, reference=None, changes
                 print(f"exactness {out.name}: {mode} still running ({time.monotonic()-started:.0f}s)", flush=True)
     elapsed = time.monotonic() - started
     row = {"mode": mode, "threads": threads, "seconds": elapsed, "exit_code": code, "command": command}
+    if code == 0:
+        operations = {}
+        positive_paths = 0
+        errors = 0
+        for line in (out / "queries.jsonl").read_text().splitlines():
+            query = json.loads(line)
+            op = query["query"]["op"]
+            operations[op] = operations.get(op, 0) + 1
+            positive_paths += bool(query["query"]["positive"])
+            errors += "error" in query["answer"]
+        row.update(queries=operations, positive_paths=positive_paths, query_errors=errors,
+                   health=json.loads((out / "health.json").read_text()),
+                   slice_cache=json.loads((out / "cache.json").read_text()))
     save(out / "run.json", row)
     print(f"exactness {out}: {elapsed:.2f}s exit={code}", flush=True)
     if code:
@@ -297,11 +315,16 @@ def run_repository(args, entry):
             else:
                 raise ValueError("deliberately broken candidate passed")
         for round_ in (1, 2):
+            previous = reference
             changed = island(root, round_) + apply_native(root, native, round_)
             changes = folder / f"changes-{round_}.json"
             save(changes, changed)
             reference = folder / f"reference-{round_}"
             result["runs"].append(probe(args, args.reference, "cold", root, folder / f"reference-store-{round_}", reference, 1))
+            before = {row["path"]: row["fragment"] for row in json.loads((previous / "files.json").read_text())}
+            after = {row["path"]: row["fragment"] for row in json.loads((reference / "files.json").read_text())}
+            affected = [path for path in sorted(before.keys() | after.keys()) if path not in changed and before.get(path) != after.get(path)]
+            result.setdefault("refresh_fanout", []).append({"round": round_, "unedited_changed_fragments": len(affected), "examples": affected[:20]})
             for threads, store in candidates.items():
                 # Both invocations exec a new process. The refresh reads only
                 # the previous publication and the explicit changed paths.

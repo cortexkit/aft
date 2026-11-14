@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location("exactness_run", Path(__file__).with_name("run.py"))
 RUN = importlib.util.module_from_spec(SPEC)
@@ -66,6 +67,25 @@ class CompareTests(unittest.TestCase):
             second = RUN.island(root, 2)
             self.assertIn("exactness_gate/iface.go", second)
             self.assertIn("func (Thing) Extra()", (root / "exactness_gate/iface.go").read_text())
+
+    def test_native_spans_are_zero_based_and_add_a_distinct_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "method.py").write_text("class Owner:\n    def run(self, value):\n        return value\n\n    def keep(self):\n        pass\n")
+            (root / "callee.py").write_text("def callee(value):\n    return value\n")
+            for name in ("a.py", "b.py"):
+                (root / name).write_text("pass\n")
+            row = {"file": "method.py", "owner": "Owner", "language": "python", "symbol": {"start_line": 1, "end_line": 2, "scoped_name": "Owner::run"}}
+            callee = {"file": "callee.py", "language": "python", "callers": 9, "symbol": {"start_line": 0, "end_line": 1, "scoped_name": "callee"}}
+            plan = {"files": ["a.py", "b.py"], "members": [{"member": "run", "sites": 100, "declarations": [row]}], "top_callees": [callee]}
+            with patch.object(RUN.subprocess, "run") as validate:
+                validate.return_value.returncode = 0
+                native, _ = RUN.native_edits(Path("probe"), root, plan, 1441)
+            added, signature = native["edits"]
+            self.assertIn("class ExactnessGateNative:\n    def run", added["round1"])
+            self.assertNotIn("def run", added["round2"])
+            self.assertIn("def keep", added["round2"])
+            self.assertIn("callee(value_exactness)", signature["round1"])
 
 
 if __name__ == "__main__":
