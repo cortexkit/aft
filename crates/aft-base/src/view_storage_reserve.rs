@@ -35,7 +35,7 @@ impl DiskReserveCondition {
 
 /// The approved pause sentence for `free_bytes` free against a floor of
 /// `floor_bytes`.
-pub(crate) fn message(free_bytes: u64, floor_bytes: u64) -> String {
+pub fn message(free_bytes: u64, floor_bytes: u64) -> String {
     APPROVED_MESSAGE
         .replace("{free}", &size(free_bytes))
         .replace("{floor}", &size(floor_bytes))
@@ -58,7 +58,7 @@ fn size(bytes: u64) -> String {
     }
 }
 
-pub(crate) fn is_message(message: &str) -> bool {
+pub fn is_message(message: &str) -> bool {
     message.starts_with("Index storage is paused: ")
         && message.ends_with("Unused index data is being cleaned up; retry later.")
 }

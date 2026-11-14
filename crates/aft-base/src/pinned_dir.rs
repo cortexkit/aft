@@ -1477,7 +1477,7 @@ fn file_mount_identity(file: &File) -> io::Result<MountIdentity> {
 thread_local! { static REPAIR_FAIL_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn with_repair_failure_after_for_test<T>(entries: usize, work: impl FnOnce() -> T) -> T {
+pub fn with_repair_failure_after_for_test<T>(entries: usize, work: impl FnOnce() -> T) -> T {
     struct Reset(Option<usize>);
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -1583,7 +1583,7 @@ type OpenatFileHook = Box<dyn FnMut(RawFd, &OsStr, i32) -> Option<io::Result<Fil
 thread_local! { static OPENAT_FILE_HOOK: std::cell::RefCell<Option<OpenatFileHook>> = const { std::cell::RefCell::new(None) }; }
 
 #[cfg(all(unix, any(test, feature = "test-support")))]
-pub(crate) fn with_openat_file_hook<T>(hook: OpenatFileHook, action: impl FnOnce() -> T) -> T {
+pub fn with_openat_file_hook<T>(hook: OpenatFileHook, action: impl FnOnce() -> T) -> T {
     struct Reset(Option<OpenatFileHook>);
     impl Drop for Reset {
         fn drop(&mut self) {

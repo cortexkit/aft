@@ -25,7 +25,7 @@ use std::path::Path;
 
 /// Which volume a file lives on and which file it is on that volume.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum FileIdentity {
+pub enum FileIdentity {
     /// Unix: device and inode numbers. Windows: volume serial number and
     /// file index.
     Known { volume: u64, index: u64 },
@@ -71,13 +71,13 @@ impl FileIdentity {
 
 /// Like `std::fs::metadata` (follows symlinks), plus the identity of the same
 /// file.
-pub(crate) fn metadata(path: &Path) -> io::Result<(Metadata, FileIdentity)> {
+pub fn metadata(path: &Path) -> io::Result<(Metadata, FileIdentity)> {
     stat(path, true).map(|(metadata, identity, _)| (metadata, identity))
 }
 
 /// Like `std::fs::symlink_metadata` (describes a symlink itself rather than
 /// its target), plus the identity of the same file.
-pub(crate) fn symlink_metadata(path: &Path) -> io::Result<(Metadata, FileIdentity)> {
+pub fn symlink_metadata(path: &Path) -> io::Result<(Metadata, FileIdentity)> {
     stat(path, false).map(|(metadata, identity, _)| (metadata, identity))
 }
 
@@ -182,7 +182,7 @@ fn windows_identity(file: &File) -> (FileIdentity, u64) {
 /// replacement lands within one clock tick, so only the file identity can
 /// tell the two files apart.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn replace_keeping_times(path: &Path, contents: &[u8]) {
+pub fn replace_keeping_times(path: &Path, contents: &[u8]) {
     let metadata = std::fs::metadata(path).unwrap();
     assert_eq!(
         metadata.len(),

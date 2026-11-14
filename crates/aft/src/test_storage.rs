@@ -1,6 +1,19 @@
 pub use aft_base::test_storage::*;
 
 #[cfg(test)]
+#[allow(unused_imports)]
+use crate::config::Config;
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::production_storage::{account_home, canonicalized_with, comparison_key, is_within};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::ffi::OsString;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::{Path, PathBuf};
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

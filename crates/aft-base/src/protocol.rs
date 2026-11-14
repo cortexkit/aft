@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub(crate) const RESULT_FORMAT: &str = "tool-result/v1";
+pub const RESULT_FORMAT: &str = "tool-result/v1";
 
 use crate::list_envelope::ListEnvelope;
 
@@ -39,7 +39,7 @@ pub struct ProgressFrame {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct ProgressOrigin {
+pub struct ProgressOrigin {
     pub channel: u16,
     pub epoch: u32,
     pub corr: u64,

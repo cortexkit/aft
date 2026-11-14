@@ -1,6 +1,16 @@
 pub use aft_base::pinned_executable::*;
 
 #[cfg(test)]
+#[allow(unused_imports)]
+use std::io;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::{Mutex, OnceLock};
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

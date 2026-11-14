@@ -195,7 +195,7 @@ pub fn contains_all_content_tokens(text: &str, tokens: &[String]) -> bool {
 /// Find the narrowest all-token window of at most three source lines. Tracking
 /// the most recent line for each token avoids rejoining overlapping windows;
 /// identifier matches cannot span the newline separators used by those windows.
-pub(crate) fn minimum_content_token_window(text: &str, tokens: &[String]) -> Option<usize> {
+pub fn minimum_content_token_window(text: &str, tokens: &[String]) -> Option<usize> {
     if tokens.is_empty() {
         return None;
     }
@@ -234,7 +234,7 @@ pub(crate) fn minimum_content_token_window(text: &str, tokens: &[String]) -> Opt
     best
 }
 
-pub(crate) fn is_type_concept_identifier_query(query: &str, shape: &QueryShape) -> bool {
+pub fn is_type_concept_identifier_query(query: &str, shape: &QueryShape) -> bool {
     if shape.kind != QueryKind::Identifier {
         return false;
     }
@@ -267,7 +267,7 @@ fn is_type_concept_type_token(token: &str) -> bool {
 /// inside natural-language queries. Bare prose words are excluded: a lone
 /// capitalized word like "Engine" is too ambiguous unless quoted, while adjacent
 /// TitleCase words are treated as one qualified name such as "Engine.Index".
-pub(crate) fn extract_explicit_code_tokens(query: &str) -> Vec<String> {
+pub fn extract_explicit_code_tokens(query: &str) -> Vec<String> {
     let mut tokens = Vec::new();
 
     push_quoted_code_tokens(query, &mut tokens);

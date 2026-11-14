@@ -15,7 +15,7 @@ use crate::process_io::Bytes;
 
 pub const RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 pub const DEFAULT_WINDOW_MS: u64 = 10 * 60 * 1_000;
-pub(crate) const MINUTE_MS: u64 = 60_000;
+pub const MINUTE_MS: u64 = 60_000;
 const PROCESS_ROOT: &str = "<process>";
 
 /// Closed attribution vocabulary used by persistence and management clients.
@@ -101,7 +101,7 @@ impl Domain {
 }
 
 #[derive(Debug)]
-pub(crate) struct Entry {
+pub struct Entry {
     pub(crate) domain: Domain,
     pub(crate) root_id: String,
     pub(crate) logical: AtomicU64,
@@ -112,7 +112,7 @@ pub(crate) struct Entry {
 }
 
 #[derive(Debug)]
-pub(crate) struct UnmeasurableEntry {
+pub struct UnmeasurableEntry {
     pub(crate) root_id: String,
     pub(crate) seam: String,
     pub(crate) reason: String,
@@ -199,20 +199,20 @@ impl Counter {
 }
 
 #[allow(deprecated)] // fetch_update became try_update in Rust 1.99; the MSRV (1.92) lacks try_update
-pub(crate) fn saturating_add(value: &AtomicU64, delta: u64) {
+pub fn saturating_add(value: &AtomicU64, delta: u64) {
     let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_add(delta))
     });
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ProcessBaseline {
+pub struct ProcessBaseline {
     pub(crate) bytes: Option<Bytes>,
     pub(crate) sampled_at_ms: u64,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct RecentRow {
+pub struct RecentRow {
     pub(crate) minute_ts: u64,
     pub(crate) domain: Domain,
     pub(crate) root_id: String,
@@ -237,7 +237,7 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-pub(crate) fn registry() -> &'static Registry {
+pub fn registry() -> &'static Registry {
     static REGISTRY: OnceLock<Registry> = OnceLock::new();
     REGISTRY.get_or_init(|| {
         let started_ms = now_ms();

@@ -28,9 +28,9 @@ use std::time::SystemTime;
 
 /// Bytes read from the start of a file for the generated-header and minified
 /// checks.
-pub(crate) const HEAD_BYTES: usize = 8 * 1024;
+pub const HEAD_BYTES: usize = 8 * 1024;
 
-pub(crate) mod generated;
+pub mod generated;
 
 /// Bytes read from the start of a JSON document for the long-line test.
 pub(crate) const JSON_HEAD_BYTES: usize = 64 * 1024;
@@ -459,7 +459,7 @@ fn is_source_file_name(file_name: &str) -> bool {
 /// file for the call graph nor embeds it for meaning search, since its names
 /// are mangled and its chunks say nothing a search could use; grep still
 /// searches it.
-pub(crate) fn is_minified(path: &str, bytes: &[u8]) -> bool {
+pub fn is_minified(path: &str, bytes: &[u8]) -> bool {
     let lower = path.to_ascii_lowercase();
     if MINIFIED_SUFFIXES
         .iter()
@@ -511,7 +511,7 @@ fn is_schema(lower_name: &str, short_head: &[u8]) -> bool {
 
 /// Whether the first [`GENERATED_HEADER_LINES`] lines of `head` carry a
 /// generated-code marker. Only the first [`HEAD_BYTES`] are looked at.
-pub(crate) fn head_has_generated_marker(head: &[u8]) -> bool {
+pub fn head_has_generated_marker(head: &[u8]) -> bool {
     let head = &head[..head.len().min(HEAD_BYTES)];
     text_has_generated_marker(&String::from_utf8_lossy(head))
 }
@@ -548,7 +548,7 @@ pub(crate) fn file_head_has_generated_marker(path: &Path) -> bool {
 
 /// The first `limit` bytes of the file at `path`, or `None` when it cannot
 /// be opened. Never reads past `limit`.
-pub(crate) fn read_head(path: &Path, limit: usize) -> Option<Vec<u8>> {
+pub fn read_head(path: &Path, limit: usize) -> Option<Vec<u8>> {
     let file = crate::project_content::open(path).ok()?;
     let mut head = Vec::with_capacity(limit.min(HEAD_BYTES));
     let mut reader = read_probe::Counting::new(file, path).take(limit as u64);
@@ -585,7 +585,7 @@ fn is_generated_segment(component: Component<'_>) -> bool {
 
 /// Only the part of `path` below `project_root` decides a generated shape;
 /// folders above the project (a checkout under `~/gen/`) must not.
-pub(crate) fn relative_shape_is_generated(project_root: &Path, path: &Path) -> bool {
+pub fn relative_shape_is_generated(project_root: &Path, path: &Path) -> bool {
     relative_within(project_root, path).is_some_and(|relative| path_has_generated_shape(&relative))
 }
 
@@ -701,7 +701,7 @@ pub(crate) mod read_probe {
 /// product code live); only their own exported symbols are suppressed from the
 /// dead/unused lists. The match is on conventional directory names anywhere in
 /// the path, kept conservative to avoid hiding real product directories.
-pub(crate) fn is_test_support_file(relative_path: &str) -> bool {
+pub fn is_test_support_file(relative_path: &str) -> bool {
     let normalized = relative_path.replace('\\', "/");
     normalized.split('/').any(is_test_support_dir_name)
 }
@@ -710,7 +710,7 @@ pub(crate) fn is_test_support_file(relative_path: &str) -> bool {
 /// (fixtures, corpora, mock data, snapshots). Shared by the reporting filter
 /// above and the language-server walk, which starts no server for these
 /// directories.
-pub(crate) fn is_test_support_dir_name(segment: &str) -> bool {
+pub fn is_test_support_dir_name(segment: &str) -> bool {
     matches!(
         segment,
         "fixtures"
@@ -732,7 +732,7 @@ pub(crate) fn is_test_support_dir_name(segment: &str) -> bool {
 /// are reporting noise excluded by path, while real tests remain scanned and can
 /// move otherwise-dead production symbols into the test-only bucket. Matching is
 /// high-precision to avoid hiding real product code.
-pub(crate) fn is_test_file(relative_path: &str) -> bool {
+pub fn is_test_file(relative_path: &str) -> bool {
     let normalized = relative_path.replace('\\', "/");
 
     // Directory-segment conventions: `__tests__` (JS/TS) and a `tests` test root

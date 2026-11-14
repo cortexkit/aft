@@ -16,7 +16,7 @@ pub const CONTENT_HASH_SIZE_CAP: u64 = 4 * 1024 * 1024;
 const MAX_STRICT_VERIFY_DEBUG_PATHS: usize = 4096;
 
 #[cfg(any(test, feature = "test-support"))]
-static STRICT_VERIFY_POOL_BUILDS: AtomicUsize = AtomicUsize::new(0);
+pub static STRICT_VERIFY_POOL_BUILDS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(debug_assertions)]
 static STRICT_VERIFY_FILE_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -266,7 +266,7 @@ pub fn search_warm_verify_plan_for_test(root: &Path, artifact_path: &Path) -> &'
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn record_verify_completed(
+pub fn record_verify_completed(
     root: &Path,
     artifact: VerifyArtifact,
     generation: Option<ArtifactGeneration>,
@@ -275,7 +275,7 @@ pub(crate) fn record_verify_completed(
     let _ = record_verify_completed_if_unchanged(root, artifact, generation, ticket);
 }
 
-pub(crate) fn invalidate_verify_memo(root: &Path) {
+pub fn invalidate_verify_memo(root: &Path) {
     let mut memo = verify_memo()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -295,7 +295,7 @@ pub(crate) fn invalidate_verify_memo(root: &Path) {
 /// filesystem watcher was stopped. A normal watcher invalidation can use
 /// stat-first verification, but an unobserved interval must hash content because
 /// size and mtime may both have been preserved by an external writer.
-pub(crate) fn invalidate_verify_memo_strict(root: &Path) {
+pub fn invalidate_verify_memo_strict(root: &Path) {
     let mut memo = verify_memo()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

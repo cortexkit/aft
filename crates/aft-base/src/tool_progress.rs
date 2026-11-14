@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Clone)]
-pub(crate) struct Progress(Arc<Inner>);
+pub struct Progress(Arc<Inner>);
 
 struct Inner {
     last_sent: Mutex<Option<Instant>>,
@@ -66,7 +66,7 @@ impl Progress {
     }
 }
 
-pub(crate) fn report() {
+pub fn report() {
     if let Some(token) = crate::executor::current_job_cancellation() {
         token.report_progress();
     }
@@ -79,7 +79,7 @@ thread_local! {
 /// Shared scanners outlive individual requests. Count their completed files so
 /// only requests waiting for that scanner can turn the counts into keepalive frames.
 #[derive(Clone, Default)]
-pub(crate) struct FileProgress(Arc<AtomicU64>);
+pub struct FileProgress(Arc<AtomicU64>);
 
 impl FileProgress {
     pub(crate) fn current() -> Option<Self> {

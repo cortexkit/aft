@@ -223,6 +223,6 @@ impl fmt::Display for AftError {
 
 impl std::error::Error for AftError {}
 
-pub(crate) fn aft_storage_denial_message(path: impl std::fmt::Display) -> String {
+pub fn aft_storage_denial_message(path: impl std::fmt::Display) -> String {
     format!("path '{path}' is in AFT's own storage, which file tools never open. For a shell task's output, use bash_status.")
 }

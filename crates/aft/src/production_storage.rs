@@ -1,6 +1,16 @@
 pub use aft_base::production_storage::*;
 
 #[cfg(test)]
+#[allow(unused_imports)]
+use std::ffi::OsString;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::io;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::{Component, Path, PathBuf};
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

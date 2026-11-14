@@ -131,14 +131,14 @@ pub fn middle_truncate(
     output
 }
 
-pub(crate) fn floor_char_boundary(input: &str, mut index: usize) -> usize {
+pub fn floor_char_boundary(input: &str, mut index: usize) -> usize {
     while index > 0 && !input.is_char_boundary(index) {
         index -= 1;
     }
     index
 }
 
-pub(crate) fn ceil_char_boundary(input: &str, mut index: usize) -> usize {
+pub fn ceil_char_boundary(input: &str, mut index: usize) -> usize {
     while index < input.len() && !input.is_char_boundary(index) {
         index += 1;
     }

@@ -142,13 +142,13 @@ const SHELL_FORMAT_TRIGGERS: &[&str] = &[
 
 /// A conservative prefilter, not a second masker. A complete capture with no
 /// trigger cannot contain any format recognized by `redact_with_range`.
-pub(crate) fn shells_may_need_format_context(text: &str) -> bool {
+pub fn shells_may_need_format_context(text: &str) -> bool {
     SHELL_FORMAT_TRIGGERS
         .iter()
         .any(|trigger| contains_ignore_ascii_case(text, trigger))
 }
 
-pub(crate) fn shells_format_scan_overlap() -> usize {
+pub fn shells_format_scan_overlap() -> usize {
     SHELL_FORMAT_TRIGGERS
         .iter()
         .map(|trigger| trigger.len())
@@ -160,7 +160,7 @@ pub(crate) fn shells_format_scan_overlap() -> usize {
 static SHELL_PRIVATE_BOUNDARY: LazyLock<Regex> =
     LazyLock::new(|| compile(r"-----(?:BEGIN|END) [A-Z0-9 ]*PRIVATE KEY-----"));
 
-pub(crate) fn shells_private_boundary_before(text: &str, before: usize) -> bool {
+pub fn shells_private_boundary_before(text: &str, before: usize) -> bool {
     SHELL_PRIVATE_BOUNDARY
         .find_iter(text)
         .any(|marker| marker.end() <= before)
@@ -881,14 +881,14 @@ pub fn redact_command(command: &str) -> Cow<'_, str> {
 
 // Separate limits bound byte scanning and expensive candidate hashes. Long
 // non-hex verdict lines need no hashes and can still retain their placeholders.
-pub(crate) const TICKET_REDACTION_BYTES: usize = 50 * 1024;
-pub(crate) const TICKET_REDACTION_WINDOWS: usize = 8 * 1024;
+pub const TICKET_REDACTION_BYTES: usize = 50 * 1024;
+pub const TICKET_REDACTION_WINDOWS: usize = 8 * 1024;
 
 // A 4 KiB range plus both 31-byte halos remains below the existing ticket
 // scanner's byte and candidate budgets, including an all-hex source window.
 const SHELL_TICKET_RANGE_BYTES: usize = 4 * 1024;
 
-pub(crate) fn shells_ticket_range(
+pub fn shells_ticket_range(
     text: &str,
     range: std::ops::Range<usize>,
     digest: Option<&str>,
@@ -925,14 +925,14 @@ pub(crate) fn shells_ticket_range(
     }
     Ok(output)
 }
-pub(crate) const TICKET_HALO_BYTES: usize = 31;
+pub const TICKET_HALO_BYTES: usize = 31;
 
 #[derive(Debug)]
-pub(crate) struct TicketRedactionBudgetExceeded;
+pub struct TicketRedactionBudgetExceeded;
 
 /// Redact only a 32-hex candidate whose BLAKE3 digest matches this task's stored
 /// ticket digest. This keeps ordinary hashes and identifiers unchanged in previews.
-pub(crate) fn redact_ticket_digest<'a>(
+pub fn redact_ticket_digest<'a>(
     text: &'a str,
     digest: Option<&str>,
 ) -> Result<Cow<'a, str>, TicketRedactionBudgetExceeded> {
@@ -945,7 +945,7 @@ thread_local! {
 }
 
 /// Range-aware form used when a watch match is anchored in captured output.
-pub(crate) fn redact_ticket_digest_range<'a>(
+pub fn redact_ticket_digest_range<'a>(
     text: &'a str,
     range: &mut std::ops::Range<usize>,
     digest: Option<&str>,
@@ -1033,7 +1033,7 @@ fn redact_ticket_digest_with_range<'a>(
     Ok(Cow::Owned(masked))
 }
 
-pub(crate) fn ticket_digest_windows(text: &str) -> usize {
+pub fn ticket_digest_windows(text: &str) -> usize {
     text.as_bytes()
         .split(|byte| !byte.is_ascii_hexdigit())
         .map(|run| run.len().saturating_sub(31))
@@ -1217,7 +1217,7 @@ fn is_short_password_name(key: &str) -> bool {
 /// A command's credential values, retained only with its live in-memory task.
 /// Deliberately has no Debug or serialization implementation.
 #[derive(Default)]
-pub(crate) struct SecretValues(Vec<String>);
+pub struct SecretValues(Vec<String>);
 
 /// Whether an environment variable name marks its value as a completion secret.
 pub fn is_secret_environment_key(key: &str) -> bool {
@@ -1408,7 +1408,7 @@ fn needs_github_token_scan(text: &str) -> bool {
 
 /// Byte ranges of the masked JSON secret fields in `text`. A field can span
 /// lines, so a slice cut at a newline may hold only part of one.
-pub(crate) fn json_secret_field_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+pub fn json_secret_field_spans(text: &str) -> Vec<std::ops::Range<usize>> {
     if !text.contains('"') {
         return Vec::new();
     }
@@ -1420,7 +1420,7 @@ pub(crate) fn json_secret_field_spans(text: &str) -> Vec<std::ops::Range<usize>>
 
 /// Byte ranges of the masked private-key blocks in `text`. A block ends at its
 /// END line or, without one, at the end of `text`.
-pub(crate) fn private_key_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+pub fn private_key_spans(text: &str) -> Vec<std::ops::Range<usize>> {
     if !text.contains("PRIVATE KEY-----") {
         return Vec::new();
     }
@@ -1432,14 +1432,14 @@ pub(crate) fn private_key_spans(text: &str) -> Vec<std::ops::Range<usize>> {
 
 /// Whether `text` holds a private-key BEGIN or END line. Without one, `text`
 /// alone cannot tell whether it starts inside a key block.
-pub(crate) fn has_private_key_marker(text: &str) -> bool {
+pub fn has_private_key_marker(text: &str) -> bool {
     text.contains("PRIVATE KEY-----")
 }
 
 /// Whether `line` has the shape of a PEM private-key body line: 40 to 76
 /// base64 characters mixing upper case, lower case and digits. Lower-case hex
 /// digests and ordinary words do not qualify; a mixed-case hex string can.
-pub(crate) fn looks_like_private_key_body(line: &str) -> bool {
+pub fn looks_like_private_key_body(line: &str) -> bool {
     let line = line.trim_end_matches('\r');
     (40..=76).contains(&line.len())
         && line
@@ -1453,7 +1453,7 @@ pub(crate) fn looks_like_private_key_body(line: &str) -> bool {
 /// Whether a JSON secret value that opens before byte `before` is still open
 /// at the end of `text`. Its closing quote, and so the match, may lie past the
 /// end of `text`; masking `text` alone would then show the value.
-pub(crate) fn json_secret_value_open_at_end(text: &str, before: usize) -> bool {
+pub fn json_secret_value_open_at_end(text: &str, before: usize) -> bool {
     if !text.contains('"') {
         return false;
     }

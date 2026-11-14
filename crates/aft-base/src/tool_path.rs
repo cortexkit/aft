@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 /// Resolve `binary` on the process `PATH` (PATHEXT-aware on Windows via `which`).
 /// An Apple developer-tools launcher on a Mac without the tools counts as not
 /// found, because running it opens the install dialog.
-pub(crate) fn resolve_on_path(binary: &str) -> Option<PathBuf> {
+pub fn resolve_on_path(binary: &str) -> Option<PathBuf> {
     which::which(binary)
         .ok()
         .or_else(|| find_on_path_manual(binary))
@@ -52,7 +52,7 @@ fn path_looks_like_tool(path: &Path) -> bool {
 
 /// On Windows, prefer `dir/<binary>.exe|.cmd|.bat|.com` over an
 /// extensionless file, which may be a colocated POSIX package-manager shim.
-pub(crate) fn probe_tool_in_dir(dir: &Path, binary: &str) -> Option<PathBuf> {
+pub fn probe_tool_in_dir(dir: &Path, binary: &str) -> Option<PathBuf> {
     probe_tool_in_dir_for_platform(dir, binary, cfg!(windows))
 }
 
@@ -99,7 +99,7 @@ pub(crate) fn well_known_windows_bin_dirs(userprofile: Option<&std::ffi::OsStr>)
 }
 
 #[cfg(not(windows))]
-pub(crate) fn well_known_windows_bin_dirs(_userprofile: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+pub fn well_known_windows_bin_dirs(_userprofile: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
     Vec::new()
 }
 

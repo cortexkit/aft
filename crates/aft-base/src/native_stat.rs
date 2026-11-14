@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::io_accounting::at;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) enum FileIdentity {
+pub enum FileIdentity {
     Unix {
         dev: u64,
         ino: u64,
@@ -32,7 +32,7 @@ pub(crate) enum FileIdentity {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct NativeStat {
+pub struct NativeStat {
     pub identity: FileIdentity,
     pub size: u64,
     pub modified_ns: i128,
@@ -223,7 +223,7 @@ fn windows_file_stat(file: &fs::File) -> io::Result<NativeStat> {
 /// The current time in nanoseconds since the Unix epoch, rounded down to a
 /// whole second, so a stamp from within the current second never counts as
 /// older than the observation (see [`NativeStat::reusable`]).
-pub(crate) fn now_ns() -> u128 {
+pub fn now_ns() -> u128 {
     u128::from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

@@ -70,7 +70,7 @@ impl Drop for Text {
     }
 }
 #[cfg(any(test, feature = "test-support"))]
-thread_local! { static WIPES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+thread_local! { pub static WIPES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
     T::deserialize(d).map(Some)

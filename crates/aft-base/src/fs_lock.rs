@@ -19,7 +19,7 @@ use crate::{slog_debug, slog_error, slog_info, slog_warn};
 /// until exec or exit. Explicitly unlock when the protected operation ends.
 /// Keep one guard per acquisition; share the guard, not cloned file handles.
 #[derive(Debug)]
-pub(crate) struct AdvisoryLockGuard(File);
+pub struct AdvisoryLockGuard(File);
 
 impl AdvisoryLockGuard {
     pub(crate) fn from_locked_file(file: File) -> Self {
@@ -258,7 +258,7 @@ pub fn try_acquire(path: &Path, timeout: Duration) -> Result<LockGuard, AcquireE
 /// Preserve a caller's deadline across filesystem preparation instead of
 /// starting a fresh timeout after that work has finished. Always allow the
 /// first attempt: slow preparation does not imply another writer owns the lock.
-pub(crate) fn try_acquire_until(path: &Path, deadline: Instant) -> Result<LockGuard, AcquireError> {
+pub fn try_acquire_until(path: &Path, deadline: Instant) -> Result<LockGuard, AcquireError> {
     crate::production_storage::refuse_write(path)?;
     #[cfg(any(test, feature = "test-support"))]
     retry_clock::before_acquire();
@@ -306,7 +306,7 @@ impl ObservedLock {
 /// Malformed contents are not proof of a dead owner: acquisition must still
 /// perform its grace-period reread and guarded reclaim. I/O failures remain
 /// errors rather than evidence about ownership.
-pub(crate) fn lock_availability(path: &Path) -> io::Result<LockAvailability> {
+pub fn lock_availability(path: &Path) -> io::Result<LockAvailability> {
     observe_lock(path, &current_hostname(), LockConfig::default())
         .map(|observed| observed.availability())
 }
@@ -850,8 +850,8 @@ fn create_new_lock(path: &Path, hostname: &str, config: LockConfig) -> io::Resul
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    static BEFORE_MALFORMED_RECLAIM: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
-    static BEFORE_HEARTBEAT_SPAWN_FAILURE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    pub static BEFORE_MALFORMED_RECLAIM: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    pub static BEFORE_HEARTBEAT_SPAWN_FAILURE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1663,7 +1663,7 @@ fn rename_over_with(
 }
 
 #[cfg(windows)]
-pub(crate) fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
+pub fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
     // MoveFileExW with MOVEFILE_REPLACE_EXISTING is the only replacement path
     // here that preserves the old destination on failure. A copy fallback
     // truncates the destination before copying and can expose partial bytes or
@@ -1677,7 +1677,7 @@ pub(crate) fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(windows))]
-pub(crate) fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
+pub fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
     fs::rename(from, to)
 }
 
@@ -2027,7 +2027,7 @@ fn emit_reclaim_warning(message: String) {
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    static RECLAIM_TEST_LOGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    pub static RECLAIM_TEST_LOGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 
     // The observer is thread-local so concurrent lock tests cannot record one
     // another's retry decisions.
@@ -2050,7 +2050,7 @@ impl Drop for RetrySleepObserverGuard {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn observe_retry_sleeps_for_test(
+pub fn observe_retry_sleeps_for_test(
     observer: Arc<std::sync::atomic::AtomicUsize>,
 ) -> RetrySleepObserverGuard {
     let previous = RETRY_SLEEP_OBSERVER.with(|slot| slot.replace(Some(observer)));
@@ -2066,7 +2066,7 @@ fn note_retry_sleep_for_test() {
     });
 }
 
-pub(crate) fn acquisition_now() -> Instant {
+pub fn acquisition_now() -> Instant {
     #[cfg(any(test, feature = "test-support"))]
     if let Some(now) = retry_clock::now() {
         return now;
@@ -2412,7 +2412,7 @@ fn process_identity(pid: u32) -> Option<ProcessIdentity> {
 
 /// Exact birth and boot identity for speech redemption. Missing evidence is denial,
 /// unlike the deliberately conservative "still alive" policy used by lock cleanup.
-pub(crate) fn speech_process_identity(pid: u32) -> Option<String> {
+pub fn speech_process_identity(pid: u32) -> Option<String> {
     let identity = process_identity(pid)?;
     if identity.exited {
         return None;

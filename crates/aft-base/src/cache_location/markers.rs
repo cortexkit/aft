@@ -368,12 +368,12 @@ pub struct ReadMarkerSweep {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn protected_read_marker_exists(cache_dir: &Path, generation_label: &str) -> bool {
+pub fn protected_read_marker_exists(cache_dir: &Path, generation_label: &str) -> bool {
     read_marker_protection(cache_dir, generation_label, false).protected
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn sweep_read_markers(cache_dir: &Path, generation_label: &str) -> ReadMarkerSweep {
+pub fn sweep_read_markers(cache_dir: &Path, generation_label: &str) -> ReadMarkerSweep {
     read_marker_protection(cache_dir, generation_label, true)
 }
 
@@ -531,7 +531,7 @@ fn marker_start_matches(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn write_marker_file(path: &Path, metadata: &ReadMarkerMetadata) -> io::Result<()> {
+pub fn write_marker_file(path: &Path, metadata: &ReadMarkerMetadata) -> io::Result<()> {
     let parent = crate::pinned_dir::PinnedDir::repair_open_path(
         path.parent()
             .ok_or_else(|| io::Error::other("marker has no parent"))?,

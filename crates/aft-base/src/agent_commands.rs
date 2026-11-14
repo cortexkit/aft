@@ -11,7 +11,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Batch {
+pub struct Batch {
     pub(crate) started: Vec<AgentCommandRoot>,
     pub(crate) finished: Vec<AgentCommandFinished>,
     pub(crate) known: Option<Vec<AgentCommandRoot>>,
@@ -288,7 +288,7 @@ impl Drop for Connection {
     }
 }
 
-pub(crate) fn connect<F, Fut>(send: F) -> Connection
+pub fn connect<F, Fut>(send: F) -> Connection
 where
     F: Fn(Batch) -> Fut + Send + 'static,
     Fut: Future<Output = Result<(), AgentCommandsError>> + Send,
@@ -296,11 +296,11 @@ where
     declarations().connect(send)
 }
 
-pub(crate) fn enable(storage: &Path) {
+pub fn enable(storage: &Path) {
     declarations().load(storage);
 }
 
-pub(crate) fn started(pid: u32) -> Option<AgentCommandRoot> {
+pub fn started(pid: u32) -> Option<AgentCommandRoot> {
     if declarations()
         .state
         .lock()
@@ -427,7 +427,7 @@ impl WindowsChild {
     }
 }
 
-pub(crate) fn wait_pty(
+pub fn wait_pty(
     child: &mut dyn portable_pty::Child,
     root: Option<AgentCommandRoot>,
 ) -> std::io::Result<portable_pty::ExitStatus> {
@@ -448,7 +448,7 @@ pub(crate) fn wait_pty(
     Ok(status)
 }
 
-pub(crate) fn try_wait_pty(
+pub fn try_wait_pty(
     child: &mut dyn portable_pty::Child,
     root: Option<AgentCommandRoot>,
 ) -> std::io::Result<Option<portable_pty::ExitStatus>> {

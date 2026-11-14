@@ -6,7 +6,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-pub(crate) const DIR_MODE: u32 = 0o700;
+pub const DIR_MODE: u32 = 0o700;
 #[cfg(unix)]
 pub(crate) const FILE_MODE: u32 = 0o600;
 
@@ -41,7 +41,7 @@ pub fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     builder.create(path)
 }
 
-pub(crate) fn create_dir(path: &Path) -> io::Result<()> {
+pub fn create_dir(path: &Path) -> io::Result<()> {
     if let Some(access) = crate::cache_location::pin_cache_path(path)? {
         let (parent, name) = access.parent()?;
         let child = parent.repair_create_dir(&name)?;
@@ -58,7 +58,7 @@ pub(crate) fn create_dir(path: &Path) -> io::Result<()> {
     builder.create(path)
 }
 
-pub(crate) fn options() -> OpenOptions {
+pub fn options() -> OpenOptions {
     #[allow(unused_mut)]
     let mut options = OpenOptions::new();
     #[cfg(unix)]
@@ -69,7 +69,7 @@ pub(crate) fn options() -> OpenOptions {
     options
 }
 
-pub(crate) fn executable_options() -> OpenOptions {
+pub fn executable_options() -> OpenOptions {
     #[allow(unused_mut)]
     let mut options = options();
     #[cfg(unix)]
@@ -80,7 +80,7 @@ pub(crate) fn executable_options() -> OpenOptions {
     options
 }
 
-pub(crate) fn write_executable(path: &Path, contents: &[u8]) -> io::Result<()> {
+pub fn write_executable(path: &Path, contents: &[u8]) -> io::Result<()> {
     if let Some(access) = crate::cache_location::pin_cache_path(path)? {
         let (parent, name) = access.parent()?;
         let mut file = parent.repair_create_file(&name)?;
@@ -114,13 +114,13 @@ pub fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Result<(
 
 /// Open a storage root and protect its immediate domains, without traversing
 /// histories or indexes. Existing files need no walk behind a private directory.
-pub(crate) fn open_root(root: &Path) -> io::Result<()> {
+pub fn open_root(root: &Path) -> io::Result<()> {
     create_dir_all(root)?;
     tighten_root(root);
     Ok(())
 }
 
-pub(crate) fn tighten_root(root: &Path) {
+pub fn tighten_root(root: &Path) {
     tighten_within(root, root);
     #[cfg(unix)]
     if let Ok(entries) = root_entries(root) {
@@ -145,7 +145,7 @@ thread_local! {
 }
 
 #[cfg(all(any(test, feature = "test-support"), unix))]
-pub(crate) fn root_listings_for_test() -> usize {
+pub fn root_listings_for_test() -> usize {
     ROOT_LISTINGS.with(std::cell::Cell::get)
 }
 
@@ -184,13 +184,13 @@ mod directory_tests {
 
 /// Protect only the ancestors of the domain/per-root directory being opened.
 /// No chmod is attempted above `root`, or through a symlink inside the store.
-pub(crate) fn open_dir(root: &Path, path: &Path) -> io::Result<()> {
+pub fn open_dir(root: &Path, path: &Path) -> io::Result<()> {
     create_dir_all(path)?;
     tighten_open_dir(root, path);
     Ok(())
 }
 
-pub(crate) fn tighten_open_dir(root: &Path, path: &Path) {
+pub fn tighten_open_dir(root: &Path, path: &Path) {
     tighten_within(root, root);
     if let Ok(relative) = path.strip_prefix(root) {
         let mut current = root.to_path_buf();
@@ -207,7 +207,7 @@ pub(crate) fn tighten_open_dir(root: &Path, path: &Path) {
 /// Keyed caches normally have `<root>/<domain>/<key>` layout. Explicit cache
 /// paths used by embedding callers are their own boundary, not a reason to
 /// chmod two arbitrary parents outside AFT's storage.
-pub(crate) fn open_keyed_dir(path: &Path, domain: &str) -> io::Result<()> {
+pub fn open_keyed_dir(path: &Path, domain: &str) -> io::Result<()> {
     let root = path
         .parent()
         .filter(|parent| parent.file_name().is_some_and(|name| name == domain))
@@ -216,7 +216,7 @@ pub(crate) fn open_keyed_dir(path: &Path, domain: &str) -> io::Result<()> {
     open_dir(root, path)
 }
 
-pub(crate) fn tighten_keyed_dir(path: &Path, domain: &str) {
+pub fn tighten_keyed_dir(path: &Path, domain: &str) {
     let root = path
         .parent()
         .filter(|parent| parent.file_name().is_some_and(|name| name == domain))
@@ -295,7 +295,7 @@ fn warn_once(path: &Path, error: &io::Error) {
 
 /// SQLite derives WAL/SHM modes from the database. Reserve the database before
 /// SQLite's first writable open, but never create a file for a read-only open.
-pub(crate) fn prepare_sqlite(path: &Path, flags: rusqlite::OpenFlags) -> rusqlite::Result<()> {
+pub fn prepare_sqlite(path: &Path, flags: rusqlite::OpenFlags) -> rusqlite::Result<()> {
     // With SQLITE_OPEN_URI, a name starting with `file:` is a URI, not a
     // filesystem path, so the cache-location checks must look at the file it
     // names. Handing them the URI text instead skips them on Unix (its

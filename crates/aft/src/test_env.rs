@@ -1,6 +1,19 @@
 pub use aft_base::test_env::*;
 
 #[cfg(test)]
+#[allow(unused_imports)]
+use std::cell::{Cell, RefCell};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::ffi::{OsStr, OsString};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::process::Command;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

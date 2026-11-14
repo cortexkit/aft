@@ -1,5 +1,5 @@
 mod context;
-pub(crate) mod root_lifecycle;
+pub mod root_lifecycle;
 mod single_flight;
 pub use context::{ExecutorApp, ExecutorContext};
 pub use root_lifecycle::SubcLifecycleAdmission;
@@ -46,7 +46,7 @@ const SCHEDULER_PROBE_WAIT: Duration = Duration::from_millis(5);
 /// unbounded receiver drain; health probes and submitters get a lock turn
 /// between batches.
 const SCHEDULER_EVENT_BATCH_CAP: usize = 64;
-pub(crate) const MAINTENANCE_QUEUE_CAP: usize = 512;
+pub const MAINTENANCE_QUEUE_CAP: usize = 512;
 const CALLGRAPH_ACQUISITION_REQUEST_ID: &str = "callgraph-view-acquire";
 
 /// Scheduler lane for command-handler execution.
@@ -118,7 +118,7 @@ pub enum JobClass {
 
 /// Idempotent maintenance drains that can share one queued execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum MaintenanceCoalesceKey {
+pub enum MaintenanceCoalesceKey {
     WatcherDrain,
     LspDrain,
     /// Standing maintenance is coalesced inside each actor queue. The executor
@@ -920,7 +920,7 @@ pub enum JobCancelOutcome {
 
 /// Result of cancelling only work whose command closure has not started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PreExecutionCancelOutcome {
+pub enum PreExecutionCancelOutcome {
     QueuedRemoved,
     DispatchedCancelled,
     AlreadyStarted,
@@ -1039,7 +1039,7 @@ impl Drop for ActorWaitingWritersGuard {
 /// Make [`current_actor_writer_waiting`] report the given counter on this
 /// thread, for tests that run a maintenance step outside an executor worker.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn install_actor_waiting_writers_for_test(
+pub fn install_actor_waiting_writers_for_test(
     waiting: Arc<AtomicUsize>,
 ) -> ActorWaitingWritersGuard {
     ActorWaitingWritersGuard::install(ActorWriterDemand {
@@ -4547,7 +4547,7 @@ thread_local! {
     static IS_EXECUTOR_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-pub(crate) fn current_thread_is_executor_worker() -> bool {
+pub fn current_thread_is_executor_worker() -> bool {
     IS_EXECUTOR_WORKER.with(std::cell::Cell::get)
 }
 
@@ -4667,10 +4667,7 @@ static REQUEUE_HANDOFF_HOOK: Mutex<Option<RequeueHandoffHook>> = Mutex::new(None
 /// Run `hook` after returning `request_id`'s token to pending, before the
 /// worker's full cancellation probe.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn set_requeue_handoff_hook_for_test(
-    request_id: &str,
-    hook: impl FnOnce() + Send + 'static,
-) {
+pub fn set_requeue_handoff_hook_for_test(request_id: &str, hook: impl FnOnce() + Send + 'static) {
     *REQUEUE_HANDOFF_HOOK.lock() = Some((request_id.to_string(), Box::new(hook)));
 }
 
@@ -4700,7 +4697,10 @@ static REQUEUE_AFTER_PROBE_HOOK: Mutex<Option<RequeueHandoffHook>> = Mutex::new(
 /// Run `hook` after the worker's cancellation probe passes, before the
 /// scheduler receives `request_id`'s requeue.
 #[cfg(any(test, feature = "test-support"))]
-fn set_requeue_after_probe_hook_for_test(request_id: &str, hook: impl FnOnce() + Send + 'static) {
+pub fn set_requeue_after_probe_hook_for_test(
+    request_id: &str,
+    hook: impl FnOnce() + Send + 'static,
+) {
     *REQUEUE_AFTER_PROBE_HOOK.lock() = Some((request_id.to_string(), Box::new(hook)));
 }
 

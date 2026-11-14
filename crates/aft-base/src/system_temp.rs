@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 /// Returns true for scratch paths that should not create external-directory asks.
 /// This only affects prompt decisions; hard project-root validation stays separate.
-pub(crate) fn is_system_temp_path(path: &Path) -> bool {
+pub fn is_system_temp_path(path: &Path) -> bool {
     let resolved = resolve_with_existing_ancestors(path);
     system_temp_roots().into_iter().any(|root| {
         let root = normalize_path(&root);
@@ -10,7 +10,7 @@ pub(crate) fn is_system_temp_path(path: &Path) -> bool {
     })
 }
 
-pub(crate) fn system_temp_roots() -> Vec<PathBuf> {
+pub fn system_temp_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     roots.push(std::env::temp_dir());
 
@@ -42,7 +42,7 @@ fn path_is_under(root: &Path, path: &Path) -> bool {
     path == root || path.starts_with(root)
 }
 
-pub(crate) fn resolve_with_existing_ancestors(path: &Path) -> PathBuf {
+pub fn resolve_with_existing_ancestors(path: &Path) -> PathBuf {
     if let Ok(canonical) = std::fs::canonicalize(path) {
         return normalize_path(&canonical);
     }

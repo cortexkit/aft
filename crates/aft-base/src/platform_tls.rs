@@ -11,7 +11,7 @@ static PLATFORM_VERIFIER_CONFIG: OnceLock<Result<ClientConfig, String>> = OnceLo
 /// built. Cloning it for reqwest is cheap because the verifier and its shared
 /// state are reference counted; importantly, native trust decisions remain
 /// connection-time work instead of per-client root-store enumeration.
-pub(crate) fn client_config() -> Result<ClientConfig, String> {
+pub fn client_config() -> Result<ClientConfig, String> {
     PLATFORM_VERIFIER_CONFIG
         .get_or_init(|| {
             // Reqwest enables rustls' ring provider, but does not install a
@@ -27,7 +27,7 @@ static BLOCKING_CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = On
 
 /// Share reqwest's blocking runtime across roots. Deadlines belong to requests,
 /// not clients, so one root's budget cannot change another root's connection pool.
-pub(crate) fn blocking_client() -> Result<reqwest::blocking::Client, String> {
+pub fn blocking_client() -> Result<reqwest::blocking::Client, String> {
     BLOCKING_CLIENT
         .get_or_init(|| {
             reqwest::blocking::Client::builder()

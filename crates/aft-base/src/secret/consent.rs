@@ -14,7 +14,7 @@
 use crate::secret::SecretScope;
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) static TEST_TRANSPORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub static TEST_TRANSPORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The consent kind a secret ask files under.
 pub const SECRET_CONSENT_KIND: &str = "secret_use";

@@ -5,14 +5,14 @@
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
-pub(crate) enum GitRootResolutionError {
+pub enum GitRootResolutionError {
     PathNotFound(PathBuf),
     NotAGitRoot,
     ProtectedScanRoot,
     Other(String),
 }
 
-pub(crate) fn resolve_git_root_from_user_path(
+pub fn resolve_git_root_from_user_path(
     project_root: &Path,
     raw_path: &str,
     scan_root_is_protected: impl Fn(&Path) -> bool,
@@ -100,7 +100,7 @@ fn plain_scan_root_is_too_broad(
     }
 }
 
-pub(crate) fn expand_tilde(raw: &str) -> PathBuf {
+pub fn expand_tilde(raw: &str) -> PathBuf {
     let home = home_dir();
     expand_tilde_with_home(raw, home.as_deref())
 }
@@ -166,7 +166,7 @@ fn git_toplevel(base_dir: &Path) -> Result<PathBuf, String> {
     Ok(std::fs::canonicalize(&toplevel).unwrap_or(toplevel))
 }
 
-pub(crate) fn project_root_is_too_broad(
+pub fn project_root_is_too_broad(
     canonical_root: &Path,
     canonicalization_failed: bool,
     account_home: Option<&Path>,

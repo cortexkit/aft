@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS: u64 = 3_000;
+pub const DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS: u64 = 3_000;
 /// `auto`: on the production lane (Bionic / Qwen3-Embedding-0.6B) the model-card
 /// instruction on queries only left concept MRR and exact recall flat within noise,
 /// raised real-query MRR 0.182 -> 0.189, and cut the dense lane's no-vocabulary
@@ -16,11 +16,11 @@ pub const QWEN3_EMBEDDING_MODEL_CARD_RETRIEVAL_TASK: &str =
     "Given a web search query, retrieve relevant passages that answer the query";
 pub const QWEN3_EMBEDDING_CODE_SEARCH_TASK: &str =
     "Given a code search query, retrieve relevant source code, symbols, and documentation";
-pub(crate) const MIN_SEMANTIC_QUERY_TIMEOUT_MS: u64 = 500;
-pub(crate) const MAX_SEMANTIC_QUERY_TIMEOUT_MS: u64 = 30_000;
+pub const MIN_SEMANTIC_QUERY_TIMEOUT_MS: u64 = 500;
+pub const MAX_SEMANTIC_QUERY_TIMEOUT_MS: u64 = 30_000;
 pub(crate) const DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS: u64 = 120_000;
-pub(crate) const MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS: u64 = 10_000;
-pub(crate) const MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS: u64 = 600_000;
+pub const MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS: u64 = 10_000;
+pub const MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS: u64 = 600_000;
 pub const DEFAULT_INSPECT_TIER2_PASS_TIMEOUT_MS: u64 = 600_000;
 pub const DEFAULT_BASH_WATCH_SYNC_MAX_MS: u64 = 120_000;
 pub const MIN_BASH_WATCH_SYNC_MAX_MS: u64 = 1_000;
@@ -91,7 +91,7 @@ use crate::harness::Harness;
 ///
 /// Prefer this over `std::fs::read_to_string` for any file a user or tool may
 /// rewrite while AFT runs: the user and project config files.
-pub(crate) fn open_config_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+pub fn open_config_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(windows)]

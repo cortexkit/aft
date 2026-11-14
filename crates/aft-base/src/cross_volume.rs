@@ -268,7 +268,7 @@ fn native_publish_no_replace(_from: &Path, _to: &Path) -> io::Result<Option<io::
 /// finalization fails and a stale source copy remains.
 #[derive(Debug)]
 #[must_use = "report any move finalization warning before using the destination"]
-pub(crate) enum Moved {
+pub enum Moved {
     /// One rename: source and destination are on the same volume.
     Renamed,
     /// The volumes differ: the source was copied, published under the
@@ -294,7 +294,7 @@ impl Moved {
 /// A collision leaves the source untouched and belongs to the caller's policy:
 /// state repair adopts the winner, while data migrations retain their source.
 #[derive(Debug)]
-pub(crate) enum MoveError {
+pub enum MoveError {
     AlreadyPublished { cleanup_warning: Option<io::Error> },
     Failed(io::Error),
 }
@@ -354,7 +354,7 @@ impl From<io::Error> for MoveError {
 /// support use the checked, non-atomic fallback described by [`rename`].
 /// Once published, directory sync or source removal failures return
 /// [`Moved::PublishedWithWarning`]: callers must report the warning and use `to`.
-pub(crate) fn move_path(from: &Path, to: &Path) -> Result<Moved, MoveError> {
+pub fn move_path(from: &Path, to: &Path) -> Result<Moved, MoveError> {
     let parent = to
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

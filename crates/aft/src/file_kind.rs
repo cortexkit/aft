@@ -1,6 +1,23 @@
 pub use aft_base::file_kind::*;
 
 #[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::HashMap;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::io::Read;
+#[cfg(test)]
+#[allow(unused_imports)]
+#[cfg(windows)]
+use std::path::PathBuf;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::{Component, Path};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::time::SystemTime;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn extension_only_source_classification_matches_parser() {

@@ -1043,7 +1043,7 @@ fn reap_child_in_background(mut child: Child) {
 /// does not. The count is per thread, so parallel tests that fork do not
 /// disturb each other.
 #[cfg(all(any(test, feature = "test-support"), unix))]
-pub(crate) mod fork_counter {
+pub mod fork_counter {
     use std::cell::Cell;
     use std::sync::Once;
 

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub(crate) mod progress;
+pub mod progress;
 
 #[cfg(not(any(test, feature = "test-support")))]
 const DEFAULT_COLD_BUILD_LIMIT: usize = 2;
@@ -18,11 +18,11 @@ const ADMISSION_EVENT_RETENTION: usize = 64;
 static GLOBAL_COLD_BUILD_LIMITER: LazyLock<Arc<ColdBuildLimiter>> =
     LazyLock::new(|| Arc::new(ColdBuildLimiter::new(DEFAULT_COLD_BUILD_LIMIT)));
 
-pub(crate) fn global_limiter() -> Arc<ColdBuildLimiter> {
+pub fn global_limiter() -> Arc<ColdBuildLimiter> {
     Arc::clone(&GLOBAL_COLD_BUILD_LIMITER)
 }
 
-pub(crate) fn isolated_limiter(limit: usize) -> Arc<ColdBuildLimiter> {
+pub fn isolated_limiter(limit: usize) -> Arc<ColdBuildLimiter> {
     Arc::new(ColdBuildLimiter::new(limit))
 }
 
@@ -68,7 +68,7 @@ pub(crate) fn acquire_blocking_while_with_limiter(
 /// that repeat admission. Standing adds a yielding class to this existing
 /// rotation; it never installs a priority retry path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ColdBuildAdmissionClass {
+pub enum ColdBuildAdmissionClass {
     InspectTriggered,
     Maintenance,
     Standing,
@@ -96,7 +96,7 @@ impl ColdBuildAdmissionClass {
 
 /// Internal request metadata attached to an admission attempt.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ColdBuildAdmissionRequest {
+pub struct ColdBuildAdmissionRequest {
     request_id: String,
     /// Root whose builds share one permit (see `holders_by_root`).
     root: Option<String>,
@@ -151,7 +151,7 @@ pub(crate) struct ColdBuildAdmissionEvent {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ColdBuildCensusEntry {
+pub struct ColdBuildCensusEntry {
     pub(crate) domain: &'static str,
     pub(crate) root: String,
     pub(crate) kind: String,
@@ -161,7 +161,7 @@ pub(crate) struct ColdBuildCensusEntry {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ColdBuildLimiterCensus {
+pub struct ColdBuildLimiterCensus {
     pub(crate) cap: usize,
     pub(crate) holders: Vec<ColdBuildCensusEntry>,
     pub(crate) queued: Vec<ColdBuildCensusEntry>,
@@ -170,7 +170,7 @@ pub(crate) struct ColdBuildLimiterCensus {
 /// Attempt immediate admission without bypassing queued requests from the other
 /// class. Tests use it to hold a slot of a given class.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn try_acquire_classified_with_limiter(
+pub fn try_acquire_classified_with_limiter(
     limiter: &Arc<ColdBuildLimiter>,
     request: &ColdBuildAdmissionRequest,
 ) -> Option<ColdBuildPermit> {
@@ -184,7 +184,7 @@ pub(crate) fn try_acquire_classified_with_limiter(
 /// permit has been acquired. The second check closes the gap before a build can
 /// start: a newly cancelled request returns the permit without emitting an
 /// admission event.
-pub(crate) fn acquire_blocking_while_cancellable_with_limiter(
+pub fn acquire_blocking_while_cancellable_with_limiter(
     limiter: &Arc<ColdBuildLimiter>,
     kind: &str,
     request: ColdBuildAdmissionRequest,
@@ -207,7 +207,7 @@ pub(crate) struct StandingColdBuildPermit {
 /// Standing performs the same waiter inspection before initial acquisition and
 /// checkpoint reacquisition because both call this one function. It declines
 /// immediately when an interactive or normal-maintenance waiter is visible.
-pub(crate) fn acquire_standing_while_cancellable_with_limiter(
+pub fn acquire_standing_while_cancellable_with_limiter(
     limiter: &Arc<ColdBuildLimiter>,
     kind: &str,
     request_id: impl Into<String>,
@@ -330,12 +330,12 @@ pub fn limit() -> usize {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn test_limiter(limit: usize) -> Arc<ColdBuildLimiter> {
+pub fn test_limiter(limit: usize) -> Arc<ColdBuildLimiter> {
     Arc::new(ColdBuildLimiter::new(limit))
 }
 
 #[derive(Debug)]
-pub(crate) struct ColdBuildLimiter {
+pub struct ColdBuildLimiter {
     available: AtomicUsize,
     limit: usize,
     /// Waiter counts are atomics so a Standing contender can yield without a
@@ -840,7 +840,7 @@ impl ColdBuildPermit {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct WeakColdBuildPermit {
+pub struct WeakColdBuildPermit {
     lease: Weak<ColdBuildPermitLease>,
 }
 

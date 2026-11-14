@@ -146,7 +146,7 @@ thread_local! {
 /// A spawned thread that misses this override therefore fails the fixture's
 /// read-count assertion instead of silently testing the real account home.
 #[cfg(all(any(test, feature = "test-support"), unix))]
-pub(crate) fn with_test_preparation_home<R>(
+pub fn with_test_preparation_home<R>(
     home: &Path,
     expected_reads: usize,
     run: impl FnOnce() -> R,
@@ -469,7 +469,7 @@ thread_local! {
 
 /// Point this thread's shim checks at test homes instead of the account's.
 #[cfg(all(any(test, feature = "test-support"), unix))]
-pub(crate) fn with_test_homes<R>(homes: Vec<PathBuf>, run: impl FnOnce() -> R) -> R {
+pub fn with_test_homes<R>(homes: Vec<PathBuf>, run: impl FnOnce() -> R) -> R {
     let previous = TEST_HOMES.with(|slot| slot.replace(Some(homes)));
     struct Restore(Option<Vec<PathBuf>>);
     impl Drop for Restore {

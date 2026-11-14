@@ -4,7 +4,7 @@
 //! text inside strings and honoring escape sequences, then remove trailing commas
 //! that appear immediately before `]` or `}`.
 
-pub(crate) fn strip_jsonc(source: &str) -> String {
+pub fn strip_jsonc(source: &str) -> String {
     strip_trailing_commas(&strip_jsonc_comments(source))
 }
 

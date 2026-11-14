@@ -13,7 +13,7 @@ use std::sync::Mutex;
 pub const MIN_FREE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub const MAX_FREE_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 
-pub(crate) fn free_disk_floor(capacity: u64) -> u64 {
+pub fn free_disk_floor(capacity: u64) -> u64 {
     (capacity / 20).clamp(MIN_FREE_BYTES, MAX_FREE_BYTES)
 }
 
@@ -147,7 +147,7 @@ pub(crate) fn unlimited_free_space_for_test_process() -> UnlimitedFreeSpaceForTe
         .unlimited += 1;
     UnlimitedFreeSpaceForTestProcess
 }
-pub(crate) fn free_space(path: &Path) -> Option<(u64, u64)> {
+pub fn free_space(path: &Path) -> Option<(u64, u64)> {
     let value = {
         let overrides = FREE_SPACE
             .lock()

@@ -107,7 +107,7 @@ pub struct RootMemorySnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub(crate) struct RootMemoryRollup {
+pub struct RootMemoryRollup {
     pub(crate) status: &'static str,
     pub(crate) attributed_bytes: u64,
     pub(crate) busy_subsystems: usize,
@@ -387,7 +387,7 @@ pub enum AllocatorSource {
 
 /// One allocator reading shared by all memory surfaces in a health refresh.
 #[derive(Clone)]
-pub(crate) struct AllocatorObservation {
+pub struct AllocatorObservation {
     pub(crate) snapshot: AllocatorMemorySnapshot,
     pub(crate) age_ms: Option<u64>,
 }
@@ -575,7 +575,7 @@ impl AllocatorPressureRelief {
 pub const MEMORY_SNAPSHOT_ROOT_DETAIL_CAP: usize = 8;
 
 /// Operations the census names by their allocation high-water mark.
-pub(crate) const CENSUS_ALLOCATION_LABELS: usize = 5;
+pub const CENSUS_ALLOCATION_LABELS: usize = 5;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MemorySnapshot {
@@ -612,13 +612,13 @@ pub struct MemorySnapshot {
 /// Memory attributed once for the whole process rather than to any root:
 /// shared semantic bases and the data layer's block cache.
 #[derive(Debug, Clone)]
-pub(crate) struct SharedProcessMemory {
+pub struct SharedProcessMemory {
     pub(crate) shared_semantic_bases: MemoryEstimate,
     pub(crate) data_layer_block_cache: Option<MemoryEstimate>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub(crate) struct MemoryRollupSnapshot {
+pub struct MemoryRollupSnapshot {
     pub(crate) roots_status: &'static str,
     pub(crate) roots: BTreeMap<String, RootMemoryRollup>,
     pub(crate) roots_total: usize,
@@ -649,7 +649,7 @@ fn cap_roots<T>(
     (entries.into_iter().collect(), omitted.len(), omitted_bytes)
 }
 
-pub(crate) fn cap_root_rollups(
+pub fn cap_root_rollups(
     roots: BTreeMap<String, RootMemoryRollup>,
     cap: usize,
 ) -> (BTreeMap<String, RootMemoryRollup>, usize, u64) {
@@ -658,7 +658,7 @@ pub(crate) fn cap_root_rollups(
 
 /// Keep the `cap` roots with the highest attributed bytes; report the rest
 /// as an omitted-count + omitted-bytes rollup.
-pub(crate) fn cap_root_detail(
+pub fn cap_root_detail(
     roots: BTreeMap<String, RootMemorySnapshot>,
     cap: usize,
 ) -> (BTreeMap<String, RootMemorySnapshot>, usize, u64) {
@@ -705,7 +705,7 @@ pub fn estimated_json_bytes(value: &Value) -> u64 {
     }
 }
 
-pub(crate) fn signed_difference(lhs: u64, rhs: u64) -> i64 {
+pub fn signed_difference(lhs: u64, rhs: u64) -> i64 {
     let difference = i128::from(lhs) - i128::from(rhs);
     difference.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
@@ -881,7 +881,7 @@ const ALLOCATOR_WALK_MAX_REUSE_MS: u64 = 10 * 60 * 1000;
 /// `ALLOCATOR_WALK_COST_FACTOR` times the walk's duration for an expensive
 /// one, and never past `ALLOCATOR_WALK_MAX_REUSE_MS` (or `floor_ms`, if that
 /// is larger).
-pub(crate) fn allocator_reuse_window_ms(floor_ms: u64, walk_ms: u64) -> u64 {
+pub fn allocator_reuse_window_ms(floor_ms: u64, walk_ms: u64) -> u64 {
     walk_ms
         .saturating_mul(ALLOCATOR_WALK_COST_FACTOR)
         .clamp(floor_ms, ALLOCATOR_WALK_MAX_REUSE_MS.max(floor_ms))
@@ -951,7 +951,7 @@ static LAST_ALLOCATOR_SLACK_RELIEF_FOOTPRINT_DROP_BYTES: std::sync::atomic::Atom
     std::sync::atomic::AtomicU64::new(UNKNOWN_ALLOCATOR_SLACK);
 
 #[cfg(any(test, feature = "test-support"))]
-static ALLOCATOR_SNAPSHOT_THREADS: std::sync::Mutex<Vec<String>> =
+pub static ALLOCATOR_SNAPSHOT_THREADS: std::sync::Mutex<Vec<String>> =
     std::sync::Mutex::new(Vec::new());
 
 #[cfg(any(test, feature = "test-support"))]
@@ -966,7 +966,7 @@ thread_local! {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn allocator_snapshot_calls_for_test() -> u64 {
+pub fn allocator_snapshot_calls_for_test() -> u64 {
     THREAD_ALLOCATOR_SNAPSHOT_CALLS.with(|calls| calls.get())
 }
 
@@ -977,14 +977,14 @@ fn allocator_observation_test_mutex() -> &'static std::sync::Mutex<()> {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn allocator_observation_test_lock() -> std::sync::MutexGuard<'static, ()> {
+pub fn allocator_observation_test_lock() -> std::sync::MutexGuard<'static, ()> {
     allocator_observation_test_mutex()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn reset_allocator_observation_for_test() {
+pub fn reset_allocator_observation_for_test() {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         ALLOCATOR_OBSERVATION_SEQUENCE.store(0, std::sync::atomic::Ordering::Release);
@@ -1480,7 +1480,7 @@ pub fn relieve_allocator_pressure() -> AllocatorPressureRelief {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn process_rss_bytes() -> Option<u64> {
+pub fn process_rss_bytes() -> Option<u64> {
     let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
     let size = std::mem::size_of::<libc::proc_taskinfo>();
     let written = unsafe {
@@ -1501,7 +1501,7 @@ pub(crate) fn process_rss_bytes() -> Option<u64> {
 /// Kernel physical footprint via `proc_pid_rusage` (`ri_phys_footprint`).
 /// See `phys_footprint_bytes` for why this, not RSS, is the headline number.
 #[cfg(target_os = "macos")]
-pub(crate) fn process_phys_footprint_bytes() -> Option<u64> {
+pub fn process_phys_footprint_bytes() -> Option<u64> {
     let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
     let rc = unsafe {
         libc::proc_pid_rusage(
@@ -1517,12 +1517,12 @@ pub(crate) fn process_phys_footprint_bytes() -> Option<u64> {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn process_phys_footprint_bytes() -> Option<u64> {
+pub fn process_phys_footprint_bytes() -> Option<u64> {
     None
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn process_rss_bytes() -> Option<u64> {
+pub fn process_rss_bytes() -> Option<u64> {
     let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
     let resident_pages = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -1533,10 +1533,10 @@ pub(crate) fn process_rss_bytes() -> Option<u64> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub(crate) fn process_rss_bytes() -> Option<u64> {
+pub fn process_rss_bytes() -> Option<u64> {
     None
 }
 
-pub(crate) fn rss_bytes() -> Option<u64> {
+pub fn rss_bytes() -> Option<u64> {
     process_rss_bytes()
 }

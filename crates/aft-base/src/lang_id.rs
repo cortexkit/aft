@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+aft_store::heap_bytes_none!(LangId);
+
 /// Supported language identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LangId {
@@ -42,7 +44,7 @@ pub enum LangId {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) const TEST_EXTENSIONS: &[&str] = &[
+pub const TEST_EXTENSIONS: &[&str] = &[
     "ts", "mts", "cts", "tsx", "js", "jsx", "mjs", "cjs", "py", "pyi", "rs", "go", "c", "h", "cc",
     "cpp", "cxx", "hpp", "hh", "cu", "cuh", "metal", "zig", "cs", "sh", "bash", "zsh", "html",
     "htm", "md", "markdown", "mdx", "qmd", "Qmd", "rmd", "Rmd", "sol", "scss", "vue", "json",

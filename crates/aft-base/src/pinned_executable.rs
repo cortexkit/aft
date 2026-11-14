@@ -27,7 +27,7 @@ thread_local! {
 }
 
 const OWNER_LOCK: &str = "owner.lock";
-pub(crate) const TASK_IMAGE_DIR: &str = "startup-image";
+pub const TASK_IMAGE_DIR: &str = "startup-image";
 
 #[cfg(target_os = "macos")]
 struct StartupSource {
@@ -276,7 +276,7 @@ impl PinnedExecutable {
 /// Freeze the launcher and shim into the task's own artifact lifetime before
 /// constructing a native profile or launching an unconfined shell. Foreground
 /// tasks need the same lifetime because they can be promoted to background.
-pub(crate) fn with_task_image<R>(task_io: &Path, run: impl FnOnce() -> R) -> io::Result<R> {
+pub fn with_task_image<R>(task_io: &Path, run: impl FnOnce() -> R) -> io::Result<R> {
     let Some(pin) = PINNED.get() else {
         return Ok(run());
     };
@@ -293,7 +293,7 @@ pub(crate) fn with_task_image<R>(task_io: &Path, run: impl FnOnce() -> R) -> io:
     Ok(run())
 }
 
-pub(crate) fn task_executable(task_io: &Path) -> PathBuf {
+pub fn task_executable(task_io: &Path) -> PathBuf {
     task_io
         .join(TASK_IMAGE_DIR)
         .join(if cfg!(windows) { "aft.exe" } else { "aft" })
@@ -301,7 +301,7 @@ pub(crate) fn task_executable(task_io: &Path) -> PathBuf {
 
 /// Non-launcher plans have no launcher pathname to carry the retained image.
 /// Redirect their request overrides before either the pipe or PTY adapter runs.
-pub(crate) fn retain_task_environment(
+pub fn retain_task_environment(
     task_io: &Path,
     environment: &mut std::collections::HashMap<String, String>,
 ) -> io::Result<()> {
@@ -323,7 +323,7 @@ pub(crate) fn retain_task_environment(
     })
 }
 
-pub(crate) fn is_dead_pin_path(path: &Path) -> bool {
+pub fn is_dead_pin_path(path: &Path) -> bool {
     path.is_absolute()
         && path.ancestors().any(|ancestor| {
             ancestor
@@ -336,7 +336,7 @@ pub(crate) fn is_dead_pin_path(path: &Path) -> bool {
         && matches!(path.try_exists(), Ok(false))
 }
 
-pub(crate) fn task_environment(
+pub fn task_environment(
     launcher: &Path,
     environment: &mut std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
 ) {
@@ -599,7 +599,7 @@ pub fn path() -> io::Result<PathBuf> {
     std::env::current_exe()
 }
 
-pub(crate) fn shims_dir(storage: &Path) -> PathBuf {
+pub fn shims_dir(storage: &Path) -> PathBuf {
     if let Some(directory) = TASK_IMAGE.with(|slot| slot.borrow().clone()) {
         return directory.join("shims");
     }

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 /// Identity for policy comparisons only. Tool return paths retain their existing
 /// resolution contract, including the unchanged spelling when unrestricted.
-pub(crate) fn policy_path(path: &Path) -> PathBuf {
+pub fn policy_path(path: &Path) -> PathBuf {
     let bounded = BOUNDED_POLICY_PATHS.with(|slot| slot.borrow().clone());
     if let Some(state) = bounded {
         if state.error.borrow().is_none() {
@@ -32,7 +32,7 @@ thread_local! {
 
 /// Resolve a complete policy with isolated filesystem probes, rejecting all of
 /// its derived authority if any probe fails. The caller supplies the I/O budget.
-pub(crate) fn with_bounded_policy_paths<T>(
+pub fn with_bounded_policy_paths<T>(
     progress: std::sync::Arc<std::sync::Mutex<PathBuf>>,
     work: impl FnOnce() -> T,
 ) -> std::io::Result<T> {

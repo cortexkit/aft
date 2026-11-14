@@ -1,6 +1,10 @@
 pub use aft_base::lang_id::*;
 
 #[cfg(test)]
+#[allow(unused_imports)]
+use std::path::Path;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

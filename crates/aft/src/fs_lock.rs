@@ -1,6 +1,40 @@
 pub use aft_base::fs_lock::*;
 
 #[cfg(test)]
+#[allow(unused_imports)]
+use crate::{slog_debug, slog_error, slog_info, slog_warn};
+#[cfg(test)]
+#[allow(unused_imports)]
+use serde::{Deserialize, Serialize};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::HashMap;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::fmt;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::fs::{self, File, OpenOptions};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::io::{self, Read, Seek, SeekFrom, Write};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    mpsc, Arc, Mutex, OnceLock, Weak,
+};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::thread::{self, JoinHandle};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

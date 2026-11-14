@@ -6,7 +6,7 @@ use std::time::Instant;
 /// Wall-clock sub-stages of one operation, printed to stderr as
 /// `view_profile {prefix}.{stage} ms=...` only when `AFT_VIEW_PROFILE` is set.
 /// It records nothing else.
-pub(crate) struct StageTimer {
+pub struct StageTimer {
     prefix: &'static str,
     pub(crate) enabled: bool,
     started: Instant,

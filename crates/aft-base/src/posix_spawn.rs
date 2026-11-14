@@ -24,7 +24,7 @@ enum Handle {
 
 /// Like std's Child, dropping this handle does not kill or reap a running child.
 #[derive(Debug)]
-pub(crate) struct Child {
+pub struct Child {
     handle: Handle,
     pub(crate) stdin: Option<File>,
     reaped: Option<ExitStatus>,
@@ -100,7 +100,7 @@ impl Child {
     }
 }
 
-pub(crate) struct PipeIo<'a> {
+pub struct PipeIo<'a> {
     pub(crate) gated_stdin: bool,
     pub(crate) stdout: &'a File,
     pub(crate) stderr: &'a File,
@@ -193,7 +193,7 @@ fn discover() -> SpawnBackend {
     Ok(functions)
 }
 
-pub(crate) fn initialize() {
+pub fn initialize() {
     BACKEND.get_or_init(|| {
         let backend = discover();
         if let Err(reason) = &backend {
@@ -215,7 +215,7 @@ fn missing_capability() -> Option<String> {
     initialize();
     BACKEND.get().unwrap().as_ref().err().cloned()
 }
-pub(crate) fn health() -> serde_json::Value {
+pub fn health() -> serde_json::Value {
     let missing = missing_capability();
     serde_json::json!({
         "backend": if missing.is_some() { "fork_fallback" } else { "posix_spawn" },
@@ -226,7 +226,7 @@ pub(crate) fn health() -> serde_json::Value {
 }
 
 /// None means the caller must use its existing pre_exec composition unchanged.
-pub(crate) fn try_spawn(
+pub fn try_spawn(
     command: &Command,
     cleared: bool,
     disclaim: bool,
@@ -345,7 +345,7 @@ fn test_glibc_version() -> Option<(u32, u32)> {
 
 /// Returns false only when native-only assertions do not apply on this libc.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn native_backend_for_tests() -> bool {
+pub fn native_backend_for_tests() -> bool {
     initialize();
     let platform = if cfg!(target_os = "macos") {
         NativeTestPlatform::MacOs

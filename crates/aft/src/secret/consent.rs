@@ -1,6 +1,10 @@
 pub use aft_base::secret::consent::*;
 
 #[cfg(test)]
+#[allow(unused_imports)]
+use crate::secret::SecretScope;
+
+#[cfg(test)]
 mod waiter_tests {
     use super::*;
     use std::sync::{

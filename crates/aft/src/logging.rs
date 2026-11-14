@@ -1,6 +1,53 @@
 pub use aft_base::logging::*;
 
 #[cfg(test)]
+#[allow(unused_imports)]
+use crate::executor::{Executor, ExecutorContext};
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::process_identity::is_process_alive;
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::tool_progress::{ToolCallPhaseDurations, WaitingOn};
+#[cfg(test)]
+#[allow(unused_imports)]
+use sha2::{Digest, Sha256};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::cell::RefCell;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::{BTreeMap, HashMap, VecDeque};
+#[cfg(test)]
+#[allow(unused_imports)]
+#[cfg(unix)]
+use std::fs::OpenOptions;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::fs::{self, File};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::io::{self, BufWriter, Write};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::mpsc::{self, SyncSender, TrySendError};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::thread;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::time::{Duration, Instant, SystemTime};
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn watchdog_append_bypasses_held_logger_control_and_follows_rotation() {

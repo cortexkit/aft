@@ -103,7 +103,7 @@ thread_local! {
 }
 
 /// The caller's reply deadline is independent of a fetch's network budget.
-pub(crate) struct FetchReplyDeadline(Option<std::time::Instant>);
+pub struct FetchReplyDeadline(Option<std::time::Instant>);
 impl FetchReplyDeadline {
     pub(crate) fn enter(deadline: std::time::Instant) -> Self {
         Self(FETCH_REPLY_DEADLINE.with(|slot| slot.replace(Some(deadline))))

@@ -11,14 +11,14 @@ use std::time::Duration;
 pub(crate) mod markers;
 use crate::pinned_dir::{PinnedDir, RepairBudget};
 
-pub(crate) struct ReaderFloorHooks {
+pub struct ReaderFloorHooks {
     pub prepare: fn(&Path),
     pub prepare_artifact_root: fn(&Path, &Path),
 }
 
 static READER_FLOOR_HOOKS: OnceLock<ReaderFloorHooks> = OnceLock::new();
 
-pub(crate) fn register_reader_floor_hooks(hooks: ReaderFloorHooks) {
+pub fn register_reader_floor_hooks(hooks: ReaderFloorHooks) {
     let _ = READER_FLOOR_HOOKS.set(hooks);
 }
 
@@ -32,7 +32,7 @@ fn reader_floor_hooks(slot: &OnceLock<ReaderFloorHooks>) -> io::Result<&ReaderFl
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn reader_floor_hooks_registered() -> bool {
+pub fn reader_floor_hooks_registered() -> bool {
     READER_FLOOR_HOOKS.get().is_some()
 }
 
@@ -128,17 +128,17 @@ struct AccessRegistry {
 }
 static STATUS: OnceLock<Mutex<AccessRegistry>> = OnceLock::new();
 #[cfg(any(test, feature = "test-support"))]
-thread_local! { static BEFORE_REPAIR_REMOVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
+thread_local! { pub static BEFORE_REPAIR_REMOVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
 #[cfg(any(test, feature = "test-support"))]
-thread_local! { static BEFORE_ENROLLMENT_DEVICE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
+thread_local! { pub static BEFORE_ENROLLMENT_DEVICE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
 #[cfg(any(test, feature = "test-support"))]
-thread_local! { static BEFORE_OTHER_ROOT_OVERLAP: std::cell::RefCell<Option<(PathBuf, Box<dyn FnOnce()>)>> = const { std::cell::RefCell::new(None) }; }
+thread_local! { pub static BEFORE_OTHER_ROOT_OVERLAP: std::cell::RefCell<Option<(PathBuf, Box<dyn FnOnce()>)>> = const { std::cell::RefCell::new(None) }; }
 #[cfg(any(test, feature = "test-support"))]
-thread_local! { static AFTER_CACHE_ROOT_CREATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
+thread_local! { pub static AFTER_CACHE_ROOT_CREATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
 #[cfg(any(test, feature = "test-support"))]
-thread_local! { static BEFORE_ROOT_HISTORY_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = const { std::cell::RefCell::new(None) }; }
+thread_local! { pub static BEFORE_ROOT_HISTORY_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = const { std::cell::RefCell::new(None) }; }
 #[cfg(any(test, feature = "test-support"))]
-thread_local! { static AFTER_CACHE_ROOT_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
+thread_local! { pub static AFTER_CACHE_ROOT_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
 
 /// Both roots travel together whenever an operation mixes artifacts and metadata.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -182,7 +182,7 @@ static PROCESS_STORAGE_LEASES: OnceLock<Mutex<HashMap<Identity, Weak<ProcessStor
     OnceLock::new();
 
 #[derive(Debug)]
-pub(crate) struct SpeechServingLease {
+pub struct SpeechServingLease {
     _file: File,
     _root: PinnedDir,
     _storage_use: Arc<ProcessStorageLease>,
@@ -350,7 +350,7 @@ fn verify_mounted_parent_under(
     Ok(())
 }
 #[cfg(any(test, feature = "test-support"))]
-thread_local! { static MOUNT_TEST_SEAM: std::cell::RefCell<Option<(PathBuf, Vec<u64>)>> = const { std::cell::RefCell::new(None) }; }
+thread_local! { pub static MOUNT_TEST_SEAM: std::cell::RefCell<Option<(PathBuf, Vec<u64>)>> = const { std::cell::RefCell::new(None) }; }
 fn check_parent_mount(parent: &Path, actual: Identity) -> io::Result<()> {
     #[cfg(any(test, feature = "test-support"))]
     if let Some((volumes, devices)) = MOUNT_TEST_SEAM.with(|seam| seam.borrow().clone()) {
@@ -440,7 +440,7 @@ pub fn cache_unavailable_for_root(config: &crate::config::Config, root: &Path) -
 /// folders configure never wrote. So a prepared cache root resolves to its
 /// durable owner. Every other path is returned as given, which includes every
 /// root while no `cache_dir` is configured: those keys do not change.
-pub(crate) fn identity_storage_root(storage: &Path) -> std::borrow::Cow<'_, Path> {
+pub fn identity_storage_root(storage: &Path) -> std::borrow::Cow<'_, Path> {
     let registry = STATUS
         .get_or_init(Default::default)
         .lock()
@@ -467,7 +467,7 @@ pub(crate) fn identity_storage_root(storage: &Path) -> std::borrow::Cow<'_, Path
 /// the cache were linked under that storage root: `<cache>/aft/index/k` reads
 /// as `<storage>/index/k`. That route is only a name for ownership; nothing
 /// opens it.
-pub(crate) fn durable_route(path: &Path) -> Option<PathBuf> {
+pub fn durable_route(path: &Path) -> Option<PathBuf> {
     let registry = STATUS
         .get_or_init(Default::default)
         .lock()
@@ -2045,7 +2045,7 @@ pub(crate) fn remove_inactive_cache_roots(storage: &Path, active: &[PathBuf]) ->
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn remove_legacy_cache_roots(storage: &Path, active: &[PathBuf]) -> CleanupReport {
+pub fn remove_legacy_cache_roots(storage: &Path, active: &[PathBuf]) -> CleanupReport {
     let mut report = CleanupReport::default();
     let root = match pin_storage_root(storage) {
         Ok(root) => root,
@@ -2248,7 +2248,7 @@ pub fn acquire_daemon_storage_lease(storage: &Path) -> io::Result<Arc<ProcessSto
 }
 
 /// Exclude another speech forwarder until managed quiescence or process exit.
-pub(crate) fn acquire_speech_serving_lease(storage: &Path) -> io::Result<Arc<SpeechServingLease>> {
+pub fn acquire_speech_serving_lease(storage: &Path) -> io::Result<Arc<SpeechServingLease>> {
     let storage_use = acquire_daemon_storage_lease(storage)?;
     let root = pin_storage_root(storage)?;
     let identity = pinned_identity(&root)?;
@@ -2276,7 +2276,7 @@ pub(crate) fn acquire_speech_serving_lease(storage: &Path) -> io::Result<Arc<Spe
 }
 
 /// Release only the anchor owned by the runtime that proved quiescence.
-pub(crate) fn release_quiescent_speech_serving_lease(lease: &Arc<SpeechServingLease>) -> bool {
+pub fn release_quiescent_speech_serving_lease(lease: &Arc<SpeechServingLease>) -> bool {
     let Some(leases) = SPEECH_SERVING_LEASES.get() else {
         return false;
     };
@@ -2377,7 +2377,7 @@ fn storage_lock_error(error: std::fs::TryLockError) -> io::Error {
 // Unit tests supply process snapshots instead of inspecting unrelated daemons
 // on the operator's machine; the same classifier and cleanup refusal still run.
 // An empty snapshot means the test supplied none, and the scan is skipped.
-thread_local! { static LEGACY_DAEMON_PROCESSES: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) }; }
+thread_local! { pub static LEGACY_DAEMON_PROCESSES: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) }; }
 
 /// A process snapshot has one process per line:
 /// `pid<TAB>executable<TAB>arguments`.
@@ -3378,7 +3378,7 @@ pub const CACHE_DOMAINS: [&str; 8] = [
     "inspect",
 ];
 
-pub(crate) fn canonical_root(project_root: &Path) -> PathBuf {
+pub fn canonical_root(project_root: &Path) -> PathBuf {
     // Nearest-existing-ancestor canonicalization, not a raw-spelling fallback:
     // registration can precede the directory's creation (and lookups can follow
     // it), and on macOS the raw tempdir spelling (/var/...) differs from the

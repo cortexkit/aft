@@ -1,6 +1,28 @@
 pub use aft_base::ort_pin::*;
 
 #[cfg(test)]
+#[allow(unused_imports)]
+use sha2::{Digest, Sha256};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::ffi::{OsStr, OsString};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::fs::File;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::io::{Read, Seek, SeekFrom};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::{Mutex, Once, OnceLock};
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};

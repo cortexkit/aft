@@ -345,7 +345,7 @@ thread_local! {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn with_git_usable_for_test<T>(usable: bool, run: impl FnOnce() -> T) -> T {
+pub fn with_git_usable_for_test<T>(usable: bool, run: impl FnOnce() -> T) -> T {
     struct Reset(Option<bool>);
     impl Drop for Reset {
         fn drop(&mut self) {

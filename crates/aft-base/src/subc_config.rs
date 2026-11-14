@@ -40,7 +40,7 @@ pub(crate) use prepared::{
 /// d5e09914b0791a66f2a5a00a9bb3422860ade95e: compare `(rung, guard)` pairs with
 /// `subc-core/src/daemon_config.rs::default_config_path` and resolve
 /// `DAEMON_CONFIG_RELATIVE_PATH` before editing this temporary copy.
-pub(crate) fn user_config_path_from(
+pub fn user_config_path_from(
     xdg_config_home: Option<&OsStr>,
     home: Option<&OsStr>,
 ) -> Option<PathBuf> {

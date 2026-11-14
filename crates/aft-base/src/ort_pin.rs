@@ -425,7 +425,7 @@ fn open_library(path: &Path) -> std::io::Result<File> {
 /// Decide whether the library at `candidate` (or the bare-name load when
 /// `None`) may be loaded. Reads and hashes the file; never loads it.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn authorize_with(
+pub fn authorize_with(
     policy: &OrtPinPolicy<'_>,
     candidate: Option<&OsStr>,
 ) -> Result<OrtLoadAuthorization, String> {
@@ -540,7 +540,7 @@ fn is_inside_any(path: &Path, roots: &[PathBuf]) -> bool {
 
 /// Lowercase hex sha256 of a file's bytes, following symlinks.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn sha256_file(path: &Path) -> std::io::Result<String> {
+pub fn sha256_file(path: &Path) -> std::io::Result<String> {
     sha256_reader(&mut File::open(path)?)
 }
 
@@ -619,7 +619,7 @@ fn log_unpinned_once(authorization: &OrtLoadAuthorization) {
 /// `after_check` runs between the hash and the load. Production passes a
 /// no-op; tests use it to replace or rewrite the file in exactly the window
 /// this function exists to close.
-pub(crate) fn load_authorized_with<T>(
+pub fn load_authorized_with<T>(
     open: impl FnOnce(Option<&OsStr>) -> Result<AuthorizedOrtLibrary, String>,
     candidate: Option<&OsStr>,
     after_check: impl FnOnce(),

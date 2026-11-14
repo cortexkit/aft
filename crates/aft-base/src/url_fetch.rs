@@ -61,7 +61,7 @@ const URL_FETCH_CEILING: Duration = Duration::from_secs(20);
 /// The last part of the call's budget, kept for building and sending the
 /// reply. Neither the download nor reading the downloaded document back may
 /// use it, so the reply reaches the caller before the call's own deadline.
-pub(crate) const URL_REPLY_MARGIN: Duration = Duration::from_secs(1);
+pub const URL_REPLY_MARGIN: Duration = Duration::from_secs(1);
 /// The part of the call's budget before the reply margin that the download
 /// leaves for the work after it: converting HTML, writing the cache, and
 /// reading the document back. A download that ends at its deadline still has
@@ -463,7 +463,7 @@ fn cache_read_stalls() -> &'static std::sync::Mutex<HashMap<PathBuf, Arc<CacheRe
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn stall_cache_reads(storage_dir: &Path) -> Arc<CacheReadStall> {
+pub fn stall_cache_reads(storage_dir: &Path) -> Arc<CacheReadStall> {
     let stall = Arc::new(CacheReadStall::default());
     cache_read_stalls()
         .lock()
@@ -493,7 +493,7 @@ fn stall_cache_read_if_requested(storage_dir: &Path) {
 
 /// Test hook: make one remembered failure `by` older.
 #[cfg(any(test, feature = "test-support"))]
-fn age_remembered_failure(key: &FailureKey, by: Duration) {
+pub fn age_remembered_failure(key: &FailureKey, by: Duration) {
     if let Some(remembered) = failure_memory()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -764,14 +764,14 @@ pub fn cached_url_document(
 
 /// Folder, under the cache root, that holds the private per-call folders of
 /// placeholder fetches. It is a sibling of the URL cache, never inside it.
-pub(crate) const SECRET_FETCH_DIR: &str = "url_secret_fetch";
+pub const SECRET_FETCH_DIR: &str = "url_secret_fetch";
 
 /// The start of every refusal a placeholder fetch makes on its own (as opposed
 /// to a refusal the vault decided) before any request carrying a key was sent.
 /// One constant so the wording is reviewed once; the message goes on to name a
 /// stable reason token and the URL as the agent wrote it, with the
 /// placeholder and never a key.
-pub(crate) const SECRET_FETCH_REFUSED: &str =
+pub const SECRET_FETCH_REFUSED: &str =
     "Secret placeholder fetch refused; no request carrying the secret was sent";
 
 /// The start of the same refusals once a request carrying a key has been sent:
@@ -795,7 +795,7 @@ const MAX_SECRET_CODINGS: usize = 4;
 /// mentions the placeholder prefix only in a malformed way: such a URL still
 /// takes the placeholder path (no cache, no web-view rewrite), it just has
 /// nothing to substitute.
-pub(crate) fn secret_labels_in_url(url: &str) -> Option<Vec<String>> {
+pub fn secret_labels_in_url(url: &str) -> Option<Vec<String>> {
     if !secret_rules::placeholder::contains_placeholder_prefix_loose(url) {
         return None;
     }
@@ -814,7 +814,7 @@ pub(crate) fn secret_labels_in_url(url: &str) -> Option<Vec<String>> {
 /// Create the private folder one placeholder fetch writes its document into,
 /// under `storage_dir` but outside the URL cache. The caller owns the folder
 /// and deletes it when its call returns.
-pub(crate) fn create_secret_fetch_dir(storage_dir: &Path) -> Result<PathBuf, UrlFetchError> {
+pub fn create_secret_fetch_dir(storage_dir: &Path) -> Result<PathBuf, UrlFetchError> {
     let parent = storage_dir.join(SECRET_FETCH_DIR);
     let failed = |error: io::Error| {
         UrlFetchError::new(format!(
@@ -1298,7 +1298,7 @@ thread_local! {
 /// Make this thread's placeholder fetches fail their body read with
 /// `message` until the returned guard drops.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn inject_secret_body_read_error_for_test(message: String) -> impl Drop {
+pub fn inject_secret_body_read_error_for_test(message: String) -> impl Drop {
     struct Restore;
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -1353,7 +1353,7 @@ thread_local! {
 /// Make this thread's placeholder fetches stop their residual check `limit`
 /// after it starts, until the returned guard drops.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn limit_secret_residual_check_for_test(limit: Duration) -> impl Drop {
+pub fn limit_secret_residual_check_for_test(limit: Duration) -> impl Drop {
     struct Restore;
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -1662,7 +1662,7 @@ fn secret_hop(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-thread_local! { static SECRET_URL_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+thread_local! { pub static SECRET_URL_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 struct SecretOutboundUrl(sensitive::Bytes);
 impl std::ops::Deref for SecretOutboundUrl {
@@ -1813,7 +1813,7 @@ fn cleanup_memo() -> &'static std::sync::Mutex<HashMap<PathBuf, HashMap<String, 
 thread_local! {
     /// Metadata files the cleanup sweep opened on this thread, for tests that
     /// check unchanged files are not read again.
-    static CLEANUP_META_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static CLEANUP_META_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub fn cleanup_url_cache(storage_dir: &Path) -> Result<usize, UrlFetchError> {

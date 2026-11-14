@@ -1,8 +1,8 @@
 use std::path::Path;
 
 pub const SHIMS_DIR_NAME: &str = "shims";
-pub(crate) const GH_SHIMS_DIR_ENV: &str = "AFT_GH_SHIMS_DIR";
-pub(crate) const GH_SHIM_BINARY_ENV: &str = "AFT_GH_SHIM_BINARY";
+pub const GH_SHIMS_DIR_ENV: &str = "AFT_GH_SHIMS_DIR";
+pub const GH_SHIM_BINARY_ENV: &str = "AFT_GH_SHIM_BINARY";
 
 /// Environment variable that carries the ticket into a spawned command.
 pub const GH_SHIM_TICKET_ENV: &str = "AFT_GH_SHIM_TICKET";

@@ -515,11 +515,11 @@ fn source_offset_for_lossy_utf8(source: &[u8], lossy_offset: usize) -> usize {
     source.len()
 }
 
-pub(super) fn context_snippet(text: &str, start: usize, end: usize) -> String {
+pub fn context_snippet(text: &str, start: usize, end: usize) -> String {
     text[context_range(text, start, end)].replace('\r', "")
 }
 
-pub(super) fn context_range(text: &str, start: usize, end: usize) -> std::ops::Range<usize> {
+pub fn context_range(text: &str, start: usize, end: usize) -> std::ops::Range<usize> {
     let before_start = text[..start]
         .char_indices()
         .rev()

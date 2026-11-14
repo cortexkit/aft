@@ -3,7 +3,7 @@
 /// Completion-only wake shared by a subc connection. Generation accounting
 /// coalesces bursts without losing a completion that races a registry poll.
 #[derive(Clone, Default)]
-pub(crate) struct DeferredResponseWake(std::sync::Arc<DeferredWakeState>);
+pub struct DeferredResponseWake(std::sync::Arc<DeferredWakeState>);
 
 #[derive(Default)]
 struct DeferredWakeState {

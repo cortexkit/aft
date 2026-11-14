@@ -2,11 +2,11 @@
 
 use std::path::Path;
 
-pub(crate) const MARKER_PREFIX: &str = ".aft-flush-";
-pub(crate) const GIT_MARKER_PREFIX: &str = "aft-flush-";
+pub const MARKER_PREFIX: &str = ".aft-flush-";
+pub const GIT_MARKER_PREFIX: &str = "aft-flush-";
 const PREFIX: &str = ".aft-cookie-";
 
-pub(crate) fn is_cookie_path(path: &Path) -> bool {
+pub fn is_cookie_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .and_then(|name| name.strip_prefix(PREFIX))
@@ -21,14 +21,14 @@ pub(crate) fn is_cookie_path(path: &Path) -> bool {
         })
 }
 
-pub(crate) fn is_marker_path(path: &Path) -> bool {
+pub fn is_marker_path(path: &Path) -> bool {
     // Project content excludes both acknowledgment protocols. Command-completion
     // intake uses only flush markers so index-delivery cookies still reach their
     // ordered event queue.
     is_cookie_path(path) || is_flush_marker_path(path)
 }
 
-pub(crate) fn is_flush_marker_path(path: &Path) -> bool {
+pub fn is_flush_marker_path(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };

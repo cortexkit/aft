@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::production_storage::{account_home, canonicalized_with, comparison_key, is_within};
 
-fn live_storage_roots() -> Vec<PathBuf> {
+pub fn live_storage_roots() -> Vec<PathBuf> {
     let home = account_home().expect("test storage fence must resolve the account profile");
     #[cfg(windows)]
     let local_data = Some(
@@ -32,7 +32,7 @@ fn live_storage_roots() -> Vec<PathBuf> {
     roots
 }
 
-fn live_storage_root_from(
+pub fn live_storage_root_from(
     home: &Path,
     local_data: Option<&Path>,
     temporary: &[PathBuf],
@@ -59,7 +59,7 @@ fn live_storage_root_from(
     })
 }
 
-pub(crate) fn assert_context(config: &Config) {
+pub fn assert_context(config: &Config) {
     let configured = config
         .storage_dir
         .as_deref()
@@ -71,7 +71,7 @@ pub(crate) fn assert_context(config: &Config) {
     assert_root(&crate::storage_path::storage_dir(Some(configured)));
 }
 
-pub(crate) fn assert_root(root: &Path) {
+pub fn assert_root(root: &Path) {
     assert!(
         !live_storage_roots()
             .iter()
@@ -81,7 +81,7 @@ pub(crate) fn assert_root(root: &Path) {
     );
 }
 
-pub(crate) fn assert_database(path: &Path) {
+pub fn assert_database(path: &Path) {
     if let Some(parent) = path.parent() {
         assert_root(parent);
     }

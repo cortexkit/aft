@@ -31,7 +31,7 @@ thread_local! {
 /// snapshot opens a group of its own for its metadata; joining keeps that to
 /// one device flush before the first unlink, and none when the delete gives
 /// up and drops its group.
-pub(crate) struct SyncGroup {
+pub struct SyncGroup {
     /// Whether this group opened the thread's pending set and so flushes it,
     /// rather than joining an enclosing group's.
     #[cfg(unix)]
@@ -128,7 +128,7 @@ fn ordered_sync(file: &File, path: &Path) -> io::Result<()> {
 // Some binaries do not use every atomic-write durability option. Callers choose
 // whether private state needs no sync, file sync, or file plus directory sync.
 #[derive(Clone, Copy)]
-pub(crate) enum AtomicWriteDurability {
+pub enum AtomicWriteDurability {
     None,
     // Callers publishing several files sync the directory once after the batch.
     File,
@@ -137,7 +137,7 @@ pub(crate) enum AtomicWriteDurability {
 
 /// Publish private state without leaving a partial destination or a failed temp.
 /// Authorization and directory creation remain the caller's responsibility.
-pub(crate) fn atomic_write(
+pub fn atomic_write(
     path: &Path,
     bytes: &[u8],
     durability: AtomicWriteDurability,
@@ -208,13 +208,13 @@ pub(crate) fn before_temp_create(path: &Path) {
     }
 }
 
-pub(crate) fn sync_file(file: &File, path: &Path) -> io::Result<()> {
+pub fn sync_file(file: &File, path: &Path) -> io::Result<()> {
     ordered_sync(file, path)?;
     record(EventKind::FileSync, path);
     Ok(())
 }
 
-pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+pub fn sync_dir(path: &Path) -> io::Result<()> {
     #[cfg(any(test, feature = "test-support"))]
     if FAIL_DIRECTORY_SYNC.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -245,7 +245,7 @@ pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EventKind {
+pub enum EventKind {
     FileSync,
     #[cfg_attr(not(unix), allow(dead_code))]
     DirectorySync,
@@ -273,12 +273,12 @@ thread_local! {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn take_full_syncs() -> Vec<PathBuf> {
+pub fn take_full_syncs() -> Vec<PathBuf> {
     FULL_SYNCS.with(|syncs| std::mem::take(&mut *syncs.borrow_mut()))
 }
 
 #[inline]
-pub(crate) fn record(kind: EventKind, path: &Path) {
+pub fn record(kind: EventKind, path: &Path) {
     #[cfg(any(test, feature = "test-support"))]
     EVENTS.with(|events| events.borrow_mut().push((kind, path.to_path_buf())));
     #[cfg(not(any(test, feature = "test-support")))]
@@ -286,12 +286,12 @@ pub(crate) fn record(kind: EventKind, path: &Path) {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn take() -> Vec<(EventKind, std::path::PathBuf)> {
+pub fn take() -> Vec<(EventKind, std::path::PathBuf)> {
     EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn sync_count(events: &[(EventKind, std::path::PathBuf)]) -> usize {
+pub fn sync_count(events: &[(EventKind, std::path::PathBuf)]) -> usize {
     events
         .iter()
         .filter(|(kind, _)| matches!(kind, EventKind::FileSync | EventKind::DirectorySync))

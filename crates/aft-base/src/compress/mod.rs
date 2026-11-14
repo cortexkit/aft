@@ -599,7 +599,7 @@ fn dropped_failure_or_error_blocks(result: &CompressionResult) -> bool {
 
 /// The line that introduces failure lines AFT kept from output it otherwise
 /// shortened, so the agent can tell them from the command's own lines.
-pub(crate) const PRESERVED_FAILURES_LABEL: &str = "[raw failure lines preserved by AFT]";
+pub const PRESERVED_FAILURES_LABEL: &str = "[raw failure lines preserved by AFT]";
 
 fn append_missing_failure_lines(
     mut result: CompressionResult,
@@ -695,7 +695,7 @@ pub(crate) fn text_has_failure_signal(text: &str) -> bool {
         .any(|(line, lower)| line_has_failure_signal_lower(line.trim(), lower.trim()))
 }
 
-pub(crate) fn line_has_failure_signal_lower(line: &str, lower: &str) -> bool {
+pub fn line_has_failure_signal_lower(line: &str, lower: &str) -> bool {
     line.contains("error[")
         || lower.contains("error:")
         || line.contains("Error")
@@ -827,7 +827,7 @@ pub fn normalize_command_for_dispatch(command: &str) -> Option<String> {
 
 /// Normalize commands for structured-output detection, where a top-level pipe
 /// must suppress structured handling instead of falling back to the raw command.
-pub(crate) fn plain_command_for_structured_output(command: &str) -> Option<String> {
+pub fn plain_command_for_structured_output(command: &str) -> Option<String> {
     match resolve_dispatch_target(command) {
         DispatchTarget::Command(resolved) => Some(resolved),
         DispatchTarget::Pipeline(_) | DispatchTarget::ForceGeneric => None,
@@ -1126,7 +1126,7 @@ struct PipelineScan {
 /// the comment to swallow. Heredocs and other multi-statement forms are already
 /// rejected by the scanner's top-level newline/separator handling.
 #[cfg(unix)]
-pub(crate) fn single_top_level_pipeline(command: &str) -> Option<PipelineInfo> {
+pub fn single_top_level_pipeline(command: &str) -> Option<PipelineInfo> {
     if strip_top_level_comment(command) != command {
         return None;
     }
@@ -1537,7 +1537,7 @@ fn legacy_user_filter_dir(storage_dir: &Path) -> PathBuf {
 /// Move filters written by the short-lived root-scoped v0.27 layout into the
 /// active harness directory. Existing harness files win; colliding root files
 /// are left in place so we never overwrite user-authored filters.
-pub(crate) fn repair_legacy_user_filter_dir(storage_dir: &Path, harness: Harness) {
+pub fn repair_legacy_user_filter_dir(storage_dir: &Path, harness: Harness) {
     let legacy_dir = legacy_user_filter_dir(storage_dir);
     if !legacy_dir.exists() {
         return;

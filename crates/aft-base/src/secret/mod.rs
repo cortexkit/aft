@@ -43,7 +43,7 @@ pub use wire::{
 };
 
 #[cfg(any(any(test, feature = "test-support"), feature = "secret-test-fake"))]
-pub(crate) use vault::fake::{approval, granted, FakeReply, FakeVault, FakeVaultScript};
+pub use vault::fake::{approval, granted, FakeReply, FakeVault, FakeVaultScript};
 
-pub(crate) mod call_context;
+pub mod call_context;
 pub(crate) mod fetch;

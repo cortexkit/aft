@@ -83,7 +83,7 @@ impl Service {
 /// Cancels a pending deadline on drop, removing its callback immediately. A
 /// callback already being dispatched must also fence its work with the root's
 /// lifecycle (usually a weak owner and the executor's cancellation token).
-pub(crate) struct Timer {
+pub struct Timer {
     service: &'static Arc<Service>,
     id: u64,
     active: Arc<AtomicBool>,

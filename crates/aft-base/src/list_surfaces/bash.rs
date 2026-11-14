@@ -199,7 +199,7 @@ pub fn build_changed_files_envelope_with_time_limit(
 /// True for a foreground task annotation: `[task <id>]` or
 /// `[task <id> (job <job>)]`. It is AFT's annotation, not command output, so
 /// it does not affect output line counts or the hash used to detect repeated output.
-pub(crate) fn is_foreground_task_line(line: &str) -> bool {
+pub fn is_foreground_task_line(line: &str) -> bool {
     let Some(inner) = line
         .strip_prefix("[task ")
         .and_then(|rest| rest.strip_suffix(']'))

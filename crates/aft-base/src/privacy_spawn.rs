@@ -9,15 +9,15 @@ use std::collections::HashMap;
 use std::process::Command;
 
 /// Private request-snapshot control, removed before executing any child.
-pub(crate) const CONTROL_ENV: &str = "AFT_AGENT_DISCLAIM_PRIVACY";
+pub const CONTROL_ENV: &str = "AFT_AGENT_DISCLAIM_PRIVACY";
 
-pub(crate) fn requested(environment: &HashMap<String, String>) -> bool {
+pub fn requested(environment: &HashMap<String, String>) -> bool {
     environment
         .get(CONTROL_ENV)
         .is_some_and(|value| value == "1")
 }
 
-pub(crate) fn install(
+pub fn install(
     command: &mut Command,
     enabled: bool,
     environment_cleared: bool,
@@ -48,7 +48,7 @@ pub(crate) fn apply_spawn_attribute(
     Ok(())
 }
 
-pub(crate) fn note_session(session: &str) {
+pub fn note_session(session: &str) {
     #[cfg(target_os = "macos")]
     {
         use std::collections::HashSet;

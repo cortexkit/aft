@@ -12,7 +12,7 @@ use std::sync::{Mutex, OnceLock};
 #[cfg(any(test, feature = "test-support"))]
 static FILE_PROBES: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> = OnceLock::new();
 
-pub(crate) fn is_generated_file(project_root: &Path, path: &Path) -> bool {
+pub fn is_generated_file(project_root: &Path, path: &Path) -> bool {
     if relative_shape_is_generated(project_root, path) {
         return true;
     }

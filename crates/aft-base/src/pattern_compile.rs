@@ -95,7 +95,7 @@ impl CompiledPattern {
 /// LF. Re-searching the match's starting line recovers the line-local match
 /// that the cross-line match would otherwise hide, then scanning resumes at
 /// the next line start so that lines the cross-line match consumed are checked.
-pub(crate) fn for_each_line_match(
+pub fn for_each_line_match(
     regex: &regex::bytes::Regex,
     content: &[u8],
     mut visit: impl FnMut(usize, usize) -> bool,

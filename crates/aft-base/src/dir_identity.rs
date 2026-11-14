@@ -4,10 +4,10 @@ use std::path::Path;
 
 /// A directory's device and inode (on Windows, volume serial number and
 /// file index), which change when it is replaced.
-pub(crate) type DirIdentity = (u64, u64);
+pub type DirIdentity = (u64, u64);
 
 #[cfg(unix)]
-pub(crate) fn dir_identity(path: &Path) -> Option<DirIdentity> {
+pub fn dir_identity(path: &Path) -> Option<DirIdentity> {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(path)
         .ok()

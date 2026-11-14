@@ -9,7 +9,7 @@ pub(crate) struct OpenCheck {
     expected: PathBuf,
 }
 
-pub(crate) fn is_scratch(path: &Path) -> bool {
+pub fn is_scratch(path: &Path) -> bool {
     path.ancestors().any(is_managed_task_temp_dir)
 }
 
@@ -53,7 +53,7 @@ pub(crate) fn check_path(path: &Path) -> io::Result<Option<OpenCheck>> {
     Ok(Some(OpenCheck { root, expected }))
 }
 
-pub(crate) fn open(path: &Path) -> io::Result<File> {
+pub fn open(path: &Path) -> io::Result<File> {
     let Some(check) = check_path(path)? else {
         return crate::bounded_io::open_content_file(path);
     };
@@ -120,7 +120,7 @@ pub fn validate_task_id(task_id: &str) -> std::io::Result<()> {
 
 /// Recognize the task bundle structurally, without trusting a caller's session
 /// namespace or granting access to the enclosing private store.
-pub(crate) fn task_directory(path: &Path) -> Option<&Path> {
+pub fn task_directory(path: &Path) -> Option<&Path> {
     // Ordinary project paths never need ancestor-by-ancestor task validation.
     // A marker match is only a fast prefilter; the component checks still win.
     static MARKER: std::sync::LazyLock<memchr::memmem::Finder<'static>> =
@@ -139,7 +139,7 @@ pub(crate) fn task_directory(path: &Path) -> Option<&Path> {
     })
 }
 
-pub(crate) fn is_task_environment(path: &Path) -> bool {
+pub fn is_task_environment(path: &Path) -> bool {
     task_directory(path).is_some_and(|root| path == root.join("control/environment.bin"))
 }
 
@@ -203,7 +203,7 @@ mod task_path_tests {
     }
 }
 
-pub(crate) fn is_managed_task_temp_dir(path: &Path) -> bool {
+pub fn is_managed_task_temp_dir(path: &Path) -> bool {
     #[cfg(unix)]
     if is_managed(path) {
         return true;
@@ -215,7 +215,7 @@ pub(crate) fn is_managed_task_temp_dir(path: &Path) -> bool {
 
 /// Where an open file really is, asked of the kernel through its handle.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub(crate) fn opened_location(file: &File) -> io::Result<PathBuf> {
+pub fn opened_location(file: &File) -> io::Result<PathBuf> {
     use std::os::fd::AsRawFd;
     std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }
@@ -283,10 +283,10 @@ pub(crate) fn opened_location(file: &File) -> io::Result<PathBuf> {
 #[cfg(target_os = "macos")]
 pub(crate) const MANAGED_TEMP_ROOT: &str = "/private/tmp/aft-w";
 #[cfg(all(unix, not(target_os = "macos")))]
-pub(crate) const MANAGED_TEMP_ROOT: &str = "/tmp/aft-w";
+pub const MANAGED_TEMP_ROOT: &str = "/tmp/aft-w";
 
 #[cfg(unix)]
-pub(crate) fn task_name(name: &str) -> bool {
+pub fn task_name(name: &str) -> bool {
     name.len() == 12
         && name
             .bytes()
@@ -294,12 +294,12 @@ pub(crate) fn task_name(name: &str) -> bool {
 }
 
 #[cfg(unix)]
-pub(crate) fn provider_root() -> std::path::PathBuf {
+pub fn provider_root() -> std::path::PathBuf {
     Path::new(MANAGED_TEMP_ROOT).join("env-provider")
 }
 
 #[cfg(unix)]
-pub(crate) fn is_managed(path: &Path) -> bool {
+pub fn is_managed(path: &Path) -> bool {
     let provider_parent = path.parent().is_some_and(|parent| {
         parent.parent() == Some(provider_root().as_path())
             && parent

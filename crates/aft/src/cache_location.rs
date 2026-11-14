@@ -1,6 +1,34 @@
 pub use aft_base::cache_location::*;
 
 #[cfg(test)]
+#[allow(unused_imports)]
+use crate::pinned_dir::{PinnedDir, RepairBudget};
+#[cfg(test)]
+#[allow(unused_imports)]
+use serde::{Deserialize, Serialize};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::fs::{self, File};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::io;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::time::Duration;
+
+#[cfg(test)]
 #[path = "cache_location_tests.rs"]
 mod tests;
 

@@ -3,7 +3,7 @@
 /// Spawn errors can mean that the child working directory is missing, or that
 /// the executable itself cannot be found. Checking here keeps filesystem
 /// probes off the successful process-launch path.
-pub(crate) fn format_spawn_failure(
+pub fn format_spawn_failure(
     context: &str,
     program: &std::path::Path,
     workdir: &std::path::Path,

@@ -1,6 +1,93 @@
 pub use aft_base::url_fetch::*;
 
 #[cfg(test)]
+#[allow(unused_imports)]
+use crate::lang_id::language_by_extension;
+#[cfg(test)]
+#[allow(unused_imports)]
+use htmd::{
+    element_handler::{HandlerResult, Handlers},
+    Element, HtmlToMarkdown,
+};
+#[cfg(test)]
+#[allow(unused_imports)]
+use markup5ever_rcdom::{Node, NodeData};
+#[cfg(test)]
+#[allow(unused_imports)]
+use reqwest::blocking::{Client, Response as HttpResponse};
+#[cfg(test)]
+#[allow(unused_imports)]
+use reqwest::header::{
+    ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, LOCATION, USER_AGENT,
+};
+#[cfg(test)]
+#[allow(unused_imports)]
+use reqwest::redirect::Policy;
+#[cfg(test)]
+#[allow(unused_imports)]
+use secret_rules::audit::{AuditReason, AuditRecordV1, Decision};
+#[cfg(test)]
+#[allow(unused_imports)]
+use secret_rules::location::{
+    evaluate_request_with_connect, location_kind_token, LabelOutcome, LabelRule, Location,
+    RequestView,
+};
+#[cfg(test)]
+#[allow(unused_imports)]
+use secret_rules::material::{check_admissible, encode_for_location};
+#[cfg(test)]
+#[allow(unused_imports)]
+use secret_rules::scrub::{MatcherSet, ScrubError, Scrubber};
+#[cfg(test)]
+#[allow(unused_imports)]
+use secret_rules::target::{normalize_request_target, ConnectAuthority};
+#[cfg(test)]
+#[allow(unused_imports)]
+use serde::{Deserialize, Serialize};
+#[cfg(test)]
+#[allow(unused_imports)]
+use sha2::{Digest, Sha256};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::HashMap;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::error::Error;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::fmt;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::fs;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::io::{self, Read, Write};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::rc::Rc;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::{mpsc, Arc};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::thread;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+#[allow(unused_imports)]
+use url::Url;
+#[cfg(test)]
+#[allow(unused_imports)]
+use zeroize::Zeroizing;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn extension_only_url_decision_matches_parser() {

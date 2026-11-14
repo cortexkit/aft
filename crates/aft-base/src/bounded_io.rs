@@ -18,9 +18,9 @@ use std::time::{Duration, Instant};
 
 use crate::protocol::Response;
 
-pub(crate) const IO_BUDGET: Duration = Duration::from_secs(5);
+pub const IO_BUDGET: Duration = Duration::from_secs(5);
 /// Wall-clock budget for grep/glob index-unavailable fallback walks on the dispatch thread.
-pub(crate) const FALLBACK_WALK_BUDGET: Duration = Duration::from_secs(10);
+pub const FALLBACK_WALK_BUDGET: Duration = Duration::from_secs(10);
 pub(crate) const WALK_PARTIAL_GAP: &str =
     "Directory walk reached its time budget; only examined entries are reported.";
 /// Request budget for a mutation's path checks when no caller budget exists.
@@ -55,7 +55,7 @@ impl std::fmt::Display for Failure {
 impl std::error::Error for Failure {}
 
 /// Keep admission timeouts distinct when callers turn I/O errors into responses.
-pub(crate) fn timeout_code(error: &io::Error) -> &'static str {
+pub fn timeout_code(error: &io::Error) -> &'static str {
     error
         .get_ref()
         .and_then(|error| error.downcast_ref::<Failure>())
@@ -131,7 +131,7 @@ impl Probe {
     }
 }
 #[derive(Clone)]
-pub(crate) struct Budget {
+pub struct Budget {
     id: u64,
     disclosure_only: bool,
     pub(crate) deadline: Instant,
@@ -237,12 +237,12 @@ impl Budget {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PermissionObservation {
+pub struct PermissionObservation {
     pub(crate) folder: PathBuf,
     pub(crate) readable: bool,
 }
 
-pub(crate) fn name_walk_root(root: &Path, name: &Path) {
+pub fn name_walk_root(root: &Path, name: &Path) {
     if let Some(budget) = current() {
         budget
             .walk_names
@@ -407,7 +407,7 @@ fn permission_folder(path: &Path) -> PathBuf {
 }
 
 /// The helper only probes access. The caller may mutate only after this returns.
-pub(crate) fn probe_access(req_id: &str, path: &Path) -> Result<(), Response> {
+pub fn probe_access(req_id: &str, path: &Path) -> Result<(), Response> {
     // A new target may have several nonexistent ancestors. Probe the nearest
     // existing directory without creating any of those missing components.
     let result = probe_target(path);
@@ -469,7 +469,7 @@ fn access_error(req_id: &str, path: &Path, error: io::Error) -> Response {
     )
 }
 
-pub(crate) fn finish_response(mut response: Response) -> Response {
+pub fn finish_response(mut response: Response) -> Response {
     response = finish_response_without_skips(response);
     response
 }
@@ -745,14 +745,14 @@ thread_local! {
 
 /// Higher layers carry request-local state without exposing its type to I/O.
 pub(crate) type Carry = Box<dyn FnOnce() -> io::Result<Box<dyn Any + Send>> + Send>;
-pub(crate) type CarryFactory = Arc<dyn Fn() -> io::Result<Carry> + Send + Sync>;
+pub type CarryFactory = Arc<dyn Fn() -> io::Result<Carry> + Send + Sync>;
 type CarryRestore = Box<dyn FnOnce() + Send>;
 
 #[cfg(any(test, feature = "test-support"))]
 static TEST_HELPER_SCOPE: std::sync::OnceLock<fn() -> Box<dyn Any>> = std::sync::OnceLock::new();
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn register_test_helper_scope(scope: fn() -> Box<dyn Any>) {
+pub fn register_test_helper_scope(scope: fn() -> Box<dyn Any>) {
     // Tool-owned counters live above this module. Their owner supplies the
     // reset scope so reused helpers start each test job with clean counters.
     let _ = TEST_HELPER_SCOPE.set(scope);
@@ -761,7 +761,7 @@ pub(crate) fn register_test_helper_scope(scope: fn() -> Box<dyn Any>) {
 /// Updated alongside the higher layer's thread-local state, including restores.
 /// A helper also restores state first installed by its work, even if the
 /// helper was entered with no carried state at all.
-pub(crate) fn replace_carry_factory(factory: Option<CarryFactory>, restore: CarryRestore) {
+pub fn replace_carry_factory(factory: Option<CarryFactory>, restore: CarryRestore) {
     CARRY_RESTORE.with(|pending| {
         if let Some(first @ None) = &mut *pending.borrow_mut() {
             *first = Some(restore);
@@ -797,7 +797,7 @@ impl Drop for CarryJobScope {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn has_carry_factory() -> bool {
+pub fn has_carry_factory() -> bool {
     CARRY_FACTORY.with(|current| current.borrow().is_some())
 }
 
@@ -857,12 +857,12 @@ impl Drop for Scope {
         CURRENT.with(|current| *current.borrow_mut() = self.0.take());
     }
 }
-pub(crate) fn current() -> Option<Budget> {
+pub fn current() -> Option<Budget> {
     capture().filter(|budget| !budget.disclosure_only)
 }
 
 /// Carry the request's skip collector even when native search has no I/O budget.
-pub(crate) fn capture() -> Option<Budget> {
+pub fn capture() -> Option<Budget> {
     CURRENT.with(|current| current.borrow().clone())
 }
 
@@ -879,7 +879,7 @@ pub(crate) fn exclude_secret_approval_wait(elapsed: Duration) {
         }
     });
 }
-pub(crate) fn enter_if_absent(duration: Duration) -> Scope {
+pub fn enter_if_absent(duration: Duration) -> Scope {
     let budget = current().unwrap_or_else(|| Budget::after(duration));
     Scope(CURRENT.with(|current| current.replace(Some(budget))))
 }
@@ -900,18 +900,18 @@ impl Drop for MutationScope {
         MUTATION_ADMISSION.with(|flag| flag.set(self.previous));
     }
 }
-pub(crate) fn enter_mutation() -> MutationScope {
+pub fn enter_mutation() -> MutationScope {
     let scope = enter_if_absent(MUTATION_BUDGET);
     MutationScope {
         previous: MUTATION_ADMISSION.with(|flag| flag.replace(true)),
         _scope: scope,
     }
 }
-pub(crate) fn with_budget<T>(budget: Option<Budget>, work: impl FnOnce() -> T) -> T {
+pub fn with_budget<T>(budget: Option<Budget>, work: impl FnOnce() -> T) -> T {
     let _scope = enter(budget);
     work()
 }
-pub(crate) fn enter(budget: Option<Budget>) -> Scope {
+pub fn enter(budget: Option<Budget>) -> Scope {
     Scope(CURRENT.with(|current| current.replace(budget)))
 }
 /// Keep the last `margin` of the current request's budget for its reply:
@@ -920,7 +920,7 @@ pub(crate) fn enter(budget: Option<Budget>) -> Scope {
 /// stalled read fails while the reply can still reach the caller in time.
 /// Only the first call moves the deadline, so a command that reads several
 /// documents keeps one margin, not one per document.
-pub(crate) fn keep_reply_margin(margin: Duration) {
+pub fn keep_reply_margin(margin: Duration) {
     CURRENT.with(|current| {
         if let Some(budget) = current.borrow_mut().as_mut() {
             if !budget.reply_margin_kept {
@@ -947,7 +947,7 @@ fn request_deadline(at: Option<Instant>) -> Option<Instant> {
 /// Check a synchronous mutation loop without dispatching another I/O helper.
 /// Record the same timeout as a bounded filesystem call so response formatting
 /// returns the existing read_deadline_exceeded reply.
-pub(crate) fn check_request_deadline(path: &Path, now: Instant) -> io::Result<()> {
+pub fn check_request_deadline(path: &Path, now: Instant) -> io::Result<()> {
     if let Some(error) = prior_failure() {
         return Err(error);
     }
@@ -996,7 +996,7 @@ type IoJob = Box<dyn FnOnce() + Send + 'static>;
 
 /// A published walk snapshot never holds its lock while accessing the filesystem.
 /// The caller can take the last examined prefix even if the helper is stuck in `next`.
-pub(crate) struct WalkProgress<T> {
+pub struct WalkProgress<T> {
     cancellation: Option<crate::executor::JobCancellation>,
     snapshot: Arc<Mutex<T>>,
     stopped: Arc<AtomicBool>,
@@ -1040,7 +1040,7 @@ impl<T> WalkProgress<T> {
     }
 }
 
-pub(crate) fn run_walk<T: Clone + Send + 'static>(
+pub fn run_walk<T: Clone + Send + 'static>(
     path: &Path,
     at: Option<Instant>,
     initial: T,
@@ -1180,7 +1180,7 @@ pub(crate) fn reading_path(path: &Path) -> impl Drop {
     }))
 }
 
-pub(crate) fn walk_path(path: &Path) -> bool {
+pub fn walk_path(path: &Path) -> bool {
     let keep_going = ACTIVE_PROBE.with(|probe| {
         if let Some(probe) = probe.borrow().as_ref() {
             let mut activity = probe.activity.lock().unwrap_or_else(|e| e.into_inner());
@@ -1419,7 +1419,7 @@ fn pool_health_snapshot(
         "queue_timeouts_total": state.queue_timeouts,
     })
 }
-pub(crate) fn helper_health() -> serde_json::Value {
+pub fn helper_health() -> serde_json::Value {
     helper_health_from(&HELPERS)
 }
 
@@ -1430,7 +1430,7 @@ pub(crate) fn helper_health() -> serde_json::Value {
 /// work fills it first; otherwise the pool growing to meet that work reads as
 /// threads the work kept.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn fill_helper_pool_for_test() {
+pub fn fill_helper_pool_for_test() {
     let pool = Arc::clone(HELPERS.get_or_init(|| Limiter::new(IO_POOL_SIZE)));
     let deadline = Instant::now() + Duration::from_secs(30);
     // Holding every permit at once leaves no idle worker to reuse, so each
@@ -1508,7 +1508,7 @@ impl Drop for Permit {
 }
 /// Isolate boundary probes, whole walks, and reads on risky filesystems.
 /// Stuck helpers retain the submitted job closure and its owned captures.
-pub(crate) fn run<T: Send + 'static>(
+pub fn run<T: Send + 'static>(
     path: &Path,
     at: Option<Instant>,
     work: impl FnOnce(PathBuf) -> io::Result<T> + Send + 'static,
@@ -1523,7 +1523,7 @@ pub(crate) fn run<T: Send + 'static>(
 
 /// A separate helper pool whose stalled jobs cannot consume file-read workers.
 #[derive(Clone)]
-pub(crate) struct IsolatedPool(Arc<Limiter>);
+pub struct IsolatedPool(Arc<Limiter>);
 
 impl IsolatedPool {
     #[cfg(any(test, feature = "test-support"))]
@@ -1546,7 +1546,7 @@ impl IsolatedPool {
 
 /// Reserves time for a bounded walk to return partial results before the bounded I/O helper's
 /// deadline; a helper still stuck in one OS call remains a `read_blocked`.
-pub(crate) fn deadline_before_io_timeout(
+pub fn deadline_before_io_timeout(
     path: &Path,
     budget: Duration,
     return_margin: Duration,
@@ -1894,7 +1894,7 @@ pub(crate) fn probe_directory(path: &Path, at: Option<Instant>) -> io::Result<()
 
 /// Only descendants discovered by a read-only walk are coverage gaps. The
 /// starting folder and its ancestors still require a named access error.
-pub(crate) fn probe_walk_directory(root: &Path, path: &Path) -> io::Result<()> {
+pub fn probe_walk_directory(root: &Path, path: &Path) -> io::Result<()> {
     let budget = current().map(|mut budget| {
         budget.walk_root = Some(root.to_path_buf());
         budget
@@ -1998,7 +1998,7 @@ fn run_traversal<T: Send + 'static>(
     }
     Ok(result)
 }
-pub(crate) fn probe_target(path: &Path) -> io::Result<()> {
+pub fn probe_target(path: &Path) -> io::Result<()> {
     if cached_directory(path).is_some() {
         return Ok(());
     }
@@ -2078,7 +2078,7 @@ fn local_filesystem(_: &Path) -> io::Result<bool> {
     Ok(false)
 }
 
-pub(crate) fn read(path: &Path, at: Option<Instant>) -> io::Result<Vec<u8>> {
+pub fn read(path: &Path, at: Option<Instant>) -> io::Result<Vec<u8>> {
     if Instant::now() >= deadline(at) {
         return Err(failure(
             path,
@@ -2111,7 +2111,7 @@ pub(crate) fn read(path: &Path, at: Option<Instant>) -> io::Result<Vec<u8>> {
 
 /// A regular file whose chunk reads retain the same access checks and helper
 /// deadlines as a whole-file read. The descriptor stays open between chunks.
-pub(crate) struct Reader {
+pub struct Reader {
     path: PathBuf,
     file: Option<std::fs::File>,
     direct: bool,
@@ -2120,7 +2120,7 @@ pub(crate) struct Reader {
     size_at_open: u64,
 }
 
-pub(crate) fn reader(path: &Path, at: Option<Instant>) -> io::Result<Reader> {
+pub fn reader(path: &Path, at: Option<Instant>) -> io::Result<Reader> {
     if Instant::now() >= deadline(at) {
         return Err(failure(
             path,
@@ -2323,11 +2323,11 @@ fn regular_read(path: &Path, no_follow: bool) -> io::Result<Vec<u8>> {
         .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
     Ok(bytes)
 }
-pub(crate) fn read_to_string(path: &Path) -> io::Result<String> {
+pub fn read_to_string(path: &Path) -> io::Result<String> {
     String::from_utf8(read(path, None)?)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
-pub(crate) fn canonicalize(path: &Path) -> io::Result<PathBuf> {
+pub fn canonicalize(path: &Path) -> io::Result<PathBuf> {
     if let Some(error) = prior_failure() {
         return Err(error);
     }
@@ -2344,7 +2344,7 @@ pub(crate) fn canonicalize(path: &Path) -> io::Result<PathBuf> {
         run_traversal(path, std::fs::canonicalize)
     }
 }
-pub(crate) fn metadata(path: &Path) -> io::Result<std::fs::Metadata> {
+pub fn metadata(path: &Path) -> io::Result<std::fs::Metadata> {
     if let Some(error) = prior_failure() {
         return Err(error);
     }
@@ -2369,7 +2369,7 @@ pub mod regression_tests;
 #[cfg(all(any(test, feature = "test-support"), unix))]
 pub use regression_tests::{stall_helper, stall_running_helper};
 #[cfg(all(any(test, feature = "test-support"), unix))]
-pub(crate) fn stall_helper_if_requested(path: &Path) {
+pub fn stall_helper_if_requested(path: &Path) {
     regression_tests::before_helper(path);
 }
 #[cfg(all(any(test, feature = "test-support"), unix))]

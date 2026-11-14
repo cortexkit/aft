@@ -68,20 +68,20 @@ thread_local! {
 /// before a health tick and read after it to prove the tick resolved shared
 /// roots once instead of once per context.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn storage_dir_calls_for_test() -> u64 {
+pub fn storage_dir_calls_for_test() -> u64 {
     STORAGE_DIR_CALLS.with(|calls| calls.get())
 }
 
 /// Test hook resetting [`storage_dir_calls_for_test`].
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn reset_storage_dir_calls_for_test() {
+pub fn reset_storage_dir_calls_for_test() {
     STORAGE_DIR_CALLS.with(|calls| calls.set(0));
 }
 
 /// Resolve the current test environment's default, excluding AFT-specific
 /// overrides. HOME and XDG may deliberately name a fixture, not the live store.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn storage_dir_without_overrides_for_test() -> PathBuf {
+pub fn storage_dir_without_overrides_for_test() -> PathBuf {
     let lookup = |name: &str| {
         if matches!(name, "AFT_STORAGE_DIR" | "AFT_CACHE_DIR") {
             None
@@ -95,7 +95,7 @@ pub(crate) fn storage_dir_without_overrides_for_test() -> PathBuf {
 /// Let the persistence fence use the production ladder with account-owned homes
 /// instead of the temporary homes installed by a test or its runner.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn storage_dir_from_test_environment(
+pub fn storage_dir_from_test_environment(
     lookup: &impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> PathBuf {
     storage_dir_from(

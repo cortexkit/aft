@@ -12,7 +12,7 @@ use std::path::{Component, Path, PathBuf};
 pub(crate) const CODE: &str = "dev_build_refused_production_migration";
 
 // Resolve an existing ancestor as well as the leaf, which may not exist yet.
-pub(crate) fn canonicalized_with(
+pub fn canonicalized_with(
     path: &Path,
     canonicalize: &impl Fn(&Path) -> Option<PathBuf>,
 ) -> PathBuf {
@@ -78,7 +78,7 @@ pub(crate) fn is_within(path: &Path, parent: &Path) -> bool {
 }
 
 #[cfg(unix)]
-pub(crate) fn account_home() -> io::Result<PathBuf> {
+pub fn account_home() -> io::Result<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
     let mut buffer = vec![0u8; 16384];
     loop {
@@ -125,7 +125,7 @@ pub(crate) fn account_home() -> io::Result<PathBuf> {
 }
 
 #[cfg(windows)]
-pub(crate) fn account_home() -> io::Result<PathBuf> {
+pub fn account_home() -> io::Result<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::Security::TOKEN_QUERY;
@@ -280,7 +280,7 @@ fn migration_opt_in() -> bool {
     lookup("AFT_ALLOW_PRODUCTION_MIGRATION").as_deref() == Some(std::ffi::OsStr::new("1"))
 }
 
-pub(crate) fn protected(path: &Path) -> bool {
+pub fn protected(path: &Path) -> bool {
     protection_status_with(path, account_storage_roots).unwrap_or(true)
 }
 
@@ -343,7 +343,7 @@ fn protection_status_with(
     Ok(roots()?.iter().any(|root| is_within(path, root)))
 }
 
-pub(crate) fn refuse_write(path: &Path) -> io::Result<()> {
+pub fn refuse_write(path: &Path) -> io::Result<()> {
     refuse_write_for_status(path, protection_status_with(path, account_storage_roots))
 }
 
@@ -368,7 +368,7 @@ thread_local! {
 
 /// Thread-local OS-directory seam, never available to a spawned binary.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn with_test_account<T>(root: &Path, allow: bool, run: impl FnOnce() -> T) -> T {
+pub fn with_test_account<T>(root: &Path, allow: bool, run: impl FnOnce() -> T) -> T {
     struct Restore(Option<(PathBuf, bool)>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -380,7 +380,7 @@ pub(crate) fn with_test_account<T>(root: &Path, allow: bool, run: impl FnOnce() 
     run()
 }
 
-pub(crate) fn resolve_account_home_dir() -> Option<PathBuf> {
+pub fn resolve_account_home_dir() -> Option<PathBuf> {
     #[cfg(unix)]
     let home = crate::production_storage::account_home().ok()?;
     #[cfg(windows)]

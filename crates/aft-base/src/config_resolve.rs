@@ -3612,7 +3612,7 @@ fn lsp_idle_minutes(value: Option<i64>) -> u32 {
 
 /// A validated `bash.env` map together with the tier it was written at.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ConfiguredBashEnv {
+pub struct ConfiguredBashEnv {
     pub names: BTreeMap<String, String>,
     pub tier: crate::bash_env::BashEnvTier,
 }

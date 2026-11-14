@@ -177,7 +177,7 @@ pub(crate) const PROJECT_ONLY_BLOCKED_ENV_PREFIXES: &[&str] = &["AWS_", "GH_", "
 /// Which tier a `bash.env` map came from. The strength of the deny list and
 /// the disclosure wording both depend on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BashEnvTier {
+pub enum BashEnvTier {
     User,
     Project,
 }
@@ -270,7 +270,7 @@ pub(crate) fn is_blocked_request_env_key(key: &str) -> bool {
     is_blocked_env_key(key)
 }
 
-pub(crate) fn first_blocked_env_key(env: &HashMap<String, String>) -> Option<&str> {
+pub fn first_blocked_env_key(env: &HashMap<String, String>) -> Option<&str> {
     env.keys()
         .find(|key| is_blocked_request_env_key(key))
         .map(String::as_str)
@@ -278,7 +278,7 @@ pub(crate) fn first_blocked_env_key(env: &HashMap<String, String>) -> Option<&st
 
 /// Startup hooks that execute code before a command can enter its sandbox.
 /// These names must be rejected for user-configured and per-call environments.
-pub(crate) fn is_preexec_hijack_env_key(key: &str) -> bool {
+pub fn is_preexec_hijack_env_key(key: &str) -> bool {
     if starts_with_prefix(key, "LD_")
         || starts_with_prefix(key, "DYLD_")
         || starts_with_prefix(key, "BASH_FUNC_")

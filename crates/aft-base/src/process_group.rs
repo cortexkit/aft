@@ -19,7 +19,7 @@ use std::process::{Child, Command};
 /// takes every malloc zone lock, so every formatter run on an edit would
 /// stall allocation across the whole process.
 #[cfg(unix)]
-pub(crate) fn isolate_in_process_group(cmd: &mut Command) {
+pub fn isolate_in_process_group(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
     cmd.process_group(0);
 }
@@ -33,7 +33,7 @@ pub(crate) fn isolate_in_process_group(_cmd: &mut Command) {
 /// Kill the child and, where supported, its entire process tree so wrapper
 /// scripts cannot leave descendants running after a timeout.
 #[cfg(unix)]
-pub(crate) fn kill_process_tree(child: &mut Child) {
+pub fn kill_process_tree(child: &mut Child) {
     let pid = child.id() as i32;
     if pid > 0 {
         // SAFETY: killpg with SIGKILL on a process group leader is safe.

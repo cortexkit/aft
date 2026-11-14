@@ -5,11 +5,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Keep the error kind and native source available to retry/absence checks
 /// while naming the I/O that failed. OS errors alone do not include its path.
-pub(crate) fn at(
-    operation: &str,
-    path: &std::path::Path,
-    source: std::io::Error,
-) -> std::io::Error {
+pub fn at(operation: &str, path: &std::path::Path, source: std::io::Error) -> std::io::Error {
     std::io::Error::new(
         source.kind(),
         PathIoError {
@@ -71,7 +67,7 @@ pub(crate) struct WorkCounters {
     pub semantic_files_filled: AtomicU64,
 }
 
-pub(crate) static WORK: WorkCounters = WorkCounters {
+pub static WORK: WorkCounters = WorkCounters {
     source_hashes: AtomicU64::new(0),
     source_hash_bytes: AtomicU64::new(0),
     content_reads: AtomicU64::new(0),
@@ -106,7 +102,7 @@ pub(crate) fn source_hash(bytes: &[u8]) -> blake3::Hash {
     blake3::hash(bytes)
 }
 
-pub(crate) fn work_snapshot() -> serde_json::Value {
+pub fn work_snapshot() -> serde_json::Value {
     serde_json::json!({
         "schema": 1,
         "pid": std::process::id(),

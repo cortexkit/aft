@@ -1,6 +1,22 @@
 pub use aft_base::engram_catalog::*;
 
 #[cfg(test)]
+#[allow(unused_imports)]
+use serde::{Deserialize, Serialize};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::fs;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::io;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::Path;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn relocated_caches_are_absent_from_storage_relative_catalog() {

@@ -163,7 +163,7 @@ pub(crate) fn boot_id() -> Option<String> {
 
 /// The root of the mounted filesystem holding `root`, with that
 /// filesystem's device number.
-pub(crate) fn volume_anchor(root: &Path) -> Option<(PathBuf, u64)> {
+pub fn volume_anchor(root: &Path) -> Option<(PathBuf, u64)> {
     #[cfg(target_os = "macos")]
     {
         let anchor = mount_point(root)?;

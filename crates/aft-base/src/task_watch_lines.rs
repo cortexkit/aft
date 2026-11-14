@@ -29,7 +29,7 @@ pub fn unavailable_match_text(count: u64, limit: usize) -> String {
     )
 }
 
-pub(super) fn unavailable_page_text(count: u64) -> String {
+pub fn unavailable_page_text(count: u64) -> String {
     unavailable_text(
         if count == 1 {
             UNAVAILABLE_PAGE_SINGULAR
@@ -491,7 +491,7 @@ pub fn format_watch_line_batch(task_id: &str, batch: &LineBatch) -> String {
 static NEXT_EVICTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static EVICTION_EPOCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-pub(crate) fn eviction_epoch() -> &'static str {
+pub fn eviction_epoch() -> &'static str {
     EVICTION_EPOCH.get_or_init(|| {
         format!(
             "{}:{}",
@@ -505,7 +505,7 @@ pub(crate) fn eviction_epoch() -> &'static str {
 }
 
 #[derive(Clone)]
-pub(crate) struct Candidate {
+pub struct Candidate {
     pub eviction_epoch: String,
     pub last_eviction: u64,
     pub fingerprint: Vec<u8>,

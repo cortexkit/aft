@@ -241,4 +241,4 @@ impl SecretVault for SubcSecretVault {
 /// The fake vault, compiled only for tests or an explicitly feature-enabled
 /// build.
 #[cfg(any(any(test, feature = "test-support"), feature = "secret-test-fake"))]
-pub(crate) mod fake;
+pub mod fake;

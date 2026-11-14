@@ -1,6 +1,16 @@
 pub use aft_base::project_content::*;
 
 #[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::{BTreeSet, HashMap};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::{Mutex, OnceLock, RwLock};
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

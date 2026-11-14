@@ -859,7 +859,6 @@ pub(crate) struct ReexportIndex {
     wildcard: bool,
 }
 
-aft_store::heap_bytes_none!(LangId);
 aft_store::heap_bytes_of_fields!(DbFileIndex {
     lang,
     exports,

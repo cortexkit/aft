@@ -756,7 +756,7 @@ pub(crate) struct TestVerdict {
     pub empty_results: Vec<usize>,
 }
 
-pub(crate) fn test_verdict(lines: &[&str]) -> Option<TestVerdict> {
+pub fn test_verdict(lines: &[&str]) -> Option<TestVerdict> {
     use std::collections::HashSet;
 
     if !lines.iter().any(|line| {

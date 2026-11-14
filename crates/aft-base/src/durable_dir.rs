@@ -4,7 +4,7 @@ use std::path::Path;
 
 /// Publish a new durable store directory and any missing ancestors into their
 /// parents before committing records inside it. Existing directories cost no sync.
-pub(crate) fn create_private_durable_dir(path: &Path) -> std::io::Result<()> {
+pub fn create_private_durable_dir(path: &Path) -> std::io::Result<()> {
     crate::production_storage::refuse_write(path)?;
     if path.is_dir() {
         return Ok(());

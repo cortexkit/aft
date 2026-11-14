@@ -94,11 +94,7 @@ pub fn refusal(
 
 /// v1 checks the requested name regardless of task_id/taskId argument spelling.
 /// Legacy plugin task polling may bypass disables; v1 agent calls never do.
-pub(crate) fn refusal_by_name(
-    request_id: &str,
-    call_name: &str,
-    disabled: &[String],
-) -> Option<Response> {
+pub fn refusal_by_name(request_id: &str, call_name: &str, disabled: &[String]) -> Option<Response> {
     refusal_for_tool(
         request_id,
         call_name,

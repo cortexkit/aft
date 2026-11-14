@@ -11,7 +11,7 @@ fn storage_roots() -> &'static RwLock<BTreeSet<PathBuf>> {
 
 /// Retain resolved storage roots even after reconfiguration: old readers and
 /// databases can remain alive while a new route starts using another root.
-pub(crate) fn register_storage_root(path: &Path) {
+pub fn register_storage_root(path: &Path) {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else if let Ok(cwd) = std::env::current_dir() {
@@ -56,7 +56,7 @@ pub(crate) fn register_storage_root(path: &Path) {
 /// repository's common dir is resolved once per boundary, and each verdict is
 /// cached per directory for the boundary's life (one walk, or one watcher
 /// filter call).
-pub(crate) struct NestedWorktreeBoundary {
+pub struct NestedWorktreeBoundary {
     root: PathBuf,
     common_dir: OnceLock<Option<PathBuf>>,
     verdicts: Mutex<HashMap<PathBuf, bool>>,
@@ -283,12 +283,12 @@ thread_local! {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn register_canonicalizations_for_test() -> u64 {
+pub fn register_canonicalizations_for_test() -> u64 {
     REGISTER_CANONICALIZATIONS.with(|count| count.get())
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn reset_register_canonicalizations_for_test() {
+pub fn reset_register_canonicalizations_for_test() {
     REGISTER_CANONICALIZATIONS.with(|count| count.set(0));
 }
 
@@ -302,21 +302,18 @@ pub(crate) fn reset_register_canonicalizations_for_test() {
 /// never feed back into project indexing.
 /// Walkers use the guarded readers' admission check to skip known live-file
 /// aliases before scheduling source reads or reusing cached entries.
-pub(crate) fn is_excluded(path: &Path) -> bool {
+pub fn is_excluded(path: &Path) -> bool {
     admit(path, None).is_err()
 }
 
-pub(crate) fn is_excluded_with_file_type(
-    path: &Path,
-    file_type: Option<&std::fs::FileType>,
-) -> bool {
+pub fn is_excluded_with_file_type(path: &Path, file_type: Option<&std::fs::FileType>) -> bool {
     admit(path, file_type).is_err()
 }
 
 /// Watcher events can name vanished directories. A SQLite suffix only excludes
 /// a known non-directory; an unknown type must still trigger reconciliation.
 /// Unlike source walks, this check does not scan live SQLite identities.
-pub(crate) fn is_excluded_event(path: &Path) -> bool {
+pub fn is_excluded_event(path: &Path) -> bool {
     is_storage_path(path)
         || crate::os_metadata::is_os_metadata_path(path)
         || crate::live_db_files::is_registered_file_path(path)
@@ -329,7 +326,7 @@ pub(crate) fn is_excluded_event(path: &Path) -> bool {
 /// makes for a file hard-linked to a live database, so use it only for paths
 /// another scan already admitted and read, such as an index-store
 /// checkout's members.
-pub(crate) fn is_excluded_file_by_path(path: &Path) -> bool {
+pub fn is_excluded_file_by_path(path: &Path) -> bool {
     crate::watcher_markers::is_marker_path(path)
         || is_storage_path(path)
         || crate::os_metadata::is_os_metadata_path(path)
@@ -346,7 +343,7 @@ fn is_storage_path(path: &Path) -> bool {
 }
 
 /// Resolve aliases without opening file contents before checking retained stores.
-pub(crate) fn storage_root_for_path(
+pub fn storage_root_for_path(
     path: &Path,
     policy: &dyn crate::read_policy::StoragePathPolicy,
 ) -> Option<PathBuf> {
@@ -398,13 +395,13 @@ fn is_excluded_file_with_metadata(
 
 /// Authorized task content is not project source, but must still be checked
 /// before a pinned-directory permission probe opens and closes its descriptor.
-pub(crate) fn is_sqlite_or_metadata(path: &Path) -> bool {
+pub fn is_sqlite_or_metadata(path: &Path) -> bool {
     is_excluded_file(path) || crate::live_db_files::is_live_sqlite_file(path)
 }
 
 /// Only explicit, ownership-checked registered task artifacts may bypass the
 /// storage root exclusion. SQLite names and aliases remain forbidden.
-pub(crate) fn reader_bounded(
+pub fn reader_bounded(
     path: &Path,
     deadline: Option<std::time::Instant>,
     authorized_task_artifact: bool,
@@ -432,7 +429,7 @@ fn admit_bounded(path: &Path, authorized_task_artifact: bool) -> std::io::Result
 
 /// Guard direct source reads as well as enumeration. Watcher deltas and queued
 /// view work can hold paths admitted before storage was configured.
-pub(crate) fn read(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
+pub fn read(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
     let path = path.as_ref();
     admit(path, None)?;
     #[cfg(any(test, feature = "test-support"))]
@@ -449,12 +446,12 @@ pub(crate) fn read(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-pub(crate) fn read_to_string(path: impl AsRef<Path>) -> std::io::Result<String> {
+pub fn read_to_string(path: impl AsRef<Path>) -> std::io::Result<String> {
     String::from_utf8(read(path)?)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
-pub(crate) fn open(path: impl AsRef<Path>) -> std::io::Result<std::fs::File> {
+pub fn open(path: impl AsRef<Path>) -> std::io::Result<std::fs::File> {
     let path = path.as_ref();
     admit(path, None)?;
     #[cfg(any(test, feature = "test-support"))]

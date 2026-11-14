@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 /// Storage-path comparison is not read authorization: retained storage roots
 /// need alias-aware identity and containment even without a request or session.
-pub(crate) trait StoragePathPolicy {
+pub trait StoragePathPolicy {
     fn identity(&self, path: &Path) -> PathBuf;
     fn contains(&self, path: &Path, prefix: &Path) -> bool;
 }

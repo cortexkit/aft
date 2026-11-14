@@ -37,7 +37,7 @@ const OS_METADATA_FILE_NAMES: [&str; 6] = [
 const APPLE_DOUBLE_PREFIX: &str = "._";
 
 /// True when `name` is an operating-system metadata file name.
-pub(crate) fn is_os_metadata_file_name(name: &OsStr) -> bool {
+pub fn is_os_metadata_file_name(name: &OsStr) -> bool {
     // Every listed name is ASCII, so a name that is not valid UTF-8 cannot match.
     let Some(name) = name.to_str() else {
         return false;
@@ -46,6 +46,6 @@ pub(crate) fn is_os_metadata_file_name(name: &OsStr) -> bool {
 }
 
 /// True when the last component of `path` is an operating-system metadata file name.
-pub(crate) fn is_os_metadata_path(path: &Path) -> bool {
+pub fn is_os_metadata_path(path: &Path) -> bool {
     path.file_name().is_some_and(is_os_metadata_file_name)
 }

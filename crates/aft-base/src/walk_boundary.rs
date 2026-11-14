@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 /// `read_dir` walkers keep their historical behavior there; `ignore::WalkBuilder`
 /// still uses its cross-platform `same_file_system` implementation.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct DeviceBoundary {
+pub struct DeviceBoundary {
     root_device: Option<u64>,
 }
 
@@ -61,7 +61,7 @@ impl DeviceBoundary {
 /// The `glob` crate traverses `**` internally and offers no filesystem-boundary
 /// option. Routing recursive glob expansion through `ignore` prevents a vanished
 /// mounted child from turning `ReadDir::drop`'s ENXIO into a daemon abort.
-pub(crate) fn expand_glob_same_file_system(
+pub fn expand_glob_same_file_system(
     full_pattern: &str,
 ) -> Result<Vec<PathBuf>, glob::PatternError> {
     expand_glob_with_visit(full_pattern, |_| {})
@@ -125,12 +125,12 @@ fn expand_glob_with_visit(
 /// Direct device-boundary predicate. Keeping it independent of filesystem I/O
 /// gives tests a portable mutation target without requiring a fragile loopback
 /// mount on macOS.
-pub(crate) fn same_filesystem_device(root_device: u64, child_device: u64) -> bool {
+pub fn same_filesystem_device(root_device: u64, child_device: u64) -> bool {
     root_device == child_device
 }
 
 #[cfg(unix)]
-pub(crate) fn filesystem_device_id(path: &Path) -> io::Result<Option<u64>> {
+pub fn filesystem_device_id(path: &Path) -> io::Result<Option<u64>> {
     use std::os::unix::fs::MetadataExt;
 
     let metadata = std::fs::metadata(path)?;
@@ -168,7 +168,7 @@ pub(crate) fn filesystem_device_id(path: &Path) -> io::Result<Option<u64>> {
 /// tests running in parallel in their own temporary folders do not see each
 /// other's volumes.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) mod simulated_volumes {
+pub mod simulated_volumes {
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
 

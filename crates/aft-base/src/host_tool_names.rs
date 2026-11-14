@@ -123,7 +123,7 @@ impl HostToolNames {
     }
 }
 
-pub(crate) fn supports_tool(bare_name: &str) -> bool {
+pub fn supports_tool(bare_name: &str) -> bool {
     matches!(
         bare_name,
         "bash"
@@ -207,7 +207,7 @@ pub(crate) fn supports_tool(bare_name: &str) -> bool {
 /// - `hashline_preflight`: parse-only, zero-mutation permission preflight for
 ///   the session's enabled hashline edit surface; it returns affected paths
 ///   before the plugin requests edit permission.
-pub(crate) fn is_subc_native_plumbing_tool(name: &str) -> bool {
+pub fn is_subc_native_plumbing_tool(name: &str) -> bool {
     matches!(
         name,
         "bash_abort_inflight"
@@ -239,7 +239,7 @@ pub(crate) fn is_subc_native_plumbing_tool(name: &str) -> bool {
 /// catalog's required camelCase `taskId` (see `translate_bash_task_tool`),
 /// while the plugins' native calls use the snake_case `task_id`. The request
 /// carries no other marker of who sent it.
-pub(crate) fn is_native_plumbing_call(name: &str, arguments: &Value) -> bool {
+pub fn is_native_plumbing_call(name: &str, arguments: &Value) -> bool {
     if !is_subc_native_plumbing_tool(name) {
         return false;
     }
@@ -257,7 +257,7 @@ use subc_protocol::manifest::ExecutionMode;
 /// Classify externally observable effects, not AFT's internal cache/index writes.
 /// The catalog conservatively classifies tools; individual calls can narrow that
 /// classification when their operation is explicitly read-only.
-pub(crate) fn tool_execution_mode(name: &str) -> ExecutionMode {
+pub fn tool_execution_mode(name: &str) -> ExecutionMode {
     match crate::tool_gate::canonical_tool_name(name).unwrap_or(name) {
         "bash" | "powershell" | "write" | "edit" | "apply_patch" | "ast_grep_replace"
         | "aft_delete" | "aft_move" | "aft_import" | "aft_safety" | "bash_kill" | "bash_write" => {
@@ -267,7 +267,7 @@ pub(crate) fn tool_execution_mode(name: &str) -> ExecutionMode {
     }
 }
 
-pub(crate) fn tool_call_is_mutating(name: &str, args: &Value) -> bool {
+pub fn tool_call_is_mutating(name: &str, args: &Value) -> bool {
     match crate::tool_gate::canonical_tool_name(name) {
         Some("aft_safety") if matches!(args["op"].as_str(), Some("history" | "list")) => false,
         Some("ast_grep_replace") if args["dryRun"].as_bool() == Some(true) => false,

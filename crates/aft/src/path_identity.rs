@@ -1,6 +1,10 @@
 pub use aft_base::path_identity::*;
 
 #[cfg(test)]
+#[allow(unused_imports)]
+use std::path::{Path, PathBuf};
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn platform_temp_root_is_broad_but_tempdir_projects_are_narrow() {

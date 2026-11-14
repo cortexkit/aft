@@ -4,6 +4,19 @@ pub use aft_base::memory::*;
 use std::collections::BTreeMap;
 
 #[cfg(test)]
+#[allow(unused_imports)]
+use serde::Serialize;
+#[cfg(test)]
+#[allow(unused_imports)]
+use serde_json::Value;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::BTreeMap;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::Path;
+
+#[cfg(test)]
 mod snapshot_cap_tests {
     use super::*;
 

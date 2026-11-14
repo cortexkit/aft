@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub(crate) struct LockDiagnostics {
+pub struct LockDiagnostics {
     site_file: &'static str,
     origin: Instant,
     held_since_ms_plus_one: AtomicU64,

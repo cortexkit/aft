@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 static PROCESS_START_TIME_OVERRIDES: OnceLock<Mutex<HashMap<u32, Option<u64>>>> = OnceLock::new();
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn set_process_start_time_for_test(pid: u32, started_at_ms: Option<u64>) {
+pub fn set_process_start_time_for_test(pid: u32, started_at_ms: Option<u64>) {
     PROCESS_START_TIME_OVERRIDES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -22,7 +22,7 @@ pub(crate) fn set_process_start_time_for_test(pid: u32, started_at_ms: Option<u6
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn clear_process_start_time_for_test(pid: u32) {
+pub fn clear_process_start_time_for_test(pid: u32) {
     if let Some(overrides) = PROCESS_START_TIME_OVERRIDES.get() {
         overrides
             .lock()

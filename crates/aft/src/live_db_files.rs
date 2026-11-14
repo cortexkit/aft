@@ -1,6 +1,19 @@
 pub use aft_base::live_db_files::*;
 
 #[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::ffi::OsStr;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::{Mutex, OnceLock, RwLock};
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::{SqliteStore, TrackedConnection};

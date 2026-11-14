@@ -9,10 +9,10 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 /// Output kept from git's small answers (rev-parse, ls-tree) and stderr.
-pub(crate) const SMALL_OUTPUT_BYTES: usize = 64 * 1024;
+pub const SMALL_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// Where a git command's standard output goes, and how much of it is allowed.
-pub(crate) enum Sink {
+pub enum Sink {
     Memory { limit: u64 },
     File { file: std::fs::File, limit: u64 },
 }
@@ -36,7 +36,7 @@ pub(crate) struct GitOutput {
     pub(crate) stderr: Vec<u8>,
 }
 
-pub(crate) enum GitFailure {
+pub enum GitFailure {
     Spawn(std::io::Error),
     Timeout,
     TooLarge,
@@ -46,7 +46,7 @@ pub(crate) enum GitFailure {
 /// Run one read-only git command in `directory` under a deadline, killing it
 /// (and anything it started) when the deadline passes or its output grows
 /// past the sink's limit.
-pub(crate) fn bounded_git_bytes(
+pub fn bounded_git_bytes(
     directory: &Path,
     args: &[&str],
     deadline: Instant,
@@ -56,7 +56,7 @@ pub(crate) fn bounded_git_bytes(
     output.status.success().then_some(output.stdout)
 }
 
-pub(crate) fn run_git<I, S>(
+pub fn run_git<I, S>(
     directory: &Path,
     args: I,
     deadline: Instant,

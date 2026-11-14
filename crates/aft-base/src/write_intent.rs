@@ -57,7 +57,7 @@ fn notify(
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    static CLASSIFICATION_STATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static CLASSIFICATION_STATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn is_directory(path: &Path) -> bool {

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FailureKind {
+pub enum FailureKind {
     /// Git exited normally and no repository marker is visible on disk.
     NotRepository,
     /// A verified repository whose current branch has no commit yet.
@@ -20,13 +20,13 @@ pub(crate) enum FailureKind {
 }
 
 #[derive(Debug)]
-pub(crate) enum ProbeError {
+pub enum ProbeError {
     Spawn(io::Error),
     Failed { kind: FailureKind, output: Output },
 }
 
 /// A Git command whose diagnostics are always in the C locale.
-pub(crate) fn command() -> Command {
+pub fn command() -> Command {
     let mut builder = crate::effective_path::new_command("git");
     // These probes classify Git's diagnostic text, so an inherited translation
     // must not change it. Environment overrides go before `build` resolves
@@ -46,7 +46,7 @@ pub(crate) fn command() -> Command {
 
 /// Preserve the probes' ordinary output and unbounded wait, while observing the
 /// child on the calling thread. No new timeout or cancellation policy is added.
-pub(crate) fn supervised_output(command: &mut Command) -> io::Result<Output> {
+pub fn supervised_output(command: &mut Command) -> io::Result<Output> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -101,14 +101,14 @@ pub(crate) fn supervised_output(command: &mut Command) -> io::Result<Output> {
 /// `git rev-parse --show-toplevel`, run with `-C root` from AFT's own working
 /// directory.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn toplevel(root: &Path) -> Result<Vec<u8>, ProbeError> {
+pub fn toplevel(root: &Path) -> Result<Vec<u8>, ProbeError> {
     Probe::new(root, ChildDirectory::Inherited).run(&["rev-parse", "--show-toplevel"])
 }
 
 /// `git rev-parse --show-toplevel`, run with `root` as the child's working
 /// directory. A relative or empty PATH entry then finds `git` relative to
 /// `root`, as it does for any other command started in that folder.
-pub(crate) fn toplevel_in_directory(root: &Path) -> Result<Vec<u8>, ProbeError> {
+pub fn toplevel_in_directory(root: &Path) -> Result<Vec<u8>, ProbeError> {
     Probe::new(root, ChildDirectory::Root).run(&["rev-parse", "--show-toplevel"])
 }
 
@@ -120,14 +120,14 @@ pub(crate) fn repository_marker_or_uncertainty_in_directory(root: &Path) -> bool
 
 /// A probe run with `root` as the child's working directory; see
 /// [`toplevel_in_directory`].
-pub(crate) fn probe_in_directory(root: &Path, args: &[&str]) -> Result<Vec<u8>, ProbeError> {
+pub fn probe_in_directory(root: &Path, args: &[&str]) -> Result<Vec<u8>, ProbeError> {
     Probe::new(root, ChildDirectory::Root).run(args)
 }
 
 /// `git rev-list --max-parents=0 HEAD`, run with `-C root`. `spawned` grows by
 /// the number of Git processes actually started, including the extra checks
 /// that verify an unborn branch.
-pub(crate) fn root_commits(root: &Path, spawned: &mut usize) -> Result<Vec<u8>, ProbeError> {
+pub fn root_commits(root: &Path, spawned: &mut usize) -> Result<Vec<u8>, ProbeError> {
     let mut probe = Probe::new(root, ChildDirectory::Inherited);
     let result = probe.run(&["rev-list", "--max-parents=0", "HEAD"]);
     *spawned += probe.spawned;
@@ -135,7 +135,7 @@ pub(crate) fn root_commits(root: &Path, spawned: &mut usize) -> Result<Vec<u8>, 
 }
 
 /// Verify repository access and the current commit without walking its parents.
-pub(crate) fn head_commit(root: &Path, spawned: &mut usize) -> Result<Vec<u8>, ProbeError> {
+pub fn head_commit(root: &Path, spawned: &mut usize) -> Result<Vec<u8>, ProbeError> {
     let mut probe = Probe::new(root, ChildDirectory::Inherited);
     let result = probe.run(&["rev-parse", "--verify", "HEAD^{commit}"]);
     *spawned += probe.spawned;
@@ -498,7 +498,7 @@ impl Probe<'_> {
 /// Test fixture: a real repository whose HEAD file is corrupt, so Git rejects
 /// it and prints its ordinary absence message even though a repository exists.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn init_repository_with_corrupt_head_for_test(path: &Path) {
+pub fn init_repository_with_corrupt_head_for_test(path: &Path) {
     assert!(command()
         .args(["init", "--quiet"])
         .arg(path)
@@ -516,7 +516,7 @@ pub(crate) fn init_repository_with_corrupt_head_for_test(path: &Path) {
 /// - `submod/`: a submodule-style checkout (a `.git` file naming
 ///   `<root>/.git/modules/submod`), still walked.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) struct NestedWorktreeFixture {
+pub struct NestedWorktreeFixture {
     pub root: PathBuf,
     pub worktree: PathBuf,
     pub independent: PathBuf,
@@ -526,10 +526,7 @@ pub(crate) struct NestedWorktreeFixture {
 /// Test fixture: `root` becomes the repository above, with `marker` written
 /// into one committed source file. Asserts Git runs and every step succeeds.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn init_repo_with_nested_worktree_for_test(
-    root: &Path,
-    marker: &str,
-) -> NestedWorktreeFixture {
+pub fn init_repo_with_nested_worktree_for_test(root: &Path, marker: &str) -> NestedWorktreeFixture {
     assert!(
         crate::developer_tools::git_usable(),
         "nested-worktree fixtures need git"
@@ -592,7 +589,7 @@ pub(crate) fn init_repo_with_nested_worktree_for_test(
 /// Test fixture: a `.git` folder holding only `info/exclude` and no HEAD, which
 /// Git itself does not treat as a repository.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn write_stub_git_directory_for_test(path: &Path) {
+pub fn write_stub_git_directory_for_test(path: &Path) {
     let info = path.join(".git").join("info");
     std::fs::create_dir_all(&info).unwrap();
     std::fs::write(info.join("exclude"), "ignored/\n").unwrap();
@@ -614,7 +611,7 @@ thread_local! {
 
 /// Test fixture: an executable `git` stub in `directory` that prints `output`.
 #[cfg(all(any(test, feature = "test-support"), unix))]
-pub(crate) fn write_stub_git_for_test(directory: &Path, output: &str) {
+pub fn write_stub_git_for_test(directory: &Path, output: &str) {
     std::fs::create_dir_all(directory).unwrap();
     let stub = directory.join("git");
     crate::executable_cache::write_executable(
@@ -628,7 +625,7 @@ pub(crate) fn write_stub_git_for_test(directory: &Path, output: &str) {
 /// the effective PATH, so a `bin/git` stub wins only when the child starts in
 /// the folder that holds it.
 #[cfg(all(any(test, feature = "test-support"), unix))]
-pub(crate) fn relative_bin_path_for_test() -> OsString {
+pub fn relative_bin_path_for_test() -> OsString {
     let mut entries = vec![PathBuf::from("bin")];
     entries.extend(std::env::split_paths(
         crate::effective_path::effective_path(),
@@ -639,10 +636,7 @@ pub(crate) fn relative_bin_path_for_test() -> OsString {
 /// Runs `body` with extra child environment for every Git probe started on
 /// this thread, leaving AFT's own process environment untouched.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn with_child_env_for_test<R>(
-    overrides: &[(&str, &OsStr)],
-    body: impl FnOnce() -> R,
-) -> R {
+pub fn with_child_env_for_test<R>(overrides: &[(&str, &OsStr)], body: impl FnOnce() -> R) -> R {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {

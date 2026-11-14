@@ -56,7 +56,7 @@ const PANIC_TRUNCATION: &str = "\n[panic diagnostic truncated]";
 
 /// Standing-index plane recorded on every `index_event` line.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub(crate) enum IndexPlane {
+pub enum IndexPlane {
     Callgraph,
     Search,
     Semantic,
@@ -156,7 +156,7 @@ impl IndexEvent {
 /// Identity of one in-flight build attempt, carried on a thread-local so nested
 /// helpers such as `ensure_cold_build_current` can emit without extra params.
 #[derive(Clone, Debug)]
-pub(crate) struct IndexBuildScope {
+pub struct IndexBuildScope {
     pub plane: IndexPlane,
     pub build_id: String,
     pub root: PathBuf,
@@ -251,7 +251,7 @@ thread_local! {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn capture_log_lines<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+pub fn capture_log_lines<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
     let capture = Arc::new(Mutex::new(Vec::new()));
     let result = capture_log_lines_into(capture.clone(), f);
     let lines = capture.lock().unwrap().clone();
@@ -260,10 +260,7 @@ pub(crate) fn capture_log_lines<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
 
 /// Share a worker thread's captured records with the test while it is running.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn capture_log_lines_into<R>(
-    capture: Arc<Mutex<Vec<String>>>,
-    f: impl FnOnce() -> R,
-) -> R {
+pub fn capture_log_lines_into<R>(capture: Arc<Mutex<Vec<String>>>, f: impl FnOnce() -> R) -> R {
     // Keep the test representative of a libtest process where another test
     // may already have installed the global logger.
     let _ = env_logger::builder().is_test(true).try_init();
@@ -357,7 +354,7 @@ pub(crate) fn mint_index_build_id() -> String {
 }
 
 /// RAII install of the current index-build attempt on this thread.
-pub(crate) struct IndexBuildGuard {
+pub struct IndexBuildGuard {
     previous: Option<IndexBuildScope>,
 }
 
@@ -370,13 +367,13 @@ impl Drop for IndexBuildGuard {
 }
 
 /// Install `scope` as the current index-build attempt until the guard drops.
-pub(crate) fn install_index_build(scope: IndexBuildScope) -> IndexBuildGuard {
+pub fn install_index_build(scope: IndexBuildScope) -> IndexBuildGuard {
     let previous = CURRENT_INDEX_BUILD.with(|slot| slot.replace(Some(scope)));
     IndexBuildGuard { previous }
 }
 
 /// Emits `build_failed` if the attempt returns without a terminal event.
-pub(crate) struct IndexBuildFailureGuard {
+pub struct IndexBuildFailureGuard {
     armed: bool,
 }
 
@@ -410,12 +407,12 @@ impl Drop for IndexBuildFailureGuard {
     }
 }
 
-pub(crate) fn current_index_build() -> Option<IndexBuildScope> {
+pub fn current_index_build() -> Option<IndexBuildScope> {
     CURRENT_INDEX_BUILD.with(|slot| slot.borrow().clone())
 }
 
 /// Normalize a project root for `index_event` (`\` → `/`).
-pub(crate) fn normalize_index_root(root: &Path) -> String {
+pub fn normalize_index_root(root: &Path) -> String {
     root.to_string_lossy().replace('\\', "/")
 }
 
@@ -566,12 +563,12 @@ fn emit_index_event_line(line: String) {
 }
 
 /// Write one greppable `index_event` info line through the house slog path.
-pub(crate) fn log_index_event(event: IndexEvent) {
+pub fn log_index_event(event: IndexEvent) {
     remember_in_flight(&event);
     emit_index_event_line(format_index_event_line(&event));
 }
 
-pub(crate) fn log_watcher_rescan(
+pub fn log_watcher_rescan(
     root: &Path,
     reason: RescanReason,
     cost_ms: u64,
@@ -609,7 +606,7 @@ pub(crate) fn log_current_index_event(kind: IndexEventKind, extra: &[(&'static s
 }
 
 /// Release start waiters when a build attempt ends before emitting `build_started`.
-pub(crate) fn release_index_build_start_waiters(plane: IndexPlane, root: &Path) {
+pub fn release_index_build_start_waiters(plane: IndexPlane, root: &Path) {
     let waiters = INDEX_BUILD_START_SIGNALS
         .lock()
         .ok()
@@ -667,13 +664,7 @@ pub(crate) fn claim_first_query(
 }
 
 /// Query-path helper: claim `first_query` on a ready plane, or attribute a Building wait.
-pub(crate) fn note_index_query(
-    plane: IndexPlane,
-    root: &Path,
-    tool: &str,
-    service_ms: u64,
-    status: &str,
-) {
+pub fn note_index_query(plane: IndexPlane, root: &Path, tool: &str, service_ms: u64, status: &str) {
     match status {
         "building" | "rebuilding" => {
             let build_id = in_flight_build_id(plane, root);
@@ -687,7 +678,7 @@ pub(crate) fn note_index_query(
 }
 
 /// Reset causal-wait state on the executor worker at job admission.
-pub(crate) fn reset_tool_call_wait() {
+pub fn reset_tool_call_wait() {
     TOOL_CALL_WAIT.with(|slot| *slot.borrow_mut() = ToolCallWaitState::default());
 }
 
@@ -701,11 +692,11 @@ pub(crate) fn note_tool_call_wait(waiting_on: WaitingOn, build_id: Option<&str>,
     });
 }
 
-pub(crate) fn note_tool_call_queue_ms(queue_ms: u64) {
+pub fn note_tool_call_queue_ms(queue_ms: u64) {
     TOOL_CALL_WAIT.with(|slot| slot.borrow_mut().queue_ms = queue_ms);
 }
 
-pub(crate) fn take_tool_call_wait() -> (WaitingOn, Option<String>, u64) {
+pub fn take_tool_call_wait() -> (WaitingOn, Option<String>, u64) {
     TOOL_CALL_WAIT.with(|slot| {
         let state = std::mem::take(&mut *slot.borrow_mut());
         (state.waiting_on, state.waiting_on_build_id, state.wait_ms)
@@ -786,7 +777,7 @@ pub(crate) struct EditPhaseTimer {
 }
 
 /// Start timing `phase` on this thread; see [`EditPhaseTimer`].
-pub(crate) fn time_edit_phase(phase: EditPhase) -> EditPhaseTimer {
+pub fn time_edit_phase(phase: EditPhase) -> EditPhaseTimer {
     EDIT_PHASES.with(|slot| {
         let mut times = slot.borrow_mut();
         times.depth[phase.index()] = times.depth[phase.index()].saturating_add(1);
@@ -813,7 +804,7 @@ impl Drop for EditPhaseTimer {
 }
 
 /// Clear this thread's edit phase times at the start of a tool call.
-pub(crate) fn reset_edit_phase_times() {
+pub fn reset_edit_phase_times() {
     EDIT_PHASES.with(|slot| {
         let mut times = slot.borrow_mut();
         times.elapsed = [Duration::ZERO; 7];
@@ -824,7 +815,7 @@ pub(crate) fn reset_edit_phase_times() {
 /// This thread's edit phase times since the last reset, rendered as
 /// `backup:1,write:0,format:0,syntax:12,validate:0,diff:3,lsp:0` (whole
 /// milliseconds), or `None` when the call ran no edit step. Clears them.
-pub(crate) fn take_edit_phase_times() -> Option<String> {
+pub fn take_edit_phase_times() -> Option<String> {
     EDIT_PHASES.with(|slot| {
         let mut times = slot.borrow_mut();
         if !times.touched {
@@ -848,7 +839,7 @@ pub(crate) fn take_edit_phase_times() -> Option<String> {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn capture_index_events<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+pub fn capture_index_events<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
     let _serial = INDEX_EVENT_CAPTURE_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -947,7 +938,7 @@ fn init_with_stderr_mode(subc: bool) {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn subc_stderr_tee_for_test() -> impl Write + Send {
+pub fn subc_stderr_tee_for_test() -> impl Write + Send {
     TeeWriter::new(None)
 }
 
@@ -992,7 +983,7 @@ fn install_panic_hook(initial_path: PathBuf) {
 }
 
 /// The process log follows storage-root reconfiguration, not a caller's project.
-pub(crate) fn daemon_log_path() -> PathBuf {
+pub fn daemon_log_path() -> PathBuf {
     let root = FILE_CONTROL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1006,7 +997,7 @@ pub(crate) fn daemon_log_path() -> PathBuf {
 /// Best-effort watchdog evidence, independent of the logger and writer locks.
 /// Reopen for each line so normal log rotation does not strand later evidence
 /// on a renamed file. The caller must write its guaranteed stderr copy first.
-pub(crate) fn write_watchdog_line(path: &Path, message: &str) -> io::Result<()> {
+pub fn write_watchdog_line(path: &Path, message: &str) -> io::Result<()> {
     let mut line = Vec::new();
     write_log_line(
         &mut line,
@@ -1020,7 +1011,7 @@ pub(crate) fn write_watchdog_line(path: &Path, message: &str) -> io::Result<()> 
 
 /// The standalone gh shim runs before logger initialization. Preserve its rare
 /// authority diagnostics in the process log without adding agent-visible stderr.
-pub(crate) fn write_preinit_warning(message: &str) -> io::Result<()> {
+pub fn write_preinit_warning(message: &str) -> io::Result<()> {
     write_preinit_warning_to(&daemon_log_path(), message)
 }
 
@@ -2320,12 +2311,12 @@ pub enum ToolCallCaller {
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    static SLOW_TOOL_CALL_CAPTURE: RefCell<Vec<(log::Level, String)>> =
+    pub static SLOW_TOOL_CALL_CAPTURE: RefCell<Vec<(log::Level, String)>> =
         const { RefCell::new(Vec::new()) };
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn take_slow_tool_call_logs_for_test() -> Vec<String> {
+pub fn take_slow_tool_call_logs_for_test() -> Vec<String> {
     SLOW_TOOL_CALL_CAPTURE.with(|captured| {
         captured
             .borrow_mut()

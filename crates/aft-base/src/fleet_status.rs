@@ -210,7 +210,7 @@ fn register_dial_client(inner: &Arc<FleetStatusInner>) {
 
 /// The holder routes the status dials stopped reopening after a terminal
 /// refusal, one row per route, for the health report's `stopped_routes`.
-pub(crate) fn stopped_routes_snapshot() -> Value {
+pub fn stopped_routes_snapshot() -> Value {
     let mut clients = DIAL_CLIENTS.lock();
     clients.retain(|client| client.strong_count() > 0);
     Value::Array(
@@ -260,7 +260,7 @@ impl RouteOpenFailure {
 }
 
 #[derive(Clone)]
-pub(crate) struct FleetStatusClient {
+pub struct FleetStatusClient {
     inner: Arc<FleetStatusInner>,
 }
 
@@ -510,7 +510,7 @@ pub async fn connect_subc_consumer(
     crate::subc::registration::connect_consumer(connection_file, options).await
 }
 
-pub(crate) fn spawn_fleet_status_dial(
+pub fn spawn_fleet_status_dial(
     connection_file: &Path,
     capacity: usize,
 ) -> (FleetStatusClient, JoinHandle<()>) {

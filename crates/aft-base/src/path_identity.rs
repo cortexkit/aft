@@ -52,7 +52,7 @@ pub fn project_scope_key(project_root: &Path) -> String {
 
 /// Inputs are canonical policy identities, including home aliases and native
 /// volume roots. Exclude system trees, root-level folders and all home ancestors.
-pub(crate) fn directory_scope_is_narrow(directory: &Path, home: &Path, volume: &Path) -> bool {
+pub fn directory_scope_is_narrow(directory: &Path, home: &Path, volume: &Path) -> bool {
     project_root_path_is_narrow(directory, home, volume)
         && directory.parent().and_then(Path::parent).is_some()
         && directory.parent() != Some(volume)
@@ -376,11 +376,7 @@ fn source_root_is_home_like(source_root: &Path, home: Option<&Path>) -> bool {
 /// Bind mounts can preserve a protected directory's identity without preserving
 /// its path spelling. Device/inode checks also catch same-device volume aliases.
 #[cfg(unix)]
-pub(crate) fn directory_is_protected_alias(
-    directory: &Path,
-    home: &Path,
-    volume: &Path,
-) -> Option<bool> {
+pub fn directory_is_protected_alias(directory: &Path, home: &Path, volume: &Path) -> Option<bool> {
     if protected_directory_alias(directory, home, volume)? {
         return Some(true);
     }
@@ -411,7 +407,7 @@ fn protected_directory_alias(_directory: &Path, _home: &Path, _volume: &Path) ->
 }
 
 #[cfg(not(unix))]
-pub(crate) fn directory_is_protected_alias(
+pub fn directory_is_protected_alias(
     _directory: &Path,
     _home: &Path,
     _volume: &Path,
@@ -432,7 +428,7 @@ fn hash16(path: &Path) -> String {
 /// relative parents remain significant; rooted paths cannot escape their root.
 /// This is not containment validation, and comparison callers apply any
 /// Windows verbatim-prefix policy before passing their path here.
-pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
+pub fn lexical_normalize(path: &Path) -> PathBuf {
     use std::path::Component;
 
     let mut result = PathBuf::new();
@@ -453,7 +449,7 @@ pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
     result
 }
 
-pub(crate) fn normalize_path(path: &Path) -> PathBuf {
+pub fn normalize_path(path: &Path) -> PathBuf {
     // Strip Windows verbatim prefixes before component normalization so paths
     // that went through fs::canonicalize (\\?\C:\ form) compare equal to paths
     // that never did. The oxc engine's resolver applies the same rule; the two
@@ -471,7 +467,7 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
 /// verbatim (`\\?\C:\`) path, and mixing verbatim and non-verbatim forms in
 /// the same comparison is this subsystem's recurring bug class. Both branches
 /// route through [`normalize_path`].
-pub(crate) fn canonicalize_normalized(path: &Path) -> PathBuf {
+pub fn canonicalize_normalized(path: &Path) -> PathBuf {
     #[cfg(any(test, feature = "test-support"))]
     CANONICALIZE_CALLS.with(|calls| {
         if let Some(calls) = calls.borrow_mut().as_mut() {
@@ -486,5 +482,5 @@ pub(crate) fn canonicalize_normalized(path: &Path) -> PathBuf {
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    pub(crate) static CANONICALIZE_CALLS: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) };
+    pub static CANONICALIZE_CALLS: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) };
 }

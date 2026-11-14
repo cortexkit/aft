@@ -22,13 +22,13 @@ use diagnostics::{Failure, Stage};
 const UNAVAILABLE: &str = "secret.use transport unavailable";
 static CONNECTION_FILE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
 
-pub(crate) fn install_connection_file(path: &std::path::Path) {
+pub fn install_connection_file(path: &std::path::Path) {
     *CONNECTION_FILE
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path.to_owned());
 }
 
-pub(crate) fn for_current_command() -> Option<SubcSecretUseTransport> {
+pub fn for_current_command() -> Option<SubcSecretUseTransport> {
     let path = CONNECTION_FILE.read().ok()?.clone()?;
     if !path.is_file() {
         return None;
@@ -114,7 +114,7 @@ fn with_test_vault_principal(mut options: CallOptions, principal: ConsumerIdenti
 
 /// A held daemon-owned route on the existing vault transport. Closing it also
 /// closes its consumer so reconnects never leave an old watch subscribed.
-pub(crate) struct ManagementSession {
+pub struct ManagementSession {
     consumer: SubcConsumer,
     route: RouteHandle,
 }

@@ -68,6 +68,6 @@ pub(crate) fn classification(name: &str) -> Option<bool> {
     }
 }
 
-pub(crate) fn requires_database(name: &str) -> bool {
+pub fn requires_database(name: &str) -> bool {
     classification(name).unwrap_or(true)
 }

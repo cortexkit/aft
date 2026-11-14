@@ -1,6 +1,10 @@
 pub use aft_base::io_accounting::*;
 
 #[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn path_context_preserves_absence_and_retry_kinds() {

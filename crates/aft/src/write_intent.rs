@@ -1,6 +1,13 @@
 pub use aft_base::write_intent::*;
 
 #[cfg(test)]
+#[allow(unused_imports)]
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
