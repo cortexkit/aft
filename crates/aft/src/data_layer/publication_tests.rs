@@ -196,9 +196,22 @@ fn streamed_fixture_segment_equals_buffered_including_shared_fragments() {
     ] {
         let mut buffered = SectionsWriter::new(&fixture.inputs.state, &fixture.records, true, None);
         let mut streamed = SectionsWriter::new(&fixture.inputs.state, &fixture.records, true, None);
-        let workspace: Box<dyn aft_store::graph::Scratch> = Box::new(
-            aft_store::graph::LocalScratch::create(family_store.dir(), "fixture").unwrap(),
+        let build = Arc::new(
+            family_store
+                .try_write()
+                .unwrap()
+                .unwrap()
+                .create_scratch(
+                    aft_store::ids::CheckoutId::from_digest(aft_store::ids::Digest128::of(
+                        b"fixture",
+                    )),
+                    |_| Ok::<_, ()>(()),
+                )
+                .unwrap(),
         );
+        let workspace: Box<dyn aft_store::graph::Scratch> =
+            Box::new(build.subdir("graph").unwrap());
+        drop(build);
         let scratch = workspace.path().to_path_buf();
         let mut config = Config::new(budget);
         config.buffer_bytes = 128;

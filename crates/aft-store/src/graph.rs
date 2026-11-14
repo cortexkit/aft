@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 
 mod scratch;
 mod spill;
-pub use scratch::{LocalScratch, Scratch};
+pub use scratch::Scratch;
 pub use spill::{GraphSectionsSpill, PackedFragment};
 
 use crate::ids::Digest128;
@@ -665,8 +665,7 @@ mod tests {
         use crate::spill::{Config, WriteGuard};
         let dir = tempfile::tempdir().unwrap();
         let store = Family::open(&dir.path().join("store"), family()).unwrap();
-        let workspace: Box<dyn Scratch> =
-            Box::new(LocalScratch::create(store.dir(), "fixture").unwrap());
+        let workspace = scratch::for_test(&store.dir().join("builds"));
         let scratch = workspace.path().to_path_buf();
         let mut config = Config::new(128 * 1024);
         config.buffer_bytes = 1024;
@@ -752,8 +751,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let dir = tempfile::tempdir().unwrap();
         let store = Family::open(&dir.path().join("store"), family()).unwrap();
-        let workspace: Box<dyn Scratch> =
-            Box::new(LocalScratch::create(store.dir(), "fixture").unwrap());
+        let workspace = scratch::for_test(&store.dir().join("builds"));
         let scratch = workspace.path().to_path_buf();
         let low = Arc::new(AtomicBool::new(false));
         let check = low.clone();

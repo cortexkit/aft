@@ -57,8 +57,9 @@ struct Placed {
     slice: (u8, u32, u32),
 }
 
-/// Private scratch is removed on drop. AFT calls `LocalScratch::sweep` when
-/// binding a checkout to its store, reaping abandoned builds but not live ones.
+/// Writes into one folder of the build's shared workspace, which is removed
+/// once every builder holding it has dropped it. The family writer's startup
+/// sweep reaps the workspaces of builds whose process died, but not live ones.
 #[derive(Debug)]
 pub struct GraphSectionsSpill {
     data: Option<BufWriter<File>>,
@@ -468,14 +469,11 @@ mod tests {
     #[test]
     fn fragment_ranges_close_before_listing_and_refuse_corruption() {
         let root = tempfile::tempdir().unwrap();
-        let workspace = super::super::LocalScratch::create(root.path(), "fixture").unwrap();
+        let workspace = super::super::scratch::for_test(root.path());
         let path = workspace.path().to_path_buf();
-        let mut spill = GraphSectionsSpill::new(
-            Box::new(workspace),
-            Config::new(1 << 20),
-            WriteGuard::new(|| Ok(())),
-        )
-        .unwrap();
+        let mut spill =
+            GraphSectionsSpill::new(workspace, Config::new(1 << 20), WriteGuard::new(|| Ok(())))
+                .unwrap();
         for n in 0..65u32 {
             spill
                 .add(

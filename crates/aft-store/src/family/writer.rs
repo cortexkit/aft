@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::lease::{self, LeaseScan};
@@ -60,9 +61,71 @@ impl<E> std::fmt::Debug for BuildScratch<E> {
 }
 
 impl<E> BuildScratch<E> {
+    /// A workspace for a build that has no family to publish into, such as
+    /// a gate's or a test's, made under `parent` (created if missing). No
+    /// writer sweeps `parent`, so a workspace whose process ends without
+    /// dropping it stays there.
+    ///
+    /// # Errors
+    ///
+    /// When the directory or its owner lock cannot be created.
+    pub fn create_unattached(
+        parent: &Path,
+        admit: impl Fn(u64) -> Result<(), E> + Send + Sync + 'static,
+    ) -> Result<Self, FamilyError> {
+        private_dir_builder()
+            .recursive(true)
+            .create(parent)
+            .map_err(FamilyError::io(parent))?;
+        Self::create_in(parent, admit)
+    }
+
+    /// Makes a fresh workspace folder under `parent`, which must exist, and
+    /// takes its owner lock.
+    fn create_in(
+        parent: &Path,
+        admit: impl Fn(u64) -> Result<(), E> + Send + Sync + 'static,
+    ) -> Result<Self, FamilyError> {
+        let path = parent.join(lease::fresh_id().to_string());
+        private_dir_builder()
+            .create(&path)
+            .map_err(FamilyError::io(&path))?;
+        // Built before the owner file, so a failure below still removes the
+        // folder when `scratch` drops.
+        let mut scratch = BuildScratch {
+            path,
+            owner: None,
+            admit: Box::new(admit),
+        };
+        let owner_path = scratch.path.join("owner");
+        let owner =
+            crate::fs::create_new_private(&owner_path).map_err(FamilyError::io(&owner_path))?;
+        owner.lock().map_err(FamilyError::io(&owner_path))?;
+        scratch.owner = Some(owner);
+        Ok(scratch)
+    }
+
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Makes `name`, a folder of the workspace that one builder of the build
+    /// keeps its files in. The folder is removed with the rest of the
+    /// workspace, when the last holder of the workspace drops it, and the
+    /// returned handle is one such holder.
+    ///
+    /// # Errors
+    ///
+    /// When the folder cannot be made, including when another builder of
+    /// the build already made one of that name.
+    pub fn subdir(self: &Arc<Self>, name: &str) -> std::io::Result<ScratchDir<E>> {
+        let path = self.path.join(name);
+        private_dir_builder().create(&path)?;
+        Ok(ScratchDir {
+            workspace: Arc::clone(self),
+            path,
+        })
     }
 
     /// Asks the caller's storage admission policy before writing a run.
@@ -73,6 +136,47 @@ impl<E> BuildScratch<E> {
     pub fn check_space(&self, additional_bytes: u64) -> Result<(), E> {
         (self.admit)(additional_bytes)
     }
+}
+
+/// A builder's own folder inside a shared [`BuildScratch`]. Holding it keeps
+/// the whole workspace alive.
+pub struct ScratchDir<E> {
+    workspace: Arc<BuildScratch<E>>,
+    path: PathBuf,
+}
+
+impl<E> std::fmt::Debug for ScratchDir<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScratchDir")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<E> ScratchDir<E> {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The workspace this folder is in, for its disk admission check.
+    #[must_use]
+    pub fn workspace(&self) -> &Arc<BuildScratch<E>> {
+        &self.workspace
+    }
+}
+
+/// Folders only their owner can enter, where the platform has such modes.
+fn private_dir_builder() -> std::fs::DirBuilder {
+    let builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    let builder = {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = builder;
+        builder.mode(0o700);
+        builder
+    };
+    builder
 }
 
 impl<E> Drop for BuildScratch<E> {
@@ -172,6 +276,41 @@ mod build_scratch_tests {
         })();
         assert!(result.is_err());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn build_scratch_subdirs_share_one_workspace_until_the_last_holder_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = Arc::new(
+            BuildScratch::create_unattached(&dir.path().join("builds"), |bytes| {
+                if bytes <= 10 {
+                    Ok(())
+                } else {
+                    Err("disk floor")
+                }
+            })
+            .unwrap(),
+        );
+        let root = scratch.path().to_path_buf();
+        assert!(root.join("owner").is_file());
+        let text = scratch.subdir("text").unwrap();
+        let graph = scratch.subdir("graph").unwrap();
+        assert_eq!(text.path(), root.join("text"));
+        assert_eq!(graph.path(), root.join("graph"));
+        assert!(
+            scratch.subdir("text").is_err(),
+            "two builders never share one folder"
+        );
+        assert_eq!(graph.workspace().check_space(11), Err("disk floor"));
+        std::fs::write(text.path().join("run"), b"partial").unwrap();
+        drop(scratch);
+        drop(text);
+        assert!(
+            root.join("text").join("run").exists(),
+            "a remaining holder keeps every folder of the workspace"
+        );
+        drop(graph);
+        assert!(!root.exists());
     }
 }
 
@@ -387,16 +526,7 @@ impl<'f> WriteSession<'f> {
             .dir
             .join("builds")
             .join(checkout.to_string());
-        let builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        let builder = {
-            use std::os::unix::fs::DirBuilderExt;
-            let mut builder = builder;
-            builder.mode(0o700);
-            builder
-        };
-        let mut parents = builder;
-        parents
+        private_dir_builder()
             .recursive(true)
             .create(&parent)
             .map_err(FamilyError::io(&parent))?;
@@ -408,22 +538,7 @@ impl<'f> WriteSession<'f> {
                 ));
             }
         }
-        let path = parent.join(lease::fresh_id().to_string());
-        parents
-            .recursive(false)
-            .create(&path)
-            .map_err(FamilyError::io(&path))?;
-        let mut scratch = BuildScratch {
-            path,
-            owner: None,
-            admit: Box::new(admit),
-        };
-        let owner_path = scratch.path.join("owner");
-        let owner =
-            crate::fs::create_new_private(&owner_path).map_err(FamilyError::io(&owner_path))?;
-        owner.lock().map_err(FamilyError::io(&owner_path))?;
-        scratch.owner = Some(owner);
-        Ok(scratch)
+        BuildScratch::create_in(&parent, admit)
     }
 
     /// Finishes a segment and stages it for publication.

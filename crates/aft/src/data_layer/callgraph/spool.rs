@@ -1,93 +1,20 @@
-//! A cold build's scratch workspace, and the spool that keeps each file's
-//! pass-2/3 resolution on disk until pass 4 has read every file's.
+//! The spool that keeps each file's pass-2/3 resolution on disk until pass 4
+//! has read every file's.
 //!
-//! The workspace is `<family>/builds/<checkout>/<build-id>/`, outside the
-//! writer's `tmp/`, with an `owner` file the build keeps locked while it
-//! lives, so a later sweep can tell a dead build's workspace from a live
-//! one. Spooled files go under its `runs/`, each written once under a new
-//! name, closed before anything refers to it, and checked against its
-//! length and checksum when read back.
+//! It writes into its own `runs/` folder of the build's shared workspace
+//! ([`BuildScratch`]), which owns the folder's cleanup, owner lock and disk
+//! admission. Each spooled file is written once under a new name, closed
+//! before anything refers to it, and checked against its length and
+//! checksum when read back.
 
 use std::fs::File;
 use std::io::{BufWriter, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::Arc;
 
-/// A cold build's scratch folder, deleted with everything in it when the
-/// build drops it.
-pub(crate) struct BuildWorkspace {
-    dir: PathBuf,
-    /// Locked for the workspace's life; dropped before the folder is
-    /// deleted, since Windows deletes no open file.
-    owner: Option<File>,
-    next_run: std::sync::atomic::AtomicU64,
-}
+use aft_store::family::{BuildScratch, ScratchDir};
 
-impl BuildWorkspace {
-    /// A new workspace for one build of `checkout` in the store at
-    /// `family_dir`.
-    pub(crate) fn create(family_dir: &Path, checkout: &str) -> std::io::Result<Self> {
-        Self::create_in(&family_dir.join("builds").join(checkout))
-    }
-
-    /// A new workspace for a build that has no store, such as a gate's or a
-    /// test's, in the system's temporary folder.
-    pub(crate) fn temporary() -> std::io::Result<Self> {
-        Self::create_in(&std::env::temp_dir().join("aft-callgraph-builds"))
-    }
-
-    fn create_in(parent: &Path) -> std::io::Result<Self> {
-        std::fs::create_dir_all(parent)?;
-        let dir = parent.join(fresh_id());
-        std::fs::create_dir(&dir)?;
-        std::fs::create_dir(dir.join("runs"))?;
-        let owner = File::create_new(dir.join("owner"))?;
-        if let Err(error) = owner.try_lock() {
-            let _ = std::fs::remove_dir_all(&dir);
-            return Err(std::io::Error::other(format!(
-                "the build workspace {} could not be locked: {error}",
-                dir.display()
-            )));
-        }
-        Ok(Self {
-            dir,
-            owner: Some(owner),
-            next_run: std::sync::atomic::AtomicU64::new(1),
-        })
-    }
-
-    /// A path under `runs/` no file of this workspace has had.
-    fn new_run(&self, kind: &str) -> PathBuf {
-        let number = self
-            .next_run
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.dir.join("runs").join(format!("{kind}-{number}"))
-    }
-}
-
-impl Drop for BuildWorkspace {
-    fn drop(&mut self) {
-        drop(self.owner.take());
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// A name no other workspace of the checkout has: the process, the time and
-/// a counter, hashed.
-fn fresh_id() -> String {
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&std::process::id().to_le_bytes());
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    hasher.update(&now.as_nanos().to_le_bytes());
-    hasher.update(
-        &COUNTER
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            .to_le_bytes(),
-    );
-    hasher.finalize().to_hex()[..16].to_string()
-}
+use super::super::checkout::DataError;
 
 /// One spooled range: its file and what reading it back must find.
 struct SpoolRange {
@@ -100,22 +27,32 @@ struct SpoolRange {
 
 /// Encoded per-file resolutions, one file per range of files written in
 /// order, read back a range at a time.
-pub(crate) struct ResolutionSpool<'w> {
-    workspace: &'w BuildWorkspace,
+pub(crate) struct ResolutionSpool {
+    dir: ScratchDir<DataError>,
     ranges: Vec<SpoolRange>,
 }
 
-impl<'w> ResolutionSpool<'w> {
-    pub(crate) fn new(workspace: &'w BuildWorkspace) -> Self {
-        Self {
-            workspace,
+impl ResolutionSpool {
+    /// A spool in a new `runs/` folder of `workspace`; a workspace holds one.
+    pub(crate) fn new(workspace: &Arc<BuildScratch<DataError>>) -> std::io::Result<Self> {
+        Ok(Self {
+            dir: workspace.subdir("runs")?,
             ranges: Vec::new(),
-        }
+        })
     }
 
-    /// Writes `entries` as the next range, returning its number.
+    /// Writes `entries` as the next range, returning its number. The
+    /// workspace's disk admission is asked first, for the range's bytes.
     pub(crate) fn write_range(&mut self, entries: &[Vec<u8>]) -> std::io::Result<usize> {
-        let path = self.workspace.new_run("resolutions");
+        let bytes = entries.iter().map(|entry| entry.len() as u64).sum();
+        self.dir
+            .workspace()
+            .check_space(bytes)
+            .map_err(std::io::Error::other)?;
+        let path = self
+            .dir
+            .path()
+            .join(format!("resolutions-{}", self.ranges.len() + 1));
         let mut hasher = blake3::Hasher::new();
         let mut lengths = Vec::with_capacity(entries.len());
         let mut total = 0u64;
@@ -190,16 +127,29 @@ impl<'w> ResolutionSpool<'w> {
 mod tests {
     use super::*;
 
+    fn workspace(
+        dir: &std::path::Path,
+        admit: impl Fn(u64) -> Result<(), DataError> + Send + Sync + 'static,
+    ) -> Arc<BuildScratch<DataError>> {
+        Arc::new(BuildScratch::create_unattached(dir, admit).unwrap())
+    }
+
     #[test]
     fn a_spooled_range_reads_back_as_written_and_a_changed_one_fails() {
-        let workspace = BuildWorkspace::temporary().unwrap();
-        let dir = workspace.dir.clone();
+        let root = tempfile::tempdir().unwrap();
+        let workspace = workspace(root.path(), |_| Ok(()));
+        let dir = workspace.path().to_path_buf();
         assert!(dir.join("owner").is_file());
-        let mut spool = ResolutionSpool::new(&workspace);
+        let mut spool = ResolutionSpool::new(&workspace).unwrap();
+        drop(workspace);
         let first = spool
             .write_range(&[b"one".to_vec(), Vec::new(), b"three".to_vec()])
             .unwrap();
         let second = spool.write_range(&[b"four".to_vec()]).unwrap();
+        assert_eq!(
+            spool.ranges[second].path,
+            dir.join("runs").join("resolutions-2")
+        );
         assert_eq!(
             spool.read_range(first).unwrap(),
             [b"one".to_vec(), Vec::new(), b"three".to_vec()]
@@ -211,7 +161,33 @@ mod tests {
         std::fs::write(&spool.ranges[second].path, b"four!").unwrap();
         assert!(spool.read_range(second).is_err());
         drop(spool);
-        drop(workspace);
-        assert!(!dir.exists());
+        assert!(
+            !dir.exists(),
+            "the spool held the last handle on the workspace"
+        );
+    }
+
+    #[test]
+    fn a_range_the_disk_floor_refuses_is_not_written() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = workspace(root.path(), |bytes| {
+            if bytes <= 4 {
+                Ok(())
+            } else {
+                Err(DataError::DiskFloor("below the floor".to_string()))
+            }
+        });
+        let mut spool = ResolutionSpool::new(&workspace).unwrap();
+        spool.write_range(&[b"four".to_vec()]).unwrap();
+        let error = spool.write_range(&[b"five!".to_vec()]).unwrap_err();
+        assert!(error.to_string().contains("below the floor"), "{error}");
+        assert_eq!(spool.ranges.len(), 1);
+        assert_eq!(
+            std::fs::read_dir(workspace.path().join("runs"))
+                .unwrap()
+                .count(),
+            1,
+            "only the admitted range is on disk"
+        );
     }
 }

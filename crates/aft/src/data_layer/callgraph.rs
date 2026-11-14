@@ -46,8 +46,6 @@ use crate::callgraph_store::{
 mod site_records;
 mod spool;
 
-pub(crate) use spool::BuildWorkspace;
-
 use super::graph_rows::references_by_key;
 use super::graph_store::StoredSlices;
 
@@ -1235,7 +1233,15 @@ pub(crate) fn resolve_checkout(
     // none of them go.
     let mut copy = inputs.clone();
     let mut resolved = BTreeMap::new();
-    let workspace = BuildWorkspace::temporary().map_err(spool_error)?;
+    // With no store to build into, the spool's workspace goes in the
+    // system's temporary folder.
+    let workspace = Arc::new(
+        aft_store::family::BuildScratch::create_unattached(
+            &std::env::temp_dir().join("aft-callgraph-builds"),
+            |_| Ok::<_, super::checkout::DataError>(()),
+        )
+        .map_err(|error| ManifestJoinError::Parse(format!("spooled resolutions: {error}")))?,
+    );
     resolve_checkout_into(&mut copy, threads, None, &workspace, &mut |_, files| {
         resolved.extend(files);
         Ok(())
@@ -1284,7 +1290,7 @@ pub(crate) fn resolve_checkout_into(
     inputs: &mut CheckoutInputs,
     threads: usize,
     mut memory: Option<&mut Vec<(String, usize)>>,
-    workspace: &BuildWorkspace,
+    workspace: &Arc<aft_store::family::BuildScratch<super::checkout::DataError>>,
     sink: &mut (dyn FnMut(&CheckoutInputs, Vec<(String, FileResolution)>) -> Result<(), ManifestJoinError>
               + Send),
 ) -> Result<BuildCensus, ManifestJoinError> {
@@ -1338,7 +1344,7 @@ pub(crate) fn resolve_checkout_into(
         // Each batch's encoded resolutions go to the spool, one range per
         // batch, and come back a batch at a time in pass 4, which visits the
         // files in the same batches.
-        let mut spool = spool::ResolutionSpool::new(workspace);
+        let mut spool = spool::ResolutionSpool::new(workspace).map_err(spool_error)?;
         let mut sites = Vec::with_capacity(paths.len());
         #[cfg(feature = "test-hooks")]
         super::refresh_probe::stage("resolution");

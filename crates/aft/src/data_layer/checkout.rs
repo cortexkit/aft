@@ -948,8 +948,6 @@ impl Checkout {
     ) -> Result<Self, DataError> {
         let checkout = CheckoutId::from_digest(Digest128::of(root.as_os_str().as_encoded_bytes()));
         let family = Family::open(family_dir, family).map_err(DataError::store)?;
-        aft_store::graph::LocalScratch::sweep(family.dir())
-            .map_err(|error| DataError::Store(error.to_string()))?;
         let live = Arc::new(RwLock::new(Live::default()));
         {
             let mut bound = layer.bound.lock().expect("no panics while holding it");
@@ -1640,10 +1638,15 @@ impl Checkout {
             .checkout(self.checkout)
             .cloned();
         let started = Instant::now();
+        // The build's one workspace: the text index's posting runs, the
+        // graph sections' spill and the resolutions spool each keep their
+        // own folder in it, and it is removed once the last of them is done.
+        let paused = DiskPause::default();
+        let scratch = self.build_scratch_noting(Arc::clone(&paused))?;
         let sink = BuildSink {
             skip_text: !self.planes.text,
             stored: self.stored_records()?,
-            ..BuildSink::new(self.text_build()?)
+            ..BuildSink::new(TextBuild::new(Arc::clone(&scratch), self.family.id()))
         };
         #[cfg(feature = "test-hooks")]
         super::refresh_probe::stage("extraction");
@@ -1753,10 +1756,10 @@ impl Checkout {
             Some(encoded),
         );
         let workspace = Box::new(
-            aft_store::graph::LocalScratch::create(self.family.dir(), &self.checkout.to_string())
+            scratch
+                .subdir("graph")
                 .map_err(|error| DataError::Store(error.to_string()))?,
         );
-        let dir = self.family.dir().to_path_buf();
         let estimate = inputs
             .state
             .paths()
@@ -1766,16 +1769,11 @@ impl Checkout {
             .saturating_mul(8);
         let reserve = Arc::new(std::sync::atomic::AtomicU64::new(estimate));
         let remaining = reserve.clone();
-        let paused = Arc::new(Mutex::new(None));
-        let disk_pause = paused.clone();
+        let admission = Arc::clone(&scratch);
         let guard = aft_store::spill::WriteGuard::new(move || {
-            match check_disk_floor_at(&dir, remaining.load(std::sync::atomic::Ordering::Relaxed)) {
-                Err(DataError::DiskFloor(message)) => {
-                    *disk_pause.lock().expect("disk pause lock") = Some(message.clone());
-                    Err(std::io::Error::other(message))
-                }
-                result => result.map_err(std::io::Error::other),
-            }
+            admission
+                .check_space(remaining.load(std::sync::atomic::Ordering::Relaxed))
+                .map_err(std::io::Error::other)
         });
         let mut config = aft_store::spill::Config::new(256 << 20);
         // A wide merge keeps ordinary large builds at one 25-byte run copy
@@ -1799,17 +1797,11 @@ impl Checkout {
             })?;
         spill.estimate_space(inputs.parses.len(), estimate, reserve);
         sections.stream(spill);
-        // Build scratch lives until this build publishes or stands down.
-        let workspace =
-            super::callgraph::BuildWorkspace::create(self.family.dir(), &self.checkout.to_string())
-                .map_err(|error| {
-                    DataError::Resolve(format!("the build workspace could not be made: {error}"))
-                })?;
         let _census = super::callgraph::resolve_checkout_into(
             &mut inputs,
             self.layer.threads,
             measure.then_some(&mut report.memory),
-            &workspace,
+            &scratch,
             &mut |inputs, files| {
                 sections
                     .add_batch(inputs, files)
@@ -2184,6 +2176,9 @@ fn check_disk_floor_at(dir: &Path, additional: u64) -> Result<(), DataError> {
     )))
 }
 
+/// The disk-floor refusal a build workspace's admission last made, if any.
+type DiskPause = Arc<Mutex<Option<String>>>;
+
 fn graph_spill_error(error: DataError, paused: &Mutex<Option<String>>) -> DataError {
     paused
         .lock()
@@ -2196,10 +2191,25 @@ impl Checkout {
     pub(super) fn build_scratch(
         &self,
     ) -> Result<Arc<aft_store::family::BuildScratch<DataError>>, DataError> {
+        self.build_scratch_noting(DiskPause::default())
+    }
+
+    /// The one workspace of a build, shared by every builder that spills to
+    /// disk. Its disk admission is the build's free-disk floor, and each
+    /// refusal is also kept in `paused`: a builder that reports a refusal
+    /// in its own words still fails the build with the floor's pause.
+    fn build_scratch_noting(
+        &self,
+        paused: DiskPause,
+    ) -> Result<Arc<aft_store::family::BuildScratch<DataError>>, DataError> {
         let dir = self.family.dir().to_path_buf();
         self.writer()?
             .create_scratch(self.checkout, move |bytes| {
-                check_disk_floor_at(&dir, bytes)
+                let result = check_disk_floor_at(&dir, bytes);
+                if let Err(DataError::DiskFloor(message)) = &result {
+                    *paused.lock().expect("disk pause lock") = Some(message.clone());
+                }
+                result
             })
             .map(Arc::new)
             .map_err(DataError::store)

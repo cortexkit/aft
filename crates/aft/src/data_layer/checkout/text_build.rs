@@ -2,7 +2,7 @@
 //! source ordinals survive a spill; resolution never holds a posting builder.
 
 use super::*;
-use aft_store::family::BuildScratch;
+use aft_store::family::{BuildScratch, ScratchDir};
 use aft_store::ids::{SegmentId, WriterIncarnation};
 use aft_store::segment::{SegmentMeta, SegmentWriter};
 
@@ -16,6 +16,9 @@ const UNIT_BYTES: usize = 128;
 
 pub(super) struct TextBuild {
     scratch: Arc<BuildScratch<DataError>>,
+    /// The build workspace's `text/` folder, made when the first run is
+    /// written.
+    dir: Option<ScratchDir<DataError>>,
     family: FamilyId,
     current: TextSectionsBuilder,
     held: usize,
@@ -28,6 +31,7 @@ impl TextBuild {
     pub(super) fn new(scratch: Arc<BuildScratch<DataError>>, family: FamilyId) -> Self {
         Self {
             scratch,
+            dir: None,
             family,
             current: TextSectionsBuilder::new(),
             held: 0,
@@ -93,7 +97,15 @@ impl TextBuild {
         self.scratch
             .check_space((self.held as u64).saturating_mul(8))?;
         let source = self.runs.len();
-        let path = self.scratch.path().join(format!("text-{source}.seg"));
+        let dir = match &self.dir {
+            Some(dir) => dir,
+            None => self.dir.insert(
+                self.scratch
+                    .subdir("text")
+                    .map_err(|error| DataError::Store(error.to_string()))?,
+            ),
+        };
+        let path = dir.path().join(format!("text-{source}.seg"));
         let mut writer = SegmentWriter::create(
             &path,
             SegmentMeta {
@@ -308,8 +320,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut bounded = build(&dir.path().join("family"), 1);
         let scratch = bounded.scratch.path().to_path_buf();
+        bounded
+            .add_unindexed(ContentKey::of(b"w"), 1, TextStatus::Binary)
+            .unwrap();
         // Force create_new to refuse a run, rather than simulating success.
-        std::fs::write(scratch.join("text-0.seg"), b"occupied").unwrap();
+        std::fs::write(scratch.join("text").join("text-1.seg"), b"occupied").unwrap();
         assert!(bounded
             .add_unindexed(ContentKey::of(b"x"), 1, TextStatus::Binary)
             .is_err());
@@ -329,7 +344,7 @@ mod tests {
             .unwrap()
             .create_scratch(
                 CheckoutId::from_digest(Digest128::of(b"checkout")),
-                move |bytes| Checkout::check_disk_space(&path, bytes),
+                move |bytes| check_disk_floor_at(&path, bytes),
             )
             .unwrap();
         let mut bounded = TextBuild::new(Arc::new(scratch), family.id());
