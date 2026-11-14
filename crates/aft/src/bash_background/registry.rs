@@ -1706,6 +1706,9 @@ pub(crate) struct BgTask {
     persisted_hard_kill_ms: AtomicU64,
     pub(crate) last_reminder_at: Mutex<Option<Instant>>,
     pub(crate) terminal_at: Mutex<Option<Instant>>,
+    /// Terminal launcher images cannot be created again. Once removal or an
+    /// absent image is confirmed, later cleanup passes need no task/IO probes.
+    terminal_image_cleaned: AtomicBool,
     /// Serialize terminal notification routing, including watch safety nets.
     /// Delivery acknowledgement remains separate so pending results can replay.
     terminal_notification_routed: Mutex<bool>,
@@ -6103,6 +6106,7 @@ impl BgTaskRegistry {
             persisted_hard_kill_ms: AtomicU64::new(timeout_ms.unwrap_or(0)),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
+            terminal_image_cleaned: AtomicBool::new(false),
             terminal_notification_routed: Mutex::new(false),
             notice_registry: Mutex::new(None),
             exit_marker_probe: Mutex::new(Default::default()),
@@ -6557,6 +6561,7 @@ impl BgTaskRegistry {
             persisted_hard_kill_ms: AtomicU64::new(timeout_ms.unwrap_or(0)),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
+            terminal_image_cleaned: AtomicBool::new(false),
             terminal_notification_routed: Mutex::new(false),
             notice_registry: Mutex::new(None),
             exit_marker_probe: Mutex::new(Default::default()),
@@ -6929,6 +6934,7 @@ impl BgTaskRegistry {
             persisted_hard_kill_ms: AtomicU64::new(timeout_ms.unwrap_or(0)),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
+            terminal_image_cleaned: AtomicBool::new(false),
             terminal_notification_routed: Mutex::new(false),
             notice_registry: Mutex::new(None),
             exit_marker_probe: Mutex::new(Default::default()),
@@ -10353,6 +10359,7 @@ impl BgTaskRegistry {
                 }
             }
         }
+        super::watchdog::record_cleanup_work(|work| work.gc_requests += requested.len());
         for root in requested {
             crate::tool_output::cleanup_expired(&root, super::watchdog::FINISHED_RETENTION);
             self.request_persisted_gc(&root);
@@ -11622,6 +11629,7 @@ impl BgTaskRegistry {
             let budget = queue.len().min(super::gc_cursor::GC_ENTRY_BUDGET);
             (0..budget).filter_map(|_| queue.pop_front()).collect()
         };
+        super::watchdog::record_cleanup_work(|work| work.queue_entries += candidates.len());
         let mut image_cleanup = task_image_cleanup::ImageCleanupPass::default();
         for task_id in candidates {
             let Some(task) = self.task(&task_id) else {
@@ -13945,6 +13953,7 @@ impl BgTaskRegistry {
             persisted_hard_kill_ms: AtomicU64::new(persisted_hard_kill_ms),
             last_reminder_at: Mutex::new(suppress_replayed_running_reminder.then(Instant::now)),
             terminal_at: Mutex::new(metadata.finished_at.map(started_instant_from_unix_millis)),
+            terminal_image_cleaned: AtomicBool::new(false),
             terminal_notification_routed: Mutex::new(terminal_already_delivered),
             notice_registry: Mutex::new(None),
             exit_marker_probe: Mutex::new(Default::default()),

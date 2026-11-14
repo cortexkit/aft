@@ -21,6 +21,82 @@ pub(super) fn cleanup_pass_counts_for_test() -> (usize, usize) {
         CLEANUP_COMPLETED.load(Ordering::SeqCst),
     )
 }
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct CleanupWork {
+    pub registries: usize,
+    pub queue_entries: usize,
+    pub image_probes: usize,
+    /// Entries for task scratch directories kept after exit, counting both
+    /// the deletion-deadline scan and the scan for unmeasured directory sizes.
+    pub scratch_entries: usize,
+    /// Storage-root requests, whether spawned or covered by an existing sweep.
+    pub gc_requests: usize,
+}
+
+thread_local! {
+    // Only the short-lived periodic cleanup worker installs these counters.
+    // Watchdog/replay calls and the separate persisted-GC thread do not count.
+    static CLEANUP_WORK: std::cell::Cell<Option<CleanupWork>> = const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn record_cleanup_work(update: impl FnOnce(&mut CleanupWork)) {
+    CLEANUP_WORK.with(|cell| {
+        if let Some(mut work) = cell.get() {
+            update(&mut work);
+            cell.set(Some(work));
+        }
+    });
+}
+
+#[derive(Default)]
+struct CleanupPass {
+    started: Option<Instant>,
+    previous: Option<CleanupWork>,
+    speech: Duration,
+    scratch: Duration,
+    finished: Duration,
+    gc_request: Duration,
+}
+
+impl CleanupPass {
+    fn start() -> Self {
+        Self {
+            started: Some(Instant::now()),
+            previous: CLEANUP_WORK.with(|cell| cell.replace(Some(CleanupWork::default()))),
+            ..Self::default()
+        }
+    }
+
+    fn summary(&self, elapsed: Duration, work: CleanupWork) -> Option<String> {
+        if elapsed <= Duration::from_millis(250) {
+            return None;
+        }
+        let other =
+            elapsed.saturating_sub(self.speech + self.scratch + self.finished + self.gc_request);
+        let ms = |duration: Duration| duration.as_secs_f64() * 1000.0;
+        Some(format!(
+            "bash periodic cleanup elapsed_ms={:.3} speech_ms={:.3} scratch_ms={:.3} finished_ms={:.3} gc_request_ms={:.3} other_ms={:.3} registries={} queue_entries={} image_probes={} scratch_entries={} gc_requests={}",
+            ms(elapsed), ms(self.speech), ms(self.scratch), ms(self.finished), ms(self.gc_request), ms(other),
+            work.registries, work.queue_entries, work.image_probes, work.scratch_entries, work.gc_requests,
+        ))
+    }
+}
+
+impl Drop for CleanupPass {
+    fn drop(&mut self) {
+        let work = CLEANUP_WORK
+            .with(|cell| cell.replace(self.previous))
+            .unwrap_or_default();
+        if let Some(summary) = self
+            .started
+            .and_then(|started| self.summary(started.elapsed(), work))
+        {
+            log::info!("{summary}");
+        }
+    }
+}
+
 /// How long periodic passes leave an exited PTY task to its reader's wake.
 /// The reader normally reaches end-of-file right after the child exits, but a
 /// background grandchild can keep the terminal open, so after this the
@@ -351,15 +427,25 @@ fn scheduler() -> &'static crossbeam_channel::Sender<std::sync::Weak<super::regi
                                 move || {
                                     #[cfg(test)]
                                     CLEANUP_STARTED.fetch_add(1, Ordering::SeqCst);
+                                    let mut pass = CleanupPass::start();
+                                    let step = Instant::now();
                                     crate::gh_shim_speech::start_view::sweep_queued();
+                                    pass.speech += step.elapsed();
                                     for inner in registries
                                         .into_iter()
                                         .filter_map(|registry| registry.upgrade())
                                     {
                                         let registry = BgTaskRegistry { inner };
+                                        record_cleanup_work(|work| work.registries += 1);
+                                        let step = Instant::now();
                                         registry.sweep_retained_scratch();
+                                        pass.scratch += step.elapsed();
+                                        let step = Instant::now();
                                         registry.cleanup_finished(FINISHED_RETENTION);
+                                        pass.finished += step.elapsed();
+                                        let step = Instant::now();
                                         registry.request_recurring_persisted_gc();
+                                        pass.gc_request += step.elapsed();
                                     }
                                     #[cfg(test)]
                                     CLEANUP_COMPLETED.fetch_add(1, Ordering::SeqCst);
@@ -520,6 +606,66 @@ fn prefer_pending_wake(selected: WatchdogPassCause, wake_rx: &Receiver<()>) -> W
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_pass_reports_only_slow_passes_with_phase_durations_and_work() {
+        let pass = CleanupPass {
+            speech: Duration::from_millis(10),
+            scratch: Duration::from_millis(20),
+            finished: Duration::from_millis(30),
+            gc_request: Duration::from_millis(40),
+            ..CleanupPass::default()
+        };
+        let work = CleanupWork {
+            registries: 2,
+            queue_entries: 128,
+            image_probes: 3,
+            scratch_entries: 4,
+            gc_requests: 5,
+        };
+        assert!(pass.summary(Duration::from_millis(250), work).is_none());
+        let report = pass.summary(Duration::from_millis(300), work).unwrap();
+        for field in [
+            "elapsed_ms=300.000",
+            "speech_ms=10.000",
+            "scratch_ms=20.000",
+            "finished_ms=30.000",
+            "gc_request_ms=40.000",
+            "other_ms=200.000",
+            "registries=2",
+            "queue_entries=128",
+            "image_probes=3",
+            "scratch_entries=4",
+            "gc_requests=5",
+        ] {
+            assert!(report.contains(field), "missing {field}: {report}");
+        }
+    }
+
+    #[test]
+    fn cleanup_pass_counts_only_work_on_its_own_thread_and_restores_scope() {
+        assert!(CLEANUP_WORK.with(|cell| cell.get().is_none()));
+        record_cleanup_work(|work| work.image_probes += 100);
+        {
+            let _pass = CleanupPass::start();
+            record_cleanup_work(|work| work.queue_entries += 7);
+            std::thread::spawn(|| record_cleanup_work(|work| work.image_probes += 100))
+                .join()
+                .unwrap();
+            {
+                let _nested = CleanupPass::start();
+                record_cleanup_work(|work| work.image_probes += 2);
+                assert_eq!(
+                    CLEANUP_WORK.with(|cell| cell.get().unwrap().image_probes),
+                    2
+                );
+            }
+            let work = CLEANUP_WORK.with(|cell| cell.get().unwrap());
+            assert_eq!(work.queue_entries, 7);
+            assert_eq!(work.image_probes, 0);
+        }
+        assert!(CLEANUP_WORK.with(|cell| cell.get().is_none()));
+    }
 
     #[test]
     fn a_tick_pass_with_a_pending_wake_counts_as_a_wake_pass() {

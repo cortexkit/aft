@@ -2349,7 +2349,7 @@ fn watchdog_cost_live_shaped_cleanup_measurement() {
         eprintln!("CLEANUP frequency elapsed_s={:.3} finishing_tasks=33 started={} completed={}", wall.elapsed().as_secs_f64(), after.0 - before.0, after.1 - before.1);
         assert_eq!(after.0 - before.0, 1);
         assert_eq!(after.1 - before.1, 1);
-        registry.detach();
+        phase("detach", || registry.detach());
         while persisted_gc_slots().lock().unwrap().values().any(|slot| slot.running) {
             assert!(Instant::now() < deadline + Duration::from_secs(120), "persisted GC did not finish after frequency measurement");
             std::thread::sleep(Duration::from_millis(10));
