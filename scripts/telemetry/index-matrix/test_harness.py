@@ -276,6 +276,70 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(result["query_latency"][0]["build"], "callgraph")
         self.assertIsNone(result["query_latency"][0]["p50_ns"])
 
+    def test_process_exit_before_census_is_not_a_deadline(self):
+        from types import SimpleNamespace
+        client = SimpleNamespace(proc=SimpleNamespace(poll=lambda: 23), guard_measurement=None, close=lambda: None)
+        sampler = SimpleNamespace(start=lambda: None, stop=lambda: None, hwm_available=True, peak_rss_hwm_kb=10,
+                                  peak_rss_kb=10, cpu_seconds=0.01, cpu_precision="0.01-second", disk_write_bytes=0, gaps=[])
+        phases = SimpleNamespace(start=lambda: None, stop=lambda: None, samples=[], gaps=[])
+        args = SimpleNamespace(guard_gib=48, cgroup_parent=None, timeout_s=86400)
+        with patch.object(RUN, "Client", return_value=client), patch.object(RUN.OSS, "ProcessSampler", return_value=sampler), \
+             patch.object(RUN.OSS, "PhaseSampler", return_value=phases), patch.object(RUN, "configure"), \
+             patch.object(RUN, "wait_ready", return_value={}):
+            result = RUN.measure_build(Path("/binary"), self.root, self.root / "early-exit", "full", args)
+        self.assertEqual(result["outcome"], "exited_before_census")
+        self.assertEqual(result["exit_status"], 23)
+        self.assertNotIn("deadline_s", result)
+        self.assertTrue((self.root / "early-exit/build.json").is_file())
+
+    def test_interrupted_query_file_is_retired_before_a_complete_replay(self):
+        from types import SimpleNamespace
+        class Fake:
+            def __init__(self, *args):
+                pass
+            def request(self, *args, **kwargs):
+                return {"success": True}
+            def close(self):
+                pass
+        prior = '{"op":"callers","latency_ns":999}\n'
+        (self.root / "queries.jsonl").write_text(prior)
+        args = SimpleNamespace(guard_gib=48, cgroup_parent=None, drop_caches=False, timeout_s=30, warm_repetitions=1, query_timeout_s=10)
+        with patch.object(RUN, "Client", Fake), patch.object(RUN, "wait_ready"):
+            result = RUN.measure_queries(Path("/default"), self.root, self.root,
+                                         {"top_callers": [{"path": "a.rs", "symbol": "run", "callers": 5}]}, args, mode="callgraph")
+        self.assertEqual(result["samples"], 6)
+        self.assertEqual(len((self.root / "queries.jsonl").read_text().splitlines()), 6)
+        retired = list(self.root.glob("queries-retired-*.jsonl"))
+        self.assertEqual(len(retired), 1)
+        self.assertEqual(retired[0].read_text(), prior)
+
+    def test_completed_query_batch_is_retained_on_minor_revision(self):
+        from types import SimpleNamespace
+        entry = {"repository": "owner/repo", "commit": "a" * 40}
+        directory = self.root / "results/owner--repo"
+        for mode in ("text", "callgraph"):
+            for name in ("build.json", "status.jsonl", "memory-census.jsonl", "phase-memory.csv", "ready-status.json"):
+                RUN.save(directory / "old" / mode / name, {})
+        query_path = directory / "old/callgraph/queries.jsonl"
+        query_path.write_text('{"latency_ns":7}\n')
+        old = {"attempt": "old", "plan_revision": "meaning-nine-v2", "completed": True,
+               "fingerprint": {"binary_sha256": "same", "guard_gib": 48, "harness_sha256": "old"},
+               "text": {"outcome": "ready"}, "callgraph": {"outcome": "ready"},
+               "queries": {"outcome": "measured", "build": "callgraph", "samples": 1, "artifact": "old/callgraph/queries.jsonl"}}
+        RUN.save(directory / "result.json", old)
+        args = SimpleNamespace(results=self.root / "results", phases=["text", "callgraph"], query_build="callgraph",
+                               plan_revision="meaning-nine-v2.1", aft_binary=Path("/default"), shape_binary=Path("/shape"))
+        identity = {**old["fingerprint"], "harness_sha256": "new", "phases": args.phases, "query_build": args.query_build, "plan_revision": args.plan_revision}
+        with patch.object(RUN, "fingerprint", return_value=identity), patch.object(RUN, "checkout", return_value=self.root), \
+             patch.object(RUN, "disk_bytes", return_value=123), patch.object(RUN, "measure_build") as builds, patch.object(RUN, "measure_queries") as queries:
+            self.assertTrue(RUN.run_repository(entry, args))
+            builds.assert_not_called()
+            queries.assert_not_called()
+        result = json.loads((directory / "result.json").read_text())
+        self.assertEqual(result["queries"]["samples"], 1)
+        self.assertEqual(result["queries_this_revision"]["outcome"], "retained")
+        self.assertEqual(query_path.read_text(), '{"latency_ns":7}\n')
+
     def test_build_deadline_is_terminal_and_preserves_raw_evidence(self):
         from types import SimpleNamespace
         client = SimpleNamespace(proc=object(), guard_measurement=None, close=lambda: None)

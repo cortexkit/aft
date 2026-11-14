@@ -14,7 +14,8 @@ import subprocess
 import sys
 
 HERE = Path(__file__).resolve().parent
-REVISION = "meaning-nine-v2"
+REVISION = "meaning-nine-v2.1"
+POLICY_REVISION = "meaning-nine-v2"
 FINISHED = {"ml-explore/mlx", "neovim/neovim", "Perl/perl5", "apache/superset", "ethereum/solidity", "ziglang/zig"}
 MEANING = {"microsoft/vscode", "elastic/elasticsearch", "kubernetes/kubernetes"}
 
@@ -59,12 +60,14 @@ def drive(manifest_path, results, arguments, revision=REVISION):
             raise ValueError("matrix inputs changed within this revision; use a new revision or results directory")
         plan = previous_plan
     else:
-        if previous_plan and (previous_plan.get("revision") not in (None, "all-meaning-v1") or
+        if previous_plan and (previous_plan.get("revision") not in (None, "all-meaning-v1", POLICY_REVISION) or
                               previous_plan["identity"]["manifest_sha256"] != identity["manifest_sha256"] or
                               previous_plan["identity"]["arguments"] != arguments):
-            raise ValueError("only an explicit unchanged-input v1 to meaning-nine-v2 transition is supported")
+            raise ValueError("only explicit unchanged-input v1/v2 to v2.1 transitions are supported")
+        if previous_plan and previous_plan.get("revision") == POLICY_REVISION and previous_plan.get("projects") != projects:
+            raise ValueError("v2.1 may not change the nine-meaning phase policy")
         plan = {"started_at": previous_plan["started_at"] if previous_plan else now(),
-                "revised_at": now(), "revision": revision, "identity": identity,
+                "revised_at": now(), "revision": revision, "policy_revision": POLICY_REVISION, "identity": identity,
                 "order": [row["repository"] for row in projects], "projects": projects,
                 "previous_plans": [previous_plan] if previous_plan else [],
                 "retired_partial_attempts": previous_plan.get("retired_partial_attempts", []) if previous_plan else [],

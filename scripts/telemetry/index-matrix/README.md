@@ -65,7 +65,7 @@ payloads and submodules are not populated, matching a plain shallow checkout.
 
 ## Run one repository or the whole matrix
 
-Run from the AFT repository root. Use `matrix.py --revision meaning-nine-v2`
+Run from the AFT repository root. Use `matrix.py --revision meaning-nine-v2.1`
 for the approved matrix phase plan, not an unfiltered standalone `run.py` call.
 `--repository` on `run.py` selects one exact manifest name. A results-directory
 lock prevents overlapping invocations. Keep results and checkouts under ignored
@@ -83,7 +83,7 @@ RSS overrun. Lower `--guard-gib` on a smaller host; it can never exceed 48.
 ```sh
 python3 scripts/telemetry/index-matrix/run.py \
   --repository neovim/neovim --phases callgraph --query-build none \
-  --plan-revision meaning-nine-v2 \
+  --plan-revision meaning-nine-v2.1 \
   --aft-binary target/aft-default --shape-binary target/aft-shape \
   --aft-source-commit "$(git rev-parse HEAD)" \
   --shape-source-commit "$(git rev-parse HEAD)" \
@@ -97,7 +97,8 @@ python3 -m unittest discover -s scripts/telemetry/index-matrix -p 'test_*.py' -v
 
 Reissue the same command to resume. A completed result is skipped only when its
 manifest entry, binary/runtime/harness hashes, commits and measurement parameters
-match. The explicit v1-to-`meaning-nine-v2` transition retains prior ready
+match. Explicit transitions from `all-meaning-v1` or `meaning-nine-v2` to
+implementation `meaning-nine-v2.1` retain prior ready
 observations only when binary/runtime hashes, commits, guards, deadlines, cache
 policy and manifest entry match; original result JSON is saved under `history/`.
 Other changed inputs require a new results directory. Incomplete attempts
@@ -169,12 +170,17 @@ The 30 s polling probe observed completion at 240.0028163800016 s (an upper boun
 not exact clone CPU time). This is practical within the 360 GB disk budget.
 The manifest independently pins Chromium's subsequently observed default head.
 
-## Revised matrix: meaning-nine-v2
+## Revised matrix: meaning-nine-v2.1
 
 The original series started at **2026-11-13T23:30:40.416178Z** and was stopped
 cleanly at **2026-11-14T05:33:09Z** to apply the nine-project meaning budget.
-The service remains `aft-index-matrix.service`; remote/local result paths are
-unchanged. `matrix-plan.json` records the revision, per-project phase plans,
+The phase policy remains `meaning-nine-v2`; implementation revision
+`meaning-nine-v2.1` also distinguishes process exit before census export from a
+24-hour deadline. It preserves the exit status and raw evidence. On a query retry,
+the incomplete batch is renamed to `queries-retired-*.jsonl` and replayed whole;
+only the new `queries.jsonl` contributes percentiles. Completed batches with
+identical inputs are retained without replay. The service remains
+`aft-index-matrix.service`; remote/local result paths are unchanged. `matrix-plan.json` records the revision, per-project phase plans,
 revised UTC time, source/input hashes and previous plan. Existing results are
 retained, with phase-specific artifact paths and revision labels in the tables.
 
@@ -204,8 +210,10 @@ build deadline records `deadline`, preserves evidence, and moves on. Terminal
 VmHWM remains empty if `/proc` has disappeared; cgroup peak includes charged file
 cache and is not substituted for process RSS.
 
-Before restarting, the cost estimate was **about 28.5–41.9 billed hours total,
+The phase-policy restart estimate was **about 28.5–41.9 billed hours total,
 €10.7–15.7 at €0.3758/h** (using eight already-billed hours conservatively).
+For the minor implementation restart, allowing ten hours already billed gives
+**about 30.5–43.9 hours total, €11.5–16.5**, still below the €45 stop threshold.
 Remaining meaning work is 105,163 tracked files, projecting 2.0–11.4 h from the
 measured Superset/Zig rates. Callgraph work is 1,450,239 tracked-file units,
 projecting 10.5–14.5 h from Elasticsearch's 5:23/7:47 probes and assumed 9k/18k
@@ -229,7 +237,7 @@ systemd-run --unit=aft-index-matrix --collect \
   --property=TimeoutStopSec=60 \
   --setenv=ORT_DYLIB_PATH=/root/onnx/onnxruntime-linux-x64-1.24.4/lib/libonnxruntime.so \
   /usr/bin/python3 scripts/telemetry/index-matrix/matrix.py \
-  --revision meaning-nine-v2 --results /root/aft/target/index-matrix/full-matrix -- \
+  --revision meaning-nine-v2.1 --results /root/aft/target/index-matrix/full-matrix -- \
   --aft-binary /root/aft-default --shape-binary /root/aft-shape \
   --aft-source-commit 0672e983c119ab0e24cb4492c47c8c54f0e4127e \
   --shape-source-commit c1efafc8eb15b81e972ca80a895887e0fe45317c \

@@ -31,6 +31,13 @@ def load_module(name, path):
 OSS = load_module("index_matrix_oss", HERE.parent / "oss-matrix.py")
 
 
+class ExitedBeforeCensus(RuntimeError):
+    def __init__(self, status):
+        self.status = status
+        super().__init__(f"AFT exited with status {status} after ready but before census export")
+
+
+
 def save(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -267,8 +274,11 @@ def measure_build(binary, root, folder, mode, args):
         if census:
             export_deadline = deadline
             while not census.exists():
-                if client.proc.poll() is not None or time.monotonic() >= export_deadline:
+                if time.monotonic() >= export_deadline:
                     raise OSS.BudgetExceeded("census export deadline exceeded")
+                exit_status = client.proc.poll()
+                if exit_status is not None:
+                    raise ExitedBeforeCensus(exit_status)
                 time.sleep(0.25)
         save(folder / "ready-status.json", status)
         result["outcome"] = "ready"
@@ -278,6 +288,11 @@ def measure_build(binary, root, folder, mode, args):
             result["store_allocated_bytes"] = disk_bytes(Path(store), allocated=True)
         else:
             result["gaps"].append("status did not expose an existing data_store_dir")
+    except ExitedBeforeCensus as error:
+        result["outcome"] = "exited_before_census"
+        result["exit_status"] = error.status
+        result["reason"] = str(error)
+        result["wall_ns"] = time.monotonic_ns() - started
     except OSS.BudgetExceeded as error:
         result["outcome"] = "deadline"
         result["reason"] = str(error)
@@ -357,6 +372,15 @@ def measure_queries(binary, root, folder, artifact, args, mode="full"):
     if not top:
         return {"outcome": "not_measured", "reason": "no callable symbols in census"}
     samples = []
+    query_path = folder / "queries.jsonl"
+    if query_path.exists():
+        # A retry is a complete new query batch. Keep the interrupted batch as
+        # evidence, but never pool its samples into the new percentiles.
+        token = str(time.time_ns())
+        query_path.rename(folder / ("queries-retired-" + token + ".jsonl"))
+        summary = folder / "query-summary.json"
+        if summary.exists():
+            summary.rename(folder / ("query-summary-retired-" + token + ".json"))
     env = isolated_environment(folder)
     guard = args.guard_gib * 1024 ** 3
     for operation in ("callers", "impact", "trace_to"):
@@ -517,7 +541,11 @@ def run_repository(entry, args):
         result["queries_this_revision"] = {"outcome": "skipped", "reason": "callgraph-only addition; previous query observations retained"}
     else:
         mode = args.query_build
-        if result.get(mode, {}).get("outcome") == "ready":
+        query = result.get("queries", {})
+        existing_query_path = folder / query["artifact"] if query.get("artifact") else None
+        if query.get("outcome") == "measured" and query.get("build") == mode and existing_query_path and existing_query_path.is_file():
+            result["queries_this_revision"] = {"outcome": "retained", "reason": "completed query batch with identical measurement inputs retained"}
+        elif result.get(mode, {}).get("outcome") == "ready":
             try:
                 directory = folder / artifacts[mode]
                 artifact = validate_shape(json.loads((directory / "call-shape.json").read_text()))
