@@ -17642,15 +17642,6 @@ fn skip_refused_task(task_id: &str, operation: &str, error: &std::io::Error) -> 
     }
 }
 
-fn task_artifacts_exist(session_dir: &Path, task_id: &str) -> bool {
-    std::iter::once(session_dir.join(task_id))
-        .chain(
-            ["json", "stdout", "stderr", "pty", "exit"]
-                .map(|suffix| session_dir.join(format!("{task_id}.{suffix}"))),
-        )
-        .any(|path| fs::symlink_metadata(path).is_ok())
-}
-
 fn replay_task_layout_is_absent(session_dir: &Path, task_id: &str) -> bool {
     // Flat-layout artifacts also count as surviving task data. Only explicit
     // NotFound results prove absence; permission errors must not permit deletion.
