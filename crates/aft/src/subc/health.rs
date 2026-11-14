@@ -2515,6 +2515,10 @@ fn priority_health_field(field: &str, value: &Value) -> bool {
             | "embedding_backend"
             | "durable_log"
             | "dispatch_liveness"
+            // Per-site large-read counts are the production evidence for
+            // sizing search's memory budget; they are already a bounded
+            // summary, so they outrank individual root rows.
+            | "large_reads"
     ) || (field == "lsp" && value.get("applicability_totals").is_some())
 }
 
@@ -10726,11 +10730,9 @@ mod tests {
                 );
                 assert!(encoded.len() <= HEALTH_METRICS_BUDGET_BYTES);
                 assert_eq!(metrics["metrics_bytes"], encoded.len() as u64);
-                // Large-read telemetry yields before root detail, even when the path still needs abbreviation.
-                assert_eq!(
-                    metrics["large_reads"],
-                    json!({"omitted": true, "bytes": serde_json::to_vec(&large_reads).unwrap().len()})
-                );
+                // Large-read telemetry is a priority section: the root's path is
+                // abbreviated instead of dropping it.
+                assert_eq!(metrics["large_reads"], large_reads);
                 assert_eq!(metrics["root_details_omitted"], 0);
                 let root = &metrics["roots"][0];
                 assert_eq!(root["abbreviated"], true);
@@ -10923,10 +10925,11 @@ mod tests {
             encoded.len()
         );
         assert_eq!(metrics["actor_count"], 71);
-        // Large-read telemetry yields before any root rows; its all-site counters have separate summary tests.
+        // Large-read telemetry is a priority section: ordinary ready root rows
+        // yield before it, even with every site at its widest.
         assert_eq!(
             metrics["large_reads"],
-            json!({"omitted": true, "bytes": serde_json::to_vec(&crate::large_read::widest_health_for_test()).unwrap().len()})
+            crate::large_read::widest_health_for_test()
         );
         assert_eq!(metrics["root_count"], 71);
         assert!(metrics["embedding_backend"].is_object());
