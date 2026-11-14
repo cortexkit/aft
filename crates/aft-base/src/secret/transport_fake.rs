@@ -28,7 +28,7 @@ use super::super::wire::Coverage;
 use super::super::wire::Target;
 
 const GOLDENS: &str = include_str!("../../../aft/tests/fixtures/secret/secret-use-v1.jsonl");
-pub(crate) const NONCE: &str = "fake-aft-launch-nonce";
+pub const NONCE: &str = "fake-aft-launch-nonce";
 
 type PendingKey = (String, String, String, String, String);
 
@@ -45,7 +45,7 @@ fn invalid() -> Value {
 }
 
 #[derive(Default)]
-pub(crate) struct State {
+pub struct State {
     pub opens: Vec<Value>,
     pub calls: usize,
     pub params: Vec<Value>,
@@ -70,7 +70,7 @@ pub(crate) struct State {
 }
 
 #[derive(Clone)]
-pub(crate) struct Record {
+pub struct Record {
     pub name: String,
     pub host: String,
     pub path: String,
@@ -347,7 +347,7 @@ fn valid_path(path: &str) -> bool {
     })
 }
 
-pub(crate) struct FakeClaustrum {
+pub struct FakeClaustrum {
     _directory: tempfile::TempDir,
     pub path: PathBuf,
     pub state: Arc<Mutex<State>>,

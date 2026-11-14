@@ -12,7 +12,7 @@ autotests = false
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)', 'cfg(aft_fake_lsp_helper)'] }
 
 [features]
-test-support = ["dep:tempfile", "dep:filetime"]
+test-support = ["dep:tempfile", "dep:filetime", "dep:crc32fast", "dep:subc-transport"]
 callgraph-shape-census = []
 test-hooks = []
 test-timing-hooks = []
@@ -30,6 +30,7 @@ parking_lot = "0.12"
 portable-pty = "0.9"
 libc = "0.2"
 getrandom = "0.3"
+crc32fast = { version = "1", optional = true }
 ignore = "0.4"
 regex = "1"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
@@ -65,6 +66,7 @@ htmd = "0.5.4"
 markup5ever_rcdom = "0.38"
 cortexkit-role-tool-provider = "=0.15.7"
 subc-protocol = "=0.35.0"
+subc-transport = { version = "=0.16.0", optional = true }
 subc-client-rs = "=0.35.0"
 subc-os = "=0.1.30"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
@@ -94,6 +96,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+crc32fast = "1"
 tempfile = "3"
 filetime = "0.2"
 subc-transport = "=0.16.0"

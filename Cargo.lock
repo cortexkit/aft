@@ -29,6 +29,7 @@ dependencies = [
  "bytes",
  "cortexkit-paths",
  "cortexkit-role-tool-provider",
+ "crc32fast",
  "crossbeam-channel",
  "env_logger",
  "filetime",

@@ -440,6 +440,6 @@ impl SecretUseTransport for SubcSecretUseTransport {
 #[cfg_attr(not(test), allow(dead_code, unused_imports))]
 pub mod tests;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[path = "transport_fake.rs"]
-pub(crate) mod fake;
+pub mod fake;
