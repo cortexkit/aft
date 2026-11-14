@@ -167,15 +167,22 @@ impl GraphSectionsSpill {
                 .len
                 .saturating_add((data.len() + slice.len()) as u64)
                 .saturating_add(self.term_count.saturating_mul(25));
-            let projected = output.saturating_mul(space.files).div_ceil(completed);
+            // Early completion order is parallel and can start with one
+            // unusually large file. Use the source estimate until there is
+            // a representative batch, rather than extrapolating that outlier.
+            let projected = if completed >= (space.files / 32).max(32) {
+                output
+                    .saturating_mul(space.files)
+                    .div_ceil(completed)
+                    .saturating_mul(3)
+            } else {
+                0
+            };
             let written = self
                 .len
                 .saturating_add(self.terms.as_ref().expect("sorter").stats().disk_bytes);
             space.remaining.store(
-                space
-                    .baseline
-                    .max(projected.saturating_mul(3))
-                    .saturating_sub(written),
+                space.baseline.max(projected).saturating_sub(written),
                 Ordering::Relaxed,
             );
         }

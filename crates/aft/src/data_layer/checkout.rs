@@ -1777,6 +1777,13 @@ impl Checkout {
         // A wide merge keeps ordinary large builds at one 25-byte run copy
         // per term while its readers still fit well inside the fixed budget.
         config.fan_in = 128;
+        #[cfg(feature = "callgraph-shape-census")]
+        if let Some(bytes) = std::env::var("AFT_GRAPH_SPILL_BUDGET_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            config.memory_budget = bytes.max(1 << 20);
+        }
         let mut spill = aft_store::graph::GraphSectionsSpill::new(workspace, config, guard)
             .map_err(|error| {
                 graph_spill_error(
