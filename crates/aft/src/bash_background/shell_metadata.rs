@@ -32,15 +32,7 @@ pub(crate) fn current() -> Option<ShellCall> {
     CURRENT.with(|slot| slot.borrow().clone())
 }
 
-fn changes() -> &'static tokio::sync::watch::Sender<u64> {
-    static CHANGES: std::sync::OnceLock<tokio::sync::watch::Sender<u64>> =
-        std::sync::OnceLock::new();
-    CHANGES.get_or_init(|| tokio::sync::watch::channel(0).0)
-}
-
-pub(crate) fn changed() {
-    changes().send_modify(|revision| *revision = revision.wrapping_add(1));
-}
+pub(crate) use crate::db::bash_tasks::changed;
 
 // A watchdog wakeup alone does not imply changed database facts.
 // Advance the cache generation only when task metadata is persisted.
@@ -55,6 +47,4 @@ pub(crate) fn facts_revision() -> u64 {
     FACTS_REVISION.load(std::sync::atomic::Ordering::Acquire)
 }
 
-pub(crate) fn subscribe() -> tokio::sync::watch::Receiver<u64> {
-    changes().subscribe()
-}
+pub(crate) use crate::db::bash_tasks::subscribe;

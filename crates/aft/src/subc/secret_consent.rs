@@ -879,7 +879,6 @@ pub(crate) fn use_label_for_fetch(
     }
 }
 
-#[cfg(test)]
 use crate::context::call_context::current_call_scopes;
 pub(crate) use crate::context::call_context::{current_secret_consent_context, SecretScopeGuard};
 
@@ -937,7 +936,9 @@ impl SecretIdentityGuard {
         let audit_scope = identity
             .as_ref()
             .and_then(|identity| identity.scope.as_ref().map(SecretScope::from_stamp));
-        let consent_context = identity.as_ref().map(|identity| (identity.project_root.clone(), identity.session.clone()));
+        let consent_context = identity
+            .as_ref()
+            .map(|identity| (identity.project_root.clone(), identity.session.clone()));
         Self {
             previous: CURRENT_IDENTITY.with(|slot| slot.replace(identity)),
             _context: crate::context::call_context::install_identity(consent_context, audit_scope),

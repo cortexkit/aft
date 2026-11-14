@@ -221,7 +221,9 @@ fn shells_v1_local_store_writer_generations_cover_insert_update_delete_and_rollb
     upsert_bash_task(&conn, &row).unwrap();
     changed(&|| {
         assert_eq!(
-            prune_terminal_rows(&conn, i64::MAX / 2, 5).unwrap().removed,
+            crate::bash_background::persistence::prune_terminal_rows(&conn, i64::MAX / 2, 5)
+                .unwrap()
+                .removed,
             1
         );
     });

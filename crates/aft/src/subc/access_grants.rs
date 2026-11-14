@@ -54,11 +54,9 @@ fn head_source(
     // still has an exact grant time, even when its head's authority is older.
     Ok(Some(GrantSource::Unknown))
 }
-use crate::access_policy::{
-    AccessGrant, AccessOperation, AccessPolicy, GrantKind, HeadPolicy,
-};
-use crate::policy_path::policy_path;
+use crate::access_policy::{AccessGrant, AccessOperation, AccessPolicy, GrantKind, HeadPolicy};
 use crate::db::access_grants::{self as store, ScopeKey};
+use crate::policy_path::policy_path;
 
 fn refusal(code: &str, message: impl Into<String>) -> subc_protocol::ErrorBody {
     subc_protocol::ErrorBody::new(code, message.into())

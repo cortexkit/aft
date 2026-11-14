@@ -1,5 +1,5 @@
 use super::clean_old_for_test as clean_old;
-use super::prepare_cache_root_for_test as prepare_cache_root;
+use crate::reader_floor::prepare_cache_root_for_test as prepare_cache_root;
 
 #[test]
 fn missing_reader_floor_registration_refuses_storage_preparation() {
@@ -11,10 +11,19 @@ fn missing_reader_floor_registration_refuses_storage_preparation() {
     };
     let hooks = std::sync::OnceLock::new();
     let warning = super::prepare_cache_root_with_floor_hooks(&mut config, &hooks).unwrap();
-    assert!(warning.message.contains("reader_floor::register_cache_hooks"));
-    assert!(config.cache_unavailable.as_deref().unwrap().contains("reader_floor::register_cache_hooks"));
+    assert!(warning
+        .message
+        .contains("reader_floor::register_cache_hooks"));
+    assert!(config
+        .cache_unavailable
+        .as_deref()
+        .unwrap()
+        .contains("reader_floor::register_cache_hooks"));
     assert!(config.cache_lease.is_none());
-    assert!(!storage.exists(), "missing floor checks must not prepare storage");
+    assert!(
+        !storage.exists(),
+        "missing floor checks must not prepare storage"
+    );
 }
 
 #[test]
@@ -26,7 +35,8 @@ fn registered_floor_hook_preserves_newer_reader_refusal() {
     let saved = serde_json::to_vec(&serde_json::json!({
         "floor_schema": crate::reader_floor::FLOOR_SCHEMA,
         "stores": {"aft.db": crate::db::CURRENT_SCHEMA_VERSION + 1}
-    })).unwrap();
+    }))
+    .unwrap();
     fs::write(&floor, &saved).unwrap();
     let mut config = crate::config::Config {
         storage_dir: Some(storage.clone()),
@@ -34,9 +44,18 @@ fn registered_floor_hook_preserves_newer_reader_refusal() {
     };
     assert!(prepare_cache_root(&mut config).is_none());
     let database = storage.join("aft.db");
-    assert!(crate::persisted_format::gate(crate::persisted_format::PersistedStore::AftDb, &database, &database, None).is_err());
+    assert!(crate::persisted_format::gate(
+        crate::persisted_format::PersistedStore::AftDb,
+        &database,
+        &database,
+        None
+    )
+    .is_err());
     let prepared: serde_json::Value = serde_json::from_slice(&fs::read(floor).unwrap()).unwrap();
-    assert_eq!(prepared["stores"]["aft.db"], crate::db::CURRENT_SCHEMA_VERSION + 1);
+    assert_eq!(
+        prepared["stores"]["aft.db"],
+        crate::db::CURRENT_SCHEMA_VERSION + 1
+    );
 }
 
 #[test]

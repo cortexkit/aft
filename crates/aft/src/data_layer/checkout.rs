@@ -660,7 +660,10 @@ impl DeadCodeMemo {
 
     fn get_or_build(
         &self,
-        build: impl FnOnce() -> Result<crate::data_layer::dead_code_snapshot::CallgraphSnapshot, DataError>,
+        build: impl FnOnce() -> Result<
+            crate::data_layer::dead_code_snapshot::CallgraphSnapshot,
+            DataError,
+        >,
     ) -> Result<Arc<crate::data_layer::dead_code_snapshot::CallgraphSnapshot>, DataError> {
         let mut slot = self.snapshot.lock().expect("no panics while holding it");
         if let Some(snapshot) = slot.as_ref() {
@@ -4458,13 +4461,15 @@ impl CheckoutView {
             .get_or_build(|| self.build_dead_code_snapshot(entry_points))?;
         // The memo holds no view: a view holds its publication, which holds
         // the memo.
-        Ok(Arc::new(crate::data_layer::dead_code_snapshot::CallgraphSnapshot {
-            data_layer: Some(super::dead_code_graph::ViewCallGraph::new(
-                self.clone(),
-                section_dir,
-            )),
-            ..crate::data_layer::dead_code_snapshot::CallgraphSnapshot::clone(&parts)
-        }))
+        Ok(Arc::new(
+            crate::data_layer::dead_code_snapshot::CallgraphSnapshot {
+                data_layer: Some(super::dead_code_graph::ViewCallGraph::new(
+                    self.clone(),
+                    section_dir,
+                )),
+                ..crate::data_layer::dead_code_snapshot::CallgraphSnapshot::clone(&parts)
+            },
+        ))
     }
 
     /// The memo of the dead-code snapshot this view's call graph serves.
@@ -6632,7 +6637,8 @@ mod tests {
             epoch,
             "reusing members allocates nothing"
         );
-        view.dead_code_snapshot_shared().unwrap();
+        view.dead_code_snapshot_shared(&crate::inspect::InspectEntryPoints)
+            .unwrap();
         assert!(
             checkout.memory_epoch() > epoch,
             "the dead-code memo was populated"

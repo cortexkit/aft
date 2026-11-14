@@ -547,7 +547,9 @@ pub fn prepare(storage_root: &Path) -> Vec<UnsupportedPersistedFormat> {
 /// Library hosts that prepare cache roots directly must register these checks too.
 pub fn register_cache_hooks() {
     crate::cache_location::register_reader_floor_hooks(crate::cache_location::ReaderFloorHooks {
-        prepare: |storage| { prepare(storage); },
+        prepare: |storage| {
+            prepare(storage);
+        },
         prepare_artifact_root,
     });
 }
@@ -1369,4 +1371,17 @@ pub(crate) mod tests {
         assert_eq!(PARSE_COUNT.with(|count| count.get()), 0);
         assert!(persisted_format::refusals_under(root.path()).is_empty());
     }
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_cache_root_for_test(
+    config: &mut crate::config::Config,
+) -> Option<crate::config_resolve::ConfigWarning> {
+    crate::reader_floor::register_cache_hooks();
+    let _volume = config
+        .cache_dir
+        .as_ref()
+        .filter(|parent| parent.is_dir())
+        .map(|parent| crate::walk_boundary::simulated_volumes::simulate(parent, u64::MAX - 17));
+    crate::cache_location::prepare_cache_root(config)
 }

@@ -49,12 +49,30 @@ mod tests {
 
     #[test]
     fn every_process_entry_registers_floor_checks_before_storage() {
-        let main = include_str!("../main.rs").split_once("fn main() {").unwrap().1;
-        let registration = main.find("aft::reader_floor::register_cache_hooks();").unwrap();
-        for entry in ["if aft::gh_shim::is_shim_invocation_from_env()", "parse_subc_arg(std::env::args_os()", "cli::index::run(args)", "Config::default()"] {
-            assert!(registration < main.find(entry).unwrap(), "reader-floor registration must precede {entry}");
+        let main = include_str!("../main.rs")
+            .split_once("fn main() {")
+            .unwrap()
+            .1;
+        let registration = main
+            .find("aft::reader_floor::register_cache_hooks();")
+            .unwrap();
+        for entry in [
+            "if aft::gh_shim::is_shim_invocation_from_env()",
+            "parse_subc_arg(std::env::args_os()",
+            "cli::index::run(args)",
+            "Config::default()",
+        ] {
+            assert!(
+                registration < main.find(entry).unwrap(),
+                "reader-floor registration must precede {entry}"
+            );
         }
-        let shim = include_str!("../gh_shim.rs").split_once("pub fn run_from_env() -> i32 {").unwrap().1;
-        assert!(shim.trim_start().starts_with("crate::reader_floor::register_cache_hooks();"));
+        let shim = include_str!("../gh_shim.rs")
+            .split_once("pub fn run_from_env() -> i32 {")
+            .unwrap()
+            .1;
+        assert!(shim
+            .trim_start()
+            .starts_with("crate::reader_floor::register_cache_hooks();"));
     }
 }

@@ -306,27 +306,7 @@ fn resolve_home_dir() -> Option<PathBuf> {
 
 pub(crate) use crate::production_storage::resolve_account_home_dir;
 
-pub(crate) fn project_root_is_too_broad(
-    canonical_root: &Path,
-    canonicalization_failed: bool,
-    account_home: Option<&Path>,
-) -> bool {
-    let root_identity = crate::policy_path::policy_path(canonical_root);
-    let account_home = account_home.filter(|home| home.is_dir());
-    canonicalization_failed
-        || crate::path_identity::project_root_volume(canonical_root, account_home)
-            .map(|volume| crate::policy_path::policy_path(&volume))
-            .is_none_or(|volume| {
-                let home_identity = account_home
-                    .map(crate::policy_path::policy_path)
-                    .unwrap_or_else(|| volume.clone());
-                crate::path_identity::project_root_is_narrow(
-                    &root_identity,
-                    &home_identity,
-                    &volume,
-                ) != Some(true)
-            })
-}
+use crate::git_root_resolution::project_root_is_too_broad;
 
 fn external_ignore_watch_paths(ctx: &AppContext, root_path: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();

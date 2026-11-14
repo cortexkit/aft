@@ -14,7 +14,7 @@ pub(crate) fn record_store_write(result: rusqlite::Result<usize>) -> rusqlite::R
         // can advance the generation too: one extra rescan is safer than a
         // missed write. data_version also detects commits on other connections.
         STORE_REVISION.fetch_add(1, std::sync::atomic::Ordering::Release);
-        crate::bash_background::shell_metadata::changed();
+        changed();
     }
     result
 }
@@ -1112,4 +1112,18 @@ mod tests {
             None
         );
     }
+}
+
+fn changes() -> &'static tokio::sync::watch::Sender<u64> {
+    static CHANGES: std::sync::OnceLock<tokio::sync::watch::Sender<u64>> =
+        std::sync::OnceLock::new();
+    CHANGES.get_or_init(|| tokio::sync::watch::channel(0).0)
+}
+
+pub(crate) fn changed() {
+    changes().send_modify(|revision| *revision = revision.wrapping_add(1));
+}
+
+pub(crate) fn subscribe() -> tokio::sync::watch::Receiver<u64> {
+    changes().subscribe()
 }

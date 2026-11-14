@@ -35,20 +35,21 @@ pub(crate) struct PolicyRow {
 pub(crate) fn prior(conn: &Connection, key: &PolicyKey) -> rusqlite::Result<Option<PolicyRow>> {
     let v = key.values();
     let epoch = key.epoch.to_string();
-    let prior = conn.query_row(
-        "SELECT params FROM remote_exec_policies
+    let prior = conn
+        .query_row(
+            "SELECT params FROM remote_exec_policies
              WHERE project_root=?1 AND harness=?2 AND session=?3 AND principal=?4
              AND owner=?5 AND scope_ref=?6 AND preset=?7
              AND (length(epoch)<length(?8) OR (length(epoch)=length(?8) AND epoch<?8))
              ORDER BY length(epoch) DESC,epoch DESC LIMIT 1",
-        params![v[0], v[1], v[2], v[3], v[4], v[5], v[6], epoch],
-        |row| {
-            Ok(PolicyRow {
-                params: row.get(0)?,
-            })
-        },
-    )
-    .optional()?;
+            params![v[0], v[1], v[2], v[3], v[4], v[5], v[6], epoch],
+            |row| {
+                Ok(PolicyRow {
+                    params: row.get(0)?,
+                })
+            },
+        )
+        .optional()?;
     match prior {
         Some(row) => Ok(Some(row)),
         None => alias(conn, key),
@@ -124,7 +125,10 @@ pub(crate) fn alias(conn: &Connection, key: &PolicyKey) -> rusqlite::Result<Opti
     .map(|row| row.map(|params| PolicyRow { params }))
 }
 
-pub(crate) fn current_direct(conn: &Connection, key: &PolicyKey) -> rusqlite::Result<Option<PolicyRow>> {
+pub(crate) fn current_direct(
+    conn: &Connection,
+    key: &PolicyKey,
+) -> rusqlite::Result<Option<PolicyRow>> {
     let v = key.values();
     let epoch = key.epoch.to_string();
     conn.query_row(

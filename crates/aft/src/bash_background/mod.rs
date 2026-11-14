@@ -593,7 +593,6 @@ pub struct TaskCallKey {
 
 pub use crate::protocol::TaskIdentity;
 
-
 thread_local! {
     static CURRENT_TASK_IDENTITY: std::cell::RefCell<Option<TaskIdentity>> = const { std::cell::RefCell::new(None) };
 }

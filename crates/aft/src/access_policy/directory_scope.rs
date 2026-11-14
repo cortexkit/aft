@@ -119,7 +119,7 @@ impl DirectoryScopeProbe {
     }
 }
 
-const DIRECTORY_SCOPE_MISSING_LOG_CAP: usize = 4_096;
+pub(crate) const DIRECTORY_SCOPE_MISSING_LOG_CAP: usize = 4_096;
 
 #[derive(Default)]
 pub(crate) struct DirectoryScopeProbes {
@@ -241,7 +241,7 @@ where
     }
 }
 
-fn log_directory_scope_fallback(parent: &Path, reason: &str) {
+pub(crate) fn log_directory_scope_fallback(parent: &Path, reason: &str) {
     // Scratch directories may be removed after their command exits, before
     // consent can offer a wider grant. The original file grant is still safe.
     if reason == "directory does not exist" {

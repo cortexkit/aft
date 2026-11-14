@@ -100,7 +100,8 @@ fn list_delivery_gaps(
         gaps.into_iter()
             .map(|(mut row, batch)| {
                 row.match_context = Some(crate::task_watch_lines::format_watch_line_batch(
-                    &row.task_id, &batch,
+                    &row.task_id,
+                    &batch,
                 ));
                 row
             })
@@ -119,7 +120,10 @@ fn saved_delivery_gap_keeps_rendered_context() {
     ).unwrap();
     let rows = list_delivery_gaps(&conn, "opencode", Some("session")).unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].match_context.as_deref(), Some("stderr byte 23 ×2: saved warning"));
+    assert_eq!(
+        rows[0].match_context.as_deref(),
+        Some("stderr byte 23 ×2: saved warning")
+    );
     assert_eq!(rows[0].match_batch.as_deref(), Some(saved));
     assert_eq!(rows[0].match_offset, Some(17));
     assert_eq!(rows[0].match_text.as_deref(), Some("watch delivery gap"));
@@ -4193,19 +4197,21 @@ impl BgTaskRegistry {
             call_key: key.key.clone(),
         };
         let mut fallback_error = Some("recovered result projection unavailable".to_string());
-        if let Some((frame, outcome, tool_result_body)) = crate::bash_background::frames::recovered_bash_frame(
-            snapshot,
-            &ledger_key,
-            metadata
-                .project_root
-                .as_deref()
-                .unwrap_or(&metadata.workdir),
-            crate::output_store::OutputScope::for_task(
-                &paths.session_dir,
-                &metadata.session_id,
-                self.clone(),
-            ),
-        ) {
+        if let Some((frame, outcome, tool_result_body)) =
+            crate::bash_background::frames::recovered_bash_frame(
+                snapshot,
+                &ledger_key,
+                metadata
+                    .project_root
+                    .as_deref()
+                    .unwrap_or(&metadata.workdir),
+                crate::output_store::OutputScope::for_task(
+                    &paths.session_dir,
+                    &metadata.session_id,
+                    self.clone(),
+                ),
+            )
+        {
             crate::slog_info!(
                 "recovered bash reply phase=settle task={} reply_bytes={} outcome={outcome}",
                 metadata.task_id,
@@ -4754,11 +4760,7 @@ impl BgTaskRegistry {
                     &conn, &harness, session_id,
                 ) {
                     Ok(mut rows) => {
-                        match list_delivery_gaps(
-                            &conn,
-                            &harness,
-                            Some(session_id),
-                        ) {
+                        match list_delivery_gaps(&conn, &harness, Some(session_id)) {
                             Ok(gaps) => rows.extend(gaps),
                             Err(error) => crate::slog_warn!(
                             "failed to load retained watch gaps for session {session_id}: {error}"
@@ -5126,12 +5128,10 @@ impl BgTaskRegistry {
         let registered = found.is_some();
         let found = match found {
             Some(row) => Some(row),
-            None => {
-                list_delivery_gaps(&conn, harness, Some(&frame.session_id))
-                    .map_err(|e| e.to_string())?
-                    .into_iter()
-                    .find(|row| row.task_id == frame.task_id && row.watch_id == frame.watch_id)
-            }
+            None => list_delivery_gaps(&conn, harness, Some(&frame.session_id))
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|row| row.task_id == frame.task_id && row.watch_id == frame.watch_id),
         };
         let mut row =
             found
@@ -5545,12 +5545,10 @@ impl BgTaskRegistry {
             let retained = registered.is_none();
             let Some(mut row) = (match registered {
                 Some(row) => Some(row),
-                None => {
-                    list_delivery_gaps(&conn, &harness, Some(session_id))
-                        .map_err(|e| e.to_string())?
-                        .into_iter()
-                        .find(|row| row.task_id == task_id && row.watch_id == watch_id)
-                }
+                None => list_delivery_gaps(&conn, &harness, Some(session_id))
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .find(|row| row.task_id == task_id && row.watch_id == watch_id),
             }) else {
                 return Ok(None);
             };

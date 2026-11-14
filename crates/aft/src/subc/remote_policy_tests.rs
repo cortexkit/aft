@@ -3441,7 +3441,7 @@ fn siblings_unauthorized_worker_scope_is_refused() {
 /// grants once, so a later plan naming the sibling in allow_paths adds none.
 #[test]
 fn siblings_owner_waiver_covers_only_the_owner_carried_worker_fetch() {
-    use crate::access_policy::{ScopeGrantsDenial};
+    use crate::access_policy::ScopeGrantsDenial;
     use crate::policy_path::policy_path;
     let fixture = SiblingGrantFixture::new("siblings-waiver-head");
     let ctx = &fixture.ctx;

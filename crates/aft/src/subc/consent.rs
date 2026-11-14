@@ -2036,7 +2036,6 @@ use crate::access_policy::directory_scope::worker_read_scope;
 #[cfg(test)]
 use crate::access_policy::directory_scope::*;
 
-
 async fn scope_before_db(grant: &AccessGrant, worker: bool) -> AccessGrant {
     let probing = grant.clone();
     // A bounded helper still waits for its deadline. Keep that wait off the

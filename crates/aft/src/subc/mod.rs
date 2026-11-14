@@ -253,10 +253,9 @@ mod views_idle_checkout_tests;
 pub(crate) use secret_consent::with_secret_bound_identity_for_test;
 #[cfg(test)]
 pub(crate) use secret_consent::with_secret_identity_for_test;
-pub(crate) use crate::context::call_context::{current_call_scopes, current_secret_audit_scope};
 pub(crate) use secret_consent::{
-    current_fetch_reply_deadline,
-    current_secret_consent_context, use_current_secret_labels, LaunchDecision,
+    current_fetch_reply_deadline, current_secret_consent_context, use_current_secret_labels,
+    LaunchDecision,
 };
 mod standalone;
 #[doc(hidden)]

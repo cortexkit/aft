@@ -1153,6 +1153,8 @@ use cortexkit_role_llm_runner::{
     wire::{read_reply, reply_body},
 };
 
+use crate::bash_background::TaskIdentityAuth;
+
 fn owner(principal: &str, harness: &str) -> crate::bash_background::TaskIdentity {
     crate::bash_background::TaskIdentity {
         principal: Some(principal.into()),

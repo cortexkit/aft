@@ -39,11 +39,11 @@ pub mod parent_session;
 #[cfg(test)]
 mod publication_tests;
 pub(crate) mod query;
+pub(crate) mod read_fence;
 mod refresh_budget;
 mod refresh_memory;
 #[cfg(feature = "test-hooks")]
 pub mod refresh_probe;
-pub(crate) mod read_fence;
 pub mod reuse;
 pub(crate) mod runtime;
 #[cfg(test)]

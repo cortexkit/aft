@@ -127,7 +127,7 @@ pub(crate) fn start(app: std::sync::Arc<crate::context::App>, path: std::path::P
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::remote_exec::PolicyKey;
+    use crate::exec_remote::persistence::PolicyKey;
 
     fn key(harness: &str) -> PolicyKey {
         PolicyKey {
@@ -148,7 +148,8 @@ mod tests {
             confine: Some(crate::exec_remote::RootConfinement::Root),
             ..Default::default()
         };
-        crate::db::remote_exec::freeze(conn, &key(harness), &frozen, timestamp, || {}).unwrap();
+        crate::exec_remote::persistence::freeze(conn, &key(harness), &frozen, timestamp, || {})
+            .unwrap();
         crate::db::catalog_edit_modes::record(conn, &key(harness), hashline, timestamp as i64)
             .unwrap();
     }
@@ -164,14 +165,14 @@ mod tests {
             let mut canonical = key("runner");
             canonical.epoch = epoch;
             assert_eq!(
-                crate::db::remote_exec::lookup(conn, &canonical, 100)
+                crate::exec_remote::persistence::lookup(conn, &canonical, 100)
                     .unwrap()
                     .unwrap()
                     .host
                     .as_deref(),
                 Some(host)
             );
-            assert!(crate::db::remote_exec::confined(conn, &canonical).unwrap());
+            assert!(crate::exec_remote::persistence::confined(conn, &canonical).unwrap());
             assert_eq!(
                 crate::db::catalog_edit_modes::lookup(conn, &canonical).unwrap(),
                 Some(hashline)
@@ -179,7 +180,7 @@ mod tests {
         }
         let mut foreign = key("runner");
         foreign.principal = "reserved:another-runner".into();
-        assert!(crate::db::remote_exec::lookup(conn, &foreign, 100)
+        assert!(crate::exec_remote::persistence::lookup(conn, &foreign, 100)
             .unwrap()
             .is_none());
         assert_eq!(
@@ -252,7 +253,7 @@ mod tests {
         seed(&conn, "broca", "third", false, 18);
         assert_eq!(copy_aliases(&conn).unwrap(), 2);
         assert_eq!(
-            crate::db::remote_exec::lookup(&conn, &key("runner"), 100)
+            crate::exec_remote::persistence::lookup(&conn, &key("runner"), 100)
                 .unwrap()
                 .unwrap()
                 .host
@@ -273,12 +274,12 @@ mod tests {
         let mut canonical = key("runner");
         canonical.epoch = 4;
         let mut confined_before_commit = false;
-        crate::db::remote_exec::freeze(&conn, &canonical, &Default::default(), 18, || {
+        crate::exec_remote::persistence::freeze(&conn, &canonical, &Default::default(), 18, || {
             confined_before_commit = true
         })
         .unwrap();
         assert!(confined_before_commit);
-        assert!(crate::db::remote_exec::confined(&conn, &canonical).unwrap());
+        assert!(crate::exec_remote::persistence::confined(&conn, &canonical).unwrap());
     }
 
     #[test]
@@ -291,7 +292,7 @@ mod tests {
         assert_read_only_fallback(&conn, "second", true);
         seed(&conn, "runner", "canonical", false, 1);
         assert_eq!(
-            crate::db::remote_exec::lookup(&conn, &key("runner"), 100)
+            crate::exec_remote::persistence::lookup(&conn, &key("runner"), 100)
                 .unwrap()
                 .unwrap()
                 .host
@@ -304,7 +305,7 @@ mod tests {
         );
         copy_aliases(&conn).unwrap();
         assert_eq!(
-            crate::db::remote_exec::lookup(&conn, &key("runner"), 100)
+            crate::exec_remote::persistence::lookup(&conn, &key("runner"), 100)
                 .unwrap()
                 .unwrap()
                 .host
@@ -337,7 +338,7 @@ mod tests {
                 epoch: 3,
                 preset: "worker".into(),
             };
-            crate::db::remote_exec::freeze(&conn, &key, &frozen, 17, || {}).unwrap();
+            crate::exec_remote::persistence::freeze(&conn, &key, &frozen, 17, || {}).unwrap();
             crate::db::catalog_edit_modes::record(&conn, &key, true, 17).unwrap();
         }
         assert_eq!(copy_aliases(&conn).unwrap(), 6);
@@ -360,7 +361,7 @@ mod tests {
                 crate::db::catalog_edit_modes::lookup(&conn, &key).unwrap(),
                 Some(true)
             );
-            let params = crate::db::remote_exec::lookup(&conn, &key, 18)
+            let params = crate::exec_remote::persistence::lookup(&conn, &key, 18)
                 .unwrap()
                 .unwrap();
             assert_eq!(

@@ -415,26 +415,29 @@ pub(crate) fn list_delivery_gaps(
                 )
             },
         )?;
-        Ok((BashPatternWatchRow {
-            harness: harness.into(),
-            session_id,
-            task_id: task_id.clone(),
-            watch_id,
-            pattern_kind: "substring".into(),
-            pattern: String::new(),
-            once: true,
-            each_line: false,
-            match_batch: Some(saved),
-            created_at: 0,
-            stdout_offset: 0,
-            stderr_offset: 0,
-            pty_offset: 0,
-            scanning: false,
-            pending_match: true,
-            match_text: Some("watch delivery gap".into()),
-            match_offset: batch.version.map(|version| version as i64),
-            match_context: None,
-        }, batch))
+        Ok((
+            BashPatternWatchRow {
+                harness: harness.into(),
+                session_id,
+                task_id: task_id.clone(),
+                watch_id,
+                pattern_kind: "substring".into(),
+                pattern: String::new(),
+                once: true,
+                each_line: false,
+                match_batch: Some(saved),
+                created_at: 0,
+                stdout_offset: 0,
+                stderr_offset: 0,
+                pty_offset: 0,
+                scanning: false,
+                pending_match: true,
+                match_text: Some("watch delivery gap".into()),
+                match_offset: batch.version.map(|version| version as i64),
+                match_context: None,
+            },
+            batch,
+        ))
     })?;
     rows.collect()
 }

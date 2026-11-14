@@ -2547,7 +2547,10 @@ impl App {
     }
 
     #[cfg(all(test, unix))]
-    pub(crate) fn collect_and_publish_lifecycle_census_for_test(&self, contexts: &[Arc<AppContext>]) {
+    pub(crate) fn collect_and_publish_lifecycle_census_for_test(
+        &self,
+        contexts: &[Arc<AppContext>],
+    ) {
         self.publish_lifecycle_census(crate::lifecycle_census::collect(self, contexts));
     }
 

@@ -92,13 +92,11 @@ fn plain_scan_root_is_too_broad(
     // HOME can differ from the OS account home, so a scan root must be narrow
     // relative to both homes when both are available.
     match (account_home, environment_home) {
-        (None, None) => crate::commands::configure::project_root_is_too_broad(root, false, None),
+        (None, None) => project_root_is_too_broad(root, false, None),
         (account_home, environment_home) => [account_home, environment_home]
             .into_iter()
             .flatten()
-            .any(|home| {
-                crate::commands::configure::project_root_is_too_broad(root, false, Some(home))
-            }),
+            .any(|home| project_root_is_too_broad(root, false, Some(home))),
     }
 }
 
@@ -404,7 +402,7 @@ mod tests {
         // policy directly so Git-root resolution cannot bypass this assertion.
         match crate::production_storage::resolve_account_home_dir() {
             Some(home) => assert!(
-                crate::commands::configure::project_root_is_too_broad(&home, false, Some(&home),),
+                project_root_is_too_broad(&home, false, Some(&home),),
                 "account home must be treated as too broad: {}",
                 home.display()
             ),
@@ -439,4 +437,26 @@ mod tests {
             .expect("configure git name");
         assert!(status.success(), "git config name failed");
     }
+}
+
+pub(crate) fn project_root_is_too_broad(
+    canonical_root: &Path,
+    canonicalization_failed: bool,
+    account_home: Option<&Path>,
+) -> bool {
+    let root_identity = crate::policy_path::policy_path(canonical_root);
+    let account_home = account_home.filter(|home| home.is_dir());
+    canonicalization_failed
+        || crate::path_identity::project_root_volume(canonical_root, account_home)
+            .map(|volume| crate::policy_path::policy_path(&volume))
+            .is_none_or(|volume| {
+                let home_identity = account_home
+                    .map(crate::policy_path::policy_path)
+                    .unwrap_or_else(|| volume.clone());
+                crate::path_identity::project_root_is_narrow(
+                    &root_identity,
+                    &home_identity,
+                    &volume,
+                ) != Some(true)
+            })
 }

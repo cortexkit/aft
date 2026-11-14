@@ -870,7 +870,9 @@ mod tests {
         let project = ProjectTypeScript::read(&project_modules.join("typescript")).unwrap();
         let binary = resolve_native_binary(&project).unwrap();
         assert!(
-            binary.starts_with(crate::path_identity::canonicalize_normalized(&store_modules)),
+            binary.starts_with(crate::path_identity::canonicalize_normalized(
+                &store_modules
+            )),
             "{}",
             binary.display()
         );

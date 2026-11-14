@@ -1703,7 +1703,9 @@ impl TargetIgnoreRules {
         if !global.is_empty() {
             rules.git.push(Arc::new(global));
         }
-        if let Some((repo, exclude)) = crate::grep_executor::git_exclude::git_info_exclude_for_target(root) {
+        if let Some((repo, exclude)) =
+            crate::grep_executor::git_exclude::git_info_exclude_for_target(root)
+        {
             Self::load(&mut rules.git, &repo, &exclude);
         }
         for ancestor in root.ancestors().collect::<Vec<_>>().into_iter().rev() {

@@ -69,18 +69,6 @@ pub(crate) fn unavailable_code(reason: &str) -> &'static str {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn prepare_cache_root_for_test(
-    config: &mut crate::config::Config,
-) -> Option<crate::config_resolve::ConfigWarning> {
-    crate::reader_floor::register_cache_hooks();
-    let _volume = config
-        .cache_dir
-        .as_ref()
-        .filter(|parent| parent.is_dir())
-        .map(|parent| crate::walk_boundary::simulated_volumes::simulate(parent, u64::MAX - 17));
-    prepare_cache_root(config)
-}
 #[derive(Debug)]
 struct ForeignCacheOwner;
 impl std::fmt::Display for ForeignCacheOwner {
@@ -1293,7 +1281,10 @@ fn prepare_cache_root_with_floor_hooks(
             config.semantic.local_cache_dir =
                 requested.as_ref().map(|_| root.join("semantic/models"));
             crate::project_content::register_storage_root(&root);
-            (floor_hooks.get().expect("storage preparation checked reader-floor registration").prepare_artifact_root)(&storage, &root);
+            (floor_hooks
+                .get()
+                .expect("storage preparation checked reader-floor registration")
+                .prepare_artifact_root)(&storage, &root);
             None
         }
         Err(error) => {
@@ -3814,7 +3805,7 @@ mod prune_legacy_tests {
             cache_dir: Some(parent.clone()),
             ..Default::default()
         };
-        let warning = prepare_cache_root_for_test(&mut config);
+        let warning = crate::reader_floor::prepare_cache_root_for_test(&mut config);
         assert!(warning.is_none(), "{warning:?}");
         drop(config);
         fs::write(storage.join("aft.db"), "db").unwrap();

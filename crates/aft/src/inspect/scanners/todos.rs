@@ -40,7 +40,6 @@ impl TodoCounts {
     }
 }
 
-
 /// What the count found for one file of its scope.
 #[derive(Debug)]
 pub(crate) enum FileTodos {
@@ -293,7 +292,7 @@ fn display_file_path(project_root: &Path, path: &Path) -> String {
 /// checks cover both summary construction and reuse across checkout changes.
 #[cfg(test)]
 pub(crate) fn uncached_aggregate_for_test(job: &InspectJob) -> serde_json::Value {
-    let stored = crate::data_layer::tools::inspect::stored_todos_uncached_for_test(
+    let stored = crate::inspect::data_sources::stored_todos_uncached_for_test(
         &job.project_root,
         &job.config,
         &job.scope_files,
@@ -870,7 +869,7 @@ mod tests {
         checkout.checkout().refresh_callgraph().unwrap();
         checkout.checkout().publish_changes().unwrap();
         parity(&job);
-        crate::data_layer::tools::inspect::set_todo_store_wait_for_test(
+        crate::inspect::data_sources::set_todo_store_wait_for_test(
             &root,
             std::time::Duration::ZERO,
         );

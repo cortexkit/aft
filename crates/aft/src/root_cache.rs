@@ -32,7 +32,7 @@ use crate::fs_lock;
 #[path = "root_cache_paths_tests.rs"]
 mod cache_paths_tests;
 #[cfg(test)]
-pub(crate) use location::prepare_cache_root_for_test;
+pub(crate) use crate::reader_floor::prepare_cache_root_for_test;
 
 use crate::cache_location as location;
 pub use crate::cache_location::CACHE_DOMAINS;

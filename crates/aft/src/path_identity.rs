@@ -123,7 +123,7 @@ pub(crate) fn project_root_is_narrow(directory: &Path, home: &Path, volume: &Pat
 /// Shared temporary roots hold other applications' files on any mount layout.
 /// Compare canonical paths, not prefixes, so projects below them stay enabled.
 fn project_root_is_shared_temp(directory: &Path) -> bool {
-    let directory = crate::access_policy::policy_path(directory);
+    let directory = crate::policy_path::policy_path(directory);
     let platform_temp = std::env::temp_dir();
     let roots = std::iter::once(platform_temp.as_path());
     #[cfg(unix)]
@@ -135,7 +135,7 @@ fn project_root_is_shared_temp(directory: &Path) -> bool {
     ]);
     let shared = roots
         .filter_map(|root| ProjectRootId::from_path(root).ok())
-        .any(|root| crate::access_policy::policy_path(&root.into_path_buf()) == directory);
+        .any(|root| crate::policy_path::policy_path(&root.into_path_buf()) == directory);
     shared
 }
 

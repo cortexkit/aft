@@ -281,7 +281,6 @@ impl CapturedAskRoute {
     }
 }
 
-
 pub(crate) fn finish_plugin_response(
     scope: &plugin::Scope,
     once: &[AccessGrant],
@@ -1414,7 +1413,6 @@ impl crate::read_policy::StoragePathPolicy for StoragePaths {
         floor_contains(path, prefix)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
