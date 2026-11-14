@@ -280,10 +280,14 @@ async fn prepare_and_send(
                             Ok(())
                         },
                         |metadata| {
-                            approval_metadata
+                            let mut entries = approval_metadata
                                 .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .insert(label.clone(), metadata);
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if metadata.granted {
+                                entries.remove(label);
+                            } else {
+                                entries.insert(label.clone(), metadata);
+                            }
                         },
                     )
                     .await

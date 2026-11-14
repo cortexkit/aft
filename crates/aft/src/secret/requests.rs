@@ -50,6 +50,7 @@ pub(crate) enum UseError {
 pub(crate) struct ApprovalMetadata {
     pub(crate) request_id: String,
     pub(crate) outcome_code: Option<&'static str>,
+    pub(crate) granted: bool,
 }
 
 /// The approved local refusal text, shared by fetches and proxy requests.
@@ -186,6 +187,7 @@ impl RequestSecrets {
         observe(ApprovalMetadata {
             request_id: request_id.clone(),
             outcome_code: None,
+            granted: false,
         });
         let Some((project_root, session)) = &self.context else {
             return Err(UseError::Unavailable);
@@ -227,6 +229,10 @@ impl RequestSecrets {
         observe(ApprovalMetadata {
             request_id,
             outcome_code,
+            granted: matches!(
+                answer,
+                ConsentOutcome::Answered | ConsentOutcome::AnsweredOnce
+            ),
         });
         match answer {
             ConsentOutcome::Answered | ConsentOutcome::AnsweredOnce => Ok(answer),

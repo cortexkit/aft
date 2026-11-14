@@ -434,6 +434,13 @@ async fn approval_log_case(
         "{line}"
     );
     assert!(line.contains("label=\"test\" host=\"localhost\""), "{line}");
+    let outcome = match expected_reason {
+        "approval_declined" => "declined",
+        "approval_expired" => "expired",
+        "approval_withdrawn" => "withdrawn",
+        _ => "not_granted",
+    };
+    assert!(line.contains(&format!("outcome={outcome}")), "{line}");
     assert!(
         line.contains(&format!("request_id={:?}", card.request_id)),
         "{line}"

@@ -102,7 +102,7 @@ pub(super) fn log_approval_refusal(
     outcome: Option<&str>,
 ) {
     // Even a syntactically valid label or host can spell an installed key.
-    // Scrub the two permitted metadata fields and quote them to keep one line.
+    // Scrub permitted metadata fields and quote them to keep one line.
     let safe = |value: &str| {
         state
             .scrub(value.as_bytes())
@@ -122,7 +122,8 @@ pub(super) fn log_approval_refusal(
             safe(approval.map(|a| a.request_id.as_str()).unwrap_or("")),
             outcome
         ));
-        if let Some(code) = approval.and_then(|a| a.outcome_code) {
+        if reason == Reason::ApprovalNotGranted {
+            let code = approval.and_then(|a| a.outcome_code).unwrap_or("unlisted");
             line.push_str(&format!("code={code}"));
         } else {
             line.pop();
