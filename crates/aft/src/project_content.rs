@@ -1,56 +1,6 @@
 pub use aft_base::project_content::*;
 
 #[cfg(test)]
-mod open_probe {
-    use super::*;
-    use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex};
-
-    type Opens = Arc<Mutex<Vec<PathBuf>>>;
-    fn probes() -> &'static Mutex<BTreeMap<PathBuf, Opens>> {
-        static PROBES: OnceLock<Mutex<BTreeMap<PathBuf, Opens>>> = OnceLock::new();
-        PROBES.get_or_init(Mutex::default)
-    }
-
-    pub(crate) struct Probe {
-        root: PathBuf,
-        opens: Opens,
-    }
-
-    impl Probe {
-        pub(crate) fn new(root: &Path) -> Self {
-            let opens = Arc::new(Mutex::new(Vec::new()));
-            probes()
-                .lock()
-                .unwrap()
-                .insert(root.to_path_buf(), opens.clone());
-            Self {
-                root: root.to_path_buf(),
-                opens,
-            }
-        }
-
-        pub(crate) fn paths(&self) -> Vec<PathBuf> {
-            self.opens.lock().unwrap().clone()
-        }
-    }
-
-    impl Drop for Probe {
-        fn drop(&mut self) {
-            probes().lock().unwrap().remove(&self.root);
-        }
-    }
-
-    pub(crate) fn record_open(path: &Path) {
-        for (root, opens) in probes().lock().unwrap().iter() {
-            if path.starts_with(root) {
-                opens.lock().unwrap().push(path.to_path_buf());
-            }
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 

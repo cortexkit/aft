@@ -2362,11 +2362,12 @@ pub(crate) fn metadata(path: &Path) -> io::Result<std::fs::Metadata> {
     run_traversal(path, std::fs::metadata)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
 #[path = "bounded_io_tests.rs"]
-pub(crate) mod regression_tests;
+pub mod regression_tests;
 #[cfg(all(any(test, feature = "test-support"), unix))]
-pub(crate) use regression_tests::{stall_helper, stall_running_helper};
+pub use regression_tests::{stall_helper, stall_running_helper};
 #[cfg(all(any(test, feature = "test-support"), unix))]
 pub(crate) fn stall_helper_if_requested(path: &Path) {
     regression_tests::before_helper(path);
@@ -2376,8 +2377,9 @@ pub(crate) fn stall_running_helper_if_requested(path: &Path) {
     regression_tests::after_helper_start(path);
 }
 
-#[cfg(all(test, unix))]
-pub(crate) mod tests {
+#[cfg(all(any(test, feature = "test-support"), unix))]
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
+pub mod tests {
     use super::*;
 
     #[test]
@@ -2409,9 +2411,9 @@ pub(crate) mod tests {
 
     static MACOS_DIRECTORIES: LazyLock<Mutex<HashMap<PathBuf, bool>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
-    pub(crate) struct MacosProbe(PathBuf);
+    pub struct MacosProbe(PathBuf);
     impl MacosProbe {
-        pub(crate) fn allow(&self) {
+        pub fn allow(&self) {
             MACOS_DIRECTORIES
                 .lock()
                 .unwrap()
@@ -2423,7 +2425,7 @@ pub(crate) mod tests {
             MACOS_DIRECTORIES.lock().unwrap().remove(&self.0);
         }
     }
-    pub(crate) fn deny_macos_directory(path: &Path) -> MacosProbe {
+    pub fn deny_macos_directory(path: &Path) -> MacosProbe {
         let path = std::fs::canonicalize(path).unwrap();
         MACOS_DIRECTORIES
             .lock()
@@ -2441,10 +2443,10 @@ pub(crate) mod tests {
     static FIFO_REPLACEMENTS: LazyLock<
         Mutex<HashMap<PathBuf, (Arc<AtomicUsize>, std::sync::mpsc::Sender<()>)>>,
     > = LazyLock::new(|| Mutex::new(HashMap::new()));
-    pub(crate) struct BlockProbe {
+    pub struct BlockProbe {
         keys: Vec<PathBuf>,
-        pub(crate) fired: Arc<AtomicUsize>,
-        pub(crate) finished: std::sync::mpsc::Receiver<()>,
+        pub fired: Arc<AtomicUsize>,
+        pub finished: std::sync::mpsc::Receiver<()>,
     }
     impl Drop for BlockProbe {
         fn drop(&mut self) {
@@ -2455,7 +2457,7 @@ pub(crate) mod tests {
             }
         }
     }
-    pub(crate) fn block_directory_probe(directory: &Path, fifo: &Path) -> BlockProbe {
+    pub fn block_directory_probe(directory: &Path, fifo: &Path) -> BlockProbe {
         let mut keys = vec![
             directory.to_path_buf(),
             std::fs::canonicalize(directory).unwrap(),
@@ -2508,16 +2510,16 @@ pub(crate) mod tests {
         LazyLock::new(|| Mutex::new(HashMap::new()));
     /// Counts the opens of one file's contents while it is alive, so a test
     /// can prove a file was never read.
-    pub(crate) struct OpenWatch {
+    pub struct OpenWatch {
         path: PathBuf,
-        pub(crate) opens: Arc<AtomicUsize>,
+        pub opens: Arc<AtomicUsize>,
     }
     impl Drop for OpenWatch {
         fn drop(&mut self) {
             OPEN_WATCHES.lock().unwrap().remove(&self.path);
         }
     }
-    pub(crate) fn watch_opens(path: &Path) -> OpenWatch {
+    pub fn watch_opens(path: &Path) -> OpenWatch {
         let opens = Arc::new(AtomicUsize::new(0));
         OPEN_WATCHES
             .lock()
@@ -2529,16 +2531,16 @@ pub(crate) mod tests {
         }
     }
     /// Record an open of `path`'s contents for an [`OpenWatch`] on it.
-    pub(crate) fn note_open(path: &Path) {
+    pub fn note_open(path: &Path) {
         if let Some(opens) = OPEN_WATCHES.lock().unwrap().get(path) {
             opens.fetch_add(1, Ordering::Relaxed);
         }
     }
-    pub(crate) fn fifo(path: &Path) {
+    pub fn fifo(path: &Path) {
         let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
     }
-    pub(crate) fn release_fifo(path: &Path) {
+    pub fn release_fifo(path: &Path) {
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .read(true)

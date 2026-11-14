@@ -328,3 +328,6 @@ mod tests {
         assert_eq!(cfg.type_checker_timeout_secs, 30);
     }
 }
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod search_hot_path_measurements;

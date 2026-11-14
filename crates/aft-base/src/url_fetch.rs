@@ -36,7 +36,11 @@ use zeroize::Zeroizing;
 use crate::lang_id::language_by_extension;
 
 #[path = "url_fetch_sensitive.rs"]
+#[cfg(not(any(test, feature = "test-support")))]
 mod sensitive;
+#[path = "url_fetch_sensitive.rs"]
+#[cfg(any(test, feature = "test-support"))]
+pub mod sensitive;
 
 const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1000;

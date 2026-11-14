@@ -515,4 +515,54 @@ fn excluded_error() -> std::io::Error {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) use open_probe::{record_open, Probe};
+pub use open_probe::{record_open, Probe};
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod open_probe {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    type Opens = Arc<Mutex<Vec<PathBuf>>>;
+    fn probes() -> &'static Mutex<BTreeMap<PathBuf, Opens>> {
+        static PROBES: OnceLock<Mutex<BTreeMap<PathBuf, Opens>>> = OnceLock::new();
+        PROBES.get_or_init(Mutex::default)
+    }
+
+    pub struct Probe {
+        root: PathBuf,
+        opens: Opens,
+    }
+
+    impl Probe {
+        pub fn new(root: &Path) -> Self {
+            let opens = Arc::new(Mutex::new(Vec::new()));
+            probes()
+                .lock()
+                .unwrap()
+                .insert(root.to_path_buf(), opens.clone());
+            Self {
+                root: root.to_path_buf(),
+                opens,
+            }
+        }
+
+        pub fn paths(&self) -> Vec<PathBuf> {
+            self.opens.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            probes().lock().unwrap().remove(&self.root);
+        }
+    }
+
+    pub fn record_open(path: &Path) {
+        for (root, opens) in probes().lock().unwrap().iter() {
+            if path.starts_with(root) {
+                opens.lock().unwrap().push(path.to_path_buf());
+            }
+        }
+    }
+}

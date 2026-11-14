@@ -2584,3 +2584,95 @@ fn windows_creation_ticks_to_unix_ms(ticks: u64) -> Option<u64> {
 pub(crate) fn process_alive(_pid: u32) -> bool {
     true
 }
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod retry_clock {
+    use super::*;
+
+    struct State {
+        started: Instant,
+        now: Instant,
+        preparation_delay: Duration,
+        sleeps: Vec<Duration>,
+        attempts: usize,
+    }
+
+    thread_local! {
+        static CLOCK: std::cell::RefCell<Option<State>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub struct Guard;
+
+    impl Guard {
+        pub fn install(preparation_delay: Duration) -> Self {
+            CLOCK.with(|clock| {
+                let mut clock = clock.borrow_mut();
+                assert!(clock.is_none(), "retry clock already installed");
+                let started = Instant::now();
+                *clock = Some(State {
+                    started,
+                    now: started,
+                    preparation_delay,
+                    sleeps: Vec::new(),
+                    attempts: 0,
+                });
+            });
+            Self
+        }
+
+        pub fn observations(&self) -> (Duration, Vec<Duration>, usize) {
+            CLOCK.with(|clock| {
+                let clock = clock.borrow();
+                let state = clock.as_ref().unwrap();
+                (
+                    state.now - state.started,
+                    state.sleeps.clone(),
+                    state.attempts,
+                )
+            })
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CLOCK.with(|clock| *clock.borrow_mut() = None);
+        }
+    }
+
+    pub fn now() -> Option<Instant> {
+        CLOCK.with(|clock| clock.borrow().as_ref().map(|state| state.now))
+    }
+
+    pub fn before_acquire() {
+        CLOCK.with(|clock| {
+            if let Some(state) = clock.borrow_mut().as_mut() {
+                // Model filesystem preparation after the caller chose its deadline.
+                state.now += std::mem::take(&mut state.preparation_delay);
+            }
+        });
+    }
+
+    pub fn note_attempt() {
+        CLOCK.with(|clock| {
+            if let Some(state) = clock.borrow_mut().as_mut() {
+                state.attempts += 1;
+            }
+        });
+    }
+
+    pub fn sleep(duration: Duration) -> bool {
+        CLOCK.with(|clock| {
+            let mut clock = clock.borrow_mut();
+            let Some(state) = clock.as_mut() else {
+                return false;
+            };
+            state.sleeps.push(duration);
+            state.now += duration;
+            assert!(
+                state.sleeps.len() <= 1_000,
+                "retry loop ignored its deadline"
+            );
+            true
+        })
+    }
+}

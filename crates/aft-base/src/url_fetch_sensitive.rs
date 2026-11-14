@@ -110,3 +110,63 @@ impl std::fmt::Debug for Bytes {
             .finish()
     }
 }
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing {
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+    thread_local! { pub static CURRENT: std::cell::RefCell<Option<Arc<Trace>>> = const { std::cell::RefCell::new(None) }; }
+    #[derive(Clone, Debug)]
+    pub struct Wipe {
+        pub growth: bool,
+        pub zeroed: bool,
+        pub capacity: usize,
+    }
+    pub struct Trace {
+        needle: &'static [u8],
+        records: Mutex<Vec<Wipe>>,
+        changed: Condvar,
+    }
+    impl Trace {
+        pub fn contains(&self, bytes: &[u8]) -> bool {
+            bytes
+                .windows(self.needle.len())
+                .any(|window| window == self.needle)
+        }
+        pub fn record(&self, bytes: &Vec<u8>, growth: bool) {
+            self.records.lock().unwrap().push(Wipe {
+                growth,
+                zeroed: bytes.iter().all(|byte| *byte == 0),
+                capacity: bytes.capacity(),
+            });
+            self.changed.notify_all();
+        }
+        pub fn wait_for(&self, count: usize) -> Vec<Wipe> {
+            let end = Instant::now() + Duration::from_secs(2);
+            let mut records = self.records.lock().unwrap();
+            while records.len() < count && Instant::now() < end {
+                records = self
+                    .changed
+                    .wait_timeout(records, end.saturating_duration_since(Instant::now()))
+                    .unwrap()
+                    .0;
+            }
+            records.clone()
+        }
+    }
+    pub struct Restore(Option<Arc<Trace>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CURRENT.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+    pub fn track(needle: &'static [u8]) -> (Arc<Trace>, Restore) {
+        let trace = Arc::new(Trace {
+            needle,
+            records: Default::default(),
+            changed: Default::default(),
+        });
+        let restore = Restore(CURRENT.with(|slot| slot.replace(Some(trace.clone()))));
+        (trace, restore)
+    }
+}

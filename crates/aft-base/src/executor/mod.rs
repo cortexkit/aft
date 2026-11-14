@@ -827,7 +827,7 @@ impl JobCancellation {
                     #[cfg(not(any(test, feature = "test-support")))]
                     let elapsed = when.elapsed();
                     #[cfg(any(test, feature = "test-support"))]
-                    let elapsed = crate::search_index::audit_cancel_elapsed(*when);
+                    let elapsed = crate::executor::audit::audit_cancel_elapsed(*when);
                     if *items < 256 && elapsed < Duration::from_millis(50) {
                         return false;
                     }
@@ -847,7 +847,7 @@ impl JobCancellation {
             return self.state() == JOB_CANCEL_STATE_CANCELLED;
         }
         #[cfg(any(test, feature = "test-support"))]
-        crate::search_index::audit_record(|work| work.cancel_probes += 1);
+        crate::executor::audit::audit_record(|work| work.cancel_probes += 1);
         #[cfg(any(test, feature = "test-support"))]
         {
             if let Some((parked, release)) = barrier {
@@ -4950,3 +4950,6 @@ impl Drop for HeavyPermit {
         debug_assert!(previous < self.semaphore.max);
     }
 }
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod audit;

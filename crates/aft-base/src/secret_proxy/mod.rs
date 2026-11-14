@@ -704,3 +704,27 @@ pub(crate) fn refusal(label: &str, host: &str) -> Response<Body> {
     );
     response
 }
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_hardening {
+    use std::cell::Cell;
+
+    /// Set by the audit tests' isolated child processes; only there does
+    /// `protect_secret_process` change the real process limits.
+    pub const REAL_ENV: &str = "AFT_S4_AUDIT_CHILD";
+
+    thread_local! {
+        static HARDENED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub fn mark() {
+        HARDENED.with(|hardened| hardened.set(true));
+    }
+
+    /// Whether `protect_secret_process` ran on this thread. Each test runs on
+    /// its own thread, so one test's call never satisfies another's check.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub fn hardened_on_this_thread() -> bool {
+        HARDENED.with(Cell::get)
+    }
+}

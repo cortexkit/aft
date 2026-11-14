@@ -638,3 +638,41 @@ pub fn reported_hazards() -> Vec<DatabaseHazard> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
 }
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod stat_probe {
+    use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static COUNTS: RefCell<Option<BTreeMap<PathBuf, usize>>> = const { RefCell::new(None) };
+        static CANDIDATES_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub fn record_followed(path: &Path) {
+        if !CANDIDATES_ONLY.with(|only| only.get()) {
+            record(path);
+        }
+    }
+
+    pub fn record(path: &Path) {
+        COUNTS.with(|counts| {
+            if let Some(counts) = counts.borrow_mut().as_mut() {
+                *counts.entry(path.to_path_buf()).or_default() += 1;
+            }
+        });
+    }
+
+    pub fn count(f: impl FnOnce()) -> BTreeMap<PathBuf, usize> {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                COUNTS.with(|counts| *counts.borrow_mut() = None);
+            }
+        }
+        let _reset = Reset;
+        COUNTS.with(|counts| *counts.borrow_mut() = Some(BTreeMap::new()));
+        f();
+        COUNTS.with(|counts| counts.borrow_mut().take().unwrap())
+    }
+}

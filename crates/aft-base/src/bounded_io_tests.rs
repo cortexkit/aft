@@ -81,10 +81,10 @@ static RUNNING_GATES: LazyLock<Mutex<HashMap<PathBuf, HelperGate>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(unix)]
-pub(crate) struct HelperStall {
+pub struct HelperStall {
     path: PathBuf,
     gates: &'static Mutex<HashMap<PathBuf, HelperGate>>,
-    pub(crate) reached: Receiver<()>,
+    pub reached: Receiver<()>,
     release: Sender<()>,
     finished: Receiver<()>,
 }
@@ -100,12 +100,12 @@ impl Drop for HelperStall {
 }
 
 #[cfg(unix)]
-pub(crate) fn stall_helper(path: &Path) -> HelperStall {
+pub fn stall_helper(path: &Path) -> HelperStall {
     stall_helper_at(path, &HELPER_GATES)
 }
 
 #[cfg(unix)]
-pub(crate) fn stall_running_helper(path: &Path) -> HelperStall {
+pub fn stall_running_helper(path: &Path) -> HelperStall {
     stall_helper_at(path, &RUNNING_GATES)
 }
 
@@ -192,10 +192,10 @@ fn walk_filter_stall_names_directory_being_read() {
     );
 }
 
-pub(crate) struct BlockDirectory(PathBuf, pub(crate) Arc<AtomicUsize>);
+pub struct BlockDirectory(PathBuf, pub Arc<AtomicUsize>);
 
 impl BlockDirectory {
-    pub(crate) fn new(path: &Path) -> Self {
+    pub fn new(path: &Path) -> Self {
         let fired = Arc::new(AtomicUsize::new(0));
         BLOCKED_DIRECTORIES
             .lock()

@@ -1,44 +1,6 @@
 pub use aft_base::live_db_files::*;
 
 #[cfg(test)]
-pub(crate) mod stat_probe {
-    use super::*;
-    use std::cell::RefCell;
-
-    thread_local! {
-        static COUNTS: RefCell<Option<BTreeMap<PathBuf, usize>>> = const { RefCell::new(None) };
-        static CANDIDATES_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-
-    pub(crate) fn record_followed(path: &Path) {
-        if !CANDIDATES_ONLY.with(|only| only.get()) {
-            record(path);
-        }
-    }
-
-    pub(crate) fn record(path: &Path) {
-        COUNTS.with(|counts| {
-            if let Some(counts) = counts.borrow_mut().as_mut() {
-                *counts.entry(path.to_path_buf()).or_default() += 1;
-            }
-        });
-    }
-
-    pub(crate) fn count(f: impl FnOnce()) -> BTreeMap<PathBuf, usize> {
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                COUNTS.with(|counts| *counts.borrow_mut() = None);
-            }
-        }
-        let _reset = Reset;
-        COUNTS.with(|counts| *counts.borrow_mut() = Some(BTreeMap::new()));
-        f();
-        COUNTS.with(|counts| counts.borrow_mut().take().unwrap())
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::{SqliteStore, TrackedConnection};
