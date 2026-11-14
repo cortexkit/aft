@@ -508,6 +508,8 @@ mod tests {
             "local M = wrap(require('./target')); local function caller() M.f() end",
             "local M = require('./target'); local function caller(M) M.f() end",
             "local M = require('./target'); local M = other; local function caller() M.f() end",
+            "local function owner() local M = require('./target') end; local function caller() M.f() end",
+            "local function caller() M.f() end; local M = require('./target')",
         ] {
             let (_, rows, _) = resolve(
                 "caller.luau",
@@ -521,5 +523,23 @@ mod tests {
                 "{source}: {rows:?}"
             );
         }
+        let (_, rows, _) = resolve(
+            "caller.luau",
+            &[
+                (
+                    "caller.luau",
+                    "local function caller() local M = require('./target'); M.f() end",
+                ),
+                ("target.luau", TARGET),
+            ],
+            &[],
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.kind == BlobRefKind::Call
+                    && r.target_symbol.as_deref() == Some("<return>::f"))
+                .count(),
+            1
+        );
     }
 }

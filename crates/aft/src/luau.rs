@@ -285,7 +285,12 @@ pub(crate) fn imports(source: &str, root: Node<'_>) -> ImportBlock {
             .and_then(local_pair)
             .filter(|(_, value)| *value == node)
             .map(|(name, _)| text(source, name).to_string())
-            .filter(|name| !reassigned(source, &all, name));
+            .filter(|name| !reassigned(source, &all, name))
+            .filter(|name| {
+                statement.is_some_and(|declaration| {
+                    binding_covers_calls(source, &all, declaration, name)
+                })
+            });
         let span = statement.unwrap_or(node);
         imports.push(ImportStatement {
             module_path,
@@ -317,6 +322,35 @@ pub(crate) fn imports(source: &str, root: Node<'_>) -> ImportBlock {
         imports,
         byte_range,
     }
+}
+
+fn binding_covers_calls(source: &str, all: &[Node<'_>], declaration: Node<'_>, name: &str) -> bool {
+    let Some(scope) = declaration.parent() else {
+        return false;
+    };
+    // References retain a local's name rather than its lexical scope. Keep a
+    // binding only when every matching member call can see that declaration;
+    // otherwise resolution could mistake a same-named global for the imported local.
+    all.iter()
+        .filter(|n| n.kind() == "function_call")
+        .filter(|n| {
+            n.child_by_field_name("name")
+                .and_then(|n| member(source, n))
+                .is_some_and(|(owner, _)| owner == name)
+        })
+        .all(|call| {
+            if call.start_byte() < declaration.end_byte() {
+                return false;
+            }
+            let mut ancestor = call.parent();
+            while let Some(node) = ancestor {
+                if node == scope {
+                    return true;
+                }
+                ancestor = node.parent();
+            }
+            false
+        })
 }
 
 fn reassigned(source: &str, all: &[Node<'_>], name: &str) -> bool {
