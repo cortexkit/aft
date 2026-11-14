@@ -1795,10 +1795,17 @@ impl Checkout {
             })?;
         spill.estimate_space(inputs.parses.len(), estimate, reserve);
         sections.stream(spill);
+        // Build scratch lives until this build publishes or stands down.
+        let workspace =
+            super::callgraph::BuildWorkspace::create(self.family.dir(), &self.checkout.to_string())
+                .map_err(|error| {
+                    DataError::Resolve(format!("the build workspace could not be made: {error}"))
+                })?;
         let _census = super::callgraph::resolve_checkout_into(
             &mut inputs,
             self.layer.threads,
             measure.then_some(&mut report.memory),
+            &workspace,
             &mut |inputs, files| {
                 sections
                     .add_batch(inputs, files)

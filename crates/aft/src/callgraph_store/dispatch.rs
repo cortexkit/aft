@@ -31,6 +31,8 @@ pub(crate) fn python_reexports(parse: &ParseBlob) -> Vec<(String, Vec<String>)> 
         .collect()
 }
 
+#[path = "dispatch/projected.rs"]
+pub(crate) mod projected;
 #[path = "dispatch/typescript.rs"]
 mod typescript;
 #[path = "dispatch/view.rs"]
@@ -2048,6 +2050,13 @@ pub(crate) trait DispatchFiles<'a> {
     fn type_target(&self, file: &str, name: &str) -> Option<(String, String)>;
     /// Whether `file`'s reference `ordinal` is an associated-function call.
     fn associated_site(&self, file: &str, ordinal: u32) -> bool;
+    /// Receiver and owner projections recorded in file order, when this
+    /// source serves them: the resolver then replays them instead of
+    /// reading imports, fields, returns, targets and directories (see
+    /// [`projected`]).
+    fn projections(&'a self) -> Option<&'a (dyn projected::Projections + 'a)> {
+        None
+    }
 }
 
 /// The ruled resolver operates on a complete manifest's immutable hints. Unknown
@@ -2352,6 +2361,9 @@ impl<'a> Resolver<'a> {
         index.get(member).cloned().unwrap_or_default()
     }
     fn project_type(&self, file: &str, name: &str) -> Option<(String, &TypeHint)> {
+        if let Some(projections) = self.projections() {
+            return self.replay_projection(projections, file, name);
+        }
         self.project_type_at_depth(file, name, 0)
     }
     fn note_file_visit(&self) {
@@ -2675,9 +2687,11 @@ impl<'a> Resolver<'a> {
         let Some((owner_file, ty)) = self.project_type(file, owner) else {
             return self.unknown("python", member);
         };
-        let Some(mro) =
-            self.python_mro(&owner_file, ty, &mut BTreeSet::new(), &mut BTreeMap::new())
-        else {
+        let mro = match self.projections() {
+            Some(projections) => self.replay_mro(projections, file, owner),
+            None => self.python_mro(&owner_file, ty, &mut BTreeSet::new(), &mut BTreeMap::new()),
+        };
+        let Some(mro) = mro else {
             return self.unknown("python", member);
         };
         for (base_file, base) in mro.into_iter().skip(1) {
