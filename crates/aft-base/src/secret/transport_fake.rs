@@ -2,6 +2,7 @@
 //! Approval is an explicit test action representing a verified phone signature;
 //! neither retrying a request nor opening another route grants access.
 
+use base64::Engine as _;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;

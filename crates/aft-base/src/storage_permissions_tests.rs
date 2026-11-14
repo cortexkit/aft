@@ -1,6 +1,8 @@
 //! Exercise actual store writers rather than reproducing their creation logic.
 
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 
 use std::path::Path;
 
