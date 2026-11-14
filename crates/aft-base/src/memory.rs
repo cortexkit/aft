@@ -108,7 +108,7 @@ pub struct RootMemorySnapshot {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RootMemoryRollup {
-    pub(crate) status: &'static str,
+    pub status: &'static str,
     pub attributed_bytes: u64,
     pub busy_subsystems: usize,
     pub not_estimated_subsystems: usize,
@@ -116,7 +116,7 @@ pub struct RootMemoryRollup {
     /// existing row uses the same top-eight selection and one omitted-roots
     /// rollup instead of creating a separate standing-memory table.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) standing: Option<bool>,
+    pub standing: Option<bool>,
     /// How long ago the index walks behind this row were made, when the
     /// health rollup reused an earlier walk (0 for a walk made now). Unset
     /// outside the health rollup.

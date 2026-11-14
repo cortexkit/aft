@@ -530,13 +530,13 @@ pub struct MutatingLaneSnapshot {
 /// it from an older job that reused the same transport request ID.
 #[derive(Debug, Clone)]
 pub(crate) struct RootJobSnapshot {
-    pub(crate) job_id: u64,
-    pub(crate) request_id: String,
-    pub(crate) command: String,
-    pub(crate) lane: Lane,
-    pub(crate) started_age_ms: u64,
-    pub(crate) execution_started: bool,
-    pub(crate) is_current: bool,
+    pub job_id: u64,
+    pub request_id: String,
+    pub command: String,
+    pub lane: Lane,
+    pub started_age_ms: u64,
+    pub execution_started: bool,
+    pub is_current: bool,
 }
 
 /// Non-blocking scheduler explanation attached to a delayed RouteBind warning.
@@ -1136,12 +1136,12 @@ struct RunningJob {
 
 #[derive(Debug, Clone)]
 pub(crate) struct LongRunningInteractiveJobSnapshot {
-    pub(crate) root_id: ProjectRootId,
-    pub(crate) request_id: String,
-    pub(crate) command: String,
-    pub(crate) lane: Lane,
-    pub(crate) age: Duration,
-    pub(crate) execution_started: bool,
+    pub root_id: ProjectRootId,
+    pub request_id: String,
+    pub command: String,
+    pub lane: Lane,
+    pub age: Duration,
+    pub execution_started: bool,
 }
 
 #[derive(Debug, Clone)]

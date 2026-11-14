@@ -943,7 +943,7 @@ impl PinnedDir {
         self.file.metadata()?.modified()
     }
 
-    pub(crate) fn same_identity(&self, other: &Self) -> io::Result<bool> {
+    pub fn same_identity(&self, other: &Self) -> io::Result<bool> {
         #[cfg(unix)]
         {
             #[cfg(any(test, feature = "test-support"))]

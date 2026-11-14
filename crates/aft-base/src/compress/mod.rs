@@ -1104,7 +1104,7 @@ pub(crate) struct PipelineInfo {
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PipelineSegment {
-    pub(crate) label: String,
+    pub label: String,
 }
 
 #[derive(Debug, Default)]
@@ -3216,7 +3216,7 @@ mod normalize_command_tests {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 mod approved_audit11 {
     use super::*;
 

@@ -30,10 +30,10 @@ impl Sink {
 }
 
 pub(crate) struct GitOutput {
-    pub(crate) status: ExitStatus,
+    pub status: ExitStatus,
     /// Captured standard output; empty when it was written to a file.
-    pub(crate) stdout: Vec<u8>,
-    pub(crate) stderr: Vec<u8>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
 }
 
 pub enum GitFailure {

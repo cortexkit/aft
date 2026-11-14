@@ -5,13 +5,13 @@ use crate::fs_lock;
 use crate::process_identity::process_start_time_ms;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 use std::fs;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

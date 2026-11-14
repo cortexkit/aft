@@ -2220,7 +2220,7 @@ impl Reader {
     /// the room already reserved. When that room is full it probes with a
     /// stack buffer before growing (std's `default_read_to_end`), and the
     /// probe of an exhausted `Take` reads nothing.
-    pub(crate) fn append(&mut self, mut buffer: Vec<u8>, size: usize) -> io::Result<Vec<u8>> {
+    pub fn append(&mut self, mut buffer: Vec<u8>, size: usize) -> io::Result<Vec<u8>> {
         if Instant::now() >= deadline(self.at) {
             return Err(failure(
                 &self.path,

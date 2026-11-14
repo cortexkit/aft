@@ -207,16 +207,16 @@ pub fn saturating_add(value: &AtomicU64, delta: u64) {
 
 #[derive(Clone, Debug)]
 pub struct ProcessBaseline {
-    pub(crate) bytes: Option<Bytes>,
-    pub(crate) sampled_at_ms: u64,
+    pub bytes: Option<Bytes>,
+    pub sampled_at_ms: u64,
 }
 
 #[derive(Clone, Debug)]
 pub struct RecentRow {
-    pub(crate) minute_ts: u64,
-    pub(crate) domain: Domain,
-    pub(crate) root_id: String,
-    pub(crate) physical_bytes: u64,
+    pub minute_ts: u64,
+    pub domain: Domain,
+    pub root_id: String,
+    pub physical_bytes: u64,
 }
 
 #[derive(Debug)]

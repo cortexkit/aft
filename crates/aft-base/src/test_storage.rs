@@ -3,7 +3,9 @@ use crate::config::Config;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use crate::production_storage::{account_home, canonicalized_with, comparison_key, is_within};
+use crate::production_storage::{account_home, is_within};
+#[cfg(test)]
+use crate::production_storage::{canonicalized_with, comparison_key};
 
 pub fn live_storage_roots() -> Vec<PathBuf> {
     let home = account_home().expect("test storage fence must resolve the account profile");
