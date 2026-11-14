@@ -1357,10 +1357,11 @@ fn runner_notices_delivery_order_capability_cache_is_incarnation_scoped() {
         (json!({}), None),
     ] {
         assert_eq!(
-            described_delivery_order(&serde_json::to_vec(&reply).unwrap()),
+            described_delivery_order(&cortexkit_role_llm_runner::wire::reply_body(&reply).unwrap()),
             expected
         );
     }
+    assert_eq!(described_delivery_order(br#"{"capabilities":["delivery_order"]}"#), None);
 }
 
 #[test]

@@ -80,10 +80,10 @@ impl ModuleHandler for Peer {
             );
         }
         assert_eq!(body["method"], "session.send");
-        let invalid = |field: &str| {
-            HandlerOutcome::Response(serde_json::to_vec(&json!({
-            "error":{"code":"invalid_params","message":"malformed notice member","detail":{"field":field}}
-        })).unwrap())
+        let invalid = |field: &str| HandlerOutcome::ErrorWithDetail {
+            code: "invalid_params".into(),
+            message: "malformed notice member".into(),
+            detail: json!({"field":field}),
         };
         let decoded: cortexkit_role_llm_runner::send::SendRequest =
             match serde_json::from_value(body["params"].clone()) {
