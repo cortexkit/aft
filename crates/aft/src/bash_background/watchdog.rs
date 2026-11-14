@@ -14,7 +14,7 @@ static CLEANUP_STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 #[cfg(test)]
 static CLEANUP_COMPLETED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn cleanup_pass_counts_for_test() -> (usize, usize) {
     (
         CLEANUP_STARTED.load(Ordering::SeqCst),
@@ -85,13 +85,13 @@ impl CleanupPass {
 
 impl Drop for CleanupPass {
     fn drop(&mut self) {
+        let Some(started) = self.started else {
+            return;
+        };
         let work = CLEANUP_WORK
             .with(|cell| cell.replace(self.previous))
             .unwrap_or_default();
-        if let Some(summary) = self
-            .started
-            .and_then(|started| self.summary(started.elapsed(), work))
-        {
+        if let Some(summary) = self.summary(started.elapsed(), work) {
             log::info!("{summary}");
         }
     }
