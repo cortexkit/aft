@@ -558,6 +558,8 @@ pub(crate) mod tests {
             .unwrap();
             let mut config = crate::config::Config::default();
             config.cache_dir = Some(directory.path().to_path_buf());
+            config.storage_dir = Some(directory.path().join("durable"));
+            assert_eq!(crate::cache_location::prepare_cache_root(&mut config), None);
             crate::grammar::configure(&config).stored().unwrap();
             directory
         });
