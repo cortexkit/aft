@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 mod approved;
 mod prepared;
 pub use approved::ApprovedUser;
-pub(crate) use prepared::{
+pub use prepared::{
     current_prepared_bind_config, read_bounded_config, with_prepared_bind_config,
     PreparedBindConfig,
 };
