@@ -71,9 +71,10 @@ impl<E> std::fmt::Debug for BuildScratch<E> {
 
 impl<E> BuildScratch<E> {
     /// A workspace for a build that has no family to publish into, such as
-    /// a gate's or a test's, made under `parent` (created if missing). It
-    /// takes no lock and no writer sweeps `parent`, so its builder must
-    /// [`remove`](Self::remove) it whether the build succeeds or fails.
+    /// a test's or a measurement tool's, made under `parent` (created if
+    /// missing). It takes no lock and no writer sweeps `parent`, so its
+    /// builder must [`remove`](Self::remove) it whether the build succeeds
+    /// or fails.
     ///
     /// # Errors
     ///
