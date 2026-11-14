@@ -1188,6 +1188,11 @@ struct HeaderParseCache {
 static HEADER_PARSE_CACHE: LazyLock<Mutex<HeaderParseCache>> =
     LazyLock::new(|| Mutex::new(HeaderParseCache::default()));
 
+#[cfg(test)]
+thread_local! {
+    static HEADER_PARSE_ON_MISS: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
 /// Reuse a resolved header tree in path-free extraction without changing the
 /// caller's already-resolved language.
 pub(crate) fn cached_header_tree(source: &str, lang: LangId) -> Option<Tree> {
@@ -1220,6 +1225,13 @@ pub(crate) fn parse_resolved_source(
     {
         return Ok(parsed.clone());
     }
+
+    #[cfg(test)]
+    HEADER_PARSE_ON_MISS.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
 
     let c_tree = parse_source_with_parser(path, source, LangId::C)?;
     let mut resolved = (c_tree.clone(), LangId::C);
@@ -1267,8 +1279,13 @@ fn parse_source_with_parser(path: &Path, source: &str, lang: LangId) -> Result<T
     })
 }
 
-// The final budget is calibrated against the Zig and Linux header corpora.
-const HEADER_FALLBACK_PARSE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(250);
+// Optimized native parses on 8 Linux CPUs: 11,492 Zig and 10,733 Linux headers.
+// C++/Objective-C 99.9th-percentile parse times were 163.527/189.362 ms (Zig),
+// 13.268/16.352 ms (Linux). Take 10x the largest, rounded up to 50 ms, with a 250 ms
+// floor: 1,900 ms. Three errorful attempts on two Zig headers were cut; no
+// selected trees changed. This is cooperative cancellation, not a memory cap
+// or a bound on one native lexer/scanner call between progress callbacks.
+const HEADER_FALLBACK_PARSE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1900);
 
 fn parse_source_with_parser_deadline(
     path: &Path,
@@ -10077,6 +10094,15 @@ mod tests {
         REUSABLE_PARSERS.with(|parsers| {
             assert!(!parsers.borrow().contains_key(&LangId::ObjC));
         });
+        let chunks = crate::semantic_index::chunk_view_file(
+            Path::new("."),
+            path,
+            source.as_bytes(),
+            crate::semantic_index::EmbedTextCaps::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(chunks.len(), 2);
         // A fresh parser must still accept a normal Objective-C header after
         // cancellation, rather than resuming the pathological header's state.
         let ordinary = "@interface AfterCancellation\n- (void)run;\n@end\n";
@@ -10089,17 +10115,19 @@ mod tests {
     #[test]
     fn h_header_cancelled_fallback_discards_partial_parser() {
         let source = "@interface Cancelled\n- (void)run;\n@end\n".repeat(1000);
-        let result = parse_source_with_parser_deadline(
-            Path::new("cancelled.h"),
-            &source,
-            LangId::ObjC,
-            Some(std::time::Duration::ZERO),
-        )
-        .unwrap();
-        assert!(result.is_none());
-        REUSABLE_PARSERS.with(|parsers| {
-            assert!(!parsers.borrow().contains_key(&LangId::ObjC));
-        });
+        for language in [LangId::Cpp, LangId::ObjC] {
+            let result = parse_source_with_parser_deadline(
+                Path::new("cancelled.h"),
+                &source,
+                language,
+                Some(std::time::Duration::ZERO),
+            )
+            .unwrap();
+            assert!(result.is_none());
+            REUSABLE_PARSERS.with(|parsers| {
+                assert!(!parsers.borrow().contains_key(&language));
+            });
+        }
     }
 
     #[test]
@@ -10109,13 +10137,22 @@ mod tests {
             "// {}\n@interface ConcurrentHeader\n- (void)run;\n@end\n",
             temp.path().display()
         ));
-        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let (ready, started) = std::sync::mpsc::channel();
+        let mut releases = Vec::new();
         let workers: Vec<_> = (0..2)
             .map(|_| {
                 let source = source.clone();
-                let barrier = barrier.clone();
+                let ready = ready.clone();
+                let (release, wait) = std::sync::mpsc::channel();
+                releases.push(release);
                 std::thread::spawn(move || {
-                    barrier.wait();
+                    HEADER_PARSE_ON_MISS.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move || {
+                            ready.send(HEADER_PARSE_CACHE.try_lock().is_ok()).unwrap();
+                            wait.recv_timeout(std::time::Duration::from_secs(10))
+                                .unwrap();
+                        }));
+                    });
                     let (tree, language) =
                         parse_resolved_source(Path::new("concurrent.h"), &source, LangId::C)
                             .unwrap();
@@ -10124,10 +10161,17 @@ mod tests {
                 })
             })
             .collect();
+        let unlocked: Vec<_> = (0..2)
+            .map(|_| started.recv_timeout(std::time::Duration::from_secs(5)))
+            .collect();
+        for release in releases {
+            let _ = release.send(());
+        }
         let results: Vec<_> = workers
             .into_iter()
             .map(|worker| worker.join().unwrap())
             .collect();
+        assert!(unlocked.into_iter().all(|result| result == Ok(true)));
         assert_eq!(results[0], results[1]);
         assert_eq!(results[0].1, LangId::ObjC);
     }
