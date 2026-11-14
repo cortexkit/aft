@@ -8507,12 +8507,18 @@ mod tests {
             checkout.fresh_view(Duration::from_secs(60)),
             crate::data_layer::runtime::Fresh::Ready(_)
         ));
+        // A published ready view can precede the build worker's completion.
+        // Wait before recording the edit so its refresh cannot be skipped.
+        checkout.wait_for_memory_profile_idle_for_test();
         std::fs::write(root.as_path().join("extra.rs"), "pub fn extra() {}\n").unwrap();
         checkout
             .checkout()
             .record_paths(&[b"extra.rs".to_vec()])
             .unwrap();
         checkout.checkout().refresh_callgraph().unwrap();
+        // Drain any refresh queued by the build before probing the engine's
+        // nonblocking lock or taking the baseline memory walk count.
+        checkout.wait_for_memory_profile_idle_for_test();
         assert!(checkout.checkout().engine_memory_parts().is_some());
         let executor = Executor::new();
         assert!(executor.register_actor(root, ctx));
@@ -8527,10 +8533,16 @@ mod tests {
             );
         };
         refresh_at(0);
+        let memory_epoch = checkout.checkout().memory_epoch();
         let walks = crate::data_layer::runtime::memory_figure_walks_for_test();
         for tick in 1..=40 {
             refresh_at(tick * 3);
         }
+        assert_eq!(
+            checkout.checkout().memory_epoch(),
+            memory_epoch,
+            "the fixture changed memory after its baseline walk"
+        );
         assert_eq!(
             crate::data_layer::runtime::memory_figure_walks_for_test(),
             walks,

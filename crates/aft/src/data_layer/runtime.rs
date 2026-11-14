@@ -1392,7 +1392,7 @@ impl DataCheckout {
     /// A checkout reusing another checkout's published call graph can serve a
     /// ready view before its background build ends.
     /// Profiles must wait before applying the edits that populate an engine.
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn wait_for_memory_profile_idle_for_test(&self) {
         let deadline = Instant::now() + Duration::from_secs(300);
         while self.work.running() {
