@@ -715,9 +715,9 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "subc/health.rs",
-        enclosing_item: "budget_health_metrics, gap_largest_ancillary_health_field, abbreviate_health_root, abbreviated_health_path, abbreviated_health_refusal",
-        location_or_primitive: "root row removal, optional root subfield removal, cache/root path and refusal character caps, storage_retention map removal, v2_family_sweeps and data_store_failed pop, named top-level telemetry gaps under HEALTH_METRICS_BUDGET_BYTES",
-        reason: "management health detail, not an agent result list; ancillary telemetry yields before root diagnostics, and ordinary ready roots yield before standing, refused or unhealthy roots; the last cache path and root row are abbreviated with full identity digests and root status instead of omitted; omitted rows are counted exactly and aggregate counters remain; oversized ancillary fields become named gaps with original byte sizes, never replacing root identity, failure or freshness fields",
+        enclosing_item: "budget_health_metrics_with_limits, gap_largest_ancillary_health_field, compact_health_lsp_preview, enforce_health_hard_limit, abbreviate_health_root, abbreviated_health_path, abbreviated_health_refusal, build_health_diagnostic_rollup_from_actors",
+        location_or_primitive: "healthy root detail cap and removal, default root counter removal, LSP preview clear, cache/root path and free-text caps, storage_retention map removal, v2_family_sweeps and data_store_failed pop, named telemetry gaps under HEALTH_METRICS_BUDGET_BYTES, root and optional gap-id pop under HEALTH_REPLY_HARD_LIMIT_BYTES",
+        reason: "management health detail, not an agent result list; small process diagnostics precede healthy root detail, whose total remains in healthy_roots; abnormal roots bypass the normal detail cap and retain non-default counters, failure records and codes; LSP fleet totals survive preview removal; long identities use full digests and bounded free text names the bytes cut; only the whole-reply hard ceiling permits abnormal root removal, with exact root_detail_gap and root_details_omitted counts and ids when they fit; other oversized telemetry becomes a named gap with its original byte size",
     },
     ExclusionEntry {
         file: "subc/health.rs",
