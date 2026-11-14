@@ -412,8 +412,9 @@ impl Sorter {
     }
 
     /// Sorts the tail and returns a bounded, fallible streaming merge. A tail
-    /// with no prior spill stays in memory; otherwise it becomes one durable
-    /// input run so that sort and merge allocations do not overlap.
+    /// with no prior spill stays in memory if an owned output record also fits.
+    /// Otherwise it becomes a durable input run so that sort and merge
+    /// allocations do not overlap.
     pub fn finish(mut self) -> Result<SortedRecords, Error> {
         if self.workspace.is_none() {
             return Err(Error::Failed);
