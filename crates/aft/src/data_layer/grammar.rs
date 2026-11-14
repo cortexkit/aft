@@ -70,6 +70,22 @@ pub(super) fn message(reason: &str, path: &std::path::Path) -> Option<String> {
     value["message"].as_str().map(str::to_owned)
 }
 
+/// The stored reason records the scan's state. For `grammar_unavailable`,
+/// check the grammar registry again so replies do not keep reporting an
+/// in-flight download after it has failed.
+pub(super) fn current_reason(stored: &str) -> String {
+    if cfg!(feature = "wasm-grammars")
+        && serde_json::from_str::<serde_json::Value>(stored)
+            .is_ok_and(|value| value["code"] == "grammar_unavailable")
+    {
+        if let Err(error) = crate::grammar::registry().stored() {
+            return reason(&ManifestJoinError::GrammarUnavailable(error))
+                .expect("typed grammar reason");
+        }
+    }
+    stored.to_string()
+}
+
 pub(super) fn extract(
     source: &[u8],
     language: &str,
@@ -83,6 +99,8 @@ pub(crate) fn response(
     reason: &str,
     path: &std::path::Path,
 ) -> Option<crate::protocol::Response> {
+    let current = current_reason(reason);
+    let reason = current.as_str();
     let mut data: serde_json::Value = serde_json::from_str(reason).ok()?;
     data["message"] = message(reason, path)?.into();
     if data["code"] == "grammar_parse_timeout" {

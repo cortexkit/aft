@@ -468,6 +468,9 @@ pub(crate) fn disclose_parse_gaps(
     roots: &[PathBuf],
     response: &mut crate::protocol::Response,
 ) {
+    if !cfg!(feature = "wasm-grammars") {
+        return;
+    }
     let fence = crate::context::confinement::capture();
     let mut gaps = Vec::new();
     let mut messages = std::collections::BTreeSet::new();
@@ -480,9 +483,10 @@ pub(crate) fn disclose_parse_gaps(
         {
             continue;
         }
+        let reason = super::grammar::current_reason(reason);
         if let (Ok(mut gap), Some(message)) = (
-            serde_json::from_str::<Value>(reason),
-            super::grammar::message(reason, &path),
+            serde_json::from_str::<Value>(&reason),
+            super::grammar::message(&reason, &path),
         ) {
             gap["path"] = serde_json::json!(path);
             gap["kind"] = "grammar_unavailable".into();

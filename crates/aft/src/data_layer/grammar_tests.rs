@@ -343,6 +343,11 @@ fn scenario(phase: &str) {
         Some(&view),
     );
     assert_eq!(response.data["complete"], false);
+    assert_eq!(
+        response.data["gaps"][0]["state"], "network_retry",
+        "replies must not retain the scan's downloading state"
+    );
+    assert_eq!(response.data["gaps"][0]["retry_after_ms"], 30000);
     assert_eq!(response.data["gaps"][0]["path"], json!(root.join("a.luau")));
     assert!(response.data["text"]
         .as_str()

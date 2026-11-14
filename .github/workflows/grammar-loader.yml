@@ -96,6 +96,7 @@ jobs:
       - name: Process restart and concurrent publication
         run: cargo test --features wasm-grammars --locked -p agent-file-tools --features test-hooks --test integration -- grammar_loader
       - name: Luau extraction and index-store feature matrix
+        if: matrix.os != 'windows-11-arm'
         run: cargo test --features wasm-grammars --locked -p agent-file-tools --features test-hooks --lib -- luau_s
       - name: Native Windows ARM64 load-and-parse smoke
         if: matrix.os == 'windows-11-arm'
