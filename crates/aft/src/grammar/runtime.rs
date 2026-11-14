@@ -132,7 +132,11 @@ impl GrammarRegistry {
             changed: Condvar::new(),
             clock: Arc::new(MonotonicClock(Instant::now())),
             transport: OnceLock::new(),
-            queries: vec!["(chunk) @root".into()],
+            queries: vec![
+                crate::luau::EXTRACTION_QUERY.into(),
+                crate::luau::COMPLEXITY_QUERY.into(),
+                crate::luau::COMMENT_QUERY.into(),
+            ],
             fault: RwLock::new(storage::StorageFault::None),
             listeners: Mutex::new(Vec::new()),
             #[cfg(any(test, feature = "test-hooks"))]

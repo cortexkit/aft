@@ -347,8 +347,17 @@ impl Address {
         let raw_harness =
             concrete_runner_harness(owner.principal.as_deref(), &owner.session, &raw_harness)?;
         Some(Self {
-            worker: module == "broca"
-                || stamp.is_some_and(|stamp| stamp.kind == subc_protocol::scope::ScopeKind::Worker),
+            // Broca hosts heads as well as workers, and a head's completion
+            // must be allowed to wake it (idle_start). On Broca only a head
+            // scope qualifies; every other Broca route, including an unscoped
+            // one with no stamp to ask, keeps the worker delivery.
+            worker: match stamp {
+                Some(stamp) if module == "broca" => {
+                    stamp.kind != subc_protocol::scope::ScopeKind::Head
+                }
+                Some(stamp) => stamp.kind == subc_protocol::scope::ScopeKind::Worker,
+                None => module == "broca",
+            },
             module,
             identity: BindIdentity::new(raw_harness, owner.session.clone()),
             scope: stamp.map(|stamp| {

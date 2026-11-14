@@ -12,6 +12,7 @@ pub(crate) struct Work {
     pub ordinal_visits: usize,
     pub dispatch_visits: usize,
     pub receiver_type_calls: usize,
+    pub receiver_class_walks: usize,
     pub receiver_function_nodes: usize,
     pub receiver_constructor_scans: usize,
     pub receiver_constructor_nodes: usize,

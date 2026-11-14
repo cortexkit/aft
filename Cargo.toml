@@ -18,6 +18,17 @@ default-members = ["crates/aft", "crates/aft-tokenizer"]
 [workspace.package]
 rust-version = "1.92"
 
+# What the build server's warm-cache fill builds for this repository, so a new
+# checkout's remote jobs start from the same outputs our gates need. These are
+# the gates' own builds: the test binaries (the integration suites need the
+# test-hooks feature) and the Windows compile check. Each string runs through
+# the shell, in order, joined with &&. Keep them in step with the gate flags.
+[workspace.metadata.motor]
+warm-commands = [
+  "cargo nextest run --no-run -p agent-file-tools --features test-hooks",
+  "cargo check --target x86_64-pc-windows-gnu -p agent-file-tools --tests --features test-hooks",
+]
+
 [profile.release]
 lto = true
 codegen-units = 1

@@ -105,10 +105,11 @@ export interface GithubAutoInstallOptions {
   __lockWaitTimeoutMsForTests?: number;
   __lockPollIntervalMsForTests?: number;
   /**
-   * Smoke budget for validating an already-cached server. Tests that must see
-   * the smoke run to completion set it high, so a loaded machine that takes
-   * longer than the production budget to start a process cannot turn the run
-   * into an inconclusive timeout.
+   * Smoke budget for validating an already-cached server and for checking a
+   * freshly staged install. Tests that must see the smoke run to completion
+   * set it high, so a loaded machine that takes longer than the production
+   * budget to start a process cannot turn the run into an inconclusive
+   * timeout.
    */
   __smokeTimeoutMsForTests?: number;
 }
@@ -1287,6 +1288,7 @@ export function createGithubInstaller(services: GithubInstallerHost) {
     arch: Arch,
     fetchImpl: typeof fetch,
     signal?: AbortSignal,
+    smokeTimeoutMs = SMOKE_TIMEOUT_MS,
   ): Promise<GithubDownloadResult> {
     const version = stripTagV(tag);
     const expected = spec.resolveAsset(platform, arch, version);
@@ -1369,7 +1371,7 @@ export function createGithubInstaller(services: GithubInstallerHost) {
           const { chmodSync } = await import("node:fs");
           chmodSync(stagedBinary, 0o755);
         }
-        const verdict = await smokeGithubBinary(spec, stagedBinary);
+        const verdict = await smokeGithubBinary(spec, stagedBinary, smokeTimeoutMs);
         if (verdict === "failed") throw new Error("staged binary failed runtime smoke check");
         smokeVerdict = verdict;
         const identityBeforeHash = fileIdentity(stagedBinary);
@@ -1445,6 +1447,7 @@ export function createGithubInstaller(services: GithubInstallerHost) {
     platform: Platform,
     arch: Arch,
     signal?: AbortSignal,
+    smokeTimeoutMs = SMOKE_TIMEOUT_MS,
   ): Promise<{ started: boolean; reason?: string }> {
     const outcome = await withInstallLock(spec.githubRepo, async () => {
       const failureMarker = readInstallFailureMarker(spec);
@@ -1508,6 +1511,7 @@ export function createGithubInstaller(services: GithubInstallerHost) {
         arch,
         fetchImpl,
         signal,
+        smokeTimeoutMs,
       ).catch((err): GithubDownloadResult => {
         const message = `install crashed: ${err instanceof Error ? err.message : String(err)}`;
         error(`[lsp] github install ${spec.id} crashed: ${err}`);
@@ -1719,6 +1723,7 @@ export function createGithubInstaller(services: GithubInstallerHost) {
                 host.platform,
                 host.arch,
                 controller.signal,
+                smokeTimeoutMs,
               ),
         )
         .then(

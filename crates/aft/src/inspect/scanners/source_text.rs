@@ -322,6 +322,27 @@ pub(crate) fn handwritten_graph_source_for_test(bytes: usize, header: &str) -> S
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_source_reads_do_not_wait_for_fifo_writers() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.rs");
+        crate::bounded_io::tests::fifo(&path);
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            assert!(super::read_source_bytes(&path).is_err());
+            assert!(super::read_source_text(&path).is_err());
+            assert!(super::read_graph_source_text(&path).is_err());
+            assert!(super::source_freshness(&path).is_err());
+            assert!(super::graph_source_freshness(&path).is_err());
+            sent.send(()).unwrap();
+        });
+        received
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("source reads waited for a FIFO writer");
+        worker.join().unwrap();
+    }
+
     use super::*;
 
     #[test]

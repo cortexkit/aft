@@ -1761,6 +1761,14 @@ fn build_file_data_from_tree_observed<'tree>(
     if let Some(outline) = outline {
         outline.clone_from(&symbols);
     }
+    if lang == LangId::Luau {
+        symbols.extend(
+            crate::luau::exports(source, tree.root_node())
+                .into_values()
+                .filter_map(|export| export.inline)
+                .map(|declaration| crate::parser::luau_symbol(source, declaration)),
+        );
+    }
     let object_nodes = crate::callgraph_store::join::dispatch::complete_typescript_symbols(
         source,
         lang,
@@ -1866,6 +1874,10 @@ fn build_file_data_from_tree_observed<'tree>(
         .filter(|s| s.exported)
         .map(|s| s.name.clone())
         .collect();
+    if lang == LangId::Luau {
+        // A symbol shown in the outline need not belong to the returned table.
+        exported_symbols = crate::luau::exports(source, root).into_keys().collect();
+    }
     if let Some(default_export) = &default_export {
         if !exported_symbols
             .iter()

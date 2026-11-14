@@ -29,23 +29,14 @@ pub(crate) fn parse_kotlin_imports(source: &str, tree: &Tree) -> ImportBlock {
     }
 }
 
-fn collect_kotlin_imports(source: &str, node: Node, imports: &mut Vec<ImportStatement>) {
-    if node.kind() == "import_header" {
+/// Collects the import headers under `root` in source order, without
+/// recursion, so a deeply nested file cannot overflow the stack.
+fn collect_kotlin_imports(source: &str, root: Node, imports: &mut Vec<ImportStatement>) {
+    super::for_each_preorder_until(root, "import_header", |node| {
         if let Some(imp) = parse_kotlin_import_header(source, &node) {
             imports.push(imp);
         }
-        return;
-    }
-
-    let mut cursor = node.walk();
-    if cursor.goto_first_child() {
-        loop {
-            collect_kotlin_imports(source, cursor.node(), imports);
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-    }
+    });
 }
 
 fn parse_kotlin_import_header(source: &str, node: &Node) -> Option<ImportStatement> {

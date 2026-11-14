@@ -1541,7 +1541,7 @@ fn resolve_node_package(module_path: &str, project_root: &Path) -> Option<PathBu
     let package_name = package_name(module_path)?;
     let package_dir = project_root.join("node_modules").join(package_name);
     let package_json = package_dir.join("package.json");
-    let value = fs::read_to_string(&package_json)
+    let value = crate::bounded_io::read_content_to_string(&package_json)
         .ok()
         .and_then(|source| serde_json::from_str::<Value>(&source).ok())?;
 

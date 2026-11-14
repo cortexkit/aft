@@ -3555,8 +3555,10 @@ fn subc_bridge_bash_hand_off_text_follows_the_worker_role() {
 }
 
 // Startup admission ends at the earlier of 15 seconds and the worker wait
-// limit. Do not shrink that startup budget on loaded Windows CI runners.
-const WORKER_BASH_WAIT_LIMIT_MS: u64 = if cfg!(windows) { 30_000 } else { 1_500 };
+// limit, so the limit is also the budget for building the command's
+// environment. On a loaded macOS runner that alone took over 1.5 s, and the
+// call was refused before the test could see the detach. Windows needs more.
+const WORKER_BASH_WAIT_LIMIT_MS: u64 = if cfg!(windows) { 30_000 } else { 6_000 };
 
 /// A delegated worker's blocking bash call over subc (`wait: true`, and a
 /// `block_to_completion` call) returns at the worker wait limit with the

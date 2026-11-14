@@ -912,14 +912,18 @@ fn running_hold_route(identity: &RouteIdentity) -> bool {
                 .is_some_and(|scope| scope.kind == subc_protocol::scope::ScopeKind::Ephemeral))
 }
 
-/// The authenticated bind principals of Thalamus's runners, whose head
-/// agents get a `background` launch answered at once (see
-/// `submit_deferred_bash`). Matched exactly: a harness label or a module name
-/// that merely starts the same way never qualifies.
-const BACKGROUND_HANDBACK_CARRIERS: [&str; 2] =
-    ["reserved:thalamus-harness", "reserved:thalamus-pi"];
+/// The authenticated bind principals of the runners that host head agents
+/// (Thalamus's runners and Broca), whose heads get a `background` launch
+/// answered at once (see `submit_deferred_bash`): the runner wakes an idle
+/// head when the completion notice arrives. Matched exactly: a harness label
+/// or a module name that merely starts the same way never qualifies.
+const BACKGROUND_HANDBACK_CARRIERS: [&str; 3] = [
+    "reserved:thalamus-harness",
+    "reserved:thalamus-pi",
+    "reserved:broca",
+];
 
-/// Whether `identity` is a head agent's route on one of Thalamus's runners:
+/// Whether `identity` is a head agent's route on a runner that hosts heads:
 /// a tool-provider v1 route bound under a head scope by one of
 /// [`BACKGROUND_HANDBACK_CARRIERS`]. The route must be first-party, because
 /// only first-party routes receive a task's completion notice; a codemode
@@ -2307,8 +2311,8 @@ pub(super) fn submit_deferred_bash(
     // A PTY launch always hands back its task id so the caller can drive the
     // interactive command with bash_write/bash_status.
     // Other server-owned calls own their command until it ends, except a
-    // `background` launch by a top-level (head) agent on a Thalamus runner,
-    // where completion reaches the session later as a notice. Handed-back
+    // `background` launch by a top-level (head) agent on a runner that hosts
+    // heads, where completion reaches the session later as a notice. Handed-back
     // tasks are ordinary background tasks: a cancel or route close before
     // the reply hands them off instead of killing them, and a slow startup
     // hands back the task id.

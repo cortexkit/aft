@@ -307,6 +307,11 @@ impl CallgraphBlob {
         let extractor_version = extractor_version.into();
         let tree = match crate::parser::cached_header_tree(source, lang) {
             Some(tree) => tree,
+            None if crate::parser::markdown_too_deep_to_parse(lang, source) => {
+                return Err(ManifestJoinError::Parse(
+                    crate::parser::MARKDOWN_TOO_DEEP.to_string(),
+                ));
+            }
             None => {
                 let mut parser = Parser::new();
                 crate::parser::initialize_parser(&mut parser, lang).map_err(extraction_error)?;
@@ -2828,6 +2833,11 @@ impl<I> ViewSurfaceIndex<'_, I> {
 }
 
 impl<I: super::ResolverIndex> super::ResolverIndex for ViewSurfaceIndex<'_, I> {
+    fn luau_config(&self, file: &str) -> Option<Arc<[u8]>> {
+        // ProjectFacts records configuration bytes and missing paths directly;
+        // these are checkout inputs, not parsed symbol data.
+        self.inner.luau_config(file)
+    }
     fn macro_use_modules(&self, file: &str) -> Vec<String> {
         let value = self.inner.macro_use_modules(file);
         self.record(ViewSurfaceQuery::MacroUse(file.into()), &value);

@@ -29,9 +29,9 @@ const CHECK_BEGIN_TIMESTAMP_MARGIN: Duration = Duration::from_secs(2);
 // Worktree churn must not turn completed compiler checks into an unbounded disk cache.
 const MAX_RECORDS: usize = 64;
 const RECORD_SCAN_LIMIT: usize = 1024;
-// Older records have no proof that skipped sources were checked for the set of
-// include-bearing macro names. Rebuild their facts before trusting a check.
-const RECORD_SCHEMA: u32 = 4;
+// Older records do not store macro parameter fragment kinds. Rebuild cached
+// source facts before deciding which arguments can safely determine include paths.
+const RECORD_SCHEMA: u32 = 5;
 
 fn canonical(path: &Path) -> Option<PathBuf> {
     fs::canonicalize(path)
@@ -2349,6 +2349,9 @@ mod tests {
     #[test]
     fn toolchain_version_change_invalidates_completed_check() {
         let (temp, mut cache) = fixture();
+        // Hashing runs the two fixture scripts; a loaded CI machine can take
+        // longer than the production budget to start them, and a timeout here
+        // would read as "no runtime" rather than test the invalidation.
         let binary = temp.path().join("compiler");
         crate::executable_cache::write_executable(&binary, b"#!/bin/sh\nprintf 'compiler 1\\n'\n")
             .unwrap();
@@ -2367,14 +2370,24 @@ mod tests {
         cache.runtime.launch_env = Some(cache.runtime.effective_env().unwrap());
         let runtime = cache
             .runtime
-            .hash(&cache.root, Instant::now() + BUDGET)
+            .hash(&cache.root, Instant::now() + LIVE_FIXTURE_CAPTURE_BUDGET)
             .unwrap();
-        cache.saved_mut().fingerprint =
-            fingerprint(&cache.root, runtime, None, Instant::now() + BUDGET, None).unwrap();
-        assert!(cache.validated(Instant::now() + BUDGET).is_some());
+        cache.saved_mut().fingerprint = fingerprint(
+            &cache.root,
+            runtime,
+            None,
+            Instant::now() + LIVE_FIXTURE_CAPTURE_BUDGET,
+            None,
+        )
+        .unwrap();
+        assert!(cache
+            .validated(Instant::now() + LIVE_FIXTURE_CAPTURE_BUDGET)
+            .is_some());
         crate::executable_cache::write_executable(&binary, b"#!/bin/sh\nprintf 'compiler 2\\n'\n")
             .unwrap();
-        assert!(cache.validated(Instant::now() + BUDGET).is_none());
+        assert!(cache
+            .validated(Instant::now() + LIVE_FIXTURE_CAPTURE_BUDGET)
+            .is_none());
     }
     #[test]
     fn unrelated_markdown_and_typescript_do_not_invalidate_completed_check() {
@@ -2877,6 +2890,128 @@ mod tests {
     }
 
     #[test]
+    fn reporter_fixture_test_macro_tracks_named_invocations_across_files() {
+        let (_temp, mut cache) = fixture();
+        write(&cache.root, "tests/fixtures/cases/a.json", "one");
+        write(&cache.root, "tests/fixtures/cases/b.json", "two");
+        write(
+            &cache.root,
+            "tests/fixtures/cases/unread.json",
+            "not an input",
+        );
+        write(
+            &cache.root,
+            "member/src/lib.rs",
+            r#"
+            macro_rules! fixture_test {
+                ($name:ident, $fixture:expr, $expr:expr) => {
+                    #[test]
+                    fn $name() {
+                        let expected = include_str!(concat!("../../tests/fixtures/cases/", $fixture));
+                        assert_eq!(expected, $expr);
+                    }
+                };
+            }
+            fixture_test!(case_a, "a.json", make_a());
+        "#,
+        );
+        write(
+            &cache.root,
+            "member/src/calls.rs",
+            "fixture_test!(case_b, \"b.json\", make_b());\n",
+        );
+        cache.saved_mut().fingerprint = capture_inputs(&cache).unwrap();
+        let fixtures: BTreeSet<_> = cache
+            .saved
+            .as_ref()
+            .unwrap()
+            .fingerprint
+            .files
+            .keys()
+            .filter(|path| path.starts_with(cache.root.join("tests/fixtures")))
+            .cloned()
+            .collect();
+        assert_eq!(
+            fixtures,
+            BTreeSet::from([
+                cache.root.join("tests/fixtures/cases/a.json"),
+                cache.root.join("tests/fixtures/cases/b.json"),
+            ])
+        );
+        assert!(valid(&cache).is_some());
+        for (file, original) in [("a.json", "one"), ("b.json", "two")] {
+            write(
+                &cache.root,
+                &format!("tests/fixtures/cases/{file}"),
+                "changed",
+            );
+            assert!(valid(&cache).is_none(), "{file} must invalidate the check");
+            write(
+                &cache.root,
+                &format!("tests/fixtures/cases/{file}"),
+                original,
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_macro_skips_unused_fragments_and_grouped_commas() {
+        for (kind, argument) in [
+            ("ident", "case_a"),
+            ("ty", "Vec<(u8, u8)>"),
+            ("tt", "{ x, y }"),
+            ("block", "{ let (x, y) = (1, 2); x + y }"),
+            ("expr", "make(a, b)"),
+        ] {
+            let (_temp, mut cache) = fixture();
+            write(&cache.root, "member/src/data/a.txt", "before");
+            write(
+                &cache.root,
+                "member/src/lib.rs",
+                &format!(
+                    r#"
+                    macro_rules! fixture {{
+                        ($before:{kind}, $fixture:expr, $after:{kind}) => {{
+                            include_str!(concat!("data/", $fixture))
+                        }};
+                    }}
+                    const DATA: &str = fixture!({argument}, "a.txt", {argument});
+                "#
+                ),
+            );
+            cache.saved_mut().fingerprint = capture_inputs(&cache)
+                .unwrap_or_else(|| panic!("unused {kind} arguments must not obscure the include"));
+            assert!(cache
+                .saved
+                .as_ref()
+                .unwrap()
+                .fingerprint
+                .files
+                .contains_key(&cache.root.join("member/src/data/a.txt")));
+            assert!(valid(&cache).is_some());
+            write(&cache.root, "member/src/data/a.txt", "after!");
+            assert!(valid(&cache).is_none(), "{kind} keeps the fixture position");
+        }
+    }
+
+    #[test]
+    fn fixture_macro_tt_parameter_in_include_path_stays_provisional() {
+        let (_temp, cache) = fixture();
+        write(&cache.root, "member/src/data/a.txt", "one");
+        write(
+            &cache.root,
+            "member/src/lib.rs",
+            r#"
+            macro_rules! fixture {
+                ($fixture:tt) => { include_str!(concat!("data/", $fixture)) };
+            }
+            const DATA: &str = fixture!("a.txt");
+        "#,
+        );
+        assert!(capture_inputs(&cache).is_none());
+    }
+
+    #[test]
     fn macro_paths_and_manifest_dir_are_relative_to_the_invocation() {
         let (_temp, mut cache) = fixture();
         write(&cache.root, "member/tests/data/a.txt", "before");
@@ -3264,11 +3399,19 @@ mod tests {
             .env
             .insert("RUSTC".into(), compiler.to_string_lossy().into_owned());
         // The fixture writes its own build-script output here; an inherited
-        // Cargo target directory must not redirect that input discovery.
-        cache.runtime.env.insert(
-            "CARGO_TARGET_DIR".into(),
-            cache.root.join("target").to_string_lossy().into_owned(),
-        );
+        // Cargo target or build directory must not redirect that input
+        // discovery. A build server may export CARGO_BUILD_BUILD_DIR with an
+        // unresolved Cargo template, which input discovery rightly refuses, so
+        // pin it to the same folder too.
+        let target = cache.root.join("target").to_string_lossy().into_owned();
+        cache
+            .runtime
+            .env
+            .insert("CARGO_TARGET_DIR".into(), target.clone());
+        cache
+            .runtime
+            .env
+            .insert("CARGO_BUILD_BUILD_DIR".into(), target);
         cache.runtime.launch_env = Some(cache.runtime.effective_env().unwrap());
         write(
             &cache.root,

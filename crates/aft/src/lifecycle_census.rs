@@ -28,6 +28,8 @@ pub(crate) struct LspChildRootSnapshot {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct LspCensus {
+    /// Worker rust-analyzer admission refusals since process start, not start failures.
+    pub capacity_refusals: u64,
     pub children_total: u64,
     pub children_by_root: Vec<LspChildRootSnapshot>,
     pub children_roots_total: u64,
@@ -128,6 +130,7 @@ pub(crate) fn collect(
 ) -> LifecycleCensusSnapshot {
     let lsp_health = app.lsp_child_registry().health_snapshot();
     let lsp = LspCensus {
+        capacity_refusals: crate::lsp::client::rust_analyzer_capacity_refusals(),
         children_total: lsp_health.children_total as u64,
         children_by_root: lsp_health
             .children_by_root

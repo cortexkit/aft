@@ -269,6 +269,34 @@ pub(crate) fn import_byte_range(imports: &[ImportStatement]) -> Option<Range<usi
     })
 }
 
+/// Calls `found` on each node of kind `kind` in the tree under `root`
+/// (`root` included), in source order, without descending into a node it
+/// found. The walk keeps its place in a tree cursor instead of recursing, so
+/// its stack use does not grow with the tree's depth: a file can nest tens
+/// of thousands of levels deep, and a stack overflow aborts the process.
+pub(crate) fn for_each_preorder_until<'tree>(
+    root: Node<'tree>,
+    kind: &str,
+    mut found: impl FnMut(Node<'tree>),
+) {
+    let mut cursor = root.walk();
+    loop {
+        let node = cursor.node();
+        if node.kind() == kind {
+            found(node);
+        } else if cursor.goto_first_child() {
+            continue;
+        }
+        // Move past this subtree: to the next sibling, or up until an
+        // ancestor has one. The cursor cannot climb above `root`.
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Specifier helpers (TS/JS verbatim-string format)
 // ---------------------------------------------------------------------------
@@ -609,6 +637,9 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
 
 /// Parse imports from source using the provided tree-sitter tree.
 pub fn parse_imports(source: &str, tree: &Tree, lang: LangId) -> ImportBlock {
+    if lang == LangId::Luau {
+        return crate::luau::imports(source, tree.root_node());
+    }
     match syntax_for(lang) {
         Some(engine) => engine.parse(source, tree),
         None => ImportBlock::empty(),

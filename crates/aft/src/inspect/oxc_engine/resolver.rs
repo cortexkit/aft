@@ -358,7 +358,7 @@ impl ModuleResolver {
             .or_insert_with(|| {
                 let package_json = package_dir.join("package.json");
                 tracker.record_if_file(&package_json);
-                let value = fs::read_to_string(&package_json)
+                let value = crate::bounded_io::read_content_to_string(&package_json)
                     .ok()
                     .and_then(|source| serde_json::from_str::<Value>(&source).ok())?;
                 Some(collect_package_entries(&value))
@@ -517,7 +517,7 @@ fn declaration_file_source_base(base: &Path) -> Option<PathBuf> {
 }
 
 fn package_json_name(package_json: &Path) -> Option<String> {
-    let value = fs::read_to_string(package_json)
+    let value = crate::bounded_io::read_content_to_string(package_json)
         .ok()
         .and_then(|source| serde_json::from_str::<Value>(&source).ok())?;
     value
@@ -527,7 +527,7 @@ fn package_json_name(package_json: &Path) -> Option<String> {
 }
 
 fn sveltekit_lib_alias_enabled(package_json: &Path) -> bool {
-    let Some(value) = fs::read_to_string(package_json)
+    let Some(value) = crate::bounded_io::read_content_to_string(package_json)
         .ok()
         .and_then(|source| serde_json::from_str::<Value>(&source).ok())
     else {
@@ -649,4 +649,36 @@ fn slash_path(path: &Path) -> String {
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    #[test]
+    fn non_regular_oxc_resolver_reads_do_not_wait_for_fifo_writers() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let dependency = root.join("node_modules/dependency");
+        std::fs::create_dir_all(&dependency).unwrap();
+        crate::bounded_io::tests::fifo(&root.join("package.json"));
+        crate::bounded_io::tests::fifo(&dependency.join("package.json"));
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let resolver = super::ModuleResolver::new(&root, &[]);
+            assert_eq!(resolver.root_package_name, None);
+            assert!(!resolver.sveltekit_lib_alias);
+            assert_eq!(
+                resolver.resolve_package_fallback(
+                    "dependency",
+                    &mut super::ResolverConfigTracker::default(),
+                    &mut super::ResolverPassCache::default(),
+                ),
+                None
+            );
+            sent.send(()).unwrap();
+        });
+        received
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("oxc resolver reads waited for a FIFO writer");
+        worker.join().unwrap();
+    }
 }

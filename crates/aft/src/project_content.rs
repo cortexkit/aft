@@ -268,7 +268,7 @@ fn bytes_to_path(bytes: &[u8]) -> Option<PathBuf> {
 
 fn capped_read(path: &Path, cap: u64) -> Option<Vec<u8>> {
     use std::io::Read;
-    let file = std::fs::File::open(path).ok()?;
+    let file = crate::bounded_io::open_content_file(path).ok()?;
     let mut bytes = Vec::new();
     file.take(cap).read_to_end(&mut bytes).ok()?;
     Some(bytes)

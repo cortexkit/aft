@@ -31,6 +31,13 @@ def load_module(name, path):
 OSS = load_module("index_matrix_oss", HERE.parent / "oss-matrix.py")
 
 
+class ExitedBeforeCensus(RuntimeError):
+    def __init__(self, status):
+        self.status = status
+        super().__init__(f"AFT exited with status {status} after ready but before census export")
+
+
+
 def save(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -130,9 +137,9 @@ def checked(response, operation):
 
 
 def configure(client, root, env, mode, timeout):
-    config = {"indexes": {"trigram": mode in ("text", "full"),
+    config = {"indexes": {"trigram": mode in ("text", "callgraph", "full"),
                           "semantic": mode in ("meaning", "full"),
-                          "callgraph": mode == "full"},
+                          "callgraph": mode in ("callgraph", "full")},
               "inspect": {"enabled": False}, "semantic": {"backend": "fastembed"}}
     if mode in ("meaning", "full"):
         # Runner sessions do not open interactive semantic roots. Measurement
@@ -146,6 +153,7 @@ def configure(client, root, env, mode, timeout):
 
 def states(status, mode):
     wanted = {"text": ["search_index"], "meaning": ["semantic_index"],
+              "callgraph": ["search_index", "callgraph_store"],
               "full": ["search_index", "semantic_index", "callgraph_store"]}[mode]
     return {key: status.get(key, {}).get("status", "unknown") for key in wanted}
 
@@ -245,7 +253,7 @@ def semantic_failure_record(folder):
 
 def measure_build(binary, root, folder, mode, args):
     folder.mkdir(parents=True, exist_ok=False)
-    census = folder / "call-shape.json" if mode == "full" else None
+    census = folder / "call-shape.json" if mode in ("callgraph", "full") else None
     env = isolated_environment(folder, census)
     result = {"mode": mode, "outcome": "failed", "guard_bytes": args.guard_gib * 1024 ** 3,
               "semantic_admission": "user-tier index.roots selecting search and semantic" if mode in ("meaning", "full") else None,
@@ -253,6 +261,7 @@ def measure_build(binary, root, folder, mode, args):
               "gaps": []}
     client = sampler = phases = None
     started = time.monotonic_ns()
+    deadline = time.monotonic() + args.timeout_s
     try:
         client = Client(binary, root, env, folder / "stderr.log", result["guard_bytes"], args.cgroup_parent)
         sampler = OSS.ProcessSampler(client.proc)
@@ -260,13 +269,16 @@ def measure_build(binary, root, folder, mode, args):
         sampler.start()
         phases.start()
         configure(client, root, env, mode, min(30, args.timeout_s))
-        status = wait_ready(client, mode, time.monotonic() + args.timeout_s, folder, sampler, phases)
+        status = wait_ready(client, mode, deadline, folder, sampler, phases)
         result["wall_ns"] = time.monotonic_ns() - started
         if census:
-            export_deadline = time.monotonic() + args.timeout_s
+            export_deadline = deadline
             while not census.exists():
-                if client.proc.poll() is not None or time.monotonic() >= export_deadline:
-                    raise OSS.NdjsonError("full build ready but census export never appeared")
+                if time.monotonic() >= export_deadline:
+                    raise OSS.BudgetExceeded("census export deadline exceeded")
+                exit_status = client.proc.poll()
+                if exit_status is not None:
+                    raise ExitedBeforeCensus(exit_status)
                 time.sleep(0.25)
         save(folder / "ready-status.json", status)
         result["outcome"] = "ready"
@@ -276,7 +288,20 @@ def measure_build(binary, root, folder, mode, args):
             result["store_allocated_bytes"] = disk_bytes(Path(store), allocated=True)
         else:
             result["gaps"].append("status did not expose an existing data_store_dir")
-    except (OSS.NdjsonError, OSS.BudgetExceeded, OSError, ValueError) as error:
+    except ExitedBeforeCensus as error:
+        result["outcome"] = "exited_before_census"
+        result["exit_status"] = error.status
+        result["reason"] = str(error)
+        result["wall_ns"] = time.monotonic_ns() - started
+    except OSS.BudgetExceeded as error:
+        result["outcome"] = "deadline"
+        result["reason"] = str(error)
+        result["deadline_s"] = args.timeout_s
+        result["wall_ns"] = time.monotonic_ns() - started
+    except (OSS.NdjsonError, OSError, ValueError) as error:
+        if time.monotonic() >= deadline:
+            result["outcome"] = "deadline"
+            result["deadline_s"] = args.timeout_s
         result["reason"] = str(error)
         result["wall_ns"] = time.monotonic_ns() - started
     finally:
@@ -339,7 +364,7 @@ def validate_shape(value):
     return value
 
 
-def measure_queries(binary, root, folder, artifact, args):
+def measure_queries(binary, root, folder, artifact, args, mode="full"):
     # Every cold request gets a new AFT process over the already-built store.
     # This empties process/query caches, NOT Linux's page cache. OS-cache-cold
     # runs require --drop-caches, an explicit privileged dedicated-server option.
@@ -347,6 +372,15 @@ def measure_queries(binary, root, folder, artifact, args):
     if not top:
         return {"outcome": "not_measured", "reason": "no callable symbols in census"}
     samples = []
+    query_path = folder / "queries.jsonl"
+    if query_path.exists():
+        # A retry is a complete new query batch. Keep the interrupted batch as
+        # evidence, but never pool its samples into the new percentiles.
+        token = str(time.time_ns())
+        query_path.rename(folder / ("queries-retired-" + token + ".jsonl"))
+        summary = folder / "query-summary.json"
+        if summary.exists():
+            summary.rename(folder / ("query-summary-retired-" + token + ".json"))
     env = isolated_environment(folder)
     guard = args.guard_gib * 1024 ** 3
     for operation in ("callers", "impact", "trace_to"):
@@ -356,8 +390,8 @@ def measure_queries(binary, root, folder, artifact, args):
                 Path("/proc/sys/vm/drop_caches").write_text("3\n")
             client = Client(binary, root, env, folder / "query-stderr.log", guard, args.cgroup_parent)
             try:
-                configure(client, root, env, "full", 30)
-                wait_ready(client, "full", time.monotonic() + args.timeout_s, folder)
+                configure(client, root, env, mode, 30)
+                wait_ready(client, mode, time.monotonic() + args.timeout_s, folder)
                 for repetition in range(args.warm_repetitions + 1):
                     started = time.monotonic_ns()
                     response = client.request("tool_call", timeout_s=args.query_timeout_s,
@@ -408,7 +442,16 @@ def fingerprint(entry, args):
             "drop_caches": args.drop_caches, "harness_sha256": sha256(Path(__file__)),
             "aft_source_commit": args.aft_source_commit, "shape_source_commit": args.shape_source_commit,
             "build_profile": args.build_profile, "cgroup_parent": str(args.cgroup_parent) if args.cgroup_parent else None,
-            "runtime_sha256": sha256(Path(os.environ["ORT_DYLIB_PATH"])) if os.environ.get("ORT_DYLIB_PATH") else None}
+            "runtime_sha256": sha256(Path(os.environ["ORT_DYLIB_PATH"])) if os.environ.get("ORT_DYLIB_PATH") else None,
+            "phases": args.phases, "query_build": args.query_build, "plan_revision": args.plan_revision}
+
+
+def compatible_observations(old, new):
+    # Explicit plan revisions may retain observations, never silently relabel
+    # different binaries, commits, repositories, guards or cache policies.
+    metadata = {"harness_sha256", "phases", "query_build", "plan_revision"}
+    return {key: value for key, value in old.items() if key not in metadata} == {
+        key: value for key, value in new.items() if key not in metadata}
 
 
 def completed(folder, expected):
@@ -419,9 +462,14 @@ def completed(folder, expected):
     if result.get("completed") is not True or result.get("fingerprint") != expected:
         return False
     attempt = folder / result["attempt"]
-    if any(not (attempt / mode / filename).is_file() for mode in ("text", "meaning")
-           for filename in ("build.json", "ready-status.json", "status.jsonl", "memory-census.jsonl", "phase-memory.csv")):
-        raise ValueError(f"completed result lost raw artifacts: {folder}; restore them before resuming")
+    artifacts = result.get("phase_artifacts", {})
+    for mode in expected.get("phases", ("text", "meaning")):
+        directory = folder / artifacts[mode] if mode in artifacts else attempt / mode
+        required = ["build.json", "status.jsonl", "memory-census.jsonl", "phase-memory.csv"]
+        if result.get(mode, {}).get("outcome", "ready") == "ready":
+            required.append("ready-status.json")
+        if any(not (directory / filename).is_file() for filename in required):
+            raise ValueError(f"completed result lost raw artifacts: {folder}; restore them before resuming")
     return True
 
 
@@ -430,42 +478,87 @@ def run_repository(entry, args):
     folder.mkdir(parents=True, exist_ok=True)
     identity = fingerprint(entry, args)
     if completed(folder, identity):
-        print(f"skip completed {entry['repository']}", flush=True)
+        print(f"skip completed {entry['repository']} ({args.plan_revision})", flush=True)
         return True
-    if (folder / "result.json").exists() and json.loads((folder / "result.json").read_text()).get("completed"):
-        raise ValueError(f"completed run has different inputs: choose a new --results folder ({folder})")
+    path = folder / "result.json"
+    result = json.loads(path.read_text()) if path.exists() else {}
+    if result:
+        old_revision = result.get("plan_revision", "all-meaning-v1")
+        if old_revision == args.plan_revision and result.get("fingerprint") != identity:
+            raise ValueError("measurement inputs changed within a revision; use a new results directory")
+        if old_revision != args.plan_revision and not compatible_observations(result["fingerprint"], identity):
+            raise ValueError("cannot preserve earlier results with different measurement inputs")
+        history = "history/result-" + str(time.time_ns()) + ".json"
+        save(folder / history, result)
+        result.setdefault("previous_results", []).append(history)
     root = checkout(entry, folder).resolve()
+    previous_attempt = result.get("attempt")
+    artifacts = result.setdefault("phase_artifacts", {})
+    revisions = result.setdefault("phase_revisions", {})
+    for mode in ("text", "meaning", "callgraph", "full"):
+        if mode in result and previous_attempt:
+            artifacts.setdefault(mode, str(Path(previous_attempt) / mode))
+            revisions.setdefault(mode, result.get("plan_revision", "all-meaning-v1"))
+    if result.get("queries") and previous_attempt:
+        result["queries"].setdefault("build", "full")
+        result["queries"].setdefault("artifact", str(Path(previous_attempt) / "full/queries.jsonl"))
+    if result.get("call_shape"):
+        result.setdefault("call_shapes", {}).setdefault(result["call_shape"].get("build", "full"), result["call_shape"])
     attempt = folder / ("attempt-" + str(time.time_ns()))
     attempt.mkdir()
-    result = {"schema_version": 1, "repository": entry["repository"], "commit": entry["commit"],
-              "fingerprint": identity, "attempt": attempt.name, "completed": False,
-              "checkout_bytes": disk_bytes(root, exclude_git=True),
-              "checkout_allocated_bytes": disk_bytes(root, exclude_git=True, allocated=True),
-              "checkout_with_git_bytes": disk_bytes(root), "host": {
-                  "uname": list(os.uname()), "logical_cpus": os.cpu_count(),
-                  "meminfo": Path("/proc/meminfo").read_text(),
-                  "python": sys.version,
-              }}
-    for mode in ("text", "meaning"):
-        result[mode] = measure_build(args.aft_binary, root, attempt / mode, mode, args)
-        save(folder / "result.json", result)
-    if args.shape_binary:
-        result["full"] = measure_build(args.shape_binary, root, attempt / "full", "full", args)
-        if result["full"]["outcome"] == "ready":
-            try:
-                artifact = validate_shape(json.loads((attempt / "full/call-shape.json").read_text()))
-                result["call_shape"] = {"outcome": "measured", "artifact": str(Path(attempt.name) / "full/call-shape.json")}
-                result["queries"] = measure_queries(args.aft_binary, root, attempt / "full", artifact, args)
-            except (OSError, ValueError, KeyError, OSS.NdjsonError, OSS.BudgetExceeded) as error:
-                result.setdefault("call_shape", {"outcome": "not_measured", "reason": str(error)})
-                result["queries"] = {"outcome": "not_measured", "reason": str(error)}
-        else:
-            reason = "full build did not finish under guard: " + result["full"].get("reason", "unknown")
-            result["call_shape"] = result["queries"] = {"outcome": "not_measured", "reason": reason}
+    result.update({"schema_version": 2, "repository": entry["repository"], "commit": entry["commit"],
+                   "fingerprint": identity, "attempt": attempt.name, "completed": False,
+                   "plan_revision": args.plan_revision, "phase_plan": args.phases,
+                   "checkout_bytes": disk_bytes(root, exclude_git=True),
+                   "checkout_allocated_bytes": disk_bytes(root, exclude_git=True, allocated=True),
+                   "checkout_with_git_bytes": disk_bytes(root), "host": {
+                       "uname": list(os.uname()), "logical_cpus": os.cpu_count(),
+                       "meminfo": Path("/proc/meminfo").read_text(), "python": sys.version}})
+    result["skipped_phases"] = {mode: {"outcome": "skipped", "reason":
+        ("separate meaning build removed; meaning is measured inside full" if mode == "meaning" and "full" in args.phases
+         else "not requested by " + args.plan_revision + "; earlier observations, if any, retained")}
+        for mode in ("text", "meaning", "callgraph", "full") if mode not in args.phases}
+    result["query_plan"] = {"build": args.query_build, "operations": ["callers", "impact", "trace_to"],
+                            "meaning_dependent_queries": {"outcome": "skipped", "reason":
+                                "baseline callers/impact/trace_to require no meaning index; no meaning-dependent query is scheduled"}}
+    for mode in args.phases:
+        if result.get(mode, {}).get("outcome") not in ("ready", "guard_killed", "deadline"):
+            binary = args.shape_binary if mode in ("callgraph", "full") else args.aft_binary
+            result[mode] = measure_build(binary, root, attempt / mode, mode, args)
+            artifacts[mode] = str(Path(attempt.name) / mode)
+            revisions[mode] = args.plan_revision
+        if mode in ("callgraph", "full"):
+            if result[mode]["outcome"] == "ready":
+                shape = {"outcome": "measured", "build": mode,
+                         "artifact": str(Path(artifacts[mode]) / "call-shape.json")}
+            else:
+                shape = {"outcome": "not_measured", "build": mode,
+                         "reason": mode + " build: " + result[mode].get("reason", result[mode]["outcome"])}
+            result.setdefault("call_shapes", {})[mode] = shape
+            result["call_shape"] = shape
+        save(path, result)
+    if args.query_build == "none":
+        result["queries_this_revision"] = {"outcome": "skipped", "reason": "callgraph-only addition; previous query observations retained"}
     else:
-        result["call_shape"] = result["queries"] = {"outcome": "not_measured", "reason": "no --shape-binary supplied; feature-gated census required"}
-    result["completed"] = all(result[mode]["outcome"] == "ready" for mode in ("text", "meaning"))
-    save(folder / "result.json", result)
+        mode = args.query_build
+        query = result.get("queries", {})
+        existing_query_path = folder / query["artifact"] if query.get("artifact") else None
+        if query.get("outcome") == "measured" and query.get("build") == mode and existing_query_path and existing_query_path.is_file():
+            result["queries_this_revision"] = {"outcome": "retained", "reason": "completed query batch with identical measurement inputs retained"}
+        elif result.get(mode, {}).get("outcome") == "ready":
+            try:
+                directory = folder / artifacts[mode]
+                artifact = validate_shape(json.loads((directory / "call-shape.json").read_text()))
+                query = measure_queries(args.aft_binary, root, directory, artifact, args, mode=mode)
+                query.update({"build": mode, "artifact": str(Path(artifacts[mode]) / "queries.jsonl")})
+                result["queries"] = query
+            except (OSError, ValueError, KeyError, OSS.NdjsonError, OSS.BudgetExceeded) as error:
+                result["queries"] = {"outcome": "not_measured", "build": mode, "reason": str(error)}
+        else:
+            result["queries"] = {"outcome": "not_measured", "build": mode,
+                                 "reason": mode + " build did not finish ready: " + result.get(mode, {}).get("outcome", "absent")}
+    result["completed"] = all(result[mode]["outcome"] in ("ready", "guard_killed", "deadline") for mode in args.phases)
+    save(path, result)
     return result["completed"]
 
 
@@ -485,7 +578,18 @@ def parse_args():
     parser.add_argument("--query-timeout-s", type=float, default=120)
     parser.add_argument("--warm-repetitions", type=int, default=10)
     parser.add_argument("--drop-caches", action="store_true", help="write Linux drop_caches=3 before every cold query (requires privilege; dedicated host only)")
+    parser.add_argument("--plan-revision", default="all-meaning-v1")
+    parser.add_argument("--phases", help="ordered comma-separated text,meaning,callgraph,full builds")
+    parser.add_argument("--query-build", choices=("full", "callgraph", "none"))
     args = parser.parse_args()
+    args.phases = args.phases.split(",") if args.phases else (["text", "meaning", "full"] if args.shape_binary else ["text", "meaning"])
+    if not args.phases or len(set(args.phases)) != len(args.phases) or any(mode not in ("text", "meaning", "callgraph", "full") for mode in args.phases):
+        parser.error("--phases must be an ordered, nonduplicate list of known phases")
+    args.query_build = args.query_build or ("full" if "full" in args.phases else "none")
+    if args.query_build != "none" and args.query_build not in args.phases:
+        parser.error("query build must be among requested phases")
+    if any(mode in ("callgraph", "full") for mode in args.phases) and not args.shape_binary:
+        parser.error("callgraph/full phases require --shape-binary")
     if not sys.platform.startswith("linux"):
         parser.error("measurement requires Linux /proc and prlimit")
     if args.timeout_s <= 0 or args.query_timeout_s <= 0 or args.warm_repetitions < 1:

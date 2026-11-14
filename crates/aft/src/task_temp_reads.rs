@@ -1,6 +1,6 @@
 //! Open scratch content without letting a replaced symlink widen a read grant.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -56,19 +56,12 @@ pub(crate) fn check_path(path: &Path) -> io::Result<Option<OpenCheck>> {
 
 pub(crate) fn open(path: &Path) -> io::Result<File> {
     let Some(check) = check_path(path)? else {
-        return File::open(path);
+        return crate::bounded_io::open_content_file(path);
     };
     // Sandbox task-temp directory names select stricter open checks so links
     // cannot redirect scratch reads elsewhere. A matching name never grants
     // access; the caller still needs authorization from the task registry.
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
-    }
-    let file = options.open(path)?;
+    let file = crate::bounded_io::open_content_file_no_follow(path)?;
     validate_opened(path, &check, &file)?;
     Ok(file)
 }

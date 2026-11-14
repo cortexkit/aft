@@ -1,7 +1,9 @@
 # Fixed-memory index measurement matrix
 
-This sibling of `../cost-gate.py` measures cold **text** and **meaning-search**
-indexes separately, then optionally today's full graph and query latency. It
+This sibling of `../cost-gate.py` measures cold index builds and guarded
+call-graph/query costs. The active matrix policy is **`meaning-nine-v2`** below:
+six completed meaning-search projects are retained and only three more projects
+build meaning search, inside their full build. It
 imports the nightly gate's `oss-matrix.py` NDJSON framing and resource/phase
 samplers. It does not change the nightly workflow, profile, fixtures or baselines.
 No debug binaries, artificial corpus subsets, sampling of call sites, or inferred
@@ -63,10 +65,11 @@ payloads and submodules are not populated, matching a plain shallow checkout.
 
 ## Run one repository or the whole matrix
 
-Run from the AFT repository root. `--repository` selects an exact manifest name;
-omit it to run all 21 serially. A results-directory lock also prevents separate
-invocations from overlapping. Keep results and checkouts under the ignored
-`target/index-matrix/` folder (the default), **never commit them**.
+Run from the AFT repository root. Use `matrix.py --revision meaning-nine-v2.1`
+for the approved matrix phase plan, not an unfiltered standalone `run.py` call.
+`--repository` on `run.py` selects one exact manifest name. A results-directory
+lock prevents overlapping invocations. Keep results and checkouts under ignored
+`target/index-matrix/`, **never commit them**.
 
 For a real 48 GiB **resident-memory guard**, use a writable cgroup-v2 parent with
 the memory controller delegated. On a dedicated root-owned Ubuntu host,
@@ -79,18 +82,14 @@ RSS overrun. Lower `--guard-gib` on a smaller host; it can never exceed 48.
 
 ```sh
 python3 scripts/telemetry/index-matrix/run.py \
-  --repository neovim/neovim \
+  --repository neovim/neovim --phases callgraph --query-build none \
+  --plan-revision meaning-nine-v2.1 \
   --aft-binary target/aft-default --shape-binary target/aft-shape \
   --aft-source-commit "$(git rev-parse HEAD)" \
   --shape-source-commit "$(git rev-parse HEAD)" \
   --cgroup-parent /sys/fs/cgroup
 
-# Entire matrix, same arguments but no --repository:
-python3 scripts/telemetry/index-matrix/run.py \
-  --aft-binary target/aft-default --shape-binary target/aft-shape \
-  --aft-source-commit "$(git rev-parse HEAD)" \
-  --shape-source-commit "$(git rev-parse HEAD)" \
-  --cgroup-parent /sys/fs/cgroup
+# For the whole matrix, use the detached revision command below.
 
 python3 scripts/telemetry/index-matrix/tables.py
 python3 -m unittest discover -s scripts/telemetry/index-matrix -p 'test_*.py' -v
@@ -98,7 +97,11 @@ python3 -m unittest discover -s scripts/telemetry/index-matrix -p 'test_*.py' -v
 
 Reissue the same command to resume. A completed result is skipped only when its
 manifest entry, binary/runtime/harness hashes, commits and measurement parameters
-match. Changed inputs require a new `--results` directory. Incomplete attempts
+match. Explicit transitions from `all-meaning-v1` or `meaning-nine-v2` to
+implementation `meaning-nine-v2.1` retain prior ready
+observations only when binary/runtime hashes, commits, guards, deadlines, cache
+policy and manifest entry match; original result JSON is saved under `history/`.
+Other changed inputs require a new results directory. Incomplete attempts
 remain as raw evidence; a retry uses new isolated storage, not an incremental
 index. A failed guarded full build is a completed observation with **not
 measured** call shape and queries, not an estimate. Without `--shape-binary`, those
@@ -123,7 +126,7 @@ Extraction alone is not exact. In `dispatch.rs`, missing receivers and missing G
 packages go directly to `Resolver::unknown`, but Rust and Go also take that path
 after resolved-method ambiguity. The optional feature classifies actual resolver
 exits, including memoized hits, and writes exact `(language, member)` groups to
-`AFT_CALLGRAPH_SHAPE_CENSUS_JSON` only after a successful full build. The harness
+`AFT_CALLGRAPH_SHAPE_CENSUS_JSON` after a successful callgraph or full build. The harness
 expects schema version 1, `groups: [{language, member, sites, targets}]`, and exact
 `top_callers: [{path, symbol, callers}]` for the busiest ten symbols (or all if
 fewer exist). Additional hook fields are retained in raw JSON. No graph build
@@ -167,27 +170,57 @@ The 30 s polling probe observed completion at 240.0028163800016 s (an upper boun
 not exact clone CPU time). This is practical within the 360 GB disk budget.
 The manifest independently pins Chromium's subsequently observed default head.
 
-## Detached full matrix and evidence collection
+## Revised matrix: meaning-nine-v2.1
 
-The active dedicated-server series started at **2026-11-13T23:30:40.416178Z**
-from source commit `fcf1199a8d6b8e52e9d1a03cceca244983c863a2`, as systemd unit
-`aft-index-matrix.service`. Its result root is
-`/root/aft/target/index-matrix/full-matrix`. The launch command below is the
-command used for that series. MLX and Neovim both finished text, meaning, full
-census and 330 timed queries; their finished artifacts have been copied into
-`.cortexkit/internal-docs/investigations/index-matrix/full-matrix/` locally.
-MLX reported zero failed semantic files; Neovim reported the same two unnamed
-failures in both meaning/full phases, preserved in `semantic-failures.json`.
-The service remains running. To keep copying later results after worker handoff,
-start `collect.py --watch` with the command below; no collector runs on the server.
+The original series started at **2026-11-13T23:30:40.416178Z** and was stopped
+cleanly at **2026-11-14T05:33:09Z** to apply the nine-project meaning budget.
+The phase policy remains `meaning-nine-v2`; implementation revision
+`meaning-nine-v2.1` also distinguishes process exit before census export from a
+24-hour deadline. It preserves the exit status and raw evidence. On a query retry,
+the incomplete batch is renamed to `queries-retired-*.jsonl` and replayed whole;
+only the new `queries.jsonl` contributes percentiles. Completed batches with
+identical inputs are retained without replay. The service remains
+`aft-index-matrix.service`; remote/local result paths are unchanged. `matrix-plan.json` records the revision, per-project phase plans,
+revised UTC time, source/input hashes and previous plan. Existing results are
+retained, with phase-specific artifact paths and revision labels in the tables.
 
-`matrix.py` orders the manifest by tracked-file count (the available consistent
-size measure), with Chromium always last. Each repository runs text, meaning,
-then the full census build and queries; a cgroup-killed full build is a recorded
-result, not a reason to stop the matrix. Results contain `guard_killed`, kernel
-cgroup `memory.peak`, OOM events, last observed VmHWM and elapsed time. Cgroup peak
-includes charged file cache and is **not** mislabeled process VmHWM; when a killed
-process's final `/proc` sample is unavailable, exact terminal VmHWM stays empty.
+The execution order is:
+
+1. TensorRT-LLM first: retain its ready text result, discard only its unfinished
+   meaning build after preserving raw evidence, then callgraph and queries.
+2. The other eleven no-meaning projects, smallest tracked-path count first:
+   Spark, Home Assistant, Swift, Magento, Node, .NET, Rust, Linux, Kotlin, GitLab,
+   Chromium. Each runs text, callgraph, and queries on the callgraph store.
+3. VS Code, Kubernetes, Elasticsearch: text, callgraph, full, then queries on
+   the full store. There is **no separate meaning-only phase**. The full build's
+   raw per-plane census gives the meaning component observations, not an
+   independently measured component peak.
+4. The six finished projects (MLX, Neovim, Perl, Superset, Solidity, Zig): preserve
+   all previous results and queries; add only a new isolated callgraph phase.
+
+`callgraph` always enables text plus call graph, with meaning **off**, and uses
+the census binary. All existing query operations (`callers`, `impact`, `trace_to`)
+need only the call graph; their warm/cold setup also leaves meaning off when the
+source build is callgraph. Meaning-dependent queries/phases excluded by the plan
+are explicitly `skipped` with a reason, never reported as zero latency.
+
+The 48 GiB cgroup guard, kernel `memory.peak`, VmHWM, drop-caches policy and
+86,400-second build deadline remain. A guard kill records `guard_killed`; a
+build deadline records `deadline`, preserves evidence, and moves on. Terminal
+VmHWM remains empty if `/proc` has disappeared; cgroup peak includes charged file
+cache and is not substituted for process RSS.
+
+The phase-policy restart estimate was **about 28.5–41.9 billed hours total,
+€10.7–15.7 at €0.3758/h** (using eight already-billed hours conservatively).
+For the minor implementation restart, allowing ten hours already billed gives
+**about 30.5–43.9 hours total, €11.5–16.5**, still below the €45 stop threshold.
+Remaining meaning work is 105,163 tracked files, projecting 2.0–11.4 h from the
+measured Superset/Zig rates. Callgraph work is 1,450,239 tracked-file units,
+projecting 10.5–14.5 h from Elasticsearch's 5:23/7:47 probes and assumed 9k/18k
+file denominators; the exact probe file counts were unavailable. An additional
+eight-hour reserve covers queries, cloning and nonlinear costs. These are
+planning assumptions, not measured future durations or a guarantee. Monitor
+actual server lifetime against the €45 review threshold and €50 ceiling.
 
 Every meaning/full phase writes `semantic-failures.json`: native failed-file
 count, any names supplied in structured status, the complete semantic status,
@@ -204,7 +237,7 @@ systemd-run --unit=aft-index-matrix --collect \
   --property=TimeoutStopSec=60 \
   --setenv=ORT_DYLIB_PATH=/root/onnx/onnxruntime-linux-x64-1.24.4/lib/libonnxruntime.so \
   /usr/bin/python3 scripts/telemetry/index-matrix/matrix.py \
-  --results /root/aft/target/index-matrix/full-matrix -- \
+  --revision meaning-nine-v2.1 --results /root/aft/target/index-matrix/full-matrix -- \
   --aft-binary /root/aft-default --shape-binary /root/aft-shape \
   --aft-source-commit 0672e983c119ab0e24cb4492c47c8c54f0e4127e \
   --shape-source-commit c1efafc8eb15b81e972ca80a895887e0fe45317c \
@@ -212,12 +245,9 @@ systemd-run --unit=aft-index-matrix --collect \
   --timeout-s 86400
 ```
 
-This full-matrix series uses a separate results folder from the Neovim run
-recorded in `.cortexkit/internal-docs/investigations/index-matrix/README.md`.
-Its per-build deadline is 86,400 seconds rather than that run's 360 seconds. `matrix-plan.json` records the actual UTC start, source
-commit, order, commands and input hashes; `matrix-state.json` records the current
-repository and each finished result. Logs stay on local disk and SSH disconnects
-do not terminate the systemd service. Follow progress with:
+`matrix-plan.json` and `matrix-state.json` preserve earlier plans/states and
+record which phases each project requested and actually ran. Logs stay on local
+disk; SSH disconnects do not terminate the service. Follow progress with:
 
 ```sh
 systemctl status aft-index-matrix --no-pager

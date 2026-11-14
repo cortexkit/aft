@@ -2036,6 +2036,41 @@ fn regular_open(path: &Path, no_follow: bool) -> io::Result<std::fs::File> {
     regular_open_sized(path, no_follow).map(|(file, _)| file)
 }
 
+/// Open project content without waiting for a FIFO writer. Judge the opened
+/// handle so replacing an admitted path cannot bypass the regular-file check.
+pub(crate) fn open_content_file(path: &Path) -> io::Result<std::fs::File> {
+    open_content_file_sized(path, false).map(|(file, _)| file)
+}
+
+/// Read UTF-8 project content with the same opened-handle requirement.
+pub(crate) fn read_content_to_string(path: impl AsRef<Path>) -> io::Result<String> {
+    std::io::read_to_string(open_content_file(path.as_ref())?)
+}
+
+/// The same handle check without following a final symlink, for scratch reads.
+pub(crate) fn open_content_file_no_follow(path: &Path) -> io::Result<std::fs::File> {
+    open_content_file_sized(path, true).map(|(file, _)| file)
+}
+
+fn open_content_file_sized(path: &Path, _no_follow: bool) -> io::Result<(std::fs::File, u64)> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | if _no_follow { libc::O_NOFOLLOW } else { 0 });
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok((file, metadata.len()))
+}
+
 /// [`regular_open`], with the opened descriptor's size.
 fn regular_open_sized(path: &Path, _no_follow: bool) -> io::Result<(std::fs::File, u64)> {
     if !_no_follow && !std::fs::metadata(path)?.is_file() {
@@ -2046,29 +2081,13 @@ fn regular_open_sized(path: &Path, _no_follow: bool) -> io::Result<(std::fs::Fil
     }
     #[cfg(all(test, unix))]
     tests::before_regular_open(path)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    // A file can become a FIFO between admission and open. Never block on that
-    // replacement, and check the opened descriptor before reading any bytes.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK | if _no_follow { libc::O_NOFOLLOW } else { 0 });
-    }
     let scratch_check = crate::task_temp_reads::check_path(path)?;
     crate::io_accounting::WORK
         .content_reads
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let file = options.open(path)?;
+    let (file, size) = open_content_file_sized(path, _no_follow)?;
     crate::task_temp_reads::check_opened(path, scratch_check.as_ref(), &file)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "not a regular file",
-        ));
-    }
-    Ok((file, metadata.len()))
+    Ok((file, size))
 }
 
 fn regular_read(path: &Path, no_follow: bool) -> io::Result<Vec<u8>> {

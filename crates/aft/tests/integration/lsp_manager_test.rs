@@ -259,6 +259,28 @@ fn rust_worker_cap_admits_next_request_after_slot_release_without_restart() {
         .result
         .failure_reason()
         .contains("rust_analyzer_capacity_exhausted"));
+    let retry_while_full = {
+        let manager = std::cell::RefCell::new(&mut managers[2]);
+        aft::lsp::manager::ensure_server_for_file_detailed_unlocked(
+            || std::cell::RefMut::map(manager.borrow_mut(), |manager| &mut **manager),
+            &fixtures[2].1,
+            &config,
+        )
+    };
+    assert!(retry_while_full.successful.is_empty());
+    assert!(retry_while_full.attempts[0]
+        .result
+        .failure_reason()
+        .contains("rust_analyzer_capacity_exhausted"));
+    assert_eq!(
+        managers[2]
+            .recent_server_exit_log_lines()
+            .iter()
+            .filter(|line| line.contains("rust_analyzer_capacity_exhausted"))
+            .count(),
+        2,
+        "each request must recheck capacity rather than replay a cached failure"
+    );
     drop(managers.remove(0));
     assert_eq!(
         crate::test_helpers::settled_lsp(&mut managers[1], |startup_manager| startup_manager.ensure_server_for_file(&fixtures[2].1, &config))
