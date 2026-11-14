@@ -4058,9 +4058,12 @@ fn build_health_diagnostic_rollup_from_actors(
                 .is_some()
         })
         .count();
-    let ordinary_candidate = |candidate: &RootCandidate| {
+    let healthy_candidate = |candidate: &RootCandidate| {
         candidate.fully_ready
-            && candidate.standing.is_none()
+            && candidate
+                .standing
+                .as_ref()
+                .is_none_or(|standing| standing.refusal.is_none())
             && candidate.health.cache_unavailable_reason.is_none()
             && candidate.health.view_load_failures.is_empty()
             && candidate.health.view_load_failure_last.is_none()
@@ -4082,9 +4085,11 @@ fn build_health_diagnostic_rollup_from_actors(
                 .as_ref()
                 .is_none_or(|watcher| !health_failure_evidence(&json!(watcher)))
     };
+    let ordinary_candidate =
+        |candidate: &RootCandidate| healthy_candidate(candidate) && candidate.standing.is_none();
     let healthy_roots = candidates
         .iter()
-        .filter(|candidate| ordinary_candidate(candidate))
+        .filter(|candidate| healthy_candidate(candidate))
         .count();
     let root_count = candidates.len();
     candidates.sort_by(|left, right| {
@@ -10876,7 +10881,11 @@ mod tests {
     fn standing_health_and_memory_reuse_existing_per_root_tables() {
         let storage = tempfile::tempdir().expect("storage directory");
         let root = tempfile::tempdir().expect("standing root");
-        let config = standing_config(root.path(), storage.path());
+        let mut config = standing_config(root.path(), storage.path());
+        config.indexes.trigram = false;
+        config.indexes.semantic = false;
+        config.indexes.callgraph = false;
+        config.inspect.enabled = false;
         let standing = crate::standing_roots::StandingRoots::default();
         standing
             .reconcile(&config)
@@ -10893,6 +10902,10 @@ mod tests {
         let metrics = DispatchPathMetrics::new();
         let report = test_health_report(&executor, &HashMap::new(), &metrics, &app);
         let metrics = report.metrics.expect("health metrics");
+        assert_eq!(
+            metrics["healthy_roots"], 1,
+            "standing does not mean unhealthy"
+        );
         let root_row = metrics["roots"]
             .as_array()
             .and_then(|rows| {
