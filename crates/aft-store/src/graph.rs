@@ -773,9 +773,9 @@ mod tests {
                 .to_string()
                 .contains("disk floor")
         );
-        assert_eq!(
-            std::fs::metadata(scratch.join("fragments")).unwrap().len(),
-            0
+        assert!(
+            !scratch.join("fragments-00000000000000000000.bin").exists(),
+            "a refused append must not create a fragment range"
         );
         drop(spill);
         assert!(!scratch.exists());
