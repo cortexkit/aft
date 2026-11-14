@@ -613,6 +613,35 @@ pub(crate) mod tests {
             ]
         );
         assert_eq!(body.outline.as_ref().unwrap().len(), rows.len());
+        for (symbol, (start, end)) in symbols.iter().zip([
+            (4, 4),
+            (5, 5),
+            (6, 6),
+            (7, 7),
+            (8, 8),
+            (9, 9),
+            (10, 10),
+            (11, 11),
+            (12, 12),
+            (13, 25),
+        ]) {
+            assert_eq!(
+                (
+                    symbol.range.start_line,
+                    symbol.range.start_col,
+                    symbol.range.end_line
+                ),
+                (start, 0, end),
+                "{}",
+                symbol.name
+            );
+            assert_eq!(
+                symbol.range.end_col as usize,
+                FIXTURE.lines().nth(end as usize).unwrap().len(),
+                "{}",
+                symbol.name
+            );
+        }
         let assigned = symbols.iter().find(|s| s.name == "assigned").unwrap();
         assert_eq!(
             (
@@ -630,14 +659,22 @@ pub(crate) mod tests {
                 exported.range.start_col,
                 exported.range.end_col
             ),
-            (12, 0, 33)
+            (12, 0, 34)
         );
         let comments = crate::inspect::scanners::todos::markers_from_tree(
             FIXTURE.as_bytes(),
             LangId::Luau,
             &tree,
         );
-        assert_eq!(comments.items.unwrap().len(), 2);
+        assert_eq!(
+            comments
+                .items
+                .unwrap()
+                .iter()
+                .map(|item| item.line)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
     }
 
     #[test]
