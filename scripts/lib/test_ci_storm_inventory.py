@@ -85,7 +85,8 @@ class StormWorkflowTests(unittest.TestCase):
         self.assertIn("--profile default --cargo-profile ci-storm", commands)
         self.assertIn("test(subc_storm)", commands)
         self.assertIn("--check-inventory", commands)
-        self.assertEqual(commands.count("--features test-hooks"), 3)
+        # Storm builds match release builds, which enable downloaded grammars.
+        self.assertEqual(commands.count("--features wasm-grammars,test-hooks"), 3)
         self.assertNotIn("test-timing-hooks", commands)
 
 
