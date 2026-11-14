@@ -164,10 +164,16 @@ fn include_path(
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct Parameter {
+    name: String,
+    kind: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Definition {
     name: String,
     path: PathBuf,
-    parameters: Option<Vec<String>>,
+    parameters: Option<Vec<Parameter>>,
     includes: Vec<(Vec<Token>, bool)>,
 }
 
@@ -703,10 +709,25 @@ impl SourceInputs {
                 let mut bindings = BTreeMap::new();
                 for (parameter, arg) in parameters.iter().zip(args) {
                     expired(deadline)?;
+                    let mut used = false;
+                    for (input, _) in &definition.includes {
+                        if uses_parameter(input, &parameter.name, deadline)? {
+                            used = true;
+                            break;
+                        }
+                    }
+                    // Only arguments substituted into an include can change
+                    // its path. Keep unused arguments in the positional count.
+                    if !used {
+                        continue;
+                    }
+                    if !matches!(parameter.kind.as_str(), "literal" | "expr") {
+                        return FileFacts::refuse(&definition.path, false, unresolved);
+                    }
                     let [Token::Literal(value)] = arg else {
                         return FileFacts::refuse(&definition.path, false, unresolved);
                     };
-                    bindings.insert(parameter.clone(), value.clone());
+                    bindings.insert(parameter.name.clone(), value.clone());
                 }
                 for (input, rust_source) in &definition.includes {
                     expired(deadline)?;
@@ -741,25 +762,38 @@ impl SourceInputs {
     }
 }
 
-fn parameters(tokens: &[Token], deadline: Instant) -> Option<Vec<String>> {
-    let mut names = Vec::new();
+fn uses_parameter(tokens: &[Token], name: &str, deadline: Instant) -> Option<bool> {
+    for token in tokens {
+        expired(deadline)?;
+        match token {
+            Token::Text(text) if text == name => return Some(true),
+            Token::Group(group) if uses_parameter(group, name, deadline)? => return Some(true),
+            _ => {}
+        }
+    }
+    Some(false)
+}
+
+fn parameters(tokens: &[Token], deadline: Instant) -> Option<Vec<Parameter>> {
+    let mut parameters: Vec<Parameter> = Vec::new();
     for arg in arguments(tokens, deadline)? {
         expired(deadline)?;
         match arg {
-            [Token::Text(name), colon, kind]
-                if name.starts_with('$')
-                    && colon.text(":")
-                    && (kind.text("literal") || kind.text("expr")) =>
+            [Token::Text(name), colon, Token::Text(kind)]
+                if name.starts_with('$') && colon.text(":") =>
             {
-                if names.contains(name) {
+                if parameters.iter().any(|parameter| parameter.name == *name) {
                     return None;
                 }
-                names.push(name.clone());
+                parameters.push(Parameter {
+                    name: name.clone(),
+                    kind: kind.clone(),
+                });
             }
             _ => return None,
         }
     }
-    Some(names)
+    Some(parameters)
 }
 
 fn environment_inputs(tokens: &[Token], keys: &mut Vec<String>, deadline: Instant) -> Option<bool> {
