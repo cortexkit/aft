@@ -10,14 +10,14 @@ pub struct ThreadCpuSample {
 }
 
 impl ThreadCpuSample {
-    pub(crate) fn now() -> Option<Self> {
+    pub fn now() -> Option<Self> {
         Some(Self {
             thread: std::thread::current().id(),
             cpu: thread_cpu_time()?,
         })
     }
 
-    pub(crate) fn elapsed(start: Option<Self>, end: Option<Self>) -> Option<Duration> {
+    pub fn elapsed(start: Option<Self>, end: Option<Self>) -> Option<Duration> {
         let (start, end) = (start?, end?);
         if start.thread != end.thread {
             return None;

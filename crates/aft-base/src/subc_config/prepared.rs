@@ -18,7 +18,7 @@ pub(crate) enum ConfigObservation {
 
 #[derive(Debug)]
 pub(crate) struct ConfigObservationError {
-    pub(crate) code: &'static str,
+    pub code: &'static str,
     detail: String,
 }
 
@@ -42,8 +42,8 @@ pub struct PreparedBindConfig {
 }
 
 impl PreparedBindConfig {
-    #[cfg(test)]
-    pub(crate) fn read(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn read(
         user_path: Option<&Path>,
         root: &Path,
         harness: &Harness,
@@ -112,26 +112,23 @@ impl PreparedBindConfig {
         }))
     }
 
-    pub(crate) fn matches(&self, root: &Path, harness: &Harness) -> bool {
+    pub fn matches(&self, root: &Path, harness: &Harness) -> bool {
         self.root == root && &self.harness == harness
     }
-    pub(crate) fn id(&self) -> u64 {
+    pub fn id(&self) -> u64 {
         self.snapshot_id
     }
 
-    pub(crate) fn tiers(&self) -> &[ConfigTier] {
+    pub fn tiers(&self) -> &[ConfigTier] {
         &self.tiers
     }
-    pub(crate) fn migration(&self) -> Option<UserConfigMigration> {
+    pub fn migration(&self) -> Option<UserConfigMigration> {
         self.migration.clone()
     }
-    pub(crate) fn resolved(&self) -> &crate::config::Config {
+    pub fn resolved(&self) -> &crate::config::Config {
         &self.resolved
     }
-    pub(crate) fn sources(
-        &self,
-        config: &crate::config::Config,
-    ) -> crate::config_sources::ConfigSources {
+    pub fn sources(&self, config: &crate::config::Config) -> crate::config_sources::ConfigSources {
         let mut sources = crate::config_sources::ConfigSources::from_observed_paths(
             self.user_path.clone(),
             self.project_path.clone(),
@@ -147,7 +144,7 @@ impl PreparedBindConfig {
         }
         sources
     }
-    pub(crate) fn legacy_notice(&self) -> Option<String> {
+    pub fn legacy_notice(&self) -> Option<String> {
         self.tiers
             .iter()
             .any(|tier| tier.tier == "project")

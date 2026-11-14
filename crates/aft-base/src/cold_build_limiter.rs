@@ -119,7 +119,7 @@ impl ColdBuildAdmissionRequest {
         }
     }
 
-    pub(crate) fn for_root(
+    pub fn for_root(
         root: impl Into<String>,
         request_id: impl Into<String>,
         class: ColdBuildAdmissionClass,
@@ -152,19 +152,19 @@ pub(crate) struct ColdBuildAdmissionEvent {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ColdBuildCensusEntry {
-    pub(crate) domain: &'static str,
-    pub(crate) root: String,
-    pub(crate) kind: String,
-    pub(crate) sharers: usize,
-    pub(crate) acquired_at_ms: u64,
-    pub(crate) age_ms: u64,
+    pub domain: &'static str,
+    pub root: String,
+    pub kind: String,
+    pub sharers: usize,
+    pub acquired_at_ms: u64,
+    pub age_ms: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ColdBuildLimiterCensus {
-    pub(crate) cap: usize,
-    pub(crate) holders: Vec<ColdBuildCensusEntry>,
-    pub(crate) queued: Vec<ColdBuildCensusEntry>,
+    pub cap: usize,
+    pub holders: Vec<ColdBuildCensusEntry>,
+    pub queued: Vec<ColdBuildCensusEntry>,
 }
 
 /// Attempt immediate admission without bypassing queued requests from the other
@@ -201,7 +201,7 @@ pub fn acquire_blocking_while_cancellable_with_limiter(
 #[derive(Debug)]
 pub(crate) struct StandingColdBuildPermit {
     _permit: ColdBuildPermit,
-    pub(crate) admission_epoch: u64,
+    pub admission_epoch: u64,
 }
 
 /// Standing performs the same waiter inspection before initial acquisition and
@@ -505,7 +505,7 @@ impl ColdBuildLimiter {
         }
     }
 
-    pub(crate) fn try_acquire(self: &Arc<Self>) -> Option<ColdBuildPermit> {
+    pub fn try_acquire(self: &Arc<Self>) -> Option<ColdBuildPermit> {
         if !self.try_take_slot() {
             return None;
         }
@@ -701,7 +701,7 @@ impl ColdBuildLimiter {
     /// O(1) waiter-set inspection used by Standing before its initial permit
     /// and every checkpoint reacquisition. The counters are maintained by RAII
     /// waiters and therefore need no scheduler-state lock on this hot path.
-    pub(crate) fn census(&self) -> ColdBuildLimiterCensus {
+    pub fn census(&self) -> ColdBuildLimiterCensus {
         let now_ms = unix_millis_now();
         let state = self
             .admission_state
@@ -726,7 +726,7 @@ impl ColdBuildLimiter {
     }
 
     /// Count standing overdue slot waits without waiting on admission or copying labels.
-    pub(crate) fn try_overdue_waits(
+    pub fn try_overdue_waits(
         &self,
         now_ms: u64,
         bound_ms: u64,
@@ -832,7 +832,7 @@ pub struct ColdBuildPermit {
 }
 
 impl ColdBuildPermit {
-    pub(crate) fn downgrade(&self) -> WeakColdBuildPermit {
+    pub fn downgrade(&self) -> WeakColdBuildPermit {
         WeakColdBuildPermit {
             lease: Arc::downgrade(&self.lease),
         }
@@ -845,7 +845,7 @@ pub struct WeakColdBuildPermit {
 }
 
 impl WeakColdBuildPermit {
-    pub(crate) fn upgrade(&self) -> Option<ColdBuildPermit> {
+    pub fn upgrade(&self) -> Option<ColdBuildPermit> {
         self.lease.upgrade().map(|lease| ColdBuildPermit { lease })
     }
 }

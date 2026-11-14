@@ -134,7 +134,7 @@ impl Probe {
 pub struct Budget {
     id: u64,
     disclosure_only: bool,
-    pub(crate) deadline: Instant,
+    pub deadline: Instant,
     failure: Arc<Mutex<Option<Failure>>>,
     failed: Arc<AtomicBool>,
     walk_partial: Arc<AtomicBool>,
@@ -175,12 +175,12 @@ impl Budget {
         budget.disclosure_only = true;
         budget
     }
-    pub(crate) fn capped(&self, deadline: Instant) -> Self {
+    pub fn capped(&self, deadline: Instant) -> Self {
         let mut budget = self.clone();
         budget.deadline = budget.deadline.min(deadline);
         budget
     }
-    pub(crate) fn after(duration: Duration) -> Self {
+    pub fn after(duration: Duration) -> Self {
         Self {
             id: NEXT_BUDGET.fetch_add(1, Ordering::Relaxed),
             disclosure_only: false,
@@ -208,7 +208,7 @@ impl Budget {
             access_budget_by_path: Arc::new(HashMap::new()),
         }
     }
-    pub(crate) fn permissions(&self) -> Vec<PermissionObservation> {
+    pub fn permissions(&self) -> Vec<PermissionObservation> {
         self.permissions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -238,8 +238,8 @@ impl Budget {
 
 #[derive(Clone, Debug)]
 pub struct PermissionObservation {
-    pub(crate) folder: PathBuf,
-    pub(crate) readable: bool,
+    pub folder: PathBuf,
+    pub readable: bool,
 }
 
 pub fn name_walk_root(root: &Path, name: &Path) {
@@ -1004,11 +1004,11 @@ pub struct WalkProgress<T> {
     published: Arc<AtomicBool>,
 }
 pub(crate) struct WalkCompletion {
-    pub(crate) incomplete: bool,
-    pub(crate) time_limit: bool,
+    pub incomplete: bool,
+    pub time_limit: bool,
 }
 impl<T> WalkProgress<T> {
-    pub(crate) fn stopped(&self) -> bool {
+    pub fn stopped(&self) -> bool {
         self.stopped.load(Ordering::Acquire)
             || self
                 .cancellation
@@ -1017,7 +1017,7 @@ impl<T> WalkProgress<T> {
             || Instant::now() >= self.deadline
             || prior_failure().is_some()
     }
-    pub(crate) fn update(&self, update: impl FnOnce(&mut T)) {
+    pub fn update(&self, update: impl FnOnce(&mut T)) {
         let mut snapshot = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
         if self.stopped.load(Ordering::Acquire) {
             return;
@@ -1530,11 +1530,11 @@ impl IsolatedPool {
     pub(crate) fn with_test_scope(thread_cap: usize, scope: fn() -> Box<dyn Any>) -> Self {
         Self(Limiter::with_options(thread_cap, thread_cap, Some(scope)))
     }
-    pub(crate) fn new(thread_cap: usize) -> Self {
+    pub fn new(thread_cap: usize) -> Self {
         Self(Limiter::with_limits(thread_cap, thread_cap))
     }
 
-    pub(crate) fn run<T: Send + 'static>(
+    pub fn run<T: Send + 'static>(
         &self,
         path: &Path,
         at: Option<Instant>,
@@ -2167,7 +2167,7 @@ pub fn reader(path: &Path, at: Option<Instant>) -> io::Result<Reader> {
 }
 
 impl Reader {
-    pub(crate) fn chunk(&mut self, mut buffer: Vec<u8>, size: usize) -> io::Result<Vec<u8>> {
+    pub fn chunk(&mut self, mut buffer: Vec<u8>, size: usize) -> io::Result<Vec<u8>> {
         if Instant::now() >= deadline(self.at) {
             return Err(failure(
                 &self.path,
@@ -2206,7 +2206,7 @@ impl Reader {
 
     /// The file's size when it was opened. A large-file read stops there, so
     /// bytes a writer appends during the read are not read.
-    pub(crate) fn size_at_open(&self) -> u64 {
+    pub fn size_at_open(&self) -> u64 {
         self.size_at_open
     }
 

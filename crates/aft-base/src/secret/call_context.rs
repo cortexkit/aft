@@ -65,9 +65,7 @@ pub fn current_secret_audit_scope() -> Option<SecretScope> {
 pub struct SecretScopeGuard(Option<Result<(CallScopes, EligibilityForm), Ineligibility>>);
 
 impl SecretScopeGuard {
-    pub(crate) fn install(
-        scopes: Option<Result<(CallScopes, EligibilityForm), Ineligibility>>,
-    ) -> Self {
+    pub fn install(scopes: Option<Result<(CallScopes, EligibilityForm), Ineligibility>>) -> Self {
         SecretScopeGuard(
             CURRENT.with(|slot| std::mem::replace(&mut slot.borrow_mut().scopes, scopes)),
         )
@@ -105,7 +103,7 @@ thread_local! {
 /// The caller's reply deadline is independent of a fetch's network budget.
 pub struct FetchReplyDeadline(Option<std::time::Instant>);
 impl FetchReplyDeadline {
-    pub(crate) fn enter(deadline: std::time::Instant) -> Self {
+    pub fn enter(deadline: std::time::Instant) -> Self {
         Self(FETCH_REPLY_DEADLINE.with(|slot| slot.replace(Some(deadline))))
     }
 }

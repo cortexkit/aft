@@ -18,13 +18,13 @@ pub enum Sink {
 }
 
 impl Sink {
-    pub(crate) fn memory(limit: usize) -> Self {
+    pub fn memory(limit: usize) -> Self {
         Self::Memory {
             limit: limit as u64,
         }
     }
 
-    pub(crate) fn file(file: std::fs::File, limit: u64) -> Self {
+    pub fn file(file: std::fs::File, limit: u64) -> Self {
         Self::File { file, limit }
     }
 }

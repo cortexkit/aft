@@ -37,15 +37,15 @@ impl Drop for DeferredCompletionWake {
 }
 
 impl DeferredResponseWake {
-    pub(crate) fn install(&self) -> DeferredWakeScope {
+    pub fn install(&self) -> DeferredWakeScope {
         DeferredWakeScope(DEFERRED_WAKE.with(|slot| slot.replace(Some(self.clone()))))
     }
 
-    pub(crate) fn generation(&self) -> u64 {
+    pub fn generation(&self) -> u64 {
         self.0.generation.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    pub(crate) async fn notified(&self) {
+    pub async fn notified(&self) {
         self.0.notify.notified().await;
     }
 }
@@ -72,7 +72,7 @@ impl<T> PendingResponseSender<T> {
 
 pub struct PendingResponseReceiver<T> {
     receiver: std::sync::mpsc::Receiver<T>,
-    pub(crate) wake_installed: bool,
+    pub wake_installed: bool,
 }
 
 impl<T> PendingResponseReceiver<T> {

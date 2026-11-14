@@ -15,7 +15,7 @@ pub struct LockDiagnostics {
 }
 
 impl LockDiagnostics {
-    pub(crate) fn new(site_file: &'static str) -> Arc<Self> {
+    pub fn new(site_file: &'static str) -> Arc<Self> {
         Arc::new(Self {
             site_file,
             origin: Instant::now(),
@@ -25,7 +25,7 @@ impl LockDiagnostics {
     }
 
     #[track_caller]
-    pub(crate) fn hold(&self) -> LockHold<'_> {
+    pub fn hold(&self) -> LockHold<'_> {
         self.line
             .store(Location::caller().line() as usize, Ordering::Relaxed);
         self.held_since_ms_plus_one
@@ -37,7 +37,7 @@ impl LockDiagnostics {
         u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    pub(crate) fn snapshot(&self) -> String {
+    pub fn snapshot(&self) -> String {
         let since = self.held_since_ms_plus_one.load(Ordering::Acquire);
         if since == 0 {
             return "holder=none".to_string();

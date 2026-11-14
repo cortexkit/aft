@@ -88,7 +88,7 @@ impl Default for SubcLifecycleAdmission {
 }
 
 impl SubcLifecycleAdmission {
-    pub(crate) fn mark_bound(&self) {
+    pub fn mark_bound(&self) {
         let _held = LifecycleLockMarker::enter(&self.unbound);
         let mut unbound = self.unbound.lock();
         *unbound = false;
@@ -96,7 +96,7 @@ impl SubcLifecycleAdmission {
         self.unbound_hint.store(false, Ordering::Release);
     }
 
-    pub(crate) fn mark_unbound(&self, configure_generation: &AtomicU64) {
+    pub fn mark_unbound(&self, configure_generation: &AtomicU64) {
         let _held = LifecycleLockMarker::enter(&self.unbound);
         let mut unbound = self.unbound.lock();
         if !*unbound {
@@ -111,7 +111,7 @@ impl SubcLifecycleAdmission {
     /// grace window. Long cold builds poll this between batches: a transient
     /// unbind (rebind within the window) never trips it, so those builds keep
     /// running exactly as they do while bound.
-    pub(crate) fn unbound_past_grace(&self) -> bool {
+    pub fn unbound_past_grace(&self) -> bool {
         let _held = LifecycleLockMarker::enter(&self.unbound);
         let unbound = self.unbound.lock();
         if !*unbound {
@@ -125,7 +125,7 @@ impl SubcLifecycleAdmission {
 
     /// Serialize cancellation with rebind: a root rebound before this decision
     /// cannot have its still-running work cancelled by a stale grace check.
-    pub(crate) fn cancel_if_abandoned(&self, cancel: impl FnOnce()) {
+    pub fn cancel_if_abandoned(&self, cancel: impl FnOnce()) {
         // Lifecycle transitions are in memory and must be observed at every
         // parser checkpoint, independently of the throttled disk-liveness
         // probe. Avoid a mutex on the usual bound-root path.
@@ -156,13 +156,13 @@ impl SubcLifecycleAdmission {
             .store(grace.as_millis() as u64, Ordering::SeqCst);
     }
 
-    pub(crate) fn advance_generation(&self, generation: &AtomicU64) -> u64 {
+    pub fn advance_generation(&self, generation: &AtomicU64) -> u64 {
         let _held = LifecycleLockMarker::enter(&self.unbound);
         let _unbound = self.unbound.lock();
         generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
     }
 
-    pub(crate) fn run_if_current<R>(
+    pub fn run_if_current<R>(
         &self,
         generation: &AtomicU64,
         expected: u64,
@@ -181,15 +181,15 @@ impl SubcLifecycleAdmission {
         !*self.unbound.lock()
     }
 
-    pub(crate) fn try_is_bound(&self) -> Option<bool> {
+    pub fn try_is_bound(&self) -> Option<bool> {
         self.unbound.try_lock().map(|unbound| !*unbound)
     }
 
-    pub(crate) fn is_unbound(&self) -> bool {
+    pub fn is_unbound(&self) -> bool {
         !self.is_bound()
     }
 
-    pub(crate) fn run_if_unbound<R>(&self, action: impl FnOnce() -> R) -> Option<R> {
+    pub fn run_if_unbound<R>(&self, action: impl FnOnce() -> R) -> Option<R> {
         let _held = LifecycleLockMarker::enter(&self.unbound);
         let unbound = self.unbound.lock();
         if !*unbound {

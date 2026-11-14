@@ -24,7 +24,7 @@ pub struct TierSource {
 /// the files changed and which changed keys are still waiting for a connect.
 #[derive(Debug, Clone)]
 pub struct ConfigSources {
-    pub(crate) prepared_bind_snapshot_id: Option<u64>,
+    pub prepared_bind_snapshot_id: Option<u64>,
     pub approved_user: Option<crate::subc_config::ApprovedUser>,
     pub user: TierSource,
     pub project: TierSource,

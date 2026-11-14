@@ -137,7 +137,7 @@ impl IndexEvent {
         }
     }
 
-    pub(crate) fn from_scope(kind: IndexEventKind, scope: &IndexBuildScope) -> Self {
+    pub fn from_scope(kind: IndexEventKind, scope: &IndexBuildScope) -> Self {
         Self::new(
             kind,
             scope.plane,
@@ -147,7 +147,7 @@ impl IndexEvent {
         )
     }
 
-    pub(crate) fn field(mut self, key: &'static str, value: impl ToString) -> Self {
+    pub fn field(mut self, key: &'static str, value: impl ToString) -> Self {
         self.extra.push((key, value.to_string()));
         self
     }
@@ -165,7 +165,7 @@ pub struct IndexBuildScope {
 }
 
 impl IndexBuildScope {
-    pub(crate) fn new(plane: IndexPlane, root: impl AsRef<Path>, key: impl Into<String>) -> Self {
+    pub fn new(plane: IndexPlane, root: impl AsRef<Path>, key: impl Into<String>) -> Self {
         Self {
             plane,
             build_id: mint_index_build_id(),
@@ -175,7 +175,7 @@ impl IndexBuildScope {
         }
     }
 
-    pub(crate) fn elapsed_ms(&self) -> u64 {
+    pub fn elapsed_ms(&self) -> u64 {
         self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64
     }
 }
@@ -378,11 +378,11 @@ pub struct IndexBuildFailureGuard {
 }
 
 impl IndexBuildFailureGuard {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self { armed: true }
     }
 
-    pub(crate) fn disarm(&mut self) {
+    pub fn disarm(&mut self) {
         self.armed = false;
     }
 }
@@ -2682,7 +2682,7 @@ pub enum RescanReason {
 }
 
 impl RescanReason {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::BufferOverflow => "buffer_overflow",
             Self::KernelDropped => "kernel_dropped",
@@ -2693,7 +2693,7 @@ impl RescanReason {
 }
 
 impl RescanReason {
-    pub(crate) fn from_event_info(info: Option<&str>) -> Self {
+    pub fn from_event_info(info: Option<&str>) -> Self {
         match info {
             Some("rescan: buffer overflow") => Self::BufferOverflow,
             Some("rescan: kernel dropped") => Self::KernelDropped,

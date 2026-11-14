@@ -892,7 +892,7 @@ impl BashConfig {
     /// keeps the user value: user names are often protective
     /// (`GIT_TERMINAL_PROMPT=0`), and a repository should add names rather
     /// than undo the user's.
-    pub(crate) fn configured_env(
+    pub fn configured_env(
         &self,
         project_trusted: bool,
     ) -> Vec<crate::config_resolve::ConfiguredBashEnv> {
@@ -913,7 +913,7 @@ impl BashConfig {
     }
 
     /// Project names that a user value already covers, and so do not apply.
-    pub(crate) fn shadowed_project_env(&self, project_trusted: bool) -> Vec<String> {
+    pub fn shadowed_project_env(&self, project_trusted: bool) -> Vec<String> {
         if !project_trusted {
             return Vec::new();
         }

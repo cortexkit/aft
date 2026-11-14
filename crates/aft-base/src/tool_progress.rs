@@ -21,7 +21,7 @@ impl std::fmt::Debug for Progress {
 }
 
 impl Progress {
-    pub(crate) fn new(send: impl Fn(usize) -> bool + Send + Sync + 'static) -> Self {
+    pub fn new(send: impl Fn(usize) -> bool + Send + Sync + 'static) -> Self {
         Self::with_clock(Instant::now, send)
     }
 
@@ -36,7 +36,7 @@ impl Progress {
         }))
     }
 
-    pub(crate) fn report(&self) {
+    pub fn report(&self) {
         let now = (self.0.clock)();
         let mut last = self.0.last_sent.lock().unwrap_or_else(|e| e.into_inner());
         let Some(last) = last.as_mut() else {
@@ -53,7 +53,7 @@ impl Progress {
     /// End the original request's keepalives for every clone, including one
     /// installed by a later approved rerun. Taking the report lock also waits
     /// for any in-flight send before the terminal reply can be queued.
-    pub(crate) fn close(&self) {
+    pub fn close(&self) {
         self.0
             .last_sent
             .lock()
@@ -61,7 +61,7 @@ impl Progress {
             .take();
     }
 
-    pub(crate) fn key(&self) -> usize {
+    pub fn key(&self) -> usize {
         Arc::as_ptr(&self.0) as usize
     }
 }
@@ -82,22 +82,22 @@ thread_local! {
 pub struct FileProgress(Arc<AtomicU64>);
 
 impl FileProgress {
-    pub(crate) fn current() -> Option<Self> {
+    pub fn current() -> Option<Self> {
         FILES.with(|files| files.borrow().clone())
     }
 
-    pub(crate) fn enter(&self) -> FileProgressGuard {
+    pub fn enter(&self) -> FileProgressGuard {
         FileProgressGuard {
             previous: FILES.with(|files| files.replace(Some(self.clone()))),
             _thread_bound: std::marker::PhantomData,
         }
     }
 
-    pub(crate) fn finished(&self) {
+    pub fn finished(&self) {
         self.0.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn completed(&self) -> u64 {
+    pub fn completed(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
 }

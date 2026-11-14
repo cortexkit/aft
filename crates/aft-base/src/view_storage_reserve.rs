@@ -16,7 +16,7 @@ pub struct DiskReserveCondition {
 }
 
 impl DiskReserveCondition {
-    pub(crate) fn observed(storage: &Path, error: &str) -> Option<Self> {
+    pub fn observed(storage: &Path, error: &str) -> Option<Self> {
         if !error.contains(CODE) && !is_message(error) {
             return None;
         }

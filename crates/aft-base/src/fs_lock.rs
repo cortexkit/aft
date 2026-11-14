@@ -22,7 +22,7 @@ use crate::{slog_debug, slog_error, slog_info, slog_warn};
 pub struct AdvisoryLockGuard(File);
 
 impl AdvisoryLockGuard {
-    pub(crate) fn from_locked_file(file: File) -> Self {
+    pub fn from_locked_file(file: File) -> Self {
         Self(file)
     }
 }

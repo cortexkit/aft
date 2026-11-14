@@ -127,7 +127,7 @@ impl FilterRegistry {
     }
 
     /// Private registry buffers, excluding shared compiled regex engines.
-    pub(crate) fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
+    pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
         let filter_bytes = |filter: &TomlFilter| {
             let source = match &filter.source {
                 FilterSource::Builtin => 0,

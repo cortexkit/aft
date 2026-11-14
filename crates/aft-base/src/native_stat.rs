@@ -44,7 +44,7 @@ pub struct NativeStat {
 impl NativeStat {
     /// Observe the handle that supplies content bytes, so a path replacement
     /// during a read cannot attach those bytes to a different file's proof.
-    pub(crate) fn read_open_file(file: &fs::File, path: &Path) -> io::Result<Self> {
+    pub fn read_open_file(file: &fs::File, path: &Path) -> io::Result<Self> {
         #[cfg(unix)]
         {
             Self::from_unix_metadata(&file.metadata()?, path)

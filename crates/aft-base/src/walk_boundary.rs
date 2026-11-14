@@ -21,19 +21,19 @@ pub struct DeviceBoundary {
 
 impl DeviceBoundary {
     /// Capture the device that recursive descendants must remain on.
-    pub(crate) fn for_root(root: &Path) -> io::Result<Self> {
+    pub fn for_root(root: &Path) -> io::Result<Self> {
         Ok(Self {
             root_device: filesystem_device_id(root)?,
         })
     }
 
     /// Return whether `child` can be entered without crossing the root mount.
-    pub(crate) fn should_descend(&self, child: &Path) -> io::Result<bool> {
+    pub fn should_descend(&self, child: &Path) -> io::Result<bool> {
         self.should_descend_with(child, filesystem_device_id)
     }
 
     /// Lookup-injectable form used by recursive walkers' regression tests.
-    pub(crate) fn should_descend_with<F>(&self, child: &Path, device_lookup: F) -> io::Result<bool>
+    pub fn should_descend_with<F>(&self, child: &Path, device_lookup: F) -> io::Result<bool>
     where
         F: FnOnce(&Path) -> io::Result<Option<u64>>,
     {

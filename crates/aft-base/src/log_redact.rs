@@ -1267,16 +1267,16 @@ fn names_auth(key: &str) -> bool {
 }
 
 impl SecretValues {
-    pub(crate) fn longest_value_len(&self) -> usize {
+    pub fn longest_value_len(&self) -> usize {
         self.0.iter().map(String::len).max().unwrap_or(0)
     }
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
     /// Byte ranges in `text` of every occurrence of a value that contains a
     /// newline. Only these occurrences can cross a cut made at a newline.
-    pub(crate) fn cross_line_spans(&self, text: &str) -> Vec<std::ops::Range<usize>> {
+    pub fn cross_line_spans(&self, text: &str) -> Vec<std::ops::Range<usize>> {
         let mut spans = Vec::new();
         for value in self.0.iter().filter(|value| value.contains('\n')) {
             let mut start = 0;
@@ -1289,7 +1289,7 @@ impl SecretValues {
         spans
     }
 
-    pub(crate) fn from_environment<'a>(
+    pub fn from_environment<'a>(
         env: impl IntoIterator<Item = (&'a std::ffi::OsStr, &'a std::ffi::OsStr)>,
     ) -> Self {
         let mut values = Vec::new();
@@ -1306,11 +1306,11 @@ impl SecretValues {
         Self(values)
     }
 
-    pub(crate) fn redact<'a>(&self, text: &'a str) -> Cow<'a, str> {
+    pub fn redact<'a>(&self, text: &'a str) -> Cow<'a, str> {
         self.redact_range(text, None)
     }
 
-    pub(crate) fn redact_range<'a>(
+    pub fn redact_range<'a>(
         &self,
         text: &'a str,
         range: Option<&mut std::ops::Range<usize>>,
@@ -1318,7 +1318,7 @@ impl SecretValues {
         self.redact_range_with_mapping(text, range, RangeMapping::Watch)
     }
 
-    pub(crate) fn redact_stream_range<'a>(
+    pub fn redact_stream_range<'a>(
         &self,
         text: &'a str,
         range: &mut std::ops::Range<usize>,

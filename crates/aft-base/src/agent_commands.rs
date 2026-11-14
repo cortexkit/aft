@@ -12,9 +12,9 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug, Default)]
 pub struct Batch {
-    pub(crate) started: Vec<AgentCommandRoot>,
-    pub(crate) finished: Vec<AgentCommandFinished>,
-    pub(crate) known: Option<Vec<AgentCommandRoot>>,
+    pub started: Vec<AgentCommandRoot>,
+    pub finished: Vec<AgentCommandFinished>,
+    pub known: Option<Vec<AgentCommandRoot>>,
     through: u64,
 }
 
@@ -274,7 +274,7 @@ pub(crate) struct Connection {
 }
 
 impl Connection {
-    pub(crate) async fn stop(mut self) {
+    pub async fn stop(mut self) {
         self.cancel.cancel();
         if let Some(task) = self.task.take() {
             let _ = task.await;

@@ -847,6 +847,30 @@ pub struct SecretFetch {
     pub cancellation: SecretFetchCancellation,
 }
 
+impl SecretFetch {
+    // Cargo feature unification can change test-only fields; keep the constructor signature fixed.
+    pub fn new(
+        vault: Arc<dyn crate::secret::SecretVault>,
+        authorization: Option<crate::secret::SecretScope>,
+        labels: Vec<String>,
+        test_https_port: Option<u16>,
+        call_id: String,
+        cancellation: SecretFetchCancellation,
+    ) -> Self {
+        #[cfg(not(any(test, feature = "test-support")))]
+        let _ = test_https_port;
+        Self {
+            vault,
+            authorization,
+            labels,
+            #[cfg(any(test, feature = "test-support"))]
+            test_https_port,
+            call_id,
+            cancellation,
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct SecretFetchCancellation {
     job: Option<crate::executor::JobCancellation>,
@@ -855,7 +879,7 @@ pub struct SecretFetchCancellation {
     clock: Option<ReplyClock>,
 }
 impl SecretFetchCancellation {
-    pub(crate) fn for_current_call(_options: &UrlFetchOptions) -> Self {
+    pub fn for_current_call(_options: &UrlFetchOptions) -> Self {
         Self {
             job: crate::executor::current_job_cancellation(),
             deadline: crate::secret::call_context::current_fetch_reply_deadline(),

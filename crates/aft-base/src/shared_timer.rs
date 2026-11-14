@@ -118,7 +118,7 @@ impl Timer {
             .map(|key| key.0)
     }
 
-    pub(crate) fn at(
+    pub fn at(
         at: Instant,
         fire: impl FnMut() -> Option<Instant> + Send + 'static,
     ) -> io::Result<Self> {

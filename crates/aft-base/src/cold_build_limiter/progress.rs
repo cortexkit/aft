@@ -424,7 +424,7 @@ pub fn advance(files: usize) {
 
 pub(crate) struct Counter(Arc<Mutex<Entry>>);
 impl Counter {
-    pub(crate) fn advance(&self, files: usize) {
+    pub fn advance(&self, files: usize) {
         let mut entry = lock(&self.0);
         let done = entry.done.saturating_add(files as u64);
         entry.advance(done, Instant::now());

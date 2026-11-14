@@ -1098,7 +1098,7 @@ enum PipeSplit {
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PipelineInfo {
-    pub(crate) segments: Vec<PipelineSegment>,
+    pub segments: Vec<PipelineSegment>,
 }
 
 #[cfg(unix)]

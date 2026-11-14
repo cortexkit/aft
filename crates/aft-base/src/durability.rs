@@ -40,7 +40,7 @@ pub struct SyncGroup {
 }
 
 impl SyncGroup {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             #[cfg(unix)]
             owner: SYNC_GROUP.with(|group| {
@@ -61,7 +61,7 @@ impl SyncGroup {
         SYNC_GROUP.with(|group| group.take().expect("active sync group"))
     }
 
-    pub(crate) fn finish(mut self) -> io::Result<()> {
+    pub fn finish(mut self) -> io::Result<()> {
         #[cfg(unix)]
         if self.owner {
             for (_, (file, path)) in self.detach().devices {

@@ -561,7 +561,11 @@ fn parse_tree_entry(output: &[u8], relative: &str) -> Option<TreeEntry> {
         is_object_id(&object).then_some(TreeEntry { kind, object, size })
     })
 }
-impl GitFailure {
+trait GitFailureResponse {
+    fn response(self, req: &RawRequest, step: &str) -> Response;
+}
+
+impl GitFailureResponse for GitFailure {
     fn response(self, req: &RawRequest, step: &str) -> Response {
         let (code, detail) = match self {
             Self::Spawn(error) => (

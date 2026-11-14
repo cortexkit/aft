@@ -224,7 +224,7 @@ impl CommandBuilder {
     /// Leave lookup to execvp when a mandatory pre_exec hook requires fork anyway.
     /// The returned command may still receive environment changes before spawning.
     #[cfg(unix)]
-    pub(crate) fn build_unresolved(self) -> std::process::Command {
+    pub fn build_unresolved(self) -> std::process::Command {
         self.environment
     }
 }

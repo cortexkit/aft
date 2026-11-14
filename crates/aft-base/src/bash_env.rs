@@ -183,7 +183,7 @@ pub enum BashEnvTier {
 }
 
 impl BashEnvTier {
-    pub(crate) fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::User => "user",
             Self::Project => "project",

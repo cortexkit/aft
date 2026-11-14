@@ -102,29 +102,29 @@ impl Domain {
 
 #[derive(Debug)]
 pub struct Entry {
-    pub(crate) domain: Domain,
-    pub(crate) root_id: String,
+    pub domain: Domain,
+    pub root_id: String,
     pub(crate) logical: AtomicU64,
     pub(crate) physical: AtomicU64,
-    pub(crate) folded_logical: AtomicU64,
-    pub(crate) folded_physical: AtomicU64,
-    pub(crate) seam_labels: Mutex<BTreeSet<String>>,
+    pub folded_logical: AtomicU64,
+    pub folded_physical: AtomicU64,
+    pub seam_labels: Mutex<BTreeSet<String>>,
 }
 
 #[derive(Debug)]
 pub struct UnmeasurableEntry {
-    pub(crate) root_id: String,
-    pub(crate) seam: String,
-    pub(crate) reason: String,
-    pub(crate) estimate_basis: Option<String>,
+    pub root_id: String,
+    pub seam: String,
+    pub reason: String,
+    pub estimate_basis: Option<String>,
     pub(crate) observations: AtomicU64,
     pub(crate) estimated_physical_bytes: AtomicU64,
-    pub(crate) folded_observations: AtomicU64,
-    pub(crate) folded_estimated_physical_bytes: AtomicU64,
+    pub folded_observations: AtomicU64,
+    pub folded_estimated_physical_bytes: AtomicU64,
 }
 
 impl UnmeasurableEntry {
-    pub(crate) fn pending(&self) -> (u64, u64) {
+    pub fn pending(&self) -> (u64, u64) {
         (
             self.observations
                 .load(Ordering::Relaxed)
@@ -137,7 +137,7 @@ impl UnmeasurableEntry {
 }
 
 impl Entry {
-    pub(crate) fn pending(&self) -> (u64, u64) {
+    pub fn pending(&self) -> (u64, u64) {
         (
             self.logical
                 .load(Ordering::Relaxed)
@@ -163,11 +163,11 @@ impl Counter {
         self.credit(logical_bytes, 0);
     }
 
-    pub(crate) fn domain(&self) -> Domain {
+    pub fn domain(&self) -> Domain {
         self.0.domain
     }
 
-    pub(crate) fn root_id(&self) -> String {
+    pub fn root_id(&self) -> String {
         self.0.root_id.clone()
     }
 
@@ -221,13 +221,13 @@ pub struct RecentRow {
 
 #[derive(Debug)]
 pub(crate) struct Registry {
-    pub(crate) started_ms: u64,
-    pub(crate) entries: Mutex<BTreeMap<(Domain, String), Arc<Entry>>>,
-    pub(crate) unmeasurable_entries: Mutex<BTreeMap<(String, String), Arc<UnmeasurableEntry>>>,
-    pub(crate) process_baseline: Mutex<ProcessBaseline>,
-    pub(crate) fold_lock: Mutex<()>,
-    pub(crate) recent: Mutex<VecDeque<RecentRow>>,
-    pub(crate) recent_top: Mutex<Vec<WriterRow>>,
+    pub started_ms: u64,
+    pub entries: Mutex<BTreeMap<(Domain, String), Arc<Entry>>>,
+    pub unmeasurable_entries: Mutex<BTreeMap<(String, String), Arc<UnmeasurableEntry>>>,
+    pub process_baseline: Mutex<ProcessBaseline>,
+    pub fold_lock: Mutex<()>,
+    pub recent: Mutex<VecDeque<RecentRow>>,
+    pub recent_top: Mutex<Vec<WriterRow>>,
 }
 
 pub(crate) fn now_ms() -> u64 {

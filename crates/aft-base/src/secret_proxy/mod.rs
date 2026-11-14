@@ -103,6 +103,34 @@ pub struct ProxyConfig {
     pub origin: String,
 }
 
+impl ProxyConfig {
+    // Cargo feature unification can change test-only fields; keep the constructor signature fixed.
+    pub fn new(
+        vault: Arc<dyn SecretVault>,
+        authorization_scope: SecretScope,
+        lifetime_scope: SecretScope,
+        scanned_labels: Vec<String>,
+        consent_context: Option<(std::path::PathBuf, String)>,
+        test_https_port: Option<u16>,
+        origin: String,
+    ) -> Self {
+        #[cfg(not(any(test, feature = "test-support")))]
+        let _ = test_https_port;
+        Self {
+            vault,
+            authorization_scope,
+            lifetime_scope,
+            scanned_labels,
+            consent_context,
+            #[cfg(any(test, feature = "test-support"))]
+            test_https_port,
+            #[cfg(any(test, feature = "test-support"))]
+            approval_clock: None,
+            origin,
+        }
+    }
+}
+
 /// Errors contain no transport diagnostics, URLs, credentials or vault text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyError {
@@ -439,7 +467,7 @@ impl SecretProxy {
     }
 
     #[cfg(unix)]
-    pub(crate) fn approval_status(&self) -> Vec<String> {
+    pub fn approval_status(&self) -> Vec<String> {
         self.state
             .approvals
             .status()

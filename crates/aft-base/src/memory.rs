@@ -109,9 +109,9 @@ pub struct RootMemorySnapshot {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RootMemoryRollup {
     pub(crate) status: &'static str,
-    pub(crate) attributed_bytes: u64,
-    pub(crate) busy_subsystems: usize,
-    pub(crate) not_estimated_subsystems: usize,
+    pub attributed_bytes: u64,
+    pub busy_subsystems: usize,
+    pub not_estimated_subsystems: usize,
     /// Present only for roots declared as standing. Keeping the marker on the
     /// existing row uses the same top-eight selection and one omitted-roots
     /// rollup instead of creating a separate standing-memory table.
@@ -121,11 +121,11 @@ pub struct RootMemoryRollup {
     /// health rollup reused an earlier walk (0 for a walk made now). Unset
     /// outside the health rollup.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) measured_age_ms: Option<u64>,
+    pub measured_age_ms: Option<u64>,
 }
 
 impl RootMemoryRollup {
-    pub(crate) fn from_estimates(estimates: &[&MemoryEstimate]) -> Self {
+    pub fn from_estimates(estimates: &[&MemoryEstimate]) -> Self {
         let attributed_bytes = estimates
             .iter()
             .filter_map(|estimate| estimate.estimated_bytes)
@@ -149,13 +149,13 @@ impl RootMemoryRollup {
     }
 
     /// Record how old the index walks behind this row are.
-    pub(crate) fn with_measured_age_ms(mut self, age_ms: u64) -> Self {
+    pub fn with_measured_age_ms(mut self, age_ms: u64) -> Self {
         self.measured_age_ms = Some(age_ms);
         self
     }
 
     /// Attribute this existing per-root rollup to a configured standing entry.
-    pub(crate) fn with_standing(mut self) -> Self {
+    pub fn with_standing(mut self) -> Self {
         self.standing = Some(true);
         self
     }
@@ -236,7 +236,7 @@ impl RootMemorySnapshot {
         self
     }
 
-    pub(crate) fn rollup(&self) -> RootMemoryRollup {
+    pub fn rollup(&self) -> RootMemoryRollup {
         let mut estimates = vec![
             &self.semantic,
             &self.trigram,
@@ -293,7 +293,7 @@ pub struct SqliteMemorySnapshot {
 }
 
 impl SqliteMemorySnapshot {
-    pub(crate) fn measure() -> Self {
+    pub fn measure() -> Self {
         // SQLite's allocator counters are process-wide and internally synchronized.
         // They intentionally replace per-connection guesses in root estimates.
         let memory_used = unsafe { rusqlite::ffi::sqlite3_memory_used() };
@@ -389,16 +389,16 @@ pub enum AllocatorSource {
 #[derive(Clone)]
 pub struct AllocatorObservation {
     pub(crate) snapshot: AllocatorMemorySnapshot,
-    pub(crate) age_ms: Option<u64>,
+    pub age_ms: Option<u64>,
 }
 
 impl AllocatorObservation {
-    pub(crate) fn from_source(source: AllocatorSource) -> Self {
+    pub fn from_source(source: AllocatorSource) -> Self {
         let (snapshot, age_ms) = allocator_observation(source);
         Self { snapshot, age_ms }
     }
 
-    pub(crate) fn measure() -> Self {
+    pub fn measure() -> Self {
         Self::from_source(AllocatorSource::Measure)
     }
 }
@@ -613,18 +613,18 @@ pub struct MemorySnapshot {
 /// shared semantic bases and the data layer's block cache.
 #[derive(Debug, Clone)]
 pub struct SharedProcessMemory {
-    pub(crate) shared_semantic_bases: MemoryEstimate,
-    pub(crate) data_layer_block_cache: Option<MemoryEstimate>,
+    pub shared_semantic_bases: MemoryEstimate,
+    pub data_layer_block_cache: Option<MemoryEstimate>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MemoryRollupSnapshot {
-    pub(crate) roots_status: &'static str,
-    pub(crate) roots: BTreeMap<String, RootMemoryRollup>,
-    pub(crate) roots_total: usize,
-    pub(crate) roots_omitted: usize,
-    pub(crate) roots_omitted_bytes: u64,
-    pub(crate) process: ProcessMemorySnapshot,
+    pub roots_status: &'static str,
+    pub roots: BTreeMap<String, RootMemoryRollup>,
+    pub roots_total: usize,
+    pub roots_omitted: usize,
+    pub roots_omitted_bytes: u64,
+    pub process: ProcessMemorySnapshot,
 }
 
 fn cap_roots<T>(

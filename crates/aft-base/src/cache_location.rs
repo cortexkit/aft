@@ -195,10 +195,10 @@ pub struct SpeechServingLease {
 static SPEECH_SERVING_LEASES: OnceLock<Mutex<HashMap<Identity, Arc<SpeechServingLease>>>> =
     OnceLock::new();
 impl CacheLease {
-    pub(crate) fn same_root(&self, other: &Self) -> bool {
+    pub fn same_root(&self, other: &Self) -> bool {
         self.root_identity == other.root_identity
     }
-    pub(crate) fn root_key(&self) -> (u64, u64) {
+    pub fn root_key(&self) -> (u64, u64) {
         (self.root_identity.device, self.root_identity.inode)
     }
 }

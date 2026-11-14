@@ -78,7 +78,7 @@ pub struct PatternMatch {
 }
 
 impl PatternMatch {
-    pub(super) fn copy_delivery_identity(&mut self, persisted: &Self) {
+    pub fn copy_delivery_identity(&mut self, persisted: &Self) {
         if let (Some(live), Some(saved)) = (self.batch.as_mut(), persisted.batch.as_ref()) {
             self.match_offset = persisted.match_offset;
             live.pending_id = saved.pending_id.clone();

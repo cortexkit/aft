@@ -120,7 +120,7 @@ pub struct ManagementSession {
 }
 
 impl ManagementSession {
-    pub(crate) async fn connect(connection_file: &std::path::Path) -> Result<Self, ()> {
+    pub async fn connect(connection_file: &std::path::Path) -> Result<Self, ()> {
         aft_identity_available().then_some(()).ok_or(())?;
         Self::connect_as(connection_file, None).await
     }
@@ -163,7 +163,7 @@ impl ManagementSession {
         .await
     }
 
-    pub(crate) async fn request(&self, body: Vec<u8>) -> Result<Vec<u8>, CallError> {
+    pub async fn request(&self, body: Vec<u8>) -> Result<Vec<u8>, CallError> {
         self.consumer
             .request(
                 &self.route,
@@ -176,13 +176,13 @@ impl ManagementSession {
             .await
     }
 
-    pub(crate) async fn watch(&self, body: Vec<u8>) -> Result<Subscription, CallError> {
+    pub async fn watch(&self, body: Vec<u8>) -> Result<Subscription, CallError> {
         self.consumer
             .subscribe_route(&self.route, body, SubscribeOptions::default())
             .await
     }
 
-    pub(crate) async fn close(self) {
+    pub async fn close(self) {
         let _ = self
             .consumer
             .close_handle(&self.route, CloseRouteOptions::default())

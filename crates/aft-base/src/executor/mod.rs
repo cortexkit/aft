@@ -609,16 +609,16 @@ impl JobCancellation {
         }
     }
 
-    pub(crate) fn with_root(mut self, root: &std::path::Path) -> Self {
+    pub fn with_root(mut self, root: &std::path::Path) -> Self {
         self.root = Some(Arc::new(root.to_path_buf()));
         self
     }
 
-    pub(crate) fn set_progress(&self, progress: crate::tool_progress::Progress) {
+    pub fn set_progress(&self, progress: crate::tool_progress::Progress) {
         *self.inner.progress.lock() = Some(progress);
     }
 
-    pub(crate) fn has_progress_channel(&self, key: usize) -> bool {
+    pub fn has_progress_channel(&self, key: usize) -> bool {
         self.inner
             .progress
             .lock()
@@ -626,7 +626,7 @@ impl JobCancellation {
             .is_some_and(|progress| progress.key() == key)
     }
 
-    pub(crate) fn report_progress(&self) {
+    pub fn report_progress(&self) {
         if !self.cancel_already_requested() {
             let progress = self.inner.progress.lock().clone();
             if let Some(progress) = progress {
@@ -635,7 +635,7 @@ impl JobCancellation {
         }
     }
 
-    pub(crate) fn with_lifecycle(
+    pub fn with_lifecycle(
         mut self,
         lifecycle: crate::executor::root_lifecycle::SubcLifecycleAdmission,
     ) -> Self {
@@ -643,7 +643,7 @@ impl JobCancellation {
         self
     }
 
-    pub(crate) fn fresh(&self) -> Self {
+    pub fn fresh(&self) -> Self {
         let mut token = Self::new();
         token.root = self.root.clone();
         token.lifecycle = self.lifecycle.clone();
@@ -1223,7 +1223,7 @@ impl RootMaintenanceExecutor {
     /// pool (one on a two-worker pool) held exactly the workers the handoff
     /// waited for, so the build started only after each read had given up.
     /// `lane` only labels the admission in the log.
-    pub(crate) fn submit_maintenance(
+    pub fn submit_maintenance(
         &self,
         request_id: &str,
         lane: Lane,
@@ -1533,7 +1533,7 @@ impl<C: ExecutorContext> Executor<C> {
     /// When a root becomes unbound, cancel queued maintenance and metadata.
     /// Started provider commits retain their result. Running maintenance checks
     /// at checkpoints whether the root stayed unbound past the abandonment grace.
-    pub(crate) fn cancel_queued_root_maintenance(&self, root_id: &ProjectRootId) -> usize {
+    pub fn cancel_queued_root_maintenance(&self, root_id: &ProjectRootId) -> usize {
         let cancelled = self
             .inner
             .state
@@ -1548,7 +1548,7 @@ impl<C: ExecutorContext> Executor<C> {
 
     /// Cancel queued maintenance and signal running root work at its checkpoints.
     /// Interactive tools other than inspect retain their normal completion path.
-    pub(crate) fn cancel_root_maintenance(&self, root_id: &ProjectRootId) -> usize {
+    pub fn cancel_root_maintenance(&self, root_id: &ProjectRootId) -> usize {
         let mut state = self.inner.state.lock();
         let mut cancelled = state
             .actors
@@ -1601,7 +1601,7 @@ impl<C: ExecutorContext> Executor<C> {
             .map(|actor| Arc::clone(&actor.ctx))
     }
 
-    pub(crate) fn scheduler_lock_diagnostics(&self) -> Arc<LockDiagnostics> {
+    pub fn scheduler_lock_diagnostics(&self) -> Arc<LockDiagnostics> {
         self.inner.state.diagnostics()
     }
 
@@ -1768,7 +1768,7 @@ impl<C: ExecutorContext> Executor<C> {
 
     /// Allows a receipt deadline to cancel admission even while submission is
     /// waiting for the scheduler state lock on a blocking worker.
-    pub(crate) fn submit_tool_call_with_cancellation_async(
+    pub fn submit_tool_call_with_cancellation_async(
         &self,
         root_id: ProjectRootId,
         lane: Lane,
@@ -1902,7 +1902,7 @@ impl<C: ExecutorContext> Executor<C> {
     /// A dispatched job may already reserve scheduler capacity; its worker sees
     /// the cancelled token before invoking the closure and releases that
     /// reservation through the normal completion event.
-    pub(crate) fn cancel_job_before_execution(
+    pub fn cancel_job_before_execution(
         &self,
         root_id: &ProjectRootId,
         token: &JobCancellation,
@@ -1946,7 +1946,7 @@ impl<C: ExecutorContext> Executor<C> {
 
     /// Final persistence is allowed after unbind so TTL eviction does not lose
     /// retained deltas. This exception does not admit indexing or refresh work.
-    pub(crate) fn submit_unbound_teardown_async(
+    pub fn submit_unbound_teardown_async(
         &self,
         root_id: ProjectRootId,
         request_id: String,
@@ -1992,7 +1992,7 @@ impl<C: ExecutorContext> Executor<C> {
         (completion_rx, cancellation)
     }
 
-    pub(crate) fn submit_coalescable_maintenance_async(
+    pub fn submit_coalescable_maintenance_async(
         &self,
         root_id: ProjectRootId,
         lane: Lane,
@@ -2289,7 +2289,7 @@ impl<C: ExecutorContext> Executor<C> {
     }
 
     /// In-memory read-job identities for management attribution; contention stays unknown.
-    pub(crate) fn try_running_read_requests(&self) -> Option<HashSet<String>> {
+    pub fn try_running_read_requests(&self) -> Option<HashSet<String>> {
         self.inner.state.try_lock().map(|state| {
             state
                 .running_jobs
@@ -2310,7 +2310,7 @@ impl<C: ExecutorContext> Executor<C> {
             .map(|state| state.mutating_lane_snapshots())
     }
 
-    pub(crate) fn try_root_job_snapshots(
+    pub fn try_root_job_snapshots(
         &self,
         root_id: &ProjectRootId,
         current: Option<&JobCancellation>,
@@ -2406,7 +2406,7 @@ impl<C: ExecutorContext> Executor<C> {
     /// Return each over-age interactive occupant once. Marking happens under the
     /// scheduler lock so repeated transport-loop censuses cannot flood logs while
     /// the same job remains stuck.
-    pub(crate) fn try_take_long_running_interactive_jobs(
+    pub fn try_take_long_running_interactive_jobs(
         &self,
         minimum_age: Duration,
     ) -> Option<Vec<LongRunningInteractiveJobSnapshot>> {

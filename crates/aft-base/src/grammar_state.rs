@@ -50,7 +50,7 @@ pub struct GrammarUnavailable {
 }
 
 impl GrammarUnavailable {
-    pub(crate) fn new(language: &str, state: GrammarState) -> Self {
+    pub fn new(language: &str, state: GrammarState) -> Self {
         let message = match state {
             GrammarState::SupportDisabled => SUPPORT_DISABLED,
             GrammarState::NotDownloaded => NOT_DOWNLOADED,

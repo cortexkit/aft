@@ -26,7 +26,7 @@ enum Handle {
 #[derive(Debug)]
 pub struct Child {
     handle: Handle,
-    pub(crate) stdin: Option<File>,
+    pub stdin: Option<File>,
     reaped: Option<ExitStatus>,
     // The kernel may reuse the PID as soon as wait4 returns; keep the identity
     // that was declared, rather than looking up a possibly newer child at reap.
@@ -47,7 +47,7 @@ impl From<std::process::Child> for Child {
     }
 }
 impl Child {
-    pub(crate) fn declare_agent(&mut self) {
+    pub fn declare_agent(&mut self) {
         self.agent_root = crate::agent_commands::started(self.id());
     }
     #[cfg(any(test, feature = "test-support"))]
@@ -75,16 +75,16 @@ impl Child {
             }
         }
     }
-    pub(crate) fn id(&self) -> u32 {
+    pub fn id(&self) -> u32 {
         match &self.handle {
             Handle::Std(child) => child.id(),
             Handle::Native { pid, .. } => *pid as u32,
         }
     }
-    pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.wait_inner(libc::WNOHANG)
     }
-    pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
+    pub fn wait(&mut self) -> io::Result<ExitStatus> {
         drop(self.stdin.take());
         self.wait_inner(0)?
             .ok_or_else(|| io::Error::other("waitpid returned no status"))
@@ -101,11 +101,11 @@ impl Child {
 }
 
 pub struct PipeIo<'a> {
-    pub(crate) gated_stdin: bool,
-    pub(crate) stdout: &'a File,
-    pub(crate) stderr: &'a File,
-    pub(crate) exit: RawFd,
-    pub(crate) failure: RawFd,
+    pub gated_stdin: bool,
+    pub stdout: &'a File,
+    pub stderr: &'a File,
+    pub exit: RawFd,
+    pub failure: RawFd,
 }
 
 type AddChdir =

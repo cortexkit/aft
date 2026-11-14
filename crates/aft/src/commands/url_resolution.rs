@@ -181,15 +181,23 @@ fn resolve_secret_fetch(
     // Owned by the enclosing call from here on, so every return below,
     // failures included, leaves the folder to be deleted at the call's end.
     FetchTempScope::adopt(document_dir.clone());
-    let secrets = SecretFetch {
-        vault: vault.clone(),
+    let secrets = SecretFetch::new(
+        vault.clone(),
         authorization,
-        labels: labels.to_vec(),
-        #[cfg(test)]
-        test_https_port: url::Url::parse(file).ok().and_then(|url| url.port()),
-        call_id: req.id.clone(),
-        cancellation: crate::url_fetch::SecretFetchCancellation::for_current_call(&options),
-    };
+        labels.to_vec(),
+        {
+            #[cfg(test)]
+            {
+                url::Url::parse(file).ok().and_then(|url| url.port())
+            }
+            #[cfg(not(test))]
+            {
+                None
+            }
+        },
+        req.id.clone(),
+        crate::url_fetch::SecretFetchCancellation::for_current_call(&options),
+    );
     let document = crate::url_fetch::fetch_url_with_secrets(file, &document_dir, options, &secrets)
         .map_err(|error| url_fetch_error_response(&req.id, &error))?;
     #[cfg(test)]

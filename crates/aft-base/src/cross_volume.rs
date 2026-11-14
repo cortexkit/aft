@@ -280,7 +280,7 @@ pub enum Moved {
 }
 
 impl Moved {
-    pub(crate) fn warn_if_incomplete(self, from: &Path, to: &Path) {
+    pub fn warn_if_incomplete(self, from: &Path, to: &Path) {
         if let Self::PublishedWithWarning(error) = self {
             crate::slog_warn!(
                 "moved {} to {}, but finalization failed; using the destination: {error}",
@@ -308,7 +308,7 @@ impl MoveError {
         }
     }
 
-    pub(crate) fn warn_if_incomplete(&self, to: &Path) {
+    pub fn warn_if_incomplete(&self, to: &Path) {
         if let Self::AlreadyPublished {
             cleanup_warning: Some(error),
         } = self

@@ -13,7 +13,7 @@ pub struct StageTimer {
 }
 
 impl StageTimer {
-    pub(crate) fn new(prefix: &'static str) -> Self {
+    pub fn new(prefix: &'static str) -> Self {
         Self {
             prefix,
             enabled: std::env::var_os("AFT_VIEW_PROFILE").is_some(),
@@ -21,7 +21,7 @@ impl StageTimer {
         }
     }
 
-    pub(crate) fn finish(&mut self, stage: &str, detail: std::fmt::Arguments<'_>) {
+    pub fn finish(&mut self, stage: &str, detail: std::fmt::Arguments<'_>) {
         #[cfg(any(test, feature = "test-support"))]
         crate::test_allocations::heap_marker(self.prefix, stage);
         if self.enabled {

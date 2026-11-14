@@ -65,7 +65,7 @@ pub struct NestedWorktreeBoundary {
 impl NestedWorktreeBoundary {
     /// One boundary per walk, rooted at the walk's root. The root itself is
     /// never reported, so a project opened inside a worktree still walks.
-    pub(crate) fn for_root(root: &Path) -> Self {
+    pub fn for_root(root: &Path) -> Self {
         Self {
             root: root.to_path_buf(),
             common_dir: OnceLock::new(),
@@ -83,7 +83,7 @@ impl NestedWorktreeBoundary {
     /// Only directories below the walk root are ever reported; callers check
     /// `entry.depth() > 0` (or an equivalent) so the named root of an
     /// explicitly targeted walk is always admitted.
-    pub(crate) fn is_nested_worktree_root(&self, dir: &Path) -> bool {
+    pub fn is_nested_worktree_root(&self, dir: &Path) -> bool {
         if dir == self.root {
             return false;
         }
@@ -112,7 +112,7 @@ impl NestedWorktreeBoundary {
     /// True when `path` is at or under a nested linked worktree of this
     /// repository. The boundary root itself never counts, even when the
     /// project is opened inside a worktree.
-    pub(crate) fn is_under_nested_worktree(&self, path: &Path) -> bool {
+    pub fn is_under_nested_worktree(&self, path: &Path) -> bool {
         let mut current = Some(path);
         while let Some(dir) = current {
             if dir == self.root || !dir.starts_with(&self.root) {

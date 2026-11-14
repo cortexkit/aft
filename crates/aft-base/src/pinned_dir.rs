@@ -28,8 +28,8 @@ use std::time::{Duration, SystemTime};
 
 #[derive(Debug)]
 pub struct PinnedDir {
-    pub(crate) file: File,
-    pub(crate) path: PathBuf,
+    pub file: File,
+    pub path: PathBuf,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) cache_device_override: Option<u64>,
 }
@@ -77,7 +77,7 @@ pub struct DirectoryIdentity {
 }
 
 impl DirectorySnapshot {
-    pub(crate) fn reopen(&self) -> io::Result<PinnedDir> {
+    pub fn reopen(&self) -> io::Result<PinnedDir> {
         let current = PinnedDir::open(&self.path)?;
         if current.identity()? != self.identity {
             return Err(io::Error::new(
@@ -90,7 +90,7 @@ impl DirectorySnapshot {
 }
 
 impl PinnedDir {
-    pub(crate) fn identity(&self) -> io::Result<DirectoryIdentity> {
+    pub fn identity(&self) -> io::Result<DirectoryIdentity> {
         #[cfg(unix)]
         {
             let metadata = self.file.metadata()?;
@@ -109,7 +109,7 @@ impl PinnedDir {
         }
     }
 
-    pub(crate) fn snapshot(&self) -> io::Result<DirectorySnapshot> {
+    pub fn snapshot(&self) -> io::Result<DirectorySnapshot> {
         Ok(DirectorySnapshot {
             path: self.path.clone(),
             identity: self.identity()?,
@@ -348,7 +348,7 @@ impl PinnedDir {
         &self.path
     }
 
-    pub(crate) fn directory_identity(&self) -> io::Result<(u64, u64)> {
+    pub fn directory_identity(&self) -> io::Result<(u64, u64)> {
         #[cfg(unix)]
         {
             let metadata = self.file.metadata()?;
@@ -518,7 +518,7 @@ impl PinnedDir {
         })
     }
 
-    pub(crate) fn repair_child(&self, name: &OsStr) -> io::Result<Self> {
+    pub fn repair_child(&self, name: &OsStr) -> io::Result<Self> {
         self.repair_child_with_access(name, false)
     }
 
@@ -689,7 +689,7 @@ impl PinnedDir {
         Ok(())
     }
 
-    pub(crate) fn repair_remove_child_with_warnings(
+    pub fn repair_remove_child_with_warnings(
         &self,
         name: &OsStr,
         expected: (u64, u64),
@@ -933,11 +933,11 @@ impl PinnedDir {
 
     /// The pinned directory's open handle, for `*at` calls relative to it.
     #[cfg(unix)]
-    pub(crate) fn as_raw_fd(&self) -> std::os::fd::RawFd {
+    pub fn as_raw_fd(&self) -> std::os::fd::RawFd {
         self.file.as_raw_fd()
     }
 
-    pub(crate) fn modified(&self) -> io::Result<SystemTime> {
+    pub fn modified(&self) -> io::Result<SystemTime> {
         #[cfg(any(test, feature = "test-support"))]
         work_counts::record_stat();
         self.file.metadata()?.modified()
@@ -966,7 +966,7 @@ impl PinnedDir {
     }
 
     #[cfg(unix)]
-    pub(crate) fn open_dir_at(&self, name: &OsStr) -> io::Result<Self> {
+    pub fn open_dir_at(&self, name: &OsStr) -> io::Result<Self> {
         self.open_dir_at_with_flags(
             name,
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
@@ -999,7 +999,7 @@ impl PinnedDir {
     }
 
     #[cfg(unix)]
-    pub(crate) fn create_dir_at(&self, name: &OsStr) -> io::Result<Self> {
+    pub fn create_dir_at(&self, name: &OsStr) -> io::Result<Self> {
         let name = os_cstring(name)?;
         let result = unsafe {
             libc::mkdirat(
@@ -1141,13 +1141,13 @@ impl PinnedDir {
         }
     }
 
-    pub(crate) fn rename(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
+    pub fn rename(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
         #[cfg(any(test, feature = "test-support"))]
         work_counts::record_rename();
         self.rename_to(from, self, to)
     }
 
-    pub(crate) fn rename_to(&self, from: &OsStr, target: &PinnedDir, to: &OsStr) -> io::Result<()> {
+    pub fn rename_to(&self, from: &OsStr, target: &PinnedDir, to: &OsStr) -> io::Result<()> {
         #[cfg(unix)]
         {
             let from = os_cstring(from)?;
@@ -1257,7 +1257,7 @@ impl PinnedDir {
         Ok(())
     }
 
-    pub(crate) fn remove_file(&self, name: &OsStr) -> io::Result<()> {
+    pub fn remove_file(&self, name: &OsStr) -> io::Result<()> {
         #[cfg(unix)]
         {
             let name = os_cstring(name)?;

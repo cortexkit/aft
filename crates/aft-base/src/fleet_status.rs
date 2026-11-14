@@ -314,7 +314,7 @@ impl FleetStatusClient {
         routes.push(stopped);
     }
 
-    pub(crate) fn set_route_live(&self, route_live: bool) {
+    pub fn set_route_live(&self, route_live: bool) {
         self.inner.route_live.store(route_live, Ordering::Release);
         if !route_live {
             self.inner.state.lock().forget_route();
@@ -332,7 +332,7 @@ impl FleetStatusClient {
     /// tool calls, a render-time age would call a steadily polling reader stale
     /// and show a duplicate bar. The ack for this call's own publish arrives
     /// after the decision, so a reader that stops is noticed one result late.
-    pub(crate) fn reader_present(&self, project_root: &Path) -> bool {
+    pub fn reader_present(&self, project_root: &Path) -> bool {
         if !self.inner.route_live.load(Ordering::Acquire) {
             return false;
         }
@@ -349,7 +349,7 @@ impl FleetStatusClient {
     /// Publish AFT's segment when the holder route is live. The return value
     /// reports route liveness only; it says nothing about whether anything
     /// reads the published scope (use [`Self::reader_present`] for that).
-    pub(crate) fn publish(
+    pub fn publish(
         &self,
         project_root: &Path,
         harness: &str,

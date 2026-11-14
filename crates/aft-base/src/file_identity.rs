@@ -37,7 +37,7 @@ pub enum FileIdentity {
 
 impl FileIdentity {
     /// The identity of an open file.
-    pub(crate) fn of_file(file: &File) -> Self {
+    pub fn of_file(file: &File) -> Self {
         #[cfg(unix)]
         {
             file.metadata().map_or(Self::Unavailable, |metadata| {

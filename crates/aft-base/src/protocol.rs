@@ -35,7 +35,7 @@ pub struct ProgressFrame {
     /// Transport-only destination, captured by the request's dispatch scope.
     /// It is never part of the JSON body consumed by bridges.
     #[serde(skip)]
-    pub(crate) origin: Option<ProgressOrigin>,
+    pub origin: Option<ProgressOrigin>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

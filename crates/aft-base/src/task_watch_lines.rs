@@ -103,7 +103,7 @@ pub struct LineBatch {
 }
 
 impl LineBatch {
-    pub(super) fn has_matches(&self) -> bool {
+    pub fn has_matches(&self) -> bool {
         !self.lines.is_empty() || self.dropped_lines > 0
     }
 
@@ -521,7 +521,7 @@ pub struct Candidate {
 }
 
 impl Candidate {
-    pub(crate) fn new(mut frame: crate::protocol::BashPatternMatchFrame) -> Self {
+    pub fn new(mut frame: crate::protocol::BashPatternMatchFrame) -> Self {
         use sha2::Digest;
         let fingerprint = sha2::Sha256::digest(frame.match_text.as_bytes()).to_vec();
         let (first_offset, last_offset, stream) = if let Some(batch) = &frame.batch {
@@ -573,7 +573,7 @@ impl Candidate {
         }
     }
 
-    pub(crate) fn merge(&mut self, next: Self) {
+    pub fn merge(&mut self, next: Self) {
         self.same_occurrence &= next.same_occurrence
             && self.fingerprint == next.fingerprint
             && self.first_version == next.first_version;
