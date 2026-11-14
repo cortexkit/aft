@@ -14,6 +14,22 @@ import subprocess
 import sys
 
 HERE = Path(__file__).resolve().parent
+REVISION = "meaning-nine-v2"
+FINISHED = {"ml-explore/mlx", "neovim/neovim", "Perl/perl5", "apache/superset", "ethereum/solidity", "ziglang/zig"}
+MEANING = {"microsoft/vscode", "elastic/elasticsearch", "kubernetes/kubernetes"}
+
+
+def phase_plan(entries):
+    by_name = {row["repository"]: row for row in entries}
+    def small(names):
+        return sorted(names, key=lambda name: (by_name[name]["tracked_files"], name))
+    no_meaning = set(by_name) - FINISHED - MEANING
+    order = ["NVIDIA/TensorRT-LLM", *small(no_meaning - {"NVIDIA/TensorRT-LLM"}), *small(MEANING), *small(FINISHED)]
+    return [{"repository": name,
+             "phases": ["callgraph"] if name in FINISHED else (["text", "callgraph", "full"] if name in MEANING else ["text", "callgraph"]),
+             "query_build": "none" if name in FINISHED else ("full" if name in MEANING else "callgraph"),
+             "meaning_policy": "previous measurements retained" if name in FINISHED else ("full only" if name in MEANING else "off")}
+            for name in order]
 
 
 def now():
@@ -30,31 +46,40 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def ordered(entries):
-    # Actual checkout sizes are unavailable until measurement; tracked paths
-    # are the manifest's consistent, complete project-size ordering metric.
-    return sorted(entries, key=lambda row: (row["repository"] == "chromium/chromium", row["tracked_files"], row["repository"]))
-
-
-def drive(manifest_path, results, arguments):
+def drive(manifest_path, results, arguments, revision=REVISION):
     results.mkdir(parents=True, exist_ok=True)
-    entries = ordered(json.loads(manifest_path.read_text())["repositories"])
+    entries = json.loads(manifest_path.read_text())["repositories"]
+    projects = phase_plan(entries)
     identity = {"manifest_sha256": digest(manifest_path), "driver_sha256": digest(Path(__file__)),
-                "runner_sha256": digest(HERE / "run.py"), "arguments": arguments}
+                "runner_sha256": digest(HERE / "run.py"), "arguments": arguments, "revision": revision, "projects": projects}
     plan_path = results / "matrix-plan.json"
-    if plan_path.exists():
-        plan = json.loads(plan_path.read_text())
-        if plan["identity"] != identity:
-            raise ValueError("matrix inputs changed; use a new results directory")
+    previous_plan = json.loads(plan_path.read_text()) if plan_path.exists() else None
+    if previous_plan and previous_plan.get("revision") == revision:
+        if previous_plan["identity"] != identity:
+            raise ValueError("matrix inputs changed within this revision; use a new revision or results directory")
+        plan = previous_plan
     else:
-        plan = {"started_at": now(), "identity": identity, "order": [row["repository"] for row in entries],
+        if previous_plan and (previous_plan.get("revision") not in (None, "all-meaning-v1") or
+                              previous_plan["identity"]["manifest_sha256"] != identity["manifest_sha256"] or
+                              previous_plan["identity"]["arguments"] != arguments):
+            raise ValueError("only an explicit unchanged-input v1 to meaning-nine-v2 transition is supported")
+        plan = {"started_at": previous_plan["started_at"] if previous_plan else now(),
+                "revised_at": now(), "revision": revision, "identity": identity,
+                "order": [row["repository"] for row in projects], "projects": projects,
+                "previous_plans": [previous_plan] if previous_plan else [],
+                "retired_partial_attempts": previous_plan.get("retired_partial_attempts", []) if previous_plan else [],
                 "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=HERE, text=True).strip()}
         save(plan_path, plan)
     state_path = results / "matrix-state.json"
     state = json.loads(state_path.read_text()) if state_path.exists() else {"started_at": plan["started_at"], "repositories": {}}
+    if state.get("revision") != revision:
+        state = {"started_at": plan["started_at"], "revision": revision, "revised_at": plan["revised_at"],
+                 "previous_states": [state], "repositories": {row["repository"]: {"status": "pending", "phase_plan": row["phases"],
+                                                                                 "query_build": row["query_build"]} for row in projects}}
+        save(state_path, state)
     state.pop("paused_reason", None)
     state.pop("finished_at", None)
-    for entry in entries:
+    for entry in projects:
         if shutil.disk_usage(results).free < 20 * 1024 ** 3:
             state["paused_reason"] = "less than 20 GiB free before next project; free disk space, then resume"
             save(state_path, state)
@@ -63,7 +88,8 @@ def drive(manifest_path, results, arguments):
         directory = results / name.replace("/", "--")
         directory.mkdir(exist_ok=True)
         command = [sys.executable, str(HERE / "run.py"), "--manifest", str(manifest_path),
-                   "--results", str(results), "--repository", name, *arguments]
+                   "--results", str(results), "--repository", name, "--plan-revision", revision,
+                   "--phases", ",".join(entry["phases"]), "--query-build", entry["query_build"], *arguments]
         previous = state["repositories"].get(name, {})
         state["current_repository"] = name
         state["repositories"][name] = {**previous, "status": "running", "started_at": now(), "command": command}
@@ -87,6 +113,7 @@ def drive(manifest_path, results, arguments):
         row = state["repositories"][name]
         row.update({"finished_at": now(), "exit_code": exit_code,
                     "status": "completed" if exit_code == 0 and result.get("completed") else "failed",
+                    "callgraph_outcome": result.get("callgraph", {}).get("outcome"),
                     "full_outcome": result.get("full", {}).get("outcome"),
                     "meaning_files_failed": result.get("meaning", {}).get("semantic_failures", {}).get("files_failed"),
                     "full_files_failed": result.get("full", {}).get("semantic_failures", {}).get("files_failed")})
@@ -107,16 +134,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=HERE / "manifest.json")
     parser.add_argument("--results", type=Path, required=True)
+    parser.add_argument("--revision", choices=(REVISION,), default=REVISION)
     parser.add_argument("arguments", nargs=argparse.REMAINDER, help="after --, arguments passed unchanged to run.py")
     args = parser.parse_args()
     arguments = args.arguments[1:] if args.arguments and args.arguments[0] == "--" else args.arguments
-    if any(item in arguments for item in ("--repository", "--results", "--manifest")):
+    if any(item in arguments for item in ("--repository", "--results", "--manifest", "--plan-revision", "--phases", "--query-build")):
         parser.error("repository, results and manifest are owned by the matrix driver")
     args.results = args.results.resolve()
     args.results.mkdir(parents=True, exist_ok=True)
     with (args.results / ".driver.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return drive(args.manifest.resolve(), args.results, arguments)
+        return drive(args.manifest.resolve(), args.results, arguments, args.revision)
 
 
 if __name__ == "__main__":

@@ -40,19 +40,33 @@ def markdown(rows, fields):
 
 def generate(manifest, results, output):
     summaries, shapes, latencies = [], [], []
+    plan_path = results / "matrix-plan.json"
+    plan = json.loads(plan_path.read_text()) if plan_path.exists() else {}
+    planned = {row["repository"]: row for row in plan.get("projects", [])}
     for entry in manifest["repositories"]:
         repo = entry["repository"]
         directory = results / repo.replace("/", "--")
         path = directory / "result.json"
         result = json.loads(path.read_text()) if path.exists() else {}
-        row = {"repository": repo, "commit": entry["commit"], "checkout_bytes": result.get("checkout_bytes"),
+        requested = planned.get(repo, {}).get("phases", result.get("phase_plan", []))
+        row = {"repository": repo, "commit": entry["commit"],
+               "planned_revision": plan.get("revision", result.get("plan_revision", "all-meaning-v1")),
+               "observed_revision": result.get("plan_revision", "all-meaning-v1") if result else None,
+               "phases_requested": ",".join(requested),
+               "phases_ran": ",".join(mode for mode in ("text", "meaning", "callgraph", "full") if mode in result),
+               "query_build": result.get("queries", {}).get("build", "full") if result.get("queries") else planned.get(repo, {}).get("query_build"),
+               "checkout_bytes": result.get("checkout_bytes"),
                "checkout_allocated_bytes": result.get("checkout_allocated_bytes")}
-        for mode in ("text", "meaning", "full"):
+        for mode in ("text", "meaning", "callgraph", "full"):
             build = result.get(mode, {})
-            row[mode + "_outcome"] = build.get("outcome", "not_measured")
+            skipped = result.get("skipped_phases", {}).get(mode, {})
+            if not build and requested and mode not in requested:
+                skipped = {"outcome": "skipped", "reason": "not requested by " + str(plan.get("revision", result.get("plan_revision")))}
+            row[mode + "_outcome"] = build.get("outcome", skipped.get("outcome", "not_measured"))
+            row[mode + "_plan_revision"] = result.get("phase_revisions", {}).get(mode, "all-meaning-v1" if build else None)
             for metric in ("vmhwm_bytes", "vmhwm_observed_bytes", "cgroup_memory_peak_bytes", "oom_killed", "wall_ns", "cpu_s", "store_bytes", "store_allocated_bytes", "storage_bytes", "model_bytes"):
                 row[mode + "_" + metric] = build.get(metric)
-            row[mode + "_reason"] = build.get("reason")
+            row[mode + "_reason"] = build.get("reason", skipped.get("reason"))
             failures = build.get("semantic_failures", {})
             row[mode + "_files_failed"] = failures.get("files_failed")
             row[mode + "_reported_failed_file_names"] = json.dumps(failures.get("reported_file_names")) if failures else None
@@ -61,6 +75,9 @@ def generate(manifest, results, output):
                 row[mode + "_census_observed_max_bytes_" + component] = value
         shape_status = result.get("call_shape", {"outcome": "not_measured", "reason": "repository not run"})
         query_status = result.get("queries", {"outcome": "not_measured", "reason": "repository not run"})
+        row["meaning_dependent_query_outcome"] = result.get("query_plan", {}).get("meaning_dependent_queries", {}).get("outcome")
+        row["meaning_dependent_query_reason"] = result.get("query_plan", {}).get("meaning_dependent_queries", {}).get("reason")
+        row["call_shape_build"] = shape_status.get("build", "full")
         row["call_shape_outcome"] = shape_status["outcome"]
         row["call_shape_reason"] = shape_status.get("reason")
         row["query_outcome"] = query_status["outcome"]
@@ -78,7 +95,7 @@ def generate(manifest, results, output):
             sizes = [group["sites"] for group in groups[language]]
             targets = [group["targets"] for group in groups[language]]
             total = language_totals.get(language)
-            shape = {"repository": repo, "language": language, "outcome": shape_status["outcome"],
+            shape = {"repository": repo, "build": shape_status.get("build", "full"), "language": language, "outcome": shape_status["outcome"],
                      "all_method_sites": total["sites"] if total else None,
                      "unknown_exit_sites": sum(count for exit_name, count in total["exits"].items() if exit_name.startswith("unknown")) if total else None,
                      "unknown_sites": sum(sizes) if measured else None,
@@ -91,14 +108,15 @@ def generate(manifest, results, output):
             shapes.append(shape)
         observations = defaultdict(list)
         if query_status["outcome"] == "measured":
-            with (directory / result["attempt"] / "full/queries.jsonl").open() as handle:
+            query_path = query_status.get("artifact", str(Path(result["attempt"]) / "full/queries.jsonl"))
+            with (directory / query_path).open() as handle:
                 for line in handle:
                     sample = json.loads(line)
                     observations[sample["op"], sample["temperature"]].append(sample["latency_ns"])
         for operation in ("callers", "impact", "trace_to"):
             for temperature in ("cold", "warm"):
                 values = observations[operation, temperature]
-                latency = {"repository": repo, "operation": operation, "temperature": temperature,
+                latency = {"repository": repo, "build": query_status.get("build", "full"), "operation": operation, "temperature": temperature,
                            "samples": len(values), "p50_ns": percentile(values, 50),
                            "p95_ns": percentile(values, 95), "p99_ns": percentile(values, 99),
                            "outcome": query_status["outcome"], "reason": query_status.get("reason")}
@@ -113,8 +131,10 @@ def generate(manifest, results, output):
     (output / "tables.json").write_text(json.dumps({"repositories": summaries, "call_shape": shapes, "query_latency": latencies}, indent=2) + "\n")
     sections = ["# Index matrix measurements", "Missing values mean not measured. Times are integer nanoseconds (CPU: kernel seconds); memory and disk are integer bytes. Percentiles use nearest rank. Call-shape rows are per repository/language, not sums of overlapping project namespaces.",
                 "## Cold text and meaning indexes", markdown(summaries, ["repository", "text_outcome", "text_vmhwm_bytes", "text_wall_ns", "text_cpu_s", "text_store_bytes", "meaning_outcome", "meaning_vmhwm_bytes", "meaning_wall_ns", "meaning_cpu_s", "meaning_store_bytes"]),
-                "## Call shape", markdown(shapes, ["repository", "language", "outcome", "unknown_sites", "distinct_language_member_groups", "sites_per_group_p50", "sites_per_group_p99", "sites_per_group_max", "reason"]),
-                "## Query latency", markdown(latencies, ["repository", "operation", "temperature", "outcome", "samples", "p50_ns", "p95_ns", "p99_ns", "reason"])]
+                "## Phase plan", markdown(summaries, ["repository", "planned_revision", "observed_revision", "phases_requested", "phases_ran", "query_build"]),
+                "## Isolated text plus call graph (meaning off)", markdown(summaries, ["repository", "callgraph_outcome", "callgraph_vmhwm_bytes", "callgraph_cgroup_memory_peak_bytes", "callgraph_wall_ns", "callgraph_cpu_s", "callgraph_store_bytes", "callgraph_reason"]),
+                "## Call shape", markdown(shapes, ["repository", "build", "language", "outcome", "unknown_sites", "distinct_language_member_groups", "sites_per_group_p50", "sites_per_group_p99", "sites_per_group_max", "reason"]),
+                "## Query latency", markdown(latencies, ["repository", "build", "operation", "temperature", "outcome", "samples", "p50_ns", "p95_ns", "p99_ns", "reason"])]
     (output / "tables.md").write_text("\n\n".join(sections) + "\n")
     return len(summaries), len(shapes), len(latencies)
 

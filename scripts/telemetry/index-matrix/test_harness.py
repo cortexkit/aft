@@ -178,11 +178,120 @@ class HarnessTests(unittest.TestCase):
         self.assertIn("lib/c.lua", result["failure_log_lines"][0]["text"])
         self.assertTrue((self.root / "semantic-failures.json").is_file())
 
-    def test_matrix_orders_smallest_first_and_chromium_last(self):
-        entries = [{"repository": name, "tracked_files": count} for name, count in
-                   (("large/repo", 100), ("chromium/chromium", 1), ("small/repo", 10))]
-        self.assertEqual([row["repository"] for row in MATRIX.ordered(entries)],
-                         ["small/repo", "large/repo", "chromium/chromium"])
+    def test_revised_plan_has_twelve_no_meaning_three_full_and_six_additions(self):
+        entries = json.loads((HERE / "manifest.json").read_text())["repositories"]
+        plan = MATRIX.phase_plan(entries)
+        self.assertEqual(len(plan), 21)
+        self.assertEqual(plan[0]["repository"], "NVIDIA/TensorRT-LLM")
+        self.assertEqual(plan[11]["repository"], "chromium/chromium")
+        self.assertEqual({row["repository"] for row in plan[12:15]}, MATRIX.MEANING)
+        self.assertEqual({row["repository"] for row in plan[15:]}, MATRIX.FINISHED)
+        self.assertTrue(all(row["phases"] == ["text", "callgraph"] and row["query_build"] == "callgraph" for row in plan[:12]))
+        self.assertTrue(all(row["phases"] == ["text", "callgraph", "full"] for row in plan[12:15]))
+        self.assertTrue(all(row["phases"] == ["callgraph"] and row["query_build"] == "none" for row in plan[15:]))
+        self.assertTrue(all("meaning" not in row["phases"] for row in plan))
+
+    def test_callgraph_mode_enables_text_and_graph_without_meaning(self):
+        class Fake:
+            def request(self, command, **kwargs):
+                self.config = json.loads(kwargs["config"][0]["doc"])
+                return {"success": True}
+        client = Fake()
+        RUN.configure(client, self.root, {"AFT_STORAGE_DIR": str(self.root / "store")}, "callgraph", 10)
+        self.assertEqual(client.config["indexes"], {"trigram": True, "callgraph": True, "semantic": False})
+        self.assertNotIn("index", client.config)
+        self.assertEqual(RUN.states({"search_index": {"status": "ready"}, "callgraph_store": {"status": "ready"}}, "callgraph"),
+                         {"search_index": "ready", "callgraph_store": "ready"})
+
+    def test_revision_reuse_rejects_changed_binary_or_guard(self):
+        old = {"binary_sha256": "a", "guard_gib": 48, "harness_sha256": "old"}
+        new = {**old, "harness_sha256": "new", "plan_revision": "meaning-nine-v2", "phases": ["callgraph"], "query_build": "none"}
+        self.assertTrue(RUN.compatible_observations(old, new))
+        self.assertFalse(RUN.compatible_observations(old, {**new, "guard_gib": 32}))
+        self.assertFalse(RUN.compatible_observations(old, {**new, "binary_sha256": "b"}))
+
+    def test_preserves_six_finished_results_and_builds_only_callgraph_addition(self):
+        from types import SimpleNamespace
+        entry = {"repository": "ml-explore/mlx", "commit": "a" * 40}
+        directory = self.root / "results/ml-explore--mlx"
+        old = {"repository": "ml-explore/mlx", "attempt": "old", "completed": True,
+               "fingerprint": {"binary_sha256": "same", "guard_gib": 48, "harness_sha256": "old"},
+               "text": {"outcome": "ready", "wall_ns": 11}, "meaning": {"outcome": "ready", "wall_ns": 22},
+               "full": {"outcome": "ready", "wall_ns": 33}, "queries": {"outcome": "measured", "samples": 330}}
+        RUN.save(directory / "result.json", old)
+        args = SimpleNamespace(results=self.root / "results", phases=["callgraph"], query_build="none",
+                               plan_revision="meaning-nine-v2", aft_binary=Path("/default"), shape_binary=Path("/shape"))
+        identity = {**old["fingerprint"], "harness_sha256": "new", "phases": args.phases, "query_build": "none", "plan_revision": args.plan_revision}
+        def build(binary, root, folder, mode, args):
+            for filename in ("build.json", "status.jsonl", "memory-census.jsonl", "phase-memory.csv", "ready-status.json"):
+                RUN.save(folder / filename, {})
+            return {"outcome": "ready", "wall_ns": 99}
+        with patch.object(RUN, "fingerprint", return_value=identity), patch.object(RUN, "checkout", return_value=self.root), \
+             patch.object(RUN, "disk_bytes", return_value=123), patch.object(RUN, "measure_build", side_effect=build) as measure, \
+             patch.object(RUN, "measure_queries") as queries:
+            self.assertTrue(RUN.run_repository(entry, args))
+            self.assertEqual(measure.call_count, 1)
+            self.assertEqual(measure.call_args.args[3], "callgraph")
+            queries.assert_not_called()
+            self.assertTrue(RUN.run_repository(entry, args))
+            self.assertEqual(measure.call_count, 1)
+        result = json.loads((directory / "result.json").read_text())
+        for mode in ("text", "meaning", "full"):
+            self.assertEqual(result[mode], old[mode])
+        self.assertEqual(result["queries"]["samples"], 330)
+        self.assertEqual(json.loads((directory / result["previous_results"][0]).read_text()), old)
+
+    def test_callgraph_queries_never_configure_meaning_search(self):
+        from types import SimpleNamespace
+        configs = []
+        class Fake:
+            def __init__(self, *args):
+                pass
+            def request(self, command, **kwargs):
+                if command == "configure":
+                    configs.append(json.loads(kwargs["config"][0]["doc"]))
+                return {"success": True}
+            def close(self):
+                pass
+        args = SimpleNamespace(guard_gib=48, cgroup_parent=None, drop_caches=False, timeout_s=30, warm_repetitions=1, query_timeout_s=10)
+        with patch.object(RUN, "Client", Fake), patch.object(RUN, "wait_ready"):
+            result = RUN.measure_queries(Path("/default"), self.root, self.root,
+                                         {"top_callers": [{"path": "a.rs", "symbol": "run", "callers": 5}]}, args, mode="callgraph")
+        self.assertEqual(result["samples"], 6)
+        self.assertEqual(len(configs), 3)
+        self.assertTrue(all(config["indexes"] == {"trigram": True, "semantic": False, "callgraph": True} for config in configs))
+
+    def test_tables_show_skipped_meaning_and_callgraph_query_source(self):
+        directory = self.root / "results/owner--repo"
+        RUN.save(directory / "result.json", {"attempt": "new", "plan_revision": "meaning-nine-v2", "phase_plan": ["text", "callgraph"],
+                 "skipped_phases": {"meaning": {"outcome": "skipped", "reason": "meaning excluded"}},
+                 "callgraph": {"outcome": "deadline", "wall_ns": 86400000000000},
+                 "queries": {"outcome": "not_measured", "build": "callgraph", "reason": "callgraph deadline"}})
+        TABLES.generate({"repositories": [{"repository": "owner/repo", "commit": "a" * 40, "languages": ["Lua"]}]}, self.root / "results", self.root / "tables")
+        result = json.loads((self.root / "tables/tables.json").read_text())
+        row = result["repositories"][0]
+        self.assertEqual(row["meaning_outcome"], "skipped")
+        self.assertIsNone(row["meaning_wall_ns"])
+        self.assertEqual(row["callgraph_outcome"], "deadline")
+        self.assertEqual(result["query_latency"][0]["build"], "callgraph")
+        self.assertIsNone(result["query_latency"][0]["p50_ns"])
+
+    def test_build_deadline_is_terminal_and_preserves_raw_evidence(self):
+        from types import SimpleNamespace
+        client = SimpleNamespace(proc=object(), guard_measurement=None, close=lambda: None)
+        sampler = SimpleNamespace(start=lambda: None, stop=lambda: None, hwm_available=True, peak_rss_hwm_kb=10,
+                                  peak_rss_kb=10, cpu_seconds=0.01, cpu_precision="0.01-second", disk_write_bytes=0, gaps=[])
+        phases = SimpleNamespace(start=lambda: None, stop=lambda: None, samples=[], gaps=[])
+        args = SimpleNamespace(guard_gib=48, cgroup_parent=None, timeout_s=86400)
+        folder = self.root / "deadline"
+        with patch.object(RUN, "Client", return_value=client), patch.object(RUN.OSS, "ProcessSampler", return_value=sampler), \
+             patch.object(RUN.OSS, "PhaseSampler", return_value=phases), patch.object(RUN, "configure"), \
+             patch.object(RUN, "wait_ready", side_effect=RUN.OSS.BudgetExceeded("readiness deadline exceeded")):
+            result = RUN.measure_build(Path("/binary"), self.root, folder, "full", args)
+        self.assertEqual(result["outcome"], "deadline")
+        self.assertEqual(result["deadline_s"], 86400)
+        self.assertTrue((folder / "build.json").is_file())
+        self.assertTrue((folder / "phase-memory.csv").is_file())
 
     def test_collector_pulls_only_finished_projects_and_does_not_copy_keys(self):
         from types import SimpleNamespace
