@@ -220,9 +220,12 @@ struct EffectiveConfig {
 }
 
 impl EffectiveConfig {
+    test_support_visibility! {
     /// Every worker thread, including the bind and provider reservations.
-    fn total_workers(&self) -> usize {
-        self.pool_size + self.bind_reserve + self.provider_reserve
+        fn total_workers(&self) -> usize {
+            self.pool_size + self.bind_reserve + self.provider_reserve
+        }
+
     }
 }
 
@@ -2587,20 +2590,22 @@ struct SchedulerState<C: ExecutorContext> {
 }
 
 impl<C: ExecutorContext> SchedulerState<C> {
+    test_support_visibility! {
     fn new(config: EffectiveConfig) -> Self {
-        Self {
-            actors: HashMap::new(),
-            actor_order: Vec::new(),
-            cursor: 0,
-            idle_workers: config.total_workers(),
-            interactive_inflight: 0,
-            maintenance_inflight: 0,
-            provider_inflight: 0,
-            binds_inflight: 0,
-            config,
-            running_jobs: HashMap::new(),
-            next_job_id: 1,
-            bind_retry_pending: false,
+            Self {
+                actors: HashMap::new(),
+                actor_order: Vec::new(),
+                cursor: 0,
+                idle_workers: config.total_workers(),
+                interactive_inflight: 0,
+                maintenance_inflight: 0,
+                provider_inflight: 0,
+                binds_inflight: 0,
+                config,
+                running_jobs: HashMap::new(),
+                next_job_id: 1,
+                bind_retry_pending: false,
+            }
         }
     }
 
@@ -3015,27 +3020,29 @@ struct ActorState<C: ExecutorContext> {
 }
 
 impl<C: ExecutorContext> ActorState<C> {
+    test_support_visibility! {
     fn new(ctx: Arc<C>) -> Self {
-        Self {
-            ctx,
-            epoch: Arc::new(RwLock::new(())),
-            read_inflight: 0,
-            lsp_inflight: false,
-            actor_total_inflight: 0,
-            writer_inflight: false,
-            shared_bind_inflight: false,
-            maintenance_commit_inflight: false,
-            callgraph_acquisition_inflight: false,
-            provider_inflight: false,
-            call_ledger_inflight: false,
-            mutating_inflight: None,
-            reader_admissions_while_promoted_writer_waited: 0,
-            deficit: 0,
-            interactive: ClassQueues::<C>::new(),
-            maintenance: ClassQueues::<C>::new(),
-            fatal: false,
-            waiting_writers: Arc::new(AtomicUsize::new(0)),
-            detached_writers: Arc::new(AtomicUsize::new(0)),
+            Self {
+                ctx,
+                epoch: Arc::new(RwLock::new(())),
+                read_inflight: 0,
+                lsp_inflight: false,
+                actor_total_inflight: 0,
+                writer_inflight: false,
+                shared_bind_inflight: false,
+                maintenance_commit_inflight: false,
+                callgraph_acquisition_inflight: false,
+                provider_inflight: false,
+                call_ledger_inflight: false,
+                mutating_inflight: None,
+                reader_admissions_while_promoted_writer_waited: 0,
+                deficit: 0,
+                interactive: ClassQueues::<C>::new(),
+                maintenance: ClassQueues::<C>::new(),
+                fatal: false,
+                waiting_writers: Arc::new(AtomicUsize::new(0)),
+                detached_writers: Arc::new(AtomicUsize::new(0)),
+            }
         }
     }
 
@@ -3044,9 +3051,11 @@ impl<C: ExecutorContext> ActorState<C> {
             .store(self.interactive.mutating.len(), Ordering::Release);
     }
 
+    test_support_visibility! {
     fn push_job(&mut self, job_class: JobClass, lane: Lane, job: QueuedJob<C>) {
-        self.class_queues_mut(job_class).push_job(lane, job);
-        self.sync_waiting_writers();
+            self.class_queues_mut(job_class).push_job(lane, job);
+            self.sync_waiting_writers();
+        }
     }
 
     fn has_queued_jobs(&self) -> bool {
@@ -3085,25 +3094,31 @@ impl<C: ExecutorContext> ActorState<C> {
         job
     }
 
+    test_support_visibility! {
     fn higher_priority_writer_barrier_blocks(&self, job_class: JobClass) -> bool {
-        // Maintenance must not start while interactive mutating work (tool
-        // mutations, route binds) waits: a maintenance job that takes the
-        // actor's writer slot would push the interactive writer behind it.
-        matches!(job_class, JobClass::Maintenance)
-            && !self.interactive.queue(Lane::Mutating).is_empty()
-    }
-
-    fn class_queues(&self, job_class: JobClass) -> &ClassQueues<C> {
-        match job_class {
-            JobClass::Interactive => &self.interactive,
-            JobClass::Maintenance => &self.maintenance,
+            // Maintenance must not start while interactive mutating work (tool
+            // mutations, route binds) waits: a maintenance job that takes the
+            // actor's writer slot would push the interactive writer behind it.
+            matches!(job_class, JobClass::Maintenance)
+                && !self.interactive.queue(Lane::Mutating).is_empty()
         }
     }
 
+    test_support_visibility! {
+    fn class_queues(&self, job_class: JobClass) -> &ClassQueues<C> {
+            match job_class {
+                JobClass::Interactive => &self.interactive,
+                JobClass::Maintenance => &self.maintenance,
+            }
+        }
+    }
+
+    test_support_visibility! {
     fn class_queues_mut(&mut self, job_class: JobClass) -> &mut ClassQueues<C> {
-        match job_class {
-            JobClass::Interactive => &mut self.interactive,
-            JobClass::Maintenance => &mut self.maintenance,
+            match job_class {
+                JobClass::Interactive => &mut self.interactive,
+                JobClass::Maintenance => &mut self.maintenance,
+            }
         }
     }
 
@@ -3122,13 +3137,15 @@ impl<C: ExecutorContext> ActorState<C> {
             || self.maintenance.has_queued_mutating_job(request_id)
     }
 
+    test_support_visibility! {
     fn remove_queued_cancellable(&mut self, token: &JobCancellation) -> Option<QueuedJob<C>> {
-        let removed = self
-            .interactive
-            .remove_cancellable(token)
-            .or_else(|| self.maintenance.remove_cancellable(token));
-        self.sync_waiting_writers();
-        removed
+            let removed = self
+                .interactive
+                .remove_cancellable(token)
+                .or_else(|| self.maintenance.remove_cancellable(token));
+            self.sync_waiting_writers();
+            removed
+        }
     }
 
     fn oldest_queued_writer_at(&self) -> Option<Instant> {
@@ -4956,34 +4973,39 @@ struct HeavySemaphore {
 }
 
 impl HeavySemaphore {
+    test_support_visibility! {
     fn new(permits: usize) -> Self {
-        Self {
-            available: AtomicUsize::new(permits),
-            max: permits,
+            Self {
+                available: AtomicUsize::new(permits),
+                max: permits,
+            }
         }
     }
 
+    test_support_visibility! {
     fn try_acquire(self: &Arc<Self>) -> Option<HeavyPermit> {
-        loop {
-            let available = self.available.load(Ordering::Acquire);
-            if available == 0 {
-                return None;
-            }
-            if self
-                .available
-                .compare_exchange(
-                    available,
-                    available - 1,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                return Some(HeavyPermit {
-                    semaphore: Arc::clone(self),
-                });
+            loop {
+                let available = self.available.load(Ordering::Acquire);
+                if available == 0 {
+                    return None;
+                }
+                if self
+                    .available
+                    .compare_exchange(
+                        available,
+                        available - 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return Some(HeavyPermit {
+                        semaphore: Arc::clone(self),
+                    });
+                }
             }
         }
+
     }
 }
 

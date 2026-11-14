@@ -37,9 +37,9 @@ pub static THREAD_SPAWNS: AtomicUsize = AtomicUsize::new(0);
 #[derive(Default)]
 pub(crate) struct Measurements {
     pub(crate) dispatches: AtomicUsize,
-    pub(crate) round_trips: AtomicUsize,
-    pub(crate) directory_probes: AtomicUsize,
-    pub(crate) traversal_probes: AtomicUsize,
+    pub round_trips: AtomicUsize,
+    pub directory_probes: AtomicUsize,
+    pub traversal_probes: AtomicUsize,
 }
 
 #[derive(Clone, Debug)]

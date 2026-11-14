@@ -2263,7 +2263,7 @@ pub mod work_counts {
     use std::cell::Cell;
 
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    pub(crate) struct Counts {
+    pub struct Counts {
         pub opens: usize,
         pub metadata_opens: usize,
         pub metadata_writes: usize,
@@ -2299,16 +2299,16 @@ pub mod work_counts {
         });
     }
 
-    pub(crate) fn record_open() {
+    pub fn record_open() {
         record(|counts| counts.opens += 1);
     }
-    pub(crate) fn record_metadata_open() {
+    pub fn record_metadata_open() {
         record(|counts| counts.metadata_opens += 1);
     }
-    pub(crate) fn record_metadata_write() {
+    pub fn record_metadata_write() {
         record(|counts| counts.metadata_writes += 1);
     }
-    pub(crate) fn record_sync() {
+    pub fn record_sync() {
         record(|counts| counts.syncs += 1);
     }
     pub(crate) fn record_rename() {
@@ -2321,34 +2321,34 @@ pub mod work_counts {
             counts.rename_max_nanos = counts.rename_max_nanos.max(elapsed.as_nanos());
         });
     }
-    pub(crate) fn record_sync_time(elapsed: std::time::Duration) {
+    pub fn record_sync_time(elapsed: std::time::Duration) {
         record(|counts| counts.sync_nanos += elapsed.as_nanos());
     }
-    pub(crate) fn record_bytes(bytes: usize) {
+    pub fn record_bytes(bytes: usize) {
         record(|counts| counts.artifact_bytes += bytes);
     }
-    pub(crate) fn record_artifact_open() {
+    pub fn record_artifact_open() {
         record(|counts| counts.artifact_opens += 1);
     }
-    pub(crate) fn record_read() {
+    pub fn record_read() {
         record(|counts| counts.metadata_reads += 1);
     }
-    pub(crate) fn record_marker_read() {
+    pub fn record_marker_read() {
         record(|counts| counts.marker_reads += 1);
     }
-    pub(crate) fn record_stat() {
+    pub fn record_stat() {
         record(|counts| counts.stats += 1);
     }
-    pub(crate) fn record_gc_entry() {
+    pub fn record_gc_entry() {
         record(|counts| counts.gc_entries += 1);
     }
-    pub(crate) fn record_gc_deadline() {
+    pub fn record_gc_deadline() {
         record(|counts| counts.gc_deadlines += 1);
     }
     pub(crate) fn record_directory_entry() {
         record(|counts| counts.directory_entries += 1);
     }
-    pub(crate) fn record_gc_teardown_since(before: Counts) {
+    pub fn record_gc_teardown_since(before: Counts) {
         record(|counts| {
             counts.gc_teardown_opens += counts.opens - before.opens;
             counts.gc_teardown_metadata_reads += counts.metadata_reads - before.metadata_reads;
@@ -2357,13 +2357,13 @@ pub mod work_counts {
                 counts.directory_entries - before.directory_entries;
         });
     }
-    pub(crate) fn record_parse() {
+    pub fn record_parse() {
         record(|counts| counts.parses += 1);
     }
-    pub(crate) fn reset() {
+    pub fn reset() {
         COUNTS.with(|cell| cell.set(Counts::default()));
     }
-    pub(crate) fn get() -> Counts {
+    pub fn get() -> Counts {
         COUNTS.with(Cell::get)
     }
 }

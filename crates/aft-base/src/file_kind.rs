@@ -685,7 +685,7 @@ pub(crate) mod read_probe {
 
     /// Bytes read so far from `path` through a [`Counting`] reader.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn bytes_read(path: &Path) -> usize {
+    pub fn bytes_read(path: &Path) -> usize {
         BYTES_READ
             .get_or_init(Default::default)
             .lock()

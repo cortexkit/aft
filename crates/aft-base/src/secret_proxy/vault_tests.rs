@@ -177,7 +177,7 @@ struct PhoneState {
 
 struct Phone {
     runtime: tokio::runtime::Handle,
-    state: std::sync::Mutex<PhoneState>,
+    pub state: std::sync::Mutex<PhoneState>,
     answer: std::sync::Condvar,
     filed: tokio::sync::Notify,
 }
@@ -191,7 +191,7 @@ impl Phone {
             filed: Default::default(),
         })
     }
-    async fn card(&self, count: usize) -> SecretConsentRequest {
+    pub async fn card(&self, count: usize) -> SecretConsentRequest {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let notified = self.filed.notified();
@@ -204,7 +204,7 @@ impl Phone {
         .await
         .expect("the proxy filed the expected card")
     }
-    fn decide(&self, daemon: &FakeClaustrum, count: usize, answer: ConsentOutcome) {
+    pub fn decide(&self, daemon: &FakeClaustrum, count: usize, answer: ConsentOutcome) {
         let mut state = self.state.lock().unwrap();
         let request = &state.requests[count - 1];
         if matches!(

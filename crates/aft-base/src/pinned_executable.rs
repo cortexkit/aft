@@ -225,10 +225,12 @@ impl PinnedExecutable {
         Ok(self.executable.clone())
     }
 
+    test_support_visibility! {
     fn cleanup_at_exit(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        state.owner.take();
-        let _ = std::fs::remove_dir_all(&self.directory);
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.owner.take();
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
     }
 
     fn task_image(&self, task_io: &Path) -> io::Result<PathBuf> {

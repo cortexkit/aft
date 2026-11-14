@@ -648,16 +648,19 @@ impl CachePath {
     pub(crate) fn directory(&self, create: bool) -> io::Result<PinnedDir> {
         self.root.repair_descendant(&self.relative, create)
     }
+    test_support_visibility! {
     pub(crate) fn parent(&self) -> io::Result<(PinnedDir, std::ffi::OsString)> {
-        let name = self
-            .relative
-            .file_name()
-            .ok_or_else(|| io::Error::other("cache file requires a child name"))?
-            .to_os_string();
-        let parent = self
-            .root
-            .repair_descendant(self.relative.parent().unwrap_or(Path::new("")), false)?;
-        Ok((parent, name))
+            let name = self
+                .relative
+                .file_name()
+                .ok_or_else(|| io::Error::other("cache file requires a child name"))?
+                .to_os_string();
+            let parent = self
+                .root
+                .repair_descendant(self.relative.parent().unwrap_or(Path::new("")), false)?;
+            Ok((parent, name))
+        }
+
     }
 }
 

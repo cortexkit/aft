@@ -36,6 +36,7 @@ impl RequestBudget {
         self.deadline.as_mut().await;
     }
 }
+test_support_visibility! {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum UseError {
     Declined,
@@ -44,6 +45,7 @@ pub(crate) enum UseError {
     Unavailable,
     Indeterminate,
     InvalidPlan(&'static str),
+}
 }
 
 #[derive(Clone, Debug)]
@@ -63,24 +65,31 @@ pub(crate) fn consent_failure_message(label: &str, host: &str, reason: UseError)
     }
 }
 
+test_support_visibility! {
 /// Shared progress for sockets whose idle budget excludes approval waits.
 #[derive(Default)]
 pub(crate) struct RequestActivity {
     waiting: AtomicUsize,
     last_activity: Mutex<Option<tokio::time::Instant>>,
 }
+}
 impl RequestActivity {
+    test_support_visibility! {
     pub(crate) fn begin_wait(&self) {
         self.waiting.fetch_add(1, Ordering::AcqRel);
     }
+    }
 
+    test_support_visibility! {
     pub(crate) fn finish_wait(&self) {
         // Publish progress before the count can reach zero, so a socket never
         // resumes against the deadline from before the approval completed.
         self.record_activity();
         self.waiting.fetch_sub(1, Ordering::AcqRel);
     }
+    }
 
+    test_support_visibility! {
     pub(crate) fn record_activity(&self) {
         let mut last = self
             .last_activity
@@ -88,7 +97,9 @@ impl RequestActivity {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *last = Some(tokio::time::Instant::now());
     }
+    }
 
+    test_support_visibility! {
     pub(crate) fn snapshot(&self) -> (bool, Option<tokio::time::Instant>) {
         // Read the count first: observing the last waiter leave also observes
         // its previously published completion timestamp.
@@ -99,8 +110,10 @@ impl RequestActivity {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (waiting, last)
     }
+    }
 }
 
+test_support_visibility! {
 pub(crate) struct RequestSecrets {
     vault: Arc<dyn SecretVault>,
     scope: SecretScope,
@@ -111,6 +124,7 @@ pub(crate) struct RequestSecrets {
     activity: Arc<RequestActivity>,
     once: Mutex<BTreeMap<String, bool>>,
     request_cancelled: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+}
 }
 struct Waiting<'a> {
     owner: &'a RequestSecrets,
@@ -127,7 +141,8 @@ impl Drop for Waiting<'_> {
     }
 }
 impl RequestSecrets {
-    pub(crate) fn new(
+    test_support_visibility! {
+pub(crate) fn new(
         vault: Arc<dyn SecretVault>,
         scope: SecretScope,
         context: Option<(std::path::PathBuf, String)>,
@@ -144,6 +159,7 @@ impl RequestSecrets {
             request_cancelled: None,
         }
     }
+}
     pub(crate) fn with_request_cancellation(
         mut self,
         cancelled: impl Fn() -> bool + Send + Sync + 'static,
@@ -161,7 +177,8 @@ impl RequestSecrets {
             deadline: self.clock.deadline(),
         }
     }
-    #[cfg(unix)]
+    test_support_visibility! {
+#[cfg(unix)]
     pub(crate) fn status(&self) -> Vec<String> {
         self.status
             .lock()
@@ -171,9 +188,12 @@ impl RequestSecrets {
             .cloned()
             .collect()
     }
-    pub(crate) fn activity(&self) -> Arc<RequestActivity> {
+}
+    test_support_visibility! {
+pub(crate) fn activity(&self) -> Arc<RequestActivity> {
         self.activity.clone()
     }
+}
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn with_clock(mut self, clock: Option<Arc<dyn ApprovalClock>>) -> Self {
         if let Some(clock) = clock {
@@ -201,7 +221,8 @@ impl RequestSecrets {
         .unwrap_or(UseAnswer::Unavailable)
     }
 
-    #[cfg(test)]
+    test_support_visibility! {
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn approve(
         &self,
         label: &str,
@@ -212,6 +233,7 @@ impl RequestSecrets {
         self.approve_with_metadata(label, target, pending, expires_at_ms, &|_| {})
             .await
     }
+}
 
     async fn approve_with_metadata(
         &self,

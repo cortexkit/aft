@@ -150,6 +150,9 @@ impl ColdBuildAdmissionRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ColdBuildAdmissionEvent {
     pub(crate) request_id: String,
+    #[cfg(any(test, feature = "test-support"))]
+    pub class: ColdBuildAdmissionClass,
+    #[cfg(not(any(test, feature = "test-support")))]
     pub(crate) class: ColdBuildAdmissionClass,
     pub(crate) admission_order: u64,
 }

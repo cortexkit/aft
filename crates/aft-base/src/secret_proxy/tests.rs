@@ -149,10 +149,10 @@ fn config(vault: Arc<Vault>, port: u16, locations: &[(&str, Location)]) -> Proxy
 }
 
 pub struct Server {
-    address: SocketAddr,
+    pub address: SocketAddr,
     root_pem: String,
-    client_tls: rustls::ClientConfig,
-    seen: Arc<Mutex<Vec<Value>>>,
+    pub client_tls: rustls::ClientConfig,
+    pub seen: Arc<Mutex<Vec<Value>>>,
     task: tokio::task::JoinHandle<()>,
     handshake_seen: Arc<tokio::sync::Notify>,
     tls_release: Arc<tokio::sync::Notify>,
@@ -165,7 +165,7 @@ impl Drop for Server {
 }
 
 impl Server {
-    async fn new(mode: &'static str) -> Self {
+    pub async fn new(mode: &'static str) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut params = CertificateParams::new(Vec::new()).unwrap();
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -511,13 +511,13 @@ fn representations(key: &[u8]) -> Vec<u8> {
 }
 
 pub struct Client {
-    process: Child,
+    pub process: Child,
     input: ChildStdin,
     output: std::io::BufReader<ChildStdout>,
 }
 
 impl Client {
-    fn spawn(proxy: &SecretProxy, server: &Server) -> Self {
+    pub fn spawn(proxy: &SecretProxy, server: &Server) -> Self {
         use std::os::unix::process::CommandExt;
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
@@ -571,10 +571,10 @@ impl Client {
         }
     }
 
-    fn connect(&mut self, h2: bool) {
+    pub fn connect(&mut self, h2: bool) {
         assert_eq!(self.command(json!({"op":"connect","h2":h2}))["ok"], true);
     }
-    fn request(&mut self, path: &str, headers: Value, body: &str) -> Value {
+    pub fn request(&mut self, path: &str, headers: Value, body: &str) -> Value {
         self.command(json!({"op":"request","path":path,"headers":headers,"body":body}))
     }
 }

@@ -11,6 +11,7 @@ pub(crate) enum FetchDecision {
     InvalidPlan(&'static str),
 }
 
+test_support_visibility! {
 pub(crate) fn fetch_consent_refusal(
     label: &str,
     host: &str,
@@ -33,6 +34,7 @@ pub(crate) fn fetch_consent_refusal(
         code: crate::secret::SECRET_ACCESS_UNAVAILABLE,
         message: held.sanitize_detail(&message),
     }
+}
 }
 
 /// Fetch and proxy requests share secret-consent requests keyed by scope and

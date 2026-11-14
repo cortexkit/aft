@@ -949,22 +949,24 @@ impl HeldKeys {
             .collect()
     }
 
+    test_support_visibility! {
     /// Hold `key` for `label`, refusing a key whose matcher would collide with
-    /// one already held (the scrubber could then write one key into a reply).
-    pub(crate) fn hold(&mut self, label: &str, key: &[u8]) -> Result<(), ScrubError> {
-        if self
-            .0
-            .iter()
-            .any(|(held, bytes)| held == label && bytes.as_slice() == key)
-        {
-            return Ok(());
+        /// one already held (the scrubber could then write one key into a reply).
+        pub(crate) fn hold(&mut self, label: &str, key: &[u8]) -> Result<(), ScrubError> {
+            if self
+                .0
+                .iter()
+                .any(|(held, bytes)| held == label && bytes.as_slice() == key)
+            {
+                return Ok(());
+            }
+            let mut matchers = self.matchers()?;
+            matchers.push(MatcherSet::new(label, key)?);
+            Scrubber::new(matchers)?;
+            self.0
+                .push((label.to_string(), Zeroizing::new(key.to_vec())));
+            Ok(())
         }
-        let mut matchers = self.matchers()?;
-        matchers.push(MatcherSet::new(label, key)?);
-        Scrubber::new(matchers)?;
-        self.0
-            .push((label.to_string(), Zeroizing::new(key.to_vec())));
-        Ok(())
     }
 
     /// `bytes` with every held key replaced by its label's placeholder.

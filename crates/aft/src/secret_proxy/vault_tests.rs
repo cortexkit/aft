@@ -4,6 +4,7 @@
 use super::*;
 use crate::secret::transport::fake::FakeClaustrum;
 use crate::secret::ConsentOutcome;
+use serde_json::json;
 
 #[allow(unused_imports)]
 pub(crate) use aft_base::secret_proxy::tests::vault_tests::*;
