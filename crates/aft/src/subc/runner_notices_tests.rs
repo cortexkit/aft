@@ -1006,6 +1006,16 @@ fn runner_notices_raw_harness_bind_back_and_worker_delivery() {
             scoped.scope.unwrap(),
             ScopeSelector::new(stamp.owner.clone(), "worker-7", Some(3))
         );
+        // A head scope is never a worker, whichever runner carries it: Broca
+        // hosts heads too, and their completions must be able to wake them.
+        let head_stamp = subc_protocol::scope::ScopeStamp::new(
+            stamp.owner.clone(),
+            "head-7",
+            3,
+            subc_protocol::scope::ScopeKind::Head,
+        );
+        let head = Address::new(&owner, raw.into(), Some(&head_stamp)).unwrap();
+        assert!(!head.worker, "{principal} head");
     }
     assert!(Address::new(&owner("reserved:thalamus-pi", "pi"), "pi".into(), None).is_none());
     assert!(!is_runner(&owner("direct", "opencode")));
