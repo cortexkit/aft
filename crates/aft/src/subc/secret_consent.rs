@@ -28,10 +28,11 @@ use super::{carrier_read_only, flow_read, tool_provider, RouteIdentity};
 use crate::secret::consent::CancellationReason;
 use crate::secret::eligibility::{alfonso_of_kind, COMMAND_SCOPE_KINDS};
 #[cfg(test)]
+use crate::secret::LabelOutcome;
+#[cfg(test)]
 use crate::secret::{file_consent, withhold_consent};
 use crate::secret::{
-    CallScopes, ConsentOutcome, EligibilityForm, Ineligibility, LabelOutcome, SecretConsentRequest,
-    SecretScope,
+    CallScopes, ConsentOutcome, EligibilityForm, Ineligibility, SecretConsentRequest, SecretScope,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -842,7 +843,7 @@ pub(crate) fn use_label_for_fetch(
 
 #[cfg(test)]
 use crate::context::call_context::current_call_scopes;
-pub(crate) use crate::context::call_context::{current_secret_consent_context, SecretScopeGuard};
+pub(crate) use crate::context::call_context::SecretScopeGuard;
 
 thread_local! {
     static CURRENT_IDENTITY: std::cell::RefCell<Option<RouteIdentity>> = const { std::cell::RefCell::new(None) };

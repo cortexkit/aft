@@ -35,8 +35,8 @@ pub(crate) fn fetch_consent_refusal(
     }
 }
 
-/// Fetch and proxy requests join the same scope/request-id cards, each with
-/// one person-wait deadline shared by every concurrently requested label.
+/// Fetch and proxy requests share secret-consent requests keyed by scope and
+/// request ID, with one person-wait deadline for all concurrent labels.
 pub(crate) fn use_current_secret_labels(
     vault: Arc<dyn crate::secret::SecretVault>,
     labels: &[String],
@@ -142,7 +142,7 @@ pub(crate) fn use_current_secret_labels(
                                 );
                                 let dummy =
                                     [(label.clone(), b"proxy-planning-value-0000".to_vec())];
-                                // Without a pending card, the vault reveals a deposit location only when releasing its key, so location-dependent refusals can follow that release.
+                                // Without a pending secret-consent request, the vault reveals a deposit location only when releasing its key, so location-dependent refusals can follow that release.
                                 if let Some(refusal) =
                                     secret_rules::location::evaluate_request_with_connect(
                                         &view,
@@ -225,7 +225,7 @@ pub(crate) fn use_current_secret_labels(
             .collect())
     };
     // Blocking fetches run on tool worker threads. A local runtime drives only
-    // their coordinator; production card workers stay on the daemon runtime.
+    // their coordinator; production secret-consent workers stay on the daemon runtime.
     let result = match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(|| handle.block_on(future))

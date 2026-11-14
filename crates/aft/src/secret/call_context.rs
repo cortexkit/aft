@@ -80,7 +80,7 @@ impl Drop for SecretScopeGuard {
     }
 }
 
-/// The executor installs the bind's policy; producers capture it before offloading.
+/// The executor installs the project binding policy; producers capture it before offloading.
 /// This flag records whether the caller negotiated the tool-result/v1 envelope.
 pub(crate) fn active() -> bool {
     CURRENT.with(|slot| slot.borrow().result_body)
