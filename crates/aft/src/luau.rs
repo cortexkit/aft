@@ -8,10 +8,9 @@ use crate::imports::{ImportBlock, ImportForm, ImportGroup, ImportKind, ImportSta
 use crate::symbols::SymbolKind;
 
 // Validate the syntax used by extraction before marking the Luau grammar ready.
-#[cfg(all(
-    feature = "wasm-grammars",
-    not(all(target_os = "windows", target_arch = "aarch64"))
-))]
+// The grammar registry reads these on every target that builds downloaded
+// grammars, Windows ARM64 included.
+#[cfg(feature = "wasm-grammars")]
 pub(crate) const EXTRACTION_QUERY: &str = r#"
 [(function_declaration name: (_) @name)
  (local_function_declaration name: (identifier) @name)
@@ -21,19 +20,13 @@ pub(crate) const EXTRACTION_QUERY: &str = r#"
  (function_definition) (table_constructor (field))
  (return_statement) (function_call name: (_) arguments: (arguments))] @declaration
 "#;
-#[cfg(all(
-    feature = "wasm-grammars",
-    not(all(target_os = "windows", target_arch = "aarch64"))
-))]
+#[cfg(feature = "wasm-grammars")]
 pub(crate) const COMPLEXITY_QUERY: &str = r#"
 [(function_declaration) (local_function_declaration) (function_definition)
  (if_statement) (elseif_statement) (if_else_expression) (elseif_expression)
  (for_statement) (while_statement) (repeat_statement) (binary_expression)] @complexity
 "#;
-#[cfg(all(
-    feature = "wasm-grammars",
-    not(all(target_os = "windows", target_arch = "aarch64"))
-))]
+#[cfg(feature = "wasm-grammars")]
 pub(crate) const COMMENT_QUERY: &str = "(comment content: (comment_content) @content) @comment";
 pub(crate) const COMMENT_KINDS: &[&str] = &["comment"];
 
