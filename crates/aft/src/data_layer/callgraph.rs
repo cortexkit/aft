@@ -1399,9 +1399,11 @@ pub(crate) fn resolve_checkout_into(
         drop(calls);
         relieve_allocator();
         if let Some(memory) = memory.as_deref_mut() {
-            let (bytes, answers) = records.census();
-            memory.push(("resolve.site_records".to_string(), bytes));
-            memory.push(("resolve.projected_answers".to_string(), answers));
+            memory.extend(
+                records
+                    .census()
+                    .map(|(part, value)| (part.to_string(), value)),
+            );
         }
         lap(&mut memory, "projection");
         let source = site_records::RecordSource::new(&records);

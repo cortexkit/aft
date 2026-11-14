@@ -77,6 +77,9 @@ pub(crate) struct FileRecord {
     /// Set for a Rust file whose every resolvable name is in
     /// `projections`, so any other name has the fixed miss answer.
     complete_names: bool,
+    /// How many of `projections` are there only because `complete_names`
+    /// is set, for measurement.
+    resolvable_name_projections: u32,
     sites: Vec<SiteRecord>,
     /// Sorted ordinals of the sites whose `associated` is set.
     associated: Vec<u32>,
@@ -109,9 +112,19 @@ impl FileRecord {
         &self.sites
     }
 
-    /// How many projected answers and resolution orders the record keeps.
-    pub(crate) fn projection_count(&self) -> usize {
-        self.projections.len() + self.mro.len()
+    /// How many projected answers and resolution orders the record keeps,
+    /// how many of those answer a Rust file's resolvable names only, and
+    /// the heap they hold.
+    pub(crate) fn projection_census(
+        &self,
+        seen: &mut aft_store::heap::Seen,
+    ) -> (usize, usize, usize) {
+        use aft_store::heap::HeapBytes as _;
+        (
+            self.projections.len() + self.mro.len(),
+            self.resolvable_name_projections as usize,
+            self.projections.heap_bytes(seen) + self.mro.heap_bytes(seen),
+        )
     }
 
     pub(crate) fn associated(&self, ordinal: u32) -> bool {
@@ -411,12 +424,15 @@ impl<'a> Resolver<'a> {
             records.push(record);
         }
         let mut complete_names = false;
+        let before = projections.len();
         if typed_rust {
             for name in rust_resolvable_names(parse, type_target_names) {
                 project(&name);
             }
             complete_names = true;
         }
+        let resolvable_name_projections =
+            u32::try_from(projections.len() - before).unwrap_or(u32::MAX);
         associated_ordinals.sort_unstable();
         associated_ordinals.dedup();
         Some(FileRecord {
@@ -424,6 +440,7 @@ impl<'a> Resolver<'a> {
             projections,
             mro,
             complete_names,
+            resolvable_name_projections,
             sites: records,
             associated: associated_ordinals,
         })
@@ -445,6 +462,7 @@ aft_store::heap_bytes_of_fields!(FileRecord {
     projections,
     mro,
     complete_names,
+    resolvable_name_projections,
     sites,
     associated,
 });

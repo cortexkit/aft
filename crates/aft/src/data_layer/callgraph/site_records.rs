@@ -51,14 +51,27 @@ impl RecordStore for MemoryRecords {
 }
 
 impl MemoryRecords {
-    /// The heap the records hold, and how many projected answers they keep.
-    pub(crate) fn census(&self) -> (usize, usize) {
+    /// What the records hold, as named measurements: their heap, the heap
+    /// of the projected answers alone, how many answers there are, and how
+    /// many of those answer a Rust file's resolvable names only.
+    pub(crate) fn census(&self) -> [(&'static str, usize); 4] {
         use aft_store::heap::HeapBytes as _;
         let mut seen = aft_store::heap::Seen::new();
-        (
-            self.0.heap_bytes(&mut seen),
-            self.0.values().map(FileRecord::projection_count).sum(),
-        )
+        let total = self.0.heap_bytes(&mut seen);
+        let mut seen = aft_store::heap::Seen::new();
+        let (mut answers, mut rust_names, mut bytes) = (0, 0, 0);
+        for record in self.0.values() {
+            let (all, rust, heap) = record.projection_census(&mut seen);
+            answers += all;
+            rust_names += rust;
+            bytes += heap;
+        }
+        [
+            ("resolve.site_records", total),
+            ("resolve.projection_bytes", bytes),
+            ("resolve.projected_answers", answers),
+            ("resolve.rust_name_answers", rust_names),
+        ]
     }
 }
 

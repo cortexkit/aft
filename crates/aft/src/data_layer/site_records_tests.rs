@@ -25,7 +25,10 @@ fn records_match_files(inputs: &CheckoutInputs) -> BTreeMap<String, FileResoluti
         );
         for (path, ours) in &records {
             let theirs = &reference[path];
-            assert_eq!(ours.sites, theirs.sites, "{path}: sites ({threads} threads)");
+            assert_eq!(
+                ours.sites, theirs.sites,
+                "{path}: sites ({threads} threads)"
+            );
             assert_eq!(
                 ours.site_dependencies, theirs.site_dependencies,
                 "{path}: site dependencies ({threads} threads)"
@@ -48,7 +51,13 @@ fn targets(
         .iter()
         .filter(|site| site.site.member.as_deref() == Some(member))
         .flat_map(|site| &site.resolution.targets)
-        .map(|target| (target.file.clone(), target.symbol.clone(), target.provenance))
+        .map(|target| {
+            (
+                target.file.clone(),
+                target.symbol.clone(),
+                target.provenance,
+            )
+        })
         .collect()
 }
 
@@ -96,7 +105,7 @@ fn python_super_follows_a_diamond_across_files_and_reused_ordinals() {
             ),
             (
                 "pkg/base.py",
-                "class A:\n    def hello(self):\n        return 1\n\n\nclass B(A):\n    def hello(self):\n        return super().hello()\n\n\nclass C(A):\n    def hello(self):\n        return super().hello()\n",
+                "class A:\n    def hello(self):\n        return 1\n\n\nclass B(A):\n    def other(self):\n        return 0\n\n\nclass C(A):\n    def hello(self):\n        return super().hello()\n",
             ),
             (
                 "pkg/leaf.py",
@@ -117,18 +126,19 @@ fn python_super_follows_a_diamond_across_files_and_reused_ordinals() {
     let distinct = ordinals.iter().collect::<std::collections::BTreeSet<_>>();
     assert!(distinct.len() < ordinals.len(), "{:?}", leaf.dispatch.sites);
     let resolved = records_match_files(&inputs);
-    // D's super() reaches B first in D's resolution order.
+    // D's resolution order is D, B, C, A: B declares no `hello`, so D's
+    // super() reaches C's, not A's.
     assert!(
         targets(&resolved, "pkg/leaf.py", "hello")
             .iter()
-            .any(|(file, symbol, _)| file == "pkg/base.py" && symbol.ends_with("B.hello")),
+            .any(|(file, symbol, _)| file == "pkg/base.py" && symbol == "C::hello"),
         "{:?}",
         resolved["pkg/leaf.py"].sites
     );
-    // B's super() in the diamond reaches A.
+    // C's own super() reaches A.
     assert!(targets(&resolved, "pkg/base.py", "hello")
         .iter()
-        .any(|(_, symbol, _)| symbol.ends_with("A.hello")));
+        .any(|(_, symbol, _)| symbol == "A::hello"));
 }
 
 #[test]
@@ -175,15 +185,26 @@ fn go_interface_dispatch_compares_whole_method_sets() {
     let reader = "package a\n\ntype Reader interface {\n\tRead() int\n\tClose() int\n}\n\nfunc Use(r Reader) int {\n\treturn r.Read()\n}\n";
     let half = "package a\n\ntype Half struct{}\n\nfunc (h Half) Read() int { return 1 }\n";
     let full = "package a\n\ntype File struct{}\n\nfunc (f File) Read() int { return 1 }\n\nfunc (f File) Close() int { return 0 }\n";
-    let without_close = "package a\n\ntype File struct{}\n\nfunc (f File) Read() int { return 1 }\n";
+    let without_close =
+        "package a\n\ntype File struct{}\n\nfunc (f File) Read() int { return 1 }\n";
     let inputs = checkout(
-        &[("a/reader.go", reader), ("a/half.go", half), ("a/file.go", full)],
+        &[
+            ("a/reader.go", reader),
+            ("a/half.go", half),
+            ("a/file.go", full),
+        ],
         &[],
     );
     let resolved = records_match_files(&inputs);
     let found = targets(&resolved, "a/reader.go", "Read");
-    assert!(found.iter().any(|(file, _, _)| file == "a/file.go"), "{found:?}");
-    assert!(!found.iter().any(|(file, _, _)| file == "a/half.go"), "{found:?}");
+    assert!(
+        found.iter().any(|(file, _, _)| file == "a/file.go"),
+        "{found:?}"
+    );
+    assert!(
+        !found.iter().any(|(file, _, _)| file == "a/half.go"),
+        "{found:?}"
+    );
 
     // Removing `Close` changes the dispatch of `Read`: a refresh must see it
     // and give what a cold build from records gives.
@@ -246,4 +267,38 @@ fn dynamic_sites_and_directory_scans_match() {
     assert!(targets(&resolved, "java/Main.java", "bar")
         .iter()
         .any(|(file, _, _)| file == "java/Foo.java"));
+}
+
+/// The same comparison on a real tree, named by `AFT_SITE_RECORDS_ROOT`:
+/// every file's resolution from records against reading files.
+#[test]
+#[ignore = "needs AFT_SITE_RECORDS_ROOT naming a checkout"]
+fn records_match_files_on_a_real_tree() {
+    let root = std::env::var("AFT_SITE_RECORDS_ROOT").unwrap();
+    let built = super::trace_measure::build(std::path::Path::new(&root), 8).unwrap();
+    let reference = LiveCheckout::cold(built.inputs.clone())
+        .unwrap()
+        .resolved
+        .to_map();
+    assert_eq!(
+        built.resolved.keys().collect::<Vec<_>>(),
+        reference.keys().collect::<Vec<_>>()
+    );
+    let mut differing = Vec::new();
+    let mut sites = 0;
+    for (path, ours) in &built.resolved {
+        sites += ours.sites.len();
+        if ours != &reference[path]
+            || super::fragment::encode(ours) != super::fragment::encode(&reference[path])
+        {
+            differing.push(path.clone());
+        }
+    }
+    println!(
+        "records_match_files_on_a_real_tree: {} files, {sites} kept sites, {} differing {:?}",
+        built.resolved.len(),
+        differing.len(),
+        differing.iter().take(20).collect::<Vec<_>>()
+    );
+    assert!(differing.is_empty());
 }
