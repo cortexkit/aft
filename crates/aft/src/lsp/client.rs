@@ -63,6 +63,7 @@ impl std::error::Error for RustAnalyzerCapacityExhausted {}
 struct RustAnalyzerCapacity {
     active: Mutex<usize>,
     cap: usize,
+    refusals: AtomicU64,
 }
 
 struct RustAnalyzerPermit(Arc<RustAnalyzerCapacity>);
@@ -71,6 +72,7 @@ impl RustAnalyzerCapacity {
     fn acquire(self: &Arc<Self>) -> io::Result<RustAnalyzerPermit> {
         let mut active = self.active.lock().unwrap();
         if *active >= self.cap {
+            self.refusals.fetch_add(1, Ordering::Relaxed);
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 RustAnalyzerCapacityExhausted {
@@ -96,8 +98,17 @@ fn rust_analyzer_capacity() -> &'static Arc<RustAnalyzerCapacity> {
         Arc::new(RustAnalyzerCapacity {
             active: Mutex::new(0),
             cap: RUST_ANALYZER_WORKER_PROCESS_CAP,
+            refusals: AtomicU64::new(0),
         })
     })
+}
+
+/// Worker rust-analyzer admission refusals since process start, not failed servers.
+/// Count before spawning or switching an existing analyzer to worker policy so
+/// both admission paths contribute. The process-wide counter outlives the roots
+/// whose requests were refused.
+pub(crate) fn rust_analyzer_capacity_refusals() -> u64 {
+    rust_analyzer_capacity().refusals.load(Ordering::Relaxed)
 }
 
 /// rust-analyzer starts a `cargo check` of the whole workspace each time it
@@ -3269,8 +3280,10 @@ mod tests {
         let capacity = Arc::new(RustAnalyzerCapacity {
             cap: 1,
             active: Mutex::new(0),
+            refusals: AtomicU64::new(0),
         });
         let permit = capacity.acquire().unwrap();
+        assert_eq!(capacity.refusals.load(Ordering::Relaxed), 0);
         let error = capacity.acquire().err().unwrap();
         let refused = error
             .get_ref()
@@ -3280,8 +3293,13 @@ mod tests {
         assert_eq!(refused.cap, 1);
         assert_eq!(refused.current, 1);
         assert!(error.to_string().contains("cap=1 reached (current=1)"));
+        assert_eq!(capacity.refusals.load(Ordering::Relaxed), 1);
+        assert!(capacity.acquire().is_err());
+        assert_eq!(capacity.refusals.load(Ordering::Relaxed), 2);
         drop(permit);
-        assert!(capacity.acquire().is_ok());
+        let next = capacity.acquire().unwrap();
+        assert_eq!(capacity.refusals.load(Ordering::Relaxed), 2);
+        drop(next);
     }
 
     #[test]

@@ -11109,9 +11109,12 @@ mod transient_retry_tests {
             std::io::ErrorKind::WouldBlock,
             super::super::client::RustAnalyzerCapacityExhausted { cap: 2, current: 2 },
         ));
-        let durability = process_start_durability(&error);
-        let result =
-            manager.record_file_start_failure(&def, &key, StartFailure { error, durability });
+        let failure = manager.absorb_spawn_failure(SpawnFailure::NotStarted {
+            error,
+            exit_log_line: "capacity refusal before initialize".into(),
+        });
+        assert_eq!(failure.durability, FailureDurability::Capacity);
+        let result = manager.record_file_start_failure(&def, &key, failure);
 
         assert!(reason(&result).contains("rust_analyzer_capacity_exhausted"));
         assert!(manager.cached_start_failure_counts().is_empty());

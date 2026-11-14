@@ -815,6 +815,14 @@ mod tests {
 
         let (_dir, contexts) = registered_status_contexts(2);
         let ctx = &contexts[0];
+        ctx.app()
+            .publish_lifecycle_census(crate::lifecycle_census::LifecycleCensusSnapshot {
+                lsp: crate::lifecycle_census::LspCensus {
+                    capacity_refusals: 3,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
         let census_builds = &ctx.status_emitter().memory_census_builds;
         let push = ctx.try_build_status_push_snapshot().unwrap();
         assert_eq!(
@@ -825,6 +833,7 @@ mod tests {
         assert!(push.get("memory").is_none());
 
         let explicit = handle_status(&request(), ctx).data;
+        assert_eq!(explicit["lsp"]["capacity_refusals"], 3);
         assert_eq!(census_builds.load(Ordering::Relaxed), 1);
         assert_eq!(
             explicit["memory"]["roots_total"],
