@@ -1863,7 +1863,10 @@ fn alternative() { wrap!(windows::run()); }
                 extract_rust_calls_with_macro_facts(source, tree.root_node(), 0, source.len());
             assert_eq!(calls.0, reference_calls.0);
             assert_eq!(calls.1.bodies, reference_calls.1.bodies);
-            assert_eq!(calls.1.unparsed_mentions, reference_calls.1.unparsed_mentions);
+            assert_eq!(
+                calls.1.unparsed_mentions,
+                reference_calls.1.unparsed_mentions
+            );
             cached_parses = RUST_FRAGMENT_PARSES.with(|count| count.get());
             assert!(cached_parses > 0);
             assert_eq!(
