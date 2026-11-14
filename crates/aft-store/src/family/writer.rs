@@ -351,12 +351,14 @@ impl<'f> WriteSession<'f> {
             .layout
             .tmp_dir()
             .join(format!("build-{}", lease::fresh_id()));
-        let mut builder = std::fs::DirBuilder::new();
+        let builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt;
+            let mut builder = builder;
             builder.mode(0o700);
-        }
+            builder
+        };
         builder.create(&path).map_err(FamilyError::io(&path))?;
         let mut scratch = BuildScratch {
             path,
