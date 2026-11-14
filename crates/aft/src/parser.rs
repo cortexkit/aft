@@ -1256,6 +1256,10 @@ pub(crate) fn parse_resolved_source(
     // Parsing must not serialize unrelated headers behind this cache lock.
     // Racing misses may both parse; return the first inserted verdict to both
     // callers, including when one of their fallback attempts was cancelled.
+    // Wall deadlines are load-sensitive: a near-budget clean alternative could
+    // finish in only one racing thread. The 1,900 ms budget leaves over 10x the
+    // largest measured corpus 99.9th percentile (189.362 ms) as a margin, while
+    // returning the stored verdict keeps callers consistent at that boundary.
     let mut cache = HEADER_PARSE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(parsed) = cache.entries.get(&hash) {
         return Ok(parsed.clone());
@@ -1335,7 +1339,13 @@ fn parse_source_with_parser_deadline(
             );
             // A cancelled parser retains partial native state. Discard it rather
             // than resuming that state on the next unrelated header.
-            Ok(if expired { None } else { tree })
+            if expired {
+                Ok(None)
+            } else {
+                tree.map(Some).ok_or_else(|| AftError::ParseError {
+                    message: format!("tree-sitter parse returned None for {}", path.display()),
+                })
+            }
         } else {
             parse_with_parser(&mut parser, path, source, lang, None).map(Some)
         };
