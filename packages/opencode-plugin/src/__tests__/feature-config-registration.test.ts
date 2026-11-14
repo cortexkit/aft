@@ -17,6 +17,7 @@ import {
   CANONICAL_TOOLS,
   REMOVED_DATA_LAYER_NOTES,
   SEMANTIC_COST_NOTICE,
+  setRunningReleaseForTest,
 } from "@cortexkit/aft-bridge";
 
 import {
@@ -87,6 +88,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  setRunningReleaseForTest(undefined);
   for (const [key, value] of Object.entries(savedEnv)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
@@ -298,6 +300,7 @@ describe("OpenCode feature-config registration", () => {
   });
 
   test("an older user key still translates: views.idle_checkout_hours becomes idle.checkout_hours", () => {
+    setRunningReleaseForTest([0, 64]);
     const user = {
       views: { idle_checkout_hours: 72 },
     };
@@ -315,6 +318,7 @@ describe("OpenCode feature-config registration", () => {
   });
 
   test("a project file with data-layer keys gets one notice covering the renamed and the removed keys", () => {
+    setRunningReleaseForTest([0, 65]);
     const projectFile = join(root, "project", ".cortexkit", "aft.jsonc");
     mkdirSync(join(root, "project", ".cortexkit"), { recursive: true });
     writeFileSync(
@@ -326,7 +330,7 @@ describe("OpenCode feature-config registration", () => {
     expect(config.idle?.checkout_hours).toBe(24);
     const notices = getConfigLoadNotices().filter((notice) => notice.configPath === projectFile);
     expect(notices.map((notice) => notice.message)).toEqual([
-      `${projectFile} uses retired keys (views.idle_checkout_hours); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file. views.idle_checkout_hours is now idle.checkout_hours; from 0.65.0 AFT refuses a config file that still sets views.idle_checkout_hours. ${REMOVED_DATA_LAYER_NOTES[0]?.[1]}`,
+      `${projectFile} uses retired keys (views.idle_checkout_hours); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file. views.idle_checkout_hours is now idle.checkout_hours; from 0.65.0 AFT refuses a user config file that still sets views.idle_checkout_hours. ${REMOVED_DATA_LAYER_NOTES[0]?.[1]}`,
     ]);
   });
 });
@@ -422,5 +426,37 @@ describe("removed data-layer config keys", () => {
         expect(readFileSync(projectFile, "utf8")).toBe(JSON.stringify(input));
       });
     }
+  }
+});
+
+describe("idle-checkout release cutover", () => {
+  for (const harnessBlock of [false, true]) {
+    test(`0.65 refuses the ${harnessBlock ? "harness" : "base"} user key but loads the project key with a notice`, () => {
+      setRunningReleaseForTest([0, 65]);
+      const input = harnessBlock
+        ? { harnesses: { opencode: { views: { idle_checkout_hours: 72 } } } }
+        : { views: { idle_checkout_hours: 72 } };
+      const key = harnessBlock
+        ? "harnesses.opencode.views.idle_checkout_hours"
+        : "views.idle_checkout_hours";
+      expect(() => loadWithUserConfig(input)).toThrow(
+        `removed_config_key:${key}; run npx @cortexkit/aft doctor --fix`,
+      );
+      expect(readFileSync(join(root, "xdg", "cortexkit", "aft.jsonc"), "utf8")).toBe(
+        JSON.stringify(input),
+      );
+
+      const projectFile = join(root, "project", ".cortexkit", "aft.jsonc");
+      mkdirSync(join(root, "project", ".cortexkit"), { recursive: true });
+      writeFileSync(projectFile, JSON.stringify(input));
+      const config = loadWithUserConfig({ idle: { checkout_hours: 2 } });
+      expect(getConfigValidationErrors()).toEqual([]);
+      expect(config.idle?.checkout_hours).toBe(72);
+      const notices = getConfigLoadNotices().filter((notice) => notice.configPath === projectFile);
+      expect(notices).toHaveLength(1);
+      expect(notices[0]?.message).toContain(`uses retired keys (${key})`);
+      expect(notices[0]?.message).toContain("views.idle_checkout_hours is now idle.checkout_hours");
+      expect(readFileSync(projectFile, "utf8")).toBe(JSON.stringify(input));
+    });
   }
 });

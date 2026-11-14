@@ -18,6 +18,7 @@ import {
   ADAPTER_UNIMPLEMENTED_TOOLS,
   CANONICAL_TOOLS,
   SEMANTIC_COST_NOTICE,
+  setRunningReleaseForTest,
 } from "@cortexkit/aft-bridge";
 
 import {
@@ -73,6 +74,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  setRunningReleaseForTest(undefined);
   process.chdir(previousCwd);
   for (const [key, value] of Object.entries(savedEnv)) {
     if (value === undefined) delete process.env[key];
@@ -171,6 +173,7 @@ describe("Pi/OMP feature-config registration", () => {
   });
 
   test("an older user key still translates and idle.checkout_hours merges per key", () => {
+    setRunningReleaseForTest([0, 64]);
     const projectFile = join(root, "project", ".cortexkit", "aft.jsonc");
     mkdirSync(join(root, "project", ".cortexkit"), { recursive: true });
     writeFileSync(projectFile, JSON.stringify({ idle: { root_ttl_minutes: 15 } }));
@@ -280,5 +283,37 @@ describe("removed data-layer config keys", () => {
         expect(readFileSync(projectFile, "utf8")).toBe(JSON.stringify(input));
       });
     }
+  }
+});
+
+describe("idle-checkout release cutover", () => {
+  for (const harnessBlock of [false, true]) {
+    test(`0.65 refuses the ${harnessBlock ? "harness" : "base"} user key but loads the project key with a notice`, () => {
+      setRunningReleaseForTest([0, 65]);
+      const input = harnessBlock
+        ? { harnesses: { pi: { views: { idle_checkout_hours: 72 } } } }
+        : { views: { idle_checkout_hours: 72 } };
+      const key = harnessBlock
+        ? "harnesses.pi.views.idle_checkout_hours"
+        : "views.idle_checkout_hours";
+      expect(() => loadWithUserConfig(input)).toThrow(
+        `removed_config_key:${key}; run npx @cortexkit/aft doctor --fix`,
+      );
+      expect(readFileSync(join(root, "xdg", "cortexkit", "aft.jsonc"), "utf8")).toBe(
+        JSON.stringify(input),
+      );
+
+      const projectFile = join(root, "project", ".cortexkit", "aft.jsonc");
+      mkdirSync(join(root, "project", ".cortexkit"), { recursive: true });
+      writeFileSync(projectFile, JSON.stringify(input));
+      const config = loadWithUserConfig({ idle: { checkout_hours: 2 } });
+      expect(getConfigValidationErrors()).toEqual([]);
+      expect(config.idle?.checkout_hours).toBe(72);
+      const notices = getConfigLoadNotices().filter((notice) => notice.configPath === projectFile);
+      expect(notices).toHaveLength(1);
+      expect(notices[0]?.message).toContain(`uses retired keys (${key})`);
+      expect(notices[0]?.message).toContain("views.idle_checkout_hours is now idle.checkout_hours");
+      expect(readFileSync(projectFile, "utf8")).toBe(JSON.stringify(input));
+    });
   }
 });

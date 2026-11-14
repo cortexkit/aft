@@ -645,13 +645,26 @@ impl ServerExitReport {
         }
     }
 
-    /// The first non-empty stderr line, trimmed to a short excerpt.
+    /// A short stderr headline. Node prints a source location and code excerpt
+    /// before the exception; prefer the exception to keep its errno and path.
     pub fn first_stderr_line(&self) -> Option<String> {
-        self.stderr_tail
+        let mut lines = self
+            .stderr_tail
             .lines()
             .map(str::trim)
-            .find(|line| !line.is_empty())
-            .map(|line| truncate_to_bytes(line, CAUSE_STDERR_LINE_BYTES))
+            .filter(|line| !line.is_empty());
+        let first = lines.next()?;
+        let headline = if first.starts_with("node:") {
+            lines
+                .find(|line| {
+                    let name = line.split([':', ' ']).next().unwrap_or_default();
+                    name.ends_with("Error") && name.chars().all(|ch| ch.is_ascii_alphabetic())
+                })
+                .unwrap_or(first)
+        } else {
+            first
+        };
+        Some(truncate_to_bytes(headline, CAUSE_STDERR_LINE_BYTES))
     }
 
     /// Compact cause for error messages, e.g.
@@ -992,6 +1005,8 @@ pub struct LspClient {
     child: Child,
     // Held until the child exits or Drop kills/reaps it, including failed handshakes.
     _rust_analyzer_permit: Option<RustAnalyzerPermit>,
+    // Drop runs after the process group has been killed and reaped.
+    pub(crate) _typescript_temp_dir: Option<super::manager::TypeScriptTempDir>,
     /// Child PID captured at spawn time. Used by Drop to untrack the
     /// PID from the shared registry; we capture once rather than reading
     /// `child.id()` later because Drop ordering with the Child can race.
@@ -1428,6 +1443,7 @@ impl LspClient {
         Ok(Self {
             instance,
             _rust_analyzer_permit: rust_analyzer_permit,
+            _typescript_temp_dir: None,
             rust_cargo_disabled_for_worker: worker_policy,
             runtime_note: None,
             kind,
@@ -3188,6 +3204,35 @@ fn parse_diagnostic_capabilities(value: &Value) -> ServerDiagnosticCapabilities 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_fs_exception_is_the_short_cause_instead_of_a_source_location() {
+        let mut report = ServerExitReport {
+            kind: ServerKind::TypeScript(Some("5.9.3".into())),
+            root: PathBuf::from("/project"),
+            pid: 1,
+            phase: ServerPhase::Initialize,
+            status: None,
+            killed_by_aft: false,
+            elapsed: Duration::from_millis(200),
+            command: "typescript-language-server --stdio".into(),
+            stderr_tail: "node:fs:1410\n  const result = binding.mkdir(\n                         ^\n\nError: EEXIST: file already exists, mkdir '/private/server-tmp/typescript-language-server501'\n    at Object.mkdirSync (node:fs:1410:26)".into(),
+        };
+        let cause = report.short_cause();
+        assert!(
+            cause.contains("Error: EEXIST: file already exists, mkdir '/private/server-tmp/"),
+            "{cause}"
+        );
+        assert!(!cause.contains("node:fs:1410"), "{cause}");
+        assert!(report.stderr_tail.contains("at Object.mkdirSync"));
+        report.stderr_tail = "\n fatal: unable to load SDK\nError: later detail".into();
+        assert_eq!(
+            report.first_stderr_line().as_deref(),
+            Some("fatal: unable to load SDK")
+        );
+        report.stderr_tail = "node:fs:1410\n  excerpt without an exception".into();
+        assert_eq!(report.first_stderr_line().as_deref(), Some("node:fs:1410"));
+    }
 
     #[test]
     fn shutdown_write_failure_after_fake_server_exits_is_clean() {

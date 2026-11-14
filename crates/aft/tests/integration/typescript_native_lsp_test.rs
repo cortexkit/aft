@@ -197,6 +197,11 @@ fn typescript_server_temp_directories_are_isolated() {
     );
     fs::set_permissions(&server, fs::Permissions::from_mode(0o755)).unwrap();
 
+    // Each TypeScript server gets its own randomly named folder under AFT's
+    // storage (`lsp-tmp/typescript-*`), never the TMPDIR AFT itself runs with:
+    // typescript-language-server creates a per-user folder there with a racy
+    // exists-then-mkdir, so two servers sharing one TMPDIR can crash at start.
+    let mut seen = Vec::new();
     for name in ["first", "second"] {
         let root = parent.join(name);
         let file = root.join("src/main.ts");
@@ -208,14 +213,36 @@ fn typescript_server_temp_directories_are_isolated() {
                 .to_string(),
         );
         let (_, stderr) = aft.stderr_output();
-        assert!(
-            stderr.contains(&format!(
-                "server TMPDIR={}",
-                root.join(".typescript-server-tmp").display()
-            )),
-            "server did not inherit its fixture's private temp directory: {stderr}"
+        // AFT also quotes the server's stderr inside its own exit log line, so
+        // take only the path token that follows the fake server's marker.
+        let server_tmp = stderr
+            .lines()
+            .find_map(|line| line.split("server TMPDIR=").nth(1))
+            .and_then(|rest| rest.split_whitespace().next())
+            .map(|token| token.trim_end_matches([')', ':', ',']).to_string())
+            .unwrap_or_else(|| panic!("the fake server never reported its TMPDIR: {stderr}"));
+        let path = Path::new(&server_tmp);
+        assert_eq!(
+            path.parent()
+                .and_then(Path::file_name)
+                .and_then(|n| n.to_str()),
+            Some("lsp-tmp"),
+            "server TMPDIR is not AFT's private lsp-tmp folder: {server_tmp}"
         );
+        assert!(
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("typescript-")),
+            "server TMPDIR is not a per-server folder: {server_tmp}"
+        );
+        assert_ne!(
+            path,
+            root.join(".typescript-server-tmp"),
+            "server inherited AFT's own TMPDIR"
+        );
+        seen.push(server_tmp);
     }
+    assert_ne!(seen[0], seen[1], "two servers shared one temp folder");
 }
 
 #[test]

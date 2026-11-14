@@ -530,10 +530,48 @@ fn experimental_keys_auto_migrate_user_once_via_doctor_mapping() {
 const RETIRED_USER_FILE: &str =
     "{\n  // my settings\n  \"search_index\": false,\n  \"hoist_builtin_tools\": false\n}\n";
 
-/// A user file whose only retired key is still translated in memory, so a
+/// A user file whose only retired key is translated in memory at 0.64, so a
 /// failed rewrite is reported with a notice rather than refused.
 const TRANSLATED_USER_FILE: &str =
     "{\n  // my settings\n  \"views\": {\"idle_checkout_hours\": 72}\n}\n";
+
+#[test]
+fn failed_user_config_migration_at_0_65_leaves_idle_key_for_refusal() {
+    let _release = feature_config::override_running_release_for_test((0, 65));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.jsonc");
+    std::fs::write(&path, TRANSLATED_USER_FILE).unwrap();
+
+    let attempted = std::cell::Cell::new(false);
+    assert_eq!(
+        auto_migrate_user_config_with_writer(&path, |_, _| {
+            attempted.set(true);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "rename denied",
+            ))
+        }),
+        None
+    );
+    assert!(attempted.get(), "the failed rewrite must reach the writer");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        TRANSLATED_USER_FILE
+    );
+    assert!(backups(dir.path()).is_empty());
+    let result = resolve_config_for_harness(
+        &[ConfigTier {
+            tier: "user".to_string(),
+            source: path.display().to_string(),
+            doc: TRANSLATED_USER_FILE.to_string(),
+        }],
+        None,
+    );
+    assert_eq!(
+        result.errors,
+        ["removed_config_key:views.idle_checkout_hours; run npx @cortexkit/aft doctor --fix"]
+    );
+}
 
 #[test]
 fn migration_keeps_backup_and_reports_applied_after_directory_sync_error() {
@@ -571,6 +609,7 @@ fn migration_keeps_backup_and_reports_applied_after_directory_sync_error() {
 
 #[test]
 fn migration_pre_rename_error_preserves_original_and_removes_backup() {
+    let _release = feature_config::override_running_release_for_test((0, 64));
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("aft.jsonc");
     std::fs::write(&path, TRANSLATED_USER_FILE).unwrap();
@@ -711,6 +750,7 @@ fn concurrent_auto_migrations_converge() {
 /// that refusal is the only message.
 #[test]
 fn a_read_only_user_file_is_left_alone_with_a_notice() {
+    let _release = feature_config::override_running_release_for_test((0, 64));
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("aft.jsonc");
     std::fs::write(&path, TRANSLATED_USER_FILE).unwrap();
@@ -842,6 +882,7 @@ fn a_symlinked_user_file_is_rewritten_at_its_target() {
 #[cfg(debug_assertions)]
 #[test]
 fn a_debug_build_never_rewrites_a_user_file_in_the_account_config_dir() {
+    let _release = feature_config::override_running_release_for_test((0, 64));
     let fixture = tempfile::tempdir().unwrap();
     let config_dir = fixture.path().join("account/.config/cortexkit");
     std::fs::create_dir_all(&config_dir).unwrap();
@@ -986,6 +1027,7 @@ fn doctor_fix_moves_idle_checkout_hours_and_deletes_removed_data_layer_keys() {
 /// A file whose only old keys are removed keys is not rewritten at all.
 #[test]
 fn automatic_user_rewrite_moves_idle_checkout_hours_but_keeps_removed_keys() {
+    let _release = feature_config::override_running_release_for_test((0, 64));
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("aft.jsonc");
     std::fs::write(&path, DATA_LAYER_FILE).unwrap();

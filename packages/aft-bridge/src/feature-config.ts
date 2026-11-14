@@ -160,9 +160,16 @@ function readRunningRelease(): readonly [number, number] {
 }
 
 let runningRelease: readonly [number, number] | undefined;
+let runningReleaseOverrideForTest: readonly [number, number] | undefined;
+
+/** Pin release-sensitive tests independently of package versions; reset with undefined after each test. */
+export function setRunningReleaseForTest(release: readonly [number, number] | undefined): void {
+  runningReleaseOverrideForTest = release;
+}
 
 /** The [major, minor] release of this package, read once. */
 export function getRunningRelease(): readonly [number, number] {
+  if (runningReleaseOverrideForTest) return runningReleaseOverrideForTest;
   runningRelease ??= readRunningRelease();
   return runningRelease;
 }
@@ -216,7 +223,7 @@ function removedBlockKeyErrors(
 ): string[] {
   const paths: string[] = REMOVED_OPENCODE_PATHS.filter((path) => hasPath(value, path));
   if (refuseRetired) paths.push(...refusedRetiredNames(value));
-  if (releaseAtLeast(release, DATA_LAYER_KEYS_REFUSED_FROM))
+  if (refuseRetired && releaseAtLeast(release, DATA_LAYER_KEYS_REFUSED_FROM))
     paths.push(...DATA_LAYER_RETIRED_PATHS.filter((path) => hasPath(value, path)));
   return paths.map((path) => `removed_config_key:${path}; run npx @cortexkit/aft doctor --fix`);
 }
@@ -937,13 +944,13 @@ export const REMOVED_DATA_LAYER_NOTES: ReadonlyArray<readonly [string, string]> 
 ];
 
 /**
- * The sentence saying a file that still names `views.idle_checkout_hours` will
+ * The sentence saying a user file that still names `views.idle_checkout_hours` will
  * be refused. Mirrors `retired_idle_checkout_hours_note` in
  * `crates/aft/src/feature_config.rs`.
  */
 export function retiredIdleCheckoutHoursNote(): string {
   const [retired, replacement] = RETIRED_IDLE_CHECKOUT_HOURS;
-  return `${retired} is now ${replacement}; from ${refusedFromVersion()} AFT refuses a config file that still sets ${retired}.`;
+  return `${retired} is now ${replacement}; from ${refusedFromVersion()} AFT refuses a user config file that still sets ${retired}.`;
 }
 
 /**

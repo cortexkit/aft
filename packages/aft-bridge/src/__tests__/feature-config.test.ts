@@ -23,6 +23,7 @@ import {
   retiredIdleCheckoutHoursNote,
   SEMANTIC_COST_NOTICE,
   semanticCostNotice,
+  setRunningReleaseForTest,
   suppliesSemanticIndexInput,
   translateConfigDocument,
   validateResolvedConfig,
@@ -48,7 +49,15 @@ const removedKeyFixtures = JSON.parse(
     "utf8",
   ),
 ) as {
-  cases: Array<{ name: string; release?: string; doc: Record<string, unknown>; errors: string[] }>;
+  cases: Array<{
+    name: string;
+    release: string;
+    tier: "user" | "project";
+    doc: Record<string, unknown>;
+    errors: string[];
+    translated?: Record<string, unknown>;
+    notice?: string;
+  }>;
 };
 
 const policy = JSON.parse(
@@ -61,6 +70,7 @@ const policy = JSON.parse(
 const roots: string[] = [];
 
 afterEach(() => {
+  setRunningReleaseForTest(undefined);
   for (const root of roots.splice(0)) {
     chmodSync(root, 0o755);
     rmSync(root, { recursive: true, force: true });
@@ -70,10 +80,21 @@ afterEach(() => {
 describe("feature-config policy", () => {
   test("removed config key checking matches shared Rust/TypeScript fixtures", () => {
     for (const fixture of removedKeyFixtures.cases) {
-      // A case may name the release that judges it; the data-layer keys are
-      // refused only from DATA_LAYER_KEYS_REFUSED_FROM.
-      const release = fixture.release === undefined ? undefined : parseRelease(fixture.release);
-      expect(removedConfigKeyErrors(fixture.doc, release), fixture.name).toEqual(fixture.errors);
+      const release = parseRelease(fixture.release);
+      expect(release, fixture.name).toBeDefined();
+      const errors = removedConfigKeyErrors(fixture.doc, release, fixture.tier === "user");
+      expect(errors, fixture.name).toEqual(fixture.errors);
+      if (fixture.translated) {
+        expect(errors, fixture.name).toEqual([]);
+        const doc = structuredClone(fixture.doc);
+        const out = translateConfigDocument(doc, fixture.tier);
+        expect(doc, fixture.name).toEqual(fixture.translated);
+        if (fixture.notice) {
+          expect(legacyConfigNoticeMessage("/project/aft.jsonc", out), fixture.name).toBe(
+            fixture.notice,
+          );
+        }
+      }
     }
   });
 
@@ -488,6 +509,20 @@ describe("feature-config policy", () => {
 });
 
 describe("data-layer keys", () => {
+  test("test-only release pins drive the default refusal check without changing the package", () => {
+    const actual = getRunningRelease();
+    const doc = { views: { idle_checkout_hours: 72 } };
+    setRunningReleaseForTest([0, 64]);
+    expect(getRunningRelease()).toEqual([0, 64]);
+    expect(removedConfigKeyErrors(doc)).toEqual([]);
+    setRunningReleaseForTest([0, 65]);
+    expect(removedConfigKeyErrors(doc)).toEqual([
+      "removed_config_key:views.idle_checkout_hours; run npx @cortexkit/aft doctor --fix",
+    ]);
+    setRunningReleaseForTest(undefined);
+    expect(getRunningRelease()).toEqual(actual);
+  });
+
   test("release parsing reads major and minor, and the running release is this package's", () => {
     expect(parseRelease("0.65.0")).toEqual([0, 65]);
     expect(parseRelease("0.64.12-beta.1")).toEqual([0, 64]);
@@ -513,6 +548,8 @@ describe("data-layer keys", () => {
         `removed_config_key:harnesses.pi.${path}; run npx @cortexkit/aft doctor --fix`,
       ]);
       expect(removedConfigKeyErrors(base, [1, 0])).toHaveLength(1);
+      expect(removedConfigKeyErrors(base, [0, 65], false)).toEqual([]);
+      expect(removedConfigKeyErrors(harness, [0, 65], false)).toEqual([]);
     }
   });
 
@@ -603,7 +640,7 @@ describe("data-layer keys", () => {
       "project",
     );
     const idleNote =
-      "views.idle_checkout_hours is now idle.checkout_hours; from 0.65.0 AFT refuses a config file that still sets views.idle_checkout_hours.";
+      "views.idle_checkout_hours is now idle.checkout_hours; from 0.65.0 AFT refuses a user config file that still sets views.idle_checkout_hours.";
     expect(retiredIdleCheckoutHoursNote()).toBe(idleNote);
     expect(legacyConfigNoticeMessage("/p", both)).toBe(
       `/p uses retired keys (views.idle_checkout_hours); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file. ${idleNote} ${REMOVED_DATA_LAYER_NOTES[1]?.[1]}`,

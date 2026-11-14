@@ -517,6 +517,11 @@ async fn live_vault_concurrent_requests_share_one_card_and_once_queues_cards_ser
         client.connect(true);
         let worker = request_in_thread(client, true);
         let first = phone.phone.card(1).await;
+        // The card is filed on the first stream's vault call. Answering it
+        // before the second stream has asked would let that stream be
+        // released directly, so it would never share the card and the call
+        // counts below would depend on thread timing.
+        condition(|| daemon.state.lock().unwrap().calls >= 2).await;
         assert!(server.seen.lock().is_empty());
         assert_eq!(phone.phone.state.lock().unwrap().requests.len(), 1);
         phone.phone.decide(
