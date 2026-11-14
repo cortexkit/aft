@@ -31,6 +31,13 @@
     clippy::unnecessary_map_or
 )]
 
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: aft_base::test_allocations::CountingAllocator =
+    aft_base::test_allocations::CountingAllocator;
+
+pub use aft_base::{slog_debug, slog_error, slog_info, slog_warn};
+
 // ## Note on `.unwrap()` / `.expect()` usage
 //
 // Some `.unwrap()` and `.expect()` calls in `src/` protect internal invariants:
@@ -50,13 +57,13 @@ pub mod access_policy;
 #[cfg(test)]
 mod access_policy_tests;
 pub mod agent_child_env;
-pub(crate) mod agent_commands;
+pub(crate) use aft_base::agent_commands;
 pub mod agent_data;
-pub mod alert_records;
+pub use aft_base::alert_records;
 pub mod alert_state;
 // The `aft` binary installs its allocator; the library sets the operation
 // labels it attributes allocations to.
-pub mod alloc_trace;
+pub use aft_base::alloc_trace;
 pub mod ast_grep_hints;
 pub mod ast_grep_lang;
 pub mod backup;
@@ -64,11 +71,11 @@ pub mod bash_background;
 pub(crate) mod bash_changed_files;
 #[cfg(unix)]
 pub(crate) mod bash_db_hints;
-pub(crate) mod bash_env;
+pub(crate) use aft_base::bash_env;
 pub mod bash_parse;
 pub mod bash_permissions;
 pub mod bash_rewrite;
-pub(crate) mod bounded_io;
+pub(crate) use aft_base::bounded_io;
 pub(crate) mod bounded_io_command;
 pub mod build_breaker;
 pub mod cache_freshness;
@@ -78,90 +85,89 @@ pub mod callgraph_extractor;
 pub mod callgraph_store;
 pub mod calls;
 pub mod checkpoint;
-pub(crate) mod clock;
-pub mod cold_build_limiter;
+pub(crate) use aft_base::clock;
+pub use aft_base::cold_build_limiter;
 pub mod commands;
-pub mod compress;
-pub mod config;
-pub mod config_fix;
+pub use aft_base::compress;
+pub use aft_base::config;
+pub use aft_base::config_fix;
 pub mod config_live;
-pub mod config_resolve;
-pub mod config_sources;
+pub use aft_base::config_resolve;
+pub use aft_base::config_sources;
 pub mod context;
-pub(crate) mod cross_volume;
+pub(crate) use aft_base::cross_volume;
 pub mod data_layer;
 pub(crate) mod database_open;
 pub mod db;
-pub mod developer_tools;
-pub(crate) mod dir_identity;
-pub mod disk_floor;
-pub(crate) mod durability;
-pub(crate) mod durable_dir;
+pub use aft_base::developer_tools;
+pub(crate) use aft_base::dir_identity;
+pub use aft_base::disk_floor;
+pub(crate) use aft_base::durability;
+pub(crate) use aft_base::durable_dir;
 pub mod edit;
-pub mod effective_path;
+pub use aft_base::effective_path;
 pub mod engram_catalog;
 #[doc(hidden)]
-pub mod environment;
-pub mod error;
+pub use aft_base::environment;
+pub use aft_base::error;
 pub mod exec_remote;
 #[cfg(test)]
-#[path = "../tests/helpers/executable_cache.rs"]
-mod executable_cache;
+use aft_base::executable_cache;
 pub mod executor;
 pub mod extract;
-pub mod feature_config;
+pub use aft_base::feature_config;
 pub mod feature_status;
-pub(crate) mod file_identity;
+pub(crate) use aft_base::file_identity;
 pub mod file_kind;
 pub(crate) mod file_read_exact;
-pub mod fleet_status;
+pub use aft_base::fleet_status;
 pub mod format;
 pub mod fs_lock;
 pub mod fuzzy_match;
 pub mod gh_shim;
-pub mod gh_shim_paths;
+pub use aft_base::gh_shim_paths;
 pub mod gh_shim_relay;
 pub(crate) mod gh_shim_speech;
 pub mod gh_shim_ticket;
 pub(crate) mod gh_shim_worker_broker;
 #[cfg(unix)]
 pub(crate) mod gh_shim_worker_endpoints;
-pub mod git_head;
+pub use aft_base::git_head;
 pub mod git_index_reader;
-pub(crate) mod git_probe;
-pub(crate) mod git_revision;
+pub(crate) use aft_base::git_probe;
+pub(crate) use aft_base::git_revision;
 pub(crate) mod git_root_resolution;
-pub(crate) mod github_address;
+pub(crate) use aft_base::github_address;
 pub mod github_read;
 pub mod grammar;
-pub mod grammar_state;
+pub use aft_base::grammar_state;
 pub mod grep_executor;
-pub mod harness;
-pub mod harness_partition_guard;
+pub use aft_base::harness;
+pub use aft_base::harness_partition_guard;
 pub mod hashline;
-pub mod host_tool_names;
+pub use aft_base::host_tool_names;
 pub mod imports;
 pub mod indent;
 pub mod inspect;
-pub mod inspect_category;
+pub use aft_base::inspect_category;
 pub(crate) mod io_accounting;
-pub mod jsonc;
-pub mod jsonc_edit;
+pub use aft_base::jsonc;
+pub use aft_base::jsonc_edit;
 pub mod lang_id;
-pub mod language;
+pub use aft_base::language;
 pub(crate) mod large_read;
 pub(crate) mod late_result_bus;
 #[doc(hidden)]
-pub mod launch_fds;
-pub mod launch_nonce;
+pub use aft_base::launch_fds;
+pub use aft_base::launch_nonce;
 pub(crate) mod lifecycle_census;
-pub mod list_envelope;
-pub mod list_surfaces;
+pub use aft_base::list_envelope;
+pub use aft_base::list_surfaces;
 pub mod live_db_files;
 pub mod local_embed;
-pub(crate) mod lock_diagnostics;
-pub mod log_ctx;
-pub mod log_redact;
+pub(crate) use aft_base::lock_diagnostics;
+pub use aft_base::log_ctx;
+pub use aft_base::log_redact;
 pub mod logging;
 pub mod lsp;
 pub mod lsp_hints;
@@ -169,11 +175,11 @@ mod luau;
 pub mod memory;
 pub mod memory_census;
 pub mod native_route;
-pub(crate) mod native_stat;
-pub mod ndjson_text;
+pub(crate) use aft_base::native_stat;
+pub use aft_base::ndjson_text;
 #[cfg(test)]
 mod nested_worktree_tests;
-pub mod ort_lifecycle;
+pub use aft_base::ort_lifecycle;
 pub mod ort_pin;
 pub(crate) mod os_metadata;
 pub(crate) mod output_store;
@@ -182,29 +188,29 @@ pub mod parent_search;
 pub mod parser;
 pub mod patch;
 pub mod path_identity;
-pub mod pattern_compile;
-pub mod pending_response;
+pub use aft_base::pattern_compile;
+pub use aft_base::pending_response;
 pub mod persisted_format;
-pub(crate) mod pinned_dir;
+pub(crate) use aft_base::pinned_dir;
 pub mod pinned_executable;
-mod platform_tls;
-pub(crate) mod policy_path;
+use aft_base::platform_tls;
+pub(crate) use aft_base::policy_path;
 #[cfg(unix)]
-pub(crate) mod posix_spawn;
-mod privacy_spawn;
+pub(crate) use aft_base::posix_spawn;
+use aft_base::privacy_spawn;
 #[doc(hidden)]
-pub mod private_storage;
-pub(crate) mod process_group;
-pub mod process_identity;
-pub mod process_io;
-pub(crate) mod process_spawn;
+pub use aft_base::private_storage;
+pub(crate) use aft_base::process_group;
+pub use aft_base::process_identity;
+pub use aft_base::process_io;
+pub(crate) use aft_base::process_spawn;
 pub(crate) mod production_storage;
 pub(crate) mod project_content;
-pub mod protocol;
+pub use aft_base::protocol;
 pub(crate) mod provisional_identity_retry;
-pub mod pty_render;
-pub mod query_shape;
-pub mod read_policy;
+pub use aft_base::pty_render;
+pub use aft_base::query_shape;
+pub use aft_base::read_policy;
 pub mod reader_floor;
 pub mod repeat_state;
 pub mod response_finalize;
@@ -225,54 +231,54 @@ pub mod secret_proxy;
 pub mod semantic_admission;
 pub mod semantic_index;
 pub mod setup_plan;
-pub(crate) mod shared_timer;
+pub(crate) use aft_base::shared_timer;
 pub(crate) mod shell_env_provider;
-pub mod shell_format;
-pub(crate) mod stage_timer;
+pub use aft_base::shell_format;
+pub(crate) use aft_base::stage_timer;
 pub mod standing_roots;
 pub(crate) mod status_push;
-pub mod storage_path;
+pub use aft_base::storage_path;
 #[cfg(all(test, unix))]
 mod storage_permissions_tests;
 pub mod subc;
-pub mod subc_config;
+pub use aft_base::subc_config;
 #[cfg(test)]
 #[path = "../tests/helpers/subc_fake.rs"]
 mod subc_fake;
 pub mod subc_format;
 pub mod subc_translate;
 pub mod symbol_diff;
-pub mod symbols;
+pub use aft_base::symbols;
 pub mod synapse_embed;
-pub(crate) mod system_temp;
-pub(crate) mod task_temp_reads;
-pub mod task_watch_lines;
-pub mod task_watches;
+pub(crate) use aft_base::system_temp;
+pub(crate) use aft_base::task_temp_reads;
+pub use aft_base::task_watch_lines;
+pub use aft_base::task_watches;
 #[cfg(test)]
 pub(crate) mod test_storage;
-pub mod tool_gate;
+pub use aft_base::tool_gate;
 pub(crate) mod tool_output;
-pub mod tool_path;
-pub(crate) mod tool_progress;
+pub use aft_base::tool_path;
+pub(crate) use aft_base::tool_progress;
 pub mod url_fetch;
-mod view_storage_reserve;
-pub(crate) mod volume;
-pub(crate) mod walk_boundary;
+use aft_base::view_storage_reserve;
+pub(crate) use aft_base::volume;
+pub(crate) use aft_base::walk_boundary;
 pub mod watcher;
 pub(crate) mod watcher_backend;
 pub mod watcher_filter;
-pub(crate) mod watcher_markers;
-pub mod write_counters;
+pub(crate) use aft_base::watcher_markers;
+pub use aft_base::write_counters;
 pub mod write_intent;
 pub mod write_ledger;
 // Compiled on all platforms so cross-platform unit tests in
 // `commands::bash::try_spawn_with_fallback` can exercise the retry
 // decision logic without a real Windows runtime. The module itself only
 // uses portable APIs; only its callers are Windows-gated.
-pub(crate) mod windows_command;
-pub mod windows_path;
+pub(crate) use aft_base::windows_command;
+pub use aft_base::windows_path;
 pub mod windows_shell;
-pub mod worker_jail_canary;
+pub use aft_base::worker_jail_canary;
 
 #[cfg(all(test, target_os = "linux"))]
 mod daemon_heap_probe;
@@ -281,184 +287,18 @@ mod gate_hermeticity_tests;
 #[cfg(test)]
 pub(crate) mod search_hot_path_measurements;
 #[cfg(test)]
-pub(crate) mod test_allocations;
+pub(crate) use aft_base::test_allocations;
 #[cfg(test)]
-pub(crate) mod test_env;
+pub(crate) use aft_base::test_env;
 #[cfg(test)]
-pub(crate) mod test_gate;
+pub(crate) use aft_base::test_gate;
 #[cfg(all(test, windows))]
-pub(crate) mod test_read_denial;
+pub(crate) use aft_base::test_read_denial;
 #[cfg(test)]
-pub(crate) mod test_support;
+pub(crate) use aft_base::test_support;
 // The fake LSP builder also compiles in integration tests under this helper name.
 #[cfg(test)]
 use test_support as test_helpers;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use config::Config;
-    use error::AftError;
-    use protocol::{RawRequest, Response};
-
-    // --- Protocol serialization ---
-
-    #[test]
-    fn raw_request_deserializes_ping() {
-        let json = r#"{"id":"1","command":"ping"}"#;
-        let req: RawRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.id, "1");
-        assert_eq!(req.command, "ping");
-        assert!(req.lsp_hints.is_none());
-    }
-
-    #[test]
-    fn raw_request_deserializes_echo_with_params() {
-        let json = r#"{"id":"2","command":"echo","message":"hello"}"#;
-        let req: RawRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.id, "2");
-        assert_eq!(req.command, "echo");
-        // "message" is captured in the flattened params
-        assert_eq!(req.params["message"], "hello");
-    }
-
-    #[test]
-    fn raw_request_preserves_unknown_fields() {
-        let json = r#"{"id":"3","command":"ping","future_field":"abc","nested":{"x":1}}"#;
-        let req: RawRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.params["future_field"], "abc");
-        assert_eq!(req.params["nested"]["x"], 1);
-    }
-
-    #[test]
-    fn raw_request_with_lsp_hints() {
-        let json = r#"{"id":"4","command":"ping","lsp_hints":{"completions":["foo","bar"]}}"#;
-        let req: RawRequest = serde_json::from_str(json).unwrap();
-        assert!(req.lsp_hints.is_some());
-        let hints = req.lsp_hints.unwrap();
-        assert_eq!(hints["completions"][0], "foo");
-    }
-
-    #[test]
-    fn response_success_round_trip() {
-        let resp = Response::success("42", serde_json::json!({"command": "pong"}));
-        let json_str = serde_json::to_string(&resp).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(v["id"], "42");
-        assert_eq!(v["success"], true);
-        assert_eq!(v["command"], "pong");
-    }
-
-    #[test]
-    fn response_error_round_trip() {
-        let resp = Response::error("99", "unknown_command", "unknown command: foo");
-        let json_str = serde_json::to_string(&resp).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(v["id"], "99");
-        assert_eq!(v["success"], false);
-        assert_eq!(v["code"], "unknown_command");
-        assert_eq!(v["message"], "unknown command: foo");
-    }
-
-    // --- Error formatting ---
-
-    #[test]
-    fn error_display_symbol_not_found() {
-        let err = AftError::SymbolNotFound {
-            name: "foo".into(),
-            file: "bar.rs".into(),
-        };
-        assert_eq!(err.to_string(), "symbol 'foo' not found in bar.rs");
-        assert_eq!(err.code(), "symbol_not_found");
-    }
-
-    #[test]
-    fn error_display_ambiguous_symbol() {
-        let err = AftError::AmbiguousSymbol {
-            name: "Foo".into(),
-            candidates: vec!["a.rs:10".into(), "b.rs:20".into()],
-        };
-        let s = err.to_string();
-        assert!(s.contains("Foo"));
-        assert!(s.contains("a.rs:10, b.rs:20"));
-    }
-
-    #[test]
-    fn error_display_parse_error() {
-        let err = AftError::ParseError {
-            message: "unexpected token".into(),
-        };
-        assert_eq!(err.to_string(), "parse error: unexpected token");
-    }
-
-    #[test]
-    fn error_display_file_not_found() {
-        let err = AftError::FileNotFound {
-            path: "/tmp/missing.rs".into(),
-        };
-        assert_eq!(err.to_string(), "file not found: /tmp/missing.rs");
-    }
-
-    #[test]
-    fn error_display_invalid_request() {
-        let err = AftError::InvalidRequest {
-            message: "missing field".into(),
-        };
-        assert_eq!(err.to_string(), "invalid request: missing field");
-    }
-
-    #[test]
-    fn error_display_checkpoint_not_found() {
-        let err = AftError::CheckpointNotFound {
-            name: "pre-refactor".into(),
-        };
-        assert_eq!(err.to_string(), "checkpoint not found: pre-refactor");
-        assert_eq!(err.code(), "checkpoint_not_found");
-    }
-
-    #[test]
-    fn error_display_no_undo_history() {
-        let err = AftError::NoUndoHistory {
-            path: "src/main.rs".into(),
-        };
-        assert_eq!(err.to_string(), "no undo history for: src/main.rs");
-        assert_eq!(err.code(), "no_undo_history");
-    }
-
-    #[test]
-    fn error_display_ambiguous_match() {
-        let err = AftError::AmbiguousMatch {
-            pattern: "TODO".into(),
-            count: 5,
-        };
-        assert_eq!(
-            err.to_string(),
-            "pattern 'TODO' matches 5 occurrences, expected exactly 1"
-        );
-        assert_eq!(err.code(), "ambiguous_match");
-    }
-
-    #[test]
-    fn error_to_json_has_code_and_message() {
-        let err = AftError::FileNotFound { path: "/x".into() };
-        let j = err.to_error_json();
-        assert_eq!(j["code"], "file_not_found");
-        assert!(j["message"].as_str().unwrap().contains("/x"));
-    }
-
-    // --- Config defaults ---
-
-    #[test]
-    fn config_default_values() {
-        let cfg = Config::default();
-        assert!(cfg.project_root.is_none());
-        assert_eq!(cfg.validation_depth, 1);
-        assert_eq!(cfg.checkpoint_ttl_hours, 24);
-        assert_eq!(cfg.max_symbol_depth, 10);
-        assert_eq!(cfg.formatter_timeout_secs, 10);
-        assert_eq!(cfg.type_checker_timeout_secs, 30);
-    }
-}
 
 #[cfg(all(test, target_os = "macos"))]
 mod disk_write_hunt;
@@ -466,4 +306,4 @@ mod disk_write_hunt;
 #[cfg(test)]
 #[path = "../tests/helpers/fake_lsp.rs"]
 pub(crate) mod fake_lsp_test_helper;
-pub(crate) mod persistence_gate;
+pub(crate) use aft_base::persistence_gate;

@@ -1,0 +1,4952 @@
+mod context;
+pub(crate) mod root_lifecycle;
+mod single_flight;
+pub use context::{ExecutorApp, ExecutorContext};
+pub use root_lifecycle::SubcLifecycleAdmission;
+
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+        Arc, Weak,
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
+
+use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError, Sender};
+use parking_lot::{Condvar, Mutex, RwLock};
+use tokio::sync::oneshot;
+
+use crate::lock_diagnostics::{LockDiagnostics, TrackedMutex};
+use crate::{path_identity::ProjectRootId, protocol::Response};
+
+// Mutation lock order: the executor's per-root mutating lane and context epoch
+// gate precede source-file admission, then backup and checkpoint locks. Never
+// wait for source-file admission while holding a backup/checkpoint lock. The
+// scheduler mutex is not held by handlers.
+// Multi-file writers admit their complete set in one registry turn, sorted by
+// resolved names with native identities covering hard-link aliases; they never
+// hold one file while waiting for another. A patch (and a symbol move) may keep
+// not-yet-written files admitted during earlier hunks' formatter runs, bounded
+// by formatter timeouts. Completed files are released after their last write
+// or delete, before their formatter/LSP waits. Single-file writers release
+// admission immediately after the atomic write, before formatting/validation.
+
+pub use single_flight::SingleFlight;
+
+const JOB_COST: isize = 1;
+/// How long the subc frame loop's scheduler probes (`try_actor_context`,
+/// `try_actor_is_idle`, `try_retire_idle_actor_in_background`) wait for the
+/// scheduler lock before answering "busy". The lock guards short map
+/// updates; a few milliseconds rides out an ordinary holder that was
+/// preempted, while a holder stuck for longer cannot stall the loop.
+const SCHEDULER_PROBE_WAIT: Duration = Duration::from_millis(5);
+/// Continuous wake producers must not keep the scheduler mutex across an
+/// unbounded receiver drain; health probes and submitters get a lock turn
+/// between batches.
+const SCHEDULER_EVENT_BATCH_CAP: usize = 64;
+pub(crate) const MAINTENANCE_QUEUE_CAP: usize = 512;
+const CALLGRAPH_ACQUISITION_REQUEST_ID: &str = "callgraph-view-acquire";
+
+/// Scheduler lane for command-handler execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Lane {
+    /// Pure read-only work. Runs under the actor epoch read gate and is capped
+    /// per actor.
+    PureRead,
+    /// LSP/status work. Serialized per actor by scheduler admission while still
+    /// using the shared epoch read gate.
+    SerialLspStatus,
+    /// Heavy lazy initialization. The scheduler acquires a process-wide heavy
+    /// permit before dispatch; cache and index builders reject stale generations
+    /// and serialize publication internally, so no actor epoch guard wraps the
+    /// command or the delivery of its response.
+    HeavyInit,
+    /// Mutating work. Becomes a writer barrier at the actor queue head, drains
+    /// in-flight reads, and runs under the actor epoch write gate. Reserved for
+    /// configure and user-initiated tool mutations: background maintenance must
+    /// use `MaintenanceCommit` so it can never exclude interactive reads.
+    Mutating,
+    /// Maintenance work that mutates only subsystem state behind that
+    /// subsystem's own lock (watcher/LSP drains, completed-build installs,
+    /// callgraph store writes). Runs under the actor epoch READ gate and
+    /// overlaps PureReads; serialized to one in-flight per actor so
+    /// maintenance cannot self-stack.
+    MaintenanceCommit,
+    /// Provider discovery and policy-store operations. Serialized per root on
+    /// reserved capacity, without an index epoch hold or writer-barrier wait.
+    ProviderMetadata,
+    /// Call-ledger bookkeeping for keyed tool calls: the row a call writes
+    /// before it dispatches, the settlement its terminal reply waits for
+    /// before the transport writer may send it, the row reads a repeated call
+    /// makes while it waits for that settlement, and the ledger and grant
+    /// writes that end a scope. Each job is one short SQLite transaction
+    /// behind the database's own mutex and touches no index state, so it takes
+    /// no epoch gate and does not wait for readers, LSP or maintenance jobs,
+    /// or a running writer. On the Mutating lane it would wait until every
+    /// read on its root had drained, and each keyed reply would wait with it.
+    /// Running beside a writer such as a configure loses no protection:
+    /// `AppContext::open_db` returns the process-shared database handle and
+    /// replaces it only when the storage path changes, so ledger jobs of other
+    /// roots always ran beside any configure. Jobs run one at a time per actor
+    /// in submission order, so one root's ledger writes land in the order they
+    /// were queued; a scope end therefore settles every admission queued on
+    /// its root before it. Queued ProviderMetadata jobs are cancelled when the
+    /// root's last route unbinds; these are not, because a settlement records
+    /// a call that already ran.
+    CallLedger,
+}
+
+const ALL_LANES: [Lane; 7] = [
+    Lane::PureRead,
+    Lane::SerialLspStatus,
+    Lane::HeavyInit,
+    Lane::Mutating,
+    Lane::MaintenanceCommit,
+    Lane::ProviderMetadata,
+    Lane::CallLedger,
+];
+
+/// Scheduler class used to keep deferrable maintenance from occupying the
+/// workers reserved for interactive route binds, tool calls, and bash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JobClass {
+    Interactive,
+    Maintenance,
+}
+
+/// Idempotent maintenance drains that can share one queued execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum MaintenanceCoalesceKey {
+    WatcherDrain,
+    LspDrain,
+    /// Standing maintenance is coalesced inside each actor queue. The executor
+    /// already scopes queue state by root, so this key cannot coalesce work for
+    /// separate standing roots.
+    StandingPass,
+    /// A live config reload re-reads the files, so one queued reload covers
+    /// every edit made before it runs.
+    ConfigReload,
+}
+
+pub type ExecutorJob<C> = Box<dyn FnOnce(&C) -> Response + Send + 'static>;
+
+/// Age at which a queued interactive mutating job (route binds, edits) jumps
+/// ahead of pure reads in interactive admission. Reads-first admission would
+/// otherwise let a sustained read stream starve queued writers; this bounds
+/// that wait. For binds it matches the half-deadline breadcrumb point: the
+/// daemon rejects binds at 12s, so promotion at 6s leaves half the budget for
+/// draining readers and running the configure itself.
+const INTERACTIVE_WRITER_PROMOTION_AGE: Duration = Duration::from_secs(6);
+/// Age at which a queued route-bind configure stops new same-root pure reads
+/// from being admitted ahead of it. Much shorter than the general writer
+/// promotion: a bind is a short configure, and after a daemon restart dozens
+/// arrive together, so reads-first admission must not spend the relay budget.
+const BIND_PROMOTION_AGE: Duration = Duration::from_millis(500);
+/// Worker threads reserved for route-bind configures, on top of `pool_size`.
+/// General interactive and maintenance jobs never occupy them, so a bind never
+/// waits for another session's long read, bash call, or maintenance tail to
+/// release a worker. Two, so a cold root's slower full configure does not
+/// serialize every other bind behind it.
+const BIND_RESERVE_WORKERS: usize = 2;
+/// Provider metadata (tool catalogs, role descriptions, grants) has reserved
+/// workers, so these short requests never wait for an index builder,
+/// configure writer or maintenance job to free a worker. Callers such as a
+/// worker launch check ask for them under a deadline of a few seconds.
+const PROVIDER_RESERVE_WORKERS: usize = 2;
+/// Readers older than this still block queued writer jobs; report their job
+/// metadata instead of only the generic `waiting_on_readers` diagnosis.
+const READER_STUCK_CENSUS_AGE: Duration = Duration::from_secs(60);
+/// Stack for executor worker threads: the standalone main thread's size, so a
+/// request that fits there cannot overflow only under the daemon. Stack pages
+/// are committed on touch, so idle workers cost nothing extra.
+const EXECUTOR_WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct ExecutorConfig {
+    pub pool_size: usize,
+    pub read_cap: usize,
+    pub actor_cap: usize,
+    pub heavy_permits: usize,
+    pub drr_quantum: isize,
+}
+
+impl Default for ExecutorConfig {
+    fn default() -> Self {
+        let available = thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(2);
+        let pool_size = available.saturating_sub(1).clamp(2, 8);
+        let actor_cap = pool_size.saturating_sub(1).clamp(1, 4);
+        let read_cap = actor_cap.clamp(1, 4);
+        let heavy_permits = pool_size.saturating_sub(1).clamp(2, 3);
+
+        Self {
+            pool_size,
+            read_cap,
+            actor_cap,
+            heavy_permits,
+            drr_quantum: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EffectiveConfig {
+    pool_size: usize,
+    read_cap: usize,
+    actor_cap: usize,
+    heavy_permits: usize,
+    drr_quantum: isize,
+    deficit_cap: isize,
+    interactive_reserve: usize,
+    maintenance_cap: usize,
+    /// Workers beyond `pool_size` that only route-bind configures may use.
+    bind_reserve: usize,
+    provider_reserve: usize,
+}
+
+impl EffectiveConfig {
+    /// Every worker thread, including the bind and provider reservations.
+    fn total_workers(&self) -> usize {
+        self.pool_size + self.bind_reserve + self.provider_reserve
+    }
+}
+
+impl ExecutorConfig {
+    fn effective(&self) -> EffectiveConfig {
+        let pool_size = self.pool_size.clamp(2, 8);
+        let max_actor_cap = pool_size.saturating_sub(1).max(1);
+        let actor_cap = self.actor_cap.max(1).min(max_actor_cap);
+        let read_cap = self.read_cap.max(1).min(actor_cap).min(4);
+        // HeavyInit jobs share workers with RouteBind/configure. Keep one worker
+        // available even in a two-worker pool so a heavy-init storm cannot hold
+        // a fresh bind behind every executor worker.
+        let heavy_permits = self
+            .heavy_permits
+            .max(1)
+            .min(pool_size.saturating_sub(1).max(1))
+            .min(3);
+        let drr_quantum = self.drr_quantum.max(1);
+        let deficit_cap = (actor_cap.max(1) as isize) * 4;
+        let interactive_reserve = if pool_size >= 4 { 2 } else { 1 };
+        let maintenance_cap = pool_size.saturating_sub(interactive_reserve).max(1);
+
+        EffectiveConfig {
+            pool_size,
+            read_cap,
+            actor_cap,
+            heavy_permits,
+            drr_quantum,
+            deficit_cap,
+            interactive_reserve,
+            maintenance_cap,
+            bind_reserve: BIND_RESERVE_WORKERS,
+            provider_reserve: PROVIDER_RESERVE_WORKERS,
+        }
+    }
+}
+
+/// Synchronous completion handle used by the executor tests and the
+/// future standalone bridge.
+pub struct CompletionHandle {
+    rx: Receiver<Response>,
+}
+
+impl CompletionHandle {
+    pub fn recv(self) -> Result<Response, RecvError> {
+        self.rx.recv()
+    }
+
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<Response, RecvTimeoutError> {
+        self.rx.recv_timeout(timeout)
+    }
+
+    pub fn into_receiver(self) -> Receiver<Response> {
+        self.rx
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchClassQueueSnapshot {
+    pub queued: usize,
+    pub oldest_age_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchRunningSnapshot {
+    pub interactive: usize,
+    pub maintenance: usize,
+    pub completion_owned_interactive: usize,
+    pub completion_owned_maintenance: usize,
+    /// Age of the oldest maintenance reservation still owned by a dispatched
+    /// worker. This distinguishes a blocked worker from a phantom reservation.
+    pub oldest_worker_owned_maintenance_age_ms: Option<u64>,
+    pub phantom_interactive: usize,
+    pub phantom_maintenance: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchLivenessSnapshot {
+    pub interactive: DispatchClassQueueSnapshot,
+    pub maintenance: DispatchClassQueueSnapshot,
+    pub running: DispatchRunningSnapshot,
+    pub phantom_running_maintenance: usize,
+    pub interactive_reserve: usize,
+    pub maintenance_cap: usize,
+}
+
+/// Scheduler-owned mirror read by health probes without taking the actor map
+/// lock or scanning every root. Oldest queue timestamps use `0` for absent and
+/// elapsed-milliseconds-plus-one for a present timestamp.
+struct DispatchLivenessAtomics {
+    origin: Instant,
+    interactive_queued: AtomicUsize,
+    interactive_oldest_enqueued_ms_plus_one: AtomicU64,
+    maintenance_queued: AtomicUsize,
+    maintenance_oldest_enqueued_ms_plus_one: AtomicU64,
+    interactive_running: AtomicUsize,
+    maintenance_running: AtomicUsize,
+    completion_owned_interactive: AtomicUsize,
+    completion_owned_maintenance: AtomicUsize,
+    oldest_worker_owned_maintenance_started_ms_plus_one: AtomicU64,
+    phantom_interactive: AtomicUsize,
+    phantom_maintenance: AtomicUsize,
+}
+
+impl DispatchLivenessAtomics {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            interactive_queued: AtomicUsize::new(0),
+            interactive_oldest_enqueued_ms_plus_one: AtomicU64::new(0),
+            maintenance_queued: AtomicUsize::new(0),
+            maintenance_oldest_enqueued_ms_plus_one: AtomicU64::new(0),
+            interactive_running: AtomicUsize::new(0),
+            maintenance_running: AtomicUsize::new(0),
+            completion_owned_interactive: AtomicUsize::new(0),
+            completion_owned_maintenance: AtomicUsize::new(0),
+            oldest_worker_owned_maintenance_started_ms_plus_one: AtomicU64::new(0),
+            phantom_interactive: AtomicUsize::new(0),
+            phantom_maintenance: AtomicUsize::new(0),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        duration_millis_u64(self.origin.elapsed())
+    }
+
+    fn record(&self, snapshot: &DispatchLivenessSnapshot) {
+        let now_ms = self.now_ms();
+        let encode_oldest = |queued: usize, oldest_age_ms: Option<u64>| {
+            if queued == 0 {
+                0
+            } else {
+                now_ms
+                    .saturating_sub(oldest_age_ms.unwrap_or(0))
+                    .saturating_add(1)
+            }
+        };
+        self.interactive_oldest_enqueued_ms_plus_one.store(
+            encode_oldest(
+                snapshot.interactive.queued,
+                snapshot.interactive.oldest_age_ms,
+            ),
+            Ordering::Relaxed,
+        );
+        self.maintenance_oldest_enqueued_ms_plus_one.store(
+            encode_oldest(
+                snapshot.maintenance.queued,
+                snapshot.maintenance.oldest_age_ms,
+            ),
+            Ordering::Relaxed,
+        );
+        self.interactive_running
+            .store(snapshot.running.interactive, Ordering::Release);
+        self.maintenance_running
+            .store(snapshot.running.maintenance, Ordering::Release);
+        self.completion_owned_interactive.store(
+            snapshot.running.completion_owned_interactive,
+            Ordering::Release,
+        );
+        self.completion_owned_maintenance.store(
+            snapshot.running.completion_owned_maintenance,
+            Ordering::Release,
+        );
+        self.oldest_worker_owned_maintenance_started_ms_plus_one
+            .store(
+                encode_oldest(
+                    snapshot.running.completion_owned_maintenance,
+                    snapshot.running.oldest_worker_owned_maintenance_age_ms,
+                ),
+                Ordering::Relaxed,
+            );
+        self.phantom_interactive
+            .store(snapshot.running.phantom_interactive, Ordering::Release);
+        self.phantom_maintenance
+            .store(snapshot.running.phantom_maintenance, Ordering::Release);
+        self.interactive_queued
+            .store(snapshot.interactive.queued, Ordering::Release);
+        self.maintenance_queued
+            .store(snapshot.maintenance.queued, Ordering::Release);
+    }
+
+    fn snapshot(&self, config: &EffectiveConfig) -> DispatchLivenessSnapshot {
+        let now_ms = self.now_ms();
+        let decode_oldest = |queued: usize, encoded: u64| {
+            (queued > 0 && encoded > 0).then(|| now_ms.saturating_sub(encoded - 1))
+        };
+        let interactive_queued = self.interactive_queued.load(Ordering::Acquire);
+        let maintenance_queued = self.maintenance_queued.load(Ordering::Acquire);
+        DispatchLivenessSnapshot {
+            interactive: DispatchClassQueueSnapshot {
+                queued: interactive_queued,
+                oldest_age_ms: decode_oldest(
+                    interactive_queued,
+                    self.interactive_oldest_enqueued_ms_plus_one
+                        .load(Ordering::Relaxed),
+                ),
+            },
+            maintenance: DispatchClassQueueSnapshot {
+                queued: maintenance_queued,
+                oldest_age_ms: decode_oldest(
+                    maintenance_queued,
+                    self.maintenance_oldest_enqueued_ms_plus_one
+                        .load(Ordering::Relaxed),
+                ),
+            },
+            running: DispatchRunningSnapshot {
+                interactive: self.interactive_running.load(Ordering::Acquire),
+                maintenance: self.maintenance_running.load(Ordering::Acquire),
+                completion_owned_interactive: self
+                    .completion_owned_interactive
+                    .load(Ordering::Acquire),
+                completion_owned_maintenance: self
+                    .completion_owned_maintenance
+                    .load(Ordering::Acquire),
+                oldest_worker_owned_maintenance_age_ms: decode_oldest(
+                    self.completion_owned_maintenance.load(Ordering::Acquire),
+                    self.oldest_worker_owned_maintenance_started_ms_plus_one
+                        .load(Ordering::Relaxed),
+                ),
+                phantom_interactive: self.phantom_interactive.load(Ordering::Acquire),
+                phantom_maintenance: self.phantom_maintenance.load(Ordering::Acquire),
+            },
+            phantom_running_maintenance: self.phantom_maintenance.load(Ordering::Acquire),
+            interactive_reserve: config.interactive_reserve,
+            maintenance_cap: config.maintenance_cap,
+        }
+    }
+}
+
+/// Progress marker for the scheduler (dispatch) loop, read by the subc stall
+/// watchdog from its own thread. Everything here is an atomic or a channel
+/// length read, so reading it never waits on the scheduler state mutex that a
+/// stalled loop may be blocked on or holding.
+pub struct DispatchLoopLiveness<C: ExecutorContext> {
+    origin: Instant,
+    /// Milliseconds since `origin` when the loop last became ready to receive
+    /// or finished an event.
+    last_progress_ms: AtomicU64,
+    /// True from channel readiness (or a due retry) until the loop has
+    /// processed the event and released the scheduler lock.
+    in_event: AtomicBool,
+    /// Clone of the scheduler's event receiver. Readiness waits and watchdog
+    /// queue checks never dequeue; only the scheduler consumes events.
+    event_rx: Receiver<SchedulerEvent<C>>,
+}
+
+impl<C: ExecutorContext> DispatchLoopLiveness<C> {
+    fn new(event_rx: Receiver<SchedulerEvent<C>>) -> Self {
+        Self {
+            origin: Instant::now(),
+            last_progress_ms: AtomicU64::new(0),
+            in_event: AtomicBool::new(false),
+            event_rx,
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        duration_millis_u64(self.origin.elapsed())
+    }
+
+    fn wait_for_event(&self, next_retry_at: Option<Instant>) -> bool {
+        let mut select = crossbeam_channel::Select::new();
+        select.recv(&self.event_rx);
+        let ready = match next_retry_at {
+            Some(at) => select
+                .ready_timeout(at.saturating_duration_since(Instant::now()))
+                .is_ok(),
+            None => {
+                select.ready();
+                true
+            }
+        };
+        // Readiness does not dequeue. Publish the active marker first so the
+        // watchdog cannot see an empty queue with an unmarked received event.
+        self.begin_event();
+        ready
+    }
+
+    fn begin_event(&self) {
+        self.last_progress_ms
+            .store(self.now_ms(), Ordering::Relaxed);
+        self.in_event.store(true, Ordering::Release);
+    }
+
+    fn end_event(&self) {
+        self.last_progress_ms
+            .store(self.now_ms(), Ordering::Relaxed);
+        self.in_event.store(false, Ordering::Release);
+    }
+
+    /// Time since the loop last became ready to receive or finished an event.
+    pub fn progress_age(&self) -> Duration {
+        let last = self.last_progress_ms.load(Ordering::Relaxed);
+        Duration::from_millis(self.now_ms().saturating_sub(last))
+    }
+
+    /// The loop owes work when it is inside an event or events are queued for
+    /// it. An idle scheduler waiting for readiness with an empty channel owes
+    /// nothing, however long ago it last ran.
+    pub fn has_pending_work(&self) -> bool {
+        // Sample the queue before the marker: receiving the last queued event
+        // publishes the marker before emptying the queue.
+        !self.event_rx.is_empty() || self.in_event.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutatingLaneSnapshot {
+    pub root_id: ProjectRootId,
+    pub request_id: String,
+    pub command: String,
+    pub started_age_ms: u64,
+}
+
+/// Scheduler occupants of one root, including jobs still waiting to enter
+/// their callback. Each call has a unique cancellation token, which distinguishes
+/// it from an older job that reused the same transport request ID.
+#[derive(Debug, Clone)]
+pub(crate) struct RootJobSnapshot {
+    pub(crate) job_id: u64,
+    pub(crate) request_id: String,
+    pub(crate) command: String,
+    pub(crate) lane: Lane,
+    pub(crate) started_age_ms: u64,
+    pub(crate) execution_started: bool,
+    pub(crate) is_current: bool,
+}
+
+/// Non-blocking scheduler explanation attached to a delayed RouteBind warning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindBlockerReaderSnapshot {
+    pub request_id: String,
+    pub command: String,
+    pub lane: Lane,
+    pub started_age_ms: u64,
+    pub execution_started: bool,
+    pub started_before_oldest_writer: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindBlockerSnapshot {
+    pub configure_state: &'static str,
+    pub configure_phase_timings: Option<String>,
+    pub blockers: Vec<String>,
+    pub oldest_queued_writer_age_ms: Option<u64>,
+    pub in_flight_readers: Vec<BindBlockerReaderSnapshot>,
+    pub in_flight_writer: Option<MutatingLaneSnapshot>,
+    pub reader_admissions_while_promoted_writer_waited: u64,
+}
+
+/// Cooperative cancellation for one cancellable executor job.
+///
+/// One atomic state machine (pending → running → committed | cancelled) is
+/// shared by the executor, the canceller, and the job. `cancel` and
+/// `try_seal_committed` race through compare-exchange on the same cell, so
+/// exactly one wins: a cancel that lands first makes the seal fail (the job
+/// must abort before mutating), and a seal that lands first makes the cancel
+/// report `RunningCommitted` (the mutation tail finishes normally). A job
+/// observes cancellation only at its own checkpoints
+/// ([`JobCancellation::cancel_requested_before_commit`]).
+#[derive(Debug, Clone)]
+pub struct JobCancellation {
+    inner: Arc<JobCancellationInner>,
+    root: Option<Arc<std::path::PathBuf>>,
+    lifecycle: Option<crate::executor::root_lifecycle::SubcLifecycleAdmission>,
+}
+
+#[derive(Debug)]
+struct JobCancellationInner {
+    state: AtomicU8,
+    progress: Mutex<Option<crate::tool_progress::Progress>>,
+    wait_lock: Mutex<()>,
+    wake: Condvar,
+    #[cfg(any(test, feature = "test-support"))]
+    root_probe_barrier: Mutex<Option<(Sender<()>, Receiver<()>)>>,
+}
+
+const JOB_CANCEL_STATE_PENDING: u8 = 0;
+const JOB_CANCEL_STATE_RUNNING: u8 = 1;
+const JOB_CANCEL_STATE_COMMITTED: u8 = 2;
+const JOB_CANCEL_STATE_CANCELLED: u8 = 3;
+
+impl JobCancellation {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(JobCancellationInner {
+                state: AtomicU8::new(JOB_CANCEL_STATE_PENDING),
+                progress: Mutex::new(None),
+                wait_lock: Mutex::new(()),
+                wake: Condvar::new(),
+                #[cfg(any(test, feature = "test-support"))]
+                root_probe_barrier: Mutex::new(None),
+            }),
+            root: None,
+            lifecycle: None,
+        }
+    }
+
+    pub(crate) fn with_root(mut self, root: &std::path::Path) -> Self {
+        self.root = Some(Arc::new(root.to_path_buf()));
+        self
+    }
+
+    pub(crate) fn set_progress(&self, progress: crate::tool_progress::Progress) {
+        *self.inner.progress.lock() = Some(progress);
+    }
+
+    pub(crate) fn has_progress_channel(&self, key: usize) -> bool {
+        self.inner
+            .progress
+            .lock()
+            .as_ref()
+            .is_some_and(|progress| progress.key() == key)
+    }
+
+    pub(crate) fn report_progress(&self) {
+        if !self.cancel_already_requested() {
+            let progress = self.inner.progress.lock().clone();
+            if let Some(progress) = progress {
+                progress.report();
+            }
+        }
+    }
+
+    pub(crate) fn with_lifecycle(
+        mut self,
+        lifecycle: crate::executor::root_lifecycle::SubcLifecycleAdmission,
+    ) -> Self {
+        self.lifecycle = Some(lifecycle);
+        self
+    }
+
+    pub(crate) fn fresh(&self) -> Self {
+        let mut token = Self::new();
+        token.root = self.root.clone();
+        token.lifecycle = self.lifecycle.clone();
+        token
+    }
+
+    fn mark_running(&self) -> bool {
+        match self.inner.state.compare_exchange(
+            JOB_CANCEL_STATE_PENDING,
+            JOB_CANCEL_STATE_RUNNING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => true,
+            Err(state) => state != JOB_CANCEL_STATE_CANCELLED,
+        }
+    }
+
+    /// Undo [`JobCancellation::mark_running`] for a job that is being queued
+    /// again without having committed. Returns false when a cancel already
+    /// won, in which case the job must be settled as cancelled instead.
+    fn return_to_pending(&self) -> bool {
+        match self.inner.state.compare_exchange(
+            JOB_CANCEL_STATE_RUNNING,
+            JOB_CANCEL_STATE_PENDING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => true,
+            Err(state) => {
+                debug_assert_ne!(
+                    state, JOB_CANCEL_STATE_COMMITTED,
+                    "a bind queued again must not have committed"
+                );
+                state == JOB_CANCEL_STATE_PENDING
+            }
+        }
+    }
+
+    fn try_cancel_before_running(&self) -> bool {
+        let cancelled = self
+            .inner
+            .state
+            .compare_exchange(
+                JOB_CANCEL_STATE_PENDING,
+                JOB_CANCEL_STATE_CANCELLED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok();
+        if cancelled {
+            let _wait_guard = self.inner.wait_lock.lock();
+            self.inner.wake.notify_all();
+        }
+        cancelled
+    }
+
+    /// Seal the job as committed. Returns `false` when a cancel already won
+    /// the race: the job must return early WITHOUT mutating, because the
+    /// canceller was told `RunningSignalled` and will discard its completion.
+    #[must_use]
+    pub fn try_seal_committed(&self) -> bool {
+        loop {
+            let current = self.state();
+            match current {
+                JOB_CANCEL_STATE_CANCELLED => return false,
+                JOB_CANCEL_STATE_COMMITTED => return true,
+                _ => {
+                    if self
+                        .inner
+                        .state
+                        .compare_exchange(
+                            current,
+                            JOB_CANCEL_STATE_COMMITTED,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Move to cancelled unless the job already sealed its commit. Returns the
+    /// state the transition observed (`COMMITTED` when the seal won).
+    fn signal_cancel(&self) -> u8 {
+        let observed = loop {
+            let current = self.state();
+            match current {
+                JOB_CANCEL_STATE_COMMITTED | JOB_CANCEL_STATE_CANCELLED => break current,
+                _ => {
+                    if self
+                        .inner
+                        .state
+                        .compare_exchange(
+                            current,
+                            JOB_CANCEL_STATE_CANCELLED,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                        .is_ok()
+                    {
+                        break current;
+                    }
+                }
+            }
+        };
+        if observed != JOB_CANCEL_STATE_COMMITTED {
+            let _wait_guard = self.inner.wait_lock.lock();
+            self.inner.wake.notify_all();
+        }
+        if observed != JOB_CANCEL_STATE_COMMITTED {
+            crate::cold_build_limiter::progress::cancel_token(self.progress_key());
+        }
+        observed
+    }
+
+    fn state(&self) -> u8 {
+        self.inner.state.load(Ordering::SeqCst)
+    }
+
+    /// Request cooperative cancellation without requiring an executor actor.
+    /// Detached continuations use this after their setup job has already left
+    /// the scheduler's running-job table.
+    pub fn request_cancel(&self) {
+        self.signal_cancel();
+    }
+
+    pub(crate) fn progress_key(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
+    }
+
+    /// True when a cancel has already won the state race. A pure read: unlike
+    /// [`Self::cancel_requested_before_commit`] it never checks the root on
+    /// disk or the abandon grace and never signals, so it is safe to call
+    /// while holding `wait_lock` and from observers such as health reports.
+    pub fn cancel_already_requested(&self) -> bool {
+        self.state() == JOB_CANCEL_STATE_CANCELLED
+    }
+
+    /// True when a cancel won the state race and the job must abort.
+    ///
+    /// This also cancels the job when its root was deleted or abandoned, which
+    /// signals and so takes `wait_lock`. Never call it while holding that lock
+    /// (it is not reentrant), and keep it out of read-only observers.
+    pub fn cancel_requested_before_commit(&self) -> bool {
+        let state = self.state();
+        match state {
+            JOB_CANCEL_STATE_CANCELLED => return true,
+            JOB_CANCEL_STATE_COMMITTED => return false,
+            _ => {}
+        }
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.cancel_if_abandoned(|| self.request_cancel());
+            if self.cancel_already_requested() {
+                return true;
+            }
+        }
+        if self.root.is_none() {
+            return false;
+        }
+        // Every checkpoint observes explicit cancellation and the in-memory
+        // lifecycle signal. Only the filesystem deletion probe is bounded to
+        // one per 256 checkpoints or 50ms on each worker, whichever comes
+        // first. A weak identity prevents a new token reusing an allocation
+        // from inheriting the previous job's delay.
+        // The first running checkpoint probes again after admission: setup may
+        // have blocked before the command got a chance to observe its root.
+        thread_local! {
+            static LAST_PROBE: std::cell::RefCell<Option<(std::sync::Weak<JobCancellationInner>, u8, u16, Instant)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        let probe = LAST_PROBE.with(|slot| {
+            let mut last = slot.borrow_mut();
+            if let Some((identity, previous_state, items, when)) = last.as_mut() {
+                if identity.as_ptr() == Arc::as_ptr(&self.inner) && *previous_state == state {
+                    *items += 1;
+                    #[cfg(not(any(test, feature = "test-support")))]
+                    let elapsed = when.elapsed();
+                    #[cfg(any(test, feature = "test-support"))]
+                    let elapsed = crate::search_index::audit_cancel_elapsed(*when);
+                    if *items < 256 && elapsed < Duration::from_millis(50) {
+                        return false;
+                    }
+                    *items = 0;
+                    *when = Instant::now();
+                    return true;
+                }
+            }
+            *last = Some((Arc::downgrade(&self.inner), state, 0, Instant::now()));
+            true
+        });
+        #[cfg(any(test, feature = "test-support"))]
+        let barrier = self.inner.root_probe_barrier.lock().take();
+        #[cfg(any(test, feature = "test-support"))]
+        let probe = probe || barrier.is_some();
+        if !probe {
+            return self.state() == JOB_CANCEL_STATE_CANCELLED;
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        crate::search_index::audit_record(|work| work.cancel_probes += 1);
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            if let Some((parked, release)) = barrier {
+                parked.send(()).unwrap();
+                release.recv().unwrap();
+            }
+        }
+        // A deleted checkout cannot publish useful work. Check here as well as
+        // at admission so deletion during a batch does not wait for the reaper.
+        // Permission/transient I/O failures do not prove that it was deleted.
+        if self
+            .root
+            .as_ref()
+            .is_some_and(|root| match std::fs::metadata(root.as_path()) {
+                Ok(metadata) => !metadata.is_dir(),
+                Err(error) => matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ),
+            })
+        {
+            self.request_cancel();
+        }
+        self.state() == JOB_CANCEL_STATE_CANCELLED
+    }
+
+    /// Sleep until cancellation is requested or the timeout expires.
+    ///
+    /// Cancellation takes the same lock before notifying, so a waiter cannot
+    /// miss a signal between its state check and the condition-variable wait.
+    pub fn wait_for_cancellation(&self, timeout: Duration) -> bool {
+        if self.cancel_requested_before_commit() {
+            return true;
+        }
+        {
+            let mut guard = self.inner.wait_lock.lock();
+            // Only the pure state read may run under `wait_lock`: the full check
+            // can decide the root is deleted or abandoned and signal, and
+            // signalling takes this same lock. Doing that here deadlocked the
+            // waiting job and then every caller that signalled it, including
+            // the health report on the module's frame loop.
+            if self.cancel_already_requested() {
+                return true;
+            }
+            self.inner.wake.wait_for(&mut guard, timeout);
+        }
+        self.cancel_requested_before_commit()
+    }
+
+    fn same_token(&self, other: &JobCancellation) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+/// Outcome of [`Executor::cancel_job`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobCancelOutcome {
+    /// The job had not started; it was removed from the queue and its
+    /// completion settled with `request_cancelled`.
+    QueuedRemoved,
+    /// The job is running; its token is signalled and the job returns through
+    /// its normal completion path at the next checkpoint.
+    RunningSignalled,
+    /// The job already sealed its commit; it finishes normally and the caller
+    /// must discard its late completion.
+    RunningCommitted,
+    /// No queued or tracked job matched the token.
+    NotFound,
+}
+
+/// Result of cancelling only work whose command closure has not started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreExecutionCancelOutcome {
+    QueuedRemoved,
+    DispatchedCancelled,
+    AlreadyStarted,
+}
+
+thread_local! {
+    static CURRENT_JOB_CANCELLATION: std::cell::RefCell<Option<JobCancellation>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The cancellation token of the job running on this worker thread, when the
+/// job was submitted through [`Executor::submit_cancellable_async`].
+pub fn current_job_cancellation() -> Option<JobCancellation> {
+    CURRENT_JOB_CANCELLATION.with(|slot| slot.borrow().clone())
+}
+
+pub fn current_job_cancelled() -> bool {
+    CURRENT_JOB_CANCELLATION.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(JobCancellation::cancel_requested_before_commit)
+    })
+}
+
+pub struct JobCancellationContextGuard {
+    previous: Option<JobCancellation>,
+}
+
+impl JobCancellationContextGuard {
+    fn install(token: Option<JobCancellation>) -> Self {
+        let previous = CURRENT_JOB_CANCELLATION.with(|slot| slot.replace(token));
+        Self { previous }
+    }
+}
+
+impl Drop for JobCancellationContextGuard {
+    fn drop(&mut self) {
+        CURRENT_JOB_CANCELLATION.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+/// Install a cancellable executor job's token on a continuation thread.
+///
+/// Executor workers install this automatically. A setup job that hands work to
+/// a detached thread must install the same token there so existing cooperative
+/// checkpoints keep observing route or transport abandonment.
+pub fn install_job_cancellation(token: JobCancellation) -> JobCancellationContextGuard {
+    JobCancellationContextGuard::install(Some(token))
+}
+
+/// The writer demand of one actor as seen by a job running on it: interactive
+/// writers still queued, and detached threads waiting to write the actor's
+/// epoch gate (content-addressed view publication).
+#[derive(Clone)]
+struct ActorWriterDemand {
+    queued: Arc<AtomicUsize>,
+    detached: Option<Arc<AtomicUsize>>,
+}
+
+impl ActorWriterDemand {
+    fn waiting(&self) -> bool {
+        self.queued.load(Ordering::Acquire) > 0
+            || self
+                .detached
+                .as_ref()
+                .is_some_and(|detached| detached.load(Ordering::Acquire) > 0)
+    }
+}
+
+thread_local! {
+    static CURRENT_ACTOR_WAITING_WRITERS: std::cell::RefCell<Option<ActorWriterDemand>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// True when interactive mutating work (a route-bind configure or a tool
+/// edit) is queued on the actor whose job runs on this worker thread, or a
+/// detached view publication is parked waiting to write the actor's epoch.
+///
+/// A long maintenance job holds its actor's epoch read gate, and a queued
+/// writer can only start once that gate is free. Maintenance that runs in
+/// resumable steps polls this between steps and hands the actor back instead
+/// of making the writer wait for the whole job. The parked publication counts
+/// too: the epoch lock is task-fair, so while that thread waits every new
+/// reader of the actor (reads, shared route binds, the next tail unit) is
+/// held behind it, and its write is a short install once the gate is free.
+/// Always false off an executor worker.
+pub fn current_actor_writer_waiting() -> bool {
+    CURRENT_ACTOR_WAITING_WRITERS.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(ActorWriterDemand::waiting)
+    })
+}
+
+pub(crate) struct ActorWaitingWritersGuard {
+    previous: Option<ActorWriterDemand>,
+}
+
+impl ActorWaitingWritersGuard {
+    fn install(demand: ActorWriterDemand) -> Self {
+        let previous = CURRENT_ACTOR_WAITING_WRITERS.with(|slot| slot.replace(Some(demand)));
+        Self { previous }
+    }
+}
+
+impl Drop for ActorWaitingWritersGuard {
+    fn drop(&mut self) {
+        CURRENT_ACTOR_WAITING_WRITERS.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+/// Make [`current_actor_writer_waiting`] report the given counter on this
+/// thread, for tests that run a maintenance step outside an executor worker.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn install_actor_waiting_writers_for_test(
+    waiting: Arc<AtomicUsize>,
+) -> ActorWaitingWritersGuard {
+    ActorWaitingWritersGuard::install(ActorWriterDemand {
+        queued: waiting,
+        detached: None,
+    })
+}
+
+/// A route-bind job that can run more than once. The scheduler may admit such
+/// a bind beside a running maintenance job or interactive readers with only a
+/// shared hold on the actor's epoch gate; when the configure finds it must change the root, the
+/// run is discarded and the same job is queued again as an exclusive writer.
+pub type RepeatableJob<C> = Arc<dyn Fn(&C) -> Response + Send + Sync + 'static>;
+
+thread_local! {
+    /// True while the job on this worker is a route bind holding its actor's
+    /// epoch gate only for reading.
+    static CURRENT_BIND_GATE_SHARED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set by a shared-hold bind that needs exclusive use of its actor.
+    static EXCLUSIVE_RERUN_REQUESTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the job on this worker as a shared-hold bind for its lifetime.
+struct SharedBindScope;
+
+impl SharedBindScope {
+    fn install() -> Self {
+        CURRENT_BIND_GATE_SHARED.with(|shared| shared.set(true));
+        EXCLUSIVE_RERUN_REQUESTED.with(|requested| requested.set(false));
+        Self
+    }
+
+    /// True when the job asked, through [`request_exclusive_rerun`], to be run
+    /// again with exclusive use of the actor.
+    fn rerun_requested(&self) -> bool {
+        EXCLUSIVE_RERUN_REQUESTED.with(std::cell::Cell::get)
+    }
+}
+
+impl Drop for SharedBindScope {
+    fn drop(&mut self) {
+        CURRENT_BIND_GATE_SHARED.with(|shared| shared.set(false));
+        EXCLUSIVE_RERUN_REQUESTED.with(|requested| requested.set(false));
+    }
+}
+
+/// True while the job on this worker is a route bind that holds its actor's
+/// epoch gate only for reading.
+///
+/// Most route binds re-attach a session to a root whose configuration is
+/// unchanged. That rebind only reads the published configuration and records
+/// the session in state behind its own locks, so it is safe next to readers,
+/// and making it wait for exclusive use would park it behind a configure tail
+/// unit that can run for many seconds on a large root, or behind a slow
+/// interactive read for as long as that read runs. Such a bind starts with a
+/// shared hold beside whatever already holds the gate for reading; a
+/// configure that turns out to change the root calls
+/// [`request_exclusive_rerun`] before its first change to actor state.
+pub fn current_bind_gate_is_shared() -> bool {
+    CURRENT_BIND_GATE_SHARED.with(std::cell::Cell::get)
+}
+
+/// Ask for the shared-hold bind on this worker to be run again as an exclusive
+/// writer. Returns false (and does nothing) for every other job.
+///
+/// The caller must return at once, without changing actor state: the executor
+/// discards the response, frees the worker, and queues the same job at the
+/// head of the actor's binds, where it counts as a waiting writer (so a
+/// running configure tail steps aside at its next unit) and is admitted once
+/// no reader or maintenance job holds the gate. The rerun starts from
+/// scratch and observes whatever changed meanwhile. No worker ever waits for
+/// the actor on the bind's behalf.
+pub fn request_exclusive_rerun() -> bool {
+    if !current_bind_gate_is_shared() {
+        return false;
+    }
+    EXCLUSIVE_RERUN_REQUESTED.with(|requested| requested.set(true));
+    true
+}
+
+#[derive(Debug, Clone)]
+struct RunningJob {
+    root_id: ProjectRootId,
+    request_id: String,
+    command: String,
+    job_class: JobClass,
+    lane: Lane,
+    started_at: Instant,
+    execution_started: Arc<AtomicBool>,
+    completion_ownership: Weak<JobCompletionOwnership>,
+    occupancy_reported: bool,
+    cancellation: Option<JobCancellation>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LongRunningInteractiveJobSnapshot {
+    pub(crate) root_id: ProjectRootId,
+    pub(crate) request_id: String,
+    pub(crate) command: String,
+    pub(crate) lane: Lane,
+    pub(crate) age: Duration,
+    pub(crate) execution_started: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RunningMutatingJob {
+    request_id: String,
+    command: String,
+    started_at: Instant,
+}
+
+/// Concurrent scheduler-dispatch executor.
+pub struct Executor<C: ExecutorContext> {
+    inner: Arc<ExecutorInner<C>>,
+}
+
+/// A root may submit maintenance without keeping its owning executor alive.
+/// The weak link avoids a cycle through the executor's actor context.
+#[derive(Clone)]
+pub struct RootMaintenanceExecutor {
+    inner: Arc<dyn MaintenanceSubmit>,
+}
+
+type MaintenanceJob = Box<dyn FnOnce() -> Response + Send + 'static>;
+
+trait MaintenanceSubmit: Send + Sync {
+    fn submit_maintenance(
+        &self,
+        request_id: &str,
+        lane: Lane,
+        cancellation: JobCancellation,
+        job: MaintenanceJob,
+    ) -> bool;
+}
+
+struct TypedMaintenanceExecutor<C: ExecutorContext> {
+    inner: std::sync::Weak<ExecutorInner<C>>,
+    root_id: ProjectRootId,
+}
+
+struct SubmissionExecutor<C: ExecutorContext>(Option<Executor<C>>);
+
+impl<C: ExecutorContext> Drop for SubmissionExecutor<C> {
+    fn drop(&mut self) {
+        let executor = self.0.take();
+        if current_thread_is_executor_worker() {
+            // Shutdown may leave this temporary as the last executor owner.
+            // Other workers can depend on this worker returning, so release
+            // the temporary off-worker rather than joining them here.
+            std::thread::spawn(move || drop(executor));
+        }
+    }
+}
+
+impl RootMaintenanceExecutor {
+    fn new<C: ExecutorContext>(
+        inner: std::sync::Weak<ExecutorInner<C>>,
+        root_id: ProjectRootId,
+    ) -> Self {
+        Self {
+            inner: Arc::new(TypedMaintenanceExecutor::<C> { inner, root_id }),
+        }
+    }
+    /// Admits `job` as this root's maintenance and runs it at once on the
+    /// calling thread, with the root's cancellation installed as the current
+    /// job's: `cancellation` gains the root and its bind lifecycle, so a root
+    /// unbinding cancels whatever the job starts at its checkpoints. The
+    /// executor refuses the job, and drops it unrun, under the same rules as
+    /// a maintenance job on a worker: the root is unbound, its folder is
+    /// gone, its actor is not registered or failed, or the token is already
+    /// cancelled. `false` when the executor has shut down; the caller must
+    /// not run the work some other way, which would reactivate a retired
+    /// root.
+    ///
+    /// The data layer's background work is the only caller, and its job only
+    /// hands the work to a pool of its own threads. The job does not wait
+    /// for a worker: a call-graph read waits on a worker for the build or
+    /// refresh it asked for, and the scheduler keeps its last
+    /// `interactive_reserve` general workers from maintenance. When the
+    /// handoff was queued as maintenance, two such reads on a four-worker
+    /// pool (one on a two-worker pool) held exactly the workers the handoff
+    /// waited for, so the build started only after each read had given up.
+    /// `lane` only labels the admission in the log.
+    pub(crate) fn submit_maintenance(
+        &self,
+        request_id: &str,
+        lane: Lane,
+        cancellation: JobCancellation,
+        job: MaintenanceJob,
+    ) -> bool {
+        self.inner
+            .submit_maintenance(request_id, lane, cancellation, job)
+    }
+}
+
+impl<C: ExecutorContext> MaintenanceSubmit for TypedMaintenanceExecutor<C> {
+    fn submit_maintenance(
+        &self,
+        request_id: &str,
+        lane: Lane,
+        cancellation: JobCancellation,
+        job: MaintenanceJob,
+    ) -> bool {
+        let Some(inner) = self.inner.upgrade() else {
+            return false;
+        };
+        // Dropped off-worker if it turns out to be the executor's last owner.
+        let owner = SubmissionExecutor::<C>(Some(Executor::<C> { inner }));
+        let executor = owner.0.as_ref().unwrap();
+        // A root stat can stall on disk I/O; probe it before taking the
+        // scheduler lock, as a queued submission does.
+        let root_exists = executor.maintenance_root_is_dir(&self.root_id);
+        let admitted = {
+            let state = executor.inner.state.lock();
+            state
+                .actors
+                .get(&self.root_id)
+                .filter(|actor| !actor.fatal && !actor.ctx.subc_unbound_quiesced())
+                .map(|actor| {
+                    let token = cancellation
+                        .with_root(self.root_id.as_path())
+                        .with_lifecycle(actor.ctx.subc_lifecycle_admission());
+                    (Arc::clone(&actor.ctx), token)
+                })
+        };
+        let Some((_ctx, token)) = admitted.filter(|_| root_exists) else {
+            log::debug!(
+                "executor refused maintenance: request_id={request_id} lane={lane:?} root={} \
+                 (unbound, missing or unregistered)",
+                self.root_id.as_path().display()
+            );
+            return true;
+        };
+        if token.cancel_requested_before_commit() || !token.mark_running() {
+            return true;
+        }
+        log::debug!(
+            "executor admitted maintenance: request_id={request_id} lane={lane:?} root={}",
+            self.root_id.as_path().display()
+        );
+        let _installed = JobCancellationContextGuard::install(Some(token));
+        let _ = job();
+        true
+    }
+}
+
+impl<C: ExecutorContext> Executor<C> {
+    pub fn new() -> Self {
+        Self::with_config(ExecutorConfig::default())
+    }
+
+    pub fn with_config(config: ExecutorConfig) -> Self {
+        let effective = config.effective();
+        let state = Arc::new(TrackedMutex::new(
+            SchedulerState::<C>::new(effective.clone()),
+            file!(),
+        ));
+        let heavy = Arc::new(HeavySemaphore::new(effective.heavy_permits));
+        let nonrunnable_dispatches = Arc::new(AtomicUsize::new(0));
+        let completed_interactive = Arc::new(AtomicU64::new(0));
+        let completed_maintenance = Arc::new(AtomicU64::new(0));
+        let dispatch_liveness = Arc::new(DispatchLivenessAtomics::new());
+        let (run_tx, run_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let dispatch_loop_liveness = Arc::new(DispatchLoopLiveness::<C>::new(event_rx.clone()));
+
+        let scheduler_event_tx = event_tx.clone();
+        let scheduler_loop_liveness = Arc::clone(&dispatch_loop_liveness);
+        let scheduler_state = Arc::clone(&state);
+        let scheduler_heavy = Arc::clone(&heavy);
+        let scheduler_violations = Arc::clone(&nonrunnable_dispatches);
+        let scheduler_completed_interactive = Arc::clone(&completed_interactive);
+        let scheduler_completed_maintenance = Arc::clone(&completed_maintenance);
+        let scheduler_dispatch_liveness = Arc::clone(&dispatch_liveness);
+        let scheduler_handle = thread::Builder::new()
+            .name("aft-executor-scheduler".to_string())
+            .spawn(move || {
+                scheduler_loop(
+                    scheduler_state,
+                    scheduler_heavy,
+                    run_tx,
+                    scheduler_event_tx,
+                    event_rx,
+                    scheduler_violations,
+                    scheduler_completed_interactive,
+                    scheduler_completed_maintenance,
+                    scheduler_dispatch_liveness,
+                    scheduler_loop_liveness,
+                );
+            })
+            .expect("spawn AFT executor scheduler");
+
+        let mut worker_handles = Vec::with_capacity(effective.total_workers());
+        for worker_id in 0..effective.total_workers() {
+            let worker_rx = run_rx.clone();
+            // Workers run every tool call, including tree-sitter walks over
+            // whatever a URL or file turns out to contain. The standalone loop
+            // runs those on the 8 MiB main thread; the 2 MiB default for spawned
+            // threads let a deep parse tree abort the whole daemon while the same
+            // request succeeded standalone. Match the main thread.
+            let handle = thread::Builder::new()
+                .name(format!("aft-executor-worker-{worker_id}"))
+                .stack_size(EXECUTOR_WORKER_STACK_BYTES)
+                .spawn(move || worker_loop(worker_rx))
+                .expect("spawn AFT executor worker");
+            worker_handles.push(handle);
+        }
+
+        Self {
+            inner: Arc::new(ExecutorInner::<C> {
+                state,
+                event_tx,
+                scheduler_handle: Mutex::new(Some(scheduler_handle)),
+                worker_handles: Mutex::new(worker_handles),
+                config: effective,
+                nonrunnable_dispatches,
+                completed_interactive,
+                completed_maintenance,
+                dispatch_liveness,
+                dispatch_loop_liveness,
+                #[cfg(any(test, feature = "test-support"))]
+                maintenance_root_check_hook: Mutex::new(None),
+            }),
+        }
+    }
+
+    /// Register an actor if one is not already present.
+    ///
+    /// Existing actors keep their current context and scheduler state; subc
+    /// routing reuses them and reconfigures through the Mutating lane
+    /// rather than replacing the per-root [`ExecutorContext`]. Returns `true` when a
+    /// new actor was inserted.
+    pub fn register_actor(&self, root_id: ProjectRootId, ctx: Arc<C>) -> bool {
+        ctx.bind_status_context();
+        let maintenance =
+            RootMaintenanceExecutor::new(Arc::downgrade(&self.inner), root_id.clone());
+        let memory_root = root_id.as_path().to_path_buf();
+        let inserted = {
+            let mut state = self.inner.state.lock();
+            if state.actors.contains_key(&root_id) {
+                false
+            } else {
+                state.actor_order.push(root_id.clone());
+                state
+                    .actors
+                    .insert(root_id, ActorState::<C>::new(Arc::clone(&ctx)));
+                true
+            }
+        };
+        if inserted {
+            ctx.install_callgraph_executor(maintenance);
+            let app = ctx.app();
+            crate::cache_location::markers::register_live_scope(&ctx.storage_dir(), &memory_root);
+            app.register_memory_context(memory_root, &ctx);
+            app.actor_root_registered();
+        }
+        self.wake_scheduler();
+        inserted
+    }
+
+    /// Remove an actor from scheduler state.
+    ///
+    /// This is intentionally minimal: subc uses it only for a just-created
+    /// RouteBind actor whose configure failed before any route was installed, so
+    /// there is no in-flight work to quiesce. The removed [`ExecutorContext`] is
+    /// dropped after releasing the scheduler lock so watcher/LSP teardown never
+    /// runs under that mutex.
+    pub fn remove_actor(&self, root_id: &ProjectRootId) {
+        let removed = {
+            let mut state = self.inner.state.lock();
+            state.actor_order.retain(|actor_root| actor_root != root_id);
+            state.actors.remove(root_id)
+        };
+        if let Some(actor) = removed.as_ref() {
+            let app = actor.ctx.app();
+            crate::cache_location::markers::unregister_live_scope(
+                &actor.ctx.storage_dir(),
+                root_id.as_path(),
+            );
+            app.unregister_memory_context(root_id.as_path(), &actor.ctx);
+            app.actor_root_unregistered();
+        }
+        drop(removed);
+        self.wake_scheduler();
+    }
+
+    /// Return true only when the actor has no queued or running executor work.
+    pub fn actor_is_idle(&self, root_id: &ProjectRootId) -> bool {
+        let state = self.inner.state.lock();
+        state
+            .actors
+            .get(root_id)
+            .is_some_and(ActorState::<C>::is_idle)
+    }
+
+    /// Idle probe for maintenance sweeps that waits at most
+    /// [`SCHEDULER_PROBE_WAIT`] for the scheduler lock. A contended scheduler
+    /// is reported separately so root retirement can conservatively wait for
+    /// the next sweep without stalling the module loop.
+    pub fn try_actor_is_idle(&self, root_id: &ProjectRootId) -> Option<bool> {
+        let state = self.inner.state.try_lock_for(SCHEDULER_PROBE_WAIT)?;
+        Some(
+            state
+                .actors
+                .get(root_id)
+                .is_some_and(ActorState::<C>::is_idle),
+        )
+    }
+
+    /// Forget an idle actor and drop its root-scoped registries off the scheduler
+    /// thread. This is reserved for roots whose project directory no longer
+    /// exists; retained existing roots are reused on a later bind.
+    pub fn retire_idle_actor_in_background(&self, root_id: &ProjectRootId) -> bool {
+        let removed = {
+            let mut state = self.inner.state.lock();
+            if !state
+                .actors
+                .get(root_id)
+                .is_some_and(ActorState::<C>::is_idle)
+            {
+                return false;
+            }
+            state.actor_order.retain(|actor_root| actor_root != root_id);
+            state.actors.remove(root_id)
+        };
+        self.finish_idle_actor_retirement(root_id, removed)
+    }
+
+    /// [`Self::retire_idle_actor_in_background`] for the subc frame loop:
+    /// `None` when the scheduler lock stays contended past
+    /// [`SCHEDULER_PROBE_WAIT`], so the caller retries on its next sweep.
+    pub fn try_retire_idle_actor_in_background(&self, root_id: &ProjectRootId) -> Option<bool> {
+        let removed = {
+            let mut state = self.inner.state.try_lock_for(SCHEDULER_PROBE_WAIT)?;
+            if !state
+                .actors
+                .get(root_id)
+                .is_some_and(ActorState::<C>::is_idle)
+            {
+                return Some(false);
+            }
+            state.actor_order.retain(|actor_root| actor_root != root_id);
+            state.actors.remove(root_id)
+        };
+        Some(self.finish_idle_actor_retirement(root_id, removed))
+    }
+
+    fn finish_idle_actor_retirement(
+        &self,
+        root_id: &ProjectRootId,
+        removed: Option<ActorState<C>>,
+    ) -> bool {
+        let Some(actor) = removed else {
+            return false;
+        };
+        let app = actor.ctx.app();
+        crate::cache_location::markers::unregister_live_scope(
+            &actor.ctx.storage_dir(),
+            root_id.as_path(),
+        );
+        app.unregister_memory_context(root_id.as_path(), &actor.ctx);
+        app.actor_root_unregistered();
+        std::thread::spawn(move || {
+            actor.ctx.teardown_deleted_root();
+            drop(actor);
+        });
+        self.wake_scheduler();
+        true
+    }
+
+    /// Cancel maintenance jobs that have not started for one retained actor.
+    ///
+    /// Interactive work and already-running maintenance remain untouched. Each
+    /// cancelled job receives a normal completion so its caller can settle
+    /// bookkeeping through the same path as an executed job.
+    pub fn cancel_queued_maintenance(&self, root_id: &ProjectRootId) -> usize {
+        let cancelled = {
+            let mut state = self.inner.state.lock();
+            state
+                .actors
+                .get_mut(root_id)
+                .map(|actor| actor.maintenance.cancel_queued_jobs())
+                .unwrap_or(0)
+        };
+        if cancelled > 0 {
+            self.wake_scheduler();
+        }
+        cancelled
+    }
+
+    /// When a root becomes unbound, cancel queued maintenance and metadata.
+    /// Started provider commits retain their result. Running maintenance checks
+    /// at checkpoints whether the root stayed unbound past the abandonment grace.
+    pub(crate) fn cancel_queued_root_maintenance(&self, root_id: &ProjectRootId) -> usize {
+        let cancelled = self
+            .inner
+            .state
+            .lock()
+            .actors
+            .get_mut(root_id)
+            .map(ActorState::<C>::cancel_queued_root_work)
+            .unwrap_or(0);
+        self.wake_scheduler();
+        cancelled
+    }
+
+    /// Cancel queued maintenance and signal running root work at its checkpoints.
+    /// Interactive tools other than inspect retain their normal completion path.
+    pub(crate) fn cancel_root_maintenance(&self, root_id: &ProjectRootId) -> usize {
+        let mut state = self.inner.state.lock();
+        let mut cancelled = state
+            .actors
+            .get_mut(root_id)
+            .map(ActorState::<C>::cancel_queued_root_work)
+            .unwrap_or(0);
+        if let Some(actor) = state.actors.get_mut(root_id) {
+            for lane in ALL_LANES {
+                for job in actor
+                    .interactive
+                    .queue(lane)
+                    .iter()
+                    .filter(|job| job.command == "inspect")
+                {
+                    if let Some(token) = &job.cancellation {
+                        token.request_cancel();
+                        cancelled += 1;
+                    }
+                }
+            }
+        }
+        for job in state.running_jobs.values() {
+            if &job.root_id == root_id
+                && (job.job_class == JobClass::Maintenance || job.command == "inspect")
+            {
+                if let Some(token) = &job.cancellation {
+                    token.request_cancel();
+                    cancelled += 1;
+                }
+            }
+        }
+        drop(state);
+        self.wake_scheduler();
+        cancelled
+    }
+
+    /// Return whether scheduler state currently has an actor for this root.
+    pub fn actor_registered(&self, root_id: &ProjectRootId) -> bool {
+        let state = self.inner.state.lock();
+        state.actors.contains_key(root_id)
+    }
+
+    /// Snapshot one actor context without retaining the scheduler lock while
+    /// maintenance drops root-scoped resources.
+    pub fn actor_context(&self, root_id: &ProjectRootId) -> Option<Arc<C>> {
+        let state = self.inner.state.lock();
+        state
+            .actors
+            .get(root_id)
+            .map(|actor| Arc::clone(&actor.ctx))
+    }
+
+    pub(crate) fn scheduler_lock_diagnostics(&self) -> Arc<LockDiagnostics> {
+        self.inner.state.diagnostics()
+    }
+
+    /// [`Self::actor_context`] waiting at most [`SCHEDULER_PROBE_WAIT`] for
+    /// the scheduler lock: the outer `None` means it stayed contended. The subc frame
+    /// loop's maintenance sweeps use this and retry on the next sweep. Request
+    /// routing keeps the blocking form, because there a missing actor and a
+    /// busy scheduler mean different things.
+    pub fn try_actor_context(&self, root_id: &ProjectRootId) -> Option<Option<Arc<C>>> {
+        let state = self.inner.state.try_lock_for(SCHEDULER_PROBE_WAIT)?;
+        Some(
+            state
+                .actors
+                .get(root_id)
+                .map(|actor| Arc::clone(&actor.ctx)),
+        )
+    }
+
+    /// Hold the scheduler state lock for the duration of `while_held`, so a
+    /// test can prove a caller does not wait for it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn hold_state_lock_for_test(&self, while_held: impl FnOnce()) {
+        let _held = self.inner.state.lock();
+        while_held();
+    }
+
+    /// Snapshot the registered actor contexts.
+    ///
+    /// The returned [`Arc`]s keep contexts alive after the scheduler lock is
+    /// released, so callers can run teardown without holding executor state.
+    pub fn actor_contexts(&self) -> Vec<Arc<C>> {
+        let state = self.inner.state.lock();
+        state
+            .actors
+            .values()
+            .map(|actor_state| Arc::clone(&actor_state.ctx))
+            .collect()
+    }
+
+    /// Snapshot the registered root ids paired with their actor contexts.
+    pub fn actor_entries(&self) -> Vec<(ProjectRootId, Arc<C>)> {
+        let state = self.inner.state.lock();
+        state
+            .actors
+            .iter()
+            .map(|(root_id, actor_state)| (root_id.clone(), Arc::clone(&actor_state.ctx)))
+            .collect()
+    }
+
+    /// Non-blocking variant for the health path: the probe reply must stay
+    /// cheap under any load, so it skips the actor list (reported as busy)
+    /// rather than waiting on the scheduler state lock.
+    pub fn try_actor_entries(&self) -> Option<Vec<(ProjectRootId, Arc<C>)>> {
+        let state = self.inner.state.try_lock()?;
+        Some(
+            state
+                .actors
+                .iter()
+                .map(|(root_id, actor_state)| (root_id.clone(), Arc::clone(&actor_state.ctx)))
+                .collect(),
+        )
+    }
+
+    /// Registered actor count under the scheduler lock. Tests that assert a
+    /// bind had no actor side effect use this rather than the try-lock form,
+    /// which reports contention (`None`) instead of a count.
+    pub fn actor_count(&self) -> usize {
+        self.inner.state.lock().actors.len()
+    }
+
+    /// Constant-time scheduler contention signal for the health reply path.
+    pub fn try_actor_count(&self) -> Option<usize> {
+        self.inner.state.try_lock().map(|state| state.actors.len())
+    }
+
+    pub fn submit(
+        &self,
+        root_id: ProjectRootId,
+        lane: Lane,
+        request_id: String,
+        job: ExecutorJob<C>,
+    ) -> CompletionHandle {
+        let (completion_tx, completion_rx) = crossbeam_channel::bounded(1);
+        self.submit_with_completion(
+            root_id,
+            JobClass::Interactive,
+            lane,
+            request_id,
+            job,
+            CompletionSender::Sync(completion_tx),
+        );
+        CompletionHandle { rx: completion_rx }
+    }
+
+    pub fn submit_async(
+        &self,
+        root_id: ProjectRootId,
+        lane: Lane,
+        request_id: String,
+        job: ExecutorJob<C>,
+    ) -> oneshot::Receiver<Response> {
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.submit_with_completion(
+            root_id,
+            JobClass::Interactive,
+            lane,
+            request_id,
+            job,
+            CompletionSender::Async(completion_tx),
+        );
+        completion_rx
+    }
+
+    /// Submit an interactive job with an exact-job cancellation token.
+    ///
+    /// The returned token cancels THIS job only (queued: removed and settled
+    /// with `request_cancelled`; running: signalled cooperatively). The job
+    /// observes the token via [`current_job_cancellation`].
+    pub fn submit_cancellable_async(
+        &self,
+        root_id: ProjectRootId,
+        lane: Lane,
+        request_id: String,
+        job: ExecutorJob<C>,
+    ) -> (oneshot::Receiver<Response>, JobCancellation) {
+        let cancellation = JobCancellation::new();
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.submit_with_completion_cancellable(
+            root_id,
+            JobClass::Interactive,
+            lane,
+            request_id,
+            job,
+            CompletionSender::Async(completion_tx),
+            Some(cancellation.clone()),
+            None,
+            None,
+        );
+        (completion_rx, cancellation)
+    }
+
+    /// [`Executor::submit_cancellable_async`] for a tool call: the job is
+    /// labelled with the tool's name, so the census and the blockers a
+    /// waiting bind reports say which tool a long-running job is running.
+    pub fn submit_tool_call_cancellable_async(
+        &self,
+        root_id: ProjectRootId,
+        lane: Lane,
+        request_id: String,
+        tool: &str,
+        job: ExecutorJob<C>,
+    ) -> (oneshot::Receiver<Response>, JobCancellation) {
+        let cancellation = JobCancellation::new();
+        let completion_rx = self.submit_tool_call_with_cancellation_async(
+            root_id,
+            lane,
+            request_id,
+            tool,
+            job,
+            cancellation.clone(),
+        );
+        (completion_rx, cancellation)
+    }
+
+    /// Allows a receipt deadline to cancel admission even while submission is
+    /// waiting for the scheduler state lock on a blocking worker.
+    pub(crate) fn submit_tool_call_with_cancellation_async(
+        &self,
+        root_id: ProjectRootId,
+        lane: Lane,
+        request_id: String,
+        tool: &str,
+        job: ExecutorJob<C>,
+        cancellation: JobCancellation,
+    ) -> oneshot::Receiver<Response> {
+        // Checkout callgraph views rebuild as Maintenance/HeavyInit jobs.
+        // Admit their tool reads as PureRead so a one-permit pool can answer
+        // Building while the rebuild owns the heavy permit.
+        let lane = if lane == Lane::HeavyInit
+            && matches!(
+                tool,
+                "callgraph"
+                    | "callers"
+                    | "call_tree"
+                    | "impact"
+                    | "trace_to"
+                    | "trace_to_symbol"
+                    | "trace_data"
+            )
+            && self.actor_context(&root_id).is_some_and(|_ctx| false)
+        {
+            Lane::PureRead
+        } else {
+            lane
+        };
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.submit_labeled(
+            root_id,
+            JobClass::Interactive,
+            lane,
+            request_id,
+            tool.to_string(),
+            job,
+            CompletionSender::Async(completion_tx),
+            Some(cancellation.clone()),
+            None,
+            None,
+        );
+        completion_rx
+    }
+
+    /// Submit a route-bind configure (a request id starting `subc-bind-`)
+    /// that may run more than once, with an exact-job cancellation token.
+    ///
+    /// Unlike [`Executor::submit_cancellable_async`], the scheduler may admit
+    /// it beside a running maintenance job or readers of its actor with only a
+    /// shared hold on the epoch gate; see [`request_exclusive_rerun`] for how a run
+    /// that must change the root hands its worker back.
+    pub fn submit_bind_cancellable_async(
+        &self,
+        root_id: ProjectRootId,
+        request_id: String,
+        job: RepeatableJob<C>,
+    ) -> (oneshot::Receiver<Response>, JobCancellation) {
+        debug_assert!(is_configure_request(&request_id));
+        let cancellation = JobCancellation::new();
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let first_run = Arc::clone(&job);
+        self.submit_with_completion_cancellable(
+            root_id,
+            JobClass::Interactive,
+            Lane::Mutating,
+            request_id,
+            Box::new(move |ctx| first_run(ctx)),
+            CompletionSender::Async(completion_tx),
+            Some(cancellation.clone()),
+            None,
+            Some(job),
+        );
+        (completion_rx, cancellation)
+    }
+
+    /// Cancel one exact job by its token.
+    ///
+    /// Queued jobs are removed and settled immediately; running jobs are
+    /// signalled and return through their normal completion path at the next
+    /// cooperative checkpoint. Jobs that sealed their commit finish normally.
+    pub fn cancel_job(&self, root_id: &ProjectRootId, token: &JobCancellation) -> JobCancelOutcome {
+        // Signal BEFORE actor lookup, deliberately: a job whose actor was
+        // already torn down (fatal teardown, root removal) must still abort at
+        // its next checkpoint, so the token is cancelled regardless. The
+        // outcome must then reflect what the signal actually did — reporting
+        // NotFound for a token that was RUNNING at signal time would mislead
+        // the caller into treating a signalled job as nonexistent.
+        let observed = token.signal_cancel();
+        let (outcome, settled) = {
+            let mut state = self.inner.state.lock();
+            let Some(actor) = state.actors.get_mut(root_id) else {
+                return match observed {
+                    JOB_CANCEL_STATE_COMMITTED => JobCancelOutcome::RunningCommitted,
+                    JOB_CANCEL_STATE_RUNNING | JOB_CANCEL_STATE_PENDING => {
+                        JobCancelOutcome::RunningSignalled
+                    }
+                    _ => JobCancelOutcome::NotFound,
+                };
+            };
+            match actor.remove_queued_cancellable(token) {
+                Some(queued) => (JobCancelOutcome::QueuedRemoved, Some(queued)),
+                None => match observed {
+                    // The seal won the race: the job commits and finishes.
+                    JOB_CANCEL_STATE_COMMITTED => (JobCancelOutcome::RunningCommitted, None),
+                    // RUNNING at signal time, or PENDING at signal time but
+                    // dispatched before we took the scheduler lock: either way
+                    // the job aborts at its next checkpoint.
+                    JOB_CANCEL_STATE_RUNNING | JOB_CANCEL_STATE_PENDING => {
+                        (JobCancelOutcome::RunningSignalled, None)
+                    }
+                    // Already cancelled by an earlier call and no longer queued.
+                    _ => (JobCancelOutcome::NotFound, None),
+                },
+            }
+        };
+        if let Some(queued) = settled {
+            queued.completion.send(Response::error(
+                queued.request_id,
+                "request_cancelled",
+                "request cancelled before execution",
+            ));
+            self.wake_scheduler();
+        }
+        outcome
+    }
+
+    /// Cancel a route job only while its command closure has not started.
+    ///
+    /// Detaching a route must discard work that cannot produce a live reply,
+    /// while a command already executing remains eligible for session replay.
+    /// A dispatched job may already reserve scheduler capacity; its worker sees
+    /// the cancelled token before invoking the closure and releases that
+    /// reservation through the normal completion event.
+    pub(crate) fn cancel_job_before_execution(
+        &self,
+        root_id: &ProjectRootId,
+        token: &JobCancellation,
+    ) -> PreExecutionCancelOutcome {
+        let (outcome, settled) = {
+            let mut state = self.inner.state.lock();
+            if !token.try_cancel_before_running() {
+                return PreExecutionCancelOutcome::AlreadyStarted;
+            }
+            let settled = state
+                .actors
+                .get_mut(root_id)
+                .and_then(|actor| actor.remove_queued_cancellable(token));
+            let outcome = if settled.is_some() {
+                PreExecutionCancelOutcome::QueuedRemoved
+            } else {
+                PreExecutionCancelOutcome::DispatchedCancelled
+            };
+            (outcome, settled)
+        };
+        if let Some(queued) = settled {
+            queued.completion.send(Response::error(
+                queued.request_id,
+                "request_cancelled",
+                "request cancelled before execution",
+            ));
+            self.wake_scheduler();
+        }
+        outcome
+    }
+
+    pub fn submit_maintenance_async(
+        &self,
+        root_id: ProjectRootId,
+        lane: Lane,
+        request_id: String,
+        job: ExecutorJob<C>,
+    ) -> oneshot::Receiver<Response> {
+        self.submit_maintenance_async_with_key(root_id, lane, request_id, job, None)
+    }
+
+    /// Final persistence is allowed after unbind so TTL eviction does not lose
+    /// retained deltas. This exception does not admit indexing or refresh work.
+    pub(crate) fn submit_unbound_teardown_async(
+        &self,
+        root_id: ProjectRootId,
+        request_id: String,
+        job: ExecutorJob<C>,
+    ) -> oneshot::Receiver<Response> {
+        let (tx, rx) = oneshot::channel();
+        self.submit_labeled(
+            root_id,
+            JobClass::Maintenance,
+            Lane::MaintenanceCommit,
+            request_id,
+            "unbound-teardown-persist".to_owned(),
+            job,
+            CompletionSender::Async(tx),
+            None,
+            None,
+            None,
+        );
+        rx
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn submit_maintenance_cancellable_async(
+        &self,
+        root_id: ProjectRootId,
+        lane: Lane,
+        request_id: String,
+        job: ExecutorJob<C>,
+    ) -> (oneshot::Receiver<Response>, JobCancellation) {
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let cancellation = JobCancellation::new();
+        self.submit_with_completion_cancellable(
+            root_id,
+            JobClass::Maintenance,
+            lane,
+            request_id,
+            job,
+            CompletionSender::Async(completion_tx),
+            Some(cancellation.clone()),
+            None,
+            None,
+        );
+        (completion_rx, cancellation)
+    }
+
+    pub(crate) fn submit_coalescable_maintenance_async(
+        &self,
+        root_id: ProjectRootId,
+        lane: Lane,
+        request_id: String,
+        coalesce_key: MaintenanceCoalesceKey,
+        job: ExecutorJob<C>,
+    ) -> oneshot::Receiver<Response> {
+        self.submit_maintenance_async_with_key(root_id, lane, request_id, job, Some(coalesce_key))
+    }
+
+    fn submit_maintenance_async_with_key(
+        &self,
+        root_id: ProjectRootId,
+        lane: Lane,
+        request_id: String,
+        job: ExecutorJob<C>,
+        coalesce_key: Option<MaintenanceCoalesceKey>,
+    ) -> oneshot::Receiver<Response> {
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.submit_with_completion_cancellable(
+            root_id,
+            JobClass::Maintenance,
+            lane,
+            request_id,
+            job,
+            CompletionSender::Async(completion_tx),
+            None,
+            coalesce_key,
+            None,
+        );
+        completion_rx
+    }
+
+    fn submit_with_completion(
+        &self,
+        root_id: ProjectRootId,
+        job_class: JobClass,
+        lane: Lane,
+        request_id: String,
+        job: ExecutorJob<C>,
+        completion: CompletionSender,
+    ) {
+        self.submit_with_completion_cancellable(
+            root_id, job_class, lane, request_id, job, completion, None, None, None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_with_completion_cancellable(
+        &self,
+        root_id: ProjectRootId,
+        job_class: JobClass,
+        lane: Lane,
+        request_id: String,
+        job: ExecutorJob<C>,
+        completion: CompletionSender,
+        cancellation: Option<JobCancellation>,
+        maintenance_coalesce_key: Option<MaintenanceCoalesceKey>,
+        rerun: Option<RepeatableJob<C>>,
+    ) {
+        // Final LSP receipts must drain after the last route closes, even
+        // though configure, watcher and indexing maintenance are suspended.
+        let command = if job_class == JobClass::Maintenance
+            && maintenance_coalesce_key == Some(MaintenanceCoalesceKey::LspDrain)
+        {
+            "lsp-event-drain".to_owned()
+        } else {
+            job_command(job_class, lane)
+        };
+        self.submit_labeled(
+            root_id,
+            job_class,
+            lane,
+            request_id,
+            command,
+            job,
+            completion,
+            cancellation,
+            maintenance_coalesce_key,
+            rerun,
+        );
+    }
+
+    /// Queue one job. `command` is the label census, blocker and panic lines
+    /// show for it.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_labeled(
+        &self,
+        root_id: ProjectRootId,
+        job_class: JobClass,
+        lane: Lane,
+        request_id: String,
+        command: String,
+        job: ExecutorJob<C>,
+        completion: CompletionSender,
+        cancellation: Option<JobCancellation>,
+        maintenance_coalesce_key: Option<MaintenanceCoalesceKey>,
+        rerun: Option<RepeatableJob<C>>,
+    ) {
+        let cancellation = if job_class == JobClass::Maintenance
+            || command == "inspect"
+            || lane == Lane::ProviderMetadata
+        {
+            Some(cancellation.unwrap_or_else(JobCancellation::new))
+        } else {
+            cancellation
+        };
+        let mut cancellation = cancellation.map(|token| token.with_root(root_id.as_path()));
+        let mut rerun = rerun;
+        let mut job = Some(job);
+        let mut completion = Some(completion);
+        let mut duplicate_victims = Vec::new();
+
+        // A root stat can stall on disk I/O. Probe before taking the shared
+        // scheduler lock; execution checks again if the root disappears later.
+        let maintenance_root_exists =
+            job_class != JobClass::Maintenance || self.maintenance_root_is_dir(&root_id);
+        let response = {
+            let mut state = self.inner.state.lock();
+            match state.actors.get_mut(&root_id) {
+                Some(actor) if actor.fatal => Some(actor_fatal_response(request_id.clone())),
+                Some(actor) => {
+                    // Validate the sampled configure generation against the bound
+                    // root under its lifecycle lock. A separate bound check and
+                    // later sample could let an older request use a rebind's generation.
+                    let provider_generation = if lane == Lane::ProviderMetadata {
+                        let generation = actor.ctx.configure_generation();
+                        actor
+                            .ctx
+                            .run_if_subc_bound_generation(generation, || generation)
+                    } else {
+                        None
+                    };
+                    if (job_class == JobClass::Maintenance
+                        || command == "inspect"
+                        || lane == Lane::ProviderMetadata)
+                        && !maintenance_allowed_while_unbound(&command)
+                    {
+                        cancellation = cancellation.map(|token| {
+                            token.with_lifecycle(actor.ctx.subc_lifecycle_admission())
+                        });
+                    }
+                    let mut admission_error = None;
+                    if lane == Lane::CallLedger && job_class != JobClass::Interactive {
+                        admission_error = Some(Response::error(
+                            request_id.clone(),
+                            "invalid_lane",
+                            "call ledger work requires interactive admission",
+                        ));
+                    }
+                    if lane == Lane::ProviderMetadata {
+                        if job_class != JobClass::Interactive {
+                            admission_error = Some(Response::error(
+                                request_id.clone(),
+                                "invalid_lane",
+                                "provider metadata requires interactive admission",
+                            ));
+                        } else if provider_generation.is_none() {
+                            admission_error = Some(Response::error(
+                                request_id.clone(),
+                                "request_cancelled",
+                                "provider metadata root is unbound",
+                            ));
+                        }
+                    }
+                    if job_class == JobClass::Maintenance {
+                        if (actor.ctx.subc_unbound_quiesced()
+                            && !maintenance_allowed_while_unbound(&command))
+                            || !maintenance_root_exists
+                        {
+                            admission_error = Some(maintenance_cancelled_response(
+                                request_id.clone(),
+                                "maintenance root is unbound or missing",
+                            ));
+                        } else if maintenance_coalesce_key
+                            .is_some_and(|key| actor.maintenance.has_maintenance_coalesce_key(key))
+                        {
+                            admission_error = Some(maintenance_cancelled_response(
+                                request_id.clone(),
+                                "maintenance drain coalesced behind an identical queued drain",
+                            ));
+                        } else {
+                            if actor.maintenance.queued_count() >= MAINTENANCE_QUEUE_CAP {
+                                duplicate_victims =
+                                    actor.maintenance.remove_duplicate_maintenance_jobs();
+                            }
+                            if actor.maintenance.queued_count() >= MAINTENANCE_QUEUE_CAP {
+                                admission_error =
+                                    Some(maintenance_backpressure_response(request_id.clone()));
+                            }
+                        }
+                    }
+
+                    if admission_error.is_none() {
+                        actor.push_job(
+                            job_class,
+                            lane,
+                            QueuedJob::<C> {
+                                job: job.take().expect("executor job already queued"),
+                                completion: completion
+                                    .take()
+                                    .expect("executor completion already queued"),
+                                request_id: request_id.clone(),
+                                command,
+                                queued_at: Instant::now(),
+                                cancellation: cancellation.clone(),
+                                maintenance_coalesce_key,
+                                rerun: rerun.take(),
+                                force_exclusive: false,
+                                not_before: None,
+                                exclusive_attempts: 0,
+                                provider_generation,
+                            },
+                        );
+                    }
+                    admission_error
+                }
+                None => Some(Response::error(
+                    request_id.clone(),
+                    "actor_not_registered",
+                    "executor actor is not registered",
+                )),
+            }
+        };
+
+        for victim in duplicate_victims {
+            victim.completion.send(maintenance_cancelled_response(
+                victim.request_id,
+                "duplicate maintenance drain removed to preserve queue capacity",
+            ));
+        }
+
+        if let Some(response) = response {
+            if let Some(completion) = completion {
+                completion.send(response);
+            }
+            return;
+        }
+
+        self.wake_scheduler();
+    }
+
+    fn maintenance_root_is_dir(&self, root_id: &ProjectRootId) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let hook = self.inner.maintenance_root_check_hook.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        root_id.as_path().is_dir()
+    }
+
+    /// Workers not running a job right now, for tests that assert nothing
+    /// holds a worker while it waits.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn idle_workers_for_test(&self) -> usize {
+        self.inner.state.lock().idle_workers
+    }
+
+    /// Number of workers reserved for provider metadata, so tests can distinguish
+    /// those idle workers from the separate bind reservation.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn provider_reserve_for_test(&self) -> usize {
+        self.inner.config.provider_reserve
+    }
+
+    pub fn pool_size(&self) -> usize {
+        self.inner.config.pool_size
+    }
+
+    pub fn actor_cap(&self) -> usize {
+        self.inner.config.actor_cap
+    }
+
+    pub fn read_cap(&self) -> usize {
+        self.inner.config.read_cap
+    }
+
+    pub fn heavy_permits(&self) -> usize {
+        self.inner.config.heavy_permits
+    }
+
+    pub fn interactive_reserve(&self) -> usize {
+        self.inner.config.interactive_reserve
+    }
+
+    pub fn maintenance_cap(&self) -> usize {
+        self.inner.config.maintenance_cap
+    }
+
+    pub fn try_dispatch_liveness_snapshot(&self) -> Option<DispatchLivenessSnapshot> {
+        Some(self.inner.dispatch_liveness.snapshot(&self.inner.config))
+    }
+
+    /// In-memory read-job identities for management attribution; contention stays unknown.
+    pub(crate) fn try_running_read_requests(&self) -> Option<HashSet<String>> {
+        self.inner.state.try_lock().map(|state| {
+            state
+                .running_jobs
+                .values()
+                .filter(|job| {
+                    matches!(job.lane, Lane::PureRead | Lane::SerialLspStatus)
+                        && job.execution_started.load(Ordering::Acquire)
+                })
+                .map(|job| job.request_id.clone())
+                .collect()
+        })
+    }
+
+    pub fn try_mutating_lane_snapshots(&self) -> Option<Vec<MutatingLaneSnapshot>> {
+        self.inner
+            .state
+            .try_lock()
+            .map(|state| state.mutating_lane_snapshots())
+    }
+
+    pub(crate) fn try_root_job_snapshots(
+        &self,
+        root_id: &ProjectRootId,
+        current: Option<&JobCancellation>,
+    ) -> Option<Vec<RootJobSnapshot>> {
+        let state = self.inner.state.try_lock()?;
+        let now = Instant::now();
+        let mut jobs = state
+            .running_jobs
+            .iter()
+            .filter(|(_, job)| &job.root_id == root_id)
+            .map(|(job_id, job)| RootJobSnapshot {
+                job_id: *job_id,
+                request_id: job.request_id.clone(),
+                command: job.command.clone(),
+                lane: job.lane,
+                started_age_ms: duration_millis_u64(now.saturating_duration_since(job.started_at)),
+                execution_started: job.execution_started.load(Ordering::Acquire),
+                is_current: current.is_some_and(|current| {
+                    job.cancellation
+                        .as_ref()
+                        .is_some_and(|token| token.same_token(current))
+                }),
+            })
+            .collect::<Vec<_>>();
+        jobs.sort_by_key(|job| job.job_id);
+        Some(jobs)
+    }
+
+    pub fn try_mutating_job_state_label(
+        &self,
+        root_id: &ProjectRootId,
+        request_id: &str,
+    ) -> Option<&'static str> {
+        self.inner
+            .state
+            .try_lock()
+            .map(|state| state.mutating_job_state_label(root_id, request_id))
+    }
+
+    /// The lane in which a job with this request id is queued on `root_id`,
+    /// for tests that hold a lane and must see the job wait behind it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn queued_lane_for_test(
+        &self,
+        root_id: &ProjectRootId,
+        request_id: &str,
+    ) -> Option<Lane> {
+        let state = self.inner.state.lock();
+        let actor = state.actors.get(root_id)?;
+        for queues in [&actor.interactive, &actor.maintenance] {
+            for lane in ALL_LANES {
+                if queues
+                    .queue(lane)
+                    .iter()
+                    .any(|job| job.request_id == request_id)
+                {
+                    return Some(lane);
+                }
+            }
+        }
+        None
+    }
+
+    /// Snapshot RouteBind blockers, waiting for the scheduler lock if it is
+    /// held. The module's bind-deadline refusal uses it to name what held the
+    /// bind; it takes the same lock right after to cancel the bind, so
+    /// waiting here costs nothing extra.
+    pub fn bind_blocker_snapshot(
+        &self,
+        root_id: &ProjectRootId,
+        request_id: &str,
+    ) -> BindBlockerSnapshot {
+        self.inner
+            .state
+            .lock()
+            .bind_blocker_snapshot(root_id, request_id)
+    }
+
+    /// Snapshot RouteBind blockers without waiting on scheduler state. The subc
+    /// health path uses this only for a delayed-bind breadcrumb, so contention
+    /// is reported as scheduler busy rather than delaying the transport loop.
+    pub fn try_bind_blocker_snapshot(
+        &self,
+        root_id: &ProjectRootId,
+        request_id: &str,
+    ) -> Option<BindBlockerSnapshot> {
+        self.inner
+            .state
+            .try_lock()
+            .map(|state| state.bind_blocker_snapshot(root_id, request_id))
+    }
+
+    /// Return each over-age interactive occupant once. Marking happens under the
+    /// scheduler lock so repeated transport-loop censuses cannot flood logs while
+    /// the same job remains stuck.
+    pub(crate) fn try_take_long_running_interactive_jobs(
+        &self,
+        minimum_age: Duration,
+    ) -> Option<Vec<LongRunningInteractiveJobSnapshot>> {
+        let now = Instant::now();
+        let mut state = self.inner.state.try_lock()?;
+        let mut snapshots = state
+            .running_jobs
+            .values_mut()
+            .filter_map(|job| {
+                let age = now.saturating_duration_since(job.started_at);
+                if job.job_class != JobClass::Interactive
+                    || job.occupancy_reported
+                    || age < minimum_age
+                {
+                    return None;
+                }
+                job.occupancy_reported = true;
+                Some(LongRunningInteractiveJobSnapshot {
+                    root_id: job.root_id.clone(),
+                    request_id: job.request_id.clone(),
+                    command: job.command.clone(),
+                    lane: job.lane,
+                    age,
+                    execution_started: job.execution_started.load(Ordering::Acquire),
+                })
+            })
+            .collect::<Vec<_>>();
+        snapshots.sort_by(|left, right| {
+            left.root_id
+                .as_path()
+                .cmp(right.root_id.as_path())
+                .then_with(|| left.request_id.cmp(&right.request_id))
+        });
+        Some(snapshots)
+    }
+
+    /// Progress marker of the scheduler loop, for the subc stall watchdog.
+    pub fn dispatch_loop_liveness(&self) -> Arc<DispatchLoopLiveness<C>> {
+        Arc::clone(&self.inner.dispatch_loop_liveness)
+    }
+
+    /// Holds the scheduler state mutex on a helper thread and wakes the
+    /// scheduler, so the scheduler loop receives an event and then blocks on
+    /// the lock: a stalled dispatch loop with pending work. The hold ends when
+    /// `release` receives a message or its sender is dropped.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn hold_dispatch_loop_for_test(&self, release: Receiver<()>) -> JoinHandle<()> {
+        let state = Arc::clone(&self.inner.state);
+        let event_tx = self.inner.event_tx.clone();
+        let (held_tx, held_rx) = crossbeam_channel::bounded(1);
+        let handle = thread::spawn(move || {
+            let _state = state.lock();
+            let _ = event_tx.send(SchedulerEvent::<C>::Wake);
+            let _ = held_tx.send(());
+            let _ = release.recv();
+        });
+        held_rx.recv().expect("dispatch hold thread started");
+        handle
+    }
+
+    pub fn nonrunnable_dispatch_count(&self) -> usize {
+        self.inner.nonrunnable_dispatches.load(Ordering::Acquire)
+    }
+
+    pub fn completion_counts(&self) -> (u64, u64) {
+        (
+            self.inner.completed_interactive.load(Ordering::Relaxed),
+            self.inner.completed_maintenance.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn actor_is_fatal(&self, root_id: &ProjectRootId) -> bool {
+        self.inner
+            .state
+            .lock()
+            .actors
+            .get(root_id)
+            .map(|actor| actor.fatal)
+            .unwrap_or(false)
+    }
+
+    fn wake_scheduler(&self) {
+        let _ = self.inner.event_tx.send(SchedulerEvent::<C>::Wake);
+    }
+}
+
+impl<C: ExecutorContext> Default for Executor<C> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct ExecutorInner<C: ExecutorContext> {
+    state: Arc<TrackedMutex<SchedulerState<C>>>,
+    event_tx: Sender<SchedulerEvent<C>>,
+    scheduler_handle: Mutex<Option<JoinHandle<()>>>,
+    worker_handles: Mutex<Vec<JoinHandle<()>>>,
+    config: EffectiveConfig,
+    nonrunnable_dispatches: Arc<AtomicUsize>,
+    completed_interactive: Arc<AtomicU64>,
+    completed_maintenance: Arc<AtomicU64>,
+    dispatch_liveness: Arc<DispatchLivenessAtomics>,
+    dispatch_loop_liveness: Arc<DispatchLoopLiveness<C>>,
+    #[cfg(any(test, feature = "test-support"))]
+    maintenance_root_check_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl<C: ExecutorContext> Drop for ExecutorInner<C> {
+    fn drop(&mut self) {
+        // Stop maintenance before joining workers. Queued closures must also
+        // release their captured builders instead of surviving a stopped loop.
+        {
+            let mut state = self.state.lock();
+            for job in state.running_jobs.values() {
+                if job.job_class == JobClass::Maintenance {
+                    if let Some(token) = &job.cancellation {
+                        token.request_cancel();
+                    }
+                }
+            }
+            for actor in state.actors.values_mut() {
+                actor.maintenance.cancel_queued_jobs();
+            }
+        }
+        let _ = self.event_tx.send(SchedulerEvent::<C>::Shutdown);
+
+        if let Some(handle) = self.scheduler_handle.lock().take() {
+            if handle.thread().id() != std::thread::current().id() {
+                let _ = handle.join();
+            }
+        }
+
+        let mut workers = self.worker_handles.lock();
+        for handle in workers.drain(..) {
+            // A job can own the last Executor handle. Its worker will exit once
+            // this job returns; joining that same thread would panic.
+            if handle.thread().id() != std::thread::current().id() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+struct SchedulerState<C: ExecutorContext> {
+    actors: HashMap<ProjectRootId, ActorState<C>>,
+    actor_order: Vec<ProjectRootId>,
+    cursor: usize,
+    idle_workers: usize,
+    interactive_inflight: usize,
+    maintenance_inflight: usize,
+    provider_inflight: usize,
+    binds_inflight: usize,
+    config: EffectiveConfig,
+    running_jobs: HashMap<u64, RunningJob>,
+    next_job_id: u64,
+    /// Set when a bind was queued again with a retry time, so the loop knows
+    /// to look for the earliest one and wake for it.
+    bind_retry_pending: bool,
+}
+
+impl<C: ExecutorContext> SchedulerState<C> {
+    fn new(config: EffectiveConfig) -> Self {
+        Self {
+            actors: HashMap::new(),
+            actor_order: Vec::new(),
+            cursor: 0,
+            idle_workers: config.total_workers(),
+            interactive_inflight: 0,
+            maintenance_inflight: 0,
+            provider_inflight: 0,
+            binds_inflight: 0,
+            config,
+            running_jobs: HashMap::new(),
+            next_job_id: 1,
+            bind_retry_pending: false,
+        }
+    }
+
+    /// The earliest time a bind queued with a retry time becomes admissible,
+    /// clearing `bind_retry_pending` once none is left.
+    fn next_bind_retry_at(&mut self) -> Option<Instant> {
+        if !self.bind_retry_pending {
+            return None;
+        }
+        let next = self
+            .actors
+            .values()
+            .flat_map(|actor| actor.interactive.queue(Lane::Mutating).iter())
+            .filter_map(|job| job.not_before)
+            .min();
+        self.bind_retry_pending = next.is_some();
+        next
+    }
+
+    fn dispatch_liveness_snapshot(&self) -> DispatchLivenessSnapshot {
+        self.assert_running_invariants();
+        let now = Instant::now();
+        let (completion_owned_interactive, completion_owned_maintenance) = self
+            .running_jobs
+            .values()
+            .filter(|job| job.completion_ownership.strong_count() > 0)
+            .fold((0, 0), |(interactive, maintenance), job| {
+                match job.job_class {
+                    JobClass::Interactive => (interactive + 1, maintenance),
+                    JobClass::Maintenance => (interactive, maintenance + 1),
+                }
+            });
+        let oldest_worker_owned_maintenance_age_ms = self
+            .running_jobs
+            .values()
+            .filter(|job| {
+                job.job_class == JobClass::Maintenance
+                    && job.completion_ownership.strong_count() > 0
+            })
+            .map(|job| duration_millis_u64(now.saturating_duration_since(job.started_at)))
+            .max();
+        let mut interactive = QueueSnapshotAccumulator::default();
+        let mut maintenance = QueueSnapshotAccumulator::default();
+        for actor in self.actors.values() {
+            interactive.add(actor.class_queues(JobClass::Interactive), now);
+            maintenance.add(actor.class_queues(JobClass::Maintenance), now);
+        }
+
+        DispatchLivenessSnapshot {
+            interactive: interactive.finish(),
+            maintenance: maintenance.finish(),
+            running: DispatchRunningSnapshot {
+                interactive: self.interactive_inflight,
+                maintenance: self.maintenance_inflight,
+                completion_owned_interactive,
+                completion_owned_maintenance,
+                oldest_worker_owned_maintenance_age_ms,
+                phantom_interactive: self
+                    .interactive_inflight
+                    .saturating_sub(completion_owned_interactive),
+                phantom_maintenance: self
+                    .maintenance_inflight
+                    .saturating_sub(completion_owned_maintenance),
+            },
+            phantom_running_maintenance: self
+                .maintenance_inflight
+                .saturating_sub(completion_owned_maintenance),
+            interactive_reserve: self.config.interactive_reserve,
+            maintenance_cap: self.config.maintenance_cap,
+        }
+    }
+
+    fn assert_running_invariants(&self) {
+        let interactive = self
+            .running_jobs
+            .values()
+            .filter(|job| job.job_class == JobClass::Interactive)
+            .count();
+        let maintenance = self
+            .running_jobs
+            .values()
+            .filter(|job| job.job_class == JobClass::Maintenance)
+            .count();
+        debug_assert_eq!(self.interactive_inflight, interactive);
+        debug_assert_eq!(self.maintenance_inflight, maintenance);
+        debug_assert_eq!(
+            self.binds_inflight,
+            self.running_jobs
+                .values()
+                .filter(|job| is_bind_job(job.job_class, job.lane, &job.request_id))
+                .count()
+        );
+        debug_assert_eq!(
+            self.provider_inflight,
+            self.running_jobs
+                .values()
+                .filter(|job| job.lane == Lane::ProviderMetadata)
+                .count()
+        );
+        debug_assert!(self.provider_inflight <= self.config.provider_reserve);
+        debug_assert_eq!(
+            self.idle_workers + self.running_jobs.len(),
+            self.config.total_workers()
+        );
+        debug_assert!(self
+            .running_jobs
+            .values()
+            .all(|job| job.completion_ownership.strong_count() > 0));
+    }
+
+    fn next_job_id(&mut self) -> u64 {
+        let job_id = self.next_job_id;
+        self.next_job_id = self.next_job_id.wrapping_add(1).max(1);
+        job_id
+    }
+
+    fn mutating_lane_snapshots(&self) -> Vec<MutatingLaneSnapshot> {
+        let now = Instant::now();
+        let mut snapshots: Vec<_> = self
+            .actors
+            .iter()
+            .filter_map(|(root_id, actor)| {
+                actor
+                    .mutating_inflight
+                    .as_ref()
+                    .map(|job| MutatingLaneSnapshot {
+                        root_id: root_id.clone(),
+                        request_id: job.request_id.clone(),
+                        command: job.command.clone(),
+                        started_age_ms: duration_millis_u64(
+                            now.saturating_duration_since(job.started_at),
+                        ),
+                    })
+            })
+            .collect();
+        snapshots.sort_by(|left, right| left.root_id.as_path().cmp(right.root_id.as_path()));
+        snapshots
+    }
+
+    /// When the most recently admitted reader still running on `root_id`
+    /// started, for interactive admission (see `next_interactive_lane`).
+    fn newest_in_flight_reader_started_at(&self, root_id: &ProjectRootId) -> Option<Instant> {
+        self.running_jobs
+            .values()
+            .filter(|job| {
+                job.root_id == *root_id
+                    && matches!(job.lane, Lane::PureRead | Lane::SerialLspStatus)
+            })
+            .map(|job| job.started_at)
+            .max()
+    }
+
+    fn mutating_job_state_label(&self, root_id: &ProjectRootId, request_id: &str) -> &'static str {
+        let Some(actor) = self.actors.get(root_id) else {
+            return "actor_missing";
+        };
+        if actor
+            .mutating_inflight
+            .as_ref()
+            .is_some_and(|job| job.request_id == request_id)
+        {
+            return "running";
+        }
+        if actor.has_queued_mutating_job(request_id) {
+            return "queued";
+        }
+        if actor.writer_inflight {
+            return "blocked_by_other_mutating";
+        }
+        "not_found"
+    }
+
+    fn bind_blocker_snapshot(
+        &self,
+        root_id: &ProjectRootId,
+        request_id: &str,
+    ) -> BindBlockerSnapshot {
+        let configure_state = self.mutating_job_state_label(root_id, request_id);
+        let now = Instant::now();
+        let actor = self.actors.get(root_id);
+        let oldest_queued_writer_at = actor.and_then(ActorState::<C>::oldest_queued_writer_at);
+        let oldest_queued_writer_age_ms = oldest_queued_writer_at
+            .map(|queued_at| duration_millis_u64(now.saturating_duration_since(queued_at)));
+        let mut in_flight_readers = self
+            .running_jobs
+            .values()
+            .filter(|job| {
+                job.root_id == *root_id
+                    && matches!(job.lane, Lane::PureRead | Lane::SerialLspStatus)
+            })
+            .map(|job| BindBlockerReaderSnapshot {
+                request_id: job.request_id.clone(),
+                command: job.command.clone(),
+                lane: job.lane,
+                started_age_ms: duration_millis_u64(now.saturating_duration_since(job.started_at)),
+                execution_started: job.execution_started.load(Ordering::Acquire),
+                started_before_oldest_writer: oldest_queued_writer_at
+                    .is_some_and(|queued_at| job.started_at <= queued_at),
+            })
+            .collect::<Vec<_>>();
+        in_flight_readers.sort_by(|left, right| left.request_id.cmp(&right.request_id));
+        // The bind's own configure job can hold the mutating slot while it
+        // runs. It is not a blocker of the bind; reporting it as one would
+        // tell the caller to wait for a different job when the bind's own
+        // configure is what is slow.
+        let in_flight_writer = actor
+            .and_then(|actor| actor.mutating_inflight.as_ref())
+            .filter(|job| job.request_id != request_id)
+            .map(|job| MutatingLaneSnapshot {
+                root_id: root_id.clone(),
+                request_id: job.request_id.clone(),
+                command: job.command.clone(),
+                started_age_ms: duration_millis_u64(now.saturating_duration_since(job.started_at)),
+            });
+
+        let mut blockers = Vec::new();
+        if let Some(actor) = actor {
+            if configure_state == "queued" {
+                let configure_count = actor.pending_configure_count();
+                if configure_count > 0 {
+                    blockers.push(format!("queued_behind_configure({configure_count})"));
+                }
+                if actor.read_inflight > 0 || actor.lsp_inflight {
+                    let zombie_readers = in_flight_readers
+                        .iter()
+                        .filter(|reader| !reader.execution_started)
+                        .map(format_bind_blocker_reader)
+                        .collect::<Vec<_>>();
+                    let stuck_readers = in_flight_readers
+                        .iter()
+                        .filter(|reader| {
+                            reader.execution_started
+                                && reader.started_age_ms
+                                    >= duration_millis_u64(READER_STUCK_CENSUS_AGE)
+                        })
+                        .map(format_bind_blocker_reader)
+                        .collect::<Vec<_>>();
+                    if !zombie_readers.is_empty() {
+                        blockers.push(format!("zombie_reader({})", zombie_readers.join("; ")));
+                    } else if !stuck_readers.is_empty() {
+                        blockers.push(format!(
+                            "waiting_on_readers_stuck({})",
+                            stuck_readers.join("; ")
+                        ));
+                    } else {
+                        blockers.push("waiting_on_readers".to_string());
+                    }
+                }
+            }
+        }
+
+        if configure_state == "queued" {
+            let maintenance: Vec<_> = self
+                .running_jobs
+                .values()
+                .filter(|job| job.job_class == JobClass::Maintenance)
+                .collect();
+            if !maintenance.is_empty() {
+                blockers.push(format!(
+                    "queued_behind_maintenance({})",
+                    format_running_jobs(&maintenance)
+                ));
+            }
+        }
+
+        if let Some(actor) = actor {
+            if configure_state == "queued" && actor.interactive.first_bind_is_forced_exclusive() {
+                blockers.push("rerun_as_exclusive_writer".to_string());
+            }
+            if actor.detached_writers.load(Ordering::Acquire) > 0 {
+                blockers.push("detached_view_publication_writer_waiting".to_string());
+            }
+            // Name the configure-tail stage in progress on this root, so a
+            // bind held up by a long tail unit says which one.
+            if let Some(stage) = actor.ctx.configure_tail_stage_snapshot() {
+                blockers.push(format!("configure_tail_stage({stage})"));
+            }
+        }
+
+        if self.idle_workers == 0 {
+            let running: Vec<_> = self.running_jobs.values().collect();
+            blockers.push(format!(
+                "idle_workers==0({})",
+                format_running_jobs(&running)
+            ));
+        }
+
+        BindBlockerSnapshot {
+            configure_state,
+            configure_phase_timings: actor.map(|actor| actor.ctx.configure_ack_phase_snapshot()),
+            blockers,
+            oldest_queued_writer_age_ms,
+            in_flight_readers,
+            in_flight_writer,
+            reader_admissions_while_promoted_writer_waited: actor
+                .map(|actor| actor.reader_admissions_while_promoted_writer_waited)
+                .unwrap_or(0),
+        }
+    }
+}
+
+fn is_configure_request(request_id: &str) -> bool {
+    request_id.starts_with("subc-bind-")
+}
+
+fn is_bind_job(job_class: JobClass, lane: Lane, request_id: &str) -> bool {
+    job_class == JobClass::Interactive && lane == Lane::Mutating && is_configure_request(request_id)
+}
+
+fn is_callgraph_acquisition(job_class: JobClass, lane: Lane, request_id: &str) -> bool {
+    job_class == JobClass::Maintenance
+        && lane == Lane::HeavyInit
+        && request_id == CALLGRAPH_ACQUISITION_REQUEST_ID
+}
+
+fn format_bind_blocker_reader(reader: &BindBlockerReaderSnapshot) -> String {
+    format!(
+        "job={} command={} lane={:?} age_ms={} execution_started={} started_before_oldest_writer={}",
+        reader.request_id,
+        reader.command,
+        reader.lane,
+        reader.started_age_ms,
+        reader.execution_started,
+        reader.started_before_oldest_writer
+    )
+}
+
+fn format_running_jobs(jobs: &[&RunningJob]) -> String {
+    let now = Instant::now();
+    let mut labels: Vec<_> = jobs
+        .iter()
+        .map(|job| {
+            format!(
+                "job={} command={} lane={:?} root={} age_ms={}",
+                job.request_id,
+                job.command,
+                job.lane,
+                job.root_id.as_path().display(),
+                duration_millis_u64(now.saturating_duration_since(job.started_at))
+            )
+        })
+        .collect();
+    labels.sort();
+    labels.truncate(4);
+    labels.join("; ")
+}
+
+#[derive(Default)]
+struct QueueSnapshotAccumulator {
+    queued: usize,
+    oldest_age_ms: Option<u64>,
+}
+
+impl QueueSnapshotAccumulator {
+    fn add<C: ExecutorContext>(&mut self, queues: &ClassQueues<C>, now: Instant) {
+        self.queued += queues.queued_count();
+        if let Some(queued_at) = queues.oldest_queued_at() {
+            let age_ms = duration_millis_u64(now.saturating_duration_since(queued_at));
+            self.oldest_age_ms = Some(
+                self.oldest_age_ms
+                    .map_or(age_ms, |oldest| oldest.max(age_ms)),
+            );
+        }
+    }
+
+    fn finish(self) -> DispatchClassQueueSnapshot {
+        DispatchClassQueueSnapshot {
+            queued: self.queued,
+            oldest_age_ms: self.oldest_age_ms,
+        }
+    }
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+struct ActorState<C: ExecutorContext> {
+    ctx: Arc<C>,
+    epoch: Arc<RwLock<()>>,
+    read_inflight: usize,
+    lsp_inflight: bool,
+    actor_total_inflight: usize,
+    writer_inflight: bool,
+    /// The running writer is a route bind that started with a shared epoch
+    /// hold beside running maintenance or readers (see
+    /// `current_bind_gate_is_shared`).
+    shared_bind_inflight: bool,
+    maintenance_commit_inflight: bool,
+    /// Only the internal callgraph acquisition bypasses interactive capacity.
+    callgraph_acquisition_inflight: bool,
+    provider_inflight: bool,
+    call_ledger_inflight: bool,
+    mutating_inflight: Option<RunningMutatingJob>,
+    reader_admissions_while_promoted_writer_waited: u64,
+    deficit: isize,
+    interactive: ClassQueues<C>,
+    maintenance: ClassQueues<C>,
+    fatal: bool,
+    /// Number of queued interactive mutating jobs, shared with this actor's
+    /// running jobs through [`current_actor_writer_waiting`]. Kept equal to
+    /// `interactive.mutating.len()` by every method that changes that queue.
+    waiting_writers: Arc<AtomicUsize>,
+    /// Detached threads (content-addressed view publication) waiting to write
+    /// this actor's epoch gate. Reported through
+    /// [`current_actor_writer_waiting`].
+    detached_writers: Arc<AtomicUsize>,
+}
+
+impl<C: ExecutorContext> ActorState<C> {
+    fn new(ctx: Arc<C>) -> Self {
+        Self {
+            ctx,
+            epoch: Arc::new(RwLock::new(())),
+            read_inflight: 0,
+            lsp_inflight: false,
+            actor_total_inflight: 0,
+            writer_inflight: false,
+            shared_bind_inflight: false,
+            maintenance_commit_inflight: false,
+            callgraph_acquisition_inflight: false,
+            provider_inflight: false,
+            call_ledger_inflight: false,
+            mutating_inflight: None,
+            reader_admissions_while_promoted_writer_waited: 0,
+            deficit: 0,
+            interactive: ClassQueues::<C>::new(),
+            maintenance: ClassQueues::<C>::new(),
+            fatal: false,
+            waiting_writers: Arc::new(AtomicUsize::new(0)),
+            detached_writers: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn sync_waiting_writers(&self) {
+        self.waiting_writers
+            .store(self.interactive.mutating.len(), Ordering::Release);
+    }
+
+    fn push_job(&mut self, job_class: JobClass, lane: Lane, job: QueuedJob<C>) {
+        self.class_queues_mut(job_class).push_job(lane, job);
+        self.sync_waiting_writers();
+    }
+
+    fn has_queued_jobs(&self) -> bool {
+        self.interactive.has_queued_jobs() || self.maintenance.has_queued_jobs()
+    }
+
+    fn is_idle(&self) -> bool {
+        self.actor_total_inflight == 0 && !self.has_queued_jobs()
+    }
+
+    fn has_queued_jobs_for(&self, job_class: JobClass) -> bool {
+        if job_class == JobClass::Interactive {
+            // Provider and call-ledger jobs are admitted by their own passes.
+            self.interactive
+                .order
+                .iter()
+                .any(|lane| !matches!(lane, Lane::ProviderMetadata | Lane::CallLedger))
+        } else {
+            self.class_queues(job_class).has_queued_jobs()
+        }
+    }
+
+    fn front_lane(&self, job_class: JobClass) -> Option<Lane> {
+        self.class_queues(job_class).front_lane()
+    }
+
+    fn pop_front_job(&mut self, job_class: JobClass, lane: Lane) -> Option<QueuedJob<C>> {
+        let job = self.class_queues_mut(job_class).pop_front_job(lane);
+        self.sync_waiting_writers();
+        job
+    }
+
+    fn pop_first_bind_job(&mut self) -> Option<QueuedJob<C>> {
+        let job = self.interactive.remove_first_bind_job();
+        self.sync_waiting_writers();
+        job
+    }
+
+    fn higher_priority_writer_barrier_blocks(&self, job_class: JobClass) -> bool {
+        // Maintenance must not start while interactive mutating work (tool
+        // mutations, route binds) waits: a maintenance job that takes the
+        // actor's writer slot would push the interactive writer behind it.
+        matches!(job_class, JobClass::Maintenance)
+            && !self.interactive.queue(Lane::Mutating).is_empty()
+    }
+
+    fn class_queues(&self, job_class: JobClass) -> &ClassQueues<C> {
+        match job_class {
+            JobClass::Interactive => &self.interactive,
+            JobClass::Maintenance => &self.maintenance,
+        }
+    }
+
+    fn class_queues_mut(&mut self, job_class: JobClass) -> &mut ClassQueues<C> {
+        match job_class {
+            JobClass::Interactive => &mut self.interactive,
+            JobClass::Maintenance => &mut self.maintenance,
+        }
+    }
+
+    fn fail_queued_jobs(&mut self) {
+        self.interactive.fail_queued_jobs();
+        self.maintenance.fail_queued_jobs();
+        self.sync_waiting_writers();
+    }
+
+    fn cancel_queued_root_work(&mut self) -> usize {
+        self.maintenance.cancel_queued_jobs() + self.interactive.cancel_queued_provider_jobs()
+    }
+
+    fn has_queued_mutating_job(&self, request_id: &str) -> bool {
+        self.interactive.has_queued_mutating_job(request_id)
+            || self.maintenance.has_queued_mutating_job(request_id)
+    }
+
+    fn remove_queued_cancellable(&mut self, token: &JobCancellation) -> Option<QueuedJob<C>> {
+        let removed = self
+            .interactive
+            .remove_cancellable(token)
+            .or_else(|| self.maintenance.remove_cancellable(token));
+        self.sync_waiting_writers();
+        removed
+    }
+
+    fn oldest_queued_writer_at(&self) -> Option<Instant> {
+        [
+            self.interactive.queue(Lane::Mutating).front(),
+            self.maintenance.queue(Lane::Mutating).front(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|job| job.queued_at)
+        .min()
+    }
+
+    fn pending_configure_count(&self) -> usize {
+        usize::from(
+            self.mutating_inflight
+                .as_ref()
+                .is_some_and(|job| is_configure_request(&job.request_id)),
+        ) + self.interactive.queued_configure_count()
+            + self.maintenance.queued_configure_count()
+    }
+}
+
+struct ClassQueues<C: ExecutorContext> {
+    order: VecDeque<Lane>,
+    pure_reads: VecDeque<QueuedJob<C>>,
+    lsp_status: VecDeque<QueuedJob<C>>,
+    heavy_init: VecDeque<QueuedJob<C>>,
+    mutating: VecDeque<QueuedJob<C>>,
+    maintenance_commit: VecDeque<QueuedJob<C>>,
+    provider_metadata: VecDeque<QueuedJob<C>>,
+    call_ledger: VecDeque<QueuedJob<C>>,
+}
+
+impl<C: ExecutorContext> ClassQueues<C> {
+    fn new() -> Self {
+        Self {
+            order: VecDeque::new(),
+            pure_reads: VecDeque::new(),
+            lsp_status: VecDeque::new(),
+            heavy_init: VecDeque::new(),
+            mutating: VecDeque::new(),
+            maintenance_commit: VecDeque::new(),
+            provider_metadata: VecDeque::new(),
+            call_ledger: VecDeque::new(),
+        }
+    }
+
+    fn push_job(&mut self, lane: Lane, job: QueuedJob<C>) {
+        self.order.push_back(lane);
+        self.queue_mut(lane).push_back(job);
+    }
+
+    /// Queue a job ahead of everything else in its lane. `order` pairs its
+    /// lane entries with each lane's queue first-to-first, so the entry goes
+    /// to the front as well.
+    fn push_front_job(&mut self, lane: Lane, job: QueuedJob<C>) {
+        self.order.push_front(lane);
+        self.queue_mut(lane).push_front(job);
+    }
+
+    /// The route bind the bind pass would admit next.
+    fn first_bind_job(&self) -> Option<&QueuedJob<C>> {
+        self.mutating
+            .iter()
+            .find(|job| is_configure_request(&job.request_id))
+    }
+
+    fn first_bind_is_forced_exclusive(&self) -> bool {
+        self.first_bind_job().is_some_and(|job| job.force_exclusive)
+    }
+
+    fn has_queued_jobs(&self) -> bool {
+        !self.order.is_empty()
+    }
+
+    fn front_lane(&self) -> Option<Lane> {
+        self.order.front().copied()
+    }
+
+    /// Interactive admission order: a starved writer preempts everything so
+    /// its deadline survives. A queued RouteBind configure counts as starved
+    /// after `BIND_PROMOTION_AGE`, any other writer after
+    /// `INTERACTIVE_WRITER_PROMOTION_AGE`. Otherwise pure reads go first (they
+    /// overlap each other and never barrier the actor), then remaining lanes
+    /// in arrival order. Maintenance keeps strict arrival order via
+    /// `front_lane`.
+    ///
+    /// `newest_reader_started_at` is when the most recently admitted reader
+    /// still running on this actor started. A writer is not promoted while
+    /// every running reader started before it queued and has run for
+    /// `READER_STUCK_CENSUS_AGE`: the writer cannot run until those readers
+    /// end, which may be never, so holding back new reads would only add an
+    /// outage of every read on the root to the writer's own wait.
+    fn next_interactive_lane(
+        &self,
+        now: Instant,
+        newest_reader_started_at: Option<Instant>,
+    ) -> Option<Lane> {
+        let stuck_readers_started_by = newest_reader_started_at
+            .filter(|started| now.saturating_duration_since(*started) >= READER_STUCK_CENSUS_AGE);
+        let starved_writer = self.mutating.iter().any(|job| {
+            let promotion_age = if is_configure_request(&job.request_id) {
+                BIND_PROMOTION_AGE
+            } else {
+                INTERACTIVE_WRITER_PROMOTION_AGE
+            };
+            let waits_only_on_stuck_readers =
+                stuck_readers_started_by.is_some_and(|newest| newest <= job.queued_at);
+            now.saturating_duration_since(job.queued_at) >= promotion_age
+                && !waits_only_on_stuck_readers
+        });
+        if starved_writer {
+            // Also stops NEW readers from being admitted on this actor while
+            // the promoted writer waits for in-flight readers to drain.
+            return Some(Lane::Mutating);
+        }
+        if !self.pure_reads.is_empty() {
+            return Some(Lane::PureRead);
+        }
+        self.order.iter().copied().find(|lane| {
+            !matches!(
+                lane,
+                Lane::PureRead | Lane::ProviderMetadata | Lane::CallLedger
+            )
+        })
+    }
+
+    fn pop_front_job(&mut self, lane: Lane) -> Option<QueuedJob<C>> {
+        // Keep `order` consistent with per-lane queues when admission picks a
+        // lane other than the arrival-order head: remove the FIRST occurrence
+        // of the chosen lane from `order`, not necessarily the front.
+        let position = self.order.iter().position(|queued| *queued == lane)?;
+        self.order.remove(position);
+        self.queue_mut(lane).pop_front()
+    }
+
+    fn queued_count(&self) -> usize {
+        self.order.len()
+    }
+
+    fn has_maintenance_coalesce_key(&self, key: MaintenanceCoalesceKey) -> bool {
+        ALL_LANES.into_iter().any(|lane| {
+            self.queue(lane)
+                .iter()
+                .any(|job| job.maintenance_coalesce_key == Some(key))
+        })
+    }
+
+    /// Remove only redundant idempotent drains while preserving survivor order.
+    fn remove_duplicate_maintenance_jobs(&mut self) -> Vec<QueuedJob<C>> {
+        let mut seen = HashSet::new();
+        let mut lane_positions = [0usize; ALL_LANES.len()];
+        let mut duplicates = Vec::new();
+
+        for (order_position, lane) in self.order.iter().copied().enumerate() {
+            let lane_index = lane_index(lane);
+            let queue_position = lane_positions[lane_index];
+            lane_positions[lane_index] += 1;
+            let Some(key) = self
+                .queue(lane)
+                .get(queue_position)
+                .and_then(|job| job.maintenance_coalesce_key)
+            else {
+                continue;
+            };
+            if !seen.insert(key) {
+                duplicates.push((order_position, lane, queue_position));
+            }
+        }
+
+        let mut removed = Vec::with_capacity(duplicates.len());
+        for (order_position, lane, queue_position) in duplicates.into_iter().rev() {
+            self.order.remove(order_position);
+            if let Some(job) = self.queue_mut(lane).remove(queue_position) {
+                removed.push(job);
+            }
+        }
+        removed
+    }
+
+    fn oldest_queued_at(&self) -> Option<Instant> {
+        self.front_lane()
+            .and_then(|lane| self.queue(lane).front().map(|job| job.queued_at))
+    }
+
+    fn fail_queued_jobs(&mut self) {
+        self.order.clear();
+        fail_queued_job_queue(&mut self.pure_reads);
+        fail_queued_job_queue(&mut self.lsp_status);
+        fail_queued_job_queue(&mut self.heavy_init);
+        fail_queued_job_queue(&mut self.mutating);
+        fail_queued_job_queue(&mut self.maintenance_commit);
+        fail_queued_job_queue(&mut self.provider_metadata);
+        fail_queued_job_queue(&mut self.call_ledger);
+    }
+
+    fn cancel_queued_jobs(&mut self) -> usize {
+        self.order.clear();
+        cancel_queued_job_queue(&mut self.pure_reads)
+            + cancel_queued_job_queue(&mut self.lsp_status)
+            + cancel_queued_job_queue(&mut self.heavy_init)
+            + cancel_queued_job_queue(&mut self.mutating)
+            + cancel_queued_job_queue(&mut self.maintenance_commit)
+            + cancel_queued_job_queue(&mut self.provider_metadata)
+            + cancel_queued_job_queue(&mut self.call_ledger)
+    }
+
+    fn cancel_queued_provider_jobs(&mut self) -> usize {
+        self.order.retain(|lane| *lane != Lane::ProviderMetadata);
+        let cancelled = self.provider_metadata.len();
+        for queued in self.provider_metadata.drain(..) {
+            if let Some(token) = &queued.cancellation {
+                let _ = token.try_cancel_before_running();
+            }
+            queued.completion.send(Response::error(
+                queued.request_id,
+                "request_cancelled",
+                "provider metadata root has no bound routes",
+            ));
+        }
+        cancelled
+    }
+
+    fn has_queued_mutating_job(&self, request_id: &str) -> bool {
+        self.mutating.iter().any(|job| job.request_id == request_id)
+    }
+
+    /// Remove the oldest queued route-bind configure from the Mutating lane,
+    /// even when other mutating jobs are ahead of it. Keeps `order` paired
+    /// with the lane queue the same way `remove_cancellable` does.
+    fn remove_first_bind_job(&mut self) -> Option<QueuedJob<C>> {
+        let position = self
+            .mutating
+            .iter()
+            .position(|job| is_configure_request(&job.request_id))?;
+        let removed = self.mutating.remove(position);
+        let mut occurrence = 0usize;
+        if let Some(order_position) = self.order.iter().position(|entry| {
+            if *entry != Lane::Mutating {
+                return false;
+            }
+            let matched = occurrence == position;
+            occurrence += 1;
+            matched
+        }) {
+            self.order.remove(order_position);
+        }
+        removed
+    }
+
+    /// Remove the queued job carrying this exact cancellation token.
+    ///
+    /// `order` holds one lane entry per push, and per-lane entries pair FIFO
+    /// with the lane queue: the k-th occurrence of a lane in `order`
+    /// corresponds to the k-th element of that lane's queue. Removing the
+    /// FIRST matching order entry for a job deeper in its lane queue would
+    /// shift the pairing and reorder the survivors, so the occurrence at the
+    /// job's own queue position is removed instead.
+    fn remove_cancellable(&mut self, token: &JobCancellation) -> Option<QueuedJob<C>> {
+        for lane in ALL_LANES {
+            let queue = self.queue_mut(lane);
+            let position = queue.iter().position(|queued| {
+                queued
+                    .cancellation
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.same_token(token))
+            });
+            if let Some(position) = position {
+                let removed = queue.remove(position);
+                let mut occurrence = 0usize;
+                if let Some(order_position) = self.order.iter().position(|entry| {
+                    if *entry != lane {
+                        return false;
+                    }
+                    let matched = occurrence == position;
+                    occurrence += 1;
+                    matched
+                }) {
+                    self.order.remove(order_position);
+                }
+                return removed;
+            }
+        }
+        None
+    }
+
+    fn queued_configure_count(&self) -> usize {
+        self.mutating
+            .iter()
+            .filter(|job| is_configure_request(&job.request_id))
+            .count()
+    }
+
+    /// Queue time of the oldest queued route-bind configure, if any.
+    fn oldest_queued_bind_at(&self) -> Option<Instant> {
+        self.mutating
+            .iter()
+            .filter(|job| is_configure_request(&job.request_id))
+            .map(|job| job.queued_at)
+            .min()
+    }
+
+    fn queue(&self, lane: Lane) -> &VecDeque<QueuedJob<C>> {
+        match lane {
+            Lane::PureRead => &self.pure_reads,
+            Lane::SerialLspStatus => &self.lsp_status,
+            Lane::HeavyInit => &self.heavy_init,
+            Lane::Mutating => &self.mutating,
+            Lane::MaintenanceCommit => &self.maintenance_commit,
+            Lane::ProviderMetadata => &self.provider_metadata,
+            Lane::CallLedger => &self.call_ledger,
+        }
+    }
+
+    fn queue_mut(&mut self, lane: Lane) -> &mut VecDeque<QueuedJob<C>> {
+        match lane {
+            Lane::PureRead => &mut self.pure_reads,
+            Lane::SerialLspStatus => &mut self.lsp_status,
+            Lane::HeavyInit => &mut self.heavy_init,
+            Lane::Mutating => &mut self.mutating,
+            Lane::MaintenanceCommit => &mut self.maintenance_commit,
+            Lane::ProviderMetadata => &mut self.provider_metadata,
+            Lane::CallLedger => &mut self.call_ledger,
+        }
+    }
+}
+
+struct QueuedJob<C: ExecutorContext> {
+    job: ExecutorJob<C>,
+    completion: CompletionSender,
+    request_id: String,
+    command: String,
+    queued_at: Instant,
+    cancellation: Option<JobCancellation>,
+    maintenance_coalesce_key: Option<MaintenanceCoalesceKey>,
+    /// Present for a route bind that may run beside maintenance with a shared
+    /// hold and be queued again (see [`RepeatableJob`]).
+    rerun: Option<RepeatableJob<C>>,
+    /// A bind queued again after a shared-hold attempt: it is admitted only
+    /// with exclusive use of the actor.
+    force_exclusive: bool,
+    /// Not admissible before this time: a bind that found the epoch gate
+    /// held by a detached writer backs off instead of waiting on a worker.
+    not_before: Option<Instant>,
+    /// How many times this bind found the gate held by a detached writer.
+    exclusive_attempts: u32,
+    /// Checked before metadata starts, so unbind or reconfiguration rejects
+    /// queued or dispatched work from an older configure generation.
+    provider_generation: Option<u64>,
+}
+
+fn lane_index(lane: Lane) -> usize {
+    match lane {
+        Lane::PureRead => 0,
+        Lane::SerialLspStatus => 1,
+        Lane::HeavyInit => 2,
+        Lane::Mutating => 3,
+        Lane::MaintenanceCommit => 4,
+        Lane::ProviderMetadata => 5,
+        Lane::CallLedger => 6,
+    }
+}
+
+fn fail_queued_job_queue<C: ExecutorContext>(queue: &mut VecDeque<QueuedJob<C>>) {
+    for queued in queue.drain(..) {
+        queued
+            .completion
+            .send(actor_fatal_response(queued.request_id));
+    }
+}
+
+fn cancel_queued_job_queue<C: ExecutorContext>(queue: &mut VecDeque<QueuedJob<C>>) -> usize {
+    let cancelled = queue.len();
+    for queued in queue.drain(..) {
+        queued.completion.send(Response::error(
+            queued.request_id,
+            "maintenance_cancelled",
+            "maintenance cancelled because the actor has no bound routes",
+        ));
+    }
+    cancelled
+}
+
+fn job_command(job_class: JobClass, lane: Lane) -> String {
+    format!("executor::{job_class:?}::{lane:?}")
+}
+
+fn maintenance_allowed_while_unbound(command: &str) -> bool {
+    matches!(command, "unbound-teardown-persist" | "lsp-event-drain")
+}
+
+fn maintenance_cancelled_response(
+    request_id: impl Into<String>,
+    message: impl Into<String>,
+) -> Response {
+    Response::error(request_id, "maintenance_cancelled", message)
+}
+
+fn maintenance_backpressure_response(request_id: impl Into<String>) -> Response {
+    Response::error_with_data(
+        request_id,
+        "maintenance_backpressure",
+        format!("maintenance queue reached its per-actor capacity of {MAINTENANCE_QUEUE_CAP} jobs"),
+        serde_json::json!({
+            "retryable": true,
+            "queue_cap": MAINTENANCE_QUEUE_CAP,
+        }),
+    )
+}
+
+fn actor_fatal_response(request_id: impl Into<String>) -> Response {
+    Response::error(
+        request_id,
+        "actor_fatal",
+        "executor actor is fatal after a mutating job panic",
+    )
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+fn panic_response(
+    request_id: impl Into<String>,
+    command: &str,
+    payload: &(dyn std::any::Any + Send),
+) -> Response {
+    let panic_message = panic_payload_message(payload);
+    Response::error(
+        request_id,
+        "actor_fatal",
+        format!("command '{command}' panicked: {panic_message}"),
+    )
+}
+
+enum CompletionSender {
+    Sync(Sender<Response>),
+    Async(oneshot::Sender<Response>),
+}
+
+impl CompletionSender {
+    fn send(self, response: Response) {
+        match self {
+            Self::Sync(tx) => {
+                let _ = tx.send(response);
+            }
+            Self::Async(tx) => {
+                let _ = tx.send(response);
+            }
+        }
+    }
+}
+
+struct RunJob<C: ExecutorContext> {
+    root_id: ProjectRootId,
+    job_class: JobClass,
+    lane: Lane,
+    ctx: Arc<C>,
+    epoch: Arc<RwLock<()>>,
+    job: ExecutorJob<C>,
+    completion: Option<CompletionSender>,
+    request_id: String,
+    command: String,
+    heavy_permit: Option<HeavyPermit>,
+    cancellation: Option<JobCancellation>,
+    execution_started: Arc<AtomicBool>,
+    completion_guard: Option<JobCompletionGuard<C>>,
+    /// The actor's queued-interactive-writer counter, exposed to the running
+    /// job through [`current_actor_writer_waiting`].
+    waiting_writers: Arc<AtomicUsize>,
+    /// The actor's parked detached writers, also reported through
+    /// [`current_actor_writer_waiting`].
+    detached_writers: Arc<AtomicUsize>,
+    /// A route bind admitted while a maintenance job or reader held the epoch
+    /// gate: it runs with a shared hold (see [`current_bind_gate_is_shared`]).
+    shared_bind_gate: bool,
+    /// How to run this bind again if it has to be queued again.
+    rerun: Option<RepeatableJob<C>>,
+    /// When the job first queued; a requeued bind keeps its age so its
+    /// promotion over new readers is not reset.
+    queued_at: Instant,
+    exclusive_attempts: u32,
+    provider_generation: Option<u64>,
+}
+
+struct JobCompletionOwnership;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobCompletionOutcome {
+    Completed,
+    Panicked,
+    Abandoned,
+}
+
+struct CompletionEvent<C: ExecutorContext> {
+    job_id: u64,
+    heavy_permit: Option<HeavyPermit>,
+    outcome: JobCompletionOutcome,
+    ownership: Arc<JobCompletionOwnership>,
+    /// A shared-hold bind that must run again as an exclusive writer. The
+    /// scheduler queues it at the head of the actor's binds in the same step
+    /// that releases the finished run's reservation.
+    requeue: Option<QueuedJob<C>>,
+}
+
+struct JobCompletionGuard<C: ExecutorContext> {
+    event_tx: Sender<SchedulerEvent<C>>,
+    event: Option<CompletionEvent<C>>,
+}
+
+impl<C: ExecutorContext> JobCompletionGuard<C> {
+    fn new(event_tx: Sender<SchedulerEvent<C>>, event: CompletionEvent<C>) -> Self {
+        Self {
+            event_tx,
+            event: Some(event),
+        }
+    }
+
+    fn set_outcome(&mut self, outcome: JobCompletionOutcome) {
+        if let Some(event) = self.event.as_mut() {
+            event.outcome = outcome;
+        }
+    }
+
+    fn set_requeue(&mut self, job: QueuedJob<C>) {
+        if let Some(event) = self.event.as_mut() {
+            event.requeue = Some(job);
+        }
+    }
+}
+
+impl<C: ExecutorContext> Drop for JobCompletionGuard<C> {
+    fn drop(&mut self) {
+        let Some(mut event) = self.event.take() else {
+            return;
+        };
+        if std::thread::panicking() {
+            event.outcome = JobCompletionOutcome::Panicked;
+        }
+        let _ = self.event_tx.send(SchedulerEvent::<C>::Completed(event));
+    }
+}
+
+enum SchedulerEvent<C: ExecutorContext> {
+    Wake,
+    Completed(CompletionEvent<C>),
+    Shutdown,
+}
+
+fn scheduler_loop<C: ExecutorContext>(
+    state: Arc<TrackedMutex<SchedulerState<C>>>,
+    heavy: Arc<HeavySemaphore>,
+    run_tx: Sender<RunJob<C>>,
+    event_tx: Sender<SchedulerEvent<C>>,
+    event_rx: Receiver<SchedulerEvent<C>>,
+    nonrunnable_dispatches: Arc<AtomicUsize>,
+    completed_interactive: Arc<AtomicU64>,
+    completed_maintenance: Arc<AtomicU64>,
+    dispatch_liveness: Arc<DispatchLivenessAtomics>,
+    loop_liveness: Arc<DispatchLoopLiveness<C>>,
+) {
+    let mut next_retry_at: Option<Instant> = None;
+    loop {
+        // A bind waiting out a retry time has no event to wake the loop, so
+        // the loop wakes itself when the earliest one comes due.
+        let event = if loop_liveness.wait_for_event(next_retry_at) {
+            // Select readiness can be spurious. Do not block with the active
+            // marker set when there is actually no event to process.
+            match event_rx.try_recv() {
+                Ok(event) => event,
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    loop_liveness.end_event();
+                    continue;
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    loop_liveness.end_event();
+                    break;
+                }
+            }
+        } else {
+            SchedulerEvent::<C>::Wake
+        };
+        let shutdown;
+        {
+            let mut state = state.lock();
+            shutdown = process_scheduler_event_batch(
+                event,
+                &event_rx,
+                &mut state,
+                &completed_interactive,
+                &completed_maintenance,
+            );
+
+            if !shutdown {
+                dispatch_runnable(
+                    &mut state,
+                    &heavy,
+                    &run_tx,
+                    &event_tx,
+                    &nonrunnable_dispatches,
+                );
+            }
+            dispatch_liveness.record(&state.dispatch_liveness_snapshot());
+            next_retry_at = state.next_bind_retry_at();
+        }
+        loop_liveness.end_event();
+
+        if shutdown {
+            break;
+        }
+    }
+}
+
+fn process_scheduler_event_batch<C: ExecutorContext>(
+    first: SchedulerEvent<C>,
+    event_rx: &Receiver<SchedulerEvent<C>>,
+    state: &mut SchedulerState<C>,
+    completed_interactive: &AtomicU64,
+    completed_maintenance: &AtomicU64,
+) -> bool {
+    let mut event = Some(first);
+    for _ in 0..SCHEDULER_EVENT_BATCH_CAP {
+        let Some(current) = event.take().or_else(|| event_rx.try_recv().ok()) else {
+            break;
+        };
+        if process_scheduler_event(current, state, completed_interactive, completed_maintenance) {
+            return true;
+        }
+    }
+    false
+}
+
+fn note_completed_class(
+    job_class: JobClass,
+    completed_interactive: &AtomicU64,
+    completed_maintenance: &AtomicU64,
+) {
+    match job_class {
+        JobClass::Interactive => {
+            completed_interactive.fetch_add(1, Ordering::Relaxed);
+        }
+        JobClass::Maintenance => {
+            completed_maintenance.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn process_scheduler_event<C: ExecutorContext>(
+    event: SchedulerEvent<C>,
+    state: &mut SchedulerState<C>,
+    completed_interactive: &AtomicU64,
+    completed_maintenance: &AtomicU64,
+) -> bool {
+    match event {
+        SchedulerEvent::<C>::Wake => false,
+        SchedulerEvent::<C>::Completed(event) => {
+            if let Some(job_class) = complete_job(state, event) {
+                note_completed_class(job_class, completed_interactive, completed_maintenance);
+            }
+            false
+        }
+        SchedulerEvent::<C>::Shutdown => true,
+    }
+}
+
+fn complete_job<C: ExecutorContext>(
+    state: &mut SchedulerState<C>,
+    event: CompletionEvent<C>,
+) -> Option<JobClass> {
+    let CompletionEvent::<C> {
+        job_id,
+        heavy_permit,
+        outcome,
+        ownership,
+        requeue,
+    } = event;
+    let Some(running) = state.running_jobs.remove(&job_id) else {
+        log::error!("executor completion: unknown job_id={job_id} outcome={outcome:?}");
+        return None;
+    };
+    debug_assert!(running
+        .completion_ownership
+        .upgrade()
+        .is_some_and(|current| Arc::ptr_eq(&current, &ownership)));
+
+    let RunningJob {
+        root_id,
+        request_id,
+        job_class,
+        lane,
+        ..
+    } = running;
+    log::debug!(
+        "executor completion: job_id={job_id} class={job_class:?} lane={lane:?} outcome={outcome:?} request_id={request_id} root={}",
+        root_id.as_path().display()
+    );
+
+    match job_class {
+        JobClass::Interactive => {
+            debug_assert!(state.interactive_inflight > 0);
+            state.interactive_inflight = state.interactive_inflight.saturating_sub(1);
+        }
+        JobClass::Maintenance => {
+            debug_assert!(state.maintenance_inflight > 0);
+            state.maintenance_inflight = state.maintenance_inflight.saturating_sub(1);
+        }
+    }
+
+    if lane == Lane::ProviderMetadata {
+        state.provider_inflight = state.provider_inflight.saturating_sub(1);
+    }
+    if is_bind_job(job_class, lane, &request_id) {
+        state.binds_inflight = state.binds_inflight.saturating_sub(1);
+    }
+    if let Some(actor) = state.actors.get_mut(&root_id) {
+        actor.actor_total_inflight = actor.actor_total_inflight.saturating_sub(1);
+        match lane {
+            Lane::PureRead => {
+                actor.read_inflight = actor.read_inflight.saturating_sub(1);
+            }
+            Lane::SerialLspStatus => {
+                actor.lsp_inflight = false;
+            }
+            Lane::HeavyInit => {
+                if is_callgraph_acquisition(job_class, lane, &request_id) {
+                    actor.callgraph_acquisition_inflight = false;
+                }
+            }
+            Lane::Mutating => {
+                actor.writer_inflight = false;
+                actor.shared_bind_inflight = false;
+                actor.mutating_inflight = None;
+            }
+            Lane::MaintenanceCommit => {
+                actor.maintenance_commit_inflight = false;
+            }
+            Lane::ProviderMetadata => actor.provider_inflight = false,
+            Lane::CallLedger => actor.call_ledger_inflight = false,
+        }
+
+        if outcome == JobCompletionOutcome::Panicked && lane == Lane::Mutating {
+            actor.fatal = true;
+            actor.fail_queued_jobs();
+        }
+    }
+
+    if let Some(queued) = requeue {
+        match state.actors.get_mut(&root_id) {
+            // A cancel that landed after the worker returned the token to
+            // pending, but before this event, found the job neither queued
+            // nor able to observe it. Settle it here, under the scheduler
+            // lock that `cancel_job` also takes, instead of queuing cancelled
+            // writer demand behind whatever holds the actor.
+            _ if queued
+                .cancellation
+                .as_ref()
+                .is_some_and(JobCancellation::cancel_already_requested) =>
+            {
+                queued.completion.send(Response::error(
+                    queued.request_id,
+                    "request_cancelled",
+                    "request cancelled before execution",
+                ));
+            }
+            Some(actor) if !actor.fatal => {
+                // Pending-bind diagnostics read the configure phases; name the
+                // wait instead of leaving the phase the discarded run reached.
+                actor.ctx.begin_configure_ack_phase("requeued_exclusive");
+                let has_retry_time = queued.not_before.is_some();
+                actor.interactive.push_front_job(Lane::Mutating, queued);
+                actor.sync_waiting_writers();
+                state.bind_retry_pending |= has_retry_time;
+            }
+            Some(_) => queued
+                .completion
+                .send(actor_fatal_response(queued.request_id)),
+            None => queued.completion.send(Response::error(
+                queued.request_id,
+                "actor_not_registered",
+                "executor actor is not registered",
+            )),
+        }
+    }
+
+    drop(heavy_permit);
+    drop(ownership);
+    state.idle_workers += 1;
+    state.assert_running_invariants();
+    Some(job_class)
+}
+
+fn dispatch_runnable<C: ExecutorContext>(
+    state: &mut SchedulerState<C>,
+    heavy: &Arc<HeavySemaphore>,
+    run_tx: &Sender<RunJob<C>>,
+    event_tx: &Sender<SchedulerEvent<C>>,
+    nonrunnable_dispatches: &AtomicUsize,
+) {
+    while state.idle_workers > 0 && !state.actor_order.is_empty() {
+        let mut made_progress = false;
+        let mut dispatch_failed = false;
+
+        // Route binds first, on any idle worker including the bind reserve:
+        // subc refuses the module once a bind relay exceeds its deadline, so a
+        // bind must never wait for a DRR turn behind other roots' work.
+        made_progress |= dispatch_queued_binds(
+            state,
+            heavy,
+            run_tx,
+            event_tx,
+            nonrunnable_dispatches,
+            &mut dispatch_failed,
+        );
+        if dispatch_failed || state.idle_workers == 0 {
+            return;
+        }
+
+        made_progress |= dispatch_provider_metadata(
+            state,
+            heavy,
+            run_tx,
+            event_tx,
+            nonrunnable_dispatches,
+            &mut dispatch_failed,
+        );
+        if dispatch_failed || state.idle_workers == 0 {
+            return;
+        }
+
+        made_progress |= dispatch_call_ledger(
+            state,
+            heavy,
+            run_tx,
+            event_tx,
+            nonrunnable_dispatches,
+            &mut dispatch_failed,
+        );
+        if dispatch_failed || state.idle_workers == 0 {
+            return;
+        }
+
+        made_progress |= dispatch_runnable_class(
+            state,
+            JobClass::Interactive,
+            heavy,
+            run_tx,
+            event_tx,
+            nonrunnable_dispatches,
+            &mut dispatch_failed,
+        );
+        if dispatch_failed || state.idle_workers == 0 {
+            return;
+        }
+
+        if can_dispatch_class(state, JobClass::Maintenance) {
+            made_progress |= dispatch_runnable_class(
+                state,
+                JobClass::Maintenance,
+                heavy,
+                run_tx,
+                event_tx,
+                nonrunnable_dispatches,
+                &mut dispatch_failed,
+            );
+            if dispatch_failed {
+                return;
+            }
+        }
+
+        if !made_progress {
+            break;
+        }
+    }
+}
+
+fn dispatch_runnable_class<C: ExecutorContext>(
+    state: &mut SchedulerState<C>,
+    job_class: JobClass,
+    heavy: &Arc<HeavySemaphore>,
+    run_tx: &Sender<RunJob<C>>,
+    event_tx: &Sender<SchedulerEvent<C>>,
+    nonrunnable_dispatches: &AtomicUsize,
+    dispatch_failed: &mut bool,
+) -> bool {
+    if !can_dispatch_class(state, job_class) || state.actor_order.is_empty() {
+        return false;
+    }
+
+    let actor_count = state.actor_order.len();
+    let mut made_progress = false;
+
+    for _ in 0..actor_count {
+        if !can_dispatch_class(state, job_class) || state.actor_order.is_empty() {
+            break;
+        }
+
+        if state.cursor >= state.actor_order.len() {
+            state.cursor = 0;
+        }
+        let root_id = state.actor_order[state.cursor].clone();
+        state.cursor = (state.cursor + 1) % state.actor_order.len();
+        let newest_reader_started_at = match job_class {
+            JobClass::Interactive => state.newest_in_flight_reader_started_at(&root_id),
+            JobClass::Maintenance => None,
+        };
+
+        let run_job = {
+            let Some(actor) = state.actors.get_mut(&root_id) else {
+                continue;
+            };
+
+            if actor.fatal {
+                actor.fail_queued_jobs();
+                actor.deficit = 0;
+                continue;
+            }
+
+            if !actor.has_queued_jobs() {
+                actor.deficit = 0;
+                continue;
+            }
+
+            if !actor.has_queued_jobs_for(job_class) {
+                continue;
+            }
+
+            actor.deficit =
+                (actor.deficit + state.config.drr_quantum).min(state.config.deficit_cap);
+            if actor.deficit < JOB_COST {
+                continue;
+            }
+
+            try_admit_actor(
+                &root_id,
+                actor,
+                AdmissionPass::Class(job_class),
+                &state.config,
+                heavy,
+                newest_reader_started_at,
+            )
+        };
+
+        if let Some(run_job) = run_job {
+            made_progress = true;
+            if !launch_run_job(state, run_job, run_tx, event_tx, nonrunnable_dispatches) {
+                *dispatch_failed = true;
+                return made_progress;
+            }
+        }
+    }
+
+    made_progress
+}
+
+/// Admit every queued route-bind configure whose actor can take a writer now,
+/// oldest bind first. Binds skip the DRR deficit and the per-actor interactive
+/// cap: a configure is short, and waiting a round-robin turn behind dozens of
+/// busy roots is what pushed binds past the daemon's relay deadline.
+fn dispatch_queued_binds<C: ExecutorContext>(
+    state: &mut SchedulerState<C>,
+    heavy: &Arc<HeavySemaphore>,
+    run_tx: &Sender<RunJob<C>>,
+    event_tx: &Sender<SchedulerEvent<C>>,
+    nonrunnable_dispatches: &AtomicUsize,
+    dispatch_failed: &mut bool,
+) -> bool {
+    let mut candidates = state
+        .actors
+        .iter()
+        .filter(|(_, actor)| !actor.fatal)
+        .filter_map(|(root_id, actor)| {
+            actor
+                .interactive
+                .oldest_queued_bind_at()
+                .map(|queued_at| (queued_at, root_id.clone()))
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return false;
+    }
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut made_progress = false;
+    for (_, root_id) in candidates {
+        if state.idle_workers
+            <= state
+                .config
+                .provider_reserve
+                .saturating_sub(state.provider_inflight)
+        {
+            break;
+        }
+        let run_job = {
+            let Some(actor) = state.actors.get_mut(&root_id) else {
+                continue;
+            };
+            try_admit_actor(
+                &root_id,
+                actor,
+                AdmissionPass::Bind,
+                &state.config,
+                heavy,
+                None,
+            )
+        };
+        if let Some(run_job) = run_job {
+            made_progress = true;
+            if !launch_run_job(state, run_job, run_tx, event_tx, nonrunnable_dispatches) {
+                *dispatch_failed = true;
+                return made_progress;
+            }
+        }
+    }
+    made_progress
+}
+
+/// Provider work uses the same root queues, completion and cancellation machinery
+/// as other jobs, but never waits for an index lane's capacity or epoch gate.
+fn dispatch_provider_metadata<C: ExecutorContext>(
+    state: &mut SchedulerState<C>,
+    heavy: &Arc<HeavySemaphore>,
+    run_tx: &Sender<RunJob<C>>,
+    event_tx: &Sender<SchedulerEvent<C>>,
+    nonrunnable_dispatches: &AtomicUsize,
+    dispatch_failed: &mut bool,
+) -> bool {
+    let mut made_progress = false;
+    for _ in 0..state.actor_order.len() {
+        if state.idle_workers == 0 || state.provider_inflight >= state.config.provider_reserve {
+            break;
+        }
+        state.cursor %= state.actor_order.len();
+        let root_id = state.actor_order[state.cursor].clone();
+        state.cursor = (state.cursor + 1) % state.actor_order.len();
+        let Some(actor) = state.actors.get_mut(&root_id).filter(|actor| !actor.fatal) else {
+            continue;
+        };
+        if let Some(run_job) = try_admit_actor(
+            &root_id,
+            actor,
+            AdmissionPass::ProviderMetadata,
+            &state.config,
+            heavy,
+            None,
+        ) {
+            made_progress = true;
+            if !launch_run_job(state, run_job, run_tx, event_tx, nonrunnable_dispatches) {
+                *dispatch_failed = true;
+                break;
+            }
+        }
+    }
+    made_progress
+}
+
+/// Call-ledger jobs are admitted ahead of the interactive deficit round-robin
+/// (DRR) pass, on general workers, without the actor's read cap, epoch gate or
+/// writer barrier: a keyed reply cannot be written until its settlement
+/// commits, so it must not wait for the reads queued or running on its root.
+/// Each actor runs one at a time, in submission order.
+fn dispatch_call_ledger<C: ExecutorContext>(
+    state: &mut SchedulerState<C>,
+    heavy: &Arc<HeavySemaphore>,
+    run_tx: &Sender<RunJob<C>>,
+    event_tx: &Sender<SchedulerEvent<C>>,
+    nonrunnable_dispatches: &AtomicUsize,
+    dispatch_failed: &mut bool,
+) -> bool {
+    let mut made_progress = false;
+    for _ in 0..state.actor_order.len() {
+        if !can_dispatch_class(state, JobClass::Interactive) {
+            break;
+        }
+        state.cursor %= state.actor_order.len();
+        let root_id = state.actor_order[state.cursor].clone();
+        state.cursor = (state.cursor + 1) % state.actor_order.len();
+        let Some(actor) = state.actors.get_mut(&root_id).filter(|actor| !actor.fatal) else {
+            continue;
+        };
+        if let Some(run_job) = try_admit_actor(
+            &root_id,
+            actor,
+            AdmissionPass::CallLedger,
+            &state.config,
+            heavy,
+            None,
+        ) {
+            made_progress = true;
+            if !launch_run_job(state, run_job, run_tx, event_tx, nonrunnable_dispatches) {
+                *dispatch_failed = true;
+                break;
+            }
+        }
+    }
+    made_progress
+}
+
+/// Record an admitted job as running and hand it to a worker. Returns false
+/// when the worker channel is closed.
+fn launch_run_job<C: ExecutorContext>(
+    state: &mut SchedulerState<C>,
+    mut run_job: RunJob<C>,
+    run_tx: &Sender<RunJob<C>>,
+    event_tx: &Sender<SchedulerEvent<C>>,
+    nonrunnable_dispatches: &AtomicUsize,
+) -> bool {
+    let job_id = state.next_job_id();
+    let ownership = Arc::new(JobCompletionOwnership);
+    run_job.completion_guard = Some(JobCompletionGuard::<C>::new(
+        event_tx.clone(),
+        CompletionEvent::<C> {
+            job_id,
+            heavy_permit: run_job.heavy_permit.take(),
+            outcome: JobCompletionOutcome::Abandoned,
+            ownership: Arc::clone(&ownership),
+            requeue: None,
+        },
+    ));
+    let replaced = state.running_jobs.insert(
+        job_id,
+        RunningJob {
+            root_id: run_job.root_id.clone(),
+            request_id: run_job.request_id.clone(),
+            command: run_job.command.clone(),
+            job_class: run_job.job_class,
+            lane: run_job.lane,
+            started_at: Instant::now(),
+            execution_started: Arc::clone(&run_job.execution_started),
+            completion_ownership: Arc::downgrade(&ownership),
+            occupancy_reported: false,
+            cancellation: run_job.cancellation.clone(),
+        },
+    );
+    debug_assert!(replaced.is_none());
+    state.idle_workers -= 1;
+    match run_job.job_class {
+        JobClass::Interactive => state.interactive_inflight += 1,
+        JobClass::Maintenance => state.maintenance_inflight += 1,
+    }
+    if run_job.lane == Lane::ProviderMetadata {
+        state.provider_inflight += 1;
+    }
+    if is_bind_job(run_job.job_class, run_job.lane, &run_job.request_id) {
+        state.binds_inflight += 1;
+    }
+    state.assert_running_invariants();
+    log::debug!(
+        "executor dispatch: job_id={job_id} class={:?} lane={:?} request_id={} root={}",
+        run_job.job_class,
+        run_job.lane,
+        run_job.request_id,
+        run_job.root_id.as_path().display()
+    );
+    if run_tx.send(run_job).is_err() {
+        nonrunnable_dispatches.fetch_add(1, Ordering::AcqRel);
+        return false;
+    }
+    true
+}
+
+fn can_dispatch_class<C: ExecutorContext>(state: &SchedulerState<C>, job_class: JobClass) -> bool {
+    // Running binds and metadata have already reduced idle_workers. Hold back
+    // only the unused part of each reservation, or each running bind would also
+    // remove a general-pool slot. All jobs still use one worker channel.
+    let provider_idle = state
+        .config
+        .provider_reserve
+        .saturating_sub(state.provider_inflight);
+    let bind_idle = state
+        .config
+        .bind_reserve
+        .saturating_sub(state.binds_inflight);
+    let general_idle = state.idle_workers.saturating_sub(bind_idle + provider_idle);
+    if general_idle == 0 {
+        return false;
+    }
+    match job_class {
+        JobClass::Interactive => true,
+        JobClass::Maintenance => {
+            state.maintenance_inflight < state.config.maintenance_cap
+                && general_idle > state.config.interactive_reserve
+        }
+    }
+}
+
+/// Which dispatch pass is asking an actor for a job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionPass {
+    /// The route-bind pass: only a queued route-bind configure, taken from the
+    /// Mutating lane ahead of any other writer queued before it. This pass may
+    /// use the reserved bind workers, so it must never admit anything else.
+    Bind,
+    /// Provider jobs bypass ordinary per-root deficit scheduling and do not
+    /// acquire the index epoch gate.
+    ProviderMetadata,
+    /// Call-ledger jobs: like provider jobs they bypass the deficit round-robin
+    /// pass and the epoch gate, but they use general workers.
+    CallLedger,
+    /// The ordinary DRR pass for one job class.
+    Class(JobClass),
+}
+
+fn try_admit_actor<C: ExecutorContext>(
+    root_id: &ProjectRootId,
+    actor: &mut ActorState<C>,
+    pass: AdmissionPass,
+    config: &EffectiveConfig,
+    heavy: &Arc<HeavySemaphore>,
+    newest_reader_started_at: Option<Instant>,
+) -> Option<RunJob<C>> {
+    let bind_pass = pass == AdmissionPass::Bind;
+    let job_class = match pass {
+        AdmissionPass::Bind | AdmissionPass::ProviderMetadata | AdmissionPass::CallLedger => {
+            JobClass::Interactive
+        }
+        AdmissionPass::Class(job_class) => job_class,
+    };
+    let lane = match pass {
+        AdmissionPass::ProviderMetadata => actor
+            .interactive
+            .provider_metadata
+            .front()
+            .map(|_| Lane::ProviderMetadata)?,
+        AdmissionPass::CallLedger => actor
+            .interactive
+            .call_ledger
+            .front()
+            .map(|_| Lane::CallLedger)?,
+        // Only the bind itself: an edit queued ahead of it waits for the
+        // general pool (it is not admitted here, so it can never occupy a
+        // reserved bind worker), and the bind runs first.
+        AdmissionPass::Bind => actor
+            .interactive
+            .oldest_queued_bind_at()
+            .map(|_| Lane::Mutating)?,
+        AdmissionPass::Class(JobClass::Interactive) => actor
+            .class_queues(JobClass::Interactive)
+            .next_interactive_lane(Instant::now(), newest_reader_started_at)?,
+        AdmissionPass::Class(JobClass::Maintenance) => actor.front_lane(job_class)?,
+    };
+    let mut heavy_permit = None;
+    let callgraph_acquisition = actor
+        .class_queues(job_class)
+        .queue(lane)
+        .front()
+        .is_some_and(|job| is_callgraph_acquisition(job_class, lane, &job.request_id));
+
+    // A bind that runs with a shared hold (see `current_bind_gate_is_shared`)
+    // blocks other writers and maintenance like any running writer, but
+    // readers may keep coming: it never waits for exclusive use in place.
+    let shared_bind_admits_lane = actor.shared_bind_inflight
+        && matches!(
+            lane,
+            Lane::PureRead | Lane::SerialLspStatus | Lane::HeavyInit
+        );
+    if !matches!(lane, Lane::ProviderMetadata | Lane::CallLedger)
+        && ((actor.writer_inflight && !shared_bind_admits_lane)
+            || actor.higher_priority_writer_barrier_blocks(job_class))
+    {
+        return None;
+    }
+    // A bind backing off from a detached writer waits out its retry time.
+    if lane == Lane::Mutating {
+        let head = if bind_pass {
+            actor.interactive.first_bind_job()
+        } else {
+            actor.class_queues(job_class).queue(Lane::Mutating).front()
+        };
+        if head
+            .and_then(|job| job.not_before)
+            .is_some_and(|not_before| Instant::now() < not_before)
+        {
+            return None;
+        }
+    }
+
+    let has_epoch_reader =
+        actor.read_inflight > 0 || actor.lsp_inflight || actor.maintenance_commit_inflight;
+    // Only a repeatable bind that has not already been sent back may start
+    // with a shared hold: a run that finds it must change the root has to be
+    // able to hand its worker back and run again.
+    let bind_may_share = bind_pass
+        && actor
+            .interactive
+            .first_bind_job()
+            .is_some_and(|job| job.rerun.is_some() && !job.force_exclusive);
+    // MaintenanceCommit and callgraph acquisition use global maintenance capacity and
+    // must not consume the per-actor slots reserved for interactive work. This
+    // matters when a two-worker executor has actor_cap=1: the global reserve
+    // leaves one worker idle, and this accounting makes that worker reachable
+    // by an interactive request for the same actor.
+    let actor_interactive_inflight = actor
+        .actor_total_inflight
+        .saturating_sub(usize::from(actor.maintenance_commit_inflight))
+        .saturating_sub(usize::from(actor.callgraph_acquisition_inflight))
+        .saturating_sub(usize::from(actor.provider_inflight))
+        .saturating_sub(usize::from(actor.call_ledger_inflight));
+    let actor_has_interactive_capacity = actor_interactive_inflight < config.actor_cap;
+    let runnable = match lane {
+        Lane::PureRead => actor.read_inflight < config.read_cap && actor_has_interactive_capacity,
+        Lane::SerialLspStatus => !actor.lsp_inflight && actor_has_interactive_capacity,
+        Lane::HeavyInit => {
+            let capacity = if callgraph_acquisition {
+                !actor.callgraph_acquisition_inflight
+            } else {
+                actor_has_interactive_capacity
+            };
+            if !capacity {
+                false
+            } else if let Some(permit) = heavy.try_acquire() {
+                heavy_permit = Some(permit);
+                true
+            } else {
+                false
+            }
+        }
+        // A bind skips the per-actor interactive cap: HeavyInit jobs count
+        // toward that cap without holding the epoch gate, and the writer only
+        // needs the gate itself to be free. A repeatable bind also does not
+        // wait for whatever holds the gate for reading (a configure tail,
+        // whose single units can run for seconds on a large root, or
+        // interactive readers, which are usually short but are not bounded:
+        // one slow read would otherwise hold every bind of its root until the
+        // bind deadline). It starts beside them with a shared hold, which is
+        // all a rebind of an unchanged root needs, the same hold readers
+        // admitted after it already overlap. A run that must change the root
+        // is sent back and queued again as an exclusive writer, which does
+        // wait for readers and maintenance. `writer_inflight` above still
+        // serializes binds and other writers per root.
+        Lane::Mutating => {
+            bind_may_share || (!has_epoch_reader && (bind_pass || actor_has_interactive_capacity))
+        }
+        // This lane has separate global and per-actor bounds: maintenance_cap
+        // reserves workers globally, and the boolean prevents same-actor
+        // maintenance from stacking without consuming an interactive slot.
+        Lane::MaintenanceCommit => !actor.maintenance_commit_inflight,
+        Lane::ProviderMetadata => !actor.provider_inflight,
+        // Short database bookkeeping, outside the per-actor interactive cap:
+        // one at a time keeps each actor's ledger writes in submission order.
+        Lane::CallLedger => !actor.call_ledger_inflight,
+    };
+
+    if !runnable {
+        return None;
+    }
+    let shared_bind_gate = bind_may_share && has_epoch_reader;
+
+    let promoted_writer_waiting = actor.oldest_queued_writer_at().is_some_and(|queued_at| {
+        Instant::now().saturating_duration_since(queued_at) >= INTERACTIVE_WRITER_PROMOTION_AGE
+    });
+    if promoted_writer_waiting && matches!(lane, Lane::PureRead | Lane::SerialLspStatus) {
+        actor.reader_admissions_while_promoted_writer_waited = actor
+            .reader_admissions_while_promoted_writer_waited
+            .saturating_add(1);
+    }
+
+    let queued = if bind_pass {
+        actor.pop_first_bind_job()?
+    } else {
+        actor.pop_front_job(job_class, lane)?
+    };
+    // The bind pass runs outside DRR, so it does not spend the actor's turn.
+    if matches!(pass, AdmissionPass::Class(_)) {
+        actor.deficit -= JOB_COST;
+    }
+    if lane == Lane::Mutating {
+        actor.mutating_inflight = Some(RunningMutatingJob {
+            request_id: queued.request_id.clone(),
+            command: queued.command.clone(),
+            started_at: Instant::now(),
+        });
+    }
+    match lane {
+        Lane::PureRead => {
+            actor.read_inflight += 1;
+            actor.actor_total_inflight += 1;
+        }
+        Lane::SerialLspStatus => {
+            actor.lsp_inflight = true;
+            actor.actor_total_inflight += 1;
+        }
+        Lane::HeavyInit => {
+            if callgraph_acquisition {
+                actor.callgraph_acquisition_inflight = true;
+            }
+            actor.actor_total_inflight += 1;
+        }
+        Lane::Mutating => {
+            actor.writer_inflight = true;
+            actor.shared_bind_inflight = shared_bind_gate;
+            actor.actor_total_inflight += 1;
+        }
+        Lane::MaintenanceCommit => {
+            actor.maintenance_commit_inflight = true;
+            actor.actor_total_inflight += 1;
+        }
+        Lane::ProviderMetadata => {
+            actor.provider_inflight = true;
+            actor.actor_total_inflight += 1;
+        }
+        Lane::CallLedger => {
+            actor.call_ledger_inflight = true;
+            actor.actor_total_inflight += 1;
+        }
+    }
+
+    Some(RunJob::<C> {
+        root_id: root_id.clone(),
+        job_class,
+        lane,
+        ctx: Arc::clone(&actor.ctx),
+        epoch: Arc::clone(&actor.epoch),
+        job: queued.job,
+        completion: Some(queued.completion),
+        request_id: queued.request_id,
+        command: queued.command,
+        heavy_permit,
+        cancellation: queued.cancellation,
+        execution_started: Arc::new(AtomicBool::new(false)),
+        completion_guard: None,
+        waiting_writers: Arc::clone(&actor.waiting_writers),
+        detached_writers: Arc::clone(&actor.detached_writers),
+        shared_bind_gate,
+        rerun: queued.rerun,
+        queued_at: queued.queued_at,
+        exclusive_attempts: queued.exclusive_attempts,
+        provider_generation: queued.provider_generation,
+    })
+}
+
+thread_local! {
+    static IS_EXECUTOR_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn current_thread_is_executor_worker() -> bool {
+    IS_EXECUTOR_WORKER.with(std::cell::Cell::get)
+}
+
+fn worker_loop<C: ExecutorContext>(run_rx: Receiver<RunJob<C>>) {
+    IS_EXECUTOR_WORKER.with(|worker| worker.set(true));
+    while let Ok(mut run_job) = run_rx.recv() {
+        let response =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_lane_job(&mut run_job)));
+        let panicked = response.is_err();
+        let response = match response {
+            Ok(LaneRun::Finished(response)) => response,
+            Ok(LaneRun::RerunExclusive { retry_after }) => {
+                match requeue_as_exclusive(&mut run_job, retry_after) {
+                    Ok(queued) => {
+                        let guard = run_job
+                            .completion_guard
+                            .as_mut()
+                            .expect("dispatched executor job is missing its completion guard");
+                        guard.set_requeue(queued);
+                        guard.set_outcome(JobCompletionOutcome::Completed);
+                        continue;
+                    }
+                    Err(response) => response,
+                }
+            }
+            Err(payload) => panic_response(
+                run_job.request_id.clone(),
+                &run_job.command,
+                payload.as_ref(),
+            ),
+        };
+
+        if let Some(completion) = run_job.completion.take() {
+            completion.send(response);
+        }
+        run_job
+            .completion_guard
+            .as_mut()
+            .expect("dispatched executor job is missing its completion guard")
+            .set_outcome(if panicked {
+                JobCompletionOutcome::Panicked
+            } else {
+                JobCompletionOutcome::Completed
+            });
+    }
+}
+
+/// Rebuild a shared-hold bind that must run again as a queued exclusive
+/// writer, keeping its completion, cancellation token, and original age.
+/// Returns the response to send instead when the bind was cancelled meanwhile.
+fn requeue_as_exclusive<C: ExecutorContext>(
+    run_job: &mut RunJob<C>,
+    retry_after: Option<Duration>,
+) -> Result<QueuedJob<C>, Response> {
+    let cancelled = || {
+        Response::error(
+            run_job.request_id.clone(),
+            "request_cancelled",
+            "request cancelled before execution",
+        )
+    };
+    // The token went to running when the first attempt started. Put it back
+    // to pending so the queued job is cancellable exactly like any other
+    // queued job; a cancel that already landed wins.
+    if run_job
+        .cancellation
+        .as_ref()
+        .is_some_and(|token| !token.return_to_pending())
+    {
+        return Err(cancelled());
+    }
+    requeue_handoff_hook_for_test(&run_job.request_id);
+    // Root and lifecycle probes can block. Keep them on the worker; completion
+    // still checks the atomic cancellation state under the scheduler lock so a
+    // cancel in the handoff window cannot leave queued writer demand behind.
+    if run_job
+        .cancellation
+        .as_ref()
+        .is_some_and(JobCancellation::cancel_requested_before_commit)
+    {
+        return Err(cancelled());
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    requeue_after_probe_hook_for_test(&run_job.request_id);
+    let rerun = run_job
+        .rerun
+        .clone()
+        .expect("only a repeatable bind runs with a shared hold");
+    let completion = run_job
+        .completion
+        .take()
+        .expect("a requeued bind still owns its completion");
+    let next_run = Arc::clone(&rerun);
+    Ok(QueuedJob::<C> {
+        job: Box::new(move |ctx| next_run(ctx)),
+        completion,
+        request_id: run_job.request_id.clone(),
+        command: run_job.command.clone(),
+        queued_at: run_job.queued_at,
+        cancellation: run_job.cancellation.clone(),
+        maintenance_coalesce_key: None,
+        rerun: Some(rerun),
+        force_exclusive: true,
+        not_before: retry_after.map(|delay| Instant::now() + delay),
+        exclusive_attempts: run_job.exclusive_attempts + u32::from(retry_after.is_some()),
+        provider_generation: None,
+    })
+}
+
+/// A request id and callback for one worker-to-scheduler requeue handoff.
+#[cfg(any(test, feature = "test-support"))]
+type RequeueHandoffHook = (String, Box<dyn FnOnce() + Send>);
+
+#[cfg(any(test, feature = "test-support"))]
+static REQUEUE_HANDOFF_HOOK: Mutex<Option<RequeueHandoffHook>> = Mutex::new(None);
+
+/// Run `hook` after returning `request_id`'s token to pending, before the
+/// worker's full cancellation probe.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn set_requeue_handoff_hook_for_test(
+    request_id: &str,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    *REQUEUE_HANDOFF_HOOK.lock() = Some((request_id.to_string(), Box::new(hook)));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn requeue_handoff_hook_for_test(request_id: &str) {
+    let hook = {
+        let mut slot = REQUEUE_HANDOFF_HOOK.lock();
+        match slot.take() {
+            Some((id, hook)) if id == request_id => Some(hook),
+            other => {
+                *slot = other;
+                None
+            }
+        }
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn requeue_handoff_hook_for_test(_request_id: &str) {}
+
+#[cfg(any(test, feature = "test-support"))]
+static REQUEUE_AFTER_PROBE_HOOK: Mutex<Option<RequeueHandoffHook>> = Mutex::new(None);
+
+/// Run `hook` after the worker's cancellation probe passes, before the
+/// scheduler receives `request_id`'s requeue.
+#[cfg(any(test, feature = "test-support"))]
+fn set_requeue_after_probe_hook_for_test(request_id: &str, hook: impl FnOnce() + Send + 'static) {
+    *REQUEUE_AFTER_PROBE_HOOK.lock() = Some((request_id.to_string(), Box::new(hook)));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn requeue_after_probe_hook_for_test(request_id: &str) {
+    let hook = {
+        let mut slot = REQUEUE_AFTER_PROBE_HOOK.lock();
+        match slot.take() {
+            Some((id, hook)) if id == request_id => Some(hook),
+            other => {
+                *slot = other;
+                None
+            }
+        }
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// How one dispatched job ended on its worker.
+enum LaneRun {
+    Finished(Response),
+    /// A repeatable bind that must run again as an exclusive writer; its
+    /// response (if it ran at all) is discarded. `retry_after` delays the
+    /// next admission when a detached writer held the epoch gate.
+    RerunExclusive {
+        retry_after: Option<Duration>,
+    },
+}
+
+/// Delay before a repeatable bind that found the epoch gate held by a
+/// detached writer is admitted again: 10 ms, doubling, capped at 200 ms.
+fn detached_writer_backoff(attempts: u32) -> Duration {
+    Duration::from_millis(10u64.saturating_mul(1u64 << attempts.min(5)).min(200))
+}
+
+/// Poll interval for epoch waits that must stay responsive to cancellation.
+const EPOCH_WAIT_POLL: Duration = Duration::from_millis(25);
+
+fn run_lane_job<C: ExecutorContext>(run_job: &mut RunJob<C>) -> LaneRun {
+    let _cancellation_ctx = JobCancellationContextGuard::install(run_job.cancellation.clone());
+    let _waiting_writers_ctx = ActorWaitingWritersGuard::install(ActorWriterDemand {
+        queued: Arc::clone(&run_job.waiting_writers),
+        detached: Some(Arc::clone(&run_job.detached_writers)),
+    });
+    let missing_request_id = run_job.request_id.clone();
+    let job = std::mem::replace(
+        &mut run_job.job,
+        Box::new(move |_| {
+            Response::error(
+                missing_request_id,
+                "job_missing",
+                "executor job already taken",
+            )
+        }),
+    );
+
+    let cancelled_before_execution = || {
+        Response::error(
+            run_job.request_id.clone(),
+            "request_cancelled",
+            "request cancelled before execution",
+        )
+    };
+    let cancel_requested = || {
+        run_job
+            .cancellation
+            .as_ref()
+            .is_some_and(JobCancellation::cancel_requested_before_commit)
+    };
+    let run = |job: ExecutorJob<C>| {
+        if cancel_requested()
+            || ((run_job.job_class == JobClass::Maintenance
+                || run_job.command == "inspect"
+                || run_job.lane == Lane::ProviderMetadata)
+                && ((run_job.ctx.subc_unbound_quiesced()
+                    && !maintenance_allowed_while_unbound(&run_job.command))
+                    || !run_job.root_id.as_path().is_dir()))
+        {
+            return cancelled_before_execution();
+        }
+        let can_start = if let Some(generation) = run_job.provider_generation {
+            // Only the start decision holds the root lifecycle lock. Once a
+            // provider may have committed policy, unbind must not discard it.
+            run_job
+                .ctx
+                .run_if_subc_bound_generation(generation, || {
+                    run_job
+                        .cancellation
+                        .as_ref()
+                        .is_none_or(|token| token.mark_running() && token.try_seal_committed())
+                })
+                .unwrap_or(false)
+        } else {
+            run_job
+                .cancellation
+                .as_ref()
+                .is_none_or(JobCancellation::mark_running)
+        };
+        if !can_start {
+            return cancelled_before_execution();
+        }
+        run_job.execution_started.store(true, Ordering::Release);
+        job(&run_job.ctx)
+    };
+
+    let response = match run_job.lane {
+        Lane::PureRead | Lane::SerialLspStatus => {
+            if run_job.cancellation.is_some() {
+                loop {
+                    if let Some(_epoch) = run_job.epoch.try_read_for(EPOCH_WAIT_POLL) {
+                        return LaneRun::Finished(run(job));
+                    }
+                    if cancel_requested() {
+                        return LaneRun::Finished(cancelled_before_execution());
+                    }
+                }
+            }
+            let _epoch = run_job.epoch.read();
+            run(job)
+        }
+        // Cache and index builders reject stale generations and serialize
+        // publication internally. Taking the actor write gate after the command
+        // constructs its response would delay completion behind maintenance and
+        // park later readers behind an otherwise unnecessary writer.
+        Lane::HeavyInit => run(job),
+        Lane::ProviderMetadata => {
+            let _config = run_job.ctx.pin_config();
+            run(job)
+        }
+        // Call-ledger writes go through the database's own mutex and touch no
+        // index state, so they take no epoch gate.
+        Lane::CallLedger => run(job),
+        Lane::Mutating if run_job.shared_bind_gate => {
+            // A cancelled bind never touches the gate.
+            if cancel_requested() {
+                return LaneRun::Finished(cancelled_before_execution());
+            }
+            // The epoch lock is task-fair: a reader waits behind any parked
+            // writer (a detached view publication, typically) even while only
+            // readers hold it. Never wait here; a bind that cannot take the
+            // shared hold at once is queued again as an exclusive writer.
+            let Some(_epoch) = run_job.epoch.try_read() else {
+                return LaneRun::RerunExclusive { retry_after: None };
+            };
+            let scope = SharedBindScope::install();
+            let response = run(job);
+            if scope.rerun_requested() {
+                return LaneRun::RerunExclusive { retry_after: None };
+            }
+            response
+        }
+        // An exclusive repeatable bind is admitted only when no scheduler-
+        // tracked reader or maintenance job holds the gate, so a held gate
+        // here means a detached view publication. Its write can outlast one
+        // install (it takes the process-wide publication lock while holding
+        // the gate), so the bind backs off in the queue rather than wait on
+        // a worker.
+        Lane::Mutating if run_job.rerun.is_some() => {
+            if cancel_requested() {
+                return LaneRun::Finished(cancelled_before_execution());
+            }
+            let Some(_epoch) = run_job.epoch.try_write() else {
+                return LaneRun::RerunExclusive {
+                    retry_after: Some(detached_writer_backoff(run_job.exclusive_attempts)),
+                };
+            };
+            run(job)
+        }
+        Lane::Mutating => {
+            if run_job.cancellation.is_some() {
+                loop {
+                    if let Some(_epoch) = run_job.epoch.try_write_for(EPOCH_WAIT_POLL) {
+                        return LaneRun::Finished(run(job));
+                    }
+                    if cancel_requested() {
+                        return LaneRun::Finished(cancelled_before_execution());
+                    }
+                }
+            }
+            let _epoch = run_job.epoch.write();
+            run(job)
+        }
+        Lane::MaintenanceCommit => {
+            // Same gate as reads: the job's mutations are protected by the
+            // touched subsystems' own locks, and holding only the read gate
+            // lets interactive PureReads overlap freely.
+            loop {
+                if cancel_requested() {
+                    return LaneRun::Finished(cancelled_before_execution());
+                }
+                if let Some(_epoch) = run_job.epoch.try_read_for(EPOCH_WAIT_POLL) {
+                    return LaneRun::Finished(run(job));
+                }
+            }
+        }
+    };
+    LaneRun::Finished(response)
+}
+
+#[derive(Debug)]
+struct HeavySemaphore {
+    available: AtomicUsize,
+    max: usize,
+}
+
+impl HeavySemaphore {
+    fn new(permits: usize) -> Self {
+        Self {
+            available: AtomicUsize::new(permits),
+            max: permits,
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<HeavyPermit> {
+        loop {
+            let available = self.available.load(Ordering::Acquire);
+            if available == 0 {
+                return None;
+            }
+            if self
+                .available
+                .compare_exchange(
+                    available,
+                    available - 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Some(HeavyPermit {
+                    semaphore: Arc::clone(self),
+                });
+            }
+        }
+    }
+}
+
+struct HeavyPermit {
+    semaphore: Arc<HeavySemaphore>,
+}
+
+impl Drop for HeavyPermit {
+    fn drop(&mut self) {
+        let previous = self.semaphore.available.fetch_add(1, Ordering::Release);
+        debug_assert!(previous < self.semaphore.max);
+    }
+}

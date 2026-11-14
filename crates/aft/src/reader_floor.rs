@@ -1385,20 +1385,3 @@ pub(crate) fn prepare_cache_root_for_test(
         .map(|parent| crate::walk_boundary::simulated_volumes::simulate(parent, u64::MAX - 17));
     crate::cache_location::prepare_cache_root(config)
 }
-
-#[cfg(test)]
-pub(crate) fn clean_old_caches_for_test(
-    tiers: &[crate::config_resolve::ConfigTier],
-    storage: &Path,
-    confirm: impl FnMut(&[crate::cache_location::CleanupCandidate]) -> bool,
-) -> crate::cache_location::CleanupReport {
-    crate::reader_floor::register_cache_hooks();
-    let parent = crate::config_resolve::resolve_config(tiers)
-        .config
-        .cache_dir;
-    let _volume = parent
-        .as_ref()
-        .filter(|parent| parent.is_dir())
-        .map(|parent| crate::walk_boundary::simulated_volumes::simulate(parent, u64::MAX - 17));
-    crate::cache_location::clean_old_caches_resolved(tiers, storage, storage, confirm)
-}

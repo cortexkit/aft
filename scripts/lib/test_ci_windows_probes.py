@@ -90,6 +90,27 @@ sys.exit(int(os.environ.get("FAKE_PROBE_EXIT", "0")))
         (self.folder / "aft-stale.exe").write_text("stale")
         self.assertEqual(probes.library_harness(self.metadata), self.binary)
 
+    def test_tls_cli_selects_the_base_harness_without_replacing_the_aft_harness(self):
+        base_binary = self.folder / "aft-base-current.exe"
+        base_binary.write_bytes(self.binary.read_bytes())
+        base_binary.chmod(0o755)
+        self.metadata["rust-binaries"]["aft-base"] = {
+            "binary-name": "aft_base", "kind": "lib", "binary-path": str(base_binary),
+        }
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts/ci-windows-probes.py"),
+             "--archive-file", str(self.archive()), "--probe", "tls"],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.calls())
+        calls = [json.loads(row) for row in base_binary.with_suffix(".calls").read_text().splitlines()]
+        self.assertEqual([call["args"] for call in calls], [
+            ["--list", "--exact", probes.PROBES["tls"]],
+            ["--exact", probes.PROBES["tls"]],
+        ])
+        self.assertEqual(probes.library_harness(self.metadata), self.binary)
+
     def test_missing_or_ambiguous_library_metadata_is_refused(self):
         del self.metadata["rust-binaries"]["agent-file-tools"]
         with self.assertRaisesRegex(ValueError, "found 0"):

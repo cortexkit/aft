@@ -1,4 +1,5 @@
-use super::super::process::{recorded_process_liveness, ProcessLiveness};
+use super::super::process::recorded_process_liveness;
+use crate::process_identity::ProcessLiveness;
 #[cfg(target_os = "linux")]
 use super::super::{
     memory_limit::MemoryPolicy,

@@ -90,7 +90,7 @@ add_job() {
 select_path() {
   local path=$1 rest target test_file module test_filter
   case "$path" in
-    Cargo.toml|Cargo.lock|build.rs|crates/aft/Cargo.toml|crates/aft/build.rs|crates/aft/src/lib.rs|crates/aft/src/context.rs|crates/aft/src/db.rs|crates/aft/src/executor.rs|crates/aft/src/config*.rs|crates/aft/src/subc_config.rs|crates/aft/src/executor/*|crates/aft/src/db/*|crates/aft-tokenizer/*)
+    Cargo.toml|Cargo.lock|build.rs|crates/aft/Cargo.toml|crates/aft/build.rs|crates/aft/src/lib.rs|crates/aft/src/context.rs|crates/aft/src/db.rs|crates/aft/src/executor.rs|crates/aft/src/config*.rs|crates/aft/src/subc_config.rs|crates/aft/src/executor/*|crates/aft/src/db/*|crates/aft-tokenizer/*|crates/aft-base/*)
       shared=1 ;;
     crates/aft/src/main.rs)
       add_job bin aft '' ;;
@@ -175,7 +175,9 @@ if ((${#job_kinds[@]} == 0)); then
 fi
 print_job() {
   local kind=$1 target=$2 test_filter=$3
-  local -a args=(test --locked -j 4 -p agent-file-tools "--$kind")
+  local -a args=(test --locked -j 4 -p agent-file-tools)
+  [[ "$kind" != lib ]] || args+=(-p aft-base)
+  args+=("--$kind")
   [[ -z "$target" ]] || args+=("$target")
   [[ "$kind" != test ]] || args+=(--features test-hooks)
   [[ -z "$features" ]] || args+=(--features "$features")
@@ -238,7 +240,9 @@ export GIT_CONFIG_GLOBAL
 started=$SECONDS
 run_job() {
   local kind=$1 target=$2 test_filter=$3 label=$4 remaining output code
-  local -a args=(test --locked -j 4 -p agent-file-tools "--$kind")
+  local -a args=(test --locked -j 4 -p agent-file-tools)
+  [[ "$kind" != lib ]] || args+=(-p aft-base)
+  args+=("--$kind")
   [[ -z "$target" ]] || args+=("$target")
   [[ "$kind" != test ]] || args+=(--features test-hooks)
   [[ -z "$features" ]] || args+=(--features "$features")

@@ -115,20 +115,21 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)'
 # Source builds need CMake 3.18+ only when downloaded grammars are enabled.
 wasm-grammars = ["tree-sitter/wasm", "dep:wasmtime", "dep:wasmtime-c-api-impl"]
 # Offline call-graph measurements only; never enabled by production builds.
-callgraph-shape-census = []
+callgraph-shape-census = ["aft-base/callgraph-shape-census"]
 test-scope-owner = []
 # Explicit opt-in for cross-process timing controls used by integration tests.
-test-timing-hooks = []
+test-timing-hooks = ["aft-base/test-timing-hooks"]
 # Opt-in integration hooks for native re-exec and deterministic conformance inputs;
 # never enable these hooks in production builds.
-test-hooks = []
+test-hooks = ["aft-base/test-hooks", "aft-base/test-support"]
 # Compiles the test-only secret vault (V5). Nothing in the product reads it:
 # a release profile must never enable it, and
 # `scripts/check-secret-test-fake.sh` fails CI when one does.
-secret-test-fake = []
+secret-test-fake = ["aft-base/secret-test-fake"]
 semantic-chunk-census = []
 
 [dependencies]
+aft-base = { path = "../aft-base" }
 aft-store = { path = "../aft-store", version = "0.66.0" }
 log = "0.4"
 env_logger = "0.11"
@@ -325,6 +326,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+aft-base = { path = "../aft-base", features = ["test-support"] }
 cortexkit-test-support = "=0.1.14"
 graphql-parser = "0.4.1"
 cortexkit-role-tool-provider-conformance = "=0.15.13"

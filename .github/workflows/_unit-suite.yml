@@ -519,7 +519,7 @@ jobs:
         run: cargo build --features wasm-grammars -p agent-file-tools --bin aft
       - name: Run worker broker host policy and rendered socket rule regressions
         run: |
-          cargo test --features wasm-grammars -p agent-file-tools --features test-hooks --lib -- gh_shim --test-threads=1
+          cargo test --features wasm-grammars -p agent-file-tools -p aft-base --features test-hooks --lib -- gh_shim --test-threads=1
           binary_listing="$(cargo test --features wasm-grammars -p agent-file-tools --features test-hooks --bin aft -- --list)"
           [[ "$binary_listing" == *"gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition: test"* ]]
           cargo test --features wasm-grammars -p agent-file-tools --features test-hooks --bin aft -- gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition --test-threads=1
