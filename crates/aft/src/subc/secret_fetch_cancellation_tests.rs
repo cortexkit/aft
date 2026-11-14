@@ -38,7 +38,11 @@ impl ConsentTransport for Phone {
                 // envelope_invalid.
                 let mut keys: Vec<_> = call.params.as_object().unwrap().keys().cloned().collect();
                 keys.sort();
-                assert_eq!(keys, ["kind", "secret_use"], "Cingulate refuses unknown filing fields");
+                assert_eq!(
+                    keys,
+                    ["kind", "secret_use"],
+                    "Cingulate refuses unknown filing fields"
+                );
                 let mut requests = self.requests.lock().unwrap();
                 requests.push(call.params.clone());
                 let id = format!("el_{}", requests.len());
