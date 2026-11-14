@@ -128,9 +128,11 @@ def parse_cargo_list(output: str) -> list[CargoEntry]:
         # a `warning:` line plus `-->`, source-excerpt, `|` and `= note:`
         # continuation lines before the listing. sccache prints its own
         # `sccache: warning:` lines when its server restarts mid-build. None of
-        # them carry test entries.
+        # them carry test entries. The MSVC linker also prints `LINK : warning
+        # LNK4217` lines for the Wasm runtime's C API when the wasm-grammars
+        # feature is on.
         if (
-            stripped.startswith(("warning:", "= note:", "= help:", "sccache: ", "--> ", "..."))
+            stripped.startswith(("warning:", "= note:", "= help:", "sccache: ", "--> ", "...", "LINK : warning "))
             or stripped == "|"
             or WARNING_EXCERPT_RE.match(stripped)
         ):

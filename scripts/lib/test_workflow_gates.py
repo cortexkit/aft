@@ -840,6 +840,40 @@ class UnitShardPartitionCountTests(unittest.TestCase):
         proof["partition_nextest_entries"](["cargo", "nextest", "list"])
         self.assertEqual([call[-1] for call in calls], ["hash:1/3", "hash:2/3", "hash:3/3"])
 
+    def test_proof_cargo_list_ignores_msvc_linker_warnings(self) -> None:
+        import ast
+
+        # The wasm-grammars build makes MSVC print LNK4217 warnings for the Wasm
+        # runtime's C API between cargo's `Running` line and the test names.
+        wanted_functions = {"parse_cargo_list", "suite_name_from_artifact"}
+        nodes = [
+            node
+            for node in ast.parse(PROOF_TEXT).body
+            if isinstance(node, (ast.Import, ast.ImportFrom, ast.ClassDef))
+            # Module constants only; the script's main flow also assigns at top level.
+            or (isinstance(node, ast.Assign) and all(
+                isinstance(target, ast.Name) and target.id.isupper() for target in node.targets
+            ))
+            or (isinstance(node, ast.FunctionDef) and node.name in wanted_functions)
+        ]
+        import types
+
+        # dataclasses look up their defining module in sys.modules.
+        module = types.ModuleType("rust_test_inventory_proof_under_test")
+        module.__file__ = str(Path(__file__).resolve().parents[2] / "scripts/rust-test-inventory-proof.py")
+        with unittest.mock.patch.dict(sys.modules, {module.__name__: module}):
+            exec(compile(ast.Module(body=nodes, type_ignores=[]), "rust-test-inventory-proof.py", "exec"), module.__dict__)
+        namespace = module.__dict__
+        output = (
+            "     Running unittests src\\lib.rs (target\\debug\\deps\\agent_file_tools-0123abcd.exe)\n"
+            "         LINK : warning LNK4217: symbol 'wasm_engine_delete' defined in 'libwasmtime_c_api.rlib' is imported\n"
+            "parser::tests::parses: test\n"
+            "\n"
+            "1 test, 0 benchmarks\n"
+        )
+        entries = namespace["parse_cargo_list"](output)
+        self.assertEqual([(entry.kind, entry.name) for entry in entries], [("lib", "parser::tests::parses")])
+
     def test_proof_remaps_every_archive_list_and_partition_to_the_consumer(self) -> None:
         import ast
 
