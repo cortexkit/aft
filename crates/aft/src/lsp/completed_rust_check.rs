@@ -674,6 +674,20 @@ impl Runtime {
             env.insert(key.into_string().ok()?, value.into_string().ok()?);
         }
         env.extend(self.env.clone());
+        for pointer in ["/cargo/extraEnv", "/check/extraEnv"] {
+            if let Some(extra) = self
+                .options
+                .as_ref()
+                .and_then(|options| options.pointer(pointer))
+                .and_then(serde_json::Value::as_object)
+            {
+                for (key, value) in extra {
+                    if let Some(value) = value.as_str() {
+                        env.insert(key.clone(), value.to_string());
+                    }
+                }
+            }
+        }
         Some(env)
     }
 
@@ -819,6 +833,7 @@ impl Runtime {
             }
             // Without a known Cargo output directory we cannot discover a build
             // script's non-Rust inputs. Refuse unusual layouts, never guess.
+            let env = self.effective_env()?;
             for path in inputs.files.keys().filter(|path| {
                 path.file_name()
                     .is_some_and(|name| name == "config" || name == "config.toml")
@@ -833,6 +848,7 @@ impl Runtime {
                         .get("build")
                         .and_then(|b| b.get("target-dir"))
                         .is_some()
+                        && !env.contains_key("CARGO_BUILD_BUILD_DIR")
                 {
                     return None;
                 }
@@ -857,7 +873,6 @@ impl Runtime {
                     return None;
                 }
             }
-            let env = self.effective_env()?;
             let mut target = root.join(
                 env.get("CARGO_TARGET_DIR")
                     .or_else(|| env.get("CARGO_BUILD_TARGET_DIR"))
@@ -872,6 +887,14 @@ impl Runtime {
                 Some(serde_json::Value::String(value)) => target = root.join(value),
                 Some(serde_json::Value::Bool(true)) => target.push("rust-analyzer"),
                 _ => {}
+            }
+            if let Some(build) = env.get("CARGO_BUILD_BUILD_DIR") {
+                // Spawn resolves Cargo's templates before injecting this path.
+                // An unresolved template cannot safely certify build inputs.
+                if build.contains('{') || build.contains('}') {
+                    return None;
+                }
+                target = root.join(build);
             }
             let mut profiles = vec![target.join("debug/build"), target.join("release/build")];
             let mut triples = fs::read_dir(&target).ok()?;
@@ -1371,7 +1394,7 @@ impl CompletedRustCheck {
             .map(String::as_str)
             .unwrap_or("cargo");
         let mut command = crate::effective_path::new_command(binary)
-            .envs(&self.runtime.env)
+            .envs(&self.runtime.effective_env().unwrap_or_default())
             .env("GIT_OPTIONAL_LOCKS", "0")
             .build();
         command
@@ -1914,44 +1937,51 @@ mod tests {
     fn build_inputs_support_legacy_and_unit_layouts() {
         for profile in ["debug", "release", "some-target/debug"] {
             for output in ["member-control/output", "member/control/run/stdout"] {
-                let (_temp, mut cache) = fixture();
-                cache.runtime.env.insert(
-                    "CARGO_TARGET_DIR".into(),
-                    cache.root.join("target").to_string_lossy().into_owned(),
-                );
-                cache.runtime.options = Some(serde_json::json!({"cargo": {"targetDir": true}}));
-                write(&cache.root, "member/input.txt", "build input");
-                let inputs = &cache.saved.as_ref().unwrap().fingerprint;
-                let collect = || {
+                for build_dir in ["target/rust-analyzer", "target/rust-analyzer/build"] {
+                    let (_temp, mut cache) = fixture();
+                    cache.runtime.env.insert(
+                        "CARGO_TARGET_DIR".into(),
+                        cache.root.join("target").to_string_lossy().into_owned(),
+                    );
                     cache
                         .runtime
-                        .build_inputs(&cache.root, inputs, Instant::now() + BUDGET)
-                };
-                assert!(
-                    collect().is_none(),
-                    "missing build output must not certify inputs"
-                );
-                write(
+                        .env
+                        .insert("CARGO_BUILD_BUILD_DIR".into(), "unused-build-dir".into());
+                    cache.runtime.options = Some(serde_json::json!({"cargo": {
+                        "targetDir": true,
+                        "extraEnv": {"CARGO_BUILD_BUILD_DIR": cache.root.join(build_dir)}
+                    }}));
+                    write(&cache.root, "member/input.txt", "build input");
+                    let inputs = &cache.saved.as_ref().unwrap().fingerprint;
+                    let collect = || {
+                        cache
+                            .runtime
+                            .build_inputs(&cache.root, inputs, Instant::now() + BUDGET)
+                    };
+                    assert!(
+                        collect().is_none(),
+                        "missing build output must not certify inputs"
+                    );
+                    write(
                     &cache.root,
-                    &format!("target/rust-analyzer/{profile}/build/{output}"),
+                    &format!("{build_dir}/{profile}/build/{output}"),
                     "cargo:rerun-if-changed=input.txt\ncargo::rerun-if-env-changed=BUILD_INPUT\n",
                 );
-                // Other packages must not add declarations to this package's
-                // certificate, even when their names share its prefix.
-                write(
-                    &cache.root,
-                    &format!(
-                        "target/rust-analyzer/{profile}/build/member-other/control/run/stdout"
-                    ),
-                    "cargo:rerun-if-changed=nonexistent.txt\n",
-                );
-                let (paths, env) = collect().expect("discover declared build inputs");
-                assert_eq!(
-                    paths,
-                    vec![canonical(&cache.root.join("member/input.txt")).unwrap()],
-                    "{profile}/{output}"
-                );
-                assert_eq!(env, vec!["BUILD_INPUT"], "{profile}/{output}");
+                    // Other packages must not add declarations to this package's
+                    // certificate, even when their names share its prefix.
+                    write(
+                        &cache.root,
+                        &format!("{build_dir}/{profile}/build/member-other/control/run/stdout"),
+                        "cargo:rerun-if-changed=nonexistent.txt\n",
+                    );
+                    let (paths, env) = collect().expect("discover declared build inputs");
+                    assert_eq!(
+                        paths,
+                        vec![canonical(&cache.root.join("member/input.txt")).unwrap()],
+                        "{profile}/{output}"
+                    );
+                    assert_eq!(env, vec!["BUILD_INPUT"], "{profile}/{output}");
+                }
             }
         }
     }
