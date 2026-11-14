@@ -1,0 +1,15 @@
+OpenCode 1 edit-family selector capture
+run_id: oc1-1.19.5-20261102T153034023Z-t7-parity
+source_sha: cfc77443f3c63ae228e440a0231bbbac7f4d5fc0
+binary: opencode-ai@1.19.5 (linux-x64)
+binary_sha256: 7df4e4136301f16589b0f30bf91a61380fca5f8ef22dd36570f5ebe1d4ec802c
+isolation: throwaway HOME and all XDG roots; no host service started for the bundle inspection
+bundle: opencode-ai/bin/opencode.exe (temporary prefix <capture-root>)
+
+registry_function: l("ToolRegistry.tools")
+selector_source: let oe=V.modelID.includes("gpt-")&&!V.modelID.includes("oss")&&!V.modelID.includes("gpt-4");if(G.id===ln.id)return oe;if(G.id===Bt.id||G.id===Zt.id)return!oe;
+tool selector apply_patch: ln=Yr("apply_patch"
+tool selector edit: Bt=Yr("edit"
+tool selector write: Zt=Yr("write"
+
+Every fragment above was found byte-for-byte in the installed host bundle. The model-id selector still enables apply_patch for eligible GPT names and edit/write otherwise.

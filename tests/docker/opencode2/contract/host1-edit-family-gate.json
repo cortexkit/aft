@@ -1,27 +1,27 @@
 {
   "schema_version": 1,
-  "run_id": "oc1-1.19.3-20261019T153146048Z-t7-parity",
-  "observed_run_id": "oc1-1.19.3-20261019T153146048Z-t7-parity",
-  "host_version": "1.19.3",
+  "run_id": "oc1-1.19.5-20261102T153034023Z-t7-parity",
+  "observed_run_id": "oc1-1.19.5-20261102T153034023Z-t7-parity",
+  "host_version": "1.19.5",
   "host": "opencode1",
   "platform": "linux-x64",
-  "transcript": "probe/host1-edit-family-gate-1.19.3.txt",
+  "transcript": "probe/host1-edit-family-gate-1.19.5.txt",
   "executable": "opencode-ai/bin/opencode.exe",
-  "executable_sha256": "179ca421d61eefeadfa0c50e084a6e79c1623734732f0f4593f81ccfd3ab7ee9",
-  "registry_function": "s.fn(\"ToolRegistry.tools\")",
-  "selector_source": "let F=D.modelID.includes(\"gpt-\")&&!D.modelID.includes(\"oss\")&&!D.modelID.includes(\"gpt-4\");if(A.id===xr.id)return F;if(A.id===Hr.id||A.id===vr.id)return!F;",
+  "executable_sha256": "7df4e4136301f16589b0f30bf91a61380fca5f8ef22dd36570f5ebe1d4ec802c",
+  "registry_function": "l(\"ToolRegistry.tools\")",
+  "selector_source": "let oe=V.modelID.includes(\"gpt-\")&&!V.modelID.includes(\"oss\")&&!V.modelID.includes(\"gpt-4\");if(G.id===ln.id)return oe;if(G.id===Bt.id||G.id===Zt.id)return!oe;",
   "tool_selectors": [
     {
       "tool": "apply_patch",
-      "source": "xr=j(\"apply_patch\""
+      "source": "ln=Yr(\"apply_patch\""
     },
     {
       "tool": "edit",
-      "source": "Hr=j(\"edit\""
+      "source": "Bt=Yr(\"edit\""
     },
     {
       "tool": "write",
-      "source": "vr=j(\"write\""
+      "source": "Zt=Yr(\"write\""
     }
   ],
   "harness_models": {
@@ -29,6 +29,6 @@
     "v2_leg": "openai/gpt-5-mock",
     "v2_default": "openai/mock-model"
   },
-  "reading": "F is true for a model id containing gpt- but neither oss nor gpt-4. True publishes apply_patch and withholds edit and write; false publishes edit and write and withholds apply_patch. V1 parity still uses the captured mock/mock-model, so its apply_patch leg remains excluded. V2 apply_patch scenarios now explicitly select openai/gpt-5-mock while other scenarios keep openai/mock-model by default. V2 disables the host patch plugin and AFT supplies the corresponding per-model gate; the V1 source fragments above remain unchanged.",
-  "capture_source_sha": "13f6f70aecd4481550fd50f34ea479ab1ee03d51"
+  "reading": "oe is true for a model id containing gpt- but neither oss nor gpt-4. True publishes apply_patch and withholds edit and write; false publishes edit and write and withholds apply_patch. V1 parity still uses the captured mock/mock-model, so its apply_patch leg remains excluded. V2 apply_patch scenarios explicitly select openai/gpt-5-mock while other scenarios keep openai/mock-model by default. V2 disables the host patch plugin and AFT supplies the corresponding per-model gate. OpenCode 1.19.5 renamed the minified bindings but kept the model predicate and edit-family filtering unchanged from 1.19.3.",
+  "capture_source_sha": "cfc77443f3c63ae228e440a0231bbbac7f4d5fc0"
 }
