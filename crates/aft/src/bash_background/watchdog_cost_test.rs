@@ -2173,7 +2173,7 @@ fn watchdog_cost_large_store_maintenance_measurement() {
     registry.detach();
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn cleanup_cpu_ns() -> u64 {
     let mut time: libc::timespec = unsafe { std::mem::zeroed() };
     assert_eq!(
@@ -2183,22 +2183,22 @@ fn cleanup_cpu_ns() -> u64 {
     time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 thread_local! {
     static CLEANUP_PHASES: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(super) struct CleanupPhaseTimer(Option<(bool, u64)>);
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 impl CleanupPhaseTimer {
     pub(super) fn start(image: bool) -> Self {
         Self(CLEANUP_PHASES.with(|phases| phases.get().map(|_| (image, cleanup_cpu_ns()))))
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 impl Drop for CleanupPhaseTimer {
     fn drop(&mut self) {
         if let Some((image, start)) = self.0 {
@@ -2219,7 +2219,7 @@ impl Drop for CleanupPhaseTimer {
 /// One scheduled minute has one cleanup pass. Measure that pass's calling-thread
 /// CPU, excluding fixture setup and the separate persisted-GC worker. Run alone
 /// with --ignored --nocapture --test-threads=1.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 #[ignore = "measurement: 154,000 terminal rows/tasks, 1,200 saved bundles"]
 fn watchdog_cost_live_shaped_cleanup_measurement() {
@@ -2279,8 +2279,8 @@ fn watchdog_cost_live_shaped_cleanup_measurement() {
             .insert_rehydrated_task(metadata, paths, true)
             .unwrap();
         if index < SAVED {
-            let scratch = base.path().join(format!("scratch-{index}"));
-            fs::create_dir(&scratch).unwrap();
+            let scratch = base.path().join("scratch").join(index.to_string());
+            fs::create_dir_all(&scratch).unwrap();
             registry.retain_scratch(
                 &format!("retained-{index}"),
                 scratch,
@@ -2334,7 +2334,29 @@ fn watchdog_cost_live_shaped_cleanup_measurement() {
             assert!(Instant::now() < deadline, "persisted GC did not finish");
             std::thread::sleep(Duration::from_millis(10));
         }
+        // Real scheduler time, not a shortened timer: terminal events and their
+        // wake sends must not turn the 60-second cleanup into per-event work.
+        let before = super::super::watchdog::cleanup_pass_counts_for_test();
+        registry.start_watchdog();
+        let wall = Instant::now();
+        for _ in 0..33 {
+            std::thread::sleep(Duration::from_secs(2));
+            let task = metadata_persistence_running_task(&storage, &registry);
+            registry.finalize_from_marker(&task, ExitMarker::Code(0), None).unwrap();
+            let _ = registry.inner.wake_tx.try_send(());
+        }
+        let after = super::super::watchdog::cleanup_pass_counts_for_test();
+        eprintln!("CLEANUP frequency elapsed_s={:.3} finishing_tasks=33 started={} completed={}", wall.elapsed().as_secs_f64(), after.0 - before.0, after.1 - before.1);
+        assert_eq!(after.0 - before.0, 1);
+        assert_eq!(after.1 - before.1, 1);
         registry.detach();
+        while persisted_gc_slots().lock().unwrap().values().any(|slot| slot.running) {
+            assert!(Instant::now() < deadline + Duration::from_secs(120), "persisted GC did not finish after frequency measurement");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The cleanup worker can be the last owner after a project detaches.
+        // Keep full-history destruction separate from periodic pass CPU.
+        phase("last_registry_drop", || drop(registry));
     }).unwrap();
     worker.join().unwrap();
 }

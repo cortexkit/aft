@@ -9,6 +9,18 @@ use super::registry::{BgTask, BgTaskRegistry, WatchdogPassCause};
 const WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 pub(super) const FINISHED_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+#[cfg(test)]
+static CLEANUP_STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static CLEANUP_COMPLETED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(super) fn cleanup_pass_counts_for_test() -> (usize, usize) {
+    (
+        CLEANUP_STARTED.load(Ordering::SeqCst),
+        CLEANUP_COMPLETED.load(Ordering::SeqCst),
+    )
+}
 /// How long periodic passes leave an exited PTY task to its reader's wake.
 /// The reader normally reaches end-of-file right after the child exits, but a
 /// background grandchild can keep the terminal open, so after this the
@@ -337,6 +349,8 @@ fn scheduler() -> &'static crossbeam_channel::Sender<std::sync::Weak<super::regi
                             start_cleanup_with(
                                 &cleaning,
                                 move || {
+                                    #[cfg(test)]
+                                    CLEANUP_STARTED.fetch_add(1, Ordering::SeqCst);
                                     crate::gh_shim_speech::start_view::sweep_queued();
                                     for inner in registries
                                         .into_iter()
@@ -347,6 +361,8 @@ fn scheduler() -> &'static crossbeam_channel::Sender<std::sync::Weak<super::regi
                                         registry.cleanup_finished(FINISHED_RETENTION);
                                         registry.request_recurring_persisted_gc();
                                     }
+                                    #[cfg(test)]
+                                    CLEANUP_COMPLETED.fetch_add(1, Ordering::SeqCst);
                                 },
                                 |work| {
                                     thread::Builder::new()

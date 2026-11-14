@@ -11612,7 +11612,7 @@ impl BgTaskRegistry {
     ) {
         let cutoff = now.checked_sub(older_than);
         let candidates: Vec<_> = {
-            #[cfg(all(test, target_os = "linux"))]
+            #[cfg(all(test, unix))]
             let _timer = watchdog_cost_tests::CleanupPhaseTimer::start(false);
             let mut queue = self
                 .inner
@@ -11628,7 +11628,7 @@ impl BgTaskRegistry {
                 continue;
             };
             {
-                #[cfg(all(test, target_os = "linux"))]
+                #[cfg(all(test, unix))]
                 let _timer = watchdog_cost_tests::CleanupPhaseTimer::start(true);
                 image_cleanup.record(self.cleanup_terminal_task_image(&task));
             }
