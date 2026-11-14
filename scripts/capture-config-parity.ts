@@ -250,6 +250,8 @@ const CASES: ParityCase[] = [
     { name: `durability_project_dropped_${harness}`, harness, user: { durability: { macos_full_sync: true } }, project: { durability: { macos_full_sync: false } } },
     { name: `durability_project_only_dropped_${harness}`, harness, project: { durability: { macos_full_sync: true } } },
     { name: `durability_user_fsync_${harness}`, harness, user: { durability: { macos_full_sync: false } }, project: { durability: { macos_full_sync: true } } },
+    { name: `durability_harness_dropped_${harness}`, harness, user: { durability: { macos_full_sync: true }, harnesses: { [harness]: { durability: { macos_full_sync: false } } } }, project: { harnesses: { [harness]: { durability: { macos_full_sync: false } } } } },
+    { name: `durability_harness_only_dropped_${harness}`, harness, user: { harnesses: { [harness]: { durability: { macos_full_sync: true } } } } },
   ]),
   { name: "lsp_idle_default", user: {} },
   { name: "lsp_max_servers_user", user: { lsp: { max_servers: 16 } } },

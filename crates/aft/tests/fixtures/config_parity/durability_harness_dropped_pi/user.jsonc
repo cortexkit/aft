@@ -1,0 +1,12 @@
+{
+  "durability": {
+    "macos_full_sync": true
+  },
+  "harnesses": {
+    "pi": {
+      "durability": {
+        "macos_full_sync": false
+      }
+    }
+  }
+}

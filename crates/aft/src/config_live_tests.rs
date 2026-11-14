@@ -119,7 +119,10 @@ fn macos_full_sync_tracks_configure_and_reload_not_context_construction() {
         return;
     }
     assert!(!aft_store::sync::macos_full_sync());
-    let fixture = Fixture::new(r#"{"durability":{"macos_full_sync":true}}"#, None);
+    let fixture = Fixture::new(
+        r#"{"durability":{"macos_full_sync":true},"harnesses":{"opencode":{"durability":{"macos_full_sync":false}}}}"#,
+        None,
+    );
     assert!(aft_store::sync::macos_full_sync());
     let _second = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
     assert!(aft_store::sync::macos_full_sync());

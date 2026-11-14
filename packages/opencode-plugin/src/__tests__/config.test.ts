@@ -601,6 +601,21 @@ describe("loadAftConfig", () => {
     const result = runConfigLoader(fixture.projectDirectory, env);
     expect(JSON.parse(result.stdout).durability).toBeUndefined();
     expect(result.stderr).toContain("Ignoring durability.macos_full_sync from project config");
+    writeFileSync(fixture.projectConfigPath, "{}");
+    for (const enabled of [false, true]) {
+      writeFileSync(
+        fixture.userConfigPath,
+        JSON.stringify({
+          durability: { macos_full_sync: enabled },
+          harnesses: { opencode: { durability: { macos_full_sync: !enabled } } },
+        }),
+      );
+      const overridden = runConfigLoader(fixture.projectDirectory, env);
+      expect(JSON.parse(overridden.stdout).durability).toEqual({ macos_full_sync: enabled });
+      expect(overridden.stderr).toContain(
+        "Ignoring durability.macos_full_sync from harnesses.opencode",
+      );
+    }
   });
 
   test("github honors only the user tier and warns for project overrides", () => {

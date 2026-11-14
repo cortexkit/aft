@@ -485,7 +485,7 @@ export interface AftConfig {
   index?: IndexConfig;
   /** Only the user config's top level may select this existing directory. Caches live in its `aft` child; an unavailable directory disables caches instead of writing them under the storage root. */
   storage?: { cache_dir?: string | null };
-  /** User-only macOS file flush policy. Full drive-cache flushes default off. */
+  /** User-base-only macOS file flush policy. Full drive-cache flushes default off. */
   durability?: { macos_full_sync?: boolean };
   /** Number of files to parse in a single batch during callgraph store cold build. Lower values reduce peak memory during cold build. Default: 100. */
   callgraph_chunk_size?: number;
@@ -1143,6 +1143,13 @@ function applyActiveHarnessOverride(config: AftConfig, trusted: boolean): AftCon
   const merged = { ...base, ...override } as AftConfigFields;
   if (base.storage) merged.storage = base.storage;
   else delete merged.storage;
+  if (override.durability?.macos_full_sync !== undefined) {
+    warn(
+      `Ignoring durability.macos_full_sync from harnesses.${ACTIVE_HARNESS} (the process-wide policy only honors the user config base)`,
+    );
+  }
+  if (base.durability) merged.durability = base.durability;
+  else delete merged.durability;
   // A harness block's `bash.env` merges names into the file's base map
   // instead of replacing it, so adding one name under `harnesses.<name>`
   // cannot silently drop every base name.

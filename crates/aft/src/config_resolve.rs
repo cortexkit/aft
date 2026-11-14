@@ -1596,6 +1596,18 @@ fn apply_harness_override(
     match serde_json::from_value::<RawAftConfig>(Value::Object(override_map)) {
         Ok(mut override_config) => {
             if override_config
+                .durability
+                .take()
+                .is_some_and(|durability| durability.macos_full_sync.is_some())
+            {
+                push_drop(
+                    dropped,
+                    "durability.macos_full_sync",
+                    &tier.tier,
+                    "sync policy is process-wide; only the user-tier base may set it",
+                );
+            }
+            if override_config
                 .storage
                 .take()
                 .is_some_and(|storage| storage.cache_dir.is_some())
@@ -2151,6 +2163,46 @@ fn macos_full_sync_is_user_only_and_defaults_off() {
     }]);
     assert!(!project.config.durability.macos_full_sync);
     assert_eq!(project.dropped[0].key, "durability.macos_full_sync");
+}
+
+#[cfg(test)]
+#[test]
+fn macos_full_sync_ignores_all_harness_overrides() {
+    for harness in [Harness::Opencode, Harness::Pi] {
+        for base in [false, true] {
+            let key = harness.wire_label();
+            let result = resolve_config_for_harness(
+                &[
+                    ConfigTier {
+                        tier: "user".into(),
+                        source: "user.jsonc".into(),
+                        doc: serde_json::json!({
+                            "durability": {"macos_full_sync": base},
+                            "harnesses": {(key.clone()): {"durability": {"macos_full_sync": !base}}}
+                        })
+                        .to_string(),
+                    },
+                    ConfigTier {
+                        tier: "project".into(),
+                        source: "project.jsonc".into(),
+                        doc: serde_json::json!({
+                            "harnesses": {(key.clone()): {"durability": {"macos_full_sync": !base}}}
+                        })
+                        .to_string(),
+                    },
+                ],
+                Some(&harness),
+            );
+            assert!(result.errors.is_empty(), "{:?}", result.errors);
+            assert_eq!(result.config.durability.macos_full_sync, base);
+            for tier in ["user", "project"] {
+                assert!(result
+                    .dropped
+                    .iter()
+                    .any(|drop| { drop.key == "durability.macos_full_sync" && drop.tier == tier }));
+            }
+        }
+    }
 }
 
 #[cfg(test)]

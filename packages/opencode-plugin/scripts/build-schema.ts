@@ -115,7 +115,8 @@ function buildSchema(): Record<string, unknown> {
       durability: {
         type: "object",
         additionalProperties: false,
-        description: "User-only file flush policy. Project values have no effect.",
+        description:
+          "Process-wide file flush policy from the user config base only. Project values and all harness overrides have no effect.",
         properties: {
           macos_full_sync: {
             type: "boolean",
@@ -887,7 +888,7 @@ function buildSchema(): Record<string, unknown> {
   configProperties.harnesses = {
     type: "object",
     description:
-      "Per-harness overrides. The active harness applies its override after the base config within each tier: user base, user override, project base, project override. storage.cache_dir is storage-wide and cannot be overridden here. Nested harnesses are ignored; unknown harness names are reserved for forward compatibility.",
+      "Per-harness overrides. The active harness applies its override after the base config within each tier: user base, user override, project base, project override. storage.cache_dir is storage-wide and durability.macos_full_sync is process-wide; neither can be overridden here. Nested harnesses are ignored; unknown harness names are reserved for forward compatibility.",
     additionalProperties: {
       type: "object",
       properties: { ...configProperties },

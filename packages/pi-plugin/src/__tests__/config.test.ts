@@ -823,6 +823,19 @@ describe("loadAftConfig", () => {
     const result = runConfigLoader(fixture.projectDirectory, env);
     expect(JSON.parse(result.stdout).durability).toBeUndefined();
     expect(result.stderr).toContain("Ignoring durability.macos_full_sync from project config");
+    writeFileSync(fixture.projectConfigPath, "{}");
+    for (const enabled of [false, true]) {
+      writeFileSync(
+        fixture.userConfigPath,
+        JSON.stringify({
+          durability: { macos_full_sync: enabled },
+          harnesses: { pi: { durability: { macos_full_sync: !enabled } } },
+        }),
+      );
+      const overridden = runConfigLoader(fixture.projectDirectory, env);
+      expect(JSON.parse(overridden.stdout).durability).toEqual({ macos_full_sync: enabled });
+      expect(overridden.stderr).toContain("Ignoring durability.macos_full_sync from harnesses.pi");
+    }
   });
 
   test("honors user backup config and ignores project backup config", () => {
