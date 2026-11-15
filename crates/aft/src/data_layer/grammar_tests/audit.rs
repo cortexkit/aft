@@ -362,7 +362,7 @@ fn trace_gaps() {
     );
     assert_eq!(
         serde_json::to_string(&clean).unwrap(),
-        r#"{"id":"luau-s4","success":true,"complete":true,"path":null,"reason":"no_path_found"}"#
+        r#"{"id":"luau-s4","success":true,"path":null,"complete":true,"reason":"no_path_found"}"#
     );
     let _forced = f
         .registry
@@ -462,7 +462,7 @@ fn readiness(before_gap_publication: bool) {
     let build = before_gap_publication.then(|| hold(&f.root, BuildPublication));
     let fill = hold(&f.root, FillSurvey);
     let publication = hold(&f.root, DeltaPublication);
-    let _model = crate::data_layer::meaning::fill_without_model_for_test(&f.root, 2);
+    let _model = crate::data_layer::meaning::fill_with_constant_vectors_for_test(&f.root, 2);
     let runtime = DataCheckout::open(&f.root, &f.storage, None).unwrap();
     runtime.configure_meaning(Some(&crate::config::SemanticBackendConfig::default()));
     if let Some(build) = &build {
@@ -634,5 +634,5 @@ fn outline_guards() {
     assert!(batch.data.get("gaps").is_none());
     let skipped = batch.data["skipped_files"].as_array().unwrap();
     assert!(skipped.iter().any(|row| row["reason"] == "too_large"));
-    assert!(skipped.iter().any(|row| row["reason"] == "error"));
+    assert!(skipped.iter().any(|row| row["reason"] == "file_not_found"));
 }

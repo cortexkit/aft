@@ -551,6 +551,13 @@ impl Meaning {
             if let Some(dimensions) = model_free_dimensions_for_test(checkout.root()) {
                 return self.fill_without_model_for_test(checkout, config, dimensions);
             }
+            #[cfg(test)]
+            if let Some(dimensions) = lock(constant_vectors_for_test())
+                .get(checkout.root())
+                .copied()
+            {
+                return self.fill_constant_vectors_for_test(checkout, config, dimensions);
+            }
             match SemanticEmbeddingModel::from_config(config) {
                 Ok(loaded) => *model = Some((config.clone(), loaded)),
                 Err(error) => return Round::Failed(self.failure(checkout.root(), error, true)),
@@ -628,6 +635,47 @@ impl Meaning {
 /// round finds nothing to embed.
 #[cfg(test)]
 impl Meaning {
+    fn fill_constant_vectors_for_test(
+        &self,
+        checkout: &Arc<Checkout>,
+        config: &SemanticBackendConfig,
+        dimensions: usize,
+    ) -> Round {
+        let plane = match self.plane_for(checkout, config, || {
+            Ok(
+                crate::semantic_index::SemanticIndexFingerprint::for_config_dimension(
+                    config, dimensions,
+                ),
+            )
+        }) {
+            Ok(plane) => plane,
+            Err(error) => return Round::Failed(FillFailure::Failed(error)),
+        };
+        match plane.fill_rounds(
+            &mut |texts| {
+                Ok(texts
+                    .iter()
+                    .map(|_| {
+                        let mut row = vec![0.0; dimensions];
+                        row[0] = 1.0;
+                        row
+                    })
+                    .collect())
+            },
+            FillBudget {
+                max_batch: 64,
+                files_per_round: FILES_PER_ROUND,
+            },
+            1,
+            &mut |_| {},
+        ) {
+            Ok(report) if report.error.is_none() && report.files_left == 0 => Round::Done,
+            Ok(report) if report.error.is_none() => Round::More,
+            Ok(report) => Round::Failed(FillFailure::Failed(format!("{report:?}"))),
+            Err(error) => Round::Failed(FillFailure::Failed(error.to_string())),
+        }
+    }
+
     fn fill_without_model_for_test(
         &self,
         checkout: &Arc<Checkout>,
@@ -666,6 +714,27 @@ fn model_free_planes_for_test() -> &'static Mutex<std::collections::HashMap<Path
     static PLANES: std::sync::OnceLock<Mutex<std::collections::HashMap<PathBuf, usize>>> =
         std::sync::OnceLock::new();
     PLANES.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn constant_vectors_for_test() -> &'static Mutex<std::collections::HashMap<PathBuf, usize>> {
+    static PLANES: std::sync::OnceLock<Mutex<std::collections::HashMap<PathBuf, usize>>> =
+        std::sync::OnceLock::new();
+    PLANES.get_or_init(Default::default)
+}
+
+/// Embed constant, correctly sized rows without model or network work, while
+/// still exercising meaning search's fill, publication and follow-up jobs.
+#[cfg(test)]
+pub(crate) fn fill_with_constant_vectors_for_test(root: &Path, dimensions: usize) -> impl Drop {
+    struct Release(PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            lock(constant_vectors_for_test()).remove(&self.0);
+        }
+    }
+    lock(constant_vectors_for_test()).insert(root.to_path_buf(), dimensions);
+    Release(root.to_path_buf())
 }
 
 #[cfg(test)]
