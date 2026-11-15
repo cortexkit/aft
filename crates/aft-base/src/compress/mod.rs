@@ -191,6 +191,9 @@ pub struct CompressionResult {
     pub input_line_count: usize,
     // Only cargo's bounded panic sections may omit detail after retaining the
     // complete failure-name list and every test result.
+    #[cfg(any(test, feature = "test-support"))]
+    pub bounded_cargo_test_details: bool,
+    #[cfg(not(any(test, feature = "test-support")))]
     bounded_cargo_test_details: bool,
 }
 
