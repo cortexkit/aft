@@ -988,9 +988,12 @@ mod tests {
         counts
     }
 
-    /// A record's outline is exactly the table a parse of the file gives
-    /// outline, while the record's call-graph symbols are not: the call
-    /// graph keeps one of each scoped name, so platform twins collapse.
+    /// A record's outline, as navigation serves it, is exactly the table a
+    /// parse of the file gives outline, while the record's call-graph symbols
+    /// are not: the call graph keeps one of each scoped name, so platform
+    /// twins collapse. For Rust, navigation adds trait members from the
+    /// stored call-graph symbols (`complete_rust_outline`), so the comparison
+    /// applies the same completion the checkout view does.
     #[test]
     fn stored_outlines_equal_the_parsers_symbol_table() {
         let mut compared = 0;
@@ -1008,10 +1011,16 @@ mod tests {
             let RecordBody::Parsed { surface, body } = &record.data else {
                 panic!("{name}: a parsed language gives a parsed record");
             };
-            let stored = body
+            let outline = body
                 .outline
-                .as_ref()
-                .unwrap_or_else(|| panic!("{name}: no outline"))
+                .clone()
+                .unwrap_or_else(|| panic!("{name}: no outline"));
+            let served = if language == "rust" {
+                complete_rust_outline(outline, surface)
+            } else {
+                outline
+            };
+            let stored = served
                 .iter()
                 .map(|symbol| symbol_from_outline(symbol).unwrap())
                 .collect::<Vec<_>>();
