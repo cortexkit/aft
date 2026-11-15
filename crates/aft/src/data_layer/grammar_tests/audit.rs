@@ -1556,7 +1556,17 @@ isolated!(
                 write(
                     &f.root,
                     "plain.ts",
-                    "export function unused() { return 1; }\n",
+                    "export function live() { return 1; }\nexport function unused() { return 2; }\n",
+                );
+                write(
+                    &f.root,
+                    "main.ts",
+                    "import { live } from './plain';\nlive();\n",
+                );
+                write(
+                    &f.root,
+                    "package.json",
+                    r#"{"main":"main.ts","type":"module"}"#,
                 );
             }
             configure_inspect(&f);
@@ -1590,5 +1600,24 @@ isolated!(
             }
             assert!(!details.iter().any(|item| item["file"] == "source.luau"));
         }
+    }
+);
+
+isolated!(
+    luau_s4_round5_cold_valid_outline_parses_once_and_known_valid_cache_does_not_parse,
+    || {
+        let f = fixture(true);
+        let path = write(&f.root, "ready.luau", SOURCE);
+        let before = crate::parser::work_counters::tree_parses();
+        let cold = ask(&f.ctx, "outline", json!({"file":f.root,"files":true}));
+        assert!(cold.success, "{:?}", cold.data);
+        assert_eq!(cold.data["complete"], true);
+        assert_eq!(cold.data["content_files"], json!([path]));
+        assert_eq!(cold.data["files"][0]["symbols"], 1);
+        assert_eq!(crate::parser::work_counters::tree_parses() - before, 1);
+        let warm = ask(&f.ctx, "outline", json!({"file":f.root,"files":true}));
+        assert!(warm.success, "{:?}", warm.data);
+        assert_eq!(warm.data, cold.data);
+        assert_eq!(crate::parser::work_counters::tree_parses() - before, 1);
     }
 );

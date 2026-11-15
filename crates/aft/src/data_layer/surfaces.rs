@@ -2888,6 +2888,36 @@ mod tests {
     }
 
     #[test]
+    fn luau_s4_round5_meaning_report_marks_only_luau_outline_failures_incomplete() {
+        for luau_failed in [0, 1] {
+            let report = MeaningReport {
+                plane: MeaningPlane::Serving {
+                    complete: luau_failed == 0,
+                    refreshing: true,
+                    coverage: MeaningCoverage {
+                        files: 2,
+                        files_failed: 2,
+                        files_luau_outline_failed: luau_failed,
+                        ..MeaningCoverage::default()
+                    },
+                    error: None,
+                },
+                filling: false,
+                waiting: false,
+                times: super::super::meaning::FillTimes::default(),
+            };
+            let status = report.status_json();
+            assert_eq!(status["status"], "ready");
+            assert_eq!(status["files_failed"], 2);
+            if luau_failed == 1 {
+                assert_eq!(status.get("complete"), Some(&json!(false)));
+            } else {
+                assert!(status.get("complete").is_none(), "{status:?}");
+            }
+        }
+    }
+
+    #[test]
     fn a_checkout_estimate_splits_the_planes_and_names_what_it_left_out() {
         let live = LiveMemory {
             state_paths: 4,
