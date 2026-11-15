@@ -479,6 +479,35 @@ mod build_scratch_tests {
     }
 
     #[test]
+    fn a_workspace_the_sweep_cannot_delete_does_not_block_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let family =
+            Family::open(dir.path(), FamilyId::from_digest(Digest128::of(b"stuck"))).unwrap();
+        let scratch = family
+            .try_write()
+            .unwrap()
+            .unwrap()
+            .create_scratch(checkout(b"checkout"), |_| Ok::<_, ()>(()))
+            .unwrap();
+        let path = scratch.path().to_path_buf();
+        drop(scratch);
+        UNDELETABLE_FOR_TEST.lock().unwrap().push(path.clone());
+        let session = family.try_write();
+        assert!(
+            matches!(session, Ok(Some(_))),
+            "the writer starts: {session:?}"
+        );
+        drop(session);
+        assert!(path.exists(), "the workspace could not be deleted");
+        UNDELETABLE_FOR_TEST
+            .lock()
+            .unwrap()
+            .retain(|stuck| stuck != &path);
+        drop(family.try_write().unwrap().unwrap());
+        assert!(!path.exists(), "the next writer deletes it");
+    }
+
+    #[test]
     fn build_scratch_subdirs_share_one_workspace() {
         let dir = tempfile::tempdir().unwrap();
         let scratch = Arc::new(
@@ -547,7 +576,22 @@ fn remove_dead_workspaces(dir: &Path) -> Result<(), FamilyError> {
     Ok(())
 }
 
+/// Workspaces a test makes impossible to delete.
+#[cfg(test)]
+static UNDELETABLE_FOR_TEST: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
 fn remove_workspace_dir(workspace: &Path) -> Result<(), FamilyError> {
+    #[cfg(test)]
+    if UNDELETABLE_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|path| path == workspace)
+    {
+        return Err(FamilyError::io(workspace)(std::io::Error::other(
+            "a test keeps it",
+        )));
+    }
     match std::fs::remove_dir_all(workspace) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
             Err(FamilyError::io(workspace)(error))
@@ -653,19 +697,26 @@ impl ScratchClaim {
     }
 }
 
-fn sweep_build_scratch(builds: &Path) -> Result<(), FamilyError> {
+/// Deletes the dead workspaces no later build may adopt, of every checkout
+/// no live build holds. Best effort: a workspace that cannot be deleted
+/// now (on Windows, a file another process still has open) is left for
+/// the next writer to try again, rather than refusing every writer of the
+/// family.
+fn sweep_build_scratch(builds: &Path) {
     if !builds.exists() {
-        return Ok(());
+        return;
     }
-    for checkout in read_dir(builds)? {
+    let Ok(checkouts) = read_dir(builds) else {
+        return;
+    };
+    for checkout in checkouts {
         if !checkout.is_dir() {
             continue;
         }
-        if let Some(_lock) = try_checkout_lock(&checkout)? {
-            remove_dead_workspaces(&checkout)?;
+        if let Ok(Some(_lock)) = try_checkout_lock(&checkout) {
+            let _ = remove_dead_workspaces(&checkout);
         }
     }
-    Ok(())
 }
 
 impl PendingSegment {
@@ -731,7 +782,7 @@ impl<'f> WriteSession<'f> {
         // build must never change what a newer one left.
         let (base, _) = family.newest_manifest()?;
         family.check_named_formats(&base)?;
-        sweep_build_scratch(&layout.dir.join("builds"))?;
+        sweep_build_scratch(&layout.dir.join("builds"));
         // Only the lock holder writes `tmp/`, so whatever is there was left
         // by an earlier writer that ended before publishing it.
         let mut next_segment = 1;
