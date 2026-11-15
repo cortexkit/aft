@@ -59,12 +59,14 @@ impl Drop for LockHold<'_> {
     }
 }
 
+test_support_visibility! {
 /// Records every acquisition, including timed and nonblocking probes. The
 /// evidence guard drops before the mutex guard unlocks, so a previous holder
 /// cannot clear a subsequent holder's record.
 pub(crate) struct TrackedMutex<T> {
     mutex: parking_lot::Mutex<T>,
     diagnostics: Arc<LockDiagnostics>,
+}
 }
 
 impl<T> TrackedMutex<T> {

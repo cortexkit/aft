@@ -3820,6 +3820,7 @@ enum JobCompletionOutcome {
 }
 }
 
+test_support_visibility! {
 struct CompletionEvent<C: ExecutorContext> {
     job_id: u64,
     heavy_permit: Option<HeavyPermit>,
@@ -3830,10 +3831,13 @@ struct CompletionEvent<C: ExecutorContext> {
     /// that releases the finished run's reservation.
     requeue: Option<QueuedJob<C>>,
 }
+}
 
+test_support_visibility! {
 struct JobCompletionGuard<C: ExecutorContext> {
     event_tx: Sender<SchedulerEvent<C>>,
     event: Option<CompletionEvent<C>>,
+}
 }
 
 impl<C: ExecutorContext> JobCompletionGuard<C> {
