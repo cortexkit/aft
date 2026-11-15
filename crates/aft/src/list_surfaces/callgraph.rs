@@ -23,7 +23,7 @@ pub static CALLGRAPH_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Budget,
                 kind: ReasonKind::Bounding,
-                predicate_name: "IMPACT_EXPANSION_BUDGET, prefetch_impact_callers",
+                predicate_name: "IMPACT_EXPANSION_BUDGET, direct_callers_bounded",
             },
             ReasonEntry {
                 reason: Reason::Cap,
@@ -136,6 +136,33 @@ pub fn build_callgraph_envelope(
         shown,
         total,
         unit,
+        causes,
+        CALLGRAPH_NARROW,
+    ))
+}
+
+/// Impact can stop while fetching caller sites, including the depth boundary.
+/// Its discovered count is then only a lower bound, even without a hub selector.
+pub fn build_impact_envelope(
+    shown: usize,
+    post_filter_count: usize,
+    truncated: usize,
+    budget_exhausted: bool,
+) -> Option<ListEnvelope> {
+    if !budget_exhausted {
+        return build_callgraph_envelope(Unit::Sites, shown, post_filter_count, truncated);
+    }
+    let mut causes = vec![Reason::Budget];
+    if depth_cut_inside_requested(truncated) {
+        causes.push(Reason::Depth);
+    }
+    if hub_selector_activated(post_filter_count) {
+        causes.push(Reason::Cap);
+    }
+    Some(ListEnvelope::new(
+        shown,
+        Total::AtLeast(post_filter_count),
+        Unit::Sites,
         causes,
         CALLGRAPH_NARROW,
     ))

@@ -7,6 +7,7 @@ fn impact_profile() {
     let root = PathBuf::from(std::env::var("IMPACT_PROFILE_ROOT").unwrap());
     let output = PathBuf::from(std::env::var("IMPACT_PROFILE_OUTPUT").unwrap());
     std::fs::create_dir_all(&output).unwrap();
+    let start = std::time::Instant::now();
     let checkout = crate::data_layer::runtime::DataCheckout::open_planes(
         &root,
         &output.join("store"),
@@ -17,11 +18,9 @@ fn impact_profile() {
         },
     )
     .unwrap();
-    let start = std::time::Instant::now();
     let view = match checkout.fresh_view(std::time::Duration::from_secs(900)) {
         crate::data_layer::runtime::Fresh::Ready(view) => view,
-        crate::data_layer::runtime::Fresh::Building => panic!("graph still building"),
-        crate::data_layer::runtime::Fresh::Failed(reason) => panic!("graph failed: {reason}"),
+        _ => panic!("graph did not publish"),
     };
     eprintln!("PROFILE build_ms={}", start.elapsed().as_millis());
     for symbol in ["validateConstraints", "upcast", "isString", "isBoolean"] {
@@ -46,19 +45,25 @@ fn impact_profile() {
         } else {
             None
         };
-        eprintln!("PROFILE symbol={symbol}");
+        eprintln!("PROFILE candidate symbol={symbol}");
         let start = std::time::Instant::now();
-        let result = impact_result(
+        let result = impact_result_with_budget(
             &view.callgraph(),
             Path::new("src/vs/base/common/types.ts"),
             symbol,
             5,
             true,
+            IMPACT_EXPANSION_BUDGET,
         )
         .unwrap();
+        eprintln!(
+            "PROFILE symbol={symbol} expansions={} complete={}",
+            result.1, !result.0.counts_are_lower_bounds
+        );
         let phase = std::time::Instant::now();
-        let value = serde_json::to_value(result).unwrap();
+        let value = serde_json::to_value(result.0).unwrap();
         let text = crate::subc_format::format_callgraph("impact", &value, false);
+        let render_us = phase.elapsed().as_micros();
         if let Some(baseline) = baseline {
             assert_eq!(
                 serde_json::to_vec(&value).unwrap(),
@@ -71,8 +76,7 @@ fn impact_profile() {
             eprintln!("PROFILE symbol={symbol} byte_identical=true");
         }
         eprintln!(
-            "PROFILE symbol={symbol} render_us={} total_ms={}",
-            phase.elapsed().as_micros(),
+            "PROFILE symbol={symbol} render_us={render_us} total_ms={}",
             start.elapsed().as_millis()
         );
         std::fs::write(

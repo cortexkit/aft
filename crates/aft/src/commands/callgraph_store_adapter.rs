@@ -1118,9 +1118,9 @@ fn impact_result_with_budget(
                 budget,
             )?
         };
+
     eprintln!("IMPACT prefetch_ms={}", profile_start.elapsed().as_millis());
     let phase = std::time::Instant::now();
-
     collect_callers_recursive(
         &callers_by_symbol,
         &target.representative.file,
@@ -1150,20 +1150,21 @@ fn impact_result_with_budget(
             store.direct_callers_bounded(&boundary, budget.saturating_sub(expansions))?;
         expansions += examined;
         budget_exhausted = exhausted;
-        let counts = if exhausted {
-            HashMap::new()
-        } else {
-            fetched
-                .into_iter()
-                .map(|(key, sites)| (key, dedup_call_site_count(sites)))
-                .collect::<HashMap<_, _>>()
-        };
+        let mut counts = fetched
+            .into_iter()
+            .map(|(key, sites)| (key, dedup_call_site_count(sites)))
+            .collect::<HashMap<_, _>>();
         let omitted = counts.values().copied().fold(0usize, usize::saturating_add);
+        // An unscanned boundary symbol may look like a root only because its
+        // callers were beyond the budget. Keep its root status unknown.
+        if exhausted {
+            counts.clear();
+        }
         (omitted > 0, omitted, counts)
     };
+
     eprintln!("IMPACT boundary_ms={}", phase.elapsed().as_millis());
     let phase = std::time::Instant::now();
-
     let mut sites = dedup_call_sites(sites);
     sites.sort_by(|left, right| {
         left.caller
@@ -1187,9 +1188,9 @@ fn impact_result_with_budget(
         .iter()
         .filter(|site| site.kind == "callback_ref")
         .count();
+
     eprintln!("IMPACT dedup_ms={}", phase.elapsed().as_millis());
     let phase = std::time::Instant::now();
-
     // Which affected callers are roots: nothing calls them, by the edges
     // this answer lists (calls and callback references). A caller whose own
     // callers were fetched is a root when the only ones are itself; one at
@@ -1216,9 +1217,9 @@ fn impact_result_with_budget(
         }
         root_kinds.insert(key, kind);
     }
+
     eprintln!("IMPACT roots_ms={}", phase.elapsed().as_millis());
     let phase = std::time::Instant::now();
-
     let summarize = hub_selector_activated(post_filter_count);
     let affected_files = visible_sites
         .iter()
@@ -1254,29 +1255,12 @@ fn impact_result_with_budget(
         None
     };
 
-    let sites_list_envelope = if budget_exhausted {
-        Some(ListEnvelope::new(
-            shown,
-            crate::list_envelope::Total::AtLeast(post_filter_count),
-            Unit::Sites,
-            if depth_limited {
-                vec![
-                    crate::list_envelope::Reason::Depth,
-                    crate::list_envelope::Reason::Budget,
-                ]
-            } else {
-                vec![crate::list_envelope::Reason::Budget]
-            },
-            CALLGRAPH_NARROW,
-        ))
-    } else {
-        build_callgraph_envelope(
-            Unit::Sites,
-            shown,
-            post_filter_count,
-            truncated.max(usize::from(depth_limited)),
-        )
-    };
+    let sites_list_envelope = build_impact_envelope(
+        shown,
+        post_filter_count,
+        truncated.max(usize::from(depth_limited)),
+        budget_exhausted,
+    );
     let target_signature = target.representative.signature.clone();
     let target_parameters = target_signature
         .as_deref()
@@ -1394,7 +1378,6 @@ fn impact_result_with_budget(
         phase.elapsed().as_millis(),
         profile_start.elapsed().as_millis()
     );
-    eprintln!("IMPACT expansions={expansions} budget_exhausted={budget_exhausted}");
     Ok((result, expansions))
 }
 
@@ -2975,6 +2958,8 @@ fn prefetch_impact_callers(
     let mut callers_by_symbol = HashMap::new();
     let mut frontier = BTreeSet::from([(file.to_string(), symbol.to_string())]);
     let mut expansions = 0;
+    let mut seen_sites = HashSet::new();
+    let mut seen_callers = HashSet::new();
     for depth in 0..max_depth {
         let targets = frontier
             .into_iter()
@@ -2992,6 +2977,18 @@ fn prefetch_impact_callers(
             targets.len(),
             examined,
             phase.elapsed().as_millis()
+        );
+        let before_sites = seen_sites.len();
+        let before_callers = seen_callers.len();
+        for site in fetched.values().flatten() {
+            seen_sites.insert(call_site_key(site));
+            seen_callers.insert((site.caller.file.clone(), site.caller.symbol.clone()));
+        }
+        eprintln!(
+            "IMPACT depth={} new_distinct_sites={} new_caller_symbols={}",
+            depth + 1,
+            seen_sites.len() - before_sites,
+            seen_callers.len() - before_callers
         );
         expansions += examined;
         frontier = BTreeSet::new();
@@ -3030,15 +3027,7 @@ fn prefetch_callers(
         if targets.is_empty() {
             break;
         }
-        let phase = std::time::Instant::now();
-        eprintln!("IMPACT depth={} targets={} begin", depth + 1, targets.len());
         let fetched = store.direct_callers_for_symbols(&targets)?;
-        eprintln!(
-            "IMPACT depth={} sites={} ms={}",
-            depth + 1,
-            fetched.values().map(Vec::len).sum::<usize>(),
-            phase.elapsed().as_millis()
-        );
         let mut next_frontier = BTreeSet::new();
         if depth + 1 < max_depth {
             for site in fetched.values().flatten() {
@@ -3407,7 +3396,6 @@ fn dedup_call_sites(sites: Vec<StoreCallSite>) -> Vec<StoreCallSite> {
     deduped
 }
 
-#[cfg(test)]
 fn dedup_call_site_count(sites: Vec<StoreCallSite>) -> usize {
     sites
         .into_iter()
@@ -3707,6 +3695,31 @@ mod trace_to_tests {
     }
 
     impl CallGraphRead for CountingStore {
+        fn direct_callers_bounded(
+            &self,
+            targets: &[(String, String)],
+            limit: usize,
+        ) -> CallGraphResult<(HashMap<(String, String), Vec<StoreCallSite>>, bool, usize)> {
+            *self.caller_frontier_query_count.borrow_mut() += 1;
+            *self.caller_frontier_target_count.borrow_mut() += targets.len();
+            let mut result: HashMap<_, Vec<_>> = targets
+                .iter()
+                .cloned()
+                .map(|key| (key, Vec::new()))
+                .collect();
+            let mut examined = 0;
+            for key in targets.iter().collect::<BTreeSet<_>>() {
+                for site in self.callers.get(key).into_iter().flatten() {
+                    if examined == limit {
+                        return Ok((result, true, examined));
+                    }
+                    examined += 1;
+                    result.get_mut(key).unwrap().push(site.clone());
+                }
+            }
+            Ok((result, false, examined))
+        }
+
         fn project_root(&self) -> &Path {
             &self.root
         }
@@ -3933,6 +3946,134 @@ mod trace_to_tests {
             previous = current;
         }
         (store, target)
+    }
+
+    #[test]
+    fn impact_budget_preserves_complete_json_and_text_bytes() {
+        let (store, target) = layered_store(4, 3);
+        for depth in [1, 2, 5] {
+            for include_tests in [false, true] {
+                let legacy = impact_result_with_budget(
+                    &store,
+                    Path::new(&target.file),
+                    &target.symbol,
+                    depth,
+                    include_tests,
+                    usize::MAX,
+                )
+                .unwrap()
+                .0;
+                let (bounded, expansions) = impact_result_with_budget(
+                    &store,
+                    Path::new(&target.file),
+                    &target.symbol,
+                    depth,
+                    include_tests,
+                    100,
+                )
+                .unwrap();
+                assert!(!bounded.counts_are_lower_bounds);
+                assert!(expansions > 0 && expansions < 100);
+                assert_eq!(
+                    serde_json::to_vec(&bounded).unwrap(),
+                    serde_json::to_vec(&legacy).unwrap()
+                );
+                assert_eq!(
+                    crate::subc_format::format_callgraph(
+                        "impact",
+                        &serde_json::to_value(bounded).unwrap(),
+                        false
+                    ),
+                    crate::subc_format::format_callgraph(
+                        "impact",
+                        &serde_json::to_value(legacy).unwrap(),
+                        false
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn impact_budget_stops_inside_a_frontier_and_marks_all_counts() {
+        let (store, target) = layered_store(4, 3);
+        let (bounded, expansions) =
+            impact_result_with_budget(&store, Path::new(&target.file), &target.symbol, 5, true, 10)
+                .unwrap();
+        assert_eq!(expansions, 10);
+        assert_eq!(bounded.total_affected, 10);
+        assert!(bounded.counts_are_lower_bounds);
+        assert!(!bounded.incomplete.as_ref().unwrap().complete);
+        assert_eq!(
+            bounded.incomplete.as_ref().unwrap().incomplete_reason,
+            IMPACT_BUDGET_NOTE
+        );
+        let envelope = bounded.sites_list_envelope.as_ref().unwrap();
+        assert_eq!(envelope.total, crate::list_envelope::Total::AtLeast(10));
+        assert_eq!(envelope.reason, Some(crate::list_envelope::Reason::Budget));
+        assert!(bounded.root_counts.is_empty());
+        let value = serde_json::to_value(bounded).unwrap();
+        assert_eq!(value["complete"], false);
+        let text = crate::subc_format::format_callgraph("impact", &value, false);
+        assert!(text.contains("≥10 affected call sites"), "{text}");
+        assert!(
+            text.contains("shown 10 of ≥10 sites (budget) · narrow: depth, includeTests"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn impact_budget_bounds_boundary_work_without_inventing_roots() {
+        let (store, target) = layered_store(1, 2);
+        let (bounded, expansions) =
+            impact_result_with_budget(&store, Path::new(&target.file), &target.symbol, 1, true, 1)
+                .unwrap();
+        assert_eq!(expansions, 1);
+        assert_eq!(bounded.total_affected, 1);
+        assert!(bounded.counts_are_lower_bounds);
+        assert!(bounded.callers.iter().all(|caller| caller.root.is_none()));
+        let (leaf_store, leaf_target) = layered_store(1, 1);
+        let (exact, expansions) = impact_result_with_budget(
+            &leaf_store,
+            Path::new(&leaf_target.file),
+            &leaf_target.symbol,
+            5,
+            true,
+            1,
+        )
+        .unwrap();
+        assert_eq!(expansions, 1);
+        assert!(
+            !exact.counts_are_lower_bounds,
+            "exactly filling the budget is not exhaustion"
+        );
+    }
+
+    #[test]
+    fn impact_budget_hub_summary_and_empty_answer_are_incomplete() {
+        let (store, target) = layered_store(20, 3);
+        let (hub, expansions) =
+            impact_result_with_budget(&store, Path::new(&target.file), &target.symbol, 5, true, 50)
+                .unwrap();
+        assert_eq!(expansions, 50);
+        assert!(hub.hub_summary.as_ref().unwrap().counts_are_lower_bounds);
+        assert_eq!(
+            hub.hub_summary.as_ref().unwrap().message,
+            IMPACT_BUDGET_NOTE
+        );
+        assert!(hub
+            .sites_list_envelope
+            .as_ref()
+            .unwrap()
+            .causes
+            .contains(&crate::list_envelope::Reason::Cap));
+        let (empty, expansions) =
+            impact_result_with_budget(&store, Path::new(&target.file), &target.symbol, 5, true, 0)
+                .unwrap();
+        assert_eq!(expansions, 0);
+        assert_eq!(empty.total_affected, 0);
+        assert!(empty.counts_are_lower_bounds);
+        assert!(!empty.incomplete.unwrap().complete);
     }
 
     fn converging_call_tree_store(width: usize) -> (CountingStore, StoreNode) {
@@ -4285,15 +4426,18 @@ mod trace_to_tests {
                             .unwrap();
                             (reply.depth_limited, reply.truncated)
                         } else {
-                            let reply = impact_result(
+                            // Exercise frontier batching independently of the
+                            // public impact budget, including the 100-layer graph.
+                            let reply = impact_result_with_budget(
                                 &store,
                                 Path::new(&target.file),
                                 &target.symbol,
                                 depth,
                                 include_tests,
+                                usize::MAX,
                             )
                             .unwrap();
-                            (reply.depth_limited, reply.truncated)
+                            (reply.0.depth_limited, reply.0.truncated)
                         };
                         assert!(depth_limited);
                         // At depth one this back edge lies beyond the boundary,
@@ -4488,10 +4632,10 @@ mod trace_to_tests {
         let impact = impact_result(&store, Path::new(&target.file), &target.symbol, 1, true)
             .expect("impact result");
         assert_eq!(store.total_caller_queries(), 0);
-        assert_eq!(store.total_caller_frontier_queries(), 1);
-        assert_eq!(store.caller_frontier_target_count(), 1);
-        assert_eq!(store.total_caller_count_queries(), 1);
-        assert_eq!(store.caller_count_target_count(), 1);
+        // Impact's boundary scan now shares its caller-site budget.
+        assert_eq!(store.total_caller_frontier_queries(), 2);
+        assert_eq!(store.caller_frontier_target_count(), 2);
+        assert_eq!(store.total_caller_count_queries(), 0);
         assert_eq!(
             serde_json::to_string(&impact).expect("serialize impact result"),
             r#"{"symbol":"target","file":"target.ts","parameters":[],"total_affected":21,"affected_files":1,"callers":[{"caller_symbol":"hubCaller","caller_file":"hubCaller.ts","line":1,"parameters":[]}],"hub_summary":{"message":"Next: 21 affected callers — showing 1; narrow with scope","total":21,"hidden_tests":0,"shown":1,"threshold":20,"limit":15},"depth_limited":true,"truncated":2,"sites_list_envelope":{"shown":1,"total":{"kind":"at_least","value":1},"unit":"sites","reason":"depth","causes":["depth","cap"],"narrow":["depth","includeTests"]}}"#

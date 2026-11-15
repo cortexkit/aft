@@ -41,6 +41,22 @@ fn kind_bound_table_test_for_registered_surfaces() {
             expected_is_at_least: true,
             expected_unit: Unit::Sites,
         },
+        TableTestCase {
+            surface_id: "payload.sites",
+            causes: &[Reason::Budget],
+            expected_selected_reason: Reason::Budget,
+            expected_causes_order: &[Reason::Budget],
+            expected_is_at_least: true,
+            expected_unit: Unit::Sites,
+        },
+        TableTestCase {
+            surface_id: "payload.sites",
+            causes: &[Reason::Cap, Reason::Budget, Reason::Depth],
+            expected_selected_reason: Reason::Depth,
+            expected_causes_order: &[Reason::Depth, Reason::Budget, Reason::Cap],
+            expected_is_at_least: true,
+            expected_unit: Unit::Sites,
+        },
         // Callers: cap only -> Exact, Selecting, unit items
         TableTestCase {
             surface_id: "payload.callers",

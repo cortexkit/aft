@@ -22,6 +22,70 @@ use crate::callgraph_store::{
 use crate::error::AftError;
 use crate::parser::LangId;
 
+#[cfg(test)]
+mod impact_budget_tests {
+    use super::*;
+
+    fn graph() -> (tempfile::TempDir, SliceReader<MemorySlices>) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"sample\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn a() {}\npub fn b() {}\npub fn caller() { a(); a(); b(); let f = a; f(); }\npub fn other() { b(); a(); }\n").unwrap();
+        let reader = crate::data_layer::trace_measure::memory_reader(dir.path());
+        (dir, reader)
+    }
+
+    #[test]
+    fn impact_batch_scan_preserves_legacy_sites_and_counts() {
+        let (_dir, reader) = graph();
+        let targets = vec![
+            ("src/lib.rs".to_string(), "a".to_string()),
+            ("src/lib.rs".to_string(), "b".to_string()),
+            ("src/lib.rs".to_string(), "missing".to_string()),
+        ];
+        let batch = reader.direct_callers_for_symbols(&targets).unwrap();
+        let counts = reader.direct_caller_counts_of(&targets).unwrap();
+        for key in targets {
+            let legacy = reader
+                .callers_of_target(&key.0, &key.1)
+                .into_iter()
+                .map(|(_, site)| site)
+                .collect::<Vec<_>>();
+            let count = legacy
+                .iter()
+                .map(|site| (&site.caller.file, site.line, &site.kind))
+                .collect::<BTreeSet<_>>()
+                .len();
+            assert_eq!(batch[&key], legacy);
+            assert_eq!(counts[&key], count);
+        }
+        assert!(!batch[&("src/lib.rs".into(), "a".into())].is_empty());
+    }
+
+    #[test]
+    fn impact_reader_budget_stops_within_one_hub_adjacency() {
+        let (_dir, reader) = graph();
+        let targets = vec![("src/lib.rs".to_string(), "a".to_string())];
+        let all = reader.direct_callers_for_symbols(&targets).unwrap();
+        let total = all[&targets[0]].len();
+        assert!(total > 1);
+        for limit in [0, 1, total, total + 1] {
+            let (found, exhausted, examined) =
+                reader.direct_callers_bounded(&targets, limit).unwrap();
+            assert_eq!(examined, limit.min(total));
+            assert_eq!(found[&targets[0]].len(), examined);
+            assert_eq!(exhausted, total > limit);
+            if !exhausted {
+                assert_eq!(found, all);
+            }
+        }
+    }
+}
+
 /// Where queries find slices and the lookups that narrow which to read.
 /// Every source can say what it holds in memory, so the memory census can
 /// count a checkout's call graph through the source it serves.
@@ -523,7 +587,28 @@ impl<S: SliceSource> SliceReader<S> {
                 if !wanted.contains(&(edge.target_file(), edge.target_symbol())) {
                     continue;
                 }
-                let kind = self.edge_kind(edge);
+                if !matches!(edge.kind(), "call" | "callback_ref" | "construction") {
+                    continue;
+                }
+                let key = (
+                    edge.target_file().to_string(),
+                    edge.target_symbol().to_string(),
+                );
+                let (target_node, target) = resolved_targets
+                    .entry((key.clone(), matches!(edge.lookup(), TargetLookup::Scoped)))
+                    .or_insert_with(|| self.target_of(&key.0, &key.1, edge.lookup()));
+                let kind = if edge.kind() == "construction" {
+                    if target
+                        .as_ref()
+                        .is_some_and(|node| matches!(node.kind.as_str(), "function" | "method"))
+                    {
+                        "call"
+                    } else {
+                        "value_ref"
+                    }
+                } else {
+                    edge.kind()
+                };
                 if !matches!(kind, "call" | "callback_ref") {
                     continue;
                 }
@@ -536,13 +621,6 @@ impl<S: SliceSource> SliceReader<S> {
                     break 'files;
                 }
                 examined += 1;
-                let key = (
-                    edge.target_file().to_string(),
-                    edge.target_symbol().to_string(),
-                );
-                let (target_node, target) = resolved_targets
-                    .entry((key.clone(), matches!(edge.lookup(), TargetLookup::Scoped)))
-                    .or_insert_with(|| self.target_of(&key.0, &key.1, edge.lookup()));
                 grouped.get_mut(&key).expect("requested target").push((
                     CallerKey {
                         source_node: source.id().to_string(),
