@@ -537,8 +537,8 @@ mod build_scratch_tests {
     }
 
     /// A workspace that a build of its checkout adopts and leaves paused
-    /// between the listing and the deletion is judged as paused: above the
-    /// floor itself it stays.
+    /// between the listing and the deletion is judged as paused: while the
+    /// disk is not below the free-space floor itself, it stays.
     #[test]
     fn disk_reclaim_reads_a_workspace_again_once_it_holds_the_lock() {
         let dir = tempfile::tempdir().unwrap();
