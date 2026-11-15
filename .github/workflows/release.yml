@@ -468,6 +468,9 @@ jobs:
         # and optimization settings are unchanged.
         run: cross build --release --target aarch64-unknown-linux-gnu --config 'profile.release.strip=false' --config 'profile.release.split-debuginfo="off"' --features wasm-grammars
         env:
+          # ARM64 Linux kernels use 4K, 16K or 64K pages; build for the largest.
+          JEMALLOC_SYS_WITH_LG_PAGE: "16"
+          CROSS_BUILD_ENV_PASSTHROUGH: AFT_BUILD_GIT_SHA JEMALLOC_SYS_WITH_LG_PAGE
           # Cross runs this script inside the target build image, before Cargo.
           CROSS_TARGET_AARCH64_UNKNOWN_LINUX_GNU_PRE_BUILD: scripts/check-cmake.sh
           CROSS_BUILD_OPTS: --no-cache

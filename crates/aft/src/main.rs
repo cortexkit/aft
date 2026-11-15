@@ -9,6 +9,12 @@ mod backup_bookkeeping_dispatch_tests;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: aft::alloc_trace::TracingAllocator = aft::alloc_trace::TracingAllocator;
 
+// jemalloc reads this before main; MALLOC_CONF can still override the default.
+// Do not set decay options: the measured Linux configuration uses their defaults.
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub static mut malloc_conf: *const std::ffi::c_char = b"background_thread:true\0".as_ptr().cast();
+
 // The tests read frames back through the unix loader, and only unix
 // targets record frames at all.
 #[cfg(all(test, unix))]
