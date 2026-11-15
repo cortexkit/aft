@@ -7546,68 +7546,6 @@ impl BgTaskRegistry {
         self.replay_session_batch(storage_dir, session_id, project_root, false, harness)
     }
 
-    fn remove_dangling_replay_row(&self, metadata: &PersistedTask, harness: Option<&str>) {
-        let task_id = &metadata.task_id;
-        let result = with_task_db_fence(&metadata.session_id, task_id, || {
-            let harness = metadata
-                .harness
-                .as_deref()
-                .or(harness)
-                .ok_or_else(|| "task harness unavailable".to_string())?;
-            let pool = self
-                .inner
-                .db_pool
-                .read()
-                .ok()
-                .and_then(|slot| slot.clone())
-                .ok_or_else(|| "task database unavailable".to_string())?;
-            let conn = pool
-                .lock()
-                .map_err(|_| "database lock poisoned".to_string())?;
-            // Check and delete under one write transaction: cascading foreign keys
-            // must not remove watches or view records along with the dangling row.
-            let tx = rusqlite::Transaction::new_unchecked(
-                &conn,
-                rusqlite::TransactionBehavior::Immediate,
-            )
-            .map_err(|error| error.to_string())?;
-            let (watches, views): (u64, u64) = tx
-                .query_row(
-                    "SELECT
-                        (SELECT count(*) FROM bash_pattern_watches
-                         WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3),
-                        (SELECT count(*) FROM bash_view_records
-                         WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3)",
-                    rusqlite::params![harness, metadata.session_id, task_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .map_err(|error| error.to_string())?;
-            if watches != 0 || views != 0 {
-                return Err(format!(
-                    "dependent rows retained: bash_pattern_watches={watches} bash_view_records={views}"
-                ));
-            }
-            let removed = crate::db::bash_tasks::delete_bash_task(
-                &tx,
-                harness,
-                &metadata.session_id,
-                task_id,
-            )
-            .map_err(|error| error.to_string())?;
-            tx.commit().map_err(|error| error.to_string())?;
-            Ok(removed)
-        });
-        match result {
-            Ok(removed) if removed > 0 => crate::slog_info!(
-                "removed dangling background task {task_id} during replay: source=bash_tasks reason=layout_absent"
-            ),
-            Ok(_) => {},
-            Err(error) => crate::slog_warn!(
-                "failed to remove dangling background task {task_id} during replay: source=bash_tasks error={error}"
-            ),
-        }
-    }
-
     fn replay_session_batch(
         &self,
         storage_dir: &Path,
@@ -7982,19 +7920,25 @@ impl BgTaskRegistry {
                     if skip_refused_task(&metadata.task_id, "replay", &error) {
                         continue;
                     }
-                    if Self::persisted_task_process_is_alive(&metadata)
-                        || self.db_has_live_process_for_task(&metadata.task_id)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && !task_artifacts_exist(&session_dir, &metadata.task_id)
+                        && !Self::persisted_task_process_is_alive(&metadata)
+                        && metadata.launching_identity.is_none()
+                        && (self.should_retire_foreign_delivery(&metadata.session_id, session_id)
+                            || &metadata.session_id != session_id)
                     {
+                        self.retire_already_reaped_orphaned_completion(
+                            &metadata.session_id,
+                            &metadata.task_id,
+                            metadata.harness.as_deref(),
+                        );
+                        continue;
+                    }
+                    if Self::persisted_task_process_is_alive(&metadata) {
                         crate::slog_warn!(
                             "refusing to quarantine unresolved live background task {}: {error}",
                             metadata.task_id
                         );
-                        continue;
-                    }
-                    if error.kind() == std::io::ErrorKind::NotFound
-                        && replay_task_layout_is_absent(&session_dir, &metadata.task_id)
-                    {
-                        self.remove_dangling_replay_row(&metadata, harness);
                         continue;
                     }
                     crate::slog_warn!(
@@ -17649,20 +17593,6 @@ fn task_artifacts_exist(session_dir: &Path, task_id: &str) -> bool {
                 .map(|suffix| session_dir.join(format!("{task_id}.{suffix}"))),
         )
         .any(|path| fs::symlink_metadata(path).is_ok())
-}
-
-fn replay_task_layout_is_absent(session_dir: &Path, task_id: &str) -> bool {
-    // Flat-layout artifacts also count as surviving task data. Only explicit
-    // NotFound results prove absence; permission errors must not permit deletion.
-    std::iter::once(session_dir.join(task_id))
-        .chain(
-            ["json", "stdout", "stderr", "pty", "exit"]
-                .map(|suffix| session_dir.join(format!("{task_id}.{suffix}"))),
-        )
-        .all(|path| {
-            fs::symlink_metadata(path)
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-        })
 }
 
 /// Quarantine history uses the same resumable iterator budget as task history.
@@ -29168,236 +29098,6 @@ mod tests {
         assert_eq!(
             quarantined, 1,
             "exactly the abandoned layout is quarantined"
-        );
-    }
-
-    fn replay_store_snapshot(
-        storage: &Path,
-        conn: &TrackedConnection,
-    ) -> (
-        BTreeMap<PathBuf, Option<Vec<u8>>>,
-        BTreeMap<String, Vec<Vec<rusqlite::types::Value>>>,
-    ) {
-        fn walk(root: &Path, dir: &Path, files: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
-            for entry in fs::read_dir(dir).unwrap() {
-                let path = entry.unwrap().path();
-                let relative = path.strip_prefix(root).unwrap().to_path_buf();
-                // Compare database contents logically; SQLite rewrites its own
-                // pages and journals even when only one task row is deleted.
-                if ["aft.db", "aft.db-wal", "aft.db-shm"].contains(&relative.to_str().unwrap()) {
-                    continue;
-                }
-                let bytes = if path.is_dir() {
-                    walk(root, &path, files);
-                    None
-                } else {
-                    Some(fs::read(&path).unwrap())
-                };
-                files.insert(relative, bytes);
-            }
-        }
-        let mut files = BTreeMap::new();
-        walk(storage, storage, &mut files);
-        let tables = conn
-            .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        let rows = tables
-            .into_iter()
-            .map(|table| {
-                let mut statement = conn
-                    .prepare(&format!("SELECT * FROM \"{}\"", table.replace('"', "\"\"")))
-                    .unwrap();
-                let columns = statement.column_count();
-                let rows = statement
-                    .query_map([], |row| {
-                        (0..columns)
-                            .map(|column| row.get(column))
-                            .collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()
-                    })
-                    .unwrap()
-                    .collect::<rusqlite::Result<Vec<_>>>()
-                    .unwrap();
-                (table, rows)
-            })
-            .collect();
-        (files, rows)
-    }
-
-    fn dangling_replay_fixture(
-        storage: &Path,
-    ) -> (BgTaskRegistry, Arc<Mutex<TrackedConnection>>, BashTaskRow) {
-        let (registry, db, _) = registry_with_db_and_frames(storage);
-        registry
-            .inner
-            .persisted_gc_started
-            .store(true, Ordering::SeqCst);
-        let task_id = "bash-0000000000000500";
-        let paths = task_paths(storage, "session", task_id).unwrap();
-        let metadata = PersistedTask::starting(
-            task_id.into(),
-            "session".into(),
-            "echo gone".into(),
-            storage.to_path_buf(),
-            Some(storage.to_path_buf()),
-            None,
-            true,
-            true,
-        );
-        let row = metadata.to_bash_task_row("opencode", &paths).unwrap();
-        crate::db::bash_tasks::upsert_bash_task(&db.lock().unwrap(), &row).unwrap();
-        (registry, db, row)
-    }
-
-    #[test]
-    fn durability_replay_removes_only_the_dangling_database_row_once() {
-        for session_directory_exists in [false, true] {
-            let storage = tempfile::tempdir().unwrap();
-            let (registry, db, row) = dangling_replay_fixture(storage.path());
-            for (harness, session) in [("pi", "session"), ("opencode", "other-session")] {
-                let mut other = row.clone();
-                other.harness = harness.into();
-                other.session_id = session.into();
-                crate::db::bash_tasks::upsert_bash_task(&db.lock().unwrap(), &other).unwrap();
-            }
-            let canary = session_tasks_dir(storage.path(), "other-session");
-            fs::create_dir_all(canary.join("unrelated-directory")).unwrap();
-            fs::write(canary.join("unrelated-file"), b"keep exactly").unwrap();
-            if session_directory_exists {
-                let session = session_tasks_dir(storage.path(), "session");
-                fs::create_dir_all(&session).unwrap();
-                fs::write(session.join("unrelated-file"), b"also keep").unwrap();
-            }
-            let mut expected = replay_store_snapshot(storage.path(), &db.lock().unwrap());
-            let tasks = expected.1.get_mut("bash_tasks").unwrap();
-            let count_before = tasks.len();
-            tasks.retain(|values| {
-                values[0] != rusqlite::types::Value::Text("opencode".into())
-                    || values[1] != rusqlite::types::Value::Text("session".into())
-            });
-            assert_eq!(tasks.len(), count_before - 1);
-
-            let (_, first_logs) = crate::logging::capture_log_lines(|| {
-                registry.replay_session(storage.path(), "session").unwrap();
-            });
-            let task_logs = first_logs
-                .iter()
-                .filter(|line| line.contains(&row.task_id))
-                .collect::<Vec<_>>();
-            assert_eq!(task_logs.len(), 1, "{first_logs:?}");
-            assert!(task_logs[0].starts_with("INFO "), "{first_logs:?}");
-            assert!(task_logs[0].contains("source=bash_tasks"));
-            assert_eq!(
-                replay_store_snapshot(storage.path(), &db.lock().unwrap()),
-                expected
-            );
-
-            let (_, second_logs) = crate::logging::capture_log_lines(|| {
-                registry.replay_session(storage.path(), "session").unwrap();
-            });
-            assert!(
-                second_logs.iter().all(|line| !line.contains(&row.task_id)),
-                "{second_logs:?}"
-            );
-            assert_eq!(
-                replay_store_snapshot(storage.path(), &db.lock().unwrap()),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn durability_replay_keeps_dangling_rows_with_dependents() {
-        for dependency in ["watch", "view"] {
-            let storage = tempfile::tempdir().unwrap();
-            let (registry, db, row) = dangling_replay_fixture(storage.path());
-            let sql = if dependency == "watch" {
-                "INSERT INTO bash_pattern_watches (harness, session_id, task_id, watch_id, pattern_kind, pattern, created_at)
-                 VALUES ('opencode', 'session', ?1, 'watch-keep', 'substring', 'keep', 1)"
-            } else {
-                "INSERT INTO bash_view_records (harness, session_id, task_id, record, row_template_digest, page_template_digest)
-                 VALUES ('opencode', 'session', ?1, 'keep', 'row', 'page')"
-            };
-            db.lock().unwrap().execute(sql, [&row.task_id]).unwrap();
-            let expected = replay_store_snapshot(storage.path(), &db.lock().unwrap());
-            let (_, logs) = crate::logging::capture_log_lines(|| {
-                registry.replay_session(storage.path(), "session").unwrap();
-            });
-            let task_logs = logs
-                .iter()
-                .filter(|line| line.contains(&row.task_id))
-                .collect::<Vec<_>>();
-            assert_eq!(task_logs.len(), 1, "{logs:?}");
-            assert!(task_logs[0].starts_with("WARN "), "{logs:?}");
-            let counts = if dependency == "watch" {
-                "bash_pattern_watches=1 bash_view_records=0"
-            } else {
-                "bash_pattern_watches=0 bash_view_records=1"
-            };
-            assert!(task_logs[0].contains(counts), "{logs:?}");
-            assert_eq!(
-                replay_store_snapshot(storage.path(), &db.lock().unwrap()),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn durability_replay_keeps_a_dangling_row_with_a_live_database_process() {
-        let storage = tempfile::tempdir().unwrap();
-        let (registry, db, mut row) = dangling_replay_fixture(storage.path());
-        // Leave the metadata snapshot without a PID to exercise the independent
-        // database liveness check, not just the replayed metadata's process check.
-        row.pid = Some(i64::from(std::process::id()));
-        crate::db::bash_tasks::upsert_bash_task(&db.lock().unwrap(), &row).unwrap();
-        let expected = replay_store_snapshot(storage.path(), &db.lock().unwrap());
-        let (_, logs) = crate::logging::capture_log_lines(|| {
-            registry.replay_session(storage.path(), "session").unwrap();
-        });
-        let task_logs = logs
-            .iter()
-            .filter(|line| line.contains(&row.task_id))
-            .collect::<Vec<_>>();
-        assert_eq!(task_logs.len(), 1, "{logs:?}");
-        assert!(task_logs[0].starts_with("WARN "), "{logs:?}");
-        assert!(
-            task_logs[0].contains("refusing to quarantine unresolved live"),
-            "{logs:?}"
-        );
-        assert_eq!(
-            replay_store_snapshot(storage.path(), &db.lock().unwrap()),
-            expected
-        );
-    }
-
-    #[test]
-    fn durability_replay_reports_a_failed_dangling_row_delete_without_success() {
-        let storage = tempfile::tempdir().unwrap();
-        let (registry, db, row) = dangling_replay_fixture(storage.path());
-        db.lock()
-            .unwrap()
-            .execute_batch(
-                "CREATE TRIGGER refuse_task_delete BEFORE DELETE ON bash_tasks
-             BEGIN SELECT RAISE(FAIL, 'injected delete failure'); END",
-            )
-            .unwrap();
-        let expected = replay_store_snapshot(storage.path(), &db.lock().unwrap());
-        let (_, logs) = crate::logging::capture_log_lines(|| {
-            registry.replay_session(storage.path(), "session").unwrap();
-        });
-        let task_logs = logs
-            .iter()
-            .filter(|line| line.contains(&row.task_id))
-            .collect::<Vec<_>>();
-        assert_eq!(task_logs.len(), 1, "{logs:?}");
-        assert!(task_logs[0].starts_with("WARN "), "{logs:?}");
-        assert!(task_logs[0].contains("injected delete failure"), "{logs:?}");
-        assert_eq!(
-            replay_store_snapshot(storage.path(), &db.lock().unwrap()),
-            expected
         );
     }
 
