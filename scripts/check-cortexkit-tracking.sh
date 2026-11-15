@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fail when Git tracks a file under .cortexkit/ that the ignore rules exclude.
+# Fail when Git tracks ignored .cortexkit/ files or build-server staging files.
 #
 # .cortexkit/ holds private CortexKit working files (drafts, reports, scratch,
 # agent state). Only the shared parts are meant to be tracked: release-notes/,
@@ -10,8 +10,8 @@
 # tracked file that the ignore rules exclude, however it got tracked.
 #
 # Usage: scripts/check-cortexkit-tracking.sh [repository-dir]
-# Exits 0 when nothing is listed, 1 when tracked ignored files exist, and 2
-# when Git itself fails.
+# Exits 0 when neither check lists files, 1 when forbidden files are tracked,
+# and 2 when Git itself fails.
 set -euo pipefail
 
 repo="${1:-.}"
@@ -32,4 +32,17 @@ if [ -n "$listed" ]; then
   exit 1
 fi
 
-echo "check-cortexkit-tracking: no ignored files are tracked under .cortexkit/"
+if ! listed="$(git -C "$repo" ls-files -- .aft-ci)"; then
+  echo "check-cortexkit-tracking: git ls-files failed in $repo" >&2
+  exit 2
+fi
+
+if [ -n "$listed" ]; then
+  {
+    echo "files under .aft-ci/ are build-server staging and must never be committed: git rm --cached <path>"
+    printf '%s\n' "$listed" | sed 's/^/  /'
+  } >&2
+  exit 1
+fi
+
+echo "check-cortexkit-tracking: no forbidden files tracked under .cortexkit/ or .aft-ci/"
