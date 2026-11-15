@@ -3827,6 +3827,15 @@ enum Settled {
 /// for later phases; `deadline` and the request's cancellation are checked
 /// before each step.
 fn presence_check(path: &Path, normalized: &str, deadline: Instant) -> PresenceCheck {
+    presence_check_after_unstamped_stat(path, normalized, deadline, || {})
+}
+
+fn presence_check_after_unstamped_stat(
+    path: &Path,
+    normalized: &str,
+    deadline: Instant,
+    after_stat: impl FnOnce(),
+) -> PresenceCheck {
     #[cfg(test)]
     PRESENCE_CHECK_STARTED.with(|hook| {
         if let Some(hook) = hook.borrow_mut().as_mut() {
@@ -3841,19 +3850,10 @@ fn presence_check(path: &Path, normalized: &str, deadline: Instant) -> PresenceC
             #[cfg(test)]
             request_files::record_disk_read(path);
             let stamp = file_stamp(path);
-            if stamp.is_some_and(|(size, _)| crate::large_read::is_large(size)) {
-                return stream_presence_check(path, stamp, normalized, deadline);
-            }
-            let Some(text) =
-                crate::search_index::read_searchable_text(path, crate::large_read::Site::Presence)
-            else {
-                return PresenceCheck::Unknown;
-            };
-            crate::large_read::record_whole(crate::large_read::Site::Presence, text.len());
-            return PresenceCheck::Read(
-                stamp,
-                exact_lane::normalize_exact_phrase(&text).contains(normalized),
-            );
+            after_stat();
+            // Reopen unstamped source through the streaming reader even when
+            // the earlier path stat was small: the file may have grown since.
+            return stream_presence_check(path, stamp, normalized, deadline);
         }
         None => {
             // A large file is read in steps instead, outside the request's
@@ -7722,54 +7722,71 @@ fn execute_degraded_grep_fallback(
     let rayon_wait = waits::time(waits::SearchWait::Rayon);
     let alloc_label = crate::alloc_trace::carry();
     let io_budget = crate::bounded_io::capture();
-    let mut readable_files = files
-        .par_iter()
-        .enumerate()
-        .filter_map(|(index, file)| {
-            let _alloc_label = alloc_label.enter();
-            if cancellation
-                .as_ref()
-                .is_some_and(|token| token.cancel_requested_before_commit())
-            {
-                return None;
-            }
-            if started.elapsed() >= DEGRADED_GREP_WALK_BUDGET {
-                read_budget_reached.store(true, Ordering::Relaxed);
-                return None;
-            }
-            crate::bounded_io::with_budget(io_budget.clone(), || {
-                read_degraded_grep_file(file, &compiled, max_results)
+    // One CPU-width batch holds at most concurrency × max_results temporary
+    // rows (including each path, line window and full match_text), plus the
+    // global max_results rows already kept for the reply. Read buffers are
+    // separate and bounded by the per-reader ceiling.
+    for batch in files.chunks(rayon::current_num_threads().max(1)) {
+        let mut readable_files = batch
+            .par_iter()
+            .enumerate()
+            .filter_map(|(index, file)| {
+                let _alloc_label = alloc_label.enter();
+                if cancellation
+                    .as_ref()
+                    .is_some_and(|token| token.cancel_requested_before_commit())
+                {
+                    return None;
+                }
+                if started.elapsed() >= DEGRADED_GREP_WALK_BUDGET {
+                    read_budget_reached.store(true, Ordering::Relaxed);
+                    return None;
+                }
+                crate::bounded_io::with_budget(io_budget.clone(), || {
+                    read_degraded_grep_file(file, &compiled, max_results)
+                })
+                .map(|outcome| (index, file.clone(), outcome))
             })
-            .map(|outcome| (index, file.clone(), outcome))
-        })
-        .collect::<Vec<_>>();
-    drop(rayon_wait);
-    if search_cancellation_requested() {
-        return Err(cancelled_search_response_from_id(request_id));
-    }
-    // Rayon collection order is not part of the response contract; restore the
-    // original walker order before applying the existing result-cap semantics.
-    readable_files.sort_by_key(|(index, _, _)| *index);
-
-    for (_, _file, (rows, count)) in readable_files {
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        record_degraded_retained_rows(
+            project_root,
+            readable_files
+                .iter()
+                .map(|(_, _, (rows, _))| rows.len())
+                .sum(),
+        );
         if search_cancellation_requested() {
             return Err(cancelled_search_response_from_id(request_id));
         }
+        // Rayon collection order is not part of the response contract; restore the
+        // original walker order before applying the existing result-cap semantics.
+        readable_files.sort_by_key(|(index, _, _)| *index);
+
+        for (_, _file, (rows, count)) in readable_files {
+            if search_cancellation_requested() {
+                return Err(cancelled_search_response_from_id(request_id));
+            }
+            if truncated {
+                engine_capped = true;
+                break;
+            }
+
+            files_searched += 1;
+
+            let remaining = max_results.saturating_sub(matches.len());
+            total_matches += count.min(remaining + 1);
+            truncated = count > remaining;
+            matches.extend(rows.into_iter().take(remaining));
+            if count > 0 {
+                files_with_matches += 1;
+            }
+        }
         if truncated {
-            engine_capped = true;
             break;
         }
-
-        files_searched += 1;
-
-        let remaining = max_results.saturating_sub(matches.len());
-        total_matches += count.min(remaining + 1);
-        truncated = count > remaining;
-        matches.extend(rows.into_iter().take(remaining));
-        if count > 0 {
-            files_with_matches += 1;
-        }
     }
+    drop(rayon_wait);
 
     if truncated {
         engine_capped = true;
@@ -7872,6 +7889,9 @@ fn read_degraded_grep_file(
         |bytes| {
             read += bytes.len() as u64;
             valid &= utf8.feed(bytes, |_| {});
+            if !valid {
+                return Some(crate::large_read::ScanEnd::Stopped);
+            }
             token
                 .as_ref()
                 .filter(|token| token.cancel_requested_before_commit())
@@ -7903,15 +7923,187 @@ fn read_degraded_grep_file(
         },
     );
     crate::large_read::record(crate::large_read::Site::DegradedGrep, size, read);
-    if scan
+    let ceiling = scan
         .as_ref()
-        .is_err_and(|error| !crate::large_read::is_ceiling_error(error))
-        || !valid
-        || !utf8.finish()
+        .is_err_and(crate::large_read::is_ceiling_error);
+    // The ceiling probe can split a UTF-8 sequence on the skipped line. Only
+    // earlier complete lines produced rows; they need no EOF validation of
+    // the partial skipped line. A real cancellation still discards all rows.
+    if !valid
+        || matches!(scan, Ok(crate::large_read::ScanEnd::Interrupted(_)))
+        || scan
+            .as_ref()
+            .is_err_and(|error| !crate::large_read::is_ceiling_error(error))
+        || (!ceiling && !utf8.finish())
     {
         return None;
     }
     Some((rows, total))
+}
+
+#[cfg(test)]
+static DEGRADED_ROW_WATCHES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<AtomicUsize>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+fn record_degraded_retained_rows(root: &Path, rows: usize) {
+    if let Some(peak) = DEGRADED_ROW_WATCHES.lock().unwrap().get(root) {
+        peak.fetch_max(rows, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+fn audit1432_degraded_literal() -> pattern_compile::CompiledPattern {
+    let pattern_compile::CompileResult::Ok(compiled) = pattern_compile::compile(
+        "foo",
+        CompileOpts {
+            literal: true,
+            ..CompileOpts::default()
+        },
+    ) else {
+        panic!("literal");
+    };
+    compiled
+}
+
+#[cfg(test)]
+#[test]
+fn audit1432_degraded_utf8_split_at_ceiling_keeps_earlier_complete_rows() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("utf8-split.txt");
+    let mut bytes = b"foo\n".to_vec();
+    bytes.extend(std::iter::repeat_n(
+        b'x',
+        crate::large_read::WHOLE_READ_CEILING as usize - 1,
+    ));
+    bytes.extend_from_slice("€\n".as_bytes());
+    fs::write(&file, bytes).unwrap();
+    let _scope = crate::bounded_io::enter_disclosure_if_absent();
+    let (rows, count) = read_degraded_grep_file(&file, &audit1432_degraded_literal(), 10)
+        .expect("complete earlier rows survive the ceiling skip");
+    assert_eq!(count, 1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].line, 1);
+    assert_eq!(rows[0].line_text, "foo");
+    let mut response = Response::success("utf8-split", serde_json::json!({}));
+    crate::bounded_io::disclose_large_read_skips(&mut response);
+    assert_eq!(
+        response.data["skipped_files"][0]["file"],
+        serde_json::json!(file)
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn audit1432_degraded_invalid_utf8_is_not_named_as_a_ceiling_skip() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("invalid.txt");
+    let mut bytes = b"foo\ninvalid\xff\n".to_vec();
+    bytes.extend(std::iter::repeat_n(b'x', 17 << 20));
+    fs::write(&file, bytes).unwrap();
+    let _scope = crate::bounded_io::enter_disclosure_if_absent();
+    assert!(read_degraded_grep_file(&file, &audit1432_degraded_literal(), 10).is_none());
+    let mut response = Response::success("invalid-utf8", serde_json::json!({}));
+    crate::bounded_io::disclose_large_read_skips(&mut response);
+    assert!(response.data.get("skipped_files").is_none(), "{response:?}");
+}
+
+#[cfg(test)]
+#[test]
+fn audit1432_degraded_mid_scan_cancellation_never_returns_partial_rows() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("cancel.txt");
+    fs::write(&file, b"foo\n".repeat(1024)).unwrap();
+    let token = crate::executor::JobCancellation::new();
+    let cancel = token.clone();
+    let _installed = crate::executor::install_job_cancellation(token);
+    let result = crate::large_read::with_test_steps(64, 0, || {
+        crate::large_read::with_step_tap(
+            move |_| cancel.request_cancel(),
+            || read_degraded_grep_file(&file, &audit1432_degraded_literal(), 10),
+        )
+    });
+    assert!(result.is_none(), "cancelled scan returned rows: {result:?}");
+}
+
+#[cfg(test)]
+#[test]
+fn audit1432_presence_unstamped_growth_streams_without_a_false_skip() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("presence.txt");
+    fs::write(&file, b"initial\n").unwrap();
+    let files = request_files::install();
+    files
+        .files()
+        .keep_read(&file, b"old unstamped\n".to_vec(), None);
+    let mut grown = b"x\n".repeat((17 << 20) / 2);
+    grown.extend_from_slice(b"needle_at_tail\n");
+    let _scope = crate::bounded_io::enter_disclosure_if_absent();
+    let answer = presence_check_after_unstamped_stat(
+        &file,
+        "needle_at_tail",
+        Instant::now() + Duration::from_secs(60),
+        || fs::write(&file, &grown).unwrap(),
+    );
+    assert!(
+        matches!(answer, PresenceCheck::Read(_, true)),
+        "growth must use the stream, not make a ceiling skip"
+    );
+    let mut response = Response::success("presence-growth", serde_json::json!({}));
+    crate::bounded_io::disclose_large_read_skips(&mut response);
+    assert!(response.data.get("skipped_files").is_none(), "{response:?}");
+}
+
+#[cfg(test)]
+#[test]
+fn audit1432_degraded_transient_rows_are_bounded_by_concurrency_not_all_files() {
+    let root = tempfile::tempdir().unwrap();
+    let query = format!("foo{}", "x".repeat(16 * 1024 - 3));
+    let content = format!("{query}\n").repeat(16);
+    for at in 0..24 {
+        fs::write(root.path().join(format!("file-{at:02}.txt")), &content).unwrap();
+    }
+    let peak = Arc::new(AtomicUsize::new(0));
+    DEGRADED_ROW_WATCHES
+        .lock()
+        .unwrap()
+        .insert(root.path().to_path_buf(), peak.clone());
+    struct Reset(PathBuf);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            DEGRADED_ROW_WATCHES.lock().unwrap().remove(&self.0);
+        }
+    }
+    let _reset = Reset(root.path().to_path_buf());
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    let result = pool
+        .install(|| execute_degraded_grep_fallback(&query, root.path(), 10, true, "retained-rows"))
+        .unwrap();
+    assert_eq!(result.grep.matches.len(), 10);
+    assert!(result.grep.truncated);
+    assert!(result
+        .grep
+        .matches
+        .iter()
+        .all(|row| row.match_text == query));
+    assert_eq!(
+        result
+            .grep
+            .matches
+            .iter()
+            .map(|row| row.line)
+            .collect::<Vec<_>>(),
+        (1..=10).collect::<Vec<_>>()
+    );
+    assert!(
+        peak.load(Ordering::Relaxed) <= 2 * 10,
+        "retained {} rows for two workers and a 10-row per-file cap",
+        peak.load(Ordering::Relaxed)
+    );
 }
 
 #[cfg(test)]

@@ -1427,7 +1427,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     // results page is the search surface's, registered under its cap reason.
     ExclusionEntry {
         file: "commands/semantic_search/external_exact.rs",
-        enclosing_item: "sweep",
+        enclosing_item: "sweep_after_metadata",
         location_or_primitive: "commands::semantic_search::external_exact::sweep skipped_foreign_mounts",
         reason: "counts mount points of other filesystems that the walk does not enter; no list is cut here, and a walk the deadline stops is reported through the sweep's enumeration_stopped and the reply's coverage line",
     },

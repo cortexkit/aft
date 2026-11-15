@@ -3108,19 +3108,26 @@ pub(crate) fn read_request_corpus_file(
             let read = files.read(path, |path| {
                 #[cfg(test)]
                 crate::search_hot_path_measurements::record_file_read_path(path);
-                // Bound the read itself as well as admission: the file can
-                // grow after stat. Bytes cut at the bound are not kept.
-                let mut bytes = Vec::with_capacity(
-                    usize::try_from(metadata.len().min(max_file_size)).unwrap_or(0),
-                );
-                crate::project_content::open(path)?
-                    .take(max_file_size.saturating_add(1))
-                    .read_to_end(&mut bytes)?;
+                let file = crate::project_content::open(path)?;
+                let stat = FileStat::of(&file.metadata()?);
+                if stat.size > max_file_size {
+                    return Err(std::io::Error::other(CutAtSizeBound));
+                }
+                crate::large_read::allow_whole(
+                    crate::large_read::Site::ExactCorpus,
+                    path,
+                    stat.size,
+                )?;
+                let mut bytes = Vec::new();
+                bytes
+                    .try_reserve_exact(stat.size as usize)
+                    .map_err(std::io::Error::other)?;
+                file.take(stat.size).read_to_end(&mut bytes)?;
                 crate::large_read::record_whole(crate::large_read::Site::ExactCorpus, bytes.len());
                 if bytes.len() as u64 > max_file_size {
                     return Err(std::io::Error::other(CutAtSizeBound));
                 }
-                Ok((bytes, Some(FileStat::of(&metadata))))
+                Ok((bytes, Some(stat)))
             });
             match read {
                 Ok(fetched) => fetched,
@@ -3136,6 +3143,18 @@ pub(crate) fn read_request_corpus_file(
         }
     };
     let bytes = fetched.file.bytes();
+    if crate::large_read::allow_whole(
+        crate::large_read::Site::ExactCorpus,
+        path,
+        bytes.len() as u64,
+    )
+    .is_err()
+    {
+        if fetched.fresh {
+            files.release(path);
+        }
+        return RequestCorpusFile::Skipped;
+    }
     if bytes.len() as u64 > max_file_size || is_binary_bytes(bytes) {
         if fetched.fresh {
             files.release(path);
@@ -3183,18 +3202,35 @@ fn read_search_corpus_file_with_metadata(
     if metadata.size > max_file_size {
         return SearchCorpusEligibility::Unindexed(metadata);
     }
+    if crate::large_read::allow_whole(crate::large_read::Site::ExactCorpus, path, metadata.size)
+        .is_err()
+    {
+        return SearchCorpusEligibility::Unindexed(metadata);
+    }
 
     #[cfg(test)]
     crate::search_hot_path_measurements::record_file_read_path(path);
-    // Bound the read itself as well as admission: the file can grow after stat.
-    let mut bytes =
-        Vec::with_capacity(usize::try_from(metadata.size.min(max_file_size)).unwrap_or(0));
+    let mut bytes = Vec::new();
     #[cfg(test)]
     audit_record(|work| work.corpus_opens += 1);
     let read = crate::project_content::open(path).and_then(|file| {
-        file.take(max_file_size.saturating_add(1))
-            .read_to_end(&mut bytes)
+        let size = file.metadata()?.len();
+        if size > max_file_size {
+            return Err(std::io::Error::other(CutAtSizeBound));
+        }
+        crate::large_read::allow_whole(crate::large_read::Site::ExactCorpus, path, size)?;
+        bytes
+            .try_reserve_exact(size as usize)
+            .map_err(std::io::Error::other)?;
+        file.take(size).read_to_end(&mut bytes)
     });
+    if read.as_ref().is_err_and(|error| {
+        error
+            .get_ref()
+            .is_some_and(|inner| inner.is::<CutAtSizeBound>())
+    }) {
+        return SearchCorpusEligibility::Unindexed(metadata);
+    }
     if read.is_err() {
         return SearchCorpusEligibility::Skipped;
     }
@@ -3704,18 +3740,6 @@ where
     Ok(files)
 }
 
-pub(crate) fn read_searchable_text(path: &Path, site: crate::large_read::Site) -> Option<String> {
-    let mut reader = crate::bounded_io::reader(path, None).ok()?;
-    crate::large_read::allow_whole(site, path, reader.size_at_open()).ok()?;
-    let bytes = reader
-        .append(Vec::new(), reader.size_at_open() as usize)
-        .ok()?;
-    if is_binary_bytes(&bytes) {
-        return None;
-    }
-    String::from_utf8(bytes).ok()
-}
-
 /// Read an indexed file whole for grep verification, as the scans read a
 /// file they do not stream. Keep the original I/O error so callers
 /// distinguish a missing entry from blocked access or a scan timeout.
@@ -3806,6 +3830,46 @@ fn open_grep_file_after_open(
 #[cfg(test)]
 mod grep_binary_prefix_tests {
     use super::*;
+
+    #[test]
+    fn audit1432_corpus_readers_enforce_ceiling_with_a_larger_configured_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("large.rs");
+        std::fs::write(&path, b"// ascii source\n".repeat((17 << 20) / 16)).unwrap();
+        for cached in [false, true] {
+            let _scope = crate::bounded_io::enter_disclosure_if_absent();
+            let files = crate::commands::semantic_search::request_files::RequestFiles::default();
+            let (eligible, _, largest) = crate::test_allocations::count_bytes_and_largest(|| {
+                if cached {
+                    matches!(
+                        read_request_corpus_file(Some(&files), &path, 64 << 20),
+                        RequestCorpusFile::Eligible { .. }
+                    )
+                } else {
+                    matches!(
+                        read_search_corpus_file(&path, 64 << 20),
+                        SearchCorpusEligibility::Eligible(_)
+                    )
+                }
+            });
+            assert!(
+                !eligible,
+                "a configured corpus limit must not bypass the whole-read ceiling"
+            );
+            assert!(
+                (largest as u64) < crate::large_read::WHOLE_READ_CEILING,
+                "largest allocation={largest}"
+            );
+            let mut response =
+                crate::protocol::Response::success("corpus-ceiling", serde_json::json!({}));
+            crate::bounded_io::disclose_large_read_skips(&mut response);
+            assert_eq!(response.data["complete"], false);
+            assert_eq!(
+                response.data["skipped_files"][0]["file"],
+                serde_json::json!(path)
+            );
+        }
+    }
 
     #[test]
     fn growing_small_grep_read_stops_at_open_size_without_large_allocation() {
