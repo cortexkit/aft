@@ -1160,15 +1160,30 @@ pub(crate) fn kill_point(point: &str) {
     unsafe {
         libc::kill(libc::getpid(), libc::SIGKILL);
     }
+    // As abruptly as SIGKILL: no destructor, buffer flush or exit handler
+    // runs. The exit code tells the test the process died here.
+    #[cfg(windows)]
+    // SAFETY: the pseudo-handle of this process needs no closing, and
+    // terminating it has no memory effects here.
+    unsafe {
+        windows_sys::Win32::System::Threading::TerminateProcess(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            KILLED_EXIT_CODE,
+        );
+    }
     std::process::abort();
 }
+
+/// The exit code of a test build [`kill_point`] terminated on Windows.
+#[cfg(all(windows, any(test, feature = "test-hooks")))]
+pub(crate) const KILLED_EXIT_CODE: u32 = 0x4B11;
 
 #[cfg(not(any(test, feature = "test-hooks")))]
 #[inline]
 pub(crate) fn kill_point(_point: &str) {}
 
 /// When `AFT_TEST_HIDE_ROOT` names a checkout's root folder, moves it away
-/// once the build has scanned it and back before the segment is written,
+/// once the build has scanned it and back once the segment is written,
 /// for the test that proves no stage after the scan reads the checkout.
 #[cfg(any(test, feature = "test-hooks"))]
 fn hide_root(point: &str) {

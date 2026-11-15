@@ -4,9 +4,9 @@
 //!
 //! Each killed build runs in a child process: this test binary again,
 //! running only [`resume_child_build`], with `AFT_TEST_KILL_AT` naming the
-//! point it kills itself at (see `resume::kill_point`).
+//! point it kills itself at (see `resume::kill_point`): SIGKILL on Unix,
+//! `TerminateProcess` on Windows.
 
-use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -152,9 +152,13 @@ fn killed_build_of(exe: &Path, store: &Path, root: &Path, point: &str, env: &[(&
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        output.status.signal(),
-        Some(libc::SIGKILL),
+    #[cfg(unix)]
+    let killed =
+        std::os::unix::process::ExitStatusExt::signal(&output.status) == Some(libc::SIGKILL);
+    #[cfg(windows)]
+    let killed = output.status.code() == i32::try_from(super::resume::KILLED_EXIT_CODE).ok();
+    assert!(
+        killed,
         "the build was killed at {point}: {:?}\n{stderr}",
         output.status
     );
@@ -407,7 +411,13 @@ fn a_config_file_renamed_between_kill_and_resume_is_read_under_its_new_name() {
     );
 }
 
+// The executable-replacement tests below run on Unix only: they model an
+// upgrade renaming a new binary over a running one, which Windows refuses
+// for a running executable (AFT's placement never replaces one there; see
+// `pinned_executable`).
+
 /// The report a child build printed when it finished.
+#[cfg(unix)]
 fn child_report(output: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
@@ -421,6 +431,7 @@ fn child_report(output: &std::process::Output) -> String {
 /// A build killed while running from one executable image, then resumed by
 /// a process of `exe` with `env` set: whether the resumed build adopted
 /// what the killed one left.
+#[cfg(unix)]
 fn resumed_after_an_image_change(replace_first: bool, env: &[(&str, &str)]) -> bool {
     let root = tempfile::tempdir().unwrap();
     project(root.path());
@@ -454,6 +465,7 @@ fn resumed_after_an_image_change(replace_first: bool, env: &[(&str, &str)]) -> b
 /// upgrade does; the next build runs the binary now at that path. Taking
 /// the image's identity from that path at build time, rather than from the
 /// image the process started from, would give both builds the same one.
+#[cfg(unix)]
 #[test]
 fn a_build_never_resumes_what_another_executable_image_wrote() {
     assert!(
@@ -468,6 +480,7 @@ fn a_build_never_resumes_what_another_executable_image_wrote() {
 
 /// As [`a_build_never_resumes_what_another_executable_image_wrote`], with
 /// the next build replacing the binary at its path in turn before it builds.
+#[cfg(unix)]
 #[test]
 fn a_build_never_resumes_what_another_executable_image_wrote_when_both_replace() {
     assert!(!resumed_after_an_image_change(
@@ -708,6 +721,7 @@ fn inputs_besides_parsed_files_changed_between_kill_and_resume_are_resolved_agai
         #[cfg(unix)]
         std::os::unix::fs::symlink("old", root.join("linked")).unwrap();
     }
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut changes: Vec<(&str, fn(&Path))> = vec![("a configuration file's bytes", |root| {
         write(
             root,

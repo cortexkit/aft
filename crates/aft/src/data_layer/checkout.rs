@@ -52,7 +52,7 @@ mod text_build;
 use text_build::TextBuild;
 #[cfg(test)]
 pub(super) mod publication_tests;
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod resume_tests;
 #[cfg(test)]
 mod todo_tests;
