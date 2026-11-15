@@ -29,7 +29,60 @@ pub const PAUSED: &str = "PAUSED";
 /// A dead workspace that no build adopted for this long is deleted.
 pub const MAX_IDLE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-const MAGIC: &[u8; 8] = b"AFTWSID1";
+const MAGIC: &[u8; 8] = b"AFTWSID2";
+
+/// How a root path's bytes are stored: exactly as the platform spells it,
+/// so a path that is not Unicode still reads back as the same path.
+#[cfg(unix)]
+const ROOT_ENCODING: u8 = 1;
+#[cfg(windows)]
+const ROOT_ENCODING: u8 = 2;
+#[cfg(not(any(unix, windows)))]
+const ROOT_ENCODING: u8 = 3;
+
+fn root_bytes(root: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        root.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        root.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        root.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+fn root_from_bytes(bytes: Vec<u8>) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt as _;
+        Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt as _;
+        if bytes.len() % 2 != 0 {
+            return None;
+        }
+        let wide = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        Some(PathBuf::from(std::ffi::OsString::from_wide(&wide)))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        String::from_utf8(bytes).ok().map(PathBuf::from)
+    }
+}
 
 /// A workspace's identity: its checkout's root folder and the builder's own
 /// description of the build.
@@ -46,10 +99,11 @@ pub struct WorkspaceIdentity {
 ///
 /// When the file cannot be written or renamed.
 pub fn write_identity(workspace: &Path, identity: &WorkspaceIdentity) -> io::Result<()> {
-    let root = identity.root.to_string_lossy();
+    let root = root_bytes(&identity.root);
     let mut bytes = Vec::with_capacity(64 + root.len() + identity.payload.len());
     bytes.extend_from_slice(MAGIC);
-    push_part(&mut bytes, root.as_bytes())?;
+    bytes.push(ROOT_ENCODING);
+    push_part(&mut bytes, &root)?;
     push_part(&mut bytes, &identity.payload)?;
     let length = bytes.len() as u64;
     bytes.extend_from_slice(&length.to_le_bytes());
@@ -84,19 +138,19 @@ pub fn read_identity(workspace: &Path) -> Option<WorkspaceIdentity> {
     {
         return None;
     }
-    let mut at = 8;
+    if *bytes.get(8)? != ROOT_ENCODING {
+        return None;
+    }
+    let mut at = 9;
     let mut part = || -> Option<Vec<u8>> {
         let length = u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as usize;
         let part = bytes.get(at + 4..at + 4 + length)?.to_vec();
         at += 4 + length;
         Some(part)
     };
-    let root = String::from_utf8(part()?).ok()?;
+    let root = root_from_bytes(part()?)?;
     let payload = part()?;
-    (at == body).then(|| WorkspaceIdentity {
-        root: PathBuf::from(root),
-        payload,
-    })
+    (at == body).then_some(WorkspaceIdentity { root, payload })
 }
 
 /// Records that a build adopted `workspace` now.
@@ -174,6 +228,26 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
         assert_eq!(read_identity(dir.path()), None, "a torn file");
+    }
+
+    // Linux file systems take any bytes but `/` and NUL in a name; macOS
+    // refuses names that are not UTF-8.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_root_that_is_not_unicode_reads_back_as_the_same_path() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"checkout-\xff-\xfe"));
+        let identity = WorkspaceIdentity {
+            root: root.clone(),
+            payload: Vec::new(),
+        };
+        write_identity(dir.path(), &identity).unwrap();
+        assert_eq!(read_identity(dir.path()).unwrap().root, root);
+        std::fs::create_dir(&root).unwrap();
+        assert!(worth_keeping(dir.path(), SystemTime::now()));
     }
 
     #[test]
