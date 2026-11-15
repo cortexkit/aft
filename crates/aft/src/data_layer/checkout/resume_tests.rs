@@ -978,6 +978,45 @@ fn free_space_just_above_the_floor_is_recovered_from_dead_workspaces() {
     );
 }
 
+/// A resumed scan that staged nothing new keeps the records marker it
+/// adopted rather than writing it again.
+#[test]
+fn a_resumed_scan_with_nothing_new_keeps_the_records_marker() {
+    let root = tempfile::tempdir().unwrap();
+    project(root.path());
+    let store = tempfile::tempdir().unwrap();
+    // Killed during passes 2-3, then during assembly: two deaths at
+    // different stages, so the last build still resumes.
+    killed_build(store.path(), root.path(), "passes.range:1");
+    let checkout = Checkout::bind(layer(), store.path(), family(), root.path()).unwrap();
+    let marker = only_workspace(&builds(&checkout)).join("STAGE-records");
+    let long_ago = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1 << 30);
+    std::fs::File::options()
+        .write(true)
+        .open(&marker)
+        .unwrap()
+        .set_modified(long_ago)
+        .unwrap();
+    killed_build(store.path(), root.path(), "stage.write");
+    assert_eq!(
+        std::fs::metadata(&marker).unwrap().modified().unwrap(),
+        long_ago,
+        "the marker was not written again"
+    );
+    let report = checkout.build().unwrap();
+    assert!(
+        report.resumed_records > 0 && report.resumed_passes,
+        "{report:?}"
+    );
+    let reference_store = tempfile::tempdir().unwrap();
+    let (reference, _) = build(reference_store.path(), root.path());
+    assert_same(
+        &published(&reference),
+        &published(&checkout),
+        "after keeping the marker",
+    );
+}
+
 #[test]
 fn a_refused_admission_writes_no_workspace() {
     let root = tempfile::tempdir().unwrap();

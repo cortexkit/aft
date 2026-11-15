@@ -380,15 +380,21 @@ impl RecordStage {
     pub(crate) fn finish(self, cache: &Arc<BlockCache>) -> Result<StagedRecords, DataError> {
         let mut out = self.out.lock().expect("no panics while holding it");
         self.finish_segment(&mut out)?;
-        let mut files = self.adopted.files.clone();
-        files.extend(out.finished.iter().flatten().cloned());
-        resume::write_marker(
-            self.dir.workspace(),
-            resume::RECORDS,
-            self.identity,
-            None,
-            &files,
-        )?;
+        // A resumed scan that staged nothing new leaves the adopted marker
+        // as it is: rewriting the same bytes over it gains nothing, and on
+        // Windows a replace another process's reader holds up would fail
+        // the build.
+        if !out.finished.is_empty() || self.adopted.files.is_empty() {
+            let mut files = self.adopted.files.clone();
+            files.extend(out.finished.iter().flatten().cloned());
+            resume::write_marker(
+                self.dir.workspace(),
+                resume::RECORDS,
+                self.identity,
+                None,
+                &files,
+            )?;
+        }
         resume::kill_point("records.committed");
         let paths = self
             .adopted
