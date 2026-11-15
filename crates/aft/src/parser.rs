@@ -4403,14 +4403,6 @@ thread_local! {
     static RUST_MACRO_BODY_PARSER: RefCell<Option<Parser>> = const { RefCell::new(None) };
 }
 
-/// Extract symbols from Rust source without compiling a tree-sitter query.
-/// Handles: free functions, struct, enum, trait (as Interface), impl methods with scope chains.
-///
-/// tree-sitter parses the body of a `macro_rules!` arm and of an item-position
-/// macro invocation as an opaque token tree, so items written there would be
-/// invisible. Code bases that group whole runtimes of methods inside macro
-/// bodies depend on seeing them, so each such body is parsed again on its own
-/// and contributes its items when, and only when, it parses cleanly as Rust.
 /// Navigation includes trait members already known to the call graph without
 /// changing the parser table persisted in content records. Both stored and
 /// freshly parsed tables use the same ownership and duplicate checks.
@@ -4462,6 +4454,14 @@ fn rust_impl_parent_name(impl_target: &str) -> String {
         .to_string()
 }
 
+/// Extract symbols from Rust source without compiling a tree-sitter query.
+/// Handles: free functions, struct, enum, trait (as Interface), impl methods with scope chains.
+///
+/// tree-sitter parses the body of a `macro_rules!` arm and of an item-position
+/// macro invocation as an opaque token tree, so items written there would be
+/// invisible. Code bases that group whole runtimes of methods inside macro
+/// bodies depend on seeing them, so each such body is parsed again on its own
+/// and contributes its items when, and only when, it parses cleanly as Rust.
 fn extract_rs_symbols<'tree>(
     source: &str,
     root: &Node<'tree>,
