@@ -334,10 +334,22 @@ fn catalog_inner(
             Err(crate::exec_remote::sibling_refusal(
                 crate::exec_remote::SiblingRefusal::NotReadable,
                 std::path::Path::new(&first),
-            ))
+            ).into())
         })
-        .map_err(|message| {
-            cortexkit_role_tool_provider::errors::invalid_request("params.siblings", message)
+        .map_err(|error| match error {
+            crate::exec_remote::SiblingValidationError::Refused(message) => {
+                cortexkit_role_tool_provider::errors::invalid_request("params.siblings", message)
+            }
+            crate::exec_remote::SiblingValidationError::Unavailable(response) => {
+                let mut error = subc_protocol::ErrorBody::new(
+                    response.data["code"].as_str().unwrap_or("grants_unavailable"),
+                    response.data["message"].as_str().unwrap_or_default(),
+                );
+                if let Some(detail) = response.data.get("detail") {
+                    error = error.with_detail(detail.clone());
+                }
+                error
+            }
         })?;
     }
     // A head preflighting a worker plan validates its override without changing

@@ -63,6 +63,135 @@ const HANG_CATCH: Duration = Duration::from_secs(30);
 const SESSION_ID: &str = "bash-reply-timing-contract";
 const ROUTE_CHANNEL: u16 = 1;
 
+#[test]
+fn standalone_foreground_bash_exit_wakes_without_pending_ticks() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut aft = AftProcess::spawn_with_env(&[
+        (
+            "AFT_TEST_PENDING_POLL_INTERVAL_MS",
+            std::ffi::OsStr::new("30000"),
+        ),
+        (
+            "AFT_TEST_BASH_WATCHDOG_INTERVAL_MS",
+            std::ffi::OsStr::new("30000"),
+        ),
+    ]);
+    configure(&mut aft, dir.path(), &dir.path().join("storage"));
+    for (id, command) in [
+        ("standalone-exit-true", "true"),
+        (
+            "standalone-exit-delayed",
+            "sleep 0.2; printf final-output; true",
+        ),
+    ] {
+        let response = aft.send_with_timeout(
+            &bash_request(
+                id,
+                json!({"command": command, "foreground_orchestrate": true, "wait": true}),
+            ),
+            Duration::from_secs(10),
+        );
+        assert_eq!(response["status"], "completed", "{response:?}");
+        assert_eq!(response["exit_code"], 0, "{response:?}");
+        if command.contains("printf") {
+            assert!(response["output"]
+                .as_str()
+                .unwrap()
+                .contains("final-output"));
+        }
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn foreground_bash_exit_wakes_without_observation_ticks() {
+    // Stretch both observation timers beyond the reply deadline. The delayed
+    // command cannot finish in the spawn's immediate status check, so only its
+    // kernel exit event can make this foreground call answer in time.
+    run_subc_with_env(
+        &[
+            ("AFT_TEST_BASH_EXIT_POLL_MS", "30000"),
+            ("AFT_TEST_BASH_WATCHDOG_INTERVAL_MS", "30000"),
+        ],
+        |mut h| async move {
+            for (corr, command, code) in [
+                (1900, "true", 0),
+                (1901, "sleep 0.2; printf final-output; true", 0),
+                (1902, "sleep 0.2; printf final-output; exit 7", 7),
+            ] {
+                send_tool_call(
+                    &mut h.stream,
+                    corr,
+                    "bash",
+                    json!({"command": command, "wait": true}),
+                )
+                .await;
+                let reply = read_tool_response(&mut h.stream, corr, Duration::from_secs(10)).await;
+                let result = tool_response_json(&reply);
+                assert_eq!(
+                    result["status"],
+                    if code == 0 { "completed" } else { "failed" },
+                    "{}",
+                    frame_body(&reply)
+                );
+                assert_eq!(result["exit_code"], code, "{}", frame_body(&reply));
+                if command.contains("printf") {
+                    assert!(
+                        tool_response_text(&reply).contains("final-output"),
+                        "{}",
+                        frame_body(&reply)
+                    );
+                }
+            }
+            h
+        },
+    );
+}
+
+#[test]
+#[ignore = "foreground latency measurement; run explicitly with --ignored --nocapture"]
+fn foreground_bash_exit_latency_measurement() {
+    run_subc(|mut h| async move {
+        let commands = [
+            ("true", 0.0),
+            ("sleep 0.01", 10.0),
+            ("sleep 0.06", 60.0),
+            ("sleep 0.29", 290.0),
+        ];
+        let mut samples = vec![Vec::new(); commands.len()];
+        for round in 0..21 {
+            for (index, (command, command_ms)) in commands.iter().enumerate() {
+                let corr = 2000 + (round * commands.len() + index) as u64;
+                let started = Instant::now();
+                send_tool_call(
+                    &mut h.stream,
+                    corr,
+                    "bash",
+                    json!({"command": command, "wait": true}),
+                )
+                .await;
+                let reply = read_tool_response(&mut h.stream, corr, HANG_CATCH).await;
+                let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                assert!(!tool_result_is_error(&reply), "{}", frame_body(&reply));
+                let result = tool_response_json(&reply);
+                assert_eq!(result["status"], "completed", "{}", frame_body(&reply));
+                assert_eq!(result["exit_code"], 0, "{}", frame_body(&reply));
+                if round > 0 {
+                    samples[index].push(elapsed_ms);
+                    println!("FOREGROUND_SAMPLE command={command:?} round={round} total_ms={elapsed_ms:.3} overhead_ms={:.3}", elapsed_ms - command_ms);
+                }
+            }
+        }
+        for ((command, command_ms), mut values) in commands.into_iter().zip(samples) {
+            values.sort_by(f64::total_cmp);
+            let median = (values[9] + values[10]) / 2.0;
+            let p90 = values[17];
+            println!("FOREGROUND_SUMMARY command={command:?} n={} median_ms={median:.3} p90_ms={p90:.3} median_overhead_ms={:.3} p90_overhead_ms={:.3}", values.len(), median - command_ms, p90 - command_ms);
+        }
+        h
+    });
+}
+
 // ---------------------------------------------------------------------------
 // (a) Omitted timeout resolves to 30 minutes in the engine.
 // ---------------------------------------------------------------------------

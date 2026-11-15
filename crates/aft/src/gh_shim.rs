@@ -903,6 +903,7 @@ fn run_with(
                 Classification::Admin { .. } => true,
                 Classification::Governed { tuple, .. } => {
                     tuple == "pr enqueue"
+                        || is_review_thread_tuple(&tuple)
                         || is_reviewed_operator_label_tuple(manifest.manifest_version, &tuple)
                 }
                 _ => false,
@@ -1184,6 +1185,15 @@ where
                     now,
                     delegate_to_upstream,
                 );
+            }
+            // A review-thread mutation has no operator row: it is only ever
+            // the bot's speech. Asking for the operator bypass from a shell
+            // that holds bot credentials is refused like every other bypass
+            // there, before anything is sent.
+            if operator_bypass_requested() && is_review_thread_tuple(&tuple) {
+                if let Some(status) = refuse_bypass_bot_credentials(&manifest.detectors) {
+                    return status;
+                }
             }
             // The classification already proves the manifest declares this
             // tuple at a version that reviewed it; the label row adds its own
@@ -8474,6 +8484,12 @@ mod v22_tests;
 #[cfg(test)]
 #[path = "gh_shim/v23_tests.rs"]
 mod v23_tests;
+
+// The review-thread rows are declared for Linux and macOS only, and the
+// signed fixtures verify only under the debug test key.
+#[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
+#[path = "gh_shim/review_thread_tests.rs"]
+mod review_thread_tests;
 
 #[cfg(test)]
 #[path = "gh_shim/bypass_bot_credentials_tests.rs"]

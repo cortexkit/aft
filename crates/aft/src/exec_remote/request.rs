@@ -37,6 +37,18 @@ pub enum RootConfinement {
     Root,
 }
 
+#[derive(Debug)]
+pub(crate) enum SiblingValidationError {
+    Refused(String),
+    Unavailable(crate::protocol::Response),
+}
+
+impl From<String> for SiblingValidationError {
+    fn from(message: String) -> Self {
+        Self::Refused(message)
+    }
+}
+
 impl FrozenParams {
     /// Authorize snapshot inputs with the file tools' read policy. Paths needing
     /// approval are refused without triggering consent prompts or plugin approval
@@ -58,21 +70,27 @@ impl FrozenParams {
         request_id: &str,
         session_id: &str,
         preflight_grants: &[crate::access_policy::AccessGrant],
-    ) -> Result<(), String> {
+    ) -> Result<(), SiblingValidationError> {
         let siblings = self
             .siblings
             .iter()
-            .map(|sibling| {
+            .map(|sibling| -> Result<String, SiblingValidationError> {
                 let given = Path::new(sibling);
                 let not_checkout_root = || sibling_refusal(SiblingRefusal::NotCheckoutRoot, given);
                 if !given.is_absolute() {
-                    return Err(not_checkout_root());
+                    return Err(not_checkout_root().into());
                 }
                 let path =
                     crate::bounded_io::canonicalize(given).map_err(|_| not_checkout_root())?;
                 let path =
                     match ctx.validate_read_path_without_approval(request_id, session_id, &path) {
                         Ok(path) => path,
+                        // An unreadable grant store is not evidence that the
+                        // session lacks a grant. Preserve the file tool's error,
+                        // even when an unsaved preflight grant covers the path.
+                        Err(response) if read_policy_unavailable(&response) => {
+                            return Err(SiblingValidationError::Unavailable(response));
+                        }
                         Err(_) if preflight_covers(preflight_grants, &path) => path,
                         Err(_) => {
                             // A confined session keeps link targets outside its
@@ -83,17 +101,17 @@ impl FrozenParams {
                             } else {
                                 crate::inspect::job::normalize_path(&path)
                             };
-                            return Err(sibling_refusal(SiblingRefusal::NotReadable, &shown));
+                            return Err(sibling_refusal(SiblingRefusal::NotReadable, &shown).into());
                         }
                     };
                 let marker = crate::bounded_io::metadata(&path.join(".git"))
                     .map_err(|_| not_checkout_root())?;
                 if !marker.is_dir() && !marker.is_file() {
-                    return Err(not_checkout_root());
+                    return Err(not_checkout_root().into());
                 }
                 path.to_str()
                     .map(str::to_owned)
-                    .ok_or_else(not_checkout_root)
+                    .ok_or_else(|| not_checkout_root().into())
             })
             .collect::<Result<Vec<_>, _>>()?;
         self.siblings = siblings;
@@ -139,6 +157,17 @@ impl FrozenParams {
                 .map(str::to_owned),
         })
     }
+}
+
+/// Whether a file-read policy error means the grant store couldn't be read in
+/// time, as opposed to the path not being granted.
+pub(crate) fn read_policy_unavailable(response: &crate::protocol::Response) -> bool {
+    response.data["code"].as_str().is_some_and(|code| {
+        code == "grants_unavailable"
+            || code == "io_timeout"
+            || code == "read_deadline_exceeded"
+            || (code.starts_with("read_io_") && code.ends_with("timeout"))
+    })
 }
 
 /// Whether a preflight's unsaved grants let it read `path`, which must already

@@ -5,7 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use aft::commands::callgraph_store_adapter::callgraph_surface::{
-    build_callgraph_envelope, cap_items, hub_selector_activated, HUB_SUMMARY_LIMIT,
+    build_callgraph_envelope, build_impact_envelope, cap_items, hub_selector_activated,
+    HUB_SUMMARY_LIMIT,
 };
 use aft::commands::callgraph_store_adapter::{
     StoreCallTreeNode, StoreCallerEntry, StoreCallerGroup, StoreCallersResult, StoreHubSummary,
@@ -234,7 +235,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         list_id: "payload.sites",
         unit: Unit::Sites,
         narrow: &["depth", "includeTests"],
-        reasons: CAP_DEPTH,
+        reasons: DEPTH_BUDGET_CAP,
     },
     SurfaceSpec {
         requires: None,
@@ -418,7 +419,16 @@ fn build_case_envelope(surface: SurfaceSpec, fired: &[Reason]) -> Option<ListEnv
         ("ast_search", "matches") => {
             Some(aft::list_surfaces::ast_search_envelope(15, 24000, false))
         }
-        ("callgraph", "impact" | "callers" | "call_tree") => {
+        ("callgraph", "impact") => {
+            let total = if has(Reason::Cap) { 21 } else { 15 };
+            build_impact_envelope(
+                15,
+                total,
+                usize::from(has(Reason::Depth)),
+                has(Reason::Budget),
+            )
+        }
+        ("callgraph", "callers" | "call_tree") => {
             let total = if has(Reason::Cap) { 21 } else { 15 };
             let truncated = usize::from(has(Reason::Depth));
             build_callgraph_envelope(surface.unit, 15, total, truncated)
@@ -524,6 +534,9 @@ fn expected_total(surface: SurfaceSpec, fired: &[Reason]) -> Total {
     let has = |reason| fired.contains(&reason);
     match (surface.command, surface.mode) {
         ("ast_search", "matches") => Total::Exact(24000),
+        ("callgraph", "impact") if has(Reason::Budget) => {
+            Total::AtLeast(if has(Reason::Cap) { 21 } else { 15 })
+        }
         ("callgraph", "impact" | "callers" | "call_tree") => {
             if has(Reason::Depth) {
                 Total::AtLeast(15)
@@ -1469,6 +1482,7 @@ pub struct CompleteFixture {
 
 fn make_impact_value(count: usize, depth_limited: bool) -> Value {
     let result = StoreImpactResult {
+        counts_are_lower_bounds: false,
         callback_dependencies: 0,
         callback_reference_label: None,
         test_filter_note: None,
@@ -1618,6 +1632,7 @@ fn make_capped_impact_value(count: usize) -> Value {
     let sites_list_envelope = build_callgraph_envelope(Unit::Sites, shown, count, 0);
 
     let result = StoreImpactResult {
+        counts_are_lower_bounds: false,
         callback_dependencies: 0,
         callback_reference_label: None,
         test_filter_note: None,
@@ -2422,6 +2437,7 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
         "DEFAULT_MAX_RESULTS",
         "HUB_SUMMARY_LIMIT",
         "TRACE_TO_EXPANSION_BUDGET",
+        "IMPACT_EXPANSION_BUDGET",
         "TRACE_TO_RETAINED_PATH_LIMIT",
         "walk_truncated",
         "skipped_foreign_mounts",

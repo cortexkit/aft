@@ -1896,7 +1896,12 @@ fn dispatch_outcome_on_route(req: RawRequest, ctx: &Arc<AppContext>) -> Dispatch
         let repeat = aft::commands::bash_orchestrate::raw_bash_repeat(&req);
         let outcome = if aft::commands::bash_orchestrate::foreground_orchestrate_enabled(&req) {
             let spawn_response = aft::commands::bash::handle(&req, ctx);
-            aft::commands::bash_orchestrate::build_bash_outcome(&req, ctx, spawn_response)
+            aft::commands::bash_orchestrate::build_bash_outcome_with_wake(
+                &req,
+                ctx,
+                spawn_response,
+                wake_standalone_loop_for_deferred_response,
+            )
         } else {
             DispatchOutcome::Immediate(dispatch(req, ctx))
         };

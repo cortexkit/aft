@@ -9883,6 +9883,32 @@ impl BgTaskRegistry {
         )
     }
 
+    /// Arm while the registered child handle still protects its process identity.
+    /// Readiness only wakes the caller; the ordinary status poll still owns
+    /// reaping, exit-marker interpretation and the final output read.
+    pub(crate) fn observe_foreground_exit(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        wake: impl FnOnce() + Send + 'static,
+    ) -> Option<super::exit_observer::ForegroundExitObserver> {
+        let task = self.task_for_session(task_id, session_id)?;
+        let state = task.lock_state().ok()?;
+        if state.metadata.remote.is_some() {
+            return None;
+        }
+        let TaskRuntime::Piped(Some(child)) = &state.runtime else {
+            return None;
+        };
+        match super::exit_observer::observe_foreground_exit(child.id(), wake) {
+            Ok(observer) => Some(observer),
+            Err(error) => {
+                log::debug!("cannot arm foreground exit observer; using poll fallback: {error}");
+                None
+            }
+        }
+    }
+
     /// Whether the task a held foreground bash call waits on has finished, or
     /// is no longer registered for the session (the same answer
     /// [`Self::status`] gives through its snapshot's status). It polls the

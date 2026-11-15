@@ -2670,6 +2670,7 @@ pub(super) fn submit_deferred_bash(
                     let command_timeout_ms = settings.timeout.unwrap_or_else(|| {
                         crate::bash_background::registry::DEFAULT_BG_TIMEOUT.as_millis() as u64
                     });
+                    let runon_requested = translated.args.contains_key("runon");
                     let raw_req = RawRequest { id: request_id_for_spawn.clone(),
                     command: "bash".to_string(),
                     lsp_hints: None,
@@ -2734,6 +2735,9 @@ pub(super) fn submit_deferred_bash(
                                                                   #[cfg(test)]
                                                                   let response = with_bash_timing_for_test(spawn_timing_for_test.clone(), || crate::bash_background::with_schema_pin(schema_pin, run_dispatch));
                                                                    let response = refuse_run_permission_ask(response, ask_unavailable);
+                                                                   if runon_requested {
+                                                                       log_runon_refusal(route, &session_for_spawn, &response);
+                                                                   }
                                                                   // Registration and revocation can race across actors.
                                                                   // Recheck after dispatch so neither ordering loses the task.
                                                                   if let Some(scope) = &task_scope {
@@ -3400,6 +3404,38 @@ pub(super) fn submit_deferred_bash(
     });
 }
 
+fn log_runon_refusal(route: RouteChannel, session: &str, response: &Response) {
+    if response.success {
+        return;
+    }
+    let code = response.data["code"].as_str().unwrap_or("unknown");
+    let classification = if crate::exec_remote::read_policy_unavailable(response) {
+        "unavailable"
+    } else {
+        "refused"
+    };
+    let ask_route = match crate::access_policy::current_ask_route() {
+        crate::access_policy::AskRoute::Lowered => "lowered",
+        crate::access_policy::AskRoute::Plugin { .. } => "plugin",
+        crate::access_policy::AskRoute::Elicitation { .. } => "elicitation",
+        crate::access_policy::AskRoute::Deny => "deny",
+        crate::access_policy::AskRoute::Consent { .. } => "consent",
+        crate::access_policy::AskRoute::Unavailable => "unavailable",
+    };
+    crate::slog_info!(
+        "runon refused: session={:?} route={} request={:?} grant_scope={:?} grant_denial={:?} ask_route={} classification={} code={} reason={:?}",
+        session,
+        route,
+        response.id,
+        crate::access_policy::current_scope(),
+        crate::access_policy::scope_grants_denial(),
+        ask_route,
+        classification,
+        code,
+        response.data["message"].as_str().unwrap_or("unknown"),
+    );
+}
+
 async fn wait_for_bash_reply_deadline(
     deadline: Instant,
     reply_budget: crate::commands::blocking_wait::ReplyBudget,
@@ -3424,6 +3460,59 @@ async fn wait_for_bash_reply_deadline(
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod runon_refusal_log_tests {
+    use super::*;
+
+    #[test]
+    fn runon_refusal_logs_checked_scope_route_and_unavailable_or_refused_reason() {
+        let scope = crate::db::access_grants::ScopeKey {
+            owner: "worker-owner".into(),
+            scope_ref: "worker-scope".into(),
+            epoch: 7,
+        };
+        let _scope = crate::access_policy::scope_guard(Some(scope));
+        let _ask = crate::access_policy::ask_route_guard(Some(
+            crate::access_policy::AskRoute::Unavailable,
+        ));
+        for (code, classification) in [
+            ("remote_run_refused", "refused"),
+            ("grants_unavailable", "unavailable"),
+            ("read_deadline_exceeded", "unavailable"),
+        ] {
+            let response = Response::error("runon-call", code, "reason\ncontinued");
+            let (_, lines) = crate::logging::capture_log_lines(|| {
+                log_runon_refusal(route_key(4855, 2), "worker-session", &response);
+            });
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            let line = &lines[0];
+            for field in [
+                "runon refused:",
+                "session=\"worker-session\"",
+                "route=4855@2",
+                "request=\"runon-call\"",
+                "scope_ref: \"worker-scope\"",
+                "epoch: 7",
+                "grant_denial=None",
+                "ask_route=unavailable",
+                &format!("classification={classification}"),
+                &format!("code={code}"),
+                "reason=\"reason\\ncontinued\"",
+            ] {
+                assert!(line.contains(field), "missing {field}: {line}");
+            }
+        }
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            log_runon_refusal(
+                route_key(4855, 2),
+                "worker-session",
+                &Response::success("accepted", json!({})),
+            );
+        });
+        assert!(lines.is_empty(), "{lines:?}");
     }
 }
 
@@ -3656,6 +3745,30 @@ async fn run_deferred_bash_wait(
         return;
     };
     let registry = wait_ctx.bash_background().clone();
+    // Arming takes the task-state lock, so keep it off the loop that processes
+    // protocol frames, just like status reads. The one-shot retains an exit
+    // that precedes our first select.
+    let (exit_tx, exit_rx) = oneshot::channel();
+    let observer_registry = registry.clone();
+    let observer_task = task_id.clone();
+    let observer_session = session_id.clone();
+    let (exit_observer, mut initial_observation) = tokio::task::spawn_blocking(move || {
+        let local_task = !observer_registry.is_remote_task(&observer_task, &observer_session);
+        let observer = observer_registry.observe_foreground_exit(
+            &observer_task,
+            &observer_session,
+            move || {
+                let _ = exit_tx.send(());
+            },
+        );
+        (observer, local_task)
+    })
+    .await
+    .unwrap_or((None, false));
+    let mut exit_rx = exit_observer.as_ref().map(|_| exit_rx);
+    // Check local tasks once after arming, closing the gap between the spawn's
+    // initial status read and installing the observer (including arm failures).
+    // Remote tasks retain their existing observation cadence.
     let mut progress = wait_ctx.request_handles_progress(&request_id).then(|| {
         crate::bash_background::progress::BashProgressPump::new(
             &wait_ctx,
@@ -3765,10 +3878,19 @@ async fn run_deferred_bash_wait(
                 break;
             }
             observation = async {
-                tokio::select! {
-                    _ = registry.terminal_transition_notified() => {}
-                    _ = tokio::time::sleep(PENDING_POLL_INTERVAL) => {}
+                if !initial_observation {
+                    tokio::select! {
+                        _ = async {
+                            match &mut exit_rx {
+                                Some(rx) => { let _ = rx.await; }
+                                None => std::future::pending::<()>().await,
+                            }
+                        } => { exit_rx = None; }
+                        _ = registry.terminal_transition_notified() => {}
+                        _ = tokio::time::sleep(foreground_bash_poll_interval()) => {}
+                    }
                 }
+                initial_observation = false;
                 observe_deferred_bash_wait(
                     registry.clone(),
                     task_id.clone(),
@@ -4160,6 +4282,17 @@ async fn run_deferred_bash_wait(
             }
         }
     }
+}
+
+fn foreground_bash_poll_interval() -> Duration {
+    #[cfg(feature = "test-hooks")]
+    if let Some(millis) = std::env::var("AFT_TEST_BASH_EXIT_POLL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_millis(millis.max(1));
+    }
+    PENDING_POLL_INTERVAL
 }
 
 async fn submit_bash_promote(

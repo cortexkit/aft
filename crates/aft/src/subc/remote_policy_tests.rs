@@ -3531,6 +3531,79 @@ async fn siblings_submit_refuses_withdrawn_catalog_grant_before_daemon_contact()
 
 #[cfg(unix)]
 #[test]
+fn siblings_unavailable_store_preserves_file_error_in_catalog_and_bash() {
+    let fixture = SiblingGrantFixture::new("siblings-unavailable-head");
+    let ctx = &fixture.ctx;
+    let sibling = fixture.path("granted/commons");
+    let worker = fixture_worker(&fixture, "siblings-unavailable-worker", BROCA);
+    catalog(sibling_plan(&[&sibling], &[&sibling]), &worker, ctx).unwrap();
+    let launch = lookup(ctx, &source(&worker, Some("worker"))).unwrap();
+    let read = |identity: &RouteIdentity| {
+        super::super::call_policy::with_tool_call_policy(
+            ctx,
+            identity,
+            "read-control",
+            access_grants::ask_route(identity),
+            identity.trust,
+            "read",
+            json!({}),
+            |_| {
+                ctx.validate_read_path_without_approval("read-control", &identity.session, &sibling)
+            },
+            |result| result.unwrap(),
+        )
+    };
+    read(&worker).unwrap();
+    ctx.db()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TABLE access_grants")
+        .unwrap();
+    let expected = read(&worker).unwrap_err();
+    assert_eq!(expected.data["code"], "grants_unavailable");
+
+    let response = super::super::call_policy::with_tool_call_policy(
+        ctx,
+        &worker,
+        "runon-control",
+        access_grants::ask_route(&worker),
+        worker.trust,
+        "bash",
+        json!({}),
+        |_| {
+            crate::bash_background::with_remote_policy(Some(launch), || {
+                crate::commands::bash::handle(
+                    &RawRequest {
+                        id: "runon-control".into(),
+                        command: "bash".into(),
+                        lsp_hints: None,
+                        session_id: Some(worker.session.clone()),
+                        params: json!({"command":"cargo test", "runon":"linux"}),
+                    },
+                    ctx,
+                )
+            })
+        },
+        |result| result.unwrap(),
+    );
+    assert_eq!(response.data, expected.data, "{response:?}");
+
+    let error = catalog(
+        json!({"preset":"worker", "params":{
+            "remote_exec":{"enabled":true}, "siblings":[sibling],
+        }}),
+        &fixture.head,
+        ctx,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, expected.data["code"].as_str().unwrap());
+    assert_eq!(error.message, expected.data["message"].as_str().unwrap());
+    assert_eq!(error.detail.as_ref(), expected.data.get("detail"));
+}
+
+#[cfg(unix)]
+#[test]
 fn worker_catalog_offers_runon_only_with_an_enabled_frozen_plan() {
     let root = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();

@@ -63,6 +63,63 @@ fn format_ndjson(base_text: &str, data: &Value, list_id: &str) -> String {
     build_ndjson_text(base_text, data, Some(list_id), false)
 }
 
+#[test]
+fn impact_budget_marks_rendered_counts_and_uses_standard_trailer() {
+    let mut data = serde_json::to_value(make_impact_result(8, false, 0)).unwrap();
+    data["complete"] = json!(false);
+    data["counts_are_lower_bounds"] = json!(true);
+    data["total_affected"] = json!(10);
+    data["hidden_test_callers"] = json!(2);
+    data["callback_dependencies"] = json!(3);
+    data["affected_files"] = json!(4);
+    data["root_counts"] = json!({"public_api": 1});
+    data["sites_list_envelope"] = serde_json::to_value(ListEnvelope::new(
+        8,
+        Total::AtLeast(8),
+        Unit::Sites,
+        vec![Reason::Budget],
+        CALLGRAPH_NARROW,
+    ))
+    .unwrap();
+    let text = format_subc("impact", &data);
+    assert!(
+        text.contains("≥8 affected sites (≥3 by callback reference)"),
+        "{text}"
+    );
+    assert!(text.contains("≥4 files"), "{text}");
+    assert!(
+        text.contains("Reaches at least 1 public API function"),
+        "{text}"
+    );
+    assert!(text.contains("≥2 callers in tests hidden"), "{text}");
+    assert!(
+        text.contains("shown 8 of ≥8 sites (budget) · narrow: depth, includeTests"),
+        "{text}"
+    );
+    let registry = find_surface("callgraph", "impact", SITES_LIST_ID).unwrap();
+    assert!(registry
+        .reasons
+        .iter()
+        .any(|reason| reason.reason == Reason::Budget));
+}
+
+#[test]
+fn impact_budget_capped_reply_exact_text() {
+    let data = json!({
+        "complete": false,
+        "counts_are_lower_bounds": true,
+        "incomplete_reason": "traversal capped",
+        "total_affected": 42,
+        "hidden_test_callers": 3,
+        "affected_files": 4,
+        "root_counts": {"public_api": 2},
+        "callers": [{"caller_file": "src/hub.ts", "caller_symbol": "handler", "line": 7, "parameters": []}],
+        "sites_list_envelope": ListEnvelope::new(1, Total::AtLeast(39), Unit::Sites, vec![Reason::Budget, Reason::Cap], CALLGRAPH_NARROW)
+    });
+    assert_eq!(aft::subc_format::format_callgraph("impact", &data, false),
+        "traversal capped\n≥39 affected call sites · ≥4 files\nReaches at least 2 public API functions\nsrc/hub.ts:7\n  ↳ handler\n≥3 callers in tests hidden — includeTests: true shows them\n\nshown 1 of ≥39 sites (budget) · narrow: depth, includeTests");
+}
+
 // -----------------------------------------------------------------------
 // Helper constructors
 // -----------------------------------------------------------------------
@@ -109,6 +166,7 @@ fn make_impact_result(count: usize, depth_limited: bool, truncated: usize) -> St
     let sites_list_envelope = build_callgraph_envelope(Unit::Sites, shown, count, truncated);
 
     StoreImpactResult {
+        counts_are_lower_bounds: false,
         callback_dependencies: 0,
         callback_reference_label: None,
         test_filter_note: None,

@@ -7,6 +7,17 @@ use crossbeam_channel::{tick, Receiver};
 
 use super::registry::{BgTask, BgTaskRegistry, WatchdogPassCause};
 const WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
+
+fn watchdog_interval() -> Duration {
+    #[cfg(feature = "test-hooks")]
+    if let Some(millis) = std::env::var("AFT_TEST_BASH_WATCHDOG_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_millis(millis.max(1));
+    }
+    WATCHDOG_INTERVAL
+}
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 pub(super) const FINISHED_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 #[cfg(test)]
@@ -369,7 +380,7 @@ fn scheduler() -> &'static crossbeam_channel::Sender<std::sync::Weak<super::regi
         thread::Builder::new()
             .name("aft-bash-watchdog".into())
             .spawn(move || {
-                let ticker = tick(WATCHDOG_INTERVAL);
+                let ticker = tick(watchdog_interval());
                 let cleanup_ticker = tick(CLEANUP_INTERVAL);
                 let mut subscriptions: Vec<Subscription> = Vec::new();
                 let cleaning = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

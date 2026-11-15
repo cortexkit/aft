@@ -3,7 +3,6 @@
 //! survive a bridge restart.
 
 pub mod buffer;
-#[cfg(unix)]
 mod exit_observer;
 mod gc_cursor;
 mod gc_memo;
