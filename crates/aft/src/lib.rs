@@ -220,7 +220,7 @@ pub mod root_identity;
 pub mod run_tool_call;
 pub mod runtime_drain;
 pub mod runtime_registry;
-pub mod sandbox_profile;
+pub use aft_db::sandbox_profile;
 pub mod sandbox_spawn;
 pub mod scoped_key;
 pub mod search_b2;

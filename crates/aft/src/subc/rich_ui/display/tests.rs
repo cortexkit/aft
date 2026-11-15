@@ -1215,7 +1215,7 @@ async fn display_read_protected_capacity_retries_past_eight_deferrals_then_annou
     let path = dir.path().join("aft.db");
     let now = crate::db::display_records::now_ms();
     let conn = crate::db::open(&path).unwrap();
-    for index in 0..crate::db::display_records::MAX_RECORDS {
+    for index in 0..crate::db::display_records::test_support::MAX_RECORDS {
         assert!(crate::db::display_records::persist(
             &conn,
             &format!("protected:{index}"),
@@ -1275,7 +1275,7 @@ async fn display_read_protected_capacity_retries_past_eight_deferrals_then_annou
         conn.query_row("SELECT count(*) FROM display_records", [], |row| row
             .get::<_, usize>(0))
             .unwrap(),
-        crate::db::display_records::MAX_RECORDS
+        crate::db::display_records::test_support::MAX_RECORDS
     );
     assert!(crate::db::display_records::read(&conn, &id, now)
         .unwrap()

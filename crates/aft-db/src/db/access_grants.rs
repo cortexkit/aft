@@ -409,7 +409,7 @@ pub fn insert_with_source(
          grant_id=coalesce(access_grants.grant_id,excluded.grant_id),
          mode=CASE WHEN excluded.mode='write' THEN 'write' ELSE access_grants.mode END",
         params![key.owner,key.scope_ref,key.epoch.to_string(),canonical.to_string_lossy(),match grant.kind {GrantKind::File=>"file",GrantKind::Subtree=>"subtree"},match grant.operation {AccessOperation::Read=>"read",AccessOperation::Write=>"write"},super::access_grant_rows::new_grant_id(),super::access_grant_rows::now_ms(),card_ref,source.map(|source| source.as_str())])?;
-    crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Grants);
+    aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Grants);
     Ok(())
 }
 
@@ -423,7 +423,7 @@ pub fn revoke(conn: &Connection, key: &ScopeKey, path: &Path) -> rusqlite::Resul
             path.to_string_lossy()
         ],
     )?;
-    crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Grants);
+    aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Grants);
     Ok(deleted)
 }
 
@@ -469,7 +469,7 @@ pub fn end_scope_grants(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<(
     crate::db::remote_exec::forget_scope(&tx, &key.owner, &key.scope_ref, key.epoch)?;
     crate::db::catalog_edit_modes::forget_scope(&tx, &key.owner, &key.scope_ref, key.epoch)?;
     tx.commit()?;
-    crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Grants);
+    aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Grants);
     Ok(())
 }
 
@@ -547,7 +547,7 @@ pub(crate) fn end_saved_scope(conn: &Connection, key: &ScopeKey) -> rusqlite::Re
         params![key.owner, key.scope_ref, key.epoch.to_string()],
     )?;
     tx.commit()?;
-    crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Grants);
+    aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Grants);
     Ok(deleted)
 }
 
@@ -586,7 +586,7 @@ pub fn materialize(
         params![key.project_root,key.harness,key.session,key.principal,key.owner,key.scope_ref,key.epoch.to_string(),key.preset,raw.to_string()])?;
     materialize_on(&tx, &scope, grants)?;
     tx.commit()?;
-    crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Grants);
+    aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Grants);
     Ok(())
 }
 

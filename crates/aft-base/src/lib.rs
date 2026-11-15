@@ -142,6 +142,7 @@ pub mod pty_render;
 pub mod query_shape;
 pub mod read_policy;
 pub mod secret;
+pub mod scope_watch_events;
 pub mod secret_proxy;
 pub mod shared_timer;
 pub mod shell_format;

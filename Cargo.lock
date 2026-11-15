@@ -79,6 +79,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "aft-db"
+version = "0.65.0"
+dependencies = [
+ "aft-base",
+ "blake3",
+ "cortexkit-role-tool-provider",
+ "libc",
+ "log",
+ "parking_lot",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "subc-protocol 0.35.0",
+ "tempfile",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "aft-secret-rules"
 version = "0.66.0"
 dependencies = [
@@ -134,6 +152,7 @@ name = "agent-file-tools"
 version = "0.66.0"
 dependencies = [
  "aft-base",
+ "aft-db",
  "aft-secret-rules",
  "aft-store",
  "aft-tokenizer",

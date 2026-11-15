@@ -118,10 +118,10 @@ wasm-grammars = ["tree-sitter/wasm", "dep:wasmtime", "dep:wasmtime-c-api-impl"]
 callgraph-shape-census = ["aft-base/callgraph-shape-census"]
 test-scope-owner = []
 # Explicit opt-in for cross-process timing controls used by integration tests.
-test-timing-hooks = ["aft-base/test-timing-hooks"]
+test-timing-hooks = ["aft-base/test-timing-hooks", "aft-db/test-timing-hooks"]
 # Opt-in integration hooks for native re-exec and deterministic conformance inputs;
 # never enable these hooks in production builds.
-test-hooks = ["aft-base/test-hooks", "aft-base/test-support"]
+test-hooks = ["aft-base/test-hooks", "aft-base/test-support", "aft-db/test-hooks", "aft-db/test-support"]
 # Compiles the test-only secret vault (V5). Nothing in the product reads it:
 # a release profile must never enable it, and
 # `scripts/check-secret-test-fake.sh` fails CI when one does.
@@ -129,7 +129,8 @@ secret-test-fake = ["aft-base/secret-test-fake"]
 semantic-chunk-census = []
 
 [dependencies]
-aft-base = { path = "../aft-base" }
+aft-base = { path = "../aft-base", version = "0.65.0" }
+aft-db = { path = "../aft-db", version = "0.65.0" }
 aft-store = { path = "../aft-store", version = "0.66.0" }
 log = "0.4"
 env_logger = "0.11"
@@ -326,7 +327,8 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-aft-base = { path = "../aft-base", features = ["test-support"] }
+aft-base = { path = "../aft-base", version = "0.65.0", features = ["test-support"] }
+aft-db = { path = "../aft-db", version = "0.65.0", features = ["test-support"] }
 cortexkit-test-support = "=0.1.14"
 graphql-parser = "0.4.1"
 cortexkit-role-tool-provider-conformance = "=0.15.13"

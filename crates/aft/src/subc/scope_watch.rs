@@ -102,52 +102,10 @@ impl Verifications {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum Source {
-    Shell,
-    Grants,
-    Held,
-    Parked,
-}
-impl Source {
-    pub(super) const ALL: [Self; 4] = [Self::Shell, Self::Grants, Self::Held, Self::Parked];
-    fn index(self) -> usize {
-        self as usize
-    }
-    pub(super) fn name(self) -> &'static str {
-        match self {
-            Self::Shell => "shell",
-            Self::Grants => "grants",
-            Self::Held => "held",
-            Self::Parked => "parked",
-        }
-    }
-}
-static CHANGED: std::sync::LazyLock<tokio::sync::Notify> =
-    std::sync::LazyLock::new(tokio::sync::Notify::new);
-static REVISIONS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-
-/// Coalesced hints carry no scope identity or authority. The worker reads the
-/// committed state again, so duplicate hints and reconnects are harmless.
-pub(crate) fn changed(source: Source) {
-    REVISIONS[source.index()].fetch_add(1, Ordering::Release);
-    CHANGED.notify_waiters();
-}
-pub(crate) fn context_changed() {
-    for source in Source::ALL {
-        changed(source);
-    }
-}
-pub(super) fn notifier() -> &'static tokio::sync::Notify {
-    &CHANGED
-}
-pub(super) fn revisions() -> [u64; 4] {
-    std::array::from_fn(|i| REVISIONS[i].load(Ordering::Acquire))
-}
+pub(crate) use aft_base::scope_watch_events::{changed, context_changed, Source};
+pub(super) use aft_base::scope_watch_events::{notifier, revisions};
 #[cfg(all(test, unix))]
-pub(crate) fn revision(source: Source) -> u64 {
-    REVISIONS[source.index()].load(Ordering::Acquire)
-}
+pub(crate) use aft_base::scope_watch_events::revision;
 
 #[derive(Default)]
 pub(super) struct Inventory {

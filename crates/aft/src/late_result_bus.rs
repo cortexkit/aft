@@ -38,7 +38,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const OVERLAP_MS: i64 = 10_000;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const LIVE_SCAN_SQL: &str = "SELECT rowid,settled_at,seq,CASE WHEN acked=0 AND late_entry IS NOT NULL AND seq>COALESCE((SELECT through_seq FROM call_ledger_ack WHERE custodian=call_ledger.custodian),0) THEN custodian END,carrier,call_key,event_id,outcome FROM call_ledger WHERE state='Settled' AND (settled_at,rowid)>(?1,?2) ORDER BY settled_at,rowid LIMIT ?3";
-static SETTLED: LazyLock<Notify> = LazyLock::new(Notify::new);
+use crate::db::call_ledger::SETTLED;
 static DISPLAY: LazyLock<Notify> = LazyLock::new(Notify::new);
 static HEALTH: LazyLock<parking_lot::Mutex<BusHealth>> = LazyLock::new(Default::default);
 
@@ -89,11 +89,6 @@ fn failure(code: &'static str) {
     ) {
         readers::unavailable(code);
     }
-}
-
-pub(crate) fn settled() {
-    // Coalesced hints carry no payload and never wait for the publisher.
-    SETTLED.notify_one();
 }
 
 pub(crate) fn display_committed() {

@@ -37,7 +37,7 @@ pub(super) fn install(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-pub(crate) fn now_ms() -> i64 {
+pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -87,7 +87,7 @@ pub(crate) fn sweep(conn: &Connection, now_ms: i64) -> rusqlite::Result<usize> {
 
 /// False means protected capacity is full: the caller must defer the wake,
 /// without interfering with the independent display.write push.
-pub(crate) fn persist(
+pub fn persist(
     conn: &Connection,
     id: &str,
     bytes: &[u8],
@@ -160,7 +160,7 @@ pub(crate) fn persist(
     Ok(true)
 }
 
-pub(crate) fn acknowledged(conn: &Connection, id: &str, now_ms: i64) -> rusqlite::Result<()> {
+pub fn acknowledged(conn: &Connection, id: &str, now_ms: i64) -> rusqlite::Result<()> {
     let updated = conn.execute(
         "UPDATE display_records SET wake_acked_at_ms=?2 WHERE record_id=?1",
         params![id, now_ms],
@@ -171,7 +171,7 @@ pub(crate) fn acknowledged(conn: &Connection, id: &str, now_ms: i64) -> rusqlite
     Ok(())
 }
 
-pub(crate) fn read(conn: &Connection, id: &str, now_ms: i64) -> rusqlite::Result<Option<Vec<u8>>> {
+pub fn read(conn: &Connection, id: &str, now_ms: i64) -> rusqlite::Result<Option<Vec<u8>>> {
     if !available(conn)? {
         return Ok(None);
     }
@@ -185,3 +185,19 @@ pub(crate) fn read(conn: &Connection, id: &str, now_ms: i64) -> rusqlite::Result
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    pub const MAX_RECORDS: usize = super::MAX_RECORDS;
+
+    pub fn available(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
+        super::available(conn)
+    }
+
+    pub fn run_migrations_supported(
+        conn: &mut rusqlite::Connection,
+        supported: u32,
+    ) -> Result<u32, super::super::OpenError> {
+        super::super::run_migrations_supported(conn, supported)
+    }
+}

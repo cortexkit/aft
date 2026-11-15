@@ -316,14 +316,24 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
                     if isinstance(spec, dict) and "path" in spec:
                         yield key, spec, (manifest_dir / spec["path"]).resolve()
 
-        published_before = run.index("cargo publish --package agent-file-tools")
+        # Check every edge, not only each dependency's position before AFT:
+        # siblings can all precede AFT while still preceding their own dependencies.
+        dry_run = next(
+            step["run"] for step in self.workflow("release.yml")["jobs"]["rehearse-publish"]["steps"]
+            if step.get("name") == "Rehearse crates.io publishing"
+        )
+        package_order = re.search(
+            r"release_crates=\(([^)]+)\)", (ROOT / "scripts/release.sh").read_text()
+        ).group(1).split()
+        dry_order = re.findall(r"-p ([\w-]+)", dry_run)
         pending, seen = [ROOT / "crates/aft"], set()
         while pending:
-            for key, spec, dep_dir in path_dependencies(pending.pop()):
-                if dep_dir in seen:
-                    continue
-                seen.add(dep_dir)
-                pending.append(dep_dir)
+            manifest_dir = pending.pop()
+            parent = tomllib.loads((manifest_dir / "Cargo.toml").read_text())["package"]["name"]
+            for key, spec, dep_dir in path_dependencies(manifest_dir):
+                if dep_dir not in seen:
+                    seen.add(dep_dir)
+                    pending.append(dep_dir)
                 package = tomllib.loads((dep_dir / "Cargo.toml").read_text())["package"]
                 name = package["name"]
                 with self.subTest(dependency=key, package=name):
@@ -331,7 +341,11 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
                     self.assertIn("version", spec, f"{key} needs a version pin to publish")
                     publish = f"cargo publish --package {name} "
                     self.assertIn(publish, run, f"publish-crates.sh must publish {name}")
-                    self.assertLess(run.index(publish), published_before, f"{name} must publish before agent-file-tools")
+                    self.assertLess(run.index(publish), run.index(f"cargo publish --package {parent} "), f"{name} must publish before {parent}")
+                    for label, order in (("release.sh", package_order), ("publish dry-run", dry_order)):
+                        self.assertIn(name, order, f"{label} must include {name}")
+                        self.assertIn(parent, order, f"{label} must include {parent}")
+                        self.assertLess(order.index(name), order.index(parent), f"{label}: {name} must precede {parent}")
                     relative = dep_dir.relative_to(ROOT).parts
                     self.assertIn(
                         ", ".join(f'"{part}"' for part in relative), sync,
@@ -419,7 +433,7 @@ class ReleaseRehearsalWorkflowTests(unittest.TestCase):
         publish = next(step["run"] for step in steps if step.get("name") == "Rehearse crates.io publishing")
         self.assertEqual(
             publish,
-            "cargo publish --dry-run --locked --allow-dirty -p aft-tokenizer -p aft-secret-rules -p aft-store -p agent-file-tools",
+            "cargo publish --dry-run --locked --allow-dirty -p aft-tokenizer -p aft-secret-rules -p aft-store -p aft-base -p aft-db -p agent-file-tools",
         )
         self.assertNotIn("--no-verify", publish)
         names = [step.get("name") for step in steps]
