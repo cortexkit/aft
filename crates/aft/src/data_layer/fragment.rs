@@ -209,13 +209,13 @@ fn decode_expanded(
             .collect::<Result<_, DecodeError>>()?;
         sites.push(SiteResolution {
             site,
-            resolution: Resolution {
+            resolution: std::sync::Arc::new(Resolution {
                 targets,
                 protected,
                 unresolved: input.usize()?,
                 external: input.usize()?,
                 dynamic: input.usize()?,
-            },
+            }),
         });
     }
     let site_dependencies = (0..input.count()?)

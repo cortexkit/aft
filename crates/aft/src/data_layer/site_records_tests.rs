@@ -5,20 +5,32 @@
 
 use std::collections::BTreeMap;
 
-use super::callgraph::{resolve_checkout, CheckoutInputs, FileResolution};
+use super::callgraph::{resolve_checkout_within, CheckoutInputs, FileResolution, KeyOrderBudget};
 use super::incremental::LiveCheckout;
 use super::incremental_tests::checkout;
 
 /// Resolves `inputs` reading files, as the live engine does, and from
-/// projected records on 1 and 4 threads, checking every file's resolution
-/// is equal. Returns the file-reading resolution.
+/// projected records in key order on 1 and 4 threads, checking every
+/// file's resolution is equal. Besides the default budget, the key order
+/// runs with a budget of one byte, where every key is resolved on its own,
+/// every group with more than one key is shared by every thread, and the
+/// sites of every key with more than one go through a scratch file; and
+/// with a few keys per flush. Returns the file-reading resolution.
 fn records_match_files(inputs: &CheckoutInputs) -> BTreeMap<String, FileResolution> {
     let reference = LiveCheckout::cold(inputs.clone())
         .unwrap()
         .resolved
         .to_map();
-    for threads in [1, 4] {
-        let records = resolve_checkout(inputs, threads).unwrap();
+    let budgets = [
+        KeyOrderBudget::default(),
+        KeyOrderBudget::of_bytes(1),
+        KeyOrderBudget::of_bytes(4096),
+    ];
+    for (threads, budget) in [1, 4]
+        .into_iter()
+        .flat_map(|threads| budgets.map(|budget| (threads, budget)))
+    {
+        let records = resolve_checkout_within(inputs, threads, budget).unwrap();
         assert_eq!(
             records.keys().collect::<Vec<_>>(),
             reference.keys().collect::<Vec<_>>()
@@ -27,13 +39,13 @@ fn records_match_files(inputs: &CheckoutInputs) -> BTreeMap<String, FileResoluti
             let theirs = &reference[path];
             assert_eq!(
                 ours.sites, theirs.sites,
-                "{path}: sites ({threads} threads)"
+                "{path}: sites ({threads} threads, {budget:?})"
             );
             assert_eq!(
                 ours.site_dependencies, theirs.site_dependencies,
-                "{path}: site dependencies ({threads} threads)"
+                "{path}: site dependencies ({threads} threads, {budget:?})"
             );
-            assert_eq!(ours, theirs, "{path} ({threads} threads)");
+            assert_eq!(ours, theirs, "{path} ({threads} threads, {budget:?})");
         }
     }
     reference
@@ -267,6 +279,44 @@ fn dynamic_sites_and_directory_scans_match() {
     assert!(targets(&resolved, "java/Main.java", "bar")
         .iter()
         .any(|(file, _, _)| file == "java/Foo.java"));
+}
+
+/// One untyped call made from many files, twice in each, and declared in
+/// a TypeScript and a JavaScript file: one key per language, its sites in
+/// many files, each file depending on what the key's resolution read.
+#[test]
+fn an_untyped_call_from_many_files_is_resolved_once_per_language() {
+    let callers = (0..12)
+        .map(|index| {
+            (
+                format!("src/caller{index:02}.ts"),
+                format!(
+                    "export function run{index}(x) {{\n  x.dispose();\n  x.dispose();\n}}\n"
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut files = callers
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect::<Vec<_>>();
+    files.extend([
+        (
+            "src/a.ts",
+            "export interface Disposable {\n  dispose(): void;\n}\nexport class A implements Disposable {\n  dispose() {}\n}\n",
+        ),
+        ("lib/b.js", "export class B {\n  dispose() {}\n}\n"),
+        ("lib/use.js", "export function use(y) {\n  y.dispose();\n}\n"),
+    ]);
+    let resolved = records_match_files(&super::incremental_tests::checkout(&files, &[]));
+    for (path, _) in &callers {
+        assert_eq!(resolved[path].sites.len(), 2, "{path}");
+        assert!(
+            resolved[path].site_dependencies.contains("m:dispose"),
+            "{path}: {:?}",
+            resolved[path].site_dependencies
+        );
+    }
 }
 
 /// The same comparison on a real tree, named by `AFT_SITE_RECORDS_ROOT`:

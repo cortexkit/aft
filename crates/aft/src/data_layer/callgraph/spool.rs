@@ -41,6 +41,11 @@ impl ResolutionSpool {
         })
     }
 
+    /// The spool's `runs/` folder, which other pass-4 runs share.
+    pub(crate) fn dir(&self) -> &ScratchDir<DataError> {
+        &self.dir
+    }
+
     /// Writes `entries` as the next range, returning its number. The
     /// workspace's disk admission is asked first, for the range's bytes.
     pub(crate) fn write_range(&mut self, entries: &[Vec<u8>]) -> std::io::Result<usize> {

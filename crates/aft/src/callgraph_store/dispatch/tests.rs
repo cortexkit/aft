@@ -157,7 +157,7 @@ fn shape_census_exact_exits_groups_and_memo_replay() {
     };
     let hit = memo.resolve("fixture", &repeated);
     assert!(
-        std::rc::Rc::ptr_eq(&first, &hit),
+        std::sync::Arc::ptr_eq(&first, &hit),
         "must exercise an actual memo hit"
     );
     census.record("typescript", &repeated, resolver.census_exit.get(), &hit);

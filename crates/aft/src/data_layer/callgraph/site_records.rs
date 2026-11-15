@@ -1,8 +1,10 @@
 //! Pass 4 of a cold build, in two steps: each file's sites and
 //! declarations projected in file order (see `dispatch::projected`), then
-//! every site matched against the projected records alone.
+//! every site matched against the projected records alone (see
+//! `key_order`).
 
-use std::collections::{BTreeSet, HashMap};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use rayon::prelude::*;
@@ -10,14 +12,10 @@ use rayon::prelude::*;
 use crate::callgraph_store::join::dispatch::projected::{
     FileRecord, ProjectedMro, ProjectedType, Projections, Recorded,
 };
-use crate::callgraph_store::join::dispatch::{
-    dependency, DispatchFiles, MemoizedResolver, Resolver,
-};
+use crate::callgraph_store::join::dispatch::{DispatchFiles, Resolver};
 use crate::callgraph_store::join::{ManifestJoinError, ParseBlob};
 
-use super::{
-    CheckoutInputs, MethodCallInputs, NoResolutions, SiteResolution, SiteSource, SMALL_SITE_RUN,
-};
+use super::{CheckoutInputs, MethodCallInputs, NoResolutions, SiteSource};
 
 /// Where the projected records are kept between the two steps. Every
 /// record is written once, in path order, and read by path.
@@ -148,14 +146,50 @@ pub(super) fn project_batch(
 /// declarations, found by method name as the in-memory inputs file them,
 /// and the projections recorded for it.
 pub(super) struct RecordSource<'r> {
-    records: &'r dyn RecordStore,
+    pub(super) records: &'r dyn RecordStore,
     /// Method name to the files declaring it, in path order.
     methods: HashMap<String, Vec<String>>,
     /// Method name to the Go files whose interfaces require it.
     go_required: HashMap<String, Vec<String>>,
     error: Mutex<Option<String>>,
+    /// Whether each record lookup is counted for the thread's
+    /// [`Touches`], for measurement.
+    count_touches: bool,
     #[cfg(feature = "callgraph-shape-census")]
     pub(super) census: Mutex<crate::data_layer::shape_census::Census>,
+}
+
+/// The record lookups one thread made while counting (see
+/// [`RecordSource::counting_touches`]): how many, and of how many files.
+#[derive(Debug, Default)]
+pub(super) struct Touches {
+    pub(super) lookups: u64,
+    /// The records looked up, by address: each file has one record.
+    pub(super) files: HashSet<usize>,
+}
+
+impl Touches {
+    pub(super) fn merge(&mut self, other: Touches) {
+        self.lookups += other.lookups;
+        self.files.extend(other.files);
+    }
+}
+
+thread_local! {
+    /// What this thread's record lookups touched since [`start_touches`].
+    static TOUCHES: RefCell<Option<Touches>> = const { RefCell::new(None) };
+}
+
+/// Starts counting this thread's record lookups, when the source counts
+/// them at all.
+pub(super) fn start_touches() {
+    TOUCHES.with(|touches| *touches.borrow_mut() = Some(Touches::default()));
+}
+
+/// What this thread's record lookups touched since [`start_touches`], and
+/// stops counting.
+pub(super) fn take_touches() -> Touches {
+    TOUCHES.with(|touches| touches.borrow_mut().take().unwrap_or_default())
 }
 
 impl<'r> RecordSource<'r> {
@@ -184,12 +218,40 @@ impl<'r> RecordSource<'r> {
             methods,
             go_required,
             error: Mutex::new(None),
+            count_touches: false,
             #[cfg(feature = "callgraph-shape-census")]
             census: Mutex::default(),
         }
     }
 
-    fn take_error(&self) -> Option<String> {
+    /// Counts every record lookup for the looking thread's [`Touches`].
+    pub(super) fn counting_touches(mut self) -> Self {
+        self.count_touches = true;
+        self
+    }
+
+    /// `path`'s record, counted for the thread's [`Touches`] when counting.
+    pub(super) fn record(&self, path: &str) -> Option<&'r FileRecord> {
+        let record = self.records.get(path);
+        if self.count_touches {
+            TOUCHES.with(|touches| {
+                if let Some(touches) = touches.borrow_mut().as_mut() {
+                    touches.lookups += 1;
+                    if let Some(record) = record {
+                        touches.files.insert(std::ptr::from_ref(record) as usize);
+                    }
+                }
+            });
+        }
+        record
+    }
+
+    /// How many files declare a method named `member`.
+    pub(super) fn declarers(&self, member: &str) -> usize {
+        self.methods.get(member).map_or(0, Vec::len)
+    }
+
+    pub(super) fn take_error(&self) -> Option<String> {
         self.error
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -199,14 +261,12 @@ impl<'r> RecordSource<'r> {
 
 impl Projections for RecordSource<'_> {
     fn projected_type(&self, file: &str, name: &str) -> Recorded<'_, ProjectedType> {
-        self.records
-            .get(file)
+        self.record(file)
             .map_or(Recorded::Missing, |record| record.projected_type(name))
     }
 
     fn projected_mro(&self, file: &str, owner: &str) -> Recorded<'_, ProjectedMro> {
-        self.records
-            .get(file)
+        self.record(file)
             .map_or(Recorded::Missing, |record| record.projected_mro(owner))
     }
 
@@ -220,7 +280,7 @@ impl Projections for RecordSource<'_> {
 
 impl<'a, 'r: 'a> DispatchFiles<'a> for RecordSource<'r> {
     fn file(&'a self, path: &str) -> Option<&'a ParseBlob> {
-        self.records.get(path).map(FileRecord::facts)
+        self.record(path).map(FileRecord::facts)
     }
 
     fn files_with_method(&self, name: &str) -> Vec<String> {
@@ -258,111 +318,11 @@ impl<'a, 'r: 'a> DispatchFiles<'a> for RecordSource<'r> {
     }
 
     fn associated_site(&self, file: &str, ordinal: u32) -> bool {
-        self.records
-            .get(file)
+        self.record(file)
             .is_some_and(|record| record.associated(ordinal))
     }
 
     fn projections(&'a self) -> Option<&'a (dyn Projections + 'a)> {
         Some(self)
     }
-}
-
-/// Pass 4 for `paths` over projected records: each file's kept method-call
-/// sites and the dependency keys their resolutions read, as
-/// `MethodCallInputs::resolve_sites` gives them. A few files run on this
-/// thread; more run in parallel chunks, each with its own resolver.
-///
-/// # Errors
-///
-/// When a file has no record, or a record the resolver needed is missing.
-pub(super) fn resolve_records(
-    source: &RecordSource<'_>,
-    paths: &[&String],
-) -> Result<Vec<(String, Vec<SiteResolution>, BTreeSet<String>)>, ManifestJoinError> {
-    if paths.is_empty() {
-        return Ok(Vec::new());
-    }
-    let results = if paths.len() <= SMALL_SITE_RUN {
-        let resolver = Resolver::over(source);
-        resolve_chunk(source, &resolver, paths)
-    } else {
-        let chunk = paths
-            .len()
-            .div_ceil(rayon::current_num_threads() * 4)
-            .max(1);
-        let carry = crate::alloc_trace::carry();
-        paths
-            .par_chunks(chunk)
-            .map(|chunk| {
-                let _label = carry.enter();
-                let resolver = Resolver::over(source);
-                resolve_chunk(source, &resolver, chunk)
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(|chunks| chunks.into_iter().flatten().collect())
-    }?;
-    if let Some(error) = source.take_error() {
-        return Err(ManifestJoinError::Parse(error));
-    }
-    Ok(results)
-}
-
-fn resolve_chunk(
-    source: &RecordSource<'_>,
-    resolver: &Resolver<'_>,
-    paths: &[&String],
-) -> Result<Vec<(String, Vec<SiteResolution>, BTreeSet<String>)>, ManifestJoinError> {
-    let memoized = MemoizedResolver::new(resolver);
-    resolver.take_dependencies();
-    #[cfg(feature = "callgraph-shape-census")]
-    let mut census = crate::data_layer::shape_census::Census::default();
-    let result = paths
-        .iter()
-        .map(|path| {
-            let record = source.records.get(path).ok_or_else(|| {
-                ManifestJoinError::Parse(format!("missing method-call record for {path}"))
-            })?;
-            let language = record.facts().language.as_str();
-            let mut sites = Vec::new();
-            for site in record.sites() {
-                let resolution = memoized.resolve(path, &site.site);
-                // This runs for memo hits too, and before Rust's ordinary-edge
-                // preservation can omit a supplemental method-call row.
-                #[cfg(feature = "callgraph-shape-census")]
-                census.record(
-                    language,
-                    &site.site,
-                    resolver.census_exit.get(),
-                    &resolution,
-                );
-                // Keep proven self-call and scoped module-function bindings
-                // when dispatch facts do not identify a project receiver type.
-                if language == "rust"
-                    && resolution.external > 0
-                    && resolution.targets.is_empty()
-                    && site.keeps_ordinary_edge
-                {
-                    continue;
-                }
-                sites.push(SiteResolution {
-                    site: site.site.clone(),
-                    resolution: (*resolution).clone(),
-                });
-            }
-            // Every file depends on its own facts, which `Resolver::resolve`
-            // reads without recording. Taken after every site, those left
-            // out above included.
-            let mut dependencies = resolver.take_dependencies();
-            dependencies.insert(dependency::file(path));
-            Ok(((*path).clone(), sites, dependencies))
-        })
-        .collect();
-    #[cfg(feature = "callgraph-shape-census")]
-    source
-        .census
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .merge(census);
-    result
 }
