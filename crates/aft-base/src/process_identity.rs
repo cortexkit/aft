@@ -2,7 +2,7 @@
 
 #[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
-#[cfg(any(target_os = "linux", any(test, feature = "test-support")))]
+#[cfg(any(target_os = "linux", test))]
 use std::fs;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::Mutex;
@@ -80,6 +80,7 @@ fn boot_time_secs() -> Option<u64> {
 /// Read once per process: boot time cannot change while the process runs.
 /// Shared with the platform-independent test that proves the reader runs once.
 #[cfg(any(target_os = "linux", any(test, feature = "test-support")))]
+#[cfg_attr(not(test), allow(dead_code))]
 fn cached_boot_time_secs(
     cache: &OnceLock<Option<u64>>,
     reader: impl FnOnce() -> Option<u64>,

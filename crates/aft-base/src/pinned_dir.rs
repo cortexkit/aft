@@ -10,7 +10,7 @@ type MountIdentity = (u64, Vec<u8>);
 use std::ffi::CString;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-#[cfg(all(any(test, feature = "test-support"), windows))]
+#[cfg(all(test, windows))]
 use std::io::Read;
 use std::io::{self, Write};
 #[cfg(unix)]
@@ -2443,6 +2443,7 @@ impl std::error::Error for CoordinationCreateContended {}
 
 #[cfg(all(unix, any(test, feature = "test-support")))]
 impl CoordinationCreateContended {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -2674,6 +2675,7 @@ const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
 #[cfg(any(windows, any(test, feature = "test-support")))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
 enum WindowsDeleteDisposition {
     Posix,
     Legacy,
@@ -2681,12 +2683,14 @@ enum WindowsDeleteDisposition {
 
 #[cfg(any(windows, any(test, feature = "test-support")))]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 enum DeleteDispositionOutcome {
     Removed,
     RemovedWithWarning(&'static str),
 }
 
 #[cfg(any(windows, any(test, feature = "test-support")))]
+#[cfg_attr(not(test), allow(dead_code))]
 fn record_delete_outcome(
     outcome: DeleteDispositionOutcome,
     path: &Path,
@@ -2701,6 +2705,7 @@ fn record_delete_outcome(
 }
 
 #[cfg(any(windows, any(test, feature = "test-support")))]
+#[cfg_attr(not(test), allow(dead_code))]
 fn windows_delete_with_fallback(
     mut set_disposition: impl FnMut(WindowsDeleteDisposition) -> io::Result<()>,
 ) -> io::Result<DeleteDispositionOutcome> {
@@ -2930,6 +2935,7 @@ fn windows_repair_rename_source(
 }
 
 #[cfg(any(windows, any(test, feature = "test-support")))]
+#[cfg_attr(not(test), allow(dead_code))]
 fn parse_repair_directory_names(bytes: &[u8]) -> io::Result<Vec<Vec<u16>>> {
     let mut result = Vec::new();
     let mut offset = 0usize;

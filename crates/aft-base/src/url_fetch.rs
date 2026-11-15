@@ -449,6 +449,7 @@ struct CacheReadStall {
 
 #[cfg(any(test, feature = "test-support"))]
 impl CacheReadStall {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn release(&self) {
         *self.released.lock().unwrap() = true;
         self.release.notify_all();
@@ -463,6 +464,7 @@ fn cache_read_stalls() -> &'static std::sync::Mutex<HashMap<PathBuf, Arc<CacheRe
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code))]
 fn stall_cache_reads(storage_dir: &Path) -> Arc<CacheReadStall> {
     let stall = Arc::new(CacheReadStall::default());
     cache_read_stalls()
@@ -493,6 +495,7 @@ fn stall_cache_read_if_requested(storage_dir: &Path) {
 
 /// Test hook: make one remembered failure `by` older.
 #[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code))]
 fn age_remembered_failure(key: &FailureKey, by: Duration) {
     if let Some(remembered) = failure_memory()
         .lock()

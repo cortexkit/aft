@@ -384,6 +384,7 @@ impl LockGuard {
     /// beat costs one write and no descriptor open or close. Tests use this to
     /// drive beats from a single thread; runtime beats go through the pump.
     #[cfg(any(test, feature = "test-support"))]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn heartbeat_once(&self) -> Result<(), HeartbeatError> {
         heartbeat_once(&self.path, &self.metadata, &self.heartbeat_file)
     }
@@ -1203,6 +1204,7 @@ impl HeartbeatPump {
 
     /// Whether the heartbeat thread ended by itself instead of at guard drop.
     #[cfg(any(test, feature = "test-support"))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn heartbeat_stopped(&self) -> bool {
         self.stopped.load(Ordering::Acquire)
     }
@@ -1671,6 +1673,7 @@ fn replace_lock_bytes_unsynced(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 #[cfg(any(windows, any(test, feature = "test-support")))]
+#[cfg_attr(not(test), allow(dead_code))]
 fn rename_over_with(
     from: &Path,
     to: &Path,
@@ -2157,6 +2160,7 @@ pub(crate) mod io_ledger {
 
     /// Return this thread's counters and reset them to zero.
     #[cfg(any(test, feature = "test-support"))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn take() -> IoLedger {
         LEDGER.with(|cell| cell.replace(IoLedger::default()))
     }
@@ -2279,6 +2283,7 @@ fn process_identity(pid: u32) -> Option<ProcessIdentity> {
 }
 
 #[cfg(any(target_os = "macos", any(test, feature = "test-support")))]
+#[cfg_attr(not(test), allow(dead_code))]
 const MACOS_KINFO_SIZE: usize = 648;
 #[rustfmt::skip]
 test_support_visibility! {
@@ -2348,6 +2353,7 @@ impl MacosKinfo {
 }
 
 #[cfg(any(target_os = "macos", any(test, feature = "test-support")))]
+#[cfg_attr(not(test), allow(dead_code))]
 fn decode_macos_kinfo(bytes: &[u8]) -> Option<MacosKinfo> {
     // Darwin's kinfo_proc ABI is 648 bytes on arm64 and x86_64. libc does not
     // declare it for Apple targets; reject any other layout rather than guess.
@@ -2422,6 +2428,7 @@ pub fn macos_kinfo(pid: u32) -> Option<MacosKinfo> {
 }
 
 #[cfg(any(target_os = "macos", any(test, feature = "test-support")))]
+#[cfg_attr(not(test), allow(dead_code))]
 fn macos_process_identity(snapshot: Option<MacosKinfo>) -> Option<ProcessIdentity> {
     let info = snapshot?;
     Some(ProcessIdentity {

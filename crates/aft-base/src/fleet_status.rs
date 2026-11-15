@@ -44,6 +44,7 @@ const STATUS_LINE_OPERATION: &str = "status.line";
 
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct StatusLineSegment {
     pub(crate) module: String,
     pub(crate) scope: String,
@@ -52,6 +53,7 @@ pub(crate) struct StatusLineSegment {
 
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct StatusLineSnapshot {
     pub(crate) line: String,
     pub(crate) segments: Vec<StatusLineSegment>,
@@ -59,10 +61,12 @@ pub(crate) struct StatusLineSnapshot {
 
 #[cfg(any(test, feature = "test-support"))]
 impl StatusLineSnapshot {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn parse(body: &[u8]) -> Option<Self> {
         serde_json::from_slice(body).ok()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn has_foreign_segment(&self) -> bool {
         self.segments
             .iter()
@@ -297,11 +301,13 @@ impl FleetStatusClient {
     /// The holder route this client's dial stopped reopening, if any.
     #[cfg(any(test, feature = "test-support"))]
     /// The most recently stopped route.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn stopped_route(&self) -> Option<StoppedRoute> {
         self.inner.stopped_routes.lock().last().cloned()
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn stopped_routes(&self) -> Vec<StoppedRoute> {
         self.inner.stopped_routes.lock().clone()
     }
@@ -405,6 +411,7 @@ impl FleetStatusClient {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn publish_fence(&self) -> PublishFence {
         self.inner.state.lock().publish_fence
     }

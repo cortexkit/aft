@@ -126,6 +126,7 @@ pub(crate) fn canonical_free_space_path(path: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct UnlimitedFreeSpaceForTestProcess;
 #[cfg(any(test, feature = "test-support"))]
 impl Drop for UnlimitedFreeSpaceForTestProcess {
@@ -140,6 +141,7 @@ impl Drop for UnlimitedFreeSpaceForTestProcess {
 /// storage roots. Their fallback can only allow admission; refusal simulations
 /// must name a storage root and always take precedence over this fallback.
 #[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn unlimited_free_space_for_test_process() -> UnlimitedFreeSpaceForTestProcess {
     FREE_SPACE
         .lock()

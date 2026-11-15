@@ -246,6 +246,7 @@ pub(crate) fn account_storage_roots() -> io::Result<Vec<PathBuf>> {
 }
 
 #[cfg(any(windows, any(test, feature = "test-support")))]
+#[cfg_attr(not(test), allow(dead_code))]
 fn combine_windows_roots(
     profile: io::Result<PathBuf>,
     local_data: io::Result<PathBuf>,

@@ -170,11 +170,13 @@ fn record_ansi_strip() {
 }
 
 #[cfg(all(debug_assertions, any(test, feature = "test-support")))]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn reset_ansi_strip_alloc_bytes() {
     ANSI_STRIP_ALLOC_BYTES.with(|bytes| bytes.set(0));
 }
 
 #[cfg(all(debug_assertions, any(test, feature = "test-support")))]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn ansi_strip_alloc_bytes() -> usize {
     ANSI_STRIP_ALLOC_BYTES.with(std::cell::Cell::get)
 }
@@ -183,11 +185,13 @@ pub(super) fn ansi_strip_alloc_bytes() -> usize {
 fn record_ansi_strip() {}
 
 #[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn reset_ansi_strip_count() {
     ANSI_STRIP_COUNT.with(|count| count.set(0));
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn ansi_strip_count() -> usize {
     ANSI_STRIP_COUNT.with(std::cell::Cell::get)
 }

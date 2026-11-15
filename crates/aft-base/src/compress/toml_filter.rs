@@ -704,11 +704,13 @@ fn record_truncate_line_call() {
 fn record_truncate_line_call() {}
 
 #[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code))]
 fn reset_truncate_line_calls() {
     TRUNCATE_LINE_CALLS.with(|calls| calls.set(0));
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code))]
 fn truncate_line_calls() -> usize {
     TRUNCATE_LINE_CALLS.with(std::cell::Cell::get)
 }

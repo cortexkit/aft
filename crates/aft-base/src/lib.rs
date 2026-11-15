@@ -31,6 +31,8 @@
     clippy::unnecessary_map_or
 )]
 
+// Private fixture helpers can compile with test-support without their unit tests. Their local
+// non-test dead-code allowances keep them private while preserving diagnostics in the unit harness.
 // Keep one item body and its original production visibility while sharing it with higher-layer tests.
 macro_rules! test_support_visibility {
     ($(#[$attribute:meta])* $visibility:vis $keyword:ident $($item:tt)*) => {

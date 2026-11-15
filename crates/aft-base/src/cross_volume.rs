@@ -301,6 +301,7 @@ pub enum MoveError {
 
 impl MoveError {
     #[cfg(any(test, feature = "test-support"))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn kind(&self) -> io::ErrorKind {
         match self {
             Self::AlreadyPublished { .. } => io::ErrorKind::AlreadyExists,

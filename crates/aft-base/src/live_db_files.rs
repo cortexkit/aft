@@ -711,6 +711,7 @@ pub mod stat_probe {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
 
     // Only the POSIX-only tests below open raw connections.

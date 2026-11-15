@@ -170,11 +170,13 @@ fn record_output_probe_json_parse() {
 fn record_output_probe_json_parse() {}
 
 #[cfg(all(debug_assertions, any(test, feature = "test-support")))]
+#[cfg_attr(not(test), allow(dead_code))]
 fn reset_output_probe_json_parse_count() {
     OUTPUT_PROBE_JSON_PARSE_COUNT.with(|count| count.set(0));
 }
 
 #[cfg(all(debug_assertions, any(test, feature = "test-support")))]
+#[cfg_attr(not(test), allow(dead_code))]
 fn output_probe_json_parse_count() -> usize {
     OUTPUT_PROBE_JSON_PARSE_COUNT.with(std::cell::Cell::get)
 }
@@ -1721,6 +1723,7 @@ mod tests {
 /// must see the cargo summary at work pads its fixture with per-test progress
 /// lines, which the summary drops.
 #[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code))]
 fn cargo_test_progress_padding() -> String {
     "test padding_case ... ok\n".repeat(50)
 }
@@ -1728,6 +1731,7 @@ fn cargo_test_progress_padding() -> String {
 /// Cargo build counterpart of [`cargo_test_progress_padding`]: status lines the
 /// build summary drops.
 #[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code))]
 fn cargo_build_progress_padding() -> String {
     "   Compiling padding v0.1.0\n".repeat(40)
 }

@@ -316,6 +316,7 @@ impl RequestSecrets {
     /// The caller supplies a fresh verified connection before a releasing retry.
     /// No mutex is held while asking the vault or waiting for a person's answer.
     #[cfg(all(any(test, feature = "test-support"), unix))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn use_in_request<F, Fut>(
         &self,
         label: &str,

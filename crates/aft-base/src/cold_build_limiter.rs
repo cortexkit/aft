@@ -784,6 +784,7 @@ impl ColdBuildLimiter {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn waiting_by_class_for_test(&self) -> [usize; ADMISSION_CLASS_COUNT] {
         std::array::from_fn(|index| self.waiting_by_class[index].load(Ordering::Acquire))
     }

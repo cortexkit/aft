@@ -2549,6 +2549,7 @@ fn listed_process(line: &str) -> Option<ListedProcess<'_>> {
     all(windows, not(any(test, feature = "test-support"))),
     allow(dead_code)
 )]
+#[cfg_attr(not(test), allow(dead_code))]
 fn compose_ps_snapshot(executables: &str, command_lines: &str) -> String {
     let flatten = |text: &str| text.replace('\t', " ");
     let args = command_lines
@@ -2640,6 +2641,7 @@ fn legacy_daemon_present(processes: &str, current_pid: u32) -> io::Result<bool> 
 }
 
 /// List every process in the snapshot format `legacy_daemon_present` reads.
+#[cfg_attr(not(test), allow(dead_code))]
 fn legacy_process_query(label: &str, timeout: Duration) -> io::Result<String> {
     #[cfg(windows)]
     {
@@ -2670,6 +2672,7 @@ fn legacy_process_query(label: &str, timeout: Duration) -> io::Result<String> {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn legacy_process_snapshot(
     command: &mut std::process::Command,
     label: &str,

@@ -162,6 +162,7 @@ thread_local! {
 
 /// Pin release-sensitive tests on this thread; dropping the guard restores the prior release.
 #[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn override_running_release_for_test(release: (u64, u64)) -> impl Drop {
     struct Reset {
         previous: Option<(u64, u64)>,
