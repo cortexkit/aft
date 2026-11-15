@@ -670,7 +670,7 @@ impl StreamConsumer {
                     let count = manifest
                         .files
                         .iter()
-                        .try_fold(0u64, |n, file| n.checked_add(file.chunks?))?;
+                        .try_fold(0u64, |n, file| n.checked_add(u64::from(file.chunks?)))?;
                     return (seq.checked_sub(start)? == count).then_some(start);
                 }
                 _ => return None,
