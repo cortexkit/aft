@@ -55,8 +55,7 @@ class HoldTests(unittest.TestCase):
             root = Path(temporary)
             hold = mac.Hold(root, END, root / "absent-grant")
             hold.request()
-            times = [NOW, NOW, NOW, NOW + timedelta(minutes=46), NOW + timedelta(minutes=46),
-                     NOW + timedelta(minutes=46), END]
+            times = [NOW, NOW, NOW + timedelta(minutes=46), NOW + timedelta(minutes=46), END]
             with patch.object(mac, "utcnow", side_effect=times), patch.object(mac.time, "sleep") as sleep:
                 self.assertFalse(hold.wait())
             self.assertEqual(sleep.call_count, 2)
