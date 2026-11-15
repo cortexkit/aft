@@ -569,14 +569,14 @@ fn cargo_failure_messages_survive_completion_preview_and_bash_output_envelope() 
     );
     let registry = build_registry(builtin_filters::ALL, None, None);
     let result = compress_with_registry_exit_code("cargo test", input, Some(101), &registry);
-    // Remote-run banners precede compressed output. Force a byte cut after
-    // adding the normal recovery marker, not merely a short-output passthrough.
-    let with_banner = format!("{}{}", "remote job context\n".repeat(40), result.text);
+    // Completion caps command output before adding the remote note. The cargo
+    // detail budget leaves room for the recovery marker, so failures are not cut.
     let marker = "[truncated output; +8 more warnings; full output: read \"/work/bash-tasks/job/io/stdout\"]";
-    let preview = cap_completion_output_with_marker(&with_banner, marker, false);
-    assert!(preview.truncated);
+    assert!(result.text.len() <= aft::bash_background::output::COMPLETION_FAILURE_TAIL_BYTES);
+    let preview = cap_completion_output_with_marker(&result.text, marker, false);
+    assert!(!preview.truncated);
     assert!(preview.text.len() <= COMPLETION_FAILURE_PREVIEW_BYTES);
-    let mut rendered = preview.text;
+    let mut rendered = format!("Remote execution: linux\n{}", preview.text);
     for message in [
         "the log kept 64000 bytes, 64 of the host's 100 filler lines",
         "the host 6851 still runs 4.5s after its keeper's death",

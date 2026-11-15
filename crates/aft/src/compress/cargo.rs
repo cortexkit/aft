@@ -370,7 +370,8 @@ fn test_noise_mask(lines: &[&str]) -> Vec<bool> {
 fn compress_test(output: &str, exit_code: Option<i64>) -> CompressionResult {
     let lines: Vec<&str> = output.lines().collect();
     let noise = test_noise_mask(&lines);
-    let has_failures = lines.iter().any(|line| line.trim() == "failures:");
+    let failure_headers = failure_list_headers(&lines);
+    let has_failures = failure_headers.iter().any(|header| *header);
     let total = cargo_test_total_line(&lines);
     if !has_failures {
         let has_error_diagnostic = lines.iter().any(|line| is_error_diagnostic(line));
@@ -407,19 +408,20 @@ fn compress_test(output: &str, exit_code: Option<i64>) -> CompressionResult {
     let mut sections = Vec::new();
     let mut summary = Vec::new();
     let mut names = Vec::new();
+    let mut seen_names = std::collections::HashSet::new();
     let mut in_failure_list = false;
     let mut warnings = 0;
     let mut index = 0usize;
     while index < lines.len() {
         let line = lines[index];
         let trimmed = line.trim_start();
-        if trimmed == "failures:" {
+        if failure_headers[index] {
             in_failure_list = true;
             index += 1;
             continue;
         }
         if let Some(name) = failure_name(trimmed.trim_end(), in_failure_list) {
-            if !names.contains(&name) {
+            if seen_names.insert(name) {
                 names.push(name);
             }
             if !line.starts_with("---- ") {
@@ -437,7 +439,7 @@ fn compress_test(output: &str, exit_code: Option<i64>) -> CompressionResult {
                 if index < lines.len()
                     && (lines[index].starts_with("---- ")
                         || lines[index].trim_start().starts_with("test result:")
-                        || lines[index].trim() == "failures:")
+                        || failure_headers[index])
                 {
                     break;
                 }
@@ -449,6 +451,10 @@ fn compress_test(output: &str, exit_code: Option<i64>) -> CompressionResult {
 
         if trimmed.starts_with("warning:") {
             warnings += 1;
+        }
+        if trimmed.starts_with("test result:") {
+            // A new test binary may report the same name as an earlier one.
+            seen_names.clear();
         }
         if !noise[index] {
             summary.push(line);
@@ -464,6 +470,7 @@ fn compress_test(output: &str, exit_code: Option<i64>) -> CompressionResult {
     summary.insert(verdict_at, &list);
     let summary =
         append_cargo_test_total(CompressionResult::new(summary.join("\n")), total.as_deref());
+    let summary = summary.map_text(|text| ensure_final_lines(output, text));
     let (details, dropped) = bounded_failure_sections(&sections, summary.text.len());
     let text = if details.is_empty() {
         summary.text
@@ -479,8 +486,7 @@ fn compress_test(output: &str, exit_code: Option<i64>) -> CompressionResult {
     if dropped > 0 {
         drops.insert(DropClass::Failure, dropped);
     }
-    let mut result = CompressionResult::with_class_drops(text, drops)
-        .map_text(|text| ensure_final_lines(output, text));
+    let mut result = CompressionResult::with_class_drops(text, drops);
     result.bounded_cargo_test_details = true;
     result
 }
@@ -545,24 +551,19 @@ fn bounded_failure_sections(sections: &[&[&str]], summary_bytes: usize) -> (Stri
 }
 
 pub(super) fn failure_summary_preserved(raw: &str, compressed: &str) -> bool {
-    let mut in_failure_list = false;
-    let mut saw_failure = false;
+    let raw_counts = failure_name_counts(raw);
+    let compressed_counts = failure_name_counts(compressed);
+    if raw_counts.is_empty()
+        || raw_counts
+            .iter()
+            .any(|(name, count)| compressed_counts.get(name).copied().unwrap_or(0) < *count)
+    {
+        return false;
+    }
     let mut saw_result = false;
     let compressed_lines: std::collections::HashSet<_> =
         compressed.lines().map(str::trim).collect();
     for line in raw.lines().map(str::trim) {
-        if line == "failures:" {
-            in_failure_list = true;
-            continue;
-        }
-        if let Some(name) = failure_name(line, in_failure_list) {
-            saw_failure = true;
-            if !compressed_lines.contains(name) {
-                return false;
-            }
-        } else if !line.is_empty() {
-            in_failure_list = false;
-        }
         if line.starts_with("test result:") {
             saw_result = true;
             if !compressed_lines.contains(line) {
@@ -570,7 +571,71 @@ pub(super) fn failure_summary_preserved(raw: &str, compressed: &str) -> bool {
             }
         }
     }
-    saw_failure && saw_result && compressed_lines.contains("failures:")
+    saw_result && compressed_lines.contains("failures:")
+}
+
+// Libtest introduces stdout sections with a header, then repeats the header
+// before an indented name list and its verdict. A test can print the same word;
+// without that surrounding structure it remains ordinary captured output.
+fn failure_list_headers(lines: &[&str]) -> Vec<bool> {
+    lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            if line.trim() != "failures:" {
+                return false;
+            }
+            let mut saw_name = false;
+            for next in &lines[index + 1..] {
+                let trimmed = next.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if !saw_name && trimmed.starts_with("---- ") && trimmed.ends_with(" stdout ----") {
+                    return true;
+                }
+                if next.starts_with(char::is_whitespace) && failure_name(trimmed, true).is_some() {
+                    saw_name = true;
+                    continue;
+                }
+                return saw_name && trimmed.starts_with("test result:");
+            }
+            false
+        })
+        .collect()
+}
+
+fn failure_name_counts(output: &str) -> std::collections::HashMap<&str, usize> {
+    let lines: Vec<_> = output.lines().collect();
+    let headers = failure_list_headers(&lines);
+    let mut counts = std::collections::HashMap::<_, [usize; 3]>::new();
+    let mut in_list = false;
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if headers[index] {
+            in_list = true;
+            continue;
+        }
+        if let Some(name) = failure_name(trimmed, in_list) {
+            let kind = if trimmed.starts_with("test ") || is_nextest_verdict(trimmed) {
+                0
+            } else if trimmed.starts_with("---- ") {
+                in_list = false;
+                1
+            } else {
+                2
+            };
+            counts.entry(name).or_default()[kind] += 1;
+        } else if !trimmed.is_empty() {
+            in_list = false;
+        }
+    }
+    // Status, stdout header and final list are three views of each failure,
+    // not three occurrences. Keep the greatest count reported by any view.
+    counts
+        .into_iter()
+        .map(|(name, views)| (name, views.into_iter().max().unwrap()))
+        .collect()
 }
 
 fn append_cargo_test_total(
@@ -701,18 +766,19 @@ pub(crate) fn test_verdict(lines: &[&str]) -> Option<TestVerdict> {
     let mut empty_results = Vec::new();
     let mut names = HashSet::new();
     let mut locations = HashSet::new();
+    let failure_headers = failure_list_headers(lines);
     let mut in_failure_list = false;
     for (index, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        if trimmed == "failures:" {
+        if failure_headers[index] {
             in_failure_list = true;
             continue;
         }
         let failure_name = failure_name(trimmed, in_failure_list);
-        if !trimmed.is_empty() && failure_name.is_none() {
+        if trimmed.starts_with("---- ") || (!trimmed.is_empty() && failure_name.is_none()) {
             in_failure_list = false;
         }
-        let is_name = failure_name.is_some_and(|name| names.insert(name));
+        let is_name = failure_name.is_some_and(|name| in_failure_list || names.insert(name));
         let is_panic = (trimmed.starts_with("thread '") && trimmed.contains("panicked at"))
             || (index > 0 && lines[index - 1].trim_end().ends_with("panicked at"));
         let is_location = is_panic && locations.len() < 20 && locations.insert(trimmed);
@@ -748,13 +814,14 @@ fn bounded_failure_verdict_lines(lines: &[&str]) -> Option<Vec<usize>> {
     let mut section_lines = 0;
     let mut detail_lines = 0;
     let mut bytes = 0;
+    let failure_headers = failure_list_headers(lines);
     for (index, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
         if line.starts_with("---- ") && line.ends_with(" stdout ----") {
             in_section = true;
             in_list = false;
             section_lines = 0;
-        } else if trimmed == "failures:" {
+        } else if failure_headers[index] {
             in_section = false;
             in_list = true;
         } else if trimmed.starts_with("test result:")
@@ -882,6 +949,73 @@ mod tests {
             "BEFORE COMPRESSED OUTPUT:\n{}\nAFTER COMPRESSED OUTPUT:\n{}",
             before.text, result.text
         );
+    }
+
+    #[test]
+    fn cargo_test_preserves_same_failure_name_from_two_binaries() {
+        let binary = "running 1 test\ntest tests::foo ... FAILED\n\nfailures:\n\n---- tests::foo stdout ----\nthread 'tests::foo' panicked at src/lib.rs:1:1:\nassertion failed\n\nfailures:\n    tests::foo\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n";
+        let raw = format!("{binary}{binary}error: test failed, to rerun pass `--lib`\n");
+        let registry = build_registry(builtin_filters::ALL, None, None);
+        let result = compress_with_registry_exit_code("cargo test", &raw, Some(101), &registry);
+        assert_eq!(
+            result
+                .text
+                .lines()
+                .filter(|line| *line == "    tests::foo")
+                .count(),
+            2,
+            "{}",
+            result.text
+        );
+        assert!(failure_summary_preserved(&raw, &result.text));
+        let collapsed = result.text.replacen("    tests::foo\n", "", 1).replacen(
+            "---- tests::foo stdout ----\n",
+            "",
+            1,
+        );
+        assert!(!failure_summary_preserved(&raw, &collapsed));
+        let preview = cap_completion_output(&result.text, false);
+        assert_eq!(
+            preview
+                .text
+                .lines()
+                .filter(|line| *line == "    tests::foo")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn cargo_test_printed_failure_header_is_not_a_failure_list() {
+        let raw = "running 1 test\ntest tests::foo ... FAILED\n\nfailures:\n\n---- tests::foo stdout ----\nthread 'tests::foo' panicked at src/lib.rs:1:1:\nfailures:\nnot_a_test\n\nfailures:\n    tests::foo\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\nerror: test failed, to rerun pass `--lib`\n";
+        let registry = build_registry(builtin_filters::ALL, None, None);
+        let result = compress_with_registry_exit_code("cargo test", raw, Some(101), &registry);
+        assert!(
+            result.text.contains("failures:\nnot_a_test\n"),
+            "{}",
+            result.text
+        );
+        assert!(!result.text.lines().any(|line| line == "    not_a_test"));
+        assert_eq!(failure_name_counts(raw).len(), 1);
+        assert_eq!(
+            failure_name_counts(&result.text).get("tests::foo"),
+            Some(&1)
+        );
+        assert!(failure_summary_preserved(raw, &result.text));
+    }
+
+    #[test]
+    fn cargo_test_reserves_final_line_before_spending_detail_budget() {
+        let final_line = format!("warning: final status {}", "x".repeat(1100));
+        let raw = format!("{HOST_SUPERVISOR_FAILURES}{final_line}\n");
+        let result = compress_test(&raw, Some(101));
+        assert_eq!(result.text.lines().last(), Some(final_line.as_str()));
+        assert!(
+            result.text.len() <= FAILURE_DETAIL_BYTES,
+            "{} bytes",
+            result.text.len()
+        );
+        assert!(failure_summary_preserved(&raw, &result.text));
     }
 
     #[test]
