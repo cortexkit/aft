@@ -1126,6 +1126,48 @@ fn free_space_just_above_the_floor_is_recovered_from_dead_workspaces() {
     );
 }
 
+/// Free space a workspace's deletion freed counts even when the deletion
+/// then fails: here everything inside the other checkout's workspace is
+/// deleted and only the workspace folder itself cannot be, so no workspace
+/// counts as deleted, yet the stage's write fits.
+#[cfg(unix)]
+#[test]
+fn a_deletion_that_fails_partway_still_admits_what_it_made_room_for() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let (own, other) = (root.path().join("own"), root.path().join("other"));
+    let store = tempfile::tempdir().unwrap();
+    let theirs = killed_builds(store.path(), &own, false, &other);
+    let checkout = Checkout::bind(layer(), store.path(), family(), &own).unwrap();
+    let identity = theirs.join(aft_store::family::workspace::IDENTITY);
+    assert!(identity.exists());
+    let floor = crate::disk_floor::free_disk_floor(CAPACITY);
+    let _low = crate::disk_floor::set_free_space_fn_for_test(store.path(), move || {
+        let free = if identity.exists() {
+            floor + 4096
+        } else {
+            floor + (64 << 30)
+        };
+        Some((free, CAPACITY))
+    });
+    // Its checkout's folder read-only: what the workspace holds can be
+    // deleted, the workspace folder itself cannot.
+    let parent = theirs.parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let writable = std::fs::write(parent.join("probe"), b"").is_ok();
+    let admitted = (checkout.admission(super::DiskPause::default()))(64 << 20);
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        !writable,
+        "a read-only folder must refuse this user's writes (is it root?)"
+    );
+    assert!(
+        theirs.exists() && !theirs.join(aft_store::family::workspace::IDENTITY).exists(),
+        "the deletion failed partway"
+    );
+    assert!(admitted.is_ok(), "{admitted:?}");
+}
+
 /// Free space that cannot be measured is not low disk: nothing is deleted
 /// to make room, whether the first probe fails or one during reclamation,
 /// and the build reports the failed measurement.

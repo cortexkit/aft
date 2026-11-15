@@ -2411,12 +2411,13 @@ impl Checkout {
                     || still_short(&dir, bytes),
                     || still_short(&dir, 0),
                 );
-                if let Some(error) = reclaimed.stopped {
-                    result = Err(error);
-                } else if reclaimed.removed > 0 {
-                    log_reclaimed(reclaimed.removed);
-                    result = check_disk_floor_at(&dir, bytes);
-                }
+                log_reclaimed(reclaimed.removed);
+                // Asked again whatever the count: a deletion that failed
+                // partway is not counted, yet may have freed enough.
+                result = match reclaimed.stopped {
+                    Some(error) => Err(error),
+                    None => check_disk_floor_at(&dir, bytes),
+                };
             }
             if let Err(DataError::DiskFloor(message)) = &result {
                 *paused.lock().expect("disk pause lock") = Some(message.clone());
