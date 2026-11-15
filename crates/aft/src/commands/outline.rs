@@ -2255,7 +2255,7 @@ fn populate_rendered_file_symbols(
             }
             let symbols = crate::data_layer::grammar::prepare(ctx, &path).and_then(|_| {
                 let mut parser = FileParser::new().with_dynamic_languages(true);
-                if parser.parse(&path)?.tree.root_node().has_error() {
+                if parser.parse(&path)?.0.root_node().has_error() {
                     skipped_files.push(SkippedFile::new(&entry.path, "parse_error"));
                     return Ok(None);
                 }
