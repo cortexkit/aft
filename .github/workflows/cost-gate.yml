@@ -120,10 +120,12 @@ jobs:
         if: always()
         run: |
           python3 - <<'PY'
-          import json
-          from pathlib import Path
-          hold = Path('/Users/Shared/motor-macos-hold/hold.json')
-          if hold.exists() and json.loads(hold.read_text()).get('owner') == 'aft-nightly':
+          import os
+          import runpy
+          protocol = runpy.run_path('scripts/telemetry/mac-cost-gate.py')
+          hold = protocol['HOLD_DIR'] / 'hold.json'
+          record = protocol['read_hold_record'](hold)
+          if record and record['owner'] == protocol['hold_owner'](os.environ.get('GITHUB_RUN_ID')):
               hold.unlink()
           PY
 

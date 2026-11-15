@@ -26,9 +26,15 @@ pins fetched **before** asking MOTOR to isolate the machine. Measurement uses
 `--prepared-only`, which refuses to build, fetch or generate missing inputs.
 
 MOTOR honours holds only during **03:00–05:00 UTC**. The check writes
-`/Users/Shared/motor-macos-hold/hold.json` with owner `aft-nightly` and an RFC 3339
-UTC expiry of 05:00, then waits for **the same owner and expiry** in
-`/Users/Shared/motor-macos-grant/granted.json`. A process listing is never the
+`/Users/Shared/motor-macos-hold/hold.json` with a per-run owner
+`aft-nightly-<GitHub run id>` (lowercase letters, digits and hyphens, at most 64
+characters) and an RFC 3339 UTC expiry of 05:00. The record contains exactly
+`owner` and `expires_at`, is a regular file of at most 4 KiB, and is published
+by writing a temporary file in the same folder and renaming it. UTC expiry
+accepts `Z` or `+00:00`. The check then waits for **the same owner and expiry** in
+`/Users/Shared/motor-macos-grant/granted.json`, validating the same record format.
+Per-run owners reject a prior run's grant while MOTOR is still removing it.
+A process listing is never the
 start decision. Draining can take about 45 minutes; the check waits for a grant
 until the window ends. No grant records **not run: machine busy**, without
 failing the night. A start with less than the expected measurement duration
