@@ -1,0 +1,9 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "note": "Post-0.65 batch 12, on main after batch 11: runner send states (not_delivered and pending replies), the worker tool list for presetless catalog fetches, cargo test failure output, #1441 step 4 (pass 4 in resolution-key order; published segments byte-identical by the exactness kit), the gh relay judging bot writes by the launching route, and integration tests launching aft from nextest's runtime path. Derived against RANKING_FENCE_PREFIXES in benchmarks/aft-search/search_quality_lib.py: no changed path matches, so search ranking, candidate selection and routing are unchanged."
+}
