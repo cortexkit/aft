@@ -1036,6 +1036,17 @@ isolated!(
         let _fill = enable_meaning(&f.ctx, &f.root);
         let runtime = f.ctx.data_checkout().unwrap();
         runtime.wait_for_memory_profile_idle_for_test();
+        until(
+            || match runtime.meaning_status() {
+                crate::data_layer::meaning::MeaningState::Serving { snapshot, .. }
+                    if snapshot.coverage().pending.is_empty() =>
+                {
+                    Some(())
+                }
+                _ => None,
+            },
+            "terminal-only fill did not settle",
+        );
         let response = meaning_query(&f.ctx);
         assert!(response.success, "{:?}", response.data);
         assert_eq!(
@@ -1222,7 +1233,7 @@ isolated!(
     || {
         let f = fixture(true);
         write(&f.root, "bad.luau", "function broken()\n return @@@\nend\n");
-        let fallback = AppContext::new(Box::new(NoBatch), f.ctx.config().clone());
+        let fallback = AppContext::new(Box::new(NoBatch), (*f.ctx.config()).clone());
         fallback.set_canonical_cache_root(f.root.clone());
         for ctx in [&fallback, &f.ctx] {
             for params in [

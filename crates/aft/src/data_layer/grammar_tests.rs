@@ -119,6 +119,7 @@ fn luau_s4_round4_non_luau_failures_preserve_main_search_contract() {
     ctx.data_checkout()
         .unwrap()
         .wait_for_memory_profile_idle_for_test();
+    wait_meaning(&ctx);
     let response = meaning_query(&ctx);
     assert!(response.success, "{:?}", response.data);
     assert_eq!(response.data["complete"], true, "{:?}", response.data);
