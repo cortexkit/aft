@@ -40,7 +40,7 @@ fn main() {
         let Some(language) = language_for(path, text.as_bytes()) else {
             continue;
         };
-        if language == "config" {
+        if aft::data_layer::content::is_config_language(&language) {
             continue;
         }
         let digest = match CallgraphBlob::extract(&text, &language, "digest") {

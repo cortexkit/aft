@@ -446,8 +446,13 @@ impl CallgraphBlob {
         Ok(Self::Parse(parse))
     }
 
-    /// Builds a manifest configuration input.  The caller must key it with
-    /// `language = "config"` and the same extractor version stored here.
+    /// Builds a manifest configuration input. The caller keys it with the
+    /// file's configuration language (plain `config`, or `config-<grammar>`
+    /// when the record also holds TODO markers read in that grammar; see
+    /// `data_layer::content::is_config_language`) and the same extractor
+    /// version stored here. The blob itself always names plain `config`:
+    /// it holds the file's bytes whole, which do not depend on the grammar,
+    /// and readers take the language from the path record, not from here.
     pub fn config(source: impl Into<Vec<u8>>, extractor_version: impl Into<String>) -> Self {
         Self::Config(ConfigBlob {
             extractor_version: extractor_version.into(),
