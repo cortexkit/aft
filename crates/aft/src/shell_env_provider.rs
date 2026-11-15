@@ -335,6 +335,9 @@ fn run(
         std::time::Instant::now() + std::time::Duration::from_millis(provider.timeout_ms),
         || false,
         OUTPUT_LIMIT + 1,
+        // Unix probes already start a new session. setpgid after setsid would
+        // refuse the child with EPERM; both forms give tree cleanup its own group.
+        cfg!(not(unix)),
     )
     .map_err(|error| match error {
         crate::format::FormatError::Timeout { .. } => Failure::Timeout(provider.timeout_ms),
@@ -822,6 +825,11 @@ mod tests {
         let home = std::fs::canonicalize(std::env::var_os("HOME").unwrap()).unwrap();
         let inside = tempfile::tempdir_in(&home).unwrap();
         let outside = tempfile::tempdir().unwrap();
+        let outside = if outside.path().starts_with(&home) {
+            tempfile::tempdir_in(home.parent().unwrap()).unwrap()
+        } else {
+            outside
+        };
         let link = inside.path().join("escape");
         std::os::unix::fs::symlink(outside.path(), &link).unwrap();
         let profile = crate::sandbox_profile::SandboxProfile::build(

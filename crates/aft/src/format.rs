@@ -252,7 +252,14 @@ pub(crate) fn capture_probe_command(
     deadline: Instant,
     cancelled: impl Fn() -> bool,
 ) -> Result<SubprocessOutcome, FormatError> {
-    capture_bounded_command(command, tool, deadline, cancelled, PROBE_CAPTURE_BYTES)
+    capture_bounded_command(
+        command,
+        tool,
+        deadline,
+        cancelled,
+        PROBE_CAPTURE_BYTES,
+        true,
+    )
 }
 
 pub(crate) fn capture_bounded_command(
@@ -261,12 +268,15 @@ pub(crate) fn capture_bounded_command(
     deadline: Instant,
     cancelled: impl Fn() -> bool,
     capture_bytes: usize,
+    new_process_group: bool,
 ) -> Result<SubprocessOutcome, FormatError> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    isolate_in_process_group(&mut command);
+    if new_process_group {
+        isolate_in_process_group(&mut command);
+    }
     let child = command.spawn().map_err(|error| FormatError::Failed {
         tool: tool.to_string(),
         stderr: error.to_string(),
