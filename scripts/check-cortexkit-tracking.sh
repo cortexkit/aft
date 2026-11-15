@@ -10,8 +10,8 @@
 # tracked file that the ignore rules exclude, however it got tracked.
 #
 # Usage: scripts/check-cortexkit-tracking.sh [repository-dir]
-# Exits 0 when neither check lists files, 1 when forbidden files are tracked,
-# and 2 when Git itself fails.
+# Exits 0 when no ignored .cortexkit/ files or .aft-ci/ files are tracked,
+# 1 when any are tracked, and 2 when Git itself fails.
 set -euo pipefail
 
 repo="${1:-.}"
