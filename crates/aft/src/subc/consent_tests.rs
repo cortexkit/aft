@@ -1998,7 +1998,7 @@ async fn consent_folder_grant_settles_and_withdraws_covered_sibling() {
 #[test]
 fn consent_folder_grant_logs_card_withdrawal_separately_from_call_resumption() {
     let grant = Permission::File(AccessGrant {
-        path: crate::access_policy::policy_path(Path::new("/tmp/scope/a.txt")),
+        path: crate::policy_path::policy_path(Path::new("/tmp/scope/a.txt")),
         kind: GrantKind::File,
         operation: AccessOperation::Read,
     });
