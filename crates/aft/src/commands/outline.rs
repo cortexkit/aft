@@ -2846,6 +2846,7 @@ fn outline_many_files(
         let metadata = match crate::bounded_io::metadata(&path) {
             Ok(metadata) => metadata,
             Err(_) => {
+                writer.content_incomplete |= detect_language(&path) == Some(LangId::Luau);
                 skipped_files.push((index, SkippedFile::new(file, "file_not_found")));
                 continue;
             }
