@@ -1960,8 +1960,12 @@ impl Checkout {
             // down: it serves that publication and records what differs from
             // the files now on disk, as a bind does.
             drop(session);
-            // The graph spill's files close before its folder is deleted.
+            // The graph spill's and the staged records' files close before
+            // their folder is deleted: Windows may keep listing a deleted
+            // file another handle still has open, so the folder would stay.
             drop(sections);
+            drop(inputs);
+            drop(collected);
             claimed.finished();
             report.superseded = true;
             self.adopt_newest()?;
@@ -2027,7 +2031,10 @@ impl Checkout {
             })
             .map_err(DataError::store)?;
         // The publication is in the manifest, so nothing in the workspace is
-        // needed any more; every builder closed its files when it finished.
+        // needed any more. The staged records' files close first (see the
+        // stand-down above); every other builder closed its files when it
+        // finished.
+        drop(inputs);
         claimed.finished();
         // Removes what no generation at or above the horizon names. A view
         // still reading an older generation holds a lease on it, so its

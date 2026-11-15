@@ -584,6 +584,28 @@ fn a_text_only_publication_keeps_a_dead_build_s_workspace() {
     assert!(report.resumed_passes, "{report:?}");
 }
 
+/// Every file of a finished build's workspace is closed before the
+/// workspace is deleted (Windows may keep listing a deleted file another
+/// handle has open, so the folder would stay).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_build_closes_its_workspace_files_before_deleting_it() {
+    let root = tempfile::tempdir().unwrap();
+    project(root.path());
+    let store = tempfile::tempdir().unwrap();
+    let (checkout, _) = build(store.path(), root.path());
+    let dir = builds(&checkout);
+    let noted = super::resume::OPEN_AT_FINISH
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(workspace, _)| workspace.starts_with(&dir))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(noted.len(), 1, "{noted:?}");
+    assert!(noted[0].1.is_empty(), "open when deleted: {:?}", noted[0].1);
+}
+
 #[test]
 fn a_build_from_another_executable_or_a_damaged_stage_is_not_reused() {
     let root = tempfile::tempdir().unwrap();

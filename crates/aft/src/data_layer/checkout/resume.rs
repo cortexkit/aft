@@ -793,9 +793,31 @@ impl Claimed {
     /// published or stood down.
     pub(crate) fn finished(&self) {
         self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(all(test, target_os = "linux"))]
+        note_open_files_for_test(self.scratch.path());
         let _ = self.scratch.remove();
         remove_attempts(&self.attempts_dir);
     }
+}
+
+/// The files under each build workspace this process still had open when
+/// the workspace was deleted, by workspace.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) static OPEN_AT_FINISH: std::sync::Mutex<Vec<(PathBuf, Vec<PathBuf>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(all(test, target_os = "linux"))]
+fn note_open_files_for_test(workspace: &Path) {
+    let open = std::fs::read_dir("/proc/self/fd")
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+        .filter(|target| target.starts_with(workspace))
+        .collect();
+    OPEN_AT_FINISH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((workspace.to_path_buf(), open));
 }
 
 fn remove_attempts(dir: &Path) {
