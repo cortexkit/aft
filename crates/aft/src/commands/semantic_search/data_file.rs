@@ -73,6 +73,14 @@ fn has_data_extension(path: &Path) -> bool {
 /// Return true when `path` names a JSON-family file whose name or content
 /// shape marks it as data rather than source or configuration.
 pub fn is_data_file(project_root: &Path, path: &Path) -> bool {
+    is_data_file_after_metadata(project_root, path, || {})
+}
+
+fn is_data_file_after_metadata(
+    project_root: &Path,
+    path: &Path,
+    after_metadata: impl FnOnce(),
+) -> bool {
     if !has_data_extension(path) {
         return false;
     }
@@ -100,19 +108,19 @@ pub fn is_data_file(project_root: &Path, path: &Path) -> bool {
     if metadata.len() >= DATA_FILE_MIN_BYTES {
         return true;
     }
-    // Below the size threshold the whole file is small, so reading it to
-    // measure its longest line is cheap.
-    let read = super::request_files::read_through(files.as_deref(), path, |path| {
+    after_metadata();
+    // This is a classification prefix, not complete source: a writer may
+    // grow the file after metadata admission. Never publish it to RequestFiles.
+    let read = (|| -> std::io::Result<Vec<u8>> {
         let file = std::fs::File::open(path)?;
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
         file.take(DATA_FILE_MIN_BYTES).read_to_end(&mut bytes)?;
         crate::large_read::record_whole(crate::large_read::Site::DataFile, bytes.len());
-        Ok((bytes, Some(super::request_files::FileStat::of(&metadata))))
-    });
-    read.is_ok_and(|fetched| {
-        fetched.file.bytes().len() as u64 >= DATA_FILE_MIN_BYTES
-            || has_long_line(fetched.file.bytes())
-    })
+        #[cfg(test)]
+        super::request_files::record_disk_read(path);
+        Ok(bytes)
+    })();
+    read.is_ok_and(|bytes| bytes.len() as u64 >= DATA_FILE_MIN_BYTES || has_long_line(&bytes))
 }
 
 fn has_long_line(bytes: &[u8]) -> bool {
@@ -206,6 +214,29 @@ pub fn demote_data_candidates(
 mod tests {
     use super::*;
     use crate::commands::semantic_search::evidence_descriptor::EvidenceDescriptor;
+
+    #[test]
+    fn classification_growth_prefix_never_becomes_cached_whole_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "capture.json", "{}\n");
+        let mut grown = b"{}\n".repeat(DATA_FILE_MIN_BYTES as usize / 3 + 64);
+        grown.extend_from_slice(b"tail_after_classification\n");
+        let scope = super::super::request_files::install();
+        assert!(is_data_file_after_metadata(dir.path(), &path, || {
+            std::fs::write(&path, &grown).unwrap()
+        }));
+        let fetched = super::super::request_files::read_through(
+            Some(scope.files()),
+            &path,
+            super::super::request_files::read_whole_file,
+        )
+        .unwrap();
+        assert_eq!(fetched.file.bytes(), grown);
+        assert!(fetched
+            .file
+            .bytes()
+            .ends_with(b"tail_after_classification\n"));
+    }
 
     fn write(dir: &Path, relative: &str, content: &str) -> PathBuf {
         let path = dir.join(relative);

@@ -1993,7 +1993,6 @@ pub(crate) fn reader(path: &Path, at: Option<Instant>) -> io::Result<Reader> {
 }
 
 impl Reader {
-
     pub(crate) fn chunk(&mut self, mut buffer: Vec<u8>, size: usize) -> io::Result<Vec<u8>> {
         if Instant::now() >= deadline(self.at) {
             return Err(failure(
