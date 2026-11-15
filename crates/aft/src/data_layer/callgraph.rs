@@ -1619,7 +1619,8 @@ pub(crate) struct PassesCheckpoint<'m> {
     pub(crate) snapshot: resume::Digest,
     /// The complete stage an earlier attempt left for these inputs, if any.
     pub(crate) adopted: Option<&'m resume::Marker>,
-    /// Set when that stage was adopted and passes 2-3 were not resolved.
+    /// Set when that stage was adopted, so binding and passes 2-3 (each
+    /// file's references and type names) were not resolved again.
     pub(crate) resumed: Option<&'m std::sync::atomic::AtomicBool>,
 }
 

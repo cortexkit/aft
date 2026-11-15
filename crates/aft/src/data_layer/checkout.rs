@@ -1593,9 +1593,10 @@ impl Checkout {
         // resolution rather than after them. So does the writer below the
         // free-disk floor.
         self.family.check_formats().map_err(DataError::store)?;
-        // Below the floor, dead build workspaces (this checkout's too: no
-        // build of it is running here yet) go first, so the disk they hold
-        // can let this build or a later one run.
+        // Below the floor, dead build workspaces go first, so the disk they
+        // hold can let this build or a later one run. This checkout's own
+        // are included: this build has not claimed a workspace yet, so none
+        // of them is its own.
         self.reclaim_disk_for(0, false);
         self.check_disk_floor()?;
         if !self.planes.callgraph {
