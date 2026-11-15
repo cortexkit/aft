@@ -60,6 +60,8 @@ mod status_counts_inspect_seams;
 mod synapse_live_test;
 #[cfg(unix)]
 use test_helpers as test_support;
+#[path = "../subc_release_compat.rs"]
+mod subc_release_compat;
 #[path = "../tool_provider_conformance.rs"]
 mod tool_provider_conformance;
 #[path = "../tool_provider_subc_e2e.rs"]

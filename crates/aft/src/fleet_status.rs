@@ -24,6 +24,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 const STATUS_CADENCE: Duration = Duration::from_millis(2_500);
+const CATALOG_BACKSTOP: Duration = Duration::from_secs(5 * 60);
 /// How recent the holder's last `status.line` read of a scope must be for AFT
 /// to count it as a live reader. Prefrontal's status stamper polls every 3 s, so
 /// a few of its cadences separate a live renderer from a stale or one-off
@@ -560,12 +561,14 @@ async fn run_fleet_status_dial(
 // the clock-driven test consumer; the latter can return actual bind errors.
 trait StatusConsumer {
     type Route;
+    type CatalogWatch: StatusCatalogWatch;
 
     fn on_connection_state(&self, cb: impl Fn(ConnectionState) + Send + 'static);
     /// The daemon's route-lifecycle notifications, sent on the connection's
     /// control channel (`route.closing`, `route.closed`, each with a reason).
     fn control_pushes(&self) -> mpsc::Receiver<ControlPush>;
     async fn catalog_list(&self) -> Result<CatalogList, String>;
+    async fn catalog_watch(&self) -> Result<Self::CatalogWatch, String>;
     async fn open_route(
         &self,
         target: RouteTarget,
@@ -579,8 +582,22 @@ trait StatusConsumer {
     async fn request(&self, route: &Self::Route, body: Vec<u8>) -> Result<Vec<u8>, String>;
 }
 
+trait StatusCatalogWatch {
+    async fn next_generation(&mut self) -> Result<Option<u64>, String>;
+}
+
+impl StatusCatalogWatch for subc_client_rs::CatalogSubscription {
+    async fn next_generation(&mut self) -> Result<Option<u64>, String> {
+        self.next()
+            .await
+            .map(|event| event.map(|event| event.generation))
+            .map_err(|error| error.to_string())
+    }
+}
+
 impl StatusConsumer for SubcConsumer {
     type Route = RouteHandle;
+    type CatalogWatch = subc_client_rs::CatalogSubscription;
 
     fn on_connection_state(&self, cb: impl Fn(ConnectionState) + Send + 'static) {
         SubcConsumer::on_connection_state(self, cb);
@@ -592,6 +609,12 @@ impl StatusConsumer for SubcConsumer {
 
     async fn catalog_list(&self) -> Result<CatalogList, String> {
         SubcConsumer::catalog_list(self)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn catalog_watch(&self) -> Result<Self::CatalogWatch, String> {
+        SubcConsumer::catalog_watch(self)
             .await
             .map_err(|error| error.to_string())
     }
@@ -670,12 +693,35 @@ async fn run_connected_status_dial<C: StatusConsumer>(
 
     let mut route: Option<C::Route> = None;
     let mut route_events = None;
+    let mut catalog_watch = None;
+    let mut catalog_generation = None;
+    let mut next_watch_at = tokio::time::Instant::now();
     let mut next_discovery_at = tokio::time::Instant::now();
     let mut discovery_backoff = DISCOVERY_INITIAL_BACKOFF;
     loop {
+        if catalog_watch.is_none() && tokio::time::Instant::now() >= next_watch_at {
+            match consumer.catalog_watch().await {
+                Ok(watch) => {
+                    catalog_watch = Some(watch);
+                    // A replacement feed cannot account for generations missed
+                    // while it was down, even if its first generation is unchanged.
+                    next_discovery_at = tokio::time::Instant::now();
+                }
+                Err(error) => {
+                    log::debug!("fleet status dial: catalog watch unavailable: {error}");
+                    next_watch_at = tokio::time::Instant::now() + STATUS_CADENCE;
+                }
+            }
+        }
+        let discovery_cadence = if catalog_watch.is_some() {
+            CATALOG_BACKSTOP
+        } else {
+            STATUS_CADENCE
+        };
         if tokio::time::Instant::now() >= next_discovery_at {
             match consumer.catalog_list().await {
                 Ok(catalog) if catalog_advertises_status_line(&catalog.modules) => {
+                    catalog_generation = Some(catalog.generation);
                     if route.is_none()
                         && reopen_forbidden.is_none()
                         && !refused_identities.contains(&route_identity)
@@ -749,21 +795,28 @@ async fn run_connected_status_dial<C: StatusConsumer>(
                         }
                     }
                     client.set_route_live(route.is_some());
-                    if route.is_some() {
-                        next_discovery_at = tokio::time::Instant::now() + STATUS_CADENCE;
+                    if route.is_some()
+                        || reopen_forbidden.is_some()
+                        || refused_identities.contains(&route_identity)
+                    {
+                        next_discovery_at = tokio::time::Instant::now() + discovery_cadence;
                     } else {
+                        // A transient route-open failure keeps its existing retry
+                        // backoff even with a healthy watch: recovery need not
+                        // advance the catalog generation.
                         next_discovery_at = tokio::time::Instant::now() + discovery_backoff;
                         discovery_backoff = next_discovery_backoff(discovery_backoff);
                     }
                 }
-                Ok(_) => {
+                Ok(catalog) => {
+                    catalog_generation = Some(catalog.generation);
                     if let Some(opened_route) = route.take() {
                         let _ = consumer.close_handle(&opened_route).await;
                     }
                     route_events = None;
                     client.set_route_live(false);
                     discovery_backoff = DISCOVERY_INITIAL_BACKOFF;
-                    next_discovery_at = tokio::time::Instant::now() + STATUS_CADENCE;
+                    next_discovery_at = tokio::time::Instant::now() + discovery_cadence;
                 }
                 Err(error) => {
                     route = None;
@@ -825,6 +878,11 @@ async fn run_connected_status_dial<C: StatusConsumer>(
             continue;
         }
 
+        let next_wake_at = if catalog_watch.is_some() {
+            next_discovery_at
+        } else {
+            next_discovery_at.min(next_watch_at)
+        };
         tokio::select! {
             maybe_request = wire_rx.recv() => {
                 let Some(request) = maybe_request else {
@@ -843,6 +901,9 @@ async fn run_connected_status_dial<C: StatusConsumer>(
                         last_route_channel = None;
                         route = None;
                         route_events = None;
+                        catalog_watch = None;
+                        catalog_generation = None;
+                        next_watch_at = tokio::time::Instant::now();
                         client.set_route_live(false);
                         next_discovery_at = tokio::time::Instant::now();
                     }
@@ -889,7 +950,24 @@ async fn run_connected_status_dial<C: StatusConsumer>(
                     next_discovery_at = tokio::time::Instant::now();
                 }
             }
-            _ = tokio::time::sleep_until(next_discovery_at) => {}
+            generation = async {
+                catalog_watch.as_mut().expect("watch guarded by select condition")
+                    .next_generation().await
+            }, if catalog_watch.is_some() => {
+                match generation {
+                    Ok(Some(generation)) => {
+                        if catalog_generation.is_none_or(|known| generation > known) {
+                            next_discovery_at = tokio::time::Instant::now();
+                        }
+                    }
+                    Ok(None) | Err(_) => {
+                        catalog_watch = None;
+                        next_watch_at = tokio::time::Instant::now() + STATUS_CADENCE;
+                        next_discovery_at = next_discovery_at.min(next_watch_at);
+                    }
+                }
+            }
+            _ = tokio::time::sleep_until(next_wake_at) => {}
         }
     }
 }
@@ -1085,6 +1163,19 @@ mod tests {
         .unwrap()
     }
 
+    #[derive(Default)]
+    struct FakeCatalogWatch {
+        available: std::sync::atomic::AtomicBool,
+        generation: AtomicU64,
+        sender: parking_lot::Mutex<Option<mpsc::Sender<u64>>>,
+    }
+
+    impl StatusCatalogWatch for mpsc::Receiver<u64> {
+        async fn next_generation(&mut self) -> Result<Option<u64>, String> {
+            Ok(self.recv().await)
+        }
+    }
+
     struct RejectingConsumer {
         attempts: Arc<parking_lot::Mutex<Vec<tokio::time::Instant>>>,
         advertises_status_line: bool,
@@ -1095,10 +1186,12 @@ mod tests {
         connection_callback: Arc<parking_lot::Mutex<Option<Box<dyn Fn(ConnectionState) + Send>>>>,
         push_sender: Arc<parking_lot::Mutex<Option<mpsc::Sender<PushEvent>>>>,
         control_sender: Arc<parking_lot::Mutex<Option<mpsc::Sender<ControlPush>>>>,
+        watch: Arc<FakeCatalogWatch>,
     }
 
     impl StatusConsumer for RejectingConsumer {
         type Route = usize;
+        type CatalogWatch = mpsc::Receiver<u64>;
 
         fn on_connection_state(&self, cb: impl Fn(ConnectionState) + Send + 'static) {
             *self.connection_callback.lock() = Some(Box::new(cb));
@@ -1113,7 +1206,7 @@ mod tests {
         async fn catalog_list(&self) -> Result<CatalogList, String> {
             self.catalog_calls.fetch_add(1, Ordering::Relaxed);
             Ok(CatalogList {
-                generation: 1,
+                generation: self.watch.generation.load(Ordering::Relaxed).max(1),
                 modules: if self.advertises_status_line {
                     vec![status_catalog_entry(
                         STATUS_HOLDER_MODULE,
@@ -1124,6 +1217,17 @@ mod tests {
                 },
                 subc_ops: Vec::new(),
             })
+        }
+
+        async fn catalog_watch(&self) -> Result<Self::CatalogWatch, String> {
+            if !self.watch.available.load(Ordering::Relaxed) {
+                return Err("catalog.watch unavailable".into());
+            }
+            let (tx, rx) = mpsc::channel(8);
+            tx.try_send(self.watch.generation.load(Ordering::Relaxed).max(1))
+                .unwrap();
+            *self.watch.sender.lock() = Some(tx);
+            Ok(rx)
         }
 
         async fn open_route(
@@ -1163,6 +1267,123 @@ mod tests {
     /// A failure the dial may retry: the holder is restarting.
     fn transient_failure() -> RouteOpenFailure {
         RouteOpenFailure::Transient("route.open refused: module_reloading".to_owned())
+    }
+
+    async fn watch_dial(
+        succeeds_on: usize,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        Arc<AtomicU64>,
+        Arc<FakeCatalogWatch>,
+        Arc<parking_lot::Mutex<Vec<tokio::time::Instant>>>,
+    ) {
+        let (client, mut wire_rx) = FleetStatusClient::dial_channel(1);
+        client.publish(Path::new("/tmp/project"), "opencode", "session", "local");
+        let request = wire_rx.try_recv().unwrap();
+        let identity = FleetRouteIdentity::from(&request);
+        request.complete_unavailable();
+        let catalog_calls = Arc::new(AtomicU64::new(0));
+        let watch = Arc::new(FakeCatalogWatch::default());
+        watch.available.store(true, Ordering::Relaxed);
+        let attempts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let consumer = RejectingConsumer {
+            attempts: attempts.clone(),
+            succeeds_on: Some(succeeds_on),
+            failure: transient_failure(),
+            advertises_status_line: true,
+            catalog_calls: catalog_calls.clone(),
+            publish_calls: Arc::default(),
+            connection_callback: Arc::default(),
+            push_sender: Arc::default(),
+            control_sender: Arc::default(),
+            watch: watch.clone(),
+        };
+        let task = tokio::spawn(run_connected_status_dial(
+            consumer, client, wire_rx, identity, None,
+        ));
+        settle_dial().await;
+        assert_eq!(catalog_calls.load(Ordering::Relaxed), 1);
+        (task, catalog_calls, watch, attempts)
+    }
+
+    async fn settle_dial() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn catalog_watch_transient_open_failure_retries_before_backstop() {
+        let (task, calls, watch, attempts) = watch_dial(2).await;
+        assert!(watch.sender.lock().is_some());
+        assert_eq!(attempts.lock().len(), 1);
+        tokio::time::advance(DISCOVERY_INITIAL_BACKOFF).await;
+        settle_dial().await;
+        assert_eq!(attempts.lock().len(), 2, "route recovered on its retry");
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        settle_dial().await;
+        assert_eq!(attempts.lock().len(), 2);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn catalog_watch_new_generation_rediscovers_without_waiting_for_a_poll() {
+        let (task, calls, watch, _) = watch_dial(1).await;
+        watch.generation.store(2, Ordering::Relaxed);
+        watch.sender.lock().as_ref().unwrap().try_send(2).unwrap();
+        settle_dial().await;
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn catalog_watch_unchanged_generation_waits_for_five_minute_backstop() {
+        let (task, calls, watch, _) = watch_dial(1).await;
+        watch.sender.lock().as_ref().unwrap().try_send(1).unwrap();
+        for _ in 0..12 {
+            tokio::time::advance(STATUS_CADENCE).await;
+            settle_dial().await;
+        }
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "no discovery in 30 seconds"
+        );
+        tokio::time::advance(CATALOG_BACKSTOP - Duration::from_secs(30)).await;
+        settle_dial().await;
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "backstop still refreshes");
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn catalog_watch_drop_falls_back_to_polling_and_recovers() {
+        let (task, calls, watch, _) = watch_dial(1).await;
+        watch.available.store(false, Ordering::Relaxed);
+        watch.sender.lock().take();
+        settle_dial().await;
+        for expected in [2, 3] {
+            tokio::time::advance(STATUS_CADENCE).await;
+            settle_dial().await;
+            assert_eq!(calls.load(Ordering::Relaxed), expected);
+        }
+        watch.available.store(true, Ordering::Relaxed);
+        tokio::time::advance(STATUS_CADENCE).await;
+        settle_dial().await;
+        assert_eq!(calls.load(Ordering::Relaxed), 4, "recovery refreshes once");
+        tokio::time::advance(Duration::from_secs(30)).await;
+        settle_dial().await;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            4,
+            "recovered feed stops fast polling"
+        );
+        watch.generation.store(3, Ordering::Relaxed);
+        watch.sender.lock().as_ref().unwrap().try_send(3).unwrap();
+        settle_dial().await;
+        assert_eq!(calls.load(Ordering::Relaxed), 5);
+        task.abort();
     }
 
     /// The terminal refusal seen live: prefrontal-core's bind check could not
@@ -1216,6 +1437,7 @@ mod tests {
             connection_callback: callback.clone(),
             push_sender: Arc::default(),
             control_sender: Arc::default(),
+            watch: Arc::default(),
         };
         let task = tokio::spawn(run_connected_status_dial(
             consumer,
@@ -1249,6 +1471,7 @@ mod tests {
             connection_callback: Arc::default(),
             push_sender: Arc::default(),
             control_sender: Arc::default(),
+            watch: Arc::default(),
         };
 
         // Closing ingress lets the real dial finish after handling the queued
@@ -1322,6 +1545,7 @@ mod tests {
             connection_callback: Arc::default(),
             push_sender: push_sender.clone(),
             control_sender: control_sender.clone(),
+            watch: Arc::default(),
         };
         let task = tokio::spawn(run_connected_status_dial(
             consumer, client, wire_rx, identity, None,
@@ -1577,6 +1801,27 @@ mod tests {
                             FrameType::Request if header.channel == 0 => {
                                 let body: Value =
                                     serde_json::from_slice(&frame.body).unwrap_or(Value::Null);
+                                if body.get("op").and_then(Value::as_str) == Some("server.describe")
+                                {
+                                    let reply = Frame::build(
+                                            FrameType::Response,
+                                            flags,
+                                            0,
+                                            0,
+                                            header.corr,
+                                            serde_json::to_vec(&json!({
+                                                "op": "server.describe", "protocol_ver": 2,
+                                                "subc_ops": [], "capabilities": [], "connected_clients": 1,
+                                            })).unwrap(),
+                                        ).unwrap();
+                                    if subc_transport::write_frame(&mut stream, &reply)
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                    continue;
+                                }
                                 if body.get("op").and_then(Value::as_str) != Some("route.open") {
                                     continue;
                                 }
