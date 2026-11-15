@@ -108,8 +108,10 @@ impl ModuleHandler for Peer {
         writeln!(file, "{}", json!({"module":self.module,"harness":binding.harness,"session":binding.session,"request":body})).unwrap();
         HandlerOutcome::Response(
             cortexkit_role_llm_runner::wire::reply_body(
-                &cortexkit_role_llm_runner::send::SendReply::new("pending")
-                    .with_submission_id("notice-1"),
+                &cortexkit_role_llm_runner::send::SendReply::new("active").with_delivered(
+                    cortexkit_role_llm_runner::send::Delivered::new("step")
+                        .with_ref(decoded.send_id),
+                ),
             )
             .unwrap(),
         )

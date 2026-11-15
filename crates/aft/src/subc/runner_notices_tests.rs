@@ -1146,6 +1146,26 @@ fn runner_notices_recovered_notice_fallback_survives_restart_observation() {
 }
 
 #[test]
+fn runner_notices_distinguishes_queued_submission_from_delivered_notice() {
+    for following in [false, true] {
+        assert!(matches!(
+            decode_reply(
+                br#"{"result":{"state":"pending","submission_id":"notice-1"}}"#,
+                following,
+            ),
+            Outcome::Pending
+        ));
+        assert!(matches!(
+            decode_reply(
+                br#"{"result":{"state":"active","delivered":{"as":"step","ref":"notice-1"}}}"#,
+                following,
+            ),
+            Outcome::Accepted
+        ));
+    }
+}
+
+#[test]
 fn runner_notices_decode_open_states_and_error_envelopes() {
     assert!(matches!(
         decode_send_reply(br#"{"result":{"state":"pending"}}"#),
@@ -1272,9 +1292,11 @@ impl FakeRunner {
         if self.lose_first_response && self.calls.len() == 1 {
             return retry(FailureClass::TestEndpoint, "response lost");
         }
-        let response = reply_body(&SendReply::new("pending").with_submission_id("send-7")).unwrap();
-        read_reply::<SendReply>(&response).unwrap();
-        Outcome::Accepted
+        let response = reply_body(&SendReply::new("active").with_delivered(
+            cortexkit_role_llm_runner::send::Delivered::new("step").with_ref("send-7"),
+        ))
+        .unwrap();
+        decode_send_reply(&response)
     }
 }
 
