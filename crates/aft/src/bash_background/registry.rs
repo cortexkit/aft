@@ -7416,20 +7416,44 @@ impl BgTaskRegistry {
                 let conn = pool
                     .lock()
                     .map_err(|_| "database_lock_poisoned".to_string())?;
-                crate::db::bash_tasks::delete_bash_task(
+                // Keep the dependency checks and delete in one write transaction:
+                // cascading foreign keys must not erase watches or view records.
+                let tx = rusqlite::Transaction::new_unchecked(
                     &conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )
+                .map_err(|error| error.to_string())?;
+                let (watches, views): (u64, u64) = tx
+                    .query_row(
+                        "SELECT
+                            (SELECT count(*) FROM bash_pattern_watches
+                             WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3),
+                            (SELECT count(*) FROM bash_view_records
+                             WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3)",
+                        rusqlite::params![harness, originating_session_id, task_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if watches != 0 || views != 0 {
+                    return Err(format!(
+                        "dependent rows retained: bash_pattern_watches={watches} bash_view_records={views}"
+                    ));
+                }
+                let removed = crate::db::bash_tasks::delete_bash_task(
+                    &tx,
                     &harness,
                     originating_session_id,
                     task_id,
                 )
-                .map(|removed| removed > 0)
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+                tx.commit().map_err(|error| error.to_string())?;
+                Ok(removed > 0)
             });
             match result {
                 Ok(retired) => retired,
                 Err(error) => {
                     crate::slog_warn!(
-                        "failed to retire already-reaped task {task_id}: error={error}"
+                        "failed to retire already-reaped task {task_id}: source=bash_tasks error={error}"
                     );
                     return false;
                 }
@@ -7440,8 +7464,8 @@ impl BgTaskRegistry {
         let _ = self.remove_pending_completion(task_id);
         self.ack_persisted_watches_for_task(originating_session_id, task_id, true);
         if retired {
-            crate::slog_warn!(
-                "orphaned completion already reaped: task_id={task_id} reason=layout_missing"
+            crate::slog_info!(
+                "orphaned completion already reaped: task_id={task_id} source=bash_tasks reason=layout_missing"
             );
         }
         true
@@ -7544,68 +7568,6 @@ impl BgTaskRegistry {
         harness: Option<&str>,
     ) -> Result<(), String> {
         self.replay_session_batch(storage_dir, session_id, project_root, false, harness)
-    }
-
-    fn remove_dangling_replay_row(&self, metadata: &PersistedTask, harness: Option<&str>) {
-        let task_id = &metadata.task_id;
-        let result = with_task_db_fence(&metadata.session_id, task_id, || {
-            let harness = metadata
-                .harness
-                .as_deref()
-                .or(harness)
-                .ok_or_else(|| "task harness unavailable".to_string())?;
-            let pool = self
-                .inner
-                .db_pool
-                .read()
-                .ok()
-                .and_then(|slot| slot.clone())
-                .ok_or_else(|| "task database unavailable".to_string())?;
-            let conn = pool
-                .lock()
-                .map_err(|_| "database lock poisoned".to_string())?;
-            // Check and delete under one write transaction: cascading foreign keys
-            // must not remove watches or view records along with the dangling row.
-            let tx = rusqlite::Transaction::new_unchecked(
-                &conn,
-                rusqlite::TransactionBehavior::Immediate,
-            )
-            .map_err(|error| error.to_string())?;
-            let (watches, views): (u64, u64) = tx
-                .query_row(
-                    "SELECT
-                        (SELECT count(*) FROM bash_pattern_watches
-                         WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3),
-                        (SELECT count(*) FROM bash_view_records
-                         WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3)",
-                    rusqlite::params![harness, metadata.session_id, task_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .map_err(|error| error.to_string())?;
-            if watches != 0 || views != 0 {
-                return Err(format!(
-                    "dependent rows retained: bash_pattern_watches={watches} bash_view_records={views}"
-                ));
-            }
-            let removed = crate::db::bash_tasks::delete_bash_task(
-                &tx,
-                harness,
-                &metadata.session_id,
-                task_id,
-            )
-            .map_err(|error| error.to_string())?;
-            tx.commit().map_err(|error| error.to_string())?;
-            Ok(removed)
-        });
-        match result {
-            Ok(removed) if removed > 0 => crate::slog_info!(
-                "removed dangling background task {task_id} during replay: source=bash_tasks reason=layout_absent"
-            ),
-            Ok(_) => {},
-            Err(error) => crate::slog_warn!(
-                "failed to remove dangling background task {task_id} during replay: source=bash_tasks error={error}"
-            ),
-        }
     }
 
     fn replay_session_batch(
@@ -7994,7 +7956,22 @@ impl BgTaskRegistry {
                     if error.kind() == std::io::ErrorKind::NotFound
                         && replay_task_layout_is_absent(&session_dir, &metadata.task_id)
                     {
-                        self.remove_dangling_replay_row(&metadata, harness);
+                        // An unfinished task's row can land before its layout.
+                        // A terminal row already records the launch's outcome.
+                        if !metadata.is_terminal()
+                            && unix_millis().saturating_sub(metadata.started_at) < 5 * 60 * 1000
+                        {
+                            crate::slog_warn!(
+                                "deferring background task {} during replay: reason=pending_initial_record",
+                                metadata.task_id
+                            );
+                            continue;
+                        }
+                        self.retire_already_reaped_orphaned_completion(
+                            &metadata.session_id,
+                            &metadata.task_id,
+                            metadata.harness.as_deref(),
+                        );
                         continue;
                     }
                     crate::slog_warn!(
@@ -29228,7 +29205,7 @@ mod tests {
             .store(true, Ordering::SeqCst);
         let task_id = "bash-0000000000000500";
         let paths = task_paths(storage, "session", task_id).unwrap();
-        let metadata = PersistedTask::starting(
+        let mut metadata = PersistedTask::starting(
             task_id.into(),
             "session".into(),
             "echo gone".into(),
@@ -29238,6 +29215,7 @@ mod tests {
             true,
             true,
         );
+        metadata.started_at = unix_millis().saturating_sub(6 * 60 * 1000);
         let row = metadata.to_bash_task_row("opencode", &paths).unwrap();
         crate::db::bash_tasks::upsert_bash_task(&db.lock().unwrap(), &row).unwrap();
         (registry, db, row)
@@ -29281,6 +29259,7 @@ mod tests {
             assert_eq!(task_logs.len(), 1, "{first_logs:?}");
             assert!(task_logs[0].starts_with("INFO "), "{first_logs:?}");
             assert!(task_logs[0].contains("source=bash_tasks"));
+            assert!(task_logs[0].contains("reaped"));
             assert_eq!(
                 replay_store_snapshot(storage.path(), &db.lock().unwrap()),
                 expected
@@ -29298,6 +29277,37 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn durability_replay_defers_a_recent_row_awaiting_its_initial_layout() {
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, db, row) = dangling_replay_fixture(storage.path());
+        let mut metadata = PersistedTask::from(row);
+        metadata.started_at = unix_millis();
+        let paths = task_paths(storage.path(), "session", &metadata.task_id).unwrap();
+        crate::db::bash_tasks::upsert_bash_task(
+            &db.lock().unwrap(),
+            &metadata.to_bash_task_row("opencode", &paths).unwrap(),
+        )
+        .unwrap();
+        let expected = replay_store_snapshot(storage.path(), &db.lock().unwrap());
+        let (_, logs) = crate::logging::capture_log_lines(|| {
+            registry.replay_session(storage.path(), "session").unwrap();
+        });
+        let task_logs = logs
+            .iter()
+            .filter(|line| line.contains(&metadata.task_id))
+            .collect::<Vec<_>>();
+        assert_eq!(task_logs.len(), 1, "{logs:?}");
+        assert!(
+            task_logs[0].contains("reason=pending_initial_record"),
+            "{logs:?}"
+        );
+        assert_eq!(
+            replay_store_snapshot(storage.path(), &db.lock().unwrap()),
+            expected
+        );
     }
 
     #[test]
@@ -29343,6 +29353,7 @@ mod tests {
         // Leave the metadata snapshot without a PID to exercise the independent
         // database liveness check, not just the replayed metadata's process check.
         row.pid = Some(i64::from(std::process::id()));
+        row.started_at = unix_millis() as i64;
         crate::db::bash_tasks::upsert_bash_task(&db.lock().unwrap(), &row).unwrap();
         let expected = replay_store_snapshot(storage.path(), &db.lock().unwrap());
         let (_, logs) = crate::logging::capture_log_lines(|| {
