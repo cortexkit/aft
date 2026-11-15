@@ -1995,8 +1995,11 @@ fn compact_write_ledger_root_ids(metrics: &mut serde_json::Map<String, Value>) {
 }
 
 fn ordinary_ready_health_root(root: &Value) -> bool {
-    root["abbreviated"] != true
-        && root["standing"] != true
+    root["abbreviated"] != true && settled_health_root(root)
+}
+
+fn settled_health_root(root: &Value) -> bool {
+    root["standing"] != true
         && !root["standing_refusal"].is_string()
         && root["cache_unavailable_reason"].is_null()
         && root["view_storage_reserve"]
@@ -2037,23 +2040,71 @@ fn ordinary_ready_health_root(root: &Value) -> bool {
 fn health_failure_evidence(value: &Value) -> bool {
     match value {
         Value::Object(fields) => fields.iter().any(|(key, value)| {
-            let failure_field = key.contains("fail")
-                || key.contains("error")
-                || key.contains("refusal")
-                || matches!(
-                    key.as_str(),
-                    "overflows_total"
-                        | "watch_lost_races_total"
-                        | "rescans_buffer_overflow_total"
-                        | "rescans_kernel_dropped_total"
-                        | "rescans_user_dropped_total"
-                        | "rescans_unknown_total"
-                );
-            (failure_field && health_nondefault(value)) || health_failure_evidence(value)
+            (health_failure_field(key) && health_nondefault(value))
+                || health_failure_evidence(value)
         }),
         Value::Array(rows) => rows.iter().any(health_failure_evidence),
         _ => false,
     }
+}
+
+fn health_failure_field(key: &str) -> bool {
+    key.contains("fail")
+        || key.contains("error")
+        || key.contains("refusal")
+        || matches!(key, "loss_unrecovered" | "watch_lost_races_total")
+}
+
+fn reduce_health_root_details(root: &mut Value) -> bool {
+    fn retain_abnormal_fields(value: &mut Value, path: &str) {
+        let Value::Object(fields) = value else { return };
+        let current_loss = fields.get("loss_unrecovered") == Some(&Value::Bool(true));
+        fields.retain(|key, value| {
+            let field_path = format!("{path}/{key}");
+            if (key == "status" && path.rfind('/') == Some(0))
+                || matches!(
+                    field_path.as_str(),
+                    "/project_root"
+                        | "/root_id"
+                        | "/state"
+                        | "/abbreviated"
+                        | "/standing"
+                        | "/standing_entry"
+                        | "/cache_unavailable_reason"
+                        | "/view_storage_reserve"
+                        | "/suspended_domains"
+                        | "/data_store/reason"
+                        | "/data_store/skipped_folders"
+                        | "/data_store/skipped_folder_note"
+                        | "/views/pinned"
+                        | "/views/callgraph_readiness_deferred"
+                )
+                || (health_failure_field(key) && health_nondefault(value))
+            {
+                return true;
+            }
+            if path == "/watcher" && current_loss {
+                if key == "overflows_total" {
+                    return true;
+                }
+                if key == "last_overflow_prefixes" {
+                    if let Some(prefixes) = value.as_array_mut() {
+                        let largest = prefixes
+                            .iter()
+                            .max_by_key(|row| row["count"].as_u64().unwrap_or(0))
+                            .cloned();
+                        *prefixes = largest.into_iter().collect();
+                    }
+                    return health_nondefault(value);
+                }
+            }
+            retain_abnormal_fields(value, &field_path);
+            value.as_object().is_some_and(|fields| !fields.is_empty())
+        });
+    }
+    let before = root.clone();
+    retain_abnormal_fields(root, "");
+    *root != before
 }
 
 fn health_nondefault(value: &Value) -> bool {
@@ -2362,6 +2413,24 @@ fn budget_health_metrics_with_limits(
                 if changed {
                     continue;
                 }
+                // Keep each abnormal identity and its failure facts before
+                // sacrificing process sections used by self-diagnosis.
+                let reduced = roots
+                    .iter_mut()
+                    .filter(|root| !settled_health_root(root))
+                    .map(|root| usize::from(reduce_health_root_details(root)))
+                    .sum::<usize>();
+                if reduced > 0 {
+                    let previous = metrics
+                        .get("root_details_reduced")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    metrics.insert(
+                        "root_details_reduced".into(),
+                        json!(previous.saturating_add(reduced as u64)),
+                    );
+                    continue;
+                }
             }
         }
         if gap_largest_ancillary_health_field(metrics, true) {
@@ -2446,6 +2515,10 @@ fn priority_health_field(field: &str, value: &Value) -> bool {
             | "embedding_backend"
             | "durable_log"
             | "dispatch_liveness"
+            // Per-site large-read counts are the production evidence for
+            // sizing search's memory budget; they are already a bounded
+            // summary, so they outrank individual root rows.
+            | "large_reads"
     ) || (field == "lsp" && value.get("applicability_totals").is_some())
 }
 
@@ -2544,6 +2617,7 @@ fn protected_health_field(field: &str) -> bool {
         || matches!(
             field,
             "roots"
+                | "root_details_reduced"
                 | "cache_roots"
                 | "cache_unavailable"
                 | "root_count"
@@ -4753,6 +4827,7 @@ fn assemble_health_report(
         "full_sync_fallbacks".to_string(),
         json!(aft_store::sync::full_sync_fallbacks()),
     );
+    metrics.insert("sync_mode".to_string(), json!(aft_store::sync::mode()));
     metrics.insert(
         "runtime".to_string(),
         json!({
@@ -5335,6 +5410,178 @@ mod tests {
         }
     }
 
+    fn recovered_overflow_health_fleet() -> serde_json::Map<String, Value> {
+        let (_, mut metrics) =
+            largest_meaning_fill_health_metrics(seventeen_active_large_read_sites());
+        let roots = (0..5).map(|index| {
+            let mut root = json!({
+                "project_root": format!("/Users/worker/.local/share/cortexkit/alfonso/worktrees/{}/{}/bg_{index:016x}", "a".repeat(64), "b".repeat(64)),
+                "state": "ready", "actor_count": 1,
+                "watcher": {
+                    "exclusion_planning": {"status": "planned", "effective_prefixes": ["node_modules/.bun"], "matcher_generation": 2},
+                    "fsevents_stream_creations_total": 5,
+                    "invalidating_events_since_last_rescan": 547, "invalidating_events_total": 4275,
+                    "last_overflow_prefixes": [{"count": 512, "prefix": "node_modules/.bun"}],
+                    "last_rescan_at_ms": 1_794_682_252_879u64, "last_rescan_cost_ms": 2,
+                    "last_rescan_rss_delta_bytes": 1_884_160, "overflows_total": 1,
+                    "paths_after_gitignore_total": 1, "paths_dispatched_total": 1,
+                    "raw_events_since_last_rescan": 547, "raw_events_total": 4295,
+                    "rescans_user_dropped_total": 1
+                },
+                "bash": {"running": 0, "pending_completions": 0}
+            });
+            for component in ["search_index", "semantic_index", "callgraph_store", "tier2"] {
+                root[component] = json!({"status": "ready", "ready_at_ms": 1_790_000_000_000u64});
+            }
+            root
+        }).collect::<Vec<_>>();
+        metrics["memory"]["roots"] = roots.iter().map(|root| {
+            (root["project_root"].as_str().unwrap().to_owned(), json!({"attributed_bytes": 9_999_999, "status": "ready", "memory_measured_age_ms": 1234}))
+        }).collect::<serde_json::Map<_, _>>().into();
+        metrics["memory"]["roots_total"] = json!(5);
+        metrics.insert(
+            "lsp".into(),
+            health_lsp_metrics(crate::lifecycle_census::LspCensus {
+                applicability_by_root: [&roots[0], &roots[1]]
+                    .into_iter()
+                    .map(|root| {
+                        (
+                            root["project_root"].as_str().unwrap().to_owned(),
+                            crate::lsp::manager::ApplicabilityMetrics {
+                                hits: 1000,
+                                misses: 10,
+                                full_walks: 10,
+                                full_walk_micros: 5000,
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+        );
+        metrics.insert("roots".into(), json!(roots));
+        metrics.insert("root_count".into(), json!(5));
+        metrics.insert("actor_count".into(), json!(5));
+        metrics.insert("healthy_roots".into(), json!(5));
+        metrics.insert("root_details_omitted".into(), json!(0));
+        metrics
+    }
+
+    #[test]
+    fn health_recovered_overflow_fleet_preserves_memory_and_lsp() {
+        let mut metrics = recovered_overflow_health_fleet();
+        for (section, range) in [("memory", 1800..2500), ("lsp", 900..1800)] {
+            let size = serde_json::to_vec(&metrics[section]).unwrap().len();
+            assert!(
+                range.contains(&size),
+                "realistic {section} section: {size} bytes"
+            );
+        }
+        assert!(metrics["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(ordinary_ready_health_root));
+        let memory = metrics["memory"].clone();
+        let lsp_totals = metrics["lsp"]["applicability_totals"].clone();
+        budget_health_metrics(&mut metrics);
+        assert!(serde_json::to_vec(&metrics).unwrap().len() <= HEALTH_METRICS_BUDGET_BYTES);
+        assert_eq!(metrics["memory"], memory);
+        assert_eq!(metrics["lsp"]["applicability_totals"], lsp_totals);
+        for field in ["memory", "lsp"] {
+            assert_ne!(metrics[field]["omitted"], true);
+            assert!(!metrics
+                .get("metrics_fields_omitted")
+                .and_then(Value::as_array)
+                .is_some_and(|omitted| omitted.iter().any(|name| name == field)));
+        }
+    }
+
+    #[test]
+    fn health_current_overflow_reduces_root_before_priority_sections() {
+        let metrics = recovered_overflow_health_fleet();
+        let mut root = metrics["roots"][0].clone();
+        root["watcher"]["loss_unrecovered"] = json!(true);
+        root["watcher"]["last_overflow_prefixes"] = json!([
+            {"count": 2, "prefix": "src"}, {"count": 512, "prefix": "node_modules/.bun"},
+            {"count": 10, "prefix": "target"}]);
+        root["watcher"]["exclusion_planning"]["detail"] = json!("p".repeat(15_000));
+        root["watcher"]["events_by_source"] = (0..150)
+            .map(|index| (format!("source_{index:03}"), json!(123_456)))
+            .collect::<serde_json::Map<_, _>>()
+            .into();
+        root["data_store"] = json!({"reason": "bind_failed", "failure": {"code": "checkout_bind_failed", "retry_after_ms": 0, "retryable": false}});
+        root["suspended_domains"] = json!(["semantic"]);
+        root["bash"]["project_replay_failures"] = json!([{"reason": "session_directory_open_failed", "error": "permission denied", "retry_after_ms": 0}]);
+        assert!(!ordinary_ready_health_root(&root));
+        let original = root.clone();
+        let memory = metrics["memory"].clone();
+        let lsp = metrics["lsp"].clone();
+        let mut metrics = json!({"roots": [root], "memory": memory, "lsp": lsp})
+            .as_object()
+            .unwrap()
+            .clone();
+        budget_health_metrics_with_limits(&mut metrics, 4500, HEALTH_REPLY_HARD_LIMIT_BYTES);
+        assert!(serde_json::to_vec(&metrics).unwrap().len() <= 4500);
+        assert_eq!(metrics["root_details_reduced"], 1);
+        assert_eq!(metrics["roots"].as_array().unwrap().len(), 1);
+        let row = &metrics["roots"][0];
+        assert_eq!(
+            row["watcher"],
+            json!({"loss_unrecovered": true, "overflows_total": 1,
+            "last_overflow_prefixes": [{"count": 512, "prefix": "node_modules/.bun"}]})
+        );
+        assert_eq!(row["data_store"], original["data_store"]);
+        assert_eq!(row["suspended_domains"], original["suspended_domains"]);
+        assert_eq!(
+            row["bash"]["project_replay_failures"],
+            original["bash"]["project_replay_failures"]
+        );
+        for component in ["search_index", "semantic_index", "callgraph_store", "tier2"] {
+            assert_eq!(row[component], json!({"status": "ready"}));
+        }
+        assert_eq!(row["state"], "ready");
+        assert!(row["project_root"]
+            .as_str()
+            .unwrap()
+            .starts_with("<blake3:"));
+        assert_eq!(metrics["memory"], memory);
+        assert_eq!(
+            metrics["lsp"]["applicability_totals"],
+            lsp["applicability_totals"]
+        );
+        assert_ne!(metrics["lsp"]["omitted"], true);
+        let once = metrics.clone();
+        budget_health_metrics_with_limits(&mut metrics, 4500, HEALTH_REPLY_HARD_LIMIT_BYTES);
+        assert_eq!(metrics, once);
+    }
+
+    #[test]
+    fn health_historical_loss_counters_do_not_mask_other_failure_evidence() {
+        let metrics = recovered_overflow_health_fleet();
+        let mut root = metrics["roots"][0].clone();
+        for key in [
+            "rescans_buffer_overflow_total",
+            "rescans_kernel_dropped_total",
+            "rescans_unknown_total",
+        ] {
+            root["watcher"][key] = json!(1);
+        }
+        assert!(ordinary_ready_health_root(&root));
+        for key in [
+            "loss_unrecovered",
+            "watch_lost_races_total",
+            "some_failure",
+            "some_error",
+            "some_refusal",
+        ] {
+            let mut abnormal = root.clone();
+            abnormal["watcher"][key] = json!(true);
+            assert!(!ordinary_ready_health_root(&abnormal), "{key}");
+        }
+    }
+
     #[test]
     fn health_live_fleet_keeps_process_sections_and_all_five_abnormal_roots() {
         let (_, mut metrics) =
@@ -5641,7 +5888,7 @@ mod tests {
 
     fn irreducible_health_failure_fleet(count: usize) -> HealthReport {
         let counters = (0..14)
-            .map(|index| (format!("nondefault_counter_{index:02}"), json!(123456)))
+            .map(|index| (format!("backend_fail_count_{index:02}"), json!(123456)))
             .collect::<serde_json::Map<_, _>>();
         HealthReport {
             status: HealthStatus::Degraded,
@@ -5650,7 +5897,7 @@ mod tests {
                 json!({"root_count": count, "healthy_roots": 0, "root_details_omitted": 0,
                 "roots": (0..count).map(|index| json!({
                     "project_root": format!("/projects/failed-{index:03}"), "state": "degraded",
-                    "semantic_index": {"status": "backend_unavailable", "reason": "backend unreachable", "counters": counters},
+                    "semantic_index": {"status": "backend_unavailable", "error": "backend unreachable!", "failures": counters},
                     "data_store": {"failure": {"code": "build_failed", "error": "x".repeat(200)}}
                 })).collect::<Vec<_>>() }),
             ),
@@ -6112,7 +6359,10 @@ mod tests {
                 "diagnostics_evidence",
                 json!({"database_open_failed": true}),
             ),
-            ("watcher", json!({"overflows_total": 1})),
+            (
+                "watcher",
+                json!({"overflows_total": 1, "loss_unrecovered": true}),
+            ),
             ("data_store", json!({"reason": "bind_failed"})),
         ] {
             let mut root = ready.clone();
@@ -9686,6 +9936,7 @@ mod tests {
             .as_u64()
             .expect("fallback count");
         assert!(fallbacks >= before);
+        assert_eq!(metrics["sync_mode"], aft_store::sync::mode());
         #[cfg(not(target_os = "macos"))]
         assert_eq!(fallbacks, 0);
     }
@@ -10479,11 +10730,9 @@ mod tests {
                 );
                 assert!(encoded.len() <= HEALTH_METRICS_BUDGET_BYTES);
                 assert_eq!(metrics["metrics_bytes"], encoded.len() as u64);
-                // Large-read telemetry yields before root detail, even when the path still needs abbreviation.
-                assert_eq!(
-                    metrics["large_reads"],
-                    json!({"omitted": true, "bytes": serde_json::to_vec(&large_reads).unwrap().len()})
-                );
+                // Large-read telemetry is a priority section: the root's path is
+                // abbreviated instead of dropping it.
+                assert_eq!(metrics["large_reads"], large_reads);
                 assert_eq!(metrics["root_details_omitted"], 0);
                 let root = &metrics["roots"][0];
                 assert_eq!(root["abbreviated"], true);
@@ -10676,10 +10925,11 @@ mod tests {
             encoded.len()
         );
         assert_eq!(metrics["actor_count"], 71);
-        // Large-read telemetry yields before any root rows; its all-site counters have separate summary tests.
+        // Large-read telemetry is a priority section: ordinary ready root rows
+        // yield before it, even with every site at its widest.
         assert_eq!(
             metrics["large_reads"],
-            json!({"omitted": true, "bytes": serde_json::to_vec(&crate::large_read::widest_health_for_test()).unwrap().len()})
+            crate::large_read::widest_health_for_test()
         );
         assert_eq!(metrics["root_count"], 71);
         assert!(metrics["embedding_backend"].is_object());

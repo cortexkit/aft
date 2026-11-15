@@ -98,6 +98,57 @@ fn staged_sources_are_cleared_at_entry_and_on_unwind() {
 }
 
 #[test]
+fn macos_full_sync_tracks_configure_and_reload_not_context_construction() {
+    const NAME: &str =
+        "config_live::tests::macos_full_sync_tracks_configure_and_reload_not_context_construction";
+    const CHILD: &str = "AFT_TEST_MACOS_FULL_SYNC_CHILD";
+    // Publications from unrelated tests must not race this process-wide policy.
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--color=never"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+            "sync policy child failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    assert!(!aft_store::sync::macos_full_sync());
+    let fixture = Fixture::new(
+        r#"{"durability":{"macos_full_sync":true},"harnesses":{"opencode":{"durability":{"macos_full_sync":false}}}}"#,
+        None,
+    );
+    assert!(aft_store::sync::macos_full_sync());
+    let _second = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+    assert!(aft_store::sync::macos_full_sync());
+    for enabled in [false, true] {
+        write(
+            &fixture.user_path,
+            &format!("{{\"durability\":{{\"macos_full_sync\":{enabled}}}}}"),
+        );
+        let outcome = fixture.reload();
+        assert!(applied(&outcome).contains(&"durability.macos_full_sync"));
+        assert_eq!(aft_store::sync::macos_full_sync(), enabled);
+        assert_eq!(
+            aft_store::sync::mode(),
+            if cfg!(target_os = "macos") && enabled {
+                "full_sync"
+            } else {
+                "fsync"
+            }
+        );
+    }
+    write(&fixture.user_path, "{}");
+    assert!(applied(&fixture.reload()).contains(&"durability.macos_full_sync"));
+    assert!(!aft_store::sync::macos_full_sync());
+}
+
+#[test]
 fn prepared_bind_watches_keep_the_captured_source() {
     const NAME: &str = "config_live::tests::prepared_bind_watches_keep_the_captured_source";
     const CHILD: &str = "AFT_TEST_PREPARED_WATCH_CHILD";

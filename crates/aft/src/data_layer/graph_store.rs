@@ -16,7 +16,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use aft_store::content::{ContentRecord, ContentSectionsBuilder, ContentSegment, RecordKey};
-use aft_store::graph::{FragmentKey, GraphSectionsBuilder, GraphSegment, TermKind};
+use aft_store::graph::{
+    FragmentKey, GraphSectionsBuilder, GraphSectionsSpill, GraphSegment, PackedFragment, TermKind,
+};
 use aft_store::ids::Digest128;
 use aft_store::segment::{KnownSection, Segment, SegmentMeta, SegmentWriter};
 
@@ -241,7 +243,7 @@ pub(crate) struct SectionsWriter<'i> {
     /// Whether `content` came with every record already in it.
     prebuilt: bool,
     content: ContentSectionsBuilder,
-    graph: GraphSectionsBuilder,
+    graph: GraphOutput,
     keys: BTreeMap<String, FragmentKey>,
     /// The file a test's build stores damaged, read from [`DAMAGED_FRAGMENT`]
     /// where the writer is made: a cold build adds fragments from the
@@ -252,7 +254,32 @@ pub(crate) struct SectionsWriter<'i> {
     legacy: bool,
 }
 
+enum GraphOutput {
+    Buffered(GraphSectionsBuilder),
+    Streamed(std::sync::Mutex<GraphSectionsSpill>),
+}
+
+impl GraphOutput {
+    fn len(&mut self) -> usize {
+        match self {
+            Self::Buffered(graph) => graph.len(),
+            Self::Streamed(graph) => graph.get_mut().expect("graph spill lock").len(),
+        }
+    }
+
+    fn retain(&mut self, keep: impl FnMut(FragmentKey) -> bool) {
+        match self {
+            Self::Buffered(graph) => graph.retain(keep),
+            Self::Streamed(graph) => graph.get_mut().expect("graph spill lock").retain(keep),
+        }
+    }
+}
+
 impl<'i> SectionsWriter<'i> {
+    #[cfg(test)]
+    pub(super) fn keys_for_test(&self) -> &BTreeMap<String, FragmentKey> {
+        &self.keys
+    }
     /// A writer for the files of a checkout in `state`, taking their content
     /// records from `records`, or from `encoded` when given (see
     /// [`write_sections`]).
@@ -284,13 +311,29 @@ impl<'i> SectionsWriter<'i> {
             all_records,
             prebuilt,
             content,
-            graph: GraphSectionsBuilder::new(),
+            graph: GraphOutput::Buffered(GraphSectionsBuilder::new()),
             keys: BTreeMap::new(),
             #[cfg(test)]
             damaged: DAMAGED_FRAGMENT.with(|damaged| damaged.borrow().clone()),
             #[cfg(test)]
             legacy: LEGACY_FRAGMENTS.with(std::cell::Cell::get),
         }
+    }
+
+    /// Cold builds append packed output while each resolver thread owns it.
+    pub(crate) fn stream(&mut self, spill: GraphSectionsSpill) {
+        self.graph = GraphOutput::Streamed(std::sync::Mutex::new(spill));
+    }
+
+    pub(crate) fn prepare_finish(&self) -> Result<(), String> {
+        if let GraphOutput::Streamed(spill) = &self.graph {
+            spill
+                .lock()
+                .expect("graph spill lock")
+                .prepare_finish()
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     /// Adds `file`'s record and fragment, reading its parse and the
@@ -388,12 +431,31 @@ impl<'i> SectionsWriter<'i> {
         fact_subjects.sort_unstable();
         fact_subjects.dedup();
         let fragment = fragment_key(&key, file, &bytes, &fact_subjects);
-        Ok(BuiltFragment {
+        let mut built = BuiltFragment {
             fragment,
             bytes,
             slice: slice.encode(),
             terms,
-        })
+        };
+        if let GraphOutput::Streamed(spill) = &self.graph {
+            let packed = PackedFragment::new(
+                &built.bytes,
+                &built.slice,
+                built
+                    .terms
+                    .iter()
+                    .map(|(kind, term)| (*kind, term.as_slice())),
+            );
+            built.bytes = Vec::new();
+            built.slice = Vec::new();
+            built.terms = Vec::new();
+            spill
+                .lock()
+                .expect("graph spill lock")
+                .add(fragment, packed)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(built)
     }
 
     /// Adds `file`'s content record, when the writer takes records one at a
@@ -418,15 +480,17 @@ impl<'i> SectionsWriter<'i> {
             None => {}
         }
         self.keys.insert(file.clone(), built.fragment);
-        self.graph.add_with_slice(
-            built.fragment,
-            built.bytes,
-            built.slice,
-            built
-                .terms
-                .iter()
-                .map(|(kind, term)| (*kind, term.as_slice())),
-        );
+        if let GraphOutput::Buffered(graph) = &mut self.graph {
+            graph.add_with_slice(
+                built.fragment,
+                built.bytes,
+                built.slice,
+                built
+                    .terms
+                    .iter()
+                    .map(|(kind, term)| (*kind, term.as_slice())),
+            );
+        }
         Ok(())
     }
 
@@ -453,7 +517,7 @@ impl<'i> SectionsWriter<'i> {
     ///
     /// When the sections cannot be written.
     pub(crate) fn finish(
-        self,
+        mut self,
         writer: &mut SegmentWriter,
         memory: Option<&mut Vec<(String, usize)>>,
     ) -> Result<BTreeMap<String, FragmentKey>, String> {
@@ -466,15 +530,24 @@ impl<'i> SectionsWriter<'i> {
             ));
             memory.push((
                 "write.graph_builder".to_string(),
-                self.graph.heap_bytes(&mut seen),
+                match &mut self.graph {
+                    GraphOutput::Buffered(graph) => graph.heap_bytes(&mut seen),
+                    GraphOutput::Streamed(graph) => {
+                        graph.get_mut().expect("graph spill lock").held_bytes()
+                    }
+                },
             ));
         }
         self.content
             .write(writer)
             .map_err(|error| error.to_string())?;
-        self.graph
-            .write(writer)
-            .map_err(|error| error.to_string())?;
+        match self.graph {
+            GraphOutput::Buffered(graph) => graph.write(writer),
+            GraphOutput::Streamed(graph) => {
+                graph.into_inner().expect("graph spill lock").write(writer)
+            }
+        }
+        .map_err(|error| error.to_string())?;
         Ok(self.keys)
     }
 }

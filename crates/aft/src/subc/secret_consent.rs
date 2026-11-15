@@ -354,6 +354,32 @@ impl SubcSecretConsent {
         let outcome = match response {
             Ok(record) => {
                 let outcome = decode_secret_record(&record, &request.request_id);
+                if matches!(
+                    outcome,
+                    ConsentOutcome::Indeterminate | ConsentOutcome::Unavailable { .. }
+                ) {
+                    let code = if record["state"].as_str() == Some("answered") {
+                        let answer = &record["secret_use_answer"];
+                        answer["items"]
+                            .as_array()
+                            .and_then(|items| {
+                                items
+                                    .iter()
+                                    .find(|item| {
+                                        item["request_id"].as_str() == Some(&request.request_id)
+                                    })
+                                    .and_then(|item| item["decision"].as_str())
+                            })
+                            .or_else(|| answer["decision"].as_str())
+                    } else {
+                        record["state"].as_str()
+                    };
+                    crate::secret::consent::record_outcome_code(
+                        &request.scope,
+                        &request.request_id,
+                        code.unwrap_or(""),
+                    );
+                }
                 if outcome == ConsentOutcome::Indeterminate && !card.warned_unreadable {
                     card.warned_unreadable = true;
                     // Peer decision text is untrusted and can contain a key.

@@ -157,6 +157,139 @@ fn family() -> FamilyId {
     FamilyId::from_digest(Digest128::of(b"publication tests"))
 }
 
+#[test]
+fn streamed_fixture_segment_equals_buffered_including_shared_fragments() {
+    use super::graph_store::SectionsWriter;
+    use aft_store::family::Family;
+    use aft_store::graph::{GraphSectionsSpill, GraphSegment};
+    use aft_store::segment::SegmentWriter;
+    use aft_store::spill::{Config, WriteGuard};
+
+    let fixture = checkout(
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = 'fixture'\nversion = '0.1.0'\nedition = '2021'\n",
+            ),
+            (
+                "src/lib.rs",
+                "mod helper; pub fn entry() { helper::target(); }",
+            ),
+            ("src/helper.rs", "pub fn target() {} pub fn unused() {}"),
+            ("package.json", "{\"type\":\"module\"}"),
+            ("a.ts", "export class Service { run() {} }"),
+            (
+                "b.ts",
+                "import { Service } from './a'; export function entry() { new Service().run(); }",
+            ),
+        ],
+        &[],
+    );
+    let resolved = resolve_checkout(&fixture.inputs, 2).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let family_store = Family::open(&dir.path().join("store"), family()).unwrap();
+    for (shared, threads, budget) in [
+        (false, 1, 16 * 1024),
+        (true, 1, 16 * 1024),
+        (false, 2, 1 << 20),
+        (true, 2, 1 << 20),
+    ] {
+        let mut buffered = SectionsWriter::new(&fixture.inputs.state, &fixture.records, true, None);
+        let mut streamed = SectionsWriter::new(&fixture.inputs.state, &fixture.records, true, None);
+        let workspace: Box<dyn aft_store::graph::Scratch> = Box::new(
+            aft_store::graph::LocalScratch::create(family_store.dir(), "fixture").unwrap(),
+        );
+        let scratch = workspace.path().to_path_buf();
+        let mut config = Config::new(budget);
+        config.buffer_bytes = 128;
+        config.fan_in = 2;
+        streamed.stream(
+            GraphSectionsSpill::new(workspace, config, WriteGuard::new(|| Ok(()))).unwrap(),
+        );
+        for (file, resolution) in &resolved {
+            buffered.add(&fixture.inputs, file, resolution).unwrap();
+        }
+        streamed
+            .add_batch(
+                &fixture.inputs,
+                resolve_checkout(&fixture.inputs, threads)
+                    .unwrap()
+                    .iter()
+                    .map(|(file, resolution)| (file.clone(), resolution.clone()))
+                    .rev()
+                    .collect(),
+            )
+            .unwrap();
+        if shared {
+            let fragment = buffered.keys_for_test()["src/helper.rs"];
+            assert_eq!(buffered.leave_out(|_| false, |key| key == fragment), (0, 1));
+            assert_eq!(streamed.leave_out(|_| false, |key| key == fragment), (0, 1));
+        }
+        let mut segments = Vec::new();
+        let mut maps = Vec::new();
+        for (index, sections) in [buffered, streamed].into_iter().enumerate() {
+            let path = dir.path().join(format!("{shared}-{threads}-{index}.seg"));
+            let mut writer = SegmentWriter::create(
+                &path,
+                SegmentMeta {
+                    family: family(),
+                    segment: SegmentId::new(1),
+                    incarnation: WriterIncarnation::new(1),
+                    created_unix_ms: 0,
+                },
+            )
+            .unwrap();
+            maps.push(sections.finish(&mut writer, None).unwrap());
+            writer.finish().unwrap();
+            segments.push(
+                Segment::open(
+                    &path,
+                    family(),
+                    &known_sections(),
+                    Arc::new(BlockCache::new(8 << 20)),
+                )
+                .unwrap(),
+            );
+        }
+        assert_eq!(
+            maps[0], maps[1],
+            "even omitted fragments keep their checkout keys"
+        );
+        assert!(!scratch.exists());
+        assert_eq!(
+            std::fs::read(segments[0].path()).unwrap(),
+            std::fs::read(segments[1].path()).unwrap()
+        );
+        for (section, info) in segments[0].sections() {
+            let other = segments[1].section(info.id).unwrap();
+            assert_eq!(
+                segments[0].read_range(section, 0..info.len).unwrap(),
+                segments[1].read_range(other, 0..info.len).unwrap(),
+                "{:?}",
+                info.id
+            );
+        }
+        let graphs = segments
+            .iter()
+            .map(|segment| GraphSegment::open(segment).unwrap().unwrap())
+            .collect::<Vec<_>>();
+        for ordinal in 0..graphs[0].len() {
+            assert_eq!(
+                graphs[0].key(ordinal).unwrap(),
+                graphs[1].key(ordinal).unwrap()
+            );
+            assert_eq!(
+                graphs[0].fragment(ordinal).unwrap(),
+                graphs[1].fragment(ordinal).unwrap()
+            );
+            assert_eq!(
+                graphs[0].slice(ordinal).unwrap(),
+                graphs[1].slice(ordinal).unwrap()
+            );
+        }
+    }
+}
+
 /// Writes `fixture`'s cold resolution as segment `id` under `dir`, as a
 /// build publishes it.
 fn write(fixture: &Fixture, dir: &Path, id: u64) -> (Arc<Segment>, Fragments) {

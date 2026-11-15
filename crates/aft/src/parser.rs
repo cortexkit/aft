@@ -1188,6 +1188,11 @@ struct HeaderParseCache {
 static HEADER_PARSE_CACHE: LazyLock<Mutex<HeaderParseCache>> =
     LazyLock::new(|| Mutex::new(HeaderParseCache::default()));
 
+#[cfg(test)]
+thread_local! {
+    static HEADER_PARSE_ON_MISS: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
 /// Reuse a resolved header tree in path-free extraction without changing the
 /// caller's already-resolved language.
 pub(crate) fn cached_header_tree(source: &str, lang: LangId) -> Option<Tree> {
@@ -1212,22 +1217,53 @@ pub(crate) fn parse_resolved_source(
         return parse_source_with_parser(path, source, lang).map(|tree| (tree, lang));
     }
     let hash = cache_freshness::hash_bytes(source.as_bytes());
-    let mut cache = HEADER_PARSE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(parsed) = cache.entries.get(&hash) {
+    if let Some(parsed) = HEADER_PARSE_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entries
+        .get(&hash)
+    {
         return Ok(parsed.clone());
     }
+
+    #[cfg(test)]
+    HEADER_PARSE_ON_MISS.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
 
     let c_tree = parse_source_with_parser(path, source, LangId::C)?;
     let mut resolved = (c_tree.clone(), LangId::C);
     if c_tree.root_node().has_error() {
         for candidate in [LangId::Cpp, LangId::ObjC] {
-            let tree = parse_source_with_parser(path, source, candidate)?;
+            let Some(tree) = parse_source_with_parser_deadline(
+                path,
+                source,
+                candidate,
+                Some(HEADER_FALLBACK_PARSE_DEADLINE),
+            )?
+            else {
+                continue;
+            };
             // has_error includes both ERROR nodes and inserted MISSING nodes.
             if !tree.root_node().has_error() {
                 resolved = (tree, candidate);
                 break;
             }
         }
+    }
+    // Parsing must not serialize unrelated headers behind this cache lock.
+    // Racing misses may both parse; return the first inserted verdict to both
+    // callers, including when one of their fallback attempts was cancelled.
+    // Wall deadlines are load-sensitive: a near-budget clean alternative could
+    // finish in only one racing thread. The 1,900 ms budget leaves over 10x Zig's
+    // measured 189.362 ms 99.9th-percentile Objective-C header parse time as a
+    // margin (see the deadline constant below). Returning the stored verdict
+    // keeps callers consistent at that boundary.
+    let mut cache = HEADER_PARSE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(parsed) = cache.entries.get(&hash) {
+        return Ok(parsed.clone());
     }
     // Bound retained trees independently of the number of FileParser instances.
     if cache.entries.len() == 128 {
@@ -1241,6 +1277,27 @@ pub(crate) fn parse_resolved_source(
 }
 
 fn parse_source_with_parser(path: &Path, source: &str, lang: LangId) -> Result<Tree, AftError> {
+    parse_source_with_parser_deadline(path, source, lang, None)?.ok_or_else(|| {
+        AftError::ParseError {
+            message: format!("tree-sitter parse returned None for {}", path.display()),
+        }
+    })
+}
+
+// Optimized native parses on 8 Linux CPUs: 11,492 Zig and 10,733 Linux headers.
+// C++/Objective-C 99.9th-percentile parse times were 163.527/189.362 ms (Zig),
+// 13.268/16.352 ms (Linux). Take 10x the largest, rounded up to 50 ms, with a 250 ms
+// floor: 1,900 ms. Three errorful attempts on two Zig headers were cut; no
+// selected trees changed. This is cooperative cancellation, not a memory cap
+// or a bound on one native lexer/scanner call between progress callbacks.
+const HEADER_FALLBACK_PARSE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1900);
+
+fn parse_source_with_parser_deadline(
+    path: &Path,
+    source: &str,
+    lang: LangId,
+    deadline: Option<std::time::Duration>,
+) -> Result<Option<Tree>, AftError> {
     if markdown_too_deep_to_parse(lang, source) {
         return Err(AftError::ParseError {
             message: format!("{}: {MARKDOWN_TOO_DEEP}", path.display()),
@@ -1264,8 +1321,36 @@ fn parse_source_with_parser(path: &Path, source: &str, lang: LangId) -> Result<T
         };
         #[cfg(test)]
         parser.note_parse();
-        let result = parse_with_parser(&mut parser, path, source, lang, None);
-        if result.is_ok() {
+        let result = if let Some(deadline) = deadline {
+            let start = std::time::Instant::now();
+            let mut expired = false;
+            let mut progress = |_: &tree_sitter::ParseState| {
+                if start.elapsed() >= deadline {
+                    expired = true;
+                    std::ops::ControlFlow::Break(())
+                } else {
+                    std::ops::ControlFlow::Continue(())
+                }
+            };
+            let bytes = source.as_bytes();
+            let tree = parser.parse_with_options(
+                &mut |offset, _| bytes.get(offset..).unwrap_or_default(),
+                None,
+                Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
+            );
+            // A cancelled parser retains partial native state. Discard it rather
+            // than resuming that state on the next unrelated header.
+            if expired {
+                Ok(None)
+            } else {
+                tree.map(Some).ok_or_else(|| AftError::ParseError {
+                    message: format!("tree-sitter parse returned None for {}", path.display()),
+                })
+            }
+        } else {
+            parse_with_parser(&mut parser, path, source, lang, None).map(Some)
+        };
+        if matches!(result, Ok(Some(_))) {
             parsers.insert(lang, parser);
         }
         result
@@ -10001,6 +10086,107 @@ mod tests {
         parser.set_language(&grammar).unwrap();
         let tree = parser.parse(source, None).unwrap();
         extract_symbols_from_tree(source, &tree, lang).unwrap()
+    }
+
+    #[test]
+    fn h_header_pathological_objc_fallback_keeps_original_c_tree() {
+        let source = include_str!("../tests/fixtures/header-fallback/is_valid.h");
+        let path = Path::new("is_valid.h");
+        let c_tree = parse_source_with_parser(path, source, LangId::C).unwrap();
+        assert!(c_tree.root_node().has_error());
+        let start = std::time::Instant::now();
+        let (tree, language) = parse_resolved_source(path, source, LangId::C).unwrap();
+        assert_eq!(language, LangId::C);
+        assert_eq!(tree.root_node().to_sexp(), c_tree.root_node().to_sexp());
+        assert!(
+            start.elapsed()
+                < HEADER_FALLBACK_PARSE_DEADLINE * 2 + std::time::Duration::from_secs(5)
+        );
+        REUSABLE_PARSERS.with(|parsers| {
+            assert!(!parsers.borrow().contains_key(&LangId::ObjC));
+        });
+        let chunks = crate::semantic_index::chunk_view_file(
+            Path::new("."),
+            path,
+            source.as_bytes(),
+            crate::semantic_index::EmbedTextCaps::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(chunks.len(), 2);
+        // A fresh parser must still accept a normal Objective-C header after
+        // cancellation, rather than resuming the pathological header's state.
+        let ordinary = "@interface AfterCancellation\n- (void)run;\n@end\n";
+        let (tree, language) =
+            parse_resolved_source(Path::new("ordinary.h"), ordinary, LangId::C).unwrap();
+        assert_eq!(language, LangId::ObjC);
+        assert!(!tree.root_node().has_error());
+    }
+
+    #[test]
+    fn h_header_cancelled_fallback_discards_partial_parser() {
+        let source = "@interface Cancelled\n- (void)run;\n@end\n".repeat(1000);
+        for language in [LangId::Cpp, LangId::ObjC] {
+            let result = parse_source_with_parser_deadline(
+                Path::new("cancelled.h"),
+                &source,
+                language,
+                Some(std::time::Duration::ZERO),
+            )
+            .unwrap();
+            assert!(result.is_none());
+            REUSABLE_PARSERS.with(|parsers| {
+                assert!(!parsers.borrow().contains_key(&language));
+            });
+        }
+    }
+
+    #[test]
+    fn h_header_concurrent_resolution_agrees() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = Arc::new(format!(
+            "// {}\n@interface ConcurrentHeader\n- (void)run;\n@end\n",
+            temp.path().display()
+        ));
+        let (ready, started) = std::sync::mpsc::channel();
+        let mut releases = Vec::new();
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let source = source.clone();
+                let ready = ready.clone();
+                let (release, wait) = std::sync::mpsc::channel();
+                releases.push(release);
+                std::thread::spawn(move || {
+                    HEADER_PARSE_ON_MISS.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move || {
+                            ready.send(()).unwrap();
+                            wait.recv_timeout(std::time::Duration::from_secs(10))
+                                .unwrap();
+                        }));
+                    });
+                    let (tree, language) =
+                        parse_resolved_source(Path::new("concurrent.h"), &source, LangId::C)
+                            .unwrap();
+                    assert!(!tree.root_node().has_error());
+                    (tree.root_node().to_sexp(), language)
+                })
+            })
+            .collect();
+        // Both cold misses must reach this rendezvous before either parses. A
+        // retained cache lock would prevent the second worker from getting here.
+        let unlocked: Vec<_> = (0..2)
+            .map(|_| started.recv_timeout(std::time::Duration::from_secs(5)))
+            .collect();
+        for release in releases {
+            let _ = release.send(());
+        }
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert!(unlocked.into_iter().all(|result| result == Ok(())));
+        assert_eq!(results[0], results[1]);
+        assert_eq!(results[0].1, LangId::ObjC);
     }
 
     #[test]

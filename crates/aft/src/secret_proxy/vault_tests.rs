@@ -398,6 +398,121 @@ async fn live_vault_release_injects_only_the_deposit_location_and_every_use_is_a
     assert_eq!(phone.phone.state.lock().unwrap().requests.len(), 1);
 }
 
+async fn approval_log_case(
+    answer: ConsentOutcome,
+    raw_code: Option<&str>,
+    expected_reason: &str,
+    expected_body: &str,
+    expected_code: Option<&str>,
+) {
+    let daemon = FakeClaustrum::start();
+    daemon.state.lock().unwrap().record = Some(record("authorization_bearer"));
+    let phone = PhoneGuard::install();
+    let server = Server::new("echo-request").await;
+    let proxy = SecretProxy::start_with_tls(
+        live_config(&daemon, server.address.port(), Clock::new()),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    let worker = request_in_thread(client, false);
+    let card = phone.phone.card(1).await;
+    if let Some(code) = raw_code {
+        crate::secret::consent::record_outcome_code(&card.scope, &card.request_id, code);
+    }
+    phone.phone.decide(&daemon, 1, answer);
+    let (reply, _client) = worker.join().unwrap();
+    assert_eq!(reply["status"], 403);
+    assert_eq!(reply["body"], expected_body);
+    let lines = proxy.state.test_refusals.lock();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let line = &lines[0];
+    assert!(
+        line.contains(&format!("reason={expected_reason} ")),
+        "{line}"
+    );
+    assert!(line.contains("label=\"test\" host=\"localhost\""), "{line}");
+    let outcome = match expected_reason {
+        "approval_declined" => "declined",
+        "approval_expired" => "expired",
+        "approval_withdrawn" => "withdrawn",
+        _ => "not_granted",
+    };
+    assert!(line.contains(&format!("outcome={outcome}")), "{line}");
+    assert!(
+        line.contains(&format!("request_id={:?}", card.request_id)),
+        "{line}"
+    );
+    if let Some(code) = expected_code {
+        assert!(line.contains(&format!("code={code}")), "{line}");
+    }
+    if expected_code == Some("unlisted") {
+        assert!(!line.contains(raw_code.unwrap()), "{line}");
+    }
+    assert!(!line.contains(std::str::from_utf8(K1).unwrap()), "{line}");
+    assert_eq!(line.lines().count(), 1);
+    assert!(server.seen.lock().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_log_declined() {
+    approval_log_case(
+        ConsentOutcome::Declined,
+        None,
+        "approval_declined",
+        "secret test: approval was declined for localhost; the request was not sent",
+        None,
+    )
+    .await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_log_expired() {
+    approval_log_case(
+        ConsentOutcome::Expired,
+        None,
+        "approval_expired",
+        "secret test: approval expired for localhost; the request was not sent",
+        None,
+    )
+    .await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_log_withdrawn() {
+    approval_log_case(
+        ConsentOutcome::Cancelled,
+        None,
+        "approval_withdrawn",
+        "secret test: the request for localhost was cancelled; the request was not sent",
+        None,
+    )
+    .await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_log_unknown_allowlisted() {
+    approval_log_case(
+        ConsentOutcome::Indeterminate,
+        Some("transient"),
+        "approval_not_granted",
+        "Secret proxy refused the request: test (localhost)\n",
+        Some("transient"),
+    )
+    .await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_log_unknown_secret_shaped() {
+    let secret_code = "secret-shaped-outcome-must-not-be-logged";
+    approval_log_case(
+        ConsentOutcome::Indeterminate,
+        Some(secret_code),
+        "approval_not_granted",
+        "Secret proxy refused the request: test (localhost)\n",
+        Some("unlisted"),
+    )
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_vault_decline_and_expiry_answer_403_without_sending_or_retrying() {
     for (decision, expected) in [
@@ -471,7 +586,7 @@ async fn live_vault_injected_ten_minute_deadline_answers_403_locally() {
     proxy.arm_command(client.process.id()).unwrap();
     client.connect(false);
     let worker = request_in_thread(client, false);
-    phone.phone.card(1).await;
+    let card = phone.phone.card(1).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert!(
         !worker.is_finished(),
@@ -493,6 +608,10 @@ async fn live_vault_injected_ten_minute_deadline_answers_403_locally() {
     );
     assert!(server.seen.lock().is_empty());
     assert!(proxy.approval_status().is_empty());
+    let lines = proxy.state.test_refusals.lock();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("reason=approval_pending_at_deadline"));
+    assert!(lines[0].contains(&format!("request_id={:?}", card.request_id)));
     phone.phone.close();
 }
 
@@ -849,6 +968,55 @@ async fn cancelling_one_waiter_keeps_the_pending_card_and_a_retry_joins_until_th
     let _ = retry.await;
     condition(|| phone.phone.state.lock().unwrap().withdrawn.len() == 1).await;
     assert!(secrets.status().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_log_concurrent_decline_and_deadline_have_distinct_ids() {
+    let daemon = FakeClaustrum::start();
+    let mut second = record("header:x-second");
+    second.name = "second".into();
+    second.key = K2.to_vec();
+    daemon.state.lock().unwrap().records = vec![record("authorization_bearer"), second];
+    let phone = PhoneGuard::install();
+    let clock = Clock::new();
+    let server = Server::new("echo-request").await;
+    let proxy_one = SecretProxy::start_with_tls(
+        live_config(&daemon, server.address.port(), clock.clone()),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut cfg = live_config(&daemon, server.address.port(), clock.clone());
+    cfg.scanned_labels = vec!["second".into()];
+    let proxy_two = SecretProxy::start_with_tls(cfg, server.client_tls.clone()).unwrap();
+    let mut one = Client::spawn(&proxy_one, &server);
+    let mut two = Client::spawn(&proxy_two, &server);
+    proxy_one.arm_command(one.process.id()).unwrap();
+    proxy_two.arm_command(two.process.id()).unwrap();
+    one.connect(false);
+    two.connect(false);
+    let first = request_in_thread(one, false);
+    let second = std::thread::spawn(move || {
+        two.request("/approved", json!({"x-second":"{{ck-secret:second}}"}), "")
+    });
+    phone.phone.card(2).await;
+    let cards = phone.phone.state.lock().unwrap().requests.clone();
+    let first_card = cards.iter().find(|card| card.label == "test").unwrap();
+    let second_card = cards.iter().find(|card| card.label == "second").unwrap();
+    let index = cards.iter().position(|card| card.label == "test").unwrap() + 1;
+    phone.phone.decide(&daemon, index, ConsentOutcome::Declined);
+    let (reply, _one) = first.join().unwrap();
+    assert_eq!(reply["status"], 403);
+    clock.advance(600_000);
+    let reply = second.join().unwrap();
+    assert_eq!(reply["status"], 403);
+    let first_lines = proxy_one.state.test_refusals.lock();
+    let second_lines = proxy_two.state.test_refusals.lock();
+    assert_eq!(first_lines.len(), 1, "{first_lines:?}");
+    assert_eq!(second_lines.len(), 1, "{second_lines:?}");
+    assert!(first_lines[0].contains("reason=approval_declined"));
+    assert!(first_lines[0].contains(&format!("request_id={:?}", first_card.request_id)));
+    assert!(second_lines[0].contains("reason=approval_pending_at_deadline"));
+    assert!(second_lines[0].contains(&format!("request_id={:?}", second_card.request_id)));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

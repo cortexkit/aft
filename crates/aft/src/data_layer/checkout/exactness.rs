@@ -1,0 +1,554 @@
+//! Offline exactness gates. Compiled only with `test-hooks`, never into a
+//! production build. Artifacts retain stored bytes, not a re-resolution of
+//! the source, so a candidate cannot erase a bad recording by recomputing it.
+
+use super::*;
+use std::io::{Read, Seek, SeekFrom, Write};
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+type GateResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+#[derive(Serialize, Deserialize)]
+struct FileEntry {
+    path: String,
+    record: String,
+    fragment: Option<String>,
+    offset: u64,
+    len: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct QuerySpec {
+    op: String,
+    file: String,
+    symbol: String,
+    stratum: String,
+    to_file: Option<String>,
+    to_symbol: Option<String>,
+    expression: Option<String>,
+    positive: bool,
+}
+
+/// Negative control: change a real method-call target before the cold
+/// builder hands the resolution to its publication writer. An explicit
+/// path keeps this independent of parallel scheduling.
+pub(crate) fn flip_site_for_control(path: &str, file: &mut FileResolution) {
+    if std::env::var("AFT_EXACTNESS_FLIP_SITE").ok().as_deref() != Some(path) {
+        return;
+    }
+    for site in &mut file.sites {
+        if let Some(mut target) = site.resolution.targets.pop_first() {
+            target.symbol.push_str("__exactness_broken");
+            site.resolution.targets.insert(target);
+            eprintln!("EXACTNESS CONTROL flipped site target in {path}");
+            return;
+        }
+    }
+    panic!("EXACTNESS CONTROL found no site target in {path}");
+}
+
+fn save(path: &Path, value: &impl Serialize) -> GateResult<()> {
+    std::fs::write(path, serde_json::to_vec(value)?)?;
+    Ok(())
+}
+
+fn checked_failures(view: &CheckoutView) -> GateResult<()> {
+    let failures = view.callgraph_failures();
+    if !failures.is_empty() {
+        return Err(format!("StoredSlices::failures(): {failures:?}").into());
+    }
+    Ok(())
+}
+
+fn export(checkout: &Checkout, out: &Path, reference: Option<&Path>) -> GateResult<usize> {
+    std::fs::create_dir_all(out.join("sections"))?;
+    let view = checkout.view().ok_or("no published view")?;
+    let published = &view.published;
+    if !published.graph_built {
+        return Err("publication has no call graph".into());
+    }
+    let expected: Option<Vec<FileEntry>> = reference
+        .map(|dir| -> GateResult<_> {
+            Ok(serde_json::from_slice(&std::fs::read(
+                dir.join("files.json"),
+            )?)?)
+        })
+        .transpose()?;
+    let mut expected_blob = reference
+        .map(|dir| std::fs::File::open(dir.join("resolutions.bin")))
+        .transpose()?;
+    let expected = expected.map(|files| {
+        files
+            .into_iter()
+            .map(|file| (file.path.clone(), file))
+            .collect::<BTreeMap<_, _>>()
+    });
+    let mut blob = std::fs::File::create(out.join("resolutions.bin"))?;
+    let mut files = Vec::new();
+    let mut count = 0;
+    let mut offset = 0;
+    for (index, record) in published.state.paths().iter().enumerate() {
+        let path = std::str::from_utf8(&record.path)?.to_string();
+        let key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION)
+            .digest()
+            .to_string();
+        let fragment = published.state.fragment(index);
+        let mut bytes = Vec::new();
+        if fragment.is_some() {
+            let resolution = published
+                .graph
+                .resolution_of(&path)
+                .ok_or_else(|| format!("{path}: missing stored resolution"))?;
+            bytes = super::super::fragment::encode(&resolution);
+            if let (Some(expected), Some(blob)) = (&expected, &mut expected_blob) {
+                let file = expected
+                    .get(&path)
+                    .ok_or_else(|| format!("{path}: absent from reference"))?;
+                blob.seek(SeekFrom::Start(file.offset))?;
+                let mut encoded = vec![0; usize::try_from(file.len)?];
+                blob.read_exact(&mut encoded)?;
+                let theirs = super::super::fragment::decode(&file.record, &path, &encoded)?;
+                if resolution != theirs {
+                    return Err(format!("{path}: full FileResolution differs (rows, sites/protected sets/order/provenance, binding, dispatch or site_dependencies)").into());
+                }
+            }
+            count += 1;
+        }
+        blob.write_all(&bytes)?;
+        files.push(FileEntry {
+            path,
+            record: key,
+            fragment: fragment.map(|key| key.to_string()),
+            offset,
+            len: bytes.len() as u64,
+        });
+        offset += bytes.len() as u64;
+    }
+    if count == 0 {
+        return Err("compared zero FileResolutions".into());
+    }
+    if let Some(expected) = &expected {
+        let paths = files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<BTreeSet<_>>();
+        if paths != expected.keys().map(String::as_str).collect() {
+            return Err("publication path set differs from reference".into());
+        }
+    }
+    save(&out.join("files.json"), &files)?;
+    // Cold and folded publications have one active graph/content segment.
+    // Match by section identity, not physical offset or section-table order.
+    let mut sections = BTreeMap::new();
+    for segment in &published.segments {
+        for (handle, info) in segment.sections() {
+            let kind = info.id.kind.get();
+            if !(0x0200..=0x0306).contains(&kind) {
+                continue;
+            }
+            let name = format!("{kind:04x}-{:04x}.bin", info.id.key_space.get());
+            if sections.contains_key(&name) {
+                return Err(format!("duplicate active section {name}; fold first").into());
+            }
+            let mut file = std::fs::File::create(out.join("sections").join(&name))?;
+            let mut position = 0;
+            while position < info.len {
+                let len = usize::try_from((info.len - position).min(1 << 20))?;
+                let mut bytes = vec![0; len];
+                segment.read(handle, position, &mut bytes)?;
+                file.write_all(&bytes)?;
+                position += len as u64;
+            }
+            sections.insert(
+                name,
+                json!({"version": info.version, "items": info.item_count, "bytes": info.len}),
+            );
+        }
+    }
+    save(&out.join("sections.json"), &sections)?;
+    checked_failures(&view)?;
+    save(
+        &out.join("health.json"),
+        &json!({"stored_slices_failures": [], "full_resolutions": count}),
+    )?;
+    Ok(count)
+}
+
+fn query_plan(view: &CheckoutView, sample: usize) -> GateResult<Vec<QuerySpec>> {
+    let mut symbols = BTreeSet::new();
+    let mut incoming = BTreeMap::<(String, String), usize>::new();
+    let mut outgoing = BTreeMap::new();
+    for record in view.published.state.paths() {
+        let path = std::str::from_utf8(&record.path)?;
+        let Some(slice) = view.graph.slice(path) else {
+            continue;
+        };
+        for node in slice.nodes() {
+            symbols.insert((path.to_string(), node.scoped_name().to_string()));
+        }
+        for edge in slice.edges() {
+            let target = (
+                edge.target_file().to_string(),
+                edge.target_symbol().to_string(),
+            );
+            *incoming.entry(target.clone()).or_default() += 1;
+            let Some(caller) = slice.node(edge.source()) else {
+                continue;
+            };
+            let origin = (path.to_string(), caller.scoped_name().to_string());
+            outgoing.entry(origin).or_insert(target);
+        }
+    }
+    let mut ranked = symbols.iter().cloned().collect::<Vec<_>>();
+    ranked.sort_by(|a, b| {
+        incoming
+            .get(b)
+            .unwrap_or(&0)
+            .cmp(incoming.get(a).unwrap_or(&0))
+            .then(a.cmp(b))
+    });
+    let mut selected = BTreeMap::new();
+    for (stratum, start) in [("busy", 0), ("middle", ranked.len() / 2)] {
+        for index in start..(start + sample).min(ranked.len()) {
+            selected.insert(ranked[index].clone(), stratum);
+        }
+    }
+    let mut leaves = 0;
+    for symbol in &symbols {
+        if !outgoing.contains_key(symbol) && leaves < sample {
+            selected.insert(symbol.clone(), "leaf");
+            leaves += 1;
+        }
+    }
+    // A small mixed-language island ensures every edited project exercises
+    // the same positive data-flow and inter-file path witnesses.
+    selected.insert(("exactness_gate/main.ts".into(), "entry".into()), "witness");
+    let mut plan = Vec::new();
+    for ((file, symbol), stratum) in selected {
+        for op in ["callers", "impact", "trace_to", "call_tree", "trace_data"] {
+            plan.push(QuerySpec {
+                op: op.into(),
+                file: file.clone(),
+                symbol: symbol.clone(),
+                stratum: stratum.into(),
+                to_file: None,
+                to_symbol: None,
+                expression: (op == "trace_data").then(|| "value".into()),
+                positive: false,
+            });
+        }
+        if let Some(target) = outgoing
+            .get(&(file.clone(), symbol.clone()))
+            .filter(|target| symbols.contains(*target))
+        {
+            plan.push(QuerySpec {
+                op: "trace_to_symbol".into(),
+                file: file.clone(),
+                symbol: symbol.clone(),
+                stratum: stratum.into(),
+                to_file: Some(target.0.clone()),
+                to_symbol: Some(target.1.clone()),
+                expression: None,
+                positive: true,
+            });
+        }
+    }
+    for (to_file, to_symbol, positive) in [
+        ("exactness_gate/lib.ts", "sink", true),
+        ("exactness_gate/lib.ts", "orphan", false),
+    ] {
+        plan.push(QuerySpec {
+            op: "trace_to_symbol".into(),
+            file: "exactness_gate/main.ts".into(),
+            symbol: "entry".into(),
+            stratum: "witness".into(),
+            to_file: Some(to_file.into()),
+            to_symbol: Some(to_symbol.into()),
+            expression: None,
+            positive,
+        });
+    }
+    checked_failures(view)?;
+    Ok(plan)
+}
+
+fn native_plan(view: &CheckoutView, out: &Path) -> GateResult<()> {
+    let mut members = BTreeMap::<String, usize>::new();
+    let mut declarations = BTreeMap::<String, Vec<Value>>::new();
+    let mut callees = BTreeMap::<(String, String), usize>::new();
+    let mut native_files = Vec::new();
+    for record in view.published.state.paths() {
+        let path = std::str::from_utf8(&record.path)?;
+        if path.starts_with("exactness_gate/") {
+            continue;
+        }
+        let Some((_, parse)) = view.published.graph.parse_of(path) else {
+            continue;
+        };
+        native_files.push(path.to_string());
+        for site in &parse.dispatch.sites {
+            if let Some(member) = &site.member {
+                *members.entry(member.clone()).or_default() += 1;
+            }
+        }
+        for method in &parse.dispatch.methods {
+            if let Some(symbol) = parse
+                .symbols
+                .iter()
+                .find(|symbol| symbol.scoped_name == method.symbol)
+            {
+                declarations
+                    .entry(method.name.clone())
+                    .or_default()
+                    .push(json!({"file": path, "language": parse.language, "owner": method.owner, "symbol": symbol}));
+            }
+        }
+        if let Some(slice) = view.graph.slice(path) {
+            for edge in slice.edges() {
+                *callees
+                    .entry((
+                        edge.target_file().to_string(),
+                        edge.target_symbol().to_string(),
+                    ))
+                    .or_default() += 1;
+            }
+        }
+    }
+    let mut member_rows = declarations.into_iter().map(|(member, declarations)| json!({"sites": members.get(&member).copied().unwrap_or(0), "member": member, "declarations": declarations})).collect::<Vec<_>>();
+    member_rows.sort_by(|a, b| {
+        b["sites"]
+            .as_u64()
+            .cmp(&a["sites"].as_u64())
+            .then(a["member"].as_str().cmp(&b["member"].as_str()))
+    });
+    let mut busiest = callees.into_iter().collect::<Vec<_>>();
+    busiest.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut top = Vec::new();
+    for ((path, name), callers) in busiest {
+        if top.len() == 10 {
+            break;
+        }
+        let Some((_, parse)) = view.published.graph.parse_of(&path) else {
+            continue;
+        };
+        if let Some(symbol) = parse
+            .symbols
+            .iter()
+            .find(|symbol| symbol.scoped_name == name)
+        {
+            top.push(json!({"file": path, "language": parse.language, "symbol": symbol, "callers": callers}));
+        }
+    }
+    save(
+        &out.join("native.json"),
+        &json!({"files": native_files, "members": member_rows, "top_callees": top}),
+    )
+}
+
+fn result<T: Serialize>(
+    value: Result<T, crate::callgraph_store::CallGraphStoreError>,
+) -> GateResult<Value> {
+    match value {
+        Ok(value) => Ok(json!({"ok": value})),
+        Err(error) => Ok(json!({"error": format!("{error:?}")})),
+    }
+}
+
+fn queries(
+    checkout: &Checkout,
+    out: &Path,
+    reference: Option<&Path>,
+    sample: usize,
+) -> GateResult<()> {
+    use crate::commands::callgraph_store_adapter as adapter;
+    let view = checkout.view().ok_or("no published view")?;
+    let plan: Vec<QuerySpec> = if let Some(reference) = reference {
+        serde_json::from_slice(&std::fs::read(reference.join("plan.json"))?)?
+    } else {
+        query_plan(&view, sample)?
+    };
+    save(&out.join("plan.json"), &plan)?;
+    let graph = view.callgraph();
+    let cache = Arc::new(RwLock::new(crate::parser::SymbolCache::new()));
+    let mut output = std::io::BufWriter::new(std::fs::File::create(out.join("queries.jsonl"))?);
+    for spec in &plan {
+        for tests in [false, true] {
+            let path = view.root().join(&spec.file);
+            let answer = match spec.op.as_str() {
+                "callers" => result(adapter::callers_result(
+                    &graph,
+                    &path,
+                    &spec.symbol,
+                    1,
+                    tests,
+                )),
+                "impact" => result(adapter::impact_result(
+                    &graph,
+                    &path,
+                    &spec.symbol,
+                    3,
+                    tests,
+                )),
+                "trace_to" => result(adapter::trace_to_result(
+                    &graph,
+                    &path,
+                    &spec.symbol,
+                    10,
+                    tests,
+                )),
+                "call_tree" => result(adapter::call_tree_result(
+                    &graph,
+                    &path,
+                    &spec.symbol,
+                    5,
+                    tests,
+                )),
+                "trace_data" => result(adapter::trace_data_result(
+                    &graph,
+                    &path,
+                    &spec.symbol,
+                    spec.expression.as_deref().unwrap(),
+                    5,
+                    Arc::clone(&cache),
+                )),
+                "trace_to_symbol" => result(adapter::trace_to_symbol_result(
+                    &graph,
+                    &path,
+                    &spec.symbol,
+                    spec.to_symbol.as_deref().unwrap(),
+                    spec.to_file
+                        .as_ref()
+                        .map(|file| view.root().join(file))
+                        .as_deref(),
+                    10,
+                    tests,
+                )),
+                _ => return Err("unknown exactness query".into()),
+            }?;
+            if spec.positive && answer.pointer("/ok/path").is_none_or(Value::is_null) {
+                return Err(format!(
+                    "positive path witness failed: {}:{}: {answer}",
+                    spec.file, spec.symbol
+                )
+                .into());
+            }
+            if spec.stratum == "witness"
+                && spec.op == "trace_data"
+                && answer
+                    .pointer("/ok/hops")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty)
+            {
+                return Err(format!("positive trace_data witness failed: {answer}").into());
+            }
+            writeln!(
+                output,
+                "{}",
+                json!({"query": spec, "include_tests": tests, "answer": answer})
+            )?;
+        }
+    }
+    // Preserve every dead-code input row, including initializer groups and
+    // protected roots. The timestamp is deliberately outside the comparison.
+    let dead = view.rows_dead_code_snapshot()?;
+    save(
+        &out.join("dead-code-findings.json"),
+        &super::super::dead_code_gate::exactness_rows(&view, &out.join("dead-code-work"))?,
+    )?;
+    let initializers = dead.go_initializers.iter().map(|group| json!({"caller_file": group.caller_file, "callers": group.callers, "targets": group.targets.iter().map(|(file, symbol)| (file.as_ref(), symbol.as_ref())).collect::<Vec<_>>()})).collect::<Vec<_>>();
+    save(
+        &out.join("dead-code.json"),
+        &json!({"files": dead.files, "exports": dead.exported_symbols, "calls": dead.outbound_calls, "entry_points": dead.entry_points, "entry_point_symbols": dead.entry_point_symbols, "go_initializers": initializers}),
+    )?;
+    checked_failures(&view)?;
+    save(&out.join("cache.json"), &super::super::slice_cache::shared().stats().map(|stats| json!({"budget": stats.budget_bytes, "evictions": stats.evictions, "misses": stats.misses})))?;
+    Ok(())
+}
+
+/// Commands are deliberately separate processes: `refresh` must bind the
+/// on-disk publication, never inherit the cold builder's engine.
+pub fn run(args: Vec<String>) -> GateResult<()> {
+    if args.first().is_some_and(|mode| mode == "validate") {
+        let path = Path::new(args.get(1).ok_or("validate requires a path")?);
+        let source = std::fs::read_to_string(path)?;
+        if crate::edit::validate_syntax_str(&source, path) != Some(true) {
+            return Err(format!(
+                "{}: edited source is invalid or unsupported",
+                path.display()
+            )
+            .into());
+        }
+        println!("EXACTNESS syntax valid: {}", path.display());
+        return Ok(());
+    }
+    if args.len() < 7 {
+        return Err(
+            "usage: MODE ROOT STORE OUT THREADS CACHE_BYTES SAMPLE [REFERENCE|-] [CHANGES_JSON]"
+                .into(),
+        );
+    }
+    let mode = &args[0];
+    let root = std::fs::canonicalize(&args[1])?;
+    let store = Path::new(&args[2]);
+    let out = Path::new(&args[3]);
+    let threads = args[4].parse()?;
+    let cache = args[5].parse()?;
+    let sample = args[6].parse()?;
+    let reference = args.get(7).filter(|arg| arg.as_str() != "-").map(Path::new);
+    std::fs::create_dir_all(out)?;
+    let checkout = Checkout::bind(
+        Arc::new(DataLayer::new(cache, threads)),
+        store,
+        FamilyId::from_digest(Digest128::of(b"callgraph exactness gate")),
+        &root,
+    )?;
+    match mode.as_str() {
+        "cold" => {
+            checkout.build()?;
+        }
+        "refresh" => {
+            if checkout.needs_build() {
+                return Err(
+                    "restart lost the publication; refusing a cold-build substitute".into(),
+                );
+            }
+            let changes: Vec<String> = serde_json::from_slice(&std::fs::read(
+                args.get(8).ok_or("refresh requires changes JSON")?,
+            )?)?;
+            checkout.record_paths(
+                &changes
+                    .into_iter()
+                    .map(String::into_bytes)
+                    .collect::<Vec<_>>(),
+            )?;
+            checkout.refresh_callgraph()?;
+            checked_failures(&checkout.view().ok_or("no published view")?)?;
+            save(
+                &out.join("prepublish-health.json"),
+                &json!({"stored_slices_failures": []}),
+            )?;
+            checkout.publish_changes()?;
+        }
+        "snapshot" => {}
+        _ => return Err("unknown exactness mode".into()),
+    }
+    if mode == "cold" {
+        export(&checkout, &out.join("raw"), None)?;
+    }
+    // Fold copies active stored units and their term postings without
+    // resolving again. Apply it to both cold and refreshed publications so
+    // obsolete records and segment-local ordinals do not create false diffs.
+    match checkout.fold()? {
+        super::Folded::Done(_) => {}
+        other => return Err(format!("fold did not finish: {other:?}").into()),
+    }
+    let count = export(&checkout, out, reference)?;
+    if reference.is_none() {
+        native_plan(&checkout.view().ok_or("no published view")?, out)?;
+    }
+    queries(&checkout, out, reference, sample)?;
+    println!("EXACTNESS snapshot: {count} full FileResolutions; StoredSlices::failures()=[]");
+    Ok(())
+}

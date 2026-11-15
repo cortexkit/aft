@@ -1,0 +1,9 @@
+{
+  "harnesses": {
+    "opencode": {
+      "durability": {
+        "macos_full_sync": false
+      }
+    }
+  }
+}

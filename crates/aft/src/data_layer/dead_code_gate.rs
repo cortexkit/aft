@@ -378,6 +378,27 @@ fn aggregate_from_view(
     )
 }
 
+/// All dead-code finding rows, recomputed without reading or writing a
+/// cached aggregate, for cross-build comparisons of a restarted publication.
+/// Phase timings are collected separately and excluded from the returned JSON.
+#[cfg(feature = "test-hooks")]
+pub(crate) fn exactness_rows(view: &CheckoutView, storage: &Path) -> Result<Value, String> {
+    let snapshot = view
+        .dead_code_snapshot_in(None)
+        .map_err(|error| error.to_string())?;
+    let job = job(view.root(), storage);
+    let entry_points = snapshot.entry_points.iter().cloned().collect::<Vec<_>>();
+    aggregate_from_view(
+        &job,
+        &snapshot.files,
+        &entry_points,
+        &snapshot,
+        &mut Vec::new(),
+        Use::Nothing,
+        None,
+    )
+}
+
 /// Where two aggregates differ, field by field; for finding lists, the
 /// findings only one side has, and the first position their orders differ.
 fn differences(old: &Value, new: &Value) -> Vec<Value> {

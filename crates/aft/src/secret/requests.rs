@@ -46,6 +46,13 @@ pub(crate) enum UseError {
     InvalidPlan(&'static str),
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ApprovalMetadata {
+    pub(crate) request_id: String,
+    pub(crate) outcome_code: Option<&'static str>,
+    pub(crate) granted: bool,
+}
+
 /// The approved local refusal text, shared by fetches and proxy requests.
 pub(crate) fn consent_failure_message(label: &str, host: &str, reason: UseError) -> String {
     match reason {
@@ -156,6 +163,7 @@ impl RequestSecrets {
         .unwrap_or(UseAnswer::Unavailable)
     }
 
+    #[cfg(test)]
     pub(crate) async fn approve(
         &self,
         label: &str,
@@ -163,6 +171,24 @@ impl RequestSecrets {
         pending: ApprovalRequest,
         expires_at_ms: u64,
     ) -> Result<ConsentOutcome, UseError> {
+        self.approve_with_metadata(label, target, pending, expires_at_ms, &|_| {})
+            .await
+    }
+
+    async fn approve_with_metadata(
+        &self,
+        label: &str,
+        target: &ApiKeyTarget,
+        pending: ApprovalRequest,
+        expires_at_ms: u64,
+        observe: &(impl Fn(ApprovalMetadata) + Sync),
+    ) -> Result<ConsentOutcome, UseError> {
+        let request_id = pending.request_id.clone();
+        observe(ApprovalMetadata {
+            request_id: request_id.clone(),
+            outcome_code: None,
+            granted: false,
+        });
         let Some((project_root, session)) = &self.context else {
             return Err(UseError::Unavailable);
         };
@@ -190,7 +216,7 @@ impl RequestSecrets {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(sequence, lines);
-        let answer = super::consent::wait_consent(SecretConsentRequest {
+        let (answer, outcome_code) = super::consent::wait_consent_with_code(SecretConsentRequest {
             scope: self.scope.clone(),
             project_root: project_root.clone(),
             session: session.clone(),
@@ -200,6 +226,14 @@ impl RequestSecrets {
             expires_at_ms: Some(expires_at_ms.min(pending.expires_at_ms)),
         })
         .await;
+        observe(ApprovalMetadata {
+            request_id,
+            outcome_code,
+            granted: matches!(
+                answer,
+                ConsentOutcome::Answered | ConsentOutcome::AnsweredOnce
+            ),
+        });
         match answer {
             ConsentOutcome::Answered | ConsentOutcome::AnsweredOnce => Ok(answer),
             ConsentOutcome::Declined => Err(UseError::Declined),
@@ -242,13 +276,42 @@ impl RequestSecrets {
         expires_at_ms: u64,
         plan: P,
         observe: O,
-        mut before_retry: F,
+        before_retry: F,
     ) -> Result<UseAnswer, UseError>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<(), UseError>>,
         P: Fn(&str) -> Result<(), UseError>,
         O: Fn(&[u8]) -> Result<(), UseError>,
+    {
+        self.use_planned_with_metadata(
+            label,
+            target,
+            expires_at_ms,
+            plan,
+            observe,
+            before_retry,
+            |_| {},
+        )
+        .await
+    }
+
+    pub(crate) async fn use_planned_with_metadata<F, Fut, P, O, M>(
+        &self,
+        label: &str,
+        target: &ApiKeyTarget,
+        expires_at_ms: u64,
+        plan: P,
+        observe: O,
+        mut before_retry: F,
+        metadata: M,
+    ) -> Result<UseAnswer, UseError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<(), UseError>>,
+        P: Fn(&str) -> Result<(), UseError>,
+        O: Fn(&[u8]) -> Result<(), UseError>,
+        M: Fn(ApprovalMetadata) + Sync,
     {
         let mut answered = std::collections::HashSet::new();
         let mut once = false;
@@ -296,7 +359,9 @@ impl RequestSecrets {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(label.into(), true);
             }
-            once = self.approve(label, target, pending, expires_at_ms).await?
+            once = self
+                .approve_with_metadata(label, target, pending, expires_at_ms, &metadata)
+                .await?
                 == ConsentOutcome::AnsweredOnce;
             before_retry().await?;
         }

@@ -1378,6 +1378,20 @@ pub(crate) fn resolve_checkout_into(
         // in parallel, and the sink builds their fragments in parallel too;
         // a whole batch decoded and built at once held about 750 MB more.
         let mut sites_ms = 0u128;
+        // On glibc, trimming every four batches saved 1.3 GiB on VS Code and
+        // 1.2 GiB on Kotlin versus streaming alone. Cold builds still beat the
+        // builder that held every fragment until output: 229.6 vs 234.8 seconds
+        // and 251.8 vs 277.6 seconds, respectively.
+        // Other allocators keep their existing stage-boundary relief. The
+        // internal cadence accepts 0 to disable the extra trims.
+        let trim_cadence = batch_trim_cadence(
+            std::env::var("AFT_INTERNAL_GRAPH_BATCH_TRIM")
+                .ok()
+                .as_deref(),
+        );
+        let mut trim_batches = 0usize;
+        let mut trim_calls = 0usize;
+        let mut trim_time = std::time::Duration::ZERO;
         #[cfg(feature = "test-hooks")]
         super::refresh_probe::stage("sites");
         for batch in paths.chunks(BATCH) {
@@ -1411,12 +1425,24 @@ pub(crate) fn resolve_checkout_into(
                             .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
                         file.sites = sites;
                         file.site_dependencies = dependencies;
+                        #[cfg(feature = "test-hooks")]
+                        super::checkout::exactness::flip_site_for_control(&path, &mut file);
                         Ok((path, file))
                     })
                     .collect::<Result<Vec<_>, ManifestJoinError>>()?;
                 sink(&*inputs, files)?;
             }
             inputs.parses.release_decoded();
+            trim_batches += 1;
+            if trim_cadence != 0 && trim_batches % trim_cadence == 0 {
+                let started = std::time::Instant::now();
+                relieve_allocator();
+                trim_time += started.elapsed();
+                trim_calls += 1;
+            }
+        }
+        if trim_cadence != 0 {
+            log::info!("pass-4 allocator relief: cadence={trim_cadence} batches={trim_batches} calls={trim_calls} elapsed_us={}", trim_time.as_micros());
         }
         #[cfg(feature = "callgraph-shape-census")]
         let census = std::mem::take(&mut *calls.census.lock().unwrap_or_else(|e| e.into_inner()));
@@ -1442,6 +1468,35 @@ pub(crate) fn resolve_checkout_into(
 fn relieve_allocator() {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let _ = crate::memory::relieve_allocator_pressure();
+}
+
+fn batch_trim_cadence(value: Option<&str>) -> usize {
+    match value {
+        None if cfg!(all(target_os = "linux", target_env = "gnu")) => 4,
+        Some(value) => value.parse::<usize>().unwrap_or(0),
+        None => 0,
+    }
+}
+
+#[cfg(test)]
+mod batch_trim_tests {
+    #[test]
+    fn batch_trim_defaults_to_four_on_glibc_and_can_be_disabled() {
+        use super::batch_trim_cadence;
+        assert_eq!(
+            batch_trim_cadence(None),
+            if cfg!(all(target_os = "linux", target_env = "gnu")) {
+                4
+            } else {
+                0
+            }
+        );
+        for value in [Some(""), Some("true"), Some("-1"), Some("0")] {
+            assert_eq!(batch_trim_cadence(value), 0);
+        }
+        assert_eq!(batch_trim_cadence(Some("1")), 1);
+        assert_eq!(batch_trim_cadence(Some("4")), 4);
+    }
 }
 
 /// A [`ResolutionLookup`] with nothing in it, for pass 4 when every file's

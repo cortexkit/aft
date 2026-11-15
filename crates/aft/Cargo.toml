@@ -33,6 +33,10 @@ path = "src/main.rs"
 name = "grammar_hardened_smoke"
 required-features = ["wasm-grammars"]
 
+[[example]]
+name = "callgraph_exactness"
+required-features = ["test-hooks"]
+
 [[bin]]
 name = "aft-test-scope-owner"
 path = "tests/helpers/scope_owner.rs"

@@ -107,6 +107,7 @@ pub struct ResolveResult {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RawAftConfig {
+    pub durability: Option<RawDurability>,
     pub storage: Option<RawStorage>,
     #[serde(rename = "$schema")]
     pub schema: Option<String>,
@@ -155,6 +156,12 @@ pub struct RawAftConfig {
     /// Raw per-harness objects stay opaque until the resolver knows the active
     /// configure harness. Unknown harness names are intentionally ignored.
     pub harnesses: Option<BTreeMap<String, Value>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RawDurability {
+    pub macos_full_sync: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1589,6 +1596,18 @@ fn apply_harness_override(
     match serde_json::from_value::<RawAftConfig>(Value::Object(override_map)) {
         Ok(mut override_config) => {
             if override_config
+                .durability
+                .take()
+                .is_some_and(|durability| durability.macos_full_sync.is_some())
+            {
+                push_drop(
+                    dropped,
+                    "durability.macos_full_sync",
+                    &tier.tier,
+                    "sync policy is process-wide; only the user-tier base may set it",
+                );
+            }
+            if override_config
                 .storage
                 .take()
                 .is_some_and(|storage| storage.cache_dir.is_some())
@@ -1619,6 +1638,14 @@ fn apply_harness_override(
 }
 
 fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) {
+    if let Some(value) = override_config
+        .durability
+        .and_then(|durability| durability.macos_full_sync)
+    {
+        base.durability
+            .get_or_insert_with(RawDurability::default)
+            .macos_full_sync = Some(value);
+    }
     if override_config
         .storage
         .as_ref()
@@ -2105,6 +2132,81 @@ fn runon_safety_switch_is_user_only_and_defaults_off() {
 
 #[cfg(test)]
 #[test]
+fn macos_full_sync_is_user_only_and_defaults_off() {
+    let defaults = resolve_config(&[]);
+    assert!(!defaults.config.durability.macos_full_sync);
+    assert!(!Config::default().durability.macos_full_sync);
+    for enabled in [false, true] {
+        let result = resolve_config(&[
+            ConfigTier {
+                tier: "user".into(),
+                source: "user.jsonc".into(),
+                doc: format!("{{\"durability\":{{\"macos_full_sync\":{enabled}}}}}"),
+            },
+            ConfigTier {
+                tier: "project".into(),
+                source: "project.jsonc".into(),
+                doc: format!("{{\"durability\":{{\"macos_full_sync\":{}}}}}", !enabled),
+            },
+        ]);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.config.durability.macos_full_sync, enabled);
+        assert!(result
+            .dropped
+            .iter()
+            .any(|drop| { drop.key == "durability.macos_full_sync" && drop.tier == "project" }));
+    }
+    let project = resolve_config(&[ConfigTier {
+        tier: "project".into(),
+        source: "project.jsonc".into(),
+        doc: r#"{"durability":{"macos_full_sync":true}}"#.into(),
+    }]);
+    assert!(!project.config.durability.macos_full_sync);
+    assert_eq!(project.dropped[0].key, "durability.macos_full_sync");
+}
+
+#[cfg(test)]
+#[test]
+fn macos_full_sync_ignores_all_harness_overrides() {
+    for harness in [Harness::Opencode, Harness::Pi] {
+        for base in [false, true] {
+            let key = harness.wire_label();
+            let result = resolve_config_for_harness(
+                &[
+                    ConfigTier {
+                        tier: "user".into(),
+                        source: "user.jsonc".into(),
+                        doc: serde_json::json!({
+                            "durability": {"macos_full_sync": base},
+                            "harnesses": {(key.clone()): {"durability": {"macos_full_sync": !base}}}
+                        })
+                        .to_string(),
+                    },
+                    ConfigTier {
+                        tier: "project".into(),
+                        source: "project.jsonc".into(),
+                        doc: serde_json::json!({
+                            "harnesses": {(key.clone()): {"durability": {"macos_full_sync": !base}}}
+                        })
+                        .to_string(),
+                    },
+                ],
+                Some(&harness),
+            );
+            assert!(result.errors.is_empty(), "{:?}", result.errors);
+            assert_eq!(result.config.durability.macos_full_sync, base);
+            for tier in ["user", "project"] {
+                assert!(result
+                    .dropped
+                    .iter()
+                    .any(|drop| { drop.key == "durability.macos_full_sync" && drop.tier == tier }));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
 fn bash_memory_limit_parses_and_project_cannot_raise_it() {
     let resolve = |user: &str, project: &str| {
         serde_json::to_value(
@@ -2426,6 +2528,18 @@ fn record_resource_loosening(
 
 fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<DroppedKey>) {
     if raw
+        .durability
+        .as_ref()
+        .is_some_and(|durability| durability.macos_full_sync.is_some())
+    {
+        push_drop(
+            dropped,
+            "durability.macos_full_sync",
+            tier,
+            USER_ONLY_REASON,
+        );
+    }
+    if raw
         .storage
         .as_ref()
         .is_some_and(|storage| storage.cache_dir.is_some())
@@ -2641,6 +2755,11 @@ fn apply_resolved_config(
     warnings: &mut Vec<ConfigWarning>,
 ) -> Result<(), Vec<String>> {
     config.hashline_enabled = matches!(raw.edit_mode, Some(RawEditMode::Hashline));
+    config.durability.macos_full_sync = raw
+        .durability
+        .as_ref()
+        .and_then(|durability| durability.macos_full_sync)
+        .unwrap_or(false);
     // The user-base default has already been applied; an absent list here is
     // a resolver bug and must not silently become an empty (all-enabled) list.
     let Some(disabled_tools) = &raw.disabled_tools else {

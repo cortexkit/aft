@@ -124,6 +124,10 @@ fn update_checked(
         assert_eq!(ours.sites, theirs.sites, "{path}: method-call sites");
         assert_eq!(ours.dispatch, theirs.dispatch, "{path}: dispatch targets");
         assert_eq!(ours.binding, theirs.binding, "{path}: recorded reads");
+        assert_eq!(
+            ours.site_dependencies, theirs.site_dependencies,
+            "{path}: site dependencies"
+        );
     }
     (stats, cold)
 }

@@ -19,6 +19,7 @@ pub mod ids;
 pub mod postings;
 pub mod scan;
 pub mod segment;
+pub mod spill;
 pub mod stat;
 pub mod sync;
 pub mod table;

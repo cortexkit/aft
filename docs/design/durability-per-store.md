@@ -1,6 +1,6 @@
 # Durability per store: measured syncs and a proposal
 
-Status: implemented (portable full-sync commit points; no macOS-specific plain-fsync refinement). Base commit `c7ecd5490`. Measured on an
+Status: implemented; macOS now defaults to plain fsync, with `durability.macos_full_sync: true` restoring full sync. The measurements below predate the default change. Base commit `c7ecd5490`. Measured on an
 Apple M5 Max (Mac17,6) running macOS 27.0.1, internal APFS SSD. The machine was
 shared with other build workers the whole time (load average about 48), so wall
 times are noisy. The sync counts are exact and were the same on every repeat.

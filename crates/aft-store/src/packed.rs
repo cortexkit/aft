@@ -77,6 +77,26 @@ pub(crate) struct StoredUnit {
 }
 
 impl StoredUnit {
+    pub(crate) fn packed(bytes: &[u8]) -> Self {
+        let (codec, packed) = pack(bytes);
+        Self {
+            codec,
+            unpacked: u32::try_from(bytes.len()).expect("a unit is under 4 GiB"),
+            bytes: packed,
+        }
+    }
+
+    pub(crate) fn parts(&self) -> (u8, u32, &[u8]) {
+        (self.codec, self.unpacked, &self.bytes)
+    }
+
+    pub(crate) fn from_parts(codec: u8, unpacked: u32, bytes: Vec<u8>) -> Self {
+        Self {
+            codec,
+            unpacked,
+            bytes,
+        }
+    }
     /// A unit with no bytes, as [`PackedBuilder::push`] stores an empty one.
     pub(crate) const EMPTY: Self = Self {
         codec: RAW,

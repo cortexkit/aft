@@ -16,7 +16,7 @@ use zeroize::Zeroizing;
 use super::vault::SecretUseTransport;
 
 #[path = "transport_diagnostics.rs"]
-mod diagnostics;
+pub(super) mod diagnostics;
 use diagnostics::{Failure, Stage};
 
 const UNAVAILABLE: &str = "secret.use transport unavailable";

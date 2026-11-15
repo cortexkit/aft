@@ -230,8 +230,22 @@ struct SharedCard {
     statement: String,
     expires: u64,
     outcome: tokio::sync::watch::Sender<Option<ConsentOutcome>>,
+    outcome_code: std::sync::Mutex<Option<&'static str>>,
     cancel: Cancellation,
     waiters: std::sync::atomic::AtomicUsize,
+}
+
+pub(crate) fn record_outcome_code(scope: &SecretScope, request_id: &str, code: &str) {
+    let cards = CARDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(card) = cards.get(&(scope.clone(), request_id.to_owned())) {
+        *card
+            .outcome_code
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(super::transport::diagnostics::safe_code(code));
+    }
 }
 static CARDS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<CardKey, std::sync::Arc<SharedCard>>>,
@@ -273,6 +287,7 @@ mod waiter_tests {
             statement: "statement".into(),
             expires: u64::MAX,
             outcome: tokio::sync::watch::channel(None).0,
+            outcome_code: Default::default(),
             cancel: Default::default(),
             waiters: AtomicUsize::new(1),
         });
@@ -313,11 +328,21 @@ mod waiter_tests {
 
 /// Every HTTP request joins the same recorded card outcome without locking
 /// another request's vault lookup or charging it another waiter's queue time.
+#[cfg(test)]
 pub(crate) async fn wait_consent(request: SecretConsentRequest) -> ConsentOutcome {
+    wait_consent_with_code(request).await.0
+}
+
+pub(crate) async fn wait_consent_with_code(
+    request: SecretConsentRequest,
+) -> (ConsentOutcome, Option<&'static str>) {
     let Some(transport) = transport() else {
-        return ConsentOutcome::Unavailable {
-            detail: "no secret consent transport is connected".into(),
-        };
+        return (
+            ConsentOutcome::Unavailable {
+                detail: "no secret consent transport is connected".into(),
+            },
+            None,
+        );
     };
     let card = {
         let mut cards = CARDS
@@ -344,6 +369,7 @@ pub(crate) async fn wait_consent(request: SecretConsentRequest) -> ConsentOutcom
                     statement: request.statement_b64url.clone(),
                     expires: request.expires_at_ms.unwrap_or(u64::MAX),
                     outcome: tokio::sync::watch::channel(None).0,
+                    outcome_code: Default::default(),
                     cancel: Default::default(),
                     waiters: Default::default(),
                 });
@@ -365,19 +391,29 @@ pub(crate) async fn wait_consent(request: SecretConsentRequest) -> ConsentOutcom
     };
     let _waiter = Waiter(card.clone());
     if card.statement != request.statement_b64url {
-        return ConsentOutcome::Unavailable {
-            detail: "Cingulate could not file the secret-use card".into(),
-        };
+        return (
+            ConsentOutcome::Unavailable {
+                detail: "Cingulate could not file the secret-use card".into(),
+            },
+            None,
+        );
     }
     let mut receiver = card.outcome.subscribe();
     loop {
         if let Some(answer) = receiver.borrow_and_update().clone() {
-            return answer;
+            let code = *card
+                .outcome_code
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            return (answer, code);
         }
         if receiver.changed().await.is_err() {
-            return ConsentOutcome::Unavailable {
-                detail: "Cingulate could not settle the secret-use card".into(),
-            };
+            return (
+                ConsentOutcome::Unavailable {
+                    detail: "Cingulate could not settle the secret-use card".into(),
+                },
+                None,
+            );
         }
     }
 }

@@ -1,13 +1,35 @@
 //! Durable flushes shared by the index store and AFT's other file writers.
 //!
-//! macOS mounts without F_FULLFSYNC support still receive fsync. Other errors
-//! remain fatal; a failed device flush must not be mistaken for unsupported I/O.
+//! macOS uses fsync by default. Opt-in full drive flushes fall back to fsync on
+//! mounts without F_FULLFSYNC support; other errors remain fatal.
 
 use std::fs::File;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Flush file contents and metadata, using the strongest sync the mount supports.
+static MACOS_FULL_SYNC: AtomicBool = AtomicBool::new(false);
+
+/// Select full drive flushes for subsequent macOS syncs. Other platforms ignore it.
+pub fn set_macos_full_sync(enabled: bool) {
+    MACOS_FULL_SYNC.store(enabled, Ordering::Relaxed);
+}
+
+/// The requested macOS policy, even on other platforms. This read is lock-free.
+pub fn macos_full_sync() -> bool {
+    MACOS_FULL_SYNC.load(Ordering::Relaxed)
+}
+
+/// The active sync policy, for runtime diagnostics.
+pub fn mode() -> &'static str {
+    if cfg!(target_os = "macos") && macos_full_sync() {
+        "full_sync"
+    } else {
+        "fsync"
+    }
+}
+
+/// Flush file contents and metadata, using the configured macOS sync policy.
 pub fn sync_all(file: &File, path: &Path) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -35,7 +57,7 @@ pub fn sync_all_in_panic(file: &File, path: &Path) -> io::Result<()> {
     }
 }
 
-/// Flush file contents, retaining the platform's existing sync_data semantics.
+/// Flush file contents, using the configured macOS policy and native semantics elsewhere.
 pub fn sync_data(file: &File, path: &Path) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -69,7 +91,7 @@ mod macos {
     use std::collections::HashSet;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
     use std::sync::{LazyLock, Mutex};
 
     #[derive(Default)]
@@ -92,6 +114,7 @@ mod macos {
             file,
             path,
             &DIAGNOSTICS,
+            &MACOS_FULL_SYNC,
             || {
                 // SAFETY: the borrowed File keeps its descriptor open.
                 retry(|| unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) })
@@ -118,16 +141,20 @@ mod macos {
         }
     }
 
-    // Inject only the syscalls: tests exercise the same errno selection,
-    // accounting, device identity and warning suppression as production.
+    // Inject the switch and syscalls so tests can change policy without racing
+    // other file writers, while keeping production's fallback and diagnostics.
     fn sync_all_with(
         file: &File,
         path: &Path,
         diagnostics: &Diagnostics,
+        full_sync_enabled: &AtomicBool,
         full_sync: impl FnOnce() -> io::Result<()>,
         fallback: impl FnOnce() -> io::Result<()>,
         warn: bool,
     ) -> io::Result<()> {
+        if !full_sync_enabled.load(Ordering::Relaxed) {
+            return fallback();
+        }
         match full_sync() {
             Ok(()) => Ok(()),
             Err(error)
@@ -205,6 +232,7 @@ mod macos {
                 file,
                 path,
                 diagnostics,
+                &AtomicBool::new(true),
                 || Err(io::Error::from_raw_os_error(errno)),
                 || {
                     fsyncs.set(fsyncs.get() + 1);
@@ -302,6 +330,7 @@ mod macos {
                 file.as_file(),
                 file.path(),
                 &diagnostics,
+                &AtomicBool::new(true),
                 || Err(io::Error::from_raw_os_error(libc::ENOTTY)),
                 || Err(io::Error::from_raw_os_error(libc::EIO)),
                 true,
@@ -319,6 +348,7 @@ mod macos {
                 file.as_file(),
                 file.path(),
                 &diagnostics,
+                &AtomicBool::new(true),
                 || Ok(()),
                 || panic!("successful full sync must not fall back"),
                 true,
@@ -338,6 +368,7 @@ mod macos {
                 file.as_file(),
                 file.path(),
                 &diagnostics,
+                &AtomicBool::new(true),
                 || Err(io::Error::from_raw_os_error(libc::ENOTTY)),
                 || {
                     fsyncs.set(fsyncs.get() + 1);
@@ -349,6 +380,46 @@ mod macos {
             assert_eq!(fsyncs.get(), 1);
             assert_eq!(diagnostics.fallbacks.load(Ordering::Relaxed), 1);
             assert!(warned.is_empty());
+            WARNINGS.with(|warnings| assert!(warnings.borrow().is_empty()));
+        }
+
+        #[test]
+        fn sync_policy_defaults_to_fsync_and_changes_on_the_next_call() {
+            let diagnostics = diagnostics();
+            let file = tempfile::NamedTempFile::new().unwrap();
+            assert!(!macos_full_sync());
+            assert_eq!(mode(), "fsync");
+            let full_syncs = Cell::new(0);
+            let fsyncs = Cell::new(0);
+            let sync = || {
+                sync_all_with(
+                    file.as_file(),
+                    file.path(),
+                    &diagnostics,
+                    &MACOS_FULL_SYNC,
+                    || {
+                        full_syncs.set(full_syncs.get() + 1);
+                        Ok(())
+                    },
+                    || {
+                        fsyncs.set(fsyncs.get() + 1);
+                        Ok(())
+                    },
+                    true,
+                )
+                .unwrap();
+            };
+            sync();
+            assert_eq!((full_syncs.get(), fsyncs.get()), (0, 1));
+            set_macos_full_sync(true);
+            assert_eq!(mode(), "full_sync");
+            sync();
+            assert_eq!((full_syncs.get(), fsyncs.get()), (1, 1));
+            set_macos_full_sync(false);
+            assert_eq!(mode(), "fsync");
+            sync();
+            assert_eq!((full_syncs.get(), fsyncs.get()), (1, 2));
+            assert_eq!(diagnostics.fallbacks.load(Ordering::Relaxed), 0);
             WARNINGS.with(|warnings| assert!(warnings.borrow().is_empty()));
         }
     }

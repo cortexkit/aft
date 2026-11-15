@@ -27,6 +27,7 @@ import {
 } from "../config-watch.js";
 
 type TestConfig = {
+  durability?: { macos_full_sync?: boolean };
   lsp?: { idle_minutes?: number | "never"; max_servers?: number };
   restrict_to_project_root?: boolean;
   disabled_tools?: string[];
@@ -65,6 +66,19 @@ function tempDir(): string {
 }
 
 describe("applyLiveConfigKeys", () => {
+  test("macos_full_sync applies live and returns to the default when removed", () => {
+    const current: TestConfig = {};
+    const next: TestConfig = { durability: { macos_full_sync: true } };
+    const enabled = applyLiveConfigKeys(current, next, KEYS);
+    expect(enabled.applied).toEqual(["durability.macos_full_sync"]);
+    expect(enabled.deferred).toEqual([]);
+    expect(enabled.config).toEqual(next);
+    expect(current).toEqual({});
+    const removed = applyLiveConfigKeys(enabled.config, {}, KEYS);
+    expect(removed.applied).toEqual(["durability.macos_full_sync"]);
+    expect(removed.deferred).toEqual([]);
+    expect(removed.config.durability?.macos_full_sync).toBeUndefined();
+  });
   test("inspect categories and LSP idle minutes apply live without deferral", () => {
     const current: TestConfig = {
       lsp: { idle_minutes: 60, max_servers: 8 },

@@ -42,6 +42,8 @@ use super::slice::FileSlice;
 use crate::callgraph_store::join::{CallgraphBlob, ParseBlob};
 
 mod engines;
+#[cfg(feature = "test-hooks")]
+pub mod exactness;
 mod fold;
 #[cfg(test)]
 pub(super) mod publication_tests;
@@ -944,6 +946,8 @@ impl Checkout {
     ) -> Result<Self, DataError> {
         let checkout = CheckoutId::from_digest(Digest128::of(root.as_os_str().as_encoded_bytes()));
         let family = Family::open(family_dir, family).map_err(DataError::store)?;
+        aft_store::graph::LocalScratch::sweep(family.dir())
+            .map_err(|error| DataError::Store(error.to_string()))?;
         let live = Arc::new(RwLock::new(Live::default()));
         {
             let mut bound = layer.bound.lock().expect("no panics while holding it");
@@ -1744,6 +1748,53 @@ impl Checkout {
             true,
             Some(encoded),
         );
+        let workspace = Box::new(
+            aft_store::graph::LocalScratch::create(self.family.dir(), &self.checkout.to_string())
+                .map_err(|error| DataError::Store(error.to_string()))?,
+        );
+        let dir = self.family.dir().to_path_buf();
+        let estimate = inputs
+            .state
+            .paths()
+            .iter()
+            .map(|record| record.stat.size)
+            .sum::<u64>()
+            .saturating_mul(8);
+        let reserve = Arc::new(std::sync::atomic::AtomicU64::new(estimate));
+        let remaining = reserve.clone();
+        let paused = Arc::new(Mutex::new(None));
+        let disk_pause = paused.clone();
+        let guard = aft_store::spill::WriteGuard::new(move || {
+            match check_disk_floor_at(&dir, remaining.load(std::sync::atomic::Ordering::Relaxed)) {
+                Err(DataError::DiskFloor(message)) => {
+                    *disk_pause.lock().expect("disk pause lock") = Some(message.clone());
+                    Err(std::io::Error::other(message))
+                }
+                result => result.map_err(std::io::Error::other),
+            }
+        });
+        let mut config = aft_store::spill::Config::new(256 << 20);
+        // A wide merge keeps ordinary large builds at one 25-byte run copy
+        // per term while its readers still fit well inside the fixed budget.
+        config.fan_in = 128;
+        #[cfg(feature = "callgraph-shape-census")]
+        if let Some(bytes) = std::env::var("AFT_GRAPH_SPILL_BUDGET_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            config.memory_budget = bytes.max(1 << 20);
+        }
+        let mut spill = aft_store::graph::GraphSectionsSpill::new(workspace, config, guard)
+            .map_err(|error| {
+                graph_spill_error(
+                    self.check_disk_floor()
+                        .err()
+                        .unwrap_or_else(|| DataError::Store(error.to_string())),
+                    &paused,
+                )
+            })?;
+        spill.estimate_space(inputs.parses.len(), estimate, reserve);
+        sections.stream(spill);
         let _census = super::callgraph::resolve_checkout_into(
             &mut inputs,
             self.layer.threads,
@@ -1754,7 +1805,14 @@ impl Checkout {
                     .map_err(crate::callgraph_store::join::ManifestJoinError::Parse)
             },
         )
-        .map_err(|error| DataError::Resolve(error.to_string()))?;
+        .map_err(|error| {
+            graph_spill_error(
+                self.check_disk_floor()
+                    .err()
+                    .unwrap_or_else(|| DataError::Resolve(error.to_string())),
+                &paused,
+            )
+        })?;
         report.resolve_ms = elapsed_ms(started);
         checkpoint()?;
 
@@ -1777,6 +1835,9 @@ impl Checkout {
         let snapshot = self.family.snapshot().map_err(DataError::store)?;
         report.shared =
             self.leave_out_shared(&snapshot, &mut collected.text, Some(&mut sections))?;
+        sections
+            .prepare_finish()
+            .map_err(|error| graph_spill_error(DataError::Store(error), &paused))?;
         let mut pending = session.create_segment().map_err(DataError::store)?;
         collected
             .text
@@ -1784,7 +1845,14 @@ impl Checkout {
             .map_err(DataError::store)?;
         let fragments = sections
             .finish(pending.writer(), measure.then_some(&mut report.memory))
-            .map_err(DataError::Store)?;
+            .map_err(|error| {
+                graph_spill_error(
+                    self.check_disk_floor()
+                        .err()
+                        .unwrap_or(DataError::Store(error)),
+                    &paused,
+                )
+            })?;
         let segment = session.finish_segment(pending).map_err(DataError::store)?;
         report.write_ms = elapsed_ms(started);
 
@@ -1811,6 +1879,7 @@ impl Checkout {
         let unneeded = self.unneeded(&state, false)?;
         report.retired_segments = unneeded.segments.len();
         report.retired_checkouts = unneeded.checkouts.len();
+        self.check_disk_floor()?;
         session
             .publish(&Publication {
                 add_segments: vec![segment],
@@ -2087,22 +2156,35 @@ impl Checkout {
     /// at most 32 GiB. A disk whose free space cannot be measured is refused
     /// too, as an error rather than a pause.
     fn check_disk_floor(&self) -> Result<(), DataError> {
-        let dir = self.family.dir();
-        let Some((free, capacity)) = crate::disk_floor::free_space(dir) else {
-            return Err(DataError::Store(format!(
-                "the free space on the disk holding {} could not be measured",
-                dir.display()
-            )));
-        };
-        let floor = crate::disk_floor::free_disk_floor(capacity);
-        if free >= floor {
-            return Ok(());
-        }
-        Err(DataError::DiskFloor(crate::view_storage_reserve::message(
-            free, floor,
-        )))
+        check_disk_floor_at(self.family.dir(), 0)
     }
+}
 
+fn check_disk_floor_at(dir: &Path, additional: u64) -> Result<(), DataError> {
+    let Some((free, capacity)) = crate::disk_floor::free_space(dir) else {
+        return Err(DataError::Store(format!(
+            "the free space on the disk holding {} could not be measured",
+            dir.display()
+        )));
+    };
+    let floor = crate::disk_floor::free_disk_floor(capacity).saturating_add(additional);
+    if free >= floor {
+        return Ok(());
+    }
+    Err(DataError::DiskFloor(crate::view_storage_reserve::message(
+        free, floor,
+    )))
+}
+
+fn graph_spill_error(error: DataError, paused: &Mutex<Option<String>>) -> DataError {
+    paused
+        .lock()
+        .expect("disk pause lock")
+        .clone()
+        .map_or(error, DataError::DiskFloor)
+}
+
+impl Checkout {
     /// Scans the checkout's text only, then publishes and serves a state
     /// that names no call-graph fragments, so text queries can start while
     /// the call graph builds. Returns `false` when another process published

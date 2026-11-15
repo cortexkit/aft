@@ -1563,6 +1563,9 @@ pub(crate) struct WatcherCountersSnapshot {
     pub(crate) directory_empty_total: u64,
     pub(crate) directory_walk_fallbacks_total: u64,
     pub(crate) overflows_total: u64,
+    /// Event loss remains actionable until a complete rescan covers it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) loss_unrecovered: bool,
     pub(crate) watch_lost_races_total: u64,
     pub(crate) overflows_during_rescan: u64,
     pub(crate) last_overflow_prefixes: Vec<WatcherOverflowPrefix>,
@@ -1575,12 +1578,22 @@ pub(crate) struct WatcherCountersSnapshot {
     pub(crate) last_rescan_rss_delta_bytes: Option<i64>,
 }
 
-// After recording a drop's prefix summary, the filter changes RUNNING to RERUN
-// using only these atomics. The project tree walk does not access the prefix
-// lock or these atomics, so another drop can be recorded while that walk runs.
+// Only the short lifecycle transitions hold the recovery lock, never the tree
+// walk itself, so another drop can request a rerun while that walk runs.
 const WATCHER_RESCAN_IDLE: u8 = 0;
 const WATCHER_RESCAN_RUNNING: u8 = 1;
 const WATCHER_RESCAN_RERUN: u8 = 2;
+
+#[derive(Debug, Default)]
+struct WatcherLossRecovery {
+    // Sequence coverage distinguishes a loss during a rescan from one the
+    // rescan covered, even when their millisecond timestamps would tie.
+    loss_seq: u64,
+    covers_seq: u64,
+    recovered_through_seq: u64,
+    rescan_state: u8,
+    rescan_again_reason: Option<crate::watcher_filter::RescanReason>,
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct WatcherCounters {
@@ -1612,8 +1625,7 @@ pub(crate) struct WatcherCounters {
     observed_exclusion_prefixes: RwLock<Vec<WatcherOverflowPrefix>>,
     backend_exclusions: RwLock<WatcherBackendExclusions>,
     exclusion_planning: RwLock<Option<WatcherExclusionPlanningSnapshot>>,
-    rescan_state: AtomicU8,
-    rescan_again_reason: AtomicU8,
+    loss_recovery: Mutex<WatcherLossRecovery>,
     rescans_buffer_overflow_total: AtomicU64,
     rescans_kernel_dropped_total: AtomicU64,
     rescans_user_dropped_total: AtomicU64,
@@ -1805,6 +1817,11 @@ impl WatcherCounters {
         reason: crate::watcher_filter::RescanReason,
         prefixes: Vec<WatcherOverflowPrefix>,
     ) -> bool {
+        let mut recovery = self
+            .loss_recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        recovery.loss_seq = recovery.loss_seq.saturating_add(1);
         self.overflows_total.fetch_add(1, Ordering::Relaxed);
         if let Some(journal) = self.bash_changes.get() {
             journal.gap();
@@ -1814,89 +1831,54 @@ impl WatcherCounters {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = prefixes;
 
-        let reason = match reason {
-            crate::watcher_filter::RescanReason::KernelDropped => 1,
-            crate::watcher_filter::RescanReason::UserDropped => 2,
-            crate::watcher_filter::RescanReason::Unknown => 3,
-            crate::watcher_filter::RescanReason::BufferOverflow => 4,
-        };
-        loop {
-            let state = self.rescan_state.load(Ordering::Acquire);
-            if state == WATCHER_RESCAN_IDLE {
-                return false;
-            }
-            self.rescan_again_reason.store(reason, Ordering::Release);
-            if self
-                .rescan_state
-                .compare_exchange(
-                    state,
-                    WATCHER_RESCAN_RERUN,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                self.overflows_during_rescan.fetch_add(1, Ordering::Relaxed);
-                self.checkout_watcher_gap_pending
-                    .store(true, Ordering::Release);
-                return true;
-            }
+        if recovery.rescan_state == WATCHER_RESCAN_IDLE {
+            return false;
         }
+        recovery.rescan_again_reason = Some(reason);
+        recovery.rescan_state = WATCHER_RESCAN_RERUN;
+        self.overflows_during_rescan.fetch_add(1, Ordering::Relaxed);
+        self.checkout_watcher_gap_pending
+            .store(true, Ordering::Release);
+        true
     }
 
     pub(crate) fn start_rescan(&self) {
-        let _ = self.rescan_state.compare_exchange(
-            WATCHER_RESCAN_IDLE,
-            WATCHER_RESCAN_RUNNING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        let mut recovery = self
+            .loss_recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if recovery.rescan_state == WATCHER_RESCAN_IDLE {
+            recovery.rescan_state = WATCHER_RESCAN_RUNNING;
+        }
     }
 
     pub(crate) fn finish_rescan_walk(&self) -> Option<crate::watcher_filter::RescanReason> {
-        loop {
-            match self.rescan_state.load(Ordering::Acquire) {
-                WATCHER_RESCAN_RERUN => {
-                    if self
-                        .rescan_state
-                        .compare_exchange(
-                            WATCHER_RESCAN_RERUN,
-                            WATCHER_RESCAN_RUNNING,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        return Some(match self.rescan_again_reason.load(Ordering::Acquire) {
-                            1 => crate::watcher_filter::RescanReason::KernelDropped,
-                            2 => crate::watcher_filter::RescanReason::UserDropped,
-                            4 => crate::watcher_filter::RescanReason::BufferOverflow,
-                            _ => crate::watcher_filter::RescanReason::Unknown,
-                        });
-                    }
-                }
-                WATCHER_RESCAN_RUNNING => {
-                    if self
-                        .rescan_state
-                        .compare_exchange(
-                            WATCHER_RESCAN_RUNNING,
-                            WATCHER_RESCAN_IDLE,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        return None;
-                    }
-                }
-                _ => return None,
-            }
+        let mut recovery = self
+            .loss_recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if recovery.rescan_state == WATCHER_RESCAN_RERUN {
+            recovery.rescan_state = WATCHER_RESCAN_RUNNING;
+            return Some(
+                recovery
+                    .rescan_again_reason
+                    .unwrap_or(crate::watcher_filter::RescanReason::Unknown),
+            );
         }
+        if recovery.rescan_state == WATCHER_RESCAN_RUNNING {
+            recovery.recovered_through_seq = recovery.covers_seq;
+            recovery.rescan_state = WATCHER_RESCAN_IDLE;
+        }
+        None
     }
 
     #[cfg(test)]
     pub(crate) fn rescan_in_progress(&self) -> bool {
-        self.rescan_state.load(Ordering::Acquire) != WATCHER_RESCAN_IDLE
+        self.loss_recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .rescan_state
+            != WATCHER_RESCAN_IDLE
     }
 
     pub(crate) fn set_observed_exclusion_prefixes(&self, prefixes: Vec<WatcherOverflowPrefix>) {
@@ -1952,6 +1934,14 @@ impl WatcherCounters {
         &self,
         reason: crate::watcher_filter::RescanReason,
     ) -> WatcherRescanInterval {
+        let mut recovery = self
+            .loss_recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        recovery.loss_seq = recovery.loss_seq.saturating_add(1);
+        recovery.covers_seq = recovery.loss_seq;
+        // Metric bookkeeping does not own a drain walk. Only start_rescan
+        // enters the lifecycle that can retain overflows for a follow-up pass.
         match reason {
             crate::watcher_filter::RescanReason::BufferOverflow => {
                 &self.rescans_buffer_overflow_total
@@ -1994,6 +1984,10 @@ impl WatcherCounters {
     }
 
     pub(crate) fn snapshot(&self) -> WatcherCountersSnapshot {
+        let recovery = self
+            .loss_recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let last_rescan_at_ms = self.last_rescan_at_ms.load(Ordering::Acquire);
         WatcherCountersSnapshot {
             exclusion_planning: self
@@ -2027,6 +2021,8 @@ impl WatcherCounters {
                 .paths_dispatched_since_last_rescan
                 .load(Ordering::Relaxed),
             overflows_total: self.overflows_total.load(Ordering::Relaxed),
+            loss_unrecovered: recovery.loss_seq > recovery.recovered_through_seq
+                || recovery.rescan_state != WATCHER_RESCAN_IDLE,
             watch_lost_races_total: self.watch_lost_races_total.load(Ordering::Relaxed),
             overflows_during_rescan: self.overflows_during_rescan.load(Ordering::Relaxed),
             last_overflow_prefixes: self
@@ -2047,6 +2043,99 @@ impl WatcherCounters {
                 && self.last_rescan_rss_delta_known.load(Ordering::Relaxed))
             .then(|| self.last_rescan_rss_delta_bytes.load(Ordering::Relaxed)),
         }
+    }
+}
+
+#[cfg(test)]
+mod watcher_loss_recovery_tests {
+    use super::*;
+    use crate::watcher_filter::RescanReason;
+
+    #[test]
+    fn watcher_loss_recovery_completed_rescan_covers_each_loss_reason() {
+        for reason in [
+            RescanReason::BufferOverflow,
+            RescanReason::KernelDropped,
+            RescanReason::UserDropped,
+            RescanReason::Unknown,
+        ] {
+            let counters = WatcherCounters::default();
+            assert!(!counters.snapshot().loss_unrecovered);
+            assert!(serde_json::to_value(counters.snapshot())
+                .unwrap()
+                .get("loss_unrecovered")
+                .is_none());
+            assert!(!counters.note_overflow(reason, Vec::new()));
+            assert!(counters.snapshot().loss_unrecovered);
+            assert_eq!(
+                serde_json::to_value(counters.snapshot()).unwrap()["loss_unrecovered"],
+                true
+            );
+            counters.start_rescan();
+            counters.begin_rescan(reason);
+            counters.finish_rescan(0, None);
+            assert!(
+                counters.snapshot().loss_unrecovered,
+                "metrics alone do not acknowledge recovery"
+            );
+            assert_eq!(counters.finish_rescan_walk(), None);
+            assert!(!counters.snapshot().loss_unrecovered);
+            assert_eq!(counters.snapshot().overflows_total, 1);
+        }
+    }
+
+    #[test]
+    fn watcher_loss_recovery_overflow_during_rescan_needs_completed_followup() {
+        let counters = WatcherCounters::default();
+        counters.note_overflow(RescanReason::UserDropped, Vec::new());
+        counters.start_rescan();
+        counters.begin_rescan(RescanReason::UserDropped);
+        assert!(counters.note_overflow(RescanReason::KernelDropped, Vec::new()));
+        counters.finish_rescan(0, None);
+        assert_eq!(
+            counters.finish_rescan_walk(),
+            Some(RescanReason::KernelDropped)
+        );
+        assert!(
+            counters.snapshot().loss_unrecovered,
+            "a rerun must not acknowledge the first pass"
+        );
+        counters.begin_rescan(RescanReason::KernelDropped);
+        assert!(counters.snapshot().loss_unrecovered);
+        counters.finish_rescan(0, None);
+        assert_eq!(counters.finish_rescan_walk(), None);
+        assert!(!counters.snapshot().loss_unrecovered);
+        // A later loss must not inherit the previous pass's recovery, even
+        // when both happen within the same millisecond.
+        assert!(!counters.note_overflow(RescanReason::BufferOverflow, Vec::new()));
+        assert!(counters.snapshot().loss_unrecovered);
+    }
+
+    #[test]
+    fn watcher_loss_recovery_pending_rescan_without_overflow_stays_actionable() {
+        let counters = WatcherCounters::default();
+        counters.start_rescan();
+        assert!(counters.snapshot().loss_unrecovered);
+        counters.begin_rescan(RescanReason::UserDropped);
+        counters.finish_rescan(1, None);
+        assert!(counters.snapshot().loss_unrecovered);
+        assert_eq!(counters.finish_rescan_walk(), None);
+        assert!(!counters.snapshot().loss_unrecovered);
+        assert_eq!(counters.snapshot().rescans_user_dropped_total, 1);
+        assert_eq!(counters.snapshot().overflows_total, 0);
+    }
+
+    #[test]
+    fn watcher_loss_recovery_metric_rescan_does_not_coalesce_next_overflow() {
+        let counters = WatcherCounters::default();
+        for _ in 0..2 {
+            assert!(!counters.note_overflow(RescanReason::UserDropped, Vec::new()));
+            counters.begin_rescan(RescanReason::UserDropped);
+            counters.finish_rescan(0, None);
+            assert!(!counters.rescan_in_progress());
+        }
+        assert_eq!(counters.snapshot().overflows_total, 2);
+        assert_eq!(counters.snapshot().overflows_during_rescan, 0);
     }
 }
 
@@ -7551,6 +7640,10 @@ impl AppContext {
             let changed = guard.project_root.as_ref().map(|root| root.as_os_str())
                 != next.project_root.as_ref().map(|root| root.as_os_str());
             *guard = Arc::clone(&next);
+            // This policy is process-wide and user-only. Constructors must not
+            // reset it when another root starts with a default config. Before
+            // the first configure publishes, syncs use the plain fsync default.
+            aft_store::sync::set_macos_full_sync(next.durability.macos_full_sync);
             (next, changed)
         };
         if replace_pin {
