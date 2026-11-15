@@ -49,6 +49,8 @@ pub(crate) enum NotReturned {
     /// The bytes the runner sent did not pass the stream checks, so every
     /// path of the job was discarded. `code` is the checker's error code.
     Unverified { code: String },
+    /// A bounded replay could not recover these returned-file records.
+    ReplayGap { from_seq: u64, before_seq: u64 },
     /// The job ended without the runner's per-path report.
     NoReport,
     /// The local destination, or a symlink on the way to it, leads outside
@@ -83,6 +85,13 @@ impl NotReturned {
             Self::Unverified { code } => {
                 format!("the copy failed verification ({code}); nothing was written")
             }
+            Self::ReplayGap {
+                from_seq,
+                before_seq,
+            } => format!(
+                "the build server's replay was missing returned-file records seq {from_seq}-{}",
+                before_seq.saturating_sub(1)
+            ),
             Self::NoReport => "the server sent no report for it".into(),
             Self::OutsideProject => "the local path resolves outside the project".into(),
             Self::LocalWrite { error } => format!("could not write it here: {error}"),
@@ -415,6 +424,7 @@ mod receiver {
         /// `None` once a stream check failed; every path is then discarded.
         assembler: Option<ReturnAssembler>,
         stream_error: Option<String>,
+        replay_gap: Option<(u64, u64)>,
         staged: Vec<Option<Staged>>,
         /// A local staging failure for one path. That path is not placed even
         /// if the manifest verifies it.
@@ -452,6 +462,7 @@ mod receiver {
                 checkout_root: checkout_root.map(Path::to_path_buf),
                 private,
                 stream_error: None,
+                replay_gap: None,
                 created_dirs: Vec::new(),
                 received_chunk: false,
                 last_chunk: None,
@@ -475,6 +486,7 @@ mod receiver {
             self.settle();
             self.assembler = Some(ReturnAssembler::new(&self.paths, self.cap_bytes));
             self.stream_error = None;
+            self.replay_gap = None;
             self.write_errors = vec![None; self.paths.len()];
             self.received_chunk = false;
             self.last_chunk = None;
@@ -513,6 +525,12 @@ mod receiver {
                 self.write_errors[index] = Some(reason);
                 self.discard(index);
             }
+        }
+
+        pub(crate) fn missing_records(&mut self, from_seq: u64, before_seq: u64) {
+            self.replay_gap.get_or_insert((from_seq, before_seq));
+            self.assembler = None;
+            self.discard_all();
         }
 
         fn write(
@@ -557,6 +575,13 @@ mod receiver {
             expired_replay: Option<u64>,
             record: &mut Recorder<'_>,
         ) -> Vec<ReturnedPath> {
+            if let Some((from_seq, before_seq)) = self.replay_gap {
+                self.settle();
+                return self.all_not_returned(NotReturned::ReplayGap {
+                    from_seq,
+                    before_seq,
+                });
+            }
             let assembler = self.assembler.take();
             let verified = match (assembler, expired_replay) {
                 // An expired replay sends no chunks and places nothing; any
@@ -618,6 +643,12 @@ mod receiver {
         pub(crate) fn without_manifest(&mut self) -> Vec<ReturnedPath> {
             self.assembler = None;
             self.settle();
+            if let Some((from_seq, before_seq)) = self.replay_gap {
+                return self.all_not_returned(NotReturned::ReplayGap {
+                    from_seq,
+                    before_seq,
+                });
+            }
             self.all_not_returned(NotReturned::NoReport)
         }
 

@@ -362,6 +362,7 @@ pub(super) struct MemorySink {
     pub(super) seqs: Vec<u64>,
     pub(super) terminals: Vec<Verdict>,
     pub(super) truncations: Vec<u64>,
+    return_gaps: Vec<(u64, u64)>,
     unknown: Vec<(u64, Vec<u8>)>,
     started: Vec<Started>,
 }
@@ -423,6 +424,10 @@ impl OutputSink for MemorySink {
     }
     fn truncated(&mut self, seq: u64) -> std::io::Result<()> {
         self.truncations.push(seq);
+        Ok(())
+    }
+    fn return_gap(&mut self, from_seq: u64, before_seq: u64) -> std::io::Result<()> {
+        self.return_gaps.push((from_seq, before_seq));
         Ok(())
     }
     fn terminal(&mut self, _record: &TerminalRecord, verdict: &Verdict) -> std::io::Result<()> {
@@ -1368,7 +1373,7 @@ fn terminal_gap_loses_each_missing_range_but_drains_later_records_in_order() {
 }
 
 #[test]
-fn pending_return_chunks_are_byte_bounded_and_released_after_drain() {
+fn pending_return_chunks_evict_payloads_but_replay_recovers_them() {
     let mut consumer = StreamConsumer::new();
     let mut sink = MemorySink::default();
     consumer.consume(accepted(), &mut sink).unwrap();
@@ -1381,29 +1386,128 @@ fn pending_return_chunks_are_byte_bounded_and_released_after_drain() {
             BytePayload(vec![42; RETURN_CHUNK_MAX_BYTES]),
         ))
     };
-    let mut refused = None;
     for seq in 1..=32 {
-        match consumer.consume(chunk(seq), &mut sink) {
-            Ok(()) => {
-                // A duplicate must not consume the budget a second time.
-                consumer.consume(chunk(seq), &mut sink).unwrap();
-            }
-            Err(Error::RecoveryRequired { .. }) => {
-                refused = Some(seq);
-                break;
-            }
-            other => panic!("unexpected result: {other:?}"),
-        }
+        consumer.consume(chunk(seq), &mut sink).unwrap();
+        consumer.consume(chunk(seq), &mut sink).unwrap();
     }
-    let seq = refused.expect("out-of-order chunks must be bounded before the receiver sees them");
-    assert!(seq <= 16);
     assert_eq!(consumer.resume_point().unwrap().last_seq, None);
     consumer
         .consume(output(0, OutputStream::Stdout, b"first"), &mut sink)
         .unwrap();
-    assert_eq!(consumer.resume_point().unwrap().last_seq, Some(seq - 1));
-    consumer.consume(chunk(seq), &mut sink).unwrap();
-    assert_eq!(consumer.resume_point().unwrap().last_seq, Some(seq));
+    assert_eq!(consumer.resume_point().unwrap().last_seq, Some(0));
+    consumer
+        .consume(
+            StreamRecord::ReturnChunk(ReturnChunk::new(
+                job_id(),
+                1,
+                0,
+                0,
+                BytePayload(vec![43; RETURN_CHUNK_MAX_BYTES]),
+            )),
+            &mut sink,
+        )
+        .unwrap();
+    assert_eq!(consumer.resume_point().unwrap().last_seq, Some(0));
+    consumer
+        .consume(
+            output(1, OutputStream::Stdout, b"conflicting duplicate"),
+            &mut sink,
+        )
+        .unwrap();
+    assert_eq!(sink.stdout, b"first");
+    assert!(matches!(
+        consumer.consume(terminal(Outcome::Exit { code: 0 }), &mut sink),
+        Err(Error::RecoveryRequired { .. })
+    ));
+    assert!(
+        serde_json::to_vec(&consumer.resume_point().unwrap().gap_recovery)
+            .unwrap()
+            .len()
+            < 12 * 1024 * 1024
+    );
+    consumer = StreamConsumer::resume(consumer.resume_point().unwrap());
+    for seq in 1..=32 {
+        consumer.consume(chunk(seq), &mut sink).unwrap();
+        assert!(consumer.resume_point().unwrap().last_seq >= Some(seq));
+    }
+    assert_eq!(
+        consumer
+            .resume_point()
+            .unwrap()
+            .attach_request()
+            .unwrap()
+            .from_seq,
+        33
+    );
+    assert_eq!(sink.seqs, (0..=32).collect::<Vec<_>>());
+    consumer
+        .consume(terminal(Outcome::Exit { code: 0 }), &mut sink)
+        .unwrap();
+    assert_eq!(consumer.finish().unwrap(), Verdict::Exited { code: 0 });
+    assert!(sink.truncations.is_empty());
+    assert!(sink.return_gaps.is_empty());
+}
+
+#[test]
+fn an_output_hole_before_a_large_counted_return_still_reports_output_lost() {
+    let mut consumer = StreamConsumer::new();
+    let mut sink = MemorySink::default();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    consumer
+        .consume(output(0, OutputStream::Stdout, b"kept"), &mut sink)
+        .unwrap();
+    for seq in 2..=34 {
+        consumer
+            .consume(
+                StreamRecord::ReturnChunk(ReturnChunk::new(
+                    job_id(),
+                    seq,
+                    0,
+                    (seq - 2) * RETURN_CHUNK_MAX_BYTES as u64,
+                    BytePayload(vec![42; RETURN_CHUNK_MAX_BYTES]),
+                )),
+                &mut sink,
+            )
+            .unwrap();
+    }
+    let mut entry = ReturnManifestEntry::returned(
+        "app.bin",
+        33 * RETURN_CHUNK_MAX_BYTES as u64,
+        "0".repeat(64),
+    );
+    entry.chunks = Some(33);
+    consumer
+        .consume(
+            StreamRecord::ReturnManifest(ReturnManifest::new(
+                job_id(),
+                35,
+                vec![entry],
+                33 * RETURN_CHUNK_MAX_BYTES as u64,
+                RETURN_LARGE_MAX_BYTES_CAP,
+            )),
+            &mut sink,
+        )
+        .unwrap();
+    assert!(matches!(
+        consumer.consume(terminal(Outcome::Exit { code: 1 }), &mut sink),
+        Err(Error::RecoveryRequired { .. })
+    ));
+    for attempt in 1..=3 {
+        consumer = StreamConsumer::resume(consumer.resume_point().unwrap());
+        let result = consumer.finish_recovery(&mut sink);
+        if attempt < 3 {
+            assert!(matches!(result, Err(Error::RecoveryRequired { .. })));
+        } else {
+            assert_eq!(result.unwrap(), Verdict::Exited { code: 1 });
+        }
+    }
+    assert_eq!(sink.stdout, b"kept");
+    assert_eq!(
+        sink.truncations,
+        [2],
+        "seq 1 was output, not a returned-file record"
+    );
+    assert!(!sink.return_gaps.is_empty());
 }
 
 #[test]

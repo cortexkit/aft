@@ -2118,6 +2118,12 @@ impl OutputSink for TaskSink {
     fn gap_recovery(&mut self, recovery: &exec::GapRecovery) -> io::Result<()> {
         self.commit(|r| r.gap_recovery = Some(recovery.clone()))
     }
+    fn return_gap(&mut self, from_seq: u64, before_seq: u64) -> io::Result<()> {
+        if let Some(returns) = self.returns.as_mut() {
+            returns.missing_records(from_seq, before_seq);
+        }
+        Ok(())
+    }
     fn unknown_output(&mut self, seq: u64, bytes: &[u8]) -> io::Result<()> {
         let offset = self.output_progress.unknown_len;
         if !bytes.is_empty() {
