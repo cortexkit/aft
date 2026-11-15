@@ -408,12 +408,14 @@ impl FleetStatusClient {
     }
 }
 
+test_support_visibility! {
 pub(crate) struct StatusWireRequest {
     body: Value,
     project_root: String,
     harness: String,
     session: String,
     client: Weak<FleetStatusInner>,
+}
 }
 
 #[derive(Clone, PartialEq, Eq)]

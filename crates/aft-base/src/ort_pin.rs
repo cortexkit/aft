@@ -250,6 +250,7 @@ fn managed_runtime_roots() -> Vec<PathBuf> {
         .collect()
 }
 
+test_support_visibility! {
 /// Inputs to one authorization decision. Production builds it from process
 /// state in [`authorize_onnx_runtime_load`]; tests build it directly.
 pub(crate) struct OrtPinPolicy<'a> {
@@ -261,6 +262,7 @@ pub(crate) struct OrtPinPolicy<'a> {
     pub managed_roots: &'a [PathBuf],
     /// Accepted library hashes, lowercase hex.
     pub pinned_sha256: &'a [&'a str],
+}
 }
 
 /// A library the pin admitted, with the open file it was hashed through.

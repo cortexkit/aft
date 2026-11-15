@@ -8,6 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+test_support_visibility! {
 struct PinnedExecutable {
     #[cfg(any(test, feature = "test-support"))]
     pub executable: PathBuf,
@@ -18,6 +19,7 @@ struct PinnedExecutable {
     #[cfg(not(any(test, feature = "test-support")))]
     directory: PathBuf,
     state: Mutex<PinState>,
+}
 }
 
 struct PinState {

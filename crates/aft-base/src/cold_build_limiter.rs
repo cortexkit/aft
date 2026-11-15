@@ -141,6 +141,7 @@ impl ColdBuildAdmissionRequest {
     }
 }
 
+test_support_visibility! {
 /// A structured record of a successful cold-build admission.
 ///
 /// `admission_order` records the order in which permits were granted, which can
@@ -155,6 +156,7 @@ pub(crate) struct ColdBuildAdmissionEvent {
     #[cfg(not(any(test, feature = "test-support")))]
     pub(crate) class: ColdBuildAdmissionClass,
     pub(crate) admission_order: u64,
+}
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

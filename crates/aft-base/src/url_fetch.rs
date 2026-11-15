@@ -1696,7 +1696,9 @@ fn secret_hop(
 #[cfg(any(test, feature = "test-support"))]
 thread_local! { pub static SECRET_URL_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
+test_support_visibility! {
 struct SecretOutboundUrl(sensitive::Bytes);
+}
 impl std::ops::Deref for SecretOutboundUrl {
     type Target = str;
     fn deref(&self) -> &str {

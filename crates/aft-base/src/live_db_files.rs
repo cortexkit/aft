@@ -92,7 +92,13 @@ test_support_visibility! {
 // SQLite aliases. Unlike ctime, birth time survives renames.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct LiveFileIdentity {
+    #[cfg(any(test, feature = "test-support"))]
+    pub file: FileIdentity,
+    #[cfg(not(any(test, feature = "test-support")))]
     file: FileIdentity,
+    #[cfg(any(test, feature = "test-support"))]
+    pub created: Option<std::time::SystemTime>,
+    #[cfg(not(any(test, feature = "test-support")))]
     created: Option<std::time::SystemTime>,
 }
 }
@@ -180,10 +186,12 @@ impl Opener {
     }
 }
 
+test_support_visibility! {
 #[derive(Debug, Default)]
 struct OpenDatabase {
     openers: Vec<Opener>,
     identities: HashSet<LiveFileIdentity>,
+}
 }
 
 test_support_visibility! {

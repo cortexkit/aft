@@ -35,7 +35,7 @@ static HELPERS: OnceLock<Arc<Limiter>> = OnceLock::new();
 pub static THREAD_SPAWNS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
-pub(crate) struct Measurements {
+pub struct Measurements {
     pub(crate) dispatches: AtomicUsize,
     pub round_trips: AtomicUsize,
     pub directory_probes: AtomicUsize,

@@ -204,6 +204,7 @@ impl Default for ExecutorConfig {
     }
 }
 
+test_support_visibility! {
 #[derive(Debug, Clone)]
 struct EffectiveConfig {
     pool_size: usize,
@@ -223,6 +224,7 @@ struct EffectiveConfig {
     pub provider_reserve: usize,
     #[cfg(not(any(test, feature = "test-support")))]
     provider_reserve: usize,
+}
 }
 
 impl EffectiveConfig {
@@ -629,6 +631,7 @@ pub struct JobCancellation {
     lifecycle: Option<crate::executor::root_lifecycle::SubcLifecycleAdmission>,
 }
 
+test_support_visibility! {
 #[derive(Debug)]
 struct JobCancellationInner {
     state: AtomicU8,
@@ -637,6 +640,7 @@ struct JobCancellationInner {
     wake: Condvar,
     #[cfg(any(test, feature = "test-support"))]
     pub root_probe_barrier: Mutex<Option<(Sender<()>, Receiver<()>)>>,
+}
 }
 
 const JOB_CANCEL_STATE_PENDING: u8 = 0;
@@ -1068,8 +1072,10 @@ pub fn current_actor_writer_waiting() -> bool {
     })
 }
 
+test_support_visibility! {
 pub(crate) struct ActorWaitingWritersGuard {
     previous: Option<ActorWriterDemand>,
+}
 }
 
 impl ActorWaitingWritersGuard {
@@ -1171,6 +1177,7 @@ pub fn request_exclusive_rerun() -> bool {
     true
 }
 
+test_support_visibility! {
 #[derive(Debug, Clone)]
 struct RunningJob {
     #[cfg(any(test, feature = "test-support"))]
@@ -1195,6 +1202,7 @@ struct RunningJob {
     completion_ownership: Weak<JobCompletionOwnership>,
     occupancy_reported: bool,
     cancellation: Option<JobCancellation>,
+}
 }
 
 #[derive(Debug, Clone)]
@@ -2561,6 +2569,7 @@ impl<C: ExecutorContext> Default for Executor<C> {
     }
 }
 
+test_support_visibility! {
 struct ExecutorInner<C: ExecutorContext> {
     #[cfg(any(test, feature = "test-support"))]
     pub state: Arc<TrackedMutex<SchedulerState<C>>>,
@@ -2580,6 +2589,7 @@ struct ExecutorInner<C: ExecutorContext> {
     dispatch_loop_liveness: Arc<DispatchLoopLiveness<C>>,
     #[cfg(any(test, feature = "test-support"))]
     pub maintenance_root_check_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
 }
 
 impl<C: ExecutorContext> Drop for ExecutorInner<C> {
@@ -3263,6 +3273,7 @@ impl<C: ExecutorContext> ActorState<C> {
     }
 }
 
+test_support_visibility! {
 struct ClassQueues<C: ExecutorContext> {
     order: VecDeque<Lane>,
     pure_reads: VecDeque<QueuedJob<C>>,
@@ -3272,6 +3283,7 @@ struct ClassQueues<C: ExecutorContext> {
     maintenance_commit: VecDeque<QueuedJob<C>>,
     provider_metadata: VecDeque<QueuedJob<C>>,
     call_ledger: VecDeque<QueuedJob<C>>,
+}
 }
 
 impl<C: ExecutorContext> ClassQueues<C> {
@@ -3578,27 +3590,69 @@ impl<C: ExecutorContext> ClassQueues<C> {
 
 test_support_visibility! {
 struct QueuedJob<C: ExecutorContext> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub job: ExecutorJob<C>,
+    #[cfg(not(any(test, feature = "test-support")))]
     job: ExecutorJob<C>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub completion: CompletionSender,
+    #[cfg(not(any(test, feature = "test-support")))]
     completion: CompletionSender,
     #[cfg(any(test, feature = "test-support"))]
     pub request_id: String,
     #[cfg(not(any(test, feature = "test-support")))]
     request_id: String,
+    #[cfg(any(test, feature = "test-support"))]
+    pub command: String,
+    #[cfg(not(any(test, feature = "test-support")))]
     command: String,
+    #[cfg(any(test, feature = "test-support"))]
+    pub queued_at: Instant,
+    #[cfg(not(any(test, feature = "test-support")))]
     queued_at: Instant,
+    #[cfg(any(test, feature = "test-support"))]
+    pub cancellation: Option<JobCancellation>,
+    #[cfg(not(any(test, feature = "test-support")))]
     cancellation: Option<JobCancellation>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub maintenance_coalesce_key: Option<MaintenanceCoalesceKey>,
+    #[cfg(not(any(test, feature = "test-support")))]
     maintenance_coalesce_key: Option<MaintenanceCoalesceKey>,
+    #[cfg(any(test, feature = "test-support"))]
+    /// Present for a route bind that may run beside maintenance with a shared
+    /// hold and be queued again (see [`RepeatableJob`]).
+    pub rerun: Option<RepeatableJob<C>>,
+    #[cfg(not(any(test, feature = "test-support")))]
     /// Present for a route bind that may run beside maintenance with a shared
     /// hold and be queued again (see [`RepeatableJob`]).
     rerun: Option<RepeatableJob<C>>,
+    #[cfg(any(test, feature = "test-support"))]
+    /// A bind queued again after a shared-hold attempt: it is admitted only
+    /// with exclusive use of the actor.
+    pub force_exclusive: bool,
+    #[cfg(not(any(test, feature = "test-support")))]
     /// A bind queued again after a shared-hold attempt: it is admitted only
     /// with exclusive use of the actor.
     force_exclusive: bool,
+    #[cfg(any(test, feature = "test-support"))]
+    /// Not admissible before this time: a bind that found the epoch gate
+    /// held by a detached writer backs off instead of waiting on a worker.
+    pub not_before: Option<Instant>,
+    #[cfg(not(any(test, feature = "test-support")))]
     /// Not admissible before this time: a bind that found the epoch gate
     /// held by a detached writer backs off instead of waiting on a worker.
     not_before: Option<Instant>,
+    #[cfg(any(test, feature = "test-support"))]
+    /// How many times this bind found the gate held by a detached writer.
+    pub exclusive_attempts: u32,
+    #[cfg(not(any(test, feature = "test-support")))]
     /// How many times this bind found the gate held by a detached writer.
     exclusive_attempts: u32,
+    #[cfg(any(test, feature = "test-support"))]
+    /// Checked before metadata starts, so unbind or reconfiguration rejects
+    /// queued or dispatched work from an older configure generation.
+    pub provider_generation: Option<u64>,
+    #[cfg(not(any(test, feature = "test-support")))]
     /// Checked before metadata starts, so unbind or reconfiguration rejects
     /// queued or dispatched work from an older configure generation.
     provider_generation: Option<u64>,
@@ -3715,6 +3769,7 @@ impl CompletionSender {
     }
 }
 
+test_support_visibility! {
 struct RunJob<C: ExecutorContext> {
     root_id: ProjectRootId,
     job_class: JobClass,
@@ -3751,6 +3806,7 @@ struct RunJob<C: ExecutorContext> {
     queued_at: Instant,
     exclusive_attempts: u32,
     provider_generation: Option<u64>,
+}
 }
 
 struct JobCompletionOwnership;
@@ -5122,8 +5178,10 @@ impl HeavySemaphore {
     }
 }
 
+test_support_visibility! {
 struct HeavyPermit {
     semaphore: Arc<HeavySemaphore>,
+}
 }
 
 impl Drop for HeavyPermit {

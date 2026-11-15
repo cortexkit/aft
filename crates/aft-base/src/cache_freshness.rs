@@ -54,10 +54,12 @@ pub enum VerifyStrategy {
     Strict,
 }
 
+test_support_visibility! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ArtifactGeneration {
     size: u64,
     modified_nanos: Option<u128>,
+}
 }
 
 #[derive(Debug, Clone)]

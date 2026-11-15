@@ -126,8 +126,8 @@ pub mod tests {
 
     pub type Events = Arc<Mutex<Vec<(WriteIntent, WritePhase, Vec<u8>)>>>;
     pub struct Listener {
-        root: PathBuf,
-        events: Events,
+        pub root: PathBuf,
+        pub events: Events,
     }
     impl WriteIntentListener for Listener {
         fn record_change(&self, change: &WriteIntent, phase: WritePhase) {

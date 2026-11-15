@@ -109,9 +109,11 @@ impl<T> TrackedMutex<T> {
     }
 }
 
+test_support_visibility! {
 pub(crate) struct TrackedGuard<'a, T> {
     _hold: LockHold<'a>,
     guard: parking_lot::MutexGuard<'a, T>,
+}
 }
 
 impl<T> Deref for TrackedGuard<'_, T> {

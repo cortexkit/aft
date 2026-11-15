@@ -151,12 +151,14 @@ impl Entry {
     }
 }
 
+test_support_visibility! {
 #[derive(Debug)]
 pub(crate) struct Job {
     registry: Arc<Registry>,
     id: u64,
     queued: bool,
     entry: Arc<Mutex<Entry>>,
+}
 }
 
 impl Registry {

@@ -2041,7 +2041,7 @@ thread_local! {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) struct RetrySleepObserverGuard {
+pub struct RetrySleepObserverGuard {
     previous: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 

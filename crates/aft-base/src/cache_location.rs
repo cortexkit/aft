@@ -216,6 +216,7 @@ impl PartialEq for CacheLease {
 }
 impl Eq for CacheLease {}
 
+test_support_visibility! {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(deny_unknown_fields)]
 struct Identity {
@@ -227,6 +228,7 @@ struct Identity {
     pub inode: u64,
     #[cfg(not(any(test, feature = "test-support")))]
     inode: u64,
+}
 }
 test_support_visibility! {
 fn identity(path: &Path) -> io::Result<Identity> {
@@ -255,11 +257,20 @@ fn real_directory(path: &Path) -> io::Result<Identity> {
 test_support_visibility! {
 #[derive(Serialize, Deserialize)]
 struct ParentIdentity {
+    #[cfg(any(test, feature = "test-support"))]
+    pub path: PathBuf,
+    #[cfg(not(any(test, feature = "test-support")))]
     path: PathBuf,
     #[cfg(any(test, feature = "test-support"))]
     pub identity: Identity,
     #[cfg(not(any(test, feature = "test-support")))]
     identity: Identity,
+    #[cfg(any(test, feature = "test-support"))]
+    /// The spelling the user configured, when it differs from `path` because
+    /// it runs through a symlink. It must keep naming the same directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured: Option<PathBuf>,
+    #[cfg(not(any(test, feature = "test-support")))]
     /// The spelling the user configured, when it differs from `path` because
     /// it runs through a symlink. It must keep naming the same directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -275,6 +286,9 @@ struct ParentIdentity {
 test_support_visibility! {
 #[derive(Serialize, Deserialize)]
 struct ParentState {
+    #[cfg(any(test, feature = "test-support"))]
+    pub version: u32,
+    #[cfg(not(any(test, feature = "test-support")))]
     version: u32,
     #[cfg(any(test, feature = "test-support"))]
     pub parents: Vec<ParentIdentity>,
@@ -657,11 +671,13 @@ fn registered_cache_path(path: &Path) -> io::Result<Option<(PathBuf, Identity)>>
     Ok(None)
 }
 
+test_support_visibility! {
 /// A cache pathname is only a label. Keep the admitted directory open while
 /// resolving descendants so replacement ancestors cannot redirect an operation.
 pub(crate) struct CachePath {
     pub(crate) root: PinnedDir,
     pub(crate) relative: PathBuf,
+}
 }
 impl CachePath {
     pub(crate) fn directory(&self, create: bool) -> io::Result<PinnedDir> {
@@ -1379,6 +1395,7 @@ fn prepare_cache_root_with_floor_hooks(
     }
 }
 
+test_support_visibility! {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RecordedRoot {
     #[cfg(any(test, feature = "test-support"))]
@@ -1392,6 +1409,7 @@ struct RecordedRoot {
     #[serde(default)]
     registration: Option<String>,
 }
+}
 test_support_visibility! {
 #[derive(Serialize, Deserialize)]
 struct OwnerMarker {
@@ -1402,6 +1420,7 @@ struct OwnerMarker {
     registration: String,
 }
 }
+test_support_visibility! {
 #[derive(Debug, Serialize, Deserialize)]
 struct History {
     version: u32,
@@ -1416,6 +1435,8 @@ struct History {
     #[serde(default)]
     pending: Vec<PendingRoot>,
 }
+}
+test_support_visibility! {
 #[derive(Debug, Serialize, Deserialize)]
 struct PendingRoot {
     #[cfg(any(test, feature = "test-support"))]
@@ -1426,6 +1447,7 @@ struct PendingRoot {
     pub staging: PathBuf,
     #[cfg(not(any(test, feature = "test-support")))]
     staging: PathBuf,
+}
 }
 test_support_visibility! {
 fn history_path(storage: &Path) -> PathBuf {

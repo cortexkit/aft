@@ -168,14 +168,14 @@ impl crate::secret::requests::ApprovalClock for Clock {
 }
 
 #[derive(Default)]
-struct PhoneState {
+pub struct PhoneState {
     pub requests: Vec<SecretConsentRequest>,
     answers: HashMap<String, ConsentOutcome>,
     closed: bool,
     withdrawn: Vec<String>,
 }
 
-struct Phone {
+pub struct Phone {
     runtime: tokio::runtime::Handle,
     pub state: std::sync::Mutex<PhoneState>,
     answer: std::sync::Condvar,
