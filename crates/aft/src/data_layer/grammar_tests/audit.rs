@@ -1039,6 +1039,7 @@ isolated!(
         let _fill = enable_meaning(&f.ctx, &f.root);
         let runtime = f.ctx.data_checkout().unwrap();
         runtime.wait_for_memory_profile_idle_for_test();
+        let _ = meaning_query(&f.ctx);
         until(
             || match runtime.meaning_status() {
                 crate::data_layer::meaning::MeaningState::Serving { snapshot, .. }

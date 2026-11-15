@@ -186,7 +186,11 @@ impl DataSemantic {
             MeaningState::Blocked(failure) => Self::NotServing(blocked(&failure, None)),
             MeaningState::Serving { snapshot, failure } => {
                 let meaning = DataMeaning { snapshot, failure };
-                if meaning.complete() || meaning.snapshot.chunks() > 0 {
+                // Files whose outlines could not be extracted have a terminal
+                // failure instead of chunks to embed. Serve a settled, possibly
+                // empty snapshot so its gaps are disclosed instead of waiting
+                // for embedding work that will never be queued.
+                if !meaning::waiting(meaning.snapshot.coverage()) || meaning.snapshot.chunks() > 0 {
                     Self::Serving(Arc::new(meaning))
                 } else {
                     let coverage = Some(meaning.snapshot.coverage());
