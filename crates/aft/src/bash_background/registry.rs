@@ -7464,8 +7464,8 @@ impl BgTaskRegistry {
         let _ = self.remove_pending_completion(task_id);
         self.ack_persisted_watches_for_task(originating_session_id, task_id, true);
         if retired {
-            crate::slog_info!(
-                "orphaned completion already reaped: task_id={task_id} source=bash_tasks reason=layout_missing"
+            crate::slog_warn!(
+                "orphaned completion already reaped: task_id={task_id} reason=layout_missing source=bash_tasks"
             );
         }
         true
@@ -29257,7 +29257,7 @@ mod tests {
                 .filter(|line| line.contains(&row.task_id))
                 .collect::<Vec<_>>();
             assert_eq!(task_logs.len(), 1, "{first_logs:?}");
-            assert!(task_logs[0].starts_with("INFO "), "{first_logs:?}");
+            assert!(task_logs[0].starts_with("WARN "), "{first_logs:?}");
             assert!(task_logs[0].contains("source=bash_tasks"));
             assert!(task_logs[0].contains("reaped"));
             assert_eq!(
