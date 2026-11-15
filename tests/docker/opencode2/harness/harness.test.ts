@@ -3228,6 +3228,7 @@ describe("a row that needs the callgraph waits for it", () => {
     for (const relative of [
       "packages/opencode-plugin/test/load-matrix/load-matrix.ts",
       "packages/aft-bridge/src/__tests__/test-utils/cached-executable.ts",
+      "packages/aft-bridge/src/__tests__/test-utils/image-cache-usage.ts",
     ]) {
       await mkdir(join(directory, relative, ".."), { recursive: true });
       await cp(join(repoRoot, relative), join(directory, relative));
