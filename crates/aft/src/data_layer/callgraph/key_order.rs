@@ -410,7 +410,8 @@ impl SiteBuffer {
                 })
             }
         };
-        // Asks the disk admission for each further memory's worth.
+        // Checks the build's free-disk policy before each further `cap`
+        // positions are written.
         if overflow.sites % self.cap as u64 == 0 {
             runs.workspace()
                 .check_space((self.cap * SITE_BYTES) as u64)

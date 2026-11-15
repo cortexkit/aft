@@ -51,8 +51,8 @@ pub(crate) fn flip_site_for_control(path: &str, file: &mut FileResolution) {
 }
 
 /// A site's targets, changeable whether the site holds its answer or shares
-/// it: the gate kit builds this file into older trees as well, where sites
-/// hold their own.
+/// it: the exactness gates (`scripts/telemetry/callgraph-exactness`) build
+/// this file into older source trees as well, where sites hold their own.
 trait TargetsMut {
     fn targets_mut(
         &mut self,
