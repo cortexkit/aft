@@ -824,14 +824,9 @@ mod tests {
     fn shell_env_provider_strict_grants_only_home_path_entries() {
         let home = std::fs::canonicalize(std::env::var_os("HOME").unwrap()).unwrap();
         let inside = tempfile::tempdir_in(&home).unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let outside = if outside.path().starts_with(&home) {
-            tempfile::tempdir_in(home.parent().unwrap()).unwrap()
-        } else {
-            outside
-        };
+        let outside = Path::new("/usr/bin");
         let link = inside.path().join("escape");
-        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        std::os::unix::fs::symlink(outside, &link).unwrap();
         let profile = crate::sandbox_profile::SandboxProfile::build(
             vec![],
             vec![],
@@ -847,7 +842,7 @@ mod tests {
             profile,
             launcher_path: "/unused".into(),
         };
-        let path = std::env::join_paths([inside.path(), outside.path(), &link]).unwrap();
+        let path = std::env::join_paths([inside.path(), outside, &link]).unwrap();
         crate::sandbox_spawn::allow_provider_path(&mut plan, path.to_str());
         let SpawnPlan::Launcher { profile, .. } = plan else {
             unreachable!()
@@ -857,7 +852,7 @@ mod tests {
             .contains(&inside.path().canonicalize().unwrap()));
         assert!(!profile
             .read_allow
-            .contains(&outside.path().canonicalize().unwrap()));
+            .contains(&outside.canonicalize().unwrap()));
         assert_eq!(profile.read_allow.len(), 1);
     }
 
