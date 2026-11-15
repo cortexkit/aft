@@ -4418,6 +4418,10 @@ pub(crate) fn complete_rust_trait_members(
     symbols: &mut Vec<Symbol>,
     members: impl IntoIterator<Item = Symbol>,
 ) {
+    // Stored symbol ordinals and live tree walkers need not visit traits in
+    // the same order; navigation always appends members in source order.
+    let mut members = members.into_iter().collect::<Vec<_>>();
+    members.sort_by_key(|member| (member.range.start_line, member.range.start_col));
     for member in members {
         if member.kind != SymbolKind::Method
             || !symbols.iter().any(|owner| {
