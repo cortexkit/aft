@@ -386,6 +386,13 @@
                 "required": [
                   "command"
                 ]
+              },
+              "else": {
+                "properties": {
+                  "watch": {
+                    "maxItems": 0
+                  }
+                }
               }
             }
           ]
@@ -1290,6 +1297,13 @@
                       "required": [
                         "command"
                       ]
+                    },
+                    "else": {
+                      "properties": {
+                        "watch": {
+                          "maxItems": 0
+                        }
+                      }
                     }
                   }
                 ]

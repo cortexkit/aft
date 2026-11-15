@@ -1,0 +1,10 @@
+{
+  "shell": {
+    "env_provider": {
+      "kind": "mise",
+      "watch": [
+        "ignored.env"
+      ]
+    }
+  }
+}

@@ -931,6 +931,12 @@ const ShellEnvProviderSchema = z
   })
   .strict()
   .superRefine((provider, context) => {
+    if (provider.kind !== "custom" && provider.watch.length > 0)
+      context.addIssue({
+        code: "custom",
+        path: ["watch"],
+        message: "invalid_security_config:shell.env_provider.watch",
+      });
     if (provider.kind === "custom" && provider.command === undefined)
       context.addIssue({
         code: "custom",
@@ -1652,11 +1658,16 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
       result.error.issues,
     );
     if (rejected.length > 0) throw new ConfigRejectedError(rejected, configPath);
-    if (tier === "user" && result.error.issues.some((issue) => issue.path[0] === "shell"))
+    const shellIssues = result.error.issues.filter(
+      (issue) =>
+        issue.path[0] === "shell" ||
+        (issue.path[0] === "harnesses" &&
+          issue.path[1] === ACTIVE_HARNESS &&
+          issue.path[2] === "shell"),
+    );
+    if (tier === "user" && shellIssues.length > 0)
       throw new ConfigRejectedError(
-        result.error.issues
-          .filter((issue) => issue.path[0] === "shell")
-          .map((issue) => issue.message),
+        shellIssues.map((issue) => issue.message),
         configPath,
       );
     const errorMsg = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join(", ");

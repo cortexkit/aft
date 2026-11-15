@@ -861,6 +861,9 @@ fn default_env_provider_timeout_ms() -> u64 {
 
 impl ShellEnvProvider {
     pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.kind != ShellEnvProviderKind::Custom && !self.watch.is_empty() {
+            return Err("invalid_security_config:shell.env_provider.watch".into());
+        }
         if !(100..=10000).contains(&self.timeout_ms) {
             return Err("shell.env_provider.timeout_ms must be between 100 and 10000".into());
         }

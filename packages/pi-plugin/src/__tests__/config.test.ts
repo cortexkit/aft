@@ -134,6 +134,28 @@ describe("loadAftConfig", () => {
     expect(JSON.parse(projectOnly.stdout).shell).toBeUndefined();
   });
 
+  test("shell env provider rejects built-in watch lists in active harness overrides", () => {
+    for (const kind of ["mise", "direnv"]) {
+      expect(
+        AftConfigSchema.safeParse({ shell: { env_provider: { kind, watch: ["ignored.env"] } } })
+          .success,
+      ).toBe(false);
+    }
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({
+        harnesses: { pi: { shell: { env_provider: { kind: "mise", watch: ["ignored.env"] } } } },
+      }),
+    );
+    expect(
+      runRejectedConfigLoader(fixture.projectDirectory, {
+        HOME: join(fixture.root, "home"),
+        XDG_CONFIG_HOME: fixture.xdgConfigHome,
+      }).errors,
+    ).toContain("invalid_security_config:shell.env_provider.watch");
+  });
+
   test("shell env provider validates argv and timeout", () => {
     for (const env_provider of [
       { kind: "custom" },

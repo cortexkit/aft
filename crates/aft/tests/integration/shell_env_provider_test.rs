@@ -8,7 +8,13 @@ use serde_json::{json, Value};
 
 use super::helpers::{user_config, AftProcess};
 
-fn configure(aft: &mut AftProcess, project: &Path, storage: &Path, command: Vec<String>) {
+fn configure(
+    aft: &mut AftProcess,
+    project: &Path,
+    storage: &Path,
+    command: Vec<String>,
+    watch: &[&str],
+) {
     let result = aft.send(
         &json!({
             "id":"provider-config", "command":"configure", "harness":"opencode",
@@ -17,7 +23,7 @@ fn configure(aft: &mut AftProcess, project: &Path, storage: &Path, command: Vec<
                 "git":{"co_author":"off"},
                 "bash":{"background":true},
                 "sandbox":{"profile":{"head":"strict", "worker":"strict"}},
-                "shell":{"env_provider":{"kind":"custom", "command":command}}
+                "shell":{"env_provider":{"kind":"custom", "command":command, "watch":watch}}
             }))
         })
         .to_string(),
@@ -56,6 +62,7 @@ fn fixture() -> (tempfile::TempDir, AftProcess) {
                 export.replace('\'', "'\\''")
             ),
         ],
+        &[],
     );
     (fixture, aft)
 }
@@ -76,6 +83,43 @@ fn shell_env_provider_native_shell_sees_path_and_removes_variables() {
     assert!(output.contains("project-node20"), "{result}");
     assert!(output.contains("Sandbox Author|unset|unset"), "{result}");
     assert!(aft.shutdown().success());
+}
+
+#[test]
+fn shell_env_provider_native_cache_ignores_temp_keys_but_never_replays_temp_values() {
+    for echo_temp in [false, true] {
+        let (fixture, mut aft) = fixture();
+        let script = if echo_temp {
+            "printf 'run\\n' >> provider-runs; printf '{\"PROJECT_TEMP\":\"%s\"}' \"$TMPDIR\""
+        } else {
+            "printf 'run\\n' >> provider-runs; printf '{\"GIT_AUTHOR_NAME\":\"Stable Author\"}'"
+        };
+        configure(
+            &mut aft,
+            &fixture.path().join("project"),
+            &fixture.path().join("storage"),
+            vec!["/bin/sh".into(), "-c".into(), script.into()],
+            &["project.env"],
+        );
+        for id in ["provider-cache-first", "provider-cache-second"] {
+            let result = call(
+                &mut aft,
+                id,
+                json!({"command":"printf '%s' \"${PROJECT_TEMP-$GIT_AUTHOR_NAME}\"", "foreground_orchestrate":true, "compressed":false}),
+            );
+            assert_eq!(result["status"], "completed", "{result}");
+        }
+        let runs = std::fs::read_to_string(fixture.path().join("project/provider-runs"))
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(
+            runs,
+            if echo_temp { 2 } else { 1 },
+            "private temp values must not survive into a subsequent call"
+        );
+        assert!(aft.shutdown().success());
+    }
 }
 
 #[test]

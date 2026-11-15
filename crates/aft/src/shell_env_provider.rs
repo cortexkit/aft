@@ -232,7 +232,7 @@ pub(crate) fn apply(
         Ok(export) => export,
         Err(reason) => return Some(failure_line(&reason)),
     };
-    if let Some(key) = key {
+    if let Some(key) = key.filter(|_| cacheable_export(&export, plan.temp_dir())) {
         cache()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -267,7 +267,45 @@ fn base_environment(
     plan: &SpawnPlan,
     overrides: &HashMap<String, String>,
 ) -> BTreeMap<OsString, OsString> {
-    crate::sandbox_spawn::provider_base_environment(plan, overrides)
+    let mut base = crate::sandbox_spawn::provider_base_environment(plan, overrides);
+    if let Some(private_temp) = plan.temp_dir() {
+        // Each sandbox receives a fresh private temp directory. Hash the base
+        // before installing its temp variables or prepending macOS's private
+        // mktemp executable directory to PATH, so identical calls share a key.
+        for name in ["TMPDIR", "TEMP", "TMP"] {
+            base.remove(OsStr::new(name));
+            if let Some(value) = std::env::var_os(name) {
+                base.insert(name.into(), value);
+            }
+        }
+        if let Some(path) = base.get(OsStr::new("PATH")) {
+            if let Ok(path) = std::env::join_paths(
+                std::env::split_paths(path).filter(|entry| !entry.starts_with(private_temp)),
+            ) {
+                base.insert("PATH".into(), path);
+            }
+        }
+    }
+    base
+}
+
+fn cacheable_export(export: &Export, private_temp: Option<&Path>) -> bool {
+    let Some(temp) = private_temp.and_then(Path::to_str) else {
+        return true;
+    };
+    !export.values().flatten().any(|value| {
+        #[cfg(windows)]
+        {
+            value
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+                .contains(&temp.replace('\\', "/").to_ascii_lowercase())
+        }
+        #[cfg(not(windows))]
+        {
+            value.contains(temp)
+        }
+    })
 }
 
 fn run(
@@ -455,6 +493,80 @@ mod tests {
             command: Some(command),
             timeout_ms: 2000,
             watch: vec![],
+        }
+    }
+
+    #[test]
+    fn shell_env_provider_fake_kinds_end_to_end() {
+        let project = tempfile::tempdir().unwrap();
+        let bin = project.path().join("toolchain");
+        std::fs::create_dir(&bin).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let tool = bin.join("provider-node");
+            std::fs::write(&tool, "#!/bin/sh\nprintf 'Node20\\n'\n").unwrap();
+            std::fs::set_permissions(tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(windows)]
+        std::fs::write(bin.join("provider-node.cmd"), "@echo Node20\r\n").unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            crate::effective_path::effective_path(),
+        ));
+        let path = std::env::join_paths(paths)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let output = project.path().join("export.json");
+        std::fs::write(&output, serde_json::to_vec(&serde_json::json!({"PATH":path, "GIT_AUTHOR_NAME":"Project Author", "REMOVE":null})).unwrap()).unwrap();
+        let kinds = [
+            ShellEnvProviderKind::Mise,
+            ShellEnvProviderKind::Custom,
+            ShellEnvProviderKind::Direnv,
+        ];
+        for kind in kinds {
+            if cfg!(windows) && kind == ShellEnvProviderKind::Direnv {
+                continue;
+            }
+            let mut env = HashMap::from([("REMOVE".into(), "base".into())]);
+            let mut plan = SpawnPlan::Unsandboxed;
+            assert!(apply(
+                Some(&fake(kind, &output)),
+                &mut plan,
+                project.path(),
+                &mut env,
+                false
+            )
+            .is_none());
+            let mut config = crate::config::Config::default();
+            config.git.co_author = "off".into();
+            crate::agent_child_env::inject(&config, project.path(), &mut env, None).unwrap();
+            #[cfg(unix)]
+            let mut child = {
+                let mut command = std::process::Command::new("/bin/sh");
+                command.args(["-c", "provider-node; printf '%s|%s|%s' \"$GIT_AUTHOR_NAME\" \"${REMOVE-unset}\" \"${AFT_INTERNAL_SHELL_ENV_REMOVALS-unset}\""]);
+                command
+            };
+            #[cfg(windows)]
+            let mut child = {
+                let mut command = std::process::Command::new("cmd.exe");
+                command.args(["/D", "/C", "call provider-node.cmd & echo %GIT_AUTHOR_NAME%& if defined REMOVE echo REMOVAL_LEAK& if defined AFT_INTERNAL_SHELL_ENV_REMOVALS echo MARKER_LEAK"]);
+                command
+            };
+            child.env("REMOVE", "base");
+            crate::agent_child_env::apply_to_command(&mut child, &env);
+            let result = child.output().unwrap();
+            assert!(result.status.success(), "{kind:?}: {:?}", result.stderr);
+            let stdout = String::from_utf8(result.stdout).unwrap();
+            assert!(stdout.contains("Node20"), "{kind:?}: {stdout}");
+            assert!(stdout.contains("Project Author"), "{kind:?}: {stdout}");
+            assert!(!stdout.contains("LEAK"), "{kind:?}: {stdout}");
+            #[cfg(unix)]
+            assert!(
+                stdout.ends_with("Project Author|unset|unset"),
+                "{kind:?}: {stdout}"
+            );
         }
     }
 

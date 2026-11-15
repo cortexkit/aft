@@ -4836,6 +4836,18 @@ mod tests {
 
     #[test]
     fn shell_env_provider_validates_command_timeout_and_platform() {
+        for kind in ["mise", "direnv"] {
+            let result = resolve_config(&[tier(
+                "user",
+                &format!(
+                    r#"{{"shell":{{"env_provider":{{"kind":"{kind}","watch":["ignored.env"]}}}}}}"#
+                ),
+            )]);
+            assert_eq!(
+                result.errors,
+                ["invalid_security_config:shell.env_provider.watch"]
+            );
+        }
         for provider in [
             r#"{"kind":"custom"}"#,
             r#"{"kind":"mise","timeout_ms":99}"#,
