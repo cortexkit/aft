@@ -1788,8 +1788,11 @@ pub(crate) fn resolve_checkout_into(
         }
         // Pass 4, first step: in file order, what every site and declaration
         // means, with each answer read from the inputs above (see
-        // `dispatch::projected`). The second step reads only these records.
-        let mut records = site_records::MemoryRecords::default();
+        // `dispatch::projected`). The records go to disk, in the workspace's
+        // `pass4/` folder; the second step reads them back through a
+        // bounded cache. That cache is a build cache like the bound files',
+        // so a smaller budget for those bounds it too.
+        let mut records = site_records::RecordWriter::new(workspace)?;
         #[cfg(feature = "test-hooks")]
         super::refresh_probe::stage("projection");
         for batch in paths.chunks(BATCH) {
@@ -1807,7 +1810,7 @@ pub(crate) fn resolve_checkout_into(
         }
         lap(&mut memory, "projection");
         boundary(inputs)?;
-        let mut source = site_records::RecordSource::new(&records);
+        let mut source = records.finish(budget.record_bytes().min(bind_bytes))?;
         if memory.is_some() {
             source = source.counting_touches();
         }
@@ -1820,6 +1823,9 @@ pub(crate) fn resolve_checkout_into(
         let (answers, mut results) =
             key_order::resolve(&source, &paths, spool.dir(), budget, memory.as_deref_mut())?;
         let sites_ms = started.elapsed().as_millis();
+        // Assembly reads each file's record once, from disk, in path order;
+        // the records the cache kept are let go.
+        source.release_cache();
         #[cfg(feature = "test-hooks")]
         super::refresh_probe::stage("assembly");
         // The key order's units and sorted keys are gone; only the answers
@@ -1872,16 +1878,12 @@ pub(crate) fn resolve_checkout_into(
                     .into_par_iter()
                     .map(|(path, bytes, site_results)| {
                         let _label = carry.enter();
-                        let record = source.records.get(&path).ok_or_else(|| {
-                            ManifestJoinError::Parse(format!(
-                                "missing method-call record for {path}"
-                            ))
-                        })?;
+                        let record = source.read_path(&path)?;
                         #[cfg(feature = "callgraph-shape-census")]
                         let mut census = super::shape_census::Census::default();
                         let (sites, dependencies) = answers.assemble(
                             &path,
-                            record,
+                            &record,
                             site_results,
                             #[cfg(feature = "callgraph-shape-census")]
                             &mut census,
@@ -1921,7 +1923,6 @@ pub(crate) fn resolve_checkout_into(
         #[cfg(feature = "callgraph-shape-census")]
         let census = std::mem::take(&mut *source.census.lock().unwrap_or_else(|e| e.into_inner()));
         drop(source);
-        drop(records);
         drop(spool);
         relieve_allocator();
         if let Some(memory) = memory.as_deref_mut() {

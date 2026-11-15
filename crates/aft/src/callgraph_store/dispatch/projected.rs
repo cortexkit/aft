@@ -27,7 +27,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{dependency, DispatchFacts, ParseBlob, Resolver, SiteHint, TypeHint};
+use super::{dependency, DispatchFacts, MethodHint, ParseBlob, Resolver, SiteHint, TypeHint};
 
 /// The answer [`Resolver::project_type`] gave for one name asked of one file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -175,19 +175,412 @@ impl FileRecord {
     }
 }
 
+/// The first byte of every scratch-encoded record (see
+/// [`FileRecord::encode_scratch`]). The encoding lives only in one build's
+/// scratch folder and is read back by the same process, so it needs no
+/// version history; the byte only catches bytes that are not a record.
+const SCRATCH_FORMAT: u8 = 1;
+
+/// Appends the scratch encoding's parts: counts and lengths as
+/// little-endian `u32`, flags as one byte, text as its length and bytes.
+struct ScratchWriter<'o>(&'o mut Vec<u8>);
+
+impl ScratchWriter<'_> {
+    fn byte(&mut self, value: u8) {
+        self.0.push(value);
+    }
+
+    fn flag(&mut self, value: bool) {
+        self.0.push(u8::from(value));
+    }
+
+    fn number(&mut self, value: u32) {
+        self.0.extend(value.to_le_bytes());
+    }
+
+    fn count(&mut self, count: usize) -> Result<(), String> {
+        let count = u32::try_from(count)
+            .map_err(|_| "a pass-4 record part has 4 billion or more items".to_string())?;
+        self.number(count);
+        Ok(())
+    }
+
+    fn text(&mut self, text: &str) -> Result<(), String> {
+        self.count(text.len())?;
+        self.0.extend_from_slice(text.as_bytes());
+        Ok(())
+    }
+
+    fn optional(&mut self, text: Option<&str>) -> Result<(), String> {
+        match text {
+            None => self.byte(0),
+            Some(text) => {
+                self.byte(1);
+                self.text(text)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn texts(&mut self, texts: &[String]) -> Result<(), String> {
+        self.count(texts.len())?;
+        for text in texts {
+            self.text(text)?;
+        }
+        Ok(())
+    }
+}
+
+/// Reads what [`ScratchWriter`] wrote, failing on anything it could not
+/// have written.
+struct ScratchReader<'b> {
+    bytes: &'b [u8],
+    at: usize,
+}
+
+impl<'b> ScratchReader<'b> {
+    fn take(&mut self, len: usize) -> Result<&'b [u8], String> {
+        let end = self
+            .at
+            .checked_add(len)
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or_else(|| "a truncated pass-4 record".to_string())?;
+        let taken = &self.bytes[self.at..end];
+        self.at = end;
+        Ok(taken)
+    }
+
+    fn byte(&mut self) -> Result<u8, String> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn flag(&mut self) -> Result<bool, String> {
+        match self.byte()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => Err(format!("a pass-4 record flag reads {other}")),
+        }
+    }
+
+    fn number(&mut self) -> Result<u32, String> {
+        let bytes = self.take(4)?;
+        Ok(u32::from_le_bytes(bytes.try_into().expect("four bytes")))
+    }
+
+    /// A count of items, each at least one byte long, so a damaged count
+    /// cannot ask for more memory than the record's bytes.
+    fn count(&mut self) -> Result<usize, String> {
+        let count = self.number()? as usize;
+        if count > self.bytes.len() - self.at {
+            return Err(format!("a pass-4 record counts {count} items past its end"));
+        }
+        Ok(count)
+    }
+
+    fn text(&mut self) -> Result<String, String> {
+        let len = self.number()? as usize;
+        String::from_utf8(self.take(len)?.to_vec())
+            .map_err(|_| "a pass-4 record holds text that is not UTF-8".to_string())
+    }
+
+    fn optional(&mut self) -> Result<Option<String>, String> {
+        match self.byte()? {
+            0 => Ok(None),
+            1 => self.text().map(Some),
+            other => Err(format!("a pass-4 record option reads {other}")),
+        }
+    }
+
+    fn texts(&mut self) -> Result<Vec<String>, String> {
+        let count = self.count()?;
+        (0..count).map(|_| self.text()).collect()
+    }
+}
+
+impl ProjectedType {
+    fn encode_scratch(&self, out: &mut ScratchWriter<'_>) -> Result<(), String> {
+        let Self {
+            found,
+            dependencies,
+        } = self;
+        match found {
+            None => out.byte(0),
+            Some((file, index)) => {
+                out.byte(1);
+                out.text(file)?;
+                out.number(*index);
+            }
+        }
+        out.texts(dependencies)
+    }
+
+    fn decode_scratch(input: &mut ScratchReader<'_>) -> Result<Self, String> {
+        let found = match input.byte()? {
+            0 => None,
+            1 => Some((input.text()?, input.number()?)),
+            other => return Err(format!("a projected type reads {other}")),
+        };
+        Ok(Self {
+            found,
+            dependencies: input.texts()?.into_boxed_slice(),
+        })
+    }
+}
+
+impl ProjectedMro {
+    fn encode_scratch(&self, out: &mut ScratchWriter<'_>) -> Result<(), String> {
+        let Self { mro, dependencies } = self;
+        match mro {
+            None => out.byte(0),
+            Some(order) => {
+                out.byte(1);
+                out.count(order.len())?;
+                for (file, name) in order {
+                    out.text(file)?;
+                    out.text(name)?;
+                }
+            }
+        }
+        out.texts(dependencies)
+    }
+
+    fn decode_scratch(input: &mut ScratchReader<'_>) -> Result<Self, String> {
+        let mro = match input.byte()? {
+            0 => None,
+            1 => {
+                let count = input.count()?;
+                Some(
+                    (0..count)
+                        .map(|_| Ok((input.text()?, input.text()?)))
+                        .collect::<Result<Vec<_>, String>>()?,
+                )
+            }
+            other => return Err(format!("a resolution order reads {other}")),
+        };
+        Ok(Self {
+            mro,
+            dependencies: input.texts()?.into_boxed_slice(),
+        })
+    }
+}
+
+impl FileRecord {
+    /// Appends the record's scratch encoding to `out`: what a cold build
+    /// writes to its scratch folder, and [`Self::decode_scratch`] reads back
+    /// equal. Never published.
+    ///
+    /// # Errors
+    ///
+    /// When a part has 4 billion or more items or bytes.
+    pub(crate) fn encode_scratch(&self, out: &mut Vec<u8>) -> Result<(), String> {
+        // Named in full, so a field added to the record must be added here.
+        let Self {
+            facts,
+            projections,
+            mro,
+            complete_names,
+            resolvable_name_projections,
+            sites,
+            associated,
+        } = self;
+        debug_assert!(
+            *facts == declarations(facts),
+            "a record keeps only the facts `declarations` keeps"
+        );
+        let mut out = ScratchWriter(out);
+        out.byte(SCRATCH_FORMAT);
+        out.text(&facts.language)?;
+        out.optional(facts.dispatch.go_package.as_deref())?;
+        out.count(facts.dispatch.types.len())?;
+        for TypeHint {
+            name,
+            bases,
+            interface,
+            closed,
+        } in &facts.dispatch.types
+        {
+            out.text(name)?;
+            out.texts(bases)?;
+            out.flag(*interface);
+            out.flag(*closed);
+        }
+        out.count(facts.dispatch.methods.len())?;
+        for MethodHint {
+            owner,
+            trait_name,
+            name,
+            symbol,
+            has_body,
+            shape,
+            private,
+        } in &facts.dispatch.methods
+        {
+            out.text(owner)?;
+            out.optional(trait_name.as_deref())?;
+            out.text(name)?;
+            out.text(symbol)?;
+            out.flag(*has_body);
+            out.text(shape)?;
+            out.flag(*private);
+        }
+        out.count(projections.len())?;
+        for (name, projected) in projections {
+            out.text(name)?;
+            projected.encode_scratch(&mut out)?;
+        }
+        out.count(mro.len())?;
+        for (owner, order) in mro {
+            out.text(owner)?;
+            order.encode_scratch(&mut out)?;
+        }
+        out.flag(*complete_names);
+        out.number(*resolvable_name_projections);
+        out.count(sites.len())?;
+        for SiteRecord {
+            site,
+            associated,
+            keeps_ordinary_edge,
+        } in sites
+        {
+            let SiteHint {
+                ordinal,
+                caller,
+                line,
+                member,
+                receiver,
+                dynamic,
+            } = site;
+            out.number(*ordinal);
+            out.optional(caller.as_deref())?;
+            out.number(*line);
+            out.optional(member.as_deref())?;
+            out.optional(receiver.as_deref())?;
+            out.flag(*dynamic);
+            out.flag(*associated);
+            out.flag(*keeps_ordinary_edge);
+        }
+        out.count(associated.len())?;
+        for ordinal in associated {
+            out.number(*ordinal);
+        }
+        Ok(())
+    }
+
+    /// The record [`Self::encode_scratch`] encoded as `bytes`.
+    ///
+    /// # Errors
+    ///
+    /// When `bytes` is not exactly one record's scratch encoding.
+    pub(crate) fn decode_scratch(bytes: &[u8]) -> Result<Self, String> {
+        let mut input = ScratchReader { bytes, at: 0 };
+        let format = input.byte()?;
+        if format != SCRATCH_FORMAT {
+            return Err(format!("not a pass-4 record (it starts with {format})"));
+        }
+        let language = input.text()?;
+        let go_package = input.optional()?;
+        let count = input.count()?;
+        let mut types = Vec::with_capacity(count);
+        for _ in 0..count {
+            types.push(TypeHint {
+                name: input.text()?,
+                bases: input.texts()?,
+                interface: input.flag()?,
+                closed: input.flag()?,
+            });
+        }
+        let count = input.count()?;
+        let mut methods = Vec::with_capacity(count);
+        for _ in 0..count {
+            methods.push(MethodHint {
+                owner: input.text()?,
+                trait_name: input.optional()?,
+                name: input.text()?,
+                symbol: input.text()?,
+                has_body: input.flag()?,
+                shape: input.text()?,
+                private: input.flag()?,
+            });
+        }
+        let mut projections = BTreeMap::new();
+        for _ in 0..input.count()? {
+            let name = input.text()?;
+            projections.insert(name, ProjectedType::decode_scratch(&mut input)?);
+        }
+        let mut mro = BTreeMap::new();
+        for _ in 0..input.count()? {
+            let owner = input.text()?;
+            mro.insert(owner, ProjectedMro::decode_scratch(&mut input)?);
+        }
+        let complete_names = input.flag()?;
+        let resolvable_name_projections = input.number()?;
+        let count = input.count()?;
+        let mut sites = Vec::with_capacity(count);
+        for _ in 0..count {
+            sites.push(SiteRecord {
+                site: SiteHint {
+                    ordinal: input.number()?,
+                    caller: input.optional()?,
+                    line: input.number()?,
+                    member: input.optional()?,
+                    receiver: input.optional()?,
+                    dynamic: input.flag()?,
+                },
+                associated: input.flag()?,
+                keeps_ordinary_edge: input.flag()?,
+            });
+        }
+        let count = input.count()?;
+        let associated = (0..count)
+            .map(|_| input.number())
+            .collect::<Result<Vec<_>, _>>()?;
+        if input.at != bytes.len() {
+            return Err(format!(
+                "a pass-4 record has {} bytes past its end",
+                bytes.len() - input.at
+            ));
+        }
+        Ok(Self {
+            facts: declarations_of(language, go_package, types, methods),
+            projections,
+            mro,
+            complete_names,
+            resolvable_name_projections,
+            sites,
+            associated,
+        })
+    }
+}
+
 /// `parse` reduced to what the resolver reads once projections are
 /// recorded: language, Go package, types and methods.
 fn declarations(parse: &ParseBlob) -> ParseBlob {
+    declarations_of(
+        parse.language.clone(),
+        parse.dispatch.go_package.clone(),
+        parse.dispatch.types.clone(),
+        parse.dispatch.methods.clone(),
+    )
+}
+
+/// The facts a [`FileRecord`] keeps, from their parts: every other field
+/// of the parse is left empty.
+fn declarations_of(
+    language: String,
+    go_package: Option<String>,
+    types: Vec<TypeHint>,
+    methods: Vec<MethodHint>,
+) -> ParseBlob {
     ParseBlob {
         entry_point_symbols: Vec::new(),
         dispatch: DispatchFacts {
-            go_package: parse.dispatch.go_package.clone(),
-            types: parse.dispatch.types.clone(),
-            methods: parse.dispatch.methods.clone(),
+            go_package,
+            types,
+            methods,
             ..DispatchFacts::default()
         },
         extractor_version: String::new(),
-        language: parse.language.clone(),
+        language,
         ast_nodes: Vec::new(),
         symbols: Vec::new(),
         default_export_symbol: None,
@@ -467,3 +860,214 @@ aft_store::heap_bytes_of_fields!(FileRecord {
     sites,
     associated,
 });
+
+#[cfg(test)]
+impl FileRecord {
+    /// A record whose parts all depend on `index`, declaring methods named
+    /// `m{index % 3}` and `shared`, for tests of where records are kept.
+    pub(crate) fn sample(index: u32) -> Self {
+        let method = |name: String| MethodHint {
+            owner: format!("Type{index}"),
+            trait_name: None,
+            name,
+            symbol: format!("Type{index}::method"),
+            has_body: index % 2 == 0,
+            shape: "x".repeat(index as usize % 40),
+            private: false,
+        };
+        FileRecord {
+            facts: declarations_of(
+                "typescript".to_string(),
+                None,
+                vec![TypeHint {
+                    name: format!("Type{index}"),
+                    bases: vec![format!("Base{}", index / 2)],
+                    interface: false,
+                    closed: false,
+                }],
+                vec![
+                    method(format!("m{}", index % 3)),
+                    method("shared".to_string()),
+                ],
+            ),
+            projections: BTreeMap::from([(
+                format!("Base{}", index / 2),
+                ProjectedType {
+                    found: (index % 2 == 0).then(|| (format!("src/{index}.ts"), index)),
+                    dependencies: vec![format!("t:src/{index}.ts\tBase")].into_boxed_slice(),
+                },
+            )]),
+            mro: BTreeMap::new(),
+            complete_names: false,
+            resolvable_name_projections: 0,
+            sites: (0..index % 5)
+                .map(|ordinal| SiteRecord {
+                    site: SiteHint {
+                        ordinal,
+                        caller: Some(format!("caller{index}")),
+                        line: ordinal + index,
+                        member: Some("shared".to_string()),
+                        receiver: None,
+                        dynamic: false,
+                    },
+                    associated: false,
+                    keeps_ordinary_edge: false,
+                })
+                .collect(),
+            associated: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::*;
+
+    fn hint(name: &str) -> MethodHint {
+        MethodHint {
+            owner: "Owner".to_string(),
+            trait_name: Some(format!("Trait\u{0}{name}")),
+            name: name.to_string(),
+            symbol: format!("Owner::{name}"),
+            has_body: true,
+            shape: "(&self)".to_string(),
+            private: false,
+        }
+    }
+
+    /// A record with every part set, including empty and missing text, a
+    /// zero byte and text that is not ASCII.
+    fn record() -> FileRecord {
+        let facts = declarations_of(
+            "python".to_string(),
+            Some("pkg".to_string()),
+            vec![
+                TypeHint {
+                    name: "Owner".to_string(),
+                    bases: vec!["Base".to_string(), String::new()],
+                    interface: false,
+                    closed: true,
+                },
+                TypeHint {
+                    name: "Ünïcode".to_string(),
+                    bases: Vec::new(),
+                    interface: true,
+                    closed: false,
+                },
+            ],
+            vec![hint("run"), hint("")],
+        );
+        let projections = BTreeMap::from([
+            (
+                "Base".to_string(),
+                ProjectedType {
+                    found: Some(("pkg/base.py".to_string(), 3)),
+                    dependencies: vec!["r:pkg/base.py".to_string(), "t:x\ty".to_string()]
+                        .into_boxed_slice(),
+                },
+            ),
+            (
+                "@field:x".to_string(),
+                ProjectedType {
+                    found: None,
+                    dependencies: Box::default(),
+                },
+            ),
+        ]);
+        let mro = BTreeMap::from([
+            (
+                "Owner".to_string(),
+                ProjectedMro {
+                    mro: Some(vec![
+                        ("pkg/a.py".to_string(), "Owner".to_string()),
+                        ("pkg/base.py".to_string(), "Base".to_string()),
+                    ]),
+                    dependencies: vec!["m:run".to_string()].into_boxed_slice(),
+                },
+            ),
+            (
+                "Other".to_string(),
+                ProjectedMro {
+                    mro: None,
+                    dependencies: Box::default(),
+                },
+            ),
+        ]);
+        let sites = vec![
+            SiteRecord {
+                site: SiteHint {
+                    ordinal: 7,
+                    caller: Some("Owner::run".to_string()),
+                    line: 12,
+                    member: Some("run".to_string()),
+                    receiver: Some("@super:Owner".to_string()),
+                    dynamic: false,
+                },
+                associated: true,
+                keeps_ordinary_edge: false,
+            },
+            SiteRecord {
+                site: SiteHint {
+                    ordinal: u32::MAX,
+                    caller: None,
+                    line: 0,
+                    member: None,
+                    receiver: None,
+                    dynamic: true,
+                },
+                associated: false,
+                keeps_ordinary_edge: true,
+            },
+        ];
+        FileRecord {
+            facts,
+            projections,
+            mro,
+            complete_names: true,
+            resolvable_name_projections: 5,
+            sites,
+            associated: vec![7],
+        }
+    }
+
+    #[test]
+    fn a_scratch_encoded_record_decodes_equal() {
+        let record = record();
+        let mut bytes = Vec::new();
+        record.encode_scratch(&mut bytes).unwrap();
+        assert_eq!(FileRecord::decode_scratch(&bytes).unwrap(), record);
+
+        // An empty record too.
+        let empty = FileRecord {
+            facts: declarations_of(String::new(), None, Vec::new(), Vec::new()),
+            projections: BTreeMap::new(),
+            mro: BTreeMap::new(),
+            complete_names: false,
+            resolvable_name_projections: 0,
+            sites: Vec::new(),
+            associated: Vec::new(),
+        };
+        let mut empty_bytes = Vec::new();
+        empty.encode_scratch(&mut empty_bytes).unwrap();
+        assert_eq!(FileRecord::decode_scratch(&empty_bytes).unwrap(), empty);
+    }
+
+    #[test]
+    fn bytes_that_are_not_one_scratch_record_fail_to_decode() {
+        let mut bytes = Vec::new();
+        record().encode_scratch(&mut bytes).unwrap();
+        for len in 0..bytes.len() {
+            assert!(
+                FileRecord::decode_scratch(&bytes[..len]).is_err(),
+                "a record cut to {len} of {} bytes decoded",
+                bytes.len()
+            );
+        }
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(FileRecord::decode_scratch(&longer).is_err());
+        let mut other = bytes;
+        other[0] = SCRATCH_FORMAT + 1;
+        assert!(FileRecord::decode_scratch(&other).is_err());
+    }
+}

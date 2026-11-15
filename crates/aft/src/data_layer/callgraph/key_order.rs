@@ -48,10 +48,10 @@ use crate::callgraph_store::join::dispatch::{
 use crate::callgraph_store::join::ManifestJoinError;
 
 use super::super::checkout::DataError;
-use super::site_records::{self, RecordSource, Touches};
+use super::site_records::{self, Pinned, RecordSource, Touches};
 use super::SiteResolution;
 
-/// The memory pass 4's key order may hold besides the records.
+/// The memory pass 4's key order may hold.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Budget {
     /// Bytes of keys waiting for their answers, of their sites' positions,
@@ -59,6 +59,9 @@ pub(crate) struct Budget {
     work_bytes: usize,
     /// Each sorted run's memory budget.
     sort_bytes: usize,
+    /// The bytes of decoded records the record cache keeps besides those
+    /// a resolver holds (see `site_records`).
+    record_bytes: usize,
 }
 
 /// The default for both budgets.
@@ -83,13 +86,19 @@ const INLINE_DEPENDENCIES: usize = 32;
 const KEY_BATCH: usize = 1024;
 
 impl Budget {
-    /// Both budgets set to `bytes`; the sorted runs get at least
+    /// Every budget set to `bytes`; the sorted runs get at least
     /// [`MIN_SORT_BYTES`].
     pub(crate) fn of_bytes(bytes: usize) -> Self {
         Self {
             work_bytes: bytes.max(1),
             sort_bytes: bytes.max(MIN_SORT_BYTES),
+            record_bytes: bytes,
         }
+    }
+
+    /// The record cache's budget.
+    pub(crate) fn record_bytes(self) -> usize {
+        self.record_bytes
     }
 
     /// The budget a build uses. With `test-hooks`, the exactness gates set
@@ -197,6 +206,32 @@ fn member_len(key: &[u8]) -> usize {
         }
     }
     key.len()
+}
+
+/// The member name whose encoding (see [`member_len`]) is `member`, or
+/// `None` for a key with no member name.
+fn member_name(member: &[u8]) -> Result<Option<String>, ManifestJoinError> {
+    let Some((&1, mut rest)) = member.split_first() else {
+        return Ok(None);
+    };
+    let mut name = Vec::with_capacity(rest.len());
+    loop {
+        match rest {
+            [0, 1] => break,
+            [0, 0xFF, after @ ..] => {
+                name.push(0);
+                rest = after;
+            }
+            [byte, after @ ..] if *byte != 0 => {
+                name.push(*byte);
+                rest = after;
+            }
+            _ => return Err(sort_error("a malformed member name in a key")),
+        }
+    }
+    String::from_utf8(name)
+        .map(Some)
+        .map_err(|_| sort_error("a member name in a key is not UTF-8"))
 }
 
 fn site_value(file: u32, position: u32) -> [u8; 8] {
@@ -815,8 +850,18 @@ struct Group<'s> {
     member: Vec<u8>,
     name: Option<String>,
     number: u64,
-    /// The group's methods, when every thread resolves the group at once.
-    shared: Option<SharedMethods<'s>>,
+    /// The records declaring the group's methods, held while the group is
+    /// read, when every thread resolves the group at once: each flush
+    /// loads the methods from them once for every thread to read.
+    shared: Option<Pinned<'s>>,
+}
+
+impl<'s> Group<'s> {
+    /// The group's name and declaring records, when every thread resolves
+    /// it at once.
+    fn shared(&self) -> Option<(&str, &Pinned<'s>)> {
+        Some((self.name.as_deref()?, self.shared.as_ref()?))
+    }
 }
 
 /// What a group's resolution read, for measurement.
@@ -840,6 +885,8 @@ struct GroupStats {
     names: BTreeMap<u64, Option<String>>,
     shared: u64,
     largest_shared_methods: usize,
+    /// The most records a shared group held for its methods.
+    largest_shared_records: usize,
 }
 
 impl GroupStats {
@@ -858,8 +905,8 @@ impl GroupStats {
 }
 
 /// What the threads resolving keys share.
-struct Context<'s, 'r> {
-    source: &'s RecordSource<'r>,
+struct Context<'s> {
+    source: &'s RecordSource,
     paths: &'s [String],
     answers: Interner<Resolution>,
     dependencies: Interner<Vec<u32>>,
@@ -867,25 +914,34 @@ struct Context<'s, 'r> {
     counting: bool,
 }
 
-impl<'s> Context<'s, '_> {
-    /// The record of the file numbered `file`.
-    fn record(&self, file: u32) -> Result<(&'s str, &'s FileRecord), ManifestJoinError> {
+impl<'s> Context<'s> {
+    /// The record of the file numbered `file`, read through `pinned`.
+    fn record<'p>(
+        &self,
+        pinned: &'p Pinned<'_>,
+        file: u32,
+    ) -> Result<(&'s str, &'p FileRecord), ManifestJoinError> {
         let path = self
             .paths
             .get(file as usize)
             .ok_or_else(|| sort_error(format!("no file numbered {file}")))?;
-        let record = self.source.record(path).ok_or_else(|| {
-            ManifestJoinError::Parse(format!("missing method-call record for {path}"))
+        let record = pinned.record_at(file).ok_or_else(|| {
+            ManifestJoinError::Parse(
+                self.source
+                    .take_error()
+                    .unwrap_or_else(|| format!("missing method-call record for {path}")),
+            )
         })?;
         Ok((path.as_str(), record))
     }
 
-    fn resolve_key(
+    fn resolve_key<'p>(
         &self,
-        resolver: &Resolver<'s>,
+        pinned: &'p Pinned<'_>,
+        resolver: &Resolver<'p>,
         key: &KeyWork,
     ) -> Result<KeyAnswer, ManifestJoinError> {
-        let (path, record) = self.record(key.file)?;
+        let (path, record) = self.record(pinned, key.file)?;
         let site = &record
             .sites()
             .get(key.position as usize)
@@ -912,19 +968,17 @@ impl<'s> Context<'s, '_> {
         })
     }
 
-    /// Resolves `keys` on this thread with one resolver, reading `shared`
-    /// when given. `segments` are where each group's keys start among
-    /// `keys`; when counting, each group's record lookups are tallied.
+    /// Resolves `keys` on this thread, reading `shared` when given.
+    /// `segments` are where each group's keys start among `keys`; each
+    /// segment gets its own resolver and its own set of held records, so a
+    /// thread holds the records of one group at a time. When counting, each
+    /// group's record lookups are tallied.
     fn resolve_keys(
         &self,
         keys: &[KeyWork],
         segments: &[(usize, u64)],
-        shared: Option<&SharedMethods<'s>>,
+        shared: Option<&SharedMethods<'_>>,
     ) -> Result<(Vec<KeyAnswer>, Vec<(u64, Touches)>), ManifestJoinError> {
-        let resolver = Resolver::over(self.source);
-        if let Some(shared) = shared {
-            resolver.use_shared_methods(shared);
-        }
         let mut answers = Vec::with_capacity(keys.len());
         let mut tallies = Vec::new();
         for (index, (start, group)) in segments.iter().enumerate() {
@@ -932,8 +986,13 @@ impl<'s> Context<'s, '_> {
             if self.counting {
                 site_records::start_touches();
             }
+            let pinned = Pinned::cached(self.source);
+            let resolver = Resolver::over(&pinned);
+            if let Some(shared) = shared {
+                resolver.use_shared_methods(shared);
+            }
             for key in &keys[*start..end] {
-                answers.push(self.resolve_key(&resolver, key)?);
+                answers.push(self.resolve_key(&pinned, &resolver, key)?);
             }
             if self.counting {
                 tallies.push((*group, site_records::take_touches()));
@@ -942,27 +1001,36 @@ impl<'s> Context<'s, '_> {
         Ok((answers, tallies))
     }
 
-    /// `name`'s methods, loaded once for every thread to read.
-    fn share(&self, name: &str) -> (SharedMethods<'s>, Touches) {
+    /// The records declaring `name`'s methods, read and held for every
+    /// flush of the group to load the methods from, with how many methods
+    /// there are and what reading them touched.
+    fn share(&self, name: &str) -> (Pinned<'s>, usize, Touches) {
         if self.counting {
             site_records::start_touches();
         }
-        let shared = Resolver::over(self.source)
-            .share_methods(name)
-            .expect("a resolver over records has a source");
+        let pinned = Pinned::cached(self.source);
+        let methods = shared_methods(&pinned, name).len();
         let touches = if self.counting {
             site_records::take_touches()
         } else {
             Touches::default()
         };
-        (shared, touches)
+        (pinned, methods, touches)
     }
+}
+
+/// The methods named `name`, loaded from the records `pinned` holds or
+/// reads, for every thread to read.
+fn shared_methods<'p>(pinned: &'p Pinned<'_>, name: &str) -> SharedMethods<'p> {
+    Resolver::over(pinned)
+        .share_methods(name)
+        .expect("a resolver over records has a source")
 }
 
 /// Writes every site's key, in file order, to `sorter`, labelling each
 /// file range's records with the range's number. Returns how many sites
 /// there are.
-fn collect_keys(context: &Context<'_, '_>, sorter: &mut Sorter) -> Result<u64, ManifestJoinError> {
+fn collect_keys(context: &Context<'_>, sorter: &mut Sorter) -> Result<u64, ManifestJoinError> {
     let mut sites = 0u64;
     let threads = rayon::current_num_threads().max(1);
     let carry = crate::alloc_trace::carry();
@@ -974,12 +1042,15 @@ fn collect_keys(context: &Context<'_, '_>, sorter: &mut Sorter) -> Result<u64, M
             .enumerate()
             .map(|(index, files)| {
                 let _label = carry.enter();
-                let resolver = Resolver::over(context.source);
+                // Every record is read once here, in file order, so each is
+                // read from disk for this chunk alone, not cached.
+                let pinned = Pinned::direct(context.source);
+                let resolver = Resolver::over(&pinned);
                 let mut keyed = Vec::new();
                 for (offset, path) in files.iter().enumerate() {
                     let file = u32::try_from(first + index * chunk + offset)
                         .map_err(|_| too_many("files"))?;
-                    let (_, record) = context.record(file)?;
+                    let (_, record) = context.record(&pinned, file)?;
                     for (position, site) in record.sites().iter().enumerate() {
                         let key = resolver.resolution_key(path, &site.site);
                         let mut bytes = Vec::new();
@@ -1003,8 +1074,8 @@ fn collect_keys(context: &Context<'_, '_>, sorter: &mut Sorter) -> Result<u64, M
 
 /// The emitting side of the pass: the run of site results, and the counts
 /// it reports.
-struct Flusher<'a, 's, 'r> {
-    context: &'a Context<'s, 'r>,
+struct Flusher<'a, 's> {
+    context: &'a Context<'s>,
     results: Sorter,
     threads: usize,
     /// The most keys one thread's pack of small groups takes.
@@ -1015,14 +1086,16 @@ struct Flusher<'a, 's, 'r> {
     stats: Option<GroupStats>,
 }
 
-impl<'s> Flusher<'_, 's, '_> {
+impl Flusher<'_, '_> {
     /// Resolves the waiting keys and writes their sites' results. Small
     /// groups are packed per thread; a shared group's keys, which come last,
-    /// are then split among every thread, all reading `shared`.
+    /// are then split among every thread, all reading the methods loaded
+    /// once from `shared`: the shared group's name and its declaring
+    /// records.
     fn flush(
         &mut self,
         unit: &mut Unit,
-        shared: Option<&SharedMethods<'s>>,
+        shared: Option<(&str, &Pinned<'_>)>,
     ) -> Result<(), ManifestJoinError> {
         if unit.keys.is_empty() {
             return Ok(());
@@ -1066,7 +1139,10 @@ impl<'s> Flusher<'_, 's, '_> {
             tallies.extend(touched);
         }
         if small_end < unit.keys.len() {
-            let shared = shared.ok_or_else(|| sort_error("a shared group without its methods"))?;
+            let (name, declarers) =
+                shared.ok_or_else(|| sort_error("a shared group without its methods"))?;
+            // Loaded from records the group holds, so nothing is read again.
+            let methods = shared_methods(declarers, name);
             let group = unit
                 .segments
                 .iter()
@@ -1079,7 +1155,7 @@ impl<'s> Flusher<'_, 's, '_> {
                 .par_chunks(chunk)
                 .map(|keys| {
                     let _label = carry.enter();
-                    context.resolve_keys(keys, &[(0, group)], Some(shared))
+                    context.resolve_keys(keys, &[(0, group)], Some(&methods))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             for (chunk, touched) in resolved {
@@ -1158,12 +1234,16 @@ impl<'s> Flusher<'_, 's, '_> {
 /// When a file has no record, a record the resolver needed is missing, or
 /// a run cannot be written or read back as written.
 pub(super) fn resolve(
-    source: &RecordSource<'_>,
+    source: &RecordSource,
     paths: &[String],
     runs: &ScratchDir<DataError>,
     budget: Budget,
     memory: Option<&mut Vec<(String, usize)>>,
 ) -> Result<(Answers, SiteResults), ManifestJoinError> {
+    // A file's number is its position in `paths` and among the records.
+    if source.paths() != paths {
+        return Err(sort_error("the records are not of the files resolved"));
+    }
     let guard = {
         let workspace = Arc::clone(runs.workspace());
         let bytes = budget.sort_bytes as u64;
@@ -1222,21 +1302,15 @@ pub(super) fn resolve(
                 if group.as_ref().is_some_and(|group| group.shared.is_some())
                     || unit.keys.len() >= unit_keys
                 {
-                    let shared = group.as_ref().and_then(|group| group.shared.as_ref());
-                    flusher.flush(&mut unit, shared)?;
+                    flusher.flush(&mut unit, group.as_ref().and_then(Group::shared))?;
                     flusher.finish_groups(Some(number));
                 }
-                let (_, first) = context.record(file)?;
-                let name = first
-                    .sites()
-                    .get(position as usize)
-                    .ok_or_else(|| sort_error(format!("no site {position} in file {file}")))?
-                    .site
-                    .member
-                    .clone();
+                // The group before lets go of the records it held, before
+                // the next group may read its own.
+                drop(group.take());
                 let mut next = Group {
                     member: member.to_vec(),
-                    name,
+                    name: member_name(member)?,
                     number,
                     shared: None,
                 };
@@ -1258,7 +1332,7 @@ pub(super) fn resolve(
                 group = Some(next);
             } else if unit.keys.len() >= unit_keys {
                 let current = group.as_ref().expect("a key continues its group");
-                flusher.flush(&mut unit, current.shared.as_ref())?;
+                flusher.flush(&mut unit, current.shared())?;
                 flusher.finish_groups(Some(current.number));
                 unit.segments.push(Segment {
                     start: 0,
@@ -1314,9 +1388,9 @@ pub(super) fn resolve(
             flusher.tallies.entry(number).or_default().sites += 1;
         }
     }
-    let shared = group.as_ref().and_then(|group| group.shared.as_ref());
-    flusher.flush(&mut unit, shared)?;
+    flusher.flush(&mut unit, group.as_ref().and_then(Group::shared))?;
     flusher.finish_groups(None);
+    drop(group);
     drop(sorted);
     if !unit.sites.is_empty() {
         return Err(sort_error("site positions left after the last flush"));
@@ -1360,25 +1434,26 @@ pub(super) fn resolve(
     ))
 }
 
-/// Loads `group`'s methods for every thread to read, and tallies what
-/// loading them read.
-fn share<'s>(context: &Context<'s, '_>, flusher: &mut Flusher<'_, 's, '_>, group: &mut Group<'s>) {
+/// Reads and holds the records declaring `group`'s methods, for every
+/// thread to read the methods from, and tallies what reading them touched.
+fn share<'s>(context: &Context<'s>, flusher: &mut Flusher<'_, 's>, group: &mut Group<'s>) {
     let name = group.name.as_deref().expect("a shared group has a name");
-    let (shared, touches) = context.share(name);
+    let (declarers, methods, touches) = context.share(name);
     if let Some(stats) = &mut flusher.stats {
         stats.shared += 1;
-        stats.largest_shared_methods = stats.largest_shared_methods.max(shared.len());
+        stats.largest_shared_methods = stats.largest_shared_methods.max(methods);
+        stats.largest_shared_records = stats.largest_shared_records.max(declarers.len());
         let tally = flusher.tallies.entry(group.number).or_default();
         tally.touches.merge(touches);
-        tally.methods = shared.len();
+        tally.methods = methods;
     }
-    group.shared = Some(shared);
+    group.shared = Some(declarers);
 }
 
 /// Adds what the pass held and read to `memory`.
 fn report(
     memory: &mut Vec<(String, usize)>,
-    source: &RecordSource<'_>,
+    source: &RecordSource,
     answers: &Answers,
     stats: GroupStats,
     counts: [(&str, u64); 6],
@@ -1388,6 +1463,23 @@ fn report(
     for (name, value) in counts {
         memory.push((name.to_string(), size(value)));
     }
+    let cache = source.cache_counts();
+    memory.extend([
+        (
+            "pass4.record_disk_bytes".to_string(),
+            size(source.disk_bytes()),
+        ),
+        ("pass4.record_cache_limit".to_string(), cache.limit),
+        ("pass4.record_cache_peak".to_string(), cache.peak),
+        ("pass4.record_cache_held".to_string(), cache.held),
+        ("pass4.record_reads".to_string(), size(cache.reads)),
+        ("pass4.record_rereads".to_string(), size(cache.rereads)),
+        ("pass4.record_evictions".to_string(), size(cache.evicted)),
+        (
+            "pass4.largest_shared_records".to_string(),
+            stats.largest_shared_records,
+        ),
+    ]);
     let mut seen = aft_store::heap::Seen::new();
     memory.push(("pass4.answers".to_string(), answers.answers.len()));
     memory.push((
@@ -1453,19 +1545,7 @@ fn report(
     if let Some((name, largest)) = stats.largest {
         // The heap of the records the largest group read: what a bounded
         // record cache must hold to resolve it without reading any twice.
-        let mut seen = aft_store::heap::Seen::new();
-        let record_bytes = source
-            .records
-            .paths_from("")
-            .filter_map(|path| source.records.get(path))
-            .filter(|record| {
-                largest
-                    .touches
-                    .files
-                    .contains(&(std::ptr::from_ref(*record) as usize))
-            })
-            .map(|record| record.heap_bytes(&mut seen))
-            .sum::<usize>();
+        let record_bytes = source.record_bytes(largest.touches.files.iter().copied());
         log::info!(
             "pass-4 largest group: {} read {} files' records ({record_bytes} bytes) with {} lookups, {} keys, {} sites, {} methods",
             name.as_deref().unwrap_or("(no member)"),
@@ -1566,6 +1646,19 @@ mod tests {
         let mut get = Vec::new();
         put_optional(&mut get, Some("get"));
         assert_eq!(members.iter().filter(|member| **member == get).count(), 2);
+        // Each group's name reads back from its member's encoding.
+        let names = members
+            .iter()
+            .map(|member| member_name(member).unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            names,
+            [None, Some("ge"), Some("get"), Some("get\0x"), Some("geta")]
+                .into_iter()
+                .map(|name| name.map(str::to_string))
+                .collect()
+        );
+        assert!(member_name(&[1, b'g', 0]).is_err());
     }
 
     fn runs() -> (tempfile::TempDir, ScratchDir<DataError>) {
