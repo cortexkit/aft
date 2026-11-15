@@ -141,13 +141,14 @@ fn assert_same(left: &[(String, Vec<u8>)], right: &[(String, Vec<u8>)], what: &s
 /// Runs the build of `root` into `store` in a child process that kills
 /// itself at `point`, and checks that it died there.
 fn killed_build(store: &Path, root: &Path, point: &str) {
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args([CHILD, "--exact", "--nocapture", "--test-threads", "1"])
-        .env("AFT_TEST_RESUME_CHILD", "1")
-        .env("AFT_TEST_RESUME_STORE", store)
-        .env("AFT_TEST_RESUME_ROOT", root)
+    killed_build_of(&std::env::current_exe().unwrap(), store, root, point, &[]);
+}
+
+/// [`killed_build`] run by the test binary at `exe`, with `env` set too.
+fn killed_build_of(exe: &Path, store: &Path, root: &Path, point: &str, env: &[(&str, &str)]) {
+    let output = child(exe, store, root)
         .env("AFT_TEST_KILL_AT", point)
-        .env_remove("AFT_TEST_HIDE_ROOT")
+        .envs(env.iter().copied())
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -163,12 +164,40 @@ fn killed_build(store: &Path, root: &Path, point: &str) {
     );
 }
 
+/// The command that runs [`resume_child_build`] from the test binary at
+/// `exe`, building `root` into `store`.
+fn child(exe: &Path, store: &Path, root: &Path) -> Command {
+    let mut command = Command::new(exe);
+    command
+        .args([CHILD, "--exact", "--nocapture", "--test-threads", "1"])
+        .env("AFT_TEST_RESUME_CHILD", "1")
+        .env("AFT_TEST_RESUME_STORE", store)
+        .env("AFT_TEST_RESUME_ROOT", root)
+        .env_remove("AFT_TEST_KILL_AT")
+        .env_remove("AFT_TEST_HIDE_ROOT")
+        .env_remove("AFT_TEST_REPLACE_EXE");
+    command
+}
+
 /// Run alone by [`killed_build`] and [`no_stage_after_the_scan_reads_the_checkout`]
-/// in a child process; a no-op otherwise.
+/// in a child process; a no-op otherwise. With `AFT_TEST_REPLACE_EXE` set,
+/// the child first renames another binary over its own executable's path,
+/// as an upgrade that places a new binary under a running daemon does.
 #[test]
 fn resume_child_build() {
     if std::env::var_os("AFT_TEST_RESUME_CHILD").is_none() {
         return;
+    }
+    // As a daemon does at startup, before anything can replace the binary.
+    crate::pinned_executable::capture_at_startup();
+    if std::env::var_os("AFT_TEST_REPLACE_EXE").is_some() {
+        let exe = std::env::current_exe().unwrap();
+        let mut bytes = std::fs::read(&exe).unwrap();
+        bytes.extend_from_slice(format!("replaced by {}", std::process::id()).as_bytes());
+        let next = exe.with_extension("next");
+        std::fs::write(&next, bytes).unwrap();
+        std::fs::set_permissions(&next, std::fs::metadata(&exe).unwrap().permissions()).unwrap();
+        std::fs::rename(&next, &exe).unwrap();
     }
     let store = PathBuf::from(std::env::var_os("AFT_TEST_RESUME_STORE").unwrap());
     let root = PathBuf::from(std::env::var_os("AFT_TEST_RESUME_ROOT").unwrap());
@@ -374,6 +403,33 @@ fn a_config_file_renamed_between_kill_and_resume_is_read_under_its_new_name() {
         &published(&reference),
         &published(&resumed),
         "after renaming a configuration file",
+    );
+}
+
+#[test]
+fn a_build_never_resumes_what_another_executable_image_wrote() {
+    let root = tempfile::tempdir().unwrap();
+    project(root.path());
+    let store = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let exe = bin.path().join("aft-under-test");
+    std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+    // The first build runs from one image and replaces the binary at its
+    // path while it runs, as an upgrade does; it is then killed.
+    let replace = [("AFT_TEST_REPLACE_EXE", "1")];
+    killed_build_of(&exe, store.path(), root.path(), "stage.sites", &replace);
+    // The next build runs from the binary now at that path, and replaces it
+    // in turn: neither image may adopt the other's work, whatever the file
+    // at the path says.
+    let output = child(&exe, store.path(), root.path())
+        .envs(replace)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("resumed_records: 0,") && stderr.contains("resumed_passes: false"),
+        "nothing was resumed: {stderr}"
     );
 }
 

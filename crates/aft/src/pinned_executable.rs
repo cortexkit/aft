@@ -566,6 +566,27 @@ pub fn cleanup_at_exit() {
     }
 }
 
+/// The metadata of the executable image this process started from, even
+/// after another binary was renamed over its path: on Linux the image the
+/// kernel holds, on macOS the file opened at startup (see
+/// [`capture_at_startup`]). Elsewhere a running executable cannot be
+/// replaced, so its path is read. `None` when the image cannot be examined.
+pub(crate) fn startup_image_metadata() -> Option<std::fs::Metadata> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::metadata(linux_image_path()).ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        capture_at_startup();
+        SOURCE.get()?.as_ref().ok()?.file.metadata().ok()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        std::env::current_exe().and_then(std::fs::metadata).ok()
+    }
+}
+
 /// Return the daemon's startup pin, or normal executable discovery for standalone
 /// and library-only hosts that have not initialized a pin.
 pub fn path() -> io::Result<PathBuf> {

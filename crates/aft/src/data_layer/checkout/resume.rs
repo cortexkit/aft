@@ -402,6 +402,9 @@ pub(crate) struct BuildIdentity {
     /// One `name=value` line per fact, in a fixed order.
     pub(crate) payload: Vec<u8>,
     pub(crate) digest: Digest,
+    /// Whether every fact is known. A build whose identity is not complete
+    /// adopts nothing: an unknown fact cannot prove two builds the same.
+    pub(crate) complete: bool,
 }
 
 impl BuildIdentity {
@@ -412,6 +415,7 @@ impl BuildIdentity {
         planes: Planes,
         policy: &ScanPolicy,
     ) -> Self {
+        let executable = executable_fingerprint();
         let mut features = Vec::new();
         for (name, enabled) in [
             ("test-hooks", cfg!(feature = "test-hooks")),
@@ -446,12 +450,23 @@ impl BuildIdentity {
             ("aft_version", env!("CARGO_PKG_VERSION").to_string()),
             (
                 "source_commit",
+                // Unstamped local builds are told apart by the executable.
                 option_env!("AFT_BUILD_GIT_SHA")
-                    .unwrap_or("unknown")
+                    .unwrap_or("unstamped")
                     .to_string(),
             ),
             ("features", features.join(",")),
-            ("executable", executable_fingerprint()),
+            (
+                "executable",
+                // An executable that cannot be examined names nothing
+                // another build could equal, so nothing is ever adopted.
+                executable.clone().unwrap_or_else(|| {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |elapsed| elapsed.as_nanos());
+                    format!("unknown-{}-{now}", std::process::id())
+                }),
+            ),
             ("extractor", super::EXTRACTOR_VERSION.to_string()),
             (
                 "fragment_format",
@@ -491,6 +506,7 @@ impl BuildIdentity {
             root: root.to_path_buf(),
             payload,
             digest,
+            complete: executable.is_some(),
         }
     }
 
@@ -519,21 +535,34 @@ impl BuildIdentity {
     }
 }
 
-/// Which executable this is: its length and modification time. A source
-/// commit alone does not tell two local builds of a changed tree apart, and
-/// a resumed build must be the same build.
-fn executable_fingerprint() -> String {
-    std::env::current_exe()
-        .and_then(std::fs::metadata)
-        .map(|metadata| {
+/// Which executable this process runs: the length, modification time and
+/// (on Unix) file identity of the image it started from, taken once. A
+/// source commit alone does not tell two local builds of a changed tree
+/// apart, and a resumed build must be the same build. The image, not the
+/// file now at the executable's path: a new binary may be renamed over
+/// that path while this process runs. `None` when the image cannot be
+/// examined.
+fn executable_fingerprint() -> Option<String> {
+    static FINGERPRINT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    FINGERPRINT
+        .get_or_init(|| {
+            let metadata = crate::pinned_executable::startup_image_metadata()?;
             let modified = metadata
                 .modified()
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |elapsed| elapsed.as_nanos());
-            format!("{}:{modified}", metadata.len())
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_nanos();
+            #[cfg(unix)]
+            let file = {
+                use std::os::unix::fs::MetadataExt as _;
+                format!(":{}:{}", metadata.dev(), metadata.ino())
+            };
+            #[cfg(not(unix))]
+            let file = String::new();
+            Some(format!("{}:{modified}{file}", metadata.len()))
         })
-        .unwrap_or_else(|_| "unknown".to_string())
+        .clone()
 }
 
 /// The digest of everything resolution reads from the scan (see the
@@ -734,6 +763,9 @@ pub(crate) fn discard(claim: ScratchClaim) {
 
 /// Why a leftover workspace cannot be adopted, or `None` when it can.
 fn adoption_refusal(workspace: &Path, identity: &BuildIdentity) -> Option<String> {
+    if !identity.complete {
+        return Some("this build's executable cannot be examined".to_string());
+    }
     match ws::read_identity(workspace) {
         None => Some("it has no readable IDENTITY".to_string()),
         Some(found) if found != identity.workspace_identity() => Some(format!(
