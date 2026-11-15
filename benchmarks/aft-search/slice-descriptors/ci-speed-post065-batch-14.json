@@ -1,0 +1,9 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "note": "Post-0.65 batch 14, based on batch 13's tip: gh-shim review-thread mutations accept the frozen --repo, impact caps busy-symbol traversal with lower-bound counts, consent logs distinguish withdrawn cards from resumed calls, runon sibling validation keeps grant-store errors, and foreground bash wakes on the kernel exit event (#1459). Derived from git diff --name-only 8cddbc95..HEAD against RANKING_FENCE_PREFIXES in benchmarks/aft-search/search_quality_lib.py: no changed path matches, so the batch does not touch the ranking fence."
+}
