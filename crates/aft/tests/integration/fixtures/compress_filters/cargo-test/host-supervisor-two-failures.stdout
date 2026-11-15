@@ -1,0 +1,367 @@
+warning: unused workspace dependency `broca-ck`
+  --> Cargo.toml:98:1
+   |
+98 | broca-ck = { git = "https://github.com/cortexkit/broca.git", rev = "75959eec1d6bb3c07f22c91cb09a1244f919fda2" }
+   | ^^^^^^^^
+   |
+   = note: `cargo::unused_workspace_dependencies` is set to `warn` by default
+help: consider removing the workspace dependency `broca-ck`
+warning: unused workspace dependency `broca-provider`
+  --> Cargo.toml:99:1
+   |
+99 | broca-provider = { git = "https://github.com/cortexkit/broca.git", rev = "75959eec1d6bb3c07f22c91cb09a1244f919fda2" }
+   | ^^^^^^^^^^^^^^
+   |
+help: consider removing the workspace dependency `broca-provider`
+warning: unused workspace dependency `cortexkit-lease`
+   --> Cargo.toml:131:1
+    |
+131 | cortexkit-lease = "0.1.2"
+    | ^^^^^^^^^^^^^^^
+    |
+help: consider removing the workspace dependency `cortexkit-lease`
+warning: unused workspace dependency `cortexkit-role-compaction-provider`
+  --> Cargo.toml:78:1
+   |
+78 | cortexkit-role-compaction-provider = "=0.7.14"
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+help: consider removing the workspace dependency `cortexkit-role-compaction-provider`
+warning: unused workspace dependency `flate2`
+   --> Cargo.toml:153:1
+    |
+153 | flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+    | ^^^^^^
+    |
+help: consider removing the workspace dependency `flate2`
+warning: unused workspace dependency `rustls`
+   --> Cargo.toml:171:1
+    |
+171 | rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+    | ^^^^^^
+    |
+help: consider removing the workspace dependency `rustls`
+warning: unused workspace dependency `rustls-native-certs`
+   --> Cargo.toml:172:1
+    |
+172 | rustls-native-certs = "0.8"
+    | ^^^^^^^^^^^^^^^^^^^
+    |
+help: consider removing the workspace dependency `rustls-native-certs`
+warning: workspace (manifest) generated 7 warnings
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.46
+   Compiling serde_core v1.0.228
+   Compiling libc v0.2.186
+   Compiling serde v1.0.228
+   Compiling cfg-if v1.0.4
+   Compiling version_check v0.9.5
+   Compiling memchr v2.8.2
+   Compiling itoa v1.0.18
+   Compiling zmij v1.0.23
+   Compiling generic-array v0.14.7
+   Compiling serde_json v1.0.150
+   Compiling subtle v2.6.1
+   Compiling typenum v1.20.1
+   Compiling smallvec v1.15.2
+   Compiling once_cell v1.21.4
+   Compiling stable_deref_trait v1.2.1
+   Compiling pin-project-lite v0.2.17
+   Compiling zerocopy v0.8.52
+   Compiling cpufeatures v0.2.17
+   Compiling shlex v2.0.1
+   Compiling getrandom v0.2.17
+   Compiling find-msvc-tools v0.1.9
+   Compiling errno v0.3.14
+   Compiling bitflags v2.13.0
+   Compiling mio v1.2.1
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling socket2 v0.6.4
+   Compiling litemap v0.8.3
+   Compiling digest v0.10.7
+   Compiling signal-hook-registry v1.4.8
+   Compiling writeable v0.6.4
+   Compiling icu_normalizer_data v2.3.0
+   Compiling icu_properties_data v2.3.0
+   Compiling utf8_iter v1.0.4
+   Compiling cc v1.2.65
+   Compiling syn v2.0.118
+   Compiling syn v3.0.6
+   Compiling futures-core v0.3.32
+   Compiling sha2 v0.10.9
+   Compiling zeroize v1.9.0
+   Compiling percent-encoding v2.3.2
+   Compiling getrandom v0.3.4
+   Compiling autocfg v1.5.1
+   Compiling ahash v0.8.12
+   Compiling form_urlencoded v1.2.2
+   Compiling rand_core v0.6.4
+   Compiling tracing-core v0.1.36
+   Compiling slab v0.4.12
+   Compiling num-traits v0.2.19
+   Compiling futures-sink v0.3.32
+   Compiling futures-task v0.3.32
+   Compiling ppv-lite86 v0.2.21
+   Compiling httparse v1.10.1
+   Compiling synstructure v0.14.0
+   Compiling zerovec-derive v0.11.6
+   Compiling zerofrom-derive v0.1.8
+   Compiling serde_derive v1.0.228
+   Compiling yoke-derive v0.8.4
+   Compiling displaydoc v0.2.7
+   Compiling tokio-macros v2.7.0
+   Compiling futures-macro v0.3.32
+   Compiling tracing-attributes v0.1.31
+   Compiling rand_chacha v0.3.1
+   Compiling ryu-js v0.2.2
+   Compiling futures-util v0.3.32
+   Compiling pulldown-cmark v0.13.5
+   Compiling rand v0.8.7
+   Compiling rustls-pki-types v1.15.0
+   Compiling ring v0.17.14
+   Compiling unicase v2.10.0
+   Compiling pkg-config v0.3.33
+   Compiling vcpkg v0.2.15
+   Compiling regex-syntax v0.8.11
+   Compiling libsqlite3-sys v0.30.1
+   Compiling tracing v0.1.44
+   Compiling zerofrom v0.1.8
+   Compiling aho-corasick v1.1.5
+   Compiling yoke v0.8.3
+   Compiling cortexkit-rich-ui-syntax v0.3.0
+   Compiling fs2 v0.4.3
+   Compiling regex-automata v0.4.18
+   Compiling untrusted v0.9.0
+   Compiling bytes v1.12.0
+   Compiling zerovec v0.11.8
+   Compiling zerotrie v0.2.5
+   Compiling subc-protocol v0.36.3
+   Compiling serde_jcs v0.2.0
+   Compiling rand_core v0.10.1
+   Compiling rustix v1.1.4
+   Compiling tokio v1.52.3
+   Compiling http v1.4.2
+   Compiling hashbrown v0.14.5
+   Compiling base64ct v1.8.3
+   Compiling httpdate v1.0.3
+   Compiling getrandom v0.4.3
+   Compiling try-lock v0.2.5
+   Compiling semver v1.0.28
+   Compiling pem-rfc7468 v0.7.0
+   Compiling http-body v1.0.1
+   Compiling want v0.3.1
+   Compiling hashlink v0.9.1
+   Compiling rustc_version v0.4.1
+   Compiling cortexkit-lease v0.1.4
+   Compiling num-integer v0.1.47
+   Compiling async-trait v0.1.92
+   Compiling futures-channel v0.3.32
+   Compiling tinystr v0.8.4
+   Compiling potential_utf v0.1.6
+   Compiling linux-raw-sys v0.12.1
+   Compiling icu_collections v2.3.0
+   Compiling icu_locale_core v2.3.0
+   Compiling tokio-util v0.7.18
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling rustls v0.23.41
+   Compiling base64 v0.22.1
+   Compiling fallible-iterator v0.3.0
+   Compiling const-oid v0.9.6
+   Compiling atomic-waker v1.1.2
+   Compiling rusqlite v0.32.1
+   Compiling der v0.7.10
+   Compiling hyper v1.10.1
+   Compiling icu_provider v2.3.1
+   Compiling tokio-stream v0.1.18
+   Compiling icu_properties v2.3.0
+   Compiling icu_normalizer v2.3.0
+   Compiling curve25519-dalek v4.1.3
+   Compiling cortexkit-store-types v0.2.2
+   Compiling signature v2.2.0
+   Compiling tower-service v0.3.3
+   Compiling log v0.4.34
+   Compiling spki v0.7.3
+   Compiling idna_adapter v1.2.2
+   Compiling cortexkit-store v0.4.2
+   Compiling num-bigint v0.4.8
+   Compiling idna v1.1.0
+   Compiling curve25519-dalek-derive v0.1.1
+   Compiling url v2.5.8
+   Compiling cortexkit-role-tool-display v0.1.5
+   Compiling ref-cast v1.0.27
+   Compiling parking_lot_core v0.9.12
+   Compiling hyper-util v0.1.20
+   Compiling thalamus-high-water v0.1.0 (/work/thalamus/crates/thalamus-high-water)
+   Compiling cortexkit-role-tool-provider v0.15.5
+   Compiling num-rational v0.4.2
+   Compiling ed25519 v2.2.3
+   Compiling pkcs8 v0.10.2
+   Compiling num-iter v0.1.46
+   Compiling http-body-util v0.1.3
+   Compiling regex v1.13.1
+   Compiling cortexkit-role-agent-data v0.1.1
+   Compiling rustls-webpki v0.103.13
+   Compiling webpki-roots v1.0.9
+   Compiling num-complex v0.4.6
+   Compiling ref-cast-impl v1.0.27
+   Compiling thalamus-host-supervisor v0.1.0 (/work/thalamus/crates/thalamus-host-supervisor)
+   Compiling data-encoding v2.11.1
+   Compiling cpufeatures v0.3.1
+   Compiling openssl-probe v0.2.1
+   Compiling cortexkit-role-llm-runner v0.8.48
+   Compiling scopeguard v1.2.0
+   Compiling thiserror v2.0.21
+   Compiling portable-atomic v1.15.0
+   Compiling rustls-native-certs v0.8.4
+   Compiling tokio-rustls v0.26.4
+   Compiling lock_api v0.4.14
+   Compiling chacha20 v0.10.2
+   Compiling num v0.4.3
+   Compiling webpki-roots v0.26.11
+   Compiling signatory v0.27.1
+   Compiling subc-os v0.1.30
+   Compiling pin-project-internal v1.1.13
+   Compiling thiserror-impl v2.0.21
+   Compiling hmac v0.12.1
+   Compiling deranged v0.5.9
+   Compiling unicode-general-category v1.1.0
+   Compiling ed25519-dalek v2.2.0
+   Compiling borrow-or-share v0.2.4
+   Compiling allocator-api2 v0.2.21
+   Compiling num-conv v0.2.2
+   Compiling powerfmt v0.2.1
+   Compiling lazy_static v1.5.0
+   Compiling equivalent v1.0.3
+   Compiling jsonschema-value v0.58.6
+   Compiling foldhash v0.2.0
+   Compiling bit-vec v0.8.0
+   Compiling time-core v0.1.9
+   Compiling heck v0.5.0
+   Compiling sharded-slab v0.1.7
+   Compiling bit-set v0.8.0
+   Compiling time v0.3.55
+   Compiling fluent-uri v0.4.1
+   Compiling thalamus-harness v0.1.0 (/work/thalamus/crates/thalamus-harness)
+   Compiling strum_macros v0.28.0
+   Compiling subc-transport v0.17.0
+   Compiling hashbrown v0.17.1
+   Compiling nkeys v0.4.5
+   Compiling parking_lot v0.12.5
+   Compiling tokio-websockets v0.10.1
+   Compiling fraction v0.17.0
+   Compiling rand v0.10.3
+   Compiling tracing-log v0.2.0
+   Compiling tryhard v0.5.2
+   Compiling matchers v0.2.0
+   Compiling serde_nanos v0.1.4
+   Compiling nuid v0.5.0
+   Compiling chrono v0.4.45
+   Compiling serde_repr v0.1.21
+   Compiling serde_path_to_error v0.1.20
+   Compiling thread_local v1.1.10
+   Compiling vsimd v0.8.0
+   Compiling num-cmp v0.1.0
+   Compiling micromap v0.3.0
+   Compiling outref v0.5.2
+   Compiling bytecount v0.6.9
+   Compiling pin-project v1.1.13
+   Compiling tinyvec v1.13.3
+   Compiling nu-ansi-term v0.50.3
+   Compiling twox-hash v2.1.5
+   Compiling sha1_smol v1.0.1
+   Compiling tracing-subscriber v0.3.23
+   Compiling ruzstd v0.8.3
+   Compiling unicode-normalization v0.1.24
+   Compiling uuid v1.28.0
+   Compiling async-nats v0.50.0
+   Compiling uuid-simd v0.8.0
+   Compiling cortexkit-role-compaction v0.4.2
+   Compiling referencing v0.58.6
+   Compiling fancy-regex v0.19.2
+   Compiling cortexkit-bus-trait v0.3.0
+   Compiling cortexkit-role-media v0.1.5
+   Compiling subc-control v0.38.3
+   Compiling cortexkit-project-identity v0.1.4
+   Compiling email_address v0.2.9
+   Compiling jsonschema-regex v0.58.6
+   Compiling jiff-core v0.1.2
+   Compiling thalamus-harness-module v0.1.0 (/work/thalamus/crates/thalamus-harness-module)
+   Compiling jiff-tzdb v0.1.9
+   Compiling cortexkit-bus-naming v0.2.0
+   Compiling unicode-properties v0.1.3
+   Compiling unicode-script v0.5.7
+   Compiling jiff v0.2.39
+   Compiling cortexkit-role-routing v0.7.28
+   Compiling subc-client-rs v0.38.5
+   Compiling cortexkit-agent-identity v0.1.2
+   Compiling cortexkit-tokens v0.1.0
+   Compiling strum v0.28.0
+   Compiling jsonschema v0.58.6
+   Compiling cortexkit-compaction-view v0.4.0
+   Compiling cortexkit-log v0.3.5
+   Compiling cortexkit-usage-steps v0.2.7
+   Compiling cortexkit-claustrum-client v0.10.0
+   Compiling cortexkit-role-step-transform-provider v0.5.0
+   Compiling hyper-rustls v0.27.9
+   Compiling cortexkit-anthropic-policy v0.1.0
+   Compiling thalamus-harness-opencode v0.1.0 (/work/thalamus/crates/thalamus-harness-opencode)
+   Compiling thalamus-harness-claude v0.1.0 (/work/thalamus/crates/thalamus-harness-claude)
+   Compiling thalamus-harness-pi v0.1.0 (/work/thalamus/crates/thalamus-harness-pi)
+   Compiling cortexkit-paths v0.1.2
+   Compiling fastrand v2.5.0
+   Compiling cortexkit-test-support v0.1.10
+   Compiling cortexkit-bus-nats v0.3.0
+   Compiling tempfile v3.27.0
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 43s
+     Running tests/host_supervisor.rs (/work/thalamus/target/debug/deps/host_supervisor-fixture)
+
+running 4 tests
+test holders::a_holder_with_a_full_log_still_stops_its_host_when_its_keeper_dies ... ok
+test holders::a_launch_keeps_one_previous_generation_of_each_log ... ok
+test holders::a_hosts_output_is_all_in_its_log_once_its_holder_has_left ... FAILED
+test holders::a_keeper_lost_before_its_start_acknowledgement_leaves_no_host_running ... FAILED
+
+failures:
+
+---- holders::a_hosts_output_is_all_in_its_log_once_its_holder_has_left stdout ----
+
+thread 'holders::a_hosts_output_is_all_in_its_log_once_its_holder_has_left' (<thread-id>) panicked at crates/thalamus-harness-module/tests/support/holders.rs:2964:5:
+the log kept 64000 bytes, 64 of the host's 100 filler lines, and ends with "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--- /work/thalamus/test-temp/holder-log-drain/data/holders/test-host.holder.log:
+holder_host_log_not_rotated: /work/thalamus/test-temp/holder-log-drain/data/holders/test-host.host.log: Is a directory (os error 21); appending to it
+holder_host_ended: phase=unexpected status=Some(0)
+
+--- /work/thalamus/test-temp/holder-log-drain/data/holders/test-host.host.log: not a plain file
+--- /work/thalamus/test-temp/holder-log-drain/standin.log: not a plain file
+record: Some(HolderRecord { version: 1, host_id: "test-host", holder: HolderEntry { identity: ProcessIdentity { pid: <holder-pid>, start: "<boot-id>:<holder-start>", group: 0, uid: <uid> }, exe_digest: "sha256:<digest>", protocol: "thalamus-holder/1" }, keeper: Some(KeeperEntry { identity: ProcessIdentity { pid: <keeper-pid>, start: "<boot-id>:<keeper-start>", group: 0, uid: <uid> }, protocol: "thalamus-host-supervisor/3" }), host: Some(HostEntry { identity: ProcessIdentity { pid: <host-pid>, start: "<boot-id>:<host-start>", group: 0, uid: <uid> }, kind: "test" }), control_endpoint: "127.0.0.1:<port>", launch_digest: "", digest_algorithm: None, plugin: PluginEntry { path: None, digest: "", protocols_in_use: {} }, highest_generation: 1, instance: Some("instance"), pi: None, pin: "/work/thalamus/test-temp/holder-log-drain/bin/ckdev-thalamus-harness", stopped: true, exit_reason: Some(HostExited), exit_status: Some(0) })
+processes: []
+
+---- holders::a_keeper_lost_before_its_start_acknowledgement_leaves_no_host_running stdout ----
+
+thread 'holders::a_keeper_lost_before_its_start_acknowledgement_leaves_no_host_running' (<thread-id>) panicked at crates/thalamus-harness-module/tests/support/holders.rs:1314:5:
+the host 6851 still runs 4.5s after its keeper's death, its holder gone; its parent is now Some(1); the holder's log:
+holder_failed: host_supervisor_startup_failed: before exec acknowledgement: failed to fill whole buffer; supervisor signal: 9 (SIGKILL)
+
+--- /work/thalamus/test-temp/holder-keeper-lost-before-ack/data/holders/test-host.holder.log:
+holder_failed: host_supervisor_startup_failed: before exec acknowledgement: failed to fill whole buffer; supervisor signal: 9 (SIGKILL)
+
+--- /work/thalamus/test-temp/holder-keeper-lost-before-ack/data/holders/test-host.host.log:
+
+--- /work/thalamus/test-temp/holder-keeper-lost-before-ack/standin.log:
+
+running 1 test
+
+record: Some(HolderRecord { version: 1, host_id: "test-host", holder: HolderEntry { identity: ProcessIdentity { pid: <holder-pid>, start: "<boot-id>:<holder-start>", group: 0, uid: <uid> }, exe_digest: "sha256:<digest>", protocol: "thalamus-holder/1" }, keeper: Some(KeeperEntry { identity: ProcessIdentity { pid: <keeper-pid>, start: "<boot-id>:<keeper-start>", group: 0, uid: <uid> }, protocol: "thalamus-host-supervisor/3" }), host: Some(HostEntry { identity: ProcessIdentity { pid: <host-pid>, start: "<boot-id>:<host-start>", group: 0, uid: <uid> }, kind: "test" }), control_endpoint: "127.0.0.1:<port>", launch_digest: "", digest_algorithm: None, plugin: PluginEntry { path: None, digest: "", protocols_in_use: {} }, highest_generation: 0, instance: None, pi: None, pin: "/work/thalamus/test-temp/holder-keeper-lost-before-ack/bin/ckdev-thalamus-harness", stopped: false, exit_reason: None, exit_status: None })
+processes: [(ProcessIdentity { pid: <host-pid>, start: "<boot-id>:<host-start>", group: 0, uid: <uid> }, 1, "/work/thalamus/test-temp/holder-keeper-lost-before-ack/bin/host-sleep")]
+
+
+failures:
+    holders::a_hosts_output_is_all_in_its_log_once_its_holder_has_left
+    holders::a_keeper_lost_before_its_start_acknowledgement_leaves_no_host_running
+
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 35 filtered out; finished in 6.11s
+
+error: test failed, to rerun pass `-p thalamus-harness-module --test host_supervisor`

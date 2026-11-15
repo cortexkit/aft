@@ -43,8 +43,11 @@ use crate::callgraph_store::{
     DbFileIndex, LoadedFileIndexes, LoadedIndex, ProjectIndex, WorkspaceCratePrefixCache,
 };
 
+mod key_order;
 mod site_records;
 mod spool;
+
+pub(crate) use key_order::Budget as KeyOrderBudget;
 
 use super::graph_rows::references_by_key;
 use super::graph_store::StoredSlices;
@@ -840,11 +843,13 @@ impl From<BTreeMap<String, FileResolution>> for Resolutions {
     }
 }
 
-/// One method-call site's resolution, as pass 4 keeps it.
+/// One method-call site's resolution, as pass 4 keeps it. Sites with the
+/// same answer share it: an unknown receiver's answer can name thousands of
+/// methods, and every site calling that name gets it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SiteResolution {
     pub(crate) site: SiteHint,
-    pub(crate) resolution: Resolution,
+    pub(crate) resolution: Arc<Resolution>,
 }
 
 /// One file's resolution.
@@ -1229,6 +1234,19 @@ pub(crate) fn resolve_checkout(
     inputs: &CheckoutInputs,
     threads: usize,
 ) -> Result<BTreeMap<String, FileResolution>, ManifestJoinError> {
+    resolve_checkout_within(inputs, threads, KeyOrderBudget::configured())
+}
+
+/// [`resolve_checkout`], with pass 4's key order held to `budget`.
+///
+/// # Errors
+///
+/// When the resolver fails on a file.
+pub(crate) fn resolve_checkout_within(
+    inputs: &CheckoutInputs,
+    threads: usize,
+    budget: KeyOrderBudget,
+) -> Result<BTreeMap<String, FileResolution>, ManifestJoinError> {
     // A copy shares every parse with `inputs`, so the stream below lets
     // none of them go.
     let mut copy = inputs.clone();
@@ -1243,10 +1261,17 @@ pub(crate) fn resolve_checkout(
         )
         .map_err(|error| ManifestJoinError::Parse(format!("spooled resolutions: {error}")))?,
     );
-    let result = resolve_checkout_into(&mut copy, threads, None, &workspace, &mut |_, files| {
-        resolved.extend(files);
-        Ok(())
-    });
+    let result = resolve_checkout_into(
+        &mut copy,
+        threads,
+        None,
+        &workspace,
+        budget,
+        &mut |_, files| {
+            resolved.extend(files);
+            Ok(())
+        },
+    );
     let removed = workspace.remove();
     result?;
     removed.map_err(spool_error)?;
@@ -1295,6 +1320,7 @@ pub(crate) fn resolve_checkout_into(
     threads: usize,
     mut memory: Option<&mut Vec<(String, usize)>>,
     workspace: &Arc<aft_store::family::BuildScratch<super::checkout::DataError>>,
+    budget: KeyOrderBudget,
     sink: &mut (dyn FnMut(&CheckoutInputs, Vec<(String, FileResolution)>) -> Result<(), ManifestJoinError>
               + Send),
 ) -> Result<BuildCensus, ManifestJoinError> {
@@ -1416,13 +1442,27 @@ pub(crate) fn resolve_checkout_into(
             );
         }
         lap(&mut memory, "projection");
-        let source = site_records::RecordSource::new(&records);
-        // Pass 4 runs a batch at a time: run over every file at once, its
-        // sites and their dependencies held about 1 GB on aft's checkout.
-        // Each batch's resolutions go to the sink in smaller chunks, decoded
-        // in parallel, and the sink builds their fragments in parallel too;
-        // a whole batch decoded and built at once held about 750 MB more.
-        let mut sites_ms = 0u128;
+        let mut source = site_records::RecordSource::new(&records);
+        if memory.is_some() {
+            source = source.counting_touches();
+        }
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("sites");
+        // Pass 4, second step: every distinct resolution key resolved once,
+        // member name first, with each site's result going to a sorted run
+        // (see `key_order`).
+        let started = std::time::Instant::now();
+        let (answers, mut results) =
+            key_order::resolve(&source, &paths, spool.dir(), budget, memory.as_deref_mut())?;
+        let sites_ms = started.elapsed().as_millis();
+        // The key order's units and sorted keys are gone; only the answers
+        // and the run of site results remain.
+        relieve_allocator();
+        // Then, in file order, each file's results become its sites and site
+        // dependencies, joined to its spooled pass-2/3 resolution. They go to
+        // the sink in small chunks, decoded in parallel, and the sink builds
+        // their fragments in parallel too; a whole batch decoded and built
+        // at once held about 750 MB more.
         // On glibc, trimming every four batches saved 1.3 GiB on VS Code and
         // 1.2 GiB on Kotlin versus streaming alone. Cold builds still beat the
         // builder that held every fragment until output: 229.6 vs 234.8 seconds
@@ -1437,36 +1477,54 @@ pub(crate) fn resolve_checkout_into(
         let mut trim_batches = 0usize;
         let mut trim_calls = 0usize;
         let mut trim_time = std::time::Duration::ZERO;
-        #[cfg(feature = "test-hooks")]
-        super::refresh_probe::stage("sites");
         for (range, batch) in paths.chunks(BATCH).enumerate() {
-            let started = std::time::Instant::now();
-            let reached = site_records::resolve_records(&source, &refs(batch))?;
-            sites_ms += started.elapsed().as_millis();
             let encoded = spool.read_range(range).map_err(spool_error)?;
-            if encoded.len() != reached.len() {
+            if encoded.len() != batch.len() {
                 return Err(ManifestJoinError::Parse(format!(
                     "spooled range {range} holds {} resolutions for {} files",
                     encoded.len(),
-                    reached.len()
+                    batch.len()
                 )));
             }
             let parses = &inputs.parses;
-            let mut reached = reached.into_iter().zip(encoded);
+            let mut files = batch.iter().zip(encoded).enumerate();
             loop {
-                let chunk = reached
-                    .by_ref()
-                    .take(SINK_CHUNK)
-                    .map(|((path, sites, dependencies), bytes)| (path, bytes, sites, dependencies))
-                    .collect::<Vec<_>>();
+                let mut chunk = Vec::with_capacity(SINK_CHUNK);
+                for (offset, (path, bytes)) in files.by_ref().take(SINK_CHUNK) {
+                    let number = u32::try_from(range * BATCH + offset).map_err(|_| {
+                        ManifestJoinError::Parse("too many files for pass 4".to_string())
+                    })?;
+                    chunk.push((path.clone(), bytes, results.take_file(number)?));
+                }
                 if chunk.is_empty() {
                     break;
                 }
                 let carry = crate::alloc_trace::carry();
+                let (answers, source) = (&answers, &source);
                 let files = chunk
                     .into_par_iter()
-                    .map(|(path, bytes, sites, dependencies)| {
+                    .map(|(path, bytes, site_results)| {
                         let _label = carry.enter();
+                        let record = source.records.get(&path).ok_or_else(|| {
+                            ManifestJoinError::Parse(format!(
+                                "missing method-call record for {path}"
+                            ))
+                        })?;
+                        #[cfg(feature = "callgraph-shape-census")]
+                        let mut census = super::shape_census::Census::default();
+                        let (sites, dependencies) = answers.assemble(
+                            &path,
+                            record,
+                            site_results,
+                            #[cfg(feature = "callgraph-shape-census")]
+                            &mut census,
+                        )?;
+                        #[cfg(feature = "callgraph-shape-census")]
+                        source
+                            .census
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .merge(census);
                         let key = parses.key(&path).expect("every resolved file is parsed");
                         let mut file = super::fragment::decode(&key, &path, &bytes)
                             .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
@@ -1488,6 +1546,8 @@ pub(crate) fn resolve_checkout_into(
                 trim_calls += 1;
             }
         }
+        results.finish()?;
+        drop(answers);
         if trim_cadence != 0 {
             log::info!("pass-4 allocator relief: cadence={trim_cadence} batches={trim_batches} calls={trim_calls} elapsed_us={}", trim_time.as_micros());
         }
@@ -2326,10 +2386,7 @@ fn resolve_chunk(
                 {
                     continue;
                 }
-                sites.push(SiteResolution {
-                    site,
-                    resolution: (*resolution).clone(),
-                });
+                sites.push(SiteResolution { site, resolution });
             }
             // Every file depends on its own facts, which `Resolver::resolve`
             // reads without recording.

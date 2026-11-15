@@ -74,6 +74,47 @@ fn checkout_path_guard_allows_runtime_reads_and_relative_includes() {
     assert!(!compile_time_checkout_path().is_match(source));
 }
 
+fn binary_path_violations(tests: &Path) -> Vec<PathBuf> {
+    let forbidden =
+        regex::Regex::new(r#"\b(?:env|option_env)\s*!\s*\(\s*"CARGO_BIN_EXE_aft""#).unwrap();
+    let mut sources = Vec::new();
+    rust_sources(tests, &mut sources);
+    sources.sort();
+    sources
+        .into_iter()
+        .filter(|source| source != &tests.join("helpers/aft_binary.rs"))
+        .filter(|source| forbidden.is_match(&std::fs::read_to_string(source).unwrap()))
+        .map(|source| source.strip_prefix(tests).unwrap().to_path_buf())
+        .collect()
+}
+
+#[test]
+fn integration_tests_do_not_embed_aft_binary_path() {
+    let tests = crate::test_helpers::cargo_manifest_dir().join("tests");
+    assert!(tests.join("sandbox_launch_probe.rs").is_file());
+    let violations = binary_path_violations(&tests);
+    assert!(
+        violations.is_empty(),
+        "use aft_binary::source_binary() instead: {violations:?}"
+    );
+}
+
+#[test]
+fn binary_path_guard_detects_macros_except_in_shared_helper() {
+    let root = tempfile::tempdir().unwrap();
+    let tests = root.path();
+    std::fs::create_dir_all(tests.join("helpers")).unwrap();
+    std::fs::create_dir_all(tests.join("nested")).unwrap();
+    let source = format!("env!(\"{}\")", "CARGO_BIN_EXE_aft");
+    std::fs::write(tests.join("helpers/aft_binary.rs"), &source).unwrap();
+    assert!(binary_path_violations(tests).is_empty());
+    std::fs::write(tests.join("nested/test.rs"), &source).unwrap();
+    assert_eq!(
+        binary_path_violations(tests),
+        [PathBuf::from("nested/test.rs")]
+    );
+}
+
 fn manifest(directory: &Path) -> toml::Value {
     let path = directory.join("Cargo.toml");
     std::fs::read_to_string(&path)

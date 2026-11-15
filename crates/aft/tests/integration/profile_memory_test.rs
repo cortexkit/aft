@@ -19,11 +19,7 @@ const ROUTE_EPOCH: u32 = 7;
 const FAKE_DAEMON_VERSION: &str = "0.39.0";
 
 fn aft_binary() -> PathBuf {
-    std::env::var_os("AFT_TEST_AFT_BINARY")
-        .or_else(|| std::env::var_os("NEXTEST_BIN_EXE_aft"))
-        .or_else(|| std::env::var_os("CARGO_BIN_EXE_aft"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_aft")))
+    crate::test_helpers::aft_binary::source_binary()
 }
 
 fn control_flags() -> Flags {

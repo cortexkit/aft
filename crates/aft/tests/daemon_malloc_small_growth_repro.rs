@@ -51,6 +51,8 @@
 
 #![cfg(target_os = "macos")]
 
+#[path = "helpers/aft_binary.rs"]
+mod aft_binary;
 #[path = "helpers/executable_cache.rs"]
 mod executable_cache;
 
@@ -473,7 +475,10 @@ fn module_pid(home: &Path) -> Option<u32> {
             Command::new("/bin/ps")
                 .args(["-o", "command=", "-p", &pid.to_string()])
                 .output()
-                .map(|out| String::from_utf8_lossy(&out.stdout).contains(env!("CARGO_BIN_EXE_aft")))
+                .map(|out| {
+                    String::from_utf8_lossy(&out.stdout)
+                        .contains(aft_binary::source_binary().to_string_lossy().as_ref())
+                })
                 .unwrap_or(false)
         })
 }
@@ -555,7 +560,7 @@ fn parked_semantic_loads_are_unattributed() {
   "modules": {{"aft": {{"program": "{aft}", "args": [],
               "env": {{"MallocStackLogging": "1"}}, "enabled": true}}}}}}"#,
             data = home.join("data").display(),
-            aft = env!("CARGO_BIN_EXE_aft"),
+            aft = aft_binary::source_binary().display(),
         ),
     )
     .unwrap();

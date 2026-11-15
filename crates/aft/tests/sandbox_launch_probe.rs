@@ -1,4 +1,9 @@
 #![cfg(unix)]
+#[cfg(not(target_os = "linux"))]
+#[path = "helpers/aft_binary.rs"]
+mod aft_binary;
+#[cfg(target_os = "linux")]
+use test_helpers::aft_binary;
 #[path = "helpers/context_storage.rs"]
 mod context_storage;
 #[path = "../src/test_gate.rs"]
@@ -23,8 +28,6 @@ mod test_helpers;
 
 #[cfg(target_os = "linux")]
 use test_helpers::{user_config, AftProcess};
-
-const AFT_BIN: &str = env!("CARGO_BIN_EXE_aft");
 
 struct ProbeFixture {
     _root_guard: TempDir,
@@ -175,7 +178,7 @@ fn set_close_on_exec(fd: RawFd, enabled: bool) {
 }
 
 fn launcher_command(fd: RawFd, target: &[&str]) -> Command {
-    let mut command = Command::new(AFT_BIN);
+    let mut command = Command::new(aft_binary::source_binary());
     command
         .arg("sandbox-launch")
         .arg("--profile-fd")
@@ -199,7 +202,7 @@ mod signal_scope {
     fn signal_scope_available() -> bool {
         #[cfg(target_os = "linux")]
         {
-            let output = Command::new(AFT_BIN)
+            let output = Command::new(aft_binary::source_binary())
                 .args(["sandbox-launch", "--support"])
                 .output()
                 .expect("probe native signal support");
@@ -457,7 +460,7 @@ fn landlock_available() -> bool {
     }
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *AVAILABLE.get_or_init(|| {
-        Command::new(AFT_BIN)
+        Command::new(aft_binary::source_binary())
             .args(["sandbox-launch", "--support"])
             .output()
             .is_ok_and(|output| output.status.success())
@@ -738,7 +741,7 @@ fn native_background_exit_marker_survives_landlock_launcher() {
 #[test]
 fn launcher_support_reports_first_party_backend() {
     skip_if_landlock_absent!();
-    let output = Command::new(AFT_BIN)
+    let output = Command::new(aft_binary::source_binary())
         .args(["sandbox-launch", "--support"])
         .output()
         .expect("run support probe");
@@ -758,7 +761,7 @@ fn launcher_support_reports_first_party_backend() {
 
 #[test]
 fn closed_profile_fd_returns_an_error_instead_of_aborting() {
-    let output = Command::new(AFT_BIN)
+    let output = Command::new(aft_binary::source_binary())
         .args([
             "sandbox-launch",
             "--profile-fd",
@@ -1582,7 +1585,7 @@ fn p9_pty_child_and_nested_child_remain_confined() {
     let launcher_script = format!(
         "exec 9< {}; exec {} sandbox-launch --profile-fd 9 -- /bin/bash -c {}",
         shell_path(fixture.profile.path()),
-        shell_path(Path::new(AFT_BIN)),
+        shell_path(&aft_binary::source_binary()),
         shell_path(Path::new(&script))
     );
     let mut command = CommandBuilder::new("/bin/bash");
@@ -1811,7 +1814,7 @@ fn access_policy_builtin_floor_inside_worktree_refuses_shell_launch() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_support_reports_sccache_server_unblockable_on_landlock() {
-    let output = Command::new(AFT_BIN)
+    let output = Command::new(aft_binary::source_binary())
         .args(["sandbox-launch", "--support"])
         .output()
         .unwrap();
@@ -2016,7 +2019,7 @@ fn launcher_failure_marker_cannot_be_forged_by_jailed_exec() {
         let profile_fd = fixture.profile.fd();
         let marker_fd = marker.as_raw_fd();
         let script="import errno,os,sys\nfd=int(sys.argv[1])\ntry:\n os.write(fd,b'sandbox_unavailable')\nexcept OSError as e:\n assert e.errno==errno.EBADF\n print('FAILURE_MARKER_CLOSED')\nelse:\n raise AssertionError('jailed exec can forge sandbox_unavailable')\n";
-        let mut command = Command::new(AFT_BIN);
+        let mut command = Command::new(aft_binary::source_binary());
         command.args([
             "sandbox-launch",
             "--profile-fd",

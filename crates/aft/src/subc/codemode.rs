@@ -200,41 +200,29 @@ pub(super) fn overlay(
     routes
 }
 
-fn resolve_owner(
-    routes: &HashMap<RouteChannel, RouteIdentity>,
-    route: RouteChannel,
-    run: &RouteIdentity,
-    launches_shell_task: bool,
-    mut saved_policy: impl FnMut(&RouteIdentity) -> Option<SavedPolicyRead>,
-) -> Result<Admission, subc_protocol::ErrorBody> {
-    use subc_protocol::scope::{ParentState, ScopeKind};
-    let Some(stamp) = run.scope.as_ref() else {
-        return Err(not_bound(
-            "run_scope_missing",
-            "codemode route carries no run scope",
-            Named::Agent(None),
-            None,
-        ));
-    };
+/// Classify the daemon-stamped run attribution without looking up live access.
+/// Catalog defaults and [`resolve_owner`]'s access checks must agree on which
+/// role a run acts as.
+pub(super) fn run_kind(
+    stamp: &subc_protocol::scope::ScopeStamp,
+) -> Result<(RunKind, &str), subc_protocol::ErrorBody> {
     fn present(value: &Option<String>) -> Option<&str> {
         value.as_deref().filter(|value| !value.is_empty())
     }
     let agent_id = present(&stamp.attributes.agent_id);
     let on_behalf_of_agent = present(&stamp.attributes.on_behalf_of_agent);
     let run_id = present(&stamp.attributes.run_id);
-    let (kind, named, run_id) = match (agent_id, on_behalf_of_agent, run_id) {
+    Ok(match (agent_id, on_behalf_of_agent, run_id) {
         (Some(agent_id), None, Some(run_id)) => (
             RunKind::Agent {
                 agent_id: agent_id.to_owned(),
             },
-            Named::Agent(Some(agent_id)),
             run_id,
         ),
         (None, Some(on_behalf_of_agent), Some(run_id)) => (
             RunKind::Worker {
                 on_behalf_of_agent: on_behalf_of_agent.to_owned(),
             },
-            Named::Worker(on_behalf_of_agent),
             run_id,
         ),
         // The daemon refuses a record naming both; a run must never borrow
@@ -255,6 +243,29 @@ fn resolve_owner(
                 run_id,
             ));
         }
+    })
+}
+
+fn resolve_owner(
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    route: RouteChannel,
+    run: &RouteIdentity,
+    launches_shell_task: bool,
+    mut saved_policy: impl FnMut(&RouteIdentity) -> Option<SavedPolicyRead>,
+) -> Result<Admission, subc_protocol::ErrorBody> {
+    use subc_protocol::scope::{ParentState, ScopeKind};
+    let Some(stamp) = run.scope.as_ref() else {
+        return Err(not_bound(
+            "run_scope_missing",
+            "codemode route carries no run scope",
+            Named::Agent(None),
+            None,
+        ));
+    };
+    let (kind, run_id) = run_kind(stamp)?;
+    let named = match &kind {
+        RunKind::Agent { agent_id } => Named::Agent(Some(agent_id)),
+        RunKind::Worker { on_behalf_of_agent } => Named::Worker(on_behalf_of_agent),
     };
     let refuse = |reason: &str, message: &str| not_bound(reason, message, named, Some(run_id));
     let worker_run = matches!(kind, RunKind::Worker { .. });

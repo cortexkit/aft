@@ -152,6 +152,23 @@ pub(super) fn catalog(
     Ok(answer)
 }
 
+fn default_catalog_preset(identity: &RouteIdentity) -> tool_provider::CatalogPreset {
+    use subc_protocol::{call_mode::CallMode, scope::ScopeKind};
+    let worker = identity.scope.as_ref().is_some_and(|scope| {
+        scope.kind == ScopeKind::Worker
+            || (identity.call_mode == CallMode::Codemode
+                && matches!(
+                    codemode::run_kind(scope),
+                    Ok((codemode::RunKind::Worker { .. }, _))
+                ))
+    });
+    if worker {
+        tool_provider::CatalogPreset::Worker
+    } else {
+        tool_provider::CatalogPreset::Head
+    }
+}
+
 fn catalog_inner(
     mut body: Value,
     identity: &RouteIdentity,
@@ -216,7 +233,12 @@ fn catalog_inner(
     }
     let powershell = crate::bash_background::powershell_available();
     let worker_wait_max_ms = ctx.config().bash.worker_wait_max_ms;
-    let (request, catalog_preset) = tool_provider::validate_catalog_request(body)?;
+    // Keep the request's preset absent for discovery and persistence semantics;
+    // only the rendered catalog defaults to the route's stamped role.
+    let (request, catalog_preset) = tool_provider::validate_catalog_request_with_default(
+        body,
+        default_catalog_preset(identity),
+    )?;
     if super::carrier_read_only::restricted(identity) {
         // Catalog discovery must not let a read-only route persist policy or
         // grants on behalf of the session it is observing.
@@ -390,7 +412,14 @@ fn catalog_inner(
     let preview = routing_policy
         .as_ref()
         .filter(|_| head_scope(identity) && policy_key(identity, Some(&preset)).is_ok());
-    let runon = catalog_runon_policy(ctx, identity, &preset, runon_enabled, project_off, preview);
+    let runon = catalog_runon_policy(
+        ctx,
+        identity,
+        catalog_preset.name(),
+        runon_enabled,
+        project_off,
+        preview,
+    );
     let is_confined = if let Some(policy) = preview {
         policy.confine.is_some()
     } else {

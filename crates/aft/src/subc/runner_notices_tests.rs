@@ -134,6 +134,14 @@ impl Completion {
             move || now.load(Ordering::Relaxed)
         ));
     }
+
+    fn restart(&mut self) {
+        self.registry.detach();
+        self.registry = crate::bash_background::BgTaskRegistry::default();
+        self.registry
+            .replay_session(self.storage.path(), &self.task)
+            .unwrap();
+    }
 }
 
 impl Drop for Completion {
@@ -151,6 +159,374 @@ fn step(scheduler: &Scheduler, now: std::time::Instant) -> Next {
     };
     scheduler.finish(&id, work, next, now);
     result
+}
+
+fn advance_notice(
+    scheduler: &Scheduler,
+    clock: &AtomicU64,
+    due: &mut std::time::Instant,
+    delay: Duration,
+) -> Next {
+    clock.fetch_add(delay.as_millis() as u64, Ordering::Relaxed);
+    *due += delay;
+    step(scheduler, *due)
+}
+
+fn undelivered(reason: &str) -> SendReply {
+    SendReply::new("not_delivered").with_reason(reason)
+}
+
+// Serialize the tests that assert process-wide not_delivered counter deltas.
+static DELIVERY_COUNTER_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn runner_notices_not_delivered_completion_uses_new_generation_and_same_body() {
+    let _guard = DELIVERY_COUNTER_TEST.lock().unwrap();
+    let before = NOT_DELIVERED.load(Ordering::Relaxed);
+    let task = Completion::new("bash-00000000000f0001", 0);
+    let capture = test_endpoint::capture(&task.task, false);
+    capture.delivery_order(Some(true));
+    capture.reply(undelivered("handover_failed"));
+    let scheduler = Scheduler::default();
+    let clock = Arc::new(AtomicU64::new(task.finished));
+    task.offer(&scheduler, clock.clone());
+    let mut due = std::time::Instant::now();
+    let Next::Retry(delay) = step(&scheduler, due) else {
+        panic!("must retry")
+    };
+    assert_eq!(delay, Duration::from_millis(250));
+    assert!(!task.delivered());
+    let first = capture.receiver.try_recv().unwrap();
+    let frozen = task.frozen();
+    assert_eq!(frozen.send_id, format!("aft:bash:{}:2", task.task));
+    assert!(matches!(
+        advance_notice(&scheduler, &clock, &mut due, delay),
+        Next::Done
+    ));
+    let second = capture.receiver.try_recv().unwrap();
+    assert_ne!(
+        first.request["params"]["send_id"],
+        second.request["params"]["send_id"]
+    );
+    let mut expected = first.request;
+    expected["params"]["send_id"] = json!(frozen.send_id);
+    assert_eq!(expected, second.request);
+    assert_eq!(
+        second.request["params"]["dedupe_key"],
+        format!("aft:bash-task:{}", task.task)
+    );
+    assert!(capture.receiver.try_recv().is_err());
+    assert_eq!(capture.effects.load(Ordering::Relaxed), 1);
+    assert!(task.delivered());
+    assert_eq!(NOT_DELIVERED.load(Ordering::Relaxed) - before, 1);
+}
+
+#[test]
+fn runner_notices_not_delivered_restart_replays_persisted_new_id() {
+    let _guard = DELIVERY_COUNTER_TEST.lock().unwrap();
+    let mut task = Completion::new("bash-00000000000f0002", 0);
+    let capture = test_endpoint::capture(&task.task, false);
+    capture.reply(undelivered("routing_refused"));
+    let scheduler = Scheduler::default();
+    let clock = Arc::new(AtomicU64::new(task.finished));
+    task.offer(&scheduler, clock.clone());
+    let mut due = std::time::Instant::now();
+    let Next::Retry(delay) = step(&scheduler, due) else {
+        panic!("must retry")
+    };
+    capture.receiver.try_recv().unwrap();
+    let frozen = envelope(&task.frozen());
+    drop(scheduler);
+    task.restart();
+    let scheduler = Scheduler::default();
+    task.offer(&scheduler, clock.clone());
+    due = std::time::Instant::now();
+    assert!(matches!(step(&scheduler, due), Next::Retry(left) if left == delay));
+    assert!(
+        capture.receiver.try_recv().is_err(),
+        "restart must respect persisted backoff"
+    );
+    assert!(matches!(
+        advance_notice(&scheduler, &clock, &mut due, delay),
+        Next::Done
+    ));
+    let replay = capture.receiver.try_recv().unwrap();
+    assert_eq!(replay.bytes, frozen);
+    assert_eq!(
+        replay.request["params"]["send_id"],
+        format!("aft:bash:{}:2", task.task)
+    );
+    assert!(capture.receiver.try_recv().is_err());
+}
+
+#[test]
+fn runner_notices_not_delivered_cap_is_five_and_is_retired_durably() {
+    let _guard = DELIVERY_COUNTER_TEST.lock().unwrap();
+    let before = NOT_DELIVERED.load(Ordering::Relaxed);
+    let mut task = Completion::new("bash-00000000000f0003", 0);
+    let capture = test_endpoint::capture(&task.task, false);
+    for _ in 0..5 {
+        capture.reply(undelivered("handover_failed"));
+    }
+    let scheduler = Scheduler::default();
+    let clock = Arc::new(AtomicU64::new(task.finished));
+    task.offer(&scheduler, clock.clone());
+    let mut due = std::time::Instant::now();
+    let mut logs = Vec::new();
+    for generation in 1..=5 {
+        let (next, lines) = crate::logging::capture_log_lines(|| step(&scheduler, due));
+        logs.extend(lines);
+        let call = capture.receiver.try_recv().unwrap();
+        let expected = if generation == 1 {
+            format!("aft:bash:{}", task.task)
+        } else {
+            format!("aft:bash:{}:{generation}", task.task)
+        };
+        assert_eq!(call.request["params"]["send_id"], expected);
+        if generation < 5 {
+            let Next::Retry(delay) = next else {
+                panic!("retired too soon")
+            };
+            clock.fetch_add(delay.as_millis() as u64, Ordering::Relaxed);
+            due += delay;
+        } else {
+            assert!(matches!(next, Next::Done));
+        }
+    }
+    assert!(capture.receiver.try_recv().is_err());
+    assert_eq!(NOT_DELIVERED.load(Ordering::Relaxed) - before, 5);
+    assert_eq!(logs.iter().filter(|line| line.starts_with("ERROR ")).collect::<Vec<_>>(), vec![&format!("ERROR runner notice task={} session={} not_delivered after 5 generations reason=handover_failed", task.task, task.task)]);
+    assert!(task.delivered());
+    let _scope = crate::bash_background::task_identity_scope(Some(task.route.task_identity()));
+    assert!(matches!(
+        task.registry
+            .notice_metadata(&task.task)
+            .unwrap()
+            .runner_completion_delivery
+            .unwrap()
+            .phase,
+        RunnerCompletionPhase::Retired
+    ));
+    task.restart();
+    assert!(task
+        .registry
+        .pending_completions_for_session(&task.task)
+        .is_empty());
+}
+
+#[test]
+fn runner_notices_not_delivered_reminder_drops_once_without_resend() {
+    let _guard = DELIVERY_COUNTER_TEST.lock().unwrap();
+    let before = NOT_DELIVERED.load(Ordering::Relaxed);
+    let task = Completion::new("bash-00000000000f0004", 0);
+    let capture = test_endpoint::capture(&task.task, false);
+    capture.reply(undelivered("handover_failed"));
+    let scheduler = Scheduler::default();
+    assert!(offer(
+        &scheduler,
+        task.registry.clone(),
+        task.reminder(600_000),
+        PathBuf::new(),
+        false,
+        || 0
+    ));
+    let (next, logs) =
+        crate::logging::capture_log_lines(|| step(&scheduler, std::time::Instant::now()));
+    assert!(matches!(next, Next::Done));
+    assert!(scheduler.entries.lock().unwrap().is_empty());
+    assert_eq!(capture.receiver.try_iter().count(), 1);
+    assert_eq!(
+        logs,
+        vec![format!(
+            "INFO runner reminder task={} not_delivered reason=handover_failed; dropped",
+            task.task
+        )]
+    );
+    assert_eq!(NOT_DELIVERED.load(Ordering::Relaxed) - before, 1);
+}
+
+#[test]
+fn runner_notices_pending_check_not_delivered_sends_exactly_one_new_generation() {
+    let _guard = DELIVERY_COUNTER_TEST.lock().unwrap();
+    for (index, typed) in [true, false].into_iter().enumerate() {
+        let task = Completion::new(&format!("bash-00000000000f001{index}"), 0);
+        let capture = test_endpoint::capture(&task.task, false);
+        capture.send_status(typed);
+        capture.reply(SendReply::new("pending"));
+        capture.reply(undelivered("handover_failed"));
+        let scheduler = Scheduler::default();
+        let clock = Arc::new(AtomicU64::new(task.finished));
+        task.offer(&scheduler, clock.clone());
+        let mut due = std::time::Instant::now();
+        assert!(
+            matches!(step(&scheduler, due), Next::Retry(delay) if delay == Duration::from_secs(5))
+        );
+        let first = capture.receiver.try_recv().unwrap();
+        assert!(
+            capture.receiver.try_recv().is_err(),
+            "pending initially sends only once"
+        );
+        assert!(!task.delivered());
+        let Next::Retry(delay) =
+            advance_notice(&scheduler, &clock, &mut due, Duration::from_secs(5))
+        else {
+            panic!("must retry new generation")
+        };
+        let check = capture.receiver.try_recv().unwrap();
+        assert_eq!(
+            check.request["params"]["send_id"],
+            first.request["params"]["send_id"]
+        );
+        if typed {
+            assert_eq!(check.request["method"], "session.send_status");
+        } else {
+            assert_eq!(check.bytes, first.bytes);
+        }
+        assert!(matches!(
+            advance_notice(&scheduler, &clock, &mut due, delay),
+            Next::Done
+        ));
+        assert_eq!(
+            capture.receiver.try_recv().unwrap().request["params"]["send_id"],
+            format!("aft:bash:{}:2", task.task)
+        );
+        assert!(capture.receiver.try_recv().is_err());
+        assert!(task.delivered());
+    }
+}
+
+#[test]
+fn runner_notices_pending_stays_durable_until_24h_without_new_send() {
+    let task = Completion::new("bash-00000000000f0020", 0);
+    let capture = test_endpoint::capture(&task.task, false);
+    capture.send_status(true);
+    capture.reply(SendReply::new("pending"));
+    let scheduler = Scheduler::default();
+    let clock = Arc::new(AtomicU64::new(task.finished));
+    task.offer(&scheduler, clock.clone());
+    let before = PENDING_UNRESOLVED.load(Ordering::Relaxed);
+    let mut due = std::time::Instant::now();
+    let mut next = step(&scheduler, due);
+    assert_eq!(
+        capture.receiver.try_recv().unwrap().request["method"],
+        "session.send"
+    );
+    let mut delays = Vec::new();
+    let mut logs = Vec::new();
+    while let Next::Retry(delay) = next {
+        assert!(!task.delivered());
+        delays.push(delay.as_secs());
+        let (result, lines) = crate::logging::capture_log_lines(|| {
+            advance_notice(&scheduler, &clock, &mut due, delay)
+        });
+        next = result;
+        logs.extend(lines);
+    }
+    assert_eq!(&delays[..4], &[5, 30, 120, 600]);
+    assert_eq!(clock.load(Ordering::Relaxed), task.finished + MAX_AGE_MS);
+    let calls: Vec<_> = capture.receiver.try_iter().collect();
+    assert_eq!(calls.len(), 146);
+    assert!(calls
+        .iter()
+        .all(|call| call.request["method"] == "session.send_status"
+            && call.request["params"]["send_id"] == format!("aft:bash:{}", task.task)));
+    assert_eq!(PENDING_UNRESOLVED.load(Ordering::Relaxed) - before, 1);
+    assert_eq!(
+        logs,
+        vec![format!(
+            "INFO runner notice task={} session={} send still pending after 24 hours",
+            task.task, task.task
+        )]
+    );
+    assert!(task.delivered());
+}
+
+#[test]
+fn runner_notices_pending_restart_keeps_next_check_and_never_resends() {
+    let mut task = Completion::new("bash-00000000000f0021", 0);
+    let capture = test_endpoint::capture(&task.task, false);
+    capture.send_status(true);
+    capture.reply(SendReply::new("pending"));
+    capture.reply(SendReply::new("finished"));
+    let scheduler = Scheduler::default();
+    let clock = Arc::new(AtomicU64::new(task.finished));
+    task.offer(&scheduler, clock.clone());
+    let mut due = std::time::Instant::now();
+    assert!(matches!(step(&scheduler, due), Next::Retry(delay) if delay == Duration::from_secs(5)));
+    capture.receiver.try_recv().unwrap();
+    drop(scheduler);
+    task.restart();
+    let scheduler = Scheduler::default();
+    task.offer(&scheduler, clock.clone());
+    due = std::time::Instant::now();
+    assert!(matches!(step(&scheduler, due), Next::Retry(delay) if delay == Duration::from_secs(5)));
+    assert!(capture.receiver.try_recv().is_err());
+    assert!(matches!(
+        advance_notice(&scheduler, &clock, &mut due, Duration::from_secs(5)),
+        Next::Done
+    ));
+    assert_eq!(
+        capture.receiver.try_recv().unwrap().request,
+        json!({"method":"session.send_status", "params":{"send_id":format!("aft:bash:{}", task.task)}})
+    );
+    assert!(capture.receiver.try_recv().is_err());
+    assert!(task.delivered());
+}
+
+#[test]
+fn runner_notices_pending_status_failures_retry_once_then_resume_schedule() {
+    let task = Completion::new("bash-00000000000f0022", 0);
+    let capture = test_endpoint::capture(&task.task, false);
+    capture.send_status(true);
+    capture.reply(SendReply::new("pending"));
+    let scheduler = Scheduler::default();
+    let clock = Arc::new(AtomicU64::new(task.finished));
+    task.offer(&scheduler, clock.clone());
+    let mut due = std::time::Instant::now();
+    step(&scheduler, due);
+    capture.receiver.try_recv().unwrap();
+    capture.refuse("invalid_params", None);
+    capture.retry(1);
+    assert!(
+        matches!(advance_notice(&scheduler, &clock, &mut due, Duration::from_secs(5)), Next::Retry(delay) if delay == Duration::from_millis(250))
+    );
+    assert!(
+        matches!(advance_notice(&scheduler, &clock, &mut due, Duration::from_millis(250)), Next::Retry(delay) if delay == Duration::from_secs(30))
+    );
+    assert!(!task.delivered());
+    capture.reply(SendReply::new("finished"));
+    assert!(matches!(
+        advance_notice(&scheduler, &clock, &mut due, Duration::from_secs(30)),
+        Next::Done
+    ));
+    let calls: Vec<_> = capture.receiver.try_iter().collect();
+    assert_eq!(calls.len(), 3);
+    assert!(calls
+        .iter()
+        .all(|call| call.request["method"] == "session.send_status"));
+    assert!(task.delivered());
+}
+
+#[test]
+fn runner_notices_pending_followup_stops_only_on_receipt_or_contract_final_state() {
+    for state in ["finished", "superseded", "expired", "template_part_gone"] {
+        assert!(matches!(
+            decode_reply(&reply_body(&SendReply::new(state)).unwrap(), true),
+            Outcome::Accepted
+        ));
+    }
+    for state in ["pending", "active", "paused", "future_state"] {
+        assert!(matches!(
+            decode_reply(&reply_body(&SendReply::new(state)).unwrap(), true),
+            Outcome::Pending
+        ));
+    }
+    let reply = SendReply::new("active")
+        .with_delivered(cortexkit_role_llm_runner::send::Delivered::new("step").with_ref("row-1"));
+    assert!(matches!(
+        decode_reply(&reply_body(&reply).unwrap(), true),
+        Outcome::Accepted
+    ));
 }
 
 fn wait_for(scheduler: &Scheduler, task: &str, finished: bool) {
@@ -770,17 +1146,51 @@ fn runner_notices_recovered_notice_fallback_survives_restart_observation() {
 }
 
 #[test]
+fn runner_notices_distinguishes_queued_submission_from_delivered_notice() {
+    for following in [false, true] {
+        assert!(matches!(
+            decode_reply(
+                br#"{"result":{"state":"pending","submission_id":"notice-1"}}"#,
+                following,
+            ),
+            Outcome::Pending
+        ));
+        assert!(matches!(
+            decode_reply(
+                br#"{"result":{"state":"active","delivered":{"as":"step","ref":"notice-1"}}}"#,
+                following,
+            ),
+            Outcome::Accepted
+        ));
+    }
+}
+
+#[test]
 fn runner_notices_decode_open_states_and_error_envelopes() {
-    for state in [
-        "pending",
-        "active",
-        "finished",
-        "paused",
-        "future_notice_state",
+    assert!(matches!(
+        decode_send_reply(br#"{"result":{"state":"pending"}}"#),
+        Outcome::Pending
+    ));
+    for (reason, expected) in [
+        (Some("handover_failed"), "handover_failed"),
+        (Some("future_reason"), "future_reason"),
     ] {
+        let mut reply = json!({"state":"not_delivered"});
+        if let Some(reason) = reason {
+            reply["reason"] = json!(reason);
+        }
+        let bytes = cortexkit_role_llm_runner::wire::reply_body(&reply).unwrap();
+        assert!(
+            matches!(decode_send_reply(&bytes), Outcome::NotDelivered(reason) if reason == expected)
+        );
+    }
+    for state in ["active", "finished", "paused", "future_notice_state"] {
         let bytes = serde_json::to_vec(&json!({"result":{"state":state,"notice":true}})).unwrap();
         assert!(matches!(decode_send_reply(&bytes), Outcome::Accepted));
     }
+    assert!(
+        matches!(decode_send_reply(br#"{"result":{"state":"not_delivered"}}"#), Outcome::Retry(failure) if failure.class == FailureClass::ReplyDecode)
+    );
     for body in [
         json!({"error":{"code":"session_released","message":"gone"}}),
         json!({"code":"session_released","message":"gone"}),
@@ -882,9 +1292,11 @@ impl FakeRunner {
         if self.lose_first_response && self.calls.len() == 1 {
             return retry(FailureClass::TestEndpoint, "response lost");
         }
-        let response = reply_body(&SendReply::new("pending").with_submission_id("send-7")).unwrap();
-        read_reply::<SendReply>(&response).unwrap();
-        Outcome::Accepted
+        let response = reply_body(&SendReply::new("active").with_delivered(
+            cortexkit_role_llm_runner::send::Delivered::new("step").with_ref("send-7"),
+        ))
+        .unwrap();
+        decode_send_reply(&response)
     }
 }
 
@@ -917,6 +1329,33 @@ fn runner_notices_retry_unknown_outcome_with_same_id_and_dedupe() {
     assert_eq!(runner.notices, 1);
     assert_eq!(runner.calls[0], runner.calls[1]);
     assert!(retry_logged);
+}
+
+#[test]
+fn runner_notices_session_unconverted_is_final_but_transient_retries() {
+    let request = request("aft:bash:bash-7".into(), "completion".into(), true, false);
+    for (code, final_refusal) in [("session_unconverted", true), ("transient", false)] {
+        let mut runner = FakeRunner {
+            refuse: Some(code),
+            ..Default::default()
+        };
+        let outcome = runner.call(&envelope(&request));
+        if final_refusal {
+            assert!(
+                matches!(&outcome, Outcome::Final(failure) if failure.code.as_deref() == Some(code))
+            );
+        } else {
+            assert!(
+                matches!(&outcome, Outcome::Retry(failure) if failure.code.as_deref() == Some(code))
+            );
+        }
+        let next = deliver(&request.send_id, 0, true, outcome, &mut false);
+        assert_eq!(matches!(next, Next::Done), final_refusal);
+        if !final_refusal {
+            assert!(matches!(next, Next::Retry(delay) if delay == Duration::from_millis(250)));
+        }
+        assert_eq!(runner.calls.len(), 1);
+    }
 }
 
 #[test]
@@ -1335,16 +1774,31 @@ fn runner_notices_delivery_order_capability_cache_is_incarnation_scoped() {
         generation: 1,
     };
     let path = Path::new("connection.json");
-    assert_eq!(cache.get(path, "broca", &first), None);
-    cache.insert(path, "broca", first.clone(), true);
-    assert_eq!(cache.get(path, "broca", &first), Some(true));
-    assert_eq!(cache.get(path, "thalamus-harness", &first), None);
-    assert_eq!(cache.get(Path::new("other.json"), "broca", &first), None);
-    assert_eq!(cache.get(path, "broca", &restarted), None);
-    assert_eq!(cache.get(path, "broca", &daemon_restarted), None);
-    cache.insert(path, "broca", restarted.clone(), false);
-    assert_eq!(cache.get(path, "broca", &restarted), Some(false));
-    assert_eq!(cache.get(path, "broca", &first), None);
+    assert_eq!(cache.get(path, "broca", &first, "delivery_order"), None);
+    cache.insert(path, "broca", first.clone(), true, "delivery_order");
+    assert_eq!(
+        cache.get(path, "broca", &first, "delivery_order"),
+        Some(true)
+    );
+    assert_eq!(
+        cache.get(path, "thalamus-harness", &first, "delivery_order"),
+        None
+    );
+    assert_eq!(
+        cache.get(Path::new("other.json"), "broca", &first, "delivery_order"),
+        None
+    );
+    assert_eq!(cache.get(path, "broca", &restarted, "delivery_order"), None);
+    assert_eq!(
+        cache.get(path, "broca", &daemon_restarted, "delivery_order"),
+        None
+    );
+    cache.insert(path, "broca", restarted.clone(), false, "delivery_order");
+    assert_eq!(
+        cache.get(path, "broca", &restarted, "delivery_order"),
+        Some(false)
+    );
+    assert_eq!(cache.get(path, "broca", &first, "delivery_order"), None);
     for (reply, expected) in [
         (
             json!({"capabilities":["steer","delivery_order"]}),

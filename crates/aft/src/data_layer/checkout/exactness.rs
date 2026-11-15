@@ -39,14 +39,40 @@ pub(crate) fn flip_site_for_control(path: &str, file: &mut FileResolution) {
         return;
     }
     for site in &mut file.sites {
-        if let Some(mut target) = site.resolution.targets.pop_first() {
+        let targets = site.resolution.targets_mut();
+        if let Some(mut target) = targets.pop_first() {
             target.symbol.push_str("__exactness_broken");
-            site.resolution.targets.insert(target);
+            targets.insert(target);
             eprintln!("EXACTNESS CONTROL flipped site target in {path}");
             return;
         }
     }
     panic!("EXACTNESS CONTROL found no site target in {path}");
+}
+
+/// A site's targets, changeable whether the site holds its answer or shares
+/// it: the exactness gates (`scripts/telemetry/callgraph-exactness`) build
+/// this file into older source trees as well, where sites hold their own.
+trait TargetsMut {
+    fn targets_mut(
+        &mut self,
+    ) -> &mut std::collections::BTreeSet<crate::callgraph_store::join::dispatch::Target>;
+}
+
+impl TargetsMut for crate::callgraph_store::join::dispatch::Resolution {
+    fn targets_mut(
+        &mut self,
+    ) -> &mut std::collections::BTreeSet<crate::callgraph_store::join::dispatch::Target> {
+        &mut self.targets
+    }
+}
+
+impl TargetsMut for std::sync::Arc<crate::callgraph_store::join::dispatch::Resolution> {
+    fn targets_mut(
+        &mut self,
+    ) -> &mut std::collections::BTreeSet<crate::callgraph_store::join::dispatch::Target> {
+        &mut std::sync::Arc::make_mut(self).targets
+    }
 }
 
 fn save(path: &Path, value: &impl Serialize) -> GateResult<()> {
@@ -326,8 +352,11 @@ fn native_plan(view: &CheckoutView, out: &Path) -> GateResult<()> {
     let mut busiest = callees.into_iter().collect::<Vec<_>>();
     busiest.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     let mut top = Vec::new();
+    // The driver renames a parameter of the first of these whose signature
+    // it can edit; on some projects none of the ten busiest has a parameter
+    // besides its receiver, so it gets more to choose from.
     for ((path, name), callers) in busiest {
-        if top.len() == 10 {
+        if top.len() == 40 {
             break;
         }
         let Some((_, parse)) = view.published.graph.parse_of(&path) else {

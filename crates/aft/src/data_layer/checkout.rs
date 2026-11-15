@@ -1802,6 +1802,7 @@ impl Checkout {
             self.layer.threads,
             measure.then_some(&mut report.memory),
             &scratch,
+            super::callgraph::KeyOrderBudget::configured(),
             &mut |inputs, files| {
                 sections
                     .add_batch(inputs, files)

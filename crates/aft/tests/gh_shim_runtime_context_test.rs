@@ -27,11 +27,7 @@ const DEV_MANIFEST_SEED: [u8; 32] = [
 ];
 
 fn aft_binary() -> PathBuf {
-    std::env::var_os("AFT_TEST_AFT_BINARY")
-        .or_else(|| std::env::var_os("NEXTEST_BIN_EXE_aft"))
-        .or_else(|| std::env::var_os("CARGO_BIN_EXE_aft"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_aft")))
+    crate::test_helpers::aft_binary::source_binary()
 }
 
 fn unix_seconds() -> u64 {

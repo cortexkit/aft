@@ -2000,13 +2000,13 @@ fn receiver_type<'tree, N: Nav<'tree>>(
     None
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Target {
     pub file: String,
     pub symbol: String,
     pub provenance: &'static str,
 }
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub struct Resolution {
     pub targets: BTreeSet<Target>,
     pub protected: BTreeSet<(String, String)>,
@@ -2027,7 +2027,24 @@ macro_rules! census_exit {
 }
 
 /// Same-named methods in path order, each file's in file order.
-type NamedMethods<'a> = std::rc::Rc<Vec<(String, view::MethodGroup<'a>, &'a MethodHint)>>;
+type NamedMethods<'a> = std::sync::Arc<Vec<(String, view::MethodGroup<'a>, &'a MethodHint)>>;
+
+/// The same-named methods of every file a source lists, loaded once and
+/// handed to several resolvers over that source (see
+/// [`Resolver::share_methods`]), so threads resolving one name do not each
+/// load it.
+#[derive(Clone)]
+pub(crate) struct SharedMethods<'a> {
+    member: String,
+    methods: NamedMethods<'a>,
+}
+
+impl SharedMethods<'_> {
+    /// How many methods have the name.
+    pub(crate) fn len(&self) -> usize {
+        self.methods.len()
+    }
+}
 
 /// What the method-call resolver reads about a checkout's files, when they
 /// are loaded on demand instead of all held in its maps. Each answer must
@@ -2317,26 +2334,56 @@ impl<'a> Resolver<'a> {
                 .cloned(),
         }
     }
+    /// Every method named `member`, in path order, read from `source`
+    /// without recording a dependency.
+    fn load_methods(
+        &self,
+        source: &'a (dyn DispatchFiles<'a> + 'a),
+        member: &str,
+    ) -> NamedMethods<'a> {
+        let mut methods = Vec::new();
+        for file in source.files_with_method(member) {
+            self.note_file_visit();
+            let Some(parse) = source.file(&file) else {
+                continue;
+            };
+            for (group, method) in view::methods(parse).filter(|(_, m)| m.name == member) {
+                methods.push((file.clone(), group, method));
+            }
+        }
+        std::sync::Arc::new(methods)
+    }
+    /// The methods named `member`, loaded from this resolver's source for
+    /// other resolvers over the same source to take with
+    /// [`Resolver::use_shared_methods`]. Records no dependency: each
+    /// resolver records `member`'s key whenever it reads the methods.
+    /// `None` for a resolver without a source.
+    pub(crate) fn share_methods(&self, member: &str) -> Option<SharedMethods<'a>> {
+        let source = self.source?;
+        Some(SharedMethods {
+            member: member.to_string(),
+            methods: self.load_methods(source, member),
+        })
+    }
+    /// Makes this resolver read `shared` instead of loading the methods of
+    /// that name itself. The answers are the same: both come from the
+    /// same source.
+    pub(crate) fn use_shared_methods(&self, shared: &SharedMethods<'a>) {
+        self.methods_loaded.borrow_mut().insert(
+            shared.member.clone(),
+            std::sync::Arc::clone(&shared.methods),
+        );
+    }
     fn methods_named(&self, member: &str) -> NamedMethods<'a> {
         self.depend(dependency::method(member));
         if let Some(source) = self.source {
             if let Some(found) = self.methods_loaded.borrow().get(member) {
-                return std::rc::Rc::clone(found);
+                return std::sync::Arc::clone(found);
             }
-            let mut methods = Vec::new();
-            for file in source.files_with_method(member) {
-                self.note_file_visit();
-                let Some(parse) = source.file(&file) else {
-                    continue;
-                };
-                for (group, method) in view::methods(parse).filter(|(_, m)| m.name == member) {
-                    methods.push((file.clone(), group, method));
-                }
-            }
-            let methods = std::rc::Rc::new(methods);
+            let methods = self.load_methods(source, member);
             self.methods_loaded
                 .borrow_mut()
-                .insert(member.to_string(), std::rc::Rc::clone(&methods));
+                .insert(member.to_string(), std::sync::Arc::clone(&methods));
             return methods;
         }
         let index = self.methods_by_name.get_or_init(|| {
@@ -2355,7 +2402,7 @@ impl<'a> Resolver<'a> {
             }
             index
                 .into_iter()
-                .map(|(name, methods)| (name, std::rc::Rc::new(methods)))
+                .map(|(name, methods)| (name, std::sync::Arc::new(methods)))
                 .collect()
         });
         index.get(member).cloned().unwrap_or_default()
@@ -3064,33 +3111,35 @@ pub struct MemoizedResolver<'r, 'a> {
 /// A memoized answer with the dependency keys computing it recorded, which a
 /// later hit records again.
 struct MemoizedResolution {
-    resolved: std::rc::Rc<Resolution>,
+    resolved: std::sync::Arc<Resolution>,
     dependencies: std::rc::Rc<BTreeSet<String>>,
     #[cfg(feature = "callgraph-shape-census")]
     census_exit: &'static str,
 }
 
-#[derive(Eq, Ord, PartialEq, PartialOrd)]
-struct ResolutionKey {
-    scope: String,
-    receiver: Option<String>,
-    member: Option<String>,
-    dynamic: bool,
-    associated: bool,
-    caller_scope: Option<String>,
+/// What a site's resolution depends on besides the checkout's facts: two
+/// sites with equal keys get the same answer and record the same
+/// dependency keys, wherever they are.
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ResolutionKey {
+    /// The caller's language when the site has no receiver; otherwise the
+    /// calling file, whose imports and directory the receiver's lookup
+    /// reads.
+    pub(crate) scope: String,
+    pub(crate) receiver: Option<String>,
+    pub(crate) member: Option<String>,
+    pub(crate) dynamic: bool,
+    pub(crate) associated: bool,
+    pub(crate) caller_scope: Option<String>,
 }
 
-impl<'r, 'a> MemoizedResolver<'r, 'a> {
-    pub fn new(resolver: &'r Resolver<'a>) -> Self {
-        Self {
-            resolver,
-            resolved: Default::default(),
-        }
-    }
-
-    pub fn resolve(&self, file: &str, site: &SiteHint) -> std::rc::Rc<Resolution> {
-        let language = self.resolver.caller_language(file);
-        let key = ResolutionKey {
+impl Resolver<'_> {
+    /// The key `site` of `file` resolves under: [`Resolver::resolve`] gives
+    /// every site with an equal key the same answer, recording the same
+    /// dependency keys.
+    pub(crate) fn resolution_key(&self, file: &str, site: &SiteHint) -> ResolutionKey {
+        let language = self.caller_language(file);
+        ResolutionKey {
             // An unknown receiver consults only language membership, so callers
             // in different files can reuse the same conservative answer. Typed
             // receiver lookup also depends on the caller's imports and directory.
@@ -3102,7 +3151,7 @@ impl<'r, 'a> MemoizedResolver<'r, 'a> {
             receiver: site.receiver.clone(),
             member: site.member.clone(),
             dynamic: site.dynamic,
-            associated: language == "rust" && self.resolver.associated_site(file, site.ordinal),
+            associated: language == "rust" && self.associated_site(file, site.ordinal),
             caller_scope: match language.as_str() {
                 "rust" if site.receiver.is_some() => site
                     .caller
@@ -3113,7 +3162,20 @@ impl<'r, 'a> MemoizedResolver<'r, 'a> {
                 "cpp" => site.caller.clone(),
                 _ => None,
             },
-        };
+        }
+    }
+}
+
+impl<'r, 'a> MemoizedResolver<'r, 'a> {
+    pub fn new(resolver: &'r Resolver<'a>) -> Self {
+        Self {
+            resolver,
+            resolved: Default::default(),
+        }
+    }
+
+    pub fn resolve(&self, file: &str, site: &SiteHint) -> std::sync::Arc<Resolution> {
+        let key = self.resolver.resolution_key(file, site);
         if let Some(answer) = self.resolved.borrow().get(&key) {
             self.resolver
                 .dependencies
@@ -3125,7 +3187,7 @@ impl<'r, 'a> MemoizedResolver<'r, 'a> {
             return answer.resolved.clone();
         }
         let outer = self.resolver.take_dependencies();
-        let resolved = std::rc::Rc::new(self.resolver.resolve(file, site));
+        let resolved = std::sync::Arc::new(self.resolver.resolve(file, site));
         let dependencies = self.resolver.take_dependencies();
         {
             let mut recorded = self.resolver.dependencies.borrow_mut();

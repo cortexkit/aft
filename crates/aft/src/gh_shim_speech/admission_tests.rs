@@ -222,6 +222,96 @@ async fn foreground_calls_and_unpromoted_tasks_use_captured_guards() {
 }
 
 #[tokio::test]
+async fn foreground_launch_uses_its_live_origin_despite_other_session_routes() {
+    let _lock = crate::test_env::process_env_lock();
+    for codemode in [false, true] {
+        let fixture = Fixture::new(codemode).await;
+        let ticket = call_ticket(&fixture).await;
+        let mut params = fixture.params.clone();
+        params["ticket"] = json!(ticket.value().unwrap());
+        let captured = fixture.launch.authority.clone();
+        fixture.partners(|partners| {
+            let reserve = partners.reserve.clone();
+            partners.reserve = Arc::new(move |project, session, scope, body| {
+                assert_eq!(scope, &captured, "dispatch must use the captured authority");
+                reserve(project, session, scope, body)
+            });
+        });
+        let mut routes = fixture.routes(true);
+        routes.push(&fixture.session, None);
+        let mut other = fixture.head.clone();
+        other.scope_epoch += 1;
+        routes.push(&fixture.session, Some(other));
+        assert_eq!(routes.for_session(&fixture.session), None);
+        let answer = post_params(&fixture, &params, &routes).await;
+        assert!(answer.ok, "codemode={codemode}: {:?}", answer.data);
+        assert_eq!(fixture.plex.state.lock().unwrap().sends, 1);
+    }
+}
+
+#[tokio::test]
+async fn foreground_classic_with_closed_origin_still_requires_a_live_launch_route() {
+    let _lock = crate::test_env::process_env_lock();
+    let fixture = Fixture::new(false).await;
+    let ticket = call_ticket(&fixture).await;
+    let mut params = fixture.params.clone();
+    params["ticket"] = json!(ticket.value().unwrap());
+    let routes = fixture.routes(false);
+    assert_eq!(routes.for_session(&fixture.session), Some(&fixture.head));
+    let answer = post_params(&fixture, &params, &routes).await;
+    assert_eq!(answer.data["refusal_code"], "task_gh_authority_unavailable");
+    assert_eq!(answer.data["reason"], "owner_unresolved");
+    assert_eq!(fixture.plex.state.lock().unwrap().sends, 0);
+}
+
+#[tokio::test]
+async fn background_classic_with_closed_origin_and_agreeing_routes_still_posts() {
+    let _lock = crate::test_env::process_env_lock();
+    let fixture = Fixture::new(false).await;
+    let routes = fixture.routes(false);
+    assert_eq!(routes.for_session(&fixture.session), Some(&fixture.head));
+    assert!(!routes.origin_live(fixture.launch.origin.as_ref(), &fixture.head));
+    let answer = post_params(&fixture, &fixture.params, &routes).await;
+    assert!(answer.ok, "{:?}", answer.data);
+    assert_eq!(fixture.plex.state.lock().unwrap().sends, 1);
+}
+
+#[tokio::test]
+async fn foreground_run_keeps_session_fallback_when_head_origin_closes() {
+    let _lock = crate::test_env::process_env_lock();
+    let fixture = Fixture::new(true).await;
+    let ticket = call_ticket(&fixture).await;
+    let mut params = fixture.params.clone();
+    params["ticket"] = json!(ticket.value().unwrap());
+    let mut routes = fixture.routes(false);
+    routes.push_origin(fixture.launch.origin.clone().unwrap(), fixture.run.clone());
+    let answer = post_params(&fixture, &params, &routes).await;
+    assert!(answer.ok, "{:?}", answer.data);
+    assert_eq!(fixture.plex.state.lock().unwrap().sends, 1);
+}
+
+#[tokio::test]
+async fn foreground_live_origin_rejects_request_for_another_agent() {
+    let _lock = crate::test_env::process_env_lock();
+    let fixture = Fixture::new(false).await;
+    let ticket = call_ticket(&fixture).await;
+    let mut params = fixture.params.clone();
+    params["ticket"] = json!(ticket.value().unwrap());
+    params["request"]["metadata"]["agent_id"] = json!("replacement-agent");
+    let mut replacement = fixture.head.clone();
+    replacement.attributes.agent_id = Some("replacement-agent".into());
+    let mut routes = fixture.routes(true);
+    routes.push(&fixture.session, Some(replacement));
+    assert!(routes.origin_live(fixture.launch.origin.as_ref(), &fixture.head));
+    assert_eq!(routes.for_session(&fixture.session), None);
+    let answer = post_params(&fixture, &params, &routes).await;
+    assert!(!answer.ok, "{:?}", answer.data);
+    assert_eq!(answer.data["refusal_code"], "agent_identity_conflict");
+    assert_eq!(answer.data["stage"], "scope");
+    assert_eq!(fixture.plex.state.lock().unwrap().sends, 0);
+}
+
+#[tokio::test]
 async fn foreground_call_rejects_each_rebound_launch_identity_field() {
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(false).await;
@@ -244,10 +334,7 @@ async fn foreground_call_rejects_each_rebound_launch_identity_field() {
         params["request"]["metadata"]["agent_id"] = json!(stamp.attributes.agent_id);
         let mut routes = RouteScopes::default();
         routes.speech = Some(fixture.service.clone());
-        routes.push_origin(
-            fixture.launch.origin.clone().unwrap(),
-            Some(fixture.head.clone()),
-        );
+        routes.push_origin(fixture.launch.origin.clone().unwrap(), Some(stamp.clone()));
         routes.push(&fixture.session, Some(stamp));
         let answer = post_params(&fixture, &params, &routes).await;
         assert_eq!(

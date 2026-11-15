@@ -188,6 +188,9 @@ pub struct CompressionResult {
     pub offset_hint_eligible: bool,
     pub offset_start_line: Option<usize>,
     pub input_line_count: usize,
+    // Only cargo's bounded panic sections may omit detail after retaining the
+    // complete failure-name list and every test result.
+    bounded_cargo_test_details: bool,
 }
 
 impl CompressionResult {
@@ -201,6 +204,7 @@ impl CompressionResult {
             offset_hint_eligible: true,
             offset_start_line: None,
             input_line_count,
+            bounded_cargo_test_details: false,
         }
     }
 
@@ -218,6 +222,7 @@ impl CompressionResult {
             offset_hint_eligible: !had_inner_drop,
             offset_start_line: None,
             input_line_count,
+            bounded_cargo_test_details: false,
         }
     }
 
@@ -231,6 +236,7 @@ impl CompressionResult {
             offset_hint_eligible,
             offset_start_line: None,
             input_line_count,
+            bounded_cargo_test_details: false,
         }
     }
 
@@ -244,6 +250,7 @@ impl CompressionResult {
             offset_hint_eligible: true,
             offset_start_line: Some(offset_start_line),
             input_line_count,
+            bounded_cargo_test_details: false,
         }
     }
 
@@ -555,6 +562,20 @@ fn failure_preserving_result(
 ) -> CompressionResult {
     if !matches!(exit_code, Some(code) if code != 0) {
         return result;
+    }
+
+    if result.bounded_cargo_test_details {
+        if result
+            .dropped_by_class
+            .get(&DropClass::Error)
+            .copied()
+            .unwrap_or(0)
+            == 0
+            && cargo::failure_summary_preserved(stripped_raw_output, &result.text)
+        {
+            return result;
+        }
+        return GenericCompressor.compress_with_exit_code(command, stripped_raw_output, exit_code);
     }
 
     if dropped_failure_or_error_blocks(&result)
@@ -2350,7 +2371,7 @@ Error: second failure
     }
 
     #[test]
-    fn nonzero_cargo_failure_class_cap_falls_back_to_all_failures() {
+    fn nonzero_cargo_failure_detail_cap_keeps_all_names_without_generic_fallback() {
         let mut output = String::from(
             "running 40 tests
 
@@ -2386,8 +2407,46 @@ test result: FAILED. 0 passed; 40 failed; 0 ignored; 0 measured; 0 filtered out
             compress_with_registry_exit_code("cargo test", &output, Some(101), &empty_registry());
 
         assert!(failed.text.contains("---- case_0 stdout ----"));
-        assert!(failed.text.contains("---- case_39 stdout ----"));
-        assert!(failed.dropped_by_class.is_empty());
+        assert!(!failed.text.contains("---- case_39 stdout ----"));
+        assert!(failed.dropped_by_class.contains_key(&DropClass::Failure));
+        for index in 0..40 {
+            assert!(failed
+                .text
+                .lines()
+                .any(|line| line == format!("    case_{index}")));
+        }
+    }
+
+    #[test]
+    fn non_cargo_failure_omission_still_falls_back_to_generic() {
+        let raw = "Error: first failure\nError: second failure\n";
+        let compressed = CompressionResult::with_class_drops(
+            "Error: first failure",
+            [(DropClass::Failure, 1)].into_iter().collect(),
+        );
+        let result = failure_preserving_result("other-tool", raw, compressed, Some(1));
+        let generic = GenericCompressor.compress_with_exit_code("other-tool", raw, Some(1));
+        assert_eq!(result, generic);
+        assert!(result.text.contains("Error: second failure"));
+    }
+
+    #[test]
+    fn cargo_summary_missing_name_or_result_still_falls_back_to_generic() {
+        let raw = include_str!("../../tests/integration/fixtures/compress_filters/cargo-test/host-supervisor-two-failures.stdout");
+        let compressed = CargoCompressor.compress_with_exit_code("cargo test", raw, Some(101));
+        assert!(compressed.bounded_cargo_test_details);
+        let generic = GenericCompressor.compress_with_exit_code("cargo test", raw, Some(101));
+        for prefix in ["    holders::a_hosts_output", "test result:"] {
+            let mut missing = compressed.clone();
+            missing.text = missing
+                .text
+                .lines()
+                .filter(|line| !line.starts_with(prefix))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let result = failure_preserving_result("cargo test", raw, missing, Some(101));
+            assert_eq!(result, generic, "missing {prefix}");
+        }
     }
 
     #[test]

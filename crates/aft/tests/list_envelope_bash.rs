@@ -559,6 +559,58 @@ fn cargo_failed_output(trailing: Option<&str>) -> String {
 }
 
 #[test]
+fn cargo_failure_messages_survive_completion_preview_and_bash_output_envelope() {
+    use aft::bash_background::output::{
+        cap_completion_output, cap_completion_output_with_marker, COMPLETION_FAILURE_PREVIEW_BYTES,
+    };
+
+    let input = include_str!(
+        "integration/fixtures/compress_filters/cargo-test/host-supervisor-two-failures.stdout"
+    );
+    let registry = build_registry(builtin_filters::ALL, None, None);
+    let result = compress_with_registry_exit_code("cargo test", input, Some(101), &registry);
+    // Completion caps command output before adding the remote note. The cargo
+    // detail budget leaves room for the recovery marker, so failures are not cut.
+    let marker = "[truncated output; +8 more warnings; full output: read \"/work/bash-tasks/job/io/stdout\"]";
+    assert!(result.text.len() <= aft::bash_background::output::COMPLETION_FAILURE_TAIL_BYTES);
+    let unmarked = cap_completion_output(&result.text, false);
+    assert!(!unmarked.truncated);
+    assert_eq!(unmarked.text, result.text);
+    let preview = cap_completion_output_with_marker(&result.text, marker, false);
+    // A supplied marker sets the flag even when no command bytes are cut.
+    assert!(preview.truncated);
+    assert_eq!(
+        preview.text,
+        format!("{}\n{marker}", result.text.trim_end())
+    );
+    assert!(preview.text.len() <= COMPLETION_FAILURE_PREVIEW_BYTES);
+    let mut rendered = format!("Remote execution: linux\n{}", preview.text);
+    for message in [
+        "the log kept 64000 bytes, 64 of the host's 100 filler lines",
+        "the host 6851 still runs 4.5s after its keeper's death",
+    ] {
+        assert!(rendered.contains(message), "{rendered}");
+    }
+    for name in [
+        "holders::a_hosts_output_is_all_in_its_log_once_its_holder_has_left",
+        "holders::a_keeper_lost_before_its_start_acknowledgement_leaves_no_host_running",
+    ] {
+        assert!(
+            rendered.lines().any(|line| line == format!("    {name}")),
+            "{rendered}"
+        );
+        assert!(rendered.contains(&format!("---- {name} stdout ----")));
+    }
+    assert!(rendered.contains("test result: FAILED. 2 passed; 2 failed"));
+    let expected_shown = count_output_lines(&rendered);
+    let envelope = append_envelope_trailer(&mut rendered, result.input_line_count)
+        .expect("compression dropped compiler progress");
+    assert_eq!(envelope.total, Total::Exact(367));
+    assert_eq!(envelope.shown, expected_shown);
+    assert!(rendered.ends_with(&format!("shown {expected_shown} of 367 lines (cap)")));
+}
+
+#[test]
 fn cargo_test_failed_verdict_is_the_final_line() {
     let verdict =
         "test result: FAILED. 248 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s";

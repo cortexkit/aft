@@ -178,10 +178,27 @@ def native_edits(binary, root, plan, seed):
         source = path.read_text()
         lines = source.splitlines(keepends=True)
         line = row["symbol"]["start_line"]
-        signature = lines[line]
+        if row["language"] == "rust":
+            # Symbol spans include documentation and attributes. Their braces
+            # and colons are not the beginning or end of the function signature.
+            declaration = r'^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|const|unsafe|extern(?:\s+"[^"]*")?)\s+)*fn\s+'
+            while line <= row["symbol"]["end_line"] and not re.match(declaration, lines[line]):
+                line += 1
+            if line > row["symbol"]["end_line"]:
+                continue
+        # The signature may span lines (Rust puts one parameter per line) or
+        # follow attribute lines, so it is read up to the body's opening
+        # brace, at most eight lines.
+        end = line
+        while end < min(len(lines), line + 8) - 1 and "{" not in lines[end] and ":" not in lines[end].rstrip()[-1:]:
+            end += 1
+        signature = "".join(lines[line:end + 1])
         # Rename a parameter, not the callee: body references may become
         # unresolved, which is intentional and must refresh identically.
-        pattern = r"\((?:self\s*,\s*)?([A-Za-z_][A-Za-z_0-9]*)\s*(?=[:,)])"
+        # A Python `self` or a Rust `self`, `&self`, `&mut self` or
+        # `&'a self` receiver is skipped, and so is a Rust `mut` binding.
+        receiver = r"(?:(?:&\s*(?:'[A-Za-z_]+\s+)?)?(?:mut\s+)?self\s*,\s*)?"
+        pattern = r"\(\s*" + receiver + r"(?!(?:mut\s+)?self\s*(?=[:,)]))(?:mut\s+)?([A-Za-z_][A-Za-z_0-9]*)\s*(?=[:,)])"
         if row["language"] == "go":
             # Skip the receiver when this is a method.
             offset = signature.find(")") + 1 if re.match(r"\s*func\s*\(", signature) else 0
@@ -199,14 +216,13 @@ def native_edits(binary, root, plan, seed):
         if not match:
             continue
         replacement = signature[:begin] + match[1] + "_exactness" + signature[finish:]
-        lines[line] = replacement
-        changed = "".join(lines)
+        changed = "".join(lines[:line] + [replacement] + lines[end + 1:])
         if valid(row, changed):
             signature_edit = {"file": row["file"], "symbol": row["symbol"], "callers": row["callers"], "round1": changed}
             originals[row["file"]] = path.read_bytes()
             break
     if not signature_edit:
-        raise ValueError("no parseable signature edit among reference top ten callees")
+        raise ValueError("no parseable signature edit among the reference's busiest callees")
     edits.extend([member_edit, signature_edit])
     return {"delete": deleted, "rename": renamed, "renamed_to": renamed + ".exactness" + Path(renamed).suffix, "edits": edits, "rejected": rejected}, originals
 
