@@ -10,6 +10,8 @@ import subprocess
 import tarfile
 import time
 
+from child_process import child_process, terminal_failure
+
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 
@@ -59,8 +61,9 @@ def build(revision, output, profile):
     env = dict(os.environ, CARGO_TARGET_DIR=str(target))
     command = ["cargo", "build", "--profile", profile, "-p", "agent-file-tools", "--example", "callgraph_exactness", "--features", "test-hooks"]
     started = time.monotonic()
-    with (output / "build.log").open("w") as log:
-        process = subprocess.Popen(command, cwd=source, env=env, stdout=log, stderr=subprocess.STDOUT)
+    with (output / "build.log").open("w") as log, child_process(
+        command, cwd=source, env=env, stdout=log, stderr=subprocess.STDOUT
+    ) as process:
         while True:
             try:
                 code = process.wait(timeout=60)
@@ -90,4 +93,7 @@ if __name__ == "__main__":
     parser.add_argument("output", type=Path)
     parser.add_argument("--profile", choices=("release", "ci-storm"), default="ci-storm")
     args = parser.parse_args()
-    build(args.revision, args.output.resolve(), args.profile)
+    try:
+        build(args.revision, args.output.resolve(), args.profile)
+    except Exception:
+        terminal_failure()

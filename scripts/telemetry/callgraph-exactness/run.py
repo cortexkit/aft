@@ -16,6 +16,8 @@ import sys
 import textwrap
 import time
 
+from child_process import child_process, terminal_failure
+
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 spec = importlib.util.spec_from_file_location("exactness_matrix", HERE.parent / "index-matrix/run.py")
@@ -252,8 +254,9 @@ def probe(args, binary, mode, root, store, out, threads, reference=None, changes
     if flip:
         env["AFT_EXACTNESS_FLIP_SITE"] = "exactness_gate/service.ts"
     started = time.monotonic()
-    with (out / "probe.log").open("w") as log:
-        process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT)
+    with (out / "probe.log").open("w") as log, child_process(
+        command, env=env, stdout=log, stderr=subprocess.STDOUT
+    ) as process:
         while True:
             remaining = args.timeout_s - (time.monotonic() - started)
             if remaining <= 0:
@@ -402,4 +405,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        terminal_failure()
