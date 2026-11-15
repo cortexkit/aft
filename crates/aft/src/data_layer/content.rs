@@ -723,6 +723,50 @@ pub fn symbol_from_outline(symbol: &OutlineSymbol) -> Option<crate::symbols::Sym
     })
 }
 
+/// Adds Rust trait members from stored call-graph symbols to a navigation
+/// table. The record itself stays unchanged, so existing publications need no
+/// rebuild just to expose members they already contain.
+pub(crate) fn complete_rust_outline(
+    symbols: Vec<OutlineSymbol>,
+    surface: &aft_store::content::Surface,
+) -> Vec<OutlineSymbol> {
+    let Some(mut navigation) = symbols
+        .iter()
+        .map(symbol_from_outline)
+        .collect::<Option<Vec<_>>>()
+    else {
+        return symbols;
+    };
+    let members = surface
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.kind == "method")
+        .map(|symbol| {
+            let scope_chain = symbol
+                .scoped_name
+                .rsplit_once("::")
+                .map_or_else(Vec::new, |(scope, _)| {
+                    scope.split("::").map(str::to_string).collect::<Vec<_>>()
+                });
+            crate::symbols::Symbol {
+                name: symbol.name.clone(),
+                kind: crate::symbols::SymbolKind::Method,
+                range: crate::symbols::Range {
+                    start_line: symbol.start_line,
+                    start_col: symbol.start_col,
+                    end_line: symbol.end_line,
+                    end_col: symbol.end_col,
+                },
+                signature: symbol.signature.clone(),
+                parent: scope_chain.last().cloned(),
+                scope_chain,
+                exported: symbol.exported,
+            }
+        });
+    crate::parser::complete_rust_trait_members(&mut navigation, members);
+    navigation.iter().map(outline_symbol).collect()
+}
+
 /// The name a record stores a parser symbol kind under: its serialized
 /// name.
 fn outline_kind_name(kind: &crate::symbols::SymbolKind) -> &'static str {

@@ -2708,8 +2708,15 @@ impl FileParser {
                 // same file a second time.
                 let (tree, lang) =
                     self.parse_with_source(path, &source, current_mtime, size, content_hash)?;
+                let mut symbols = extract_symbols_from_tree(&source, tree, lang)?;
+                if lang == LangId::Rust {
+                    complete_rust_trait_members(
+                        &mut symbols,
+                        crate::callgraph::rust_trait_members(&source, tree.root_node(), Direct),
+                    );
+                }
                 (
-                    Arc::new(extract_symbols_from_tree(&source, tree, lang)?),
+                    Arc::new(symbols),
                     (lang == LangId::Rust)
                         .then(|| Arc::new(rust_modules(tree.root_node(), &source))),
                     Some(tree.root_node().has_error()),
@@ -4404,6 +4411,36 @@ thread_local! {
 /// invisible. Code bases that group whole runtimes of methods inside macro
 /// bodies depend on seeing them, so each such body is parsed again on its own
 /// and contributes its items when, and only when, it parses cleanly as Rust.
+/// Navigation includes trait members already known to the call graph without
+/// changing the parser table persisted in content records. Both stored and
+/// freshly parsed tables use the same ownership and duplicate checks.
+pub(crate) fn complete_rust_trait_members(
+    symbols: &mut Vec<Symbol>,
+    members: impl IntoIterator<Item = Symbol>,
+) {
+    for member in members {
+        if member.kind != SymbolKind::Method
+            || !symbols.iter().any(|owner| {
+                owner.kind == SymbolKind::Interface
+                    && member.parent.as_deref() == Some(owner.name.as_str())
+                    && (owner.range.start_line, owner.range.start_col)
+                        <= (member.range.start_line, member.range.start_col)
+                    && (member.range.end_line, member.range.end_col)
+                        <= (owner.range.end_line, owner.range.end_col)
+            })
+            || symbols.iter().any(|existing| {
+                existing.kind == member.kind
+                    && existing.name == member.name
+                    && existing.range == member.range
+                    && existing.scope_chain == member.scope_chain
+            })
+        {
+            continue;
+        }
+        symbols.push(member);
+    }
+}
+
 /// The type an impl block's methods belong to, as outlines name it: generic
 /// arguments and path qualifiers are dropped, so `impl<T> Trait for a::Box<T>`
 /// nests its methods under the `Box` struct instead of a name no symbol has.

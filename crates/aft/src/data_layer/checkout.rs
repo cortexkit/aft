@@ -5758,12 +5758,16 @@ impl CheckoutView {
             #[cfg(test)]
             super::outline::note_record_read();
             let record = content.record(ordinal).map_err(DataError::store)?;
-            let RecordBody::Parsed { body, .. } = record.data else {
+            let RecordBody::Parsed { surface, body } = record.data else {
                 return Ok(None);
             };
             return Ok(body.outline.map(|symbols| super::outline::StoredOutline {
                 content: published.content,
-                symbols,
+                symbols: if published.language == "rust" {
+                    super::content::complete_rust_outline(symbols, &surface)
+                } else {
+                    symbols
+                },
             }));
         }
         Ok(None)
