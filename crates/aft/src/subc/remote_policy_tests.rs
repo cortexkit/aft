@@ -883,6 +883,43 @@ mod catalog_preset_tests {
     }
 
     #[test]
+    fn presetless_worker_runon_uses_only_its_frozen_policy() {
+        for head_enabled in [false, true] {
+            for worker_enabled in [None, Some(false), Some(true)] {
+                for (kind, attributes, codemode) in [
+                    ("worker", json!({}), false),
+                    (
+                        "ephemeral",
+                        json!({"on_behalf_of_agent":"head-a", "run_id":"run-1"}),
+                        true,
+                    ),
+                ] {
+                    let f = fixture(Some(kind), attributes, codemode);
+                    f.ctx
+                        .update_config(|config| config.remote_exec.enabled = head_enabled);
+                    if let Some(enabled) = worker_enabled {
+                        catalog(json!({"preset":"worker", "params":{"remote_exec":{"enabled":enabled}}}), &f.route, &f.ctx).unwrap();
+                    }
+                    let key = key(&f.route, Some("worker")).unwrap();
+                    let before = saved_policy(&f.ctx, &key).unwrap();
+                    let answer = catalog(json!({}), &f.route, &f.ctx).unwrap();
+                    let runon = tool(&answer, "bash").unwrap()["input_schema"]["properties"]
+                        .get("runon")
+                        .is_some();
+                    assert_eq!(
+                        runon,
+                        cfg!(unix) && worker_enabled == Some(true),
+                        "head={head_enabled}, worker={worker_enabled:?}, kind={kind}"
+                    );
+                    assert_eq!(saved_policy(&f.ctx, &key).unwrap(), before);
+                    let named = catalog(json!({"preset":"worker"}), &f.route, &f.ctx).unwrap();
+                    assert_eq!(answer["tools"], named["tools"]);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn presetless_worker_scope_serves_worker_tools_and_wording() {
         let f = fixture(Some("worker"), json!({}), false);
         let answer = check_default(&f, "worker");

@@ -412,7 +412,14 @@ fn catalog_inner(
     let preview = routing_policy
         .as_ref()
         .filter(|_| head_scope(identity) && policy_key(identity, Some(&preset)).is_ok());
-    let runon = catalog_runon_policy(ctx, identity, &preset, runon_enabled, project_off, preview);
+    let runon = catalog_runon_policy(
+        ctx,
+        identity,
+        catalog_preset.name(),
+        runon_enabled,
+        project_off,
+        preview,
+    );
     let is_confined = if let Some(policy) = preview {
         policy.confine.is_some()
     } else {
