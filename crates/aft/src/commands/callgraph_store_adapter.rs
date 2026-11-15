@@ -37,8 +37,11 @@ pub const HUB_SUMMARY_LIMIT: usize = 15;
 // 10k expansion budget leaves ample room for ordinary traces while preventing a
 // layered call graph from unfolding millions of path prefixes synchronously.
 const TRACE_TO_EXPANSION_BUDGET: usize = 10_000;
-// Limit examined caller sites, not symbols: one hub can have thousands of
-// callers before the walk advances a level.
+// Count examined caller sites, including boundary checks, not symbols: one
+// hub can have thousands of callers before the walk advances a level. At 10k,
+// pinned VS Code's isString and isBoolean return in under two seconds in a
+// release probe without link-time optimization; validateConstraints and upcast need 12 and
+// 42 sites and retain their complete, byte-identical answers.
 const IMPACT_EXPANSION_BUDGET: usize = 10_000;
 const IMPACT_BUDGET_NOTE: &str = "traversal capped";
 const TRACE_TO_RETAINED_PATH_LIMIT: usize = HUB_SUMMARY_LIMIT * 4;
@@ -1090,7 +1093,6 @@ fn impact_result_with_budget(
     include_tests: bool,
     budget: usize,
 ) -> StoreAdapterResult<(StoreImpactResult, usize)> {
-    let profile_start = std::time::Instant::now();
     let target = resolve_symbol_query(store, file, symbol)?;
     let effective_depth = depth.max(1);
     let mut visited = HashMap::new();
@@ -1119,8 +1121,6 @@ fn impact_result_with_budget(
             )?
         };
 
-    eprintln!("IMPACT prefetch_ms={}", profile_start.elapsed().as_millis());
-    let phase = std::time::Instant::now();
     collect_callers_recursive(
         &callers_by_symbol,
         &target.representative.file,
@@ -1131,14 +1131,6 @@ fn impact_result_with_budget(
         &mut sites,
         &mut boundary,
     )?;
-    eprintln!(
-        "IMPACT recursion_ms={} sites={} visited={} boundary={}",
-        phase.elapsed().as_millis(),
-        sites.len(),
-        visited.len(),
-        boundary.len()
-    );
-    let phase = std::time::Instant::now();
     let (depth_limited, truncated, boundary_counts) = if budget_exhausted {
         (false, 0, HashMap::new())
     } else if budget == usize::MAX {
@@ -1163,8 +1155,6 @@ fn impact_result_with_budget(
         (omitted > 0, omitted, counts)
     };
 
-    eprintln!("IMPACT boundary_ms={}", phase.elapsed().as_millis());
-    let phase = std::time::Instant::now();
     let mut sites = dedup_call_sites(sites);
     sites.sort_by(|left, right| {
         left.caller
@@ -1189,8 +1179,6 @@ fn impact_result_with_budget(
         .filter(|site| site.kind == "callback_ref")
         .count();
 
-    eprintln!("IMPACT dedup_ms={}", phase.elapsed().as_millis());
-    let phase = std::time::Instant::now();
     // Which affected callers are roots: nothing calls them, by the edges
     // this answer lists (calls and callback references). A caller whose own
     // callers were fetched is a root when the only ones are itself; one at
@@ -1218,8 +1206,6 @@ fn impact_result_with_budget(
         root_kinds.insert(key, kind);
     }
 
-    eprintln!("IMPACT roots_ms={}", phase.elapsed().as_millis());
-    let phase = std::time::Instant::now();
     let summarize = hub_selector_activated(post_filter_count);
     let affected_files = visible_sites
         .iter()
@@ -1373,11 +1359,6 @@ fn impact_result_with_budget(
         truncated,
         sites_list_envelope,
     };
-    eprintln!(
-        "IMPACT assembly_ms={} total_ms={}",
-        phase.elapsed().as_millis(),
-        profile_start.elapsed().as_millis()
-    );
     Ok((result, expansions))
 }
 
@@ -2958,8 +2939,6 @@ fn prefetch_impact_callers(
     let mut callers_by_symbol = HashMap::new();
     let mut frontier = BTreeSet::from([(file.to_string(), symbol.to_string())]);
     let mut expansions = 0;
-    let mut seen_sites = HashSet::new();
-    let mut seen_callers = HashSet::new();
     for depth in 0..max_depth {
         let targets = frontier
             .into_iter()
@@ -2968,28 +2947,8 @@ fn prefetch_impact_callers(
         if targets.is_empty() {
             break;
         }
-        let phase = std::time::Instant::now();
         let (fetched, exhausted, examined) =
             store.direct_callers_bounded(&targets, budget.saturating_sub(expansions))?;
-        eprintln!(
-            "IMPACT depth={} targets={} sites={} ms={}",
-            depth + 1,
-            targets.len(),
-            examined,
-            phase.elapsed().as_millis()
-        );
-        let before_sites = seen_sites.len();
-        let before_callers = seen_callers.len();
-        for site in fetched.values().flatten() {
-            seen_sites.insert(call_site_key(site));
-            seen_callers.insert((site.caller.file.clone(), site.caller.symbol.clone()));
-        }
-        eprintln!(
-            "IMPACT depth={} new_distinct_sites={} new_caller_symbols={}",
-            depth + 1,
-            seen_sites.len() - before_sites,
-            seen_callers.len() - before_callers
-        );
         expansions += examined;
         frontier = BTreeSet::new();
         if depth + 1 < max_depth && !exhausted {
