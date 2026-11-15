@@ -681,7 +681,7 @@ mod receiver {
                         index,
                         ReturnOutcome::NotReturned {
                             reason: NotReturned::Runner {
-                                cause: String::from(cause),
+                                cause: String::from(cause.clone()),
                             },
                         },
                     ))
