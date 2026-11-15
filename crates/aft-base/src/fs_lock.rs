@@ -216,8 +216,14 @@ impl Default for LockConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProcessIdentity {
+    #[cfg(any(test, feature = "test-support"))]
+    pub start_time: u64,
+    #[cfg(not(any(test, feature = "test-support")))]
     start_time: u64,
     boot_id: Option<String>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub exited: bool,
+    #[cfg(not(any(test, feature = "test-support")))]
     exited: bool,
 }
 
@@ -2298,16 +2304,27 @@ pub(crate) enum MacosExitState {
 #[cfg(any(target_os = "macos", any(test, feature = "test-support")))]
 #[derive(Clone, Debug)]
 pub struct MacosKinfo {
-    pub(crate) comm: String,
-    pub(crate) ruid: u32,
-    pub(crate) pgid: i32,
+    pub comm: String,
+    pub ruid: u32,
+    pub pgid: i32,
+    #[cfg(any(test, feature = "test-support"))]
+    pub state: u8,
+    #[cfg(not(any(test, feature = "test-support")))]
     pub(crate) state: u8,
+    #[cfg(any(test, feature = "test-support"))]
+    pub flags: u32,
+    #[cfg(not(any(test, feature = "test-support")))]
     pub(crate) flags: u32,
+    #[cfg(any(test, feature = "test-support"))]
+    pub started_at_us: Option<u64>,
+    #[cfg(not(any(test, feature = "test-support")))]
     pub(crate) started_at_us: Option<u64>,
 }
 
 #[cfg(any(target_os = "macos", any(test, feature = "test-support")))]
 impl MacosKinfo {
+    #[rustfmt::skip]
+    test_support_visibility! {
     pub(crate) fn exit_state(&self) -> MacosExitState {
         if self.state == SZOMB {
             MacosExitState::Zombie
@@ -2317,11 +2334,12 @@ impl MacosKinfo {
             MacosExitState::NotExiting
         }
     }
+    }
 
     /// The kernel exposes exit-started (P_WEXIT) before the process reaches the
     /// zombie state (SZOMB). Both count as exited for lease ownership and for
     /// deciding when a killed background task has finished.
-    pub(crate) fn has_exited(&self) -> bool {
+    pub fn has_exited(&self) -> bool {
         self.exit_state() != MacosExitState::NotExiting
     }
 }
