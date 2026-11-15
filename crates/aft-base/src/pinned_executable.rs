@@ -638,8 +638,9 @@ fn linux_image_path() -> PathBuf {
     PathBuf::from(format!("/proc/{}/exe", std::process::id()))
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
+pub mod tests {
     use super::*;
 
     #[test]
@@ -658,7 +659,9 @@ mod tests {
         );
     }
 
-    #[test]
+    #[rustfmt::skip]
+    test_support_visibility! {
+    #[cfg_attr(test, test)]
     fn pinned_executable_cleanup_preserves_live_owner_and_unrelated_entries() {
         let storage = tempfile::tempdir().unwrap();
         let run = storage.path();
@@ -675,6 +678,7 @@ mod tests {
         assert!(live.join("aft").exists());
         assert!(!reused.exists(), "a reused PID must not retain an old pin");
         assert!(unrelated.join("aft").exists());
+    }
     }
 
     #[cfg(unix)]

@@ -22911,7 +22911,7 @@ mod compile_fence_tests {
         let source = compact(include_str!("mod.rs"));
         assert!(source.contains("#[cfg(any(test,feature=\"test-timing-hooks\"))]{ifletOk(raw)=std::env::var(\"AFT_TEST_SUBC_BASH_ELICITATION_TTL_MS\")"));
         let source = compact(include_str!("../../../aft-base/src/subc_config.rs"));
-        assert!(source.contains("#[cfg(any(test,feature=\"test-timing-hooks\"))]ifletSome(delay_ms)=std::env::var(\"AFT_TEST_SUBC_CONFIG_READ_DELAY_MS\")"));
+        assert!(source.contains("#[cfg(any(any(test,feature=\"test-support\"),feature=\"test-timing-hooks\"))]ifletSome(delay_ms)=std::env::var(\"AFT_TEST_SUBC_CONFIG_READ_DELAY_MS\")"));
     }
 }
 

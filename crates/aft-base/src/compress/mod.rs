@@ -1844,7 +1844,7 @@ mod output_probe_tests {
 
     fn integration_filter_inputs() -> Vec<(String, String)> {
         let root = Path::new(crate::test_support::manifest_dir())
-            .join("tests/integration/fixtures/compress_filters");
+            .join("../aft/tests/integration/fixtures/compress_filters");
         let mut paths = Vec::new();
         collect_named_files(&root, "input.txt", &mut paths);
         paths.sort();

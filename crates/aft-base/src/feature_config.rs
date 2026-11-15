@@ -2079,7 +2079,7 @@ mod tests {
     #[test]
     fn notice_digests_match_the_shared_fixtures() {
         let path = std::path::Path::new(crate::test_support::manifest_dir())
-            .join("tests/fixtures/feature_config/notice_projection.json");
+            .join("../aft/tests/fixtures/feature_config/notice_projection.json");
         let fixtures: Value =
             serde_json::from_str(&std::fs::read_to_string(path).expect("fixture")).unwrap();
         for case in fixtures["cases"].as_array().unwrap() {

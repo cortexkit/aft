@@ -1,6 +1,8 @@
 use super::*;
 
-#[test]
+#[rustfmt::skip]
+test_support_visibility! {
+#[cfg_attr(test, test)]
 fn child() {
     let Some(root) = std::env::var_os("AFT_TEST_SPEECH_LOCK_ROOT") else {
         return;
@@ -9,6 +11,7 @@ fn child() {
     let acquired = acquire_speech_serving_lease(Path::new(&root)).is_ok();
     println!("speech-lock-child-executed");
     assert_eq!(acquired, expected == "available");
+}
 }
 
 pub fn probe(root: &Path, expected: &str) {

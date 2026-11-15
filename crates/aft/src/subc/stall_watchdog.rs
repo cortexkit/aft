@@ -1070,7 +1070,7 @@ mod tests {
         line.split_whitespace().any(|token| {
             token.strip_prefix("holder=").is_some_and(|site| {
                 site.replace('\\', "/")
-                    .starts_with("crates/aft/src/executor/mod.rs:")
+                    .starts_with("crates/aft-base/src/executor/mod.rs:")
             })
         })
     }

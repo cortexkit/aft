@@ -1093,9 +1093,9 @@ mod tests {
         for source in [
             "../aft-store/src/stat.rs",
             "../aft-store/src/content/mod.rs",
-            "src/effective_path.rs",
-            "src/format.rs",
-            "src/symbols.rs",
+            "../aft-base/src/effective_path.rs",
+            "../aft-base/src/format.rs",
+            "../aft-base/src/symbols.rs",
             "src/data_layer/runtime.rs",
             "src/data_layer/content.rs",
         ] {

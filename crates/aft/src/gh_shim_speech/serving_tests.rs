@@ -2,6 +2,12 @@ use super::*;
 #[allow(unused_imports)]
 pub(crate) use aft_base::cache_location::speech_serving_tests::*;
 
+// speech_serving_tests::probe re-execs this exact test name in its caller's harness.
+#[test]
+fn child() {
+    aft_base::cache_location::speech_serving_tests::child();
+}
+
 #[tokio::test]
 async fn speech_runtime_successor_waits_for_quiescent_relay_and_finalization() {
     let dir = tempfile::tempdir().unwrap();

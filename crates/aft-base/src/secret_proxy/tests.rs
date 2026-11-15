@@ -586,7 +586,9 @@ impl Drop for Client {
     }
 }
 
-#[test]
+#[rustfmt::skip]
+test_support_visibility! {
+#[cfg_attr(test, test)]
 fn client_child() {
     if std::env::var_os("AFT_SECRET_PROXY_CHILD").is_none() {
         return;
@@ -744,6 +746,7 @@ fn client_child() {
             std::io::stdout().flush().unwrap();
         }
     });
+}
 }
 
 #[path = "audit_tests.rs"]

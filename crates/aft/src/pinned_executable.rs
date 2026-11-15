@@ -21,6 +21,13 @@ mod tests {
     #[cfg(unix)]
     use super::*;
 
+    // pinned_executable_unsandboxed_background_shim_outlives_daemon_pin uses --list
+    // with this name to verify its copied aft test executable still runs.
+    #[test]
+    fn pinned_executable_cleanup_preserves_live_owner_and_unrelated_entries() {
+        aft_base::pinned_executable::tests::pinned_executable_cleanup_preserves_live_owner_and_unrelated_entries();
+    }
+
     #[test]
     fn pinned_executable_explicit_gh_binary_path_wins() {
         let mut config = crate::config::Config::default();
