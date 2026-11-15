@@ -7743,6 +7743,11 @@ fn execute_degraded_grep_fallback(
                     return None;
                 }
                 crate::bounded_io::with_budget(io_budget.clone(), || {
+                    // Rayon does not inherit executor thread-local state. The
+                    // streamed reader must see cancellation after admission too.
+                    let _cancellation = cancellation
+                        .clone()
+                        .map(crate::executor::install_job_cancellation);
                     read_degraded_grep_file(file, &compiled, max_results)
                 })
                 .map(|outcome| (index, file.clone(), outcome))
@@ -7888,6 +7893,8 @@ fn read_degraded_grep_file(
         true,
         |bytes| {
             read += bytes.len() as u64;
+            #[cfg(test)]
+            observe_degraded_read_step(file, read);
             valid &= utf8.feed(bytes, |_| {});
             if !valid {
                 return Some(crate::large_read::ScanEnd::Stopped);
@@ -7945,6 +7952,138 @@ fn read_degraded_grep_file(
 static DEGRADED_ROW_WATCHES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<AtomicUsize>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+struct DegradedReadWatch {
+    bytes: AtomicUsize,
+    paused: AtomicBool,
+    owner_paused: AtomicBool,
+    owner: std::sync::Mutex<Option<std::thread::ThreadId>>,
+    reached: std::sync::mpsc::SyncSender<u64>,
+    resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    resume_owner: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    worker: std::sync::Mutex<Option<std::thread::ThreadId>>,
+}
+
+#[cfg(test)]
+static DEGRADED_READ_WATCHES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<DegradedReadWatch>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+fn observe_degraded_read_step(path: &Path, read: u64) {
+    let watch = DEGRADED_READ_WATCHES.lock().unwrap().get(path).cloned();
+    if let Some(watch) = watch {
+        let owner = *watch.owner.lock().unwrap();
+        if Some(std::thread::current().id()) == owner {
+            if read >= crate::large_read::STEP_BYTES as u64
+                && !watch.owner_paused.swap(true, Ordering::Relaxed)
+            {
+                watch
+                    .resume_owner
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("caller releases the coordinating scan");
+            }
+            return;
+        }
+        watch.bytes.store(read as usize, Ordering::Relaxed);
+        if read >= crate::large_read::STEP_BYTES as u64
+            && !watch.paused.swap(true, Ordering::Relaxed)
+        {
+            *watch.worker.lock().unwrap() = Some(std::thread::current().id());
+            watch.reached.send(read).unwrap();
+            watch
+                .resume
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .expect("caller releases the paused Rayon scan");
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn audit1432_round2_degraded_rayon_scan_observes_caller_cancellation_mid_file() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = [root.path().join("a.rs"), root.path().join("b.rs")];
+    let mut source = b"// foo\n".to_vec();
+    source.extend(b"// padding without a match\n".repeat((24 << 20) / 27));
+    for path in &paths {
+        fs::write(path, &source).unwrap();
+    }
+    let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    let (owner_tx, owner_rx) = std::sync::mpsc::sync_channel(1);
+    let watch = Arc::new(DegradedReadWatch {
+        bytes: AtomicUsize::new(0),
+        paused: AtomicBool::new(false),
+        owner_paused: AtomicBool::new(false),
+        owner: std::sync::Mutex::new(None),
+        reached: reached_tx,
+        resume: std::sync::Mutex::new(resume_rx),
+        resume_owner: std::sync::Mutex::new(owner_rx),
+        worker: std::sync::Mutex::new(None),
+    });
+    for path in &paths {
+        DEGRADED_READ_WATCHES
+            .lock()
+            .unwrap()
+            .insert(path.clone(), watch.clone());
+    }
+    struct Reset(Vec<PathBuf>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                DEGRADED_READ_WATCHES.lock().unwrap().remove(path);
+            }
+        }
+    }
+    let _reset = Reset(paths.to_vec());
+    let token = crate::executor::JobCancellation::new();
+    let request_token = token.clone();
+    let path = root.path().to_path_buf();
+    let observer = watch.clone();
+    let request = std::thread::spawn(move || {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            *observer.owner.lock().unwrap() = Some(std::thread::current().id());
+            let _token = crate::executor::install_job_cancellation(request_token);
+            execute_degraded_grep_fallback("foo", &path, 10, true, "rayon-cancel")
+        })
+    });
+    let paused_at = reached_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the production Rayon worker reached a real file step");
+    assert_ne!(
+        *watch.worker.lock().unwrap(),
+        *watch.owner.lock().unwrap(),
+        "the test must cross the caller/worker thread boundary"
+    );
+    token.request_cancel();
+    resume_tx.send(()).unwrap();
+    owner_tx.send(()).unwrap();
+    let result = request.join().unwrap();
+    assert!(
+        result.is_err(),
+        "the cancelled request must not return rows"
+    );
+    let read = watch.bytes.load(Ordering::Relaxed);
+    assert!(read > 0);
+    assert!(
+        read <= paused_at as usize + crate::large_read::STEP_BYTES,
+        "worker read {read} bytes after cancellation at {paused_at}"
+    );
+    assert!(
+        read < source.len(),
+        "the scan read to EOF after cancellation"
+    );
+}
 
 #[cfg(test)]
 fn record_degraded_retained_rows(root: &Path, rows: usize) {
