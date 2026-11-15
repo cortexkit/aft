@@ -378,6 +378,41 @@ fn stage2_candidate_invalid_leading_continuation_boundary_matches_whole() {
 }
 
 #[test]
+fn stage2_candidate_text_skips_an_oversized_line_outside_symbol_range() {
+    use std::io::Write;
+    let project = tempfile::tempdir().unwrap();
+    let file = project.path().join("blob.rs");
+    let prefix = b"fn normal_symbol() {}\n";
+    let mut writer = std::fs::File::create(&file).unwrap();
+    writer.write_all(prefix).unwrap();
+    writer.write_all(&vec![b'x'; 17 * 1024 * 1024]).unwrap();
+    drop(writer);
+    let candidate = CandidateResult::new_exact(
+        file.clone(),
+        Some(super::super::comparator::SymbolOffsetRange::new(
+            0,
+            prefix.len(),
+        )),
+        super::super::evidence_descriptor::EvidenceDescriptor::for_e1(1, true, false),
+    );
+    let _scope = crate::bounded_io::enter_disclosure_if_absent();
+    let text = candidate_text(project.path(), &candidate, "normal_symbol");
+    assert_eq!(text, "blob.rs:1\nnormal_symbol");
+    let mut reply =
+        crate::protocol::Response::success("oversized-window", serde_json::json!({"text":text}));
+    crate::bounded_io::disclose_large_read_skips(&mut reply);
+    assert_eq!(reply.data["complete"], false);
+    assert_eq!(
+        reply.data["skipped_files"][0]["file"],
+        serde_json::json!(file)
+    );
+    assert_eq!(
+        reply.data["skipped_files"][0]["reason"],
+        crate::large_read::WHOLE_READ_SKIP_REASON
+    );
+}
+
+#[test]
 fn audit01_raw_range_survives_crlf_and_invalid_prefix() {
     let project = tempfile::tempdir().unwrap();
     let file = project.path().join("raw.rs");
