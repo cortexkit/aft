@@ -2798,6 +2798,9 @@ fn search_candidate_file_streamed(
             None
         }
         Err(error) if crate::large_read::is_ceiling_error(&error) => {
+            // Earlier complete lines participated, but the unread tail is not
+            // byte-verified and is disclosed separately as a coverage gap.
+            files_searched.fetch_add(1, Ordering::Relaxed);
             return Ok(state.finish(files_with_matches));
         }
         Err(error) => Some(error),
@@ -7142,6 +7145,35 @@ mod streamed_scan_tests {
             ],
             [truncated.into_inner(), capped.into_inner()],
         )
+    }
+
+    #[test]
+    fn audit1432_round2_indexed_ceiling_keeps_earlier_rows_with_consistent_file_counters() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("early-match.txt");
+        let mut bytes = b"foo\n".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', 17 << 20));
+        std::fs::write(&path, bytes).unwrap();
+        let _scope = crate::bounded_io::enter_disclosure_if_absent();
+        let (rows, counters, _) = candidate_scan(&path, &foo_literal(), 10);
+        assert_eq!(rows, vec![(1, 1, "foo".into(), "foo".into())]);
+        assert_eq!(
+            counters,
+            [1, 1, 1, 0, 0],
+            "partial files participate in searched/matched counts, never full-byte verification"
+        );
+        let mut response =
+            crate::protocol::Response::success("indexed-ceiling", serde_json::json!({}));
+        crate::bounded_io::disclose_large_read_skips(&mut response);
+        assert_eq!(response.data["complete"], false);
+        assert_eq!(
+            response.data["skipped_files"][0]["file"],
+            serde_json::json!(path)
+        );
+        assert_eq!(
+            response.data["skipped_files"][0]["reason"],
+            crate::large_read::WHOLE_READ_SKIP_REASON
+        );
     }
 
     #[test]
