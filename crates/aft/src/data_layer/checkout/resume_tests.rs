@@ -1112,6 +1112,15 @@ fn free_space_just_above_the_floor_is_recovered_from_dead_workspaces() {
     let (own, other) = (root.path().join("own"), root.path().join("other"));
     let store = tempfile::tempdir().unwrap();
     let theirs = killed_builds(store.path(), &own, false, &other);
+    // A third checkout's build stopped for lack of disk: above the floor
+    // itself, its workspace is kept.
+    let third = root.path().join("third");
+    project(&third);
+    killed_build(store.path(), &third, "stage.sites");
+    let paused = only_workspace(&builds(
+        &Checkout::bind(layer(), store.path(), family(), &third).unwrap(),
+    ));
+    std::fs::File::create(paused.join(aft_store::family::workspace::PAUSED)).unwrap();
     let floor = crate::disk_floor::free_disk_floor(CAPACITY);
     let _low = short_until_deleted(store.path(), theirs.clone(), floor + 4096);
     let (resumed, _) = build(store.path(), &own);
@@ -1119,6 +1128,7 @@ fn free_space_just_above_the_floor_is_recovered_from_dead_workspaces() {
         !theirs.exists(),
         "the other checkout's workspace was deleted"
     );
+    assert!(paused.exists(), "the paused workspace was kept");
     assert_same(
         &reference_beside(&own, &other),
         &published(&resumed),
@@ -1282,7 +1292,8 @@ fn a_refused_admission_writes_no_workspace() {
 
 /// Times a cold build of the checkout `AFT_TEST_RESUME_PROJECT` names, then
 /// for each of several kill points a build killed there and the build that
-/// resumes it, and checks each resumed publication equals the cold one.
+/// resumes it, and checks each resumed publication equals the cold one and
+/// reused what the kill point had committed.
 #[test]
 #[ignore = "measurement; AFT_TEST_RESUME_PROJECT names a checkout to build"]
 fn measure_resume_on_a_project() {
@@ -1308,6 +1319,12 @@ fn measure_resume_on_a_project() {
         let (checkout, report) = build(store.path(), &root);
         let resumed_ms = started.elapsed().as_millis();
         assert_same(&expected, &published(&checkout), point);
+        assert!(report.resumed_records > 0, "{point}: {report:?}");
+        assert_eq!(
+            report.resumed_passes,
+            point != "records.committed",
+            "{point}: {report:?}"
+        );
         eprintln!(
             "RESUME MEASURE point={point} killed_after_ms={killed_ms} resumed_wall_ms={resumed_ms} scan_ms={:.0} resolve_ms={:.0} write_ms={:.0} resumed_records={} resumed_passes={} identical=yes",
             report.scan_ms,

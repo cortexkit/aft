@@ -40,7 +40,7 @@ fn main() {
         let Some(language) = language_for(path, text.as_bytes()) else {
             continue;
         };
-        if aft::data_layer::content::is_config_language(&language) {
+        if is_config_language(&language) {
             continue;
         }
         let digest = match CallgraphBlob::extract(&text, &language, "digest") {
@@ -49,4 +49,13 @@ fn main() {
         };
         println!("{path}\t{language}\t{digest}");
     }
+}
+
+/// Whether `language` names a configuration file the call graph reads raw:
+/// `config` in older checkouts, `config-<grammar>` in newer ones. Kept here
+/// rather than imported, as older checkouts lack the library's version.
+fn is_config_language(language: &str) -> bool {
+    language
+        .strip_prefix("config")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
 }
