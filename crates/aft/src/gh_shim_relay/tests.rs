@@ -612,6 +612,41 @@ async fn call_ticket_must_not_adopt_a_rebound_agent() {
     );
 }
 
+#[tokio::test]
+async fn legacy_call_without_origin_rejects_disagreeing_session_routes() {
+    let original = delegating_stamp();
+    let ticket = crate::bash_background::registry::with_scope_spawn(Some(original.clone()), || {
+        crate::gh_shim_ticket::ScopedTicket::issue("legacy-call-mixed-routes", "call", "/p")
+    });
+    let launch = crate::gh_shim_ticket::redeem(ticket.value().unwrap())
+        .unwrap()
+        .launch
+        .unwrap();
+    assert_eq!(launch.authority, original);
+    assert!(launch.origin.is_none());
+    let mut replacement = original.clone();
+    replacement.scope_epoch += 1;
+    for other in [None, Some(replacement)] {
+        let mut routes = scopes_for("legacy-call-mixed-routes", Some(original.clone()));
+        routes.push("legacy-call-mixed-routes", other);
+        let transport = FakeTransport::scoped();
+        let answer = relay(
+            &transport,
+            RelayCall {
+                operation: BOT_REQUEST_OPERATION,
+                params: &bot_params(ticket.value().unwrap(), "legacy-call-write"),
+                first_party: true,
+                route_scopes: &routes,
+            },
+            &|_| {},
+        )
+        .await;
+        assert_eq!(answer.data["refusal_code"], "task_gh_identity_conflict");
+        assert_eq!(answer.data["reason"], "request_mismatch");
+        assert!(transport.calls().is_empty());
+    }
+}
+
 fn background_ticket(
     root: &std::path::Path,
     session: &str,

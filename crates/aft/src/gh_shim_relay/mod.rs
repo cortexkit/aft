@@ -266,11 +266,12 @@ impl RouteScopes {
 
     /// The stamp of the session's tool route, when there is exactly one answer.
     ///
-    /// A ticket names a session, not a route, and a session can have more than
-    /// one route bound at a time. When those routes carry different stamps, or
-    /// one of them carries none, the relay cannot tell which route launched the
-    /// command, so this returns `None` and the write is refused as unscoped,
-    /// which is what an unstamped session gets.
+    /// Used for reads, session context, and bot writes when captured launch
+    /// origins cannot prove the authority is still bound (including legacy
+    /// tickets without origins). A session can have more than one route bound
+    /// at a time. Different stamps, or an unscoped route, leave its authority
+    /// ambiguous, so this returns `None`. A live captured origin lets bot
+    /// writes use the launch authority without requiring session-wide agreement.
     pub fn for_session(&self, session: &str) -> Option<&ScopeStamp> {
         let mut stamps = self
             .routes
@@ -578,15 +579,14 @@ async fn relay_inner<T: RelayTransport>(
                 let stamp = if captured_background {
                     bot_authority(&redeemed, call.route_scopes)
                 } else if let Some(launch) = redeemed.launch.as_ref().filter(|launch| {
-                    launch.run.is_some()
-                        && launch.required_scopes().into_iter().all(|(role, scope)| {
-                            let origin = if role == crate::gh_shim_speech::ScopeRole::Head {
-                                launch.head_origin.as_ref()
-                            } else {
-                                launch.origin.as_ref()
-                            };
-                            call.route_scopes.origin_live(origin, scope)
-                        })
+                    launch.required_scopes().into_iter().all(|(role, scope)| {
+                        let origin = if role == crate::gh_shim_speech::ScopeRole::Head {
+                            launch.head_origin.as_ref()
+                        } else {
+                            launch.origin.as_ref()
+                        };
+                        call.route_scopes.origin_live(origin, scope)
+                    })
                 }) {
                     Some(launch.authority.clone())
                 } else {
