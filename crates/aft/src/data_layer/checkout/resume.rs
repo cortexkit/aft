@@ -382,7 +382,7 @@ fn verify_marker(workspace: &Path, marker: &Marker, identity: Digest) -> Result<
         return Err("it was written by another build".to_string());
     }
     for (name, expected) in marker.files() {
-        if name.is_empty() || name.split('/').any(|part| part.is_empty() || part == "..") {
+        if !is_member_name(name) {
             return Err(format!("it lists a malformed file name {name:?}"));
         }
         let actual = sum_file(&workspace.join(name)).map_err(|error| format!("{name}: {error}"))?;
@@ -391,6 +391,22 @@ fn verify_marker(workspace: &Path, marker: &Marker, identity: Digest) -> Result<
         }
     }
     Ok(())
+}
+
+/// Whether `name` is a file name a stage may list: folders and a file
+/// inside the workspace, `/`-separated, each made of ASCII letters, digits,
+/// `.`, `_` and `-` only and never `.` or `..`. So no name can reach out of
+/// the workspace on any platform: no backslash, drive prefix or root.
+fn is_member_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        })
 }
 
 /// What a build is: everything its checkpoints depend on besides the
@@ -1216,6 +1232,41 @@ mod tests {
         assert_eq!(a, member_name("resolutions", [b"a".as_slice(), b"b"]));
         assert_ne!(a, member_name("resolutions", [b"ab".as_slice()]));
         assert_ne!(a, member_name("records", [b"a".as_slice(), b"b"]));
+    }
+
+    #[test]
+    fn a_stage_may_list_only_names_inside_its_workspace() {
+        for good in ["runs/resolutions-0a1b", "records/records-ff.seg", "STAGE-x"] {
+            assert!(is_member_name(good), "{good}");
+        }
+        for bad in [
+            "",
+            "/etc/passwd",
+            "../outside",
+            "runs/../../outside",
+            "runs//x",
+            "./x",
+            "..\\outside",
+            "C:/outside",
+            "C:outside",
+            "runs\\x",
+        ] {
+            assert!(!is_member_name(bad), "{bad}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let marker = Marker {
+            header: Header {
+                identity: [1; 32],
+                snapshot: None,
+                stage: RECORDS.to_string(),
+                members: vec![b"..\\outside".to_vec()],
+            },
+            sums: vec![FileSum {
+                len: 0,
+                checksum: *blake3::hash(b"").as_bytes(),
+            }],
+        };
+        assert!(verify_marker(dir.path(), &marker, [1; 32]).is_err());
     }
 
     #[test]
