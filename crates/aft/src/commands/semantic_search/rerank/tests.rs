@@ -351,6 +351,33 @@ fn candidate_text_reuses_raw_source_without_lossy_matching_or_stale_lines() {
 }
 
 #[test]
+fn stage2_candidate_invalid_leading_continuation_boundary_matches_whole() {
+    let project = tempfile::tempdir().unwrap();
+    let file = project.path().join("boundary.rs");
+    for prefix in [b"header\r\n".as_slice(), b"".as_slice()] {
+        let mut bytes = prefix.to_vec();
+        bytes.extend_from_slice(b"\x80\x80fn boundary_name() {}\r\n");
+        std::fs::write(&file, &bytes).unwrap();
+        for start in prefix.len()..=prefix.len() + 2 {
+            let candidate = CandidateResult::new_exact(
+                file.clone(),
+                Some(super::super::comparator::SymbolOffsetRange::new(
+                    start,
+                    bytes.len(),
+                )),
+                super::super::evidence_descriptor::EvidenceDescriptor::for_e1(1, true, false),
+            );
+            assert_eq!(
+                streamed_candidate_text(project.path(), &candidate, "boundary_name"),
+                candidate_text(project.path(), &candidate, "boundary_name"),
+                "prefix={}, start={start}",
+                prefix.len()
+            );
+        }
+    }
+}
+
+#[test]
 fn audit01_raw_range_survives_crlf_and_invalid_prefix() {
     let project = tempfile::tempdir().unwrap();
     let file = project.path().join("raw.rs");
