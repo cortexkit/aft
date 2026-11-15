@@ -412,6 +412,12 @@ pub(crate) async fn daemon_with_capabilities(
                         }));
                     },
                     Some("route.open") => replies.push(reply(FrameType::Response, json!({"op":"route.open", "route_channel":40, "route_epoch":1}))),
+                    // subc-client 0.40 probes server.describe before it opens a
+                    // route; this fake advertises nothing beyond the old protocol.
+                    Some("server.describe") => replies.push(reply(
+                        FrameType::Response,
+                        json!({"op":"server.describe", "protocol_ver":2, "subc_ops":[], "capabilities":[], "connected_clients":1}),
+                    )),
                     _ => panic!("unexpected control request {body}"),
                 },
                 FrameType::Request => {
@@ -1416,7 +1422,13 @@ async fn outage_daemon_with(
                                 FrameType::Response,
                                 json!({"op":"route.open", "route_channel":40, "route_epoch":1}),
                             )),
-                            _ => panic!("unexpected control request {body}"),
+                            // subc-client 0.40 probes server.describe before it opens a
+                    // route; this fake advertises nothing beyond the old protocol.
+                    Some("server.describe") => replies.push(reply(
+                        FrameType::Response,
+                        json!({"op":"server.describe", "protocol_ver":2, "subc_ops":[], "capabilities":[], "connected_clients":1}),
+                    )),
+                    _ => panic!("unexpected control request {body}"),
                         },
                         FrameType::Request => {
                             log.lock().unwrap().push(body.clone());
