@@ -1594,9 +1594,11 @@ impl Checkout {
         // free-disk floor.
         self.family.check_formats().map_err(DataError::store)?;
         // Below the floor, dead build workspaces go first, so the disk they
-        // hold can let this build or a later one run. This checkout's own
-        // are included: this build has not claimed a workspace yet, so none
-        // of them is its own.
+        // hold can let this build or a later one run: other checkouts'
+        // first, then, only if that was not enough, this checkout's own,
+        // which this build could otherwise resume from. This build has not
+        // claimed a workspace yet, so none of them is live here.
+        self.reclaim_disk_for(0, true);
         self.reclaim_disk_for(0, false);
         self.check_disk_floor()?;
         if !self.planes.callgraph {
@@ -2338,6 +2340,12 @@ fn remove_workspace(scratch: &aft_store::family::BuildScratch<DataError>) {
     let _ = scratch.remove();
 }
 
+fn log_reclaimed(removed: usize) {
+    if removed > 0 {
+        log::info!("callgraph build: deleted {removed} dead build workspace(s) to make room");
+    }
+}
+
 /// The disk-floor refusal a build workspace's admission last made, if any.
 type DiskPause = Arc<Mutex<Option<String>>>;
 
@@ -2370,15 +2378,32 @@ impl Checkout {
             .map_err(DataError::store)
     }
 
-    /// A build workspace's disk admission: the free-disk floor, with each
-    /// refusal also kept in `paused`.
+    /// A build workspace's disk admission: the free-disk floor. Before it
+    /// refuses, other checkouts' dead build workspaces are deleted to make
+    /// room (see [`aft_store::family::reclaim_dead_workspaces`]): free space
+    /// just above the floor, but short of what a stage asks to write, would
+    /// otherwise stop the build before the later reclamation for the graph
+    /// is reached. Each refusal is also kept in `paused`.
     fn admission(
         &self,
         paused: DiskPause,
     ) -> impl Fn(u64) -> Result<(), DataError> + Send + Sync + 'static {
         let dir = self.family.dir().to_path_buf();
+        let checkout = self.checkout;
         move |bytes| {
-            let result = check_disk_floor_at(&dir, bytes);
+            let mut result = check_disk_floor_at(&dir, bytes);
+            if matches!(result, Err(DataError::DiskFloor(_))) {
+                let removed = aft_store::family::reclaim_dead_workspaces(
+                    &dir,
+                    Some(checkout),
+                    || check_disk_floor_at(&dir, bytes).is_err(),
+                    || check_disk_floor_at(&dir, 0).is_err(),
+                );
+                if removed > 0 {
+                    log_reclaimed(removed);
+                    result = check_disk_floor_at(&dir, bytes);
+                }
+            }
             if let Err(DataError::DiskFloor(message)) = &result {
                 *paused.lock().expect("disk pause lock") = Some(message.clone());
             }
@@ -2437,17 +2462,12 @@ impl Checkout {
         let Ok(Some(mut session)) = self.family.try_write() else {
             return;
         };
-        match session.reclaim_dead_workspaces(
+        let removed = session.reclaim_dead_workspaces(
             others_only.then_some(self.checkout),
             || check_disk_floor_at(&dir, reserve).is_err(),
             || check_disk_floor_at(&dir, 0).is_err(),
-        ) {
-            Ok(0) => {}
-            Ok(removed) => log::info!(
-                "callgraph build: deleted {removed} dead build workspace(s) to make room"
-            ),
-            Err(error) => log::warn!("callgraph build: reclaiming dead build workspaces: {error}"),
-        }
+        );
+        log_reclaimed(removed);
     }
 
     #[cfg(test)]

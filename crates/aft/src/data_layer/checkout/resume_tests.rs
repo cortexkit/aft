@@ -846,6 +846,96 @@ fn below_the_floor_a_build_first_deletes_dead_workspaces() {
     );
 }
 
+/// A store with two checkouts, `own` and `other`, and a killed build of
+/// `other`, after one of `own` too when `own_killed`. Returns `other`'s
+/// dead workspace.
+fn killed_builds(store: &Path, own: &Path, own_killed: bool, other: &Path) -> PathBuf {
+    project(own);
+    if own_killed {
+        killed_build(store, own, "stage.sites");
+    }
+    project(other);
+    killed_build(store, other, "stage.sites");
+    let checkout = Checkout::bind(layer(), store, family(), other).unwrap();
+    only_workspace(&builds(&checkout))
+}
+
+/// The publication of a fresh build of `own` in a store where `other`'s
+/// build was killed: as `own` here first publishes from `other`'s text
+/// index (a near-identical sibling), so does the reference.
+fn reference_beside(own: &Path, other: &Path) -> Vec<(String, Vec<u8>)> {
+    let store = tempfile::tempdir().unwrap();
+    killed_build(store.path(), other, "stage.sites");
+    let (reference, _) = build(store.path(), own);
+    published(&reference)
+}
+
+/// Capacity the free-space probes below report: its floor is 5%, 50 GiB.
+const CAPACITY: u64 = 1 << 40;
+
+/// Below the floor until `workspace` is deleted, then plenty: the dead
+/// workspace of another checkout holds what this build needs.
+fn short_until_deleted(store: &Path, workspace: PathBuf, short: u64) -> impl Drop {
+    let floor = crate::disk_floor::free_disk_floor(CAPACITY);
+    crate::disk_floor::set_free_space_fn_for_test(store, move || {
+        let free = if workspace.exists() {
+            short
+        } else {
+            floor + (64 << 30)
+        };
+        (free, CAPACITY)
+    })
+}
+
+/// Below the floor, another checkout's newer dead workspace goes before
+/// this checkout's older one, which the build then resumes from.
+#[test]
+fn below_the_floor_other_checkouts_dead_workspaces_go_before_the_own() {
+    let root = tempfile::tempdir().unwrap();
+    let (own, other) = (root.path().join("own"), root.path().join("other"));
+    let store = tempfile::tempdir().unwrap();
+    let theirs = killed_builds(store.path(), &own, true, &other);
+    let floor = crate::disk_floor::free_disk_floor(CAPACITY);
+    let _low = short_until_deleted(store.path(), theirs.clone(), floor - 1);
+    let (resumed, report) = build(store.path(), &own);
+    assert!(
+        !theirs.exists(),
+        "the other checkout's workspace was deleted"
+    );
+    assert!(
+        report.resumed_records > 0 && report.resumed_passes,
+        "{report:?}"
+    );
+    assert_same(
+        &reference_beside(&own, &other),
+        &published(&resumed),
+        "after reclaiming",
+    );
+}
+
+/// Free space above the floor but short of what a stage asks to write is
+/// recovered from another checkout's dead workspace, and the build runs.
+/// With nothing to resume, the scan's own writes are the first to ask.
+#[test]
+fn free_space_just_above_the_floor_is_recovered_from_dead_workspaces() {
+    let root = tempfile::tempdir().unwrap();
+    let (own, other) = (root.path().join("own"), root.path().join("other"));
+    let store = tempfile::tempdir().unwrap();
+    let theirs = killed_builds(store.path(), &own, false, &other);
+    let floor = crate::disk_floor::free_disk_floor(CAPACITY);
+    let _low = short_until_deleted(store.path(), theirs.clone(), floor + 4096);
+    let (resumed, _) = build(store.path(), &own);
+    assert!(
+        !theirs.exists(),
+        "the other checkout's workspace was deleted"
+    );
+    assert_same(
+        &reference_beside(&own, &other),
+        &published(&resumed),
+        "after reclaiming",
+    );
+}
+
 #[test]
 fn a_refused_admission_writes_no_workspace() {
     let root = tempfile::tempdir().unwrap();
