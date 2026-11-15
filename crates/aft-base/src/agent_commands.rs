@@ -409,7 +409,8 @@ impl WindowsChild {
     pub fn declare_agent(&mut self) {
         self.root = started(self.child.id());
     }
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Preserve the std::process::Child-compatible wait API without exposing unused methods publicly.
+    #[allow(dead_code)]
     pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         let status = self.child.try_wait()?;
         if status.is_some() {
@@ -417,13 +418,13 @@ impl WindowsChild {
         }
         Ok(status)
     }
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         let status = self.child.wait()?;
         self.finished();
         Ok(status)
     }
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     fn finished(&self) {
         use std::os::windows::io::AsRawHandle;
         finished(self.root, windows_cpu_ms(self.child.as_raw_handle()));

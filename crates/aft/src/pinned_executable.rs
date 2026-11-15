@@ -18,6 +18,7 @@ use std::sync::OnceLock;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
 
     #[test]

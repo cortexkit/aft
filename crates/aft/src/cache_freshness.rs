@@ -136,6 +136,7 @@ mod tests {
 #[cfg(test)]
 #[allow(hidden_glob_reexports)]
 mod warm_reload_tests {
+    #[cfg(unix)]
     use super::*;
     #[allow(unused_imports)]
     pub(crate) use aft_base::cache_freshness::warm_reload_tests::*;
