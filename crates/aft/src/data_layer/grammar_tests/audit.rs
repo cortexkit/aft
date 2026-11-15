@@ -952,7 +952,7 @@ fn dead_code_gaps() {
         let dead = &response.data["summary"]["dead_code"];
         assert_eq!(dead["complete"], false, "{:?}", response.data);
         if !mixed {
-            assert!(dead["count"].is_null(), "{:?}", response.data);
+            assert_eq!(dead.get("count"), Some(&Value::Null), "{:?}", response.data);
         }
         assert!(dead["gaps"]
             .as_array()
@@ -962,7 +962,7 @@ fn dead_code_gaps() {
                 && gap["language"] == "luau"
                 && gap["files"] == 1));
         assert!(response.data["text"].as_str().unwrap().contains("luau"));
-        assert!(!dead["items"]
+        assert!(!response.data["details"]["dead_code"]
             .as_array()
             .is_some_and(|items| items.iter().any(|item| item["file"] == "source.luau")));
         assert!(f.ctx.data_checkout().unwrap().view().is_none());
@@ -1209,6 +1209,20 @@ isolated!(
             .unwrap();
         assert_eq!(warm_row["symbols"], 1, "{:?}", response.data);
         let manifest = response.data["content_files"].as_array().unwrap();
+        assert!(manifest.contains(&json!(warm)), "{:?}", response.data);
+        assert_eq!(response.data["complete"], false, "{:?}", response.data);
+        assert!(
+            response.data["gaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|gap| gap["state"] == "network_retry"
+                    && gap["path"]
+                        .as_str()
+                        .is_some_and(|path| path.ends_with("cold.luau"))),
+            "{:?}",
+            response.data
+        );
         assert!(
             !manifest.iter().any(|path| path
                 .as_str()
@@ -1222,6 +1236,7 @@ isolated!(
 enum StructureError {
     Syntax,
     Timeout,
+    RemoveNext(PathBuf),
 }
 struct NoBatch(Option<StructureError>);
 impl crate::language::LanguageProvider for NoBatch {
@@ -1243,7 +1258,7 @@ impl crate::language::LanguageProvider for NoBatch {
         &self,
         file: &Path,
     ) -> Result<Vec<crate::symbols::Symbol>, crate::error::AftError> {
-        match self.0 {
+        match &self.0 {
             Some(StructureError::Syntax) => {
                 return Err(crate::error::AftError::ParseError {
                     message: "injected structure failure".into(),
@@ -1255,6 +1270,9 @@ impl crate::language::LanguageProvider for NoBatch {
                     language: "luau".into(),
                     timeout_ms: 30_000,
                 })
+            }
+            Some(StructureError::RemoveNext(path)) => {
+                std::fs::remove_file(path).unwrap();
             }
             None => (),
         }
@@ -1317,12 +1335,12 @@ isolated!(
     luau_s4_round4_unsupported_assignment_preserves_rhs_parameter_hops,
     || {
         let f = fixture(true);
-        let path = write(&f.root, "rhs.luau", "local function sink(accepted)\n return accepted\nend\nfunction field(input)\n self.x = sink(input)\nend\nfunction indexed(input)\n t[k] = sink(input)\nend\nfunction parallel(input)\n input, b = sink(input), 2\nend\n");
+        let path = write(&f.root, "rhs.luau", "local function sink(accepted)\n return accepted\nend\nfunction field(input)\n self.x = sink(input)\nend\nfunction indexed(input)\n t[k] = sink(input)\nend\nfunction parallel(input)\n input, b = sink(input), 2\nend\nfunction local_parallel(input)\n local a, b = sink(input), 2\nend\n");
         f.ctx
             .data_checkout()
             .unwrap()
             .wait_for_memory_profile_idle_for_test();
-        for symbol in ["field", "indexed", "parallel"] {
+        for symbol in ["field", "indexed", "parallel", "local_parallel"] {
             let response = ask(
                 &f.ctx,
                 "trace_data",
@@ -1418,6 +1436,155 @@ isolated!(
                 "already-ready subscription lost its retry driver"
             );
             std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+);
+
+isolated!(
+    luau_s4_round5_store_prewarmed_syntax_matches_cold_skips_and_manifest,
+    || {
+        let f = fixture(true);
+        let bad = write(&f.root, "bad.luau", "function broken()\n return @@@\nend\n");
+        let cold = ask(&f.ctx, "outline", json!({"file":f.root,"files":true}));
+        assert!(cold.success, "{:?}", cold.data);
+        assert_eq!(cold.data["complete"], false);
+        assert_eq!(
+            cold.data["skipped_files"],
+            json!([{"file":"bad.luau","reason":"parse_error"}])
+        );
+        assert_eq!(cold.data["content_files"], json!([]));
+
+        let checkout = f.ctx.data_checkout().unwrap();
+        checkout.wait_for_memory_profile_idle_for_test();
+        let view = checkout.view().unwrap();
+        assert!(!view
+            .outline_symbols(b"bad.luau")
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        let cache = f.ctx.symbol_cache();
+        let generation = cache.write().unwrap().reset();
+        let report =
+            crate::data_layer::outline::prewarm(&view, &cache, generation, &|| false).unwrap();
+        assert_eq!(report.loaded, 1, "{report:?}");
+        let parser =
+            crate::parser::FileParser::with_symbol_cache(cache).with_dynamic_languages(true);
+        assert_eq!(parser.cached_has_error(&bad), None);
+        assert!(crate::parser::cached_symbol_count_shared(
+            &f.ctx.symbol_cache(),
+            &bad,
+            std::fs::metadata(&bad).unwrap().modified().unwrap(),
+            std::fs::metadata(&bad).unwrap().len()
+        )
+        .is_some());
+
+        let warm = ask(&f.ctx, "outline", json!({"file":f.root,"files":true}));
+        assert!(warm.success, "{:?}", warm.data);
+        for field in ["skipped_files", "complete", "content_files"] {
+            assert_eq!(
+                warm.data.get(field),
+                cold.data.get(field),
+                "{field}: cold={:?}, warm={:?}",
+                cold.data,
+                warm.data
+            );
+        }
+    }
+);
+
+isolated!(
+    luau_s4_round5_discovered_metadata_failure_is_partial_only_for_luau,
+    || {
+        let f = fixture(true);
+        for extension in ["luau", "ts"] {
+            let root = f.dir.join(extension);
+            write(&root, "a.ts", "export function first() { return 1; }\n");
+            let missing = write(
+                &root,
+                &format!("z.{extension}"),
+                if extension == "luau" {
+                    SOURCE
+                } else {
+                    "export function last() { return 2; }\n"
+                },
+            );
+            let mut config = (*f.ctx.config()).clone();
+            config.project_root = Some(root.clone());
+            let ctx = AppContext::new(
+                Box::new(NoBatch(Some(StructureError::RemoveNext(missing.clone())))),
+                config,
+            );
+            ctx.set_canonical_cache_root(root.clone());
+            let response = ask(&ctx, "outline", json!({"directory":root}));
+            assert!(response.success, "{:?}", response.data);
+            assert_eq!(
+                response.data["skipped_files"],
+                json!([{"file":missing,"reason":"file_not_found"}]),
+                "{:?}",
+                response.data
+            );
+            assert_eq!(
+                response.data["complete"],
+                extension != "luau",
+                "{:?}",
+                response.data
+            );
+            assert_eq!(response.data["content_files"], json!([root.join("a.ts")]));
+        }
+    }
+);
+
+isolated!(
+    luau_s4_round5_stored_dead_code_counts_supported_files_and_names_luau,
+    || {
+        let mut f = fixture(true);
+        for mixed in [false, true] {
+            f.root = f
+                .dir
+                .join(if mixed { "stored-mixed" } else { "stored-luau" });
+            f.ctx = context(&f.root, &f.storage);
+            write(
+                &f.root,
+                "source.luau",
+                "function exported(input)\n return input\nend\n",
+            );
+            if mixed {
+                write(
+                    &f.root,
+                    "plain.ts",
+                    "export function unused() { return 1; }\n",
+                );
+            }
+            configure_inspect(&f);
+            f.ctx
+                .data_checkout()
+                .unwrap()
+                .wait_for_memory_profile_idle_for_test();
+            assert!(f.ctx.data_checkout().unwrap().view().is_some());
+            let response = inspect_category(&f.ctx, &f.root, "dead_code");
+            assert!(response.success, "{:?}", response.data);
+            let dead = &response.data["summary"]["dead_code"];
+            assert_eq!(dead["complete"], false, "{:?}", response.data);
+            assert!(dead["gaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|gap| gap["language"] == "luau" && gap["files"] == 1));
+            let details = response.data["details"]["dead_code"].as_array().unwrap();
+            if mixed {
+                assert_eq!(dead.get("count"), Some(&json!(1)), "{:?}", response.data);
+                assert!(
+                    details
+                        .iter()
+                        .any(|item| item["file"] == "plain.ts" && item["symbol"] == "unused"),
+                    "{:?}",
+                    response.data
+                );
+            } else {
+                assert_eq!(dead.get("count"), Some(&Value::Null), "{:?}", response.data);
+                assert!(details.is_empty());
+            }
+            assert!(!details.iter().any(|item| item["file"] == "source.luau"));
         }
     }
 );

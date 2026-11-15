@@ -120,6 +120,14 @@ fn luau_s4_round4_non_luau_failures_preserve_main_search_contract() {
         .unwrap()
         .wait_for_memory_profile_idle_for_test();
     wait_meaning(&ctx);
+    let plane = crate::data_layer::tools::search::DataSemantic::current(&ctx).unwrap();
+    let coverage = plane.serving().unwrap().coverage();
+    assert_eq!(coverage.files, 2, "{coverage:?}");
+    assert_eq!(coverage.files_embedded, 1, "{coverage:?}");
+    assert!(coverage.pending.is_empty(), "{coverage:?}");
+    assert_eq!(coverage.files_failed.len(), 1, "{coverage:?}");
+    assert_eq!(coverage.files_failed[0].0, root.join("b.rs"));
+    assert!(coverage.files_failed[0].1.to_lowercase().contains("utf-8"));
     let response = meaning_query(&ctx);
     assert!(response.success, "{:?}", response.data);
     assert_eq!(response.data["complete"], true, "{:?}", response.data);
