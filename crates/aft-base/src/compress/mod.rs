@@ -2432,7 +2432,7 @@ test result: FAILED. 0 passed; 40 failed; 0 ignored; 0 measured; 0 filtered out
 
     #[test]
     fn cargo_summary_missing_name_or_result_still_falls_back_to_generic() {
-        let raw = include_str!("../../tests/integration/fixtures/compress_filters/cargo-test/host-supervisor-two-failures.stdout");
+        let raw = include_str!("../../../aft/tests/integration/fixtures/compress_filters/cargo-test/host-supervisor-two-failures.stdout");
         let compressed = CargoCompressor.compress_with_exit_code("cargo test", raw, Some(101));
         assert!(compressed.bounded_cargo_test_details);
         let generic = GenericCompressor.compress_with_exit_code("cargo test", raw, Some(101));
