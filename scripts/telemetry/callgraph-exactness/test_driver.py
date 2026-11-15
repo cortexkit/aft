@@ -87,6 +87,28 @@ class CompareTests(unittest.TestCase):
             self.assertIn("def keep", added["round2"])
             self.assertIn("callee(value_exactness)", signature["round1"])
 
+    def test_signature_edit_skips_rust_receivers_and_reads_past_the_first_line(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "method.py").write_text("class Owner:\n    def run(self, value):\n        return value\n")
+            (root / "only_self.rs").write_text("impl S {\n    pub fn len(&self) -> usize {\n        0\n    }\n}\n")
+            (root / "callee.rs").write_text(
+                "impl S {\n    pub fn put<'a>(\n        &'a mut self,\n        mut value: u32,\n    ) -> u32 {\n        value\n    }\n}\n")
+            for name in ("a.py", "b.py"):
+                (root / name).write_text("pass\n")
+            row = {"file": "method.py", "owner": "Owner", "language": "python", "symbol": {"start_line": 1, "end_line": 2, "scoped_name": "Owner::run"}}
+            only_self = {"file": "only_self.rs", "language": "rust", "callers": 20, "symbol": {"start_line": 1, "end_line": 3, "scoped_name": "S::len"}}
+            callee = {"file": "callee.rs", "language": "rust", "callers": 9, "symbol": {"start_line": 1, "end_line": 6, "scoped_name": "S::put"}}
+            plan = {"files": ["a.py", "b.py"], "members": [{"member": "run", "sites": 100, "declarations": [row]}], "top_callees": [only_self, callee]}
+            with patch.object(RUN.subprocess, "run") as validate:
+                validate.return_value.returncode = 0
+                native, _ = RUN.native_edits(Path("probe"), root, plan, 1441)
+            _, signature = native["edits"]
+            self.assertEqual(signature["file"], "callee.rs")
+            self.assertEqual(
+                signature["round1"],
+                "impl S {\n    pub fn put<'a>(\n        &'a mut self,\n        mut value_exactness: u32,\n    ) -> u32 {\n        value\n    }\n}\n")
+
 
 if __name__ == "__main__":
     unittest.main()

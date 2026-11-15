@@ -352,8 +352,11 @@ fn native_plan(view: &CheckoutView, out: &Path) -> GateResult<()> {
     let mut busiest = callees.into_iter().collect::<Vec<_>>();
     busiest.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     let mut top = Vec::new();
+    // The driver renames a parameter of the first of these whose signature
+    // it can edit; on some projects none of the ten busiest has a parameter
+    // besides its receiver, so it gets more to choose from.
     for ((path, name), callers) in busiest {
-        if top.len() == 10 {
+        if top.len() == 40 {
             break;
         }
         let Some((_, parse)) = view.published.graph.parse_of(&path) else {

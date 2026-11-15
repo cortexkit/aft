@@ -98,7 +98,8 @@ again, on top of round one.
 Native edits are derived from the reference's stored graph, not fixed source
 locations: seeded file deletion/rename, a declaration of a busy member name in
 a distinct new owner, removal of an existing declaration in the next round,
-and a parameter-name change on a top-ten callee's signature line. Edits are
+and a parameter-name change on the busiest callee (of the forty busiest) whose
+signature has a parameter besides its receiver. Edits are
 syntax-validated; rejected declarations and the selected locations are recorded.
 The island and native edits are restored in `finally`, including failure paths.
 `refresh_fanout` records changed fragments belonging to files not directly edited.
