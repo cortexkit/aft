@@ -3132,12 +3132,15 @@ mod tests {
         fill(&capped, &mut recorder, 10);
         assert!(recorder.texts.is_empty(), "{:?}", recorder.texts);
 
-        // With the cap raised, the rest is embedded and coverage completes.
+        // Raising the cap finishes pending work, but the recorded invalid-UTF-8
+        // file remains a terminal coverage gap rather than a complete answer.
         let open = VectorPlane::new(Arc::clone(&checkout), producer(), 20_000);
         let report = fill(&open, &mut recorder, 10);
         assert_eq!(report.files_queued, 2, "{report:?}");
         let coverage = open.coverage(&view).unwrap();
-        assert!(coverage.complete(), "{coverage:?}");
+        assert!(coverage.pending.is_empty(), "{coverage:?}");
+        assert!(!coverage.files_failed.is_empty(), "{coverage:?}");
+        assert!(!coverage.complete(), "{coverage:?}");
         assert_eq!(coverage.files_embedded, 4);
         // Files past one plane's cap are searched once another embedded them.
         let names: BTreeSet<String> = capped
