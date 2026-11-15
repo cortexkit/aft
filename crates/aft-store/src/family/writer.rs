@@ -447,10 +447,11 @@ mod build_scratch_tests {
                 Some(checkout(b"own")),
                 || {
                     asked += 1;
-                    asked <= 1
+                    Ok::<_, ()>(asked <= 1)
                 },
-                || false,
-            );
+                || Ok(false),
+            )
+            .removed;
         assert_eq!(removed, 1);
         assert!(!made[0].exists(), "the oldest dead one goes first");
         assert!(made[1].exists() && made[2].exists());
@@ -458,7 +459,8 @@ mod build_scratch_tests {
             .try_write()
             .unwrap()
             .unwrap()
-            .reclaim_dead_workspaces(Some(checkout(b"own")), || true, || false);
+            .reclaim_dead_workspaces(Some(checkout(b"own")), || Ok::<_, ()>(true), || Ok(false))
+            .removed;
         assert_eq!(removed, 1);
         assert!(made[1].exists(), "a paused one stays above the floor");
         assert!(!made[2].exists());
@@ -466,7 +468,8 @@ mod build_scratch_tests {
             .try_write()
             .unwrap()
             .unwrap()
-            .reclaim_dead_workspaces(Some(checkout(b"own")), || true, || true);
+            .reclaim_dead_workspaces(Some(checkout(b"own")), || Ok::<_, ()>(true), || Ok(true))
+            .removed;
         assert_eq!(removed, 1);
         assert!(!made[1].exists(), "below the floor a paused one goes too");
         assert!(
@@ -509,7 +512,13 @@ mod build_scratch_tests {
             .create_scratch(checkout(b"live"), |_| Ok::<_, ()>(()))
             .unwrap();
         UNDELETABLE_FOR_TEST.lock().unwrap().push(made[0].clone());
-        let removed = reclaim_dead_workspaces(dir.path(), None, || made[1].exists(), || false);
+        let removed = reclaim_dead_workspaces(
+            dir.path(),
+            None,
+            || Ok::<_, ()>(made[1].exists()),
+            || Ok(false),
+        )
+        .removed;
         UNDELETABLE_FOR_TEST
             .lock()
             .unwrap()
@@ -517,13 +526,44 @@ mod build_scratch_tests {
         assert_eq!(removed, 1);
         assert!(made[0].exists(), "the undeletable one stays");
         assert!(!made[1].exists(), "the next one is deleted all the same");
-        let removed = reclaim_dead_workspaces(dir.path(), None, || true, || true);
+        let removed =
+            reclaim_dead_workspaces(dir.path(), None, || Ok::<_, ()>(true), || Ok(true)).removed;
         assert_eq!(removed, 1);
         assert!(!made[0].exists());
         assert!(
             live.path().exists(),
             "a live build's workspace is never reclaimed"
         );
+    }
+
+    /// Free space that cannot be measured stops reclamation before it
+    /// deletes anything.
+    #[test]
+    fn disk_reclaim_stops_when_the_free_space_cannot_be_measured() {
+        let dir = tempfile::tempdir().unwrap();
+        let family =
+            Family::open(dir.path(), FamilyId::from_digest(Digest128::of(b"probe"))).unwrap();
+        let scratch = family
+            .try_write()
+            .unwrap()
+            .unwrap()
+            .create_scratch(checkout(b"victim"), |_| Ok::<_, ()>(()))
+            .unwrap();
+        crate::family::workspace::write_identity(
+            scratch.path(),
+            &crate::family::workspace::WorkspaceIdentity {
+                root: dir.path().to_path_buf(),
+                payload: Vec::new(),
+            },
+        )
+        .unwrap();
+        let victim = scratch.path().to_path_buf();
+        drop(scratch);
+        let reclaimed =
+            reclaim_dead_workspaces(dir.path(), None, || Err("unknown"), || Err("unknown"));
+        assert_eq!(reclaimed.removed, 0);
+        assert_eq!(reclaimed.stopped, Some("unknown"));
+        assert!(victim.exists());
     }
 
     #[test]
@@ -653,22 +693,26 @@ fn remove_workspace_dir(workspace: &Path) -> Result<(), FamilyError> {
 /// of what the next build needs. A workspace a build left when it stopped
 /// for lack of disk goes only after every other one, and only while
 /// `below_floor` says the disk is below the free-space floor itself.
-/// Returns how many were deleted.
+/// Either probe failing stops it: free space that cannot be measured never
+/// justifies deleting anything.
 ///
 /// Needs no write session: each deletion holds the workspace's checkout
 /// lock, which a live build of that checkout holds for as long as it runs.
 /// Best effort: a checkout that cannot be listed or locked, or a workspace
 /// that cannot be deleted now (on Windows, a file another process still has
 /// open), is passed over for the next one.
-pub fn reclaim_dead_workspaces(
+pub fn reclaim_dead_workspaces<E>(
     family_dir: &Path,
     keep: Option<CheckoutId>,
-    mut short: impl FnMut() -> bool,
-    mut below_floor: impl FnMut() -> bool,
-) -> usize {
+    mut short: impl FnMut() -> Result<bool, E>,
+    mut below_floor: impl FnMut() -> Result<bool, E>,
+) -> Reclaimed<E> {
     let builds = family_dir.join("builds");
     let Ok(checkouts) = read_dir(&builds) else {
-        return 0;
+        return Reclaimed {
+            removed: 0,
+            stopped: None,
+        };
     };
     let keep = keep.map(|checkout| checkout.to_string());
     let mut dead = Vec::new();
@@ -702,9 +746,15 @@ pub fn reclaim_dead_workspaces(
     dead.sort();
     let mut removed = 0;
     for (paused, _, checkout, workspace) in dead {
-        let wanted = if paused { below_floor() } else { short() };
-        if !wanted {
-            continue;
+        match if paused { below_floor() } else { short() } {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                return Reclaimed {
+                    removed,
+                    stopped: Some(error),
+                };
+            }
         }
         let Ok(Some(_lock)) = try_checkout_lock(&checkout) else {
             continue;
@@ -713,7 +763,21 @@ pub fn reclaim_dead_workspaces(
             removed += 1;
         }
     }
-    removed
+    Reclaimed {
+        removed,
+        stopped: None,
+    }
+}
+
+/// What [`reclaim_dead_workspaces`] did.
+#[derive(Debug)]
+pub struct Reclaimed<E> {
+    /// How many workspaces it deleted. A workspace whose deletion failed
+    /// partway is not counted, though it may have freed most of its space.
+    pub removed: usize,
+    /// The error that stopped it: the free space could not be measured, so
+    /// nothing more was deleted.
+    pub stopped: Option<E>,
 }
 
 /// A checkout's build folder, `builds/<checkout>/`, with its
@@ -1034,12 +1098,12 @@ impl<'f> WriteSession<'f> {
     }
 
     /// [`reclaim_dead_workspaces`] in this session's family.
-    pub fn reclaim_dead_workspaces(
+    pub fn reclaim_dead_workspaces<E>(
         &mut self,
         keep: Option<CheckoutId>,
-        short: impl FnMut() -> bool,
-        below_floor: impl FnMut() -> bool,
-    ) -> usize {
+        short: impl FnMut() -> Result<bool, E>,
+        below_floor: impl FnMut() -> Result<bool, E>,
+    ) -> Reclaimed<E> {
         reclaim_dead_workspaces(&self.family.layout.dir, keep, short, below_floor)
     }
 

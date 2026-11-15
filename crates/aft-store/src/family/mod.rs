@@ -60,8 +60,8 @@ use std::sync::{Arc, Mutex};
 pub use manifest::{Manifest, SegmentEntry, StateRef};
 pub use snapshot::Snapshot;
 pub use writer::{
-    BuildScratch, PendingSegment, Publication, ReclaimOutcome, ReclaimReport, ScratchClaim,
-    ScratchDir, WriteSession, reclaim_dead_workspaces,
+    BuildScratch, PendingSegment, Publication, ReclaimOutcome, ReclaimReport, Reclaimed,
+    ScratchClaim, ScratchDir, WriteSession, reclaim_dead_workspaces,
 };
 
 use crate::ids::{CheckoutId, FamilyId, Generation, SegmentId};

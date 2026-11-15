@@ -46,7 +46,7 @@ struct FreeSpaceOverride {
 enum Probe {
     Fixed(Option<(u64, u64)>),
     #[cfg(test)]
-    Computed(std::sync::Arc<dyn Fn() -> (u64, u64) + Send + Sync>),
+    Computed(std::sync::Arc<dyn Fn() -> Option<(u64, u64)> + Send + Sync>),
 }
 static FREE_SPACE: Mutex<FreeSpaceOverrides> = Mutex::new(FreeSpaceOverrides {
     storage: std::collections::BTreeMap::new(),
@@ -82,11 +82,11 @@ pub fn set_free_space_for_test(storage: &Path, free: u64, capacity: u64) -> Free
 }
 
 /// [`set_free_space_for_test`], with `probe` computing the free space and
-/// capacity at each probe.
+/// capacity at each probe; `None` is a probe that fails.
 #[cfg(test)]
 pub(crate) fn set_free_space_fn_for_test(
     storage: &Path,
-    probe: impl Fn() -> (u64, u64) + Send + Sync + 'static,
+    probe: impl Fn() -> Option<(u64, u64)> + Send + Sync + 'static,
 ) -> FreeSpaceTestGuard {
     set_probe_for_test(storage, Probe::Computed(std::sync::Arc::new(probe)))
 }
@@ -183,7 +183,7 @@ pub(crate) fn free_space(path: &Path) -> Option<(u64, u64)> {
     match value {
         Some(Probe::Fixed(value)) => return value,
         #[cfg(test)]
-        Some(Probe::Computed(probe)) => return Some(probe()),
+        Some(Probe::Computed(probe)) => return probe(),
         None => {}
     }
     probe_free_space(path)

@@ -2332,6 +2332,18 @@ fn check_disk_floor_at(dir: &Path, additional: u64) -> Result<(), DataError> {
     )))
 }
 
+/// Whether the disk holding `dir` has less free space than the floor plus
+/// `additional`. An error when the free space cannot be measured: an
+/// unknown measurement is not low disk, and never justifies deleting
+/// anything to make room.
+fn still_short(dir: &Path, additional: u64) -> Result<bool, DataError> {
+    match check_disk_floor_at(dir, additional) {
+        Ok(()) => Ok(false),
+        Err(DataError::DiskFloor(_)) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
 /// Deletes a build's workspace once the build published or stood down. A
 /// workspace that cannot be deleted now (on Windows, a file another process
 /// still has open) is left to the next writer's sweep, which deletes it
@@ -2393,14 +2405,16 @@ impl Checkout {
         move |bytes| {
             let mut result = check_disk_floor_at(&dir, bytes);
             if matches!(result, Err(DataError::DiskFloor(_))) {
-                let removed = aft_store::family::reclaim_dead_workspaces(
+                let reclaimed = aft_store::family::reclaim_dead_workspaces(
                     &dir,
                     Some(checkout),
-                    || check_disk_floor_at(&dir, bytes).is_err(),
-                    || check_disk_floor_at(&dir, 0).is_err(),
+                    || still_short(&dir, bytes),
+                    || still_short(&dir, 0),
                 );
-                if removed > 0 {
-                    log_reclaimed(removed);
+                if let Some(error) = reclaimed.stopped {
+                    result = Err(error);
+                } else if reclaimed.removed > 0 {
+                    log_reclaimed(reclaimed.removed);
                     result = check_disk_floor_at(&dir, bytes);
                 }
             }
@@ -2453,21 +2467,23 @@ impl Checkout {
     /// itself. `others_only` keeps this checkout's own, which a build of it
     /// running here holds. Best effort, and safe against live builds: each
     /// deletion takes the workspace's checkout lock first, and the build's
-    /// own admission still refuses what does not fit.
+    /// own admission still refuses what does not fit. Free space that
+    /// cannot be measured deletes nothing; the floor check that follows
+    /// reports it.
     fn reclaim_disk_for(&self, reserve: u64, others_only: bool) {
         let dir = self.family.dir().to_path_buf();
-        if check_disk_floor_at(&dir, reserve).is_ok() {
+        if !matches!(still_short(&dir, reserve), Ok(true)) {
             return;
         }
         let Ok(Some(mut session)) = self.family.try_write() else {
             return;
         };
-        let removed = session.reclaim_dead_workspaces(
+        let reclaimed = session.reclaim_dead_workspaces(
             others_only.then_some(self.checkout),
-            || check_disk_floor_at(&dir, reserve).is_err(),
-            || check_disk_floor_at(&dir, 0).is_err(),
+            || still_short(&dir, reserve),
+            || still_short(&dir, 0),
         );
-        log_reclaimed(removed);
+        log_reclaimed(reclaimed.removed);
     }
 
     #[cfg(test)]

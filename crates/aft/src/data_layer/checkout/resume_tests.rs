@@ -1073,7 +1073,7 @@ fn short_until_deleted(store: &Path, workspace: PathBuf, short: u64) -> impl Dro
         } else {
             floor + (64 << 30)
         };
-        (free, CAPACITY)
+        Some((free, CAPACITY))
     })
 }
 
@@ -1124,6 +1124,51 @@ fn free_space_just_above_the_floor_is_recovered_from_dead_workspaces() {
         &published(&resumed),
         "after reclaiming",
     );
+}
+
+/// Free space that cannot be measured is not low disk: nothing is deleted
+/// to make room, whether the first probe fails or one during reclamation,
+/// and the build reports the failed measurement.
+#[test]
+fn free_space_that_cannot_be_measured_deletes_nothing() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let root = tempfile::tempdir().unwrap();
+    let (own, other) = (root.path().join("own"), root.path().join("other"));
+    let store = tempfile::tempdir().unwrap();
+    let theirs = killed_builds(store.path(), &own, false, &other);
+    let checkout = Checkout::bind(layer(), store.path(), family(), &own).unwrap();
+    {
+        let _unknown = crate::disk_floor::set_free_space_fn_for_test(store.path(), || None);
+        checkout.reclaim_disk_for(0, false);
+        let admitted = (checkout.admission(super::DiskPause::default()))(64 << 20);
+        assert!(matches!(admitted, Err(DataError::Store(_))), "{admitted:?}");
+        let built = checkout.build();
+        assert!(matches!(built, Err(DataError::Store(_))), "{built:?}");
+        assert!(theirs.exists(), "nothing was deleted on the first probe");
+    }
+    let floor = crate::disk_floor::free_disk_floor(CAPACITY);
+    for admission in [true, false] {
+        // The first probe says the disk is short; every later one fails.
+        let probes = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&probes);
+        let _partway = crate::disk_floor::set_free_space_fn_for_test(store.path(), move || {
+            (counted.fetch_add(1, Ordering::SeqCst) == 0).then_some((floor - 1, CAPACITY))
+        });
+        if admission {
+            let admitted = (checkout.admission(super::DiskPause::default()))(0);
+            assert!(matches!(admitted, Err(DataError::Store(_))), "{admitted:?}");
+        } else {
+            checkout.reclaim_disk_for(0, true);
+        }
+        assert!(
+            probes.load(Ordering::SeqCst) >= 2,
+            "reclamation probed the disk again"
+        );
+        assert!(
+            theirs.exists(),
+            "nothing was deleted once a probe failed (admission: {admission})"
+        );
+    }
 }
 
 /// A resumed scan that staged nothing new keeps the records marker it
