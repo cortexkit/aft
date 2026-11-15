@@ -1182,13 +1182,25 @@ isolated!(
         let f = fixture(true);
         let warm = write(&f.root, "warm.luau", SOURCE);
         crate::parser::list_symbols_shared(f.ctx.provider(), &warm, true).unwrap();
-        write(&f.root, "nested/deeper/cold.luau", SOURCE);
+        for n in 0..512 {
+            write(
+                &f.root,
+                &format!("nested/{n:04}-{}-cold.luau", "member".repeat(16)),
+                SOURCE,
+            );
+        }
         large_luau(&f.root);
         let _forced = f
             .registry
             .force_unavailable_for_test(crate::grammar::GrammarState::NetworkRetry);
+        let before = crate::parser::work_counters::tree_parses();
         let response = ask(&f.ctx, "outline", json!({"file":f.root,"files":true}));
+        assert_eq!(crate::parser::work_counters::tree_parses(), before);
         assert!(response.success, "{:?}", response.data);
+        assert!(
+            response.data["rollup_count"].as_u64().unwrap() > 0,
+            "fixture must roll up the nested files"
+        );
         let warm_row = response.data["files"]
             .as_array()
             .unwrap()
@@ -1207,7 +1219,11 @@ isolated!(
     }
 );
 
-struct NoBatch;
+enum StructureError {
+    Syntax,
+    Timeout,
+}
+struct NoBatch(Option<StructureError>);
 impl crate::language::LanguageProvider for NoBatch {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -1227,6 +1243,21 @@ impl crate::language::LanguageProvider for NoBatch {
         &self,
         file: &Path,
     ) -> Result<Vec<crate::symbols::Symbol>, crate::error::AftError> {
+        match self.0 {
+            Some(StructureError::Syntax) => {
+                return Err(crate::error::AftError::ParseError {
+                    message: "injected structure failure".into(),
+                })
+            }
+            Some(StructureError::Timeout) => {
+                return Err(crate::error::AftError::GrammarParseTimeout {
+                    path: file.display().to_string(),
+                    language: "luau".into(),
+                    timeout_ms: 30_000,
+                })
+            }
+            None => (),
+        }
         crate::parser::FileParser::new()
             .with_dynamic_languages(true)
             .extract_symbols(file)
@@ -1237,7 +1268,7 @@ isolated!(
     || {
         let f = fixture(true);
         write(&f.root, "bad.luau", "function broken()\n return @@@\nend\n");
-        let fallback = AppContext::new(Box::new(NoBatch), (*f.ctx.config()).clone());
+        let fallback = AppContext::new(Box::new(NoBatch(None)), (*f.ctx.config()).clone());
         fallback.set_canonical_cache_root(f.root.clone());
         for ctx in [&fallback, &f.ctx] {
             for params in [
@@ -1252,6 +1283,30 @@ isolated!(
                     .unwrap()
                     .iter()
                     .any(|gap| gap["file"] == "bad.luau" && gap["reason"] == "parse_error"));
+                assert!(response.data.get("gaps").is_none());
+            }
+        }
+    }
+);
+
+isolated!(
+    luau_s4_round4_outline_late_structure_errors_are_incomplete_and_not_read,
+    || {
+        let f = fixture(true);
+        let path = write(&f.root, "source.luau", SOURCE);
+        for error in [StructureError::Syntax, StructureError::Timeout] {
+            let timeout = matches!(error, StructureError::Timeout);
+            let ctx = AppContext::new(Box::new(NoBatch(Some(error))), (*f.ctx.config()).clone());
+            ctx.set_canonical_cache_root(f.root.clone());
+            let response = ask(&ctx, "outline", json!({"directory":f.root}));
+            assert!(response.success, "{:?}", response.data);
+            assert_eq!(response.data["complete"], false, "{:?}", response.data);
+            assert_eq!(response.data["content_files"], json!([]));
+            if timeout {
+                assert_eq!(response.data["gaps"][0]["code"], "grammar_parse_timeout");
+                assert_eq!(response.data["gaps"][0]["path"], json!(path));
+            } else {
+                assert_eq!(response.data["skipped_files"][0]["reason"], "parse_error");
                 assert!(response.data.get("gaps").is_none());
             }
         }
