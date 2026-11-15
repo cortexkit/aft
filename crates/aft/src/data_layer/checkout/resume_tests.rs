@@ -462,6 +462,78 @@ fn a_build_killed_while_it_starts_fresh_still_starts_fresh_only_once() {
     assert_same(&published(&reference), &published(&resumed), "after deaths");
 }
 
+/// Rewrites the marker of `stage` in `workspace` with each listed file's
+/// current sum, as if the files had been written as they now are.
+fn bless(workspace: &Path, stage: &str) {
+    let marker = super::resume::read_marker(workspace, stage)
+        .unwrap()
+        .unwrap();
+    let mut body = Vec::new();
+    for (name, _) in marker.files() {
+        let sum = super::resume::sum_file(&workspace.join(name)).unwrap();
+        body.extend_from_slice(&sum.len.to_le_bytes());
+        body.extend_from_slice(&sum.checksum);
+    }
+    super::resume::write_framed(
+        &super::resume::marker_path(workspace, stage),
+        &marker.header,
+        &body,
+    )
+    .unwrap();
+}
+
+/// The one workspace in the checkout's build folder `dir`.
+fn only_workspace(dir: &Path) -> PathBuf {
+    let names = workspaces(dir);
+    assert_eq!(names.len(), 1, "{names:?}");
+    dir.join(&names[0])
+}
+
+/// The files in `dir` whose names end with `suffix`.
+fn files_ending(dir: &Path, suffix: &str) -> Vec<PathBuf> {
+    let mut files = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.to_string_lossy().ends_with(suffix))
+        .collect::<Vec<_>>();
+    files.sort();
+    files
+}
+
+#[test]
+fn a_stage_that_fails_the_build_that_adopted_it_is_built_again() {
+    let root = tempfile::tempdir().unwrap();
+    project(root.path());
+    let store = tempfile::tempdir().unwrap();
+    killed_build(store.path(), root.path(), "stage.sites");
+    let checkout = Checkout::bind(layer(), store.path(), family(), root.path()).unwrap();
+    let workspace = only_workspace(&builds(&checkout));
+    // A staging segment damaged as it was written: its whole-file sum
+    // matches, and its records fail their own checks when read.
+    let segment = files_ending(&workspace.join("records"), ".seg").remove(0);
+    let mut bytes = std::fs::read(&segment).unwrap();
+    let middle = bytes.len() / 2;
+    for byte in &mut bytes[middle..middle + 64] {
+        *byte ^= 0xff;
+    }
+    std::fs::write(&segment, bytes).unwrap();
+    bless(&workspace, super::resume::RECORDS);
+    assert!(
+        checkout.build().is_err(),
+        "the damaged records fail the build"
+    );
+    let report = checkout.build().unwrap();
+    assert_eq!(report.resumed_records, 0, "{report:?}");
+    assert!(!report.resumed_passes, "{report:?}");
+    let reference_store = tempfile::tempdir().unwrap();
+    let (reference, _) = build(reference_store.path(), root.path());
+    assert_same(
+        &published(&reference),
+        &published(&checkout),
+        "after a stage failed its build",
+    );
+}
+
 #[test]
 fn a_build_from_another_executable_or_a_damaged_stage_is_not_reused() {
     let root = tempfile::tempdir().unwrap();

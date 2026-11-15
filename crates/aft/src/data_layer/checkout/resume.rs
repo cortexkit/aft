@@ -753,12 +753,32 @@ impl Claimed {
     /// Records that this attempt ended without dying: it failed, paused
     /// for lack of disk, or was cancelled. A pause also marks the workspace
     /// paused, so reclaiming disk deletes it after every dead one.
+    ///
+    /// An attempt that failed for any other reason may have failed on what
+    /// it adopted: a file that passed its whole-file checks can still fail
+    /// its record's own (one written damaged and summed as written). So the
+    /// stages it adopted are no longer complete, and the next attempt
+    /// builds them again rather than failing on them every time.
     pub(crate) fn ended(&self, error: &DataError) {
         if self.done.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        if matches!(error, DataError::DiskFloor(_)) {
-            let _ = self.scratch.mark_paused();
+        match error {
+            DataError::DiskFloor(_) => {
+                let _ = self.scratch.mark_paused();
+            }
+            DataError::Cancelled | DataError::Busy(_) | DataError::NewerFormat(_) => {}
+            _ => {
+                for marker in [&self.records, &self.passes].into_iter().flatten() {
+                    let stage = &marker.header.stage;
+                    match std::fs::remove_file(marker_path(self.scratch.path(), stage)) {
+                        Err(failure) if failure.kind() != io::ErrorKind::NotFound => {}
+                        _ => log::info!(
+                            "callgraph build resume: discarded stage {stage}: the build that adopted it failed ({error})"
+                        ),
+                    }
+                }
+            }
         }
         let attempts = Attempts {
             running: false,
