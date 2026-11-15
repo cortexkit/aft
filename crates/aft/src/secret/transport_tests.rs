@@ -118,6 +118,34 @@ fn secret_use_route_maps_all_sender_refusals_without_releasing_material() {
 }
 
 #[test]
+fn secret_use_federated_scope_is_labelled_but_never_releases_material() {
+    let daemon = FakeClaustrum::start();
+    let transport = transport(&daemon);
+    let mut params = golden(0);
+    params["stamp"]["kind"] = json!("federated");
+    let stamp: ScopeStamp = serde_json::from_value(params["stamp"].clone()).unwrap();
+    assert_eq!(
+        crate::secret::SecretScope::from_stamp(&stamp).kind(),
+        "federated"
+    );
+    assert_eq!(
+        call(&transport, params.clone()),
+        refusal("not_found", "permanent")
+    );
+    assert!(daemon.state.lock().unwrap().pending.is_empty());
+    daemon.state.lock().unwrap().open_error = Some(peer_error("scope_not_carrier"));
+    let diagnostic_transport = SubcSecretUseTransport {
+        worker: Arc::default(),
+        ..transport.clone()
+    };
+    let line = assert_failure_log(
+        || diagnostic_transport.dispatch(params, principal("aft")),
+        "stage=route_open variant=NotSent code=scope_not_carrier",
+    );
+    assert!(line.contains("scope_kind=federated"));
+}
+
+#[test]
 fn secret_use_fake_grant_lookup_is_independent_of_requested_coverage_and_covers_linked_workers() {
     let daemon = FakeClaustrum::start();
     let head_transport = transport(&daemon);

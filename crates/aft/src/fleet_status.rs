@@ -948,6 +948,15 @@ const CONTROL_PUSH_CAPACITY: usize = 16;
 /// disable, capability_denied) keep their behaviour: the next discovery reopens
 /// when the holder is advertised again.
 fn close_forbids_reopen(reason: &str) -> bool {
+    // Authority changes retire this route, not its scope: rediscovery may open
+    // a fresh route under the daemon's current authority. Only a definite
+    // scope.describe answer may end the scope itself.
+    if matches!(
+        RouteCloseReason::from_wire(reason),
+        RouteCloseReason::AuthorityChanged
+    ) {
+        return false;
+    }
     reason.starts_with("scope_")
         || matches!(
             RouteCloseReason::from_wire(reason),
@@ -1371,6 +1380,11 @@ mod tests {
             route_opens_after_holder_close("reload").await > 1,
             "a reload close still reopens on the next discovery"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn authority_changed_reopens_the_holder_route() {
+        assert!(route_opens_after_holder_close("authority_changed").await > 1);
     }
 
     #[tokio::test(start_paused = true)]

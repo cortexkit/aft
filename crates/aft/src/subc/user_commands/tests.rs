@@ -698,8 +698,19 @@ fn user_commands_samples() {
         ("not-bound.json", not_bound),
         ("wrong-caller.json", encode(&refusal)),
     ];
-    for (_, body) in &samples {
-        assert!(body.is_object());
+    let baseline = crate::test_support::manifest_dir().join("tests/fixtures/aft-user-commands-v1");
+    for (name, body) in &samples {
+        // These samples were captured with the pre-upgrade SDK and role crates.
+        // Pin both the published sample and the compact body sent to apps.
+        let bytes = std::fs::read(baseline.join(name)).unwrap();
+        assert_eq!(serde_json::to_vec_pretty(body).unwrap(), bytes, "{name}");
+        let expected: Value = serde_json::from_slice(&bytes).unwrap();
+        let request = Frame::build(FrameType::Request, control_flags(), 1, 1, 3, vec![]).unwrap();
+        assert_eq!(
+            response_frame(&request, body).unwrap().body,
+            serde_json::to_vec(&expected).unwrap(),
+            "{name}"
+        );
     }
     if let Ok(directory) = std::env::var("AFT_USER_COMMAND_SAMPLES_DIR") {
         std::fs::create_dir_all(&directory).unwrap();

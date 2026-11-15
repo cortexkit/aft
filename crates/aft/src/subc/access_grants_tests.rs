@@ -442,6 +442,24 @@ fn saved_scope_grants_unknown_scope_kind_fails_closed_with_typed_reason() {
     );
 }
 
+#[test]
+fn federated_scope_cannot_use_saved_grants_or_act_as_a_worker() {
+    let (dir, ctx, _, worker) = fixture();
+    let outside = dir.path().join("outside.txt");
+    std::fs::write(&outside, "saved authority").unwrap();
+    let mut federated = copied_identity(&worker);
+    federated.scope.as_mut().unwrap().kind = subc_protocol::scope::ScopeKind::Federated;
+    let federated = RouteIdentity(Arc::new(federated));
+    assert!(!alfonso_worker(&federated));
+    assert!(head_scope(&federated).is_none());
+    assert_saved_scope_grants(
+        &ctx,
+        &federated,
+        &outside,
+        Some(crate::access_policy::ScopeGrantsDenial::UnknownScopeKind),
+    );
+}
+
 fn worker_at_parent_epoch(worker: &RouteIdentity, parent: &str, epoch: u64) -> RouteIdentity {
     let mut data = copied_identity(worker);
     let parent_stamp = data.scope.as_mut().unwrap().parent.as_mut().unwrap();

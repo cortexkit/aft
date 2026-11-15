@@ -1,0 +1,73 @@
+{
+  "version": "ed13b1b555f72b09a9760d325b157c7aa7e35cd3d761732500037ad1bdc4fc35",
+  "available": true,
+  "effect": "Search ready; code map ready",
+  "facts": [
+    {
+      "label": "Text search",
+      "state": "ready"
+    },
+    {
+      "label": "Code map",
+      "state": "ready"
+    },
+    {
+      "label": "Errors",
+      "value": 2.0,
+      "unit": "count",
+      "tone": "danger"
+    },
+    {
+      "label": "Warnings",
+      "value": 3.0,
+      "unit": "count"
+    },
+    {
+      "label": "Shells running",
+      "value": 1.0,
+      "unit": "count"
+    }
+  ],
+  "table": {
+    "columns": [
+      "State",
+      "Files"
+    ],
+    "rows": [
+      {
+        "label": "Text search",
+        "cells": [
+          {
+            "state": "ready"
+          },
+          {
+            "value": 10.0,
+            "unit": "count"
+          }
+        ]
+      },
+      {
+        "label": "Code map",
+        "cells": [
+          {
+            "state": "ready"
+          },
+          {
+            "state": "unavailable"
+          }
+        ]
+      },
+      {
+        "label": "Meaning search",
+        "cells": [
+          {
+            "state": "off"
+          },
+          {
+            "state": "off"
+          }
+        ]
+      }
+    ]
+  }
+}

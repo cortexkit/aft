@@ -275,6 +275,11 @@ fn ineligible_cases() -> Vec<(&'static str, RouteIdentity, Ineligibility)> {
             Ineligibility::OtherOwner,
         ),
         (
+            "federated scope",
+            classic(Some(stamp("remote", "federated"))),
+            Ineligibility::OtherOwner,
+        ),
+        (
             "flow read",
             RouteIdentity(Arc::new(RouteIdentityData {
                 spawn_principal: principal("reserved:basal"),

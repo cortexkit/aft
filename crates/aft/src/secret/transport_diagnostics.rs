@@ -129,6 +129,8 @@ impl fmt::Display for Failure {
                 ScopeKind::Head => "head",
                 ScopeKind::Worker => "worker",
                 ScopeKind::Ephemeral => "ephemeral",
+                ScopeKind::Federated => "federated",
+                _ => "unsupported",
             };
             write!(
                 f,

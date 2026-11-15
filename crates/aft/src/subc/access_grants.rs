@@ -191,6 +191,8 @@ pub(super) fn scope_grants_denial_for_parent(
                     });
             (!session_parent).then_some(ScopeGrantsDenial::UnknownScopeKind)
         }
+        ScopeKind::Federated => Some(ScopeGrantsDenial::UnknownScopeKind),
+        _ => Some(ScopeGrantsDenial::UnknownScopeKind),
     }
 }
 

@@ -148,6 +148,8 @@ impl State {
                 };
                 (parent.owner, "head", parent.scope_ref, parent.scope_epoch)
             }
+            ScopeKind::Federated => return not_found(),
+            _ => return not_found(),
         };
         let coverage = params.coverage;
         let record = self
@@ -393,7 +395,12 @@ impl FakeClaustrum {
                                     }
                                     if request.header.ty != FrameType::Request { continue; }
                                     let value: Value = serde_json::from_slice(&request.body).unwrap();
-                                    let (reply, error) = if value["op"] == "route.open" {
+                                    let (reply, error) = if value["op"] == "server.describe" {
+                                        // This fake predates reason-bearing closes; the SDK
+                                        // may probe, but must not infer extra capabilities.
+                                        (json!({"op":"server.describe", "protocol_ver":2,
+                                            "subc_ops":[], "capabilities":[], "connected_clients":1}), false)
+                                    } else if value["op"] == "route.open" {
                                         assert_eq!(value["target"], json!({"kind":"management_surface","module_id":"claustrum"}));
                                         assert!(value.get("scope").is_some());
                                         let (hold, error) = {

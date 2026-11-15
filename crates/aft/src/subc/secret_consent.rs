@@ -581,6 +581,8 @@ pub(super) fn call_scopes(
         } else {
             Ineligibility::EphemeralOutsideCodemode
         }),
+        ScopeKind::Federated => Err(Ineligibility::NotACommandScope),
+        _ => Err(Ineligibility::NotACommandScope),
     }
 }
 

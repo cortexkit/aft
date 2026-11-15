@@ -1,0 +1,15 @@
+{
+  "commands": [
+    {
+      "id": "status",
+      "title": "AFT status",
+      "summary": "Shows whether AFT's search and code map are ready for this chat's project, its open errors, and its running shells.",
+      "subject": "session",
+      "args": [],
+      "effects": [
+        "read"
+      ]
+    }
+  ],
+  "digest": "b2e25da71a1fec029ceedc1962fe5f6578976d42e30e77bcd4979363789f69a6"
+}
