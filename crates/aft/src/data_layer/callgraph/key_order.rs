@@ -51,7 +51,8 @@ use super::super::checkout::DataError;
 use super::site_records::{self, Pinned, RecordSource, Touches};
 use super::SiteResolution;
 
-/// The memory pass 4's key order may hold.
+/// The memory pass 4's key order may hold besides the record cache (whose
+/// budget is the build cache's; see `site_records`).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Budget {
     /// Bytes of keys waiting for their answers, of their sites' positions,
@@ -59,9 +60,6 @@ pub(crate) struct Budget {
     work_bytes: usize,
     /// Each sorted run's memory budget.
     sort_bytes: usize,
-    /// The bytes of decoded records the record cache keeps besides those
-    /// a resolver holds (see `site_records`).
-    record_bytes: usize,
 }
 
 /// The default for both budgets.
@@ -86,19 +84,13 @@ const INLINE_DEPENDENCIES: usize = 32;
 const KEY_BATCH: usize = 1024;
 
 impl Budget {
-    /// Every budget set to `bytes`; the sorted runs get at least
+    /// Both budgets set to `bytes`; the sorted runs get at least
     /// [`MIN_SORT_BYTES`].
     pub(crate) fn of_bytes(bytes: usize) -> Self {
         Self {
             work_bytes: bytes.max(1),
             sort_bytes: bytes.max(MIN_SORT_BYTES),
-            record_bytes: bytes,
         }
-    }
-
-    /// The record cache's budget.
-    pub(crate) fn record_bytes(self) -> usize {
-        self.record_bytes
     }
 
     /// The budget a build uses. With `test-hooks`, the exactness gates set
@@ -1471,9 +1463,21 @@ fn report(
         ),
         ("pass4.record_cache_limit".to_string(), cache.limit),
         ("pass4.record_cache_peak".to_string(), cache.peak),
+        (
+            "pass4.record_peak_with_read_through".to_string(),
+            cache.peak_with_outside,
+        ),
         ("pass4.record_cache_held".to_string(), cache.held),
         ("pass4.record_reads".to_string(), size(cache.reads)),
         ("pass4.record_rereads".to_string(), size(cache.rereads)),
+        (
+            "pass4.record_read_through".to_string(),
+            size(cache.read_through),
+        ),
+        (
+            "pass4.record_direct_reads".to_string(),
+            size(cache.direct_reads),
+        ),
         ("pass4.record_evictions".to_string(), size(cache.evicted)),
         (
             "pass4.largest_shared_records".to_string(),

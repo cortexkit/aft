@@ -11,8 +11,10 @@
 //! record lies) and the names each file declares. The second step reads
 //! records back through a cache bounded in bytes ([`RecordSource`]), and
 //! each resolver reads them through its own [`Pinned`] set, which keeps
-//! every record the resolver has read alive, and out of the cache's
-//! eviction, until the resolver is done with them. A record read again
+//! every record the resolver has read alive until the resolver is done
+//! with them. The cache never lets go of a record a set still holds; when
+//! such records fill it, a record read next is read through, held by its
+//! reader alone, rather than kept past the bound. A record read again
 //! after the cache let it go decodes equal, so eviction never changes an
 //! answer.
 
@@ -317,8 +319,7 @@ impl RecordWriter {
     }
 
     /// Finishes the record segments and opens them for reading, through a
-    /// cache keeping decoded records that count for at most `cache_bytes`
-    /// besides those a [`Pinned`] set holds.
+    /// cache keeping decoded records that count for at most `cache_bytes`.
     ///
     /// # Errors
     ///
@@ -437,16 +438,27 @@ struct RecordCache {
     map: HashMap<u32, Cached>,
     /// The files kept, in the order a second-chance sweep visits them.
     order: VecDeque<u32>,
-    /// The bytes the kept records count for, and the most they counted
-    /// for at once.
+    /// The bytes the kept records count for, never more than the limit.
     held: usize,
+    /// The bytes of records read through the cache without being kept,
+    /// while the sets that read them still hold them.
+    outside: usize,
+    /// The most `held` reached, and the most `held` and `outside` reached
+    /// together.
     peak: usize,
-    /// Records read from disk, how many of those had been read before, and
-    /// how many the cache let go.
+    peak_with_outside: usize,
+    /// Records read from disk through the cache, how many of those it had
+    /// read before (work redone because the record was let go or never
+    /// kept), how many it let go, and how many it did not keep because
+    /// what readers held filled it.
     reads: u64,
     rereads: u64,
     evicted: u64,
-    /// Whether each file's record has been read from disk.
+    read_through: u64,
+    /// Records read from disk for one pass over every file, around the
+    /// cache.
+    direct_reads: u64,
+    /// Whether the cache has read each file's record from disk.
     read_before: Vec<bool>,
 }
 
@@ -464,8 +476,12 @@ pub(crate) struct RecordCacheCounts {
     pub(crate) reads: u64,
     pub(crate) rereads: u64,
     pub(crate) evicted: u64,
+    pub(crate) read_through: u64,
+    pub(crate) direct_reads: u64,
     pub(crate) held: usize,
+    pub(crate) outside: usize,
     pub(crate) peak: usize,
+    pub(crate) peak_with_outside: usize,
 }
 
 impl RecordCache {
@@ -475,10 +491,14 @@ impl RecordCache {
             map: HashMap::new(),
             order: VecDeque::new(),
             held: 0,
+            outside: 0,
             peak: 0,
+            peak_with_outside: 0,
             reads: 0,
             rereads: 0,
             evicted: 0,
+            read_through: 0,
+            direct_reads: 0,
             read_before: vec![false; files],
         }
     }
@@ -489,8 +509,13 @@ impl RecordCache {
         Some(Arc::clone(&cached.record))
     }
 
-    /// Notes that `file`'s record was read from disk.
-    fn note_read(&mut self, file: u32) {
+    /// Notes that `file`'s record was read from disk, for the cache or
+    /// around it.
+    fn note_read(&mut self, file: u32, through_cache: bool) {
+        if !through_cache {
+            self.direct_reads += 1;
+            return;
+        }
         self.reads += 1;
         if let Some(read) = self.read_before.get_mut(file as usize) {
             if *read {
@@ -500,12 +525,28 @@ impl RecordCache {
         }
     }
 
-    /// Keeps `record` as `file`'s, unless another thread kept one first,
-    /// and returns the one kept. Then lets go of records until those kept
-    /// count for at most the limit, or none left can go.
-    fn insert(&mut self, file: u32, record: Arc<FileRecord>, bytes: usize) -> Arc<FileRecord> {
+    /// Keeps `record`, which counts for `bytes`, as `file`'s, unless
+    /// another thread kept one first, and returns the one to read. Records
+    /// are let go first, so that those kept count for at most the limit
+    /// with this one. When records readers still hold fill the cache, this
+    /// one is not kept but read through: only its reader holds it, and the
+    /// returned bytes are what it counts for outside the cache, which the
+    /// reader gives back with [`Self::release_outside`].
+    fn insert(
+        &mut self,
+        file: u32,
+        record: Arc<FileRecord>,
+        bytes: usize,
+    ) -> (Arc<FileRecord>, Option<usize>) {
         if let Some(kept) = self.get(file) {
-            return kept;
+            return (kept, None);
+        }
+        self.evict_for(bytes);
+        if self.held + bytes > self.limit {
+            self.read_through += 1;
+            self.outside += bytes;
+            self.peak_with_outside = self.peak_with_outside.max(self.held + self.outside);
+            return (record, Some(bytes));
         }
         self.map.insert(
             file,
@@ -518,18 +559,22 @@ impl RecordCache {
         self.order.push_back(file);
         self.held += bytes;
         self.peak = self.peak.max(self.held);
-        self.evict();
-        record
+        self.peak_with_outside = self.peak_with_outside.max(self.held + self.outside);
+        (record, None)
+    }
+
+    fn release_outside(&mut self, bytes: usize) {
+        self.outside = self.outside.saturating_sub(bytes);
     }
 
     /// One sweep at most over the kept records, letting go of those not
     /// read since the sweep last passed them and held by no [`Pinned`]
-    /// set, until the rest count for at most the limit. A record a pinned
-    /// set holds stays: a resolver may still be reading it, and letting it
-    /// go would only make the next reader read it again.
-    fn evict(&mut self) {
+    /// set, until the rest and `room` more bytes fit the limit. A record a
+    /// pinned set holds stays: a resolver is still reading it, so letting it
+    /// go would free nothing.
+    fn evict_for(&mut self, room: usize) {
         let mut visits = self.order.len();
-        while self.held > self.limit && visits > 0 {
+        while self.held + room > self.limit && visits > 0 {
             visits -= 1;
             let Some(file) = self.order.pop_front() else {
                 break;
@@ -568,8 +613,12 @@ impl RecordCache {
             reads: self.reads,
             rereads: self.rereads,
             evicted: self.evicted,
+            read_through: self.read_through,
+            direct_reads: self.direct_reads,
             held: self.held,
+            outside: self.outside,
             peak: self.peak,
+            peak_with_outside: self.peak_with_outside,
         }
     }
 }
@@ -676,9 +725,9 @@ impl RecordSource {
         self.paths[first..].iter().map(String::as_str)
     }
 
-    /// File `file`'s record, read and decoded from its segment, without the
-    /// cache.
-    fn read(&self, file: u32) -> Result<FileRecord, String> {
+    /// File `file`'s record, read and decoded from its segment, without
+    /// keeping it; `for_cache` says whether the cache asked for it.
+    fn read(&self, file: u32, for_cache: bool) -> Result<FileRecord, String> {
         let placed = self
             .placed
             .get(file as usize)
@@ -696,7 +745,7 @@ impl RecordSource {
         self.cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .note_read(file);
+            .note_read(file, for_cache);
         FileRecord::decode_scratch(&bytes).map_err(|error| {
             format!(
                 "the pass-4 record of {}: {error}",
@@ -705,18 +754,20 @@ impl RecordSource {
         })
     }
 
-    /// File `file`'s record, from the cache or else read and kept there.
-    fn cached(&self, file: u32) -> Result<Arc<FileRecord>, String> {
+    /// File `file`'s record, from the cache or else read and, when it fits,
+    /// kept there. With the bytes the record counts for outside the cache
+    /// when it was read through instead (see [`RecordCache::insert`]).
+    fn cached(&self, file: u32) -> Result<(Arc<FileRecord>, Option<usize>), String> {
         let lock = || {
             self.cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         };
         if let Some(record) = lock().get(file) {
-            return Ok(record);
+            return Ok((record, None));
         }
         // Read outside the lock, so threads read different records at once.
-        let record = Arc::new(self.read(file)?);
+        let record = Arc::new(self.read(file, true)?);
         let bytes = self.placed[file as usize].heap as usize + std::mem::size_of::<FileRecord>();
         Ok(lock().insert(file, record, bytes))
     }
@@ -731,7 +782,7 @@ impl RecordSource {
         let file = self.number(path).ok_or_else(|| {
             ManifestJoinError::Parse(format!("missing method-call record for {path}"))
         })?;
-        self.read(file).map_err(ManifestJoinError::Parse)
+        self.read(file, false).map_err(ManifestJoinError::Parse)
     }
 
     /// How many files declare a method named `member`.
@@ -790,7 +841,9 @@ impl RecordSource {
 /// A resolver keeps references into the records it read (the methods it
 /// loaded by name, the types it projected), so every record it reads must
 /// stay alive while it does. The cache never lets go of a record a set
-/// holds, so readers share one copy.
+/// holds, so readers share one copy; a record the cache had no room for is
+/// held by its reader alone, and counted as outside the cache until the
+/// reader drops it.
 pub(super) struct Pinned<'s> {
     source: &'s RecordSource,
     /// Whether records are read through the cache, or read from disk for
@@ -798,6 +851,21 @@ pub(super) struct Pinned<'s> {
     /// only churn).
     through_cache: bool,
     held: RefCell<HashMap<u32, Arc<FileRecord>>>,
+    /// The bytes of the records held that the cache read through.
+    outside: std::cell::Cell<usize>,
+}
+
+impl Drop for Pinned<'_> {
+    fn drop(&mut self) {
+        let outside = self.outside.get();
+        if outside > 0 {
+            self.source
+                .cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .release_outside(outside);
+        }
+    }
 }
 
 impl<'s> Pinned<'s> {
@@ -807,6 +875,7 @@ impl<'s> Pinned<'s> {
             source,
             through_cache: true,
             held: RefCell::default(),
+            outside: std::cell::Cell::new(0),
         }
     }
 
@@ -816,6 +885,7 @@ impl<'s> Pinned<'s> {
             source,
             through_cache: false,
             held: RefCell::default(),
+            outside: std::cell::Cell::new(0),
         }
     }
 
@@ -837,10 +907,17 @@ impl<'s> Pinned<'s> {
         let read = if self.through_cache {
             self.source.cached(file)
         } else {
-            self.source.read(file).map(Arc::new)
+            self.source
+                .read(file, false)
+                .map(|record| (Arc::new(record), None))
         };
         let record = match read {
-            Ok(record) => record,
+            Ok((record, outside)) => {
+                if let Some(bytes) = outside {
+                    self.outside.set(self.outside.get() + bytes);
+                }
+                record
+            }
             Err(error) => {
                 self.source.note_error(error);
                 return None;
@@ -969,8 +1046,19 @@ mod tests {
         writer
     }
 
+    /// The bytes the largest of the first `count` sample records counts for
+    /// in the cache.
+    fn largest(writer: &RecordWriter) -> usize {
+        writer
+            .placed
+            .iter()
+            .map(|placed| placed.heap as usize + std::mem::size_of::<FileRecord>())
+            .max()
+            .unwrap()
+    }
+
     #[test]
-    fn records_read_back_equal_after_the_cache_lets_them_go() {
+    fn records_read_back_equal_through_a_cache_too_small_to_keep_any() {
         let root = tempfile::tempdir().unwrap();
         let workspace = workspace(root.path());
         let source = written(&workspace, 60).finish(1).unwrap();
@@ -980,9 +1068,9 @@ mod tests {
         assert_eq!(source.read_path(&path(17)).unwrap(), FileRecord::sample(17));
         assert!(source.read_path("src/missing.ts").is_err());
 
-        // Each record read through its own set, which lets it go when
-        // dropped: a one-byte cache keeps none of them, so the second round
-        // reads every record from disk again, and each decodes equal.
+        // A one-byte cache keeps nothing: every record is read through,
+        // held only by the set reading it, so the second round reads every
+        // record from disk again, and each decodes equal.
         for _round in 0..2 {
             for index in 0..60 {
                 let pinned = Pinned::cached(&source);
@@ -990,32 +1078,83 @@ mod tests {
                     pinned.record(&path(index)),
                     Some(&FileRecord::sample(index))
                 );
+                assert!(source.cache_counts().outside > 0);
             }
         }
         let counts = source.cache_counts();
-        assert!(counts.evicted >= 59, "{counts:?}");
-        assert!(counts.rereads >= 59, "{counts:?}");
-
-        // A record a set holds is kept however small the cache: reading it
-        // again, through another set, reads nothing from disk, while other
-        // records go.
-        let holding = Pinned::cached(&source);
-        let held = holding.record(&path(3)).unwrap();
-        for index in 10..20 {
-            let pinned = Pinned::cached(&source);
-            assert!(pinned.record(&path(index)).is_some());
-        }
-        let reads = source.cache_counts().reads;
-        let again = Pinned::cached(&source);
-        assert!(std::ptr::eq(again.record(&path(3)).unwrap(), held));
-        assert_eq!(source.cache_counts().reads, reads);
-        assert_eq!(held, &FileRecord::sample(3));
+        assert_eq!(
+            (
+                counts.reads,
+                counts.rereads,
+                counts.read_through,
+                counts.evicted
+            ),
+            (120, 60, 120, 0),
+            "{counts:?}"
+        );
+        assert_eq!((counts.held, counts.peak, counts.outside), (0, 0, 0));
         // A set reading from disk leaves the cache alone.
         let direct = Pinned::direct(&source);
         assert_eq!(direct.record_at(3), Some(&FileRecord::sample(3)));
-        assert!(!std::ptr::eq(direct.record_at(3).unwrap(), held));
+        assert_eq!(source.cache_counts().direct_reads, 2);
         assert!(source.take_error().is_none());
-        drop((holding, again, direct));
+        drop(direct);
+        drop(source);
+        workspace.remove().unwrap();
+    }
+
+    #[test]
+    fn the_cache_lets_records_go_within_its_bound_and_keeps_those_held() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = workspace(root.path());
+        let writer = written(&workspace, 60);
+        let limit = 4 * largest(&writer);
+        let source = writer.finish(limit).unwrap();
+
+        // Each record read through its own set, which lets it go when
+        // dropped: the cache lets records go to stay within its bound, and
+        // a record read again after that decodes equal.
+        for _round in 0..2 {
+            for index in 0..60 {
+                let pinned = Pinned::cached(&source);
+                assert_eq!(pinned.record_at(index), Some(&FileRecord::sample(index)));
+            }
+        }
+        let counts = source.cache_counts();
+        assert!(counts.evicted >= 50, "{counts:?}");
+        assert!(counts.rereads >= 50, "{counts:?}");
+        assert_eq!(counts.read_through, 0, "{counts:?}");
+        assert!(counts.peak <= limit, "{counts:?}");
+
+        // A record a set holds stays kept: reading it again, through
+        // another set, reads nothing from disk, while other records go.
+        let holding = Pinned::cached(&source);
+        let held = holding.record_at(3).unwrap();
+        for index in 10..20 {
+            let pinned = Pinned::cached(&source);
+            assert!(pinned.record_at(index).is_some());
+        }
+        let reads = source.cache_counts().reads;
+        let again = Pinned::cached(&source);
+        assert!(std::ptr::eq(again.record_at(3).unwrap(), held));
+        assert_eq!(source.cache_counts().reads, reads);
+        drop(again);
+
+        // One set holding every record: the cache stays within its bound
+        // and reads the rest through, and every record decodes equal.
+        let all = Pinned::cached(&source);
+        for index in 0..60 {
+            assert_eq!(all.record_at(index), Some(&FileRecord::sample(index)));
+        }
+        let counts = source.cache_counts();
+        assert!(counts.held <= limit && counts.peak <= limit, "{counts:?}");
+        assert!(counts.read_through >= 50, "{counts:?}");
+        assert!(counts.outside > 0, "{counts:?}");
+        assert!(std::ptr::eq(all.record_at(3).unwrap(), held));
+        drop(all);
+        assert_eq!(source.cache_counts().outside, 0);
+        assert!(source.take_error().is_none());
+        drop(holding);
         drop(source);
         workspace.remove().unwrap();
     }

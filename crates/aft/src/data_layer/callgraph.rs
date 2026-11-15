@@ -1790,8 +1790,8 @@ pub(crate) fn resolve_checkout_into(
         // means, with each answer read from the inputs above (see
         // `dispatch::projected`). The records go to disk, in the workspace's
         // `pass4/` folder; the second step reads them back through a
-        // bounded cache. That cache is a build cache like the bound files',
-        // so a smaller budget for those bounds it too.
+        // bounded cache. Its budget is the build cache's: the bound files
+        // above were let go before it fills, so the two never add up.
         let mut records = site_records::RecordWriter::new(workspace)?;
         #[cfg(feature = "test-hooks")]
         super::refresh_probe::stage("projection");
@@ -1810,7 +1810,7 @@ pub(crate) fn resolve_checkout_into(
         }
         lap(&mut memory, "projection");
         boundary(inputs)?;
-        let mut source = records.finish(budget.record_bytes().min(bind_bytes))?;
+        let mut source = records.finish(bind_bytes)?;
         if memory.is_some() {
             source = source.counting_touches();
         }
@@ -1940,7 +1940,9 @@ pub(crate) fn resolve_checkout_into(
     })
 }
 
-/// The byte budget of a cold build's bound files (see [`BindCache::bounded`]).
+/// The byte budget of a cold build's bound files (see [`BindCache::bounded`]),
+/// and later of its pass-4 record cache (see `site_records`), which fills
+/// only after the bound files are let go.
 /// VS Code's bound surfaces average about 58 KB a file, so the default keeps
 /// about 4,500 files: a batch of 1,024 and the files it reaches. With
 /// `test-hooks`, `AFT_CALLGRAPH_BUILD_CACHE_BYTES` sets it, so a tiny budget
