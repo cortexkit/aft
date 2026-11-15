@@ -1,5 +1,7 @@
 //! Kernel exit observation without taking ownership of the child handle.
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 /// Dropping a foreground wait stops its observer, even if the command continues
 /// in the background. The timeout below bounds cancellation, not exit detection:
@@ -40,6 +42,7 @@ pub(crate) fn observe_foreground_exit(
     Ok(ForegroundExitObserver(cancelled))
 }
 
+#[cfg(unix)]
 #[derive(Default)]
 pub(crate) struct AdoptedExit {
     initialized: bool,
@@ -49,6 +52,7 @@ pub(crate) struct AdoptedExit {
     fallback: MarkerBackoff,
 }
 
+#[cfg(unix)]
 impl AdoptedExit {
     pub(crate) fn marker_due(&mut self, pid: Option<u32>, now: Instant) -> bool {
         if self.exited {
@@ -76,12 +80,14 @@ impl AdoptedExit {
     }
 }
 
+#[cfg(unix)]
 #[derive(Default)]
 pub(crate) struct MarkerBackoff {
     next: Option<Instant>,
     interval: Option<Duration>,
 }
 
+#[cfg(unix)]
 impl MarkerBackoff {
     pub(crate) fn due(&mut self, now: Instant) -> bool {
         if self.next.is_some_and(|next| now < next) {
@@ -318,6 +324,7 @@ mod tests {
         assert_eq!(child.wait().unwrap().code(), Some(7));
     }
 
+    #[cfg(unix)]
     #[test]
     fn watchdog_cost_marker_fallback_backs_off_to_five_seconds() {
         let mut backoff = MarkerBackoff::default();
