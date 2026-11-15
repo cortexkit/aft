@@ -535,6 +535,36 @@ fn a_stage_that_fails_the_build_that_adopted_it_is_built_again() {
 }
 
 #[test]
+fn a_passes_stage_that_cannot_be_adopted_is_not_reported_resumed() {
+    let root = tempfile::tempdir().unwrap();
+    project(root.path());
+    let store = tempfile::tempdir().unwrap();
+    killed_build(store.path(), root.path(), "stage.sites");
+    let checkout = Checkout::bind(layer(), store.path(), family(), root.path()).unwrap();
+    let workspace = only_workspace(&builds(&checkout));
+    // A range that names a file its batch does not hold, with every sum
+    // matching: the stage passes its checks, and adopting it fails.
+    let range = files_ending(&workspace.join("runs"), "")
+        .into_iter()
+        .find(|path| path.to_string_lossy().contains("resolutions-"))
+        .unwrap();
+    let (mut header, body) = super::resume::read_framed(&range).unwrap();
+    header.members[0] = b"gen/missing.ts".to_vec();
+    super::resume::write_framed(&range, &header, &body).unwrap();
+    bless(&workspace, super::resume::PASSES);
+    let report = checkout.build().unwrap();
+    assert!(report.resumed_records > 0, "{report:?}");
+    assert!(!report.resumed_passes, "{report:?}");
+    let reference_store = tempfile::tempdir().unwrap();
+    let (reference, _) = build(reference_store.path(), root.path());
+    assert_same(
+        &published(&reference),
+        &published(&checkout),
+        "after a stage could not be adopted",
+    );
+}
+
+#[test]
 fn a_build_from_another_executable_or_a_damaged_stage_is_not_reused() {
     let root = tempfile::tempdir().unwrap();
     project(root.path());

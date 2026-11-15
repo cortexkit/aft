@@ -1826,7 +1826,8 @@ impl Checkout {
             }
             matches
         });
-        report.resumed_passes = passes.is_some();
+        // Set only once the stage is adopted, which can still fail.
+        let resumed_passes = std::sync::atomic::AtomicBool::new(false);
         // A stage boundary: the scan's staging and text runs are written.
         scratch
             .check_space(0)
@@ -1926,6 +1927,7 @@ impl Checkout {
                 identity: claimed.identity.digest,
                 snapshot,
                 adopted: passes,
+                resumed: Some(&resumed_passes),
             },
             &mut |inputs, files| {
                 resume::kill_point("assembly.batch");
@@ -1943,6 +1945,7 @@ impl Checkout {
             )
         })?;
         report.resolve_ms = elapsed_ms(started);
+        report.resumed_passes = resumed_passes.into_inner();
         checkpoint()?;
 
         #[cfg(feature = "test-hooks")]

@@ -1619,6 +1619,8 @@ pub(crate) struct PassesCheckpoint<'m> {
     pub(crate) snapshot: resume::Digest,
     /// The complete stage an earlier attempt left for these inputs, if any.
     pub(crate) adopted: Option<&'m resume::Marker>,
+    /// Set when that stage was adopted and passes 2-3 were not resolved.
+    pub(crate) resumed: Option<&'m std::sync::atomic::AtomicBool>,
 }
 
 impl PassesCheckpoint<'_> {
@@ -1627,6 +1629,7 @@ impl PassesCheckpoint<'_> {
         identity: [0; 32],
         snapshot: [0; 32],
         adopted: None,
+        resumed: None,
     };
 }
 
@@ -1745,7 +1748,12 @@ pub(crate) fn resolve_checkout_into(
                 checkpoint.snapshot,
                 paths.chunks(BATCH),
             ) {
-                Ok(spool) => Some(spool),
+                Ok(spool) => {
+                    if let Some(resumed) = checkpoint.resumed {
+                        resumed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Some(spool)
+                }
                 Err(error) => {
                     log::info!(
                         "callgraph build resume: discarded stage {}: {error}",
