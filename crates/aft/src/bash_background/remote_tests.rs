@@ -6374,15 +6374,28 @@ async fn remote_restart_unaccepted_queued_progress_reaches_bash_status() {
     let daemon = outage_daemon_with_replay(OutageReplay::Queued).await;
     let (_dir, ctx, task_id, paths) =
         restart_unaccepted_submission(daemon.connection.clone(), Some(id()), true).await;
-    wait_for("attach queue progress must reach task metadata", || {
-        (read_task(&paths.json)
-            .unwrap()
-            .remote
-            .unwrap()
-            .queue_wait_ms
-            == Some(42_000))
-        .then_some(())
-    })
+    let task = ctx.bash_background().task(&task_id).unwrap();
+    wait_for(
+        "attach queue progress must finish publishing its status",
+        || {
+            let mut state = task.state.lock().unwrap();
+            if state.remote_admission_note.as_deref() != Some("queued on the runner (42 s)") {
+                return None;
+            }
+            // Metadata is saved before the ephemeral line is published. Wait for
+            // both, then remove the line so bash_status must render the phase note.
+            assert_eq!(
+                state.metadata.remote.as_ref().unwrap().queue_wait_ms,
+                Some(42_000)
+            );
+            state.remote_admission_note = None;
+            assert_eq!(
+                remote_phase_note(&state.metadata, unix_millis()).as_deref(),
+                Some("queued on the runner (42 s)")
+            );
+            Some(())
+        },
+    )
     .await;
     let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
         "id": "status", "command": "bash_status", "session_id": "session",
@@ -9592,6 +9605,24 @@ fn remote_phase_note_says_submitting_then_queued_until_started() {
     assert_eq!(remote_phase_note(&fallback, now), None);
     metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
     assert_eq!(remote_phase_note(&metadata, now), None);
+}
+
+#[test]
+fn remote_phase_note_queue_wait_uses_runner_elapsed_not_task_age() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_registry, _task_id, paths) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "cargo test");
+    let mut metadata = read_task(&paths.json).unwrap();
+    let now = unix_millis();
+    metadata.started_at = now;
+    let remote = metadata.remote.as_mut().unwrap();
+    remote.accepted = false;
+    remote.queue_position = None;
+    remote.queue_wait_ms = Some(42_000);
+    assert_eq!(
+        remote_phase_note(&metadata, now).as_deref(),
+        Some("queued on the runner (42 s)")
+    );
 }
 
 /// A configured name the user forwarded through `bash.runon_env` travels to

@@ -1249,7 +1249,11 @@ pub(crate) fn remote_phase_note(metadata: &super::PersistedTask, now_ms: u64) ->
             None => "running on the runner".to_string(),
         });
     }
-    if phase == RemotePhase::WaitingOnRunner && !remote.accepted {
+    // Queue progress supplies its own elapsed time, independent of when AFT
+    // created the task. Reuse the same rendering as the live progress line.
+    if matches!(phase, RemotePhase::QueueWait { .. })
+        || phase == RemotePhase::WaitingOnRunner && !remote.accepted
+    {
         return Some(phase.describe());
     }
     // The persisted task creation time includes submission as well as queueing.
