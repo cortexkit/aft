@@ -489,7 +489,8 @@ pub(super) fn run_cleanup(registries: impl IntoIterator<Item = BgTaskRegistry>) 
     let step = Instant::now();
     crate::gh_shim_speech::start_view::sweep_queued();
     pass.speech += step.elapsed();
-    for registry in registries {
+    let registries: Vec<_> = registries.into_iter().collect();
+    for registry in &registries {
         record_cleanup_work(|work| work.registries += 1);
         let step = Instant::now();
         registry.sweep_retained_scratch();
@@ -497,10 +498,10 @@ pub(super) fn run_cleanup(registries: impl IntoIterator<Item = BgTaskRegistry>) 
         let step = Instant::now();
         registry.cleanup_finished(FINISHED_RETENTION);
         pass.finished += step.elapsed();
-        let step = Instant::now();
-        registry.request_recurring_persisted_gc();
-        pass.gc_request += step.elapsed();
     }
+    let step = Instant::now();
+    BgTaskRegistry::request_recurring_persisted_gc(&registries);
+    pass.gc_request += step.elapsed();
     CLEANUP_WORK.with(|cell| cell.get().unwrap())
 }
 

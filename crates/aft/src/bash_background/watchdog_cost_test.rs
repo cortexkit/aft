@@ -1707,7 +1707,7 @@ fn watchdog_cost_persisted_gc_recurs_without_a_new_replay() {
         Instant::now() - Duration::from_secs(61),
         "aft-bash-task-gc".into(),
     ));
-    registry.request_recurring_persisted_gc();
+    BgTaskRegistry::request_recurring_persisted_gc(std::slice::from_ref(&registry));
     while paths.json.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -1748,9 +1748,22 @@ fn watchdog_cost_inactive_harness_store_is_swept_without_binding_its_worktree() 
     let opencode = storage.path().join("opencode");
     fs::create_dir_all(&runner).unwrap();
     let (_, paths) = fixture(&opencode, "old-session", true, 2);
+    let output = opencode
+        .join("tool-results")
+        .join("old-session")
+        .join("1-1-1.txt");
+    fs::create_dir_all(output.parent().unwrap()).unwrap();
+    fs::write(&output, "expired sibling output").unwrap();
+    filetime::set_file_mtime(&output, filetime::FileTime::from_unix_time(0, 0)).unwrap();
     let registry = BgTaskRegistry::default();
     registry.request_persisted_gc(&runner);
-    registry.request_recurring_persisted_gc();
+    let work = super::super::watchdog::run_cleanup([registry.clone()]);
+    assert_eq!(work.gc_requests, 2, "{work:?}");
+    assert_eq!(work.tool_output_walks, 2, "{work:?}");
+    assert!(
+        !output.exists(),
+        "inactive harness tool results were skipped"
+    );
     let deadline = Instant::now() + Duration::from_secs(30);
     while paths.json.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
@@ -1798,6 +1811,54 @@ fn wait_for_shared_store_gc(store: &Path) {
         assert!(Instant::now() < deadline, "shared store GC did not finish");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn watchdog_cost_shared_tool_output_cleanup_is_once_per_canonical_store_per_pass() {
+    let (base, registries) = shared_tool_output_store(67);
+    let store = base.path().join("runner");
+    #[cfg(not(unix))]
+    let alias = store.join("..").join("runner");
+    #[cfg(unix)]
+    let alias = {
+        let alias = base.path().join("runner-alias");
+        std::os::unix::fs::symlink(&store, &alias).unwrap();
+        alias
+    };
+    for registry in registries.iter().skip(1) {
+        let mut roots = registry.inner.persisted_gc_storage.lock().unwrap();
+        roots.clear();
+        roots.insert(alias.clone());
+    }
+    let work = super::super::watchdog::run_cleanup(registries.iter().cloned());
+    assert_eq!(work.registries, 67);
+    assert_eq!(work.tool_output_walks, 1, "{work:?}");
+    assert_eq!(work.gc_requests, 1, "{work:?}");
+    assert_eq!(work.tool_output_remove_dirs, 0, "{work:?}");
+    wait_for_shared_store_gc(&store);
+
+    let work = super::super::watchdog::run_cleanup(registries.iter().cloned());
+    assert_eq!(work.tool_output_walks, 1, "{work:?}");
+    assert_eq!(work.gc_requests, 1, "{work:?}");
+    assert_eq!(work.tool_output_remove_dirs, 0, "{work:?}");
+    assert!(
+        work.tool_output_read_dirs > 0,
+        "the retained cursor resumes"
+    );
+    wait_for_shared_store_gc(&store);
+}
+
+#[test]
+fn watchdog_cost_shared_tool_output_cleanup_collects_all_registry_stores() {
+    let (first, mut registries) = shared_tool_output_store(1);
+    let (second, others) = shared_tool_output_store(1);
+    registries.extend(others);
+    let work = super::super::watchdog::run_cleanup(registries);
+    assert_eq!(work.registries, 2, "{work:?}");
+    assert_eq!(work.tool_output_walks, 2, "{work:?}");
+    assert_eq!(work.gc_requests, 2, "{work:?}");
+    wait_for_shared_store_gc(&first.path().join("runner"));
+    wait_for_shared_store_gc(&second.path().join("runner"));
 }
 
 /// Measures the calling thread only; persisted-task GC runs on a separate worker.
@@ -2384,7 +2445,7 @@ fn watchdog_cost_live_shaped_cleanup_measurement() {
         let speech = phase("speech_sweep", crate::gh_shim_speech::start_view::sweep_queued);
         let scratch = phase("scratch_sweep", || registry.sweep_retained_scratch());
         let finished = phase("finished_total", || registry.cleanup_finished(super::super::watchdog::FINISHED_RETENTION));
-        let gc = phase("gc_request", || registry.request_recurring_persisted_gc());
+        let gc = phase("gc_request", || BgTaskRegistry::request_recurring_persisted_gc(std::slice::from_ref(&registry)));
         let total = speech + scratch + finished + gc;
         let (queue, images) = CLEANUP_PHASES.with(|phases| phases.take().unwrap());
         eprintln!("CLEANUP tasks={TASKS} saved={SAVED} rows={TASKS} queue_drain_us={:.3} images_us={:.3} retention_and_lookup_us={:.3} image_stats={} total_cpu_us/min={:.3}", queue as f64 / 1_000.0, images as f64 / 1_000.0, (finished - queue - images) as f64 / 1_000.0, work_counts::get().stats, total as f64 / 1_000.0);
