@@ -23,7 +23,16 @@ pub(crate) fn removals(environment: &HashMap<String, String>) -> Vec<String> {
         .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
         .unwrap_or_default()
         .into_iter()
-        .filter(|name| !environment.contains_key(name))
+        .filter(|name| {
+            #[cfg(windows)]
+            {
+                !environment.keys().any(|key| key.eq_ignore_ascii_case(name))
+            }
+            #[cfg(not(windows))]
+            {
+                !environment.contains_key(name)
+            }
+        })
         .collect()
 }
 
@@ -232,6 +241,12 @@ pub(crate) fn apply(
     let mut removed = Vec::new();
     for (name, value) in export {
         #[cfg(windows)]
+        let name = if name.eq_ignore_ascii_case("PATH") {
+            "PATH".to_owned()
+        } else {
+            name
+        };
+        #[cfg(windows)]
         environment.retain(|key, _| !key.eq_ignore_ascii_case(&name));
         match value {
             Some(value) => {
@@ -408,7 +423,7 @@ fn parse_export(output: &[u8]) -> Result<Export, Failure> {
             _ => return Err(invalid(&format!("non-string value for {name}"))),
         };
         if crate::bash_env::is_blocked_provider_env_key(name) {
-            tracing::debug!(name, "dropped project environment provider variable");
+            log::debug!("dropped project environment provider variable: {name}");
             continue;
         }
         export.insert(name.clone(), value);

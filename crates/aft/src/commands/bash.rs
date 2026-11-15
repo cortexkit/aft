@@ -421,7 +421,10 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut host_escalation: Option<crate::sandbox_spawn::HostEscalationAttempt> = None;
     #[cfg(not(unix))]
     let host_escalation: Option<crate::sandbox_spawn::HostEscalationAttempt> = None;
+    #[cfg(unix)]
     let mut host_provider_failure: Option<String> = None;
+    #[cfg(not(unix))]
+    let host_provider_failure: Option<String> = None;
     #[cfg(unix)]
     if host_requested && crate::sandbox_spawn::sandbox_required(ctx) {
         let configured_root = ctx

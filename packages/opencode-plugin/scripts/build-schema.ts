@@ -416,6 +416,7 @@ function buildSchema(): Record<string, unknown> {
             allOf: [
               {
                 if: { properties: { kind: { const: "custom" } } },
+                // biome-ignore lint/suspicious/noThenProperty: JSON Schema uses then as a conditional keyword, not a Promise method.
                 then: { required: ["command"] },
               },
             ],

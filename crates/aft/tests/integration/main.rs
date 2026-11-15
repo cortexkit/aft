@@ -151,6 +151,7 @@ mod semantic_disk_test;
 mod shared_db_call_ledger_test;
 mod shared_db_contention_test;
 mod shared_index_scope_test;
+mod shell_env_provider_test;
 mod stage_card_floor_test;
 mod staging_cleanup_test;
 mod standalone_search_deferred_test;

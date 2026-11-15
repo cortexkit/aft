@@ -246,6 +246,64 @@ fn shell_env_provider_direnv_end_to_end() {
 }
 
 #[test]
+fn shell_env_provider_untrusted_managers_fall_back_to_default_path() {
+    for (kind, binary_env, config_file, content, stderr, reason) in [
+        (
+            crate::config::ShellEnvProviderKind::Mise,
+            "AFT_TEST_MISE",
+            "mise.toml",
+            "[env]\nGIT_AUTHOR_NAME='Untrusted'\n",
+            "mise ERROR Config files are not trusted.",
+            "mise: config not trusted, run 'mise trust'",
+        ),
+        (
+            crate::config::ShellEnvProviderKind::Direnv,
+            "AFT_TEST_DIRENV",
+            ".envrc",
+            "export GIT_AUTHOR_NAME=Untrusted\n",
+            ".envrc is blocked. Run direnv allow",
+            "direnv: .envrc is blocked, run 'direnv allow'",
+        ),
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join(config_file), content).unwrap();
+        let command = if let Ok(binary) = std::env::var(binary_env) {
+            let args = if kind == crate::config::ShellEnvProviderKind::Mise {
+                ["env", "--json"]
+            } else {
+                ["export", "json"]
+            };
+            vec![binary, args[0].into(), args[1].into()]
+        } else {
+            vec![
+                "sh".into(),
+                "-c".into(),
+                format!("printf '%s\\n' '{}' >&2; exit 1", stderr),
+            ]
+        };
+        let ctx = provider_context(project.path(), storage.path(), kind, command);
+        let mut call = request("provider-untrusted", "printf '%s' \"$PATH\"");
+        call.params["params"]["env"] = json!({"MISE_PARANOID":"1"});
+        let response = handle(&call, &ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(
+            response.data["_bash_env_provider_failure"],
+            format!(
+                "Project environment not loaded ({reason}); this command used AFT's default PATH."
+            )
+        );
+        let actual = run_output(&ctx, project.path(), &call);
+        let default = run_output(
+            &context(project.path(), storage.path()),
+            project.path(),
+            &request("provider-default-path", "printf '%s' \"$PATH\""),
+        );
+        assert_eq!(actual, default);
+    }
+}
+
+#[test]
 fn an_untrusted_project_bash_env_is_ignored_until_the_project_is_trusted() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
