@@ -1,3 +1,4 @@
+#[allow(unused_imports)]
 pub use aft_base::test_gate::*;
 
 #[cfg(all(test, unix))]
