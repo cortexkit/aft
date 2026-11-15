@@ -232,10 +232,7 @@ pub(super) async fn run() {
                     "notice-allowed",
                     Some(1),
                 ),
-                subc_client_rs::CallOptions {
-                    consumer_identity: aft::launch_nonce::consumer_identity(),
-                    ..Default::default()
-                },
+                subc_client_rs::CallOptions::default(),
             )
             .await
             .unwrap();

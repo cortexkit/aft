@@ -121,9 +121,9 @@ pub fn current() -> Option<ModuleLaunchNonce> {
     }
 }
 
-/// The identity AFT presents when it opens a route as a consumer: its module
-/// id and the captured nonce. Passed explicitly on every route open so the
-/// subc client never has to find the identity on its own.
+/// AFT's own launch identity, for local checks before opening a route.
+/// Calls leave identity selection to the SDK: a connection claim when bound,
+/// otherwise the implicit identity from the same cached launch nonce.
 pub fn consumer_identity() -> Option<subc_client_rs::ConsumerIdentity> {
     let module_id = std::env::var(subc_protocol::SUBC_MODULE_ID_ENV)
         .ok()

@@ -53,7 +53,7 @@ impl ModuleTransport {
                 .build()
                 .map_err(|error| DoorError::unavailable(error.to_string()))?;
             runtime.block_on(async {
-                let principal = crate::launch_nonce::consumer_identity().ok_or_else(|| {
+                crate::launch_nonce::consumer_identity().ok_or_else(|| {
                     DoorError::unavailable("AFT module launch identity is unavailable")
                 })?;
                 let consumer =
@@ -61,14 +61,7 @@ impl ModuleTransport {
                         .await
                         .map_err(|error| DoorError::unavailable(error.to_string()))?;
                 let route = consumer
-                    .open_route(
-                        this.target,
-                        this.identity,
-                        CallOptions {
-                            consumer_identity: Some(principal),
-                            ..CallOptions::default()
-                        },
-                    )
+                    .open_route(this.target, this.identity, CallOptions::default())
                     .await
                     .map_err(|error| DoorError::unavailable(error.to_string()))?;
                 let result = consumer

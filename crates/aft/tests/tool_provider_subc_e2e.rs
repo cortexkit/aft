@@ -852,3 +852,56 @@ async fn runner_notice_real_daemon_recovers_concrete_harnesses_without_model() {
     }
     println!("real daemon: adopted broca runner -> broca; thalamus runner waited for opencode2 bind; stored pi unchanged; 3 accepted sends, 3 success logs, completion dedupe keys (no model or plan)");
 }
+
+#[cfg(all(target_os = "linux", feature = "test-scope-owner"))]
+#[tokio::test]
+#[ignore = "opt-in real-daemon consumer identity; Linux only, needs test-scope-owner"]
+async fn vault_transports_real_daemon_keep_implicit_aft_principal_and_scope() {
+    let (_temp, home, _project) = hermetic_home();
+    let config_path = home.join("config/cortexkit/subc.jsonc");
+    let mut config: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    let mut module = config["modules"]["aft-test-scope-owner"].clone();
+    module["env"]["AFT_TEST_CONSUMER_IDENTITY"] = json!("1");
+    module["env"]["AFT_TEST_CONNECTION"] = json!(home.join("runtime/subc-connection.json"));
+    for id in ["aft", "aft-test-scope-owner", "claustrum"] {
+        config["modules"][id] = module.clone();
+    }
+    std::fs::write(config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    let _daemon = HermeticDaemon::start(&home).await;
+    let result_path = home.join("identity-outcomes.json");
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while !result_path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "vault transport timed out:\n{}",
+            fixture_logs(&home.join("logs"))
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let result: Value = serde_json::from_slice(&std::fs::read(result_path).unwrap()).unwrap();
+    let aft = json!({"kind":"reserved", "module_id":"aft"});
+    for name in ["secret", "manifest"] {
+        assert_eq!(result[name]["result"]["principal"], aft, "{result}");
+    }
+    let secret = &result["secret"]["result"];
+    assert_eq!(secret["method"], "secret.use");
+    assert_eq!(
+        secret["identity"],
+        json!({"harness":"aft-secret-use","session":"identity-proof"})
+    );
+    assert_eq!(
+        secret["scope"]["owner"],
+        json!({"kind":"reserved","module_id":"aft-test-scope-owner"})
+    );
+    assert_eq!(secret["scope"]["ref"], "identity-vault");
+    assert_eq!(secret["scope"]["scope_epoch"], 7);
+    assert_eq!(secret["scope"]["kind"], "head");
+    let manifest = &result["manifest"]["result"];
+    assert_eq!(manifest["method"], "manifest.latest");
+    assert_eq!(
+        manifest["identity"],
+        json!({"harness":"aft-manifest-sync","session":"daemon"})
+    );
+    assert!(manifest["scope"].is_null(), "{result}");
+    println!("real daemon: production secret.use and manifest.latest admitted as reserved:aft using implicit launch identity; secret scope owner/ref/epoch/kind preserved; manifest unscoped");
+}

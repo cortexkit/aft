@@ -83,11 +83,14 @@ async fn open_vault_route(
         module_id: "claustrum".into(),
     };
     let options = CallOptions {
-        consumer_identity: Some(principal),
         timeout,
         route_retry_deadline: timeout,
         ..CallOptions::default()
     };
+    #[cfg(test)]
+    let options = with_test_vault_principal(options, principal);
+    #[cfg(not(test))]
+    let _ = principal;
     match scope {
         Some(scope) => {
             consumer
@@ -96,6 +99,14 @@ async fn open_vault_route(
         }
         None => consumer.open_route(target, identity, options).await,
     }
+}
+
+// In-process fakes supply independent principals without changing the SDK's
+// process-wide launch-nonce cache. Production calls always use SDK identity.
+#[cfg(test)]
+fn with_test_vault_principal(mut options: CallOptions, principal: ConsumerIdentity) -> CallOptions {
+    options.consumer_identity = Some(principal);
+    options
 }
 
 /// A held daemon-owned route on the existing vault transport. Closing it also
@@ -175,6 +186,23 @@ impl ManagementSession {
             .await;
         let _ = self.consumer.close().await;
     }
+}
+
+/// Exercise the manifest synchronizer's production transport in a supervised
+/// real-daemon fixture, without starting its long-lived watch worker.
+#[cfg(feature = "test-hooks")]
+pub async fn manifest_latest_for_test(
+    connection_file: &std::path::Path,
+) -> Result<Vec<u8>, String> {
+    let session = ManagementSession::connect(connection_file)
+        .await
+        .map_err(|()| "manifest transport unavailable".to_string())?;
+    let result = session
+        .request(br#"{"method":"manifest.latest","params":{}}"#.to_vec())
+        .await
+        .map_err(|error| error.to_string());
+    session.close().await;
+    result
 }
 
 impl SubcSecretUseTransport {

@@ -1279,7 +1279,7 @@ async fn open_notice_route(
     consumer: &SubcConsumer,
     address: &Address,
 ) -> Result<subc_client_rs::RouteHandle, Outcome> {
-    let Some(principal) = crate::launch_nonce::consumer_identity() else {
+    let Some(_) = crate::launch_nonce::consumer_identity() else {
         return Err(retry(
             FailureClass::ConsumerIdentity,
             "AFT launch has no consumer identity",
@@ -1289,7 +1289,6 @@ async fn open_notice_route(
     let options = CallOptions {
         timeout: Duration::from_secs(5),
         route_retry_deadline: Duration::from_secs(5),
-        consumer_identity: Some(principal),
         role_versions: Some(role_versions()),
         ..CallOptions::default()
     };

@@ -629,7 +629,6 @@ impl StatusConsumer for SubcConsumer {
             target,
             identity,
             CallOptions {
-                consumer_identity: crate::launch_nonce::consumer_identity(),
                 ..CallOptions::default()
             },
         )

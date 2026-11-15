@@ -8,6 +8,8 @@ use subc_protocol::Principal;
 
 struct ScopeOwner;
 
+#[cfg(feature = "test-hooks")]
+mod consumer_identity_fixture;
 mod runner_notice_fixture;
 
 #[async_trait]
@@ -18,7 +20,9 @@ impl ModuleHandler for ScopeOwner {
 }
 
 fn main() {
-    if std::env::var_os("AFT_TEST_RUNNER_NOTICE").is_some() {
+    if std::env::var_os("AFT_TEST_RUNNER_NOTICE").is_some()
+        || std::env::var_os("AFT_TEST_CONSUMER_IDENTITY").is_some()
+    {
         aft::launch_nonce::capture_at_startup();
     }
     tokio::runtime::Builder::new_current_thread()
@@ -29,6 +33,11 @@ fn main() {
 }
 
 async fn run() {
+    #[cfg(feature = "test-hooks")]
+    if std::env::var_os("AFT_TEST_CONSUMER_IDENTITY").is_some() {
+        consumer_identity_fixture::run().await;
+        return;
+    }
     if std::env::var_os("AFT_TEST_RUNNER_NOTICE").is_some() {
         runner_notice_fixture::run().await;
         return;

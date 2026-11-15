@@ -701,10 +701,7 @@ async fn send_loop(connection_file: PathBuf, mut receiver: tokio::sync::mpsc::Re
                     .open_route(
                         subc_protocol::RouteTarget::ToolProvider { module_id },
                         BindIdentity::new("aft", "tool-display"),
-                        CallOptions {
-                            consumer_identity: crate::launch_nonce::consumer_identity(),
-                            ..CallOptions::default()
-                        },
+                        CallOptions::default(),
                     )
                     .await
                 {
