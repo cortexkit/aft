@@ -916,6 +916,62 @@ fn a_build_from_another_executable_or_a_damaged_stage_is_not_reused() {
     );
 }
 
+/// An upgrade from record-13 to record-14: the store holds a publication
+/// and a dead build's workspace, both written by the record-13 extractor.
+/// The upgraded binary rebuilds the call graph once, never adopts the
+/// record-13 workspace (its records are planted damaged, so adopting them
+/// would fail the build or change the publication), and once it has
+/// published, a restart does not build again.
+#[test]
+fn an_upgrade_from_record_13_rebuilds_once_and_never_adopts_its_workspace() {
+    const RECORD_13: &str = "ruled-callgraph-v14-resolver-precision+record-13";
+    assert_ne!(super::EXTRACTOR_VERSION, RECORD_13);
+    let root = tempfile::tempdir().unwrap();
+    project(root.path());
+    let store = tempfile::tempdir().unwrap();
+    let old = Checkout::bind(layer(), store.path(), family(), root.path()).unwrap();
+    super::tests::publish_legacy_graph(&old, RECORD_13, Some(RECORD_13));
+    drop(old);
+    // A build killed at record-14 leaves a workspace; naming the record-13
+    // extractor in its identity makes it the workspace a record-13 build
+    // would have left.
+    killed_build(store.path(), root.path(), "stage.sites");
+    let checkout = Checkout::bind(layer(), store.path(), family(), root.path()).unwrap();
+    assert!(checkout.needs_build(), "a record-13 graph is not served");
+    let workspace = only_workspace(&builds(&checkout));
+    poison(&workspace);
+    let mut identity = aft_store::family::workspace::read_identity(&workspace).unwrap();
+    let payload = String::from_utf8(identity.payload).unwrap();
+    let current = format!("extractor={}", super::EXTRACTOR_VERSION);
+    assert!(payload.contains(&current), "{payload}");
+    identity.payload = payload
+        .replace(&current, &format!("extractor={RECORD_13}"))
+        .into_bytes();
+    aft_store::family::workspace::write_identity(&workspace, &identity).unwrap();
+
+    let report = checkout.build().unwrap();
+    assert_eq!(report.resumed_records, 0, "{report:?}");
+    assert!(!report.resumed_passes, "{report:?}");
+    assert!(!workspace.exists(), "the record-13 workspace was deleted");
+    assert!(!checkout.needs_build());
+    let reference_store = tempfile::tempdir().unwrap();
+    let (reference, _) = build(reference_store.path(), root.path());
+    assert_same(
+        &published(&reference),
+        &published(&checkout),
+        "after upgrading from record-13",
+    );
+    drop(checkout);
+
+    // A restart finds the record-14 graph published: nothing to build.
+    let restarted = Checkout::bind(layer(), store.path(), family(), root.path()).unwrap();
+    assert!(
+        !restarted.needs_build(),
+        "the upgrade rebuilt more than once"
+    );
+    assert!(workspaces(&builds(&restarted)).is_empty());
+}
+
 /// The child moves the checkout away once it is scanned and back once the
 /// segment is written: every stage between, resolution and the write
 /// included, reads only what the scan captured. Run on a fresh build and on

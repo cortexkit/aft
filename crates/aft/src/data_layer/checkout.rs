@@ -7379,12 +7379,12 @@ pub fn other() { callee(); }
         assert!(callers.contains("caller"), "{callers}");
     }
 
-    /// Publishes the older string-table representation with keys from another
-    /// extractor, without running another binary or sharing process globals.
-    fn publish_legacy_graph(checkout: &Checkout, stamp: Option<&str>) {
+    /// Publishes the older string-table representation with keys from the
+    /// extractor `version`, without running another binary or sharing
+    /// process globals. `stamp` is the extractor the published state names.
+    pub(super) fn publish_legacy_graph(checkout: &Checkout, version: &str, stamp: Option<&str>) {
         use crate::callgraph_store::join::CallgraphBlob;
         use aft_store::content::ContentSectionsBuilder;
-        let version = "ruled-callgraph-v14-resolver-precision+record-12";
         let sink = BuildSink::new(checkout.text_build().unwrap());
         let scanned = scan(&checkout.root, &checkout.layer.policy, None, &sink).unwrap();
         let collected = sink.finish().unwrap();
@@ -7509,7 +7509,11 @@ pub fn other() { callee(); }
         }
         let layer = Arc::new(DataLayer::new(8 << 20, 2));
         let old = Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path()).unwrap();
-        publish_legacy_graph(&old, stamp);
+        publish_legacy_graph(
+            &old,
+            "ruled-callgraph-v14-resolver-precision+record-12",
+            stamp,
+        );
         drop(old);
         let other =
             Checkout::bind(Arc::clone(&layer), store.path(), family(), sibling.path()).unwrap();
