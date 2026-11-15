@@ -347,14 +347,22 @@ pub struct Coverage {
 }
 
 impl Coverage {
-    /// Whether every source is accounted for without excluded parse paths,
-    /// failed files or unfilled work.
+    /// Whether every source is accounted for without excluded Luau outlines
+    /// or unfilled work. Other files that cannot be read or cut into chunks
+    /// remain terminal outcomes: they are counted and never queued again for
+    /// the same content, preserving the built-in languages' coverage policy.
     #[must_use]
     pub fn complete(&self) -> bool {
         self.pending.is_empty()
             && self.past_cap == 0
             && self.skipped_parses.is_empty()
-            && self.files_failed.is_empty()
+            && self.luau_outline_failures().next().is_none()
+    }
+
+    pub(crate) fn luau_outline_failures(&self) -> impl Iterator<Item = &(PathBuf, String)> {
+        self.files_failed
+            .iter()
+            .filter(|(_, reason)| cfg!(feature = "wasm-grammars") && reason == LUAU_OUTLINE_FAILED)
     }
 }
 
@@ -3132,15 +3140,12 @@ mod tests {
         fill(&capped, &mut recorder, 10);
         assert!(recorder.texts.is_empty(), "{:?}", recorder.texts);
 
-        // Raising the cap finishes pending work, but the recorded invalid-UTF-8
-        // file remains a terminal coverage gap rather than a complete answer.
+        // With the cap raised, the rest is embedded and coverage completes.
         let open = VectorPlane::new(Arc::clone(&checkout), producer(), 20_000);
         let report = fill(&open, &mut recorder, 10);
         assert_eq!(report.files_queued, 2, "{report:?}");
         let coverage = open.coverage(&view).unwrap();
-        assert!(coverage.pending.is_empty(), "{coverage:?}");
-        assert!(!coverage.files_failed.is_empty(), "{coverage:?}");
-        assert!(!coverage.complete(), "{coverage:?}");
+        assert!(coverage.complete(), "{coverage:?}");
         assert_eq!(coverage.files_embedded, 4);
         // Files past one plane's cap are searched once another embedded them.
         let names: BTreeSet<String> = capped

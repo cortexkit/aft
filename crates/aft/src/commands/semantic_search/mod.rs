@@ -3386,7 +3386,7 @@ impl CheckoutSemanticGaps {
                 .filter_map(|(path, reason)| reply.value(reason, path))
                 .collect(),
             pending: coverage.pending.clone(),
-            failed: coverage.files_failed.clone(),
+            failed: coverage.luau_outline_failures().cloned().collect(),
             unvouched: false,
             unavailable: None,
             fill_failure: None,
@@ -3425,6 +3425,7 @@ impl CheckoutSemanticGaps {
             &self
                 .failed
                 .iter()
+                .take(crate::data_layer::surfaces::INDEX_GAP_PREVIEW)
                 .map(|(path, _)| path.clone())
                 .collect::<Vec<_>>(),
         );
@@ -3480,6 +3481,11 @@ impl CheckoutSemanticGaps {
         for (path, (_, reason)) in failed.iter().zip(&self.failed) {
             lines.push(format!("{path}: {reason}"));
         }
+        let failed_preview =
+            crate::data_layer::surfaces::parse_gap_preview(failed.len(), self.failed.len());
+        if let Some(trailer) = crate::subc_format::render_envelope_trailer(&failed_preview) {
+            lines.push(trailer);
+        }
         if self.unvouched {
             lines.push(
                 "semantic: file membership was re-walked because changes may have been missed; vectors can lag the disk"
@@ -3495,10 +3501,20 @@ impl CheckoutSemanticGaps {
         let mut gap = serde_json::json!({
             "pending": pending,
             "failed": failed,
-            "failed_files": self.failed.iter().zip(&failed).map(|((_, reason), path)| serde_json::json!({"path":path,"reason":reason})).collect::<Vec<_>>(),
             "unvouched": self.unvouched,
             "unavailable": self.unavailable,
         });
+        if !failed.is_empty() {
+            gap["failed_files"] = serde_json::json!(self
+                .failed
+                .iter()
+                .zip(&failed)
+                .map(|((_, reason), path)| serde_json::json!({"path":path,"reason":reason}))
+                .collect::<Vec<_>>());
+            gap["failed_files_count"] = serde_json::json!(self.failed.len());
+            gap["failed_files_omitted"] = serde_json::json!(self.failed.len() - failed.len());
+            gap["failed_files_list"] = serde_json::json!(failed_preview);
+        }
         if !skipped.is_empty() {
             gap["skipped_files"] = serde_json::json!(skipped);
             gap["skipped_files_count"] = serde_json::json!(self.skipped.len());

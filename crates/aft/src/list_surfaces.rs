@@ -1459,7 +1459,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         file: "commands/semantic_search/mod.rs",
         enclosing_item: "CheckoutSemanticGaps::disclose",
         location_or_primitive: ".take(crate::data_layer::surfaces::INDEX_GAP_PREVIEW)",
-        reason: "semantic parse-coverage preview; skipped_files_count and skipped_files_omitted retain full counts; skipped_files_list and its standard trailer disclose the preview cap",
+        reason: "semantic Luau coverage previews; skipped_files_count/omitted and failed_files_count/omitted retain full counts; each list envelope and its standard trailer disclose the preview cap",
     },
 ];
 

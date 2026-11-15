@@ -61,10 +61,15 @@ impl DataMeaning {
     }
 
     /// Whether every file meaning search applies to within
-    /// `semantic.max_files` has finished without an extraction failure.
+    /// `semantic.max_files` is accounted for, apart from Luau outline failures.
     pub(crate) fn complete(&self) -> bool {
         !meaning::waiting(self.snapshot.coverage())
-            && self.snapshot.coverage().files_failed.is_empty()
+            && self
+                .snapshot
+                .coverage()
+                .luau_outline_failures()
+                .next()
+                .is_none()
     }
 
     pub(crate) fn coverage(&self) -> &Coverage {

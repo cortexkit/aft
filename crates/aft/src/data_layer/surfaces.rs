@@ -691,6 +691,7 @@ pub(crate) struct MeaningCoverage {
     pub(crate) files_embedded: usize,
     pub(crate) files_too_large: usize,
     pub(crate) files_failed: usize,
+    pub(crate) files_luau_outline_failed: usize,
     pub(crate) files_pending: usize,
     pub(crate) files_past_cap: usize,
     pub(crate) chunks: usize,
@@ -706,6 +707,7 @@ impl MeaningCoverage {
             files_embedded: coverage.files_embedded,
             files_too_large: coverage.files_too_large,
             files_failed: coverage.files_failed.len(),
+            files_luau_outline_failed: coverage.luau_outline_failures().count(),
             files_pending: coverage.pending.len(),
             files_past_cap: coverage.past_cap,
             chunks: coverage.chunks,
@@ -745,6 +747,9 @@ impl MeaningReport {
                 }
                 if coverage.files_skipped > 0 {
                     value["files_skipped"] = json!(coverage.files_skipped);
+                    value["complete"] = false.into();
+                }
+                if coverage.files_luau_outline_failed > 0 {
                     value["complete"] = false.into();
                 }
                 if let Some(error) = error {
@@ -2775,6 +2780,7 @@ mod tests {
             files_embedded: 30,
             files_too_large: 1,
             files_failed: 2,
+            files_luau_outline_failed: 0,
             files_pending: 7,
             files_past_cap: 0,
             chunks: 300,
