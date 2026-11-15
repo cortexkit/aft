@@ -387,6 +387,17 @@ impl SiteBuffer {
         membership: (u64, u64),
     ) -> std::io::Result<()> {
         if self.overflow.is_none() && self.memory.len() < self.cap {
+            if self.memory.len() == self.memory.capacity() {
+                // Grow on demand, but do not round a non-power-of-two site
+                // budget up to the vector's next geometric capacity.
+                let capacity = self
+                    .memory
+                    .capacity()
+                    .saturating_mul(2)
+                    .max(4)
+                    .min(self.cap);
+                self.memory.reserve_exact(capacity - self.memory.len());
+            }
             self.memory.push(site);
             return Ok(());
         }
@@ -1564,6 +1575,28 @@ mod tests {
         );
         let runs = workspace.subdir("runs").unwrap();
         (root, runs)
+    }
+
+    #[test]
+    fn site_position_capacity_stays_within_its_budget_and_grows_on_demand() {
+        let (_root, runs) = runs();
+        let mut names = 0;
+        assert_eq!(SiteBuffer::new(usize::MAX).memory.capacity(), 0);
+        for cap in [1, 3, 5, 9, 2049] {
+            let mut buffer = SiteBuffer::new(cap);
+            for index in 0..cap + 2 {
+                buffer
+                    .push((0, index as u32), &runs, &mut names, (0, 0))
+                    .unwrap();
+                assert!(buffer.memory.capacity() <= cap, "cap={cap}");
+                assert_eq!(buffer.memory.len(), (index + 1).min(cap));
+            }
+            let mut reader = buffer.drain(1).unwrap();
+            for index in 0..cap + 2 {
+                assert_eq!(reader.next().unwrap(), (0, index as u32));
+            }
+            reader.finish(1).unwrap();
+        }
     }
 
     #[test]

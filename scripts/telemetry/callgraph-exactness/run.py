@@ -178,6 +178,14 @@ def native_edits(binary, root, plan, seed):
         source = path.read_text()
         lines = source.splitlines(keepends=True)
         line = row["symbol"]["start_line"]
+        if row["language"] == "rust":
+            # Symbol spans include documentation and attributes. Their braces
+            # and colons are not the beginning or end of the function signature.
+            declaration = r'^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|const|unsafe|extern(?:\s+"[^"]*")?)\s+)*fn\s+'
+            while line <= row["symbol"]["end_line"] and not re.match(declaration, lines[line]):
+                line += 1
+            if line > row["symbol"]["end_line"]:
+                continue
         # The signature may span lines (Rust puts one parameter per line) or
         # follow attribute lines, so it is read up to the body's opening
         # brace, at most eight lines.
@@ -190,7 +198,7 @@ def native_edits(binary, root, plan, seed):
         # A Python `self` or a Rust `self`, `&self`, `&mut self` or
         # `&'a self` receiver is skipped, and so is a Rust `mut` binding.
         receiver = r"(?:(?:&\s*(?:'[A-Za-z_]+\s+)?)?(?:mut\s+)?self\s*,\s*)?"
-        pattern = r"\(\s*" + receiver + r"(?:mut\s+)?([A-Za-z_][A-Za-z_0-9]*)\s*(?=[:,)])"
+        pattern = r"\(\s*" + receiver + r"(?!(?:mut\s+)?self\s*(?=[:,)]))(?:mut\s+)?([A-Za-z_][A-Za-z_0-9]*)\s*(?=[:,)])"
         if row["language"] == "go":
             # Skip the receiver when this is a method.
             offset = signature.find(")") + 1 if re.match(r"\s*func\s*\(", signature) else 0

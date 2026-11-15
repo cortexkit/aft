@@ -87,6 +87,38 @@ class CompareTests(unittest.TestCase):
             self.assertIn("def keep", added["round2"])
             self.assertIn("callee(value_exactness)", signature["round1"])
 
+    def rust_signature_edit(self, first_source):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "method.py").write_text("class Owner:\n    def run(self, value):\n        return value\n")
+            (root / "first.rs").write_text(first_source)
+            (root / "fallback.rs").write_text("fn fallback(value: u32) {}\n")
+            for name in ("a.py", "b.py"):
+                (root / name).write_text("pass\n")
+            row = {"file": "method.py", "owner": "Owner", "language": "python", "symbol": {"start_line": 1, "end_line": 2, "scoped_name": "Owner::run"}}
+            callees = [{"file": name, "language": "rust", "callers": 9, "symbol": {"start_line": 0, "end_line": len(source.splitlines()) - 1, "scoped_name": "callee"}}
+                       for name, source in (("first.rs", first_source), ("fallback.rs", "fn fallback(value: u32) {}\n"))]
+            plan = {"files": ["a.py", "b.py"], "members": [{"member": "run", "sites": 100, "declarations": [row]}], "top_callees": callees}
+            with patch.object(RUN.subprocess, "run") as validate:
+                validate.return_value.returncode = 0
+                native, _ = RUN.native_edits(Path("probe"), root, plan, 1441)
+            return native["edits"][1]
+
+    def test_signature_edit_ignores_braces_and_colons_in_rust_docs_and_attributes(self):
+        for prefix in ("/// Example { brace }\n", "/// Arguments:\n", '#[doc = "Example { brace }:"]\n'):
+            with self.subTest(prefix=prefix):
+                source = prefix + "pub fn callee(value: u32) {}\n"
+                signature = self.rust_signature_edit(source)
+                self.assertEqual(signature["file"], "first.rs")
+                self.assertEqual(signature["round1"], prefix + "pub fn callee(value_exactness: u32) {}\n")
+
+    def test_signature_edit_never_renames_a_lone_rust_receiver(self):
+        for receiver in ("self", "mut self", "&self", "&mut self", "&'a self", "self: Box<Self>"):
+            with self.subTest(receiver=receiver):
+                signature = self.rust_signature_edit(f"pub fn callee<'a>({receiver}) {{}}\n")
+                self.assertEqual(signature["file"], "fallback.rs")
+                self.assertEqual(signature["round1"], "fn fallback(value_exactness: u32) {}\n")
+
     def test_signature_edit_skips_rust_receivers_and_reads_past_the_first_line(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
