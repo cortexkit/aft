@@ -577,7 +577,7 @@ fn stage2_ceiling_fixture() -> tempfile::TempDir {
         for at in (127..size).step_by(128) {
             bytes[at] = b'\n';
         }
-        bytes[..12].copy_from_slice(b"needle\ntail\n");
+        bytes[..12].copy_from_slice(b"needle tail\n");
         fs::write(project.path().join(name), bytes).unwrap();
     }
     project
@@ -593,7 +593,7 @@ fn assert_stage2_ceiling_reply(indexed: bool, search: bool) {
     }
     let request = |pattern: &str| {
         if search {
-            json!({"id":"ceiling-search", "command":"semantic_search", "query":pattern, "hint":"literal", "include_tests":true, "top_k":10})
+            json!({"id":"ceiling-search", "command":"semantic_search", "query":pattern, "pattern":pattern, "include_tests":true, "top_k":10})
         } else {
             json!({"id":"ceiling-grep", "command":"grep", "pattern":pattern, "include_tests":true})
         }
