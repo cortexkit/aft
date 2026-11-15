@@ -19,6 +19,14 @@ pub(crate) fn observe_foreground_exit(
     wake: impl FnOnce() + Send + 'static,
 ) -> std::io::Result<ForegroundExitObserver> {
     let monitor = ProcessExit::open(pid)?;
+    #[cfg(all(feature = "test-hooks", target_os = "macos"))]
+    eprintln!(
+        "EXIT_TRACE event=observer_armed pid={pid} us={}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros()
+    );
     let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stopping = cancelled.clone();
     std::thread::Builder::new()
@@ -27,7 +35,16 @@ pub(crate) fn observe_foreground_exit(
             while !stopping.load(std::sync::atomic::Ordering::Acquire) {
                 match monitor.wait(Duration::from_millis(100)) {
                     Ok(false) => continue,
-                    Ok(true) => {}
+                    Ok(true) => {
+                        #[cfg(all(feature = "test-hooks", target_os = "macos"))]
+                        eprintln!(
+                            "EXIT_TRACE event=kernel_exit pid={pid} us={}",
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_micros()
+                        );
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(error) => {
                         log::debug!(

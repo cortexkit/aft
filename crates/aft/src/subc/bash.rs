@@ -1774,6 +1774,14 @@ fn finish_bash_spawn_immediate(
     allow_bg_completions: bool,
     repeat: &mut Option<crate::run_tool_call::RepeatObservation>,
 ) -> Response {
+    #[cfg(all(feature = "test-hooks", target_os = "macos"))]
+    eprintln!(
+        "EXIT_TRACE event=finish_poll us={}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros()
+    );
     let result = finalized_bash_result(
         response,
         ctx,
@@ -3880,9 +3888,19 @@ async fn run_deferred_bash_wait(
                                 Some(rx) => { let _ = rx.await; }
                                 None => std::future::pending::<()>().await,
                             }
-                        } => { exit_rx = None; }
-                        _ = registry.terminal_transition_notified() => {}
-                        _ = tokio::time::sleep(foreground_bash_poll_interval()) => {}
+                        } => {
+                            #[cfg(all(feature = "test-hooks", target_os = "macos"))]
+                            eprintln!("EXIT_TRACE event=call_woke_exit task={task_id} us={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros());
+                            exit_rx = None;
+                        }
+                        _ = registry.terminal_transition_notified() => {
+                            #[cfg(all(feature = "test-hooks", target_os = "macos"))]
+                            eprintln!("EXIT_TRACE event=call_woke_terminal task={task_id} us={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros());
+                        }
+                        _ = tokio::time::sleep(foreground_bash_poll_interval()) => {
+                            #[cfg(all(feature = "test-hooks", target_os = "macos"))]
+                            eprintln!("EXIT_TRACE event=call_woke_timer task={task_id} us={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros());
+                        }
                     }
                 }
                 initial_observation = false;
