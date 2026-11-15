@@ -16,8 +16,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "a1227b8cd954a9f6472a3888827ea9a6410e694d121d09aeb02817eb43e6215f",
-      "catalog_digest": "a1227b8cd954a9f6472a3888827ea9a6410e694d121d09aeb02817eb43e6215f",
+      "generation": "63fda671fcbf1b61970cbdcc7906166b89118e86a83c73d5d3b1208d0e04696b",
+      "catalog_digest": "63fda671fcbf1b61970cbdcc7906166b89118e86a83c73d5d3b1208d0e04696b",
       "tools": [
         {
           "name": "status",
@@ -1051,13 +1051,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -1099,13 +1099,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -1230,8 +1230,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "396a772ce414dcfd059041d4937d619eef4a6c77e743278762896b81e40796b9",
-      "catalog_digest": "396a772ce414dcfd059041d4937d619eef4a6c77e743278762896b81e40796b9",
+      "generation": "0c8ddf6db8226a605fa83a0630b5df23af23928efd80290674b9da76bdd627d7",
+      "catalog_digest": "0c8ddf6db8226a605fa83a0630b5df23af23928efd80290674b9da76bdd627d7",
       "tools": [
         {
           "name": "status",
@@ -2265,13 +2265,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -2313,13 +2313,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -2446,8 +2446,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "415749f2ce5307070d97616ec774dc3db92d66e25151114ef477194431b803f4",
-      "catalog_digest": "415749f2ce5307070d97616ec774dc3db92d66e25151114ef477194431b803f4",
+      "generation": "484e3b5c67b8512065d8b5188508846b12b705074bd6e697703edd1686bb77e1",
+      "catalog_digest": "484e3b5c67b8512065d8b5188508846b12b705074bd6e697703edd1686bb77e1",
       "tools": [
         {
           "name": "status",
@@ -3399,13 +3399,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -3447,13 +3447,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -3579,8 +3579,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "d07cf660f5ec470ab0b33df1b14259949069ca162ddf410bbb41fc84b6b7684a",
-      "catalog_digest": "d07cf660f5ec470ab0b33df1b14259949069ca162ddf410bbb41fc84b6b7684a",
+      "generation": "20bd4ee287eb786ecdf0d90f603abceb9283be00fbbb5ce930aaf22fe5654765",
+      "catalog_digest": "20bd4ee287eb786ecdf0d90f603abceb9283be00fbbb5ce930aaf22fe5654765",
       "tools": [
         {
           "name": "status",
@@ -4568,13 +4568,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -4616,13 +4616,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -4748,8 +4748,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "0636e68e47c292f42ddd7c2d1d74be6914c456a8df0a140b9511ddf31f153270",
-      "catalog_digest": "0636e68e47c292f42ddd7c2d1d74be6914c456a8df0a140b9511ddf31f153270",
+      "generation": "443716cc6fd8df6f307e7560c3f686c0f14fbf0acdff05c17b68a79af10e49b1",
+      "catalog_digest": "443716cc6fd8df6f307e7560c3f686c0f14fbf0acdff05c17b68a79af10e49b1",
       "tools": [
         {
           "name": "status",
@@ -5734,13 +5734,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -5782,13 +5782,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -5915,8 +5915,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "1bfd450c4f711900a40000681577c3ac38acf45f89e480f5578309eb6dcbdf50",
-      "catalog_digest": "1bfd450c4f711900a40000681577c3ac38acf45f89e480f5578309eb6dcbdf50",
+      "generation": "6a30c8c85aa0fcf9d25e24024a08ef7b6fa97c209dcb7d35ef014f1441a21917",
+      "catalog_digest": "6a30c8c85aa0fcf9d25e24024a08ef7b6fa97c209dcb7d35ef014f1441a21917",
       "tools": [
         {
           "name": "status",
@@ -6844,13 +6844,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -6892,13 +6892,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -7024,8 +7024,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "7ae46a7104f46d18dc25c2f33a074e0a0a76308f7ac670947b99fff2e8c85f2a",
-      "catalog_digest": "7ae46a7104f46d18dc25c2f33a074e0a0a76308f7ac670947b99fff2e8c85f2a",
+      "generation": "8b873bfcf8f224726ec0fcb2e1012fee78575ce2219c76d22fbf086fa433ff44",
+      "catalog_digest": "8b873bfcf8f224726ec0fcb2e1012fee78575ce2219c76d22fbf086fa433ff44",
       "tools": [
         {
           "name": "status",
@@ -7950,13 +7950,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -7998,13 +7998,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -8130,8 +8130,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "6e4d0ce313eb42a6585e8f9ea937ebe6f7ed400839129a71bf3bf7574466b671",
-      "catalog_digest": "6e4d0ce313eb42a6585e8f9ea937ebe6f7ed400839129a71bf3bf7574466b671",
+      "generation": "a020f4d59d4dc4f864bf940f85594fc97bda23ae2b69974b45a556567121c1ed",
+      "catalog_digest": "a020f4d59d4dc4f864bf940f85594fc97bda23ae2b69974b45a556567121c1ed",
       "tools": [
         {
           "name": "status",
@@ -9053,13 +9053,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -9101,13 +9101,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -9233,8 +9233,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "cb9a2ccc5665c5478a21c9267e2c6aa9a09f735ce854872c2b7bd7f443b400b6",
-      "catalog_digest": "cb9a2ccc5665c5478a21c9267e2c6aa9a09f735ce854872c2b7bd7f443b400b6",
+      "generation": "698fd59ad041e1c9b11525b4b745c4fc4fa36994be303b3c8cdb3cc9422414e9",
+      "catalog_digest": "698fd59ad041e1c9b11525b4b745c4fc4fa36994be303b3c8cdb3cc9422414e9",
       "tools": [
         {
           "name": "status",
@@ -10153,13 +10153,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -10201,13 +10201,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -10330,8 +10330,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "b49b22389ed15e7d65aeb1044cb2f63f09305aeeeab1423802d9d4fb6b4c98cf",
-      "catalog_digest": "b49b22389ed15e7d65aeb1044cb2f63f09305aeeeab1423802d9d4fb6b4c98cf",
+      "generation": "9be148acfd77523758ac65a620acc0400cafe64f8faf71acbc1a82ef3f33d4ec",
+      "catalog_digest": "9be148acfd77523758ac65a620acc0400cafe64f8faf71acbc1a82ef3f33d4ec",
       "tools": [
         {
           "name": "status",
@@ -11439,13 +11439,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -11487,13 +11487,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -11619,8 +11619,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "aa47885bbfad6282a259c481dc1341666567cb09693263ae5a6da9e0e38aa20d",
-      "catalog_digest": "aa47885bbfad6282a259c481dc1341666567cb09693263ae5a6da9e0e38aa20d",
+      "generation": "3c389a53a105cb13e22664b3e631de0f9253d47a88d72d98a92c5bee7f2cb5a2",
+      "catalog_digest": "3c389a53a105cb13e22664b3e631de0f9253d47a88d72d98a92c5bee7f2cb5a2",
       "tools": [
         {
           "name": "status",
@@ -12728,13 +12728,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -12776,13 +12776,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -12910,8 +12910,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "3849e16295b82d92de75e28c854017292e04e512bfdf1808ad7846ab3528ab63",
-      "catalog_digest": "3849e16295b82d92de75e28c854017292e04e512bfdf1808ad7846ab3528ab63",
+      "generation": "7b2cf6a3e1ceec6e5194568d814c36393dd2b9d445beddf73ea0a4094110fcca",
+      "catalog_digest": "7b2cf6a3e1ceec6e5194568d814c36393dd2b9d445beddf73ea0a4094110fcca",
       "tools": [
         {
           "name": "status",
@@ -13937,13 +13937,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -13985,13 +13985,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -14118,8 +14118,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "3f2e4f9cd012c56555fdbd6571a1e4a2b3c9cf2ac4cabe7190a39030c5eb3a4c",
-      "catalog_digest": "3f2e4f9cd012c56555fdbd6571a1e4a2b3c9cf2ac4cabe7190a39030c5eb3a4c",
+      "generation": "f0266955adf0da046cf7f0395ca8f5cedbde89e02eac634c358b746a2ce8f998",
+      "catalog_digest": "f0266955adf0da046cf7f0395ca8f5cedbde89e02eac634c358b746a2ce8f998",
       "tools": [
         {
           "name": "status",
@@ -15181,13 +15181,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -15229,13 +15229,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -15362,8 +15362,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "1c11856529943c6a28aed338145e1d7c466d00faf8e59ee96bcaca2b622e0ed4",
-      "catalog_digest": "1c11856529943c6a28aed338145e1d7c466d00faf8e59ee96bcaca2b622e0ed4",
+      "generation": "eedf71bdf5f123cec3defdafc857ee0ae947cda695e7494ef1a68abef2f290e7",
+      "catalog_digest": "eedf71bdf5f123cec3defdafc857ee0ae947cda695e7494ef1a68abef2f290e7",
       "tools": [
         {
           "name": "status",
@@ -16422,13 +16422,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -16470,13 +16470,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -16604,8 +16604,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "0f4bd2af5c1ed6fd0490563e809281ba5e6c6a0881aec58d78fc0bad4ec3f93e",
-      "catalog_digest": "0f4bd2af5c1ed6fd0490563e809281ba5e6c6a0881aec58d78fc0bad4ec3f93e",
+      "generation": "49677212db3029f3d550aa37f33320652aa9b4dd4f9ffe2ab1f64e0bd6095470",
+      "catalog_digest": "49677212db3029f3d550aa37f33320652aa9b4dd4f9ffe2ab1f64e0bd6095470",
       "tools": [
         {
           "name": "status",
@@ -17607,13 +17607,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -17655,13 +17655,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -17788,8 +17788,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "9a69061abfe9910721e9c384a2bf7687659635ee21d05076f77601c4b430da50",
-      "catalog_digest": "9a69061abfe9910721e9c384a2bf7687659635ee21d05076f77601c4b430da50",
+      "generation": "cbf11c2341ee5ec0c38cc3250800da7ee6bc8c3d5089d34254adeb566850b6cd",
+      "catalog_digest": "cbf11c2341ee5ec0c38cc3250800da7ee6bc8c3d5089d34254adeb566850b6cd",
       "tools": [
         {
           "name": "status",
@@ -18788,13 +18788,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -18836,13 +18836,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -18969,8 +18969,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "ab0f953f4eb0e617ee8baeff1aaf93225f08699c72e46c6ce9184790741bee4d",
-      "catalog_digest": "ab0f953f4eb0e617ee8baeff1aaf93225f08699c72e46c6ce9184790741bee4d",
+      "generation": "d39d9754cb68ff774ce77c978dbc38e2b9ff48f6c594f3ebca6177e7b33d7de8",
+      "catalog_digest": "d39d9754cb68ff774ce77c978dbc38e2b9ff48f6c594f3ebca6177e7b33d7de8",
       "tools": [
         {
           "name": "status",
@@ -19966,13 +19966,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -20014,13 +20014,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -20147,8 +20147,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "bdeb18ccc5e3fc1c9c5e84843cb26688fdc2a21c4bf567a308f6e02f9422d174",
-      "catalog_digest": "bdeb18ccc5e3fc1c9c5e84843cb26688fdc2a21c4bf567a308f6e02f9422d174",
+      "generation": "974e1d20586f7e3d636f54bef24c3c7f211d7eeda8778d3d0b71934afabd7a10",
+      "catalog_digest": "974e1d20586f7e3d636f54bef24c3c7f211d7eeda8778d3d0b71934afabd7a10",
       "tools": [
         {
           "name": "status",
@@ -21141,13 +21141,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -21189,13 +21189,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },

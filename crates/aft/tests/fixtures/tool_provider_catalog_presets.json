@@ -10,8 +10,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "2e849b73208d0c837ad48ea747e3b0bef621c1f7bc42dad73caec69faad79d18",
-      "catalog_digest": "2e849b73208d0c837ad48ea747e3b0bef621c1f7bc42dad73caec69faad79d18",
+      "generation": "91d45467367c9f0a0564f8f6a2cca3618fab70db23b11bf6d52d9701abe8aa44",
+      "catalog_digest": "91d45467367c9f0a0564f8f6a2cca3618fab70db23b11bf6d52d9701abe8aa44",
       "tools": [
         {
           "name": "status",
@@ -1045,13 +1045,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion. To wait, use bash_watch.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion. To wait, use bash_watch.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -1090,7 +1090,7 @@
             "shell.exec/v1",
             "call.yield/v1"
           ],
-          "description": "Watch a background bash task and wait until it exits or prints a pattern. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit. A background task never wakes you, so wait on it before you report a result. Call bash_watch again to keep waiting; don't report a result until the command finishes. Never loop bash_status to wait.",
+          "description": "Watch a background bash task and wait until it exits or prints a pattern; a remote job ID works too. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit. A background task never wakes you, so wait on it before you report a result. Call bash_watch again to keep waiting; don't report a result until the command finishes. Never loop bash_status to wait.",
           "reply": {
             "max_ms": 2040000
           },
@@ -1099,7 +1099,7 @@
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }).",
+                "description": "Background task ID returned by bash({ background: true }), or its remote job ID.",
                 "type": "string"
               },
               "pattern": {
@@ -1158,13 +1158,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -1279,8 +1279,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "094c7b9d8d58e6a9f2313569600712fa914cd53b88a1feb822af95ec634e9ea9",
-      "catalog_digest": "094c7b9d8d58e6a9f2313569600712fa914cd53b88a1feb822af95ec634e9ea9",
+      "generation": "a151655d2bce9fd77c2aa9fd61fe48282dcf07e66ce8937a5d7dd4131ea637a9",
+      "catalog_digest": "a151655d2bce9fd77c2aa9fd61fe48282dcf07e66ce8937a5d7dd4131ea637a9",
       "tools": [
         {
           "name": "status",
@@ -2388,13 +2388,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion. To wait, use bash_watch.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion. To wait, use bash_watch.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -2433,7 +2433,7 @@
             "shell.exec/v1",
             "call.yield/v1"
           ],
-          "description": "Watch a background bash task and wait until it exits or prints a pattern. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit. A background task never wakes you, so wait on it before you report a result. Call bash_watch again to keep waiting; don't report a result until the command finishes. Never loop bash_status to wait.",
+          "description": "Watch a background bash task and wait until it exits or prints a pattern; a remote job ID works too. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit. A background task never wakes you, so wait on it before you report a result. Call bash_watch again to keep waiting; don't report a result until the command finishes. Never loop bash_status to wait.",
           "reply": {
             "max_ms": 2040000
           },
@@ -2442,7 +2442,7 @@
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }).",
+                "description": "Background task ID returned by bash({ background: true }), or its remote job ID.",
                 "type": "string"
               },
               "pattern": {
@@ -2501,13 +2501,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -3530,8 +3530,8 @@
     "powershell_available": false,
     "remote_runs": true,
     "reply": {
-      "generation": "48fd83c071fb0a81052d9a84cbe582bd1c12559b51d273a2a22514f7689310c2",
-      "catalog_digest": "48fd83c071fb0a81052d9a84cbe582bd1c12559b51d273a2a22514f7689310c2",
+      "generation": "6aaf0b4f01b3bd3c9761b11737b4827f7c1a0e644c6667bd17223d3523e50040",
+      "catalog_digest": "6aaf0b4f01b3bd3c9761b11737b4827f7c1a0e644c6667bd17223d3523e50040",
       "tools": [
         {
           "name": "status",
@@ -4577,13 +4577,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion. To wait, use bash_watch.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion. To wait, use bash_watch.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -4622,7 +4622,7 @@
             "shell.exec/v1",
             "call.yield/v1"
           ],
-          "description": "Watch a background bash task and wait until it exits or prints a pattern. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit. A background task never wakes you, so wait on it before you report a result. Call bash_watch again to keep waiting; don't report a result until the command finishes. Never loop bash_status to wait.",
+          "description": "Watch a background bash task and wait until it exits or prints a pattern; a remote job ID works too. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit. A background task never wakes you, so wait on it before you report a result. Call bash_watch again to keep waiting; don't report a result until the command finishes. Never loop bash_status to wait.",
           "reply": {
             "max_ms": 2040000
           },
@@ -4631,7 +4631,7 @@
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }).",
+                "description": "Background task ID returned by bash({ background: true }), or its remote job ID.",
                 "type": "string"
               },
               "pattern": {
@@ -4690,13 +4690,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -4812,8 +4812,8 @@
     "powershell_available": true,
     "remote_runs": true,
     "reply": {
-      "generation": "8981f547341797ce06b09c4e412b147c1e7098564cb9a1e7527cb97f6ec4c840",
-      "catalog_digest": "8981f547341797ce06b09c4e412b147c1e7098564cb9a1e7527cb97f6ec4c840",
+      "generation": "990c1a56df78f97d6579f7d7b71791025f01181998fb50b01963ed252ad9b5a3",
+      "catalog_digest": "990c1a56df78f97d6579f7d7b71791025f01181998fb50b01963ed252ad9b5a3",
       "tools": [
         {
           "name": "status",
@@ -5933,13 +5933,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion. To wait, use bash_watch.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion. To wait, use bash_watch.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -5978,7 +5978,7 @@
             "shell.exec/v1",
             "call.yield/v1"
           ],
-          "description": "Watch a background bash task and wait until it exits or prints a pattern. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit. A background task never wakes you, so wait on it before you report a result. Call bash_watch again to keep waiting; don't report a result until the command finishes. Never loop bash_status to wait.",
+          "description": "Watch a background bash task and wait until it exits or prints a pattern; a remote job ID works too. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit. A background task never wakes you, so wait on it before you report a result. Call bash_watch again to keep waiting; don't report a result until the command finishes. Never loop bash_status to wait.",
           "reply": {
             "max_ms": 2040000
           },
@@ -5987,7 +5987,7 @@
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }).",
+                "description": "Background task ID returned by bash({ background: true }), or its remote job ID.",
                 "type": "string"
               },
               "pattern": {
@@ -6046,13 +6046,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -6168,8 +6168,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "792f31b8e5cf6bea49dd033a821430361ba090f3305c4596b11a10e2c999455b",
-      "catalog_digest": "792f31b8e5cf6bea49dd033a821430361ba090f3305c4596b11a10e2c999455b",
+      "generation": "73d0a290aa26ca651afb96a34482c720b1bc087492555b6e04ef17af4905d930",
+      "catalog_digest": "73d0a290aa26ca651afb96a34482c720b1bc087492555b6e04ef17af4905d930",
       "tools": [
         {
           "name": "status",
@@ -7203,13 +7203,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -7251,13 +7251,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -7371,8 +7371,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "80b9292af124f53486b18cab4e23cc96a2474ae6a24cda50b17fd429dca05397",
-      "catalog_digest": "80b9292af124f53486b18cab4e23cc96a2474ae6a24cda50b17fd429dca05397",
+      "generation": "3e24367d31fe785131d3f41d55ec219cff34378fa83fef7559bdd70f2fd52f77",
+      "catalog_digest": "3e24367d31fe785131d3f41d55ec219cff34378fa83fef7559bdd70f2fd52f77",
       "tools": [
         {
           "name": "status",
@@ -8480,13 +8480,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -8528,13 +8528,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -8655,8 +8655,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "e1af3bb9f289e38233b748d8101120386732e363782a67d98549c475e3b0c243",
-      "catalog_digest": "e1af3bb9f289e38233b748d8101120386732e363782a67d98549c475e3b0c243",
+      "generation": "09a33cb022dd42772af20a2f71d1d73c66f1b272727b438df331254cb50115d1",
+      "catalog_digest": "09a33cb022dd42772af20a2f71d1d73c66f1b272727b438df331254cb50115d1",
       "tools": [
         {
           "name": "bash",
@@ -9558,13 +9558,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -9603,7 +9603,7 @@
             "shell.exec/v1",
             "call.yield/v1"
           ],
-          "description": "Watch a background bash task. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit. In a main session sync waits are for a short remaining wait on a task; for anything longer, first do the work that doesn't need the result, end the turn only when everything left needs it, and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. Never loop bash_status to wait.",
+          "description": "Watch a background bash task; a remote job ID works too. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit. In a main session sync waits are for a short remaining wait on a task; for anything longer, first do the work that doesn't need the result, end the turn only when everything left needs it, and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. Never loop bash_status to wait.",
           "reply": {
             "max_ms": 2040000
           },
@@ -9612,7 +9612,7 @@
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }).",
+                "description": "Background task ID returned by bash({ background: true }), or its remote job ID.",
                 "type": "string"
               },
               "pattern": {
@@ -9658,13 +9658,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -9782,8 +9782,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "cc4fbb8c49838aa8e68204db6508f9318185a9ec06f0fb8439d4dd49381307a6",
-      "catalog_digest": "cc4fbb8c49838aa8e68204db6508f9318185a9ec06f0fb8439d4dd49381307a6",
+      "generation": "fe29190a1fbd6bc7554d9aa14fbf5850d7e852752a855128e7b9d8259a4149a3",
+      "catalog_digest": "fe29190a1fbd6bc7554d9aa14fbf5850d7e852752a855128e7b9d8259a4149a3",
       "tools": [
         {
           "name": "bash",
@@ -10773,13 +10773,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -10818,7 +10818,7 @@
             "shell.exec/v1",
             "call.yield/v1"
           ],
-          "description": "Watch a background bash task. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit. In a main session sync waits are for a short remaining wait on a task; for anything longer, first do the work that doesn't need the result, end the turn only when everything left needs it, and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. Never loop bash_status to wait.",
+          "description": "Watch a background bash task; a remote job ID works too. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit. In a main session sync waits are for a short remaining wait on a task; for anything longer, first do the work that doesn't need the result, end the turn only when everything left needs it, and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. Never loop bash_status to wait.",
           "reply": {
             "max_ms": 2040000
           },
@@ -10827,7 +10827,7 @@
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }).",
+                "description": "Background task ID returned by bash({ background: true }), or its remote job ID.",
                 "type": "string"
               },
               "pattern": {
@@ -10873,13 +10873,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
@@ -11001,8 +11001,8 @@
       "hashline": true
     },
     "reply": {
-      "generation": "0e5ffdee40f8d31ccd52aa045e2228f69465fc8fb765eb65cc503921d5b3cdcc",
-      "catalog_digest": "0e5ffdee40f8d31ccd52aa045e2228f69465fc8fb765eb65cc503921d5b3cdcc",
+      "generation": "f35fd9c145b413ab88777e7f3c1607e0c408b1ffc9b1b87714cb049a46586fd4",
+      "catalog_digest": "f35fd9c145b413ab88777e7f3c1607e0c408b1ffc9b1b87714cb049a46586fd4",
       "tools": [
         {
           "name": "bash",
@@ -11938,13 +11938,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               },
               "outputOffset": {
@@ -11983,7 +11983,7 @@
             "shell.exec/v1",
             "call.yield/v1"
           ],
-          "description": "Watch a background bash task. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit. In a main session sync waits are for a short remaining wait on a task; for anything longer, first do the work that doesn't need the result, end the turn only when everything left needs it, and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. Never loop bash_status to wait.",
+          "description": "Watch a background bash task; a remote job ID works too. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit. In a main session sync waits are for a short remaining wait on a task; for anything longer, first do the work that doesn't need the result, end the turn only when everything left needs it, and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. Never loop bash_status to wait.",
           "reply": {
             "max_ms": 2040000
           },
@@ -11992,7 +11992,7 @@
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }).",
+                "description": "Background task ID returned by bash({ background: true }), or its remote job ID.",
                 "type": "string"
               },
               "pattern": {
@@ -12038,13 +12038,13 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "description": "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "taskId": {
-                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
                 "type": "string"
               }
             },
