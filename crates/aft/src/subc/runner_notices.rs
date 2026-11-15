@@ -1166,6 +1166,8 @@ pub(super) async fn transport_for_test(path: &Path, session: &str, scope: ScopeS
     let outcome = send(path, &address, &request).await;
     let mut result = match &outcome {
         Outcome::Accepted => json!({"outcome":"accepted"}),
+        Outcome::Pending => json!({"outcome":"pending"}),
+        Outcome::NotDelivered(reason) => json!({"outcome":"not_delivered","reason":reason}),
         Outcome::Final(failure) | Outcome::Retry(failure) => json!({
             "outcome": if matches!(outcome, Outcome::Final(_)) { "final" } else { "retry" },
             "class": format!("{:?}", failure.class), "code": failure.code, "detail": failure.detail,
