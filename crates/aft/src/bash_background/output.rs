@@ -21,7 +21,7 @@ pub const COMPLETION_SUCCESS_HEAD_BYTES: usize = 0;
 pub const COMPLETION_SUCCESS_TAIL_BYTES: usize = 600;
 pub const COMPLETION_FAILURE_PREVIEW_BYTES: usize = 2304;
 pub const COMPLETION_FAILURE_HEAD_BYTES: usize = 512;
-pub const COMPLETION_FAILURE_TAIL_BYTES: usize = 1792;
+pub use crate::compress::caps::COMPLETION_FAILURE_TAIL_BYTES;
 
 pub const RAW_PASSTHROUGH_CAP_BYTES: usize = 50 * 1024;
 pub const RAW_PASSTHROUGH_HEAD_BYTES: usize = 20 * 1024;

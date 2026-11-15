@@ -4,6 +4,7 @@ pub const CAP_ERRORS: usize = 20;
 pub const CAP_WARNINGS: usize = 10;
 pub const CAP_LIST: usize = 20;
 pub const CAP_INVENTORY: usize = 50;
+pub const COMPLETION_FAILURE_TAIL_BYTES: usize = 1792;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DropClass {

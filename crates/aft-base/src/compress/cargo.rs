@@ -496,7 +496,7 @@ fn compress_test(output: &str, exit_code: Option<i64>) -> CompressionResult {
 // on panic sections, so compiler warnings cannot displace the explanation.
 const FAILURE_SECTION_LINES: usize = 6;
 const FAILURE_DETAIL_LINES: usize = 20;
-const FAILURE_DETAIL_BYTES: usize = crate::bash_background::output::COMPLETION_FAILURE_TAIL_BYTES;
+const FAILURE_DETAIL_BYTES: usize = super::caps::COMPLETION_FAILURE_TAIL_BYTES;
 
 fn bounded_failure_sections(sections: &[&[&str]], summary_bytes: usize) -> (String, usize) {
     let mut remaining_bytes = FAILURE_DETAIL_BYTES.saturating_sub(summary_bytes + 1);
