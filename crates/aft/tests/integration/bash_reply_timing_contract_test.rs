@@ -88,7 +88,12 @@ fn foreground_bash_exit_wakes_without_observation_ticks() {
                 .await;
                 let reply = read_tool_response(&mut h.stream, corr, Duration::from_secs(10)).await;
                 let result = tool_response_json(&reply);
-                assert_eq!(result["status"], "completed", "{}", frame_body(&reply));
+                assert_eq!(
+                    result["status"],
+                    if code == 0 { "completed" } else { "failed" },
+                    "{}",
+                    frame_body(&reply)
+                );
                 assert_eq!(result["exit_code"], code, "{}", frame_body(&reply));
                 if command.contains("printf") {
                     assert!(
