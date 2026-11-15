@@ -6424,6 +6424,62 @@ async fn remote_restart_unaccepted_queued_progress_reaches_bash_status() {
 }
 
 #[tokio::test]
+async fn remote_queue_wait_wire_vectors_reach_bash_status_as_queued_progress() {
+    use crate::exec_remote::wire_tests::{outage_daemon_with_replay, OutageReplay};
+    use sha2::{Digest, Sha256};
+    // Published 0.2.22 progress vectors, including an unknown waiting reason.
+    // Send their bytes unchanged: enum construction can conceal pin changes.
+    for (bytes, digest) in [
+        (
+            include_bytes!("../exec_remote/fixtures/progress/queue-wait.jcs").as_slice(),
+            include_str!("../exec_remote/fixtures/progress/queue-wait.sha256"),
+        ),
+        (
+            include_bytes!("../exec_remote/fixtures/progress/queue-wait-unknown-reason.jcs")
+                .as_slice(),
+            include_str!("../exec_remote/fixtures/progress/queue-wait-unknown-reason.sha256"),
+        ),
+    ] {
+        assert_eq!(format!("{:x}", Sha256::digest(bytes)), digest.trim());
+        let daemon = outage_daemon_with_replay(OutageReplay::QueuedWire(bytes)).await;
+        let (_dir, ctx, task_id, paths) =
+            restart_unaccepted_submission(daemon.connection.clone(), Some(id()), true).await;
+        let task = ctx.bash_background().task(&task_id).unwrap();
+        wait_for("published queue-wait bytes must reach bash status", || {
+            let mut state = task.state.lock().unwrap();
+            if state.remote_admission_note.as_deref() != Some("queued on the runner (0 s)") {
+                return None;
+            }
+            assert_eq!(
+                state.metadata.remote.as_ref().unwrap().queue_wait_ms,
+                Some(42)
+            );
+            state.remote_admission_note = None;
+            Some(())
+        })
+        .await;
+        let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+            "id":"status", "command":"bash_status", "session_id":"session", "params":{"task_id":task_id},
+        })).unwrap();
+        let response = crate::commands::bash_status::handle(&request, &ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["phase"], "queued", "{response:?}");
+        assert!(rendered_status(&ctx, &task_id).contains("queued on the runner (0 s)"));
+        let remote = read_task(&paths.json).unwrap().remote.unwrap();
+        assert_eq!(remote.queue_wait_ms, Some(42));
+        assert!(!remote.accepted);
+        assert_eq!(remote.last_seq, None);
+        assert_eq!(remote.stdout_len, 0);
+        assert!(daemon.methods("exec.run").is_empty());
+        daemon.finish_job();
+        assert_eq!(
+            terminal(ctx.bash_background(), &task_id).await.info.status,
+            BgTaskStatus::Completed
+        );
+    }
+}
+
+#[tokio::test]
 async fn remote_restart_unaccepted_quiet_attach_waits_without_claiming_capture() {
     use crate::exec_remote::wire_tests::{outage_daemon_with_replay, OutageReplay};
     let daemon = outage_daemon_with_replay(OutageReplay::Silent).await;

@@ -1176,9 +1176,7 @@ fn admission_progress_detail(detail: &str) -> String {
 
 #[cfg(unix)]
 fn queue_wait_progress_ms(progress: &exec::types::Progress) -> Option<u64> {
-    // The pinned types crate has no typed QueueWait variant; this is the
-    // runner's queue-progress wire spelling, not an arbitrary unknown phase.
-    matches!(progress.phase(), exec::types::ProgressPhase::Unknown(phase) if phase == "queue_wait")
+    matches!(progress.phase(), exec::types::ProgressPhase::QueueWait)
         .then(|| progress.phase_elapsed_ms())
 }
 
