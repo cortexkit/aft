@@ -911,7 +911,10 @@ mod catalog_preset_tests {
                         cfg!(unix) && worker_enabled == Some(true),
                         "head={head_enabled}, worker={worker_enabled:?}, kind={kind}"
                     );
-                    assert_eq!(saved_policy(&f.ctx, &key).unwrap(), before);
+                    assert_eq!(
+                        serde_json::to_value(saved_policy(&f.ctx, &key).unwrap()).unwrap(),
+                        serde_json::to_value(before).unwrap()
+                    );
                     let named = catalog(json!({"preset":"worker"}), &f.route, &f.ctx).unwrap();
                     assert_eq!(answer["tools"], named["tools"]);
                 }
