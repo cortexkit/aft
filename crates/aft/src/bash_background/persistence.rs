@@ -2688,16 +2688,24 @@ fn sync_task_directory(dir: &PinnedDir) -> io::Result<()> {
         // FlushFileBuffers requires GENERIC_WRITE even for a directory. Keep
         // ordinary pinned opens read-only; acquire write access only to flush,
         // and verify that the reopened handle still names the pinned folder.
-        let writable = PinnedDir {
-            file: OpenOptions::new()
+        let writable = PinnedDir::from_open_file(
+            OpenOptions::new()
                 .read(true)
                 .write(true)
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
                 .open(&dir.path)?,
-            path: dir.path.clone(),
-            #[cfg(test)]
-            cache_device_override: dir.cache_device_override,
-        };
+            dir.path.clone(),
+            {
+                #[cfg(test)]
+                {
+                    dir.cache_device_override
+                }
+                #[cfg(not(test))]
+                {
+                    None
+                }
+            },
+        );
         validate_directory_handle(&writable.file)?;
         if !dir.same_identity(&writable)? {
             return Err(io::Error::new(

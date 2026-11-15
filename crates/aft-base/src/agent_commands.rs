@@ -406,7 +406,7 @@ impl std::ops::DerefMut for WindowsChild {
 
 #[cfg(windows)]
 impl WindowsChild {
-    pub(crate) fn declare_agent(&mut self) {
+    pub fn declare_agent(&mut self) {
         self.root = started(self.child.id());
     }
     pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {

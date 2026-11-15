@@ -90,6 +90,18 @@ impl DirectorySnapshot {
 }
 
 impl PinnedDir {
+    // Cargo feature unification can change test-only fields; keep the constructor signature fixed.
+    pub fn from_open_file(file: File, path: PathBuf, cache_device_override: Option<u64>) -> Self {
+        #[cfg(not(any(test, feature = "test-support")))]
+        let _ = cache_device_override;
+        Self {
+            file,
+            path,
+            #[cfg(any(test, feature = "test-support"))]
+            cache_device_override,
+        }
+    }
+
     pub fn identity(&self) -> io::Result<DirectoryIdentity> {
         #[cfg(unix)]
         {
