@@ -377,7 +377,7 @@ pub(crate) fn windows_cpu_ms(handle: std::os::windows::io::RawHandle) -> Option<
 
 #[cfg(windows)]
 #[derive(Debug)]
-pub(crate) struct WindowsChild {
+pub struct WindowsChild {
     child: std::process::Child,
     root: Option<AgentCommandRoot>,
 }

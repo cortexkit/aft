@@ -142,7 +142,7 @@ pub fn filesystem_device_id(path: &Path) -> io::Result<Option<u64>> {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn filesystem_device_id(path: &Path) -> io::Result<Option<u64>> {
+pub fn filesystem_device_id(path: &Path) -> io::Result<Option<u64>> {
     // Standard metadata on non-Unix platforms has file attributes but no
     // reliable volume identifier, so this raw-directory-walk check is a no-op.
     // Recursive walks using `ignore::WalkBuilder` still enforce their own

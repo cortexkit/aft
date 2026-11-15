@@ -16,7 +16,7 @@ const BATCH_ARGUMENT_ENV_PREFIX: &str = "AFT_BATCH_ARGUMENT_";
 
 /// Whether `path` must be dispatched by `cmd.exe` on Windows.
 #[cfg(windows)]
-pub(crate) fn is_batch_file(path: &Path) -> bool {
+pub fn is_batch_file(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
@@ -27,7 +27,7 @@ pub(crate) fn is_batch_file(path: &Path) -> bool {
 /// Callers that add their own child environment must not override these values,
 /// because `cmd.exe` expands the command tail using them.
 #[cfg(windows)]
-pub(crate) fn is_batch_internal_env(key: &str, argument_count: usize) -> bool {
+pub fn is_batch_internal_env(key: &str, argument_count: usize) -> bool {
     if key.eq_ignore_ascii_case(BATCH_COMMAND_ENV) {
         return true;
     }
@@ -53,7 +53,7 @@ pub(crate) fn is_batch_internal_env(key: &str, argument_count: usize) -> bool {
 /// literal `%` remains literal after single-pass expansion), then pass one
 /// explicitly quoted command tail.
 #[cfg(windows)]
-pub(crate) fn batch_command<I, S>(binary: &Path, args: I) -> io::Result<Command>
+pub fn batch_command<I, S>(binary: &Path, args: I) -> io::Result<Command>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,

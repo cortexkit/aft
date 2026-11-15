@@ -31,7 +31,7 @@ pub struct PinnedDir {
     pub file: File,
     pub path: PathBuf,
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) cache_device_override: Option<u64>,
+    pub cache_device_override: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -999,7 +999,7 @@ impl PinnedDir {
     }
 
     #[cfg(windows)]
-    pub(crate) fn open_dir_at(&self, name: &OsStr) -> io::Result<Self> {
+    pub fn open_dir_at(&self, name: &OsStr) -> io::Result<Self> {
         self.ensure_current_identity()?;
         let child = Self::open(&self.path.join(name))?;
         self.ensure_current_identity()?;
@@ -1023,7 +1023,7 @@ impl PinnedDir {
     }
 
     #[cfg(windows)]
-    pub(crate) fn create_dir_at(&self, name: &OsStr) -> io::Result<Self> {
+    pub fn create_dir_at(&self, name: &OsStr) -> io::Result<Self> {
         self.ensure_current_identity()?;
         let path = self.path.join(name);
         fs::create_dir(&path)?;
@@ -1254,7 +1254,7 @@ impl PinnedDir {
     }
 
     #[cfg(windows)]
-    pub(crate) fn ensure_current_identity(&self) -> io::Result<()> {
+    pub fn ensure_current_identity(&self) -> io::Result<()> {
         let current = Self::open(&self.path)?;
         if !self.same_identity(&current)? {
             return Err(io::Error::new(
@@ -1284,7 +1284,7 @@ impl PinnedDir {
     }
 
     #[cfg(windows)]
-    pub(crate) fn remove_self(&self) -> io::Result<()> {
+    pub fn remove_self(&self) -> io::Result<()> {
         self.ensure_current_identity()?;
         windows_delete_pinned_handle(&self.file, true)
     }
@@ -2507,7 +2507,7 @@ pub fn os_cstring(value: &OsStr) -> io::Result<CString> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))
 }
 
-pub(crate) fn validate_directory_handle(file: &File) -> io::Result<()> {
+pub fn validate_directory_handle(file: &File) -> io::Result<()> {
     // Reject reparse points before classifying a non-directory as a file that
     // recursive cleanup may unlink. Junctions must never enter that fallback.
     #[cfg(windows)]
@@ -2618,9 +2618,9 @@ pub fn set_close_on_exec(fd: RawFd, enabled: bool) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-pub(crate) const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+pub const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 #[cfg(windows)]
-pub(crate) const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+pub const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 #[cfg(windows)]

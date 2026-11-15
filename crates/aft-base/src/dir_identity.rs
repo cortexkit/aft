@@ -20,7 +20,7 @@ pub fn dir_identity(path: &Path) -> Option<DirIdentity> {
 /// entry that last had it, so a directory renamed aside and recreated looks
 /// unchanged by that measure.
 #[cfg(windows)]
-pub(crate) fn dir_identity(path: &Path) -> Option<DirIdentity> {
+pub fn dir_identity(path: &Path) -> Option<DirIdentity> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{

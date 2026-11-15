@@ -250,7 +250,7 @@ pub(crate) fn opened_location(_file: &File) -> io::Result<PathBuf> {
 
 /// Where an open file really is, with every junction and symlink resolved.
 #[cfg(windows)]
-pub(crate) fn opened_location(file: &File) -> io::Result<PathBuf> {
+pub fn opened_location(file: &File) -> io::Result<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{

@@ -76,7 +76,7 @@ fn probe_tool_in_dir_for_platform(dir: &Path, binary: &str, windows: bool) -> Op
 
 /// Extra bin directories GUI-launched hosts often omit from `PATH`.
 #[cfg(windows)]
-pub(crate) fn well_known_windows_bin_dirs(userprofile: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+pub fn well_known_windows_bin_dirs(userprofile: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::with_capacity(10);
     dirs.push(PathBuf::from(r"C:\Go\bin"));
     dirs.push(PathBuf::from(r"C:\Program Files\Go\bin"));

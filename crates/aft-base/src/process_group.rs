@@ -25,7 +25,7 @@ pub fn isolate_in_process_group(cmd: &mut Command) {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn isolate_in_process_group(_cmd: &mut Command) {
+pub fn isolate_in_process_group(_cmd: &mut Command) {
     // Best-effort no-op outside Unix. Windows timeout cleanup uses taskkill /T
     // in kill_process_tree so .cmd wrappers and grandchildren are terminated.
 }
@@ -46,7 +46,7 @@ pub fn kill_process_tree(child: &mut Child) {
 }
 
 #[cfg(windows)]
-pub(crate) fn kill_process_tree(child: &mut Child) {
+pub fn kill_process_tree(child: &mut Child) {
     let pid = child.id().to_string();
     let _ = Command::new("taskkill")
         .args(["/PID", pid.as_str(), "/T", "/F"])
