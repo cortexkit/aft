@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -124,7 +126,7 @@ class BaselineProvenanceTests(unittest.TestCase):
             "ImageVersion": "20261012.334.1",
             "GITHUB_SHA": "44f7009c9460ea83fa6bc4d2920d8a1e6367ff8c",
         }
-        with patch.dict("os.environ", env, clear=True):
+        with patch.dict("os.environ", env, clear=True), patch.object(gate.platform, "system", return_value="Linux"):
             provenance = gate.write_baseline_provenance()
         for part in env.values():
             self.assertIn(part, provenance)
@@ -133,6 +135,117 @@ class BaselineProvenanceTests(unittest.TestCase):
         with patch.dict("os.environ", {}, clear=True):
             provenance = gate.write_baseline_provenance()
         self.assertTrue(provenance.startswith("local --write-baseline on "), provenance)
+
+    def test_mac_run_names_self_hosted_hardware_not_github_image(self):
+        with patch.dict("os.environ", {"GITHUB_RUN_ID": "123", "GITHUB_SHA": "abc", "RUNNER_NAME": "mini"}, clear=True), \
+                patch.object(gate.platform, "system", return_value="Darwin"):
+            provenance = gate.write_baseline_provenance()
+        self.assertIn("self-hosted mac-mini runner mini", provenance)
+        self.assertIn("direct-child wait4 ru_maxrss (bytes)", provenance)
+        self.assertNotIn("github-hosted", provenance)
+
+
+class MacResidentMemoryTests(unittest.TestCase):
+    def test_wait4_bytes_and_fractional_cpu_are_for_the_direct_child(self):
+        process = SimpleNamespace(pid=4242, child_usage=SimpleNamespace(
+            ru_maxrss=314572800, ru_utime=3.741234, ru_stime=0.012345))
+        sampler = matrix.ProcessSampler(process, peak_rss_kb=90000)
+        with patch.object(matrix.sys, "platform", "darwin"):
+            sampler.collect_child_usage()
+            metrics = matrix.peak_memory_metrics(sampler)
+            precision = sampler.cpu_precision
+        self.assertEqual(metrics["peak_rss_mb"], "300.0")
+        self.assertEqual(metrics["peak_rss_ru_maxrss_mb"], "300.0")
+        self.assertEqual(metrics["peak_rss_hwm_mb"], "n/a")
+        self.assertEqual(metrics["peak_rss_source"], "darwin-wait4-ru_maxrss-bytes")
+        self.assertEqual(metrics["peak_rss_sampled_mb"], "87.9")
+        self.assertAlmostEqual(sampler.cpu_seconds, 3.753579)
+        self.assertEqual(precision, "0.000001-second")
+        row = metrics | {"cpu_s": f"{sampler.cpu_seconds:.6f}"}
+        self.assertEqual(gate.row_metrics(row)["peak_rss_mb"], 300.0)
+        self.assertNotIn("peak_rss_ru_maxrss_mb", gate.row_metrics(row))
+
+    def test_missing_child_usage_is_a_gap_never_sampled_memory_or_zero(self):
+        for usage in (None, SimpleNamespace(ru_maxrss=0)):
+            sampler = matrix.ProcessSampler(SimpleNamespace(child_usage=usage), peak_rss_kb=90000)
+            with patch.object(matrix.sys, "platform", "darwin"):
+                sampler.collect_child_usage()
+                self.assertEqual(matrix.peak_memory_metrics(sampler)["peak_rss_mb"], "n/a")
+            self.assertIsNone(sampler.cpu_seconds)
+            self.assertIn("direct-child wait4 rusage missing", sampler.gaps[0])
+
+    def test_collection_follows_exit_without_changing_final_sample_order(self):
+        order = []
+        sampler = SimpleNamespace(stop=lambda: order.append("sample"),
+                                  collect_child_usage=lambda: order.append("usage"))
+        client = SimpleNamespace(close=lambda: order.append("exit"))
+        matrix.close_after_final_sample(sampler, client)
+        self.assertEqual(order, ["sample", "exit", "usage"])
+
+    @unittest.skipUnless(hasattr(os, "wait4"), "POSIX direct-child wait4")
+    def test_real_child_usage_survives_both_poll_and_wait_reaping(self):
+        for poll_first in (False, True):
+            with self.subTest(poll_first=poll_first):
+                with matrix.RusagePopen([sys.executable, "-c", "data = bytearray(8 * 1024 * 1024)"]) as child:
+                    if poll_first:
+                        deadline = time.monotonic() + 10
+                        while child.poll() is None and time.monotonic() < deadline:
+                            time.sleep(0.01)
+                        self.assertIsNotNone(child.poll())
+                    self.assertEqual(child.wait(timeout=10), 0)
+                    self.assertIsNotNone(child.child_usage)
+                    self.assertGreater(child.child_usage.ru_maxrss, 0)
+
+
+class PreparedCorpusTests(unittest.TestCase):
+    def test_cross_platform_bootstrap_writes_fresh_values_but_comparison_refuses(self):
+        baseline = gate.self_test_baseline()
+        metrics = {name: 1.0 for name in gate.DEFAULT_METRICS}
+        run = gate.RunData(Path("fixture.csv"), "hugo", metrics, {}, True,
+                           {"measurement_profile": MEASURED_PROFILE})
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "aft"
+            binary.write_bytes(b"fixture")
+            args = SimpleNamespace(self_test=False, baseline=root / "baseline.json", write_baseline_from=None,
+                                   write_baseline=True, ignore_platform=False, repo="hugo", cache_dir=root / "cache",
+                                   results_dir=root / "results", aft_binary=None, budget_min=15)
+            with patch.object(gate, "parse_args", return_value=args), \
+                    patch.object(gate, "load_baseline", return_value=baseline), \
+                    patch.object(gate, "current_platform", return_value="darwin-arm64"), \
+                    patch.object(gate, "runner_facts", return_value="Mac fixture"), \
+                    patch.object(gate, "ensure_release_binary", return_value=binary), \
+                    patch.object(gate, "prepare_repositories", return_value={}), \
+                    patch.object(gate, "run_matrix_once", return_value=([run], root / "fixture.csv")) as measure, \
+                    patch.object(gate, "run_command", return_value=SimpleNamespace(stdout="a" * 40)):
+                self.assertEqual(gate.main(), 0)
+                self.assertEqual(measure.call_count, 2)
+                written = json.loads(args.baseline.read_text())
+                self.assertEqual(written["measured_on"]["platform"], "darwin-arm64")
+                self.assertEqual(written["repos"]["hugo"]["metrics"]["peak_rss_mb"]["value"], 1.0)
+                args.write_baseline = False
+                self.assertEqual(gate.main(), 2)
+                self.assertEqual(measure.call_count, 2, "comparison must stop before any cross-platform measurement")
+
+    def test_measured_path_cannot_fetch_or_generate_a_missing_pin(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(gate, "run_command") as command:
+            root = Path(temporary)
+            with self.assertRaisesRegex(RuntimeError, "not prepared"):
+                gate.git_clone_pinned({"sha": "a" * 40}, "hugo", root, prepared_only=True)
+            with self.assertRaisesRegex(RuntimeError, "not prepared"):
+                gate.ensure_synthetic_tree(root, prepared_only=True)
+            command.assert_not_called()
+
+    def test_existing_pin_only_checks_identity_without_fetch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / "repos" / ("a" * 40) / "hugo"
+            destination.mkdir(parents=True)
+            replies = [SimpleNamespace(returncode=0, stdout="a" * 40),
+                       SimpleNamespace(returncode=0, stdout="true")]
+            with patch.object(gate, "run_command", side_effect=replies) as command:
+                self.assertEqual(gate.git_clone_pinned({"sha": "a" * 40}, "hugo", root, prepared_only=True), destination)
+            self.assertEqual([call.args[0][-1] for call in command.call_args_list], ["HEAD", "--is-shallow-repository"])
 
 
 class ColdIndexMeasurementTests(unittest.TestCase):

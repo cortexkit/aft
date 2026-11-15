@@ -36,7 +36,7 @@ CSV_FIELDS: tuple[str, ...] = (
     "callgraph_status", "index_store_build_ready_ms", "callgraph_store_build_ready_ms",
     "search_first_query_latency_ms", "callgraph_first_query_latency_ms", "callgraph_refresh_ms", "waiting_on",
     "edit_apply_ms", "edit_backup_ms", "edit_write_ms", "edit_backup_phases", "edit_write_phases",
-    "peak_rss_mb", "peak_rss_sampled_mb", "peak_rss_hwm_mb", "hwm_by_phase", "cpu_s", "cpu_precision", "disk_write_bytes", "outcome", "log_path", "gaps", "measurement_profile",
+    "peak_rss_mb", "peak_rss_sampled_mb", "peak_rss_hwm_mb", "peak_rss_source", "peak_rss_ru_maxrss_mb", "hwm_by_phase", "cpu_s", "cpu_precision", "disk_write_bytes", "outcome", "log_path", "gaps", "measurement_profile",
 )
 TEXT_SUFFIXES = {
     ".c", ".cc", ".cpp", ".cs", ".go", ".h", ".hpp", ".java", ".js", ".jsx", ".kt",
@@ -62,6 +62,38 @@ class NdjsonError(RuntimeError):
     pass
 
 
+class RusagePopen(subprocess.Popen):
+    """Retain wait4 usage for this child, even if poll reaps it before wait.
+
+    Popen normally discards rusage. Both reaping paths must use wait4 so a fast
+    exit cannot lose the process's peak or substitute cumulative child usage.
+    Only the Darwin transport uses this POSIX-specific subclass.
+    """
+
+    child_usage: Any = None
+    _waitpid_lock: Any
+
+    def _try_wait(self, wait_flags):
+        try:
+            pid, status, usage = os.wait4(self.pid, wait_flags)
+        except ChildProcessError:
+            return self.pid, 0
+        if pid == self.pid:
+            self.child_usage = usage
+        return pid, status
+
+    def _internal_poll(self, _deadstate=None):
+        if self.returncode is None and self._waitpid_lock.acquire(False):
+            try:
+                if self.returncode is None:
+                    pid, status = self._try_wait(os.WNOHANG)
+                    if pid == self.pid:
+                        getattr(self, "_handle_exitstatus")(status)
+            finally:
+                self._waitpid_lock.release()
+        return self.returncode
+
+
 class NdjsonClient:
     """Minimal request/response client that ignores asynchronous standalone frames."""
 
@@ -69,7 +101,8 @@ class NdjsonClient:
         env = os.environ.copy()
         env["AFT_STORAGE_DIR"] = str(storage)
         env.setdefault("RUST_LOG", "info")
-        self.proc = subprocess.Popen(
+        process_type = RusagePopen if sys.platform == "darwin" else subprocess.Popen
+        self.proc = process_type(
             [str(binary)],
             cwd=str(root),
             env=env,
@@ -137,9 +170,12 @@ class ProcessSampler:
     # between two polls is invisible to it. VmHWM is exact and monotonic, which
     # makes the difference between the two a direct measure of how much the
     # poll missed. The gate uses this kernel peak, with the sampled maximum
-    # retained as a diagnostic. Linux is the only platform this gate compares on.
+    # retained as a diagnostic. Darwin uses the direct child's wait4 ru_maxrss
+    # after exit, not physical footprint (which includes non-resident charges).
     peak_rss_hwm_kb: int = 0
     hwm_available: bool = False
+    peak_rss_ru_maxrss_bytes: int | None = None
+    child_cpu_collected: bool = False
     cpu_seconds: float | None = None
     disk_write_bytes: int | None = None
     gaps: list[str] = field(default_factory=list)
@@ -148,7 +184,23 @@ class ProcessSampler:
 
     @property
     def cpu_precision(self) -> str:
+        if self.child_cpu_collected:
+            return "0.000001-second"
         return "0.01-second" if sys.platform.startswith("linux") else "whole-second"
+
+    def collect_child_usage(self) -> None:
+        if sys.platform != "darwin":
+            return
+        usage = getattr(self.proc, "child_usage", None)
+        if usage is None or usage.ru_maxrss <= 0:
+            self._add_gap("macOS peak resident memory unavailable: direct-child wait4 rusage missing")
+            self.cpu_seconds = None
+            return
+        # Darwin reports bytes, unlike Linux's KiB. This is the AFT child's
+        # own RSS maximum, not a delta of RUSAGE_CHILDREN across unrelated work.
+        self.peak_rss_ru_maxrss_bytes = usage.ru_maxrss
+        self.cpu_seconds = usage.ru_utime + usage.ru_stime
+        self.child_cpu_collected = True
 
     def _add_gap(self, message: str) -> None:
         if message not in self.gaps:
@@ -757,10 +809,19 @@ def empty_row(repo: str, root: Path) -> dict[str, str]:
 def close_after_final_sample(sampler: ProcessSampler | None, client: NdjsonClient | None) -> str | None:
     if sampler is not None:
         sampler.stop()
-    return client.close() if client is not None else None
+    gap = client.close() if client is not None else None
+    if sampler is not None and hasattr(sampler, "collect_child_usage"):
+        sampler.collect_child_usage()
+    return gap
 
 
 def peak_memory_metrics(sampler: ProcessSampler) -> dict[str, str]:
+    if sys.platform == "darwin":
+        peak = getattr(sampler, "peak_rss_ru_maxrss_bytes", None)
+        value = f"{peak / 1024 / 1024:.1f}" if peak and peak > 0 else "n/a"
+        return {"peak_rss_mb": value, "peak_rss_ru_maxrss_mb": value,
+                "peak_rss_source": "darwin-wait4-ru_maxrss-bytes", "peak_rss_hwm_mb": "n/a",
+                "peak_rss_sampled_mb": f"{sampler.peak_rss_kb / 1024:.1f}"}
     # Only the kernel peak captures a spike that falls between resource polls.
     # Require a successful final read while AFT is alive, before closing stdin;
     # a missing HWM must not become a zero or fall back to the sampled maximum.
@@ -954,7 +1015,8 @@ def run_repo(binary: Path, script_dir: Path, root: Path, storage: Path, budget_s
         if sampler is not None:
             gaps.extend(sampler.gaps)
             row.update(peak_memory_metrics(sampler))
-            row["cpu_s"] = f"{sampler.cpu_seconds:.2f}" if sampler.cpu_seconds is not None else "n/a"
+            row["cpu_s"] = (f"{sampler.cpu_seconds:.6f}" if sys.platform == "darwin" else f"{sampler.cpu_seconds:.2f}") if sampler.cpu_seconds is not None else "n/a"
+            row["peak_rss_source"] = row.get("peak_rss_source", "n/a") if sys.platform == "darwin" else "linux-proc-VmHWM-kib"
             row["cpu_precision"] = sampler.cpu_precision
             row["disk_write_bytes"] = str(sampler.disk_write_bytes) if sampler.disk_write_bytes is not None else "n/a"
     metrics = census_metrics(script_dir, root, storage, git, gaps)
@@ -1012,10 +1074,10 @@ def write_markdown(path: Path, rows: list[dict[str, str]], scratch: Path) -> Non
         gaps = [(row["repo"], row["gaps"]) for row in rows if row["gaps"] != "none"]
         handle.write("\n## Peak memory by build phase\n\n")
         handle.write("High-water growth charged to the phase that took it, largest first. `callgraph_stage/search_stage`, with `+tier2:<category>` where an inspect category overlapped, so a phase that only exists while two builds run at once is named as one.\n\n")
-        handle.write("| Repo | Gated kernel peak RSS MB | Diagnostic sampled peak MB | High-water growth by phase |\n| --- | ---: | ---: | --- |\n")
+        handle.write("| Repo | Gated peak RSS MB | Peak source | Diagnostic sampled peak MB | High-water growth by phase (Linux only) |\n| --- | ---: | --- | ---: | --- |\n")
         for row in rows:
             handle.write(
-                f"| {row['repo']} | {row['peak_rss_mb']} | {row.get('peak_rss_sampled_mb', 'n/a')} | {row.get('hwm_by_phase', 'n/a')} |\n"
+                f"| {row['repo']} | {row['peak_rss_mb']} | {row.get('peak_rss_source', 'n/a')} | {row.get('peak_rss_sampled_mb', 'n/a')} | {row.get('hwm_by_phase', 'n/a')} |\n"
             )
         handle.write("\n## Gaps\n\n")
         handle.write(f"- Scratch root: `{scratch}`.\n")
