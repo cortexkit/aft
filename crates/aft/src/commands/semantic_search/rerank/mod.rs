@@ -678,6 +678,16 @@ fn streamed_candidate_text(project_root: &Path, result: &CandidateResult, prose:
                         + usize::from(
                             range.start >= offset + bytes.len() && bytes.ends_with(b"\n"),
                         );
+                    let at = range.start - offset;
+                    // A leading invalid continuation run floors back onto the
+                    // preceding LF, which belongs to the preceding source line.
+                    if offset > 0
+                        && at < bytes.len()
+                        && bytes[0] & 0xc0 == 0x80
+                        && floor_raw_boundary(bytes, at) == 0
+                    {
+                        raw_line = index.saturating_sub(1);
+                    }
                 }
                 let selected = selected_line(bytes, offset, range);
                 if !selected.is_empty() && !saw_code {
