@@ -541,7 +541,7 @@ impl<S: SliceSource> SliceReader<S> {
                     edge.target_symbol().to_string(),
                 );
                 let (target_node, target) = resolved_targets
-                    .entry((key.clone(), edge.lookup()))
+                    .entry((key.clone(), matches!(edge.lookup(), TargetLookup::Scoped)))
                     .or_insert_with(|| self.target_of(&key.0, &key.1, edge.lookup()));
                 grouped.get_mut(&key).expect("requested target").push((
                     CallerKey {
