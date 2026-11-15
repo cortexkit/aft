@@ -1234,3 +1234,138 @@ fn probe_pool_workload() {
     let probes: usize = totals.iter().map(|row| row[3]).sum();
     println!("PROBE_LOAD calls/directory/traversal/dispatch={totals:?} wall_s={wall:.6} cpu_s={cpu:.6} spawns={spawns} threads_per_s={:.3} cpu_us_per_probe={:.3}", spawns as f64 / wall, cpu * 1_000_000.0 / probes as f64);
 }
+#[test]
+fn audit1432_skip_disclosure_does_not_mutate_error_or_cancelled_replies() {
+    with_budget(Some(Budget::after(Duration::from_secs(30))), || {
+        note_large_read_skip(Path::new("large.log"));
+        for code in ["test_error", "request_cancelled"] {
+            let mut response = Response::error("omission-error", code, "original failure");
+            let original = serde_json::to_value(&response).unwrap();
+            disclose_large_read_skips(&mut response);
+            assert_eq!(serde_json::to_value(response).unwrap(), original, "{code}");
+        }
+    });
+}
+
+#[test]
+fn audit1432_zero_result_search_keeps_no_results_and_independent_honesty_notes() {
+    with_budget(Some(Budget::after(Duration::from_secs(30))), || {
+        note_large_read_skip(Path::new("large.log"));
+        let mut response = Response::success(
+            "empty-search",
+            serde_json::json!({
+                "text":"", "results":[], "more_available":true, "engine_capped":true
+            }),
+        );
+        disclose_large_read_skips(&mut response);
+        let text = crate::subc_format::format_response("search", &response, false);
+        for expected in [
+            "No results.",
+            "more results available",
+            "enumeration capped",
+            "large.log",
+            crate::large_read::WHOLE_READ_SKIP_REASON,
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}: {text}");
+        }
+    });
+}
+
+#[test]
+fn audit1432_grep_without_producer_text_still_renders_named_skips() {
+    with_budget(Some(Budget::after(Duration::from_secs(30))), || {
+        note_large_read_skip(Path::new("large.log"));
+        let mut response = Response::success("textless-grep", serde_json::json!({"matches":[]}));
+        disclose_large_read_skips(&mut response);
+        response.data.as_object_mut().unwrap().remove("text");
+        let text = crate::subc_format::format_response("grep", &response, false);
+        assert!(text.contains("large.log"), "{text}");
+        assert!(
+            text.contains(crate::large_read::WHOLE_READ_SKIP_REASON),
+            "{text}"
+        );
+    });
+}
+
+#[test]
+fn audit1432_walk_gap_precedes_the_entire_skipped_files_block() {
+    with_budget(Some(Budget::after(Duration::from_secs(30))), || {
+        let budget = current().unwrap();
+        budget.walk_partial.store(true, Ordering::Release);
+        budget
+            .walk_time_limit_reached
+            .store(true, Ordering::Release);
+        for at in 0..23 {
+            note_large_read_skip(Path::new(&format!("large-{at:02}.log")));
+        }
+        let response = finish_response(Response::success(
+            "walk-and-skips",
+            serde_json::json!({"text":"rows"}),
+        ));
+        let text = response.data["text"].as_str().unwrap();
+        assert!(
+            text.find(WALK_PARTIAL_GAP).unwrap()
+                < text
+                    .find(crate::large_read::WHOLE_READ_SKIP_REASON)
+                    .unwrap(),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("shown 20 of 23 files (cap) · narrow: path"),
+            "{text}"
+        );
+    });
+}
+
+#[test]
+fn audit1432_skip_collector_is_order_independent_and_deduplicates_paths_with_both_reasons() {
+    let collect = |reverse: bool| {
+        with_skip_disclosure(|| {
+            let floor = || {
+                for at in 0..23 {
+                    note_skipped_file(Path::new(&format!("file-{at:02}.log")), "denied_floor");
+                }
+            };
+            let ceiling = || {
+                for at in 0..23 {
+                    note_large_read_skip(Path::new(&format!("file-{at:02}.log")));
+                }
+            };
+            if reverse {
+                ceiling();
+                floor();
+            } else {
+                floor();
+                ceiling();
+            }
+            finish_response(Response::success(
+                "mixed-order",
+                serde_json::json!({"text":"rows"}),
+            ))
+        })
+    };
+    let first = collect(false);
+    let second = collect(true);
+    assert_eq!(
+        serde_json::to_value(&first).unwrap(),
+        serde_json::to_value(second).unwrap()
+    );
+    let files = first.data["skipped_files"].as_array().unwrap();
+    assert_eq!(files.len(), 20);
+    assert_eq!(first.data["skipped_files_remaining"], 3);
+    assert_eq!(first.data["skipped_files_list_envelope"]["shown"], 20);
+    assert_eq!(
+        first.data["skipped_files_list_envelope"]["total"]["value"],
+        23
+    );
+    assert_eq!(files[0]["file"], "file-00.log");
+    let reasons = files[0]["reasons"].as_array().unwrap();
+    assert!(reasons.contains(&serde_json::json!("denied_floor")));
+    assert!(reasons.contains(&serde_json::json!(
+        crate::large_read::WHOLE_READ_SKIP_REASON
+    )));
+    assert!(first.data["text"]
+        .as_str()
+        .unwrap()
+        .ends_with("shown 20 of 23 files (cap) · narrow: path"));
+}

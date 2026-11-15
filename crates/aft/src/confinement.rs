@@ -138,17 +138,19 @@ impl Fence {
 
 /// Carry omission reporting through the same helper-thread scope as read policy.
 pub(crate) fn with_floor_disclosure(run: impl FnOnce() -> Response) -> Response {
+    crate::bounded_io::with_skip_disclosure(|| with_floor_disclosure_inner(run))
+}
+
+fn with_floor_disclosure_inner(run: impl FnOnce() -> Response) -> Response {
     let omissions = Arc::new(parking_lot::Mutex::new(FloorOmissions::default()));
     let mut fence = capture();
     fence.floor_omissions = Some(omissions.clone());
-    let mut response = inherit(fence, run);
+    let response = inherit(fence, run);
     let omissions = omissions.lock();
     if !omissions.paths.is_empty() {
-        response.data["skipped_files"] =
-            serde_json::json!(omissions.paths.iter().map(|path| {
-            serde_json::json!({"file": path.display().to_string(), "reason": "denied_floor"})
-        }).collect::<Vec<_>>());
-        response.data["complete"] = serde_json::json!(false);
+        for path in &omissions.paths {
+            crate::bounded_io::note_skipped_file(path, "denied_floor");
+        }
     }
     response
 }

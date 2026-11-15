@@ -81,6 +81,38 @@ fn has_floor_skip(response: &Response, path: &Path) -> bool {
         })
 }
 
+#[test]
+fn audit1432_mixed_floor_and_ceiling_grep_preserves_both_omissions() {
+    let f = Fixture::new();
+    let large = f._root.path().join("large.log");
+    let mut bytes = b"padding\n".repeat((17 << 20) / 8);
+    bytes.extend_from_slice(b"only_at_tail\n");
+    std::fs::write(&large, bytes).unwrap();
+    let response = super::grep::handle_grep(
+        &request("grep", json!({"pattern":"(?s)only_at_tail.*"})),
+        &f.ctx,
+    );
+    assert!(response.success, "{response:?}");
+    assert!(
+        has_floor_skip(&response, f.store.parent().unwrap()),
+        "{response:?}"
+    );
+    let skipped = response.data["skipped_files"].as_array().unwrap();
+    assert!(
+        skipped.iter().any(|entry| entry["file"] == json!(large)
+            && entry["reason"] == crate::large_read::WHOLE_READ_SKIP_REASON),
+        "{response:?}"
+    );
+    assert_eq!(response.data["complete"], false);
+    assert_eq!(response.data["skipped_files_remaining"], 0);
+    let text = response.data["text"].as_str().unwrap();
+    assert!(text.contains("denied_floor"), "{text}");
+    assert!(
+        text.contains(crate::large_read::WHOLE_READ_SKIP_REASON),
+        "{text}"
+    );
+}
+
 fn request(command: &str, params: serde_json::Value) -> RawRequest {
     RawRequest {
         id: "storage-floor".into(),

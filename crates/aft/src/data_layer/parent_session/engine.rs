@@ -159,6 +159,10 @@ fn render_text(query: &str, page: &[Value], more_available: bool) -> String {
 }
 
 pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession) -> Response {
+    crate::bounded_io::with_skip_disclosure(|| search_with_disclosure(req, ctx, session))
+}
+
+fn search_with_disclosure(req: &RawRequest, ctx: &AppContext, session: &ParentSession) -> Response {
     let Some(query) = req.params.get("query").and_then(Value::as_str) else {
         return Response::error(
             &req.id,
@@ -273,6 +277,7 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
             .collect::<Vec<_>>(),
         None => vec![None; children.len()],
     };
+    let skip_scope = crate::bounded_io::capture();
     let run = |child: &Child,
                checkout: Option<&Arc<crate::data_layer::runtime::DataCheckout>>,
                lent: Option<crate::semantic_index::EmbeddingModel>,
@@ -303,14 +308,14 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
         let search = || {
             crate::commands::semantic_search::handle_parent_child_search(&child_req, &engine.ctx)
         };
-        let response = match vector {
+        let response = crate::bounded_io::with_budget(skip_scope.clone(), || match vector {
             Some(vector) => crate::commands::semantic_search::with_precomputed_query_vector(
                 query,
                 vector.clone(),
                 search,
             ),
             None => search(),
-        };
+        });
         let returned = if lending {
             engine.ctx.semantic_embedding_model().lock().take()
         } else {

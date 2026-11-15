@@ -645,7 +645,10 @@ fn cancelled_search_response_from_id(request_id: &str) -> Response {
 }
 
 pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
-    let _disclosure = crate::bounded_io::enter_disclosure_if_absent();
+    crate::bounded_io::with_skip_disclosure(|| handle_semantic_search_with_disclosure(req, ctx))
+}
+
+fn handle_semantic_search_with_disclosure(req: &RawRequest, ctx: &AppContext) -> Response {
     let _cost = telemetry::CostRequest::start(&req.id);
     let mut response = handle_semantic_search_with_disk_fallback(req, ctx, false);
     if let Some(reason) = ctx.cache_unavailable_reason() {
@@ -662,14 +665,16 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
     disclose_skipped_folders(req, ctx, &mut response);
-    crate::bounded_io::disclose_large_read_skips(&mut response);
     response
 }
 
 /// Parent-folder children may have no publication yet. Their reader engines
 /// must still run the bounded exact/lexical scan while the indexes warm.
 pub(crate) fn handle_parent_child_search(req: &RawRequest, ctx: &AppContext) -> Response {
-    let _disclosure = crate::bounded_io::enter_disclosure_if_absent();
+    crate::bounded_io::with_skip_disclosure(|| handle_parent_child_search_with_disclosure(req, ctx))
+}
+
+fn handle_parent_child_search_with_disclosure(req: &RawRequest, ctx: &AppContext) -> Response {
     let config = ctx.config();
     let mut response = handle_semantic_search_with_disk_fallback(
         req,
@@ -677,7 +682,6 @@ pub(crate) fn handle_parent_child_search(req: &RawRequest, ctx: &AppContext) -> 
         config.indexes.trigram || config.indexes.semantic,
     );
     disclose_skipped_folders(req, ctx, &mut response);
-    crate::bounded_io::disclose_large_read_skips(&mut response);
     response
 }
 

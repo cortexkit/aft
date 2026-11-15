@@ -1943,6 +1943,7 @@ fn format_grep(data: &Value) -> String {
         .and_then(|v| serde_json::from_value::<crate::list_envelope::ListEnvelope>(v.clone()).ok());
 
     let base = if let Some(text) = data.get("text").and_then(Value::as_str) {
+        let text = crate::bounded_io::strip_skipped_files_text(text, data);
         if envelope.is_some() {
             text.replace(" (capped)", "")
         } else {
@@ -2000,7 +2001,7 @@ fn format_grep(data: &Value) -> String {
     };
 
     let base = if data.get("skipped_files_list_envelope").is_some() {
-        base
+        crate::bounded_io::append_skipped_files_text(base, data)
     } else {
         append_ast_skipped_files(base, data.get("skipped_files"))
     };
@@ -2436,9 +2437,15 @@ fn format_search(data: &Value) -> String {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
     {
+        let text = crate::bounded_io::strip_skipped_files_text(text, data);
         match note {
             Some(n) => format!("{text}\n{n}"),
             None => text.to_string(),
+        }
+    } else if data.get("skipped_files_list_envelope").is_some() {
+        match semantic_honesty_note(data) {
+            Some(note) => format!("No results.\n{note}"),
+            None => "No results.".to_string(),
         }
     } else if envelope.is_some() {
         match note {
@@ -2449,6 +2456,7 @@ fn format_search(data: &Value) -> String {
         semantic_honesty_note(data).unwrap_or_else(|| "No results.".to_string())
     };
 
+    let base = crate::bounded_io::append_skipped_files_text(base, data);
     if let Some(env) = envelope {
         if let Some(trailer) = render_envelope_trailer(&env) {
             if base.is_empty() {

@@ -139,7 +139,7 @@ pub(crate) struct Budget {
     /// A read stall alone does not mean the walk reached its own deadline.
     walk_time_limit_reached: Arc<AtomicBool>,
     walk_gap: Arc<Mutex<Option<String>>>,
-    large_read_skips: Arc<Mutex<std::collections::BTreeSet<PathBuf>>>,
+    large_read_skips: Arc<Mutex<SkipCollector>>,
     directories: Arc<Mutex<HashMap<PathBuf, Arc<Probe>>>>,
     traversable: Arc<Mutex<HashSet<PathBuf>>>,
     permissions: Arc<Mutex<Vec<PermissionObservation>>>,
@@ -157,6 +157,12 @@ pub(crate) struct Budget {
     access_budget: Duration,
     #[cfg(test)]
     access_budget_by_path: Arc<HashMap<PathBuf, Duration>>,
+}
+
+#[derive(Default)]
+struct SkipCollector {
+    files: std::collections::BTreeMap<PathBuf, std::collections::BTreeSet<String>>,
+    scopes: usize,
 }
 impl Budget {
     /// Collect skips for native search without adding a request deadline or
@@ -182,7 +188,9 @@ impl Budget {
             walk_partial: Arc::new(AtomicBool::new(false)),
             walk_time_limit_reached: Arc::new(AtomicBool::new(false)),
             walk_gap: Arc::new(Mutex::new(None)),
-            large_read_skips: Arc::default(),
+            large_read_skips: capture()
+                .map(|budget| budget.large_read_skips)
+                .unwrap_or_default(),
             directories: Arc::new(Mutex::new(HashMap::new())),
             traversable: Arc::new(Mutex::new(HashSet::new())),
             permissions: Arc::new(Mutex::new(Vec::new())),
@@ -457,6 +465,12 @@ fn access_error(req_id: &str, path: &Path, error: io::Error) -> Response {
 }
 
 pub(crate) fn finish_response(mut response: Response) -> Response {
+    response = finish_response_without_skips(response);
+    disclose_large_read_skips(&mut response);
+    response
+}
+
+fn finish_response_without_skips(mut response: Response) -> Response {
     if matches!(
         response.data["code"].as_str(),
         Some("denied_floor" | "path_outside_root" | "access_read_only")
@@ -472,7 +486,6 @@ pub(crate) fn finish_response(mut response: Response) -> Response {
     }) {
         return Response::error_with_data(&response.id, "macos_permission_denied", format!("macOS denied access to {}; grant ck-aft access in System Settings → Privacy & Security, then retry", folder.display()), serde_json::json!({"folder":folder,"program":"ck-aft"}));
     }
-    disclose_large_read_skips(&mut response);
     let error = current().and_then(|budget| {
         budget
             .failure
@@ -553,62 +566,155 @@ pub(crate) fn finish_response(mut response: Response) -> Response {
 /// A ceiling skip is a coverage gap, not a sticky I/O failure: other files
 /// in the same request must still be readable.
 pub(crate) fn note_large_read_skip(path: &Path) {
+    note_skipped_file(path, crate::large_read::WHOLE_READ_SKIP_REASON);
+}
+
+pub(crate) fn note_skipped_file(path: &Path, reason: &str) {
     if let Some(budget) = capture() {
         budget
             .large_read_skips
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(path.to_path_buf());
+            .files
+            .entry(path.to_path_buf())
+            .or_default()
+            .insert(reason.to_string());
     }
 }
 
+/// Keep all omission categories until the outer command has finished. Nested
+/// commands and workers that inherit the budget share the collector rather
+/// than adding a response field.
+pub(crate) fn with_skip_disclosure(run: impl FnOnce() -> Response) -> Response {
+    let _scope = enter_disclosure_if_absent();
+    let budget = capture().unwrap();
+    let root = {
+        let mut skips = budget
+            .large_read_skips
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = skips.scopes == 0;
+        skips.scopes += 1;
+        root
+    };
+    struct Depth(Arc<Mutex<SkipCollector>>);
+    impl Drop for Depth {
+        fn drop(&mut self) {
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).scopes -= 1;
+        }
+    }
+    let depth = Depth(budget.large_read_skips);
+    let mut response = run();
+    drop(depth);
+    if root {
+        disclose_large_read_skips(&mut response);
+    }
+    response
+}
+
 pub(crate) fn disclose_large_read_skips(response: &mut Response) {
-    if response.data.get("skipped_files").is_some() {
+    if !response.success {
         return;
     }
     let Some(budget) = capture() else { return };
-    let skipped = budget
+    let mut skipped = budget
         .large_read_skips
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if skipped.is_empty() {
+    if skipped.scopes != 0 {
         return;
     }
-    let total = skipped.len();
-    let names = skipped.iter().take(20).collect::<Vec<_>>();
-    let reason = crate::large_read::WHOLE_READ_SKIP_REASON;
+    if let Some(existing) = response.data["skipped_files"].as_array() {
+        for entry in existing {
+            if let (Some(file), Some(reason)) = (entry["file"].as_str(), entry["reason"].as_str()) {
+                let reasons = skipped.files.entry(PathBuf::from(file)).or_default();
+                if let Some(all) = entry["reasons"].as_array() {
+                    reasons.extend(
+                        all.iter()
+                            .filter_map(|reason| reason.as_str().map(str::to_string)),
+                    );
+                } else {
+                    reasons.insert(reason.to_string());
+                }
+            }
+        }
+    }
+    if skipped.files.is_empty() {
+        return;
+    }
+    let total = skipped.files.len();
+    let names = skipped.files.iter().take(20).map(|(path, reasons)| {
+        let mut entry = serde_json::json!({"file":path,"reason":reasons.iter().cloned().collect::<Vec<_>>().join("; ")});
+        if reasons.len() > 1 { entry["reasons"] = serde_json::json!(reasons); }
+        entry
+    }).collect::<Vec<_>>();
     response.data["complete"] = serde_json::json!(false);
-    response.data["skipped_files"] = serde_json::json!(names
-        .iter()
-        .map(|path| serde_json::json!({"file": path, "reason": reason}))
-        .collect::<Vec<_>>());
+    response.data["skipped_files"] = serde_json::json!(names);
     response.data["skipped_files_remaining"] = serde_json::json!(total - names.len());
     let envelope = crate::list_surfaces::search::skipped_files_envelope(names.len(), total);
     response.data["skipped_files_list_envelope"] = serde_json::json!(envelope);
-    let mut gap = format!(
-        "{reason}\n{}",
-        names
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-    let trailer = crate::ndjson_text::build_ndjson_text(
-        "",
-        &response.data,
-        Some("payload.skipped_files"),
-        false,
-    );
+    // Leave empty search text for format_search to supply "No results." and
+    // notes about capped enumeration, more available rows and degraded search.
+    if let Some(text) = response.data["text"]
+        .as_str()
+        .filter(|text| !text.is_empty())
+    {
+        response.data["text"] =
+            serde_json::json!(append_skipped_files_text(text.to_string(), &response.data));
+    }
+}
+
+pub(crate) fn append_skipped_files_text(text: String, data: &serde_json::Value) -> String {
+    let gap = skipped_files_text(data);
+    if gap.is_empty() {
+        return text;
+    }
+    let text = strip_skipped_files_text(&text, data);
+    match text.rsplit_once("\n\n") {
+        Some((body, trailer)) if trailer.starts_with("shown ") => {
+            format!("{body}\n\n{gap}\n\n{trailer}")
+        }
+        _ if text.is_empty() => gap,
+        _ => format!("{text}\n\n{gap}"),
+    }
+}
+
+pub(crate) fn strip_skipped_files_text(text: &str, data: &serde_json::Value) -> String {
+    let gap = skipped_files_text(data);
+    if gap.is_empty() {
+        return text.to_string();
+    }
+    if text == gap {
+        return String::new();
+    }
+    text.replacen(&format!("\n\n{gap}"), "", 1)
+}
+
+fn skipped_files_text(data: &serde_json::Value) -> String {
+    if data.get("skipped_files_list_envelope").is_none() {
+        return String::new();
+    }
+    let Some(files) = data["skipped_files"].as_array() else {
+        return String::new();
+    };
+    let mut groups = std::collections::BTreeMap::<&str, Vec<&str>>::new();
+    for file in files {
+        if let (Some(path), Some(reason)) = (file["file"].as_str(), file["reason"].as_str()) {
+            groups.entry(reason).or_default().push(path);
+        }
+    }
+    let mut gap = groups
+        .into_iter()
+        .map(|(reason, names)| format!("{reason}\n{}", names.join("\n")))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let trailer =
+        crate::ndjson_text::build_ndjson_text("", data, Some("payload.skipped_files"), false);
     if !trailer.is_empty() {
         gap.push_str("\n\n");
         gap.push_str(&trailer);
     }
-    let text = response.data["text"].as_str().unwrap_or_default();
-    response.data["text"] = serde_json::json!(match text.rsplit_once("\n\n") {
-        Some((body, trailer)) if trailer.starts_with("shown ") =>
-            format!("{body}\n\n{gap}\n\n{trailer}"),
-        _ => format!("{text}\n\n{gap}"),
-    });
+    gap
 }
 thread_local! {
     static CURRENT: RefCell<Option<Budget>> = const { RefCell::new(None) };
@@ -767,6 +873,14 @@ thread_local! {
 }
 
 pub(crate) fn command(
+    req: &RawRequest,
+    ctx: &AppContext,
+    work: impl FnOnce(&RawRequest, &AppContext) -> Response,
+) -> Response {
+    with_skip_disclosure(|| command_without_skip_scope(req, ctx, work))
+}
+
+fn command_without_skip_scope(
     req: &RawRequest,
     ctx: &AppContext,
     work: impl FnOnce(&RawRequest, &AppContext) -> Response,
