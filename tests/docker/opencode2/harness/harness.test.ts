@@ -1535,10 +1535,10 @@ describe("source-of-truth derivation", () => {
     expect(() => validateT6(matrix, fixtures, [surface])).toThrow("unknown T6 surface");
   });
 
-  test("all fifteen list surfaces and route requirements come from the Rust registry", async () => {
+  test("all sixteen list surfaces and route requirements come from the Rust registry", async () => {
     const repo = join(import.meta.dir, "../../../..");
     const surfaces = await deriveListSurfaces(repo);
-    expect(surfaces).toHaveLength(15);
+    expect(surfaces).toHaveLength(16);
     expect(surfaces.find((surface) => surface.id === "ast_search.matches.payload.matches"))
       .toMatchObject({
         owner: "ast_search",
@@ -1547,7 +1547,10 @@ describe("source-of-truth derivation", () => {
         reasons: ["budget"],
         narrow: ["paths", "globs", "pattern"],
       });
-    expect(surfaces.filter((surface) => surface.requires == null)).toHaveLength(14);
+    expect(surfaces.filter((surface) => surface.requires == null)).toHaveLength(15);
+    expect(
+      surfaces.find((surface) => surface.id === "callgraph.callers.payload.unresolved_callers.sites"),
+    ).toMatchObject({ owner: "callgraph", unit: "sites", reasons: ["cap"], narrow: ["includeTests"] });
     expect(surfaces.find((surface) => surface.id === "bash.changed_files.bash.changed_files"))
       .toMatchObject({ owner: "bash", unit: "files" });
     expect(surfaces.find((surface) => surface.id === "bash.diff_lines.bash.diff_lines"))
