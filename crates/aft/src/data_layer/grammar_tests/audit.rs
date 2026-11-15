@@ -1445,6 +1445,7 @@ isolated!(
     || {
         let f = fixture(true);
         let bad = write(&f.root, "bad.luau", "function broken()\n return @@@\nend\n");
+        let valid = write(&f.root, "valid.luau", SOURCE);
         let cold = ask(&f.ctx, "outline", json!({"file":f.root,"files":true}));
         assert!(cold.success, "{:?}", cold.data);
         assert_eq!(cold.data["complete"], false);
@@ -1452,7 +1453,7 @@ isolated!(
             cold.data["skipped_files"],
             json!([{"file":"bad.luau","reason":"parse_error"}])
         );
-        assert_eq!(cold.data["content_files"], json!([]));
+        assert_eq!(cold.data["content_files"], json!([valid]));
 
         let checkout = f.ctx.data_checkout().unwrap();
         checkout.wait_for_memory_profile_idle_for_test();
@@ -1467,10 +1468,11 @@ isolated!(
         let generation = cache.write().unwrap().reset();
         let report =
             crate::data_layer::outline::prewarm(&view, &cache, generation, &|| false).unwrap();
-        assert_eq!(report.loaded, 1, "{report:?}");
+        assert_eq!(report.loaded, 2, "{report:?}");
         let parser =
             crate::parser::FileParser::with_symbol_cache(cache).with_dynamic_languages(true);
         assert_eq!(parser.cached_has_error(&bad), None);
+        assert_eq!(parser.cached_has_error(&valid), None);
         assert!(crate::parser::cached_symbol_count_shared(
             &f.ctx.symbol_cache(),
             &bad,
@@ -1490,6 +1492,7 @@ isolated!(
                 warm.data
             );
         }
+        assert_eq!(parser.cached_has_error(&valid), Some(false));
     }
 );
 

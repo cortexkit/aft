@@ -2261,12 +2261,19 @@ fn populate_rendered_file_symbols(
                 continue;
             }
             if let Some(count) = cached_symbol_count(ctx, &path, &metadata) {
-                if dynamic_parser.cached_has_error(&path) == Some(true) {
-                    skipped_files.push(SkippedFile::new(&entry.path, "parse_error"));
-                } else {
-                    entry.symbols = Some(count);
+                match dynamic_parser.cached_has_error(&path) {
+                    Some(true) => {
+                        skipped_files.push(SkippedFile::new(&entry.path, "parse_error"));
+                        continue;
+                    }
+                    Some(false) => {
+                        entry.symbols = Some(count);
+                        continue;
+                    }
+                    // Symbol tables loaded from index-store records have no
+                    // syntax verdict. Validate their source before using the count.
+                    None => (),
                 }
-                continue;
             }
             let symbols = crate::data_layer::grammar::prepare(ctx, &path).and_then(|_| {
                 let parsed = dynamic_parser.parse_snapshot(&path)?;
