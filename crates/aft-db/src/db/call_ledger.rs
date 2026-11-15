@@ -3356,7 +3356,6 @@ pub mod tests {
         }
     }
     #[cfg(any(test, feature = "test-support"))]
-
     /// A settle enforces the retention bounds over all of the custodian's late
     /// entries. Its reads must not depend on how large the stored results
     /// are: each unexpired result here is either about 8 KB or 18 KB, and the
@@ -3523,7 +3522,6 @@ pub mod tests {
         assert!(get(&actual, &key("running")).unwrap().is_some());
     }
     #[cfg(any(test, feature = "test-support"))]
-
     /// Wall-clock settle time on ledgers of 20 KB results, printed for a
     /// manual before-and-after comparison. Run it with
     /// `cargo test -p agent-file-tools --lib -- --ignored --nocapture settle_time_on_large_ledgers`.

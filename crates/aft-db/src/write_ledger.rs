@@ -680,7 +680,6 @@ pub mod tests {
         assert_eq!(expired, 0);
     }
     #[cfg(any(test, feature = "test-support"))]
-
     /// A fold that cannot open its transaction (in production: another
     /// process holds the write lock) must lose nothing: its bytes stay pending
     /// in memory and the next successful fold writes all of them.
