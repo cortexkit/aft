@@ -164,7 +164,7 @@ fn map_content(content: ContentKey, path: &[u8]) -> ContentKey {
     ContentKey::from_digest(aft_store::ids::Digest128::from_hash(&hash.finalize()))
 }
 
-const LUAU_OUTLINE_FAILED: &str =
+pub(super) const LUAU_OUTLINE_FAILED: &str =
     "Meaning search skipped this Luau file because AFT could not extract its outline.";
 
 fn cut_stored(
@@ -1472,6 +1472,8 @@ impl VectorPlane {
             queue
         };
         report.files_queued = queue.len();
+        #[cfg(test)]
+        super::test_gates::arrive(view.root(), super::test_gates::Point::FillSurvey);
         let per_vector = VectorSectionsBuilder::bytes_per_vector(dimensions);
         let mut embed_rows = |texts: Vec<String>| embed(texts);
         let mut queue = queue.into_iter().peekable();

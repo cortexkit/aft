@@ -14,6 +14,13 @@ use super::checkout::{Checkout, DataLayer};
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
+#[cfg(all(
+    feature = "wasm-grammars",
+    feature = "test-hooks",
+    not(all(target_os = "windows", target_arch = "aarch64"))
+))]
+mod audit;
+
 fn write(root: &Path, path: &str, bytes: impl AsRef<[u8]>) -> PathBuf {
     let path = root.join(path);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -46,6 +53,8 @@ fn ask(ctx: &AppContext, command: &str, params: Value) -> Response {
         "zoom" => crate::commands::zoom::handle_zoom(&req, ctx),
         "callers" => crate::commands::callers::handle_callers(&req, ctx),
         "impact" => crate::commands::impact::handle_impact(&req, ctx),
+        "trace_to_symbol" => crate::commands::trace_to_symbol::handle_trace_to_symbol(&req, ctx),
+        "trace_data" => crate::commands::trace_data::handle_trace_data(&req, ctx),
         _ => panic!("unhandled test command"),
     }
 }
@@ -157,6 +166,37 @@ fn luau_s4_feature_off_does_not_discover_or_request_a_grammar() {
     assert_eq!(outline.data["code"], "grammar_unavailable");
     assert_eq!(outline.data["state"], "support_disabled");
     assert_eq!(outline.data["message"], "This AFT build has no downloaded-grammar support, so Luau files can't be parsed. Use a released AFT build, or rebuild with cargo install agent-file-tools --features wasm-grammars (needs CMake 3.18 or later).");
+    assert_eq!(outline.data["complete"], false);
+    let zoom = ask(
+        &ctx,
+        "zoom",
+        json!({"file": root.join("a.luau"), "symbol": "target"}),
+    );
+    assert_eq!(zoom.data["code"], "grammar_unavailable");
+    assert_eq!(zoom.data["state"], "support_disabled");
+    assert_eq!(zoom.data["message"], outline.data["message"]);
+    assert_eq!(zoom.data["complete"], false);
+    let files = ask(&ctx, "outline", json!({"file": root, "files": true}));
+    assert!(files.success, "{:?}", files.data);
+    assert_eq!(files.data["complete"], true);
+    assert!(files.data.get("gaps").is_none());
+    assert!(files.data["text"].as_str().unwrap().contains("a.luau"));
+    let plane = super::vectors::VectorPlane::new(
+        checkout,
+        super::vectors::Producer::for_stored_model(aft_store::vector::ModelIdentity {
+            name: "feature-off".into(),
+            revision: "fixture".into(),
+            dimensions: 2,
+            normalized: false,
+            text_template: 1,
+            chunk_template: 1,
+        }),
+        1000,
+    );
+    let coverage = plane.coverage(&view).unwrap();
+    assert_eq!(coverage.files, 0);
+    assert!(coverage.pending.is_empty());
+    assert!(coverage.skipped_parses.is_empty());
 }
 
 #[cfg(all(

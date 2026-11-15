@@ -116,7 +116,61 @@ pub(super) fn extract(
     language: &str,
 ) -> Result<aft_store::content::ContentRecord, ManifestJoinError> {
     request(language)?;
-    super::content::extract(source, language)
+    #[cfg(test)]
+    if extraction_for_test(source) == Some(TestExtraction::Failure) {
+        return Err(ManifestJoinError::UnsupportedLanguage(language.into()));
+    }
+    let record = super::content::extract(source, language);
+    #[cfg(test)]
+    let record = record.map(|mut record| {
+        if extraction_for_test(source) == Some(TestExtraction::NoOutline) {
+            if let aft_store::content::RecordBody::Parsed { body, .. } = &mut record.data {
+                body.outline = None;
+            }
+        }
+        record
+    });
+    record
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum TestExtraction {
+    Failure,
+    NoOutline,
+    MarkersOnly,
+}
+
+#[cfg(test)]
+fn extraction_overrides(
+) -> &'static std::sync::Mutex<std::collections::HashMap<aft_store::ids::ContentKey, TestExtraction>>
+{
+    static OVERRIDES: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<aft_store::ids::ContentKey, TestExtraction>>,
+    > = std::sync::LazyLock::new(Default::default);
+    &OVERRIDES
+}
+
+#[cfg(test)]
+pub(super) fn extraction_for_test(source: &[u8]) -> Option<TestExtraction> {
+    extraction_overrides()
+        .lock()
+        .unwrap()
+        .get(&aft_store::ids::ContentKey::of(source))
+        .copied()
+}
+
+#[cfg(test)]
+pub(super) fn override_extraction_for_test(source: &[u8], outcome: TestExtraction) -> impl Drop {
+    struct Guard(aft_store::ids::ContentKey);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            extraction_overrides().lock().unwrap().remove(&self.0);
+        }
+    }
+    let key = aft_store::ids::ContentKey::of(source);
+    extraction_overrides().lock().unwrap().insert(key, outcome);
+    Guard(key)
 }
 
 pub(crate) fn response(

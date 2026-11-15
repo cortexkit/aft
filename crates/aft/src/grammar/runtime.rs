@@ -317,8 +317,8 @@ impl GrammarRegistry {
             .ok_or_else(|| self.unavailable(&entry))
     }
 
-    /// Called only by named-file command handlers. Stored bytes always win over
-    /// a download, including the very first qualifying call after a restart.
+    /// Called by dynamic command preparation and checkout maintenance. Stored
+    /// bytes win over a download, including the first request after a restart.
     pub fn request(self: &Arc<Self>) -> Result<Language, GrammarUnavailable> {
         #[cfg(test)]
         if let Some(error) = self.forced_unavailable.lock().clone() {

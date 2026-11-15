@@ -184,6 +184,12 @@ fn parsed_or_embedded_path(path: &[u8]) -> bool {
 /// with neither.
 #[must_use]
 pub fn language_for(path: &str, source: &[u8]) -> Option<String> {
+    #[cfg(test)]
+    if super::grammar::extraction_for_test(source)
+        == Some(super::grammar::TestExtraction::MarkersOnly)
+    {
+        return Some(format!("{MARKERS_PREFIX}{}", TodoLanguage::Lexical.name()));
+    }
     if crate::callgraph_extractor::is_resolution_input(path.as_bytes()) {
         return Some(config_language(Path::new(path)));
     }

@@ -1424,7 +1424,7 @@ impl Checkout {
                     .map_err(|error| DataError::Scan(error.to_string()))?;
                 (scanned.state, scanned.changed)
             };
-            let mut read = sink.finish()?;
+            let mut read = sink.finish();
             if retry_grammar {
                 for path in paths {
                     let Some(record) = state.get(path) else {
@@ -1835,6 +1835,8 @@ impl Checkout {
         let mut collected = sink
             .finish()
             .map_err(|error| graph_spill_error(error, &paused))?;
+        #[cfg(test)]
+        super::test_gates::arrive(self.root(), super::test_gates::Point::BuildPublication);
         // Contents too large to read are members whose text is not
         // indexed; record them so grep reports them rather than walking
         // them.
@@ -4562,7 +4564,7 @@ impl CheckoutView {
     }
 
     pub(crate) fn awaits_parse_publication(&self, path: &[u8]) -> bool {
-        if self.callgraph_pending.contains(path) {
+        if !self.published.graph_built || self.callgraph_pending.contains(path) {
             return true;
         }
         match (

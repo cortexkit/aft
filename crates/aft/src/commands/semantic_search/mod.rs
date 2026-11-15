@@ -3527,6 +3527,39 @@ fn luau_s4_callgraph_off_semantic_disclosure_is_ready_and_typed() {
     assert!(!text.contains("not yet embedded"));
 }
 
+#[cfg(all(test, feature = "wasm-grammars"))]
+#[test]
+fn luau_s4_semantic_skip_preview_retains_full_counts() {
+    let root = Path::new("/project");
+    let coverage = crate::data_layer::vectors::Coverage {
+        skipped_parses: (0..6)
+            .map(|n| {
+                (
+                    root.join(format!("file-{n}.luau")),
+                    crate::data_layer::grammar::meaning_callgraph_off_reason(),
+                )
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let gaps = CheckoutSemanticGaps::from_coverage(&coverage);
+    let mut text = String::new();
+    let mut extras = serde_json::Map::new();
+    gaps.disclose(root, &mut text, &mut extras);
+    assert_eq!(extras["complete"], false);
+    assert_eq!(
+        extras["semantic_gap"]["skipped_files"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(extras["semantic_gap"]["skipped_files_count"], 6);
+    assert_eq!(extras["semantic_gap"]["skipped_files_omitted"], 3);
+    assert!(text.contains("and 3 more"));
+    assert!(!text.ends_with("\n\n"));
+}
+
 #[derive(Clone)]
 struct PreparedEngineLane {
     kind: SearchLaneKind,

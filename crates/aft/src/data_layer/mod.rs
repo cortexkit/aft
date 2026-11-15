@@ -54,6 +54,8 @@ pub mod standing;
 pub(crate) mod subjects;
 pub mod surfaces;
 pub mod symbol_prewarm_measure;
+#[cfg(test)]
+mod test_gates;
 pub(crate) mod tools;
 pub mod trace_measure;
 pub mod vectors;

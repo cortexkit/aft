@@ -800,6 +800,11 @@ impl Work {
             let delay = *self.publication_delay.lock();
             std::thread::sleep(delay);
         }
+        #[cfg(test)]
+        super::test_gates::arrive(
+            self.checkout.root(),
+            super::test_gates::Point::DeltaPublication,
+        );
         match self.checkout.publish_changes() {
             Ok(Some(report)) => {
                 *self.many_since.lock() = None;
@@ -1525,6 +1530,11 @@ impl DataCheckout {
     #[cfg(test)]
     pub(crate) fn checkout_arc_for_test(&self) -> Arc<Checkout> {
         Arc::clone(&self.work.checkout)
+    }
+
+    #[cfg(all(test, feature = "wasm-grammars"))]
+    pub(crate) fn grammar_driver_running_for_test(&self) -> bool {
+        self.work.grammar_driving.load(Ordering::Acquire)
     }
 
     /// A checkout reusing another checkout's published call graph can serve a
