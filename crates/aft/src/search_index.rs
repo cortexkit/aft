@@ -3808,7 +3808,8 @@ fn open_grep_file_after_open(
     let mut reader =
         crate::project_content::reader_bounded(path, deadline, authorized_task_artifact)?;
     after_open();
-    let prefix = reader.chunk(Vec::new(), 1024)?;
+    let sniff_bytes = reader.size_at_open().min(1024) as usize;
+    let prefix = reader.chunk(Vec::new(), sniff_bytes)?;
     if is_binary_bytes(&prefix) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
