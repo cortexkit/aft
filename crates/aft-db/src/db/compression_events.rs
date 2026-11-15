@@ -857,13 +857,10 @@ pub fn prune_retention_once_observed(
     }))
 }
 
-#[rustfmt::skip]
-test_support_visibility! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RetentionCountPhase {
+pub enum RetentionCountPhase {
     Opening,
     Closing,
-}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
