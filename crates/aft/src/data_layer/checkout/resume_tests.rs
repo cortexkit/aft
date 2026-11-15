@@ -407,31 +407,73 @@ fn a_config_file_renamed_between_kill_and_resume_is_read_under_its_new_name() {
     );
 }
 
-#[test]
-fn a_build_never_resumes_what_another_executable_image_wrote() {
+/// The report a child build printed when it finished.
+fn child_report(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    stderr
+        .lines()
+        .find(|line| line.starts_with("CHILD BUILD FINISHED"))
+        .unwrap_or_else(|| panic!("the child finished: {stderr}"))
+        .to_string()
+}
+
+/// A build killed while running from one executable image, then resumed by
+/// a process of `exe` with `env` set: whether the resumed build adopted
+/// what the killed one left.
+fn resumed_after_an_image_change(replace_first: bool, env: &[(&str, &str)]) -> bool {
     let root = tempfile::tempdir().unwrap();
     project(root.path());
     let store = tempfile::tempdir().unwrap();
     let bin = tempfile::tempdir().unwrap();
     let exe = bin.path().join("aft-under-test");
     std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
-    // The first build runs from one image and replaces the binary at its
-    // path while it runs, as an upgrade does; it is then killed.
-    let replace = [("AFT_TEST_REPLACE_EXE", "1")];
-    killed_build_of(&exe, store.path(), root.path(), "stage.sites", &replace);
-    // The next build runs from the binary now at that path, and replaces it
-    // in turn: neither image may adopt the other's work, whatever the file
-    // at the path says.
-    let output = child(&exe, store.path(), root.path())
-        .envs(replace)
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stderr}");
-    assert!(
-        stderr.contains("resumed_records: 0,") && stderr.contains("resumed_passes: false"),
-        "nothing was resumed: {stderr}"
+    let replace: &[(&str, &str)] = if replace_first {
+        &[("AFT_TEST_REPLACE_EXE", "1")]
+    } else {
+        &[]
+    };
+    killed_build_of(&exe, store.path(), root.path(), "stage.sites", replace);
+    let report = child_report(
+        &child(&exe, store.path(), root.path())
+            .envs(env.iter().copied())
+            .output()
+            .unwrap(),
     );
+    let fresh = report.contains("resumed_records: 0,") && report.contains("resumed_passes: false");
+    let resumed =
+        !report.contains("resumed_records: 0,") && report.contains("resumed_passes: true");
+    assert!(
+        fresh || resumed,
+        "either all or nothing was resumed: {report}"
+    );
+    resumed
+}
+
+/// The killed build replaces the binary at its path while it runs, as an
+/// upgrade does; the next build runs the binary now at that path. Taking
+/// the image's identity from that path at build time, rather than from the
+/// image the process started from, would give both builds the same one.
+#[test]
+fn a_build_never_resumes_what_another_executable_image_wrote() {
+    assert!(
+        resumed_after_an_image_change(false, &[]),
+        "the same image resumes"
+    );
+    assert!(
+        !resumed_after_an_image_change(true, &[]),
+        "the replacing image's work is not resumed"
+    );
+}
+
+/// As [`a_build_never_resumes_what_another_executable_image_wrote`], with
+/// the next build replacing the binary at its path in turn before it builds.
+#[test]
+fn a_build_never_resumes_what_another_executable_image_wrote_when_both_replace() {
+    assert!(!resumed_after_an_image_change(
+        true,
+        &[("AFT_TEST_REPLACE_EXE", "1")]
+    ));
 }
 
 #[test]

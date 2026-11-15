@@ -231,9 +231,13 @@ fn main() {
         startup_phase("nonce_capture_start");
         aft::launch_nonce::capture_at_startup();
         startup_phase("nonce_capture_done");
-        aft::pinned_executable::capture_at_startup();
-        startup_phase("executable_source_captured");
     }
+    // Every mode, not only the supervised one, holds its startup executable
+    // open now (macOS): a cold build's resume checkpoints are tied to the
+    // image this process runs, which must be read before an upgrade can
+    // place another binary at the same path.
+    aft::pinned_executable::capture_at_startup();
+    startup_phase("executable_source_captured");
 
     // Only the binary embeds the per-commit revision. Declare it before CLI
     // dispatch or the subc HELLO can request the library's build provenance.
