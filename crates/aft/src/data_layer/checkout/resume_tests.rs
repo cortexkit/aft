@@ -242,6 +242,7 @@ fn a_build_killed_at_any_stage_resumes_to_the_same_publication() {
     // and passes 2-3.
     let points = [
         ("records.append:50", false, false),
+        ("records.segment", false, false),
         ("records.committed", true, false),
         ("passes.range:1", true, false),
         ("passes.committed", true, true),
@@ -623,6 +624,128 @@ fn a_build_of_a_checkout_another_build_holds_is_busy() {
     assert!(matches!(error, DataError::Busy(_)), "{error:?}");
     drop(held);
     checkout.build().unwrap();
+}
+
+/// Inputs that are not parsed files but that resolution reads: a
+/// configuration file's bytes, a symlink's target and the set of paths.
+#[test]
+fn inputs_besides_parsed_files_changed_between_kill_and_resume_are_resolved_again() {
+    let changes: [(&str, fn(&Path)); 3] = [
+        ("a configuration file's bytes", |root| {
+            write(root, "package.json", "{\"name\": \"renamed\"}\n");
+        }),
+        // Both targets hold the same bytes: only the link changes.
+        ("a symlink's target", |root| {
+            std::fs::remove_file(root.join("gen/link.txt")).unwrap();
+            std::os::unix::fs::symlink("b.txt", root.join("gen/link.txt")).unwrap();
+        }),
+        ("a path that is not parsed", |root| {
+            std::fs::rename(root.join("notes.txt"), root.join("gen/notes.txt")).unwrap();
+        }),
+    ];
+    for (what, change) in changes {
+        let root = tempfile::tempdir().unwrap();
+        project(root.path());
+        write(root.path(), "gen/a.txt", "same\n");
+        write(root.path(), "gen/b.txt", "same\n");
+        std::os::unix::fs::symlink("a.txt", root.path().join("gen/link.txt")).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        killed_build(store.path(), root.path(), "passes.committed");
+        change(root.path());
+        let (resumed, report) = build(store.path(), root.path());
+        assert!(report.resumed_records > 0, "{what}: {report:?}");
+        assert!(!report.resumed_passes, "{what}: {report:?}");
+        let reference_store = tempfile::tempdir().unwrap();
+        let (reference, _) = build(reference_store.path(), root.path());
+        assert_same(&published(&reference), &published(&resumed), what);
+    }
+}
+
+/// Each kind of damage to a checkpoint drops what it damaged, and the
+/// resumed build still publishes what a fresh build does.
+#[test]
+fn damaged_or_torn_checkpoints_are_built_again_to_the_same_publication() {
+    fn flip(path: &Path) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 1;
+        std::fs::write(path, bytes).unwrap();
+    }
+    fn tear(path: &Path) {
+        let bytes = std::fs::read(path).unwrap();
+        std::fs::write(path, &bytes[..bytes.len() / 2]).unwrap();
+    }
+    fn first(workspace: &Path, folder: &str, suffix: &str) -> PathBuf {
+        files_ending(&workspace.join(folder), suffix)
+            .into_iter()
+            .find(|path| {
+                let name = path.file_name().unwrap().to_string_lossy();
+                name.starts_with("records-") || name.starts_with("resolutions-")
+            })
+            .unwrap()
+    }
+    // Each damage, with whether the records and passes 2-3 are reused.
+    let cases: [(&str, fn(&Path, &Path), bool, bool); 7] = [
+        (
+            "a torn staging segment",
+            |w, _| tear(&first(w, "records", ".seg")),
+            false,
+            true,
+        ),
+        (
+            "a changed staging segment",
+            |w, _| flip(&first(w, "records", ".seg")),
+            false,
+            true,
+        ),
+        (
+            "a changed records table",
+            |w, _| flip(&first(w, "records", ".keys")),
+            false,
+            true,
+        ),
+        (
+            "a torn records marker",
+            |w, _| tear(&w.join("STAGE-records")),
+            false,
+            true,
+        ),
+        (
+            "a changed passes marker",
+            |w, _| flip(&w.join("STAGE-passes-2-3")),
+            true,
+            false,
+        ),
+        (
+            "a torn spooled range",
+            |w, _| tear(&first(w, "runs", "")),
+            true,
+            false,
+        ),
+        (
+            "an unreadable attempts record",
+            |_, dir| std::fs::write(dir.join("attempts"), b"torn").unwrap(),
+            false,
+            false,
+        ),
+    ];
+    let root = tempfile::tempdir().unwrap();
+    project(root.path());
+    let reference_store = tempfile::tempdir().unwrap();
+    let (reference, _) = build(reference_store.path(), root.path());
+    let expected = published(&reference);
+    drop(reference);
+    for (what, damage, records, passes) in cases {
+        let store = tempfile::tempdir().unwrap();
+        killed_build(store.path(), root.path(), "stage.sites");
+        let checkout = Checkout::bind(layer(), store.path(), family(), root.path()).unwrap();
+        let dir = builds(&checkout);
+        damage(&only_workspace(&dir), &dir);
+        let report = checkout.build().unwrap();
+        assert_eq!(report.resumed_records > 0, records, "{what}: {report:?}");
+        assert_eq!(report.resumed_passes, passes, "{what}: {report:?}");
+        assert_same(&expected, &published(&checkout), what);
+    }
 }
 
 #[test]

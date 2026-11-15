@@ -365,6 +365,7 @@ impl RecordStage {
             (format!("{FOLDER}/{name}.seg"), segment_sum),
             (format!("{FOLDER}/{name}.keys"), table_sum),
         ]);
+        resume::kill_point("records.segment");
         Ok(())
     }
 
