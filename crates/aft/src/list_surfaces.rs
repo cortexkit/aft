@@ -835,9 +835,9 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "commands/semantic_search/memo.rs",
-        enclosing_item: "digest_open_file",
-        location_or_primitive: "io::Read::take(LARGE_READ_BYTES + 1)",
-        reason: "a bounded prefix selects retained small bytes or a streamed digest of the remaining descriptor; no hash input or result is omitted",
+        enclosing_item: "digest_open_file_at_size",
+        location_or_primitive: "io::Read::take(size)",
+        reason: "small and streamed digests both stop at the descriptor's size at open; growth changes the stat and is re-digested by the next lookup, not silently accepted as a complete current-file hash",
     },
     ExclusionEntry {
         file: "commands/semantic_search/request_files.rs",
