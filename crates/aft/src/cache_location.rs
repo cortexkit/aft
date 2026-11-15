@@ -54,13 +54,16 @@ use std::time::Duration;
 
 #[cfg(test)]
 #[path = "cache_location_tests.rs"]
+#[allow(hidden_glob_reexports)]
 mod tests;
 
 #[cfg(test)]
 #[path = "gh_shim_speech/serving_tests.rs"]
+#[allow(hidden_glob_reexports)]
 mod speech_serving_tests;
 
 #[cfg(test)]
+#[allow(hidden_glob_reexports)]
 mod prune_legacy_tests {
 
     use super::*;

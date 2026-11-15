@@ -463,7 +463,7 @@ fn cache_read_stalls() -> &'static std::sync::Mutex<HashMap<PathBuf, Arc<CacheRe
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn stall_cache_reads(storage_dir: &Path) -> Arc<CacheReadStall> {
+fn stall_cache_reads(storage_dir: &Path) -> Arc<CacheReadStall> {
     let stall = Arc::new(CacheReadStall::default());
     cache_read_stalls()
         .lock()
@@ -493,7 +493,7 @@ fn stall_cache_read_if_requested(storage_dir: &Path) {
 
 /// Test hook: make one remembered failure `by` older.
 #[cfg(any(test, feature = "test-support"))]
-pub fn age_remembered_failure(key: &FailureKey, by: Duration) {
+fn age_remembered_failure(key: &FailureKey, by: Duration) {
     if let Some(remembered) = failure_memory()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -774,6 +774,7 @@ pub const SECRET_FETCH_DIR: &str = "url_secret_fetch";
 pub const SECRET_FETCH_REFUSED: &str =
     "Secret placeholder fetch refused; no request carrying the secret was sent";
 
+#[rustfmt::skip]
 test_support_visibility! {
 /// The start of the same refusals once a request carrying a key has been sent:
 /// the response (or a later hop) was refused, so the claim above would be
@@ -931,6 +932,7 @@ impl SecretFetchCancellation {
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 /// Keys the vault released during one placeholder fetch. They are kept, wiped
 /// on drop, only until the fetch returns, so every header and body read after
@@ -949,24 +951,26 @@ impl HeldKeys {
             .collect()
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     /// Hold `key` for `label`, refusing a key whose matcher would collide with
-        /// one already held (the scrubber could then write one key into a reply).
-        pub(crate) fn hold(&mut self, label: &str, key: &[u8]) -> Result<(), ScrubError> {
-            if self
-                .0
-                .iter()
-                .any(|(held, bytes)| held == label && bytes.as_slice() == key)
-            {
-                return Ok(());
-            }
-            let mut matchers = self.matchers()?;
-            matchers.push(MatcherSet::new(label, key)?);
-            Scrubber::new(matchers)?;
-            self.0
-                .push((label.to_string(), Zeroizing::new(key.to_vec())));
-            Ok(())
+    /// one already held (the scrubber could then write one key into a reply).
+    pub(crate) fn hold(&mut self, label: &str, key: &[u8]) -> Result<(), ScrubError> {
+        if self
+            .0
+            .iter()
+            .any(|(held, bytes)| held == label && bytes.as_slice() == key)
+        {
+            return Ok(());
         }
+        let mut matchers = self.matchers()?;
+        matchers.push(MatcherSet::new(label, key)?);
+        Scrubber::new(matchers)?;
+        self.0
+            .push((label.to_string(), Zeroizing::new(key.to_vec())));
+        Ok(())
+    }
     }
 
     /// `bytes` with every held key replaced by its label's placeholder.
@@ -1511,7 +1515,9 @@ fn drain_decoder(
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 /// Decide one hop of a placeholder fetch; every hop, redirects included, is
 /// evaluated as a new request.
 ///
@@ -1696,6 +1702,7 @@ fn secret_hop(
 #[cfg(any(test, feature = "test-support"))]
 thread_local! { pub static SECRET_URL_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
+#[rustfmt::skip]
 test_support_visibility! {
 struct SecretOutboundUrl(sensitive::Bytes);
 }
@@ -2855,7 +2862,9 @@ fn resolve_fetch_extension(url: &Url, content_type: &str) -> Option<(&'static st
     resolve_extension_from_content_type(content_type).map(|ext| (ext, false))
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 fn extension_from_url_path(url: &Url) -> Option<&'static str> {
     let path = url.path();
     if path.is_empty() || path == "/" {
@@ -2904,7 +2913,9 @@ fn from_hex(byte: u8) -> Option<u8> {
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 /// Dotted cache extension for a path extension that `detect_language` accepts.
 fn static_extension_for_lang_ext(ext: &str) -> Option<&'static str> {
     match ext.to_ascii_lowercase().as_str() {

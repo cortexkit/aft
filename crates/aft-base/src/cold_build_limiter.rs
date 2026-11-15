@@ -52,7 +52,9 @@ pub fn acquire_blocking_while(kind: &str, admitted: impl Fn() -> bool) -> Option
     acquire_blocking_while_with_limiter(&GLOBAL_COLD_BUILD_LIMITER, kind, admitted)
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 pub(crate) fn acquire_blocking_while_with_limiter(
     limiter: &Arc<ColdBuildLimiter>,
     kind: &str,
@@ -108,19 +110,20 @@ pub struct ColdBuildAdmissionRequest {
 }
 
 impl ColdBuildAdmissionRequest {
+    #[rustfmt::skip]
     test_support_visibility! {
     pub(crate) fn new(request_id: impl Into<String>, class: ColdBuildAdmissionClass) -> Self {
-            let request_id = request_id.into();
-            let root = request_id
-                .strip_prefix("inspect:")
-                .and_then(|value| value.rsplit_once(':').map(|(root, _)| root.to_string()));
-            Self {
-                request_id,
-                root,
-                census_root: None,
-                class,
-            }
+        let request_id = request_id.into();
+        let root = request_id
+            .strip_prefix("inspect:")
+            .and_then(|value| value.rsplit_once(':').map(|(root, _)| root.to_string()));
+        Self {
+            request_id,
+            root,
+            census_root: None,
+            class,
         }
+    }
     }
 
     pub fn for_root(
@@ -141,6 +144,7 @@ impl ColdBuildAdmissionRequest {
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 /// A structured record of a successful cold-build admission.
 ///
@@ -694,19 +698,21 @@ impl ColdBuildLimiter {
         state.events.push_back(event);
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     /// Expose recorded admissions to internal tests and harness code so they
-        /// can verify limiter behavior without parsing log output.
-        #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
-        pub(crate) fn admission_events(&self) -> Vec<ColdBuildAdmissionEvent> {
-            self.admission_state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .events
-                .iter()
-                .cloned()
-                .collect()
-        }
+    /// can verify limiter behavior without parsing log output.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+    pub(crate) fn admission_events(&self) -> Vec<ColdBuildAdmissionEvent> {
+        self.admission_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .events
+            .iter()
+            .cloned()
+            .collect()
+    }
     }
 
     /// O(1) waiter-set inspection used by Standing before its initial permit

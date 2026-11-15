@@ -91,6 +91,7 @@ use std::time::Instant;
 use std::time::SystemTime;
 
 #[cfg(test)]
+#[allow(hidden_glob_reexports)]
 mod tests {
 
     use super::*;

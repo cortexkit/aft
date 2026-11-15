@@ -68,7 +68,9 @@ fn native_identity(identity: crate::file_identity::FileIdentity) -> Option<FileI
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 fn metadata_identity(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
     #[cfg(unix)]
     {
@@ -86,6 +88,7 @@ fn metadata_identity(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
 }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 // Cached sidecar identities outlive unlinks while a database remains open.
 // Include birth time where available to distinguish recycled inodes from live
@@ -186,6 +189,7 @@ impl Opener {
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 #[derive(Debug, Default)]
 struct OpenDatabase {
@@ -194,7 +198,9 @@ struct OpenDatabase {
 }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 fn open_databases() -> &'static Mutex<BTreeMap<PathBuf, OpenDatabase>> {
     static DATABASES: OnceLock<Mutex<BTreeMap<PathBuf, OpenDatabase>>> = OnceLock::new();
     DATABASES.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -212,7 +218,9 @@ fn live_files() -> &'static RwLock<LiveFiles> {
     FILES.get_or_init(RwLock::default)
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 fn database_files(key: &Path) -> [PathBuf; 4] {
     let sidecar = |suffix| {
         let mut path = key.as_os_str().to_os_string();
@@ -228,7 +236,9 @@ fn database_files(key: &Path) -> [PathBuf; 4] {
 }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 fn retain_identities(
     database: &mut OpenDatabase,
     identities: impl IntoIterator<Item = LiveFileIdentity>,
@@ -457,7 +467,9 @@ pub fn open_connections(path: &Path) -> usize {
         .sum()
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 /// Cheap name check for project walkers whose roots are already canonical.
 pub(crate) fn is_registered_file_path(path: &Path) -> bool {
     live_files()

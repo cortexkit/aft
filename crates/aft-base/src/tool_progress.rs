@@ -25,17 +25,19 @@ impl Progress {
         Self::with_clock(Instant::now, send)
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     pub(crate) fn with_clock(
-            clock: impl Fn() -> Instant + Send + Sync + 'static,
-            send: impl Fn(usize) -> bool + Send + Sync + 'static,
-        ) -> Self {
-            Self(Arc::new(Inner {
-                last_sent: Mutex::new(Some(clock())),
-                clock: Box::new(clock),
-                send: Box::new(send),
-            }))
-        }
+        clock: impl Fn() -> Instant + Send + Sync + 'static,
+        send: impl Fn(usize) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(Inner {
+            last_sent: Mutex::new(Some(clock())),
+            clock: Box::new(clock),
+            send: Box::new(send),
+        }))
+    }
     }
 
     pub fn report(&self) {

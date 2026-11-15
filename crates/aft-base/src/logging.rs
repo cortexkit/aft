@@ -44,6 +44,7 @@ const LOG_DIRECTORY_BUDGET_BYTES: u64 = 200 * 1024 * 1024;
 const LOG_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_PERF_TICK_INTERVAL: Duration = Duration::from_secs(60);
 const PERF_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+#[rustfmt::skip]
 test_support_visibility! {
 pub(crate) const SLOW_TOOL_CALL_THRESHOLD: Duration = Duration::from_millis(50);
 }
@@ -684,7 +685,9 @@ pub fn reset_tool_call_wait() {
     TOOL_CALL_WAIT.with(|slot| *slot.borrow_mut() = ToolCallWaitState::default());
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 /// Record what the current tool-call thread waited on.
 pub(crate) fn note_tool_call_wait(waiting_on: WaitingOn, build_id: Option<&str>, wait_ms: u64) {
     TOOL_CALL_WAIT.with(|slot| {

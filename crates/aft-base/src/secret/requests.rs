@@ -36,6 +36,7 @@ impl RequestBudget {
         self.deadline.as_mut().await;
     }
 }
+#[rustfmt::skip]
 test_support_visibility! {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum UseError {
@@ -65,6 +66,7 @@ pub(crate) fn consent_failure_message(label: &str, host: &str, reason: UseError)
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 /// Shared progress for sockets whose idle budget excludes approval waits.
 #[derive(Default)]
@@ -141,8 +143,9 @@ impl Drop for Waiting<'_> {
     }
 }
 impl RequestSecrets {
+    #[rustfmt::skip]
     test_support_visibility! {
-pub(crate) fn new(
+    pub(crate) fn new(
         vault: Arc<dyn SecretVault>,
         scope: SecretScope,
         context: Option<(std::path::PathBuf, String)>,
@@ -159,7 +162,7 @@ pub(crate) fn new(
             request_cancelled: None,
         }
     }
-}
+    }
     pub(crate) fn with_request_cancellation(
         mut self,
         cancelled: impl Fn() -> bool + Send + Sync + 'static,
@@ -177,8 +180,9 @@ pub(crate) fn new(
             deadline: self.clock.deadline(),
         }
     }
+    #[rustfmt::skip]
     test_support_visibility! {
-#[cfg(unix)]
+    #[cfg(unix)]
     pub(crate) fn status(&self) -> Vec<String> {
         self.status
             .lock()
@@ -188,12 +192,13 @@ pub(crate) fn new(
             .cloned()
             .collect()
     }
-}
+    }
+    #[rustfmt::skip]
     test_support_visibility! {
-pub(crate) fn activity(&self) -> Arc<RequestActivity> {
+    pub(crate) fn activity(&self) -> Arc<RequestActivity> {
         self.activity.clone()
     }
-}
+    }
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn with_clock(mut self, clock: Option<Arc<dyn ApprovalClock>>) -> Self {
         if let Some(clock) = clock {
@@ -221,6 +226,7 @@ pub(crate) fn activity(&self) -> Arc<RequestActivity> {
         .unwrap_or(UseAnswer::Unavailable)
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn approve(

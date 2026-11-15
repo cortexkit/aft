@@ -9,6 +9,7 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+#[rustfmt::skip]
 test_support_visibility! {
 pub(crate) const CODE: &str = "dev_build_refused_production_migration";
 }

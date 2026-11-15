@@ -270,10 +270,12 @@ impl FleetStatusClient {
         Self::channel_with_liveness(capacity, true)
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     pub(crate) fn dial_channel(capacity: usize) -> (Self, mpsc::Receiver<StatusWireRequest>) {
-            Self::channel_with_liveness(capacity, false)
-        }
+        Self::channel_with_liveness(capacity, false)
+    }
     }
 
     fn channel_with_liveness(
@@ -408,6 +410,7 @@ impl FleetStatusClient {
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 pub(crate) struct StatusWireRequest {
     body: Value,
@@ -463,10 +466,12 @@ impl StatusWireRequest {
         &self.session
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     pub(crate) fn body(&self) -> &Value {
-            &self.body
-        }
+        &self.body
+    }
     }
 
     pub(crate) fn complete_response(self, body: &[u8]) -> bool {
@@ -488,13 +493,15 @@ impl StatusWireRequest {
         true
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     pub(crate) fn complete_unavailable(self) {
-            if let Some(client) = self.client.upgrade() {
-                client.route_live.store(false, Ordering::Release);
-                client.state.lock().forget_route();
-            }
+        if let Some(client) = self.client.upgrade() {
+            client.route_live.store(false, Ordering::Release);
+            client.state.lock().forget_route();
         }
+    }
 
     }
 }

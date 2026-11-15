@@ -105,4 +105,5 @@ use tokio::sync::watch;
 use zeroize::Zeroizing;
 
 #[cfg(all(test, unix))]
+#[allow(hidden_glob_reexports)]
 mod tests;

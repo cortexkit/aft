@@ -250,6 +250,7 @@ fn managed_runtime_roots() -> Vec<PathBuf> {
         .collect()
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 /// Inputs to one authorization decision. Production builds it from process
 /// state in [`authorize_onnx_runtime_load`]; tests build it directly.
@@ -434,7 +435,9 @@ pub fn authorize_with(
     open_authorized_with(policy, candidate).map(|library| library.authorization)
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 /// [`authorize_with`], keeping a pinned library's file open so it can be
 /// loaded through the same open file it was hashed through.
 pub(crate) fn open_authorized_with(

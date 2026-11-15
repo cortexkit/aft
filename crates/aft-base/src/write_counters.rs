@@ -230,7 +230,9 @@ pub struct Registry {
     pub recent_top: Mutex<Vec<WriterRow>>,
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

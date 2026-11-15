@@ -327,7 +327,9 @@ pub fn effective_path() -> &'static OsStr {
         .as_os_str()
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 /// Where the probed login-shell PATH is cached between processes.
 #[cfg(unix)]
 pub(crate) fn effective_path_cache_path() -> PathBuf {

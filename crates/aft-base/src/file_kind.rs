@@ -441,7 +441,9 @@ impl ContentChecks {
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 /// A source-language file whose header may mark it generated. Docs and
 /// config formats are excluded: their text is what a reader searches.
 fn is_source_file_name(file_name: &str) -> bool {
@@ -638,6 +640,7 @@ fn test_role(relative: &Path) -> TestRole {
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 /// Byte accounting for content reads, so tests can prove a read stayed
 /// within its bound. Outside tests the wrapper only forwards.

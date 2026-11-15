@@ -1,5 +1,3 @@
-use super::*;
-
 use crate::protocol::RawRequest;
 use serde_json::json;
 use std::path::Path;

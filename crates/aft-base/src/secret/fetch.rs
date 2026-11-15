@@ -11,7 +11,9 @@ pub(crate) enum FetchDecision {
     InvalidPlan(&'static str),
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 pub(crate) fn fetch_consent_refusal(
     label: &str,
     host: &str,

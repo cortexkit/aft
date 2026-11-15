@@ -47,6 +47,7 @@ use std::sync::Once;
 use std::sync::OnceLock;
 
 #[cfg(test)]
+#[allow(hidden_glob_reexports)]
 mod tests {
     use super::*;
     #[allow(unused_imports)]

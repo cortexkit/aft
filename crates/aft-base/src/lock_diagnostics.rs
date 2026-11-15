@@ -59,6 +59,7 @@ impl Drop for LockHold<'_> {
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 /// Records every acquisition, including timed and nonblocking probes. The
 /// evidence guard drops before the mutex guard unlocks, so a previous holder
@@ -81,15 +82,17 @@ impl<T> TrackedMutex<T> {
         Arc::clone(&self.diagnostics)
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     #[track_caller]
-        pub(crate) fn lock(&self) -> TrackedGuard<'_, T> {
-            let guard = self.mutex.lock();
-            TrackedGuard {
-                _hold: self.diagnostics.hold(),
-                guard,
-            }
+    pub(crate) fn lock(&self) -> TrackedGuard<'_, T> {
+        let guard = self.mutex.lock();
+        TrackedGuard {
+            _hold: self.diagnostics.hold(),
+            guard,
         }
+    }
     }
 
     #[track_caller]
@@ -111,6 +114,7 @@ impl<T> TrackedMutex<T> {
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 pub(crate) struct TrackedGuard<'a, T> {
     _hold: LockHold<'a>,

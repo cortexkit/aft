@@ -20,6 +20,7 @@ use std::sync::OnceLock;
 use std::sync::Weak;
 
 #[cfg(test)]
+#[allow(hidden_glob_reexports)]
 mod tests {
     use super::*;
     #[allow(unused_imports)]

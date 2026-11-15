@@ -14,6 +14,7 @@
 pub mod consent;
 pub mod eligibility;
 pub mod outcome;
+#[rustfmt::skip]
 test_support_visibility! {
 pub(crate) mod requests;
 }
@@ -48,6 +49,7 @@ pub use wire::{
 pub use vault::fake::{approval, granted, FakeReply, FakeVault, FakeVaultScript};
 
 pub mod call_context;
+#[rustfmt::skip]
 test_support_visibility! {
 pub(crate) mod fetch;
 }

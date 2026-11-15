@@ -422,7 +422,9 @@ pub fn inside_worker_jail() -> bool {
     denied_candidate()
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 #[cfg(target_os = "linux")]
 pub(crate) fn inside_worker_jail_with_no_new_privs(result: i32) -> bool {
     if result == 0 {

@@ -180,9 +180,6 @@ use zeroize::Zeroizing;
 
 #[cfg(test)]
 mod tests {
-
-    use super::*;
-    use url::Url;
     #[test]
     fn extension_only_url_decision_matches_parser() {
         for ext in crate::lang_id::TEST_EXTENSIONS {
@@ -206,6 +203,7 @@ mod tests {
 /// The fetch times the slow-call line reports, measured against local
 /// servers that are slow in a known phase.
 #[path = "url_fetch_deadline_tests.rs"]
+#[allow(hidden_glob_reexports)]
 mod deadline_tests;
 
 #[cfg(test)]

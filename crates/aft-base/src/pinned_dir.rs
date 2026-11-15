@@ -128,49 +128,51 @@ impl PinnedDir {
         Self::repair_walk(&canonical_root_path(path)?)
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     /// Open an absolute directory one component at a time without following
-        /// a symlink an unprivileged process could retarget.
-        ///
-        /// Two kinds of symlinked ancestor are accepted. A system symlink such as
-        /// macOS `/var` or `/tmp` (owned by root, in a directory only root can
-        /// rename it in) is resolved during the walk. A configured storage or
-        /// cache root whose own path runs through a user symlink is resolved once
-        /// by [`resolve_configured_root`] when AFT opens it; a later walk under
-        /// that spelling opens the resolved directory and refuses if its device
-        /// and inode are no longer the ones recorded then. Every component below
-        /// such a root is still opened without following symlinks.
-        pub(crate) fn repair_open_path(path: &Path) -> io::Result<Self> {
-            if !path.is_absolute() {
-                return Err(io::Error::other("repair requires an absolute directory"));
-            }
-            if let Some(root) = resolved_root_for(path) {
-                // The configured spelling must still name the directory recorded
-                // when the root was opened: same resolved path, same identity.
-                let pinned = Self::repair_walk(&root.resolved)?;
-                if fs::canonicalize(&root.configured).ok().as_ref() != Some(&root.resolved)
-                    || pinned.directory_identity()? != root.identity
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        format!(
-                            "configured root {} no longer resolves to the directory it was opened as",
-                            root.configured.display()
-                        ),
-                    ));
-                }
-                let mut pinned = pinned;
-                for component in path
-                    .strip_prefix(&root.configured)
-                    .map_err(io::Error::other)?
-                    .components()
-                {
-                    pinned = pinned.repair_child(component.as_os_str())?;
-                }
-                return Ok(pinned);
-            }
-            Self::repair_walk(path)
+    /// a symlink an unprivileged process could retarget.
+    ///
+    /// Two kinds of symlinked ancestor are accepted. A system symlink such as
+    /// macOS `/var` or `/tmp` (owned by root, in a directory only root can
+    /// rename it in) is resolved during the walk. A configured storage or
+    /// cache root whose own path runs through a user symlink is resolved once
+    /// by [`resolve_configured_root`] when AFT opens it; a later walk under
+    /// that spelling opens the resolved directory and refuses if its device
+    /// and inode are no longer the ones recorded then. Every component below
+    /// such a root is still opened without following symlinks.
+    pub(crate) fn repair_open_path(path: &Path) -> io::Result<Self> {
+        if !path.is_absolute() {
+            return Err(io::Error::other("repair requires an absolute directory"));
         }
+        if let Some(root) = resolved_root_for(path) {
+            // The configured spelling must still name the directory recorded
+            // when the root was opened: same resolved path, same identity.
+            let pinned = Self::repair_walk(&root.resolved)?;
+            if fs::canonicalize(&root.configured).ok().as_ref() != Some(&root.resolved)
+                || pinned.directory_identity()? != root.identity
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "configured root {} no longer resolves to the directory it was opened as",
+                        root.configured.display()
+                    ),
+                ));
+            }
+            let mut pinned = pinned;
+            for component in path
+                .strip_prefix(&root.configured)
+                .map_err(io::Error::other)?
+                .components()
+            {
+                pinned = pinned.repair_child(component.as_os_str())?;
+            }
+            return Ok(pinned);
+        }
+        Self::repair_walk(path)
+    }
     }
 
     #[cfg(not(unix))]
@@ -475,15 +477,17 @@ impl PinnedDir {
         Ok(())
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     pub(crate) fn repair_create_file(&self, name: &OsStr) -> io::Result<File> {
-            let file = self.repair_coordination_file(name)?;
-            if file_mount_identity(&file)? != file_mount_identity(&self.file)? {
-                return Err(io::Error::other("cache file crosses a mount"));
-            }
-            file.set_len(0)?;
-            Ok(file)
+        let file = self.repair_coordination_file(name)?;
+        if file_mount_identity(&file)? != file_mount_identity(&self.file)? {
+            return Err(io::Error::other("cache file crosses a mount"));
         }
+        file.set_len(0)?;
+        Ok(file)
+    }
     }
 
     pub(crate) fn repair_replace_file(&self, name: &OsStr, contents: &[u8]) -> io::Result<()> {
@@ -1531,7 +1535,9 @@ fn resolved_root_for(path: &Path) -> Option<ResolvedRoot> {
         .cloned()
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 /// `fs::canonicalize` for a storage or cache root whose resolved path is kept
 /// and handed on (to SQLite, to cache keys, to path comparisons). On Windows
 /// `fs::canonicalize` returns a verbatim `\\?\C:\...` path, a spelling no
@@ -1546,7 +1552,9 @@ pub(crate) fn canonical_root_path(path: &Path) -> io::Result<PathBuf> {
 }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 /// Resolve a configured storage or cache root once, when AFT opens it, and
 /// record the directory it names by device and inode. Later pinned walks
 /// under the configured spelling open that directory and refuse if it has
@@ -2209,6 +2217,7 @@ fn removal_device(path: &Path, actual: u64) -> u64 {
     actual
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 /// A removal walk met a directory on another filesystem (a mount point) and
 /// kept it, with everything below it and the tree that contains it.

@@ -42,6 +42,7 @@ const JOB_COST: isize = 1;
 /// updates; a few milliseconds rides out an ordinary holder that was
 /// preempted, while a holder stuck for longer cannot stall the loop.
 const SCHEDULER_PROBE_WAIT: Duration = Duration::from_millis(5);
+#[rustfmt::skip]
 test_support_visibility! {
 /// Continuous wake producers must not keep the scheduler mutex across an
 /// unbounded receiver drain; health probes and submitters get a lock turn
@@ -134,6 +135,7 @@ pub enum MaintenanceCoalesceKey {
 
 pub type ExecutorJob<C> = Box<dyn FnOnce(&C) -> Response + Send + 'static>;
 
+#[rustfmt::skip]
 test_support_visibility! {
 /// Age at which a queued interactive mutating job (route binds, edits) jumps
 /// ahead of pure reads in interactive admission. Reads-first admission would
@@ -143,6 +145,7 @@ test_support_visibility! {
 /// draining readers and running the configure itself.
 const INTERACTIVE_WRITER_PROMOTION_AGE: Duration = Duration::from_secs(6);
 }
+#[rustfmt::skip]
 test_support_visibility! {
 /// Age at which a queued route-bind configure stops new same-root pure reads
 /// from being admitted ahead of it. Much shorter than the general writer
@@ -150,6 +153,7 @@ test_support_visibility! {
 /// arrive together, so reads-first admission must not spend the relay budget.
 const BIND_PROMOTION_AGE: Duration = Duration::from_millis(500);
 }
+#[rustfmt::skip]
 test_support_visibility! {
 /// Worker threads reserved for route-bind configures, on top of `pool_size`.
 /// General interactive and maintenance jobs never occupy them, so a bind never
@@ -158,6 +162,7 @@ test_support_visibility! {
 /// serialize every other bind behind it.
 const BIND_RESERVE_WORKERS: usize = 2;
 }
+#[rustfmt::skip]
 test_support_visibility! {
 /// Provider metadata (tool catalogs, role descriptions, grants) has reserved
 /// workers, so these short requests never wait for an index builder,
@@ -165,6 +170,7 @@ test_support_visibility! {
 /// worker launch check ask for them under a deadline of a few seconds.
 const PROVIDER_RESERVE_WORKERS: usize = 2;
 }
+#[rustfmt::skip]
 test_support_visibility! {
 /// Readers older than this still block queued writer jobs; report their job
 /// metadata instead of only the generic `waiting_on_readers` diagnosis.
@@ -204,6 +210,7 @@ impl Default for ExecutorConfig {
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 #[derive(Debug, Clone)]
 struct EffectiveConfig {
@@ -228,48 +235,50 @@ struct EffectiveConfig {
 }
 
 impl EffectiveConfig {
+    #[rustfmt::skip]
     test_support_visibility! {
     /// Every worker thread, including the bind and provider reservations.
-        fn total_workers(&self) -> usize {
-            self.pool_size + self.bind_reserve + self.provider_reserve
-        }
+    fn total_workers(&self) -> usize {
+        self.pool_size + self.bind_reserve + self.provider_reserve
+    }
 
     }
 }
 
 impl ExecutorConfig {
+    #[rustfmt::skip]
     test_support_visibility! {
     fn effective(&self) -> EffectiveConfig {
-            let pool_size = self.pool_size.clamp(2, 8);
-            let max_actor_cap = pool_size.saturating_sub(1).max(1);
-            let actor_cap = self.actor_cap.max(1).min(max_actor_cap);
-            let read_cap = self.read_cap.max(1).min(actor_cap).min(4);
-            // HeavyInit jobs share workers with RouteBind/configure. Keep one worker
-            // available even in a two-worker pool so a heavy-init storm cannot hold
-            // a fresh bind behind every executor worker.
-            let heavy_permits = self
-                .heavy_permits
-                .max(1)
-                .min(pool_size.saturating_sub(1).max(1))
-                .min(3);
-            let drr_quantum = self.drr_quantum.max(1);
-            let deficit_cap = (actor_cap.max(1) as isize) * 4;
-            let interactive_reserve = if pool_size >= 4 { 2 } else { 1 };
-            let maintenance_cap = pool_size.saturating_sub(interactive_reserve).max(1);
+        let pool_size = self.pool_size.clamp(2, 8);
+        let max_actor_cap = pool_size.saturating_sub(1).max(1);
+        let actor_cap = self.actor_cap.max(1).min(max_actor_cap);
+        let read_cap = self.read_cap.max(1).min(actor_cap).min(4);
+        // HeavyInit jobs share workers with RouteBind/configure. Keep one worker
+        // available even in a two-worker pool so a heavy-init storm cannot hold
+        // a fresh bind behind every executor worker.
+        let heavy_permits = self
+            .heavy_permits
+            .max(1)
+            .min(pool_size.saturating_sub(1).max(1))
+            .min(3);
+        let drr_quantum = self.drr_quantum.max(1);
+        let deficit_cap = (actor_cap.max(1) as isize) * 4;
+        let interactive_reserve = if pool_size >= 4 { 2 } else { 1 };
+        let maintenance_cap = pool_size.saturating_sub(interactive_reserve).max(1);
 
-            EffectiveConfig {
-                pool_size,
-                read_cap,
-                actor_cap,
-                heavy_permits,
-                drr_quantum,
-                deficit_cap,
-                interactive_reserve,
-                maintenance_cap,
-                bind_reserve: BIND_RESERVE_WORKERS,
-                provider_reserve: PROVIDER_RESERVE_WORKERS,
-            }
+        EffectiveConfig {
+            pool_size,
+            read_cap,
+            actor_cap,
+            heavy_permits,
+            drr_quantum,
+            deficit_cap,
+            interactive_reserve,
+            maintenance_cap,
+            bind_reserve: BIND_RESERVE_WORKERS,
+            provider_reserve: PROVIDER_RESERVE_WORKERS,
         }
+    }
 
     }
 }
@@ -502,39 +511,42 @@ pub struct DispatchLoopLiveness<C: ExecutorContext> {
 }
 
 impl<C: ExecutorContext> DispatchLoopLiveness<C> {
+    #[rustfmt::skip]
     test_support_visibility! {
     fn new(event_rx: Receiver<SchedulerEvent<C>>) -> Self {
-            Self {
-                origin: Instant::now(),
-                last_progress_ms: AtomicU64::new(0),
-                in_event: AtomicBool::new(false),
-                event_rx,
-            }
+        Self {
+            origin: Instant::now(),
+            last_progress_ms: AtomicU64::new(0),
+            in_event: AtomicBool::new(false),
+            event_rx,
         }
+    }
     }
 
     fn now_ms(&self) -> u64 {
         duration_millis_u64(self.origin.elapsed())
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     fn wait_for_event(&self, next_retry_at: Option<Instant>) -> bool {
-            let mut select = crossbeam_channel::Select::new();
-            select.recv(&self.event_rx);
-            let ready = match next_retry_at {
-                Some(at) => select
-                    .ready_timeout(at.saturating_duration_since(Instant::now()))
-                    .is_ok(),
-                None => {
-                    select.ready();
-                    true
-                }
-            };
-            // Readiness does not dequeue. Publish the active marker first so the
-            // watchdog cannot see an empty queue with an unmarked received event.
-            self.begin_event();
-            ready
-        }
+        let mut select = crossbeam_channel::Select::new();
+        select.recv(&self.event_rx);
+        let ready = match next_retry_at {
+            Some(at) => select
+                .ready_timeout(at.saturating_duration_since(Instant::now()))
+                .is_ok(),
+            None => {
+                select.ready();
+                true
+            }
+        };
+        // Readiness does not dequeue. Publish the active marker first so the
+        // watchdog cannot see an empty queue with an unmarked received event.
+        self.begin_event();
+        ready
+    }
     }
 
     fn begin_event(&self) {
@@ -543,12 +555,14 @@ impl<C: ExecutorContext> DispatchLoopLiveness<C> {
         self.in_event.store(true, Ordering::Release);
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     fn end_event(&self) {
-            self.last_progress_ms
-                .store(self.now_ms(), Ordering::Relaxed);
-            self.in_event.store(false, Ordering::Release);
-        }
+        self.last_progress_ms
+            .store(self.now_ms(), Ordering::Relaxed);
+        self.in_event.store(false, Ordering::Release);
+    }
     }
 
     /// Time since the loop last became ready to receive or finished an event.
@@ -631,6 +645,7 @@ pub struct JobCancellation {
     lifecycle: Option<crate::executor::root_lifecycle::SubcLifecycleAdmission>,
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 #[derive(Debug)]
 struct JobCancellationInner {
@@ -1072,6 +1087,7 @@ pub fn current_actor_writer_waiting() -> bool {
     })
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 pub(crate) struct ActorWaitingWritersGuard {
     previous: Option<ActorWriterDemand>,
@@ -1177,6 +1193,7 @@ pub fn request_exclusive_rerun() -> bool {
     true
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 #[derive(Debug, Clone)]
 struct RunningJob {
@@ -2569,6 +2586,7 @@ impl<C: ExecutorContext> Default for Executor<C> {
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 struct ExecutorInner<C: ExecutorContext> {
     #[cfg(any(test, feature = "test-support"))]
@@ -2628,6 +2646,7 @@ impl<C: ExecutorContext> Drop for ExecutorInner<C> {
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 struct SchedulerState<C: ExecutorContext> {
     #[cfg(any(test, feature = "test-support"))]
@@ -2669,23 +2688,24 @@ struct SchedulerState<C: ExecutorContext> {
 }
 
 impl<C: ExecutorContext> SchedulerState<C> {
+    #[rustfmt::skip]
     test_support_visibility! {
     fn new(config: EffectiveConfig) -> Self {
-            Self {
-                actors: HashMap::new(),
-                actor_order: Vec::new(),
-                cursor: 0,
-                idle_workers: config.total_workers(),
-                interactive_inflight: 0,
-                maintenance_inflight: 0,
-                provider_inflight: 0,
-                binds_inflight: 0,
-                config,
-                running_jobs: HashMap::new(),
-                next_job_id: 1,
-                bind_retry_pending: false,
-            }
+        Self {
+            actors: HashMap::new(),
+            actor_order: Vec::new(),
+            cursor: 0,
+            idle_workers: config.total_workers(),
+            interactive_inflight: 0,
+            maintenance_inflight: 0,
+            provider_inflight: 0,
+            binds_inflight: 0,
+            config,
+            running_jobs: HashMap::new(),
+            next_job_id: 1,
+            bind_retry_pending: false,
         }
+    }
     }
 
     /// The earliest time a bind queued with a retry time becomes admissible,
@@ -2857,134 +2877,136 @@ impl<C: ExecutorContext> SchedulerState<C> {
         "not_found"
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     fn bind_blocker_snapshot(
-            &self,
-            root_id: &ProjectRootId,
-            request_id: &str,
-        ) -> BindBlockerSnapshot {
-            let configure_state = self.mutating_job_state_label(root_id, request_id);
-            let now = Instant::now();
-            let actor = self.actors.get(root_id);
-            let oldest_queued_writer_at = actor.and_then(ActorState::<C>::oldest_queued_writer_at);
-            let oldest_queued_writer_age_ms = oldest_queued_writer_at
-                .map(|queued_at| duration_millis_u64(now.saturating_duration_since(queued_at)));
-            let mut in_flight_readers = self
-                .running_jobs
-                .values()
-                .filter(|job| {
-                    job.root_id == *root_id
-                        && matches!(job.lane, Lane::PureRead | Lane::SerialLspStatus)
-                })
-                .map(|job| BindBlockerReaderSnapshot {
-                    request_id: job.request_id.clone(),
-                    command: job.command.clone(),
-                    lane: job.lane,
-                    started_age_ms: duration_millis_u64(now.saturating_duration_since(job.started_at)),
-                    execution_started: job.execution_started.load(Ordering::Acquire),
-                    started_before_oldest_writer: oldest_queued_writer_at
-                        .is_some_and(|queued_at| job.started_at <= queued_at),
-                })
-                .collect::<Vec<_>>();
-            in_flight_readers.sort_by(|left, right| left.request_id.cmp(&right.request_id));
-            // The bind's own configure job can hold the mutating slot while it
-            // runs. It is not a blocker of the bind; reporting it as one would
-            // tell the caller to wait for a different job when the bind's own
-            // configure is what is slow.
-            let in_flight_writer = actor
-                .and_then(|actor| actor.mutating_inflight.as_ref())
-                .filter(|job| job.request_id != request_id)
-                .map(|job| MutatingLaneSnapshot {
-                    root_id: root_id.clone(),
-                    request_id: job.request_id.clone(),
-                    command: job.command.clone(),
-                    started_age_ms: duration_millis_u64(now.saturating_duration_since(job.started_at)),
-                });
+        &self,
+        root_id: &ProjectRootId,
+        request_id: &str,
+    ) -> BindBlockerSnapshot {
+        let configure_state = self.mutating_job_state_label(root_id, request_id);
+        let now = Instant::now();
+        let actor = self.actors.get(root_id);
+        let oldest_queued_writer_at = actor.and_then(ActorState::<C>::oldest_queued_writer_at);
+        let oldest_queued_writer_age_ms = oldest_queued_writer_at
+            .map(|queued_at| duration_millis_u64(now.saturating_duration_since(queued_at)));
+        let mut in_flight_readers = self
+            .running_jobs
+            .values()
+            .filter(|job| {
+                job.root_id == *root_id
+                    && matches!(job.lane, Lane::PureRead | Lane::SerialLspStatus)
+            })
+            .map(|job| BindBlockerReaderSnapshot {
+                request_id: job.request_id.clone(),
+                command: job.command.clone(),
+                lane: job.lane,
+                started_age_ms: duration_millis_u64(now.saturating_duration_since(job.started_at)),
+                execution_started: job.execution_started.load(Ordering::Acquire),
+                started_before_oldest_writer: oldest_queued_writer_at
+                    .is_some_and(|queued_at| job.started_at <= queued_at),
+            })
+            .collect::<Vec<_>>();
+        in_flight_readers.sort_by(|left, right| left.request_id.cmp(&right.request_id));
+        // The bind's own configure job can hold the mutating slot while it
+        // runs. It is not a blocker of the bind; reporting it as one would
+        // tell the caller to wait for a different job when the bind's own
+        // configure is what is slow.
+        let in_flight_writer = actor
+            .and_then(|actor| actor.mutating_inflight.as_ref())
+            .filter(|job| job.request_id != request_id)
+            .map(|job| MutatingLaneSnapshot {
+                root_id: root_id.clone(),
+                request_id: job.request_id.clone(),
+                command: job.command.clone(),
+                started_age_ms: duration_millis_u64(now.saturating_duration_since(job.started_at)),
+            });
 
-            let mut blockers = Vec::new();
-            if let Some(actor) = actor {
-                if configure_state == "queued" {
-                    let configure_count = actor.pending_configure_count();
-                    if configure_count > 0 {
-                        blockers.push(format!("queued_behind_configure({configure_count})"));
-                    }
-                    if actor.read_inflight > 0 || actor.lsp_inflight {
-                        let zombie_readers = in_flight_readers
-                            .iter()
-                            .filter(|reader| !reader.execution_started)
-                            .map(format_bind_blocker_reader)
-                            .collect::<Vec<_>>();
-                        let stuck_readers = in_flight_readers
-                            .iter()
-                            .filter(|reader| {
-                                reader.execution_started
-                                    && reader.started_age_ms
-                                        >= duration_millis_u64(READER_STUCK_CENSUS_AGE)
-                            })
-                            .map(format_bind_blocker_reader)
-                            .collect::<Vec<_>>();
-                        if !zombie_readers.is_empty() {
-                            blockers.push(format!("zombie_reader({})", zombie_readers.join("; ")));
-                        } else if !stuck_readers.is_empty() {
-                            blockers.push(format!(
-                                "waiting_on_readers_stuck({})",
-                                stuck_readers.join("; ")
-                            ));
-                        } else {
-                            blockers.push("waiting_on_readers".to_string());
-                        }
-                    }
-                }
-            }
-
+        let mut blockers = Vec::new();
+        if let Some(actor) = actor {
             if configure_state == "queued" {
-                let maintenance: Vec<_> = self
-                    .running_jobs
-                    .values()
-                    .filter(|job| job.job_class == JobClass::Maintenance)
-                    .collect();
-                if !maintenance.is_empty() {
-                    blockers.push(format!(
-                        "queued_behind_maintenance({})",
-                        format_running_jobs(&maintenance)
-                    ));
+                let configure_count = actor.pending_configure_count();
+                if configure_count > 0 {
+                    blockers.push(format!("queued_behind_configure({configure_count})"));
                 }
-            }
-
-            if let Some(actor) = actor {
-                if configure_state == "queued" && actor.interactive.first_bind_is_forced_exclusive() {
-                    blockers.push("rerun_as_exclusive_writer".to_string());
+                if actor.read_inflight > 0 || actor.lsp_inflight {
+                    let zombie_readers = in_flight_readers
+                        .iter()
+                        .filter(|reader| !reader.execution_started)
+                        .map(format_bind_blocker_reader)
+                        .collect::<Vec<_>>();
+                    let stuck_readers = in_flight_readers
+                        .iter()
+                        .filter(|reader| {
+                            reader.execution_started
+                                && reader.started_age_ms
+                                    >= duration_millis_u64(READER_STUCK_CENSUS_AGE)
+                        })
+                        .map(format_bind_blocker_reader)
+                        .collect::<Vec<_>>();
+                    if !zombie_readers.is_empty() {
+                        blockers.push(format!("zombie_reader({})", zombie_readers.join("; ")));
+                    } else if !stuck_readers.is_empty() {
+                        blockers.push(format!(
+                            "waiting_on_readers_stuck({})",
+                            stuck_readers.join("; ")
+                        ));
+                    } else {
+                        blockers.push("waiting_on_readers".to_string());
+                    }
                 }
-                if actor.detached_writers.load(Ordering::Acquire) > 0 {
-                    blockers.push("detached_view_publication_writer_waiting".to_string());
-                }
-                // Name the configure-tail stage in progress on this root, so a
-                // bind held up by a long tail unit says which one.
-                if let Some(stage) = actor.ctx.configure_tail_stage_snapshot() {
-                    blockers.push(format!("configure_tail_stage({stage})"));
-                }
-            }
-
-            if self.idle_workers == 0 {
-                let running: Vec<_> = self.running_jobs.values().collect();
-                blockers.push(format!(
-                    "idle_workers==0({})",
-                    format_running_jobs(&running)
-                ));
-            }
-
-            BindBlockerSnapshot {
-                configure_state,
-                configure_phase_timings: actor.map(|actor| actor.ctx.configure_ack_phase_snapshot()),
-                blockers,
-                oldest_queued_writer_age_ms,
-                in_flight_readers,
-                in_flight_writer,
-                reader_admissions_while_promoted_writer_waited: actor
-                    .map(|actor| actor.reader_admissions_while_promoted_writer_waited)
-                    .unwrap_or(0),
             }
         }
+
+        if configure_state == "queued" {
+            let maintenance: Vec<_> = self
+                .running_jobs
+                .values()
+                .filter(|job| job.job_class == JobClass::Maintenance)
+                .collect();
+            if !maintenance.is_empty() {
+                blockers.push(format!(
+                    "queued_behind_maintenance({})",
+                    format_running_jobs(&maintenance)
+                ));
+            }
+        }
+
+        if let Some(actor) = actor {
+            if configure_state == "queued" && actor.interactive.first_bind_is_forced_exclusive() {
+                blockers.push("rerun_as_exclusive_writer".to_string());
+            }
+            if actor.detached_writers.load(Ordering::Acquire) > 0 {
+                blockers.push("detached_view_publication_writer_waiting".to_string());
+            }
+            // Name the configure-tail stage in progress on this root, so a
+            // bind held up by a long tail unit says which one.
+            if let Some(stage) = actor.ctx.configure_tail_stage_snapshot() {
+                blockers.push(format!("configure_tail_stage({stage})"));
+            }
+        }
+
+        if self.idle_workers == 0 {
+            let running: Vec<_> = self.running_jobs.values().collect();
+            blockers.push(format!(
+                "idle_workers==0({})",
+                format_running_jobs(&running)
+            ));
+        }
+
+        BindBlockerSnapshot {
+            configure_state,
+            configure_phase_timings: actor.map(|actor| actor.ctx.configure_ack_phase_snapshot()),
+            blockers,
+            oldest_queued_writer_age_ms,
+            in_flight_readers,
+            in_flight_writer,
+            reader_admissions_while_promoted_writer_waited: actor
+                .map(|actor| actor.reader_admissions_while_promoted_writer_waited)
+                .unwrap_or(0),
+        }
+    }
 
     }
 }
@@ -3061,12 +3083,15 @@ impl QueueSnapshotAccumulator {
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 struct ActorState<C: ExecutorContext> {
     ctx: Arc<C>,
@@ -3120,30 +3145,31 @@ struct ActorState<C: ExecutorContext> {
 }
 
 impl<C: ExecutorContext> ActorState<C> {
+    #[rustfmt::skip]
     test_support_visibility! {
     fn new(ctx: Arc<C>) -> Self {
-            Self {
-                ctx,
-                epoch: Arc::new(RwLock::new(())),
-                read_inflight: 0,
-                lsp_inflight: false,
-                actor_total_inflight: 0,
-                writer_inflight: false,
-                shared_bind_inflight: false,
-                maintenance_commit_inflight: false,
-                callgraph_acquisition_inflight: false,
-                provider_inflight: false,
-                call_ledger_inflight: false,
-                mutating_inflight: None,
-                reader_admissions_while_promoted_writer_waited: 0,
-                deficit: 0,
-                interactive: ClassQueues::<C>::new(),
-                maintenance: ClassQueues::<C>::new(),
-                fatal: false,
-                waiting_writers: Arc::new(AtomicUsize::new(0)),
-                detached_writers: Arc::new(AtomicUsize::new(0)),
-            }
+        Self {
+            ctx,
+            epoch: Arc::new(RwLock::new(())),
+            read_inflight: 0,
+            lsp_inflight: false,
+            actor_total_inflight: 0,
+            writer_inflight: false,
+            shared_bind_inflight: false,
+            maintenance_commit_inflight: false,
+            callgraph_acquisition_inflight: false,
+            provider_inflight: false,
+            call_ledger_inflight: false,
+            mutating_inflight: None,
+            reader_admissions_while_promoted_writer_waited: 0,
+            deficit: 0,
+            interactive: ClassQueues::<C>::new(),
+            maintenance: ClassQueues::<C>::new(),
+            fatal: false,
+            waiting_writers: Arc::new(AtomicUsize::new(0)),
+            detached_writers: Arc::new(AtomicUsize::new(0)),
         }
+    }
     }
 
     fn sync_waiting_writers(&self) {
@@ -3151,17 +3177,21 @@ impl<C: ExecutorContext> ActorState<C> {
             .store(self.interactive.mutating.len(), Ordering::Release);
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     fn push_job(&mut self, job_class: JobClass, lane: Lane, job: QueuedJob<C>) {
-            self.class_queues_mut(job_class).push_job(lane, job);
-            self.sync_waiting_writers();
-        }
+        self.class_queues_mut(job_class).push_job(lane, job);
+        self.sync_waiting_writers();
+    }
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     fn has_queued_jobs(&self) -> bool {
-            self.interactive.has_queued_jobs() || self.maintenance.has_queued_jobs()
-        }
+        self.interactive.has_queued_jobs() || self.maintenance.has_queued_jobs()
+    }
     }
 
     fn is_idle(&self) -> bool {
@@ -3196,32 +3226,38 @@ impl<C: ExecutorContext> ActorState<C> {
         job
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     fn higher_priority_writer_barrier_blocks(&self, job_class: JobClass) -> bool {
-            // Maintenance must not start while interactive mutating work (tool
-            // mutations, route binds) waits: a maintenance job that takes the
-            // actor's writer slot would push the interactive writer behind it.
-            matches!(job_class, JobClass::Maintenance)
-                && !self.interactive.queue(Lane::Mutating).is_empty()
-        }
+        // Maintenance must not start while interactive mutating work (tool
+        // mutations, route binds) waits: a maintenance job that takes the
+        // actor's writer slot would push the interactive writer behind it.
+        matches!(job_class, JobClass::Maintenance)
+            && !self.interactive.queue(Lane::Mutating).is_empty()
+    }
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     fn class_queues(&self, job_class: JobClass) -> &ClassQueues<C> {
-            match job_class {
-                JobClass::Interactive => &self.interactive,
-                JobClass::Maintenance => &self.maintenance,
-            }
+        match job_class {
+            JobClass::Interactive => &self.interactive,
+            JobClass::Maintenance => &self.maintenance,
         }
     }
+    }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     fn class_queues_mut(&mut self, job_class: JobClass) -> &mut ClassQueues<C> {
-            match job_class {
-                JobClass::Interactive => &mut self.interactive,
-                JobClass::Maintenance => &mut self.maintenance,
-            }
+        match job_class {
+            JobClass::Interactive => &mut self.interactive,
+            JobClass::Maintenance => &mut self.maintenance,
         }
+    }
     }
 
     fn fail_queued_jobs(&mut self) {
@@ -3234,22 +3270,26 @@ impl<C: ExecutorContext> ActorState<C> {
         self.maintenance.cancel_queued_jobs() + self.interactive.cancel_queued_provider_jobs()
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     fn has_queued_mutating_job(&self, request_id: &str) -> bool {
-            self.interactive.has_queued_mutating_job(request_id)
-                || self.maintenance.has_queued_mutating_job(request_id)
-        }
+        self.interactive.has_queued_mutating_job(request_id)
+            || self.maintenance.has_queued_mutating_job(request_id)
+    }
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     fn remove_queued_cancellable(&mut self, token: &JobCancellation) -> Option<QueuedJob<C>> {
-            let removed = self
-                .interactive
-                .remove_cancellable(token)
-                .or_else(|| self.maintenance.remove_cancellable(token));
-            self.sync_waiting_writers();
-            removed
-        }
+        let removed = self
+            .interactive
+            .remove_cancellable(token)
+            .or_else(|| self.maintenance.remove_cancellable(token));
+        self.sync_waiting_writers();
+        removed
+    }
     }
 
     fn oldest_queued_writer_at(&self) -> Option<Instant> {
@@ -3273,6 +3313,7 @@ impl<C: ExecutorContext> ActorState<C> {
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 struct ClassQueues<C: ExecutorContext> {
     order: VecDeque<Lane>,
@@ -3324,77 +3365,85 @@ impl<C: ExecutorContext> ClassQueues<C> {
         self.first_bind_job().is_some_and(|job| job.force_exclusive)
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     fn has_queued_jobs(&self) -> bool {
-            !self.order.is_empty()
-        }
+        !self.order.is_empty()
+    }
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     fn front_lane(&self) -> Option<Lane> {
-            self.order.front().copied()
-        }
+        self.order.front().copied()
+    }
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     /// Interactive admission order: a starved writer preempts everything so
-        /// its deadline survives. A queued RouteBind configure counts as starved
-        /// after `BIND_PROMOTION_AGE`, any other writer after
-        /// `INTERACTIVE_WRITER_PROMOTION_AGE`. Otherwise pure reads go first (they
-        /// overlap each other and never barrier the actor), then remaining lanes
-        /// in arrival order. Maintenance keeps strict arrival order via
-        /// `front_lane`.
-        ///
-        /// `newest_reader_started_at` is when the most recently admitted reader
-        /// still running on this actor started. A writer is not promoted while
-        /// every running reader started before it queued and has run for
-        /// `READER_STUCK_CENSUS_AGE`: the writer cannot run until those readers
-        /// end, which may be never, so holding back new reads would only add an
-        /// outage of every read on the root to the writer's own wait.
-        fn next_interactive_lane(
-            &self,
-            now: Instant,
-            newest_reader_started_at: Option<Instant>,
-        ) -> Option<Lane> {
-            let stuck_readers_started_by = newest_reader_started_at
-                .filter(|started| now.saturating_duration_since(*started) >= READER_STUCK_CENSUS_AGE);
-            let starved_writer = self.mutating.iter().any(|job| {
-                let promotion_age = if is_configure_request(&job.request_id) {
-                    BIND_PROMOTION_AGE
-                } else {
-                    INTERACTIVE_WRITER_PROMOTION_AGE
-                };
-                let waits_only_on_stuck_readers =
-                    stuck_readers_started_by.is_some_and(|newest| newest <= job.queued_at);
-                now.saturating_duration_since(job.queued_at) >= promotion_age
-                    && !waits_only_on_stuck_readers
-            });
-            if starved_writer {
-                // Also stops NEW readers from being admitted on this actor while
-                // the promoted writer waits for in-flight readers to drain.
-                return Some(Lane::Mutating);
-            }
-            if !self.pure_reads.is_empty() {
-                return Some(Lane::PureRead);
-            }
-            self.order.iter().copied().find(|lane| {
-                !matches!(
-                    lane,
-                    Lane::PureRead | Lane::ProviderMetadata | Lane::CallLedger
-                )
-            })
+    /// its deadline survives. A queued RouteBind configure counts as starved
+    /// after `BIND_PROMOTION_AGE`, any other writer after
+    /// `INTERACTIVE_WRITER_PROMOTION_AGE`. Otherwise pure reads go first (they
+    /// overlap each other and never barrier the actor), then remaining lanes
+    /// in arrival order. Maintenance keeps strict arrival order via
+    /// `front_lane`.
+    ///
+    /// `newest_reader_started_at` is when the most recently admitted reader
+    /// still running on this actor started. A writer is not promoted while
+    /// every running reader started before it queued and has run for
+    /// `READER_STUCK_CENSUS_AGE`: the writer cannot run until those readers
+    /// end, which may be never, so holding back new reads would only add an
+    /// outage of every read on the root to the writer's own wait.
+    fn next_interactive_lane(
+        &self,
+        now: Instant,
+        newest_reader_started_at: Option<Instant>,
+    ) -> Option<Lane> {
+        let stuck_readers_started_by = newest_reader_started_at
+            .filter(|started| now.saturating_duration_since(*started) >= READER_STUCK_CENSUS_AGE);
+        let starved_writer = self.mutating.iter().any(|job| {
+            let promotion_age = if is_configure_request(&job.request_id) {
+                BIND_PROMOTION_AGE
+            } else {
+                INTERACTIVE_WRITER_PROMOTION_AGE
+            };
+            let waits_only_on_stuck_readers =
+                stuck_readers_started_by.is_some_and(|newest| newest <= job.queued_at);
+            now.saturating_duration_since(job.queued_at) >= promotion_age
+                && !waits_only_on_stuck_readers
+        });
+        if starved_writer {
+            // Also stops NEW readers from being admitted on this actor while
+            // the promoted writer waits for in-flight readers to drain.
+            return Some(Lane::Mutating);
         }
+        if !self.pure_reads.is_empty() {
+            return Some(Lane::PureRead);
+        }
+        self.order.iter().copied().find(|lane| {
+            !matches!(
+                lane,
+                Lane::PureRead | Lane::ProviderMetadata | Lane::CallLedger
+            )
+        })
+    }
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     fn pop_front_job(&mut self, lane: Lane) -> Option<QueuedJob<C>> {
-            // Keep `order` consistent with per-lane queues when admission picks a
-            // lane other than the arrival-order head: remove the FIRST occurrence
-            // of the chosen lane from `order`, not necessarily the front.
-            let position = self.order.iter().position(|queued| *queued == lane)?;
-            self.order.remove(position);
-            self.queue_mut(lane).pop_front()
-        }
+        // Keep `order` consistent with per-lane queues when admission picks a
+        // lane other than the arrival-order head: remove the FIRST occurrence
+        // of the chosen lane from `order`, not necessarily the front.
+        let position = self.order.iter().position(|queued| *queued == lane)?;
+        self.order.remove(position);
+        self.queue_mut(lane).pop_front()
+    }
     }
 
     fn queued_count(&self) -> usize {
@@ -3588,6 +3637,7 @@ impl<C: ExecutorContext> ClassQueues<C> {
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 struct QueuedJob<C: ExecutorContext> {
     #[cfg(any(test, feature = "test-support"))]
@@ -3749,6 +3799,7 @@ fn panic_response(
     )
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 enum CompletionSender {
     Sync(Sender<Response>),
@@ -3769,6 +3820,7 @@ impl CompletionSender {
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 struct RunJob<C: ExecutorContext> {
     root_id: ProjectRootId,
@@ -3811,6 +3863,7 @@ struct RunJob<C: ExecutorContext> {
 
 struct JobCompletionOwnership;
 
+#[rustfmt::skip]
 test_support_visibility! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JobCompletionOutcome {
@@ -3820,6 +3873,7 @@ enum JobCompletionOutcome {
 }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 struct CompletionEvent<C: ExecutorContext> {
     job_id: u64,
@@ -3833,6 +3887,7 @@ struct CompletionEvent<C: ExecutorContext> {
 }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 struct JobCompletionGuard<C: ExecutorContext> {
     event_tx: Sender<SchedulerEvent<C>>,
@@ -3848,12 +3903,14 @@ impl<C: ExecutorContext> JobCompletionGuard<C> {
         }
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     fn set_outcome(&mut self, outcome: JobCompletionOutcome) {
-            if let Some(event) = self.event.as_mut() {
-                event.outcome = outcome;
-            }
+        if let Some(event) = self.event.as_mut() {
+            event.outcome = outcome;
         }
+    }
     }
 
     fn set_requeue(&mut self, job: QueuedJob<C>) {
@@ -3875,6 +3932,7 @@ impl<C: ExecutorContext> Drop for JobCompletionGuard<C> {
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 enum SchedulerEvent<C: ExecutorContext> {
     Wake,
@@ -3947,7 +4005,9 @@ fn scheduler_loop<C: ExecutorContext>(
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 fn process_scheduler_event_batch<C: ExecutorContext>(
     first: SchedulerEvent<C>,
     event_rx: &Receiver<SchedulerEvent<C>>,
@@ -4001,7 +4061,9 @@ fn process_scheduler_event<C: ExecutorContext>(
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 fn complete_job<C: ExecutorContext>(
     state: &mut SchedulerState<C>,
     event: CompletionEvent<C>,
@@ -4129,7 +4191,9 @@ fn complete_job<C: ExecutorContext>(
 }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 fn dispatch_runnable<C: ExecutorContext>(
     state: &mut SchedulerState<C>,
     heavy: &Arc<HeavySemaphore>,
@@ -4525,6 +4589,7 @@ fn can_dispatch_class<C: ExecutorContext>(state: &SchedulerState<C>, job_class: 
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 /// Which dispatch pass is asking an actor for a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4544,7 +4609,9 @@ enum AdmissionPass {
 }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 fn try_admit_actor<C: ExecutorContext>(
     root_id: &ProjectRootId,
     actor: &mut ActorState<C>,
@@ -4952,6 +5019,7 @@ fn requeue_after_probe_hook_for_test(request_id: &str) {
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 /// How one dispatched job ended on its worker.
 enum LaneRun {
@@ -4974,7 +5042,9 @@ fn detached_writer_backoff(attempts: u32) -> Duration {
 /// Poll interval for epoch waits that must stay responsive to cancellation.
 const EPOCH_WAIT_POLL: Duration = Duration::from_millis(25);
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 fn run_lane_job<C: ExecutorContext>(run_job: &mut RunJob<C>) -> LaneRun {
     let _cancellation_ctx = JobCancellationContextGuard::install(run_job.cancellation.clone());
     let _waiting_writers_ctx = ActorWaitingWritersGuard::install(ActorWriterDemand {
@@ -5137,6 +5207,7 @@ fn run_lane_job<C: ExecutorContext>(run_job: &mut RunJob<C>) -> LaneRun {
 }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 #[derive(Debug)]
 struct HeavySemaphore {
@@ -5146,42 +5217,46 @@ struct HeavySemaphore {
 }
 
 impl HeavySemaphore {
+    #[rustfmt::skip]
     test_support_visibility! {
     fn new(permits: usize) -> Self {
-            Self {
-                available: AtomicUsize::new(permits),
-                max: permits,
+        Self {
+            available: AtomicUsize::new(permits),
+            max: permits,
+        }
+    }
+    }
+
+    #[rustfmt::skip]
+    test_support_visibility! {
+
+    fn try_acquire(self: &Arc<Self>) -> Option<HeavyPermit> {
+        loop {
+            let available = self.available.load(Ordering::Acquire);
+            if available == 0 {
+                return None;
+            }
+            if self
+                .available
+                .compare_exchange(
+                    available,
+                    available - 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Some(HeavyPermit {
+                    semaphore: Arc::clone(self),
+                });
             }
         }
     }
-
-    test_support_visibility! {
-    fn try_acquire(self: &Arc<Self>) -> Option<HeavyPermit> {
-            loop {
-                let available = self.available.load(Ordering::Acquire);
-                if available == 0 {
-                    return None;
-                }
-                if self
-                    .available
-                    .compare_exchange(
-                        available,
-                        available - 1,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    return Some(HeavyPermit {
-                        semaphore: Arc::clone(self),
-                    });
-                }
-            }
-        }
 
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 struct HeavyPermit {
     semaphore: Arc<HeavySemaphore>,

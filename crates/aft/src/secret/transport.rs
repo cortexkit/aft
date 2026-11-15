@@ -70,4 +70,5 @@ use zeroize::Zeroizing;
 
 #[cfg(test)]
 #[path = "transport_tests.rs"]
+#[allow(hidden_glob_reexports)]
 mod tests;

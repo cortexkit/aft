@@ -151,6 +151,7 @@ impl Entry {
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 #[derive(Debug)]
 pub(crate) struct Job {
@@ -342,7 +343,9 @@ pub(crate) fn admitted(root: &str, kind: &str) -> Option<Job> {
     Some(REGISTRY.register(root, kind, false, true))
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 pub(crate) fn queued(root: &str, kind: &str) -> Job {
     REGISTRY.register(root, kind, true, false)
 }

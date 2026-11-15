@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 #[cfg(test)]
+#[allow(hidden_glob_reexports)]
 mod snapshot_cap_tests {
     use super::*;
     #[allow(unused_imports)]

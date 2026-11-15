@@ -10,8 +10,6 @@ use std::path::PathBuf;
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
-    use std::process::Command;
 
     #[cfg(unix)]
     #[test]

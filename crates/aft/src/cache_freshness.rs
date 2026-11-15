@@ -51,6 +51,7 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 #[cfg(test)]
+#[allow(hidden_glob_reexports)]
 mod tests {
     use super::*;
 
@@ -133,6 +134,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(hidden_glob_reexports)]
 mod warm_reload_tests {
     use super::*;
     #[allow(unused_imports)]

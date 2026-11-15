@@ -8,6 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+#[rustfmt::skip]
 test_support_visibility! {
 struct PinnedExecutable {
     #[cfg(any(test, feature = "test-support"))]
@@ -28,6 +29,7 @@ struct PinState {
     source: std::fs::File,
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 static PINNED: OnceLock<PinnedExecutable> = OnceLock::new();
 }
@@ -72,7 +74,9 @@ pub fn initialize() -> io::Result<()> {
         .map_err(|_| io::Error::other("executable pin was initialized concurrently"))
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 fn prepare(storage: &Path) -> io::Result<PinnedExecutable> {
     // Resolve the image before touching storage. Keep an open source when a
     // copy is needed so a concurrent placement cannot change the copied bytes.
@@ -233,12 +237,14 @@ impl PinnedExecutable {
         Ok(self.executable.clone())
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     fn cleanup_at_exit(&self) {
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            state.owner.take();
-            let _ = std::fs::remove_dir_all(&self.directory);
-        }
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.owner.take();
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
     }
 
     fn task_image(&self, task_io: &Path) -> io::Result<PathBuf> {

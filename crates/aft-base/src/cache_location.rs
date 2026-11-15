@@ -107,9 +107,11 @@ fn paths_overlap(a: &Path, b: &Path) -> bool {
             .any(|b| a.starts_with(b) || b.starts_with(a))
     })
 }
+#[rustfmt::skip]
 test_support_visibility! {
 const OWNER: &str = ".aft-owner.json";
 }
+#[rustfmt::skip]
 test_support_visibility! {
 const IN_USE: &str = ".aft-in-use.lock";
 }
@@ -216,6 +218,7 @@ impl PartialEq for CacheLease {
 }
 impl Eq for CacheLease {}
 
+#[rustfmt::skip]
 test_support_visibility! {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(deny_unknown_fields)]
@@ -230,6 +233,7 @@ struct Identity {
     inode: u64,
 }
 }
+#[rustfmt::skip]
 test_support_visibility! {
 fn identity(path: &Path) -> io::Result<Identity> {
     #[cfg(any(test, feature = "test-support"))]
@@ -254,6 +258,7 @@ fn real_directory(path: &Path) -> io::Result<Identity> {
     identity(path)
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 #[derive(Serialize, Deserialize)]
 struct ParentIdentity {
@@ -283,6 +288,7 @@ struct ParentIdentity {
     volume_uuid: Option<String>,
 }
 }
+#[rustfmt::skip]
 test_support_visibility! {
 #[derive(Serialize, Deserialize)]
 struct ParentState {
@@ -296,11 +302,13 @@ struct ParentState {
     parents: Vec<ParentIdentity>,
 }
 }
+#[rustfmt::skip]
 test_support_visibility! {
 fn parent_state_path(storage: &Path) -> PathBuf {
     storage.join("retention/cache-parents.json")
 }
 }
+#[rustfmt::skip]
 test_support_visibility! {
 fn read_parent_state(storage: &Path) -> io::Result<ParentState> {
     match fs::read(parent_state_path(storage)) {
@@ -555,6 +563,7 @@ fn mirror_status(configured: Option<&Path>, root: &Path) {
         roots.locations.insert(configured.to_path_buf(), entry);
     }
 }
+#[rustfmt::skip]
 test_support_visibility! {
 fn set_status(root: &Path, reason: Option<String>, identity: Option<Identity>) -> u64 {
     let mut roots = STATUS
@@ -671,6 +680,7 @@ fn registered_cache_path(path: &Path) -> io::Result<Option<(PathBuf, Identity)>>
     Ok(None)
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 /// A cache pathname is only a label. Keep the admitted directory open while
 /// resolving descendants so replacement ancestors cannot redirect an operation.
@@ -683,23 +693,26 @@ impl CachePath {
     pub(crate) fn directory(&self, create: bool) -> io::Result<PinnedDir> {
         self.root.repair_descendant(&self.relative, create)
     }
+    #[rustfmt::skip]
     test_support_visibility! {
     pub(crate) fn parent(&self) -> io::Result<(PinnedDir, std::ffi::OsString)> {
-            let name = self
-                .relative
-                .file_name()
-                .ok_or_else(|| io::Error::other("cache file requires a child name"))?
-                .to_os_string();
-            let parent = self
-                .root
-                .repair_descendant(self.relative.parent().unwrap_or(Path::new("")), false)?;
-            Ok((parent, name))
-        }
+        let name = self
+            .relative
+            .file_name()
+            .ok_or_else(|| io::Error::other("cache file requires a child name"))?
+            .to_os_string();
+        let parent = self
+            .root
+            .repair_descendant(self.relative.parent().unwrap_or(Path::new("")), false)?;
+        Ok((parent, name))
+    }
 
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 pub(crate) fn pin_cache_path(path: &Path) -> io::Result<Option<CachePath>> {
     // A nested alias must not replace the enclosing registered namespace as
     // the admission boundary. The pathname selects a candidate; its open
@@ -886,17 +899,21 @@ pub fn unavailable_warning(path: &Path, reason: &str) -> crate::config_resolve::
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 fn open_use_lock(root: &PinnedDir) -> io::Result<File> {
     root.repair_coordination_file(std::ffi::OsStr::new(IN_USE))
 }
 }
+#[rustfmt::skip]
 test_support_visibility! {
 fn pinned_identity(root: &PinnedDir) -> io::Result<Identity> {
     let (device, inode) = root.directory_identity()?;
     Ok(Identity { device, inode })
 }
 }
+#[rustfmt::skip]
 test_support_visibility! {
 /// A configured durable root may be a symlink. Resolve it at the operation's
 /// boundary and retain the directory handle for every ownership comparison.
@@ -1395,6 +1412,7 @@ fn prepare_cache_root_with_floor_hooks(
     }
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RecordedRoot {
@@ -1410,6 +1428,7 @@ struct RecordedRoot {
     registration: Option<String>,
 }
 }
+#[rustfmt::skip]
 test_support_visibility! {
 #[derive(Serialize, Deserialize)]
 struct OwnerMarker {
@@ -1420,6 +1439,7 @@ struct OwnerMarker {
     registration: String,
 }
 }
+#[rustfmt::skip]
 test_support_visibility! {
 #[derive(Debug, Serialize, Deserialize)]
 struct History {
@@ -1436,6 +1456,7 @@ struct History {
     pending: Vec<PendingRoot>,
 }
 }
+#[rustfmt::skip]
 test_support_visibility! {
 #[derive(Debug, Serialize, Deserialize)]
 struct PendingRoot {
@@ -1449,6 +1470,7 @@ struct PendingRoot {
     staging: PathBuf,
 }
 }
+#[rustfmt::skip]
 test_support_visibility! {
 fn history_path(storage: &Path) -> PathBuf {
     storage.join("retention/cache-roots.json")
@@ -1528,7 +1550,9 @@ fn lock_root_history(storage: &Path) -> io::Result<crate::fs_lock::LockGuard> {
     .map_err(io::Error::other)
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 fn read_root_history(storage: &Path) -> io::Result<History> {
     Ok(match fs::read(history_path(storage)) {
         Ok(bytes) => match serde_json::from_slice::<History>(&bytes) {
@@ -1674,6 +1698,7 @@ fn read_marker_identity(file: File) -> io::Result<OwnerMarker> {
     }
     serde_json::from_reader(file).map_err(io::Error::other)
 }
+#[rustfmt::skip]
 test_support_visibility! {
 fn marker_matches_pinned(root: &PinnedDir, storage: &PinnedDir) -> io::Result<String> {
     let recorded = read_marker_identity(root.repair_read_file(std::ffi::OsStr::new(OWNER))?)?;
@@ -1697,6 +1722,7 @@ fn marker_matches_pinned(root: &PinnedDir, storage: &PinnedDir) -> io::Result<St
 fn known_harness(name: &str) -> bool {
     crate::engram_catalog::harness_label(name).is_some()
 }
+#[rustfmt::skip]
 test_support_visibility! {
 fn candidates_and_durable(storage: &Path) -> io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     candidates_and_durable_with_budget(storage, &mut RepairBudget::new())
@@ -2133,7 +2159,9 @@ fn cleanup_roots(
     Ok(())
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 pub(crate) fn remove_inactive_cache_roots(storage: &Path, active: &[PathBuf]) -> CleanupReport {
     let mut report = CleanupReport::default();
     if let Err(error) = cleanup_roots(storage, active, &mut report, None, None) {
@@ -2174,6 +2202,7 @@ pub fn clean_old(
     )
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
 pub(crate) fn clean_old_resolved(
     tiers: &[crate::config_resolve::ConfigTier],
@@ -2446,7 +2475,9 @@ pub fn prepare_process_cache_root(
     prepare_cache_root(config)
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 /// Hold exclusion across inventory, confirmation and deletion. A host-wide
 /// process or connection-file check cannot identify which storage a daemon uses.
 pub(crate) fn acquire_cache_cleanup_lease(storage: &Path) -> io::Result<File> {

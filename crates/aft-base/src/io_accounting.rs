@@ -133,8 +133,6 @@ pub fn work_snapshot() -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-
-    use super::*;
     #[test]
     fn path_context_preserves_absence_and_retry_kinds() {
         for kind in [std::io::ErrorKind::NotFound, std::io::ErrorKind::WouldBlock] {

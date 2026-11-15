@@ -72,7 +72,7 @@ pub fn note_session(session: &str) {
 /// master (resize/read/write) and use a Rust child with the same terminal setup
 /// for the opt-in path. SETEXEC keeps the session leader's PID and terminal.
 #[cfg(target_os = "macos")]
-pub(crate) fn spawn_pty(
+pub fn spawn_pty(
     builder: portable_pty::CommandBuilder,
     master: &dyn portable_pty::MasterPty,
 ) -> Result<Box<dyn portable_pty::Child + Send + Sync>, String> {

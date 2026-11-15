@@ -222,7 +222,7 @@ pub fn opened_location(file: &File) -> io::Result<PathBuf> {
 
 /// Where an open file really is, asked of the kernel through its handle.
 #[cfg(target_os = "macos")]
-pub(crate) fn opened_location(file: &File) -> io::Result<PathBuf> {
+pub fn opened_location(file: &File) -> io::Result<PathBuf> {
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
     let mut buffer = vec![0u8; libc::PATH_MAX as usize];
@@ -281,7 +281,7 @@ pub(crate) fn opened_location(file: &File) -> io::Result<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) const MANAGED_TEMP_ROOT: &str = "/private/tmp/aft-w";
+pub const MANAGED_TEMP_ROOT: &str = "/private/tmp/aft-w";
 #[cfg(all(unix, not(target_os = "macos")))]
 pub const MANAGED_TEMP_ROOT: &str = "/tmp/aft-w";
 

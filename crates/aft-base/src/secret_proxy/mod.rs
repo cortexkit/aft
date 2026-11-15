@@ -141,7 +141,9 @@ pub enum ProxyError {
     Stopped,
 }
 
+#[rustfmt::skip]
 test_support_visibility! {
+
 /// This protection is process-wide and intentionally irreversible. Resolution
 /// adapters can transiently receive material, so every proxy owner must prevent
 /// core dumps before starting a secret runtime.
@@ -356,114 +358,116 @@ impl SecretProxy {
         Self::start_with_tls(config, upstream)
     }
 
+    #[rustfmt::skip]
     test_support_visibility! {
+
     fn start_with_tls(
-            config: ProxyConfig,
-            upstream: rustls::ClientConfig,
-        ) -> Result<Self, ProxyError> {
-            protect_secret_process()?;
-            if !cfg!(any(target_os = "linux", target_os = "macos")) {
-                return Err(ProxyError::UnsupportedPlatform);
-            }
-            let scanned: BTreeSet<_> = config.scanned_labels.iter().collect();
-            if scanned.is_empty()
-                || scanned.len() != config.scanned_labels.len()
-                || scanned
-                    .iter()
-                    .any(|label| !secret_rules::placeholder::is_label(label))
-            {
-                return Err(ProxyError::InvalidRules);
-            }
-            let _ = rustls::crypto::ring::default_provider().install_default();
-            let mut params =
-                CertificateParams::new(Vec::new()).map_err(|_| ProxyError::Initialization)?;
-            params.distinguished_name = rcgen::DistinguishedName::new();
-            params
-                .distinguished_name
-                .push(rcgen::DnType::CommonName, "AFT per-command secret proxy CA");
-            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-            params.key_usages = vec![
-                rcgen::KeyUsagePurpose::KeyCertSign,
-                rcgen::KeyUsagePurpose::DigitalSignature,
-            ];
-            let ca_key = KeyPair::generate().map_err(|_| ProxyError::Initialization)?;
-            let ca = params
-                .self_signed(&ca_key)
-                .map_err(|_| ProxyError::Initialization)?;
-            let ca_pem = ca.pem();
-            let mut random = Zeroizing::new([0u8; 32]);
-            getrandom::fill(&mut random[..]).map_err(|_| ProxyError::Initialization)?;
-            let token =
-                Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&random[..]));
-            let expected_auth = basic_credentials(&token)?;
-            let stopped = Arc::new(AtomicBool::new(false));
-            let cancelled = stopped.clone();
-            let approvals = crate::secret::requests::RequestSecrets::new(
-                config.vault.clone(),
-                config.authorization_scope.clone(),
-                config.consent_context.clone(),
-            )
-            .with_request_cancellation(move || cancelled.load(Ordering::Acquire));
-            #[cfg(any(test, feature = "test-support"))]
-            let approvals = approvals.with_clock(config.approval_clock.clone());
-            let state = Arc::new(State {
-                approvals,
-                config,
-                session: AtomicI32::new(0),
-                session_birth: std::sync::atomic::AtomicU64::new(0),
-                stopped,
-                token,
-                expected_auth,
-                ca,
-                ca_key,
-                upstream,
-                material_gate: Mutex::new(()),
-                connections: Arc::new(tokio::sync::Semaphore::new(limits::CONNECTIONS)),
-                requests: Arc::new(tokio::sync::Semaphore::new(limits::REQUESTS)),
-                patterns: Mutex::new(Vec::new()),
-                #[cfg(any(test, feature = "test-support"))]
-                headers_sensitive: AtomicBool::new(false),
-                #[cfg(any(test, feature = "test-support"))]
-                test_identity_generation: std::sync::atomic::AtomicU64::new(0),
-                #[cfg(any(test, feature = "test-support"))]
-                test_idle_timeout_ms: std::sync::atomic::AtomicU64::new(0),
-                #[cfg(any(test, feature = "test-support"))]
-                test_upstream: Mutex::default(),
-                #[cfg(any(test, feature = "test-support"))]
-                test_refusals: Mutex::default(),
-            });
-            let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-                .map_err(|_| ProxyError::Initialization)?;
-            listener
-                .set_nonblocking(true)
-                .map_err(|_| ProxyError::Initialization)?;
-            let address = listener
-                .local_addr()
-                .map_err(|_| ProxyError::Initialization)?;
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .map_err(|_| ProxyError::Initialization)?;
-            let (stop, receiver) = watch::channel(false);
-            let shared = state.clone();
-            let thread = std::thread::Builder::new()
-                .name("secret-proxy".into())
-                .spawn(move || {
-                    runtime.block_on(serve(listener, shared.clone(), receiver));
-                    shared.mark_stopped();
-                    runtime.shutdown_timeout(Duration::from_secs(1));
-                    shared.patterns.lock().clear();
-                })
-                .map_err(|_| ProxyError::Initialization)?;
-            Ok(Self {
-                address,
-                ca_pem,
-                state,
-                stop,
-                thread: Some(thread),
-            })
+        config: ProxyConfig,
+        upstream: rustls::ClientConfig,
+    ) -> Result<Self, ProxyError> {
+        protect_secret_process()?;
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+            return Err(ProxyError::UnsupportedPlatform);
         }
+        let scanned: BTreeSet<_> = config.scanned_labels.iter().collect();
+        if scanned.is_empty()
+            || scanned.len() != config.scanned_labels.len()
+            || scanned
+                .iter()
+                .any(|label| !secret_rules::placeholder::is_label(label))
+        {
+            return Err(ProxyError::InvalidRules);
+        }
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut params =
+            CertificateParams::new(Vec::new()).map_err(|_| ProxyError::Initialization)?;
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "AFT per-command secret proxy CA");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        let ca_key = KeyPair::generate().map_err(|_| ProxyError::Initialization)?;
+        let ca = params
+            .self_signed(&ca_key)
+            .map_err(|_| ProxyError::Initialization)?;
+        let ca_pem = ca.pem();
+        let mut random = Zeroizing::new([0u8; 32]);
+        getrandom::fill(&mut random[..]).map_err(|_| ProxyError::Initialization)?;
+        let token =
+            Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&random[..]));
+        let expected_auth = basic_credentials(&token)?;
+        let stopped = Arc::new(AtomicBool::new(false));
+        let cancelled = stopped.clone();
+        let approvals = crate::secret::requests::RequestSecrets::new(
+            config.vault.clone(),
+            config.authorization_scope.clone(),
+            config.consent_context.clone(),
+        )
+        .with_request_cancellation(move || cancelled.load(Ordering::Acquire));
+        #[cfg(any(test, feature = "test-support"))]
+        let approvals = approvals.with_clock(config.approval_clock.clone());
+        let state = Arc::new(State {
+            approvals,
+            config,
+            session: AtomicI32::new(0),
+            session_birth: std::sync::atomic::AtomicU64::new(0),
+            stopped,
+            token,
+            expected_auth,
+            ca,
+            ca_key,
+            upstream,
+            material_gate: Mutex::new(()),
+            connections: Arc::new(tokio::sync::Semaphore::new(limits::CONNECTIONS)),
+            requests: Arc::new(tokio::sync::Semaphore::new(limits::REQUESTS)),
+            patterns: Mutex::new(Vec::new()),
+            #[cfg(any(test, feature = "test-support"))]
+            headers_sensitive: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-support"))]
+            test_identity_generation: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            test_idle_timeout_ms: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            test_upstream: Mutex::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            test_refusals: Mutex::default(),
+        });
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .map_err(|_| ProxyError::Initialization)?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|_| ProxyError::Initialization)?;
+        let address = listener
+            .local_addr()
+            .map_err(|_| ProxyError::Initialization)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|_| ProxyError::Initialization)?;
+        let (stop, receiver) = watch::channel(false);
+        let shared = state.clone();
+        let thread = std::thread::Builder::new()
+            .name("secret-proxy".into())
+            .spawn(move || {
+                runtime.block_on(serve(listener, shared.clone(), receiver));
+                shared.mark_stopped();
+                runtime.shutdown_timeout(Duration::from_secs(1));
+                shared.patterns.lock().clear();
+            })
+            .map_err(|_| ProxyError::Initialization)?;
+        Ok(Self {
+            address,
+            ca_pem,
+            state,
+            stop,
+            thread: Some(thread),
+        })
+    }
     }
 
     pub fn address(&self) -> SocketAddr {

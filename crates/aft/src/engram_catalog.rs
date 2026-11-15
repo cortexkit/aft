@@ -23,10 +23,8 @@ use std::io;
 use std::path::Path;
 
 #[cfg(test)]
+#[allow(hidden_glob_reexports)]
 mod tests {
-    use super::*;
-
-    use serde_json::Value;
 
     #[allow(unused_imports)]
     pub(crate) use aft_base::engram_catalog::tests::*;

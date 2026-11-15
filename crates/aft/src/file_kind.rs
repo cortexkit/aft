@@ -22,8 +22,6 @@ use std::time::SystemTime;
 
 #[cfg(test)]
 mod tests {
-
-    use super::*;
     #[test]
     fn extension_only_source_classification_matches_parser() {
         use crate::lang_id::{LangId, TEST_EXTENSIONS};

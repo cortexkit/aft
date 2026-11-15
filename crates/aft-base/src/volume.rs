@@ -182,6 +182,7 @@ pub fn volume_anchor(root: &Path) -> Option<(PathBuf, u64)> {
         Some((anchor.to_path_buf(), dev))
     }
 }
+#[rustfmt::skip]
 test_support_visibility! {
 /// The identity of the filesystem holding `root`, where the platform
 /// reports one.
