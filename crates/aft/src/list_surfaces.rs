@@ -79,7 +79,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
-                predicate_name: "HUB_SUMMARY_LIMIT, impact_result",
+                predicate_name: "HUB_SUMMARY_LIMIT, impact_result, impact_result_with_budget",
             },
             ReasonEntry {
                 reason: Reason::Depth,
