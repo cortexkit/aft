@@ -506,7 +506,7 @@ def load_baseline(path: Path) -> dict[str, Any]:
     return payload
 
 
-def git_clone_pinned(config: dict[str, Any], name: str, cache_dir: Path) -> Path:
+def git_clone_pinned(config: dict[str, Any], name: str, cache_dir: Path, *, prepared_only: bool = False) -> Path:
     sha = str(config["sha"])
     # Keep the checkout basename equal to the baseline repo name because the
     # matrix CSV uses the root basename as its repository identity.
@@ -517,6 +517,8 @@ def git_clone_pinned(config: dict[str, Any], name: str, cache_dir: Path) -> Path
         if checked.returncode == 0 and checked.stdout.strip() == sha and shallow.stdout.strip() == "true":
             return destination
         raise RuntimeError(f"cached repository is not the pinned shallow checkout: {destination}")
+    if prepared_only:
+        raise RuntimeError(f"pinned repository was not prepared before measurement: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     initialized = run_command(["git", "init", "--quiet", str(destination)], timeout=30)
     if initialized.returncode != 0:
@@ -536,7 +538,7 @@ def git_clone_pinned(config: dict[str, Any], name: str, cache_dir: Path) -> Path
     return destination
 
 
-def ensure_synthetic_tree(cache_dir: Path) -> Path:
+def ensure_synthetic_tree(cache_dir: Path, *, prepared_only: bool = False) -> Path:
     root = cache_dir / "synthetic" / SYNTHETIC_VERSION / "synthetic-24k"
     marker = root.with_name(root.name + ".complete")
     root.parent.mkdir(parents=True, exist_ok=True)
@@ -545,6 +547,8 @@ def ensure_synthetic_tree(cache_dir: Path) -> Path:
         if count == SYNTHETIC_FILE_COUNT and not (root / ".git").exists():
             return root
         raise RuntimeError(f"synthetic cache marker is stale: {root}")
+    if prepared_only:
+        raise RuntimeError(f"synthetic tree was not prepared before measurement: {root}")
     if root.exists() and not root.is_dir():
         raise RuntimeError(f"synthetic cache path is not a directory: {root}")
     root.mkdir(parents=True, exist_ok=True)
@@ -569,14 +573,14 @@ def ensure_synthetic_tree(cache_dir: Path) -> Path:
     return root
 
 
-def prepare_repositories(payload: dict[str, Any], names: list[str], cache_dir: Path) -> dict[str, Path]:
+def prepare_repositories(payload: dict[str, Any], names: list[str], cache_dir: Path, *, prepared_only: bool = False) -> dict[str, Path]:
     paths: dict[str, Path] = {}
     for name in names:
         config = payload["repos"][name]
         if config["kind"] == "git":
-            paths[name] = git_clone_pinned(config, name, cache_dir)
+            paths[name] = git_clone_pinned(config, name, cache_dir, prepared_only=prepared_only)
         else:
-            paths[name] = ensure_synthetic_tree(cache_dir)
+            paths[name] = ensure_synthetic_tree(cache_dir, prepared_only=prepared_only)
     return paths
 
 
@@ -709,6 +713,11 @@ def write_baseline_provenance() -> str:
     run_id = os.environ.get("GITHUB_RUN_ID")
     if not run_id:
         return f"local --write-baseline on {current_platform()}"
+    if platform.system() == "Darwin":
+        return (f"workflow run {run_id} ({os.environ.get('GITHUB_WORKFLOW', 'unknown workflow')}), "
+                f"{date.today().isoformat()}, self-hosted mac-mini runner {os.environ.get('RUNNER_NAME', 'unknown')}, "
+                f"head {os.environ.get('GITHUB_SHA', 'unknown commit')}; "
+                "minimum observed value per metric over the run's two passes; memory=direct-child wait4 ru_maxrss (bytes)")
     image = os.environ.get("ImageOS", "unknown image")
     image_version = os.environ.get("ImageVersion", "unknown version")
     commit = os.environ.get("GITHUB_SHA", "unknown commit")
@@ -822,6 +831,19 @@ def runner_facts() -> str:
     Runner images can also land on different CPU models, so record the model
     and one reported clock reading as diagnostics, not comparison inputs.
     """
+    if platform.system() == "Darwin":
+        facts = {}
+        for name, command in {
+            "model": ["sysctl", "-n", "hw.model"],
+            "cpu": ["sysctl", "-n", "machdep.cpu.brand_string"],
+            "macos": ["sw_vers"],
+            "power": ["pmset", "-g", "batt"],
+        }.items():
+            completed = run_command(command, timeout=30)
+            if completed.returncode != 0:
+                raise RuntimeError(f"cannot record Mac runner {name}: {completed.stderr.strip()}")
+            facts[name] = completed.stdout.strip()
+        return f"runner: platform={current_platform()} cpus={os.cpu_count()} facts={json.dumps(facts)}"
     cpus: str
     try:
         # The scheduler affinity mask, not the machine's core count: a cgroup or
@@ -890,6 +912,9 @@ def observation_line(repo: str, runs: list[RunData]) -> str:
     sampled = [run.row.get("peak_rss_sampled_mb", "n/a") or "n/a" for run in runs if run.ready]
     if any(value != "n/a" for value in sampled):
         parts.append(f"peak_rss_sampled_mb(ungated)={'/'.join(sampled)}")
+    resident = [run.row.get("peak_rss_ru_maxrss_mb", "n/a") or "n/a" for run in runs if run.ready]
+    if any(value != "n/a" for value in resident):
+        parts.append(f"peak_rss_ru_maxrss_mb(ungated)={'/'.join(resident)}")
     for diagnostic in ("edit_apply_ms", "edit_backup_ms", "edit_write_ms"):
         values = [run.row.get(diagnostic, "n/a") or "n/a" for run in runs if run.ready]
         if any(value != "n/a" for value in values):
@@ -990,10 +1015,10 @@ def self_test() -> int:
             ("model name : Model without frequency\n", "Model without frequency", "unknown"),
             ("", "unknown", "unknown"),
         ):
-            with patch.object(Path, "read_text", return_value=contents):
+            with patch.object(Path, "read_text", return_value=contents), patch.object(platform, "system", return_value="Linux"):
                 facts = runner_facts()
             assert f"cpu_model={json.dumps(model)} cpu_mhz={mhz}" in facts, facts
-        with patch.object(Path, "read_text", side_effect=OSError("no proc filesystem")):
+        with patch.object(Path, "read_text", side_effect=OSError("no proc filesystem")), patch.object(platform, "system", return_value="Linux"):
             assert 'cpu_model="unknown" cpu_mhz=unknown' in runner_facts()
 
         csv_path = temporary / "synthetic.csv"
@@ -1251,6 +1276,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--provenance", help="Where those results came from, recorded in the baseline (required with --write-baseline-from)")
     parser.add_argument("--ignore-platform", action="store_true", help="Compare against a baseline captured on another platform; the numbers are not comparable, so this never gates")
     parser.add_argument("--self-test", action="store_true", help="Run the synthetic comparator self-test")
+    parser.add_argument("--prepared-only", action="store_true", help="Require an existing binary and pinned corpus; never build or fetch during measurement")
     args = parser.parse_args()
     if args.budget_min <= 0:
         parser.error("--budget-min must be greater than zero")
@@ -1275,7 +1301,7 @@ def main() -> int:
     # signal, it produces a wrong one, so say which two platforms disagree
     # instead of reporting the gap between them as a regression.
     recorded_platform = baseline[PLATFORM_KEY]["platform"]
-    if recorded_platform != current_platform() and not args.ignore_platform:
+    if recorded_platform != current_platform() and not args.ignore_platform and not args.write_baseline:
         print(
             f"cost-gate: baseline was captured on {recorded_platform}; this run measures on {current_platform()}. "
             f"Re-capture on this platform, or pass --ignore-platform to measure without gating.",
@@ -1296,10 +1322,17 @@ def main() -> int:
     results_dir = args.results_dir.expanduser().resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
     results_dir.mkdir(parents=True, exist_ok=True)
-    binary = ensure_release_binary(repo_root, args.aft_binary)
+    prepared_only = getattr(args, "prepared_only", False)
+    if prepared_only:
+        binary = Path(args.aft_binary or os.environ.get("AFT_BINARY", ""))
+        if not binary.is_file() or not os.access(binary, os.X_OK):
+            raise RuntimeError("release binary was not prepared before measurement")
+        binary = binary.resolve()
+    else:
+        binary = ensure_release_binary(repo_root, args.aft_binary)
     print(runner_facts())
     print(f"release binary: {binary} sha256={sha256(binary)}")
-    repo_paths = prepare_repositories(baseline, names, cache_dir)
+    repo_paths = prepare_repositories(baseline, names, cache_dir, prepared_only=prepared_only)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output_root = results_dir / f"cost-gate-{stamp}"
     output_root.mkdir(parents=True, exist_ok=False)

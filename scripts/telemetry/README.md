@@ -2,9 +2,90 @@
 
 `cost-gate.sh` runs the standalone `oss-matrix.sh` harness twice over a fixed,
 shallow-cloned corpus and compares the better (lower) observation for each
-metric with [`cost-baselines.json`](cost-baselines.json). Running twice is
+metric with the baseline for that machine: `cost-baselines.mac-mini.json` for
+the nightly Mac mini, or [`cost-baselines.json`](cost-baselines.json) for the
+manual GitHub-hosted Linux path. Running twice is
 intentional: one slow scheduler interval is treated as noise and must not page
 anyone.
+
+## Isolated Mac mini nightly
+
+The cost job runs at **03:05 UTC** on `[self-hosted, mac-mini]`. The runner
+accepts one GitHub job at a time, so an already-running release build simply
+delays the nightly. No release workflow or release-build storage is changed.
+Linux cost measurements remain available only through manual dispatch with
+`runner=linux`; their baseline is never compared with Mac numbers.
+
+`mac-cost-gate.py` keeps Cargo output, the SHA-addressed pinned corpus and run
+storage under **`~/aft-nightly-cost/`**, outside the Actions checkout and outside
+the disposable macOS Caches folder. It creates `.metadata_never_index`, applies
+the runner user's `tmutil addexclusion`, and verifies the exclusion. A missing
+tool, disk or permission is an operator problem: the workflow never installs
+system software or uses sudo. The binary is rebuilt and any changed corpus
+pins fetched **before** asking MOTOR to isolate the machine. Measurement uses
+`--prepared-only`, which refuses to build, fetch or generate missing inputs.
+
+MOTOR honours holds only during **03:00–05:00 UTC**. The check writes
+`/Users/Shared/motor-macos-hold/hold.json` with owner `aft-nightly` and an RFC 3339
+UTC expiry of 05:00, then waits for **the same owner and expiry** in
+`/Users/Shared/motor-macos-grant/granted.json`. A process listing is never the
+start decision. Draining can take about 45 minutes; the check waits for a grant
+until the window ends. No grant records **not run: machine busy**, without
+failing the night. A start with less than the expected measurement duration
+plus ten minutes remaining records **not run: too late in the window**, without
+requesting a hold. The initial expected duration is 30 minutes; subsequent
+runs use the longest of the last three successful measured durations.
+
+During capture and independent verification, a one-second monitor records job
+VM processes (including MOTOR's `com.apple.Virtualization.VirtualMachine`),
+swap growth, grant loss/change and window expiry. Any of these makes the night
+**not judged**, even if the comparator failed; no candidate is accepted. The
+whole measurement process group is stopped at 05:00. The hold is removed in a
+`finally` block and an always-run Actions step also removes it on cancellation.
+MOTOR owns removal of the grant file.
+
+Every run carries model, CPU/core count, memory, macOS version, power source
+and power settings in `machine.json`, with a post-run snapshot and a separate
+`night-status.json` verdict. Pass logs also record model, CPU, macOS and power.
+Artifacts retain those records, CSVs, logs and any accepted candidate, not the
+index payloads. The retained local index scratch is removed after measurement.
+
+### Mac memory and baseline capture
+
+`peak_rss_mb` on macOS is the direct AFT child's **`wait4` `ru_maxrss`**, converted
+from Darwin bytes to MiB. It is the process's peak resident memory over its
+lifetime, closest to Linux `VmHWM`. Physical footprint is not used: its charge
+accounting includes non-resident memory and is not peak RSS. Both Popen reap
+paths retain the child's usage, so an early `poll()` cannot discard it.
+`peak_rss_source=darwin-wait4-ru_maxrss-bytes` and
+`peak_rss_ru_maxrss_mb` name the source honestly; the Linux-only
+`peak_rss_hwm_mb` is `n/a` on Mac. Missing usage is a measurement gap, never a
+sampled fallback or zero. CPU comes from that same child's fractional user and
+system seconds. The existing budgets and every Linux assertion remain intact.
+Phase-by-phase kernel high-water attribution remains Linux-only.
+
+Bootstrap the Mac baseline with two **separate** workflow runs on the same task
+branch, after MOTOR enables grants, each within the isolation window:
+
+```bash
+gh workflow run cost-gate.yml --ref <task-branch> \
+  -f runner=mac-mini -f repo=all -f write_baseline=true
+```
+
+Each run requires two ready capture passes within the existing tolerance/floor
+rule, then gates two independent fresh-storage verification passes. The first
+Mac capture uses only the Linux file's pins and budgets, never its measured
+values. Candidates are uploaded as `cost-baselines.candidate.json`, not committed
+by CI. Review the two dispatches side by side, require their per-metric minima
+to agree under the same spread rule, and commit the accepted candidate as
+`cost-baselines.mac-mini.json`. Keep the Linux file unchanged.
+
+Pure contract checks (including stand-in hold/grant folders, no real MOTOR state):
+
+```bash
+python3 -m unittest discover -s scripts/telemetry -p 'test_cpu_precision.py' -v
+python3 -m unittest discover -s scripts/telemetry -p 'test_mac_cost_gate.py' -v
+```
 
 ## Run locally
 
@@ -112,7 +193,7 @@ into the new baseline.
   Missing slow-edit records are `n/a`, not zero. These and `edit_apply_ms` never
   become baseline budgets. CPU and kernel peak still cover the entire process,
   including edit work.
-- `peak_rss_mb` now uses the Linux kernel's `VmHWM` for the same AFT process
+- On Linux, `peak_rss_mb` uses the kernel's `VmHWM` for the same AFT process
   sampled by `ps` and `/proc/<pid>/stat`. A final read before AFT shuts down is
   required; a missing kernel peak is missing data, never zero or a fallback to
   the polled value. `peak_rss_sampled_mb` retains the two-second sampled maximum
@@ -138,8 +219,8 @@ into the new baseline.
 - Baseline generation requires two ready passes with every core metric and
   refuses a pair whose maximum exceeds the minimum's tolerance/floor budget.
   A noisy capture is a failed capture, not permission to widen a threshold.
-- The committed legacy baseline is incompatible with this profile. A fresh
-  GitHub-hosted capture with `write_baseline: true` is required; no old timing or
+- A baseline from the retired profile is incompatible. A fresh capture on the
+  gate's hardware with `write_baseline: true` is required; no old timing or
   sampled-memory number is relabelled. That dispatch also gates two independent
   fresh-storage passes in the same job against the new candidate, with logs/CSVs
   under `verification/`. The baseline candidate is uploaded for review, not
