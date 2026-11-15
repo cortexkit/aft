@@ -565,6 +565,26 @@ fn a_passes_stage_that_cannot_be_adopted_is_not_reported_resumed() {
 }
 
 #[test]
+fn a_text_only_publication_keeps_a_dead_build_s_workspace() {
+    let root = tempfile::tempdir().unwrap();
+    project(root.path());
+    let store = tempfile::tempdir().unwrap();
+    // The killed build published the text index first.
+    killed_build(store.path(), root.path(), "stage.sites");
+    let checkout = Checkout::bind(layer(), store.path(), family(), root.path()).unwrap();
+    assert!(checkout.needs_build());
+    let dir = builds(&checkout);
+    checkout.discard_build_workspace();
+    assert_eq!(
+        workspaces(&dir).len(),
+        1,
+        "kept while a cold build is needed"
+    );
+    let report = checkout.build().unwrap();
+    assert!(report.resumed_passes, "{report:?}");
+}
+
+#[test]
 fn a_build_from_another_executable_or_a_damaged_stage_is_not_reused() {
     let root = tempfile::tempdir().unwrap();
     project(root.path());

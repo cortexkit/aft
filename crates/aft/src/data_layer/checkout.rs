@@ -1616,7 +1616,7 @@ impl Checkout {
         if unpublished && self.planes.text && self.planes.callgraph {
             if let Some(report) = self.start_from_sibling(build_started)? {
                 // Published from a sibling, or by another process: there
-                // is no cold build left to resume.
+                // may be no cold build left to resume.
                 self.discard_build_workspace();
                 return Ok(report);
             }
@@ -2392,10 +2392,14 @@ impl Checkout {
     }
 
     /// Deletes what an earlier cold build of this checkout left to resume
-    /// from, once the checkout no longer needs a cold build. Best effort: a
-    /// live build keeps its own, and a later writer's sweep deletes the
-    /// rest.
+    /// from, once the checkout no longer needs a cold build: kept while it
+    /// still does, as when another process published only its text index
+    /// and died building the call graph. Best effort: a live build keeps
+    /// its own, and a later writer's sweep deletes the rest.
     fn discard_build_workspace(&self) {
+        if self.needs_build() {
+            return;
+        }
         let claim = match self.family.try_write() {
             Ok(Some(mut session)) => session.claim_scratch(self.checkout),
             _ => return,
