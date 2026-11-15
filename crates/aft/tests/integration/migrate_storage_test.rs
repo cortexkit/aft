@@ -7,11 +7,7 @@ use aft::harness::Harness;
 use aft::migrate_storage::{Args, ExitStatus, Options};
 
 fn aft_binary() -> PathBuf {
-    std::env::var_os("AFT_TEST_AFT_BINARY")
-        .or_else(|| std::env::var_os("NEXTEST_BIN_EXE_aft"))
-        .or_else(|| std::env::var_os("CARGO_BIN_EXE_aft"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_aft")))
+    crate::test_helpers::aft_binary::source_binary()
 }
 
 fn args(from: PathBuf, to: PathBuf, log: PathBuf) -> Args {

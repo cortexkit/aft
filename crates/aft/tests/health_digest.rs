@@ -39,13 +39,8 @@ fn health_digest_is_absent_from_agent_tool_registries_and_descriptions() {
     }
 }
 
-/// Nextest archive shards extract binaries to a different tree than the
-/// archive builder compiled on, so the compile-time Cargo path may not exist;
-/// nextest publishes the remapped location in its own runtime variable.
 fn aft_binary() -> std::path::PathBuf {
-    std::env::var_os("NEXTEST_BIN_EXE_aft")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_BIN_EXE_aft")))
+    crate::test_helpers::aft_binary::source_binary()
 }
 
 #[test]
