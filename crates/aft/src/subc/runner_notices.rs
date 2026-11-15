@@ -381,6 +381,140 @@ fn request(id: String, text: String, completion: bool, worker: bool) -> SendRequ
         .with_delivery_order(&DeliveryOrder::new(modes))
 }
 
+fn task_request(
+    request: SendRequest,
+    task_id: &str,
+    started_at: u64,
+    reminder_elapsed_ms: Option<u64>,
+    policy: crate::bash_background::persistence::RunnerNoticePolicy,
+) -> SendRequest {
+    if !policy.dedupe {
+        return request;
+    }
+    let mut order = request.delivery_order().unwrap().unwrap();
+    order.dedupe_key = Some(format!("aft:bash-task:{task_id}"));
+    order.expires_at_ms = reminder_elapsed_ms.map(|elapsed| {
+        started_at
+            .saturating_add(elapsed)
+            .saturating_add(policy.reminder_interval_ms)
+    });
+    request.with_delivery_order(&order)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RunnerIncarnation {
+    daemon: String,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct RunnerCapabilities {
+    entries: HashMap<(PathBuf, String), (RunnerIncarnation, bool)>,
+}
+
+impl RunnerCapabilities {
+    fn get(&self, path: &Path, module: &str, incarnation: &RunnerIncarnation) -> Option<bool> {
+        self.entries
+            .get(&(path.into(), module.into()))
+            .filter(|(cached, _)| cached == incarnation)
+            .map(|(_, supported)| *supported)
+    }
+
+    fn insert(
+        &mut self,
+        path: &Path,
+        module: &str,
+        incarnation: RunnerIncarnation,
+        supported: bool,
+    ) {
+        self.entries
+            .insert((path.into(), module.into()), (incarnation, supported));
+    }
+}
+
+static RUNNER_CAPABILITIES: OnceLock<std::sync::Mutex<RunnerCapabilities>> = OnceLock::new();
+
+async fn runner_incarnation(consumer: &SubcConsumer, module: &str) -> Option<RunnerIncarnation> {
+    let snapshot = tokio::time::timeout(Duration::from_secs(5), consumer.spawn_snapshot())
+        .await
+        .ok()?
+        .ok()?;
+    let spawn = snapshot
+        .live
+        .iter()
+        .find(|spawn| spawn.module_id == module)?;
+    Some(RunnerIncarnation {
+        daemon: snapshot.cursor.daemon_incarnation,
+        generation: spawn.spawn_generation,
+    })
+}
+
+fn described_delivery_order(bytes: &[u8]) -> Option<bool> {
+    let description = cortexkit_role_llm_runner::wire::read_reply::<Value>(bytes).ok()?;
+    let capabilities = description.get("capabilities")?.as_array()?;
+    if !capabilities.iter().all(Value::is_string) {
+        return None;
+    }
+    Some(
+        capabilities
+            .iter()
+            .any(|capability| capability == "delivery_order"),
+    )
+}
+
+async fn runner_delivery_order(path: &Path, address: &Address) -> Option<bool> {
+    #[cfg(test)]
+    if let Some(capability) = test_endpoint::capability(address) {
+        return capability;
+    }
+    let consumer = SubcConsumer::connect(path, ConsumerOptions::default())
+        .await
+        .ok()?;
+    let result = async {
+        let before = runner_incarnation(&consumer, &address.module).await?;
+        let route = open_notice_route(&consumer, address).await.ok()?;
+        let result = async {
+            // A route is tied to one runner process. Check both sides of the
+            // probe so a restart cannot label an old reply as a new capability.
+            if runner_incarnation(&consumer, &address.module).await? != before {
+                return None;
+            }
+            let cache = RUNNER_CAPABILITIES.get_or_init(Default::default);
+            if let Some(supported) = cache.lock().unwrap().get(path, &address.module, &before) {
+                return Some(supported);
+            }
+            let bytes = consumer
+                .request(
+                    &route,
+                    br#"{"method":"role.describe","params":{}}"#.to_vec(),
+                    CallOptions {
+                        timeout: Duration::from_secs(5),
+                        ..CallOptions::default()
+                    },
+                )
+                .await
+                .ok()?;
+            let supported = described_delivery_order(&bytes)?;
+            if runner_incarnation(&consumer, &address.module).await? != before {
+                return None;
+            }
+            cache
+                .lock()
+                .unwrap()
+                .insert(path, &address.module, before, supported);
+            Some(supported)
+        }
+        .await;
+        let _ = consumer
+            .close_handle(&route, CloseRouteOptions::default())
+            .await;
+        result
+    }
+    .await;
+    let _ = consumer.close().await;
+    result
+}
+
 fn envelope(request: &SendRequest) -> Vec<u8> {
     serde_json::to_vec(&json!({"method":"session.send", "params":request}))
         .expect("notice request is JSON")
@@ -404,7 +538,8 @@ pub(super) mod test_endpoint {
     use super::*;
     struct Endpoint {
         sender: std::sync::mpsc::Sender<Received>,
-        stored: std::sync::Mutex<Option<Vec<u8>>>,
+        stored: std::sync::Mutex<HashMap<String, Vec<u8>>>,
+        delivery_order: std::sync::Mutex<Option<bool>>,
         lose_response: AtomicBool,
         effects: Arc<AtomicU64>,
         retries: std::sync::Mutex<u64>,
@@ -436,6 +571,9 @@ pub(super) mod test_endpoint {
         endpoint: Arc<Endpoint>,
     }
     impl Capture {
+        pub(super) fn delivery_order(&self, supported: Option<bool>) {
+            *self.endpoint.delivery_order.lock().unwrap() = supported;
+        }
         pub(super) fn retry(&self, count: u64) {
             *self.endpoint.retries.lock().unwrap() = count;
         }
@@ -474,6 +612,7 @@ pub(super) mod test_endpoint {
         let endpoint = Arc::new(Endpoint {
             sender,
             stored: Default::default(),
+            delivery_order: Default::default(),
             lose_response: AtomicBool::new(lose_response),
             effects: effects.clone(),
             retries: Default::default(),
@@ -494,13 +633,28 @@ pub(super) mod test_endpoint {
             endpoint,
         }
     }
+    pub(super) fn capability(address: &Address) -> Option<Option<bool>> {
+        let endpoint = endpoints()
+            .lock()
+            .unwrap()
+            .get(&format!("aft:bash:{}", address.identity.session))
+            .cloned()?;
+        let supported = *endpoint.delivery_order.lock().unwrap();
+        Some(supported)
+    }
     pub(super) fn call(address: &Address, bytes: &[u8]) -> Option<Result<Vec<u8>, Outcome>> {
         let body: Value = serde_json::from_slice(bytes).unwrap();
         let key = body["params"]["send_id"]
             .as_str()
             .map(str::to_owned)
             .unwrap_or_else(|| format!("aft:bash:{}", address.identity.session));
-        let endpoint = endpoints().lock().unwrap().get(&key).cloned()?;
+        let endpoint = {
+            let endpoints = endpoints().lock().unwrap();
+            endpoints
+                .get(&key)
+                .or_else(|| endpoints.get(&format!("aft:bash:{}", address.identity.session)))
+                .cloned()?
+        };
         let active = endpoint.active.fetch_add(1, Ordering::Relaxed) + 1;
         endpoint.max_active.fetch_max(active, Ordering::Relaxed);
         struct Active<'a>(&'a AtomicU64);
@@ -524,6 +678,7 @@ pub(super) mod test_endpoint {
         }
         let decoded: SendRequest = serde_json::from_value(body["params"].clone()).unwrap();
         decoded.check_prompt().unwrap();
+        decoded.delivery_order().unwrap();
         assert_eq!(body["params"]["notice"], true);
         let gate = endpoint.gate.lock().unwrap().take();
         if let Some((entered, release)) = gate {
@@ -547,12 +702,12 @@ pub(super) mod test_endpoint {
         }
         let bytes = serde_json::to_vec(&decoded).unwrap();
         let mut stored = endpoint.stored.lock().unwrap();
-        if let Some(first) = stored.as_ref() {
+        if let Some(first) = stored.get(&key) {
             if first != &bytes {
                 return Some(Err(refusal("send_id_reuse")));
             }
         } else {
-            *stored = Some(bytes);
+            stored.insert(key, bytes);
             endpoint.effects.fetch_add(1, Ordering::Relaxed);
         }
         if endpoint.lose_response.swap(false, Ordering::Relaxed) {
@@ -789,6 +944,26 @@ fn idle_start_fallback(request: &SendRequest, outcome: &Outcome) -> Option<SendR
     Some(request.clone().with_delivery_order(&order))
 }
 
+fn refused_notice_members(outcome: &Outcome) -> bool {
+    matches!(outcome, Outcome::Final(failure)
+        if failure.class == FailureClass::PeerRefusal
+            && failure.code.as_deref() == Some("invalid_params")
+            && matches!(failure.field.as_deref(), Some("dedupe_key" | "expires_at_ms")))
+}
+
+fn notice_members_fallback(request: &SendRequest, outcome: &Outcome) -> Option<SendRequest> {
+    if !refused_notice_members(outcome) {
+        return None;
+    }
+    let mut order = request.delivery_order().ok()??;
+    if order.dedupe_key.is_none() && order.expires_at_ms.is_none() {
+        return None;
+    }
+    order.dedupe_key = None;
+    order.expires_at_ms = None;
+    Some(request.clone().with_delivery_order(&order))
+}
+
 fn request_failure(error: CallError) -> Outcome {
     match error {
         CallError::Module(error) => {
@@ -830,14 +1005,48 @@ pub(super) async fn transport_for_test(path: &Path, session: &str, scope: ScopeS
         true,
         true,
     );
+    let request = task_request(
+        request,
+        session,
+        0,
+        None,
+        crate::bash_background::persistence::RunnerNoticePolicy {
+            dedupe: runner_delivery_order(path, &address).await == Some(true),
+            reminder_interval_ms: 600_000,
+        },
+    );
     let outcome = send(path, &address, &request).await;
-    let result = match &outcome {
+    let mut result = match &outcome {
         Outcome::Accepted => json!({"outcome":"accepted"}),
         Outcome::Final(failure) | Outcome::Retry(failure) => json!({
             "outcome": if matches!(outcome, Outcome::Final(_)) { "final" } else { "retry" },
             "class": format!("{:?}", failure.class), "code": failure.code, "detail": failure.detail,
         }),
     };
+    if matches!(outcome, Outcome::Accepted) {
+        let mut refusals = Vec::new();
+        for (field, value) in [
+            ("dedupe_key", json!(42)),
+            ("dedupe_key", json!("")),
+            ("expires_at_ms", json!(-1)),
+            ("expires_at_ms", json!("tomorrow")),
+            ("delivery", json!("steer")),
+        ] {
+            let mut body: Value = serde_json::from_slice(&envelope(&request)).unwrap();
+            body["params"]["dedupe_key"] = json!("aft:bash-task:validation");
+            body["params"][field] = value;
+            let reply = call(path, &address, serde_json::to_vec(&body).unwrap()).await;
+            let refusal = match reply {
+                Ok(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+                Err(Outcome::Final(failure)) => {
+                    json!({"error":{"code":failure.code,"detail":{"field":failure.field}}})
+                }
+                Err(_) => json!({"transport_error":true}),
+            };
+            refusals.push(refusal);
+        }
+        result["invalid_members"] = json!(refusals);
+    }
     deliver(&request.send_id, 0, true, outcome, &mut false);
     result
 }
@@ -879,7 +1088,7 @@ async fn call(path: &Path, address: &Address, body: Vec<u8>) -> Result<Vec<u8>, 
     if let Some(result) = test_endpoint::call(address, &body) {
         return result;
     }
-    let Some(principal) = crate::launch_nonce::consumer_identity() else {
+    let Some(_) = crate::launch_nonce::consumer_identity() else {
         return Err(retry(
             FailureClass::ConsumerIdentity,
             "AFT launch has no consumer identity",
@@ -888,6 +1097,43 @@ async fn call(path: &Path, address: &Address, body: Vec<u8>) -> Result<Vec<u8>, 
     let consumer = match SubcConsumer::connect(path, ConsumerOptions::default()).await {
         Ok(consumer) => consumer,
         Err(error) => return Err(retry(FailureClass::Connect, error)),
+    };
+    let route = open_notice_route(&consumer, address).await;
+    let result = match route {
+        Ok(route) => {
+            let result = consumer
+                .request(
+                    &route,
+                    body,
+                    CallOptions {
+                        timeout: Duration::from_secs(5),
+                        ..CallOptions::default()
+                    },
+                )
+                .await;
+            let _ = consumer
+                .close_handle(&route, CloseRouteOptions::default())
+                .await;
+            match result {
+                Ok(bytes) => Ok(bytes),
+                Err(error) => Err(request_failure(error)),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    let _ = consumer.close().await;
+    result
+}
+
+async fn open_notice_route(
+    consumer: &SubcConsumer,
+    address: &Address,
+) -> Result<subc_client_rs::RouteHandle, Outcome> {
+    let Some(principal) = crate::launch_nonce::consumer_identity() else {
+        return Err(retry(
+            FailureClass::ConsumerIdentity,
+            "AFT launch has no consumer identity",
+        ));
     };
     let target = target(address);
     let options = CallOptions {
@@ -909,30 +1155,7 @@ async fn call(path: &Path, address: &Address, body: Vec<u8>) -> Result<Vec<u8>, 
                 .await
         }
     };
-    let result = match route {
-        Ok(route) => {
-            let result = consumer
-                .request(
-                    &route,
-                    body,
-                    CallOptions {
-                        timeout: Duration::from_secs(5),
-                        ..CallOptions::default()
-                    },
-                )
-                .await;
-            let _ = consumer
-                .close_handle(&route, CloseRouteOptions::default())
-                .await;
-            match result {
-                Ok(bytes) => Ok(bytes),
-                Err(error) => Err(request_failure(error)),
-            }
-        }
-        Err(error) => Err(route_failure(address, error)),
-    };
-    let _ = consumer.close().await;
-    result
+    route.map_err(|error| route_failure(address, error))
 }
 
 pub(super) fn enqueue(registry: crate::bash_background::BgTaskRegistry, frame: PushFrame) -> bool {
@@ -1061,6 +1284,10 @@ fn offer(
         ),
         _ => unreachable!(),
     };
+    let reminder_elapsed_ms = match &frame {
+        PushFrame::BashLongRunning(frame) => Some(frame.elapsed_ms),
+        _ => None,
+    };
     let mut attempt = None;
     let mut retry_logged = false;
     let mut settled = false;
@@ -1116,7 +1343,22 @@ fn offer(
                         Ok(runtime) => runtime,
                         Err(error) => return retry(FailureClass::Runtime, error),
                     };
-                    let request = request(id.clone(), text.clone(), completion, address.worker);
+                    let mut request = request(id.clone(), text.clone(), completion, address.worker);
+                    if completion || reminder_elapsed_ms.is_some() {
+                        let policy = if let Some(policy) = metadata.runner_notice_policy.filter(|_| {
+                            reminder_elapsed_ms <= metadata.runner_reminder_elapsed_ms
+                        }) {
+                            policy
+                        } else {
+                            let dedupe = metadata.runner_notice_policy.map(|policy| policy.dedupe)
+                                .unwrap_or_else(|| runtime.block_on(runner_delivery_order(&path, &address)) == Some(true));
+                            match registry.freeze_runner_notice_policy(&owner.session, &task_id, dedupe, reminder_elapsed_ms) {
+                                Ok(policy) => policy,
+                                Err(error) => return retry(FailureClass::Persistence, error),
+                            }
+                        };
+                        request = task_request(request, &task_id, metadata.started_at, reminder_elapsed_ms, policy);
+                    }
                     let request = if let Some(request) = metadata
                         .runner_completion_notice
                         .clone()
@@ -1167,25 +1409,41 @@ fn offer(
                             runtime.block_on(send(&path, &address, request))
                         }
                     };
-                    let outcome = send_request(&request);
-                    if completion && !address.worker {
-                        if let Some(request) = idle_start_fallback(&request, &outcome) {
-                            // A delivery refusal records no send_id on the runner, so the
-                            // frozen request can be replaced before retrying the send.
+                    let mut outcome = send_request(&request);
+                    let mut request = request;
+                    if completion {
+                        for _ in 0..2 {
+                            let (fallback, reason) = if !address.worker {
+                                (idle_start_fallback(&request, &outcome), "idle_start")
+                            } else {
+                                (None, "idle_start")
+                            };
+                            let (fallback, reason) = match fallback {
+                                Some(request) => (Some(request), reason),
+                                None => (notice_members_fallback(&request, &outcome), "dedupe_key/expires_at_ms"),
+                            };
+                            let Some(fallback) = fallback else { break };
+                            // A refused send records no send_id on the runner. Persist
+                            // the smaller request before sending it, including on replay.
                             if let Err(error) = registry.replace_runner_completion_notice(
                                 &owner.session,
                                 &task_id,
-                                request.clone(),
+                                fallback.clone(),
                             ) {
                                 return retry(FailureClass::Persistence, error);
                             }
-                            IDLE_START_FALLBACK.fetch_add(1, Ordering::Relaxed);
-                            log::info!(
-                                "runner notice task={task_id} session={} retrying without idle_start after delivery refusal",
+                            if reason == "idle_start" {
+                                IDLE_START_FALLBACK.fetch_add(1, Ordering::Relaxed);
+                            }
+                            crate::slog_info!(
+                                "runner notice task={task_id} send_id={id} session={} retrying without {reason} after invalid_params refusal",
                                 owner.session
                             );
-                            return send_request(&request);
+                            request = fallback;
+                            outcome = send_request(&request);
                         }
+                    } else if reminder_elapsed_ms.is_some() && refused_notice_members(&outcome) {
+                        crate::slog_info!("runner reminder task={task_id} send_id={id} dropped after optional member refusal");
                     }
                     outcome
                 })();

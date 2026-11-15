@@ -22,11 +22,47 @@ const MAX_RUST_MACRO_CALL_DEPTH: u32 = 32;
 
 thread_local! {
     static RUST_FRAGMENT_PARSER: std::cell::RefCell<Option<tree_sitter::Parser>> = const { std::cell::RefCell::new(None) };
+    static RUST_FRAGMENT_TREES: std::cell::RefCell<Option<FxHashMap<String, tree_sitter::Tree>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
 thread_local! {
     static RUST_FRAGMENT_PARSER_INITIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RUST_FRAGMENT_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Keeps fragment trees only while one content record is extracted. Both the
+/// call graph and dead-code facts walk the same macros, sometimes again for
+/// nested functions; parsing depends on the fragment text, not its caller.
+pub(crate) struct RustMacroFragmentCache {
+    owner: bool,
+    _thread: std::marker::PhantomData<*mut ()>,
+}
+
+pub(crate) fn cache_rust_macro_fragments() -> RustMacroFragmentCache {
+    let owner = RUST_FRAGMENT_TREES.with(|trees| {
+        let mut trees = trees.borrow_mut();
+        if trees.is_some() {
+            false
+        } else {
+            *trees = Some(FxHashMap::default());
+            true
+        }
+    });
+    RustMacroFragmentCache {
+        owner,
+        _thread: std::marker::PhantomData,
+    }
+}
+
+impl Drop for RustMacroFragmentCache {
+    fn drop(&mut self) {
+        if self.owner {
+            // Drop on unwind too, so a worker never retains a previous file's
+            // fragments or grows a process-wide cache as it visits new files.
+            RUST_FRAGMENT_TREES.with(|trees| *trees.borrow_mut() = None);
+        }
+    }
 }
 
 /// Returns the tree-sitter node kind strings that represent call expressions
@@ -1492,9 +1528,17 @@ fn visit_rust_macro_node(
 }
 
 fn parse_rust_macro_fragment(fragment: &str) -> Option<tree_sitter::Tree> {
+    if let Some(tree) = RUST_FRAGMENT_TREES.with(|trees| {
+        trees
+            .borrow()
+            .as_ref()
+            .and_then(|trees| trees.get(fragment).cloned())
+    }) {
+        return Some(tree);
+    }
     // Release the parser borrow before walking the owned tree: nested macros
     // can then reuse the same parser without recursive RefCell borrowing.
-    RUST_FRAGMENT_PARSER.with(|cached| {
+    let tree = RUST_FRAGMENT_PARSER.with(|cached| {
         let mut cached = cached.borrow_mut();
         if cached.is_none() {
             let mut parser = tree_sitter::Parser::new();
@@ -1505,8 +1549,16 @@ fn parse_rust_macro_fragment(fragment: &str) -> Option<tree_sitter::Tree> {
             RUST_FRAGMENT_PARSER_INITIALIZATIONS.with(|count| count.set(count.get() + 1));
             *cached = Some(parser);
         }
+        #[cfg(test)]
+        RUST_FRAGMENT_PARSES.with(|count| count.set(count.get() + 1));
         cached.as_mut()?.parse(fragment, None)
-    })
+    })?;
+    RUST_FRAGMENT_TREES.with(|trees| {
+        if let Some(trees) = trees.borrow_mut().as_mut() {
+            trees.insert(fragment.to_string(), tree.clone());
+        }
+    });
+    Some(tree)
 }
 
 fn collect_rust_token_tree_calls(
@@ -1772,6 +1824,92 @@ mod tests {
             assert!(calls.iter().any(|call| call.0 == name));
         }
         RUST_FRAGMENT_PARSER_INITIALIZATIONS.with(|count| assert_eq!(count.get(), 1));
+    }
+
+    #[test]
+    fn rust_macro_fragment_cache_preserves_dead_code_fact_bytes() {
+        use crate::inspect::scanners::dead_code::StoredFileFacts;
+        let source = r#"
+macro_rules! top { ($f:expr) => { wrap!(nested!($f())) }; }
+#[attribute_macro(callback = "hook")]
+fn entry() {
+    macro_rules! unused { () => { never_called() }; }
+    macro_rules! inner { () => { helper(); wrap!(nested!(callback())); }; }
+    macro_rules! outer { () => { inner!(); }; }
+    outer!();
+    wrap!(nested!(callback()));
+    fn nested_function() { wrap!(nested!(callback())); }
+}
+#[cfg(unix)]
+fn alternative() { wrap!(unix::run()); }
+#[cfg(windows)]
+fn alternative() { wrap!(windows::run()); }
+"#;
+        let tree = parse_source(LangId::Rust, source);
+        assert!(!tree.root_node().has_error());
+        RUST_FRAGMENT_PARSES.with(|count| count.set(0));
+        let reference_calls =
+            extract_rust_calls_with_macro_facts(source, tree.root_node(), 0, source.len());
+        let reference_bytes =
+            StoredFileFacts::encode_for_record(source.as_bytes(), LangId::Rust, &tree);
+        let uncached_parses = RUST_FRAGMENT_PARSES.with(|count| count.get());
+        assert!(uncached_parses > 0);
+
+        RUST_FRAGMENT_PARSES.with(|count| count.set(0));
+        let cached_parses;
+        {
+            let _cache = cache_rust_macro_fragments();
+            let calls =
+                extract_rust_calls_with_macro_facts(source, tree.root_node(), 0, source.len());
+            assert_eq!(calls.0, reference_calls.0);
+            assert_eq!(calls.1.bodies, reference_calls.1.bodies);
+            assert_eq!(
+                calls.1.unparsed_mentions,
+                reference_calls.1.unparsed_mentions
+            );
+            cached_parses = RUST_FRAGMENT_PARSES.with(|count| count.get());
+            assert!(cached_parses > 0);
+            assert_eq!(
+                StoredFileFacts::encode_for_record(source.as_bytes(), LangId::Rust, &tree),
+                reference_bytes
+            );
+            RUST_FRAGMENT_PARSES.with(|count| assert_eq!(count.get(), cached_parses));
+        }
+        assert!(cached_parses < uncached_parses);
+
+        // Exercise the production scope too: sharing only inside this test
+        // would preserve facts while leaving content extraction unchanged.
+        RUST_FRAGMENT_PARSES.with(|count| count.set(0));
+        let record = crate::data_layer::content::extract(source.as_bytes(), "rust").unwrap();
+        let aft_store::content::RecordBody::Parsed { body, .. } = record.data else {
+            panic!("expected a parsed Rust content record");
+        };
+        assert_eq!(body.dead_code.as_deref(), Some(reference_bytes.as_slice()));
+        RUST_FRAGMENT_PARSES.with(|count| assert_eq!(count.get(), cached_parses));
+    }
+
+    #[test]
+    fn rust_macro_fragment_cache_is_scoped_and_unwind_safe() {
+        RUST_FRAGMENT_PARSES.with(|count| count.set(0));
+        let fragment = "first()";
+        let failed = std::panic::catch_unwind(|| {
+            let _cache = cache_rust_macro_fragments();
+            let first = parse_rust_macro_fragment(fragment).unwrap();
+            {
+                let _nested_cache = cache_rust_macro_fragments();
+                let second = parse_rust_macro_fragment(fragment).unwrap();
+                assert_eq!(first.root_node().to_sexp(), second.root_node().to_sexp());
+            }
+            assert!(parse_rust_macro_fragment(fragment).is_some());
+            assert!(parse_rust_macro_fragment("second()").is_some());
+            RUST_FRAGMENT_PARSES.with(|count| assert_eq!(count.get(), 2));
+            panic!("exercise extraction unwinding");
+        });
+        assert!(failed.is_err());
+        RUST_FRAGMENT_TREES.with(|trees| assert!(trees.borrow().is_none()));
+        let _cache = cache_rust_macro_fragments();
+        assert!(parse_rust_macro_fragment(fragment).is_some());
+        RUST_FRAGMENT_PARSES.with(|count| assert_eq!(count.get(), 3));
     }
 
     fn parse_source(lang: LangId, source: &str) -> tree_sitter::Tree {

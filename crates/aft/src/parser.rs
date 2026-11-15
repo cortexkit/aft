@@ -2708,8 +2708,15 @@ impl FileParser {
                 // same file a second time.
                 let (tree, lang) =
                     self.parse_with_source(path, &source, current_mtime, size, content_hash)?;
+                let mut symbols = extract_symbols_from_tree(&source, tree, lang)?;
+                if lang == LangId::Rust {
+                    complete_rust_trait_members(
+                        &mut symbols,
+                        crate::callgraph::rust_trait_members(&source, tree.root_node(), Direct),
+                    );
+                }
                 (
-                    Arc::new(extract_symbols_from_tree(&source, tree, lang)?),
+                    Arc::new(symbols),
                     (lang == LangId::Rust)
                         .then(|| Arc::new(rust_modules(tree.root_node(), &source))),
                     Some(tree.root_node().has_error()),
@@ -4396,14 +4403,45 @@ thread_local! {
     static RUST_MACRO_BODY_PARSER: RefCell<Option<Parser>> = const { RefCell::new(None) };
 }
 
-/// Extract symbols from Rust source without compiling a tree-sitter query.
-/// Handles: free functions, struct, enum, trait (as Interface), impl methods with scope chains.
-///
-/// tree-sitter parses the body of a `macro_rules!` arm and of an item-position
-/// macro invocation as an opaque token tree, so items written there would be
-/// invisible. Code bases that group whole runtimes of methods inside macro
-/// bodies depend on seeing them, so each such body is parsed again on its own
-/// and contributes its items when, and only when, it parses cleanly as Rust.
+/// Navigation includes trait members already known to the call graph without
+/// changing the parser table persisted in content records. Both stored and
+/// freshly parsed tables use the same ownership and duplicate checks.
+pub(crate) fn complete_rust_trait_members(
+    symbols: &mut Vec<Symbol>,
+    members: impl IntoIterator<Item = Symbol>,
+) {
+    // Stored symbol ordinals and live tree walkers need not visit traits in
+    // the same order; navigation always appends members in source order.
+    let mut members = members.into_iter().collect::<Vec<_>>();
+    members.sort_by_key(|member| (member.range.start_line, member.range.start_col));
+    for mut member in members {
+        if member.kind != SymbolKind::Method
+            || !symbols.iter().any(|owner| {
+                owner.kind == SymbolKind::Interface
+                    && member.parent.as_deref() == Some(owner.name.as_str())
+                    && (owner.range.start_line, owner.range.start_col)
+                        <= (member.range.start_line, member.range.start_col)
+                    && (member.range.end_line, member.range.end_col)
+                        <= (owner.range.end_line, owner.range.end_col)
+            })
+        {
+            continue;
+        }
+        // Like impl members, navigation names trait members as Trait::method,
+        // even inside a module. Stored call-graph identities keep module scope.
+        member.scope_chain = member.parent.iter().cloned().collect();
+        if symbols.iter().any(|existing| {
+            existing.kind == member.kind
+                && existing.name == member.name
+                && existing.range == member.range
+                && existing.scope_chain == member.scope_chain
+        }) {
+            continue;
+        }
+        symbols.push(member);
+    }
+}
+
 /// The type an impl block's methods belong to, as outlines name it: generic
 /// arguments and path qualifiers are dropped, so `impl<T> Trait for a::Box<T>`
 /// nests its methods under the `Box` struct instead of a name no symbol has.
@@ -4416,6 +4454,14 @@ fn rust_impl_parent_name(impl_target: &str) -> String {
         .to_string()
 }
 
+/// Extract symbols from Rust source without compiling a tree-sitter query.
+/// Handles: free functions, struct, enum, trait (as Interface), impl methods with scope chains.
+///
+/// tree-sitter parses the body of a `macro_rules!` arm and of an item-position
+/// macro invocation as an opaque token tree, so items written there would be
+/// invisible. Code bases that group whole runtimes of methods inside macro
+/// bodies depend on seeing them, so each such body is parsed again on its own
+/// and contributes its items when, and only when, it parses cleanly as Rust.
 fn extract_rs_symbols<'tree>(
     source: &str,
     root: &Node<'tree>,
@@ -11874,7 +11920,13 @@ const helpers = {
 
         let mut parser = FileParser::new();
         let (tree, lang) = parser.parse(&path).unwrap();
-        let extracted = extract_symbols_from_tree(&source, tree, lang).unwrap();
+        let mut extracted = extract_symbols_from_tree(&source, tree, lang).unwrap();
+        // Navigation adds Rust trait members after the tree walk, and the
+        // stored records keep the walk's table, so complete it the same way.
+        complete_rust_trait_members(
+            &mut extracted,
+            crate::callgraph::rust_trait_members(&source, tree.root_node(), Direct),
+        );
 
         assert_eq!(symbols_as_debug(&extracted), symbols_as_debug(&listed));
     }

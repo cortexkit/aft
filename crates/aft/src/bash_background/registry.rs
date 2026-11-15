@@ -7416,20 +7416,44 @@ impl BgTaskRegistry {
                 let conn = pool
                     .lock()
                     .map_err(|_| "database_lock_poisoned".to_string())?;
-                crate::db::bash_tasks::delete_bash_task(
+                // Keep the dependency checks and delete in one write transaction:
+                // cascading foreign keys must not erase watches or view records.
+                let tx = rusqlite::Transaction::new_unchecked(
                     &conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )
+                .map_err(|error| error.to_string())?;
+                let (watches, views): (u64, u64) = tx
+                    .query_row(
+                        "SELECT
+                            (SELECT count(*) FROM bash_pattern_watches
+                             WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3),
+                            (SELECT count(*) FROM bash_view_records
+                             WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3)",
+                        rusqlite::params![harness, originating_session_id, task_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if watches != 0 || views != 0 {
+                    return Err(format!(
+                        "dependent rows retained: bash_pattern_watches={watches} bash_view_records={views}"
+                    ));
+                }
+                let removed = crate::db::bash_tasks::delete_bash_task(
+                    &tx,
                     &harness,
                     originating_session_id,
                     task_id,
                 )
-                .map(|removed| removed > 0)
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+                tx.commit().map_err(|error| error.to_string())?;
+                Ok(removed > 0)
             });
             match result {
                 Ok(retired) => retired,
                 Err(error) => {
                     crate::slog_warn!(
-                        "failed to retire already-reaped task {task_id}: error={error}"
+                        "failed to retire already-reaped task {task_id}: source=bash_tasks error={error}"
                     );
                     return false;
                 }
@@ -7441,7 +7465,7 @@ impl BgTaskRegistry {
         self.ack_persisted_watches_for_task(originating_session_id, task_id, true);
         if retired {
             crate::slog_warn!(
-                "orphaned completion already reaped: task_id={task_id} reason=layout_missing"
+                "orphaned completion already reaped: task_id={task_id} reason=layout_missing source=bash_tasks"
             );
         }
         true
@@ -7920,24 +7944,33 @@ impl BgTaskRegistry {
                     if skip_refused_task(&metadata.task_id, "replay", &error) {
                         continue;
                     }
-                    if error.kind() == std::io::ErrorKind::NotFound
-                        && !task_artifacts_exist(&session_dir, &metadata.task_id)
-                        && !Self::persisted_task_process_is_alive(&metadata)
-                        && metadata.launching_identity.is_none()
-                        && (self.should_retire_foreign_delivery(&metadata.session_id, session_id)
-                            || &metadata.session_id != session_id)
+                    if Self::persisted_task_process_is_alive(&metadata)
+                        || self.db_has_live_process_for_task(&metadata.task_id)
                     {
+                        crate::slog_warn!(
+                            "refusing to quarantine unresolved live background task {}: {error}",
+                            metadata.task_id
+                        );
+                        continue;
+                    }
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && replay_task_layout_is_absent(&session_dir, &metadata.task_id)
+                    {
+                        // An unfinished task's row can land before its layout.
+                        // A terminal row already records the launch's outcome.
+                        if !metadata.is_terminal()
+                            && unix_millis().saturating_sub(metadata.started_at) < 5 * 60 * 1000
+                        {
+                            crate::slog_warn!(
+                                "deferring background task {} during replay: reason=pending_initial_record",
+                                metadata.task_id
+                            );
+                            continue;
+                        }
                         self.retire_already_reaped_orphaned_completion(
                             &metadata.session_id,
                             &metadata.task_id,
                             metadata.harness.as_deref(),
-                        );
-                        continue;
-                    }
-                    if Self::persisted_task_process_is_alive(&metadata) {
-                        crate::slog_warn!(
-                            "refusing to quarantine unresolved live background task {}: {error}",
-                            metadata.task_id
                         );
                         continue;
                     }
@@ -12293,6 +12326,50 @@ impl BgTaskRegistry {
         Ok(())
     }
 
+    pub(crate) fn freeze_runner_notice_policy(
+        &self,
+        session: &str,
+        task_id: &str,
+        dedupe: bool,
+        reminder_elapsed_ms: Option<u64>,
+    ) -> std::io::Result<super::persistence::RunnerNoticePolicy> {
+        let task = self
+            .task_for_session(task_id, session)
+            .ok_or_else(|| std::io::Error::other("notice task is not owned by this session"))?;
+        self.retry_terminal_persist(&task)?;
+        let mut db = DeferredDbWrites::new(self, &task);
+        let mut state = task
+            .lock_state()
+            .map_err(|_| std::io::Error::other("background task lock poisoned"))?;
+        state.metadata = self.update_task_metadata_locked(&task, &mut db, |metadata| {
+            let dedupe = metadata
+                .runner_completion_notice
+                .as_ref()
+                .map_or(dedupe, |request| {
+                    request
+                        .delivery_order()
+                        .ok()
+                        .flatten()
+                        .is_some_and(|order| order.dedupe_key.is_some())
+                });
+            metadata
+                .runner_notice_policy
+                .get_or_insert(super::persistence::RunnerNoticePolicy {
+                    dedupe,
+                    reminder_interval_ms: self
+                        .inner
+                        .long_running_reminder_interval_ms
+                        .load(Ordering::SeqCst),
+                });
+            metadata.runner_reminder_elapsed_ms =
+                metadata.runner_reminder_elapsed_ms.max(reminder_elapsed_ms);
+        })?;
+        Ok(state
+            .metadata
+            .runner_notice_policy
+            .expect("notice policy was frozen"))
+    }
+
     pub(crate) fn freeze_runner_completion_notice(
         &self,
         session: &str,
@@ -12308,6 +12385,19 @@ impl BgTaskRegistry {
             .lock_state()
             .map_err(|_| std::io::Error::other("background task lock poisoned"))?;
         state.metadata = self.update_task_metadata_locked(&task, &mut db, |metadata| {
+            metadata
+                .runner_notice_policy
+                .get_or_insert(super::persistence::RunnerNoticePolicy {
+                    dedupe: request
+                        .delivery_order()
+                        .ok()
+                        .flatten()
+                        .is_some_and(|order| order.dedupe_key.is_some()),
+                    reminder_interval_ms: self
+                        .inner
+                        .long_running_reminder_interval_ms
+                        .load(Ordering::SeqCst),
+                });
             metadata.runner_completion_notice.get_or_insert(request);
         })?;
         Ok(state
@@ -15740,10 +15830,16 @@ impl BgTaskRegistry {
         {
             return;
         }
-        let interval_ms = self
-            .inner
-            .long_running_reminder_interval_ms
-            .load(Ordering::SeqCst);
+        let interval_ms = task
+            .lock_state()
+            .ok()
+            .and_then(|state| state.metadata.runner_notice_policy)
+            .map(|policy| policy.reminder_interval_ms)
+            .unwrap_or_else(|| {
+                self.inner
+                    .long_running_reminder_interval_ms
+                    .load(Ordering::SeqCst)
+            });
         if interval_ms == 0 {
             return;
         }
@@ -17523,13 +17619,18 @@ fn skip_refused_task(task_id: &str, operation: &str, error: &std::io::Error) -> 
     }
 }
 
-fn task_artifacts_exist(session_dir: &Path, task_id: &str) -> bool {
+fn replay_task_layout_is_absent(session_dir: &Path, task_id: &str) -> bool {
+    // Flat-layout artifacts also count as surviving task data. Only explicit
+    // NotFound results prove absence; permission errors must not permit deletion.
     std::iter::once(session_dir.join(task_id))
         .chain(
             ["json", "stdout", "stderr", "pty", "exit"]
                 .map(|suffix| session_dir.join(format!("{task_id}.{suffix}"))),
         )
-        .any(|path| fs::symlink_metadata(path).is_ok())
+        .all(|path| {
+            fs::symlink_metadata(path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        })
 }
 
 /// Quarantine history uses the same resumable iterator budget as task history.
@@ -18106,7 +18207,11 @@ impl BgTask {
                 .as_ref()
                 .filter(|_| !metadata.is_terminal())
                 .filter(|_| metadata.child_pid.is_none())
-                .filter(|_| metadata.remote.as_ref().is_some_and(|r| !r.accepted))
+                .filter(|_| {
+                    metadata.remote.as_ref().is_some_and(|r| {
+                        !r.accepted && remote::RemotePhase::of(r) != remote::RemotePhase::Running
+                    })
+                })
                 .cloned()
                 .or_else(|| remote::remote_phase_note(metadata, unix_millis())),
         }
@@ -29031,6 +29136,270 @@ mod tests {
         assert_eq!(
             quarantined, 1,
             "exactly the abandoned layout is quarantined"
+        );
+    }
+
+    fn replay_store_snapshot(
+        storage: &Path,
+        conn: &TrackedConnection,
+    ) -> (
+        BTreeMap<PathBuf, Option<Vec<u8>>>,
+        BTreeMap<String, Vec<Vec<rusqlite::types::Value>>>,
+    ) {
+        fn walk(root: &Path, dir: &Path, files: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                // Compare database contents logically; SQLite rewrites its own
+                // pages and journals even when only one task row is deleted.
+                if ["aft.db", "aft.db-wal", "aft.db-shm"].contains(&relative.to_str().unwrap()) {
+                    continue;
+                }
+                let bytes = if path.is_dir() {
+                    walk(root, &path, files);
+                    None
+                } else {
+                    Some(fs::read(&path).unwrap())
+                };
+                files.insert(relative, bytes);
+            }
+        }
+        let mut files = BTreeMap::new();
+        walk(storage, storage, &mut files);
+        let tables = conn
+            .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let rows = tables
+            .into_iter()
+            .map(|table| {
+                let mut statement = conn
+                    .prepare(&format!("SELECT * FROM \"{}\"", table.replace('"', "\"\"")))
+                    .unwrap();
+                let columns = statement.column_count();
+                let rows = statement
+                    .query_map([], |row| {
+                        (0..columns)
+                            .map(|column| row.get(column))
+                            .collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                (table, rows)
+            })
+            .collect();
+        (files, rows)
+    }
+
+    fn dangling_replay_fixture(
+        storage: &Path,
+    ) -> (BgTaskRegistry, Arc<Mutex<TrackedConnection>>, BashTaskRow) {
+        let (registry, db, _) = registry_with_db_and_frames(storage);
+        registry
+            .inner
+            .persisted_gc_started
+            .store(true, Ordering::SeqCst);
+        let task_id = "bash-0000000000000500";
+        let paths = task_paths(storage, "session", task_id).unwrap();
+        let mut metadata = PersistedTask::starting(
+            task_id.into(),
+            "session".into(),
+            "echo gone".into(),
+            storage.to_path_buf(),
+            Some(storage.to_path_buf()),
+            None,
+            true,
+            true,
+        );
+        metadata.started_at = unix_millis().saturating_sub(6 * 60 * 1000);
+        let row = metadata.to_bash_task_row("opencode", &paths).unwrap();
+        crate::db::bash_tasks::upsert_bash_task(&db.lock().unwrap(), &row).unwrap();
+        (registry, db, row)
+    }
+
+    #[test]
+    fn durability_replay_removes_only_the_dangling_database_row_once() {
+        for session_directory_exists in [false, true] {
+            let storage = tempfile::tempdir().unwrap();
+            let (registry, db, row) = dangling_replay_fixture(storage.path());
+            for (harness, session) in [("pi", "session"), ("opencode", "other-session")] {
+                let mut other = row.clone();
+                other.harness = harness.into();
+                other.session_id = session.into();
+                crate::db::bash_tasks::upsert_bash_task(&db.lock().unwrap(), &other).unwrap();
+            }
+            let canary = session_tasks_dir(storage.path(), "other-session");
+            fs::create_dir_all(canary.join("unrelated-directory")).unwrap();
+            fs::write(canary.join("unrelated-file"), b"keep exactly").unwrap();
+            if session_directory_exists {
+                let session = session_tasks_dir(storage.path(), "session");
+                fs::create_dir_all(&session).unwrap();
+                fs::write(session.join("unrelated-file"), b"also keep").unwrap();
+            }
+            let mut expected = replay_store_snapshot(storage.path(), &db.lock().unwrap());
+            let tasks = expected.1.get_mut("bash_tasks").unwrap();
+            let count_before = tasks.len();
+            tasks.retain(|values| {
+                values[0] != rusqlite::types::Value::Text("opencode".into())
+                    || values[1] != rusqlite::types::Value::Text("session".into())
+            });
+            assert_eq!(tasks.len(), count_before - 1);
+
+            let (_, first_logs) = crate::logging::capture_log_lines(|| {
+                registry.replay_session(storage.path(), "session").unwrap();
+            });
+            let task_logs = first_logs
+                .iter()
+                .filter(|line| line.contains(&row.task_id))
+                .collect::<Vec<_>>();
+            assert_eq!(task_logs.len(), 1, "{first_logs:?}");
+            assert!(task_logs[0].starts_with("WARN "), "{first_logs:?}");
+            assert!(task_logs[0].contains("source=bash_tasks"));
+            assert!(task_logs[0].contains("reaped"));
+            assert_eq!(
+                replay_store_snapshot(storage.path(), &db.lock().unwrap()),
+                expected
+            );
+
+            let (_, second_logs) = crate::logging::capture_log_lines(|| {
+                registry.replay_session(storage.path(), "session").unwrap();
+            });
+            assert!(
+                second_logs.iter().all(|line| !line.contains(&row.task_id)),
+                "{second_logs:?}"
+            );
+            assert_eq!(
+                replay_store_snapshot(storage.path(), &db.lock().unwrap()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn durability_replay_defers_a_recent_row_awaiting_its_initial_layout() {
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, db, row) = dangling_replay_fixture(storage.path());
+        let mut metadata = PersistedTask::from(row);
+        metadata.started_at = unix_millis();
+        let paths = task_paths(storage.path(), "session", &metadata.task_id).unwrap();
+        crate::db::bash_tasks::upsert_bash_task(
+            &db.lock().unwrap(),
+            &metadata.to_bash_task_row("opencode", &paths).unwrap(),
+        )
+        .unwrap();
+        let expected = replay_store_snapshot(storage.path(), &db.lock().unwrap());
+        let (_, logs) = crate::logging::capture_log_lines(|| {
+            registry.replay_session(storage.path(), "session").unwrap();
+        });
+        let task_logs = logs
+            .iter()
+            .filter(|line| line.contains(&metadata.task_id))
+            .collect::<Vec<_>>();
+        assert_eq!(task_logs.len(), 1, "{logs:?}");
+        assert!(
+            task_logs[0].contains("reason=pending_initial_record"),
+            "{logs:?}"
+        );
+        assert_eq!(
+            replay_store_snapshot(storage.path(), &db.lock().unwrap()),
+            expected
+        );
+    }
+
+    #[test]
+    fn durability_replay_keeps_dangling_rows_with_dependents() {
+        for dependency in ["watch", "view"] {
+            let storage = tempfile::tempdir().unwrap();
+            let (registry, db, row) = dangling_replay_fixture(storage.path());
+            let sql = if dependency == "watch" {
+                "INSERT INTO bash_pattern_watches (harness, session_id, task_id, watch_id, pattern_kind, pattern, created_at)
+                 VALUES ('opencode', 'session', ?1, 'watch-keep', 'substring', 'keep', 1)"
+            } else {
+                "INSERT INTO bash_view_records (harness, session_id, task_id, record, row_template_digest, page_template_digest)
+                 VALUES ('opencode', 'session', ?1, 'keep', 'row', 'page')"
+            };
+            db.lock().unwrap().execute(sql, [&row.task_id]).unwrap();
+            let expected = replay_store_snapshot(storage.path(), &db.lock().unwrap());
+            let (_, logs) = crate::logging::capture_log_lines(|| {
+                registry.replay_session(storage.path(), "session").unwrap();
+            });
+            let task_logs = logs
+                .iter()
+                .filter(|line| line.contains(&row.task_id))
+                .collect::<Vec<_>>();
+            assert_eq!(task_logs.len(), 1, "{logs:?}");
+            assert!(task_logs[0].starts_with("WARN "), "{logs:?}");
+            let counts = if dependency == "watch" {
+                "bash_pattern_watches=1 bash_view_records=0"
+            } else {
+                "bash_pattern_watches=0 bash_view_records=1"
+            };
+            assert!(task_logs[0].contains(counts), "{logs:?}");
+            assert_eq!(
+                replay_store_snapshot(storage.path(), &db.lock().unwrap()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn durability_replay_keeps_a_dangling_row_with_a_live_database_process() {
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, db, mut row) = dangling_replay_fixture(storage.path());
+        // Leave the metadata snapshot without a PID to exercise the independent
+        // database liveness check, not just the replayed metadata's process check.
+        row.pid = Some(i64::from(std::process::id()));
+        row.started_at = unix_millis() as i64;
+        crate::db::bash_tasks::upsert_bash_task(&db.lock().unwrap(), &row).unwrap();
+        let expected = replay_store_snapshot(storage.path(), &db.lock().unwrap());
+        let (_, logs) = crate::logging::capture_log_lines(|| {
+            registry.replay_session(storage.path(), "session").unwrap();
+        });
+        let task_logs = logs
+            .iter()
+            .filter(|line| line.contains(&row.task_id))
+            .collect::<Vec<_>>();
+        assert_eq!(task_logs.len(), 1, "{logs:?}");
+        assert!(task_logs[0].starts_with("WARN "), "{logs:?}");
+        assert!(
+            task_logs[0].contains("refusing to quarantine unresolved live"),
+            "{logs:?}"
+        );
+        assert_eq!(
+            replay_store_snapshot(storage.path(), &db.lock().unwrap()),
+            expected
+        );
+    }
+
+    #[test]
+    fn durability_replay_reports_a_failed_dangling_row_delete_without_success() {
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, db, row) = dangling_replay_fixture(storage.path());
+        db.lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_task_delete BEFORE DELETE ON bash_tasks
+             BEGIN SELECT RAISE(FAIL, 'injected delete failure'); END",
+            )
+            .unwrap();
+        let expected = replay_store_snapshot(storage.path(), &db.lock().unwrap());
+        let (_, logs) = crate::logging::capture_log_lines(|| {
+            registry.replay_session(storage.path(), "session").unwrap();
+        });
+        let task_logs = logs
+            .iter()
+            .filter(|line| line.contains(&row.task_id))
+            .collect::<Vec<_>>();
+        assert_eq!(task_logs.len(), 1, "{logs:?}");
+        assert!(task_logs[0].starts_with("WARN "), "{logs:?}");
+        assert!(task_logs[0].contains("injected delete failure"), "{logs:?}");
+        assert_eq!(
+            replay_store_snapshot(storage.path(), &db.lock().unwrap()),
+            expected
         );
     }
 

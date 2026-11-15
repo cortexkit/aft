@@ -647,6 +647,160 @@ pub fn separator() -> char {
         Arc::new(std::sync::RwLock::new(SymbolCache::new()))
     }
 
+    #[test]
+    fn rust_trait_methods_agree_in_stored_and_live_navigation_without_reindexing() {
+        use crate::symbols::SymbolKind;
+        use aft_store::content::RecordBody;
+
+        let source = include_str!("../../tests/fixtures/rust_trait_methods.rs");
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let file = write(&root, "host.rs", source);
+        let record = super::super::content::extract(source.as_bytes(), "rust").unwrap();
+        let encoded = record.encode();
+        let RecordBody::Parsed { surface, body } = &record.data else {
+            panic!("Rust fixture must have a parsed record");
+        };
+        let raw = body.outline.as_ref().unwrap();
+        assert!(!raw
+            .iter()
+            .any(|symbol| symbol.parent.as_deref() == Some("Host")));
+        assert!(surface
+            .symbols
+            .iter()
+            .any(|symbol| symbol.scoped_name == "Host::held_calls"));
+        let completed = super::super::content::complete_rust_outline(raw.clone(), surface);
+        assert_eq!(
+            record.encode(),
+            encoded,
+            "navigation must not rewrite the record"
+        );
+        assert_eq!(
+            super::super::content::complete_rust_outline(completed.clone(), surface),
+            completed,
+            "members must not be duplicated when already present"
+        );
+
+        let (stored, _storage) = published_then_restarted(&root);
+        let view = stored.data_checkout().unwrap().view().unwrap();
+        let cache = stored.symbol_cache();
+        let generation = cache.read().unwrap().generation();
+        assert_eq!(
+            prewarm(&view, &cache, generation, &|| false)
+                .unwrap()
+                .loaded,
+            1
+        );
+        let before = work_counters::tree_parses();
+        let warm = crate::parser::FileParser::with_symbol_cache(cache.clone())
+            .extract_symbols(&file)
+            .unwrap();
+        assert_eq!(
+            work_counters::tree_parses(),
+            before,
+            "stored members must need no parse"
+        );
+        let parsed = crate::parser::FileParser::new()
+            .extract_symbols(&file)
+            .unwrap();
+        assert_eq!(warm, parsed);
+        for (owner, name, scope) in [
+            ("Host", "context_ceiling", vec!["Host"]),
+            ("Host", "held_calls", vec!["Host"]),
+            ("Nested", "default_method", vec!["Nested"]),
+            ("Nested", "required_method", vec!["Nested"]),
+            ("Runner", "new", vec!["Runner"]),
+            ("Runner", "held_calls", vec!["Host for Runner"]),
+            ("NestedRunner", "create", vec!["NestedRunner"]),
+        ] {
+            let matches = warm
+                .iter()
+                .filter(|symbol| symbol.name == name && symbol.parent.as_deref() == Some(owner))
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 1, "{owner}::{name}: {warm:?}");
+            assert_eq!(matches[0].kind, SymbolKind::Method);
+            assert_eq!(matches[0].scope_chain, scope);
+            if owner == "Host" || owner == "Nested" {
+                assert!(
+                    !matches[0].exported,
+                    "trait members are reached through their owner"
+                );
+            }
+        }
+
+        let live_storage = tempfile::tempdir().unwrap();
+        let live = context(&root, live_storage.path());
+        let answer = outline(&stored, &file);
+        assert!(answer.success, "{:?}", answer.data);
+        assert_eq!(answer.data, outline(&live, &file).data);
+        let text = answer.data["text"].as_str().unwrap();
+        let lines = text.lines().collect::<Vec<_>>();
+        for (owner, methods) in [
+            ("pub trait Host", vec!["context_ceiling", "held_calls"]),
+            (
+                "pub trait Nested",
+                vec!["default_method", "required_method"],
+            ),
+            ("pub struct Runner", vec!["new", "held_calls"]),
+        ] {
+            let start = lines
+                .iter()
+                .position(|line| line.trim_start().trim_start_matches('.').starts_with(owner))
+                .unwrap_or_else(|| panic!("{owner}: {text}"));
+            let indent = lines[start].len() - lines[start].trim_start().len();
+            let member_indent = " ".repeat(indent + 2);
+            for method in methods {
+                assert!(
+                    lines[start + 1..]
+                        .iter()
+                        .take_while(|line| line.starts_with(&member_indent))
+                        .any(|line| line.contains(method)
+                            && (indent != 2 || line.starts_with("    ."))),
+                    "{owner} must nest {method}: {text}"
+                );
+            }
+        }
+        for symbol in [
+            "context_ceiling",
+            "Host::context_ceiling",
+            "held_calls",
+            "Host::held_calls",
+            "default_method",
+            "Nested::default_method",
+            "required_method",
+            "Nested::required_method",
+            "create",
+            "NestedRunner::create",
+            "Runner::new",
+        ] {
+            let request = request("zoom", serde_json::json!({"file": file, "symbol": symbol}));
+            let warm_answer = crate::commands::zoom::handle_zoom(&request, &stored);
+            let live_answer = crate::commands::zoom::handle_zoom(&request, &live);
+            assert!(warm_answer.success, "{symbol}: {:?}", warm_answer.data);
+            assert_eq!(warm_answer.data, live_answer.data, "{symbol}");
+            assert!(
+                warm_answer.data["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains(symbol.rsplit("::").next().unwrap())),
+                "{symbol}: {:?}",
+                warm_answer.data
+            );
+        }
+
+        write(&root, "host.rs", &source.replace("4096", "81920"));
+        assert!(
+            !warm_file(&view, &fresh_cache(), &file),
+            "an unpublished edit must use live symbols"
+        );
+        let request = request(
+            "zoom",
+            serde_json::json!({"file": file, "symbol": "Host::context_ceiling"}),
+        );
+        let edited = crate::commands::zoom::handle_zoom(&request, &stored);
+        assert!(edited.success, "{:?}", edited.data);
+        assert!(edited.data["content"].as_str().unwrap().contains("81920"));
+    }
+
     /// After a restart the checkout's records fill the symbol cache with
     /// the tables a parse gives, and outline then answers as a context that
     /// parses every file does, without parsing.

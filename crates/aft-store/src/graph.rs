@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 
 mod scratch;
 mod spill;
-pub use scratch::{LocalScratch, Scratch};
+pub use scratch::Scratch;
 pub use spill::{GraphSectionsSpill, PackedFragment};
 
 use crate::ids::Digest128;
@@ -665,8 +665,7 @@ mod tests {
         use crate::spill::{Config, WriteGuard};
         let dir = tempfile::tempdir().unwrap();
         let store = Family::open(&dir.path().join("store"), family()).unwrap();
-        let workspace: Box<dyn Scratch> =
-            Box::new(LocalScratch::create(store.dir(), "fixture").unwrap());
+        let workspace = scratch::for_test(&store.dir().join("builds"));
         let scratch = workspace.path().to_path_buf();
         let mut config = Config::new(128 * 1024);
         config.buffer_bytes = 1024;
@@ -714,8 +713,8 @@ mod tests {
         streamed.write(&mut writer).unwrap();
         writer.finish().unwrap();
         assert!(
-            !scratch.exists(),
-            "successful writes remove all spill files"
+            scratch.exists(),
+            "the spill leaves its folder to the build workspace, which is deleted after publication"
         );
         assert_eq!(
             std::fs::read(dir.path().join("buffered")).unwrap(),
@@ -746,14 +745,13 @@ mod tests {
     }
 
     #[test]
-    fn streamed_output_refuses_disk_floor_and_cleans_up_on_error() {
+    fn streamed_output_refuses_disk_floor_and_keeps_its_folder_on_error() {
         use crate::family::Family;
         use crate::spill::{Config, WriteGuard};
         use std::sync::atomic::{AtomicBool, Ordering};
         let dir = tempfile::tempdir().unwrap();
         let store = Family::open(&dir.path().join("store"), family()).unwrap();
-        let workspace: Box<dyn Scratch> =
-            Box::new(LocalScratch::create(store.dir(), "fixture").unwrap());
+        let workspace = scratch::for_test(&store.dir().join("builds"));
         let scratch = workspace.path().to_path_buf();
         let low = Arc::new(AtomicBool::new(false));
         let check = low.clone();
@@ -778,7 +776,10 @@ mod tests {
             "a refused append must not create a fragment range"
         );
         drop(spill);
-        assert!(!scratch.exists());
+        assert!(
+            scratch.exists(),
+            "a disk-floor pause leaves the build's work for the workspace's owner to delete"
+        );
     }
 
     /// Graph sections holding one fragment and one call-target term, `t`,

@@ -45,6 +45,8 @@ mod engines;
 #[cfg(feature = "test-hooks")]
 pub mod exactness;
 mod fold;
+mod text_build;
+use text_build::TextBuild;
 #[cfg(test)]
 pub(super) mod publication_tests;
 #[cfg(test)]
@@ -946,8 +948,6 @@ impl Checkout {
     ) -> Result<Self, DataError> {
         let checkout = CheckoutId::from_digest(Digest128::of(root.as_os_str().as_encoded_bytes()));
         let family = Family::open(family_dir, family).map_err(DataError::store)?;
-        aft_store::graph::LocalScratch::sweep(family.dir())
-            .map_err(|error| DataError::Store(error.to_string()))?;
         let live = Arc::new(RwLock::new(Live::default()));
         {
             let mut bound = layer.bound.lock().expect("no panics while holding it");
@@ -1638,16 +1638,21 @@ impl Checkout {
             .checkout(self.checkout)
             .cloned();
         let started = Instant::now();
+        // The build's one workspace: the text index's posting runs, the
+        // graph sections' spill and the resolutions spool each keep their
+        // own folder in it, and it is removed once the last of them is done.
+        let paused = DiskPause::default();
+        let scratch = self.build_scratch_noting(Arc::clone(&paused))?;
         let sink = BuildSink {
             skip_text: !self.planes.text,
             stored: self.stored_records()?,
-            ..BuildSink::default()
+            ..BuildSink::new(TextBuild::new(Arc::clone(&scratch), self.family.id()))
         };
         #[cfg(feature = "test-hooks")]
         super::refresh_probe::stage("extraction");
         let scanned = scan(&self.root, &self.layer.policy, None, &sink)
             .map_err(|error| DataError::Scan(error.to_string()))?;
-        let mut collected = sink.finish();
+        let mut collected = sink.finish()?;
         // Contents too large to read are members whose text is not
         // indexed; record them so grep reports them rather than walking
         // them.
@@ -1661,7 +1666,7 @@ impl Checkout {
                     record.content,
                     record.stat.size,
                     TextStatus::Oversize,
-                );
+                )?;
             }
         }
         report.files = scanned.state.paths().len();
@@ -1669,6 +1674,8 @@ impl Checkout {
         report.extract_failures = collected.failures;
         report.stored_records = collected.reused;
         report.scan_ms = elapsed_ms(started);
+
+        collected.text.spill()?;
 
         // The state, with each parsed path's language.
         let records = scanned
@@ -1749,10 +1756,10 @@ impl Checkout {
             Some(encoded),
         );
         let workspace = Box::new(
-            aft_store::graph::LocalScratch::create(self.family.dir(), &self.checkout.to_string())
+            scratch
+                .subdir("graph")
                 .map_err(|error| DataError::Store(error.to_string()))?,
         );
-        let dir = self.family.dir().to_path_buf();
         let estimate = inputs
             .state
             .paths()
@@ -1762,16 +1769,11 @@ impl Checkout {
             .saturating_mul(8);
         let reserve = Arc::new(std::sync::atomic::AtomicU64::new(estimate));
         let remaining = reserve.clone();
-        let paused = Arc::new(Mutex::new(None));
-        let disk_pause = paused.clone();
+        let admission = Arc::clone(&scratch);
         let guard = aft_store::spill::WriteGuard::new(move || {
-            match check_disk_floor_at(&dir, remaining.load(std::sync::atomic::Ordering::Relaxed)) {
-                Err(DataError::DiskFloor(message)) => {
-                    *disk_pause.lock().expect("disk pause lock") = Some(message.clone());
-                    Err(std::io::Error::other(message))
-                }
-                result => result.map_err(std::io::Error::other),
-            }
+            admission
+                .check_space(remaining.load(std::sync::atomic::Ordering::Relaxed))
+                .map_err(std::io::Error::other)
         });
         let mut config = aft_store::spill::Config::new(256 << 20);
         // A wide merge keeps ordinary large builds at one 25-byte run copy
@@ -1799,6 +1801,7 @@ impl Checkout {
             &mut inputs,
             self.layer.threads,
             measure.then_some(&mut report.memory),
+            &scratch,
             &mut |inputs, files| {
                 sections
                     .add_batch(inputs, files)
@@ -1828,6 +1831,9 @@ impl Checkout {
             // down: it serves that publication and records what differs from
             // the files now on disk, as a bind does.
             drop(session);
+            // The graph spill's files close before its folder is deleted.
+            drop(sections);
+            remove_workspace(&scratch);
             report.superseded = true;
             self.adopt_newest()?;
             return Ok(report);
@@ -1839,10 +1845,7 @@ impl Checkout {
             .prepare_finish()
             .map_err(|error| graph_spill_error(DataError::Store(error), &paused))?;
         let mut pending = session.create_segment().map_err(DataError::store)?;
-        collected
-            .text
-            .write(pending.writer())
-            .map_err(DataError::store)?;
+        collected.text.write(pending.writer())?;
         let fragments = sections
             .finish(pending.writer(), measure.then_some(&mut report.memory))
             .map_err(|error| {
@@ -1888,6 +1891,9 @@ impl Checkout {
                 retire_checkouts: unneeded.checkouts,
             })
             .map_err(DataError::store)?;
+        // The publication is in the manifest, so nothing in the workspace is
+        // needed any more; every builder closed its files when it finished.
+        remove_workspace(&scratch);
         // Removes what no generation at or above the horizon names. A view
         // still reading an older generation holds a lease on it, so its
         // files stay until the view drops.
@@ -2176,6 +2182,17 @@ fn check_disk_floor_at(dir: &Path, additional: u64) -> Result<(), DataError> {
     )))
 }
 
+/// Deletes a build's workspace once the build published or stood down. A
+/// workspace that cannot be deleted now (on Windows, a file another process
+/// still has open) is left to the next writer's sweep, which deletes it
+/// once this build has let go of the checkout's build lock.
+fn remove_workspace(scratch: &aft_store::family::BuildScratch<DataError>) {
+    let _ = scratch.remove();
+}
+
+/// The disk-floor refusal a build workspace's admission last made, if any.
+type DiskPause = Arc<Mutex<Option<String>>>;
+
 fn graph_spill_error(error: DataError, paused: &Mutex<Option<String>>) -> DataError {
     paused
         .lock()
@@ -2185,6 +2202,38 @@ fn graph_spill_error(error: DataError, paused: &Mutex<Option<String>>) -> DataEr
 }
 
 impl Checkout {
+    pub(super) fn build_scratch(
+        &self,
+    ) -> Result<Arc<aft_store::family::BuildScratch<DataError>>, DataError> {
+        self.build_scratch_noting(DiskPause::default())
+    }
+
+    /// The one workspace of a build, shared by every builder that spills to
+    /// disk. Its disk admission is the build's free-disk floor, and each
+    /// refusal is also kept in `paused`: a builder that reports a refusal
+    /// in its own words still fails the build with the floor's pause.
+    fn build_scratch_noting(
+        &self,
+        paused: DiskPause,
+    ) -> Result<Arc<aft_store::family::BuildScratch<DataError>>, DataError> {
+        let dir = self.family.dir().to_path_buf();
+        self.writer()?
+            .create_scratch(self.checkout, move |bytes| {
+                let result = check_disk_floor_at(&dir, bytes);
+                if let Err(DataError::DiskFloor(message)) = &result {
+                    *paused.lock().expect("disk pause lock") = Some(message.clone());
+                }
+                result
+            })
+            .map(Arc::new)
+            .map_err(DataError::store)
+    }
+
+    #[cfg(test)]
+    fn text_build(&self) -> Result<TextBuild, DataError> {
+        Ok(TextBuild::new(self.build_scratch()?, self.family.id()))
+    }
+
     /// Scans the checkout's text only, then publishes and serves a state
     /// that names no call-graph fragments, so text queries can start while
     /// the call graph builds. Returns `false` when another process published
@@ -2208,10 +2257,14 @@ impl Checkout {
             .checkout(self.checkout)
             .cloned();
         let started = Instant::now();
-        let sink = BuildSink::text_only();
+        let scratch = self.build_scratch()?;
+        let sink = BuildSink {
+            text_only: true,
+            ..BuildSink::new(TextBuild::new(Arc::clone(&scratch), self.family.id()))
+        };
         let scanned = scan(&self.root, &self.layer.policy, None, &sink)
             .map_err(|error| DataError::Scan(error.to_string()))?;
-        let mut collected = sink.finish();
+        let mut collected = sink.finish()?;
         for record in scanned.state.paths() {
             if record.kind == PathKind::Text
                 && record.stat.size > self.layer.policy.max_indexed_len
@@ -2221,25 +2274,24 @@ impl Checkout {
                     record.content,
                     record.stat.size,
                     TextStatus::Oversize,
-                );
+                )?;
             }
         }
         report.files = scanned.state.paths().len();
         report.text_units = collected.text.len();
         report.scan_ms = elapsed_ms(started);
+        collected.text.spill()?;
         let mut session = self.writer()?;
         if session.base().checkout(self.checkout) != started_from.as_ref() {
             drop(session);
+            remove_workspace(&scratch);
             self.adopt_newest()?;
             return Ok(false);
         }
         let snapshot = self.family.snapshot().map_err(DataError::store)?;
         report.shared = self.leave_out_shared(&snapshot, &mut collected.text, None)?;
         let mut pending = session.create_segment().map_err(DataError::store)?;
-        collected
-            .text
-            .write(pending.writer())
-            .map_err(DataError::store)?;
+        collected.text.write(pending.writer())?;
         let segment = session.finish_segment(pending).map_err(DataError::store)?;
         let written = session
             .write_checkout_state(self.checkout, &scanned.state)
@@ -2258,6 +2310,7 @@ impl Checkout {
                 retire_checkouts: unneeded.checkouts,
             })
             .map_err(DataError::store)?;
+        remove_workspace(&scratch);
         // As in a full build: the publication stands whether or not
         // reclamation runs, and the next one tries again.
         match session.reclaim() {
@@ -2692,7 +2745,7 @@ impl Checkout {
     fn leave_out_shared(
         &self,
         snapshot: &Snapshot,
-        text: &mut TextSectionsBuilder,
+        text: &mut TextBuild,
         mut sections: Option<&mut super::graph_store::SectionsWriter<'_>>,
     ) -> Result<SharedUnits, DataError> {
         let Some(read) = self.read_by_others(snapshot)? else {
@@ -2719,7 +2772,15 @@ impl Checkout {
             );
         }
         let kept = fold::shared_holders(&read, units.into_iter().chain(fragments));
-        Ok(read.leave_out(Some(text), sections, |holder| kept.contains(&holder)))
+        let before = text.len();
+        text.retain(|key| {
+            !read
+                .holder(ReadUnit::Text(key))
+                .is_some_and(|holder| kept.contains(&holder))
+        });
+        let mut shared = read.leave_out(None, sections, |holder| kept.contains(&holder));
+        shared.text_units = before - text.len();
+        Ok(shared)
     }
 
     /// Resolves the call graph again for the paths changed since the
@@ -4949,13 +5010,13 @@ fn folder_is_gone(root: &Path) -> bool {
 }
 
 /// What a build's scan collects from the files it reads.
-#[derive(Default)]
 struct BuildSink {
     /// Whether parsed files are extracted, or only text is indexed.
     text_only: bool,
     /// Whether the text index is off, so no text is indexed.
     skip_text: bool,
-    text: Mutex<TextSectionsBuilder>,
+    text: Mutex<TextBuild>,
+    text_error: Mutex<Option<DataError>>,
     seen_text: Mutex<HashSet<ContentKey>>,
     /// Each parsed path's language.
     languages: Mutex<HashMap<Vec<u8>, String>>,
@@ -5002,7 +5063,7 @@ impl StoredRecords {
 
 /// A build sink's results, after the scan.
 struct Collected {
-    text: TextSectionsBuilder,
+    text: TextBuild,
     seen_text: HashSet<ContentKey>,
     languages: HashMap<Vec<u8>, String>,
     records: HashMap<String, (RecordKey, Arc<ContentRecord>)>,
@@ -5012,15 +5073,30 @@ struct Collected {
 }
 
 impl BuildSink {
-    fn text_only() -> Self {
+    fn new(text: TextBuild) -> Self {
         Self {
-            text_only: true,
-            ..Self::default()
+            text_only: false,
+            skip_text: false,
+            text: Mutex::new(text),
+            text_error: Mutex::new(None),
+            seen_text: Mutex::default(),
+            languages: Mutex::default(),
+            records: Mutex::default(),
+            failures: std::sync::atomic::AtomicUsize::default(),
+            stored: StoredRecords::default(),
+            reused: std::sync::atomic::AtomicUsize::default(),
         }
     }
 
-    fn finish(self) -> Collected {
-        Collected {
+    fn finish(self) -> Result<Collected, DataError> {
+        if let Some(error) = self
+            .text_error
+            .into_inner()
+            .expect("no panics while holding it")
+        {
+            return Err(error);
+        }
+        Ok(Collected {
             text: self.text.into_inner().expect("no panics while holding it"),
             seen_text: self
                 .seen_text
@@ -5036,7 +5112,7 @@ impl BuildSink {
                 .expect("no panics while holding it"),
             failures: self.failures.into_inner(),
             reused: self.reused.into_inner(),
-        }
+        })
     }
 }
 
@@ -5048,15 +5124,26 @@ impl ContentSink for BuildSink {
             .expect("no panics while holding it")
             .insert(key);
         if first && !self.skip_text {
+            if self
+                .text_error
+                .lock()
+                .expect("no panics while holding it")
+                .is_some()
+            {
+                return;
+            }
+            let trigrams = (kind == ContentKind::Text).then(|| ContentTrigrams::of(bytes));
+            let mut error = self.text_error.lock().expect("no panics while holding it");
+            if error.is_some() {
+                return;
+            }
             let len = bytes.len() as u64;
-            match kind {
-                ContentKind::Text => {
-                    let trigrams = ContentTrigrams::of(bytes);
-                    self.text
-                        .lock()
-                        .expect("no panics while holding it")
-                        .add_indexed(key, len, &trigrams);
-                }
+            let result = match kind {
+                ContentKind::Text => self
+                    .text
+                    .lock()
+                    .expect("no panics while holding it")
+                    .add_indexed(key, len, trigrams.as_ref().expect("text has trigrams")),
                 ContentKind::Binary => self
                     .text
                     .lock()
@@ -5068,6 +5155,10 @@ impl ContentSink for BuildSink {
                     .lock()
                     .expect("no panics while holding it")
                     .add_unindexed(key, len, TextStatus::Oversize),
+            };
+            if let Err(failure) = result {
+                *error = Some(failure);
+                return;
             }
         }
         if kind == ContentKind::Binary || self.text_only {
@@ -5667,12 +5758,16 @@ impl CheckoutView {
             #[cfg(test)]
             super::outline::note_record_read();
             let record = content.record(ordinal).map_err(DataError::store)?;
-            let RecordBody::Parsed { body, .. } = record.data else {
+            let RecordBody::Parsed { surface, body } = record.data else {
                 return Ok(None);
             };
             return Ok(body.outline.map(|symbols| super::outline::StoredOutline {
                 content: published.content,
-                symbols,
+                symbols: if published.language == "rust" {
+                    super::content::complete_rust_outline(symbols, &surface)
+                } else {
+                    symbols
+                },
             }));
         }
         Ok(None)
@@ -6856,9 +6951,9 @@ pub fn other() { callee(); }
         use crate::callgraph_store::join::CallgraphBlob;
         use aft_store::content::ContentSectionsBuilder;
         let version = "ruled-callgraph-v14-resolver-precision+record-12";
-        let sink = BuildSink::default();
+        let sink = BuildSink::new(checkout.text_build().unwrap());
         let scanned = scan(&checkout.root, &checkout.layer.policy, None, &sink).unwrap();
-        let collected = sink.finish();
+        let collected = sink.finish().unwrap();
         let mut state = scanned.state;
         let mut parses = BTreeMap::new();
         let mut configs = HashMap::new();
@@ -8879,6 +8974,42 @@ pub fn other() { callee(); }
 
         drop(low);
         checkout.build().unwrap();
+    }
+
+    #[test]
+    fn a_build_deletes_its_workspace_after_publishing_but_not_on_a_disk_floor_pause() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        let builds = checkout
+            .family
+            .dir()
+            .join("builds")
+            .join(checkout.checkout.to_string());
+        checkout.build().unwrap();
+        assert_eq!(listing(&builds), ["checkout.lock"]);
+
+        // One byte above the floor: the build starts, and the text index's
+        // first run is refused once the workspace exists.
+        let low = crate::disk_floor::set_free_space_for_test(
+            store.path(),
+            crate::disk_floor::MIN_FREE_BYTES + 1,
+            10 * 1024 * 1024 * 1024,
+        );
+        let error = checkout.build().unwrap_err();
+        assert!(matches!(error, DataError::DiskFloor(_)), "{error}");
+        assert_eq!(
+            listing(&builds).len(),
+            2,
+            "a paused build keeps its workspace: {:?}",
+            listing(&builds)
+        );
+
+        drop(low);
+        checkout.build().unwrap();
+        assert_eq!(listing(&builds), ["checkout.lock"]);
     }
 
     /// Rewrites the segment format version of every segment the newest

@@ -1271,6 +1271,8 @@ pub(crate) async fn preaccepted_outage_daemon(answer: SubmissionOutage) -> Outag
 #[derive(Clone, Copy)]
 pub(crate) enum OutageReplay {
     Running,
+    Queued,
+    Silent,
     Finished,
     NotFound,
     Unknown,
@@ -1507,6 +1509,14 @@ async fn outage_daemon_with(
                                         replies.push(frame_of(FrameType::StreamEnd, vec![]));
                                     } else if matches!(replay, OutageReplay::NotFound) {
                                         replies.push(reply(FrameType::Error, json!({"code":"job_not_found", "message":"job not found"})));
+                                    } else if matches!(replay, OutageReplay::Queued | OutageReplay::Silent) {
+                                        // Attach need not replay Accepted. A queued job may send
+                                        // only display progress, or stay quiet until it finishes.
+                                        if matches!(replay, OutageReplay::Queued) {
+                                            replies.push(record(&StreamRecord::Progress(
+                                                Progress::new(ProgressPhase::Unknown("queue_wait".into()), 42_000, None).unwrap().with_job_id(id())
+                                            )));
+                                        }
                                     } else {
                                         let from = body["params"]["from_seq"].as_u64().unwrap();
                                         for job_record in outage_job_records() {
@@ -1549,7 +1559,7 @@ async fn outage_daemon_with(
                         let _ = subc_transport::write_frame(&mut writer, &error).await;
                         return;
                     }
-                    if body["method"] == "exec.attach" && matches!(replay, OutageReplay::Running) {
+                    if body["method"] == "exec.attach" && matches!(replay, OutageReplay::Running | OutageReplay::Queued | OutageReplay::Silent) {
                         finish_job.notified().await;
                         let terminal = TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 1, 0, 0)
                             .with_ran(Ran::Remote);

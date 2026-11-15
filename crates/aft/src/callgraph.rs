@@ -2167,7 +2167,11 @@ fn qualify_rust_impl_methods<'tree>(
     translated
 }
 
-fn rust_trait_members<'tree>(source: &str, root: Node<'tree>, nav: impl Nav<'tree>) -> Vec<Symbol> {
+pub(crate) fn rust_trait_members<'tree>(
+    source: &str,
+    root: Node<'tree>,
+    nav: impl Nav<'tree>,
+) -> Vec<Symbol> {
     let mut symbols = Vec::new();
     nav.walk_named(root, |node, kind| {
         if kind == "trait_item" {

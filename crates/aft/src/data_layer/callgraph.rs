@@ -43,6 +43,9 @@ use crate::callgraph_store::{
     DbFileIndex, LoadedFileIndexes, LoadedIndex, ProjectIndex, WorkspaceCratePrefixCache,
 };
 
+mod site_records;
+mod spool;
+
 use super::graph_rows::references_by_key;
 use super::graph_store::StoredSlices;
 
@@ -1230,11 +1233,30 @@ pub(crate) fn resolve_checkout(
     // none of them go.
     let mut copy = inputs.clone();
     let mut resolved = BTreeMap::new();
-    resolve_checkout_into(&mut copy, threads, None, &mut |_, files| {
+    // With no store to build into, the spool's workspace goes in the
+    // system's temporary folder. Nothing sweeps it there, so it is deleted
+    // whether or not resolution succeeds.
+    let workspace = Arc::new(
+        aft_store::family::BuildScratch::create_unattached(
+            &std::env::temp_dir().join("aft-callgraph-builds"),
+            |_| Ok::<_, super::checkout::DataError>(()),
+        )
+        .map_err(|error| ManifestJoinError::Parse(format!("spooled resolutions: {error}")))?,
+    );
+    let result = resolve_checkout_into(&mut copy, threads, None, &workspace, &mut |_, files| {
         resolved.extend(files);
         Ok(())
-    })?;
+    });
+    let removed = workspace.remove();
+    result?;
+    removed.map_err(spool_error)?;
     Ok(resolved)
+}
+
+/// A spool that could not be written or read back fails the build: pass 4
+/// must never run on a resolution that is missing or changed.
+fn spool_error(error: std::io::Error) -> ManifestJoinError {
+    ManifestJoinError::Parse(format!("spooled resolutions: {error}"))
 }
 
 /// How many files each stage of [`resolve_checkout_into`] takes before it
@@ -1272,6 +1294,7 @@ pub(crate) fn resolve_checkout_into(
     inputs: &mut CheckoutInputs,
     threads: usize,
     mut memory: Option<&mut Vec<(String, usize)>>,
+    workspace: &Arc<aft_store::family::BuildScratch<super::checkout::DataError>>,
     sink: &mut (dyn FnMut(&CheckoutInputs, Vec<(String, FileResolution)>) -> Result<(), ManifestJoinError>
               + Send),
 ) -> Result<BuildCensus, ManifestJoinError> {
@@ -1322,21 +1345,27 @@ pub(crate) fn resolve_checkout_into(
         bound.set_lists(lists);
         relieve_allocator();
         lap(&mut memory, "bind");
-        let mut resolved = Vec::with_capacity(paths.len());
+        // Each batch's encoded resolutions go to the spool, one range per
+        // batch, and come back a batch at a time in pass 4, which visits the
+        // files in the same batches.
+        let mut spool = spool::ResolutionSpool::new(workspace).map_err(spool_error)?;
+        let mut sites = Vec::with_capacity(paths.len());
         #[cfg(feature = "test-hooks")]
         super::refresh_probe::stage("resolution");
         for batch in paths.chunks(BATCH) {
             let parses = &inputs.parses;
-            resolved.extend(resolve_files_with(
-                inputs,
-                &bound,
-                &refs(batch),
-                &|path, resolution| {
+            let resolved =
+                resolve_files_with(inputs, &bound, &refs(batch), &|path, resolution| {
                     let (_, parse) = &parses[path];
                     let site = Arc::new(SiteFile::new(parse, &resolution));
                     (site, super::fragment::encode(&resolution))
-                },
-            )?);
+                })?;
+            let mut encoded = Vec::with_capacity(resolved.len());
+            for (path, (site, bytes)) in resolved {
+                sites.push((path, site));
+                encoded.push(bytes);
+            }
+            spool.write_range(&encoded).map_err(spool_error)?;
             inputs.parses.release_decoded();
         }
         if let Some(memory) = memory.as_deref_mut() {
@@ -1346,19 +1375,18 @@ pub(crate) fn resolve_checkout_into(
             // parts below count only what they hold besides.
             let _ = inputs.parses.heap_bytes(&mut seen);
             memory.push(("resolve.bound".to_string(), bound.heap_bytes(&mut seen)));
+            memory.push((
+                "resolve.spooled_resolution_bytes".to_string(),
+                usize::try_from(spool.bytes()).unwrap_or(usize::MAX),
+            ));
+            memory.push(("resolve.spool_table".to_string(), spool.table_bytes()));
         }
         lap(&mut memory, "resolve");
         // Pass 4 reads each file's own inputs, built above from its parse
         // and resolution, and never the bound surfaces.
         drop(bound);
         relieve_allocator();
-        let mut encoded = BTreeMap::new();
-        let mut sites = Vec::with_capacity(resolved.len());
-        for (path, (site, bytes)) in resolved {
-            sites.push((path.clone(), site));
-            encoded.insert(path, bytes);
-        }
-        let mut calls = MethodCallInputs::from_site_files(sites);
+        let calls = MethodCallInputs::of_files(sites);
         if let Some(memory) = memory.as_deref_mut() {
             use aft_store::heap::HeapBytes as _;
             let mut seen = aft_store::heap::Seen::new();
@@ -1367,11 +1395,28 @@ pub(crate) fn resolve_checkout_into(
                 "resolve.method_call_inputs".to_string(),
                 calls.heap_bytes(&mut seen),
             ));
-            memory.push((
-                "resolve.encoded_resolutions".to_string(),
-                encoded.heap_bytes(&mut seen),
-            ));
         }
+        // Pass 4, first step: in file order, what every site and declaration
+        // means, with each answer read from the inputs above (see
+        // `dispatch::projected`). The second step reads only these records.
+        let mut records = site_records::MemoryRecords::default();
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("projection");
+        for batch in paths.chunks(BATCH) {
+            site_records::project_batch(inputs, &calls, &refs(batch), &mut records)?;
+            inputs.parses.release_decoded();
+        }
+        drop(calls);
+        relieve_allocator();
+        if let Some(memory) = memory.as_deref_mut() {
+            memory.extend(
+                records
+                    .census()
+                    .map(|(part, value)| (part.to_string(), value)),
+            );
+        }
+        lap(&mut memory, "projection");
+        let source = site_records::RecordSource::new(&records);
         // Pass 4 runs a batch at a time: run over every file at once, its
         // sites and their dependencies held about 1 GB on aft's checkout.
         // Each batch's resolutions go to the sink in smaller chunks, decoded
@@ -1394,23 +1439,25 @@ pub(crate) fn resolve_checkout_into(
         let mut trim_time = std::time::Duration::ZERO;
         #[cfg(feature = "test-hooks")]
         super::refresh_probe::stage("sites");
-        for batch in paths.chunks(BATCH) {
+        for (range, batch) in paths.chunks(BATCH).enumerate() {
             let started = std::time::Instant::now();
-            let mut reached = calls
-                .resolve_sites(inputs, &NoResolutions, &refs(batch))?
-                .into_iter();
+            let reached = site_records::resolve_records(&source, &refs(batch))?;
             sites_ms += started.elapsed().as_millis();
+            let encoded = spool.read_range(range).map_err(spool_error)?;
+            if encoded.len() != reached.len() {
+                return Err(ManifestJoinError::Parse(format!(
+                    "spooled range {range} holds {} resolutions for {} files",
+                    encoded.len(),
+                    reached.len()
+                )));
+            }
             let parses = &inputs.parses;
+            let mut reached = reached.into_iter().zip(encoded);
             loop {
                 let chunk = reached
                     .by_ref()
                     .take(SINK_CHUNK)
-                    .map(|(path, sites, dependencies)| {
-                        let bytes = encoded
-                            .remove(&path)
-                            .expect("every parsed file was resolved");
-                        (path, bytes, sites, dependencies)
-                    })
+                    .map(|((path, sites, dependencies), bytes)| (path, bytes, sites, dependencies))
                     .collect::<Vec<_>>();
                 if chunk.is_empty() {
                     break;
@@ -1445,8 +1492,10 @@ pub(crate) fn resolve_checkout_into(
             log::info!("pass-4 allocator relief: cadence={trim_cadence} batches={trim_batches} calls={trim_calls} elapsed_us={}", trim_time.as_micros());
         }
         #[cfg(feature = "callgraph-shape-census")]
-        let census = std::mem::take(&mut *calls.census.lock().unwrap_or_else(|e| e.into_inner()));
-        drop(calls);
+        let census = std::mem::take(&mut *source.census.lock().unwrap_or_else(|e| e.into_inner()));
+        drop(source);
+        drop(records);
+        drop(spool);
         relieve_allocator();
         if let Some(memory) = memory.as_deref_mut() {
             memory.push((
@@ -1858,6 +1907,16 @@ impl MethodCallInputs {
         Self::from_site_files(built)
     }
 
+    /// Every file's inputs, from inputs already built for every file,
+    /// without the method-name filings: for reading files by path only, as
+    /// the cold build's projection pass does.
+    fn of_files(files: Vec<(String, Arc<SiteFile>)>) -> Self {
+        Self {
+            files: files.into_iter().collect(),
+            ..Self::default()
+        }
+    }
+
     /// Every file's inputs, from inputs already built for every file.
     fn from_site_files(files: Vec<(String, Arc<SiteFile>)>) -> Self {
         let mut calls = Self::default();
@@ -2061,6 +2120,23 @@ impl<'s> SiteSource<'s> {
             resolved,
             calls,
             loaded,
+            error: Mutex::new(None),
+        }
+    }
+
+    /// The source over `calls` when it keeps every parsed file's inputs, as
+    /// a cold build's do: no file is computed on first read, so the parsed
+    /// files are not listed.
+    fn kept(
+        inputs: &'s CheckoutInputs,
+        resolved: &'s (dyn ResolutionLookup + Sync),
+        calls: &'s MethodCallInputs,
+    ) -> Self {
+        Self {
+            inputs,
+            resolved,
+            calls,
+            loaded: HashMap::new(),
             error: Mutex::new(None),
         }
     }

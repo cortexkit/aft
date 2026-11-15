@@ -264,11 +264,13 @@ impl StreamConsumer {
         sink: &mut S,
     ) -> Result<(), super::Error> {
         if let StreamRecord::Progress(progress) = record {
-            if !self.accepted && self.point.is_none() && self.terminal.is_none() {
+            if !self.accepted && self.terminal.is_none() {
                 if let Some(job_id) = progress.job_id() {
                     self.check_job(job_id)?;
-                    sink.submission_job(job_id)?;
-                    self.submission_job_id = Some(job_id);
+                    if self.point.is_none() {
+                        sink.submission_job(job_id)?;
+                        self.submission_job_id = Some(job_id);
+                    }
                 }
                 sink.admission_progress(&progress);
             }

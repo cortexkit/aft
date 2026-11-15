@@ -196,9 +196,22 @@ fn streamed_fixture_segment_equals_buffered_including_shared_fragments() {
     ] {
         let mut buffered = SectionsWriter::new(&fixture.inputs.state, &fixture.records, true, None);
         let mut streamed = SectionsWriter::new(&fixture.inputs.state, &fixture.records, true, None);
-        let workspace: Box<dyn aft_store::graph::Scratch> = Box::new(
-            aft_store::graph::LocalScratch::create(family_store.dir(), "fixture").unwrap(),
+        let build = Arc::new(
+            family_store
+                .try_write()
+                .unwrap()
+                .unwrap()
+                .create_scratch(
+                    aft_store::ids::CheckoutId::from_digest(aft_store::ids::Digest128::of(
+                        b"fixture",
+                    )),
+                    |_| Ok::<_, ()>(()),
+                )
+                .unwrap(),
         );
+        let workspace: Box<dyn aft_store::graph::Scratch> =
+            Box::new(build.subdir("graph").unwrap());
+        drop(build);
         let scratch = workspace.path().to_path_buf();
         let mut config = Config::new(budget);
         config.buffer_bytes = 128;
@@ -255,7 +268,10 @@ fn streamed_fixture_segment_equals_buffered_including_shared_fragments() {
             maps[0], maps[1],
             "even omitted fragments keep their checkout keys"
         );
-        assert!(!scratch.exists());
+        assert!(
+            scratch.exists(),
+            "finishing the sections leaves the workspace for the build to delete"
+        );
         assert_eq!(
             std::fs::read(segments[0].path()).unwrap(),
             std::fs::read(segments[1].path()).unwrap()

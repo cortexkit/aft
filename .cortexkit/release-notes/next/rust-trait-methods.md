@@ -1,0 +1,1 @@
+- Rust outlines now nest default and required trait methods, and zoom finds them by name or `Trait::method`.

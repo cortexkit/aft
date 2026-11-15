@@ -352,6 +352,11 @@ pub fn extract_parsed(
             tree.language
         )));
     }
+    // The call graph and stored dead-code facts reparse the same opaque macro
+    // tokens. Share their trees for this extraction without retaining them in
+    // the content record or after the file has been processed.
+    let _macro_fragments =
+        (tree.language == LangId::Rust).then(crate::calls::cache_rust_macro_fragments);
     let (blob, outline) = CallgraphBlob::extract_tree_with_outline(
         parsed_text(source),
         language,
@@ -718,6 +723,50 @@ pub fn symbol_from_outline(symbol: &OutlineSymbol) -> Option<crate::symbols::Sym
     })
 }
 
+/// Adds Rust trait members from stored call-graph symbols to a navigation
+/// table. The record itself stays unchanged, so existing publications need no
+/// rebuild just to expose members they already contain.
+pub(crate) fn complete_rust_outline(
+    symbols: Vec<OutlineSymbol>,
+    surface: &aft_store::content::Surface,
+) -> Vec<OutlineSymbol> {
+    let Some(mut navigation) = symbols
+        .iter()
+        .map(symbol_from_outline)
+        .collect::<Option<Vec<_>>>()
+    else {
+        return symbols;
+    };
+    let members = surface
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.kind == "method")
+        .map(|symbol| {
+            let scope_chain = symbol
+                .scoped_name
+                .rsplit_once("::")
+                .map_or_else(Vec::new, |(scope, _)| {
+                    scope.split("::").map(str::to_string).collect::<Vec<_>>()
+                });
+            crate::symbols::Symbol {
+                name: symbol.name.clone(),
+                kind: crate::symbols::SymbolKind::Method,
+                range: crate::symbols::Range {
+                    start_line: symbol.start_line,
+                    start_col: symbol.start_col,
+                    end_line: symbol.end_line,
+                    end_col: symbol.end_col,
+                },
+                signature: symbol.signature.clone(),
+                parent: scope_chain.last().cloned(),
+                scope_chain,
+                exported: symbol.exported,
+            }
+        });
+    crate::parser::complete_rust_trait_members(&mut navigation, members);
+    navigation.iter().map(outline_symbol).collect()
+}
+
 /// The name a record stores a parser symbol kind under: its serialized
 /// name.
 fn outline_kind_name(kind: &crate::symbols::SymbolKind) -> &'static str {
@@ -939,9 +988,12 @@ mod tests {
         counts
     }
 
-    /// A record's outline is exactly the table a parse of the file gives
-    /// outline, while the record's call-graph symbols are not: the call
-    /// graph keeps one of each scoped name, so platform twins collapse.
+    /// A record's outline, as navigation serves it, is exactly the table a
+    /// parse of the file gives outline, while the record's call-graph symbols
+    /// are not: the call graph keeps one of each scoped name, so platform
+    /// twins collapse. For Rust, navigation adds trait members from the
+    /// stored call-graph symbols (`complete_rust_outline`), so the comparison
+    /// applies the same completion the checkout view does.
     #[test]
     fn stored_outlines_equal_the_parsers_symbol_table() {
         let mut compared = 0;
@@ -959,10 +1011,16 @@ mod tests {
             let RecordBody::Parsed { surface, body } = &record.data else {
                 panic!("{name}: a parsed language gives a parsed record");
             };
-            let stored = body
+            let outline = body
                 .outline
-                .as_ref()
-                .unwrap_or_else(|| panic!("{name}: no outline"))
+                .clone()
+                .unwrap_or_else(|| panic!("{name}: no outline"));
+            let served = if language == "rust" {
+                complete_rust_outline(outline, surface)
+            } else {
+                outline
+            };
+            let stored = served
                 .iter()
                 .map(|symbol| symbol_from_outline(symbol).unwrap())
                 .collect::<Vec<_>>();

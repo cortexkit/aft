@@ -13,15 +13,16 @@
 //! and payloads in the same blocks. Only the order of the sections in the
 //! file differs, which readers do not depend on.
 //!
-//! Memory stays bounded by what the new segment indexes, not by what it
-//! holds: unit tables, the posting-list index of each term, and one term's
-//! posting list at a time. Unit bytes and posting blocks go to the file as
-//! they are copied.
+//! Posting merges hold one decoded block per source and one output block,
+//! never a whole term's postings. Unit ordinal maps and term lookup tables
+//! remain metadata; unit bytes and posting blocks go to the file as copied.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use crate::postings::{PostingCursor, PostingLayout, PostingList, PostingsBuilder};
+use crate::postings::{
+    BLOCK_ENTRIES, Block, PostingCursor, PostingLayout, PostingList, PostingsBuilder,
+};
 use crate::segment::{SectionHandle, SectionSpec, Segment, SegmentError, SegmentWriter};
 use crate::table::{LookupTable, LookupTableBuilder};
 
@@ -72,10 +73,9 @@ pub(crate) fn write_postings(
     }
     let mut postings = PostingsBuilder::new(layout.clone());
     let mut lookup = LookupTableBuilder::new();
-    let mut merged = Vec::new();
     writer.begin_section(postings_spec)?;
     while let Some(Reverse((term, _))) = next.peek().copied() {
-        merged.clear();
+        let mut readers = Vec::new();
         while let Some(Reverse((same, index))) = next.peek().copied() {
             if same != term {
                 break;
@@ -86,7 +86,12 @@ pub(crate) fn write_postings(
                 .1
                 .take()
                 .expect("a queued source has its next list");
-            copy_list(source, layout, list, &mut merged)?;
+            readers.push(ListReader {
+                source,
+                cursor: PostingCursor::new(source.segment, source.postings, layout.clone(), list),
+                block: None,
+                position: 0,
+            });
             let read = entries[index].0;
             if read < source.lookup.len() {
                 let (term, list) = source.lookup.entry(read)?;
@@ -94,25 +99,42 @@ pub(crate) fn write_postings(
                 next.push(Reverse((term, index)));
             }
         }
-        if merged.is_empty() {
-            continue;
+        let mut heads = BinaryHeap::new();
+        for (index, reader) in readers.iter_mut().enumerate() {
+            if let Some((ordinal, value)) = reader.next()? {
+                heads.push(Reverse((ordinal, index, value)));
+            }
         }
-        // Each source's renumbered ordinals ascend, and no two sources give
-        // the same one, so a stable sort keeps any repeats in their order.
-        merged.sort_by_key(|(ordinal, _)| *ordinal);
-        let ordinals = merged
-            .iter()
-            .map(|(ordinal, _)| *ordinal)
-            .collect::<Vec<_>>();
-        let values = merged.iter().map(|(_, value)| *value).collect::<Vec<_>>();
-        let list = if columns == 0 {
-            postings.add_list(&ordinals, &[])
-        } else {
-            postings.add_list(&ordinals, &[&values])
-        };
-        lookup.push(term, list);
-        if postings.held() >= FLUSH_AT {
-            writer.write(&postings.drain())?;
+        let mut list: Option<PostingList> = None;
+        let mut ordinals = Vec::with_capacity(BLOCK_ENTRIES);
+        let mut values = Vec::with_capacity(BLOCK_ENTRIES);
+        while let Some(Reverse((ordinal, index, value))) = heads.pop() {
+            ordinals.push(ordinal);
+            values.push(value);
+            if let Some((ordinal, value)) = readers[index].next()? {
+                heads.push(Reverse((ordinal, index, value)));
+            }
+            if ordinals.len() == BLOCK_ENTRIES || heads.is_empty() {
+                // Full blocks have the same boundaries as add_list on the
+                // entire merged list, preserving its exact encoded bytes.
+                let block = if columns == 0 {
+                    postings.add_list(&ordinals, &[])
+                } else {
+                    postings.add_list(&ordinals, &[&values])
+                };
+                match &mut list {
+                    Some(list) => list.count += block.count,
+                    None => list = Some(block),
+                }
+                ordinals.clear();
+                values.clear();
+                if postings.held() >= FLUSH_AT {
+                    writer.write(&postings.drain())?;
+                }
+            }
+        }
+        if let Some(list) = list {
+            lookup.push(term, list);
         }
     }
     let (rest, count) = postings.finish();
@@ -122,20 +144,33 @@ pub(crate) fn write_postings(
     writer.write_section(lookup_spec, &lookup, terms)
 }
 
-/// Appends to `merged` each posting of `list` in `source` whose unit is
-/// copied, with its new ordinal and its payload value (zero without one).
-fn copy_list(
-    source: &PostingSource<'_>,
-    layout: &PostingLayout,
-    list: PostingList,
-    merged: &mut Vec<(u32, u32)>,
-) -> Result<(), SegmentError> {
-    let mut cursor = PostingCursor::new(source.segment, source.postings, layout.clone(), list);
-    while let Some(block) = cursor.next_block()? {
-        for (position, ordinal) in block.ordinals.iter().enumerate() {
-            let Some(&new) = source.renumbered.get(*ordinal as usize) else {
+struct ListReader<'a, 's> {
+    source: &'a PostingSource<'s>,
+    cursor: PostingCursor<'s>,
+    block: Option<Block>,
+    position: usize,
+}
+
+impl ListReader<'_, '_> {
+    fn next(&mut self) -> Result<Option<(u32, u32)>, SegmentError> {
+        loop {
+            if self
+                .block
+                .as_ref()
+                .is_none_or(|block| self.position == block.ordinals.len())
+            {
+                self.block = self.cursor.next_block()?;
+                self.position = 0;
+            }
+            let Some(block) = &self.block else {
+                return Ok(None);
+            };
+            let position = self.position;
+            self.position += 1;
+            let ordinal = block.ordinals[position];
+            let Some(&new) = self.source.renumbered.get(ordinal as usize) else {
                 return Err(SegmentError::new(
-                    source.segment.path(),
+                    self.source.segment.path(),
                     crate::segment::ErrorKind::Malformed("a posting names a unit past the table"),
                 ));
             };
@@ -143,10 +178,9 @@ fn copy_list(
                 continue;
             }
             let value = block.columns.first().map_or(0, |column| column[position]);
-            merged.push((new, value));
+            return Ok(Some((new, value)));
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
