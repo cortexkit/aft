@@ -2316,7 +2316,7 @@ fn fallback_grep_with_limits_counted(
     let mut batch: Vec<PathBuf> = Vec::with_capacity(256);
     // Files for a path-ordered scan, searched one at a time after the walk.
     let mut ordered: Vec<PathBuf> = Vec::new();
-    let io_budget = crate::bounded_io::current();
+    let io_budget = crate::bounded_io::capture();
     let alloc_label = crate::alloc_trace::carry();
     let confinement = crate::context::confinement::capture();
 

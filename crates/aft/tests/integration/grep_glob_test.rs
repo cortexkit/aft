@@ -607,7 +607,9 @@ fn assert_stage2_ceiling_reply(indexed: bool, search: bool) {
     let skipped = send(&mut aft, request(r"needle\s+tail"));
     assert_eq!(skipped["success"], true, "{skipped}");
     assert_eq!(skipped["complete"], false, "{skipped}");
-    let skips = skipped["skipped_files"].as_array().expect("named skips");
+    let skips = skipped["skipped_files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("named skips missing: {skipped}"));
     assert_eq!(skips.len(), 1, "{skipped}");
     assert!(
         skips[0]["file"].as_str().unwrap().ends_with("over.txt"),

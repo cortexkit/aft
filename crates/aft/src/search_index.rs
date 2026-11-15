@@ -1715,7 +1715,7 @@ impl SearchIndexSnapshot {
         let stop_after = max_results.saturating_mul(2);
         let stop_scan = Arc::new(AtomicBool::new(false));
         let deadline = make_deadline();
-        let io_budget = crate::bounded_io::current();
+        let io_budget = crate::bounded_io::capture();
         let alloc_label = crate::alloc_trace::carry();
         let floor_disclosure = crate::context::confinement::capture();
         let verification_claims = AtomicUsize::new(0);
@@ -2040,7 +2040,7 @@ impl SearchIndexSnapshot {
         let job_cancellation = crate::executor::current_job_cancellation();
         let started = Instant::now();
         let stopped_early = AtomicBool::new(false);
-        let io_budget = crate::bounded_io::current();
+        let io_budget = crate::bounded_io::capture();
         let alloc_label = crate::alloc_trace::carry();
         let files_examined = AtomicUsize::new(0);
         let missing_on_disk = AtomicUsize::new(0);

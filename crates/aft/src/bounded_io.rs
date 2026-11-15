@@ -131,6 +131,7 @@ impl Probe {
 #[derive(Clone)]
 pub(crate) struct Budget {
     id: u64,
+    disclosure_only: bool,
     pub(crate) deadline: Instant,
     failure: Arc<Mutex<Option<Failure>>>,
     failed: Arc<AtomicBool>,
@@ -158,6 +159,14 @@ pub(crate) struct Budget {
     access_budget_by_path: Arc<HashMap<PathBuf, Duration>>,
 }
 impl Budget {
+    /// Collect skips for native search without adding a request deadline or
+    /// sticky read failures. I/O helpers see no budget; parallel readers carry
+    /// the disclosure context with `capture` instead.
+    pub(crate) fn disclosure_only() -> Self {
+        let mut budget = Self::after(IO_BUDGET);
+        budget.disclosure_only = true;
+        budget
+    }
     pub(crate) fn capped(&self, deadline: Instant) -> Self {
         let mut budget = self.clone();
         budget.deadline = budget.deadline.min(deadline);
@@ -166,6 +175,7 @@ impl Budget {
     pub(crate) fn after(duration: Duration) -> Self {
         Self {
             id: NEXT_BUDGET.fetch_add(1, Ordering::Relaxed),
+            disclosure_only: false,
             deadline: Instant::now() + duration,
             failure: Arc::new(Mutex::new(None)),
             failed: Arc::new(AtomicBool::new(false)),
@@ -543,7 +553,7 @@ pub(crate) fn finish_response(mut response: Response) -> Response {
 /// A ceiling skip is a coverage gap, not a sticky I/O failure: other files
 /// in the same request must still be readable.
 pub(crate) fn note_large_read_skip(path: &Path) {
-    if let Some(budget) = current() {
+    if let Some(budget) = capture() {
         budget
             .large_read_skips
             .lock()
@@ -552,9 +562,12 @@ pub(crate) fn note_large_read_skip(path: &Path) {
     }
 }
 
-fn disclose_large_read_skips(response: &mut Response) {
+pub(crate) fn disclose_large_read_skips(response: &mut Response) {
     use crate::list_envelope::{ListEnvelope, Reason, Total, Unit};
-    let Some(budget) = current() else { return };
+    if response.data.get("skipped_files").is_some() {
+        return;
+    }
+    let Some(budget) = capture() else { return };
     let skipped = budget
         .large_read_skips
         .lock()
@@ -618,7 +631,16 @@ impl Drop for Scope {
     }
 }
 pub(crate) fn current() -> Option<Budget> {
+    capture().filter(|budget| !budget.disclosure_only)
+}
+
+/// Carry the request's skip collector even when native search has no I/O budget.
+pub(crate) fn capture() -> Option<Budget> {
     CURRENT.with(|current| current.borrow().clone())
+}
+
+pub(crate) fn enter_disclosure_if_absent() -> Scope {
+    enter(capture().or_else(|| Some(Budget::disclosure_only())))
 }
 
 /// Person approval has its own deadline; preserve the remaining filesystem and
@@ -691,7 +713,7 @@ fn deadline(at: Option<Instant>) -> Instant {
 }
 fn request_deadline(at: Option<Instant>) -> Option<Instant> {
     at.into_iter()
-        .chain(CURRENT.with(|budget| budget.borrow().as_ref().map(|b| b.deadline)))
+        .chain(current().map(|budget| budget.deadline))
         .min()
 }
 

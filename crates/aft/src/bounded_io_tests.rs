@@ -1,6 +1,37 @@
 use super::*;
 
 #[test]
+fn stage2_disclosure_scope_has_no_deadline_or_sticky_read_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let _scope = enter_disclosure_if_absent();
+    assert!(current().is_none());
+    assert!(request_deadline(None).is_none());
+    let id = capture().unwrap().id;
+    {
+        let _nested = enter_disclosure_if_absent();
+        assert_eq!(capture().unwrap().id, id);
+    }
+    let _error = failure(&root.path().join("absent"), "read_blocked", "test failure");
+    assert!(prior_failure().is_none());
+    let context = capture();
+    rayon::join(
+        || {
+            with_budget(context.clone(), || {
+                note_large_read_skip(&root.path().join("large.txt"))
+            })
+        },
+        || {},
+    );
+    let response = finish_response(Response::success(
+        "native",
+        serde_json::json!({"complete":true}),
+    ));
+    assert!(response.success);
+    assert_eq!(response.data["complete"], false);
+    assert_eq!(response.data["skipped_files"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn stage2_skip_disclosure_is_sorted_bounded_deduplicated_and_non_failing() {
     let root = tempfile::tempdir().unwrap();
     let readable = root.path().join("readable.txt");
