@@ -404,40 +404,30 @@ fn compress_test(output: &str, exit_code: Option<i64>) -> CompressionResult {
         );
     }
 
-    let mut blocks = Vec::new();
+    let mut sections = Vec::new();
+    let mut summary = Vec::new();
+    let mut names = Vec::new();
+    let mut in_failure_list = false;
+    let mut warnings = 0;
     let mut index = 0usize;
     while index < lines.len() {
         let line = lines[index];
         let trimmed = line.trim_start();
-        if trimmed.starts_with("running ")
-            || trimmed.starts_with("test result:")
-            || trimmed.starts_with("error: test failed, to rerun")
-        {
-            blocks.push(ClassifiedBlock::unclassified(line.to_string()));
+        if trimmed == "failures:" {
+            in_failure_list = true;
             index += 1;
             continue;
         }
-
-        if trimmed == "failures:" {
-            let start = index;
-            let mut next = index + 1;
-            while next < lines.len() && lines[next].trim().is_empty() {
-                next += 1;
+        if let Some(name) = failure_name(trimmed.trim_end(), in_failure_list) {
+            if !names.contains(&name) {
+                names.push(name);
             }
-            if next < lines.len() && lines[next].starts_with("---- ") {
-                blocks.push(ClassifiedBlock::unclassified(line.to_string()));
+            if !line.starts_with("---- ") {
                 index += 1;
                 continue;
             }
-
-            index += 1;
-            while index < lines.len() && !lines[index].trim_start().starts_with("test result:") {
-                index += 1;
-            }
-            blocks.push(ClassifiedBlock::unclassified(
-                lines[start..index].join("\n"),
-            ));
-            continue;
+        } else if !trimmed.is_empty() {
+            in_failure_list = false;
         }
 
         if line.starts_with("---- ") {
@@ -452,28 +442,135 @@ fn compress_test(output: &str, exit_code: Option<i64>) -> CompressionResult {
                     break;
                 }
             }
-            blocks.push(ClassifiedBlock::new(
-                DropClass::Failure,
-                lines[start..index].join("\n"),
-            ));
+            sections.push(&lines[start..index]);
+            in_failure_list = false;
             continue;
         }
 
+        if trimmed.starts_with("warning:") {
+            warnings += 1;
+        }
         if !noise[index] {
-            blocks.push(ClassifiedBlock::unclassified(line.to_string()));
+            summary.push(line);
         }
         index += 1;
     }
 
-    let capped = cap_classified_blocks(blocks);
-    append_cargo_test_total(
-        CompressionResult::with_class_drops(
-            trim_trailing_lines(&capped.text),
-            capped.dropped_by_class,
-        )
-        .map_text(|text| ensure_final_lines(output, text)),
-        total.as_deref(),
-    )
+    let list = format!("failures:\n    {}", names.join("\n    "));
+    let verdict_at = summary
+        .iter()
+        .position(|line| line.trim_start().starts_with("test result:"))
+        .unwrap_or(summary.len());
+    summary.insert(verdict_at, &list);
+    let summary =
+        append_cargo_test_total(CompressionResult::new(summary.join("\n")), total.as_deref());
+    let (details, dropped) = bounded_failure_sections(&sections, summary.text.len());
+    let text = if details.is_empty() {
+        summary.text
+    } else {
+        summary
+            .text
+            .replacen(&list, &format!("{details}\n{list}"), 1)
+    };
+    let mut drops = std::collections::BTreeMap::new();
+    if warnings > 0 {
+        drops.insert(DropClass::Warning, warnings);
+    }
+    if dropped > 0 {
+        drops.insert(DropClass::Failure, dropped);
+    }
+    let mut result = CompressionResult::with_class_drops(text, drops)
+        .map_text(|text| ensure_final_lines(output, text));
+    result.bounded_cargo_test_details = true;
+    result
+}
+
+// Failed completion previews have a 512-byte head and a 1,792-byte tail,
+// not a fixed line cap. Reserve the names and results before spending the tail
+// on panic sections, so compiler warnings cannot displace the explanation.
+const FAILURE_SECTION_LINES: usize = 6;
+const FAILURE_DETAIL_LINES: usize = 20;
+const FAILURE_DETAIL_BYTES: usize = crate::bash_background::output::COMPLETION_FAILURE_TAIL_BYTES;
+
+fn bounded_failure_sections(sections: &[&[&str]], summary_bytes: usize) -> (String, usize) {
+    let mut remaining_bytes = FAILURE_DETAIL_BYTES.saturating_sub(summary_bytes + 1);
+    let mut remaining_lines = FAILURE_DETAIL_LINES;
+    let mut kept = Vec::new();
+    let mut dropped = 0;
+    for section in sections {
+        let panic = section.iter().position(|line| line.contains("panicked at"));
+        let start = panic.unwrap_or(1);
+        let body: Vec<&str> = section[start..]
+            .iter()
+            .copied()
+            .filter(|line| {
+                !line.trim().is_empty()
+                    && !line
+                        .trim_start()
+                        .starts_with("note: run with `RUST_BACKTRACE")
+            })
+            .collect();
+        let mut candidate = vec![section[0]];
+        let mut bytes = section[0].len() + 1;
+        // A panic location alone does not explain why the assertion failed.
+        // Keep the header and the first two body lines together, or omit them.
+        let minimum = body.len().min(2);
+        let minimum_bytes = bytes
+            + body[..minimum]
+                .iter()
+                .map(|line| line.len() + 1)
+                .sum::<usize>();
+        if remaining_lines < minimum + 1 || remaining_bytes < minimum_bytes {
+            dropped += 1;
+            continue;
+        }
+        for line in &body {
+            if candidate.len() == FAILURE_SECTION_LINES
+                || candidate.len() == remaining_lines
+                || bytes + line.len() + 1 > remaining_bytes
+            {
+                break;
+            }
+            candidate.push(line);
+            bytes += line.len() + 1;
+        }
+        if candidate.len() < body.len() + 1 {
+            dropped += 1;
+        }
+        remaining_lines -= candidate.len();
+        remaining_bytes -= bytes;
+        kept.extend(candidate);
+    }
+    (kept.join("\n"), dropped)
+}
+
+pub(super) fn failure_summary_preserved(raw: &str, compressed: &str) -> bool {
+    let mut in_failure_list = false;
+    let mut saw_failure = false;
+    let mut saw_result = false;
+    let compressed_lines: std::collections::HashSet<_> =
+        compressed.lines().map(str::trim).collect();
+    for line in raw.lines().map(str::trim) {
+        if line == "failures:" {
+            in_failure_list = true;
+            continue;
+        }
+        if let Some(name) = failure_name(line, in_failure_list) {
+            saw_failure = true;
+            if !compressed_lines.contains(name) {
+                return false;
+            }
+        } else if !line.is_empty() {
+            in_failure_list = false;
+        }
+        if line.starts_with("test result:") {
+            saw_result = true;
+            if !compressed_lines.contains(line) {
+                return false;
+            }
+        }
+    }
+    saw_failure && saw_result && compressed_lines.contains("failures:")
 }
 
 fn append_cargo_test_total(
@@ -584,7 +681,8 @@ fn trim_trailing_lines(input: &str) -> String {
 
 /// Lines a byte-capped bash reply must retain even when stderr follows the
 /// test results. Names and totals are never capped; priority protection covers
-/// the first twenty distinct panic locations so backtraces cannot consume the reply.
+/// the first twenty distinct panic locations so backtraces cannot consume the
+/// reply. Already bounded panic sections also retain their message lines.
 pub(crate) struct TestVerdict {
     pub required: Vec<usize>,
     pub empty_results: Vec<usize>,
@@ -632,10 +730,66 @@ pub(crate) fn test_verdict(lines: &[&str]) -> Option<TestVerdict> {
             required.push(index);
         }
     }
+    if let Some(bounded) = bounded_failure_verdict_lines(lines) {
+        required.extend(bounded);
+        required.sort_unstable();
+        required.dedup();
+    }
     Some(TestVerdict {
         required,
         empty_results,
     })
+}
+
+fn bounded_failure_verdict_lines(lines: &[&str]) -> Option<Vec<usize>> {
+    let mut required = Vec::new();
+    let mut in_section = false;
+    let mut in_list = false;
+    let mut section_lines = 0;
+    let mut detail_lines = 0;
+    let mut bytes = 0;
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if line.starts_with("---- ") && line.ends_with(" stdout ----") {
+            in_section = true;
+            in_list = false;
+            section_lines = 0;
+        } else if trimmed == "failures:" {
+            in_section = false;
+            in_list = true;
+        } else if trimmed.starts_with("test result:")
+            || trimmed.starts_with("cargo test total:")
+            || trimmed.starts_with("error: test failed, to rerun")
+        {
+            in_section = false;
+            in_list = false;
+        } else if in_list && !trimmed.is_empty() && failure_name(trimmed, true).is_none() {
+            in_list = false;
+        }
+        if trimmed.is_empty() {
+            continue;
+        }
+        if in_section {
+            section_lines += 1;
+            detail_lines += 1;
+            if section_lines > FAILURE_SECTION_LINES || detail_lines > FAILURE_DETAIL_LINES {
+                return None;
+            }
+        }
+        if in_section
+            || in_list
+            || trimmed.starts_with("test result:")
+            || trimmed.starts_with("cargo test total:")
+            || trimmed.starts_with("error: test failed, to rerun")
+        {
+            bytes += line.len() + 1;
+            if bytes > FAILURE_DETAIL_BYTES {
+                return None;
+            }
+            required.push(index);
+        }
+    }
+    (detail_lines > 0).then_some(required)
 }
 
 fn is_nextest_verdict(line: &str) -> bool {
@@ -670,10 +824,68 @@ fn failure_name(line: &str, in_failure_list: bool) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compress::caps::{DropClass, CAP_ERRORS};
+    use crate::bash_background::output::cap_completion_output;
+    use crate::compress::caps::DropClass;
+    use crate::compress::{
+        builtin_filters, compress_with_registry_exit_code, toml_filter::build_registry,
+    };
+
+    const HOST_SUPERVISOR_FAILURES: &str = include_str!(
+        "../../tests/integration/fixtures/compress_filters/cargo-test/host-supervisor-two-failures.stdout"
+    );
 
     #[test]
-    fn cargo_test_caps_failure_blocks_after_failures_header() {
+    fn cargo_test_specimen_panic_messages_survive_completion_preview() {
+        let registry = build_registry(builtin_filters::ALL, None, None);
+        let result = compress_with_registry_exit_code(
+            "cargo test --locked -p thalamus-harness-module --features keeper-test-seams --test host_supervisor",
+            HOST_SUPERVISOR_FAILURES,
+            Some(101),
+            &registry,
+        );
+        let preview = cap_completion_output(&result.text, false);
+        assert_eq!(result.input_line_count, 367);
+        assert!(result.text.len() <= FAILURE_DETAIL_BYTES, "{}", result.text);
+        assert!(!preview.truncated, "{}", preview.text);
+        for message in [
+            "the log kept 64000 bytes, 64 of the host's 100 filler lines",
+            "the host 6851 still runs 4.5s after its keeper's death",
+        ] {
+            assert!(result.text.contains(message), "{}", result.text);
+            assert!(preview.text.contains(message), "{}", preview.text);
+        }
+        for noise in [
+            "Compiling ",
+            "Finished `test`",
+            "Running tests/",
+            "warning:",
+            "RUST_BACKTRACE",
+            " ... FAILED",
+        ] {
+            assert!(!result.text.contains(noise), "{}", result.text);
+        }
+        assert_eq!(result.text.matches(" stdout ----").count(), 2);
+        assert!(result.text.contains("failures:\n    holders::"));
+        assert!(result
+            .text
+            .contains("test result: FAILED. 2 passed; 2 failed"));
+        assert_eq!(result.dropped_by_class.get(&DropClass::Warning), Some(&8));
+
+        // Before bounded cargo summaries, the shared failure guard treated the
+        // word `passed` in a failing verdict as success and returned generic text.
+        let before = GenericCompressor.compress_with_exit_code(
+            "cargo test",
+            HOST_SUPERVISOR_FAILURES,
+            Some(101),
+        );
+        println!(
+            "BEFORE COMPRESSED OUTPUT:\n{}\nAFTER COMPRESSED OUTPUT:\n{}",
+            before.text, result.text
+        );
+    }
+
+    #[test]
+    fn cargo_test_caps_failure_details_but_keeps_every_failure_name() {
         let mut output = String::from("running 40 tests\n\nfailures:\n\n");
         for index in 0..40 {
             output.push_str(&format!(
@@ -690,15 +902,59 @@ mod tests {
 
         let result = compress_test(&output, None);
 
-        assert_eq!(
-            result.dropped_by_class.get(&DropClass::Failure),
-            Some(&(40 - CAP_ERRORS))
+        assert!(
+            result
+                .dropped_by_class
+                .get(&DropClass::Failure)
+                .copied()
+                .unwrap_or(0)
+                > 0
         );
-        assert_eq!(result.text.matches(" stdout ----").count(), CAP_ERRORS);
-        assert!(result.text.contains("---- case_19 stdout ----"));
-        assert!(!result.text.contains("---- case_20 stdout ----"));
+        let (details, names) = result.text.split_once("failures:\n").expect("failure list");
+        assert!(details.lines().count() <= FAILURE_DETAIL_LINES + 1);
+        assert!(result.text.len() <= FAILURE_DETAIL_BYTES);
+        assert!(details.contains("---- case_0 stdout ----"));
+        assert!(details.contains("stack line 0"));
+        assert!(!details.contains("---- case_39 stdout ----"));
+        for index in 0..40 {
+            assert!(names
+                .lines()
+                .any(|line| line == format!("    case_{index}")));
+        }
         assert!(result.had_inner_drop);
         assert!(!result.offset_hint_eligible);
+    }
+
+    #[test]
+    fn cargo_test_many_failures_keep_first_message_after_preview_cap() {
+        let mut output = String::from("running 30 tests\nfailures:\n");
+        for index in 0..30 {
+            output.push_str(&format!("---- case_{index} stdout ----\nnoise before panic\nthread 'case_{index}' panicked at src/lib.rs:{index}:1:\nmessage for failure {index}\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n{}", "extra message context\n".repeat(50)));
+        }
+        output.push_str("failures:\n");
+        for index in 0..30 {
+            output.push_str(&format!("    case_{index}\n"));
+        }
+        output.push_str(
+            "test result: FAILED. 0 passed; 30 failed; 0 ignored; 0 measured; 0 filtered out\n",
+        );
+        let registry = build_registry(builtin_filters::ALL, None, None);
+        let result = compress_with_registry_exit_code("cargo test", &output, Some(101), &registry);
+        let (details, names) = result.text.split_once("failures:\n").expect("failure list");
+        assert!(details.lines().count() <= FAILURE_DETAIL_LINES + 1);
+        assert!(result.text.len() <= FAILURE_DETAIL_BYTES);
+        assert!(!result.text.contains("RUST_BACKTRACE"));
+        assert!(!result.text.contains("noise before panic"));
+        for section in details.split("---- ").skip(1) {
+            assert!(section.lines().count() <= FAILURE_SECTION_LINES);
+        }
+        let preview = cap_completion_output(&result.text, false);
+        assert!(preview.text.contains("message for failure 0"));
+        for index in 0..30 {
+            let expected = format!("    case_{index}");
+            assert!(names.lines().any(|line| line == expected));
+            assert!(preview.text.lines().any(|line| line == expected));
+        }
     }
 
     #[test]
