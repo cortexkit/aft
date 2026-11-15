@@ -2263,7 +2263,7 @@ pub(crate) fn open_content_file(path: &Path) -> io::Result<std::fs::File> {
 }
 
 /// Read UTF-8 project content with the same opened-handle requirement.
-pub(crate) fn read_content_to_string(path: impl AsRef<Path>) -> io::Result<String> {
+pub fn read_content_to_string(path: impl AsRef<Path>) -> io::Result<String> {
     std::io::read_to_string(open_content_file(path.as_ref())?)
 }
 
