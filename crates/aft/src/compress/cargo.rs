@@ -554,9 +554,9 @@ pub(super) fn failure_summary_preserved(raw: &str, compressed: &str) -> bool {
     let raw_counts = failure_name_counts(raw);
     let compressed_counts = failure_name_counts(compressed);
     if raw_counts.is_empty()
-        || raw_counts
-            .iter()
-            .any(|(name, count)| compressed_counts.get(name).copied().unwrap_or(0) < *count)
+        || raw_counts.iter().any(|(name, views)| {
+            compressed_counts.get(name).map_or(0, |counts| counts[2]) < *views.iter().max().unwrap()
+        })
     {
         return false;
     }
@@ -605,7 +605,7 @@ fn failure_list_headers(lines: &[&str]) -> Vec<bool> {
         .collect()
 }
 
-fn failure_name_counts(output: &str) -> std::collections::HashMap<&str, usize> {
+fn failure_name_counts(output: &str) -> std::collections::HashMap<&str, [usize; 3]> {
     let lines: Vec<_> = output.lines().collect();
     let headers = failure_list_headers(&lines);
     let mut counts = std::collections::HashMap::<_, [usize; 3]>::new();
@@ -617,25 +617,28 @@ fn failure_name_counts(output: &str) -> std::collections::HashMap<&str, usize> {
             continue;
         }
         if let Some(name) = failure_name(trimmed, in_list) {
-            let kind = if trimmed.starts_with("test ") || is_nextest_verdict(trimmed) {
-                0
-            } else if trimmed.starts_with("---- ") {
+            let kind = failure_name_kind(trimmed);
+            if kind == 1 {
                 in_list = false;
-                1
-            } else {
-                2
-            };
+            }
             counts.entry(name).or_default()[kind] += 1;
         } else if !trimmed.is_empty() {
             in_list = false;
         }
     }
-    // Status, stdout header and final list are three views of each failure,
-    // not three occurrences. Keep the greatest count reported by any view.
     counts
-        .into_iter()
-        .map(|(name, views)| (name, views.into_iter().max().unwrap()))
-        .collect()
+}
+
+// Status, stdout header and final list are three views of each failure,
+// not three occurrences. The summary must list each reported occurrence.
+fn failure_name_kind(line: &str) -> usize {
+    if line.starts_with("test ") || is_nextest_verdict(line) {
+        0
+    } else if line.starts_with("---- ") {
+        1
+    } else {
+        2
+    }
 }
 
 fn append_cargo_test_total(
@@ -764,7 +767,7 @@ pub(crate) fn test_verdict(lines: &[&str]) -> Option<TestVerdict> {
 
     let mut required = Vec::new();
     let mut empty_results = Vec::new();
-    let mut names = HashSet::new();
+    let mut names = std::collections::HashMap::<_, [usize; 3]>::new();
     let mut locations = HashSet::new();
     let failure_headers = failure_list_headers(lines);
     let mut in_failure_list = false;
@@ -778,7 +781,13 @@ pub(crate) fn test_verdict(lines: &[&str]) -> Option<TestVerdict> {
         if trimmed.starts_with("---- ") || (!trimmed.is_empty() && failure_name.is_none()) {
             in_failure_list = false;
         }
-        let is_name = failure_name.is_some_and(|name| in_failure_list || names.insert(name));
+        let is_name = failure_name.is_some_and(|name| {
+            let counts = names.entry(name).or_default();
+            let previous = *counts.iter().max().unwrap();
+            let kind = failure_name_kind(trimmed);
+            counts[kind] += 1;
+            counts[kind] > previous
+        });
         let is_panic = (trimmed.starts_with("thread '") && trimmed.contains("panicked at"))
             || (index > 0 && lines[index - 1].trim_end().ends_with("panicked at"));
         let is_location = is_panic && locations.len() < 20 && locations.insert(trimmed);
@@ -997,9 +1006,10 @@ mod tests {
         );
         assert!(!result.text.lines().any(|line| line == "    not_a_test"));
         assert_eq!(failure_name_counts(raw).len(), 1);
+        assert_eq!(failure_name_counts(raw).get("tests::foo"), Some(&[1, 1, 1]));
         assert_eq!(
             failure_name_counts(&result.text).get("tests::foo"),
-            Some(&1)
+            Some(&[0, 1, 1])
         );
         assert!(failure_summary_preserved(raw, &result.text));
     }
