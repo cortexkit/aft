@@ -292,7 +292,16 @@ export function githubLayoutTests(installer: Installer): void {
     async () => {
       const script = '#!/bin/sh\nprintf x >> "${0}.runs"\nexit 0\n';
       await withCachedServer(script, async (binary) => {
-        const first = installer.runGithubAutoInstall(new Set(), withoutInstall, fetch);
+        // Each spawning check must run to completion: on a loaded CI machine
+        // starting the script can exceed the 2 s production budget, which
+        // records a timeout instead of the pass this test reuses.
+        const runToCompletion = { __smokeTimeoutMsForTests: 30_000 };
+        const first = installer.runGithubAutoInstall(
+          new Set(),
+          withoutInstall,
+          fetch,
+          runToCompletion,
+        );
         await first.installsComplete;
         expect(readFileSync(`${binary}.runs`, "utf8")).toBe("x");
         const second = installer.runGithubAutoInstall(new Set(), withoutInstall, fetch);
@@ -306,13 +315,23 @@ export function githubLayoutTests(installer: Installer): void {
         writeFileSync(binary, changed, { mode: 0o755 });
         meta.sha256 = meta.binarySha256 = createHash("sha256").update(changed).digest("hex");
         writeFileSync(metaPath, JSON.stringify(meta));
-        const third = installer.runGithubAutoInstall(new Set(), withoutInstall, fetch);
+        const third = installer.runGithubAutoInstall(
+          new Set(),
+          withoutInstall,
+          fetch,
+          runToCompletion,
+        );
         await third.installsComplete;
         expect(readFileSync(`${binary}.runs`, "utf8")).toBe("xx");
         const migrated = JSON.parse(readFileSync(metaPath, "utf8"));
         delete migrated.smoke;
         writeFileSync(metaPath, JSON.stringify(migrated));
-        const missing = installer.runGithubAutoInstall(new Set(), withoutInstall, fetch);
+        const missing = installer.runGithubAutoInstall(
+          new Set(),
+          withoutInstall,
+          fetch,
+          runToCompletion,
+        );
         await missing.installsComplete;
         expect(readFileSync(`${binary}.runs`, "utf8")).toBe("xxx");
       });
