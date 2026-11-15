@@ -74,7 +74,7 @@ impl FrozenParams {
         let siblings = self
             .siblings
             .iter()
-            .map(|sibling| {
+            .map(|sibling| -> Result<String, SiblingValidationError> {
                 let given = Path::new(sibling);
                 let not_checkout_root = || sibling_refusal(SiblingRefusal::NotCheckoutRoot, given);
                 if !given.is_absolute() {
