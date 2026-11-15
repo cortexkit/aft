@@ -559,13 +559,14 @@ impl BuildIdentity {
 /// that path while this process runs. `None` when the image cannot be
 /// examined.
 ///
-/// Metadata, not a hash of the image's bytes: hashing a binary of
-/// hundreds of megabytes at every start costs more than it buys, because
-/// AFT's placement never changes a binary in place. A new binary is always
-/// a new file renamed over the path, so it has a new inode (and, on
-/// Windows, a new modification time and usually length). Rewriting an
-/// executable's bytes in place with the same length and restoring its
-/// modification time is not something placement does.
+/// Metadata, not a hash of the image's bytes, so the guarantee is narrower
+/// than "the same bytes": an executable rewritten in place, keeping its
+/// length and modification time, is not told apart (on Unix its inode
+/// stays too). That is acceptable because nothing that installs AFT does
+/// it: AFT's placement renames a new file over the path, and cargo links
+/// each build into a new file, so a new binary always has a new inode (and,
+/// on Windows, a new modification time). Hashing a binary of hundreds of
+/// megabytes at every start would cost more than it buys.
 fn executable_fingerprint() -> Option<String> {
     static FINGERPRINT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     FINGERPRINT
