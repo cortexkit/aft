@@ -85,6 +85,7 @@ dependencies = [
  "aft-base",
  "blake3",
  "cortexkit-role-tool-provider",
+ "getrandom 0.3.4",
  "libc",
  "log",
  "parking_lot",
@@ -93,6 +94,7 @@ dependencies = [
  "serde_json",
  "subc-protocol 0.35.0",
  "tempfile",
+ "tokio",
  "windows-sys 0.61.2",
 ]
 

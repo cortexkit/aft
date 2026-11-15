@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Mutex, OnceLock,
@@ -11,7 +11,7 @@ use std::sync::{
 use serde::{Deserialize, Serialize};
 
 use crate::process_io::Bytes;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::write_counters::now_ms;
 pub use crate::write_counters::{
     credit, note_process_unmeasurable, process_root_counter, register, Counter, Domain, WriterRow,
@@ -520,7 +520,7 @@ fn census_with_sample(
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn set_process_baseline_for_test(bytes: Option<Bytes>, sampled_at_ms: u64) {
     *registry()
         .process_baseline
@@ -531,7 +531,7 @@ fn set_process_baseline_for_test(bytes: Option<Bytes>, sampled_at_ms: u64) {
     };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn pending_for_test(domain: Domain, root_id: &str) -> (u64, u64) {
     registry()
         .entries
@@ -541,7 +541,7 @@ pub(crate) fn pending_for_test(domain: Domain, root_id: &str) -> (u64, u64) {
         .map_or((0, 0), |entry| entry.pending())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn seam_labels_for_test(domain: Domain, root_id: &str) -> Vec<String> {
     registry()
         .entries
@@ -560,7 +560,7 @@ pub(crate) fn seam_labels_for_test(domain: Domain, root_id: &str) -> Vec<String>
         .unwrap_or_default()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn unmeasurable_for_test(root_id: &str) -> Vec<UnmeasurableSeam> {
     unmeasurable_entries_snapshot()
         .into_iter()

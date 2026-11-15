@@ -1,4 +1,4 @@
-// Module aliases keep the moved implementation's downward paths unchanged.
+// Module aliases preserve the implementation's existing module paths.
 pub use aft_base::live_db_files;
 use aft_base::*;
 
