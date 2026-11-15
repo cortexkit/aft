@@ -17,6 +17,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 #[cfg(test)]
+#[allow(hidden_glob_reexports)]
 mod tests {
     #[cfg(unix)]
     use super::*;
