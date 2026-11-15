@@ -1993,42 +1993,6 @@ pub(crate) fn reader(path: &Path, at: Option<Instant>) -> io::Result<Reader> {
 }
 
 impl Reader {
-    pub(crate) fn rest(&mut self, mut bytes: Vec<u8>) -> io::Result<Vec<u8>> {
-        if Instant::now() >= deadline(self.at) {
-            return Err(failure(
-                &self.path,
-                "read_deadline_exceeded",
-                "scan deadline elapsed during file read",
-            ));
-        }
-        let mut file = self
-            .file
-            .take()
-            .ok_or_else(|| io::Error::other("file read already failed"))?;
-        let read = move || {
-            use std::io::Seek;
-            let remaining = file
-                .metadata()?
-                .len()
-                .saturating_sub(file.stream_position()?);
-            let size = usize::try_from(remaining).map_err(io::Error::other)?;
-            bytes.try_reserve_exact(size).map_err(io::Error::other)?;
-            let before = bytes.len();
-            file.read_to_end(&mut bytes)?;
-            crate::io_accounting::WORK.content_read_bytes.fetch_add(
-                (bytes.len() - before) as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            Ok((file, bytes))
-        };
-        let (file, bytes) = if self.direct {
-            read()?
-        } else {
-            run(&self.path, self.at, move |_| read())?
-        };
-        self.file = Some(file);
-        Ok(bytes)
-    }
 
     pub(crate) fn chunk(&mut self, mut buffer: Vec<u8>, size: usize) -> io::Result<Vec<u8>> {
         if Instant::now() >= deadline(self.at) {

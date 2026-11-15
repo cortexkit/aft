@@ -3760,8 +3760,27 @@ pub(crate) fn open_grep_file(
     site: crate::large_read::Site,
     stream: impl FnOnce() -> bool,
 ) -> std::io::Result<GrepFileRead> {
+    open_grep_file_after_open(
+        path,
+        deadline,
+        authorized_task_artifact,
+        site,
+        stream,
+        || {},
+    )
+}
+
+fn open_grep_file_after_open(
+    path: &Path,
+    deadline: Option<Instant>,
+    authorized_task_artifact: bool,
+    site: crate::large_read::Site,
+    stream: impl FnOnce() -> bool,
+    after_open: impl FnOnce(),
+) -> std::io::Result<GrepFileRead> {
     let mut reader =
         crate::project_content::reader_bounded(path, deadline, authorized_task_artifact)?;
+    after_open();
     let prefix = reader.chunk(Vec::new(), 1024)?;
     if is_binary_bytes(&prefix) {
         return Err(std::io::Error::new(
@@ -3779,17 +3798,48 @@ pub(crate) fn open_grep_file(
         }));
     }
     crate::large_read::allow_whole(site, path, reader.size_at_open())?;
-    if crate::large_read::is_large(reader.size_at_open()) {
-        let remaining = reader.size_at_open().saturating_sub(prefix.len() as u64) as usize;
-        reader.append(prefix, remaining).map(GrepFileRead::Whole)
-    } else {
-        reader.rest(prefix).map(GrepFileRead::Whole)
-    }
+    // Bound the small branch too: a log can grow after its descriptor opens.
+    let remaining = reader.size_at_open().saturating_sub(prefix.len() as u64) as usize;
+    reader.append(prefix, remaining).map(GrepFileRead::Whole)
 }
 
 #[cfg(test)]
 mod grep_binary_prefix_tests {
     use super::*;
+
+    #[test]
+    fn growing_small_grep_read_stops_at_open_size_without_large_allocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("growing.log");
+        let opened = vec![b'x'; 2048];
+        std::fs::write(&path, &opened).unwrap();
+        let (read, allocated) = crate::test_allocations::count_bytes(|| {
+            open_grep_file_after_open(
+                &path,
+                None,
+                false,
+                crate::large_read::Site::GrepIndexed,
+                || true,
+                || {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .unwrap()
+                        .set_len(64 << 20)
+                        .unwrap()
+                },
+            )
+            .unwrap()
+        });
+        assert!(
+            allocated < 8 << 20,
+            "allocated {allocated} bytes for a 2 KiB opened file"
+        );
+        let GrepFileRead::Whole(bytes) = read else {
+            panic!("small opened file must use the whole branch")
+        };
+        assert_eq!(bytes, opened);
+    }
 
     #[test]
     fn grep_binary_prefix_rejects_archive_before_returning_its_body() {
