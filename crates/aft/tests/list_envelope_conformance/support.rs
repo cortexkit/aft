@@ -1469,6 +1469,7 @@ pub struct CompleteFixture {
 
 fn make_impact_value(count: usize, depth_limited: bool) -> Value {
     let result = StoreImpactResult {
+        counts_are_lower_bounds: false,
         callback_dependencies: 0,
         callback_reference_label: None,
         test_filter_note: None,
@@ -1618,6 +1619,7 @@ fn make_capped_impact_value(count: usize) -> Value {
     let sites_list_envelope = build_callgraph_envelope(Unit::Sites, shown, count, 0);
 
     let result = StoreImpactResult {
+        counts_are_lower_bounds: false,
         callback_dependencies: 0,
         callback_reference_label: None,
         test_filter_note: None,

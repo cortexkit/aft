@@ -867,6 +867,21 @@ impl<S: SliceSource> CallGraphRead for SliceReader<S> {
         &self,
         targets: &[(String, String)],
     ) -> Result<HashMap<(String, String), Vec<StoreCallSite>>> {
+        #[cfg(test)]
+        if std::env::var_os("IMPACT_PROFILE_LEGACY").is_some() {
+            return Ok(targets
+                .iter()
+                .cloned()
+                .map(|key| {
+                    let sites = self
+                        .callers_of_target(&key.0, &key.1)
+                        .into_iter()
+                        .map(|(_, site)| site)
+                        .collect();
+                    (key, sites)
+                })
+                .collect());
+        }
         Ok(self.callers_of_targets(targets, usize::MAX).0)
     }
 
@@ -874,6 +889,22 @@ impl<S: SliceSource> CallGraphRead for SliceReader<S> {
         &self,
         targets: &[(String, String)],
     ) -> Result<HashMap<(String, String), usize>> {
+        #[cfg(test)]
+        if std::env::var_os("IMPACT_PROFILE_LEGACY").is_some() {
+            return Ok(targets
+                .iter()
+                .cloned()
+                .map(|key| {
+                    let count = self
+                        .callers_of_target(&key.0, &key.1)
+                        .into_iter()
+                        .map(|(_, site)| (site.caller.file, site.line, site.kind))
+                        .collect::<BTreeSet<_>>()
+                        .len();
+                    (key, count)
+                })
+                .collect());
+        }
         Ok(self
             .callers_of_targets(targets, usize::MAX)
             .0
@@ -886,6 +917,14 @@ impl<S: SliceSource> CallGraphRead for SliceReader<S> {
                 (target, groups.len())
             })
             .collect())
+    }
+
+    fn direct_callers_bounded(
+        &self,
+        targets: &[(String, String)],
+        limit: usize,
+    ) -> Result<(HashMap<(String, String), Vec<StoreCallSite>>, bool, usize)> {
+        Ok(self.callers_of_targets(targets, limit))
     }
 
     fn outgoing_calls_for_symbols(

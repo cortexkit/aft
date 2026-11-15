@@ -486,6 +486,27 @@ pub trait CallGraphRead {
         &self,
         targets: &[(String, String)],
     ) -> Result<HashMap<(String, String), usize>>;
+    /// Fetch at most `limit` caller sites, reporting whether more were found.
+    /// Readers backed by an edge iterator stop before constructing another site.
+    fn direct_callers_bounded(
+        &self,
+        targets: &[(String, String)],
+        limit: usize,
+    ) -> Result<(HashMap<(String, String), Vec<StoreCallSite>>, bool, usize)> {
+        let mut fetched = self.direct_callers_for_symbols(targets)?;
+        let mut remaining = limit;
+        let mut exhausted = false;
+        for key in targets.iter().collect::<BTreeSet<_>>() {
+            if let Some(sites) = fetched.get_mut(key) {
+                if sites.len() > remaining {
+                    sites.truncate(remaining);
+                    exhausted = true;
+                }
+                remaining -= sites.len();
+            }
+        }
+        Ok((fetched, exhausted, limit - remaining))
+    }
     fn outgoing_calls_for_symbols(
         &self,
         sources: &[(String, String)],
@@ -1709,6 +1730,14 @@ impl<T: CallGraphRead + ?Sized> CallGraphRead for Arc<T> {
         targets: &[(String, String)],
     ) -> Result<HashMap<(String, String), usize>> {
         (**self).direct_caller_counts_of(targets)
+    }
+
+    fn direct_callers_bounded(
+        &self,
+        targets: &[(String, String)],
+        limit: usize,
+    ) -> Result<(HashMap<(String, String), Vec<StoreCallSite>>, bool, usize)> {
+        (**self).direct_callers_bounded(targets, limit)
     }
     fn callers_of(
         &self,

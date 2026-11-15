@@ -21,6 +21,11 @@ pub static CALLGRAPH_SURFACES: &[SurfaceEntry] = &[
         narrow: CALLGRAPH_NARROW,
         reasons: &[
             ReasonEntry {
+                reason: Reason::Budget,
+                kind: ReasonKind::Bounding,
+                predicate_name: "IMPACT_EXPANSION_BUDGET, prefetch_impact_callers",
+            },
+            ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
                 predicate_name: "HUB_SUMMARY_LIMIT, impact_result",

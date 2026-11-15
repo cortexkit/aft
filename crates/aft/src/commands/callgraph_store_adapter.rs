@@ -37,6 +37,10 @@ pub const HUB_SUMMARY_LIMIT: usize = 15;
 // 10k expansion budget leaves ample room for ordinary traces while preventing a
 // layered call graph from unfolding millions of path prefixes synchronously.
 const TRACE_TO_EXPANSION_BUDGET: usize = 10_000;
+// Limit examined caller sites, not symbols: one hub can have thousands of
+// callers before the walk advances a level.
+const IMPACT_EXPANSION_BUDGET: usize = 10_000;
+const IMPACT_BUDGET_NOTE: &str = "traversal capped";
 const TRACE_TO_RETAINED_PATH_LIMIT: usize = HUB_SUMMARY_LIMIT * 4;
 /// Maximum number of macro-template and macro-invocation entries added to one
 /// `callers` answer; further ones are not listed.
@@ -245,6 +249,8 @@ pub struct StoreCallTreeNode {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreImpactResult {
+    #[serde(skip_serializing_if = "is_false")]
+    pub counts_are_lower_bounds: bool,
     #[serde(skip_serializing_if = "is_zero")]
     pub callback_dependencies: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1065,18 +1071,53 @@ pub fn impact_result(
     depth: usize,
     include_tests: bool,
 ) -> StoreAdapterResult<StoreImpactResult> {
+    impact_result_with_budget(
+        store,
+        file,
+        symbol,
+        depth,
+        include_tests,
+        IMPACT_EXPANSION_BUDGET,
+    )
+    .map(|(result, _)| result)
+}
+
+fn impact_result_with_budget(
+    store: &impl CallGraphRead,
+    file: &Path,
+    symbol: &str,
+    depth: usize,
+    include_tests: bool,
+    budget: usize,
+) -> StoreAdapterResult<(StoreImpactResult, usize)> {
     let profile_start = std::time::Instant::now();
     let target = resolve_symbol_query(store, file, symbol)?;
     let effective_depth = depth.max(1);
     let mut visited = HashMap::new();
     let mut sites = Vec::new();
     let mut boundary = BTreeSet::new();
-    let callers_by_symbol = prefetch_callers(
-        store,
-        &target.representative.file,
-        &target.representative.symbol,
-        effective_depth,
-    )?;
+    let (callers_by_symbol, mut budget_exhausted, mut expansions, incomplete_keys) =
+        if budget == usize::MAX {
+            (
+                prefetch_callers(
+                    store,
+                    &target.representative.file,
+                    &target.representative.symbol,
+                    effective_depth,
+                )?,
+                false,
+                0,
+                BTreeSet::new(),
+            )
+        } else {
+            prefetch_impact_callers(
+                store,
+                &target.representative.file,
+                &target.representative.symbol,
+                effective_depth,
+                budget,
+            )?
+        };
     eprintln!("IMPACT prefetch_ms={}", profile_start.elapsed().as_millis());
     let phase = std::time::Instant::now();
 
@@ -1098,8 +1139,28 @@ pub fn impact_result(
         boundary.len()
     );
     let phase = std::time::Instant::now();
-    let (depth_limited, truncated, boundary_counts) =
-        omitted_boundary_callers(store, boundary, &visited)?;
+    let (depth_limited, truncated, boundary_counts) = if budget_exhausted {
+        (false, 0, HashMap::new())
+    } else if budget == usize::MAX {
+        omitted_boundary_callers(store, boundary, &visited)?
+    } else {
+        boundary.retain(|key| !visited.contains_key(key));
+        let boundary = boundary.into_iter().collect::<Vec<_>>();
+        let (fetched, exhausted, examined) =
+            store.direct_callers_bounded(&boundary, budget.saturating_sub(expansions))?;
+        expansions += examined;
+        budget_exhausted = exhausted;
+        let counts = if exhausted {
+            HashMap::new()
+        } else {
+            fetched
+                .into_iter()
+                .map(|(key, sites)| (key, dedup_call_site_count(sites)))
+                .collect::<HashMap<_, _>>()
+        };
+        let omitted = counts.values().copied().fold(0usize, usize::saturating_add);
+        (omitted > 0, omitted, counts)
+    };
     eprintln!("IMPACT boundary_ms={}", phase.elapsed().as_millis());
     let phase = std::time::Instant::now();
 
@@ -1142,12 +1203,13 @@ pub fn impact_result(
         if root_kinds.contains_key(&key) {
             continue;
         }
-        let is_root = match callers_by_symbol.get(&key) {
-            Some(callers) => callers
-                .iter()
-                .all(|caller| calls_itself(caller, &site.caller)),
-            None => boundary_counts.get(&key) == Some(&0),
-        };
+        let is_root = !incomplete_keys.contains(&key)
+            && match callers_by_symbol.get(&key) {
+                Some(callers) => callers
+                    .iter()
+                    .all(|caller| calls_itself(caller, &site.caller)),
+                None => boundary_counts.get(&key) == Some(&0),
+            };
         let kind = is_root.then(|| roots.kind(&site.caller, site.caller_is_test));
         if let Some(kind) = kind {
             root_tally.add(kind, &site.caller);
@@ -1192,12 +1254,29 @@ pub fn impact_result(
         None
     };
 
-    let sites_list_envelope = build_callgraph_envelope(
-        Unit::Sites,
-        shown,
-        post_filter_count,
-        truncated.max(usize::from(depth_limited)),
-    );
+    let sites_list_envelope = if budget_exhausted {
+        Some(ListEnvelope::new(
+            shown,
+            crate::list_envelope::Total::AtLeast(post_filter_count),
+            Unit::Sites,
+            if depth_limited {
+                vec![
+                    crate::list_envelope::Reason::Depth,
+                    crate::list_envelope::Reason::Budget,
+                ]
+            } else {
+                vec![crate::list_envelope::Reason::Budget]
+            },
+            CALLGRAPH_NARROW,
+        ))
+    } else {
+        build_callgraph_envelope(
+            Unit::Sites,
+            shown,
+            post_filter_count,
+            truncated.max(usize::from(depth_limited)),
+        )
+    };
     let target_signature = target.representative.signature.clone();
     let target_parameters = target_signature
         .as_deref()
@@ -1265,16 +1344,37 @@ pub fn impact_result(
             .then(left.line.cmp(&right.line))
     });
 
+    let mut incomplete = receiver_note(
+        store,
+        &target.representative,
+        post_filter_count,
+        include_tests,
+    )?;
+    if budget_exhausted {
+        if let Some(note) = &mut incomplete {
+            note.incomplete_reason.push_str("; ");
+            note.incomplete_reason.push_str(IMPACT_BUDGET_NOTE);
+        } else {
+            incomplete = Some(StoreIncompleteNote {
+                complete: false,
+                unresolved_call_sites: 0,
+                incomplete_reason: IMPACT_BUDGET_NOTE.to_string(),
+            });
+        }
+    }
+    let mut hub_summary = hub_summary;
+    if budget_exhausted {
+        if let Some(summary) = &mut hub_summary {
+            summary.counts_are_lower_bounds = true;
+            summary.message = IMPACT_BUDGET_NOTE.to_string();
+        }
+    }
     let result = StoreImpactResult {
+        counts_are_lower_bounds: budget_exhausted,
         callback_dependencies,
         callback_reference_label: (callback_dependencies > 0).then_some(CALLBACK_REFERENCE_LABEL),
         test_filter_note,
-        incomplete: receiver_note(
-            store,
-            &target.representative,
-            post_filter_count,
-            include_tests,
-        )?,
+        incomplete,
         symbol: target.representative.symbol,
         file: target.representative.file,
         signature: target_signature,
@@ -1294,7 +1394,8 @@ pub fn impact_result(
         phase.elapsed().as_millis(),
         profile_start.elapsed().as_millis()
     );
-    Ok(result)
+    eprintln!("IMPACT expansions={expansions} budget_exhausted={budget_exhausted}");
+    Ok((result, expansions))
 }
 
 #[cfg(test)]
@@ -2857,6 +2958,59 @@ fn collapse_exact_nodes(mut nodes: Vec<StoreNode>) -> ResolvedStoreSymbol {
         representative,
         nodes,
     }
+}
+
+fn prefetch_impact_callers(
+    store: &impl CallGraphRead,
+    file: &str,
+    symbol: &str,
+    max_depth: usize,
+    budget: usize,
+) -> StoreAdapterResult<(
+    HashMap<(String, String), Vec<StoreCallSite>>,
+    bool,
+    usize,
+    BTreeSet<(String, String)>,
+)> {
+    let mut callers_by_symbol = HashMap::new();
+    let mut frontier = BTreeSet::from([(file.to_string(), symbol.to_string())]);
+    let mut expansions = 0;
+    for depth in 0..max_depth {
+        let targets = frontier
+            .into_iter()
+            .filter(|key| !callers_by_symbol.contains_key(key))
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            break;
+        }
+        let phase = std::time::Instant::now();
+        let (fetched, exhausted, examined) =
+            store.direct_callers_bounded(&targets, budget.saturating_sub(expansions))?;
+        eprintln!(
+            "IMPACT depth={} targets={} sites={} ms={}",
+            depth + 1,
+            targets.len(),
+            examined,
+            phase.elapsed().as_millis()
+        );
+        expansions += examined;
+        frontier = BTreeSet::new();
+        if depth + 1 < max_depth && !exhausted {
+            for site in fetched.values().flatten() {
+                frontier.insert((site.caller.file.clone(), site.caller.symbol.clone()));
+            }
+        }
+        callers_by_symbol.extend(fetched);
+        if exhausted {
+            return Ok((
+                callers_by_symbol,
+                true,
+                expansions,
+                targets.into_iter().collect(),
+            ));
+        }
+    }
+    Ok((callers_by_symbol, false, expansions, BTreeSet::new()))
 }
 
 fn prefetch_callers(

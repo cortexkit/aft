@@ -109,6 +109,7 @@ fn make_impact_result(count: usize, depth_limited: bool, truncated: usize) -> St
     let sites_list_envelope = build_callgraph_envelope(Unit::Sites, shown, count, truncated);
 
     StoreImpactResult {
+        counts_are_lower_bounds: false,
         callback_dependencies: 0,
         callback_reference_label: None,
         test_filter_note: None,

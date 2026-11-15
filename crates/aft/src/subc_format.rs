@@ -3687,7 +3687,16 @@ fn unresolved_summary_text(nodes: &[&serde_json::Map<String, Value>]) -> String 
 fn callback_reference_count_suffix(record: &serde_json::Map<String, Value>) -> String {
     let count = number_field(record, "callback_dependencies").unwrap_or(0);
     if count > 0 {
-        format!(" ({count} by callback reference)")
+        let prefix = if record
+            .get("counts_are_lower_bounds")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            "≥"
+        } else {
+            ""
+        };
+        format!(" ({prefix}{count} by callback reference)")
     } else {
         String::new()
     }
@@ -3991,6 +4000,12 @@ fn render_trace_path(path: &serde_json::Map<String, Value>, index: usize, lines:
 }
 
 fn format_impact_sections(record: &serde_json::Map<String, Value>) -> Vec<String> {
+    const LOWER_BOUND_ROOTS: &str = "Reaches at least {roots}";
+    let lower_bound = record
+        .get("counts_are_lower_bounds")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let count_prefix = if lower_bound { "≥" } else { "" };
     let envelope = record
         .get("sites_list_envelope")
         .or_else(|| record.get("callers_list_envelope"))
@@ -4030,7 +4045,7 @@ fn format_impact_sections(record: &serde_json::Map<String, Value>) -> Vec<String
             if total_str == "1" { "" } else { "s" }
         )),
         Some(format!(
-            "{affected_files} file{}",
+            "{count_prefix}{affected_files} file{}",
             if affected_files == 1 { "" } else { "s" }
         )),
         (!warning.is_empty()).then_some(warning),
@@ -4039,7 +4054,11 @@ fn format_impact_sections(record: &serde_json::Map<String, Value>) -> Vec<String
         sections.push(summary);
     }
     if let Some(roots) = root_counts_summary(record) {
-        sections.push(format!("Reaches {roots}"));
+        sections.push(if lower_bound {
+            LOWER_BOUND_ROOTS.replace("{roots}", &roots)
+        } else {
+            format!("Reaches {roots}")
+        });
     }
     if callers.is_empty() {
         sections.push("No impacted callers found.".to_string());
@@ -4085,7 +4104,7 @@ fn format_impact_sections(record: &serde_json::Map<String, Value>) -> Vec<String
     }
     if hidden_test_callers > 0 {
         sections.push(format!(
-            "{hidden_test_callers} callers in tests hidden — includeTests: true shows them"
+            "{count_prefix}{hidden_test_callers} callers in tests hidden — includeTests: true shows them"
         ));
     }
     if let Some(env) = envelope {

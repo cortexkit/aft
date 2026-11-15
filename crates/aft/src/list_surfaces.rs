@@ -72,6 +72,11 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         narrow: &["depth", "includeTests"],
         reasons: &[
             ReasonEntry {
+                reason: Reason::Budget,
+                kind: ReasonKind::Bounding,
+                predicate_name: "IMPACT_EXPANSION_BUDGET, direct_callers_bounded",
+            },
+            ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
                 predicate_name: "HUB_SUMMARY_LIMIT, impact_result",

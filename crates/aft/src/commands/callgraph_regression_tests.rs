@@ -24,7 +24,28 @@ fn impact_profile() {
         crate::data_layer::runtime::Fresh::Failed(reason) => panic!("graph failed: {reason}"),
     };
     eprintln!("PROFILE build_ms={}", start.elapsed().as_millis());
-    for symbol in ["isBoolean", "isNumber", "isString"] {
+    for symbol in ["validateConstraints", "upcast", "isString", "isBoolean"] {
+        let baseline = if matches!(symbol, "validateConstraints" | "upcast") {
+            eprintln!("PROFILE legacy symbol={symbol}");
+            std::env::set_var("IMPACT_PROFILE_LEGACY", "1");
+            let value = serde_json::to_value(
+                impact_result_with_budget(
+                    &view.callgraph(),
+                    Path::new("src/vs/base/common/types.ts"),
+                    symbol,
+                    5,
+                    true,
+                    usize::MAX,
+                )
+                .unwrap()
+                .0,
+            )
+            .unwrap();
+            std::env::remove_var("IMPACT_PROFILE_LEGACY");
+            Some(value)
+        } else {
+            None
+        };
         eprintln!("PROFILE symbol={symbol}");
         let start = std::time::Instant::now();
         let result = impact_result(
@@ -38,6 +59,17 @@ fn impact_profile() {
         let phase = std::time::Instant::now();
         let value = serde_json::to_value(result).unwrap();
         let text = crate::subc_format::format_callgraph("impact", &value, false);
+        if let Some(baseline) = baseline {
+            assert_eq!(
+                serde_json::to_vec(&value).unwrap(),
+                serde_json::to_vec(&baseline).unwrap()
+            );
+            assert_eq!(
+                text,
+                crate::subc_format::format_callgraph("impact", &baseline, false)
+            );
+            eprintln!("PROFILE symbol={symbol} byte_identical=true");
+        }
         eprintln!(
             "PROFILE symbol={symbol} render_us={} total_ms={}",
             phase.elapsed().as_micros(),
