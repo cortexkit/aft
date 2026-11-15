@@ -18230,7 +18230,11 @@ impl BgTask {
                 .as_ref()
                 .filter(|_| !metadata.is_terminal())
                 .filter(|_| metadata.child_pid.is_none())
-                .filter(|_| metadata.remote.as_ref().is_some_and(|r| !r.accepted))
+                .filter(|_| {
+                    metadata.remote.as_ref().is_some_and(|r| {
+                        !r.accepted && remote::RemotePhase::of(r) != remote::RemotePhase::Running
+                    })
+                })
                 .cloned()
                 .or_else(|| remote::remote_phase_note(metadata, unix_millis())),
         }

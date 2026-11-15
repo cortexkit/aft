@@ -2206,6 +2206,7 @@ fn remote_execution_header_without_a_job_id_keeps_its_existing_text() {
         fallback_digest: None,
         env_not_forwarded: None,
         queue_position: None,
+        queue_wait_ms: None,
         output_received: false,
         retry: None,
         output_incomplete: None,
@@ -4818,6 +4819,7 @@ async fn restart_uses_persisted_seq_without_duplicates_or_gaps(keyed: bool) {
         fallback_digest: None,
         env_not_forwarded: None,
         queue_position: None,
+        queue_wait_ms: None,
         output_received: false,
         retry: None,
         output_incomplete: None,
@@ -6204,6 +6206,243 @@ async fn held_call_startup_remote_result(lost: bool, output: &str) {
     }
 }
 
+async fn restart_unaccepted_submission(
+    connection: PathBuf,
+    job_id: Option<Uuid>,
+    keyed: bool,
+) -> (
+    tempfile::TempDir,
+    Arc<crate::context::AppContext>,
+    String,
+    TaskPaths,
+) {
+    use crate::subc::held_task_recovery::tests as recovery;
+    let dir = tempfile::tempdir().unwrap();
+    let storage = dir.path().join("storage");
+    let root = storage.join("runner");
+    fs::create_dir_all(&root).unwrap();
+    let old = recovery::context(&root, &storage);
+    let (registry, task_id, paths) =
+        persist_accepted_with_snapshot(&root, connection, "printf must-not-run-locally");
+    registry.detach();
+    drop(registry);
+    let mut metadata = read_task(&paths.json).unwrap();
+    metadata.harness = Some("runner".into());
+    metadata.execution_note = None;
+    let remote = metadata.remote.as_mut().unwrap();
+    remote.accepted = false;
+    remote.job_id = job_id;
+    remote.queue_position = None;
+    remote.explicit_runon = true;
+    remote.submission = keyed.then(|| KeyedSubmission {
+        key: format!("aft:{task_id}"),
+        created_at_ms: unix_millis(),
+        request_digest: "must-not-be-resubmitted".into(),
+        attempts: 1,
+        recovery_started_at_ms: None,
+        fresh_key_used: false,
+        resuming: false,
+        reattached: false,
+        refusal: None,
+    });
+    write_task(&paths.json, &metadata).unwrap();
+    let db = old.db().unwrap();
+    crate::db::bash_tasks::upsert_bash_task(
+        &db.lock().unwrap(),
+        &metadata.to_bash_task_row("runner", &paths).unwrap(),
+    )
+    .unwrap();
+    drop(db);
+    drop(old);
+    let restarted = recovery::context(&root, &storage);
+    let executor = recovery::startup(&restarted).await;
+    let context = executor
+        .actor_contexts()
+        .into_iter()
+        .find(|actor| actor.bash_background().task(&task_id).is_some())
+        .expect("startup must adopt the saved submission without a held call or route bind");
+    (dir, context, task_id, paths)
+}
+
+#[tokio::test]
+async fn remote_restart_unaccepted_running_job_attaches_and_finishes() {
+    use crate::exec_remote::wire_tests::{outage_daemon_with_replay, OutageReplay};
+    let daemon = outage_daemon_with_replay(OutageReplay::Running).await;
+    let (_dir, ctx, task_id, paths) =
+        restart_unaccepted_submission(daemon.connection.clone(), Some(id()), true).await;
+    let registry = ctx.bash_background();
+    wait_for(
+        "attached output must arrive while the job is running",
+        || (fs::read(&paths.stdout).unwrap() == b"AB").then_some(()),
+    )
+    .await;
+    assert!(!registry
+        .observed_status(&task_id, "session", 0)
+        .unwrap()
+        .info
+        .status
+        .is_terminal());
+    assert_eq!(
+        registry.remote_progress(&task_id, "session").unwrap().phase,
+        RemotePhase::Running
+    );
+    assert!(!rendered_status(&ctx, &task_id).contains("capturing inputs"));
+    daemon.finish_job();
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    assert_eq!(done.exit_code, Some(0));
+    assert_eq!(fs::read(&paths.stdout).unwrap(), b"AB");
+    assert!(done.output_preview.contains("AB"), "{done:?}");
+    let attaches = daemon.methods("exec.attach");
+    assert_eq!(attaches.len(), 1);
+    assert_eq!(attaches[0]["params"]["job_id"], id().to_string());
+    assert_eq!(attaches[0]["params"]["from_seq"], 0);
+    assert!(daemon.methods("exec.run").is_empty());
+    assert!(!read_task(&paths.json).unwrap().local_fallback_started);
+}
+
+#[tokio::test]
+async fn remote_restart_unaccepted_completed_job_replays_output() {
+    use crate::exec_remote::wire_tests::{outage_daemon_with_replay, OutageReplay};
+    let daemon = outage_daemon_with_replay(OutageReplay::Finished).await;
+    let (_dir, ctx, task_id, paths) =
+        restart_unaccepted_submission(daemon.connection.clone(), Some(id()), false).await;
+    let registry = ctx.bash_background();
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    assert_eq!(done.exit_code, Some(0));
+    assert_eq!(fs::read(&paths.stdout).unwrap(), b"AB");
+    assert!(done.output_preview.contains("AB"), "{done:?}");
+    let attaches = daemon.methods("exec.attach");
+    assert_eq!(attaches.len(), 1);
+    assert_eq!(attaches[0]["params"]["job_id"], id().to_string());
+    assert_eq!(attaches[0]["params"]["from_seq"], 0);
+    assert!(daemon.methods("exec.run").is_empty());
+    assert!(!read_task(&paths.json).unwrap().local_fallback_started);
+}
+
+#[tokio::test]
+async fn remote_restart_unaccepted_never_ran_job_settles() {
+    let daemon = daemon(Script::PlacementWait { job_id: true }, "exec-remote/v1").await;
+    let (_dir, ctx, task_id, paths) =
+        restart_unaccepted_submission(daemon.connection.clone(), Some(id()), false).await;
+    let registry = ctx.bash_background();
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown, "{done:?}");
+    assert!(
+        done.output_preview
+            .contains("command never started on ck-motor"),
+        "{done:?}"
+    );
+    let saved = read_task(&paths.json).unwrap();
+    assert_eq!(saved.remote.unwrap().terminal.unwrap().ran, Some(Ran::None));
+    assert!(!saved.local_fallback_started);
+    let log = daemon.log.lock().unwrap();
+    let attaches: Vec<_> = log
+        .iter()
+        .filter(|(_, body)| body["method"] == "exec.attach")
+        .collect();
+    assert_eq!(attaches.len(), 1);
+    assert_eq!(attaches[0].1["params"]["job_id"], id().to_string());
+    assert!(!log.iter().any(|(_, body)| body["method"] == "exec.run"));
+}
+
+#[tokio::test]
+async fn remote_restart_unaccepted_without_job_id_settles_without_resubmission() {
+    for keyed in [false, true] {
+        let daemon = daemon(Script::PlacementWait { job_id: false }, "exec-remote/v1").await;
+        let (_dir, ctx, task_id, paths) =
+            restart_unaccepted_submission(daemon.connection.clone(), None, keyed).await;
+        let registry = ctx.bash_background();
+        let done = terminal(&registry, &task_id).await;
+        assert_eq!(done.info.status, BgTaskStatus::FateUnknown, "{done:?}");
+        assert!(
+            done.output_preview.contains("command was not resubmitted"),
+            "{done:?}"
+        );
+        assert!(!read_task(&paths.json).unwrap().local_fallback_started);
+        let log = daemon.log.lock().unwrap();
+        assert!(!log
+            .iter()
+            .any(|(_, body)| matches!(body["method"].as_str(), Some("exec.run" | "exec.attach"))));
+    }
+}
+
+#[tokio::test]
+async fn remote_restart_unaccepted_queued_progress_reaches_bash_status() {
+    use crate::exec_remote::wire_tests::{outage_daemon_with_replay, OutageReplay};
+    let daemon = outage_daemon_with_replay(OutageReplay::Queued).await;
+    let (_dir, ctx, task_id, paths) =
+        restart_unaccepted_submission(daemon.connection.clone(), Some(id()), true).await;
+    wait_for("attach queue progress must reach task metadata", || {
+        (read_task(&paths.json)
+            .unwrap()
+            .remote
+            .unwrap()
+            .queue_wait_ms
+            == Some(42_000))
+        .then_some(())
+    })
+    .await;
+    let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "status", "command": "bash_status", "session_id": "session",
+        "params": { "task_id": task_id },
+    }))
+    .unwrap();
+    let response = crate::commands::bash_status::handle(&request, &ctx);
+    assert!(response.success, "{response:?}");
+    assert_eq!(response.data["phase"], "queued", "{response:?}");
+    let status = rendered_status(&ctx, &task_id);
+    assert!(status.contains("queued on the runner (42 s)"), "{status}");
+    assert!(!status.contains("capturing inputs"), "{status}");
+    let saved = read_task(&paths.json).unwrap();
+    let remote = saved.remote.unwrap();
+    assert!(!remote.accepted);
+    assert_eq!(remote.last_seq, None);
+    assert_eq!(remote.queue_position, None);
+    assert_eq!(remote.stdout_len, 0);
+    assert!(daemon.methods("exec.run").is_empty());
+    assert_eq!(daemon.methods("exec.attach").len(), 1);
+    daemon.finish_job();
+    assert_eq!(
+        terminal(ctx.bash_background(), &task_id).await.info.status,
+        BgTaskStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn remote_restart_unaccepted_quiet_attach_waits_without_claiming_capture() {
+    use crate::exec_remote::wire_tests::{outage_daemon_with_replay, OutageReplay};
+    let daemon = outage_daemon_with_replay(OutageReplay::Silent).await;
+    let (_dir, ctx, task_id, paths) =
+        restart_unaccepted_submission(daemon.connection.clone(), Some(id()), false).await;
+    wait_for("startup must subscribe to the saved job", || {
+        (!daemon.methods("exec.attach").is_empty()).then_some(())
+    })
+    .await;
+    let status = rendered_status(&ctx, &task_id);
+    assert!(
+        status.contains(
+            "waiting on the runner (ck-motor has not reported a queue position or any output yet)"
+        ),
+        "{status}"
+    );
+    assert!(!status.contains("capturing inputs"), "{status}");
+    assert!(!status.contains("queued on the runner"), "{status}");
+    let saved = read_task(&paths.json).unwrap();
+    assert!(!saved.remote.as_ref().unwrap().accepted);
+    assert!(serde_json::to_value(saved).unwrap()["remote"]
+        .get("queue_wait_ms")
+        .is_none());
+    assert!(daemon.methods("exec.run").is_empty());
+    assert_eq!(daemon.methods("exec.attach").len(), 1);
+    daemon.finish_job();
+    assert_eq!(
+        terminal(ctx.bash_background(), &task_id).await.info.status,
+        BgTaskStatus::Completed
+    );
+}
+
 #[test]
 fn shells_v1_remote_acceptance_persists_only_a_reported_placement_host() {
     use exec::types::Placement;
@@ -6326,6 +6565,7 @@ fn persist_accepted_with_snapshot_cap(
         fallback_digest: Some(digest),
         env_not_forwarded: None,
         queue_position: None,
+        queue_wait_ms: None,
         output_received: false,
         retry: None,
         output_incomplete: None,
@@ -9150,7 +9390,7 @@ async fn non_blocking_runon_is_still_promoted_at_the_foreground_wait_window() {
 }
 
 #[test]
-fn remote_phase_comes_from_acceptance_started_or_output() {
+fn remote_phase_comes_from_runner_evidence() {
     let mut remote = RemoteTask {
         submission: None,
         accepted_platform: None,
@@ -9179,6 +9419,7 @@ fn remote_phase_comes_from_acceptance_started_or_output() {
         fallback_digest: None,
         env_not_forwarded: None,
         queue_position: None,
+        queue_wait_ms: None,
         output_received: false,
         retry: None,
         output_incomplete: None,
@@ -9195,9 +9436,15 @@ fn remote_phase_comes_from_acceptance_started_or_output() {
     remote.job_id = Some(id());
     assert_eq!(
         RemotePhase::of(&remote),
-        RemotePhase::Submitting,
-        "a refusal can carry a job id without acceptance"
+        RemotePhase::WaitingOnRunner,
+        "a saved job id identifies a submitted job, not an input-capture phase"
     );
+    remote.queue_wait_ms = Some(42_000);
+    assert_eq!(
+        RemotePhase::of(&remote),
+        RemotePhase::QueueWait { elapsed_ms: 42_000 }
+    );
+    remote.queue_wait_ms = None;
     remote.accepted = true;
     assert_eq!(
         RemotePhase::of(&remote),
@@ -9304,6 +9551,7 @@ fn remote_phase_note_says_submitting_then_queued_until_started() {
         fallback_digest: None,
         env_not_forwarded: None,
         queue_position: None,
+        queue_wait_ms: None,
         output_received: false,
         retry: None,
         output_incomplete: None,
@@ -9757,6 +10005,7 @@ async fn reattach_limit_counts_from_a_late_draining_resubmission() {
         fallback_digest: None,
         env_not_forwarded: None,
         queue_position: None,
+        queue_wait_ms: None,
         output_received: false,
         retry: Some(DrainingRetry {
             request_digest: "digest".into(),
@@ -16096,7 +16345,7 @@ async fn submission_key_daemon_restart_reconnects_and_attaches_without_resubmiss
 }
 
 #[tokio::test]
-async fn submission_key_restart_before_acceptance_replays_from_beginning() {
+async fn remote_restart_unaccepted_keyed_without_job_id_is_not_resubmitted() {
     let daemon = submission_daemon(false, false, false, 2).await;
     let dir = tempfile::tempdir().unwrap();
     let (old, task_id) = stopped_submission(dir.path(), &daemon).await;
@@ -16114,19 +16363,26 @@ async fn submission_key_restart_before_acceptance_replays_from_beginning() {
     drop(old);
     let restarted = registry();
     restarted.replay_session(dir.path(), "session").unwrap();
-    assert_eq!(
-        terminal(&restarted, &task_id).await.info.status,
-        BgTaskStatus::Completed
+    let done = terminal(&restarted, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown, "{done:?}");
+    assert!(
+        done.output_preview.contains("command was not resubmitted"),
+        "{done:?}"
     );
     let task = restarted.task(&task_id).unwrap();
-    assert_eq!(
-        fs::read_to_string(&task.paths.stdout).unwrap(),
-        "line-0\nline-1\nline-2\nline-3\n"
-    );
+    assert!(fs::read(&task.paths.stdout).unwrap().is_empty());
     let runs = submission_runs(&daemon);
-    assert_eq!(runs.len(), 2);
-    assert_eq!(runs[1]["submission_key"], runs[0]["submission_key"]);
-    assert!(runs[1].get("resume_from_seq").is_none());
+    assert_eq!(
+        runs.len(),
+        1,
+        "restart must not redispatch the saved request"
+    );
+    assert!(!daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, body)| body["method"] == "exec.attach"));
 }
 
 #[tokio::test]
@@ -16839,6 +17095,7 @@ async fn runon_return_paths_restart_before_the_manifest_replays_chunks_and_place
         fallback_digest: None,
         env_not_forwarded: None,
         queue_position: None,
+        queue_wait_ms: None,
         output_received: false,
         retry: None,
         output_incomplete: None,

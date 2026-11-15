@@ -1071,9 +1071,16 @@ pub(crate) fn with_capture_warning(response: &Response) -> Response {
     if !reply_announces_live_task(&response) {
         return response;
     }
-    response.data["status"] = json!("starting");
-    response.data["phase"] = json!("submitting");
-    response.data["remote_phase"] = json!("submitting");
+    // An attach can report queueing or execution without replaying Accepted.
+    // Keep that evidence instead of relabelling the job as input capture.
+    if response.data["phase"]
+        .as_str()
+        .is_none_or(|phase| phase == "submitting")
+    {
+        response.data["status"] = json!("starting");
+        response.data["phase"] = json!("submitting");
+        response.data["remote_phase"] = json!("submitting");
+    }
     let field =
         if response.data.get("output").is_none() && response.data.get("output_preview").is_some() {
             "output_preview"

@@ -949,6 +949,9 @@ pub(crate) struct RemoteTask {
     /// reported once and never updated, so it can only fall afterwards.
     #[serde(default)]
     pub queue_position: Option<u32>,
+    /// Queue progress can precede Accepted, including on an attach after restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_wait_ms: Option<u64>,
     /// Output proves execution started even when an older runner sends no
     /// `Started` record.
     #[serde(default)]
@@ -1081,10 +1084,12 @@ pub(crate) struct WorkspaceHolder {
 pub(crate) enum RemotePhase {
     /// Inputs are still being submitted; the runner has not accepted the job.
     Submitting,
-    /// Accepted, but no queue position was retained across a restart.
+    /// Submitted, but the runner has not supplied queue or execution evidence.
     WaitingOnRunner,
     /// Accepted at this queue position, and nothing has shown it started.
     Queued { position: u32 },
+    /// The runner reported queue waiting without a queue position.
+    QueueWait { elapsed_ms: u64 },
     /// The command has started on the runner.
     Running,
 }
@@ -1095,12 +1100,16 @@ impl RemotePhase {
     /// New runners explicitly report `Started`; output remains evidence of
     /// execution for older runners that do not send that record.
     pub(crate) fn of(remote: &RemoteTask) -> Self {
-        if !remote.accepted {
+        if !remote.accepted && remote.terminal.is_some() {
             Self::Submitting
         } else if remote.started.is_some() || remote.output_received {
             Self::Running
         } else if let (Some(_), Some(position)) = (remote.job_id, remote.queue_position) {
             Self::Queued { position }
+        } else if let Some(elapsed_ms) = remote.queue_wait_ms {
+            Self::QueueWait { elapsed_ms }
+        } else if !remote.accepted && remote.job_id.is_none() {
+            Self::Submitting
         } else {
             Self::WaitingOnRunner
         }
@@ -1111,7 +1120,7 @@ impl RemotePhase {
         match self {
             Self::Submitting => "submitting",
             Self::WaitingOnRunner => "waiting_on_runner",
-            Self::Queued { .. } => "queued",
+            Self::Queued { .. } | Self::QueueWait { .. } => "queued",
             Self::Running => "running",
         }
     }
@@ -1127,6 +1136,9 @@ impl RemotePhase {
             Self::Queued { position } => format!(
                 "queued at position {position} on ck-motor (the position when the job was accepted; no output yet)"
             ),
+            Self::QueueWait { elapsed_ms } => {
+                format!("queued on the runner ({} s)", elapsed_ms / 1000)
+            }
             Self::Running => "running on ck-motor (execution started)".to_string(),
         }
     }
@@ -1163,8 +1175,19 @@ fn admission_progress_detail(detail: &str) -> String {
 }
 
 #[cfg(unix)]
+fn queue_wait_progress_ms(progress: &exec::types::Progress) -> Option<u64> {
+    // The pinned types crate has no typed QueueWait variant; this is the
+    // runner's queue-progress wire spelling, not an arbitrary unknown phase.
+    matches!(progress.phase(), exec::types::ProgressPhase::Unknown(phase) if phase == "queue_wait")
+        .then(|| progress.phase_elapsed_ms())
+}
+
+#[cfg(unix)]
 fn admission_progress_line(progress: &exec::types::Progress) -> Option<String> {
     use exec::types::ProgressPhase;
+    if let Some(elapsed_ms) = queue_wait_progress_ms(progress) {
+        return Some(RemotePhase::QueueWait { elapsed_ms }.describe());
+    }
     let step = match progress.phase() {
         ProgressPhase::Upload => "uploading its files".to_owned(),
         ProgressPhase::PlacementWait => "waiting for a free build host".to_owned(),
@@ -1194,8 +1217,9 @@ impl RemoteProgress {
 }
 
 /// Where a still-running remote task is, for bash_status and bash_watch:
-/// `submitting to the runner (capturing inputs)` before acceptance, then
-/// `queued on the runner (N s, position P)` until the runner reports that the
+/// `submitting to the runner (capturing inputs)` before a job id arrives, then
+/// waiting on the runner until it supplies queue or execution evidence.
+/// `queued on the runner (N s, position P)` lasts until the runner reports that the
 /// command started, then `the runner stops it N s after it started`, because
 /// the runner enforces the timeout from start, not from queue entry.
 ///
@@ -1224,6 +1248,9 @@ pub(crate) fn remote_phase_note(metadata: &super::PersistedTask, now_ms: u64) ->
             ),
             None => "running on the runner".to_string(),
         });
+    }
+    if phase == RemotePhase::WaitingOnRunner && !remote.accepted {
+        return Some(phase.describe());
     }
     // The persisted task creation time includes submission as well as queueing.
     let queued_s = now_ms.saturating_sub(metadata.started_at) / 1000;
@@ -1901,19 +1928,33 @@ impl OutputSink for TaskSink {
     }
 
     fn admission_progress(&mut self, progress: &exec::types::Progress) {
-        if let Some(job_id) = progress.job_id() {
+        let queue_wait_ms = queue_wait_progress_ms(progress);
+        if progress.job_id().is_some() || queue_wait_ms.is_some() {
             let mut db = DeferredDbWrites::new(&self.registry, &self.task);
             if let Ok(mut state) = self.task.lock_state() {
-                let job_id = job_id.to_string();
-                if state.metadata.shell_remote_job_id.as_ref() != Some(&job_id) {
+                let mut changed = false;
+                if let Some(job_id) = progress.job_id().map(|id| id.to_string()) {
                     // Display a job id before acceptance without marking the
                     // job accepted or changing the execution retry state.
-                    state.metadata.shell_remote_job_id = Some(job_id);
+                    if state.metadata.shell_remote_job_id.as_ref() != Some(&job_id) {
+                        state.metadata.shell_remote_job_id = Some(job_id);
+                        changed = true;
+                    }
+                }
+                if let (Some(elapsed_ms), Some(remote)) =
+                    (queue_wait_ms, state.metadata.remote.as_mut())
+                {
+                    if remote.terminal.is_none() && remote.queue_wait_ms != Some(elapsed_ms) {
+                        remote.queue_wait_ms = Some(elapsed_ms);
+                        changed = true;
+                    }
+                }
+                if changed {
                     if let Err(error) =
                         self.registry
                             .persist_task_locked(&self.task, &state.metadata, &mut db)
                     {
-                        log::warn!("could not persist shell job id: {error}");
+                        log::warn!("could not persist remote admission progress: {error}");
                     }
                 }
             }
@@ -2804,6 +2845,7 @@ impl BgTaskRegistry {
             fallback_digest: None,
             env_not_forwarded: None,
             queue_position: None,
+            queue_wait_ms: None,
             output_received: false,
             retry: None,
             output_incomplete: None,
@@ -3381,6 +3423,11 @@ impl BgTaskRegistry {
                 .map_err(|_| "task lock poisoned")?
                 .metadata,
         );
+        // A restart cannot recover a submission without an addressable job.
+        // Replaying its key could dispatch a command the old process never sent.
+        if initial.is_none() && remote.terminal.is_none() && remote.job_id.is_none() {
+            return Err("remote outcome unknown: acceptance job ID was not persisted; command was not resubmitted".into());
+        }
         let mut retry_request = None;
         let resume_submission = initial.is_none()
             // A known job without a terminal was detached by an AFT restart.
