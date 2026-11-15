@@ -159,7 +159,9 @@ impl FrozenParams {
     }
 }
 
-fn read_policy_unavailable(response: &crate::protocol::Response) -> bool {
+/// Whether a file-read policy error means the grant store couldn't be read in
+/// time, as opposed to the path not being granted.
+pub(crate) fn read_policy_unavailable(response: &crate::protocol::Response) -> bool {
     response.data["code"].as_str().is_some_and(|code| {
         code == "grants_unavailable"
             || code == "io_timeout"

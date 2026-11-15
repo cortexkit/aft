@@ -3409,11 +3409,7 @@ fn log_runon_refusal(route: RouteChannel, session: &str, response: &Response) {
         return;
     }
     let code = response.data["code"].as_str().unwrap_or("unknown");
-    let classification = if code == "grants_unavailable"
-        || code == "io_timeout"
-        || code == "read_deadline_exceeded"
-        || (code.starts_with("read_io_") && code.ends_with("timeout"))
-    {
+    let classification = if crate::exec_remote::read_policy_unavailable(response) {
         "unavailable"
     } else {
         "refused"
