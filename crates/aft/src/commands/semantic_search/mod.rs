@@ -8199,10 +8199,32 @@ fn audit1432_presence_unstamped_growth_streams_without_a_false_skip() {
 fn audit1432_degraded_transient_rows_are_bounded_by_concurrency_not_all_files() {
     let root = tempfile::tempdir().unwrap();
     let query = format!("foo{}", "x".repeat(16 * 1024 - 3));
-    let content = format!("{query}\n").repeat(16);
+    let modified = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     for at in 0..24 {
-        fs::write(root.path().join(format!("file-{at:02}.txt")), &content).unwrap();
+        let path = root.path().join(format!("file-{at:02}.txt"));
+        let content = (1..=3)
+            .map(|line| format!("file-{at:02} row-{line:02} {query}\n"))
+            .collect::<String>();
+        fs::write(&path, content).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
     }
+    let (walk_order, file_cap, time_cap, _) =
+        collect_degraded_grep_files(root.path(), true, Instant::now());
+    assert_eq!(walk_order.len(), 24);
+    assert!(!file_cap && !time_cap);
+    // The walk is the input order, independent of how Rayon completes reads.
+    // Equal mtimes make the final reply sort by path, then line.
+    let mut expected = walk_order
+        .iter()
+        .flat_map(|path| (1..=3).map(move |line| (path.clone(), line)))
+        .take(10)
+        .collect::<Vec<_>>();
+    expected.sort();
     let peak = Arc::new(AtomicUsize::new(0));
     DEGRADED_ROW_WATCHES
         .lock()
@@ -8222,27 +8244,32 @@ fn audit1432_degraded_transient_rows_are_bounded_by_concurrency_not_all_files() 
     let result = pool
         .install(|| execute_degraded_grep_fallback(&query, root.path(), 10, true, "retained-rows"))
         .unwrap();
-    assert_eq!(result.grep.matches.len(), 10);
     assert!(result.grep.truncated);
-    assert!(result
-        .grep
-        .matches
-        .iter()
-        .all(|row| row.match_text == query));
     assert_eq!(
         result
             .grep
             .matches
             .iter()
-            .map(|row| row.line)
+            .map(|row| (row.file.clone(), row.line))
             .collect::<Vec<_>>(),
-        (1..=10).collect::<Vec<_>>()
+        expected
     );
-    assert!(
-        peak.load(Ordering::Relaxed) <= 2 * 10,
-        "retained {} rows for two workers and a 10-row per-file cap",
-        peak.load(Ordering::Relaxed)
-    );
+    assert!(result
+        .grep
+        .matches
+        .iter()
+        .all(|row| row.match_text == query));
+    for row in &result.grep.matches {
+        let name = row.file.file_stem().unwrap().to_str().unwrap();
+        assert!(
+            row.line_text
+                .starts_with(&format!("{name} row-{:02} ", row.line)),
+            "{row:?}"
+        );
+    }
+    let retained = peak.load(Ordering::Relaxed);
+    assert!(retained > 0, "the observer must have seen a real batch");
+    assert_eq!(retained, 2 * 3, "two workers retain at most the three distinct rows each file contains, not all files' rows");
 }
 
 #[cfg(test)]

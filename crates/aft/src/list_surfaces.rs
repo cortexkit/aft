@@ -1402,6 +1402,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         location_or_primitive: "commands::zoom indexed offset work-count test",
         reason: "test fixture selecting sample offsets for a work-count assertion; not an agent-visible list",
     },
+    ExclusionEntry {
+        file: "commands/semantic_search/mod.rs",
+        enclosing_item: "audit1432_degraded_transient_rows_are_bounded_by_concurrency_not_all_files",
+        location_or_primitive: "degraded grep fixture expected first ten rows",
+        reason: "test-only reference selecting the expected input-order prefix before comparing independently sorted paths and line numbers; no tool response is produced",
+    },
     // Split-query search (aft_search with both query and pattern). The
     // results list is the search surface's, cut and enveloped by the engine;
     // these items only describe the pattern input.

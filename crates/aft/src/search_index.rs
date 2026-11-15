@@ -3876,36 +3876,42 @@ mod grep_binary_prefix_tests {
 
     #[test]
     fn growing_small_grep_read_stops_at_open_size_without_large_allocation() {
+        use std::io::{Seek, Write};
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("growing.log");
-        let opened = vec![b'x'; 2048];
-        std::fs::write(&path, &opened).unwrap();
-        let (read, allocated) = crate::test_allocations::count_bytes(|| {
-            open_grep_file_after_open(
-                &path,
-                None,
-                false,
-                crate::large_read::Site::GrepIndexed,
-                || true,
-                || {
-                    std::fs::OpenOptions::new()
-                        .write(true)
-                        .open(&path)
-                        .unwrap()
-                        .set_len(64 << 20)
-                        .unwrap()
-                },
-            )
-            .unwrap()
-        });
-        assert!(
-            allocated < 8 << 20,
-            "allocated {allocated} bytes for a 2 KiB opened file"
-        );
-        let GrepFileRead::Whole(bytes) = read else {
-            panic!("small opened file must use the whole branch")
-        };
-        assert_eq!(bytes, opened);
+        for size in [0, 8, 512, 1023, 2048] {
+            for nul_growth in [false, true] {
+                let opened = vec![b'x'; size];
+                std::fs::write(&path, &opened).unwrap();
+                let (read, allocated) = crate::test_allocations::count_bytes(|| {
+                    open_grep_file_after_open(
+                        &path,
+                        None,
+                        false,
+                        crate::large_read::Site::GrepIndexed,
+                        || true,
+                        || {
+                            let mut file =
+                                std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                            file.set_len(64 << 20).unwrap();
+                            if !nul_growth {
+                                file.seek(std::io::SeekFrom::Start(size as u64)).unwrap();
+                                file.write_all(&[b'y'; 2048]).unwrap();
+                            }
+                        },
+                    )
+                    .expect("growth beyond the opened size must not affect binary admission")
+                });
+                assert!(
+                    allocated < 8 << 20,
+                    "allocated {allocated} bytes for a {size}-byte opened file"
+                );
+                let GrepFileRead::Whole(bytes) = read else {
+                    panic!("small opened file must use the whole branch");
+                };
+                assert_eq!(bytes, opened, "size={size}, nul_growth={nul_growth}");
+            }
+        }
     }
 
     #[test]

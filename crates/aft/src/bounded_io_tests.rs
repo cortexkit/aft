@@ -1376,7 +1376,7 @@ fn audit1432_round2_nested_dead_code_reply_keeps_main_skip_contract_bytes() {
             |at| serde_json::json!({"file":format!("large-{at:02}.rs"),"reason":"graph_too_large"}),
         )
         .collect::<Vec<_>>();
-    let body = serde_json::json!({"dead_code":{"complete":false,"skipped_files_count":23,"skipped_files":skips}});
+    let body = serde_json::json!({"summary":{"dead_code":{"complete":false,"skipped_files_count":23,"skipped_files":skips}}});
     let expected = Response::success("main-contract", body.clone());
     let response = round2_nonsearch_reply("inspect", body, &[]);
     assert_eq!(
@@ -1435,37 +1435,42 @@ fn audit1432_walk_gap_precedes_the_entire_skipped_files_block() {
 
 #[test]
 fn audit1432_skip_collector_is_order_independent_and_deduplicates_paths_with_both_reasons() {
-    let collect = |reverse: bool| {
+    let collect = |command_name: &str, reverse: bool| {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = round2_context(root.path());
+        let req: RawRequest =
+            serde_json::from_value(serde_json::json!({"id":"mixed-order","command":command_name}))
+                .unwrap();
         with_skip_disclosure(|| {
-            let floor = || {
+            let work = || {
                 for at in 0..23 {
-                    note_skipped_file(Path::new(&format!("file-{at:02}.log")), "denied_floor");
+                    let path = PathBuf::from(format!("file-{at:02}.log"));
+                    crate::context::confinement::capture().record_matched_floor(&path);
+                    note_large_read_skip(&path);
                 }
-            };
-            let ceiling = || {
-                for at in 0..23 {
-                    note_large_read_skip(Path::new(&format!("file-{at:02}.log")));
-                }
+                Response::success("mixed-order", serde_json::json!({"text":"rows"}))
             };
             if reverse {
-                ceiling();
-                floor();
+                command(&req, &ctx, |_, _| {
+                    crate::context::confinement::with_floor_disclosure(work)
+                })
             } else {
-                floor();
-                ceiling();
+                crate::context::confinement::with_floor_disclosure(|| {
+                    command(&req, &ctx, |_, _| work())
+                })
             }
-            finish_response(Response::success(
-                "mixed-order",
-                serde_json::json!({"text":"rows"}),
-            ))
         })
     };
-    let first = collect(false);
-    let second = collect(true);
-    assert_eq!(
-        serde_json::to_value(&first).unwrap(),
-        serde_json::to_value(second).unwrap()
-    );
+    let first = collect("grep", false);
+    for command in ["grep", "semantic_search"] {
+        for reverse in [false, true] {
+            assert_eq!(
+                serde_json::to_vec(&first).unwrap(),
+                serde_json::to_vec(&collect(command, reverse)).unwrap(),
+                "{command}, reverse={reverse}"
+            );
+        }
+    }
     let files = first.data["skipped_files"].as_array().unwrap();
     assert_eq!(files.len(), 20);
     assert_eq!(first.data["skipped_files_remaining"], 3);
