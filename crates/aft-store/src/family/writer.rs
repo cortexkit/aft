@@ -444,7 +444,7 @@ mod build_scratch_tests {
             .unwrap()
             .unwrap()
             .reclaim_dead_workspaces(
-                checkout(b"own"),
+                Some(checkout(b"own")),
                 || {
                     asked += 1;
                     asked <= 1
@@ -459,7 +459,7 @@ mod build_scratch_tests {
             .try_write()
             .unwrap()
             .unwrap()
-            .reclaim_dead_workspaces(checkout(b"own"), || true, || false)
+            .reclaim_dead_workspaces(Some(checkout(b"own")), || true, || false)
             .unwrap();
         assert_eq!(removed, 1);
         assert!(made[1].exists(), "a paused one stays above the floor");
@@ -468,7 +468,7 @@ mod build_scratch_tests {
             .try_write()
             .unwrap()
             .unwrap()
-            .reclaim_dead_workspaces(checkout(b"own"), || true, || true)
+            .reclaim_dead_workspaces(Some(checkout(b"own")), || true, || true)
             .unwrap();
         assert_eq!(removed, 1);
         assert!(!made[1].exists(), "below the floor a paused one goes too");
@@ -866,7 +866,7 @@ impl<'f> WriteSession<'f> {
         Ok(ScratchClaim { dir: parent, lock })
     }
 
-    /// Deletes dead workspaces of checkouts other than `keep`, oldest first,
+    /// Deletes dead workspaces of every checkout but `keep`, oldest first,
     /// while `short` says the disk is still short of what the next build
     /// needs. A workspace a build left when it stopped for lack of disk goes
     /// only after every other one, and only while `below_floor` says the
@@ -878,7 +878,7 @@ impl<'f> WriteSession<'f> {
     /// When a folder cannot be listed or deleted.
     pub fn reclaim_dead_workspaces(
         &mut self,
-        keep: CheckoutId,
+        keep: Option<CheckoutId>,
         mut short: impl FnMut() -> bool,
         mut below_floor: impl FnMut() -> bool,
     ) -> Result<usize, FamilyError> {
@@ -886,11 +886,12 @@ impl<'f> WriteSession<'f> {
         if !builds.exists() {
             return Ok(0);
         }
-        let keep = keep.to_string();
+        let keep = keep.map(|checkout| checkout.to_string());
         let mut dead = Vec::new();
         for checkout in read_dir(&builds)? {
             if !checkout.is_dir()
-                || checkout.file_name().and_then(|name| name.to_str()) == Some(keep.as_str())
+                || (keep.is_some()
+                    && checkout.file_name().and_then(|name| name.to_str()) == keep.as_deref())
             {
                 continue;
             }

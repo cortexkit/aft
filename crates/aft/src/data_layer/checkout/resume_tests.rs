@@ -453,6 +453,29 @@ fn no_stage_after_the_scan_reads_the_checkout() {
 }
 
 #[test]
+fn below_the_floor_a_build_first_deletes_dead_workspaces() {
+    let root = tempfile::tempdir().unwrap();
+    project(root.path());
+    let store = tempfile::tempdir().unwrap();
+    killed_build(store.path(), root.path(), "stage.sites");
+    let checkout = Checkout::bind(layer(), store.path(), family(), root.path()).unwrap();
+    let dir = builds(&checkout);
+    assert_eq!(workspaces(&dir).len(), 1, "the killed build left its work");
+    let _low = crate::disk_floor::set_free_space_for_test(
+        store.path(),
+        crate::disk_floor::MIN_FREE_BYTES - 1,
+        10 * 1024 * 1024 * 1024,
+    );
+    let error = checkout.build().unwrap_err();
+    assert!(matches!(error, DataError::DiskFloor(_)), "{error}");
+    assert!(
+        workspaces(&dir).is_empty(),
+        "the dead workspace was deleted to make room: {:?}",
+        workspaces(&dir)
+    );
+}
+
+#[test]
 fn a_refused_admission_writes_no_workspace() {
     let root = tempfile::tempdir().unwrap();
     project(root.path());

@@ -1588,6 +1588,10 @@ impl Checkout {
         // resolution rather than after them. So does the writer below the
         // free-disk floor.
         self.family.check_formats().map_err(DataError::store)?;
+        // Below the floor, dead build workspaces (this checkout's too: no
+        // build of it is running here yet) go first, so the disk they hold
+        // can let this build or a later one run.
+        self.reclaim_disk_for(0, false);
         self.check_disk_floor()?;
         if !self.planes.callgraph {
             // Without a call graph, a build is the text scan alone.
@@ -1879,7 +1883,7 @@ impl Checkout {
             .map(|record| record.stat.size)
             .sum::<u64>()
             .saturating_mul(8);
-        self.reclaim_disk_for(estimate);
+        self.reclaim_disk_for(estimate, true);
         let reserve = Arc::new(std::sync::atomic::AtomicU64::new(estimate));
         let remaining = reserve.clone();
         let admission = Arc::clone(&scratch);
@@ -2399,11 +2403,13 @@ impl Checkout {
     }
 
     /// Below the free-disk floor plus `reserve`, what the next stage of the
-    /// build may write, deletes other checkouts' dead build workspaces,
-    /// oldest first, until there is room; one a paused build left goes only
-    /// below the floor itself. Best effort: the build's own admission still
-    /// refuses what does not fit.
-    fn reclaim_disk_for(&self, reserve: u64) {
+    /// build may write, deletes dead build workspaces, oldest first, until
+    /// there is room; one a paused build left goes only below the floor
+    /// itself. `others_only` keeps this checkout's own, which a build of it
+    /// running here holds. Best effort, and safe against live builds: each
+    /// deletion takes the workspace's checkout lock first, and the build's
+    /// own admission still refuses what does not fit.
+    fn reclaim_disk_for(&self, reserve: u64, others_only: bool) {
         let dir = self.family.dir().to_path_buf();
         if check_disk_floor_at(&dir, reserve).is_ok() {
             return;
@@ -2412,13 +2418,13 @@ impl Checkout {
             return;
         };
         match session.reclaim_dead_workspaces(
-            self.checkout,
+            others_only.then_some(self.checkout),
             || check_disk_floor_at(&dir, reserve).is_err(),
             || check_disk_floor_at(&dir, 0).is_err(),
         ) {
             Ok(0) => {}
             Ok(removed) => log::info!(
-                "callgraph build: deleted {removed} dead build workspace(s) of other checkouts to make room"
+                "callgraph build: deleted {removed} dead build workspace(s) to make room"
             ),
             Err(error) => log::warn!("callgraph build: reclaiming dead build workspaces: {error}"),
         }
