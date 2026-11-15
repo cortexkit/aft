@@ -534,6 +534,10 @@ impl Meaning {
         config: &SemanticBackendConfig,
         model: &mut Option<(SemanticBackendConfig, SemanticEmbeddingModel)>,
     ) -> Round {
+        #[cfg(all(test, target_os = "linux"))]
+        if main_parity_capture::uses_constant_vectors(checkout.root()) {
+            return self.fill_main_parity_vectors(checkout, config);
+        }
         if model
             .as_ref()
             .is_none_or(|(made_for, _)| made_for != config)
@@ -841,3 +845,7 @@ pub(crate) fn fail_model_loads_for_test(root: &Path, error: &str) -> impl Drop {
 pub(crate) fn waiting(coverage: &Coverage) -> bool {
     !coverage.pending.is_empty()
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "main_parity_capture.rs"]
+mod main_parity_capture;
