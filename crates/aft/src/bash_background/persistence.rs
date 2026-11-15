@@ -1954,6 +1954,9 @@ pub struct PersistedTask {
     /// reuse the same text and delivery list even if task observations change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) runner_completion_notice: Option<cortexkit_role_llm_runner::send::SendRequest>,
+    /// Delivery generations and pending checks advance atomically with the frozen send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runner_completion_delivery: Option<RunnerCompletionDelivery>,
     /// The saved folder grants this command's sandbox allowed, so revoking
     /// one can stop it. Persisted so a restarted AFT still knows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1964,6 +1967,25 @@ pub struct PersistedTask {
 pub(crate) struct RunnerNoticePolicy {
     pub dedupe: bool,
     pub reminder_interval_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RunnerCompletionDelivery {
+    pub generation: u8,
+    pub phase: RunnerCompletionPhase,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum RunnerCompletionPhase {
+    Ready {
+        due_ms: u64,
+    },
+    Pending {
+        checks: u32,
+        due_ms: u64,
+        retry: bool,
+    },
+    Retired,
 }
 
 fn default_notify_on_completion() -> bool {
@@ -2081,6 +2103,7 @@ impl PersistedTask {
             runner_notice_policy: None,
             runner_reminder_elapsed_ms: None,
             runner_completion_notice: None,
+            runner_completion_delivery: None,
             folder_grants: super::registry::folder_grants::for_spawn(),
         };
         crate::gh_shim_ticket::capture_spawn(&metadata);
@@ -2261,6 +2284,7 @@ impl From<BashTaskRow> for PersistedTask {
             cancelled_call_unannounced: false,
             runner_completion_offers: 0,
             runner_completion_notice: None,
+            runner_completion_delivery: None,
             runner_notice_policy: None,
             runner_reminder_elapsed_ms: None,
             folder_grants: None,
@@ -3359,6 +3383,7 @@ where
         let runner_completion_offers = metadata
             .runner_completion_offers
             .max(original.runner_completion_offers);
+        let runner_completion_delivery = metadata.runner_completion_delivery.clone();
         let runner_completion_notice = original
             .runner_completion_notice
             .clone()
@@ -3373,6 +3398,7 @@ where
         metadata.completion_delivered = completion_delivered;
         metadata.runner_completion_offers = runner_completion_offers;
         metadata.runner_completion_notice = runner_completion_notice;
+        metadata.runner_completion_delivery = runner_completion_delivery;
         metadata.runner_notice_policy = runner_notice_policy;
         metadata.runner_reminder_elapsed_ms = runner_reminder_elapsed_ms;
         metadata.schema_version = SCHEMA_VERSION;

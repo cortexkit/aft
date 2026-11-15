@@ -269,7 +269,7 @@ markup5ever_rcdom = "0.38"
 # runs only at the --subc transport edge; AFT's command core stays synchronous.
 cortexkit-persona = "=0.3.0"
 cortexkit-role-tool-provider = "=0.15.7"
-cortexkit-role-llm-runner = "=0.8.36"
+cortexkit-role-llm-runner = "=0.8.53"
 cortexkit-role-tool-display = "=0.1.5"
 cortexkit-role-agent-data = "=0.2.4"
 cortexkit-role-user-commands = "=0.1.0"

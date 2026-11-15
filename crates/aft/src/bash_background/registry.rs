@@ -12307,6 +12307,17 @@ impl BgTaskRegistry {
         task_id: &str,
         request: cortexkit_role_llm_runner::send::SendRequest,
     ) -> std::io::Result<()> {
+        self.persist_runner_completion_delivery(session, task_id, request, None)
+    }
+
+    /// Save the request and its delivery progress together before another network call.
+    pub(crate) fn persist_runner_completion_delivery(
+        &self,
+        session: &str,
+        task_id: &str,
+        request: cortexkit_role_llm_runner::send::SendRequest,
+        delivery: Option<super::persistence::RunnerCompletionDelivery>,
+    ) -> std::io::Result<()> {
         let task = self
             .task_for_session(task_id, session)
             .ok_or_else(|| std::io::Error::other("completion task is not owned by this session"))?;
@@ -12317,6 +12328,9 @@ impl BgTaskRegistry {
             .map_err(|_| std::io::Error::other("background task lock poisoned"))?;
         let mut updated = state.metadata.clone();
         updated.runner_completion_notice = Some(request);
+        if let Some(delivery) = delivery {
+            updated.runner_completion_delivery = Some(delivery);
+        }
         if let Err(error) = self.persist_task_locked(&task, &updated, &mut db) {
             task.drain_reply
                 .publish_metadata(&state.metadata, task.hard_kill_renewable);

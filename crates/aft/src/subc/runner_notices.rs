@@ -2,15 +2,18 @@
 //! the same notice twice. Runner sessions do not acknowledge AFT push frames.
 
 use super::*;
+use crate::bash_background::persistence::{RunnerCompletionDelivery, RunnerCompletionPhase};
 use cortexkit_role_llm_runner::{
     delivery_order::{DeliveryOrder, Mode},
-    send::{SendReply, SendRequest},
+    send::{states, SendReply, SendRequest},
+    send_status::SendStatusRequest,
 };
 use subc_client_rs::{CallError, CallOptions, CloseRouteOptions, ConsumerOptions, SubcConsumer};
 use subc_protocol::{scope::ScopeSelector, BindIdentity, RouteTarget};
 
 const MAX_ATTEMPTS: usize = 10;
 const MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
+const MAX_GENERATIONS: u8 = 5;
 const RUNNER_CARRIERS: &[&str] = &["reserved:thalamus-harness", "reserved:broca"];
 
 pub(super) fn known_runner(module_id: &str) -> bool {
@@ -27,6 +30,8 @@ static BOUND_ROUTES: OnceLock<
 static SCHEDULER: OnceLock<Result<Arc<Scheduler>, String>> = OnceLock::new();
 static EXPIRED: AtomicU64 = AtomicU64::new(0);
 static IDLE_START_FALLBACK: AtomicU64 = AtomicU64::new(0);
+static NOT_DELIVERED: AtomicU64 = AtomicU64::new(0);
+static PENDING_UNRESOLVED: AtomicU64 = AtomicU64::new(0);
 const QUEUE_CAPACITY: usize = 1024;
 type Work = Box<dyn FnMut() -> Next + Send>;
 
@@ -169,7 +174,7 @@ fn scheduler() -> Option<&'static Arc<Scheduler>> {
     }
 }
 
-pub(super) fn health() -> (usize, u64, u64) {
+pub(super) fn health() -> (usize, u64, u64, u64, u64) {
     let waiting = SCHEDULER
         .get()
         .and_then(|result| result.as_ref().ok())
@@ -187,6 +192,8 @@ pub(super) fn health() -> (usize, u64, u64) {
         waiting,
         EXPIRED.load(Ordering::Relaxed),
         IDLE_START_FALLBACK.load(Ordering::Relaxed),
+        NOT_DELIVERED.load(Ordering::Relaxed),
+        PENDING_UNRESOLVED.load(Ordering::Relaxed),
     )
 }
 
@@ -409,13 +416,19 @@ struct RunnerIncarnation {
 
 #[derive(Default)]
 struct RunnerCapabilities {
-    entries: HashMap<(PathBuf, String), (RunnerIncarnation, bool)>,
+    entries: HashMap<(PathBuf, String, String), (RunnerIncarnation, bool)>,
 }
 
 impl RunnerCapabilities {
-    fn get(&self, path: &Path, module: &str, incarnation: &RunnerIncarnation) -> Option<bool> {
+    fn get(
+        &self,
+        path: &Path,
+        module: &str,
+        incarnation: &RunnerIncarnation,
+        capability: &str,
+    ) -> Option<bool> {
         self.entries
-            .get(&(path.into(), module.into()))
+            .get(&(path.into(), module.into(), capability.into()))
             .filter(|(cached, _)| cached == incarnation)
             .map(|(_, supported)| *supported)
     }
@@ -426,9 +439,12 @@ impl RunnerCapabilities {
         module: &str,
         incarnation: RunnerIncarnation,
         supported: bool,
+        capability: &str,
     ) {
-        self.entries
-            .insert((path.into(), module.into()), (incarnation, supported));
+        self.entries.insert(
+            (path.into(), module.into(), capability.into()),
+            (incarnation, supported),
+        );
     }
 }
 
@@ -450,22 +466,26 @@ async fn runner_incarnation(consumer: &SubcConsumer, module: &str) -> Option<Run
 }
 
 fn described_delivery_order(bytes: &[u8]) -> Option<bool> {
+    described_capability(bytes, "delivery_order")
+}
+
+fn described_capability(bytes: &[u8], name: &str) -> Option<bool> {
     let description = cortexkit_role_llm_runner::wire::read_reply::<Value>(bytes).ok()?;
     let capabilities = description.get("capabilities")?.as_array()?;
     if !capabilities.iter().all(Value::is_string) {
         return None;
     }
-    Some(
-        capabilities
-            .iter()
-            .any(|capability| capability == "delivery_order"),
-    )
+    Some(capabilities.iter().any(|capability| capability == name))
 }
 
 async fn runner_delivery_order(path: &Path, address: &Address) -> Option<bool> {
+    runner_capability(path, address, "delivery_order").await
+}
+
+async fn runner_capability(path: &Path, address: &Address, capability: &str) -> Option<bool> {
     #[cfg(test)]
-    if let Some(capability) = test_endpoint::capability(address) {
-        return capability;
+    if let Some(supported) = test_endpoint::capability(address, capability) {
+        return supported;
     }
     let consumer = SubcConsumer::connect(path, ConsumerOptions::default())
         .await
@@ -480,7 +500,12 @@ async fn runner_delivery_order(path: &Path, address: &Address) -> Option<bool> {
                 return None;
             }
             let cache = RUNNER_CAPABILITIES.get_or_init(Default::default);
-            if let Some(supported) = cache.lock().unwrap().get(path, &address.module, &before) {
+            if let Some(supported) =
+                cache
+                    .lock()
+                    .unwrap()
+                    .get(path, &address.module, &before, capability)
+            {
                 return Some(supported);
             }
             let bytes = consumer
@@ -494,14 +519,18 @@ async fn runner_delivery_order(path: &Path, address: &Address) -> Option<bool> {
                 )
                 .await
                 .ok()?;
-            let supported = described_delivery_order(&bytes)?;
+            let supported = if capability == "delivery_order" {
+                described_delivery_order(&bytes)?
+            } else {
+                described_capability(&bytes, capability)?
+            };
             if runner_incarnation(&consumer, &address.module).await? != before {
                 return None;
             }
             cache
                 .lock()
                 .unwrap()
-                .insert(path, &address.module, before, supported);
+                .insert(path, &address.module, before, supported, capability);
             Some(supported)
         }
         .await;
@@ -540,6 +569,9 @@ pub(super) mod test_endpoint {
         sender: std::sync::mpsc::Sender<Received>,
         stored: std::sync::Mutex<HashMap<String, Vec<u8>>>,
         delivery_order: std::sync::Mutex<Option<bool>>,
+        send_status: AtomicBool,
+        replies: std::sync::Mutex<std::collections::VecDeque<SendReply>>,
+        states: std::sync::Mutex<HashMap<String, SendReply>>,
         lose_response: AtomicBool,
         effects: Arc<AtomicU64>,
         retries: std::sync::Mutex<u64>,
@@ -577,6 +609,14 @@ pub(super) mod test_endpoint {
         pub(super) fn retry(&self, count: u64) {
             *self.endpoint.retries.lock().unwrap() = count;
         }
+        pub(super) fn send_status(&self, supported: bool) {
+            self.endpoint
+                .send_status
+                .store(supported, Ordering::Relaxed);
+        }
+        pub(super) fn reply(&self, reply: SendReply) {
+            self.endpoint.replies.lock().unwrap().push_back(reply);
+        }
         pub(super) fn refuse(&self, code: &str, field: Option<&str>) {
             let mut error = json!({"code": code, "message": "notice refused"});
             if let Some(field) = field {
@@ -613,6 +653,9 @@ pub(super) mod test_endpoint {
             sender,
             stored: Default::default(),
             delivery_order: Default::default(),
+            send_status: AtomicBool::new(false),
+            replies: Default::default(),
+            states: Default::default(),
             lose_response: AtomicBool::new(lose_response),
             effects: effects.clone(),
             retries: Default::default(),
@@ -633,13 +676,17 @@ pub(super) mod test_endpoint {
             endpoint,
         }
     }
-    pub(super) fn capability(address: &Address) -> Option<Option<bool>> {
+    pub(super) fn capability(address: &Address, capability: &str) -> Option<Option<bool>> {
         let endpoint = endpoints()
             .lock()
             .unwrap()
             .get(&format!("aft:bash:{}", address.identity.session))
             .cloned()?;
-        let supported = *endpoint.delivery_order.lock().unwrap();
+        let supported = if capability == "send_status" {
+            Some(endpoint.send_status.load(Ordering::Relaxed))
+        } else {
+            *endpoint.delivery_order.lock().unwrap()
+        };
         Some(supported)
     }
     pub(super) fn call(address: &Address, bytes: &[u8]) -> Option<Result<Vec<u8>, Outcome>> {
@@ -672,14 +719,25 @@ pub(super) mod test_endpoint {
             request: body.clone(),
             bytes: bytes.to_vec(),
         });
-        if body["method"] != "session.send" {
+        if body["method"] != "session.send"
+            && body["method"] != cortexkit_role_llm_runner::ops::SESSION_SEND_STATUS
+        {
             assert_eq!(body["method"], "session.head");
             return Some(Err(refusal("invalid_params")));
         }
-        let decoded: SendRequest = serde_json::from_value(body["params"].clone()).unwrap();
-        decoded.check_prompt().unwrap();
-        decoded.delivery_order().unwrap();
-        assert_eq!(body["params"]["notice"], true);
+        let decoded = if body["method"] == cortexkit_role_llm_runner::ops::SESSION_SEND_STATUS {
+            let request: SendStatusRequest =
+                serde_json::from_value(body["params"].clone()).unwrap();
+            assert_eq!(request.send_id, key);
+            assert!(endpoint.send_status.load(Ordering::Relaxed));
+            None
+        } else {
+            let decoded: SendRequest = serde_json::from_value(body["params"].clone()).unwrap();
+            decoded.check_prompt().unwrap();
+            decoded.delivery_order().unwrap();
+            assert_eq!(body["params"]["notice"], true);
+            Some(decoded)
+        };
         let gate = endpoint.gate.lock().unwrap().take();
         if let Some((entered, release)) = gate {
             entered.send(()).unwrap();
@@ -700,23 +758,41 @@ pub(super) mod test_endpoint {
                 "endpoint unavailable",
             )));
         }
-        let bytes = serde_json::to_vec(&decoded).unwrap();
         let mut stored = endpoint.stored.lock().unwrap();
-        if let Some(first) = stored.get(&key) {
-            if first != &bytes {
-                return Some(Err(refusal("send_id_reuse")));
+        let new = !stored.contains_key(&key);
+        if let Some(decoded) = decoded {
+            let bytes = serde_json::to_vec(&decoded).unwrap();
+            if let Some(first) = stored.get(&key) {
+                if first != &bytes {
+                    return Some(Err(refusal("send_id_reuse")));
+                }
+            } else {
+                stored.insert(key.clone(), bytes);
             }
-        } else {
-            stored.insert(key, bytes);
+        } else if new {
+            return Some(Err(refusal("unknown_send")));
+        }
+        let mut states = endpoint.states.lock().unwrap();
+        let response = endpoint
+            .replies
+            .lock()
+            .unwrap()
+            .pop_front()
+            .or_else(|| states.get(&key).cloned())
+            .unwrap_or_else(|| SendReply::new("active"));
+        states.insert(key, response.clone());
+        if new
+            && !matches!(
+                decode_send_reply(&cortexkit_role_llm_runner::wire::reply_body(&response).unwrap()),
+                Outcome::NotDelivered(_)
+            )
+        {
             endpoint.effects.fetch_add(1, Ordering::Relaxed);
         }
         if endpoint.lose_response.swap(false, Ordering::Relaxed) {
             return Some(Err(retry(FailureClass::TestEndpoint, "response lost")));
         }
-        let reply = cortexkit_role_llm_runner::wire::reply_body(
-            &SendReply::new("pending").with_submission_id("notice-1"),
-        )
-        .unwrap();
+        let reply = cortexkit_role_llm_runner::wire::reply_body(&response).unwrap();
         cortexkit_role_llm_runner::wire::read_reply::<SendReply>(&reply).unwrap();
         Some(Ok(reply))
     }
@@ -725,6 +801,8 @@ pub(super) mod test_endpoint {
 #[derive(Debug)]
 enum Outcome {
     Accepted,
+    Pending,
+    NotDelivered(String),
     Final(Failure),
     Retry(Failure),
 }
@@ -808,7 +886,8 @@ fn deliver(
         }
     }
     match outcome {
-        Outcome::Accepted => Next::Done,
+        Outcome::Accepted | Outcome::Pending => Next::Done,
+        Outcome::NotDelivered(_) => Next::Done,
         Outcome::Final(failure) => {
             let code = failure.code.as_deref().unwrap_or("unknown");
             if completion && code == "expired" {
@@ -902,9 +981,77 @@ async fn send(path: &Path, address: &Address, request: &SendRequest) -> Outcome 
     outcome
 }
 
+async fn check_send(path: &Path, address: &Address, request: &SendRequest) -> Outcome {
+    // The send_status group promises a read-only lookup. Older runners instead
+    // answer an identical session.send from the durable idempotency record.
+    let bytes = if runner_capability(path, address, "send_status").await == Some(true) {
+        serde_json::to_vec(&json!({"method": cortexkit_role_llm_runner::ops::SESSION_SEND_STATUS, "params": SendStatusRequest::new(&request.send_id)})).unwrap()
+    } else {
+        envelope(request)
+    };
+    match call(path, address, bytes).await {
+        Ok(bytes) => decode_reply(&bytes, true),
+        Err(outcome) => outcome,
+    }
+}
+
+fn pending_delay(checks: u32) -> Duration {
+    Duration::from_secs(match checks {
+        0 => 5,
+        1 => 30,
+        2 => 120,
+        _ => 600,
+    })
+}
+
+type DeliveryUpdate = (SendRequest, RunnerCompletionDelivery);
+
+fn flush_delivery_update(
+    registry: &crate::bash_background::BgTaskRegistry,
+    session: &str,
+    task: &str,
+    update: &mut Option<DeliveryUpdate>,
+) -> std::io::Result<()> {
+    if let Some((request, delivery)) = update {
+        registry.persist_runner_completion_delivery(
+            session,
+            task,
+            request.clone(),
+            Some(delivery.clone()),
+        )?;
+    }
+    *update = None;
+    Ok(())
+}
+
 fn decode_send_reply(bytes: &[u8]) -> Outcome {
+    decode_reply(bytes, false)
+}
+
+fn decode_reply(bytes: &[u8], following: bool) -> Outcome {
     match cortexkit_role_llm_runner::wire::read_reply::<SendReply>(bytes) {
-        Ok(_) => Outcome::Accepted,
+        Ok(reply) => {
+            // llm-runner 0.8.53 CONTRACT §9: not_delivered is final for this
+            // send_id; only a new send_id may try the same words again.
+            if reply.state == states::NOT_DELIVERED {
+                return Outcome::NotDelivered(reply.reason.unwrap_or_else(|| "unknown".into()));
+            }
+            // CONTRACT §9 and §9.7 list finished, superseded, expired
+            // and template_part_gone as final. Active/paused (or future states)
+            // without a receipt do not end follow-up of a previously pending send.
+            let terminal = matches!(
+                reply.state.as_str(),
+                states::FINISHED
+                    | states::SUPERSEDED
+                    | states::EXPIRED
+                    | states::TEMPLATE_PART_GONE
+            );
+            if reply.delivered.is_none() && !terminal && (following || reply.state == "pending") {
+                Outcome::Pending
+            } else {
+                Outcome::Accepted
+            }
+        }
         Err(error) => {
             if let Ok(body) = serde_json::from_slice::<Value>(bytes) {
                 let refusal_body = body.get("error").unwrap_or(&body);
@@ -1291,16 +1438,46 @@ fn offer(
     let mut attempt = None;
     let mut retry_logged = false;
     let mut settled = false;
+    let mut delivery_update: Option<DeliveryUpdate> = None;
     let queued = scheduler.offer(
         id.clone(),
         completion,
         Box::new(move || {
             let _identity = crate::bash_background::task_identity_scope(Some(owner.clone()));
+            // Keep a failed durable transition in memory: never send the old
+            // generation again just because writing its replacement failed.
+            if let Err(error) = flush_delivery_update(&registry, &owner.session, &task_id, &mut delivery_update) {
+                log::warn!("runner notice task={task_id} could not persist delivery progress: {error}");
+                return Next::Retry(retry_delay(0));
+            }
             let Some(metadata) = registry.notice_metadata(&task_id) else {
                 return Next::Done;
             };
             if completion && metadata.completion_delivered {
                 return Next::Done;
+            }
+            let timestamp = now();
+            let age = timestamp.saturating_sub(metadata.finished_at.unwrap_or(metadata.started_at));
+            let progress = metadata.runner_completion_delivery.clone();
+            let generation = progress.as_ref().map_or(1, |progress| progress.generation);
+            let checking = completion && matches!(progress.as_ref().map(|progress| &progress.phase), Some(RunnerCompletionPhase::Pending { .. }));
+            if completion {
+                match progress.as_ref().map(|progress| &progress.phase) {
+                    Some(RunnerCompletionPhase::Retired) => settled = true,
+                    Some(RunnerCompletionPhase::Ready { due_ms } | RunnerCompletionPhase::Pending { due_ms, .. }) if *due_ms > timestamp && age < MAX_AGE_MS => {
+                        return Next::Retry(Duration::from_millis((*due_ms - timestamp).min(MAX_AGE_MS - age)));
+                    }
+                    _ => {}
+                }
+                if checking && age >= MAX_AGE_MS {
+                    PENDING_UNRESOLVED.fetch_add(1, Ordering::Relaxed);
+                    crate::slog_info!("runner notice task={task_id} session={} send still pending after 24 hours", owner.session);
+                    delivery_update = Some((metadata.runner_completion_notice.clone().expect("pending send is frozen"), RunnerCompletionDelivery { generation, phase: RunnerCompletionPhase::Retired }));
+                    if flush_delivery_update(&registry, &owner.session, &task_id, &mut delivery_update).is_err() {
+                        return Next::Retry(retry_delay(0));
+                    }
+                    settled = true;
+                }
             }
             if settled {
                 return if registry
@@ -1320,7 +1497,7 @@ fn offer(
             } else {
                 0
             });
-            let age = now().saturating_sub(metadata.finished_at.unwrap_or(metadata.started_at));
+            let mut current_request = None;
             let outcome = if completion && age >= MAX_AGE_MS {
                 Outcome::Final(Failure::coded(
                     FailureClass::Expired,
@@ -1382,6 +1559,10 @@ fn offer(
                     } else {
                         request
                     };
+                    current_request = Some(request.clone());
+                    if checking {
+                        return runtime.block_on(check_send(&path, &address, &request));
+                    }
                     if completion {
                         let Some(offers) = registry.reserve_runner_completion_offer(&task_id)
                         else {
@@ -1440,6 +1621,7 @@ fn offer(
                                 owner.session
                             );
                             request = fallback;
+                            current_request = Some(request.clone());
                             outcome = send_request(&request);
                         }
                     } else if reminder_elapsed_ms.is_some() && refused_notice_members(&outcome) {
@@ -1449,6 +1631,55 @@ fn offer(
                 })();
                 outcome
             };
+            let mut outcome = outcome;
+            if let Outcome::NotDelivered(reason) = &outcome {
+                NOT_DELIVERED.fetch_add(1, Ordering::Relaxed);
+                if completion {
+                    let mut request = current_request.expect("send reply has a frozen request");
+                    let (next_generation, phase) = if generation < MAX_GENERATIONS {
+                        let next_generation = generation + 1;
+                        request.send_id = format!("{id}:{next_generation}");
+                        crate::slog_info!("runner notice task={task_id} session={} not_delivered reason={reason}; retrying generation={next_generation}", owner.session);
+                        (next_generation, RunnerCompletionPhase::Ready { due_ms: timestamp.saturating_add(retry_delay(*attempt).as_millis() as u64) })
+                    } else {
+                        crate::slog_error!("runner notice task={task_id} session={} not_delivered after {MAX_GENERATIONS} generations reason={reason}", owner.session);
+                        (generation, RunnerCompletionPhase::Retired)
+                    };
+                    delivery_update = Some((request, RunnerCompletionDelivery { generation: next_generation, phase }));
+                    if flush_delivery_update(&registry, &owner.session, &task_id, &mut delivery_update).is_err() {
+                        return Next::Retry(retry_delay(0));
+                    }
+                    if generation < MAX_GENERATIONS {
+                        let delay = retry_delay(*attempt);
+                        *attempt = attempt.saturating_add(1);
+                        return Next::Retry(delay.min(Duration::from_millis(MAX_AGE_MS.saturating_sub(age))));
+                    }
+                    outcome = Outcome::Accepted;
+                } else {
+                    crate::slog_info!("runner reminder task={task_id} not_delivered reason={reason}; dropped");
+                }
+            } else if completion && (matches!(outcome, Outcome::Pending) || checking && matches!(outcome, Outcome::Retry(_) | Outcome::Final(_))) {
+                let (checks, retrying) = match progress.as_ref().map(|progress| &progress.phase) {
+                    Some(RunnerCompletionPhase::Pending { checks, retry, .. }) => (*checks, *retry),
+                    _ => (0, false),
+                };
+                let failed = !matches!(outcome, Outcome::Pending);
+                let (checks, retrying, delay) = if failed && !retrying {
+                    (checks, true, retry_delay(0))
+                } else {
+                    let checks = if checking { checks.saturating_add(1) } else { checks };
+                    (checks, false, pending_delay(checks))
+                };
+                let delay = delay.min(Duration::from_millis(MAX_AGE_MS.saturating_sub(age)));
+                delivery_update = Some((current_request.or(metadata.runner_completion_notice).expect("pending send is frozen"), RunnerCompletionDelivery {
+                    generation,
+                    phase: RunnerCompletionPhase::Pending { checks, due_ms: timestamp.saturating_add(delay.as_millis() as u64), retry: retrying },
+                }));
+                if flush_delivery_update(&registry, &owner.session, &task_id, &mut delivery_update).is_err() {
+                    return Next::Retry(retry_delay(0));
+                }
+                return Next::Retry(delay);
+            }
             settled = completion && !matches!(outcome, Outcome::Retry(_));
             let next = deliver(&id, *attempt, completion, outcome, &mut retry_logged);
             *attempt = attempt.saturating_add(1);
