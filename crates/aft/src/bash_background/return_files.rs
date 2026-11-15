@@ -385,6 +385,7 @@ mod receiver {
     use crate::bash_background::persistence::PinnedDir;
     use crate::exec_remote::types::{
         ReturnAssembler, ReturnChunk, ReturnManifest, ReturnManifestOutcome,
+        ReturnPathsFailureCause,
     };
     use sha2::Digest;
     use std::ffi::{CString, OsStr, OsString};
@@ -577,6 +578,9 @@ mod receiver {
         ) -> Vec<ReturnedPath> {
             if let Some((from_seq, before_seq)) = self.replay_gap {
                 self.settle();
+                if let Some(report) = self.expired_report(manifest) {
+                    return report;
+                }
                 return self.all_not_returned(NotReturned::ReplayGap {
                     from_seq,
                     before_seq,
@@ -603,6 +607,9 @@ mod receiver {
                 Ok(verified) => verified,
                 Err(code) => {
                     self.settle();
+                    if let Some(report) = self.expired_report(manifest) {
+                        return report;
+                    }
                     return self.all_not_returned(NotReturned::Unverified { code });
                 }
             };
@@ -637,6 +644,49 @@ mod receiver {
             }
             self.settle();
             report
+        }
+
+        /// A refused gap cannot verify bytes, but a correctly echoed expired
+        /// manifest still explains why the host has no files left. This path
+        /// only reports failures; it never authorizes placing any file.
+        fn expired_report(&self, manifest: &ReturnManifest) -> Option<Vec<ReturnedPath>> {
+            if manifest.total_bytes != 0
+                || manifest.files.len() != self.paths.len()
+                || !manifest
+                    .files
+                    .iter()
+                    .zip(&self.paths)
+                    .all(|(entry, path)| entry.path == *path)
+                || !manifest.files.iter().any(|entry| {
+                    matches!(
+                        &entry.outcome,
+                        ReturnManifestOutcome::Failed {
+                            cause: ReturnPathsFailureCause::Expired,
+                            ..
+                        }
+                    )
+                })
+            {
+                return None;
+            }
+            manifest
+                .files
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| {
+                    let ReturnManifestOutcome::Failed { cause, .. } = &entry.outcome else {
+                        return None;
+                    };
+                    Some(self.entry(
+                        index,
+                        ReturnOutcome::NotReturned {
+                            reason: NotReturned::Runner {
+                                cause: String::from(cause),
+                            },
+                        },
+                    ))
+                })
+                .collect()
         }
 
         /// The job ended without a manifest: nothing is placed.

@@ -1041,13 +1041,13 @@ mod through_the_stream {
 
     /// The same manifest after the runner stopped keeping the file.
     fn expired(seq: u64) -> StreamRecord {
+        let mut entry = ReturnManifestEntry::failed(PATH, ReturnPathsFailureCause::Expired)
+            .with_size(DATA.len() as u64);
+        entry.chunks = Some(1);
         StreamRecord::ReturnManifest(ReturnManifest::new(
             job_id(),
             seq,
-            vec![
-                ReturnManifestEntry::failed(PATH, ReturnPathsFailureCause::Expired)
-                    .with_size(DATA.len() as u64),
-            ],
+            vec![entry],
             0,
             RETURN_CHUNKED_MAX_BYTES_CAP,
         ))
@@ -1321,6 +1321,89 @@ mod through_the_stream {
         "dist/app.bin: not returned (the server no longer keeps this job's files)";
 
     #[test]
+    fn expired_replay_accepts_only_exact_counts_and_keeps_expired_reasons() {
+        for count in [Some(1), Some(2), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = fs::canonicalize(dir.path()).unwrap();
+            let root = base.join("project");
+            let private = base.join("private");
+            fs::create_dir(&root).unwrap();
+            fs::create_dir(&private).unwrap();
+            let mut sink = ReceiverSink {
+                receiver: ReturnReceiver::new(
+                    vec![PATH.to_string()],
+                    1 << 20,
+                    &root,
+                    &root,
+                    None,
+                    Arc::new(PinnedDir::open(&private).unwrap()),
+                    "expired-replay",
+                )
+                .unwrap(),
+                reports: Vec::new(),
+                manifests_delivered: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                lost: Vec::new(),
+                verdicts: Vec::new(),
+            };
+            let mut consumer = StreamConsumer::new();
+            consumer
+                .consume(
+                    StreamRecord::Accepted(Accepted::new(job_id(), 1)),
+                    &mut sink,
+                )
+                .unwrap();
+            consumer.consume(output(0), &mut sink).unwrap();
+            let StreamRecord::ReturnManifest(mut manifest) = expired(2) else {
+                unreachable!()
+            };
+            manifest.files[0].chunks = count;
+            let terminal = StreamRecord::Terminal(TerminalRecord::new(
+                job_id(),
+                Outcome::Exit { code: 1 },
+                1,
+                0,
+                0,
+            ));
+            let attempts = if count == Some(1) { 0 } else { 3 };
+            for attempt in 0..=attempts {
+                consumer
+                    .consume(StreamRecord::ReturnManifest(manifest.clone()), &mut sink)
+                    .unwrap();
+                let result = consumer.consume(terminal.clone(), &mut sink);
+                if attempt < attempts {
+                    assert!(matches!(
+                        result,
+                        Err(crate::exec_remote::Error::RecoveryRequired { .. })
+                    ));
+                    assert!(sink.reports.is_empty());
+                    let point = consumer.resume_point().unwrap();
+                    assert_eq!(point.attach_request().unwrap().from_seq, 1);
+                    consumer = StreamConsumer::resume(point);
+                } else {
+                    result.unwrap();
+                }
+            }
+            assert_eq!(consumer.finish().unwrap(), Verdict::Exited { code: 1 });
+            assert_eq!(sink.stdout, b"a");
+            assert_eq!(sink.lost, if attempts == 0 { Vec::new() } else { vec![2] });
+            assert_eq!(sink.manifests_delivered, 1);
+            assert_eq!(
+                sink.reports[0][0].outcome,
+                ReturnOutcome::NotReturned {
+                    reason: NotReturned::Runner {
+                        cause: "expired".into()
+                    }
+                }
+            );
+            assert!(render_report(&sink.reports[0]).contains(EXPIRED_TEXT));
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+            assert_eq!(fs::read_dir(&private).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
     fn an_expired_replay_replaces_a_buffered_retained_manifest_at_the_same_seq() {
         // The file's one chunk at seq 1 was lost, so the retained manifest at
         // seq 2 is buffered for gap recovery. By the reconnect the runner no
@@ -1339,7 +1422,7 @@ mod through_the_stream {
     #[test]
     fn a_retained_replay_never_overwrites_a_buffered_expired_manifest() {
         // An expired manifest at seq 3 after a two-seq gap, which its one
-        // derived chunk cannot account for, is buffered for gap recovery.
+        // advertised chunk cannot account for, is buffered for gap recovery.
         // The replay sends a retained manifest at seq 3 while that expired
         // one is still buffered, then fills seqs 1 and 2; the retained one
         // must not replace it.

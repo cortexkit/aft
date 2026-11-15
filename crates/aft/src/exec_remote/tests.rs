@@ -33,7 +33,7 @@ fn accepted_021_vector_and_single_locked_contract_are_pinned() {
         .filter(|p| p["name"].as_str() == Some("cortexkit-exec-remote-types"))
         .collect();
     assert_eq!(packages.len(), 1);
-    assert_eq!(packages[0]["version"].as_str(), Some("0.2.21"));
+    assert_eq!(packages[0]["version"].as_str(), Some("0.2.22"));
 }
 
 fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {

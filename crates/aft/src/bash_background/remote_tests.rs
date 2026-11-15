@@ -16810,7 +16810,7 @@ async fn runon_return_paths_places_verified_files_and_lists_every_path() {
 }
 
 #[tokio::test]
-async fn runon_return_paths_expired_replay_reports_expired_without_output_loss() {
+async fn runon_uncounted_expired_replay_reports_expired_after_bounded_recovery() {
     let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
         Script::MotorExpiredReplay,
         RETURN_CLAIMS,
@@ -16834,7 +16834,7 @@ async fn runon_return_paths_expired_replay_reports_expired_without_output_loss()
         ),
         "{output}"
     );
-    assert!(!output.contains("output lost"), "{output}");
+    assert!(output.contains("output lost"), "{output}");
     assert!(!dir.path().join("dist").exists());
     let attaches = daemon
         .log
@@ -16843,7 +16843,7 @@ async fn runon_return_paths_expired_replay_reports_expired_without_output_loss()
         .iter()
         .filter(|(_, body)| body["method"] == "exec.attach")
         .count();
-    assert_eq!(attaches, 0, "the chunk gap is accepted, not recovered");
+    assert_eq!(attaches, 3, "uncounted gaps require bounded recovery");
 }
 
 #[tokio::test]
@@ -17459,10 +17459,9 @@ async fn runon_return_paths_restart_during_gap_recovery_rewinds_to_the_first_chu
 }
 
 #[tokio::test]
-async fn runon_uncounted_expired_gap_that_never_fills_is_reported_unverified_not_lost() {
-    // The crate's replay-expired vector sends no chunk counts and its gap (3
-    // seqs) is not the one chunk derived from the 10-byte file. Each
-    // re-attach replays the same records, so the gap never fills.
+async fn runon_uncounted_expired_gap_reports_loss_and_the_manifest_expired_reason() {
+    // Without explicit counts the gap cannot be proved to contain only file
+    // chunks. Replaying the same missing records must still end honestly.
     let daemon = return_daemon("replay-expired").await;
     let dir = tempfile::tempdir().unwrap();
     let ctx = restarted_context(dir.path());
@@ -17474,13 +17473,7 @@ async fn runon_uncounted_expired_gap_that_never_fills_is_reported_unverified_not
     .await;
     assert!(reply.success, "{reply:?}");
     let output = reply.data["output"].as_str().unwrap();
-    assert!(
-        output.contains(
-            "records 3 to 5 could not be verified: they may be expired returned-file data or lost output, and the runner did not report chunk counts"
-        ),
-        "{output}"
-    );
-    assert!(!output.contains("output lost"), "{output}");
+    assert!(output.contains("output lost"), "{output}");
     assert!(
         output
             .contains("  dist/app.bin: not returned (the server no longer keeps this job's files)"),
