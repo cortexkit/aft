@@ -726,12 +726,7 @@ fn constant_vectors_for_test() -> &'static Mutex<std::collections::HashMap<PathB
 
 /// Embed constant, correctly sized rows without model or network work, while
 /// still exercising meaning search's fill, publication and follow-up jobs.
-#[cfg(all(
-    test,
-    feature = "wasm-grammars",
-    feature = "test-hooks",
-    not(all(target_os = "windows", target_arch = "aarch64"))
-))]
+#[cfg(test)]
 pub(crate) fn fill_with_constant_vectors_for_test(root: &Path, dimensions: usize) -> impl Drop {
     struct Release(PathBuf);
     impl Drop for Release {

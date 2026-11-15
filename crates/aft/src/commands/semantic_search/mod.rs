@@ -3322,17 +3322,17 @@ fn auto_regex_literal_fallback_warning(reason: impl AsRef<str>) -> String {
     )
 }
 
-/// What a views-on semantic answer could not cover, named so an incomplete
+/// What an index-store semantic answer could not cover, named so an incomplete
 /// answer says which files it is missing instead of looking complete.
 struct CheckoutSemanticGaps {
     /// Files excluded by grammar availability or parsing policy, with typed
     /// reasons. They are not waiting for a fill and are not fill failures.
-    skipped: Vec<(PathBuf, String)>,
+    skipped: Vec<serde_json::Value>,
     /// Files whose current content has no vectors yet (awaiting a fill, or
     /// edited since the last one).
     pending: Vec<PathBuf>,
-    /// Files whose embedding failed for this content and producer.
-    failed: Vec<PathBuf>,
+    /// Terminal failures extracting a file's outline or embedding its chunks.
+    failed: Vec<(PathBuf, String)>,
     /// The watcher could not vouch for membership, so the checkout was
     /// re-walked and vectors may lag the disk.
     unvouched: bool,
@@ -3350,9 +3350,13 @@ impl CheckoutSemanticGaps {
     fn status(&self) -> &'static str {
         if self.unavailable.is_some() {
             "unavailable"
-        } else if !self.skipped.is_empty()
-            && self.pending.is_empty()
-            && self.failed.is_empty()
+        } else if self.pending.is_empty()
+            && !self.skipped.iter().any(|gap| {
+                matches!(
+                    gap["state"].as_str(),
+                    Some("not_downloaded" | "downloading" | "network_retry" | "storage_retry")
+                )
+            })
             && !self.unvouched
             && self.fill_failure.is_none()
         {
@@ -3362,11 +3366,7 @@ impl CheckoutSemanticGaps {
         }
     }
 
-    /// What a data-layer meaning plane whose fill is under way does not
-    /// cover yet: the files waiting for vectors. Files that cannot be cut
-    /// into chunks are accounted for, as today's index leaves them out, and
-    /// chunks the embedder refused are disclosed as today's index discloses
-    /// them.
+    /// Pending work and recorded exclusions from data-layer semantic search.
     fn from_data(meaning: &crate::data_layer::tools::search::DataMeaning) -> Self {
         let mut gaps = Self::from_coverage(meaning.coverage());
         gaps.fill_failure = meaning.failure().map(str::to_string);
@@ -3374,10 +3374,19 @@ impl CheckoutSemanticGaps {
     }
 
     fn from_coverage(coverage: &crate::data_layer::vectors::Coverage) -> Self {
+        let reply = if coverage.skipped_parses.is_empty() {
+            crate::data_layer::grammar::GapReply::default()
+        } else {
+            crate::data_layer::grammar::GapReply::capture()
+        };
         Self {
-            skipped: coverage.skipped_parses.clone(),
+            skipped: coverage
+                .skipped_parses
+                .iter()
+                .filter_map(|(path, reason)| reply.value(reason, path))
+                .collect(),
             pending: coverage.pending.clone(),
-            failed: Vec::new(),
+            failed: coverage.files_failed.clone(),
             unvouched: false,
             unavailable: None,
             fill_failure: None,
@@ -3412,7 +3421,13 @@ impl CheckoutSemanticGaps {
                 .collect::<Vec<_>>()
         };
         let pending = relative(&self.pending);
-        let failed = relative(&self.failed);
+        let failed = relative(
+            &self
+                .failed
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>(),
+        );
         let named = |label: &str, paths: &[String]| {
             let shown = paths
                 .iter()
@@ -3431,25 +3446,30 @@ impl CheckoutSemanticGaps {
             }
         };
         let mut lines = Vec::new();
-        let reply = if self.skipped.is_empty() {
-            crate::data_layer::grammar::GapReply::default()
-        } else {
-            crate::data_layer::grammar::GapReply::capture()
-        };
         let skipped = self
             .skipped
             .iter()
             .take(crate::data_layer::surfaces::INDEX_GAP_PREVIEW)
-            .filter_map(|(path, reason)| {
-                reply.value(reason, &project_relative_path(path, project_root))
+            .map(|gap| {
+                let mut gap = gap.clone();
+                if let Some(path) = gap["path"].as_str() {
+                    gap["path"] =
+                        serde_json::json!(project_relative_path(Path::new(path), project_root));
+                }
+                gap
             })
             .collect::<Vec<_>>();
-        for message in skipped
-            .iter()
-            .filter_map(|value| value["message"].as_str())
-            .collect::<std::collections::BTreeSet<_>>()
-        {
-            lines.push(message.to_string());
+        for gap in &skipped {
+            lines.push(format!(
+                "{}: {}",
+                gap["path"].as_str().unwrap_or_default(),
+                gap["message"].as_str().unwrap_or_default()
+            ));
+        }
+        let preview =
+            crate::data_layer::surfaces::parse_gap_preview(skipped.len(), self.skipped.len());
+        if let Some(trailer) = crate::list_envelope::render_trailer(&preview) {
+            lines.push(trailer);
         }
         if let Some(reason) = &self.unavailable {
             lines.push(format!("semantic: unavailable: {reason}"));
@@ -3457,8 +3477,8 @@ impl CheckoutSemanticGaps {
         if !pending.is_empty() {
             lines.push(named("not yet embedded", &pending));
         }
-        if !failed.is_empty() {
-            lines.push(named("failed to embed", &failed));
+        for (path, (_, reason)) in failed.iter().zip(&self.failed) {
+            lines.push(format!("{path}: {reason}"));
         }
         if self.unvouched {
             lines.push(
@@ -3475,6 +3495,7 @@ impl CheckoutSemanticGaps {
         let mut gap = serde_json::json!({
             "pending": pending,
             "failed": failed,
+            "failed_files": self.failed.iter().zip(&failed).map(|((_, reason), path)| serde_json::json!({"path":path,"reason":reason})).collect::<Vec<_>>(),
             "unvouched": self.unvouched,
             "unavailable": self.unavailable,
         });
@@ -3484,9 +3505,7 @@ impl CheckoutSemanticGaps {
             let omitted =
                 self.skipped.len() - gap["skipped_files"].as_array().expect("skip preview").len();
             gap["skipped_files_omitted"] = serde_json::json!(omitted);
-            if omitted > 0 {
-                lines.push(format!("and {omitted} more"));
-            }
+            gap["skipped_files_list"] = serde_json::json!(preview);
         }
         if let Some(error) = &self.fill_failure {
             gap["fill_failure"] = serde_json::json!(error);
@@ -3497,67 +3516,6 @@ impl CheckoutSemanticGaps {
             text.push_str(&line);
         }
     }
-}
-
-#[cfg(all(test, feature = "wasm-grammars"))]
-#[test]
-fn luau_s4_callgraph_off_semantic_disclosure_is_ready_and_typed() {
-    let root = Path::new("/project");
-    let reason = crate::data_layer::grammar::meaning_callgraph_off_reason();
-    let coverage = crate::data_layer::vectors::Coverage {
-        files: 2,
-        files_embedded: 1,
-        skipped_parses: vec![(root.join("source.luau"), reason.clone())],
-        ..Default::default()
-    };
-    let gaps = CheckoutSemanticGaps::from_coverage(&coverage);
-    assert_eq!(gaps.status(), "ready");
-    let mut text = "TypeScript search result".to_string();
-    let mut extras = serde_json::Map::new();
-    gaps.disclose(root, &mut text, &mut extras);
-    assert_eq!(extras["complete"], false);
-    assert_eq!(extras["semantic_gap"]["pending"], serde_json::json!([]));
-    assert_eq!(extras["semantic_gap"]["failed"], serde_json::json!([]));
-    let skipped = &extras["semantic_gap"]["skipped_files"][0];
-    assert_eq!(skipped["code"], "callgraph_off");
-    assert_eq!(skipped["language"], "luau");
-    assert_eq!(skipped["path"], "source.luau");
-    let reason: serde_json::Value = serde_json::from_str(&reason).unwrap();
-    assert!(text.contains(reason["message"].as_str().unwrap()));
-    assert!(!text.contains("not yet embedded"));
-}
-
-#[cfg(all(test, feature = "wasm-grammars"))]
-#[test]
-fn luau_s4_semantic_skip_preview_retains_full_counts() {
-    let root = Path::new("/project");
-    let coverage = crate::data_layer::vectors::Coverage {
-        skipped_parses: (0..6)
-            .map(|n| {
-                (
-                    root.join(format!("file-{n}.luau")),
-                    crate::data_layer::grammar::meaning_callgraph_off_reason(),
-                )
-            })
-            .collect(),
-        ..Default::default()
-    };
-    let gaps = CheckoutSemanticGaps::from_coverage(&coverage);
-    let mut text = String::new();
-    let mut extras = serde_json::Map::new();
-    gaps.disclose(root, &mut text, &mut extras);
-    assert_eq!(extras["complete"], false);
-    assert_eq!(
-        extras["semantic_gap"]["skipped_files"]
-            .as_array()
-            .unwrap()
-            .len(),
-        3
-    );
-    assert_eq!(extras["semantic_gap"]["skipped_files_count"], 6);
-    assert_eq!(extras["semantic_gap"]["skipped_files_omitted"], 3);
-    assert!(text.contains("and 3 more"));
-    assert!(!text.ends_with("\n\n"));
 }
 
 #[derive(Clone)]

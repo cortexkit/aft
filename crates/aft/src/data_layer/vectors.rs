@@ -347,11 +347,14 @@ pub struct Coverage {
 }
 
 impl Coverage {
-    /// Whether every source is accounted for without excluded parse paths or
-    /// unfilled work: embedded, too large, or failed with a reason.
+    /// Whether every source is accounted for without excluded parse paths,
+    /// failed files or unfilled work.
     #[must_use]
     pub fn complete(&self) -> bool {
-        self.pending.is_empty() && self.past_cap == 0 && self.skipped_parses.is_empty()
+        self.pending.is_empty()
+            && self.past_cap == 0
+            && self.skipped_parses.is_empty()
+            && self.files_failed.is_empty()
     }
 }
 

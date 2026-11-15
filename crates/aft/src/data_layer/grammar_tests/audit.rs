@@ -164,6 +164,7 @@ fn refusals() {
             assert_eq!(response.data["code"], "grammar_unavailable");
             assert_eq!(response.data["state"], json!(state));
             assert_eq!(response.data["complete"], false);
+            assert_eq!(response.data["path"], json!(path));
         }
         let runtime = ctx.data_checkout().unwrap();
         runtime.wait_for_memory_profile_idle_for_test();
@@ -245,51 +246,52 @@ fn missing_outlines() {
             outcome,
         ));
     }
-    let checkout = bind(&f.root, &f.dir.join("missing-store"));
-    let built = checkout.build().unwrap();
-    assert_eq!(built.extract_failures, 1);
-    assert!(checkout
+    let _fill = enable_meaning(&f.ctx, &f.root);
+    let runtime = f.ctx.data_checkout().unwrap();
+    runtime.wait_for_memory_profile_idle_for_test();
+    assert!(runtime
         .view()
         .unwrap()
         .current_state()
         .skipped_parses()
         .is_empty());
-    let plane = vector_plane(&checkout);
-    let filled = plane
-        .fill(
-            &mut |texts| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
-            Default::default(),
-            &mut |_| {},
-        )
-        .unwrap();
-    assert_eq!(filled.files_failed, 3);
-    assert_eq!(filled.files_left, 0);
-    let result = plane
-        .search(&checkout.view().unwrap(), &[1.0, 0.0], 10, &|_| true)
-        .unwrap();
-    assert_eq!(result.coverage.files, 4);
-    assert!(result.coverage.pending.is_empty(), "{:?}", result.coverage);
-    assert_eq!(result.coverage.files_failed.len(), 3);
-    assert!(result.results.iter().any(|row| row.name == "searchable"));
+    wait_meaning(&f.ctx);
+    let response = meaning_query(&f.ctx);
+    assert!(response.success, "{:?}", response.data);
+    assert_eq!(response.data["complete"], false, "{:?}", response.data);
     assert_eq!(
-        crate::data_layer::vectors::LUAU_OUTLINE_FAILED,
-        "Meaning search skipped this Luau file because AFT could not extract its outline."
+        response.data["semantic_status"], "ready",
+        "terminal failures are not a running fill"
     );
-    for (_, reason) in &result.coverage.files_failed {
-        assert_eq!(reason, crate::data_layer::vectors::LUAU_OUTLINE_FAILED);
+    assert_eq!(response.data["semantic_gap"]["pending"], json!([]));
+    let failed = response.data["semantic_gap"]["failed_files"]
+        .as_array()
+        .unwrap();
+    assert_eq!(failed.len(), 3, "{:?}", response.data);
+    for name in ["failed.luau", "no_outline.luau", "not_luau.luau"] {
+        let row = failed.iter().find(|row| row["path"] == name).unwrap();
+        assert_eq!(
+            row["reason"],
+            "Meaning search skipped this Luau file because AFT could not extract its outline."
+        );
+        assert!(response.data["text"].as_str().unwrap().contains(name));
     }
-    assert!(!crate::data_layer::meaning::waiting(&result.coverage));
-    assert_eq!(
-        plane
-            .fill(
-                &mut |_| panic!("terminal paths must not embed again"),
-                Default::default(),
-                &mut |_| {}
-            )
-            .unwrap()
-            .files_queued,
-        0
-    );
+    assert!(response.data["text"]
+        .as_str()
+        .unwrap()
+        .contains("searchable"));
+    assert!(!response.data["semantic_gap"]
+        .to_string()
+        .contains("binary.luau"));
+    let coverage = crate::data_layer::tools::search::DataSemantic::current(&f.ctx)
+        .unwrap()
+        .serving()
+        .unwrap()
+        .coverage()
+        .clone();
+    assert_eq!(coverage.files, 4);
+    assert!(!crate::data_layer::meaning::waiting(&coverage));
+    assert!(!coverage.complete());
 }
 
 isolated!(
@@ -624,32 +626,348 @@ fn zoom_and_trace() {
 }
 
 isolated!(
-    luau_s4_outline_size_guard_precedes_timeout_and_nongrammar_errors_stay_skips,
+    luau_s4_outline_size_guard_and_syntax_errors_are_truthful_skips,
     outline_guards
 );
 fn outline_guards() {
-    use std::io::Write as _;
     let f = fixture(true);
-    let large = f.root.join("large.luau");
+    let large = large_luau(&f.root);
+    let bad = write(
+        &f.root,
+        "nested/bad.luau",
+        "local function broken(\n return )\nend\n",
+    );
+    let files = ask(&f.ctx, "outline", json!({"file":f.root,"files":true}));
+    assert!(files.success, "{:?}", files.data);
+    assert_eq!(files.data["complete"], false, "{:?}", files.data);
+    assert!(files.data.get("gaps").is_none());
+    let skipped = files.data["skipped_files"].as_array().unwrap();
+    assert!(skipped
+        .iter()
+        .any(|row| row["file"] == "large.luau" && row["reason"] == "too_large"));
+    assert!(skipped
+        .iter()
+        .any(|row| row["file"] == "nested/bad.luau" && row["reason"] == "parse_error"));
+    let batch = ask(&f.ctx, "outline", json!({"files":[large,bad]}));
+    assert!(batch.success, "{:?}", batch.data);
+    assert_eq!(batch.data["complete"], false);
+    assert!(batch.data.get("gaps").is_none());
+    let skipped = batch.data["skipped_files"].as_array().unwrap();
+    assert!(skipped.iter().any(|row| row["reason"] == "too_large"));
+    assert!(skipped.iter().any(|row| row["reason"] == "parse_error"));
+    let directory = ask(&f.ctx, "outline", json!({"file":f.root}));
+    assert!(directory.success, "{:?}", directory.data);
+    assert_eq!(directory.data["complete"], false, "{:?}", directory.data);
+}
+
+fn large_luau(root: &Path) -> PathBuf {
+    use std::io::Write as _;
+    std::fs::create_dir_all(root).unwrap();
+    let large = root.join("large.luau");
     let mut file = std::fs::File::create(&large).unwrap();
     let block = "-- comment\n".repeat(4096);
     for _ in 0..1200 {
         file.write_all(block.as_bytes()).unwrap();
     }
-    drop(file);
-    assert!(std::fs::metadata(&large).unwrap().len() > 50 * 1024 * 1024);
-    let bad = write(&f.root, "bad.luau", b"local x = '\xff'\n");
-    let files = ask(&f.ctx, "outline", json!({"file":f.root,"files":true}));
-    assert!(files.success, "{:?}", files.data);
-    assert!(
-        files.data.get("gaps").is_none(),
-        "size guard must precede a zero-budget parse: {:?}",
-        files.data
+    assert!(file.metadata().unwrap().len() > 50 * 1024 * 1024);
+    large
+}
+
+isolated!(
+    luau_s4_rolled_up_size_guard_precedes_a_zero_budget_timeout,
+    || {
+        let f = fixture(true);
+        large_luau(&f.root.join("nested"));
+        let response = ask(&f.ctx, "outline", json!({"file":f.root,"files":true}));
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["complete"], false);
+        assert!(
+            response.data.get("gaps").is_none(),
+            "the 50 MiB guard must run before the zero-budget parser: {:?}",
+            response.data
+        );
+        assert!(response.data["skipped_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|gap| gap["file"] == "nested/large.luau" && gap["reason"] == "too_large"));
+    }
+);
+
+isolated!(
+    luau_s4_meaning_transient_gaps_name_files_and_use_standard_preview,
+    meaning_transient
+);
+fn meaning_transient() {
+    use crate::grammar::GrammarState::*;
+    let f = fixture(true);
+    let _hold = f.registry.force_unavailable_for_test(NotDownloaded);
+    for n in 0..6 {
+        write(&f.root, &format!("file-{n}.luau"), SOURCE);
+    }
+    write(
+        &f.root,
+        "plain.ts",
+        "export function searchable() { return 1; }\n",
     );
-    let batch = ask(&f.ctx, "outline", json!({"files":[large,bad]}));
-    assert!(batch.success, "{:?}", batch.data);
-    assert!(batch.data.get("gaps").is_none());
-    let skipped = batch.data["skipped_files"].as_array().unwrap();
-    assert!(skipped.iter().any(|row| row["reason"] == "too_large"));
-    assert!(skipped.iter().any(|row| row["reason"] == "file_not_found"));
+    let _fill = enable_meaning(&f.ctx, &f.root);
+    f.ctx
+        .data_checkout()
+        .unwrap()
+        .wait_for_memory_profile_idle_for_test();
+    wait_meaning(&f.ctx);
+    for state in [
+        NotDownloaded,
+        Downloading,
+        NetworkRetry,
+        StorageRetry,
+        AttemptsExhausted,
+    ] {
+        let _state = f.registry.force_unavailable_for_test(state);
+        let response = meaning_query(&f.ctx);
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["complete"], false, "{:?}", response.data);
+        assert_eq!(
+            response.data["semantic_status"],
+            if state == AttemptsExhausted {
+                "ready"
+            } else {
+                "refreshing"
+            },
+            "{:?}",
+            response.data
+        );
+        let gap = &response.data["semantic_gap"];
+        assert_eq!(gap["pending"], json!([]));
+        assert_eq!(gap["skipped_files_count"], 6);
+        assert_eq!(gap["skipped_files_omitted"], 3);
+        assert_eq!(gap["skipped_files"].as_array().unwrap().len(), 3);
+        let text = response.data["text"].as_str().unwrap();
+        for n in 0..3 {
+            assert!(text.contains(&format!("file-{n}.luau")), "{text}");
+        }
+        assert!(
+            text.contains("shown 3 of 6 files (cap) · narrow: path"),
+            "{text}"
+        );
+        assert!(!text.contains("and 3 more"));
+        assert!(!text.ends_with("\n\n"));
+    }
+}
+
+isolated!(
+    luau_s4_files_rollup_discloses_unavailable_luau_members,
+    outline_rollup
+);
+fn outline_rollup() {
+    let f = fixture(true);
+    let _state = f
+        .registry
+        .force_unavailable_for_test(crate::grammar::GrammarState::NetworkRetry);
+    let path = write(&f.root, "nested/deeper/source.luau", SOURCE);
+    write(
+        &f.root,
+        "plain.ts",
+        "export function searchable() { return 1; }\n",
+    );
+    let response = ask(&f.ctx, "outline", json!({"file":f.root,"files":true}));
+    assert!(response.success, "{:?}", response.data);
+    assert_eq!(response.data["complete"], false, "{:?}", response.data);
+    assert_eq!(response.data["gaps"][0]["path"], json!(path));
+    assert_eq!(response.data["gaps"][0]["state"], "network_retry");
+    assert!(response.data["text"]
+        .as_str()
+        .unwrap()
+        .contains("The Luau grammar"));
+    assert!(response.data["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|file| file["path"] == "nested/deeper/source.luau" && file.get("symbols").is_none()));
+}
+
+fn inspect_category(ctx: &AppContext, scope: &Path, category: &str) -> Response {
+    until(
+        || {
+            let response = ask(
+                ctx,
+                "inspect",
+                json!({"scope":[scope],"sections":[category]}),
+            );
+            let deadline = response.data["code"] == "inspect_not_fresh"
+                && response.data["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("deadline elapsed"));
+            (!deadline).then_some(response)
+        },
+        "inspect category missed its deadline",
+    )
+}
+
+isolated!(
+    luau_s4_inspect_todos_terminal_gaps_are_final_not_pending,
+    || todo_gaps(true)
+);
+isolated!(
+    luau_s4_inspect_todos_transient_gaps_retry_to_counted,
+    || todo_gaps(false)
+);
+fn todo_gaps(terminal: bool) {
+    use crate::grammar::GrammarState;
+    let f = fixture(true);
+    write(
+        &f.root,
+        "plain.ts",
+        "// TODO: builtin marker\nexport function searchable() { return 1; }\n",
+    );
+    write(
+        &f.root,
+        "source.luau",
+        format!("-- TODO: dynamic marker\n{SOURCE}"),
+    );
+    let forced = f.registry.force_unavailable_for_test(if terminal {
+        GrammarState::AttemptsExhausted
+    } else {
+        GrammarState::NetworkRetry
+    });
+    let runtime = f.ctx.data_checkout().unwrap();
+    runtime.wait_for_memory_profile_idle_for_test();
+    assert_eq!(
+        runtime
+            .view()
+            .unwrap()
+            .current_state()
+            .skipped_parses()
+            .len(),
+        1
+    );
+    // The second request checks reuse of stored TODO counts without waiting
+    // for an edit or new publication.
+    for _ in 0..2 {
+        let started = Instant::now();
+        let response = inspect_category(&f.ctx, &f.root, "todos");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "TODO query waited for a nonexistent record"
+        );
+        assert!(response.success, "{:?}", response.data);
+        let todos = &response.data["summary"]["todos"];
+        assert_ne!(todos["status"], "pending", "{:?}", response.data);
+        assert_eq!(todos["complete"], false, "{:?}", response.data);
+        assert_eq!(todos["count"], 1, "{:?}", response.data);
+        assert!(todos["skipped_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|gap| gap["file"] == "source.luau"
+                && gap["reason"] == "no TODO record for this file in the index store"));
+    }
+    if !terminal {
+        drop(forced);
+        until(
+            || {
+                runtime.view().filter(|view| {
+                    view.current_state().skipped_parses().is_empty()
+                        && !runtime.checkout().has_unpublished_luau_changes()
+                })
+            },
+            "grammar-ready TODO gap did not publish",
+        );
+        let response = inspect_category(&f.ctx, &f.root, "todos");
+        assert!(response.success, "{:?}", response.data);
+        let todos = &response.data["summary"]["todos"];
+        assert_eq!(todos["count"], 2, "{:?}", response.data);
+        assert_ne!(todos["complete"], false, "{:?}", response.data);
+    }
+}
+
+isolated!(
+    luau_s4_inspect_dead_code_discloses_luau_only_and_mixed_scopes,
+    dead_code_gaps
+);
+fn dead_code_gaps() {
+    let f = fixture(true);
+    let _state = f
+        .registry
+        .force_unavailable_for_test(crate::grammar::GrammarState::AttemptsExhausted);
+    let path = write(&f.root, "source.luau", SOURCE);
+    write(
+        &f.root,
+        "plain.ts",
+        "export function searchable() { return 1; }\n",
+    );
+    f.ctx
+        .data_checkout()
+        .unwrap()
+        .wait_for_memory_profile_idle_for_test();
+    for scope in [&path, &f.root] {
+        let response = inspect_category(&f.ctx, scope, "dead_code");
+        assert!(response.success, "{:?}", response.data);
+        let dead = &response.data["summary"]["dead_code"];
+        assert_eq!(dead["complete"], false, "{:?}", response.data);
+        assert!(dead["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|gap| gap["kind"] == "language_unsupported"
+                && gap["language"] == "luau"
+                && gap["files"] == 1));
+        assert!(response.data["text"].as_str().unwrap().contains("luau"));
+        assert!(!dead["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["file"] == "source.luau")));
+    }
+}
+
+isolated!(
+    luau_s4_failed_readiness_publication_retries_without_an_edit_or_graph_query,
+    publication_retry
+);
+fn publication_retry() {
+    let f = fixture(true);
+    let forced = f
+        .registry
+        .force_unavailable_for_test(crate::grammar::GrammarState::NetworkRetry);
+    write(&f.root, "source.luau", SOURCE);
+    write(
+        &f.root,
+        "plain.ts",
+        "export function searchable() { return 1; }\n",
+    );
+    let _fill = enable_meaning(&f.ctx, &f.root);
+    let runtime = f.ctx.data_checkout().unwrap();
+    runtime.wait_for_memory_profile_idle_for_test();
+    wait_meaning(&f.ctx);
+    let publication = test_gates::hold(&f.root, test_gates::Point::DeltaPublication);
+    let low = crate::disk_floor::set_free_space_for_test(&f.storage, 1 << 30, 1 << 40);
+    drop(forced);
+    publication.wait_entered();
+    drop(publication);
+    runtime.wait_for_memory_profile_idle_for_test();
+    assert!(runtime.checkout().has_unpublished_luau_changes());
+    let response = meaning_query(&f.ctx);
+    assert!(response.success, "{:?}", response.data);
+    assert_eq!(response.data["complete"], false, "{:?}", response.data);
+    assert!(response.data["semantic_gap"]["pending"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path == "source.luau"));
+    drop(low);
+    // Observe only: neither view() nor has_unpublished_luau_changes() starts
+    // refresh work. The failed publication must have armed its own retry.
+    until(
+        || {
+            runtime.view().filter(|view| {
+                view.current_state().skipped_parses().is_empty()
+                    && !runtime.checkout().has_unpublished_luau_changes()
+            })
+        },
+        "failed Luau publication had no retry driver",
+    );
+    wait_meaning(&f.ctx);
+    let response = meaning_query(&f.ctx);
+    assert!(response.success, "{:?}", response.data);
+    assert_eq!(response.data["complete"], true, "{:?}", response.data);
+    assert!(response.data.get("semantic_gap").is_none());
 }

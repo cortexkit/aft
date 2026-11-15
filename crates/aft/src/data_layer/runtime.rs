@@ -736,7 +736,9 @@ impl Work {
                             *requested = (*requested).max(publish);
                             continue;
                         }
-                        work.maybe_publish(publish);
+                        if !work.maybe_publish(publish) {
+                            return;
+                        }
                     }
                 }
                 drop(flag.take());
@@ -762,8 +764,9 @@ impl Work {
 
     /// Publishes the changes a refresh resolved, when `publish` asks for it,
     /// and folds the checkout's segments once publications of changes have
-    /// piled up.
-    fn maybe_publish(self: &Arc<Self>, publish: Publish) {
+    /// piled up. Returns false when a failed publication is deferred to the
+    /// settle timer, so the refresh worker yields rather than retrying at once.
+    fn maybe_publish(self: &Arc<Self>, publish: Publish) -> bool {
         let changed = self.checkout.changed_paths();
         let refreshed = self.checkout.refreshed_files();
         let many = changed >= PUBLISH_AT || refreshed >= PUBLISH_AT_REFRESHED;
@@ -778,21 +781,21 @@ impl Work {
             }
         };
         if changed == 0 || (publish != Publish::Always && !many) {
-            return;
+            return true;
         }
         if publish != Publish::Always
             && !capped
             && (publish == Publish::WhenMany || !self.settle.due())
         {
             self.settle.arm();
-            return;
+            return true;
         }
         // A change can arrive after the worker's final refresh, including
         // while a timer request is being handled. Never start with it pending.
         if pending(&self.checkout) {
             let mut requested = self.publish_requested.lock();
             *requested = (*requested).max(publish);
-            return;
+            return true;
         }
         #[cfg(test)]
         {
@@ -835,11 +838,19 @@ impl Work {
                     );
                 }
             }
-            Err(error) => crate::slog_warn!(
-                "data layer could not publish changes for {}: {error}",
-                self.checkout.root().display()
-            ),
+            Err(error) => {
+                crate::slog_warn!(
+                    "data layer could not publish changes for {}: {error}",
+                    self.checkout.root().display()
+                );
+                // Keep publication mandatory, but yield to the settle timer
+                // instead of spinning on low free disk space or a transient I/O failure.
+                *self.publish_requested.lock() = Publish::Always;
+                self.settle.changed();
+                return false;
+            }
         }
+        true
     }
 
     /// Folds the checkout's segments when a publication of its changes left
@@ -1031,11 +1042,22 @@ impl Work {
                                 if work.checkout.retry_grammar_gaps().unwrap_or(false) {
                                     work.start_refresh(Publish::Always);
                                 }
-                                break;
+                                if !work.checkout.has_grammar_gaps() {
+                                    break;
+                                }
                             }
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
                                 if work.checkout.has_grammar_gaps() =>
                             {
+                                // A ready notification is not proof that every
+                                // affected file was reread. Retry maintenance
+                                // after transient scan or read failures too.
+                                if registry.status_snapshot().is_none() {
+                                    if work.checkout.retry_grammar_gaps().unwrap_or(false) {
+                                        work.start_refresh(Publish::Always);
+                                    }
+                                    continue;
+                                }
                                 if registry.retry_due() {
                                     let _ = registry.request();
                                 }

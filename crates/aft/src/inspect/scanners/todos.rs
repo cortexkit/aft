@@ -83,7 +83,9 @@ pub(crate) fn path_todo_language(path: &Path) -> Option<TodoLanguage> {
     if is_plain_json(path) {
         return None;
     }
-    crate::parser::language_for_extension(path).map(TodoLanguage::Tree)
+    crate::parser::language_for_extension(path)
+        .or_else(|| crate::parser::detect_language_any(path, cfg!(feature = "wasm-grammars")))
+        .map(TodoLanguage::Tree)
 }
 
 /// Whether `path` is a C header, whose comments are read as whichever of C,

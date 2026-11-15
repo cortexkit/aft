@@ -2,7 +2,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(feature = "wasm-grammars")]
 use std::time::{Duration, Instant};
 
 use aft_store::ids::{ContentKey, Digest128, FamilyId};
@@ -55,6 +54,10 @@ fn ask(ctx: &AppContext, command: &str, params: Value) -> Response {
         "impact" => crate::commands::impact::handle_impact(&req, ctx),
         "trace_to_symbol" => crate::commands::trace_to_symbol::handle_trace_to_symbol(&req, ctx),
         "trace_data" => crate::commands::trace_data::handle_trace_data(&req, ctx),
+        "call_tree" => crate::commands::call_tree::handle_call_tree(&req, ctx),
+        "trace_to" => crate::commands::trace_to::handle_trace_to(&req, ctx),
+        "semantic_search" => crate::commands::semantic_search::handle_semantic_search(&req, ctx),
+        "inspect" => crate::commands::inspect::handle_inspect(&req, ctx),
         _ => panic!("unhandled test command"),
     }
 }
@@ -70,6 +73,34 @@ fn context(root: &Path, storage: &Path) -> AppContext {
     let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
     ctx.set_canonical_cache_root(root.into());
     ctx
+}
+
+fn meaning_query(ctx: &AppContext) -> Response {
+    const QUERY: &str = "searchable source input";
+    crate::commands::semantic_search::with_precomputed_query_vector(QUERY, vec![1.0, 0.0], || {
+        ask(ctx, "semantic_search", json!({"query":QUERY,"top_k":10}))
+    })
+}
+
+fn enable_meaning(ctx: &AppContext, root: &Path) -> impl Drop {
+    ctx.update_config(|config| config.indexes.semantic = true);
+    let fill = super::meaning::fill_with_constant_vectors_for_test(root, 2);
+    crate::semantic_admission::note_opened("luau-s4", root);
+    fill
+}
+
+fn wait_meaning(ctx: &AppContext) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if crate::data_layer::tools::search::DataSemantic::current(ctx)
+            .and_then(|data| data.serving().cloned())
+            .is_some_and(|meaning| meaning.coverage().pending.is_empty())
+        {
+            return;
+        }
+        assert!(Instant::now() < deadline, "meaning plane did not settle");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[cfg(feature = "wasm-grammars")]
@@ -152,6 +183,12 @@ fn luau_s4_feature_off_does_not_discover_or_request_a_grammar() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("project");
     write(&root, "a.luau", "local function target() end");
+    write(
+        &root,
+        "plain.ts",
+        "export function searchable() { return 1; }\n",
+    );
+    let root = std::fs::canonicalize(root).unwrap();
     let checkout = bind(&root, &dir.path().join("store"));
     checkout.build().unwrap();
     let view = checkout.view().unwrap();
@@ -167,6 +204,7 @@ fn luau_s4_feature_off_does_not_discover_or_request_a_grammar() {
     assert_eq!(outline.data["state"], "support_disabled");
     assert_eq!(outline.data["message"], "This AFT build has no downloaded-grammar support, so Luau files can't be parsed. Use a released AFT build, or rebuild with cargo install agent-file-tools --features wasm-grammars (needs CMake 3.18 or later).");
     assert_eq!(outline.data["complete"], false);
+    assert_eq!(outline.data["path"], json!(root.join("a.luau")));
     let zoom = ask(
         &ctx,
         "zoom",
@@ -176,27 +214,60 @@ fn luau_s4_feature_off_does_not_discover_or_request_a_grammar() {
     assert_eq!(zoom.data["state"], "support_disabled");
     assert_eq!(zoom.data["message"], outline.data["message"]);
     assert_eq!(zoom.data["complete"], false);
+    assert_eq!(zoom.data["path"], json!(root.join("a.luau")));
+    for command in [
+        "callers",
+        "impact",
+        "call_tree",
+        "trace_to",
+        "trace_to_symbol",
+        "trace_data",
+    ] {
+        let response = ask(
+            &ctx,
+            command,
+            json!({"file":root.join("a.luau"),"symbol":"target","toSymbol":"target","expression":"input"}),
+        );
+        assert!(!response.success, "{command}: {:?}", response.data);
+        assert_eq!(
+            response.data["state"], "support_disabled",
+            "{command}: {:?}",
+            response.data
+        );
+        assert_eq!(response.data["complete"], false);
+        assert_eq!(response.data["path"], json!(root.join("a.luau")));
+    }
     let files = ask(&ctx, "outline", json!({"file": root, "files": true}));
     assert!(files.success, "{:?}", files.data);
     assert_eq!(files.data["complete"], true);
     assert!(files.data.get("gaps").is_none());
     assert!(files.data["text"].as_str().unwrap().contains("a.luau"));
-    let plane = super::vectors::VectorPlane::new(
-        checkout,
-        super::vectors::Producer::for_stored_model(aft_store::vector::ModelIdentity {
-            name: "feature-off".into(),
-            revision: "fixture".into(),
-            dimensions: 2,
-            normalized: false,
-            text_template: 1,
-            chunk_template: 1,
-        }),
-        1000,
+    let directory = ask(&ctx, "outline", json!({"file":root}));
+    assert!(directory.success, "{:?}", directory.data);
+    assert_eq!(directory.data["complete"], true, "{:?}", directory.data);
+    assert!(!directory.data.to_string().contains("support_disabled"));
+    let _fill = enable_meaning(&ctx, &root);
+    ctx.data_checkout()
+        .unwrap()
+        .wait_for_memory_profile_idle_for_test();
+    wait_meaning(&ctx);
+    let response = meaning_query(&ctx);
+    assert!(response.success, "{:?}", response.data);
+    assert_eq!(response.data["complete"], true, "{:?}", response.data);
+    assert!(response.data.get("semantic_gap").is_none());
+    assert!(!response.data.to_string().contains("support_disabled"));
+    assert!(response.data["text"]
+        .as_str()
+        .unwrap()
+        .contains("searchable"));
+    let builtin_graph = ask(
+        &ctx,
+        "callers",
+        json!({"file":root.join("plain.ts"),"symbol":"searchable"}),
     );
-    let coverage = plane.coverage(&view).unwrap();
-    assert_eq!(coverage.files, 0);
-    assert!(coverage.pending.is_empty());
-    assert!(coverage.skipped_parses.is_empty());
+    assert!(builtin_graph.success, "{:?}", builtin_graph.data);
+    assert!(builtin_graph.data.get("gaps").is_none());
+    assert!(!builtin_graph.data.to_string().contains("support_disabled"));
 }
 
 #[cfg(all(
@@ -518,51 +589,29 @@ fn luau_s4_callgraph_off_skips_luau_without_blocking_meaning_search() {
         "source.luau",
         "local function luau_function()\n return 1\nend\n",
     );
-    let mut config = crate::config::Config::default();
-    config.indexes.callgraph = false;
-    config.indexes.semantic = true;
-    let checkout = Arc::new(
-        Checkout::bind_planes(
-            Arc::new(DataLayer::new(8 << 20, 1)),
-            &dir.path().join("store"),
-            FamilyId::from_digest(Digest128::of(b"callgraph-off")),
-            &root,
-            super::checkout::Planes {
-                text: config.indexes.trigram,
-                callgraph: config.indexes.callgraph,
-            },
-        )
-        .unwrap(),
-    );
-    checkout.build().unwrap();
-    let plane = vector_plane(&checkout);
-    assert!(config.indexes.semantic);
-    plane
-        .fill(
-            &mut |texts| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
-            super::vectors::FillBudget::default(),
-            &mut |_| {},
-        )
-        .unwrap();
-    let result = plane
-        .search(&checkout.view().unwrap(), &[1.0, 0.0], 10, &|_| true)
-        .unwrap();
-    assert!(result
-        .results
-        .iter()
-        .any(|row| row.file.ends_with("plain.ts") && row.name == "searchable"));
-    assert!(
-        !super::meaning::waiting(&result.coverage),
-        "{:?}",
-        result.coverage
-    );
-    assert!(result.coverage.pending.is_empty());
-    assert!(result.coverage.files_failed.is_empty());
-    assert_eq!(result.coverage.skipped_parses.len(), 1);
-    assert!(result.coverage.skipped_parses[0].0.ends_with("source.luau"));
-    let reason: Value = serde_json::from_str(&result.coverage.skipped_parses[0].1).unwrap();
+    let root = std::fs::canonicalize(root).unwrap();
+    let ctx = context(&root, &dir.path().join("storage"));
+    ctx.update_config(|config| config.indexes.callgraph = false);
+    let _fill = enable_meaning(&ctx, &root);
+    ctx.data_checkout()
+        .unwrap()
+        .wait_for_memory_profile_idle_for_test();
+    wait_meaning(&ctx);
+    let response = meaning_query(&ctx);
+    assert!(response.success, "{:?}", response.data);
+    assert_eq!(response.data["complete"], false, "{:?}", response.data);
+    assert_eq!(response.data["semantic_status"], "ready");
+    assert_eq!(response.data["semantic_gap"]["pending"], json!([]));
+    assert_eq!(response.data["semantic_gap"]["failed"], json!([]));
+    assert_eq!(response.data["semantic_gap"]["skipped_files_count"], 1);
+    let reason = &response.data["semantic_gap"]["skipped_files"][0];
+    assert_eq!(reason["path"], "source.luau");
     assert_eq!(reason["code"], "callgraph_off");
     assert_eq!(reason["message"], "Luau files are skipped by meaning search because the call-graph index is off (indexes.callgraph: false).");
+    let text = response.data["text"].as_str().unwrap();
+    assert!(text.contains(reason["message"].as_str().unwrap()));
+    assert!(text.contains("source.luau"));
+    assert!(text.contains("searchable"));
 }
 
 #[cfg(all(

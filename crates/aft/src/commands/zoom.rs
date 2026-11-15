@@ -1547,11 +1547,11 @@ fn zoom_one_symbol_inner(
     }
 
     if let Err(error) = crate::data_layer::grammar::prepare(ctx, path) {
-        return crate::data_layer::grammar::error_response(&req.id, &error);
+        return crate::data_layer::grammar::error_response_for_path(&req.id, &error, path);
     }
     let matches = match resolve_zoom_symbol(ctx.provider(), path, symbol_name, is_heading) {
         Ok(matches) => matches,
-        Err(e) => return crate::data_layer::grammar::error_response(&req.id, &e),
+        Err(e) => return crate::data_layer::grammar::error_response_for_path(&req.id, &e, path),
     };
 
     // LSP-enhanced disambiguation (S03)
@@ -1610,7 +1610,7 @@ fn zoom_one_symbol_inner(
         ) {
             Ok(all_symbols) => symbol_not_found_message(symbol_name, &all_symbols, is_heading),
             Err(error) if crate::data_layer::grammar::is_grammar_error(&error) => {
-                return crate::data_layer::grammar::error_response(&req.id, &error)
+                return crate::data_layer::grammar::error_response_for_path(&req.id, &error, path)
             }
             Err(_) => deterministic_zoom_refusal(
                 format!("symbol '{symbol_name}' not found"),
@@ -1642,7 +1642,11 @@ fn zoom_one_symbol_inner(
         match build_container_outline(ctx, resolved_file_path, target) {
             Ok(outline) => Some(outline),
             Err(e) => {
-                return crate::data_layer::grammar::error_response(&req.id, &e);
+                return crate::data_layer::grammar::error_response_for_path(
+                    &req.id,
+                    &e,
+                    resolved_file_path,
+                );
             }
         }
     } else {
@@ -1739,12 +1743,24 @@ fn zoom_one_symbol_inner(
                 cfg!(feature = "wasm-grammars"),
             ) {
                 Ok(symbols) => symbols,
-                Err(e) => return crate::data_layer::grammar::error_response(&req.id, &e),
+                Err(e) => {
+                    return crate::data_layer::grammar::error_response_for_path(
+                        &req.id,
+                        &e,
+                        resolved_file_path,
+                    )
+                }
             };
             let resolved_source = resolved_source.as_deref().unwrap_or(source).to_string();
             let (tree, lang) = match zoom_parse_source(resolved_file_path, &resolved_source) {
                 Ok(parsed) => parsed,
-                Err(e) => return crate::data_layer::grammar::error_response(&req.id, &e),
+                Err(e) => {
+                    return crate::data_layer::grammar::error_response_for_path(
+                        &req.id,
+                        &e,
+                        resolved_file_path,
+                    )
+                }
             };
             let calls = extract_calls_with_ranges(&resolved_source, tree.root_node(), lang);
             let line_starts = zoom_line_starts(&resolved_source);

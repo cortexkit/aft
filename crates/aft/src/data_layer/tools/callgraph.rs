@@ -113,6 +113,14 @@ pub(crate) fn ops_graph(
         index_refusal_response, not_indexed_response, store_error_response,
     };
     use crate::context::CallgraphStoreAccess;
+    #[cfg(not(feature = "wasm-grammars"))]
+    for file in files {
+        if let Err(error) = super::super::grammar::prepare(ctx, file) {
+            return Err(super::super::grammar::error_response_for_path(
+                req_id, &error, file,
+            ));
+        }
+    }
     match access(ctx) {
         Access::Building => Err(index_refusal_response(
             req_id,

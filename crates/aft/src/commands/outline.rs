@@ -293,7 +293,7 @@ fn outline_single_target(req: &RawRequest, ctx: &AppContext, file: &str) -> Resp
 /// the caller's spelling (a URL for a downloaded document).
 fn outline_single_file(req: &RawRequest, ctx: &AppContext, path: PathBuf, file: &str) -> Response {
     if let Err(error) = crate::data_layer::grammar::prepare(ctx, &path) {
-        return crate::data_layer::grammar::error_response(&req.id, &error);
+        return crate::data_layer::grammar::error_response_for_path(&req.id, &error, &path);
     }
     let symbols = match crate::parser::list_symbols_shared(
         ctx.provider(),
@@ -302,7 +302,7 @@ fn outline_single_file(req: &RawRequest, ctx: &AppContext, path: PathBuf, file: 
     ) {
         Ok(s) => s,
         Err(e) => {
-            return crate::data_layer::grammar::error_response(&req.id, &e);
+            return crate::data_layer::grammar::error_response_for_path(&req.id, &e, &path);
         }
     };
 
@@ -333,7 +333,9 @@ fn outline_single_file(req: &RawRequest, ctx: &AppContext, path: PathBuf, file: 
     };
     let entries = match structure {
         Ok(entries) => entries,
-        Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
+        Err(error) => {
+            return crate::data_layer::grammar::error_response_for_path(&req.id, &error, &path)
+        }
     };
     let filename = if is_http_url(file) {
         file.to_string()
@@ -1718,7 +1720,8 @@ fn handle_outline_files_mode(
         &file_entries,
         max_output_bytes.saturating_sub(empty_targets.iter().map(String::len).sum::<usize>()),
     );
-    let grammar_gaps = populate_rendered_file_symbols(&rows, &mut file_entries, ctx);
+    let grammar_gaps =
+        populate_rendered_file_symbols(&rows, &mut file_entries, ctx, &mut skipped_files);
     let table = format_files_table(&rows, &directory_nodes, &file_entries, max_output_bytes);
     let mut text = table.into_string();
     for explanation in empty_targets {
@@ -1781,6 +1784,7 @@ fn handle_outline_files_mode(
             OutlineTableRow::File(file_id) => Some(file_entries[*file_id].absolute_path.clone()),
             OutlineTableRow::Rollup(_) => None,
         })
+        .chain(file_entries.iter().filter(|entry| detect_language(&entry.absolute_path) == Some(LangId::Luau)).map(|entry| entry.absolute_path.clone()))
         // A read manifest is a set: sorted and without duplicates, whatever
         // order the rows are displayed in.
         .collect::<BTreeSet<_>>();
@@ -2213,13 +2217,22 @@ fn populate_rendered_file_symbols(
     rows: &[OutlineTableRow],
     file_entries: &mut [OutlineFileEntry],
     ctx: &AppContext,
+    skipped_files: &mut Vec<SkippedFile>,
 ) -> Vec<serde_json::Value> {
     let mut gaps = Vec::new();
-    for file_id in rows.iter().filter_map(|row| match row {
-        OutlineTableRow::File(file_id) => Some(*file_id),
-        OutlineTableRow::Rollup(_) => None,
-    }) {
-        let entry = &mut file_entries[file_id];
+    let rendered = rows
+        .iter()
+        .filter_map(|row| match row {
+            OutlineTableRow::File(file_id) => Some(*file_id),
+            OutlineTableRow::Rollup(_) => None,
+        })
+        .collect::<HashSet<_>>();
+    // A directory rollup hides symbol rows, not the files' parse coverage.
+    for (file_id, entry) in file_entries.iter_mut().enumerate() {
+        let dynamic = detect_language(&entry.absolute_path) == Some(LangId::Luau);
+        if !rendered.contains(&file_id) && !dynamic {
+            continue;
+        }
         if entry.symbols.is_some() {
             continue;
         }
@@ -2228,23 +2241,37 @@ fn populate_rendered_file_symbols(
             continue;
         }
         let path = entry.absolute_path.clone();
-        if detect_language(&path) == Some(LangId::Luau) {
-            if !crate::bounded_io::metadata(&path)
-                .is_ok_and(|metadata| metadata.len() <= MAX_OUTLINE_FILE_BYTES)
-            {
-                entry.symbols = Some(0);
+        if dynamic {
+            let metadata = match crate::bounded_io::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    skipped_files.push(SkippedFile::new(&entry.path, "file_not_found"));
+                    continue;
+                }
+            };
+            if metadata.len() > MAX_OUTLINE_FILE_BYTES {
+                skipped_files.push(SkippedFile::new(&entry.path, "too_large"));
                 continue;
             }
-            let symbols = crate::data_layer::grammar::prepare(ctx, &path)
-                .and_then(|_| crate::parser::list_symbols_shared(ctx.provider(), &path, true));
+            let symbols = crate::data_layer::grammar::prepare(ctx, &path).and_then(|_| {
+                let mut parser = FileParser::new().with_dynamic_languages(true);
+                if parser.parse(&path)?.tree.root_node().has_error() {
+                    skipped_files.push(SkippedFile::new(&entry.path, "parse_error"));
+                    return Ok(None);
+                }
+                crate::parser::list_symbols_shared(ctx.provider(), &path, true).map(Some)
+            });
             match symbols {
-                Ok(symbols) => entry.symbols = Some(symbols.len()),
+                Ok(Some(symbols)) => entry.symbols = Some(symbols.len()),
+                Ok(None) => (),
                 Err(error) if crate::data_layer::grammar::is_grammar_error(&error) => {
                     let mut gap = error.to_error_json();
                     gap["path"] = serde_json::json!(path);
                     gaps.push(gap);
                 }
-                Err(_) => entry.symbols = Some(0),
+                Err(error) => {
+                    skipped_files.push(SkippedFile::new(&entry.path, outline_error_reason(&error)))
+                }
             }
             continue;
         }
@@ -2799,6 +2826,7 @@ fn outline_many_files(
             }
         };
         if metadata.len() > MAX_OUTLINE_FILE_BYTES {
+            writer.content_incomplete |= detect_language(&path) == Some(LangId::Luau);
             skipped_files.push((index, SkippedFile::new(rel_path, "too_large")));
             continue;
         }
@@ -2813,6 +2841,7 @@ fn outline_many_files(
             });
             if let Err(error) = parsed {
                 if !crate::data_layer::grammar::is_grammar_error(&error) {
+                    writer.content_incomplete = true;
                     skipped_files.push((
                         index,
                         SkippedFile::new(rel_path, outline_error_reason(&error)),
@@ -2834,6 +2863,7 @@ fn outline_many_files(
             }
         }
         if let Some(reason) = outline_skip_reason(&path, batch_parser.as_mut()) {
+            writer.content_incomplete |= detect_language(&path) == Some(LangId::Luau);
             if let Some(parser) = batch_parser.as_mut() {
                 parser.evict_parse_tree(&path);
             }
@@ -5217,7 +5247,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
             .map(OutlineTableRow::File)
             .collect::<Vec<_>>();
         let before = crate::parser::work_counters::OWNED_SYMBOL_COPIES.with(|count| count.get());
-        let _ = populate_rendered_file_symbols(&rows, &mut entries, &ctx);
+        let _ = populate_rendered_file_symbols(&rows, &mut entries, &ctx, &mut Vec::new());
         assert!(entries.iter().all(|entry| entry.symbols == Some(2)));
         assert_eq!(
             crate::parser::work_counters::OWNED_SYMBOL_COPIES.with(|count| count.get()) - before,

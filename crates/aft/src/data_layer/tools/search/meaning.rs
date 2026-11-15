@@ -61,10 +61,10 @@ impl DataMeaning {
     }
 
     /// Whether every file meaning search applies to within
-    /// `semantic.max_files` has its vectors, or a recorded reason it has
-    /// none (too large, or it could not be cut into chunks).
+    /// `semantic.max_files` has finished without an extraction failure.
     pub(crate) fn complete(&self) -> bool {
         !meaning::waiting(self.snapshot.coverage())
+            && self.snapshot.coverage().files_failed.is_empty()
     }
 
     pub(crate) fn coverage(&self) -> &Coverage {

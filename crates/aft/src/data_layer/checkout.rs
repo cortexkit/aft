@@ -6551,7 +6551,10 @@ impl Checkout {
                 .iter()
                 .map(|path| {
                     let record = view.current_state().get(path)?;
-                    if record.stat.size > max_len || record.language.is_empty() {
+                    if record.stat.size > max_len
+                        || record.language.is_empty()
+                        || view.current_state().skipped_parses().contains_key(path)
+                    {
                         return None;
                     }
                     let published = view.published.state.get(path).is_some_and(|published| {
@@ -6664,6 +6667,12 @@ impl Checkout {
                 }
                 if record.language.is_empty() {
                     return Ok(PathTodos::Unrecorded);
+                }
+                // A recorded parse gap has no TODO record. The grammar driver
+                // retries transient gaps; a TODO query must not wait for a
+                // publication that cannot contain this file's markers yet.
+                if view.current_state().skipped_parses().contains_key(path) {
+                    return Ok(PathTodos::Unextracted);
                 }
                 let published = view.published.state.get(path).is_some_and(|published| {
                     published.content == record.content && published.language == record.language

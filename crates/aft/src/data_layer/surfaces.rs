@@ -358,6 +358,21 @@ const INDEX_GAP_NOTE: &str =
     "(Index skipped {folders}; results may miss files in them:\n{paths}\n)";
 pub(crate) const INDEX_GAP_PREVIEW: usize = 3;
 
+pub(crate) fn parse_gap_preview(shown: usize, total: usize) -> crate::list_envelope::ListEnvelope {
+    use crate::list_envelope::{ListEnvelope, Reason, Total, Unit};
+    ListEnvelope::new(
+        shown,
+        Total::Exact(total),
+        Unit::Files,
+        if shown < total {
+            vec![Reason::Cap]
+        } else {
+            Vec::new()
+        },
+        &["path"],
+    )
+}
+
 fn folder_count(count: usize) -> String {
     format!(
         "{count} unreadable folder{}",
@@ -433,9 +448,11 @@ pub(crate) fn disclose_index_gaps(
         return;
     }
     let omitted = count - gaps.len();
-    if omitted > 0 {
-        lines.push(format!("and {omitted} more"));
+    let preview = parse_gap_preview(gaps.len(), count);
+    if let Some(trailer) = crate::list_envelope::render_trailer(&preview) {
+        lines.push(trailer);
     }
+    response.data["parse_gaps_list"] = serde_json::json!(preview);
     let note = INDEX_GAP_NOTE
         .replace("{folders}", &folder_count(count))
         .replace("{paths}", &lines.join("\n"));

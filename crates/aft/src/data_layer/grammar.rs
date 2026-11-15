@@ -28,6 +28,18 @@ pub(crate) fn error_response(id: &str, error: &AftError) -> crate::protocol::Res
     response
 }
 
+pub(crate) fn error_response_for_path(
+    id: &str,
+    error: &AftError,
+    path: &std::path::Path,
+) -> crate::protocol::Response {
+    let mut response = error_response(id, error);
+    if is_grammar_error(error) {
+        response.data["path"] = serde_json::json!(path);
+    }
+    response
+}
+
 pub(crate) fn is_grammar_error(error: &AftError) -> bool {
     matches!(
         error,
