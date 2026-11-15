@@ -11920,7 +11920,13 @@ const helpers = {
 
         let mut parser = FileParser::new();
         let (tree, lang) = parser.parse(&path).unwrap();
-        let extracted = extract_symbols_from_tree(&source, tree, lang).unwrap();
+        let mut extracted = extract_symbols_from_tree(&source, tree, lang).unwrap();
+        // Navigation adds Rust trait members after the tree walk, and the
+        // stored records keep the walk's table, so complete it the same way.
+        complete_rust_trait_members(
+            &mut extracted,
+            crate::callgraph::rust_trait_members(&source, tree.root_node(), Direct),
+        );
 
         assert_eq!(symbols_as_debug(&extracted), symbols_as_debug(&listed));
     }
