@@ -242,7 +242,7 @@ pub(crate) struct SectionsWriter<'i> {
     all_records: bool,
     /// Whether `content` came with every record already in it.
     prebuilt: bool,
-    content: ContentSectionsBuilder,
+    content: ContentOutput,
     graph: GraphOutput,
     keys: BTreeMap<String, FragmentKey>,
     /// The file a test's build stores damaged, read from [`DAMAGED_FRAGMENT`]
@@ -252,6 +252,73 @@ pub(crate) struct SectionsWriter<'i> {
     damaged: Option<String>,
     #[cfg(test)]
     legacy: bool,
+}
+
+/// The records a [`SectionsWriter`] writes into the content sections: held
+/// encoded in memory, or staged on disk by a cold build's scan.
+enum ContentOutput {
+    Built(ContentSectionsBuilder),
+    Staged(StagedContent),
+}
+
+/// Every record a cold build's scan staged, by key (see `staged_records`).
+pub(crate) struct StagedContent {
+    pub(crate) records: Arc<super::checkout::staged_records::StagedRecords>,
+    pub(crate) units: BTreeMap<RecordKey, super::checkout::staged_records::StagedAt>,
+}
+
+impl ContentOutput {
+    /// Adds a record a writer takes one at a time. A staged writer is given
+    /// every record up front and never takes one.
+    fn add(&mut self, key: RecordKey, record: &ContentRecord) {
+        match self {
+            Self::Built(content) => content.add(key, record),
+            Self::Staged(_) => debug_assert!(false, "a staged writer takes no records"),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Built(content) => content.len(),
+            Self::Staged(staged) => staged.units.len(),
+        }
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(RecordKey) -> bool) {
+        match self {
+            Self::Built(content) => content.retain(keep),
+            Self::Staged(staged) => staged.units.retain(|key, _| keep(*key)),
+        }
+    }
+
+    fn write(self, writer: &mut SegmentWriter) -> Result<(), String> {
+        match self {
+            Self::Built(content) => content.write(writer).map_err(|error| error.to_string()),
+            Self::Staged(staged) => {
+                // A staged record that could not be read fails the build
+                // before anything built from it is written.
+                staged.records.check()?;
+                staged
+                    .records
+                    .write_sections(writer, staged.units.into_iter())
+            }
+        }
+    }
+}
+
+impl aft_store::heap::HeapBytes for ContentOutput {
+    fn heap_bytes(&self, seen: &mut aft_store::heap::Seen) -> usize {
+        match self {
+            Self::Built(content) => content.heap_bytes(seen),
+            Self::Staged(staged) => {
+                aft_store::heap::btree_bytes(
+                    staged.units.len(),
+                    std::mem::size_of::<RecordKey>()
+                        + std::mem::size_of::<super::checkout::staged_records::StagedAt>(),
+                ) + staged.records.heap_bytes(seen)
+            }
+        }
+    }
 }
 
 enum GraphOutput {
@@ -289,8 +356,36 @@ impl<'i> SectionsWriter<'i> {
         all_records: bool,
         encoded: Option<ContentSectionsBuilder>,
     ) -> Self {
-        let prebuilt = encoded.is_some();
-        let mut content = encoded.unwrap_or_default();
+        let encoded_given = encoded.is_some();
+        Self::with_content(
+            state,
+            records,
+            all_records,
+            encoded.map_or_else(
+                || ContentOutput::Built(ContentSectionsBuilder::default()),
+                ContentOutput::Built,
+            ),
+            encoded_given,
+        )
+    }
+
+    /// A writer whose content sections are copied from the records a cold
+    /// build's scan staged, which are every record the segment needs.
+    pub(crate) fn staged(
+        state: &aft_store::checkout::CheckoutState,
+        records: &'i HashMap<String, (RecordKey, Arc<ContentRecord>)>,
+        staged: StagedContent,
+    ) -> Self {
+        Self::with_content(state, records, true, ContentOutput::Staged(staged), true)
+    }
+
+    fn with_content(
+        state: &aft_store::checkout::CheckoutState,
+        records: &'i HashMap<String, (RecordKey, Arc<ContentRecord>)>,
+        all_records: bool,
+        mut content: ContentOutput,
+        prebuilt: bool,
+    ) -> Self {
         // Configuration files' records too, so a reader of the segment can
         // give the resolver the same configuration bytes the build read.
         for record in state.paths() {
@@ -538,9 +633,7 @@ impl<'i> SectionsWriter<'i> {
                 },
             ));
         }
-        self.content
-            .write(writer)
-            .map_err(|error| error.to_string())?;
+        self.content.write(writer)?;
         match self.graph {
             GraphOutput::Buffered(graph) => graph.write(writer),
             GraphOutput::Streamed(graph) => {

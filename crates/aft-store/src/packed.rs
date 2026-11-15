@@ -180,12 +180,22 @@ pub(crate) fn read(
     index: SectionHandle,
     ordinal: u32,
 ) -> Result<Vec<u8>, SegmentError> {
-    let malformed = |reason| SegmentError::new(segment.path(), ErrorKind::Malformed(reason));
+    unpack(segment.path(), read_stored(segment, data, index, ordinal)?)
+}
+
+/// `unit`'s bytes, unpacked. `path` names the file it was read from, for
+/// the error.
+///
+/// # Errors
+///
+/// When the stored bytes do not unpack to their recorded length.
+pub(crate) fn unpack(path: &std::path::Path, unit: StoredUnit) -> Result<Vec<u8>, SegmentError> {
+    let malformed = |reason| SegmentError::new(path, ErrorKind::Malformed(reason));
     let StoredUnit {
         codec,
         unpacked,
         bytes,
-    } = read_stored(segment, data, index, ordinal)?;
+    } = unit;
     match codec {
         RAW => Ok(bytes),
         _ => {
@@ -201,6 +211,17 @@ pub(crate) fn read(
                 Err(malformed("a packed unit unpacks to the wrong length"))
             }
         }
+    }
+}
+
+/// Whether an index entry's codec and lengths are ones [`PackedBuilder`]
+/// writes: raw bytes stored at their own length, or compressed bytes that
+/// unpack to at most [`MAX_UNPACKED`].
+pub(crate) fn entry_is_valid(codec: u8, stored: u32, unpacked: u32) -> bool {
+    match codec {
+        RAW => stored == unpacked,
+        ZLIB => unpacked <= MAX_UNPACKED,
+        _ => false,
     }
 }
 
@@ -228,10 +249,8 @@ pub(crate) fn read_stored(
     let stored = u32_at(&entry, 8);
     let unpacked = u32_at(&entry, 12);
     let codec = entry[16];
-    match codec {
-        RAW if stored == unpacked => {}
-        ZLIB if unpacked <= MAX_UNPACKED => {}
-        _ => return Err(malformed("unknown packed unit codec")),
+    if !entry_is_valid(codec, stored, unpacked) {
+        return Err(malformed("unknown packed unit codec"));
     }
     let end = offset
         .checked_add(u64::from(stored))

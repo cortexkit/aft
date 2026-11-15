@@ -49,6 +49,7 @@ mod spool;
 
 pub(crate) use key_order::Budget as KeyOrderBudget;
 
+use super::checkout::staged_records::{StagedAt, StagedRecords};
 use super::graph_rows::references_by_key;
 use super::graph_store::StoredSlices;
 
@@ -86,9 +87,17 @@ pub(crate) struct ParseSlot {
     /// The encoded content record the parse is decoded from, with its
     /// parse key.
     encoded: Option<(BlobKey, Arc<aft_store::content::EncodedRecord>)>,
+    /// The staged content record the parse is decoded from, with its parse
+    /// key: a cold build's records are on disk (see `staged_records`).
+    staged: Option<(BlobKey, StagedAt, Arc<StagedRecords>)>,
 }
 
 impl ParseSlot {
+    /// Whether the parse can be decoded again once let go.
+    fn redecodable(&self) -> bool {
+        self.encoded.is_some() || self.stored.is_some() || self.staged.is_some()
+    }
+
     /// The parse, decoded from its encoded record or the publication; its
     /// kinds are noted in [`parse_kinds`] on the way.
     fn decode(&self, path: &str) -> (BlobKey, Arc<ParseBlob>) {
@@ -110,6 +119,32 @@ impl ParseSlot {
                     _ => None,
                 })
                 .map_or_else(empty_parse, |parse| (key.clone(), Arc::new(parse)));
+        }
+        if let Some((key, at, records)) = &self.staged {
+            // A read or decode that fails is recorded, and the build fails
+            // on it at its next stage boundary; until then it reads as an
+            // empty parse, as a failed stored read does.
+            let Some(record) = records.encoded(*at, path) else {
+                return empty_parse();
+            };
+            return match record
+                .decode()
+                .map_err(|error| error.to_string())
+                .and_then(|record| {
+                    super::content::blob_from_record(&record).map_err(|error| error.to_string())
+                }) {
+                Ok(crate::callgraph_store::join::CallgraphBlob::Parse(parse)) => {
+                    (key.clone(), Arc::new(parse))
+                }
+                Ok(_) => {
+                    records.note_failure(format!("the staged record of {path} is not a parse"));
+                    empty_parse()
+                }
+                Err(error) => {
+                    records.note_failure(format!("the staged record of {path}: {error}"));
+                    empty_parse()
+                }
+            };
         }
         self.stored
             .as_ref()
@@ -192,6 +227,7 @@ impl Parses {
                             value: std::sync::OnceLock::new(),
                             stored: Some(Arc::clone(stored)),
                             encoded: None,
+                            staged: None,
                         }),
                     )
                 })
@@ -213,6 +249,7 @@ impl Parses {
                             value: std::sync::OnceLock::new(),
                             stored: None,
                             encoded: Some((key, record)),
+                            staged: None,
                         }),
                     )
                 })
@@ -220,13 +257,43 @@ impl Parses {
         }
     }
 
+    /// Entries kept as staged content records in `records`, each decoded on
+    /// every read that does not find it decoded (see
+    /// [`Self::release_decoded`]).
+    pub(crate) fn staged(
+        entries: impl IntoIterator<Item = (String, BlobKey, StagedAt)>,
+        records: &Arc<StagedRecords>,
+    ) -> Self {
+        Self {
+            map: entries
+                .into_iter()
+                .map(|(path, key, at)| {
+                    (
+                        path,
+                        Arc::new(ParseSlot {
+                            value: std::sync::OnceLock::new(),
+                            stored: None,
+                            encoded: None,
+                            staged: Some((key, at, Arc::clone(records))),
+                        }),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// The staged records these parses read, when they are a cold build's.
+    pub(crate) fn staged_records(&self) -> Option<&Arc<StagedRecords>> {
+        self.map
+            .values()
+            .find_map(|slot| slot.staged.as_ref().map(|(_, _, records)| records))
+    }
+
     /// How many entries that can be decoded again are decoded now.
     pub(crate) fn decoded_count(&self) -> usize {
         self.map
             .values()
-            .filter(|slot| {
-                (slot.encoded.is_some() || slot.stored.is_some()) && slot.value.get().is_some()
-            })
+            .filter(|slot| slot.redecodable() && slot.value.get().is_some())
             .count()
     }
 
@@ -236,7 +303,7 @@ impl Parses {
     pub(crate) fn release_decoded(&mut self) {
         for slot in self.map.values_mut() {
             if let Some(slot) = Arc::get_mut(slot) {
-                if slot.encoded.is_some() || slot.stored.is_some() {
+                if slot.redecodable() {
                     slot.value.take();
                 }
             }
@@ -266,6 +333,7 @@ impl Parses {
                     value,
                     stored: Some(Arc::clone(stored)),
                     encoded: None,
+                    staged: None,
                 }),
             );
         }
@@ -277,6 +345,7 @@ impl Parses {
             value: std::sync::OnceLock::from(value),
             stored: None,
             encoded: None,
+            staged: None,
         };
         self.map.insert(path, Arc::new(slot));
     }
@@ -319,6 +388,9 @@ impl Parses {
             return Some(key.clone());
         }
         if let Some((key, _)) = &slot.encoded {
+            return Some(key.clone());
+        }
+        if let Some((key, _, _)) = &slot.staged {
             return Some(key.clone());
         }
         slot.stored
@@ -1338,6 +1410,17 @@ pub(crate) fn resolve_checkout_into(
         }
         started = std::time::Instant::now();
     };
+    // At each stage boundary: a staged record that could not be read fails
+    // the build, and so does a disk that fell below the free-space floor
+    // (the build then pauses; see `checkout::graph_spill_error`).
+    let boundary = |inputs: &CheckoutInputs| -> Result<(), ManifestJoinError> {
+        if let Some(records) = inputs.parses.staged_records() {
+            records.check().map_err(ManifestJoinError::Parse)?;
+        }
+        workspace
+            .check_space(0)
+            .map_err(|error| ManifestJoinError::Parse(error.to_string()))
+    };
     crate::alloc_trace::install(&pool(threads)?, || {
         let paths = inputs.parses.keys().cloned().collect::<Vec<_>>();
         let bound = BindCache::default();
@@ -1371,6 +1454,7 @@ pub(crate) fn resolve_checkout_into(
         bound.set_lists(lists);
         relieve_allocator();
         lap(&mut memory, "bind");
+        boundary(inputs)?;
         // Each batch's encoded resolutions go to the spool, one range per
         // batch, and come back a batch at a time in pass 4, which visits the
         // files in the same batches.
@@ -1408,6 +1492,7 @@ pub(crate) fn resolve_checkout_into(
             memory.push(("resolve.spool_table".to_string(), spool.table_bytes()));
         }
         lap(&mut memory, "resolve");
+        boundary(inputs)?;
         // Pass 4 reads each file's own inputs, built above from its parse
         // and resolution, and never the bound surfaces.
         drop(bound);
@@ -1442,6 +1527,7 @@ pub(crate) fn resolve_checkout_into(
             );
         }
         lap(&mut memory, "projection");
+        boundary(inputs)?;
         let mut source = site_records::RecordSource::new(&records);
         if memory.is_some() {
             source = source.counting_touches();
@@ -1566,6 +1652,7 @@ pub(crate) fn resolve_checkout_into(
             ));
         }
         lap(&mut memory, "sites_and_fragments");
+        boundary(inputs)?;
         #[cfg(feature = "callgraph-shape-census")]
         return Ok(census);
         #[cfg(not(feature = "callgraph-shape-census"))]
@@ -2621,7 +2708,8 @@ aft_store::heap_bytes_of_fields!(Parses { map });
 aft_store::heap_bytes_of_fields!(ParseSlot {
     value,
     stored,
-    encoded
+    encoded,
+    staged
 });
 aft_store::heap_bytes_of_fields!(Resolutions { map, changed });
 aft_store::heap_bytes_of_fields!(ResolutionSlot { value, source });

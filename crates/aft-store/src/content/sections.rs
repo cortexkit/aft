@@ -23,10 +23,10 @@ use crate::segment::{
 };
 use crate::table::{UnitLocation, UnitTable, UnitTableBuilder};
 
-const UNITS: SectionKind = SectionKind::new(0x0200);
-const SURFACES: SectionKind = SectionKind::new(0x0201);
-const BODIES: SectionKind = SectionKind::new(0x0202);
-const BODY_INDEX: SectionKind = SectionKind::new(0x0203);
+pub(super) const UNITS: SectionKind = SectionKind::new(0x0200);
+pub(super) const SURFACES: SectionKind = SectionKind::new(0x0201);
+pub(super) const BODIES: SectionKind = SectionKind::new(0x0202);
+pub(super) const BODY_INDEX: SectionKind = SectionKind::new(0x0203);
 const VERSION: u16 = 1;
 const KEY_SPACE: KeySpace = KeySpace::new(0);
 const BODY_INDEX_LEN: usize = packed::INDEX_ENTRY_LEN;
@@ -234,7 +234,7 @@ pub fn write_folded(
     writer.write_section(spec(UNITS), &table, count)
 }
 
-fn spec(kind: SectionKind) -> SectionSpec {
+pub(super) fn spec(kind: SectionKind) -> SectionSpec {
     SectionSpec {
         id: SectionId::new(kind, KEY_SPACE),
         version: VERSION,
@@ -382,7 +382,7 @@ fn malformed(segment: &Segment, reason: &'static str) -> SegmentError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::sync::Arc;
 
     use super::*;
@@ -391,7 +391,7 @@ mod tests {
     use crate::ids::{ContentKey, FamilyId, SegmentId, WriterIncarnation};
     use crate::segment::{BLOCK_LEN, SegmentMeta};
 
-    fn record(index: u32) -> ContentRecord {
+    pub(in crate::content) fn record(index: u32) -> ContentRecord {
         let reference = Reference {
             ordinal: index,
             kind: RefKind::Call,
