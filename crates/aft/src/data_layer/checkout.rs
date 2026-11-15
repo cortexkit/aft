@@ -1336,7 +1336,12 @@ impl Checkout {
         if paths.is_empty() || crate::grammar::registry().stored().is_err() {
             return Ok(false);
         }
-        #[cfg(all(test, feature = "wasm-grammars"))]
+        #[cfg(all(
+            test,
+            feature = "wasm-grammars",
+            feature = "test-hooks",
+            not(all(target_os = "windows", target_arch = "aarch64"))
+        ))]
         {
             super::test_gates::arrive(&self.root, super::test_gates::Point::GrammarRetryRead);
             if super::test_gates::fail_grammar_retry(&self.root) {

@@ -125,6 +125,7 @@ impl GrammarRegistry {
         self.entry.lock().compiles
     }
 
+    #[cfg(feature = "test-hooks")]
     pub fn request_count(&self) -> usize {
         self.entry.lock().attempts_started
     }

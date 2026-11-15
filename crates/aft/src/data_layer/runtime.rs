@@ -1028,7 +1028,12 @@ impl Work {
                 .spawn(move || {
                     let _flag = flag;
                     let registry = crate::grammar::registry();
-                    #[cfg(test)]
+                    #[cfg(all(
+                        test,
+                        feature = "wasm-grammars",
+                        feature = "test-hooks",
+                        not(all(target_os = "windows", target_arch = "aarch64"))
+                    ))]
                     if let Some(work) = weak.upgrade() {
                         super::test_gates::arrive(
                             work.checkout.root(),
