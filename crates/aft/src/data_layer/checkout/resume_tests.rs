@@ -353,6 +353,31 @@ fn two_deaths_at_the_same_stage_start_fresh_once() {
 }
 
 #[test]
+fn a_config_file_renamed_between_kill_and_resume_is_read_under_its_new_name() {
+    let root = tempfile::tempdir().unwrap();
+    project(root.path());
+    // The same bytes are a comment in TOML and in YAML; each name reads
+    // the TODO in its own grammar.
+    write(root.path(), "tools/Cargo.toml", "# TODO: fix this\n");
+    let store = tempfile::tempdir().unwrap();
+    killed_build(store.path(), root.path(), "records.committed");
+    std::fs::rename(
+        root.path().join("tools/Cargo.toml"),
+        root.path().join("tools/pnpm-workspace.yaml"),
+    )
+    .unwrap();
+    let (resumed, report) = build(store.path(), root.path());
+    assert!(report.resumed_records > 0, "{report:?}");
+    let reference_store = tempfile::tempdir().unwrap();
+    let (reference, _) = build(reference_store.path(), root.path());
+    assert_same(
+        &published(&reference),
+        &published(&resumed),
+        "after renaming a configuration file",
+    );
+}
+
+#[test]
 fn a_build_from_another_executable_or_a_damaged_stage_is_not_reused() {
     let root = tempfile::tempdir().unwrap();
     project(root.path());

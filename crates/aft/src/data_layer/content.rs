@@ -51,8 +51,38 @@ use crate::parser::LangId;
 /// unresolved site replaced the call's resolved module binding; 12 added
 /// each file's TODO markers, and records holding only the markers of the
 /// files whose comments are counted but which the call graph does not parse
-/// (see [`MARKERS_PREFIX`]), so counting TODOs never parses a file.
-pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-13";
+/// (see [`MARKERS_PREFIX`]), so counting TODOs never parses a file; 14
+/// named, in a configuration file's language, the grammar its TODO comments
+/// are read in (see [`CONFIG`]), so two configuration files with the same
+/// bytes and different names have different records.
+pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-14";
+
+/// The language of a resolver configuration file the call graph reads raw,
+/// or the start of it. A configuration record also holds the TODO markers
+/// of the file's comments, read in the grammar the file's name calls for
+/// (TOML for `Cargo.toml`, YAML for `pnpm-workspace.yaml`), so its language
+/// names that grammar after a `-` (`config-toml`): a record's key is its
+/// content, language and extractor version, and two files with the same
+/// bytes whose comments are read in different grammars must not share one.
+pub const CONFIG: &str = "config";
+
+/// Whether `language` (as [`language_for`] chose it) is a configuration
+/// file's (see [`CONFIG`]).
+#[must_use]
+pub fn is_config_language(language: &str) -> bool {
+    language
+        .strip_prefix(CONFIG)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
+}
+
+/// The language of the configuration file at `path`: [`CONFIG`], followed
+/// by the grammar its TODO comments are read in, if they are.
+fn config_language(path: &Path) -> String {
+    match todos::path_todo_language(path) {
+        Some(language @ TodoLanguage::Tree(_)) => format!("{CONFIG}-{}", language.name()),
+        _ => CONFIG.to_string(),
+    }
+}
 
 /// The start of the language of a file whose record holds only its TODO
 /// markers: a Markdown file, a minified bundle, or a C header no grammar
@@ -65,7 +95,7 @@ pub const MARKERS_PREFIX: &str = "markers-";
 /// only its TODO markers.
 #[must_use]
 pub fn is_parsed_language(language: &str) -> bool {
-    !language.is_empty() && language != "config" && !language.starts_with(MARKERS_PREFIX)
+    !language.is_empty() && !is_config_language(language) && !language.starts_with(MARKERS_PREFIX)
 }
 
 /// The scan policy every data-layer scan uses: a file a plane parses or
@@ -98,15 +128,15 @@ fn parsed_or_embedded_path(path: &[u8]) -> bool {
         || crate::semantic_index::is_semantic_indexed_extension(path)
 }
 
-/// The language the call graph parses the file at `path` as, `"config"`
-/// for resolver configuration it reads raw, a [`MARKERS_PREFIX`] language
+/// The language the call graph parses the file at `path` as, a [`CONFIG`]
+/// language for resolver configuration it reads raw, a [`MARKERS_PREFIX`] language
 /// for a file whose record holds only its TODO markers (a Markdown file, a
 /// minified bundle, a C header no grammar resolves), or `None` for a file
 /// with neither.
 #[must_use]
 pub fn language_for(path: &str, source: &[u8]) -> Option<String> {
     if crate::callgraph_extractor::is_resolution_input(path.as_bytes()) {
-        return Some("config".to_string());
+        return Some(config_language(Path::new(path)));
     }
     let path_text = path;
     let path = Path::new(path);
@@ -168,9 +198,9 @@ fn markers_record(source: &[u8], language: &str) -> Result<ContentRecord, Manife
 /// Adds to `record`, when it is the configuration record of the file at
 /// `path` (relative to the root) holding `source`, the TODO markers of the
 /// file's comments, read as the language its name calls for (TOML for
-/// `Cargo.toml`, YAML for `pnpm-workspace.yaml`). A configuration record's
-/// key does not name that language, so the markers say which they were
-/// read as.
+/// `Cargo.toml`, YAML for `pnpm-workspace.yaml`). The record's language,
+/// and so its key, names that grammar too (see [`CONFIG`]), and the
+/// markers say which they were read as.
 ///
 /// # Errors
 ///
@@ -264,7 +294,7 @@ pub fn extract_with_tree(
     source: &[u8],
     language: &str,
 ) -> Result<(ContentRecord, Option<SyntaxTree>), ManifestJoinError> {
-    if language == "config" {
+    if is_config_language(language) {
         let blob = CallgraphBlob::config(source.to_vec(), EXTRACTOR_VERSION);
         return Ok((record_from_blob(&blob), None));
     }
@@ -297,7 +327,7 @@ pub fn reparse(
     source: &[u8],
     language: &str,
 ) -> Result<Option<SyntaxTree>, ManifestJoinError> {
-    if language == "config" || language.starts_with(MARKERS_PREFIX) {
+    if is_config_language(language) || language.starts_with(MARKERS_PREFIX) {
         return Ok(None);
     }
     let lang = join::language_id(language)
@@ -337,7 +367,7 @@ pub fn extract_parsed(
     language: &str,
     tree: &SyntaxTree,
 ) -> Result<ContentRecord, ManifestJoinError> {
-    if language == "config" {
+    if is_config_language(language) {
         return Ok(record_from_blob(&CallgraphBlob::config(
             source.to_vec(),
             EXTRACTOR_VERSION,
@@ -925,6 +955,29 @@ mod tests {
     /// Every stored kind name is the parser's serialized name, and reads
     /// back as the same kind.
     #[test]
+    fn configuration_files_of_different_comment_grammars_have_different_record_keys() {
+        let bytes = b"# TODO: fix this\n";
+        let toml = language_for("tools/Cargo.toml", bytes).unwrap();
+        let yaml = language_for("tools/pnpm-workspace.yaml", bytes).unwrap();
+        assert_eq!(toml, "config-toml");
+        assert_eq!(yaml, "config-yaml");
+        for language in [&toml, &yaml, &CONFIG.to_string()] {
+            assert!(is_config_language(language), "{language}");
+            assert!(!is_parsed_language(language), "{language}");
+            assert!(matches!(
+                extract(bytes, language).unwrap().data,
+                RecordBody::Config { .. }
+            ));
+        }
+        assert!(!is_config_language("configuration"));
+        let content = aft_store::ids::ContentKey::from_digest(aft_store::ids::Digest128::of(bytes));
+        assert_ne!(
+            aft_store::content::RecordKey::new(content, &toml, EXTRACTOR_VERSION),
+            aft_store::content::RecordKey::new(content, &yaml, EXTRACTOR_VERSION),
+        );
+    }
+
+    #[test]
     fn outline_kinds_round_trip_under_their_serialized_names() {
         use crate::symbols::SymbolKind;
         for kind in [
@@ -1140,7 +1193,7 @@ mod tests {
             let (surface, body) = record.encode();
             let decoded = ContentRecord::decode(&surface, &body).unwrap();
             assert_eq!(decoded, record, "{path}");
-            let mut original = if language == "config" {
+            let mut original = if is_config_language(&language) {
                 CallgraphBlob::config(source.as_bytes().to_vec(), EXTRACTOR_VERSION)
             } else {
                 CallgraphBlob::extract(source, &language, EXTRACTOR_VERSION).unwrap()
