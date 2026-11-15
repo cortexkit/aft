@@ -763,6 +763,10 @@ pub(crate) fn apply_to_command(command: &mut Command, environment: &HashMap<Stri
         command.env_remove(key);
     }
     command.envs(environment);
+    command.env_remove(crate::shell_env_provider::REMOVALS_ENV);
+    for name in crate::shell_env_provider::removals(environment) {
+        command.env_remove(name);
+    }
     command.env_remove(crate::privacy_spawn::CONTROL_ENV);
 
     let mut credential_keys = std::env::vars_os()

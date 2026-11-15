@@ -247,10 +247,20 @@ const PROBE_CAPTURE_BYTES: usize = 4096;
 
 /// Bound the child and pipe lifetime together; callers must reject truncated output.
 pub(crate) fn capture_probe_command(
+    command: Command,
+    tool: &str,
+    deadline: Instant,
+    cancelled: impl Fn() -> bool,
+) -> Result<SubprocessOutcome, FormatError> {
+    capture_bounded_command(command, tool, deadline, cancelled, PROBE_CAPTURE_BYTES)
+}
+
+pub(crate) fn capture_bounded_command(
     mut command: Command,
     tool: &str,
     deadline: Instant,
     cancelled: impl Fn() -> bool,
+    capture_bytes: usize,
 ) -> Result<SubprocessOutcome, FormatError> {
     command
         .stdin(Stdio::null())
@@ -261,7 +271,7 @@ pub(crate) fn capture_probe_command(
         tool: tool.to_string(),
         stderr: error.to_string(),
     })?;
-    wait_with_deadline_with_limit(child, tool, deadline, cancelled, PROBE_CAPTURE_BYTES)
+    wait_with_deadline_with_limit(child, tool, deadline, cancelled, capture_bytes)
 }
 
 /// Share output capture and process-tree cleanup with deadline-bound inspect checks.

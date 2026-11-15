@@ -214,6 +214,14 @@ pub(crate) fn is_blocked_env_key(key: &str) -> bool {
         || is_preexec_hijack_env_key(key)
 }
 
+// A provider's purpose is to replace PATH. Every other name uses the fixed deny
+// list for user configuration, which refuses module-control and startup names.
+const PROVIDER_PATH_EXCEPTION: &str = "PATH";
+
+pub(crate) fn is_blocked_provider_env_key(key: &str) -> bool {
+    !key.eq_ignore_ascii_case(PROVIDER_PATH_EXCEPTION) && is_blocked_env_key(key)
+}
+
 /// Whether `key` may not be set from project configuration. Names refused at
 /// every tier are also refused here: a single reason is reported per key.
 pub(crate) fn is_project_blocked_env_key(key: &str) -> bool {

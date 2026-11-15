@@ -383,6 +383,45 @@ function buildSchema(): Record<string, unknown> {
           "Shell sandbox profiles: stamped workers default to relaxed, all other sessions to off; untrusted routes always use strict.",
       },
 
+      shell: {
+        type: "object",
+        additionalProperties: false,
+        description:
+          "User-only shell environment settings. Project configuration cannot select an environment provider.",
+        properties: {
+          env_provider: {
+            type: "object",
+            additionalProperties: false,
+            required: ["kind"],
+            description:
+              "Opt-in per-project environment export, run in the command workdir under its sandbox. Omit to preserve AFT's default environment. direnv is unsupported on Windows.",
+            properties: {
+              kind: { type: "string", enum: ["mise", "direnv", "custom"] },
+              command: {
+                type: "array",
+                minItems: 1,
+                items: { type: "string" },
+                description:
+                  "Provider argv. Defaults to mise env --json or direnv export json; required for custom.",
+              },
+              timeout_ms: { type: "integer", minimum: 100, maximum: 10000, default: 2000 },
+              watch: {
+                type: "array",
+                items: { type: "string" },
+                default: [],
+                description:
+                  "Custom provider watch files, checked at every ancestor. A custom provider with no watches runs on every call.",
+              },
+            },
+            allOf: [
+              {
+                if: { properties: { kind: { const: "custom" } } },
+                then: { required: ["command"] },
+              },
+            ],
+          },
+        },
+      },
       bash: {
         oneOf: [
           {

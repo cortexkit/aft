@@ -1,0 +1,7 @@
+{
+  "shell": {
+    "env_provider": {
+      "kind": "mise"
+    }
+  }
+}

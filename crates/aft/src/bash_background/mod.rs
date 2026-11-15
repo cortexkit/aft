@@ -1291,34 +1291,52 @@ pub(crate) fn spawn_with_secrets(
     );
     let _speech_ticket = crate::gh_shim_ticket::spawn_ticket_guard(gh_shim_ticket.value());
     crate::gh_shim_ticket::mark_spawn_background(require_background_flag || pty);
-    if let Err(error) = crate::agent_child_env::inject(
-        config.as_ref(),
-        &child_storage_root,
-        &mut env,
-        gh_shim_ticket.value(),
-    ) {
-        return Response::error(request_id, "child_environment_unavailable", error);
-    }
-    let start_view = crate::gh_shim_speech::start_view::inject(
-        gh_shim_ticket.value(),
-        &mut env,
-        &child_storage_root,
-    );
-    if worker_preset_active() {
-        let worktree_root = project_root.as_deref().unwrap_or(&workdir);
-        crate::agent_child_env::inject_worker_test_threads(worktree_root, &mut env);
-    }
-    crate::sandbox_spawn::apply_worker_jail_environment(
-        &mut env,
-        crate::sandbox_spawn::effective_sandbox_mode(
-            ctx,
-            &crate::sandbox_spawn::current_authenticated_principal(),
-        ),
-    );
-    #[cfg(target_os = "linux")]
-    if !pty && config.bash.linux_scope {
-        env.insert(registry::LINUX_SCOPE_ENV.to_string(), "1".to_string());
-    }
+    let mut start_view = None;
+    let mut provider_failure = None;
+    let prepare_environment = |plan: &mut crate::sandbox_spawn::SpawnPlan,
+                               env: &mut HashMap<String, String>|
+     -> Result<_, String> {
+        let failure = crate::shell_env_provider::apply(
+            config
+                .shell
+                .env_provider
+                .as_ref()
+                .filter(|_| host_escalation.is_none()),
+            plan,
+            &workdir,
+            env,
+            remote.is_some(),
+        );
+        crate::agent_child_env::inject(
+            config.as_ref(),
+            &child_storage_root,
+            env,
+            gh_shim_ticket.value(),
+        )?;
+        let view = crate::gh_shim_speech::start_view::inject(
+            gh_shim_ticket.value(),
+            env,
+            &child_storage_root,
+        );
+        if worker_preset_active() {
+            crate::agent_child_env::inject_worker_test_threads(
+                project_root.as_deref().unwrap_or(&workdir),
+                env,
+            );
+        }
+        crate::sandbox_spawn::apply_worker_jail_environment(
+            env,
+            crate::sandbox_spawn::effective_sandbox_mode(
+                ctx,
+                &crate::sandbox_spawn::current_authenticated_principal(),
+            ),
+        );
+        #[cfg(target_os = "linux")]
+        if !pty && config.bash.linux_scope {
+            env.insert(registry::LINUX_SCOPE_ENV.to_string(), "1".to_string());
+        }
+        Ok((view, failure))
+    };
     enter_runon_phase("sandbox_preflight");
     let task_kind = if pty {
         SandboxTaskKind::BashPty
@@ -1361,7 +1379,7 @@ pub(crate) fn spawn_with_secrets(
             }
         };
         enter_bash_startup_step(BashStartupStep::Profile);
-        let plan = secret_launch
+        let mut plan = secret_launch
             .as_ref()
             .map(|launch| launch.preflight.plan.clone())
             .unwrap_or_else(|| {
@@ -1378,6 +1396,16 @@ pub(crate) fn spawn_with_secrets(
         if plan.refusal_code().is_some() {
             (plan, Some(task))
         } else {
+            match prepare_environment(&mut plan, &mut env) {
+                Ok((view, failure)) => {
+                    start_view = view;
+                    provider_failure = failure;
+                }
+                Err(error) => {
+                    let _ = persistence::delete_resolved_task(&task);
+                    return Response::error(request_id, "child_environment_unavailable", error);
+                }
+            }
             let root = project_root.as_deref().unwrap_or(&workdir);
             provision_worker_read_broker(
                 &plan,
@@ -1419,23 +1447,32 @@ pub(crate) fn spawn_with_secrets(
         }
     } else {
         enter_bash_startup_step(BashStartupStep::Profile);
-        (
-            crate::sandbox_spawn::resolve_command_sandbox_spawn(
-                ctx,
-                &principal,
-                requested_tier,
-                task_kind,
-                &session_dir,
-                host_escalation.as_ref(),
-                sandbox_requirement,
-            ),
-            None,
-        )
+        let mut plan = crate::sandbox_spawn::resolve_command_sandbox_spawn(
+            ctx,
+            &principal,
+            requested_tier,
+            task_kind,
+            &session_dir,
+            host_escalation.as_ref(),
+            sandbox_requirement,
+        );
+        if plan.refusal_code().is_none() {
+            match prepare_environment(&mut plan, &mut env) {
+                Ok((view, failure)) => {
+                    start_view = view;
+                    provider_failure = failure;
+                }
+                Err(error) => {
+                    return Response::error(request_id, "child_environment_unavailable", error)
+                }
+            }
+        }
+        (plan, None)
     };
     #[cfg(not(unix))]
     enter_bash_startup_step(BashStartupStep::Profile);
     #[cfg(not(unix))]
-    let spawn_plan = crate::sandbox_spawn::resolve_command_sandbox_spawn(
+    let mut spawn_plan = crate::sandbox_spawn::resolve_command_sandbox_spawn(
         ctx,
         &principal,
         requested_tier,
@@ -1444,6 +1481,18 @@ pub(crate) fn spawn_with_secrets(
         host_escalation.as_ref(),
         sandbox_requirement,
     );
+    #[cfg(not(unix))]
+    if spawn_plan.refusal_code().is_none() {
+        match prepare_environment(&mut spawn_plan, &mut env) {
+            Ok((view, failure)) => {
+                start_view = view;
+                provider_failure = failure;
+            }
+            Err(error) => {
+                return Response::error(request_id, "child_environment_unavailable", error)
+            }
+        }
+    }
     if let Some(code) = spawn_plan.refusal_code() {
         #[cfg(unix)]
         if let Some(task) = unregistered_task.as_ref() {
@@ -1602,7 +1651,12 @@ pub(crate) fn spawn_with_secrets(
             {
                 crate::slog_warn!("{error}");
             }
-            successful_spawn_response(request_id, session_id, &task_id, pty, ctx)
+            let mut response =
+                successful_spawn_response(request_id, session_id, &task_id, pty, ctx);
+            if let Some(failure) = provider_failure {
+                response.data["_bash_env_provider_failure"] = json!(failure);
+            }
+            response
         }
         Err(registry::RegistryError::TaskLimit(message)) => {
             cleanup_plan.cleanup_unspawned();

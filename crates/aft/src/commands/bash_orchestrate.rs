@@ -487,7 +487,7 @@ pub fn build_bash_outcome_with_wake(
             let warning = data
                 .remove("_bash_duplicate_warning")
                 .and_then(|value| value.as_str().map(str::to_owned));
-            let keys = data.remove("_bash_env_keys").and_then(|value| {
+            let mut keys = data.remove("_bash_env_keys").and_then(|value| {
                 let lines = value.get("lines")?.as_array()?;
                 Some(
                     lines
@@ -497,6 +497,12 @@ pub fn build_bash_outcome_with_wake(
                         .collect::<Vec<_>>(),
                 )
             });
+            if let Some(failure) = data
+                .remove("_bash_env_provider_failure")
+                .and_then(|value| value.as_str().map(str::to_owned))
+            {
+                keys.get_or_insert_with(Vec::new).push(failure);
+            }
             (warning, keys)
         })
         .unwrap_or_default();

@@ -125,6 +125,45 @@ struct EscalationGrant {
     payload_reclaimed: bool,
     session_dir: PathBuf,
     task_id: String,
+    provider_snapshot: Option<ProviderApprovalSnapshot>,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderApprovalSnapshot {
+    pub(crate) input: HashMap<String, String>,
+    pub(crate) environment: ChildEnvironment,
+    pub(crate) failure: Option<String>,
+}
+
+#[cfg(unix)]
+pub(crate) fn save_provider_approval(
+    ctx: &AppContext,
+    id: &str,
+    snapshot: ProviderApprovalSnapshot,
+) {
+    if let Some(grant) = ctx.escalation_grants().lock().grants.get_mut(id) {
+        grant.provider_snapshot = Some(snapshot);
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn frozen_provider_approval(
+    ctx: &AppContext,
+    id: &str,
+    principal: &AuthenticatedPrincipal,
+    input: &HashMap<String, String>,
+) -> Option<ProviderApprovalSnapshot> {
+    let store = ctx.escalation_grants().lock();
+    let grant = store.grants.get(id)?;
+    if grant.consumed || grant.expires_at <= Instant::now() || grant.principal != *principal {
+        return None;
+    }
+    grant
+        .provider_snapshot
+        .as_ref()
+        .filter(|snapshot| snapshot.input == *input)
+        .cloned()
 }
 
 #[cfg(unix)]
@@ -152,6 +191,7 @@ impl EscalationGrantStore {
                 continue;
             }
             grant.payload_reclaimed = true;
+            grant.provider_snapshot = None;
             payloads.push((grant.session_dir.clone(), grant.task_id.clone()));
         }
         payloads
@@ -1007,6 +1047,7 @@ fn mint_host_escalation_grant_at(
         payload_reclaimed: false,
         session_dir: prepared.0.paths.session_dir.clone(),
         task_id: prepared.0.paths.task_id.clone(),
+        provider_snapshot: None,
     };
     store.grants.insert(grant_id.clone(), grant);
     drop(store);
@@ -1039,6 +1080,7 @@ fn check_escalation_grant(
         None
     };
     grant.consumed = true;
+    grant.provider_snapshot = None;
     if let Some(refusal) = refusal {
         grant.refused = true;
         return Err(refusal);
@@ -6472,6 +6514,79 @@ fn isolated_environment_for_plan(
     }
 }
 
+pub(crate) fn provider_base_environment(
+    plan: &SpawnPlan,
+    overrides: &HashMap<String, String>,
+) -> ChildEnvironment {
+    isolated_environment_for_plan(plan, overrides).unwrap_or_else(|| {
+        let mut environment: ChildEnvironment = std::env::vars_os().collect();
+        environment.insert(
+            "PATH".into(),
+            crate::effective_path::effective_path().into(),
+        );
+        environment.extend(overrides.iter().map(|(k, v)| (k.into(), v.into())));
+        environment.retain(|key, _| {
+            !key.to_str()
+                .is_some_and(crate::agent_child_env::is_subc_credential_env_key)
+        });
+        environment
+    })
+}
+
+/// A version manager may expose toolchain directories, not arbitrary home reads.
+/// Canonicalization prevents a home-relative symlink from granting an outside tree.
+pub(crate) fn allow_provider_path(plan: &mut SpawnPlan, path: Option<&str>) {
+    let SpawnPlan::Launcher { profile, .. } = plan else {
+        return;
+    };
+    if profile.mode != SandboxMode::Strict {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .and_then(|home| std::fs::canonicalize(home).ok())
+    else {
+        return;
+    };
+    let Some(path) = path else {
+        return;
+    };
+    for entry in std::env::split_paths(path) {
+        if !entry.is_absolute() || !entry.starts_with(&home) {
+            continue;
+        }
+        let Ok(entry) = entry.canonicalize() else {
+            continue;
+        };
+        if !entry.starts_with(&home) {
+            continue;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let intended = [IntendedReadGrant {
+                path: entry,
+                force_children: false,
+                mandatory: false,
+            }];
+            let denies: Vec<_> = profile
+                .read_deny
+                .iter()
+                .chain(&profile.data_policy.deny)
+                .cloned()
+                .collect();
+            if let Ok(grants) =
+                split_read_grants(&intended, &denies, &mut SecureReadDirectoryLister)
+            {
+                profile.read_allow.extend(grants);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        profile.read_allow.push(entry);
+    }
+    profile.read_allow.sort_unstable();
+    profile.read_allow.dedup();
+}
+
 /// Stores live output secrets and whether any non-ticket secret must remain
 /// withheld after restart. The ticket digest lets previews redact that exact value.
 pub(crate) struct CompletionSecrets {
@@ -6575,6 +6690,7 @@ fn sandboxed_child_environment(
         }
         environment.insert(OsString::from(key), OsString::from(value));
     }
+    crate::shell_env_provider::apply_removals_to_snapshot(&mut environment, request_environment);
     for key in ["TMPDIR", "TEMP", "TMP"] {
         environment.insert(OsString::from(key), temp_dir.as_os_str().to_os_string());
     }
@@ -6725,6 +6841,10 @@ pub(crate) fn pty_command_for_plan(
         command.env_remove(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV);
         for (key, value) in env {
             command.env(key, value);
+        }
+        command.env_remove(crate::shell_env_provider::REMOVALS_ENV);
+        for name in crate::shell_env_provider::removals(env) {
+            command.env_remove(name);
         }
     }
     // Scrub credentials after explicit overrides too; only the command's own

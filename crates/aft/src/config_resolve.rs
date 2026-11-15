@@ -139,6 +139,7 @@ pub struct RawAftConfig {
     pub pi: Option<RawPi>,
     pub sandbox: Option<RawSandbox>,
     pub bash: Option<RawBash>,
+    pub shell: Option<crate::config::ShellConfig>,
     pub experimental: Option<RawExperimental>,
     pub lsp: Option<RawLsp>,
     pub url_fetch_allow_private: Option<bool>,
@@ -1638,6 +1639,9 @@ fn apply_harness_override(
 }
 
 fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) {
+    if override_config.shell.is_some() {
+        base.shell = override_config.shell.clone();
+    }
     if let Some(value) = override_config
         .durability
         .and_then(|durability| durability.macos_full_sync)
@@ -2528,6 +2532,13 @@ fn record_resource_loosening(
 
 fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<DroppedKey>) {
     if raw
+        .shell
+        .as_ref()
+        .is_some_and(|shell| shell.env_provider.is_some())
+    {
+        push_drop(dropped, "shell.env_provider", tier, USER_ONLY_REASON);
+    }
+    if raw
         .durability
         .as_ref()
         .is_some_and(|durability| durability.macos_full_sync.is_some())
@@ -2754,6 +2765,10 @@ fn apply_resolved_config(
     config: &mut Config,
     warnings: &mut Vec<ConfigWarning>,
 ) -> Result<(), Vec<String>> {
+    config.shell = raw.shell.clone().unwrap_or_default();
+    if let Some(provider) = &config.shell.env_provider {
+        provider.validate().map_err(|error| vec![error])?;
+    }
     config.hashline_enabled = matches!(raw.edit_mode, Some(RawEditMode::Hashline));
     config.durability.macos_full_sync = raw
         .durability
@@ -4791,6 +4806,64 @@ mod tests {
             "{:?}",
             result.dropped
         );
+    }
+
+    #[test]
+    fn shell_env_provider_is_off_by_default_and_user_only() {
+        assert!(resolve_config(&[]).config.shell.env_provider.is_none());
+        let result = resolve_config(&[
+            tier("user", r#"{"shell":{"env_provider":{"kind":"mise"}}}"#),
+            tier(
+                "project",
+                r#"{"shell":{"env_provider":{"kind":"custom","command":["hostile"]}}}"#,
+            ),
+        ]);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let provider = result.config.shell.env_provider.unwrap();
+        assert_eq!(provider.kind, crate::config::ShellEnvProviderKind::Mise);
+        assert_eq!(provider.timeout_ms, 2000);
+        assert_eq!(provider.argv(), ["mise", "env", "--json"]);
+        assert!(result
+            .dropped
+            .iter()
+            .any(|drop| drop.key == "shell.env_provider"));
+        let project = resolve_config(&[tier(
+            "project",
+            r#"{"shell":{"env_provider":{"kind":"mise"}}}"#,
+        )]);
+        assert!(project.config.shell.env_provider.is_none());
+    }
+
+    #[test]
+    fn shell_env_provider_validates_command_timeout_and_platform() {
+        for provider in [
+            r#"{"kind":"custom"}"#,
+            r#"{"kind":"mise","timeout_ms":99}"#,
+            r#"{"kind":"mise","timeout_ms":10001}"#,
+            r#"{"kind":"custom","command":[]}"#,
+        ] {
+            let result = resolve_config(&[tier(
+                "user",
+                &format!(r#"{{"shell":{{"env_provider":{provider}}}}}"#),
+            )]);
+            assert!(!result.errors.is_empty(), "{provider}");
+        }
+        let direnv = resolve_config(&[tier(
+            "user",
+            r#"{"shell":{"env_provider":{"kind":"direnv"}}}"#,
+        )]);
+        if cfg!(windows) {
+            assert!(direnv
+                .errors
+                .iter()
+                .any(|error| error.contains("direnv is not supported on Windows")));
+        } else {
+            assert!(direnv.errors.is_empty(), "{:?}", direnv.errors);
+            assert_eq!(
+                direnv.config.shell.env_provider.unwrap().argv(),
+                ["direnv", "export", "json"]
+            );
+        }
     }
 
     #[test]

@@ -201,6 +201,7 @@ pub mod semantic_admission;
 pub mod semantic_index;
 pub mod setup_plan;
 pub(crate) mod shared_timer;
+pub(crate) mod shell_env_provider;
 pub(crate) mod stage_timer;
 pub mod standing_roots;
 pub(crate) mod status_push;
