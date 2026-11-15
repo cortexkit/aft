@@ -105,6 +105,10 @@ pub enum FamilyError {
     Poisoned,
     #[error("{0}")]
     Misuse(&'static str),
+    /// Another live build holds the checkout's `checkout.lock`: the work
+    /// can be tried again once it ends.
+    #[error("{0}")]
+    CheckoutBusy(&'static str),
 }
 
 impl FamilyError {

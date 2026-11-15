@@ -858,8 +858,8 @@ impl<'f> WriteSession<'f> {
             .create(&parent)
             .map_err(FamilyError::io(&parent))?;
         let Some(lock) = try_checkout_lock(&parent)? else {
-            return Err(FamilyError::Misuse(
-                "this checkout already has a live build workspace",
+            return Err(FamilyError::CheckoutBusy(
+                "another process is building this checkout",
             ));
         };
         // Holding the lock, no workspace left here belongs to a live build.

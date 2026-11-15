@@ -213,6 +213,11 @@ impl DataError {
                     .downcast_ref::<aft_store::segment::SegmentError>()
                     .and_then(aft_store::family::NewerFormat::of_segment)
             });
+        if let Some(aft_store::family::FamilyError::CheckoutBusy(reason)) =
+            error_any.downcast_ref::<aft_store::family::FamilyError>()
+        {
+            return Self::Busy((*reason).to_string());
+        }
         match refusal {
             Some(refusal) => Self::NewerFormat(refusal),
             None => Self::Store(error.to_string()),

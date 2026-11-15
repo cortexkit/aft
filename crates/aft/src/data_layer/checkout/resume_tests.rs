@@ -607,6 +607,25 @@ fn a_build_closes_its_workspace_files_before_deleting_it() {
 }
 
 #[test]
+fn a_build_of_a_checkout_another_build_holds_is_busy() {
+    let root = tempfile::tempdir().unwrap();
+    project(root.path());
+    let store = tempfile::tempdir().unwrap();
+    let checkout = Checkout::bind(layer(), store.path(), family(), root.path()).unwrap();
+    let held = checkout
+        .family
+        .try_write()
+        .unwrap()
+        .unwrap()
+        .claim_scratch(checkout.checkout)
+        .unwrap();
+    let error = checkout.build().unwrap_err();
+    assert!(matches!(error, DataError::Busy(_)), "{error:?}");
+    drop(held);
+    checkout.build().unwrap();
+}
+
+#[test]
 fn a_build_from_another_executable_or_a_damaged_stage_is_not_reused() {
     let root = tempfile::tempdir().unwrap();
     project(root.path());
