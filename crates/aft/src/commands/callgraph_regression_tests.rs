@@ -412,9 +412,9 @@ fn callgraph_zero_callers_discloses_unresolved_sites_but_clean_zero_stays_clean(
 #[test]
 fn callgraph_zero_callers_lists_same_name_candidates_with_exact_text() {
     for (a_calls, z_calls, expected) in [
-        (0, 1, "No resolved callers; 1 unresolved call sites name `target` (possible callers, targets not confirmed).\n  z.py:4 — late"),
+        (0, 1, "No resolved callers; 1 unresolved call site names `target` (possible callers, targets not confirmed).\n  z.py:4 — late"),
         (2, 1, "No resolved callers; 3 unresolved call sites name `target` (possible callers, targets not confirmed).\n  a.py:4 — early\n  a.py:5 — early\n  z.py:4 — late"),
-        (4, 3, "No resolved callers; 7 unresolved call sites name `target` (possible callers, targets not confirmed).\n  a.py:4 — early\n  a.py:5 — early\n  a.py:6 — early\n  a.py:7 — early\n  z.py:4 — late\n2 more unresolved call sites.\nshown 5 of 7 sites (cap) · narrow: includeTests"),
+        (4, 3, "No resolved callers; 7 unresolved call sites name `target` (possible callers, targets not confirmed).\n  a.py:4 — early\n  a.py:5 — early\n  a.py:6 — early\n  a.py:7 — early\n  z.py:4 — late\nshown 5 of 7 sites (cap) · narrow: includeTests"),
     ] {
         let a = format!("from missing import target\n\ndef early():\n{}", "    target()\n".repeat(a_calls));
         let z = format!("from missing import target\n\ndef late():\n{}    unrelated()\n", "    target()\n".repeat(z_calls));

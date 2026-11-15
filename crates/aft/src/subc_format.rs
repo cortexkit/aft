@@ -3724,8 +3724,13 @@ fn format_callers_sections(record: &serde_json::Map<String, Value>) -> Vec<Strin
     let mut sections = if let Some(unresolved) = unresolved {
         let total = number_field(unresolved, "total").unwrap_or(0).max(0) as usize;
         let name = string_field(unresolved, "name").unwrap_or_default();
+        let site_phrase = if total == 1 {
+            "site names"
+        } else {
+            "sites name"
+        };
         let mut lines = vec![format!(
-            "No resolved callers; {total} unresolved call sites name `{name}` (possible callers, targets not confirmed)."
+            "No resolved callers; {total} unresolved call {site_phrase} `{name}` (possible callers, targets not confirmed)."
         )];
         let sites = records_field(unresolved, "sites");
         for site in &sites {
@@ -3734,12 +3739,6 @@ fn format_callers_sections(record: &serde_json::Map<String, Value>) -> Vec<Strin
                 string_field(site, "file").unwrap_or_default(),
                 number_field(site, "line").unwrap_or(0),
                 string_field(site, "calling_function").unwrap_or("<top level>"),
-            ));
-        }
-        if total > sites.len() {
-            lines.push(format!(
-                "{} more unresolved call sites.",
-                total - sites.len()
             ));
         }
         if let Some(trailer) = unresolved
