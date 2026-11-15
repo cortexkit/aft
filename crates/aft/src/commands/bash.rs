@@ -293,15 +293,18 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(launch) = remote.as_mut() {
         // Submission counts only the session's saved grants: a worker's plan
         // grants were saved by its catalog fetch.
-        if let Err(message) = launch
+        if let Err(error) = launch
             .params
             .validate_siblings(ctx, &req.id, req.session(), &[])
         {
-            return Response::error(
-                &req.id,
-                "remote_run_refused",
-                format!("runon refused: {message}"),
-            );
+            return match error {
+                crate::exec_remote::SiblingValidationError::Refused(message) => Response::error(
+                    &req.id,
+                    "remote_run_refused",
+                    format!("runon refused: {message}"),
+                ),
+                crate::exec_remote::SiblingValidationError::Unavailable(response) => response,
+            };
         }
         launch.configured_env_names = configured_env_names;
     }

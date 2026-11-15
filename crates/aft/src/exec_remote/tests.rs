@@ -880,7 +880,9 @@ fn siblings_read_gate_requires_checkout_marker_and_canonicalizes_gitfile_root() 
         ..Default::default()
     };
     assert_eq!(
-        params.validate_siblings(&ctx, "siblings", "session", &[]),
+        params
+            .validate_siblings(&ctx, "siblings", "session", &[])
+            .map_err(refused_sibling_message),
         Err(not_checkout_root(&given))
     );
     std::fs::write(root.path().join(".git"), "gitdir: /checkout/metadata\n").unwrap();
@@ -910,6 +912,97 @@ fn not_readable(resolved: &std::path::Path) -> String {
         "this session's file tools may not read sibling {}; grant read access to it in allow_paths; the command was not run",
         resolved.display()
     )
+}
+
+fn refused_sibling_message(error: SiblingValidationError) -> String {
+    match error {
+        SiblingValidationError::Refused(message) => message,
+        SiblingValidationError::Unavailable(response) => {
+            panic!("unexpected unavailable policy: {response:?}")
+        }
+    }
+}
+
+#[test]
+fn siblings_busy_grant_store_preserves_read_error_instead_of_missing_grant_refusal() {
+    use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    let root = tempfile::tempdir().unwrap();
+    let sibling = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    std::fs::create_dir(sibling.path().join(".git")).unwrap();
+    let sibling = sibling.path().canonicalize().unwrap();
+    let ctx = crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(root.path().into()),
+            storage_dir: Some(storage.path().into()),
+            ..Default::default()
+        },
+    );
+    let db = Arc::new(Mutex::new(
+        crate::db::open(&storage.path().join("aft.db")).unwrap(),
+    ));
+    ctx.set_db(db.clone());
+    let scope = crate::db::access_grants::ScopeKey {
+        owner: "worker-owner".into(),
+        scope_ref: "worker-scope".into(),
+        epoch: 1,
+    };
+    let grant = AccessGrant {
+        path: crate::access_policy::policy_path(&sibling),
+        kind: GrantKind::Subtree,
+        operation: AccessOperation::Read,
+    };
+    crate::db::access_grants::register_scope(&db.lock().unwrap(), &scope, None, &ctx.config())
+        .unwrap();
+    crate::db::access_grants::insert(&db.lock().unwrap(), &scope, &grant).unwrap();
+    let _scope = crate::access_policy::scope_guard(Some(scope));
+    let _ask =
+        crate::access_policy::ask_route_guard(Some(crate::access_policy::AskRoute::Unavailable));
+    ctx.validate_read_path_without_approval("read", "worker", &sibling)
+        .unwrap();
+
+    let mut params = FrozenParams {
+        siblings: vec![sibling.to_str().unwrap().into()],
+        ..Default::default()
+    };
+    params
+        .validate_siblings(&ctx, "runon", "worker", &[])
+        .unwrap();
+    for preflight in [vec![], vec![grant]] {
+        let budget = crate::bounded_io::Budget::after(Duration::from_secs(1));
+        let release_at = budget.deadline + Duration::from_millis(20);
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let held_db = db.clone();
+        let holder = std::thread::spawn(move || {
+            let _held = held_db.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(release_at.saturating_duration_since(Instant::now()));
+        });
+        locked_rx.recv().unwrap();
+        let result = {
+            let _budget = crate::bounded_io::enter(Some(budget));
+            params.validate_siblings(&ctx, "runon", "worker", &preflight)
+        };
+        holder.join().unwrap();
+        let Err(SiblingValidationError::Unavailable(response)) = result else {
+            panic!("busy grant store was reported as a missing grant or bypassed: {result:?}");
+        };
+        assert_eq!(
+            response.data["code"], "read_deadline_exceeded",
+            "{response:?}"
+        );
+        assert!(!response.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("allow_paths"));
+    }
+    params
+        .validate_siblings(&ctx, "runon", "worker", &[])
+        .unwrap();
 }
 
 /// A plan preflight may count grants its own allow_paths validated but did not
@@ -948,6 +1041,7 @@ fn siblings_read_gate_counts_preflight_grants_only_where_they_cover_a_checkout_r
         };
         params
             .validate_siblings(&ctx, "siblings", "session", grants)
+            .map_err(refused_sibling_message)
             .map(|()| params.siblings)
     };
     let folder_grant = [grant(&granted, AccessOperation::Read)];

@@ -22,7 +22,7 @@ pub use request::{
     build_request, return_max_bytes, FrozenParams, PresetParams, RootConfinement,
     RETURN_TOTAL_CAP_BYTES,
 };
-pub(crate) use request::{sibling_refusal, SiblingRefusal};
+pub(crate) use request::{sibling_refusal, SiblingRefusal, SiblingValidationError};
 pub use stream::{GapRecovery, OutputSink, ResumePoint, StreamConsumer};
 
 #[derive(Debug, Clone, Copy)]
