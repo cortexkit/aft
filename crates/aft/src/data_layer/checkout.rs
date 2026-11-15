@@ -6565,9 +6565,11 @@ impl Checkout {
                     {
                         return None;
                     }
-                    let published = view.published.state.get(path).is_some_and(|published| {
-                        published.content == record.content && published.language == record.language
-                    });
+                    let published = !view.published.state.skipped_parses().contains_key(path)
+                        && view.published.state.get(path).is_some_and(|published| {
+                            published.content == record.content
+                                && published.language == record.language
+                        });
                     if published {
                         if view.unparsed.contains(path) {
                             return None;
@@ -6682,9 +6684,10 @@ impl Checkout {
                 if view.current_state().skipped_parses().contains_key(path) {
                     return Ok(PathTodos::Unextracted);
                 }
-                let published = view.published.state.get(path).is_some_and(|published| {
-                    published.content == record.content && published.language == record.language
-                });
+                let published = !view.published.state.skipped_parses().contains_key(path)
+                    && view.published.state.get(path).is_some_and(|published| {
+                        published.content == record.content && published.language == record.language
+                    });
                 if published {
                     if view.unparsed.contains(path) {
                         return Ok(PathTodos::Unextracted);
