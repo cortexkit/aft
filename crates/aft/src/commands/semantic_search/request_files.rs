@@ -824,3 +824,22 @@ mod search_read_tests {
         );
     }
 }
+#[test]
+fn audit1432_exactly_reserved_whole_read_does_not_double_at_the_ceiling() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("at-ceiling.bin");
+    let size = crate::large_read::WHOLE_READ_CEILING as usize;
+    std::fs::write(&path, vec![b'x'; size]).unwrap();
+    let (read, volume, largest) = crate::test_allocations::count_bytes_and_largest(|| {
+        read_whole_file_at(&path, crate::large_read::Site::SourceFile)
+    });
+    eprintln!("whole read: allocated_bytes={volume}, largest_allocation_bytes={largest}");
+    let (bytes, stat) = read.unwrap();
+    assert_eq!(bytes.len(), size);
+    assert_eq!(stat.unwrap().size as usize, size);
+    assert_eq!(largest, size, "whole-file reservation unexpectedly grew");
+    assert!(
+        volume < size + crate::large_read::STEP_BYTES,
+        "allocation volume={volume}, largest={largest}"
+    );
+}

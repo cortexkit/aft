@@ -963,13 +963,14 @@ fn skipped_files_fixture() -> Value {
     let envelope = aft::list_surfaces::search::skipped_files_envelope(20, 23);
     let mut reply = json!({
         "complete": false,
-        "skipped_files": (0..20).map(|at| json!({"file": format!("large-{at:02}.txt"), "reason": "read ceiling"})).collect::<Vec<_>>(),
+        "skipped_files": (0..20).map(|at| json!({"file": format!("large-{at:02}.txt"), "reason": "Skipped: reading this file would exceed the 16 MiB in-memory read ceiling."})).collect::<Vec<_>>(),
         "skipped_files_remaining": 3,
         "skipped_files_list_envelope": envelope,
         "results": [], "matches": [],
     });
+    let producer_text = format!("Read ceiling: 20 named files skipped, 3 more omitted\n\nSkipped: reading this file would exceed the 16 MiB in-memory read ceiling.\n{}", (0..20).map(|at| format!("large-{at:02}.txt")).collect::<Vec<_>>().join("\n"));
     reply["text"] = json!(build_ndjson_text(
-        "Read ceiling: 20 named files skipped, 3 more omitted",
+        &producer_text,
         &reply,
         Some("payload.skipped_files"),
         false
@@ -2023,9 +2024,10 @@ pub fn render_transports(fixture: &CappedParityFixture) -> (String, String) {
     let subc_text = render(fixture.command, fixture.mode, &fixture.reply);
     let base_text = if fixture.list_id == "payload.skipped_files" {
         let trailer = build_ndjson_text("", &fixture.reply, Some(fixture.list_id), false);
-        subc_text
+        let producer_text = fixture.reply["text"].as_str().unwrap();
+        producer_text
             .strip_suffix(&format!("\n\n{trailer}"))
-            .unwrap_or(&subc_text)
+            .unwrap_or(producer_text)
             .to_string()
     } else if fixture.command == "bash" {
         fixture

@@ -577,7 +577,7 @@ fn stage2_ceiling_fixture() -> tempfile::TempDir {
         for at in (127..size).step_by(128) {
             bytes[at] = b'\n';
         }
-        bytes[..12].copy_from_slice(b"needle tail\n");
+        bytes[size - 12..].copy_from_slice(b"needle tail\n");
         fs::write(project.path().join(name), bytes).unwrap();
     }
     project
@@ -662,6 +662,8 @@ fn stage2_aft_search_discloses_large_whole_read_skip() {
 
 #[test]
 fn stage2_single_line_over_ceiling_is_named_and_skipped() {
+    // The paired in-process fallback scan test measures allocation volume and
+    // its largest reservation; this child-process check covers the wire reply.
     let project = setup_project(&[]);
     let mut bytes = vec![b'x'; 17 * 1024 * 1024];
     let end = bytes.len();

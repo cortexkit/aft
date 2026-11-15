@@ -327,6 +327,59 @@ fn stage2_candidate_line_windows_match_whole_read() {
 }
 
 #[test]
+fn audit1432_candidate_windows_match_cached_whole_source_through_production_large_dispatch() {
+    let project = tempfile::tempdir().unwrap();
+    let file = project.path().join("large-window.rs");
+    for megabytes in [5, 9, 15] {
+        let mut bytes = b"// padding with unicode \xc3\xa9\r\n".repeat((megabytes << 20) / 28);
+        let start = bytes.len();
+        bytes.extend_from_slice(
+            b"#[inline]\r\npub fn tail_identifier() {\r\n    tail_identifier();\r\n}\r\n",
+        );
+        assert!(bytes.len() as u64 > crate::large_read::LARGE_READ_BYTES);
+        assert!((bytes.len() as u64) < crate::large_read::WHOLE_READ_CEILING);
+        std::fs::write(&file, &bytes).unwrap();
+        for range in [
+            None,
+            Some(super::super::comparator::SymbolOffsetRange::new(
+                start,
+                bytes.len(),
+            )),
+        ] {
+            let candidate = CandidateResult::new_exact(
+                file.clone(),
+                range,
+                super::super::evidence_descriptor::EvidenceDescriptor::for_e1(1, true, false),
+            );
+            for prose in [
+                "tail_identifier",
+                "missing_identifier",
+                "how does the last function work",
+            ] {
+                let expected = {
+                    let scope = super::super::request_files::install();
+                    scope.files().keep_read(&file, bytes.clone(), None);
+                    candidate_text(project.path(), &candidate, prose)
+                };
+                assert!(super::super::request_files::current().is_none());
+                let (streamed, _, largest) =
+                    crate::test_allocations::count_bytes_and_largest(|| {
+                        candidate_text(project.path(), &candidate, prose)
+                    });
+                assert!(
+                    (largest as u64) < crate::large_read::LARGE_READ_BYTES,
+                    "production dispatch retained a whole large file: largest allocation={largest}"
+                );
+                assert_eq!(
+                    streamed, expected,
+                    "MiB={megabytes}, range={range:?}, prose={prose}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn candidate_text_reuses_raw_source_without_lossy_matching_or_stale_lines() {
     let project = tempfile::tempdir().unwrap();
     let file = project.path().join("raw.rs");

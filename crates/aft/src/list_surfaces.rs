@@ -829,7 +829,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "commands/semantic_search/data_file.rs",
-        enclosing_item: "is_data_file",
+        enclosing_item: "is_data_file_after_metadata",
         location_or_primitive: "io::Read::take(DATA_FILE_MIN_BYTES)",
         reason: "classification needs only the size threshold or a long line in a smaller file; reaching the byte threshold classifies the file as data, without cutting a result list",
     },

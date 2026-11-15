@@ -15,6 +15,7 @@ thread_local! {
     static COUNTING: Cell<bool> = const { Cell::new(false) };
     static ALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
     static ALLOCATION_BYTES: Cell<usize> = const { Cell::new(0) };
+    static LARGEST_ALLOCATION: Cell<usize> = const { Cell::new(0) };
 }
 
 unsafe impl GlobalAlloc for CountingAllocator {
@@ -105,6 +106,7 @@ fn record_allocation(bytes: usize) {
     if COUNTING.try_with(Cell::get).unwrap_or(false) {
         let _ = ALLOCATION_COUNT.try_with(|count| count.set(count.get() + 1));
         let _ = ALLOCATION_BYTES.try_with(|total| total.set(total.get().saturating_add(bytes)));
+        let _ = LARGEST_ALLOCATION.try_with(|largest| largest.set(largest.get().max(bytes)));
     }
 }
 
@@ -119,6 +121,7 @@ pub(crate) fn count<T>(operation: impl FnOnce() -> T) -> (T, usize) {
 
     ALLOCATION_COUNT.with(|count| count.set(0));
     ALLOCATION_BYTES.with(|bytes| bytes.set(0));
+    LARGEST_ALLOCATION.with(|bytes| bytes.set(0));
     COUNTING.with(|counting| counting.set(true));
     let guard = CountingGuard;
     let result = operation();
@@ -132,6 +135,13 @@ pub(crate) fn count<T>(operation: impl FnOnce() -> T) -> (T, usize) {
 pub(crate) fn count_bytes<T>(operation: impl FnOnce() -> T) -> (T, usize) {
     let (result, _) = count(operation);
     (result, ALLOCATION_BYTES.with(Cell::get))
+}
+
+/// Allocation volume and the largest single allocation/reallocation on this
+/// thread. Volume also bounds the peak heap added while the operation runs.
+pub(crate) fn count_bytes_and_largest<T>(operation: impl FnOnce() -> T) -> (T, usize, usize) {
+    let (result, volume) = count_bytes(operation);
+    (result, volume, LARGEST_ALLOCATION.with(Cell::get))
 }
 
 /// Read the current thread's counters without starting a nested counting scope.

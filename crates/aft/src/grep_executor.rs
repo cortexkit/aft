@@ -5016,4 +5016,38 @@ mod streamed_fallback_tests {
             }
         }
     }
+    #[test]
+    fn audit1432_single_line_over_ceiling_keeps_allocation_below_the_file_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("single-line.txt");
+        let mut bytes = vec![b'x'; 17 << 20];
+        let end = bytes.len();
+        bytes[end - 3..].copy_from_slice(b"foo");
+        std::fs::write(&path, bytes).unwrap();
+        let pattern = foo_literal();
+        let _scope = crate::bounded_io::enter_disclosure_if_absent();
+        let ((rows, counts, _), volume, largest) =
+            crate::test_allocations::count_bytes_and_largest(|| scan(&path, &pattern, 10));
+        eprintln!("single-line scan: allocated_bytes={volume}, largest_allocation_bytes={largest}");
+        assert!(rows.is_empty());
+        assert_eq!(counts[0], 0);
+        assert!(
+            largest <= crate::large_read::WHOLE_READ_CEILING as usize + 1,
+            "largest allocation={largest}"
+        );
+        assert!(
+            volume
+                < crate::large_read::WHOLE_READ_CEILING as usize
+                    + 4 * crate::large_read::STEP_BYTES,
+            "allocation volume={volume}, largest={largest}"
+        );
+        let mut response =
+            crate::protocol::Response::success("allocation-skip", serde_json::json!({}));
+        crate::bounded_io::disclose_large_read_skips(&mut response);
+        assert_eq!(response.data["complete"], false);
+        assert_eq!(
+            response.data["skipped_files"][0]["file"],
+            serde_json::json!(path)
+        );
+    }
 }
