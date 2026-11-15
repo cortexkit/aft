@@ -469,7 +469,13 @@ impl InspectInventory {
                         .directories
                         .insert(entry.path().to_path_buf(), (source, manifest));
                 } else if entry.file_type().is_some_and(|kind| kind.is_file()) {
-                    if source && crate::parser::detect_language(entry.path()).is_some() {
+                    if source
+                        && crate::parser::detect_language_any(
+                            entry.path(),
+                            cfg!(feature = "wasm-grammars"),
+                        )
+                        .is_some()
+                    {
                         state.sources.push(entry.path().to_path_buf());
                     }
                     if manifest && entry_points::is_entry_point_manifest(entry.path()) {

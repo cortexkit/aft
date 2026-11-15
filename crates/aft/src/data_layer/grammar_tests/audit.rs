@@ -944,7 +944,9 @@ fn dead_code_gaps() {
                 "export function searchable() { return 1; }\n",
             );
         }
+        let _build = crate::data_layer::runtime::hold_builds_for_test(&f.root);
         configure_inspect_with_graph(&f, false);
+        assert!(f.ctx.data_checkout().unwrap().view().is_none());
         let response = inspect_category(&f.ctx, &f.root, "dead_code");
         assert!(response.success, "{:?}", response.data);
         let dead = &response.data["summary"]["dead_code"];
@@ -963,6 +965,7 @@ fn dead_code_gaps() {
         assert!(!dead["items"]
             .as_array()
             .is_some_and(|items| items.iter().any(|item| item["file"] == "source.luau")));
+        assert!(f.ctx.data_checkout().unwrap().view().is_none());
     }
 }
 
