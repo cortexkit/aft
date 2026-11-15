@@ -85,7 +85,11 @@ pub(crate) fn from_environment(mut registry: Arc<GrammarRegistry>) -> Arc<Gramma
 }
 
 impl GrammarRegistry {
-    #[cfg(test)]
+    #[cfg(all(
+        test,
+        feature = "test-hooks",
+        not(all(target_os = "windows", target_arch = "aarch64"))
+    ))]
     pub(crate) fn force_unavailable_for_test(&self, state: GrammarState) -> impl Drop + '_ {
         struct Guard<'a>(&'a GrammarRegistry);
         impl Drop for Guard<'_> {

@@ -1472,7 +1472,12 @@ impl VectorPlane {
             queue
         };
         report.files_queued = queue.len();
-        #[cfg(test)]
+        #[cfg(all(
+            test,
+            feature = "wasm-grammars",
+            feature = "test-hooks",
+            not(all(target_os = "windows", target_arch = "aarch64"))
+        ))]
         super::test_gates::arrive(view.root(), super::test_gates::Point::FillSurvey);
         let per_vector = VectorSectionsBuilder::bytes_per_vector(dimensions);
         let mut embed_rows = |texts: Vec<String>| embed(texts);

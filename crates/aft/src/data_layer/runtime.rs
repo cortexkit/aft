@@ -800,7 +800,12 @@ impl Work {
             let delay = *self.publication_delay.lock();
             std::thread::sleep(delay);
         }
-        #[cfg(test)]
+        #[cfg(all(
+            test,
+            feature = "wasm-grammars",
+            feature = "test-hooks",
+            not(all(target_os = "windows", target_arch = "aarch64"))
+        ))]
         super::test_gates::arrive(
             self.checkout.root(),
             super::test_gates::Point::DeltaPublication,
@@ -1532,7 +1537,12 @@ impl DataCheckout {
         Arc::clone(&self.work.checkout)
     }
 
-    #[cfg(all(test, feature = "wasm-grammars"))]
+    #[cfg(all(
+        test,
+        feature = "wasm-grammars",
+        feature = "test-hooks",
+        not(all(target_os = "windows", target_arch = "aarch64"))
+    ))]
     pub(crate) fn grammar_driver_running_for_test(&self) -> bool {
         self.work.grammar_driving.load(Ordering::Acquire)
     }

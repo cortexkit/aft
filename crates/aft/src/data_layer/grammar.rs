@@ -160,7 +160,12 @@ pub(super) fn extraction_for_test(source: &[u8]) -> Option<TestExtraction> {
         .copied()
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    feature = "wasm-grammars",
+    feature = "test-hooks",
+    not(all(target_os = "windows", target_arch = "aarch64"))
+))]
 pub(super) fn override_extraction_for_test(source: &[u8], outcome: TestExtraction) -> impl Drop {
     struct Guard(aft_store::ids::ContentKey);
     impl Drop for Guard {

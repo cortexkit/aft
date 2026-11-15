@@ -1835,7 +1835,12 @@ impl Checkout {
         let mut collected = sink
             .finish()
             .map_err(|error| graph_spill_error(error, &paused))?;
-        #[cfg(test)]
+        #[cfg(all(
+            test,
+            feature = "wasm-grammars",
+            feature = "test-hooks",
+            not(all(target_os = "windows", target_arch = "aarch64"))
+        ))]
         super::test_gates::arrive(self.root(), super::test_gates::Point::BuildPublication);
         // Contents too large to read are members whose text is not
         // indexed; record them so grep reports them rather than walking
