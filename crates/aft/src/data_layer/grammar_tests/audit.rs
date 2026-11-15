@@ -655,7 +655,7 @@ fn outline_guards() {
     let skipped = batch.data["skipped_files"].as_array().unwrap();
     assert!(skipped.iter().any(|row| row["reason"] == "too_large"));
     assert!(skipped.iter().any(|row| row["reason"] == "parse_error"));
-    let directory = ask(&f.ctx, "outline", json!({"file":f.root}));
+    let directory = ask(&f.ctx, "outline", json!({"directory":f.root}));
     assert!(directory.success, "{:?}", directory.data);
     assert_eq!(directory.data["complete"], false, "{:?}", directory.data);
 }

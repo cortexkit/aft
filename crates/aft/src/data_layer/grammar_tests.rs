@@ -242,7 +242,7 @@ fn luau_s4_feature_off_does_not_discover_or_request_a_grammar() {
     assert_eq!(files.data["complete"], true);
     assert!(files.data.get("gaps").is_none());
     assert!(files.data["text"].as_str().unwrap().contains("a.luau"));
-    let directory = ask(&ctx, "outline", json!({"file":root}));
+    let directory = ask(&ctx, "outline", json!({"directory":root}));
     assert!(directory.success, "{:?}", directory.data);
     assert_eq!(directory.data["complete"], true, "{:?}", directory.data);
     assert!(!directory.data.to_string().contains("support_disabled"));
