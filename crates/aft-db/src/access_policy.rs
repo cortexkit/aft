@@ -554,8 +554,8 @@ impl FloorRule {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PolicyFloor {
-    pub(crate) path: PathBuf,
-    pub(crate) rule: FloorRule,
+    pub path: PathBuf,
+    pub rule: FloorRule,
 }
 
 pub(crate) use crate::error::aft_storage_denial_message;

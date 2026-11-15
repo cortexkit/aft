@@ -1103,6 +1103,7 @@ fn apply_migration_v21(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
 pub mod tests {
     use super::*;
     #[cfg(test)]

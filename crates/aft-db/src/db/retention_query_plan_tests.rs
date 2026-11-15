@@ -75,9 +75,9 @@ impl Fixture {
 
 #[derive(Debug)]
 pub struct Executed {
-    sql: String,
+    pub sql: String,
     pub template: String,
-    vm_steps: i32,
+    pub vm_steps: i32,
 }
 
 // PROFILE observes the statements the production functions actually execute,

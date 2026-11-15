@@ -93,6 +93,7 @@ pub(crate) fn prune_presets(conn: &Connection, now_ms: i64) -> rusqlite::Result<
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
 pub mod tests {
     use super::*;
     use rusqlite::Connection;

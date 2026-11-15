@@ -1315,6 +1315,7 @@ fn note_skipped_sweep() -> bool {
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
 pub mod tests {
     use super::*;
     use tempfile::tempdir;

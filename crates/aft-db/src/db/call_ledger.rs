@@ -1758,6 +1758,7 @@ fn run_before_recovery_read(conn: &Connection, key: &Key) {
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
 pub mod tests {
     #[cfg(test)]
     #[test]

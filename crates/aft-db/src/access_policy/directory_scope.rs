@@ -134,9 +134,21 @@ pub(crate) const DIRECTORY_SCOPE_MISSING_LOG_CAP: usize = 4_096;
 test_support_visibility! {
 #[derive(Default)]
 pub(crate) struct DirectoryScopeProbes {
+    #[cfg(any(test, feature = "test-support"))]
+    pub probes: HashMap<PathBuf, Arc<DirectoryScopeProbe>>,
+    #[cfg(not(any(test, feature = "test-support")))]
     pub(crate) probes: HashMap<PathBuf, Arc<DirectoryScopeProbe>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub logged: HashMap<(PathBuf, &'static str), Instant>,
+    #[cfg(not(any(test, feature = "test-support")))]
     pub(crate) logged: HashMap<(PathBuf, &'static str), Instant>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub missing_logged: std::collections::HashSet<PathBuf>,
+    #[cfg(not(any(test, feature = "test-support")))]
     pub(crate) missing_logged: std::collections::HashSet<PathBuf>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub last_pruned: Option<Instant>,
+    #[cfg(not(any(test, feature = "test-support")))]
     pub(crate) last_pruned: Option<Instant>,
 }
 }
@@ -163,7 +175,9 @@ impl DirectoryScopeProbes {
         (probe, true)
     }
 
-    pub(crate) fn note_fallback(&mut self, directory: &Path, reason: &'static str) -> bool {
+    #[rustfmt::skip]
+    test_support_visibility! {
+pub(crate) fn note_fallback(&mut self, directory: &Path, reason: &'static str) -> bool {
         if reason == "directory does not exist" {
             if self.missing_logged.contains(directory) {
                 return false;
@@ -188,6 +202,8 @@ impl DirectoryScopeProbes {
         }
         true
     }
+
+}
 }
 
 #[rustfmt::skip]
@@ -330,7 +346,10 @@ pub(crate) fn probe_directory_scope_at_home(
     Ok(true)
 }
 
+#[rustfmt::skip]
+test_support_visibility! {
 pub(crate) use crate::path_identity::{directory_is_protected_alias, directory_scope_is_narrow};
+}
 
 /// A canonical directory can still be a root-level alias, such as /etc pointing
 /// to /private/etc. Only resolvable aliases have a target identity to compare.
@@ -342,20 +361,28 @@ pub(crate) const ROOT_ALIAS_SCAN_BUDGET: Duration = Duration::from_millis(250);
 #[rustfmt::skip]
 test_support_visibility! {
 pub(crate) struct ScopeProbeLimiter {
+    #[cfg(any(test, feature = "test-support"))]
+    pub in_flight: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(not(any(test, feature = "test-support")))]
     pub(crate) in_flight: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) available: Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
 }
 }
 
 impl ScopeProbeLimiter {
-    pub(crate) fn new() -> Self {
+    #[rustfmt::skip]
+    test_support_visibility! {
+pub(crate) fn new() -> Self {
         Self {
             in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             available: Arc::default(),
         }
     }
+}
 
-    pub(crate) fn try_acquire(&self) -> Option<ScopeProbePermit> {
+    #[rustfmt::skip]
+    test_support_visibility! {
+pub(crate) fn try_acquire(&self) -> Option<ScopeProbePermit> {
         self.in_flight
             .compare_exchange(
                 false,
@@ -366,6 +393,7 @@ impl ScopeProbeLimiter {
             .ok()
             .map(|_| ScopeProbePermit(Arc::clone(&self.in_flight), Arc::clone(&self.available)))
     }
+}
 
     pub(crate) fn acquire_until(&self, deadline: Instant) -> Option<ScopeProbePermit> {
         let (mutex, available) = &*self.available;
@@ -379,7 +407,9 @@ impl ScopeProbeLimiter {
         }
     }
 
-    pub(crate) fn scan<F>(&self, scan: F) -> Option<bool>
+    #[rustfmt::skip]
+    test_support_visibility! {
+pub(crate) fn scan<F>(&self, scan: F) -> Option<bool>
     where
         F: FnOnce() -> Option<bool> + Send + 'static,
     {
@@ -401,6 +431,8 @@ impl ScopeProbeLimiter {
 
         receiver.recv_timeout(ROOT_ALIAS_SCAN_BUDGET).ok().flatten()
     }
+
+}
 }
 
 pub(crate) struct ScopeProbePermit(

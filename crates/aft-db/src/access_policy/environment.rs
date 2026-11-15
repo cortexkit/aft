@@ -9,7 +9,7 @@ use std::{
 type ManagedReadPaths = fn(&Config, &Path) -> Vec<PathBuf>;
 static MANAGED_READ_PATHS: OnceLock<ManagedReadPaths> = OnceLock::new();
 
-pub(crate) fn register(paths: ManagedReadPaths) {
+pub fn register(paths: ManagedReadPaths) {
     let _ = MANAGED_READ_PATHS.set(paths);
 }
 
@@ -23,6 +23,6 @@ pub(crate) fn managed_read_paths(config: &Config, storage: &Path) -> Vec<PathBuf
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn registered() -> bool {
+pub fn registered() -> bool {
     MANAGED_READ_PATHS.get().is_some()
 }

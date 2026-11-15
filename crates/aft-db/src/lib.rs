@@ -1,4 +1,4 @@
-// Keep production internals private unless retained higher-layer tests need them.
+// Expose these items only in tests or when the test-support feature is enabled.
 macro_rules! test_support_visibility {
     ($(#[$attribute:meta])* $visibility:vis $keyword:ident $($item:tt)*) => {
         #[cfg(any(test, feature = "test-support"))]

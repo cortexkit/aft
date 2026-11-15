@@ -8,7 +8,7 @@ thread_local! {
 
 /// Restores the previous temp-root override when dropped.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) struct RootsOverride(Option<Vec<PathBuf>>);
+pub struct RootsOverride(Option<Vec<PathBuf>>);
 
 #[cfg(any(test, feature = "test-support"))]
 impl Drop for RootsOverride {
@@ -22,13 +22,13 @@ impl Drop for RootsOverride {
 /// directories, so a test can exercise the temp guards on a directory it owns
 /// instead of the host's real `/tmp`.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn override_roots_for_test(roots: Vec<PathBuf>) -> RootsOverride {
+pub fn override_roots_for_test(roots: Vec<PathBuf>) -> RootsOverride {
     RootsOverride(ROOTS_FOR_TEST.with(|current| current.borrow_mut().replace(roots)))
 }
 
 /// The temp-root override installed on the calling thread, if any. Read it on
 /// the request thread: policy construction may run on the bounded IO helper.
-pub(crate) fn roots_override() -> Option<Vec<PathBuf>> {
+pub fn roots_override() -> Option<Vec<PathBuf>> {
     #[cfg(any(test, feature = "test-support"))]
     {
         ROOTS_FOR_TEST.with(|roots| roots.borrow().clone())
@@ -40,7 +40,7 @@ pub(crate) fn roots_override() -> Option<Vec<PathBuf>> {
 }
 
 /// Every system temp directory the standalone temp guards cover.
-pub(crate) fn guard_roots(overridden: Option<&[PathBuf]>) -> Vec<PathBuf> {
+pub fn guard_roots(overridden: Option<&[PathBuf]>) -> Vec<PathBuf> {
     match overridden {
         Some(roots) => roots.iter().map(|root| super::policy_path(root)).collect(),
         None => crate::system_temp::system_temp_roots()
@@ -51,7 +51,7 @@ pub(crate) fn guard_roots(overridden: Option<&[PathBuf]>) -> Vec<PathBuf> {
 }
 
 /// The temp directories a standalone call may use without an outside ask.
-pub(crate) fn allowed_roots(overridden: Option<&[PathBuf]>) -> Vec<PathBuf> {
+pub fn allowed_roots(overridden: Option<&[PathBuf]>) -> Vec<PathBuf> {
     match overridden {
         Some(roots) => roots.iter().map(|root| super::policy_path(root)).collect(),
         None => roots(),
@@ -67,6 +67,8 @@ pub(crate) fn roots() -> Vec<PathBuf> {
     roots_for(own, cfg!(target_os = "macos"))
 }
 
+#[rustfmt::skip]
+test_support_visibility! {
 pub(crate) fn roots_for(own: Option<PathBuf>, macos: bool) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     roots.extend(own);
@@ -82,8 +84,9 @@ pub(crate) fn roots_for(own: Option<PathBuf>, macos: bool) -> Vec<PathBuf> {
         .map(|root| super::policy_path(&root))
         .collect()
 }
+}
 
-pub(crate) fn managed_roots() -> Vec<PathBuf> {
+pub fn managed_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     roots.push(std::env::temp_dir().join("aft-w"));
     #[cfg(unix)]
@@ -123,12 +126,15 @@ const SPECIAL_FILE_MESSAGE: &str =
 const PROTECTED_ROOT_MESSAGE: &str = "AFT does not replace or remove temporary directory roots";
 
 impl TempDenial {
-    pub(crate) fn new(entry: &Path, reason: TempReason) -> Self {
+    #[rustfmt::skip]
+    test_support_visibility! {
+pub(crate) fn new(entry: &Path, reason: TempReason) -> Self {
         Self {
             entry: entry.to_path_buf(),
             reason,
         }
     }
+}
 
     pub fn message(&self, requested: &Path, canonical_requested: &Path) -> String {
         let folder = requested.display();

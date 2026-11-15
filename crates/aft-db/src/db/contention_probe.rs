@@ -76,7 +76,7 @@ pub(super) fn maintenance_retry_checkpoint(
 
 /// Record the connection actually acquired by db_get_state and whether its
 /// acquisition queued on the shared mutex. No gate means the normal lock path.
-pub(crate) fn lock_state_read(
+pub fn lock_state_read(
     db: &Mutex<TrackedConnection>,
 ) -> LockResult<MutexGuard<'_, TrackedConnection>> {
     let Some(directory) = directory() else {

@@ -8,7 +8,7 @@ use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
-pub(crate) struct Scope {
+pub struct Scope {
     route: Weak<dyn Any + Send + Sync>,
     session: String,
     tool: String,
@@ -26,14 +26,14 @@ pub(crate) struct Scope {
 }
 
 impl Scope {
-    pub(crate) fn session(&self) -> &str {
+    pub fn session(&self) -> &str {
         &self.session
     }
-    pub(crate) fn for_tool(mut self, tool: &str, arguments: &serde_json::Value) -> Self {
+    pub fn for_tool(mut self, tool: &str, arguments: &serde_json::Value) -> Self {
         self.tool = tool_family(tool, arguments);
         self
     }
-    pub(crate) fn new<T: Any + Send + Sync>(route: &Arc<T>, session: &str) -> Self {
+    pub fn new<T: Any + Send + Sync>(route: &Arc<T>, session: &str) -> Self {
         let route: Arc<dyn Any + Send + Sync> = route.clone();
         Self {
             route: Arc::downgrade(&route),
@@ -54,7 +54,7 @@ impl Scope {
             .any(|expired| expired.operation == grant.operation && expired.path == grant.path)
     }
 
-    pub(crate) fn retry_refusal_reason(
+    pub fn retry_refusal_reason(
         &self,
         grant: &AccessGrant,
         claimed_any: bool,
@@ -78,7 +78,7 @@ impl Scope {
         }
     }
 
-    pub(crate) fn log_retry_refusal(&self, operation: AccessOperation, path: &Path, reason: &str) {
+    pub fn log_retry_refusal(&self, operation: AccessOperation, path: &Path, reason: &str) {
         if !self.presented_outside_token {
             return;
         }
@@ -144,7 +144,7 @@ fn retained(token: &Issued, now: Instant) -> bool {
 /// continuations. Past this, the host must ask the user again.
 pub(crate) const MAX_CHAIN: Duration = Duration::from_secs(30 * 60);
 
-pub(crate) fn issue(scope: &Scope, grant: &AccessGrant) -> String {
+pub fn issue(scope: &Scope, grant: &AccessGrant) -> String {
     issue_until(scope, grant, Instant::now() + TTL, None)
 }
 
@@ -184,7 +184,7 @@ fn issue_until(
 /// tokens, which bounds any continuation issued for this dispatch. An
 /// expired token authorizes nothing; it is consumed and its capability is
 /// remembered on the scope so the next ask for it can say it expired.
-pub(crate) fn claim(scope: &mut Scope, ids: &[String]) -> Vec<AccessGrant> {
+pub fn claim(scope: &mut Scope, ids: &[String]) -> Vec<AccessGrant> {
     let mut tokens = TOKENS.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
     tokens.retain(|_, token| retained(token, now));
@@ -242,7 +242,7 @@ fn continuation_at(scope: &Scope, grants: &[AccessGrant], now: Instant) -> Vec<S
 
 /// Make an issued token expire now, to test what a late approval does.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn expire_for_test(id: &str) {
+pub fn expire_for_test(id: &str) {
     if let Some(token) = TOKENS.lock().unwrap().get_mut(id) {
         token.expires = Instant::now() - Duration::from_secs(1);
     }

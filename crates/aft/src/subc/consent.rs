@@ -716,7 +716,12 @@ pub(super) fn requested_ask(response: &Response) -> Option<AccessGrant> {
     serde_json::from_value(response.data.get("ask")?.clone()).ok()
 }
 
-impl Permission {
+trait PermissionDisplay {
+    fn path(&self) -> &Path;
+    fn operation(&self) -> &'static str;
+}
+
+impl PermissionDisplay for Permission {
     fn path(&self) -> &Path {
         match self {
             Self::File(grant) => &grant.path,

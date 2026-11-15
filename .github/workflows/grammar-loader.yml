@@ -38,8 +38,8 @@ jobs:
           if cmake --version; then exit 1; fi
           rm -f "$AFT_NO_CMAKE_MARKER"
           cargo check --locked -p agent-file-tools
-          cargo test --locked -p agent-file-tools -p aft-base --features test-hooks --lib -- grammar_disabled_
-          cargo test --locked -p agent-file-tools -p aft-base --features test-hooks --lib -- data_layer::content::tests::grammar_unavailable_survives_the_content_record_boundary --exact
+          cargo test --locked -p agent-file-tools -p aft-base -p aft-db --features test-hooks --lib -- grammar_disabled_
+          cargo test --locked -p agent-file-tools -p aft-base -p aft-db --features test-hooks --lib -- data_layer::content::tests::grammar_unavailable_survives_the_content_record_boundary --exact
           test ! -e "$AFT_NO_CMAKE_MARKER"
           cargo tree --locked -p agent-file-tools -e features > default-features.txt
           python3 - <<'PY'
@@ -105,7 +105,7 @@ jobs:
 
       - name: Loader state and compile tests
         run: |
-          cargo test --features wasm-grammars --locked -p agent-file-tools -p aft-base --features test-hooks --lib -- grammar_
+          cargo test --features wasm-grammars --locked -p agent-file-tools -p aft-base -p aft-db --features test-hooks --lib -- grammar_
       - name: Process restart and concurrent publication
         run: cargo test --features wasm-grammars --locked -p agent-file-tools --features test-hooks --test integration -- grammar_loader
       # The no-Luau parity half needs a second, feature-less debug build of the

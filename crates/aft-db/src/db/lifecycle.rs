@@ -280,6 +280,7 @@ fn register_close(store: SqliteStore) {
 /// connections concurrently, so a test cannot assert a delta against it. This
 /// mirror only ever sees the calling thread's own opens and closes.
 #[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
 pub mod thread_counts {
     use super::SqliteStore;
     use std::cell::RefCell;
@@ -297,11 +298,11 @@ pub mod thread_counts {
         }
     }
 
-    pub(crate) fn total_opens_on_this_thread(store: SqliteStore) -> u64 {
+    pub fn total_opens_on_this_thread(store: SqliteStore) -> u64 {
         OPENS.with(|counts| counts.borrow().get(&store).copied().unwrap_or(0))
     }
 
-    pub(crate) fn open_on_this_thread(store: SqliteStore) -> i64 {
+    pub fn open_on_this_thread(store: SqliteStore) -> i64 {
         COUNTS.with(|counts| counts.borrow().get(&store).copied().unwrap_or(0))
     }
 }
@@ -355,7 +356,7 @@ impl CheckpointStats {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn snapshot(&self) -> (u64, std::time::Duration) {
+    pub fn snapshot(&self) -> (u64, std::time::Duration) {
         (
             self.attempts.load(Ordering::Relaxed),
             std::time::Duration::from_nanos(self.mutex_hold_ns.load(Ordering::Relaxed)),

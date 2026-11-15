@@ -55,13 +55,13 @@ pub struct TerminalRowsPrune {
 #[derive(Debug, Clone)]
 pub struct TerminalPruneCandidate {
     pub(crate) harness: String,
-    pub(crate) session_id: String,
-    pub(crate) task_id: String,
+    pub session_id: String,
+    pub task_id: String,
     pub(crate) pid: Option<i64>,
     pub(crate) pgid: Option<i64>,
     pub(crate) started_at: i64,
-    pub(crate) stdout_path: Option<String>,
-    pub(crate) stderr_path: Option<String>,
+    pub stdout_path: Option<String>,
+    pub stderr_path: Option<String>,
 }
 
 /// Shell facts checked outside the database lock before deleting terminal rows.

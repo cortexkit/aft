@@ -85,7 +85,7 @@ impl Request {
 /// Attach once, after putting the connection behind its resident owning lock.
 /// The callback retains only a weak reference, so queued work cannot keep an
 /// evicted store (or its connection) alive.
-pub(crate) fn register(pool: &Arc<Mutex<TrackedConnection>>) {
+pub fn register(pool: &Arc<Mutex<TrackedConnection>>) {
     let weak = Arc::downgrade(pool);
     let conn = pool
         .lock()
@@ -113,7 +113,7 @@ pub(crate) fn register(pool: &Arc<Mutex<TrackedConnection>>) {
 
 /// Shared aft.db must remain available while its pages are copied and synced.
 /// Keep its lifetime, but never take its mutex on the checkpoint worker.
-pub(crate) fn register_shared(pool: &Arc<Mutex<TrackedConnection>>) {
+pub fn register_shared(pool: &Arc<Mutex<TrackedConnection>>) {
     let weak = Arc::downgrade(pool);
     let conn = pool
         .lock()
@@ -290,7 +290,8 @@ mod tests {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) mod test_hooks {
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
+pub mod test_hooks {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};

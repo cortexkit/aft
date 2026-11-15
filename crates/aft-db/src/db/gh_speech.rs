@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS gh_speech_initialization (
 INSERT OR IGNORE INTO gh_speech_initialization(singleton,initialized) VALUES(1,0);
 "#;
 
-pub(crate) fn connect(path: &Path) -> rusqlite::Result<TrackedConnection> {
+pub fn connect(path: &Path) -> rusqlite::Result<TrackedConnection> {
     let conn = TrackedConnection::open_path_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
@@ -89,11 +89,11 @@ pub(crate) fn connect(path: &Path) -> rusqlite::Result<TrackedConnection> {
     Ok(conn)
 }
 
-pub(crate) fn schema_version(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
+pub fn schema_version(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
     super::current_schema_version(conn)
 }
 
-pub(crate) struct AuthorityRow {
+pub struct AuthorityRow {
     pub(crate) record_json: String,
     pub(crate) record_digest: Vec<u8>,
     pub(crate) ticket_digest: Option<Vec<u8>>,
@@ -105,7 +105,7 @@ pub(crate) struct AuthorityRow {
     pub(crate) task_id: String,
 }
 
-pub(crate) fn load(
+pub fn load(
     conn: &rusqlite::Connection,
     incarnation: &str,
 ) -> rusqlite::Result<Option<AuthorityRow>> {
@@ -121,7 +121,7 @@ pub(crate) fn load(
     ).optional()
 }
 
-pub(crate) fn capture(
+pub fn capture(
     conn: &rusqlite::Connection,
     incarnation: &str,
     row: &AuthorityRow,
@@ -134,7 +134,7 @@ pub(crate) fn capture(
     Ok(())
 }
 
-pub(crate) struct ScopeEndRow {
+pub struct ScopeEndRow {
     pub(crate) owner: String,
     pub(crate) scope_ref: String,
     pub(crate) epoch: String,
@@ -142,7 +142,7 @@ pub(crate) struct ScopeEndRow {
     pub(crate) recorded_at_ms: i64,
 }
 
-pub(crate) fn record_end(conn: &rusqlite::Connection, row: &ScopeEndRow) -> rusqlite::Result<()> {
+pub fn record_end(conn: &rusqlite::Connection, row: &ScopeEndRow) -> rusqlite::Result<()> {
     conn.execute("INSERT OR IGNORE INTO gh_speech_scope_ends(owner,scope_ref,epoch,evidence_json,recorded_at_ms) VALUES(?1,?2,?3,?4,?5)",
         params![row.owner,row.scope_ref,row.epoch,row.evidence_json,row.recorded_at_ms])?;
     Ok(())

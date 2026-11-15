@@ -108,6 +108,7 @@ pub fn initialize(conn: &Connection) {
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
 pub mod tests {
     use super::*;
 
