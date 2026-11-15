@@ -82,6 +82,11 @@ pub trait OutputSink {
     fn undelivered(&mut self, before_seq: u64) -> io::Result<()> {
         self.truncated(before_seq)
     }
+    /// Returned-file records in this range could not be recovered. Discard the
+    /// entire return rather than placing files from an incomplete stream.
+    fn return_gap(&mut self, _from_seq: u64, _before_seq: u64) -> io::Result<()> {
+        Ok(())
+    }
     /// A future stream record or output descriptor is not attributed to stdout
     /// or stderr. Checkpoint its sequence and raw bytes together, without
     /// attributing an unknown descriptor's bytes to either known stream.
@@ -103,11 +108,8 @@ pub trait OutputSink {
     ) -> io::Result<()> {
         self.unknown_output(manifest.seq, &[])
     }
-    /// Seqs from the last committed one up to `before_seq` never arrived, and
-    /// directly precede an expired replay's manifest whose runner sent no
-    /// chunk counts. AFT derived the count it expected and it did not match,
-    /// so these may be expired file chunks sized differently, or lost output:
-    /// AFT cannot tell which.
+    /// Report missing seqs whose relationship to expired returned files could
+    /// not be established, without claiming that only output was missing.
     fn expired_gap_unverified(&mut self, before_seq: u64) -> io::Result<()> {
         self.undelivered(before_seq)
     }
@@ -124,6 +126,7 @@ pub struct StreamConsumer {
     pending_bytes: usize,
     terminal: Option<Verdict>,
     recovering_gap: bool,
+    logged_gap: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -132,6 +135,9 @@ enum Pending {
     Started(Started),
     ReturnChunk(ReturnChunk),
     ReturnManifest(ReturnManifest),
+    // A payload evicted at the byte cap, not a committed record. Replay must
+    // replace it before the contiguous cursor can advance over it.
+    DroppedReturnChunk([u8; 32]),
     Unknown,
 }
 
@@ -148,10 +154,20 @@ impl Pending {
             Self::ReturnChunk(chunk) => chunk.data().len(),
             Self::Started(started) => json_bytes(started).saturating_mul(8),
             Self::ReturnManifest(manifest) => json_bytes(manifest).saturating_mul(8),
-            Self::Unknown => 0,
+            Self::Unknown | Self::DroppedReturnChunk(_) => 0,
         };
         payload.saturating_add(std::mem::size_of::<Self>() + 128)
     }
+}
+
+fn chunk_fingerprint(chunk: &ReturnChunk) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::new()
+        .chain_update(chunk.path_index.to_le_bytes())
+        .chain_update(chunk.offset.to_le_bytes())
+        .chain_update(chunk.data())
+        .finalize()
+        .into()
 }
 
 fn json_bytes(value: &impl serde::Serialize) -> usize {
@@ -238,6 +254,18 @@ impl StreamConsumer {
         let value: serde_json::Value =
             serde_json::from_slice(bytes).map_err(|e| Error::Protocol(e.to_string()))?;
         let seq = value.get("seq").and_then(serde_json::Value::as_u64);
+        if !self.logged_gap {
+            if let (Some(seq), Ok(expected)) = (seq, self.next_seq()) {
+                if seq > expected {
+                    let record_type = value.get("type").and_then(serde_json::Value::as_str);
+                    crate::slog_warn!(
+                        "runon: remote stream sequence gap job_id={:?} first_missing_seq={expected} record_seq={seq} record_type={record_type:?}",
+                        self.known_job_id(),
+                    );
+                    self.logged_gap = true;
+                }
+            }
+        }
         let record: StreamRecord =
             serde_json::from_value(value).map_err(|e| Error::Protocol(e.to_string()))?;
         let progress = matches!(record, StreamRecord::Progress(_));
@@ -255,6 +283,7 @@ impl StreamConsumer {
     }
 
     /// First-seen wins for duplicate seqs, including conflicting duplicates.
+    /// An evicted return payload can only be restored by an identical chunk.
     /// Out-of-order records wait until every preceding job-wide seq is present;
     /// each stream's bytes therefore retain seq order. Already committed seqs
     /// are ignored, also after restart. Bytes are never decoded chunk by chunk.
@@ -412,25 +441,11 @@ impl StreamConsumer {
     /// it. When a manifest still returns bytes, the missing seqs held those
     /// bytes, so the ordinary gap recovery re-attaches to fetch them.
     ///
-    /// The chunks are the seqs after the job's last output record and before
-    /// the manifest. Counting from that record rather than from the next
-    /// expected seq handles chunks received before a reconnect, and a lost
-    /// final output record shows up as one seq too many. When the manifest's
-    /// entries carry `chunks`, the contract's
-    /// `ReturnAssembler::finish_expired_replay` checks that count. When they
-    /// do not, as from ck-motor's runner today, AFT derives it: ck-motor sends
-    /// a file of size S as ceil(S / `RETURN_CHUNK_MAX_BYTES`) chunks, every
-    /// one full but the last, gives the chunks consecutive seqs after output
-    /// has ended and the manifest the next one, and in an expired replay keeps
-    /// the manifest's seq and turns returned entries into `expired` with their
-    /// original size; entries that had already failed never had chunks. The
-    /// contract itself allows smaller chunks, so a derived count that does not
-    /// match cannot tell lost output from differently sized chunks: after the
-    /// ordinary recovery fails to fill it, that gap is reported under its own
-    /// reason (`OutputSink::expired_gap_unverified`), not as lost output. A
-    /// mismatch when the entries carry counts stays lost output, as the
-    /// contract decides. Any gap that does not match goes to the ordinary gap
-    /// recovery first, as does one with a record received inside it.
+    /// The contract verifies explicit per-file chunk counts against the seqs
+    /// after the last output and before the manifest. Counting from the last
+    /// output handles chunks committed before reconnecting without concealing
+    /// a lost final output record. Missing counts are never guessed from file
+    /// sizes; any unverified gap goes through bounded recovery instead.
     /// Returns whether the gap was skipped.
     fn skip_expired_return_chunks(&mut self, manifest: &ReturnManifest) -> Result<bool, Error> {
         let next = self.next_seq()?;
@@ -484,7 +499,13 @@ impl StreamConsumer {
         if seq < self.next_seq()? {
             return Ok(());
         }
-        if !self.pending.contains_key(&seq) {
+        let restore = match (self.pending.get(&seq), &record) {
+            (Some(Pending::DroppedReturnChunk(fingerprint)), Pending::ReturnChunk(chunk)) => {
+                *fingerprint == chunk_fingerprint(chunk)
+            }
+            _ => false,
+        };
+        if !self.pending.contains_key(&seq) || restore {
             self.insert_pending(seq, record)?;
         }
         self.drain(sink)
@@ -496,10 +517,31 @@ impl StreamConsumer {
 
     fn insert_pending(&mut self, seq: u64, record: Pending) -> Result<(), Error> {
         let previous = self.pending.get(&seq).map_or(0, Pending::buffer_bytes);
-        let bytes = self
+        let mut bytes = self
             .pending_bytes
             .saturating_sub(previous)
             .saturating_add(record.buffer_bytes());
+        if bytes > MAX_PENDING_BYTES {
+            if self
+                .pending
+                .values()
+                .any(|pending| matches!(pending, Pending::ReturnChunk(_)))
+            {
+                // Keep reading to terminal proof even when a large file return
+                // follows a hole. Evicted payloads remain holes themselves:
+                // only a later replay or bounded loss recovery may pass them.
+                for pending in self.pending.values_mut() {
+                    if let Pending::ReturnChunk(chunk) = pending {
+                        *pending = Pending::DroppedReturnChunk(chunk_fingerprint(chunk));
+                    }
+                }
+                self.recount_pending();
+                bytes = self
+                    .pending_bytes
+                    .saturating_sub(self.pending.get(&seq).map_or(0, Pending::buffer_bytes))
+                    .saturating_add(record.buffer_bytes());
+            }
+        }
         if bytes > MAX_PENDING_BYTES {
             // Use the existing gap-recovery path, which closes this stream and
             // reattaches from the committed cursor without installing any file.
@@ -532,6 +574,7 @@ impl StreamConsumer {
                 }
                 Pending::Unknown => sink.unknown_output(next, &[])?,
                 Pending::Started(started) => sink.started(started)?,
+                Pending::DroppedReturnChunk(_) => break,
             }
             let output = matches!(record, Pending::Output(_) | Pending::Started(_));
             self.pending_bytes -= record.buffer_bytes();
@@ -562,17 +605,57 @@ impl StreamConsumer {
 
     fn lose_pending<S: OutputSink>(&mut self, sink: &mut S) -> Result<(), Error> {
         self.drain(sink)?;
+        let return_start = self.counted_return_start();
         while let Some((&before, record)) = self.pending.first_key_value() {
-            match record {
-                Pending::ReturnManifest(manifest) if uncounted_expired_replay(manifest) => {
-                    sink.expired_gap_unverified(before)?
+            let next = self.next_seq()?;
+            if next < before {
+                // Any unrecovered record invalidates the all-or-nothing file
+                // return, even if its missing bytes might have been output.
+                sink.return_gap(next, before)?;
+            }
+            if matches!(record, Pending::DroppedReturnChunk(_)) {
+                let end = before
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Protocol("sequence exhausted".into()))?;
+                sink.return_gap(before, end)?;
+                if next < before && !return_start.is_some_and(|start| next >= start) {
+                    sink.undelivered(before)?;
                 }
-                _ => sink.undelivered(before)?,
+                sink.unknown_output(before, &[])?;
+                self.point.as_mut().unwrap().last_seq = Some(before);
+                self.pending.remove(&before);
+                self.recount_pending();
+                self.drain(sink)?;
+                continue;
+            }
+            if !return_start.is_some_and(|start| next >= start) {
+                sink.undelivered(before)?;
             }
             self.point.as_mut().unwrap().last_seq = before.checked_sub(1);
             self.drain(sink)?;
         }
         Ok(())
+    }
+
+    /// Explicit chunk counts prove that the region after the last output and
+    /// before the manifest contains only returned files, not missing output.
+    /// Without those counts a hole remains output loss, even beside chunks.
+    fn counted_return_start(&self) -> Option<u64> {
+        let start = self.point.as_ref()?.last_output_seq?.checked_add(1)?;
+        for (&seq, record) in &self.pending {
+            match record {
+                Pending::ReturnChunk(_) | Pending::DroppedReturnChunk(_) => {}
+                Pending::ReturnManifest(manifest) => {
+                    let count = manifest
+                        .files
+                        .iter()
+                        .try_fold(0u64, |n, file| n.checked_add(u64::from(file.chunks?)))?;
+                    return (seq.checked_sub(start)? == count).then_some(start);
+                }
+                _ => return None,
+            }
+        }
+        None
     }
 
     #[cfg(unix)]
@@ -620,28 +703,15 @@ fn has_expired_entry(manifest: &ReturnManifest) -> bool {
     })
 }
 
-/// An expired replay whose entries carry no chunk counts, so AFT has to
-/// derive the count it expects.
-fn uncounted_expired_replay(manifest: &ReturnManifest) -> bool {
-    has_expired_entry(manifest) && manifest.files.iter().all(|entry| entry.chunks.is_none())
-}
-
 /// Whether the seqs between `last_output_seq` and the expired replay's
 /// manifest are exactly the chunks the runner no longer sends.
 ///
-/// When the entries carry `chunks`, the contract's own check decides
-/// (`ReturnAssembler::finish_expired_replay`). When they carry none, as from
-/// ck-motor's runner today, the count is derived: T is the sum over `expired`
-/// entries of ceil(size / `RETURN_CHUNK_MAX_BYTES`), with `read_error` and
-/// unrecognised entries counting zero, and the gap must equal T.
+/// Only explicit per-file counts and the contract's own check may establish
+/// this exception to contiguous delivery.
 fn expired_gap_matches(manifest: &ReturnManifest, last_output_seq: u64) -> bool {
     use super::types::ReturnAssembler;
-    let gap = manifest
-        .seq
-        .checked_sub(last_output_seq)
-        .and_then(|d| d.checked_sub(1));
-    if uncounted_expired_replay(manifest) {
-        return gap == Some(derived_expired_chunk_count(manifest));
+    if manifest.files.iter().any(|entry| entry.chunks.is_none()) {
+        return false;
     }
     // A fresh assembler: the check concerns the replayed seqs, not chunks
     // received before a reconnect.
@@ -653,23 +723,4 @@ fn expired_gap_matches(manifest: &ReturnManifest, last_output_seq: u64) -> bool 
     ReturnAssembler::new(&paths, manifest.cap_bytes)
         .finish_expired_replay(manifest, last_output_seq)
         .is_ok()
-}
-
-/// The chunks an expired replay dropped, derived from sizes for a runner that
-/// sends no counts: ceil(size / `RETURN_CHUNK_MAX_BYTES`) for each `expired`
-/// entry, which keeps its original size. Other failed entries, `read_error`
-/// and causes this version does not know included, count zero.
-fn derived_expired_chunk_count(manifest: &ReturnManifest) -> u64 {
-    use super::types::{ReturnManifestOutcome, ReturnPathsFailureCause, RETURN_CHUNK_MAX_BYTES};
-    manifest
-        .files
-        .iter()
-        .filter_map(|entry| match &entry.outcome {
-            ReturnManifestOutcome::Failed {
-                cause: ReturnPathsFailureCause::Expired,
-                size,
-            } => Some(size.unwrap_or(0).div_ceil(RETURN_CHUNK_MAX_BYTES as u64)),
-            _ => None,
-        })
-        .fold(0, u64::saturating_add)
 }

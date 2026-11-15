@@ -8,6 +8,7 @@ SUBC_CORE_WIRE_VERSION="2"
 SUBC_REPO="cortexkit/subconscious"
 BIN_NAME="ck-subc"
 CACHE_DIR="$HOME/.cache/aft-ci/subc-core/$SUBC_CORE_TAG"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 fail() {
   echo "$*" >&2
@@ -128,7 +129,12 @@ case "${1:-}" in
   --self-test) self_test; exit 0 ;;
 esac
 
-TARGET="$(resolve_target)"
+if [[ "${1:-}" == "--stage-linux" ]]; then
+  TARGET="linux-x64"
+  CACHE_DIR="$CACHE_DIR/runon-linux-x64"
+else
+  TARGET="$(resolve_target)"
+fi
 case "$TARGET" in
   darwin-arm64)
     EXPECTED_SHA256="03da4455a8653356ee58b06abdafd713d47cfcd89aa42cbc1e5077269bbb193e"
@@ -143,14 +149,37 @@ SIDECAR_NAME="$TARBALL_NAME.sha256"
 CACHED_TARBALL="$CACHE_DIR/$TARBALL_NAME"
 CACHED_SIDECAR="$CACHE_DIR/$SIDECAR_NAME"
 CACHED_BINARY="$CACHE_DIR/$BIN_NAME"
+CI_DIR="$REPO_ROOT/.aft-ci/subc-core/$SUBC_CORE_TAG"
+
+finish() {
+  if [[ "${1:-}" == "--stage-linux" ]]; then
+    mkdir -p "$CI_DIR"
+    cp "$CACHED_TARBALL" "$CI_DIR/$TARBALL_NAME"
+    cp "$CACHED_SIDECAR" "$CI_DIR/$SIDECAR_NAME"
+    printf '%s\n' "$CI_DIR is untracked on purpose; do not commit it or add it to .gitignore"
+  else
+    printf '%s\n' "$CACHED_BINARY"
+  fi
+}
+
+if [[ "${1:-}" != "--stage-linux" ]] && [[ -e "$CI_DIR/$TARBALL_NAME" || -e "$CI_DIR/$SIDECAR_NAME" ]]; then
+  [[ -f "$CI_DIR/$TARBALL_NAME" && -f "$CI_DIR/$SIDECAR_NAME" ]] || fail "Incomplete staged subc-core archive in $CI_DIR"
+  verify_or_fail "$CI_DIR/$TARBALL_NAME" "$CI_DIR/$SIDECAR_NAME"
+  [[ "$(read_expected_sha "$CI_DIR/$SIDECAR_NAME")" == "$EXPECTED_SHA256" ]] || fail "Staged subc-core checksum does not match pinned SHA-256: $CI_DIR/$SIDECAR_NAME"
+  extract_cached_binary "$CI_DIR/$TARBALL_NAME" "$CACHE_DIR"
+  cp "$CI_DIR/$TARBALL_NAME" "$CACHED_TARBALL"
+  cp "$CI_DIR/$SIDECAR_NAME" "$CACHED_SIDECAR"
+  finish "$@"
+  exit 0
+fi
 
 if [[ -f "$CACHED_TARBALL" && -f "$CACHED_SIDECAR" ]] && sidecar_matches "$CACHED_TARBALL" "$CACHED_SIDECAR"; then
   if [[ -x "$CACHED_BINARY" ]]; then
-    printf '%s\n' "$CACHED_BINARY"
+    finish "$@"
     exit 0
   fi
   extract_cached_binary "$CACHED_TARBALL" "$CACHE_DIR"
-  printf '%s\n' "$CACHED_BINARY"
+  finish "$@"
   exit 0
 fi
 
@@ -191,4 +220,4 @@ cp "$stage_dir/$SIDECAR_NAME" "$CACHED_SIDECAR"
 cp "$stage_dir/$BIN_NAME" "$CACHED_BINARY"
 chmod +x "$CACHED_BINARY"
 
-printf '%s\n' "$CACHED_BINARY"
+finish "$@"

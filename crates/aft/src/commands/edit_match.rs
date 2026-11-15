@@ -416,6 +416,9 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         "syntax_valid": syntax_valid,
         "formatted": formatted,
     });
+    if crate::parser::detect_language(path.as_path()) == Some(crate::parser::LangId::Markdown) {
+        result.as_object_mut().unwrap().remove("syntax_valid");
+    }
     if !warnings.is_empty() {
         result["warnings"] = serde_json::json!(warnings);
     }
@@ -454,6 +457,7 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
     // `lsp_exited_servers` shape as `write` and `edit_match` find/replace.
     if lsp_outcome.is_some() {
         let write_result = edit::WriteResult {
+            markdown_table_advisory: None,
             syntax_valid,
             syntax_skipped_reason,
             syntax_error_line,
@@ -481,6 +485,9 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
     }
 
     if let Some(content) = final_content.as_deref() {
+        if let Some(advisory) = edit::markdown_table_advisory(path.as_path(), content) {
+            result["markdown_table_advisory"] = serde_json::json!(advisory);
+        }
         edit::attach_edit_diff(&mut result, &req.params, file, &before_content, content);
     }
     Response::success(&req.id, result)
@@ -1053,9 +1060,12 @@ fn handle_glob_edit_match_inner(
             syntax_failures.push(file_str.clone());
         }
 
-        if let Ok(final_content) = std::fs::read_to_string(&edit.path) {
+        let markdown_advisory = if let Ok(final_content) = std::fs::read_to_string(&edit.path) {
             ctx.lsp_notify_file_changed(&edit.path, &final_content);
-        }
+            edit::markdown_table_advisory(&edit.path, &final_content)
+        } else {
+            None
+        };
 
         let mut file_result = serde_json::json!({
             "file": file_str,
@@ -1063,6 +1073,12 @@ fn handle_glob_edit_match_inner(
             "formatted": formatted,
             "syntax_valid": syntax_valid,
         });
+        if crate::parser::detect_language(&edit.path) == Some(crate::parser::LangId::Markdown) {
+            file_result.as_object_mut().unwrap().remove("syntax_valid");
+        }
+        if let Some(advisory) = markdown_advisory {
+            file_result["markdown_table_advisory"] = serde_json::json!(advisory);
+        }
         if let Some(reason) = format_skipped_reason {
             file_result["format_skipped_reason"] = serde_json::json!(reason);
         }

@@ -93,6 +93,129 @@ fn write_new_valid_file_has_no_syntax_line() {
     assert!(aft.shutdown().success());
 }
 
+#[test]
+fn markdown_write_and_edit_report_only_specific_table_pipe_hints() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut aft = configured(dir.path());
+    let notice = "Markdown table at line 3: an unescaped `|` inside a cell splits it";
+    for (index, content, expected) in [
+        (0, "| a | b |\n|---|---|\n| x | `x || y` |\n", Some(notice)),
+        (1, "| a | b |\n|---|---|\n| x | `x | y` |\n", Some(notice)),
+        (2, "| a | b |\n|---|---|\n| x | `x \\|\\| y` |\n", None),
+        (3, "Outside a table: `x | y`\n", None),
+        (4, "| a | b |\n|---|---|\n| x | x || y |\n", None),
+        (
+            5,
+            "```markdown\n| a | b |\n|---|---|\n| x | `x | y` |\n```\n",
+            None,
+        ),
+        (
+            6,
+            "| a | b |\n|---|---|\n| x | ``x ` | y`` |\n",
+            Some(notice),
+        ),
+        (7, "| a | b |\n|---|---|\n| x | `x | y |\n", None),
+    ] {
+        let path = format!("case-{index}.md");
+        let write = tool_call(
+            &mut aft,
+            "markdown-write",
+            "write",
+            json!({"path":path, "content":content}),
+        );
+        assert!(write.get("syntax_valid").is_none(), "{write:?}");
+        assert!(write.get("syntax_error_line").is_none(), "{write:?}");
+        assert!(!text(&write).contains("Syntax check"), "{write:?}");
+        assert_eq!(
+            write.get("markdown_table_advisory").and_then(Value::as_str),
+            expected,
+            "{write:?}"
+        );
+        if let Some(expected) = expected {
+            assert_eq!(text(&write), format!("Created new file.\n\n{expected}"));
+        } else {
+            assert_eq!(text(&write), "Created new file.");
+        }
+
+        let append = tool_call(
+            &mut aft,
+            "markdown-append",
+            "edit",
+            json!({"path":format!("append-{index}.md"), "appendContent":content}),
+        );
+        assert!(append.get("syntax_valid").is_none(), "{append:?}");
+        assert_eq!(
+            append
+                .get("markdown_table_advisory")
+                .and_then(Value::as_str),
+            expected,
+            "{append:?}"
+        );
+        assert!(!text(&append).contains("Syntax check"), "{append:?}");
+        if let Some(expected) = expected {
+            assert!(text(&append).ends_with(expected), "{append:?}");
+        }
+    }
+
+    let clean = "| a | b |\n|---|---|\n| x | `x \\|\\| y` |\n";
+    for extension in ["md", "markdown", "mdx", "qmd", "Qmd", "rmd", "Rmd"] {
+        let path = format!("existing.{extension}");
+        fs::write(dir.path().join(&path), clean).unwrap();
+        let edit = tool_call(
+            &mut aft,
+            "markdown-replace",
+            "edit",
+            json!({
+                "path":path, "edits":[{"oldString":"\\|\\|", "newString":"||"}]
+            }),
+        );
+        assert_eq!(edit["rolled_back"], false, "{edit:?}");
+        assert!(edit.get("syntax_valid").is_none(), "{edit:?}");
+        assert_eq!(edit["markdown_table_advisory"], notice, "{edit:?}");
+        assert!(text(&edit).ends_with(notice), "{edit:?}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join(path)).unwrap(),
+            clean.replace("\\|\\|", "||")
+        );
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn markdown_policy_keeps_json_yaml_and_toml_syntax_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut aft = configured(dir.path());
+    for (extension, valid, broken) in [
+        ("json", "{\"value\": 1}\n", "{\"value\": [\n"),
+        ("yaml", "value: 1\n", "value: [\n"),
+        ("toml", "value = 1\n", "value = [\n"),
+    ] {
+        let new = tool_call(
+            &mut aft,
+            "structured-new",
+            "write",
+            json!({"path":format!("new.{extension}"), "content":broken}),
+        );
+        assert_eq!(new["syntax_valid"], false, "{new:?}");
+        assert!(
+            text(&new).contains("Syntax check: the new file does not parse"),
+            "{new:?}"
+        );
+        let path = format!("existing.{extension}");
+        fs::write(dir.path().join(&path), valid).unwrap();
+        let write = tool_call(
+            &mut aft,
+            "structured-existing",
+            "write",
+            json!({"path":path, "content":broken}),
+        );
+        assert_eq!(write["syntax_valid"], false, "{write:?}");
+        assert_eq!(write["rolled_back"], true, "{write:?}");
+        assert_eq!(fs::read_to_string(dir.path().join(path)).unwrap(), valid);
+    }
+    assert!(aft.shutdown().success());
+}
+
 /// A real script that `bash -n` accepts but tree-sitter-bash rejects, for its
 /// escaped `[ ... \< ... ]` comparison on line 19.
 #[cfg(unix)]

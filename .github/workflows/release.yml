@@ -450,6 +450,19 @@ jobs:
 
       # Use gnu target (not musl) so dlopen works for ONNX Runtime loading.
       # musl produces static binaries where dlopen is a stub that always fails.
+      # The fat-LTO link of the binary with the Wasm grammar runtime outgrows
+      # the hosted runner's 16 GB: rustc was SIGKILLed twice on 15 Nov 2026
+      # (first build with wasm-grammars), while x64 passed. Swap lets the link
+      # finish without changing the release profile or the shipped binary.
+      - name: Add swap for the LTO link
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 24G /mnt/aft-lto-swap
+          sudo chmod 600 /mnt/aft-lto-swap
+          sudo mkswap /mnt/aft-lto-swap
+          sudo swapon /mnt/aft-lto-swap
+          free -h
+
       - name: Build
         # Keep line tables only until objcopy detaches them below; shipped code
         # and optimization settings are unchanged.

@@ -340,6 +340,8 @@ fn stores() -> &'static Mutex<Vec<std::sync::Weak<OutputFiles>>> {
 pub(crate) struct CleanupReport {
     pub session_entries: usize,
     pub file_entries: usize,
+    pub read_dirs: usize,
+    pub remove_dirs: usize,
     pub removed: usize,
     pub errors: usize,
     pub steps: usize,
@@ -348,7 +350,13 @@ pub(crate) struct CleanupReport {
 
 struct CleanupCursor {
     sessions: ReadDir,
-    files: Option<(PathBuf, ReadDir)>,
+    files: Option<CleanupSession>,
+}
+
+struct CleanupSession {
+    path: PathBuf,
+    entries: ReadDir,
+    has_remaining_entries: bool,
 }
 
 /// The task-artifact watchdog uses the same retention window as finished shell
@@ -358,8 +366,10 @@ pub(crate) fn cleanup_expired(harness: &Path, retention: std::time::Duration) ->
     let root = crate::access_policy::policy_path(&harness.join("tool-results"));
     static CURSORS: std::sync::OnceLock<Mutex<HashMap<PathBuf, CleanupCursor>>> =
         std::sync::OnceLock::new();
+    let mut report = CleanupReport::default();
     let mut cursors = CURSORS.get_or_init(Default::default).lock();
     if !cursors.contains_key(&root) {
+        report.read_dirs += 1;
         match std::fs::read_dir(&root) {
             Ok(sessions) => {
                 cursors.insert(
@@ -374,7 +384,7 @@ pub(crate) fn cleanup_expired(harness: &Path, retention: std::time::Duration) ->
                 let report = CleanupReport {
                     errors: usize::from(error.kind() != io::ErrorKind::NotFound),
                     complete: true,
-                    ..Default::default()
+                    ..report
                 };
                 log::debug!(
                     "tool result cleanup root={} examined={report:?}",
@@ -393,14 +403,13 @@ pub(crate) fn cleanup_expired(harness: &Path, retention: std::time::Duration) ->
             .and_then(|time| time.elapsed().ok())
             .is_some_and(|age| age >= retention)
     };
-    let mut report = CleanupReport::default();
     let mut removed = Vec::new();
     // Retain the two directory iterators across passes. A fresh iterator would
     // revisit unexpired entries forever and starve later sessions or files.
     for _ in 0..SCAN_ENTRIES {
         report.steps += 1;
-        if let Some((_, files)) = &mut cursor.files {
-            match files.next() {
+        if let Some(session) = &mut cursor.files {
+            match session.entries.next() {
                 Some(Ok(file)) => {
                     report.file_entries += 1;
                     let path = file.path();
@@ -410,18 +419,29 @@ pub(crate) fn cleanup_expired(harness: &Path, retention: std::time::Duration) ->
                                 report.removed += 1;
                                 removed.push(path);
                             }
-                            Err(_) => report.errors += 1,
+                            Err(_) => {
+                                report.errors += 1;
+                                session.has_remaining_entries = true;
+                            }
                         }
+                    } else {
+                        session.has_remaining_entries = true;
                     }
                 }
                 Some(Err(_)) => {
                     report.file_entries += 1;
                     report.errors += 1;
+                    session.has_remaining_entries = true;
                 }
                 None => {
-                    let (session, entries) = cursor.files.take().unwrap();
-                    drop(entries);
-                    let _ = std::fs::remove_dir(session);
+                    let session = cursor.files.take().unwrap();
+                    drop(session.entries);
+                    // Keep this flag with the cursor: earlier bounded passes may
+                    // have retained entries even if the final pass removed all its files.
+                    if !session.has_remaining_entries {
+                        report.remove_dirs += 1;
+                        let _ = std::fs::remove_dir(session.path);
+                    }
                 }
             }
         } else {
@@ -429,8 +449,15 @@ pub(crate) fn cleanup_expired(harness: &Path, retention: std::time::Duration) ->
                 Some(Ok(session)) => {
                     report.session_entries += 1;
                     if session.file_type().is_ok_and(|kind| kind.is_dir()) {
+                        report.read_dirs += 1;
                         match std::fs::read_dir(session.path()) {
-                            Ok(files) => cursor.files = Some((session.path(), files)),
+                            Ok(entries) => {
+                                cursor.files = Some(CleanupSession {
+                                    path: session.path(),
+                                    entries,
+                                    has_remaining_entries: false,
+                                });
+                            }
                             Err(_) => report.errors += 1,
                         }
                     }
@@ -1992,6 +2019,68 @@ mod tests {
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
             .unwrap();
+    }
+
+    #[test]
+    fn tool_output_cap_retention_removes_only_sessions_with_no_entries_left() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tool-results");
+        let retained = root.join("retained");
+        let emptied = root.join("emptied");
+        let empty = root.join("empty");
+        let unknown = root.join("unknown");
+        for dir in [&retained, &emptied, &empty, &unknown] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let current = retained.join("1-1-1.txt");
+        std::fs::write(&current, "fresh").unwrap();
+        let foreign = unknown.join("not-a-generated-name.txt");
+        std::fs::write(&foreign, "unowned").unwrap();
+        make_expired(&foreign);
+        for dir in [&retained, &emptied] {
+            let old = dir.join("1-1-2.txt");
+            std::fs::write(&old, "old").unwrap();
+            make_expired(&old);
+        }
+
+        let report = cleanup_expired(temp.path(), std::time::Duration::from_secs(3600));
+        assert!(report.complete, "{report:?}");
+        assert_eq!(report.errors, 0, "{report:?}");
+        assert_eq!(report.removed, 2, "{report:?}");
+        assert_eq!(report.remove_dirs, 2, "only empty sessions need rmdir");
+        assert!(current.exists() && foreign.exists());
+        assert!(!empty.exists() && !emptied.exists());
+        assert!(!retained.join("1-1-2.txt").exists());
+    }
+
+    #[test]
+    fn tool_output_cap_retention_remembers_remaining_entries_across_passes() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = temp.path().join("tool-results").join("session");
+        std::fs::create_dir_all(&session).unwrap();
+        for index in 0..300 {
+            std::fs::write(session.join(format!("1-1-{index}.txt")), "fresh").unwrap();
+        }
+        let first = cleanup_expired(temp.path(), std::time::Duration::from_secs(3600));
+        assert!(!first.complete, "{first:?}");
+        assert!(first.file_entries > 0, "{first:?}");
+        // The resumed pass removes all entries it sees, but files retained by
+        // the first pass still make the session nonempty.
+        for entry in std::fs::read_dir(&session).unwrap() {
+            make_expired(&entry.unwrap().path());
+        }
+        let second = cleanup_expired(temp.path(), std::time::Duration::from_secs(3600));
+        assert!(second.complete, "{second:?}");
+        assert!(second.removed > 0, "{second:?}");
+        assert_eq!(first.file_entries + second.file_entries, 300);
+        assert_eq!(second.remove_dirs, 0, "{second:?}");
+        assert!(session.exists());
+        let final_pass = cleanup_expired(temp.path(), std::time::Duration::from_secs(3600));
+        assert!(!final_pass.complete, "{final_pass:?}");
+        let final_pass = cleanup_expired(temp.path(), std::time::Duration::from_secs(3600));
+        assert!(final_pass.complete, "{final_pass:?}");
+        assert_eq!(final_pass.remove_dirs, 1, "{final_pass:?}");
+        assert!(!session.exists());
     }
 
     fn finish_cleanup(harness: &Path) -> (usize, usize, usize) {

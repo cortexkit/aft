@@ -81,6 +81,8 @@ struct EdgeMarker {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreCallersResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unresolved_callers: Option<StoreUnresolvedCallers>,
     #[serde(skip_serializing_if = "is_zero")]
     pub callback_dependencies: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -106,6 +108,24 @@ pub struct StoreCallersResult {
     pub macro_note: Option<StoreMacroNote>,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub incomplete: Option<StoreIncompleteNote>,
+}
+
+const UNRESOLVED_CALLER_SITES_LIMIT: usize = 5;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreUnresolvedCallers {
+    pub name: String,
+    pub total: usize,
+    pub sites: Vec<StoreUnresolvedCallerSite>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sites_list_envelope: Option<ListEnvelope>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreUnresolvedCallerSite {
+    pub file: String,
+    pub line: u32,
+    pub calling_function: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -791,7 +811,40 @@ pub fn callers_result(
         truncated.max(usize::from(depth_limited)),
     );
 
+    let unresolved_callers = if post_filter_count + via_count == 0 {
+        let (total, sites) = store.unresolved_call_sites_named(
+            &target.representative.name,
+            target.representative.lang,
+            include_tests,
+            UNRESOLVED_CALLER_SITES_LIMIT,
+        )?;
+        (total > 0).then(|| StoreUnresolvedCallers {
+            name: target.representative.name.clone(),
+            total,
+            sites_list_envelope: (total > sites.len()).then(|| {
+                ListEnvelope::new(
+                    sites.len(),
+                    crate::list_envelope::Total::Exact(total),
+                    Unit::Sites,
+                    vec![crate::list_envelope::Reason::Cap],
+                    &["includeTests"],
+                )
+            }),
+            sites: sites
+                .into_iter()
+                .map(|site| StoreUnresolvedCallerSite {
+                    file: site.file,
+                    line: site.line,
+                    calling_function: site.caller_symbol,
+                })
+                .collect(),
+        })
+    } else {
+        None
+    };
+
     Ok(StoreCallersResult {
+        unresolved_callers,
         callback_dependencies,
         callback_reference_label: (callback_dependencies > 0).then_some(CALLBACK_REFERENCE_LABEL),
         test_filter_note,

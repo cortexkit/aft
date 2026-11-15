@@ -26,10 +26,12 @@
 
 pub mod codec;
 mod sections;
+mod stage;
 
 pub use sections::{
     ContentReadError, ContentSectionsBuilder, ContentSegment, EncodedRecord, KNOWN, write_folded,
 };
+pub use stage::{PackedRecord, Stage, StageWriter, StagedUnit, write_staged};
 
 use codec::{Decoder, Encoder};
 

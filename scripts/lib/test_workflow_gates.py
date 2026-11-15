@@ -1963,6 +1963,25 @@ class CortexkitTrackingGateTests(unittest.TestCase):
             self.assertEqual(green.returncode, 0, green.stdout + green.stderr)
             self.assertTrue(draft.exists(), "git rm --cached must keep the working copy")
 
+    def test_check_rejects_tracked_aft_ci_staging_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._fixture(Path(tmp))
+            archive = repo / ".aft-ci/subc-core/tag/ck-subc-linux-x64.zip"
+            archive.parent.mkdir(parents=True)
+            archive.write_text("staged archive\n")
+            self.assertEqual(self._check(repo).returncode, 0)
+            self._git(repo, "add", ".aft-ci")
+
+            red = self._check(repo)
+            self.assertEqual(red.returncode, 1, red.stdout + red.stderr)
+            self.assertIn("files under .aft-ci/ are build-server staging and must never be committed: git rm --cached <path>", red.stderr)
+            self.assertIn(".aft-ci/subc-core/tag/ck-subc-linux-x64.zip", red.stderr)
+
+            self._git(repo, "rm", "--cached", "-q", ".aft-ci/subc-core/tag/ck-subc-linux-x64.zip")
+            green = self._check(repo)
+            self.assertEqual(green.returncode, 0, green.stdout + green.stderr)
+            self.assertTrue(archive.exists())
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPLOAD_RETRY = "./.github/actions/upload-artifact-retry"

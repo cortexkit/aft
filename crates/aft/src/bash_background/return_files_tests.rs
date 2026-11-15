@@ -957,16 +957,30 @@ mod through_the_stream {
         receiver: ReturnReceiver,
         reports: Vec<Vec<ReturnedPath>>,
         manifests_delivered: usize,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        lost: Vec<u64>,
+        verdicts: Vec<Verdict>,
     }
 
     impl OutputSink for ReceiverSink {
         fn accepted(&mut self, _: &Accepted) -> std::io::Result<()> {
             Ok(())
         }
-        fn output(&mut self, _: u64, _: OutputStream, _: &[u8]) -> std::io::Result<()> {
+        fn output(&mut self, _: u64, stream: OutputStream, bytes: &[u8]) -> std::io::Result<()> {
+            match stream {
+                OutputStream::Stdout => self.stdout.extend_from_slice(bytes),
+                OutputStream::Stderr => self.stderr.extend_from_slice(bytes),
+                _ => panic!("unexpected output stream"),
+            }
             Ok(())
         }
-        fn truncated(&mut self, _: u64) -> std::io::Result<()> {
+        fn truncated(&mut self, before_seq: u64) -> std::io::Result<()> {
+            self.lost.push(before_seq);
+            Ok(())
+        }
+        fn return_gap(&mut self, from_seq: u64, before_seq: u64) -> std::io::Result<()> {
+            self.receiver.missing_records(from_seq, before_seq);
             Ok(())
         }
         fn unknown_output(&mut self, _: u64, _: &[u8]) -> std::io::Result<()> {
@@ -988,7 +1002,8 @@ mod through_the_stream {
             self.reports.push(report);
             Ok(())
         }
-        fn terminal(&mut self, _: &TerminalRecord, _: &Verdict) -> std::io::Result<()> {
+        fn terminal(&mut self, _: &TerminalRecord, verdict: &Verdict) -> std::io::Result<()> {
+            self.verdicts.push(verdict.clone());
             Ok(())
         }
     }
@@ -1026,13 +1041,13 @@ mod through_the_stream {
 
     /// The same manifest after the runner stopped keeping the file.
     fn expired(seq: u64) -> StreamRecord {
+        let mut entry = ReturnManifestEntry::failed(PATH, ReturnPathsFailureCause::Expired)
+            .with_size(DATA.len() as u64);
+        entry.chunks = Some(1);
         StreamRecord::ReturnManifest(ReturnManifest::new(
             job_id(),
             seq,
-            vec![
-                ReturnManifestEntry::failed(PATH, ReturnPathsFailureCause::Expired)
-                    .with_size(DATA.len() as u64),
-            ],
+            vec![entry],
             0,
             RETURN_CHUNKED_MAX_BYTES_CAP,
         ))
@@ -1046,6 +1061,207 @@ mod through_the_stream {
             0,
             0,
         ))
+    }
+
+    /// Captured replay shape: 816 output records, a nine-chunk hole, 47
+    /// surviving chunks, a counted manifest at 873 and exit 1. Payloads and
+    /// paths are synthetic; sizes, chunk boundaries and sequence numbers are
+    /// retained so the return exceeds the consumer's pending-byte budget.
+    fn runon_gap_shape() -> (Vec<serde_json::Value>, String, String) {
+        use base64::Engine;
+        use serde_json::json;
+        let mut records =
+            vec![json!({"type":"started", "seq":0, "queue_wait_ms":0, "started_at_ms":0})];
+        let mut stdout = Vec::new();
+        for seq in 1..=816 {
+            let bytes = format!("output {seq}\n").into_bytes();
+            stdout.extend_from_slice(&bytes);
+            records.push(
+                serde_json::to_value(StreamRecord::Output(Output::new(
+                    seq,
+                    OutputStream::Stdout,
+                    BytePayload(bytes),
+                )))
+                .unwrap(),
+            );
+        }
+        let sizes = [
+            8155, 19236, 2636, 6426, 5731178, 6355274, 439049, 39, 5738391, 6355274, 440452, 39,
+        ];
+        let names = [
+            "summary.json",
+            "added-edges.jsonl.gz",
+            "changed-records.jsonl.gz",
+            "field-changes.jsonl.gz",
+            "reference-edges.jsonl.gz",
+            "reference-sites.jsonl.gz",
+            "reference-records.jsonl.gz",
+            "reference-probe.log",
+            "candidate-edges.jsonl.gz",
+            "candidate-sites.jsonl.gz",
+            "candidate-records.jsonl.gz",
+            "candidate-probe.log",
+        ];
+        let mut files = vec![json!({"path":"result.json", "cause":"missing", "chunks":0})];
+        let mut seq = 817;
+        for (index, (size, name)) in sizes.into_iter().zip(names).enumerate() {
+            let data = vec![index as u8; size];
+            let chunks = data.chunks(RETURN_CHUNK_MAX_BYTES);
+            let count = chunks.len();
+            for (number, chunk) in chunks.enumerate() {
+                if seq >= 826 {
+                    records.push(json!({"type":"return_chunk", "job_id":job_id(), "seq":seq, "path_index":index + 1, "offset":number * RETURN_CHUNK_MAX_BYTES, "data":base64::engine::general_purpose::STANDARD.encode(chunk)}));
+                }
+                seq += 1;
+            }
+            files.push(json!({"path":format!("aft-{name}"), "size":size, "chunks":count, "sha256":format!("{:x}", sha2::Sha256::digest(&data))}));
+        }
+        for prefix in ["thalamus", "ripgrep"] {
+            files.push(
+                json!({"path":format!("{prefix}-summary.json"), "cause":"missing", "chunks":0}),
+            );
+            for name in &names[1..] {
+                files.push(
+                    json!({"path":format!("{prefix}-{name}"), "cause":"missing", "chunks":0}),
+                );
+            }
+        }
+        assert_eq!(seq, 873);
+        records.push(json!({"type":"return_manifest", "job_id":job_id(), "seq":873, "files":files, "total_bytes":25096149, "cap_bytes":134217728}));
+        records.push(json!({"type":"terminal", "job_id":job_id(), "outcome":{"type":"exit", "code":1}, "wall_ms":1747003, "queue_wait_ms":1, "bundle_bytes":229075974}));
+        (
+            records,
+            format!("{:x}", sha2::Sha256::digest(&stdout)),
+            format!("{:x}", sha2::Sha256::digest([])),
+        )
+    }
+
+    #[test]
+    fn runon_replay_missing_return_chunks_preserves_exit_and_output() {
+        // AFT_TEST_RUNON_GAP_REPLAY supplies captured records and independent
+        // output hashes in place of the synthetic fixture, without committing
+        // the large private payloads.
+        let (records, stdout_sha, stderr_sha) =
+            if let Some(path) = std::env::var_os("AFT_TEST_RUNON_GAP_REPLAY") {
+                let input: serde_json::Value =
+                    serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+                (
+                    input["records"].as_array().unwrap().clone(),
+                    input["stdout_sha256"].as_str().unwrap().to_string(),
+                    input["stderr_sha256"].as_str().unwrap().to_string(),
+                )
+            } else {
+                runon_gap_shape()
+            };
+        let manifest = records
+            .iter()
+            .find(|r| r["type"] == "return_manifest")
+            .unwrap();
+        let paths: Vec<String> = manifest["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["path"].as_str().unwrap().to_string())
+            .collect();
+        let job_id: Uuid = serde_json::from_value(manifest["job_id"].clone()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("project");
+        let private = base.join("private");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&private).unwrap();
+        let mut sink = ReceiverSink {
+            receiver: ReturnReceiver::new(
+                paths.clone(),
+                134217728,
+                &root,
+                &root,
+                None,
+                Arc::new(PinnedDir::open(&private).unwrap()),
+                "replay-gap",
+            )
+            .unwrap(),
+            reports: Vec::new(),
+            manifests_delivered: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            lost: Vec::new(),
+            verdicts: Vec::new(),
+        };
+        let mut consumer = StreamConsumer::new();
+        consumer
+            .consume(StreamRecord::Accepted(Accepted::new(job_id, 1)), &mut sink)
+            .unwrap();
+        for attempt in 0..=3 {
+            let from_seq = consumer
+                .resume_point()
+                .unwrap()
+                .attach_request()
+                .unwrap()
+                .from_seq;
+            assert_eq!(from_seq, if attempt == 0 { 0 } else { 817 });
+            for record in &records {
+                if record["seq"].as_u64().is_some_and(|seq| seq < from_seq) {
+                    continue;
+                }
+                let result =
+                    consumer.consume_bytes(&serde_json::to_vec(record).unwrap(), &mut sink);
+                if record["type"] == "terminal" && attempt < 3 {
+                    assert!(
+                        matches!(
+                            result,
+                            Err(crate::exec_remote::Error::RecoveryRequired { .. })
+                        ),
+                        "{result:?}"
+                    );
+                } else {
+                    result.expect("a return-chunk hole must not disconnect before terminal proof");
+                }
+            }
+            if attempt < 3 {
+                let point = consumer.resume_point().unwrap();
+                assert_eq!(point.gap_recovery.as_ref().unwrap().reattaches, attempt);
+                assert!(sink.reports.is_empty());
+                consumer = StreamConsumer::resume(point);
+            }
+        }
+        assert_eq!(consumer.finish().unwrap(), Verdict::Exited { code: 1 });
+        assert_eq!(sink.verdicts, [Verdict::Exited { code: 1 }]);
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(&sink.stdout)),
+            stdout_sha
+        );
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(&sink.stderr)),
+            stderr_sha
+        );
+        assert!(
+            sink.lost.is_empty(),
+            "the manifest counts prove all missing seqs were chunks"
+        );
+        assert_eq!(sink.manifests_delivered, 1);
+        assert_eq!(sink.reports[0].len(), paths.len());
+        for (report, path) in sink.reports[0].iter().zip(&paths) {
+            assert_eq!(&report.path, path);
+            assert_eq!(
+                report.outcome,
+                ReturnOutcome::NotReturned {
+                    reason: NotReturned::ReplayGap {
+                        from_seq: 817,
+                        before_seq: 826
+                    }
+                }
+            );
+        }
+        let report = render_report(&sink.reports[0]);
+        assert_eq!(
+            report
+                .matches("the build server's replay was missing returned-file records seq 817-825")
+                .count(),
+            paths.len()
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&private).unwrap().count(), 0);
     }
 
     /// Deliver `first` on a new stream, which must stop for gap recovery,
@@ -1074,6 +1290,10 @@ mod through_the_stream {
             receiver,
             reports: Vec::new(),
             manifests_delivered: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            lost: Vec::new(),
+            verdicts: Vec::new(),
         };
         let mut consumer = StreamConsumer::new();
         let accepted = StreamRecord::Accepted(Accepted::new(job_id(), 1));
@@ -1101,6 +1321,89 @@ mod through_the_stream {
         "dist/app.bin: not returned (the server no longer keeps this job's files)";
 
     #[test]
+    fn expired_replay_accepts_only_exact_counts_and_keeps_expired_reasons() {
+        for count in [Some(1), Some(2), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = fs::canonicalize(dir.path()).unwrap();
+            let root = base.join("project");
+            let private = base.join("private");
+            fs::create_dir(&root).unwrap();
+            fs::create_dir(&private).unwrap();
+            let mut sink = ReceiverSink {
+                receiver: ReturnReceiver::new(
+                    vec![PATH.to_string()],
+                    1 << 20,
+                    &root,
+                    &root,
+                    None,
+                    Arc::new(PinnedDir::open(&private).unwrap()),
+                    "expired-replay",
+                )
+                .unwrap(),
+                reports: Vec::new(),
+                manifests_delivered: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                lost: Vec::new(),
+                verdicts: Vec::new(),
+            };
+            let mut consumer = StreamConsumer::new();
+            consumer
+                .consume(
+                    StreamRecord::Accepted(Accepted::new(job_id(), 1)),
+                    &mut sink,
+                )
+                .unwrap();
+            consumer.consume(output(0), &mut sink).unwrap();
+            let StreamRecord::ReturnManifest(mut manifest) = expired(2) else {
+                unreachable!()
+            };
+            manifest.files[0].chunks = count;
+            let terminal = StreamRecord::Terminal(TerminalRecord::new(
+                job_id(),
+                Outcome::Exit { code: 1 },
+                1,
+                0,
+                0,
+            ));
+            let attempts = if count == Some(1) { 0 } else { 3 };
+            for attempt in 0..=attempts {
+                consumer
+                    .consume(StreamRecord::ReturnManifest(manifest.clone()), &mut sink)
+                    .unwrap();
+                let result = consumer.consume(terminal.clone(), &mut sink);
+                if attempt < attempts {
+                    assert!(matches!(
+                        result,
+                        Err(crate::exec_remote::Error::RecoveryRequired { .. })
+                    ));
+                    assert!(sink.reports.is_empty());
+                    let point = consumer.resume_point().unwrap();
+                    assert_eq!(point.attach_request().unwrap().from_seq, 1);
+                    consumer = StreamConsumer::resume(point);
+                } else {
+                    result.unwrap();
+                }
+            }
+            assert_eq!(consumer.finish().unwrap(), Verdict::Exited { code: 1 });
+            assert_eq!(sink.stdout, b"a");
+            assert_eq!(sink.lost, if attempts == 0 { Vec::new() } else { vec![2] });
+            assert_eq!(sink.manifests_delivered, 1);
+            assert_eq!(
+                sink.reports[0][0].outcome,
+                ReturnOutcome::NotReturned {
+                    reason: NotReturned::Runner {
+                        cause: "expired".into()
+                    }
+                }
+            );
+            assert!(render_report(&sink.reports[0]).contains(EXPIRED_TEXT));
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+            assert_eq!(fs::read_dir(&private).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
     fn an_expired_replay_replaces_a_buffered_retained_manifest_at_the_same_seq() {
         // The file's one chunk at seq 1 was lost, so the retained manifest at
         // seq 2 is buffered for gap recovery. By the reconnect the runner no
@@ -1119,7 +1422,7 @@ mod through_the_stream {
     #[test]
     fn a_retained_replay_never_overwrites_a_buffered_expired_manifest() {
         // An expired manifest at seq 3 after a two-seq gap, which its one
-        // derived chunk cannot account for, is buffered for gap recovery.
+        // advertised chunk cannot account for, is buffered for gap recovery.
         // The replay sends a retained manifest at seq 3 while that expired
         // one is still buffered, then fills seqs 1 and 2; the retained one
         // must not replace it.

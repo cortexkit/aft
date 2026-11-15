@@ -1176,9 +1176,7 @@ fn admission_progress_detail(detail: &str) -> String {
 
 #[cfg(unix)]
 fn queue_wait_progress_ms(progress: &exec::types::Progress) -> Option<u64> {
-    // The pinned types crate has no typed QueueWait variant; this is the
-    // runner's queue-progress wire spelling, not an arbitrary unknown phase.
-    matches!(progress.phase(), exec::types::ProgressPhase::Unknown(phase) if phase == "queue_wait")
+    matches!(progress.phase(), exec::types::ProgressPhase::QueueWait)
         .then(|| progress.phase_elapsed_ms())
 }
 
@@ -2117,6 +2115,12 @@ impl OutputSink for TaskSink {
     }
     fn gap_recovery(&mut self, recovery: &exec::GapRecovery) -> io::Result<()> {
         self.commit(|r| r.gap_recovery = Some(recovery.clone()))
+    }
+    fn return_gap(&mut self, from_seq: u64, before_seq: u64) -> io::Result<()> {
+        if let Some(returns) = self.returns.as_mut() {
+            returns.missing_records(from_seq, before_seq);
+        }
+        Ok(())
     }
     fn unknown_output(&mut self, seq: u64, bytes: &[u8]) -> io::Result<()> {
         let offset = self.output_progress.unknown_len;

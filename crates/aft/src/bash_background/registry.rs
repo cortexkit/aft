@@ -10372,30 +10372,46 @@ impl BgTaskRegistry {
         self.kill_with_status_reason(task_id, &task.session_id, BgTaskStatus::Killed, None)
     }
 
-    pub(crate) fn request_recurring_persisted_gc(&self) {
-        let roots = self
-            .inner
-            .persisted_gc_storage
-            .lock()
-            .map(|storage| storage.iter().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
-        let mut requested = BTreeSet::new();
-        for root in roots {
-            requested.insert(root.clone());
-            // Standard storage is partitioned by harness, not project. A
-            // deleted worktree may never bind again, and an inactive harness
-            // has no registry left to request its sweep. Share this root's DB
-            // mirror with sibling harness stores from the same storage base.
-            if is_harness_store(&root) {
-                if let Some(base) = root.parent() {
-                    requested.extend(gc_harness_stores(base));
+    /// Shared stores get one tool-result walk and one coalesced GC request per
+    /// periodic pass, even when several project registries remember the store.
+    pub(super) fn request_recurring_persisted_gc(registries: &[Self]) {
+        let mut requested = BTreeMap::new();
+        for registry in registries {
+            let roots = registry
+                .inner
+                .persisted_gc_storage
+                .lock()
+                .map(|storage| storage.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            for root in roots {
+                requested
+                    .entry(canonicalized_path(&root))
+                    .or_insert((root.clone(), registry));
+                // Standard storage is partitioned by harness, not project. A
+                // deleted worktree may never bind again, and an inactive harness
+                // has no registry left to request its sweep. Also sweep sibling
+                // harness stores from the same storage base.
+                if is_harness_store(&root) {
+                    if let Some(base) = root.parent() {
+                        for sibling in gc_harness_stores(base) {
+                            requested
+                                .entry(canonicalized_path(&sibling))
+                                .or_insert((sibling, registry));
+                        }
+                    }
                 }
             }
         }
         super::watchdog::record_cleanup_work(|work| work.gc_requests += requested.len());
-        for root in requested {
-            crate::tool_output::cleanup_expired(&root, super::watchdog::FINISHED_RETENTION);
-            self.request_persisted_gc(&root);
+        for (root, registry) in requested.into_values() {
+            let report =
+                crate::tool_output::cleanup_expired(&root, super::watchdog::FINISHED_RETENTION);
+            super::watchdog::record_cleanup_work(|work| {
+                work.tool_output_walks += 1;
+                work.tool_output_read_dirs += report.read_dirs;
+                work.tool_output_remove_dirs += report.remove_dirs;
+            });
+            registry.request_persisted_gc(&root);
         }
     }
 

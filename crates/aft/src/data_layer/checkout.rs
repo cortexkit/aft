@@ -45,6 +45,7 @@ mod engines;
 #[cfg(feature = "test-hooks")]
 pub mod exactness;
 mod fold;
+pub(crate) mod staged_records;
 mod text_build;
 use text_build::TextBuild;
 #[cfg(test)]
@@ -1643,16 +1644,28 @@ impl Checkout {
         // own folder in it, and it is removed once the last of them is done.
         let paused = DiskPause::default();
         let scratch = self.build_scratch_noting(Arc::clone(&paused))?;
+        // Each extracted record goes to a staging segment in the workspace as
+        // it is extracted, rather than staying in memory until the segment
+        // is written (see `staged_records`).
+        let stage = staged_records::RecordStage::new(
+            scratch
+                .subdir("records")
+                .map_err(|error| DataError::Store(error.to_string()))?,
+            self.family.id(),
+        );
         let sink = BuildSink {
             skip_text: !self.planes.text,
             stored: self.stored_records()?,
+            stage: Some((stage, Arc::clone(&self.layer.cache))),
             ..BuildSink::new(TextBuild::new(Arc::clone(&scratch), self.family.id()))
         };
         #[cfg(feature = "test-hooks")]
         super::refresh_probe::stage("extraction");
         let scanned = scan(&self.root, &self.layer.policy, None, &sink)
             .map_err(|error| DataError::Scan(error.to_string()))?;
-        let mut collected = sink.finish()?;
+        let mut collected = sink
+            .finish()
+            .map_err(|error| graph_spill_error(error, &paused))?;
         // Contents too large to read are members whose text is not
         // indexed; record them so grep reports them rather than walking
         // them.
@@ -1675,6 +1688,8 @@ impl Checkout {
         report.stored_records = collected.reused;
         report.scan_ms = elapsed_ms(started);
 
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("inputs");
         collected.text.spill()?;
 
         // The state, with each parsed path's language.
@@ -1713,6 +1728,28 @@ impl Checkout {
                         })
                         .sum(),
                 ),
+                (
+                    "scan.staged_bytes".to_string(),
+                    collected.staged.as_ref().map_or(0, |(records, _)| {
+                        usize::try_from(records.bytes()).unwrap_or(usize::MAX)
+                    }),
+                ),
+                (
+                    "scan.staged_table".to_string(),
+                    collected.staged.as_ref().map_or(0, |(_, entries)| {
+                        entries
+                            .iter()
+                            .map(|(key, entry)| {
+                                key.heap_bytes(&mut seen)
+                                    + std::mem::size_of::<StagedEntry>()
+                                    + match &entry.kind {
+                                        StagedKind::Config(source) => source.len(),
+                                        _ => 0,
+                                    }
+                            })
+                            .sum()
+                    }),
+                ),
                 ("scan.state".to_string(), state.heap_bytes(&mut seen)),
             ]);
         }
@@ -1720,8 +1757,12 @@ impl Checkout {
         // decoded size, and the resolver decodes each parse from them when it
         // reads it; the decoded records go before resolving.
         let taking = Instant::now();
-        let (mut inputs, encoded) = collected.take_inputs(&state);
+        let (mut inputs, content) = collected.take_inputs(&state);
         report.parsed_files = inputs.parses.len();
+        // A stage boundary: the scan's staging and text runs are written.
+        scratch
+            .check_space(0)
+            .map_err(|error| graph_spill_error(error, &paused))?;
         if measure {
             report.memory.push((
                 "ms.take_inputs".to_string(),
@@ -1734,7 +1775,7 @@ impl Checkout {
             report.memory.extend([
                 (
                     "scan.records_encoded".to_string(),
-                    encoded.heap_bytes(&mut seen),
+                    content.heap_bytes(&mut seen),
                 ),
                 (
                     "scan.configs".to_string(),
@@ -1749,12 +1790,19 @@ impl Checkout {
         // `resolve_ms` covers building the fragments too.
         let started = Instant::now();
         note_source_work(&self.root, |work| work.resolutions += 1);
-        let mut sections = super::graph_store::SectionsWriter::new(
-            &inputs.state,
-            &collected.records,
-            true,
-            Some(encoded),
-        );
+        let mut sections = match content {
+            InputsContent::Built(encoded) => super::graph_store::SectionsWriter::new(
+                &inputs.state,
+                &collected.records,
+                true,
+                Some(encoded),
+            ),
+            InputsContent::Staged(staged) => super::graph_store::SectionsWriter::staged(
+                &inputs.state,
+                &collected.records,
+                staged,
+            ),
+        };
         let workspace = Box::new(
             scratch
                 .subdir("graph")
@@ -1803,6 +1851,7 @@ impl Checkout {
             measure.then_some(&mut report.memory),
             &scratch,
             super::callgraph::KeyOrderBudget::configured(),
+            super::callgraph::bind_cache_bytes(),
             &mut |inputs, files| {
                 sections
                     .add_batch(inputs, files)
@@ -1845,6 +1894,8 @@ impl Checkout {
         sections
             .prepare_finish()
             .map_err(|error| graph_spill_error(DataError::Store(error), &paused))?;
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("write");
         let mut pending = session.create_segment().map_err(DataError::store)?;
         collected.text.write(pending.writer())?;
         let fragments = sections
@@ -1860,6 +1911,8 @@ impl Checkout {
         let segment = session.finish_segment(pending).map_err(DataError::store)?;
         report.write_ms = elapsed_ms(started);
 
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("publish");
         let started = Instant::now();
         let per_path = state
             .paths()
@@ -5021,8 +5074,16 @@ struct BuildSink {
     seen_text: Mutex<HashSet<ContentKey>>,
     /// Each parsed path's language.
     languages: Mutex<HashMap<Vec<u8>, String>>,
-    /// Each extracted record, by the parse key the resolver uses.
+    /// Each extracted record, by the parse key the resolver uses, when the
+    /// sink holds records in memory.
     records: Mutex<HashMap<String, (RecordKey, Arc<ContentRecord>)>>,
+    /// Where extracted records are staged instead, when they are, with the
+    /// block cache they are read back through.
+    stage: Option<(staged_records::RecordStage, Arc<BlockCache>)>,
+    /// Each staged record, by the parse key the resolver uses.
+    staged: Mutex<HashMap<String, StagedEntry>>,
+    /// The first staging write that failed.
+    stage_error: Mutex<Option<DataError>>,
     failures: std::sync::atomic::AtomicUsize,
     /// The records the family already stores, read instead of parsing a
     /// file again, and how many were.
@@ -5062,12 +5123,60 @@ impl StoredRecords {
     }
 }
 
+/// One record a scan staged: its key, where it lies, and what reading the
+/// call graph's inputs needs of it without reading it back.
+struct StagedEntry {
+    key: RecordKey,
+    at: staged_records::StagedAt,
+    kind: StagedKind,
+}
+
+enum StagedKind {
+    /// A configuration file's record, with its bytes, which the resolver
+    /// reads from memory.
+    Config(Arc<[u8]>),
+    /// A parsed file's record, and whether its parse converts for the call
+    /// graph (one that does not is left out of the resolver's inputs), with
+    /// the parse's kinds the resolver lists files by
+    /// ([`super::callgraph::list_kinds`]).
+    Parsed {
+        converts: bool,
+        kinds: (bool, bool),
+    },
+    Markers,
+}
+
+impl StagedKind {
+    fn of(record: &ContentRecord) -> Self {
+        match &record.data {
+            RecordBody::Config { source } => Self::Config(Arc::from(source.as_slice())),
+            RecordBody::Parsed { .. } => match blob_from_record(record) {
+                Ok(CallgraphBlob::Parse(parse)) => Self::Parsed {
+                    converts: true,
+                    kinds: super::callgraph::list_kinds(&parse),
+                },
+                _ => Self::Parsed {
+                    converts: false,
+                    kinds: (false, false),
+                },
+            },
+            RecordBody::Markers => Self::Markers,
+        }
+    }
+}
+
 /// A build sink's results, after the scan.
 struct Collected {
     text: TextBuild,
     seen_text: HashSet<ContentKey>,
     languages: HashMap<Vec<u8>, String>,
     records: HashMap<String, (RecordKey, Arc<ContentRecord>)>,
+    /// The staged records, when the scan staged them, and each one's entry
+    /// by parse key.
+    staged: Option<(
+        Arc<staged_records::StagedRecords>,
+        HashMap<String, StagedEntry>,
+    )>,
     failures: usize,
     /// Records read from the store rather than parsed.
     reused: usize,
@@ -5083,6 +5192,9 @@ impl BuildSink {
             seen_text: Mutex::default(),
             languages: Mutex::default(),
             records: Mutex::default(),
+            stage: None,
+            staged: Mutex::default(),
+            stage_error: Mutex::new(None),
             failures: std::sync::atomic::AtomicUsize::default(),
             stored: StoredRecords::default(),
             reused: std::sync::atomic::AtomicUsize::default(),
@@ -5097,6 +5209,22 @@ impl BuildSink {
         {
             return Err(error);
         }
+        if let Some(error) = self
+            .stage_error
+            .into_inner()
+            .expect("no panics while holding it")
+        {
+            return Err(error);
+        }
+        let staged = match self.stage {
+            Some((stage, cache)) => Some((
+                Arc::new(stage.finish(&cache)?),
+                self.staged
+                    .into_inner()
+                    .expect("no panics while holding it"),
+            )),
+            None => None,
+        };
         Ok(Collected {
             text: self.text.into_inner().expect("no panics while holding it"),
             seen_text: self
@@ -5111,6 +5239,7 @@ impl BuildSink {
                 .records
                 .into_inner()
                 .expect("no panics while holding it"),
+            staged,
             failures: self.failures.into_inner(),
             reused: self.reused.into_inner(),
         })
@@ -5177,12 +5306,18 @@ impl ContentSink for BuildSink {
             .insert(path.to_vec(), language.clone());
         let record_key = RecordKey::new(key, &language, EXTRACTOR_VERSION);
         let parse_key = record_key.digest().to_string();
-        if self
-            .records
-            .lock()
-            .expect("no panics while holding it")
-            .contains_key(&parse_key)
-        {
+        let held = if self.stage.is_some() {
+            self.staged
+                .lock()
+                .expect("no panics while holding it")
+                .contains_key(&parse_key)
+        } else {
+            self.records
+                .lock()
+                .expect("no panics while holding it")
+                .contains_key(&parse_key)
+        };
+        if held {
             return;
         }
         let extracted = match self.stored.record(record_key) {
@@ -5199,6 +5334,36 @@ impl ContentSink for BuildSink {
             }),
         };
         match extracted {
+            Ok(record) if self.stage.is_some() => {
+                let (stage, _) = self.stage.as_ref().expect("checked by the guard");
+                if self
+                    .stage_error
+                    .lock()
+                    .expect("no panics while holding it")
+                    .is_some()
+                {
+                    return;
+                }
+                match stage.append(&record) {
+                    Ok(at) => {
+                        self.staged
+                            .lock()
+                            .expect("no panics while holding it")
+                            .entry(parse_key)
+                            .or_insert_with(|| StagedEntry {
+                                key: record_key,
+                                at,
+                                kind: StagedKind::of(&record),
+                            });
+                    }
+                    Err(error) => {
+                        self.stage_error
+                            .lock()
+                            .expect("no panics while holding it")
+                            .get_or_insert(error);
+                    }
+                }
+            }
             Ok(record) => {
                 self.records
                     .lock()
@@ -5220,10 +5385,10 @@ impl Collected {
     /// encoded record and decoded when the resolver reads it (see
     /// [`super::callgraph::Parses::encoded`]), so the build never holds the
     /// decoded records and every decoded parse at once.
-    fn take_inputs(
-        &mut self,
-        state: &CheckoutState,
-    ) -> (CheckoutInputs, aft_store::content::ContentSectionsBuilder) {
+    fn take_inputs(&mut self, state: &CheckoutState) -> (CheckoutInputs, InputsContent) {
+        if let Some((records, entries)) = self.staged.take() {
+            return Self::staged_inputs(state, records, entries);
+        }
         let mut configs = HashMap::new();
         // A record whose parse does not convert is left out, as reading it
         // decoded would leave it out; checked once while it is at hand.
@@ -5274,8 +5439,91 @@ impl Collected {
                 parses: super::callgraph::Parses::encoded(parses),
                 configs,
             },
-            encoded,
+            InputsContent::Built(encoded),
         )
+    }
+
+    /// [`Self::take_inputs`] of a scan that staged its records: every
+    /// parse is read from its staged record, and every staged record goes
+    /// into the segment's content sections.
+    fn staged_inputs(
+        state: &CheckoutState,
+        records: Arc<staged_records::StagedRecords>,
+        entries: HashMap<String, StagedEntry>,
+    ) -> (CheckoutInputs, InputsContent) {
+        let mut configs = HashMap::new();
+        let mut parses = Vec::new();
+        for record in state.paths() {
+            if record.language.is_empty() {
+                continue;
+            }
+            let record_key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
+            let parse_key = record_key.digest().to_string();
+            let Some(entry) = entries.get(&parse_key) else {
+                continue;
+            };
+            match &entry.kind {
+                StagedKind::Config(source) => {
+                    configs.insert(record.path.clone(), Arc::clone(source));
+                }
+                StagedKind::Parsed {
+                    converts: true,
+                    kinds,
+                } => {
+                    if let Ok(path) = std::str::from_utf8(&record.path) {
+                        parses.push((
+                            path.to_string(),
+                            super::callgraph::StagedParse {
+                                key: parse_key,
+                                at: entry.at,
+                                kinds: *kinds,
+                                records: Arc::clone(&records),
+                            },
+                        ));
+                    }
+                }
+                StagedKind::Parsed {
+                    converts: false, ..
+                }
+                | StagedKind::Markers => {}
+            }
+        }
+        let units = entries
+            .into_values()
+            .map(|entry| (entry.key, entry.at))
+            .collect();
+        (
+            CheckoutInputs {
+                state: state.clone(),
+                parses: super::callgraph::Parses::staged(parses),
+                configs,
+            },
+            InputsContent::Staged(super::graph_store::StagedContent { records, units }),
+        )
+    }
+}
+
+/// The records a build's segment holds, as [`Collected::take_inputs`]
+/// hands them on.
+enum InputsContent {
+    /// Encoded in memory.
+    Built(aft_store::content::ContentSectionsBuilder),
+    /// Staged on disk by the scan.
+    Staged(super::graph_store::StagedContent),
+}
+
+impl aft_store::heap::HeapBytes for InputsContent {
+    fn heap_bytes(&self, seen: &mut aft_store::heap::Seen) -> usize {
+        match self {
+            Self::Built(content) => content.heap_bytes(seen),
+            Self::Staged(staged) => {
+                aft_store::heap::btree_bytes(
+                    staged.units.len(),
+                    std::mem::size_of::<RecordKey>()
+                        + std::mem::size_of::<staged_records::StagedAt>(),
+                ) + staged.records.heap_bytes(seen)
+            }
+        }
     }
 }
 
@@ -6338,13 +6586,20 @@ mod tests {
     }
 
     fn callers_of(view: &CheckoutView, file: &str, symbol: &str) -> String {
+        // Resolved callers only: `callers` also lists unresolved call sites
+        // that merely share the name, and those would make a negative check
+        // ("main.ts is not a caller yet") match on the candidate list.
         let callers = crate::commands::callgraph_store_adapter::callers_result(
             &view.callgraph(),
             &view.root().join(file),
             symbol,
             1,
             true,
-        );
+        )
+        .map(|mut result| {
+            result.unresolved_callers = None;
+            result
+        });
         format!("{callers:?}")
     }
 

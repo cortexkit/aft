@@ -373,6 +373,21 @@ pub(crate) fn format_response_unbounded(
         }
     }
     if matches!(bare_name, "edit" | "write") {
+        if let Some(files) = data.get("files").and_then(Value::as_array) {
+            for file in files {
+                if let Some(advisory) = file.get("markdown_table_advisory").and_then(Value::as_str)
+                {
+                    text.push_str("\n\n");
+                    text.push_str(file.get("file").and_then(Value::as_str).unwrap_or_default());
+                    text.push_str(": ");
+                    text.push_str(advisory);
+                }
+            }
+        }
+        if let Some(advisory) = data.get("markdown_table_advisory").and_then(Value::as_str) {
+            text.push_str("\n\n");
+            text.push_str(advisory);
+        }
         if let Some(notice) = created_file_syntax_error_line(data) {
             if text.is_empty() {
                 text = notice;
@@ -3705,18 +3720,51 @@ fn format_callers_sections(record: &serde_json::Map<String, Value>) -> Vec<Strin
         format!("{}", total.saturating_sub(hidden_test_callers))
     };
     let callback_note = callback_reference_count_suffix(record);
-    let mut sections = vec![join_non_empty(&[
-        Some(format!(
-            "{total_str} caller{}{callback_note}",
-            if total_str == "1" { "" } else { "s" }
-        )),
-        Some(format!(
-            "{} file group{}",
-            groups.len(),
-            if groups.len() == 1 { "" } else { "s" }
-        )),
-        (!warning.is_empty()).then_some(warning),
-    ])];
+    let unresolved = record.get("unresolved_callers").and_then(Value::as_object);
+    let mut sections = if let Some(unresolved) = unresolved {
+        let total = number_field(unresolved, "total").unwrap_or(0).max(0) as usize;
+        let name = string_field(unresolved, "name").unwrap_or_default();
+        let site_phrase = if total == 1 {
+            "site names"
+        } else {
+            "sites name"
+        };
+        let mut lines = vec![format!(
+            "No resolved callers; {total} unresolved call {site_phrase} `{name}` (possible callers, targets not confirmed)."
+        )];
+        let sites = records_field(unresolved, "sites");
+        for site in &sites {
+            lines.push(format!(
+                "  {}:{} — {}",
+                string_field(site, "file").unwrap_or_default(),
+                number_field(site, "line").unwrap_or(0),
+                string_field(site, "calling_function").unwrap_or("<top level>"),
+            ));
+        }
+        if let Some(trailer) = unresolved
+            .get("sites_list_envelope")
+            .and_then(|value| {
+                serde_json::from_value::<crate::list_envelope::ListEnvelope>(value.clone()).ok()
+            })
+            .and_then(|envelope| render_envelope_trailer(&envelope))
+        {
+            lines.push(trailer);
+        }
+        vec![lines.join("\n")]
+    } else {
+        vec![join_non_empty(&[
+            Some(format!(
+                "{total_str} caller{}{callback_note}",
+                if total_str == "1" { "" } else { "s" }
+            )),
+            Some(format!(
+                "{} file group{}",
+                groups.len(),
+                if groups.len() == 1 { "" } else { "s" }
+            )),
+            (!warning.is_empty()).then_some(warning),
+        ])]
+    };
     if let Some(summary) = hub_summary {
         sections.push(summary);
     }

@@ -185,7 +185,9 @@ fn adding_an_unregistered_capped_array_fails_registry_free_discovery() {
 fn deleting_one_capped_parity_fixture_fails_the_coverage_guard() {
     let mut fixtures = capped_parity_fixtures();
     let initial_len = fixtures.len();
-    fixtures.retain(|f| !(f.command == "callgraph" && f.mode == "callers"));
+    fixtures.retain(|f| {
+        !(f.command == "callgraph" && f.mode == "callers" && f.list_id == "payload.callers")
+    });
     assert_eq!(fixtures.len(), initial_len - 1);
 
     let errors = validate_capped_parity_coverage(&fixtures);

@@ -64,3 +64,10 @@ were copied byte-for-byte from the published `cortexkit-exec-remote-types`
 checksum locked in `Cargo.lock`). They add per-entry `chunks` counts. The 21
 earlier vectors are unchanged in 0.2.12 and were checked byte for byte
 against it.
+
+`progress/{queue-wait,queue-wait-unknown-reason}.{jcs,sha256}` were copied
+byte-for-byte from `cortexkit-exec-remote-types` 0.2.22,
+`test-vectors/exec-remote-v1/progress/`. The crate archive SHA-256 is
+`b092e07997eb492305acb0f3a069391591e4dff0f8dda929bbbdcd859b5b8ca9`,
+as locked in `Cargo.lock`. The bash status tests verify the published digests
+and send these bytes unchanged through the daemon's stream and AFT's decoder.

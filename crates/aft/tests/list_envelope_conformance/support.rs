@@ -248,6 +248,18 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
     SurfaceSpec {
         requires: None,
         command: "callgraph",
+        mode: "callers",
+        list_id: "payload.unresolved_callers.sites",
+        unit: Unit::Sites,
+        narrow: &["includeTests"],
+        reasons: &[ReasonSpec {
+            reason: Reason::Cap,
+            kind: ReasonKind::Selecting,
+        }],
+    },
+    SurfaceSpec {
+        requires: None,
+        command: "callgraph",
         mode: "call_tree",
         list_id: "payload.tree",
         unit: Unit::Items,
@@ -390,6 +402,17 @@ fn sorted_causes(causes: &[Reason]) -> Vec<Reason> {
 }
 
 fn build_case_envelope(surface: SurfaceSpec, fired: &[Reason]) -> Option<ListEnvelope> {
+    if surface.list_id == "payload.unresolved_callers.sites" {
+        return fired.contains(&Reason::Cap).then(|| {
+            ListEnvelope::new(
+                5,
+                Total::Exact(7),
+                Unit::Sites,
+                vec![Reason::Cap],
+                &["includeTests"],
+            )
+        });
+    }
     let has = |reason| fired.contains(&reason);
     match (surface.command, surface.mode) {
         ("ast_search", "matches") => {
@@ -495,6 +518,9 @@ fn build_case_envelope(surface: SurfaceSpec, fired: &[Reason]) -> Option<ListEnv
 }
 
 fn expected_total(surface: SurfaceSpec, fired: &[Reason]) -> Total {
+    if surface.list_id == "payload.unresolved_callers.sites" {
+        return Total::Exact(7);
+    }
     let has = |reason| fired.contains(&reason);
     match (surface.command, surface.mode) {
         ("ast_search", "matches") => Total::Exact(24000),
@@ -1480,6 +1506,7 @@ fn make_impact_value(count: usize, depth_limited: bool) -> Value {
 
 fn make_callers_value(count: usize, depth_limited: bool) -> Value {
     let result = StoreCallersResult {
+        unresolved_callers: None,
         callback_dependencies: 0,
         callback_reference_label: None,
         test_filter_note: None,
@@ -1650,6 +1677,7 @@ fn make_capped_callers_value(count: usize) -> Value {
     let callers_list_envelope = build_callgraph_envelope(Unit::Items, shown, count, 0);
 
     let result = StoreCallersResult {
+        unresolved_callers: None,
         callback_dependencies: 0,
         callback_reference_label: None,
         test_filter_note: None,
@@ -1731,6 +1759,26 @@ fn changed_files_fixture(mode: &str) -> Value {
 
 pub fn capped_parity_fixtures() -> Vec<CappedParityFixture> {
     vec![
+        CappedParityFixture {
+            name: "callgraph/unresolved_callers_7",
+            command: "callgraph",
+            mode: "callers",
+            list_id: "payload.unresolved_callers.sites",
+            reply: json!({
+                "callers": [], "total_callers": 0,
+                "unresolved_callers": {
+                    "name": "target", "total": 7,
+                    "sites": [
+                        {"file":"a.py", "line":1, "calling_function":"one"},
+                        {"file":"a.py", "line":2, "calling_function":"one"},
+                        {"file":"a.py", "line":3, "calling_function":"one"},
+                        {"file":"a.py", "line":4, "calling_function":"one"},
+                        {"file":"b.py", "line":1, "calling_function":"two"}
+                    ],
+                    "sites_list_envelope": ListEnvelope::new(5, Total::Exact(7), Unit::Sites, vec![Reason::Cap], &["includeTests"]),
+                }
+            }),
+        },
         CappedParityFixture {
             name: "ast_search/result_budget",
             command: "ast_search",

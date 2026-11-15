@@ -32,6 +32,10 @@ pub(super) struct CleanupWork {
     pub scratch_entries: usize,
     /// Storage-root requests, whether spawned or covered by an existing sweep.
     pub gc_requests: usize,
+    pub tool_output_walks: usize,
+    /// Calls to read_dir and remove_dir in the retained tool-result walk.
+    pub tool_output_read_dirs: usize,
+    pub tool_output_remove_dirs: usize,
 }
 
 thread_local! {
@@ -76,9 +80,10 @@ impl CleanupPass {
             elapsed.saturating_sub(self.speech + self.scratch + self.finished + self.gc_request);
         let ms = |duration: Duration| duration.as_secs_f64() * 1000.0;
         Some(format!(
-            "bash periodic cleanup elapsed_ms={:.3} speech_ms={:.3} scratch_ms={:.3} finished_ms={:.3} gc_request_ms={:.3} other_ms={:.3} registries={} queue_entries={} image_probes={} scratch_entries={} gc_requests={}",
+            "bash periodic cleanup elapsed_ms={:.3} speech_ms={:.3} scratch_ms={:.3} finished_ms={:.3} gc_request_ms={:.3} other_ms={:.3} registries={} queue_entries={} image_probes={} scratch_entries={} gc_requests={} tool_output_walks={} tool_output_read_dirs={} tool_output_remove_dirs={}",
             ms(elapsed), ms(self.speech), ms(self.scratch), ms(self.finished), ms(self.gc_request), ms(other),
             work.registries, work.queue_entries, work.image_probes, work.scratch_entries, work.gc_requests,
+            work.tool_output_walks, work.tool_output_read_dirs, work.tool_output_remove_dirs,
         ))
     }
 }
@@ -427,26 +432,9 @@ fn scheduler() -> &'static crossbeam_channel::Sender<std::sync::Weak<super::regi
                                 move || {
                                     #[cfg(test)]
                                     CLEANUP_STARTED.fetch_add(1, Ordering::SeqCst);
-                                    let mut pass = CleanupPass::start();
-                                    let step = Instant::now();
-                                    crate::gh_shim_speech::start_view::sweep_queued();
-                                    pass.speech += step.elapsed();
-                                    for inner in registries
-                                        .into_iter()
-                                        .filter_map(|registry| registry.upgrade())
-                                    {
-                                        let registry = BgTaskRegistry { inner };
-                                        record_cleanup_work(|work| work.registries += 1);
-                                        let step = Instant::now();
-                                        registry.sweep_retained_scratch();
-                                        pass.scratch += step.elapsed();
-                                        let step = Instant::now();
-                                        registry.cleanup_finished(FINISHED_RETENTION);
-                                        pass.finished += step.elapsed();
-                                        let step = Instant::now();
-                                        registry.request_recurring_persisted_gc();
-                                        pass.gc_request += step.elapsed();
-                                    }
+                                    run_cleanup(registries.into_iter().filter_map(|registry| {
+                                        registry.upgrade().map(|inner| BgTaskRegistry { inner })
+                                    }));
                                     #[cfg(test)]
                                     CLEANUP_COMPLETED.fetch_add(1, Ordering::SeqCst);
                                 },
@@ -494,6 +482,27 @@ fn scheduler() -> &'static crossbeam_channel::Sender<std::sync::Weak<super::regi
             .expect("failed to start bash watchdog");
         tx
     })
+}
+
+pub(super) fn run_cleanup(registries: impl IntoIterator<Item = BgTaskRegistry>) -> CleanupWork {
+    let mut pass = CleanupPass::start();
+    let step = Instant::now();
+    crate::gh_shim_speech::start_view::sweep_queued();
+    pass.speech += step.elapsed();
+    let registries: Vec<_> = registries.into_iter().collect();
+    for registry in &registries {
+        record_cleanup_work(|work| work.registries += 1);
+        let step = Instant::now();
+        registry.sweep_retained_scratch();
+        pass.scratch += step.elapsed();
+        let step = Instant::now();
+        registry.cleanup_finished(FINISHED_RETENTION);
+        pass.finished += step.elapsed();
+    }
+    let step = Instant::now();
+    BgTaskRegistry::request_recurring_persisted_gc(&registries);
+    pass.gc_request += step.elapsed();
+    CLEANUP_WORK.with(|cell| cell.get().unwrap())
 }
 
 pub(super) fn run_pass(
@@ -622,6 +631,9 @@ mod tests {
             image_probes: 3,
             scratch_entries: 4,
             gc_requests: 5,
+            tool_output_walks: 6,
+            tool_output_read_dirs: 7,
+            tool_output_remove_dirs: 8,
         };
         assert!(pass.summary(Duration::from_millis(250), work).is_none());
         let report = pass.summary(Duration::from_millis(300), work).unwrap();
@@ -637,6 +649,9 @@ mod tests {
             "image_probes=3",
             "scratch_entries=4",
             "gc_requests=5",
+            "tool_output_walks=6",
+            "tool_output_read_dirs=7",
+            "tool_output_remove_dirs=8",
         ] {
             assert!(report.contains(field), "missing {field}: {report}");
         }
