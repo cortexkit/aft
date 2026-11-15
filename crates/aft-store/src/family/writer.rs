@@ -536,6 +536,49 @@ mod build_scratch_tests {
         );
     }
 
+    /// A workspace that a build of its checkout adopts and leaves paused
+    /// between the listing and the deletion is judged as paused: above the
+    /// floor itself it stays.
+    #[test]
+    fn disk_reclaim_reads_a_workspace_again_once_it_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let family =
+            Family::open(dir.path(), FamilyId::from_digest(Digest128::of(b"stale"))).unwrap();
+        let scratch = family
+            .try_write()
+            .unwrap()
+            .unwrap()
+            .create_scratch(checkout(b"victim"), |_| Ok::<_, ()>(()))
+            .unwrap();
+        // Resumable, so no writer's sweep deletes it meanwhile.
+        crate::family::workspace::write_identity(
+            scratch.path(),
+            &crate::family::workspace::WorkspaceIdentity {
+                root: dir.path().to_path_buf(),
+                payload: Vec::new(),
+            },
+        )
+        .unwrap();
+        let victim = scratch.path().to_path_buf();
+        drop(scratch);
+        assert!(!crate::family::workspace::is_paused(&victim));
+        PAUSE_BEFORE_DELETION_FOR_TEST
+            .lock()
+            .unwrap()
+            .push(victim.clone());
+        let reclaimed =
+            reclaim_dead_workspaces(dir.path(), None, || Ok::<_, ()>(true), || Ok(false));
+        PAUSE_BEFORE_DELETION_FOR_TEST
+            .lock()
+            .unwrap()
+            .retain(|path| path != &victim);
+        assert_eq!(reclaimed.removed, 0);
+        assert!(victim.exists(), "a workspace paused meanwhile stays");
+        let reclaimed =
+            reclaim_dead_workspaces(dir.path(), None, || Ok::<_, ()>(true), || Ok(true));
+        assert_eq!(reclaimed.removed, 1, "below the floor it goes");
+    }
+
     /// Free space that cannot be measured stops reclamation before it
     /// deletes anything.
     #[test]
@@ -733,6 +776,7 @@ pub fn reclaim_dead_workspaces<E>(
         };
         for workspace in workspaces {
             if workspace.is_dir() {
+                // For the order only; read again before deleting.
                 let paused = crate::family::workspace::is_paused(&workspace);
                 dead.push((
                     paused,
@@ -745,7 +789,21 @@ pub fn reclaim_dead_workspaces<E>(
     }
     dead.sort();
     let mut removed = 0;
-    for (paused, _, checkout, workspace) in dead {
+    for (_, _, checkout, workspace) in dead {
+        #[cfg(test)]
+        pause_before_deletion_for_test(&workspace);
+        let Ok(Some(_lock)) = try_checkout_lock(&checkout) else {
+            continue;
+        };
+        // What the listing saw may be stale: since the listing lock was
+        // let go, a build of that checkout may have adopted the workspace,
+        // stopped for lack of disk and marked it paused, or deleted it. With
+        // the lock held again no build of it runs, so what is read now holds
+        // until the deletion.
+        if !workspace.is_dir() {
+            continue;
+        }
+        let paused = crate::family::workspace::is_paused(&workspace);
         match if paused { below_floor() } else { short() } {
             Ok(true) => {}
             Ok(false) => continue,
@@ -756,9 +814,6 @@ pub fn reclaim_dead_workspaces<E>(
                 };
             }
         }
-        let Ok(Some(_lock)) = try_checkout_lock(&checkout) else {
-            continue;
-        };
         if remove_workspace_dir(&workspace).is_ok() {
             removed += 1;
         }
@@ -778,6 +833,25 @@ pub struct Reclaimed<E> {
     /// The error that stopped it: the free space could not be measured, so
     /// nothing more was deleted.
     pub stopped: Option<E>,
+}
+
+/// Workspaces a test marks paused between the listing and the deletion, as
+/// a build of their checkout that adopted one and stopped for lack of disk
+/// would.
+#[cfg(test)]
+static PAUSE_BEFORE_DELETION_FOR_TEST: std::sync::Mutex<Vec<PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn pause_before_deletion_for_test(workspace: &Path) {
+    if PAUSE_BEFORE_DELETION_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|path| path == workspace)
+    {
+        std::fs::File::create(workspace.join(crate::family::workspace::PAUSED)).unwrap();
+    }
 }
 
 /// A checkout's build folder, `builds/<checkout>/`, with its
