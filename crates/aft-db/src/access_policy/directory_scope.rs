@@ -1,6 +1,6 @@
 //! Bounded directory-consent scope probing, independent of the daemon transport.
 use super::{AccessGrant, AccessOperation, GrantKind};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     collections::HashMap,
@@ -14,7 +14,7 @@ use std::{
 /// folder, a home ancestor, a root-level or volume-level folder, or a protected
 /// system tree (including nested system folders). macOS per-user temporary
 /// trees remain eligible. Unknown home/volume identity stays file-only.
-pub(crate) fn directory_scope(grant: &AccessGrant) -> AccessGrant {
+pub fn directory_scope(grant: &AccessGrant) -> AccessGrant {
     directory_scope_with(grant, directory_is_root_alias)
 }
 
@@ -65,11 +65,13 @@ pub(crate) fn repository_scope_with(directory: &Path, eligible: impl Fn(&Path) -
 }
 
 pub(crate) const DIRECTORY_SCOPE_PROBE_BUDGET: Duration = Duration::from_millis(250);
-#[cfg(test)]
-pub(crate) static DIRECTORY_SCOPE_PROBE_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, feature = "test-support"))]
+pub static DIRECTORY_SCOPE_PROBE_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
 
+#[rustfmt::skip]
+test_support_visibility! {
 pub(crate) fn directory_scope_probe_budget() -> Duration {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         let ms = DIRECTORY_SCOPE_PROBE_OVERRIDE_MS.load(Ordering::SeqCst);
         if ms > 0 {
@@ -78,8 +80,12 @@ pub(crate) fn directory_scope_probe_budget() -> Duration {
     }
     DIRECTORY_SCOPE_PROBE_BUDGET
 }
+}
 
+#[rustfmt::skip]
+test_support_visibility! {
 pub(crate) const DIRECTORY_SCOPE_MEMO_TTL: Duration = Duration::from_secs(60);
+}
 pub(crate) type DirectoryScopeAnswer = Result<bool, &'static str>;
 
 #[derive(Default)]
@@ -119,14 +125,20 @@ impl DirectoryScopeProbe {
     }
 }
 
+#[rustfmt::skip]
+test_support_visibility! {
 pub(crate) const DIRECTORY_SCOPE_MISSING_LOG_CAP: usize = 4_096;
+}
 
+#[rustfmt::skip]
+test_support_visibility! {
 #[derive(Default)]
 pub(crate) struct DirectoryScopeProbes {
     pub(crate) probes: HashMap<PathBuf, Arc<DirectoryScopeProbe>>,
     pub(crate) logged: HashMap<(PathBuf, &'static str), Instant>,
     pub(crate) missing_logged: std::collections::HashSet<PathBuf>,
     pub(crate) last_pruned: Option<Instant>,
+}
 }
 
 impl DirectoryScopeProbes {
@@ -178,9 +190,14 @@ impl DirectoryScopeProbes {
     }
 }
 
+#[rustfmt::skip]
+test_support_visibility! {
 pub(crate) static DIRECTORY_SCOPE_PROBES: LazyLock<std::sync::Mutex<DirectoryScopeProbes>> =
     LazyLock::new(|| std::sync::Mutex::new(DirectoryScopeProbes::default()));
+}
 
+#[rustfmt::skip]
+test_support_visibility! {
 pub(crate) fn directory_scope_with<F>(grant: &AccessGrant, root_alias_check: F) -> AccessGrant
 where
     F: Fn(&Path, &Path) -> Option<bool> + Send + Sync + 'static,
@@ -240,7 +257,10 @@ where
         }
     }
 }
+}
 
+#[rustfmt::skip]
+test_support_visibility! {
 pub(crate) fn log_directory_scope_fallback(parent: &Path, reason: &str) {
     // Scratch directories may be removed after their command exits, before
     // consent can offer a wider grant. The original file grant is still safe.
@@ -256,6 +276,7 @@ pub(crate) fn log_directory_scope_fallback(parent: &Path, reason: &str) {
         );
     }
 }
+}
 
 pub(crate) fn probe_directory_scope_with(
     parent: &Path,
@@ -266,7 +287,7 @@ pub(crate) fn probe_directory_scope_with(
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .map(|path| {
-            #[cfg(all(test, unix))]
+            #[cfg(all(any(test, feature = "test-support"), unix))]
             crate::bounded_io::stall_helper_if_requested(&path);
             crate::policy_path::policy_path(&path)
         })
@@ -318,9 +339,12 @@ pub(crate) use crate::path_identity::{directory_is_protected_alias, directory_sc
 /// or busy scans must never widen a file grant.
 pub(crate) const ROOT_ALIAS_SCAN_BUDGET: Duration = Duration::from_millis(250);
 
+#[rustfmt::skip]
+test_support_visibility! {
 pub(crate) struct ScopeProbeLimiter {
     pub(crate) in_flight: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) available: Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
+}
 }
 
 impl ScopeProbeLimiter {
@@ -393,15 +417,21 @@ impl Drop for ScopeProbePermit {
     }
 }
 
+#[rustfmt::skip]
+test_support_visibility! {
 pub(crate) static DIRECTORY_SCOPE_PROBE_LIMITER: LazyLock<ScopeProbeLimiter> =
     LazyLock::new(ScopeProbeLimiter::new);
+}
 pub(crate) static ROOT_ALIAS_SCAN_LIMITER: LazyLock<ScopeProbeLimiter> =
     LazyLock::new(ScopeProbeLimiter::new);
 
+#[rustfmt::skip]
+test_support_visibility! {
 pub(crate) fn directory_is_root_alias(directory: &Path, root: &Path) -> Option<bool> {
     let directory = directory.to_path_buf();
     let root = root.to_path_buf();
     ROOT_ALIAS_SCAN_LIMITER.scan(move || scan_root_alias(&directory, &root))
+}
 }
 
 pub(crate) fn scan_root_alias(directory: &Path, root: &Path) -> Option<bool> {

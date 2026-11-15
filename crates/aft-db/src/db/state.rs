@@ -2,10 +2,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 pub(crate) const RUNNER_COMPLETION_DELIVERY_CUTOVER: &str = "runner_completion_delivery_cutover_ms";
 
-pub(crate) fn runner_completion_delivery_cutover(
-    conn: &Connection,
-    now_ms: u64,
-) -> rusqlite::Result<u64> {
+pub fn runner_completion_delivery_cutover(conn: &Connection, now_ms: u64) -> rusqlite::Result<u64> {
     let value = match get_host_state(conn, RUNNER_COMPLETION_DELIVERY_CUTOVER)? {
         Some(value) => value,
         None => {

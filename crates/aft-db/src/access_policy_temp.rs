@@ -1,16 +1,16 @@
 use std::path::{Path, PathBuf};
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static ROOTS_FOR_TEST: std::cell::RefCell<Option<Vec<PathBuf>>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// Restores the previous temp-root override when dropped.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) struct RootsOverride(Option<Vec<PathBuf>>);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for RootsOverride {
     fn drop(&mut self) {
         let previous = self.0.take();
@@ -21,7 +21,7 @@ impl Drop for RootsOverride {
 /// Make this thread's access policies treat `roots` as the only system temp
 /// directories, so a test can exercise the temp guards on a directory it owns
 /// instead of the host's real `/tmp`.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn override_roots_for_test(roots: Vec<PathBuf>) -> RootsOverride {
     RootsOverride(ROOTS_FOR_TEST.with(|current| current.borrow_mut().replace(roots)))
 }
@@ -29,11 +29,11 @@ pub(crate) fn override_roots_for_test(roots: Vec<PathBuf>) -> RootsOverride {
 /// The temp-root override installed on the calling thread, if any. Read it on
 /// the request thread: policy construction may run on the bounded IO helper.
 pub(crate) fn roots_override() -> Option<Vec<PathBuf>> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         ROOTS_FOR_TEST.with(|roots| roots.borrow().clone())
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     {
         None
     }
@@ -130,7 +130,7 @@ impl TempDenial {
         }
     }
 
-    pub(crate) fn message(&self, requested: &Path, canonical_requested: &Path) -> String {
+    pub fn message(&self, requested: &Path, canonical_requested: &Path) -> String {
         let folder = requested.display();
         // Checks use canonical paths; render descendants under the caller's spelling.
         let rendered_entry = match self.entry.strip_prefix(canonical_requested) {

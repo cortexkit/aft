@@ -377,12 +377,12 @@ impl fmt::Display for SandboxProfileError {
 impl std::error::Error for SandboxProfileError {}
 
 fn canonicalize_path(path: &Path) -> std::io::Result<PathBuf> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     CANONICALIZE_CALLS.with(|count| count.set(count.get() + 1));
     path.canonicalize()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static CANONICALIZE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -597,7 +597,7 @@ fn canonicalize_optional_paths(
 /// Resolve an environment deny before profile validation, retaining a normalized
 /// alias as well as its target so replacing a config symlink stays forbidden.
 #[cfg(unix)]
-pub(crate) fn resolve_env_deny_paths(
+pub fn resolve_env_deny_paths(
     path: PathBuf,
     variable: &str,
 ) -> Result<Vec<PathBuf>, SandboxProfileError> {
@@ -620,7 +620,7 @@ pub(crate) fn resolve_env_deny_paths(
 }
 
 #[cfg(unix)]
-pub(crate) fn resolved_env_deny_paths(variable: &str, path: PathBuf) -> Vec<PathBuf> {
+pub fn resolved_env_deny_paths(variable: &str, path: PathBuf) -> Vec<PathBuf> {
     match resolve_env_deny_paths(path, variable) {
         Ok(paths) => paths,
         Err(error) => {

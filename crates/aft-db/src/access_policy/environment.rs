@@ -22,7 +22,7 @@ pub(crate) fn managed_read_paths(config: &Config, storage: &Path) -> Vec<PathBuf
         .unwrap_or_default()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn registered() -> bool {
     MANAGED_READ_PATHS.get().is_some()
 }

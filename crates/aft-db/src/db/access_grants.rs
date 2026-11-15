@@ -89,7 +89,7 @@ fn agent_head(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<Option<Scop
     }).optional()
 }
 
-pub(crate) fn is_head(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<bool> {
+pub fn is_head(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<bool> {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM access_scope_agents a JOIN access_scopes s USING(owner,scope_ref,epoch) WHERE a.owner=?1 AND a.scope_ref=?2 AND a.epoch=?3 AND a.kind='head' AND s.ended=0)",
         params![key.owner, key.scope_ref, key.epoch.to_string()],
@@ -212,7 +212,7 @@ pub fn scope_config(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<Optio
 }
 
 /// Confirmed ends remain authoritative even when cleanup of another table fails.
-pub(crate) fn scope_ended(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<bool> {
+pub fn scope_ended(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<bool> {
     conn.query_row("SELECT EXISTS(SELECT 1 FROM access_scopes WHERE owner=?1 AND scope_ref=?2 AND epoch=?3 AND ended!=0)",
         params![key.owner,key.scope_ref,key.epoch.to_string()], |row| row.get(0))
 }
@@ -337,7 +337,7 @@ pub fn insert(conn: &Connection, key: &ScopeKey, grant: &AccessGrant) -> rusqlit
 }
 
 /// Person-given authority only; legacy rows cannot establish provenance.
-pub(crate) fn person_grant_covers(
+pub fn person_grant_covers(
     conn: &Connection,
     key: &ScopeKey,
     requested: &AccessGrant,
@@ -497,7 +497,7 @@ pub(crate) fn saved_scopes(conn: &Connection) -> rusqlite::Result<Vec<rusqlite::
 }
 
 /// Keyset pagination bounds housekeeping work, not a tool's result list.
-pub(crate) fn saved_scope_batch(
+pub fn saved_scope_batch(
     conn: &Connection,
     after: Option<&ScopeKey>,
     limit: usize,
@@ -536,7 +536,7 @@ pub(crate) fn saved_scope_batch(
 }
 
 /// A definite daemon end and its saved-grant deletion commit together.
-pub(crate) fn end_saved_scope(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<usize> {
+pub fn end_saved_scope(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<usize> {
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "UPDATE access_scopes SET ended=1 WHERE owner=?1 AND scope_ref=?2 AND epoch=?3",

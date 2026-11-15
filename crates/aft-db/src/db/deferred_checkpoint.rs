@@ -91,10 +91,10 @@ pub(crate) fn register(pool: &Arc<Mutex<TrackedConnection>>) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let stats = conn.checkpoint_stats();
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let path = PathBuf::from(conn.path().unwrap_or_default());
     conn.set_checkpoint_owner(Box::new(move || {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         test_hooks::wait_at_gate(&path);
         let Some(pool) = weak.upgrade() else {
             return true;
@@ -174,7 +174,7 @@ fn checkpoint_shared(path: &Path, identity: FileIdentity, stats: &CheckpointStat
             }
         }
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     test_hooks::wait_at_gate(path);
     // The same sync policy the database's writers use, so the checkpoint
     // syncs exactly what an inline one would.
@@ -243,7 +243,7 @@ fn run(queue: &'static Queue) {
                 if !(request.work)() {
                     request.schedule_after(Duration::from_millis(100));
                 } else {
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     test_hooks::note_finished(&request.path);
                 }
             }
@@ -289,7 +289,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) mod test_hooks {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};

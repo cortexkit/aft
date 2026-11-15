@@ -261,7 +261,7 @@ fn register_open(store: SqliteStore) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *counts.entry(store).or_default() += 1;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     thread_counts::record(store, 1);
 }
 
@@ -271,7 +271,7 @@ fn register_close(store: SqliteStore) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let count = counts.entry(store).or_default();
     *count = count.saturating_sub(1);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     thread_counts::record(store, -1);
 }
 
@@ -279,8 +279,8 @@ fn register_close(store: SqliteStore) {
 /// shared with every other test in the binary, which open and close their own
 /// connections concurrently, so a test cannot assert a delta against it. This
 /// mirror only ever sees the calling thread's own opens and closes.
-#[cfg(test)]
-pub(crate) mod thread_counts {
+#[cfg(any(test, feature = "test-support"))]
+pub mod thread_counts {
     use super::SqliteStore;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
@@ -354,7 +354,7 @@ impl CheckpointStats {
         );
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn snapshot(&self) -> (u64, std::time::Duration) {
         (
             self.attempts.load(Ordering::Relaxed),
@@ -377,7 +377,7 @@ struct WalHookState {
     lag_reported: AtomicBool,
     lag_warned: AtomicBool,
     checkpoint_stats: Arc<CheckpointStats>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     inline_for_attribution_test: AtomicBool,
 }
 
@@ -501,7 +501,7 @@ unsafe extern "C" fn tracked_wal_hook(
     if threshold <= 0 || frame_count < threshold {
         return rusqlite::ffi::SQLITE_OK;
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if state.inline_for_attribution_test.load(Ordering::Relaxed) {
         return unsafe { inline_checkpoint_for_attribution_test(state, _db, _database_name) };
     }
@@ -516,7 +516,7 @@ unsafe extern "C" fn tracked_wal_hook(
 
 // Retain the old SQLite-default behavior only for byte-attribution parity
 // fixtures. Production hooks never call sqlite3_wal_checkpoint_v2.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 unsafe fn inline_checkpoint_for_attribution_test(
     state: &WalHookState,
     db: *mut rusqlite::ffi::sqlite3,
@@ -558,14 +558,14 @@ thread_local! {
 }
 
 /// WAL checkpoints that ran inside this thread's own commits so far.
-#[cfg(test)]
-pub(crate) fn inline_checkpoints_on_this_thread() -> u64 {
+#[cfg(any(test, feature = "test-support"))]
+pub fn inline_checkpoints_on_this_thread() -> u64 {
     INLINE_CHECKPOINTS.with(std::cell::Cell::get)
 }
 
 /// Total time this thread has spent in WAL checkpoints that ran inside its
 /// own commits. Callers difference two readings to split a commit's time.
-pub(crate) fn inline_checkpoint_time_on_this_thread() -> std::time::Duration {
+pub fn inline_checkpoint_time_on_this_thread() -> std::time::Duration {
     INLINE_CHECKPOINT_TIME.with(std::cell::Cell::get)
 }
 
@@ -772,7 +772,7 @@ impl TrackedConnection {
                 attempts: AtomicU64::new(0),
                 mutex_hold_ns: AtomicU64::new(0),
             }),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             inline_for_attribution_test: AtomicBool::new(false),
         });
         let context = std::ptr::from_ref(wal_hook.as_ref())
@@ -858,7 +858,7 @@ impl TrackedConnection {
 
     /// Keep the connection alive until its final checkpoint and close happen
     /// on the maintenance thread. Used by request-local SQLite owners.
-    pub(crate) fn close_in_background(&self) {
+    pub fn close_in_background(&self) {
         if !self
             .is_readonly(rusqlite::DatabaseName::Main)
             .unwrap_or(true)
@@ -893,9 +893,12 @@ impl TrackedConnection {
         }
     }
 
-    pub(crate) fn checkpoint_stats(&self) -> Arc<CheckpointStats> {
+    #[rustfmt::skip]
+    test_support_visibility! {
+pub(crate) fn checkpoint_stats(&self) -> Arc<CheckpointStats> {
         Arc::clone(&self.wal_hook.checkpoint_stats)
     }
+}
 
     pub(crate) fn checkpoint_feedback(&self) -> impl Fn(bool) + Send + Sync + 'static {
         let weak = Arc::downgrade(&self.wal_hook);
@@ -928,7 +931,7 @@ impl TrackedConnection {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn enable_inline_checkpoint_for_attribution_test(&self) {
         self.wal_hook
             .inline_for_attribution_test
@@ -1028,11 +1031,11 @@ impl Drop for TrackedConnection {
                 file_identity_key: self.file_identity_key.take(),
             };
             super::deferred_checkpoint::close(move || {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 let path = closing.path().map(PathBuf::from);
                 closing.checkpoint_in_background();
                 drop(closing);
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 if let Some(path) = path {
                     super::deferred_checkpoint::test_hooks::note_finished(&path);
                 }

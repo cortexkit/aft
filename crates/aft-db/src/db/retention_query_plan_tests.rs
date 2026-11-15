@@ -3,16 +3,16 @@ use rusqlite::ffi;
 use std::ffi::{c_int, c_void, CStr};
 
 pub const NOW: i64 = 100 * TERMINAL_ROW_RETENTION_AGE_MS;
-const TASK_HISTORY_ROWS: usize = 4096;
-const EVENT_HISTORY_ROWS: usize = 8192;
+pub const TASK_HISTORY_ROWS: usize = 4096;
+pub const EVENT_HISTORY_ROWS: usize = 8192;
 
 pub struct Fixture {
-    conn: crate::db::TrackedConnection,
+    pub conn: crate::db::TrackedConnection,
     _dir: tempfile::TempDir,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self::with_sizes(TASK_HISTORY_ROWS, EVENT_HISTORY_ROWS)
     }
 
@@ -76,7 +76,7 @@ impl Fixture {
 #[derive(Debug)]
 pub struct Executed {
     sql: String,
-    template: String,
+    pub template: String,
     vm_steps: i32,
 }
 

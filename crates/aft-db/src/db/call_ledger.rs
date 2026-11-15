@@ -14,13 +14,15 @@ fn settled() {
 pub(crate) type HeldResultProjector =
     fn(&RecordedFrame, Option<&[u8]>, bool) -> Result<RecordedFrame, String>;
 static HELD_RESULT_PROJECTOR: std::sync::OnceLock<HeldResultProjector> = std::sync::OnceLock::new();
-pub(crate) fn register_held_result_projector(project: HeldResultProjector) {
+pub fn register_held_result_projector(project: HeldResultProjector) {
     let _ = HELD_RESULT_PROJECTOR.set(project);
 }
-#[cfg(test)]
-pub(crate) fn held_result_projector_registered() -> bool {
+#[cfg(any(test, feature = "test-support"))]
+pub fn held_result_projector_registered() -> bool {
     HELD_RESULT_PROJECTOR.get().is_some()
 }
+#[rustfmt::skip]
+test_support_visibility! {
 pub(crate) fn project_held_result(
     frame: &RecordedFrame,
     source: Option<&[u8]>,
@@ -31,6 +33,7 @@ pub(crate) fn project_held_result(
         .ok_or_else(|| "held result projection unavailable".to_string())?(
         frame, source, structured
     )
+}
 }
 
 use cortexkit_role_tool_provider::late_results::{check_since, Cursor};
@@ -78,7 +81,7 @@ CREATE TABLE IF NOT EXISTS call_ledger_updates (
 CREATE INDEX IF NOT EXISTS idx_call_ledger_updates_cursor ON call_ledger_updates(custodian,seq);
 "#;
 
-pub(crate) fn record_running_update(
+pub fn record_running_update(
     conn: &Connection,
     key: &Key,
     approval_key: &str,
@@ -398,7 +401,7 @@ pub fn admit_with_tool_result_source(
             Admission::Conflict
         });
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     run_after_ledger_read(&tx);
     tx.execute("INSERT INTO call_ledger (carrier,call_key,digest,state,owner,scope_ref,scope_epoch,custodian,event_id)
         VALUES (?1,?2,?3,?4,?5,?6,?7,CASE WHEN ?5 IS NULL THEN NULL ELSE ?1 END,?8)",
@@ -424,7 +427,7 @@ pub fn transition(conn: &Connection, key: &Key, from: State, to: State) -> rusql
 /// A permission preflight did not dispatch the requested action. Return it to
 /// the withdrawable state and retain its held-reply/v1 body before sending that
 /// permission-wait reply to the program.
-pub(crate) fn hold_permission(
+pub fn hold_permission(
     conn: &Connection,
     key: &Key,
     body: &[u8],
@@ -441,7 +444,7 @@ pub(crate) fn hold_permission(
 /// the call is in flight: a later end must not settle it as not_started or undo
 /// its handler. Scope cleanup still kills shell tasks belonging to that scope.
 /// The transaction ends here; no authorization lock spans native dispatch.
-pub(crate) fn begin_approved(conn: &Connection, key: &Key) -> rusqlite::Result<bool> {
+pub fn begin_approved(conn: &Connection, key: &Key) -> rusqlite::Result<bool> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let Some(row) = get(&tx, key)?.filter(|row| row.state == State::Prepared) else {
         return Ok(false);
@@ -474,7 +477,7 @@ pub(crate) fn begin_approved(conn: &Connection, key: &Key) -> rusqlite::Result<b
 
 /// Retain a task-backed hold before replying. Keep a prior consent hold marker:
 /// reason transitions use separate non-terminal entries, not another initial reply.
-pub(crate) fn hold_running(
+pub fn hold_running(
     conn: &Connection,
     key: &Key,
     task_id: &str,
@@ -508,7 +511,7 @@ fn has_held_reply(row: &Row) -> bool {
     })
 }
 
-pub(crate) fn hold_watch(conn: &Connection, key: &Key, body: &[u8]) -> rusqlite::Result<()> {
+pub fn hold_watch(conn: &Connection, key: &Key, body: &[u8]) -> rusqlite::Result<()> {
     let changed = conn.execute("UPDATE call_ledger SET recovered=1,frame_type='Response',frame_body=?3 WHERE carrier=?1 AND call_key=?2 AND state='DispatchStarted'", params![key.carrier, key.call_key, body])?;
     if changed != 1 {
         return Err(rusqlite::Error::QueryReturnedNoRows);
@@ -516,7 +519,7 @@ pub(crate) fn hold_watch(conn: &Connection, key: &Key, body: &[u8]) -> rusqlite:
     Ok(())
 }
 
-pub(crate) fn unknown_held_result() -> RecordedFrame {
+pub fn unknown_held_result() -> RecordedFrame {
     unknown_held_result_with_text("")
 }
 
@@ -531,7 +534,7 @@ fn unknown_held_result_with_text(text: &str) -> RecordedFrame {
 }
 
 /// The preview must already have the shell output's usual cap and masking.
-pub(crate) fn unknown_bash_result(
+pub fn unknown_bash_result(
     task_id: &str,
     job_id: Option<&str>,
     output_preview: &str,
@@ -552,7 +555,7 @@ pub(crate) fn unknown_bash_result(
     unknown_held_result_with_text(&text)
 }
 
-pub(crate) fn unknown_bash_result_missing_root(task_id: &str) -> RecordedFrame {
+pub fn unknown_bash_result_missing_root(task_id: &str) -> RecordedFrame {
     unknown_held_result_with_text(&format!(
         "Task {task_id}: outcome unknown (AFT restarted and this command's project folder no longer exists, so it can't tell whether the command ran)."
     ))
@@ -634,7 +637,7 @@ pub fn settle_with_tool_result_source(
     if row.state == State::Settled {
         return Ok(false);
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     run_after_ledger_read(&tx);
     settle_row(&tx, &row, frame, outcome, reason, now, source)?;
     tx.commit()?;
@@ -1239,7 +1242,7 @@ pub fn late_results(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn late_results_for_consumer(
+pub fn late_results_for_consumer(
     conn: &Connection,
     custodian: &str,
     incarnation: &str,
@@ -1421,7 +1424,7 @@ pub fn recover(conn: &Connection) -> rusqlite::Result<()> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for key in keys {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         run_before_recovery_read(conn, &key);
         let Some(row) = get(conn, &key)? else {
             continue;
@@ -1543,7 +1546,7 @@ pub struct TaskObservation {
 /// Remember the notice lane before ending its abandoned hold with the existing
 /// unknown-outcome response. The marker survives restart without freezing a
 /// withdrawal answer or allowing a later recovery to publish the real result.
-pub(crate) fn settle_task_notice_fallback(
+pub fn settle_task_notice_fallback(
     conn: &Connection,
     key: &Key,
     task_id: &str,
@@ -1728,17 +1731,17 @@ fn new_event_id() -> String {
     id.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 type LedgerReadHook = Box<dyn FnOnce(&Connection)>;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 type RecoveryReadHook = Box<dyn FnOnce(&Connection, &Key)>;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static AFTER_LEDGER_READ: std::cell::RefCell<Option<LedgerReadHook>> = const { std::cell::RefCell::new(None) };
     static BEFORE_RECOVERY_READ: std::cell::RefCell<Option<RecoveryReadHook>> = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn run_after_ledger_read(conn: &Connection) {
     let hook = AFTER_LEDGER_READ.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
@@ -1746,7 +1749,7 @@ fn run_after_ledger_read(conn: &Connection) {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn run_before_recovery_read(conn: &Connection, key: &Key) {
     let hook = BEFORE_RECOVERY_READ.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
@@ -3351,7 +3354,7 @@ pub mod tests {
             result_entries_parsed: parsed.load(Ordering::SeqCst),
         }
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
 
     /// A settle enforces the retention bounds over all of the custodian's late
     /// entries. Its reads must not depend on how large the stored results
@@ -3518,7 +3521,7 @@ pub mod tests {
         );
         assert!(get(&actual, &key("running")).unwrap().is_some());
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
 
     /// Wall-clock settle time on ledgers of 20 KB results, printed for a
     /// manual before-and-after comparison. Run it with

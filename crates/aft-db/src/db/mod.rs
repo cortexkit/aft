@@ -23,15 +23,15 @@ pub mod call_ledger;
 pub mod catalog_edit_modes;
 pub mod compression_events;
 #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
-pub(crate) mod contention_probe;
-pub(crate) mod deferred_checkpoint;
+pub mod contention_probe;
+pub mod deferred_checkpoint;
 pub mod display_records;
-pub(crate) mod gh_speech;
+pub mod gh_speech;
 pub mod github_read_cache;
 pub mod remote_exec;
 pub mod removal;
 pub mod rich_ui;
-pub(crate) mod runner_harness_keys;
+pub mod runner_harness_keys;
 pub mod standing_roots;
 pub mod state;
 
@@ -449,7 +449,7 @@ impl fmt::Display for OpenError {
 }
 
 impl OpenError {
-    pub(crate) fn is_busy(&self) -> bool {
+    pub fn is_busy(&self) -> bool {
         let error = match self {
             Self::Sqlite(error)
             | Self::InitializationFailed { error, .. }
@@ -489,14 +489,14 @@ pub fn open(path: &Path) -> Result<TrackedConnection, OpenError> {
     open_with_mode(path, OpenMode::Deferred)
 }
 
-pub(crate) const TOOL_RETRY_BUSY_WAIT: Duration = Duration::from_millis(250);
+pub const TOOL_RETRY_BUSY_WAIT: Duration = Duration::from_millis(250);
 
 /// How long a statement on an open AFT connection waits for another process's
 /// lock before SQLite reports `database is locked`.
-pub(crate) const STEADY_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+pub const STEADY_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// True for SQLite's lock-contention results (`SQLITE_BUSY`, `SQLITE_LOCKED`).
-pub(crate) fn is_busy_error(error: &rusqlite::Error) -> bool {
+pub fn is_busy_error(error: &rusqlite::Error) -> bool {
     matches!(
         error.sqlite_error_code(),
         Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
@@ -648,13 +648,13 @@ pub(crate) fn maintenance_interval() -> Duration {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OpenMode {
+pub enum OpenMode {
     Deferred,
     SingleAttempt,
 }
 
-pub(crate) fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConnection, OpenError> {
-    #[cfg(test)]
+pub fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConnection, OpenError> {
+    #[cfg(any(test, feature = "test-support"))]
     crate::test_storage::assert_database(path);
     // Decide before mkdir, journal PRAGMAs, or a writable SQLite open. A dev
     // reader can inspect a matching schema, but cannot create even one record.
@@ -760,11 +760,11 @@ pub fn open_readonly(path: &Path) -> Result<TrackedConnection, OpenError> {
 /// absent, cannot be opened read-only, has no schema table yet, or is locked
 /// right now: the peek never waits, because the full open that follows has
 /// its own bounded busy handling and repeats the version check.
-pub(crate) fn peek_schema_version(path: &Path) -> Option<u32> {
+pub fn peek_schema_version(path: &Path) -> Option<u32> {
     if !path.is_file() {
         return None;
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     SCHEMA_PEEKS.with(|count| count.set(count.get() + 1));
     let conn = open_readonly(path).ok()?;
     conn.busy_timeout(Duration::ZERO).ok()?;
@@ -781,13 +781,13 @@ pub(crate) fn peek_schema_version(path: &Path) -> Option<u32> {
     current_schema_version(&conn).ok()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static SCHEMA_PEEKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
-pub(crate) fn schema_peek_count_for_test() -> u64 {
+#[cfg(any(test, feature = "test-support"))]
+pub fn schema_peek_count_for_test() -> u64 {
     SCHEMA_PEEKS.with(std::cell::Cell::get)
 }
 
@@ -859,8 +859,11 @@ fn run_migrations_supported(conn: &mut Connection, supported: u32) -> Result<u32
     Ok(supported)
 }
 
+#[rustfmt::skip]
+test_support_visibility! {
 fn ensure_additive_indexes(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(ADDITIVE_INDEXES)
+}
 }
 
 /// `host_state` key recording that shell command text written to
@@ -909,7 +912,7 @@ fn current_schema_version(conn: &Connection) -> Result<u32, rusqlite::Error> {
 
 /// Re-check a resident database without waiting for another process's lock or
 /// opening a second descriptor. Restore its normal busy wait before release.
-pub(crate) fn schema_version_without_wait(conn: &mut TrackedConnection) -> rusqlite::Result<u32> {
+pub fn schema_version_without_wait(conn: &mut TrackedConnection) -> rusqlite::Result<u32> {
     with_busy_wait(conn, Duration::ZERO, |conn| current_schema_version(conn))
 }
 
@@ -1023,6 +1026,8 @@ fn migration_already_applied(conn: &Connection, version: u32) -> rusqlite::Resul
     }
 }
 
+#[rustfmt::skip]
+test_support_visibility! {
 fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Result<()> {
     match version {
         1 => conn.execute_batch(MIGRATION_V1),
@@ -1065,6 +1070,7 @@ fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Resu
         call_ledger::CARRIER_CUSTODY_SCHEMA_VERSION => call_ledger::migrate_carrier_custody(conn),
         _ => Ok(()),
     }
+}
 }
 
 fn apply_migration_v4(conn: &Connection) -> rusqlite::Result<()> {

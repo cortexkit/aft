@@ -112,7 +112,7 @@ pub(crate) fn new_grant_id() -> String {
     format!("aftg_{hex}")
 }
 
-pub(crate) fn now_ms() -> i64 {
+pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| {
@@ -250,7 +250,7 @@ fn head_agent(
 /// Resolve a shell's recorded scope without requiring it to hold a saved grant.
 /// Use the worker's recorded parent owner, scope and epoch. If that exact
 /// registration is absent, a revived head keeps its newest registered agent id.
-pub(crate) fn holder_for_scope(
+pub fn holder_for_scope(
     conn: &Connection,
     scope: &ScopeKey,
 ) -> rusqlite::Result<Option<GrantHolder>> {
@@ -292,7 +292,7 @@ pub(crate) fn holder_for_scope(
     })
 }
 
-pub(crate) fn known_agent_ids(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+pub fn known_agent_ids(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     conn.prepare("SELECT DISTINCT agent_id FROM access_scope_agents WHERE kind='head' AND agent_id<>'' ORDER BY agent_id")?
         .query_map([], |row| row.get(0))?.collect()
 }

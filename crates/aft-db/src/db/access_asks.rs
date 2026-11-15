@@ -33,7 +33,7 @@ pub enum Permission {
 }
 
 impl Permission {
-    pub(crate) fn file(&self) -> Option<&AccessGrant> {
+    pub fn file(&self) -> Option<&AccessGrant> {
         match self {
             Self::File(grant) => Some(grant),
             Self::Shell { .. } => None,
@@ -192,7 +192,7 @@ pub fn open(
     )
 }
 
-pub(crate) fn open_permission(
+pub fn open_permission(
     conn: &Connection,
     key: &AskKey,
     call_key: &str,
@@ -260,7 +260,7 @@ pub fn claim(
 }
 
 /// The caller serializes origin-scope checks and grant insertion in this transaction.
-pub(crate) fn claim_in_transaction(
+pub fn claim_in_transaction(
     conn: &Connection,
     key: &AskKey,
     call_key: &str,

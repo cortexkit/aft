@@ -241,7 +241,7 @@ fn continuation_at(scope: &Scope, grants: &[AccessGrant], now: Instant) -> Vec<S
 }
 
 /// Make an issued token expire now, to test what a late approval does.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn expire_for_test(id: &str) {
     if let Some(token) = TOKENS.lock().unwrap().get_mut(id) {
         token.expires = Instant::now() - Duration::from_secs(1);

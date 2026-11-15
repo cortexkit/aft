@@ -1,9 +1,9 @@
 //! Route-local filesystem authority. Resolution belongs to the caller; every
 //! resolved target is decided here before a tool mutates it or a shell launches.
 
-pub(crate) mod directory_scope;
-pub(crate) use directory_scope::directory_scope;
-pub(crate) mod environment;
+pub mod directory_scope;
+pub use directory_scope::directory_scope;
+pub mod environment;
 
 use std::path::{Path, PathBuf};
 
@@ -17,7 +17,7 @@ thread_local! {
 
 /// Bind saved-grant eligibility to the authenticated caller. Nested work cannot
 /// restore authority withheld by an outer caller, including during traversal.
-pub(crate) fn scope_grants_guard(denial: Option<ScopeGrantsDenial>) -> ScopeGrantsGuard {
+pub fn scope_grants_guard(denial: Option<ScopeGrantsDenial>) -> ScopeGrantsGuard {
     ScopeGrantsGuard(
         SCOPE_GRANTS_DENIAL.with(|slot| slot.replace(slot.get().or(denial))),
         std::marker::PhantomData,
@@ -35,11 +35,11 @@ impl Drop for ScopeGrantsGuard {
     }
 }
 
-pub(crate) fn scope_grants_denial() -> Option<ScopeGrantsDenial> {
+pub fn scope_grants_denial() -> Option<ScopeGrantsDenial> {
     SCOPE_GRANTS_DENIAL.with(std::cell::Cell::get)
 }
 
-pub(crate) fn with_scope<R>(
+pub fn with_scope<R>(
     scope: Option<crate::db::access_grants::ScopeKey>,
     run: impl FnOnce() -> R,
 ) -> R {
@@ -47,10 +47,13 @@ pub(crate) fn with_scope<R>(
     run()
 }
 
+#[rustfmt::skip]
+test_support_visibility! {
 pub(crate) struct ScopeGuard(
     Option<crate::db::access_grants::ScopeKey>,
     std::marker::PhantomData<*const ()>,
 );
+}
 
 impl Drop for ScopeGuard {
     fn drop(&mut self) {
@@ -60,18 +63,18 @@ impl Drop for ScopeGuard {
     }
 }
 
-pub(crate) fn scope_guard(scope: Option<crate::db::access_grants::ScopeKey>) -> ScopeGuard {
+pub fn scope_guard(scope: Option<crate::db::access_grants::ScopeKey>) -> ScopeGuard {
     ScopeGuard(
         REQUEST_SCOPE.with(|slot| slot.replace(scope)),
         std::marker::PhantomData,
     )
 }
 
-pub(crate) fn current_scope() -> Option<crate::db::access_grants::ScopeKey> {
+pub fn current_scope() -> Option<crate::db::access_grants::ScopeKey> {
     REQUEST_SCOPE.with(|slot| slot.borrow().clone())
 }
 
-pub(crate) fn scope_matches(scope: &Option<crate::db::access_grants::ScopeKey>) -> bool {
+pub fn scope_matches(scope: &Option<crate::db::access_grants::ScopeKey>) -> bool {
     REQUEST_SCOPE.with(|slot| *slot.borrow() == *scope)
 }
 
@@ -177,7 +180,7 @@ fn no_symlink_below(root: &Path, path: &Path) -> bool {
 
 /// Who answers an `ask` decision for the call running on this thread.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) enum AskRoute {
+pub enum AskRoute {
     /// CLI/library callers without a host retain their configured legacy access.
     /// Subc and native OpenCode/Pi entry points install an explicit route.
     #[default]
@@ -215,7 +218,7 @@ pub(crate) enum AskRoute {
 }
 
 /// Refusal for a codemode call that would need a permission ask.
-pub(crate) const PERMISSION_ASK_UNAVAILABLE: &str = "permission_ask_unavailable";
+pub const PERMISSION_ASK_UNAVAILABLE: &str = "permission_ask_unavailable";
 
 /// The refusal for an `ask` on a route that cannot put the question to anyone:
 /// [`AskRoute::Unavailable`] (a codemode program) or [`AskRoute::Fork`]. Any
@@ -258,11 +261,11 @@ pub fn unasked_refusal(
 }
 
 #[path = "access_policy_plugin.rs"]
-pub(crate) mod plugin;
+pub mod plugin;
 pub mod prefrontal;
 
 #[path = "access_policy_temp.rs"]
-pub(crate) mod temp;
+pub mod temp;
 
 pub struct CapturedAskRoute(AskRoute);
 pub struct InstalledAskRoute {
@@ -281,7 +284,7 @@ impl CapturedAskRoute {
     }
 }
 
-pub(crate) fn finish_plugin_response(
+pub fn finish_plugin_response(
     scope: &plugin::Scope,
     once: &[AccessGrant],
     preview: bool,
@@ -297,7 +300,7 @@ pub(crate) fn finish_plugin_response(
     response
 }
 
-pub(crate) fn finish_current_plugin_response(
+pub fn finish_current_plugin_response(
     response: crate::protocol::Response,
 ) -> crate::protocol::Response {
     match current_ask_route() {
@@ -308,7 +311,7 @@ pub(crate) fn finish_current_plugin_response(
 
 /// Internal refusal code for an `ask` that must go to Cingulate. The subc
 /// layer turns it into a held call; it never reaches the agent as-is.
-pub(crate) const ACCESS_ASK_REQUIRED: &str = "access_ask_required";
+pub const ACCESS_ASK_REQUIRED: &str = "access_ask_required";
 
 /// Whether `response` asks for access instead of failing: a plugin host's
 /// outside-access ask (`permission_required` with the `asks` the host prompts
@@ -318,7 +321,7 @@ pub(crate) const ACCESS_ASK_REQUIRED: &str = "access_ask_required";
 /// asked and the call can never run. A fork call's refusal in place of an ask
 /// (`fork_call_refused`) is kept whole the same way, so the caller gets the
 /// refusal rather than a partial result.
-pub(crate) fn is_access_request(response: &crate::protocol::Response) -> bool {
+pub fn is_access_request(response: &crate::protocol::Response) -> bool {
     matches!(
         response
             .data
@@ -337,7 +340,10 @@ thread_local! {
     static ASK_ROUTE_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+#[rustfmt::skip]
+test_support_visibility! {
 pub(crate) struct AskRouteGuard(Option<AskRoute>, std::marker::PhantomData<*const ()>);
+}
 
 impl Drop for AskRouteGuard {
     fn drop(&mut self) {
@@ -348,7 +354,7 @@ impl Drop for AskRouteGuard {
     }
 }
 
-pub(crate) fn ask_route_guard(route: Option<AskRoute>) -> AskRouteGuard {
+pub fn ask_route_guard(route: Option<AskRoute>) -> AskRouteGuard {
     ASK_ROUTE_GENERATION.with(|generation| generation.set(generation.get().wrapping_add(1)));
     AskRouteGuard(
         ASK_ROUTE.with(|slot| slot.replace(route)),
@@ -356,23 +362,18 @@ pub(crate) fn ask_route_guard(route: Option<AskRoute>) -> AskRouteGuard {
     )
 }
 
-pub(crate) fn ask_route_generation() -> u64 {
+pub fn ask_route_generation() -> u64 {
     ASK_ROUTE_GENERATION.with(|generation| generation.get())
 }
 
-pub(crate) fn current_ask_route() -> AskRoute {
+pub fn current_ask_route() -> AskRoute {
     ASK_ROUTE
         .with(|slot| slot.borrow().clone())
         .unwrap_or_default()
 }
 
 impl AccessGrant {
-    pub(crate) fn covers_kind(
-        &self,
-        operation: AccessOperation,
-        path: &Path,
-        kind: GrantKind,
-    ) -> bool {
+    pub fn covers_kind(&self, operation: AccessOperation, path: &Path, kind: GrantKind) -> bool {
         self.covers(operation, path) && (self.kind == GrantKind::Subtree || kind == GrantKind::File)
     }
     /// Whether this capability lets `operation` touch `path`. Write implies
@@ -752,7 +753,7 @@ impl AccessPolicy {
     /// through here, so the
     /// in-process tool checks and the subc consent and launch checks cannot
     /// disagree about what a worker may read.
-    pub(crate) fn install_scope_grants(&mut self, stored: Vec<AccessGrant>, worker: bool) {
+    pub fn install_scope_grants(&mut self, stored: Vec<AccessGrant>, worker: bool) {
         self.install_scope_grants_from(stored, worker, WorkerRustSources::daemon());
     }
 
@@ -786,7 +787,7 @@ impl AccessPolicy {
         self.decide_inner(operation, path, owned_artifact, false)
     }
 
-    pub(crate) fn decide_resolved(
+    pub fn decide_resolved(
         &self,
         operation: AccessOperation,
         path: &Path,
@@ -898,7 +899,7 @@ impl AccessPolicy {
             })
     }
 
-    pub(crate) fn floor_denial_message(
+    pub fn floor_denial_message(
         &self,
         operation: AccessOperation,
         identity: &Path,
@@ -942,7 +943,7 @@ impl AccessPolicy {
     }
 
     #[cfg(unix)]
-    pub(crate) fn add_session_store_floor(&mut self, path: PathBuf) {
+    pub fn add_session_store_floor(&mut self, path: PathBuf) {
         self.floor_rules.push(PolicyFloor {
             path: path.clone(),
             rule: FloorRule::SessionStore,
@@ -1034,7 +1035,7 @@ impl AccessPolicy {
 
     /// Report the same floor that rejects a capability, including a protected
     /// descendant of a subtree. Provenance is recorded when the floor is built.
-    pub(crate) fn capability_floor(
+    pub fn capability_floor(
         &self,
         operation: AccessOperation,
         kind: GrantKind,
@@ -1136,7 +1137,7 @@ impl AccessPolicy {
 
     /// Select held shell capabilities without widening file grants to directories.
     /// A subtree must be usable in full; a denied descendant cannot be delegated.
-    pub(crate) fn shell_grants(&self, operation: AccessOperation) -> Vec<PathBuf> {
+    pub fn shell_grants(&self, operation: AccessOperation) -> Vec<PathBuf> {
         self.grants
             .iter()
             .chain(&self.worker_read_grants)
@@ -1256,7 +1257,7 @@ fn environment_private_store_floors(
     denies
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(any(test, feature = "test-support"), unix))]
 fn environment_private_store_denies(
     getenv: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Vec<PathBuf> {
@@ -1386,7 +1387,7 @@ pub(crate) fn floor_contains(path: &Path, prefix: &Path) -> bool {
     })
 }
 
-pub(crate) fn expand_home(path: &Path, home: &Path) -> PathBuf {
+pub fn expand_home(path: &Path, home: &Path) -> PathBuf {
     let mut components = path.components();
     if components
         .next()
@@ -1400,7 +1401,7 @@ pub(crate) fn expand_home(path: &Path, home: &Path) -> PathBuf {
 
 use crate::policy_path::policy_path;
 
-pub(crate) struct StoragePaths;
+pub struct StoragePaths;
 
 impl crate::read_policy::StoragePathPolicy for StoragePaths {
     fn identity(&self, path: &Path) -> PathBuf {

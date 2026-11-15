@@ -296,7 +296,7 @@ fn census_key(conn: &Connection) -> String {
         .unwrap_or_else(|| format!("memory:{:p}", conn))
 }
 
-pub(crate) fn refresh_watch_gap_health(conn: &Connection) {
+pub fn refresh_watch_gap_health(conn: &Connection) {
     let key = census_key(conn);
     let census = (|| -> rusqlite::Result<GapCensus> {
         let mut stmt = conn.prepare("SELECT match_batch FROM bash_pattern_watches WHERE pending_match = 1 AND match_batch IS NOT NULL UNION ALL SELECT batch FROM bash_watch_delivery_gaps")?;
@@ -333,7 +333,7 @@ pub(crate) fn refresh_watch_gap_health(conn: &Connection) {
     }
 }
 
-pub(crate) fn watch_gap_health() -> GapCensus {
+pub fn watch_gap_health() -> GapCensus {
     WATCH_GAP_CENSUS
         .get_or_init(Default::default)
         .lock()
@@ -348,7 +348,7 @@ pub(crate) fn watch_gap_health() -> GapCensus {
         })
 }
 
-pub(crate) fn delivery_ack_version(
+pub fn delivery_ack_version(
     conn: &Connection,
     harness: &str,
     session: &str,
@@ -358,7 +358,7 @@ pub(crate) fn delivery_ack_version(
     conn.query_row("SELECT version, eviction_epoch, evicted_through FROM bash_watch_delivery_acks WHERE harness=?1 AND session_id=?2 AND task_id=?3 AND watch_id=?4", params![harness, session, task, watch], |r| Ok((r.get::<_, i64>(0)?.max(0) as u64, r.get(1)?, r.get::<_, i64>(2)?.max(0) as u64))).optional()
 }
 
-pub(crate) fn acknowledge_delivery(
+pub fn acknowledge_delivery(
     conn: &Connection,
     harness: &str,
     session: &str,
@@ -384,8 +384,8 @@ pub(crate) fn acknowledge_delivery(
 /// One database's census entry. Uses the connection's own key rather than a
 /// path the test spells, since SQLite reports its file name in its own form
 /// (symlinks resolved on macOS, no verbatim prefix on Windows).
-#[cfg(test)]
-pub(crate) fn watch_gap_health_for(conn: &Connection) -> GapCensus {
+#[cfg(any(test, feature = "test-support"))]
+pub fn watch_gap_health_for(conn: &Connection) -> GapCensus {
     WATCH_GAP_CENSUS
         .get_or_init(Default::default)
         .lock()
@@ -395,7 +395,7 @@ pub(crate) fn watch_gap_health_for(conn: &Connection) -> GapCensus {
         .unwrap_or_default()
 }
 
-pub(crate) fn list_delivery_gaps(
+pub fn list_delivery_gaps(
     conn: &Connection,
     harness: &str,
     session: Option<&str>,
@@ -442,16 +442,13 @@ pub(crate) fn list_delivery_gaps(
     rows.collect()
 }
 
-pub(crate) fn upsert_delivery_gap(
-    conn: &Connection,
-    row: &BashPatternWatchRow,
-) -> rusqlite::Result<()> {
+pub fn upsert_delivery_gap(conn: &Connection, row: &BashPatternWatchRow) -> rusqlite::Result<()> {
     conn.execute("INSERT INTO bash_watch_delivery_gaps(harness,session_id,task_id,watch_id,batch) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(harness,session_id,task_id,watch_id) DO UPDATE SET batch=excluded.batch", params![row.harness,row.session_id,row.task_id,row.watch_id,row.match_batch])?;
     refresh_watch_gap_health(conn);
     Ok(())
 }
 
-pub(crate) fn delete_delivery_gap(
+pub fn delete_delivery_gap(
     conn: &Connection,
     harness: &str,
     session: &str,

@@ -4,11 +4,11 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 
 static STORE_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-pub(crate) fn store_revision() -> u64 {
+pub fn store_revision() -> u64 {
     STORE_REVISION.load(std::sync::atomic::Ordering::Acquire)
 }
 
-pub(crate) fn record_store_write(result: rusqlite::Result<usize>) -> rusqlite::Result<usize> {
+pub fn record_store_write(result: rusqlite::Result<usize>) -> rusqlite::Result<usize> {
     if matches!(result, Ok(changed) if changed > 0) {
         // Transaction callers hold their connection until commit. A rollback
         // can advance the generation too: one extra rescan is safer than a
@@ -53,7 +53,7 @@ pub struct TerminalRowsPrune {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TerminalPruneCandidate {
+pub struct TerminalPruneCandidate {
     pub(crate) harness: String,
     pub(crate) session_id: String,
     pub(crate) task_id: String,
@@ -66,7 +66,7 @@ pub(crate) struct TerminalPruneCandidate {
 
 /// Shell facts checked outside the database lock before deleting terminal rows.
 #[derive(Clone, Copy)]
-pub(crate) struct RetentionHooks {
+pub struct RetentionHooks {
     pub(crate) write_order_is_live: fn(&str, &str) -> bool,
     pub(crate) process_alive: fn(u32, u64) -> bool,
     pub(crate) layout_is_gone: fn(Option<&Path>, &TerminalPruneCandidate) -> bool,
@@ -265,7 +265,7 @@ pub fn delete_bash_task(
 /// and the task layout is absent. The filesystem check uses the same lookup and
 /// initialization grace as persisted-task garbage collection, so a task being
 /// created concurrently is not mistaken for a missing task.
-pub(crate) fn prune_terminal_rows(
+pub fn prune_terminal_rows(
     conn: &Connection,
     now_ms: i64,
     limit: usize,
@@ -477,7 +477,7 @@ pub fn get_bash_task(
 const TASK_OWNER_SQL: &str =
     "SELECT session_id FROM bash_tasks WHERE task_id = ?1 AND harness = ?2 LIMIT 1";
 
-pub(crate) fn find_bash_task_session(
+pub fn find_bash_task_session(
     conn: &Connection,
     harness: &str,
     task_id: &str,
@@ -630,7 +630,7 @@ pub fn list_replayable_bash_tasks_for_project(
 
 /// Reconcile only the snapshot's delivery bit; a recovery snapshot must not
 /// replace newer status, output, or metadata committed by the task's owner.
-pub(crate) fn checkpoint_bash_task_acknowledgement(
+pub fn checkpoint_bash_task_acknowledgement(
     conn: &Connection,
     harness: &str,
     session_id: &str,
@@ -695,7 +695,7 @@ fn map_bash_task_row(row: &Row<'_>) -> rusqlite::Result<BashTaskRow> {
 
 /// Operator inventory includes acknowledged terminal tasks until its shorter
 /// display retention expires, as well as every task whose outcome is pending.
-pub(crate) fn operator_shell_rows(
+pub fn operator_shell_rows(
     conn: &Connection,
     cutoff_ms: u64,
 ) -> rusqlite::Result<Vec<BashTaskRow>> {
@@ -1120,10 +1120,10 @@ fn changes() -> &'static tokio::sync::watch::Sender<u64> {
     CHANGES.get_or_init(|| tokio::sync::watch::channel(0).0)
 }
 
-pub(crate) fn changed() {
+pub fn changed() {
     changes().send_modify(|revision| *revision = revision.wrapping_add(1));
 }
 
-pub(crate) fn subscribe() -> tokio::sync::watch::Receiver<u64> {
+pub fn subscribe() -> tokio::sync::watch::Receiver<u64> {
     changes().subscribe()
 }

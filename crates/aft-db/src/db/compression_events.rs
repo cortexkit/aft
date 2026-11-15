@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
@@ -96,7 +96,7 @@ pub struct CompressionAggregateCache {
     inner: Mutex<CompressionAggregateCacheInner>,
     refreshing: Mutex<std::collections::HashSet<(usize, SessionAggregateKey)>>,
     epoch: std::sync::atomic::AtomicU64,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     aggregate_scan_count: AtomicUsize,
 }
 
@@ -191,7 +191,7 @@ impl CompressionAggregateCache {
 
     /// Validate warm totals with one indexed watermark lookup, never aggregate
     /// on the push thread. A miss is recomputed by `refresh_for_status`.
-    pub(crate) fn validated_for_status(
+    pub fn validated_for_status(
         &self,
         conn: &Connection,
         harness: &str,
@@ -213,7 +213,7 @@ impl CompressionAggregateCache {
             .map(|(project, session)| (project.aggregate, session.aggregate)))
     }
 
-    pub(crate) fn refresh_for_status(
+    pub fn refresh_for_status(
         self: &std::sync::Arc<Self>,
         db: std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
         harness: String,
@@ -325,17 +325,17 @@ impl CompressionAggregateCache {
         *self.inner.lock() = CompressionAggregateCacheInner::default();
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn aggregate_scan_count_for_test(&self) -> usize {
         self.aggregate_scan_count.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn note_aggregate_scan(&self) {
         self.aggregate_scan_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     fn note_aggregate_scan(&self) {}
 }
 
@@ -466,11 +466,17 @@ const RETENTION_BATCH: i64 = 500;
 // Production selects, stats, and mutates at most 250 rows per transaction;
 // filesystem checks still run after releasing the shared database mutex.
 pub const BASH_TASK_STEADY_STATE_ROWS: usize = 250;
+#[rustfmt::skip]
+test_support_visibility! {
 const RETENTION_LOCK_BUDGET_MICROS: u128 = 100_000;
+}
+#[rustfmt::skip]
+test_support_visibility! {
 // A representative one-row retention sweep measured 7 ms in the mutation lock
 // (and under 1 ms in each count/selection lock). Allow 10 ms for that contention,
 // still well below the 100 ms maximum hold for a retention transaction.
 const RETENTION_COUNT_LOCK_RETRY_BUDGET_MICROS: u128 = 10_000;
+}
 // A retention transaction keeps retrying for this long while another process
 // holds the write lock, releasing the shared connection mutex between attempts.
 const RETENTION_MUTATION_BUSY_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
@@ -684,7 +690,7 @@ fn prune_compression_events_in_transaction(
     Ok(deleted)
 }
 
-pub(crate) fn prune_retention_tick(
+pub fn prune_retention_tick(
     conn: &mut Connection,
     now_ms: i64,
     hooks: crate::db::bash_tasks::RetentionHooks,
@@ -742,7 +748,7 @@ fn apply_prepared_retention_tick_timed(
 }
 
 #[derive(Clone)]
-pub(crate) struct RetentionGuard {
+pub struct RetentionGuard {
     pub(crate) hooks: crate::db::bash_tasks::RetentionHooks,
     pub(crate) has_active_watch: Option<std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>>,
 }
@@ -755,7 +761,7 @@ pub(crate) fn prune_retention_once(
     prune_retention_once_observed(db, now_ms, guard, || {})
 }
 
-pub(crate) fn prune_retention_once_observed(
+pub fn prune_retention_once_observed(
     db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
     now_ms: i64,
     guard: &RetentionGuard,
@@ -851,10 +857,13 @@ pub(crate) fn prune_retention_once_observed(
     }))
 }
 
+#[rustfmt::skip]
+test_support_visibility! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RetentionCountPhase {
     Opening,
     Closing,
+}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -913,14 +922,14 @@ fn try_retention_count_lock_observed<'a>(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    static RETENTION_COUNT_LOCK_RETRY_BUDGET_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+    pub static RETENTION_COUNT_LOCK_RETRY_BUDGET_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
         const { std::cell::Cell::new(None) };
 }
 
 fn retention_count_lock_retry_budget() -> std::time::Duration {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(budget) = RETENTION_COUNT_LOCK_RETRY_BUDGET_OVERRIDE.with(std::cell::Cell::get) {
         return budget;
     }
@@ -1055,7 +1064,7 @@ fn retention_row_ceiling(eligible_rows: usize) -> usize {
 
 /// Drain a retention backlog through independently committed, bounded transactions.
 /// Contention between batches stops the sweep so interactive work always wins the mutex.
-pub(crate) fn prune_retention_sweep(
+pub fn prune_retention_sweep(
     db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
     now_ms: i64,
     guard: &RetentionGuard,
@@ -1063,7 +1072,7 @@ pub(crate) fn prune_retention_sweep(
     prune_retention_sweep_observed(db, now_ms, guard, |_, _| {})
 }
 
-pub(crate) fn prune_retention_sweep_observed(
+pub fn prune_retention_sweep_observed(
     db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
     now_ms: i64,
     guard: &RetentionGuard,
@@ -1172,7 +1181,7 @@ pub(crate) fn prune_retention_sweep_observed(
 /// Schedule bounded retention away from the daemon and standalone request loops.
 /// A process can have only one sweep in flight and attempts at most once a
 /// minute, or a few seconds after a sweep skipped for lack of the mutex.
-pub(crate) fn maybe_spawn_retention(
+pub fn maybe_spawn_retention(
     db: Option<std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>>,
     guard: RetentionGuard,
 ) {

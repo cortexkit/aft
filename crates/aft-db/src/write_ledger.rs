@@ -532,7 +532,7 @@ fn set_process_baseline_for_test(bytes: Option<Bytes>, sampled_at_ms: u64) {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn pending_for_test(domain: Domain, root_id: &str) -> (u64, u64) {
+pub fn pending_for_test(domain: Domain, root_id: &str) -> (u64, u64) {
     registry()
         .entries
         .lock()
@@ -678,7 +678,7 @@ pub mod tests {
             .unwrap();
         assert_eq!(expired, 0);
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
 
     /// A fold that cannot open its transaction (in production: another
     /// process holds the write lock) must lose nothing: its bytes stay pending

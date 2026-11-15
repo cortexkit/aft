@@ -2,7 +2,10 @@
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
+#[rustfmt::skip]
+test_support_visibility! {
 const SOURCE_LIMIT: usize = 65_536;
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum AliasTable {
@@ -56,8 +59,11 @@ pub(super) fn lookup_alias<T: rusqlite::types::FromSql>(
     }
 }
 
+#[rustfmt::skip]
+test_support_visibility! {
 pub(super) fn copy_aliases(conn: &Connection) -> rusqlite::Result<usize> {
     copy_aliases_with_limit(conn, SOURCE_LIMIT)
+}
 }
 
 fn copy_aliases_with_limit(conn: &Connection, source_limit: usize) -> rusqlite::Result<usize> {
@@ -95,7 +101,7 @@ fn copy_aliases_with_limit(conn: &Connection, source_limit: usize) -> rusqlite::
     Ok(copied)
 }
 
-pub(crate) fn initialize(conn: &Connection) {
+pub fn initialize(conn: &Connection) {
     if let Err(error) = copy_aliases(conn) {
         log::warn!("canonical runner harness key copy skipped; raw rows remain readable: {error}");
     }

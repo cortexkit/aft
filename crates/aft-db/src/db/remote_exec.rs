@@ -15,7 +15,9 @@ pub struct PolicyKey {
 }
 
 impl PolicyKey {
-    pub(crate) fn values(&self) -> [&str; 7] {
+    #[rustfmt::skip]
+    test_support_visibility! {
+pub(crate) fn values(&self) -> [&str; 7] {
         [
             &self.project_root,
             &self.harness,
@@ -26,13 +28,15 @@ impl PolicyKey {
             &self.preset,
         ]
     }
+
+}
 }
 
-pub(crate) struct PolicyRow {
-    pub(crate) params: String,
+pub struct PolicyRow {
+    pub params: String,
 }
 
-pub(crate) fn prior(conn: &Connection, key: &PolicyKey) -> rusqlite::Result<Option<PolicyRow>> {
+pub fn prior(conn: &Connection, key: &PolicyKey) -> rusqlite::Result<Option<PolicyRow>> {
     let v = key.values();
     let epoch = key.epoch.to_string();
     let prior = conn
@@ -56,7 +60,7 @@ pub(crate) fn prior(conn: &Connection, key: &PolicyKey) -> rusqlite::Result<Opti
     }
 }
 
-pub(crate) fn insert(
+pub fn insert(
     conn: &Connection,
     key: &PolicyKey,
     row: &PolicyRow,
@@ -73,7 +77,7 @@ pub(crate) fn insert(
     Ok(())
 }
 
-pub(crate) fn confine(conn: &Connection, key: &PolicyKey) -> rusqlite::Result<()> {
+pub fn confine(conn: &Connection, key: &PolicyKey) -> rusqlite::Result<()> {
     let v = key.values();
     conn.execute(
         "UPDATE remote_exec_policies SET params=json_set(params,'$.confine','root')
@@ -93,7 +97,7 @@ pub(crate) fn confine(conn: &Connection, key: &PolicyKey) -> rusqlite::Result<()
     Ok(())
 }
 
-pub(crate) fn lookup(
+pub fn lookup(
     tx: &Transaction<'_>,
     key: &PolicyKey,
     now: u64,
@@ -109,14 +113,14 @@ pub(crate) fn lookup(
         .transpose()
 }
 
-pub(crate) fn current(conn: &Connection, key: &PolicyKey) -> rusqlite::Result<Option<PolicyRow>> {
+pub fn current(conn: &Connection, key: &PolicyKey) -> rusqlite::Result<Option<PolicyRow>> {
     match current_direct(conn, key)? {
         Some(row) => Ok(Some(row)),
         None => alias(conn, key),
     }
 }
 
-pub(crate) fn alias(conn: &Connection, key: &PolicyKey) -> rusqlite::Result<Option<PolicyRow>> {
+pub fn alias(conn: &Connection, key: &PolicyKey) -> rusqlite::Result<Option<PolicyRow>> {
     super::runner_harness_keys::lookup_alias::<String>(
         conn,
         key,
@@ -125,10 +129,7 @@ pub(crate) fn alias(conn: &Connection, key: &PolicyKey) -> rusqlite::Result<Opti
     .map(|row| row.map(|params| PolicyRow { params }))
 }
 
-pub(crate) fn current_direct(
-    conn: &Connection,
-    key: &PolicyKey,
-) -> rusqlite::Result<Option<PolicyRow>> {
+pub fn current_direct(conn: &Connection, key: &PolicyKey) -> rusqlite::Result<Option<PolicyRow>> {
     let v = key.values();
     let epoch = key.epoch.to_string();
     conn.query_row(
