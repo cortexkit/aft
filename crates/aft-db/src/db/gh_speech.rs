@@ -94,15 +94,15 @@ pub fn schema_version(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
 }
 
 pub struct AuthorityRow {
-    pub(crate) record_json: String,
-    pub(crate) record_digest: Vec<u8>,
-    pub(crate) ticket_digest: Option<Vec<u8>>,
-    pub(crate) phase: String,
-    pub(crate) generation: i64,
-    pub(crate) minting_run: String,
-    pub(crate) harness: String,
-    pub(crate) session_id: String,
-    pub(crate) task_id: String,
+    pub record_json: String,
+    pub record_digest: Vec<u8>,
+    pub ticket_digest: Option<Vec<u8>>,
+    pub phase: String,
+    pub generation: i64,
+    pub minting_run: String,
+    pub harness: String,
+    pub session_id: String,
+    pub task_id: String,
 }
 
 pub fn load(
@@ -135,11 +135,11 @@ pub fn capture(
 }
 
 pub struct ScopeEndRow {
-    pub(crate) owner: String,
-    pub(crate) scope_ref: String,
-    pub(crate) epoch: String,
-    pub(crate) evidence_json: String,
-    pub(crate) recorded_at_ms: i64,
+    pub owner: String,
+    pub scope_ref: String,
+    pub epoch: String,
+    pub evidence_json: String,
+    pub recorded_at_ms: i64,
 }
 
 pub fn record_end(conn: &rusqlite::Connection, row: &ScopeEndRow) -> rusqlite::Result<()> {

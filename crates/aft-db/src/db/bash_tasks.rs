@@ -68,9 +68,9 @@ pub struct TerminalPruneCandidate {
 /// Shell facts checked outside the database lock before deleting terminal rows.
 #[derive(Clone, Copy)]
 pub struct RetentionHooks {
-    pub(crate) write_order_is_live: fn(&str, &str) -> bool,
-    pub(crate) process_alive: fn(u32, u64) -> bool,
-    pub(crate) layout_is_gone: fn(Option<&Path>, &TerminalPruneCandidate) -> bool,
+    pub write_order_is_live: fn(&str, &str) -> bool,
+    pub process_alive: fn(u32, u64) -> bool,
+    pub layout_is_gone: fn(Option<&Path>, &TerminalPruneCandidate) -> bool,
 }
 
 #[derive(Debug)]

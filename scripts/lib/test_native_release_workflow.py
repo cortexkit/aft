@@ -353,6 +353,34 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
                     )
         self.assertTrue(seen, "agent-file-tools has no path dependencies; the check found nothing")
 
+    def test_version_sync_updates_layer_versions_and_all_path_pins(self):
+        scratch = ROOT / "target/scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        version = "0.65.1-rehearsal.1.1"
+        with tempfile.TemporaryDirectory(dir=scratch) as temporary:
+            fixture = Path(temporary)
+            (fixture / "scripts").mkdir()
+            shutil.copy2(ROOT / "scripts/version-sync.mjs", fixture / "scripts/version-sync.mjs")
+            packages = ["aft-bridge", "opencode-plugin", "pi-plugin", "aft-cli"]
+            packages += [f"npm/{platform}" for platform in ("darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "win32-arm64", "win32-x64")]
+            for package in packages:
+                manifest = fixture / "packages" / package / "package.json"
+                manifest.parent.mkdir(parents=True)
+                manifest.write_text(json.dumps({"version": "0.65.0"}))
+            crates = ("aft", "aft-base", "aft-db", "aft-store", "aft-tokenizer", "secret-rules")
+            for crate in crates:
+                manifest = fixture / "crates" / crate / "Cargo.toml"
+                manifest.parent.mkdir(parents=True)
+                shutil.copy2(ROOT / "crates" / crate / "Cargo.toml", manifest)
+            subprocess.run(["node", str(fixture / "scripts/version-sync.mjs"), version], check=True, capture_output=True, text=True)
+            for crate in crates:
+                manifest = tomllib.loads((fixture / "crates" / crate / "Cargo.toml").read_text())
+                self.assertEqual(manifest["package"]["version"], version, crate)
+                for table in ("dependencies", "dev-dependencies", "build-dependencies"):
+                    for name, spec in manifest.get(table, {}).items():
+                        if isinstance(spec, dict) and "path" in spec:
+                            self.assertEqual(spec["version"], version, f"{crate}: {table}.{name}")
+
 
 class ReleaseRehearsalWorkflowTests(unittest.TestCase):
     def setUp(self):
@@ -503,7 +531,7 @@ class ReleaseRehearsalWorkflowTests(unittest.TestCase):
             target = Path(temporary)
             directory = target / "package"
             directory.mkdir()
-            packages = [{"name": name, "version": "0.63.5-rehearsal.1.1"} for name in ("aft-tokenizer", "aft-secret-rules", "aft-store", "agent-file-tools")]
+            packages = [{"name": name, "version": "0.63.5-rehearsal.1.1"} for name in ("aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "agent-file-tools")]
             files = [directory / f"{package['name']}-{package['version']}.crate" for package in packages]
             for file in files:
                 file.write_bytes(b"crate")
@@ -526,7 +554,7 @@ class ReleaseRehearsalWorkflowTests(unittest.TestCase):
         scratch.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=scratch) as temporary:
             target = Path(temporary)
-            packages = [{"name": name, "version": "0.63.5-rehearsal.1.1"} for name in ("aft-tokenizer", "aft-secret-rules", "aft-store", "agent-file-tools")]
+            packages = [{"name": name, "version": "0.63.5-rehearsal.1.1"} for name in ("aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "agent-file-tools")]
             metadata = json.dumps({"target_directory": str(target), "packages": packages})
             with mock.patch("subprocess.check_output", return_value=metadata):
                 copies = []

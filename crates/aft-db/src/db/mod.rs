@@ -1,6 +1,6 @@
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
-pub use crate::live_db_files as file_identity;
+pub use aft_base::live_db_files as file_identity;
 pub mod lifecycle;
 pub(crate) mod sealed_database;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

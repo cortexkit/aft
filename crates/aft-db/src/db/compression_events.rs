@@ -749,8 +749,8 @@ fn apply_prepared_retention_tick_timed(
 
 #[derive(Clone)]
 pub struct RetentionGuard {
-    pub(crate) hooks: crate::db::bash_tasks::RetentionHooks,
-    pub(crate) has_active_watch: Option<std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>>,
+    pub hooks: crate::db::bash_tasks::RetentionHooks,
+    pub has_active_watch: Option<std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>>,
 }
 
 pub(crate) fn prune_retention_once(
