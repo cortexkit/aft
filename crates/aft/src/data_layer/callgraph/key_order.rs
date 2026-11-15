@@ -229,18 +229,33 @@ impl<T: Hash + Eq> Interner<T> {
     }
 
     fn intern(&self, value: T) -> Result<u32, ManifestJoinError> {
+        self.intern_all([value]).map(|ids| ids[0])
+    }
+
+    /// The numbers of `values`, in order, taking the lock once.
+    fn intern_all(
+        &self,
+        values: impl IntoIterator<Item = T>,
+    ) -> Result<Vec<u32>, ManifestJoinError> {
         let mut table = self
             .table
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(&id) = table.0.get(&value) {
-            return Ok(id);
-        }
-        let id = u32::try_from(table.1.len()).map_err(|_| too_many("distinct answers"))?;
-        let value = Arc::new(value);
-        table.1.push(Arc::clone(&value));
-        table.0.insert(value, id);
-        Ok(id)
+        let (numbers, values_by_number) = &mut *table;
+        values
+            .into_iter()
+            .map(|value| {
+                if let Some(&id) = numbers.get(&value) {
+                    return Ok(id);
+                }
+                let id = u32::try_from(values_by_number.len())
+                    .map_err(|_| too_many("distinct answers or dependency keys"))?;
+                let value = Arc::new(value);
+                values_by_number.push(Arc::clone(&value));
+                numbers.insert(value, id);
+                Ok(id)
+            })
+            .collect()
     }
 
     fn into_values(self) -> Vec<Arc<T>> {
@@ -660,10 +675,13 @@ impl SiteResults {
 }
 
 /// The distinct answers and the large dependency sets that site results
-/// name by number.
+/// name by number. A large set is kept as the numbers of its keys in
+/// `keys`: sets of keys with the same member mostly share their keys, so
+/// each key's text is kept once.
 pub(super) struct Answers {
     answers: Vec<Arc<Resolution>>,
-    dependencies: Vec<Arc<Vec<String>>>,
+    dependencies: Vec<Arc<Vec<u32>>>,
+    keys: Vec<Arc<String>>,
 }
 
 impl Answers {
@@ -691,6 +709,7 @@ impl Answers {
         let language = record.facts().language.as_str();
         let mut dependencies = BTreeSet::new();
         let mut shared = HashSet::new();
+        let mut shared_keys = Vec::new();
         let mut sites = Vec::new();
         for (position, (site, result)) in records.iter().zip(results).enumerate() {
             if result.position as usize != position {
@@ -707,7 +726,7 @@ impl Answers {
                             .dependencies
                             .get(id as usize)
                             .ok_or_else(|| sort_error("an unknown dependency set"))?;
-                        dependencies.extend(keys.iter().cloned());
+                        shared_keys.extend(keys.iter().copied());
                     }
                 }
                 Dependencies::Inline(keys) => dependencies.extend(keys.into_vec()),
@@ -733,6 +752,15 @@ impl Answers {
                 site: site.site.clone(),
                 resolution: Arc::clone(resolution),
             });
+        }
+        shared_keys.sort_unstable();
+        shared_keys.dedup();
+        for key in shared_keys {
+            let key = self
+                .keys
+                .get(key as usize)
+                .ok_or_else(|| sort_error("an unknown dependency key"))?;
+            dependencies.insert(key.as_str().to_owned());
         }
         // `Resolver::resolve` reads the caller's own facts without
         // recording them.
@@ -822,7 +850,8 @@ struct Context<'s, 'r> {
     source: &'s RecordSource<'r>,
     paths: &'s [String],
     answers: Interner<Resolution>,
-    dependencies: Interner<Vec<String>>,
+    dependencies: Interner<Vec<u32>>,
+    dependency_keys: Interner<String>,
     counting: bool,
 }
 
@@ -858,7 +887,10 @@ impl<'s> Context<'s, '_> {
             count if count <= INLINE_DEPENDENCIES => {
                 Dependencies::Inline(keys.into_iter().collect())
             }
-            _ => Dependencies::Shared(self.dependencies.intern(keys.into_iter().collect())?),
+            _ => Dependencies::Shared(
+                self.dependencies
+                    .intern(self.dependency_keys.intern_all(keys)?)?,
+            ),
         };
         Ok(KeyAnswer {
             answer: self.answers.intern(resolution)?,
@@ -1130,6 +1162,7 @@ pub(super) fn resolve(
         paths,
         answers: Interner::new(),
         dependencies: Interner::new(),
+        dependency_keys: Interner::new(),
         counting: memory.is_some(),
     };
     let mut keys = Sorter::new(runs.path(), budget.sort_config()).map_err(sort_error)?;
@@ -1287,6 +1320,7 @@ pub(super) fn resolve(
     let answers = Answers {
         answers: context.answers.into_values(),
         dependencies: context.dependencies.into_values(),
+        keys: context.dependency_keys.into_values(),
     };
     if let Some(memory) = memory {
         report(
@@ -1355,6 +1389,11 @@ fn report(
     memory.push((
         "pass4.shared_dependency_bytes".to_string(),
         answers.dependencies.heap_bytes(&mut seen),
+    ));
+    memory.push(("pass4.dependency_keys".to_string(), answers.keys.len()));
+    memory.push((
+        "pass4.dependency_key_bytes".to_string(),
+        answers.keys.heap_bytes(&mut seen),
     ));
     memory.push(("pass4.shared_groups".to_string(), size(stats.shared)));
     memory.push((
