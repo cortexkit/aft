@@ -54,8 +54,9 @@ use crate::parser::LangId;
 /// (see [`MARKERS_PREFIX`]), so counting TODOs never parses a file; 14
 /// named, in a configuration file's language, the grammar its TODO comments
 /// are read in (see [`CONFIG`]), so two configuration files with the same
-/// bytes and different names have different records, and retained the inner
-/// project type of proven standard-library smart-pointer fields.
+/// bytes and different names have different records; it also retained the
+/// contained type of proven standard-library smart-pointer fields (for example,
+/// `Runner` in `Arc<Runner>`), so calls can resolve to that type's methods.
 pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-14";
 
 /// The language of a resolver configuration file the call graph reads raw,
