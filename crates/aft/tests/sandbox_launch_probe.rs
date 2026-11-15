@@ -1,6 +1,9 @@
 #![cfg(unix)]
+#[cfg(not(target_os = "linux"))]
 #[path = "helpers/aft_binary.rs"]
 mod aft_binary;
+#[cfg(target_os = "linux")]
+use test_helpers::aft_binary;
 #[path = "helpers/context_storage.rs"]
 mod context_storage;
 #[path = "../src/test_gate.rs"]

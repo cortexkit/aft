@@ -193,7 +193,7 @@ warning: workspace (manifest) generated 7 warnings
    Compiling ref-cast v1.0.27
    Compiling parking_lot_core v0.9.12
    Compiling hyper-util v0.1.20
-   Compiling thalamus-high-water v0.1.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/cf59575c7ffe72b4/bg_908a999699eeff8c/crates/thalamus-high-water)
+   Compiling thalamus-high-water v0.1.0 (/work/thalamus/crates/thalamus-high-water)
    Compiling cortexkit-role-tool-provider v0.15.5
    Compiling num-rational v0.4.2
    Compiling ed25519 v2.2.3
@@ -206,7 +206,7 @@ warning: workspace (manifest) generated 7 warnings
    Compiling webpki-roots v1.0.9
    Compiling num-complex v0.4.6
    Compiling ref-cast-impl v1.0.27
-   Compiling thalamus-host-supervisor v0.1.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/cf59575c7ffe72b4/bg_908a999699eeff8c/crates/thalamus-host-supervisor)
+   Compiling thalamus-host-supervisor v0.1.0 (/work/thalamus/crates/thalamus-host-supervisor)
    Compiling data-encoding v2.11.1
    Compiling cpufeatures v0.3.1
    Compiling openssl-probe v0.2.1
@@ -243,7 +243,7 @@ warning: workspace (manifest) generated 7 warnings
    Compiling bit-set v0.8.0
    Compiling time v0.3.55
    Compiling fluent-uri v0.4.1
-   Compiling thalamus-harness v0.1.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/cf59575c7ffe72b4/bg_908a999699eeff8c/crates/thalamus-harness)
+   Compiling thalamus-harness v0.1.0 (/work/thalamus/crates/thalamus-harness)
    Compiling strum_macros v0.28.0
    Compiling subc-transport v0.17.0
    Compiling hashbrown v0.17.1
@@ -287,7 +287,7 @@ warning: workspace (manifest) generated 7 warnings
    Compiling email_address v0.2.9
    Compiling jsonschema-regex v0.58.6
    Compiling jiff-core v0.1.2
-   Compiling thalamus-harness-module v0.1.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/cf59575c7ffe72b4/bg_908a999699eeff8c/crates/thalamus-harness-module)
+   Compiling thalamus-harness-module v0.1.0 (/work/thalamus/crates/thalamus-harness-module)
    Compiling jiff-tzdb v0.1.9
    Compiling cortexkit-bus-naming v0.2.0
    Compiling unicode-properties v0.1.3
@@ -306,16 +306,16 @@ warning: workspace (manifest) generated 7 warnings
    Compiling cortexkit-role-step-transform-provider v0.5.0
    Compiling hyper-rustls v0.27.9
    Compiling cortexkit-anthropic-policy v0.1.0
-   Compiling thalamus-harness-opencode v0.1.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/cf59575c7ffe72b4/bg_908a999699eeff8c/crates/thalamus-harness-opencode)
-   Compiling thalamus-harness-claude v0.1.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/cf59575c7ffe72b4/bg_908a999699eeff8c/crates/thalamus-harness-claude)
-   Compiling thalamus-harness-pi v0.1.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/cf59575c7ffe72b4/bg_908a999699eeff8c/crates/thalamus-harness-pi)
+   Compiling thalamus-harness-opencode v0.1.0 (/work/thalamus/crates/thalamus-harness-opencode)
+   Compiling thalamus-harness-claude v0.1.0 (/work/thalamus/crates/thalamus-harness-claude)
+   Compiling thalamus-harness-pi v0.1.0 (/work/thalamus/crates/thalamus-harness-pi)
    Compiling cortexkit-paths v0.1.2
    Compiling fastrand v2.5.0
    Compiling cortexkit-test-support v0.1.10
    Compiling cortexkit-bus-nats v0.3.0
    Compiling tempfile v3.27.0
     Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 43s
-     Running tests/host_supervisor.rs (/run/motor/target/bd/c4/5dbf218d1ce062/debug/build/thalamus-harness-module/167f615110fa593a/out/host_supervisor-167f615110fa593a)
+     Running tests/host_supervisor.rs (/work/thalamus/target/debug/deps/host_supervisor-fixture)
 
 running 4 tests
 test holders::a_holder_with_a_full_log_still_stops_its_host_when_its_keeper_dies ... ok
@@ -327,35 +327,35 @@ failures:
 
 ---- holders::a_hosts_output_is_all_in_its_log_once_its_holder_has_left stdout ----
 
-thread 'holders::a_hosts_output_is_all_in_its_log_once_its_holder_has_left' (6797) panicked at crates/thalamus-harness-module/tests/support/holders.rs:2964:5:
+thread 'holders::a_hosts_output_is_all_in_its_log_once_its_holder_has_left' (<thread-id>) panicked at crates/thalamus-harness-module/tests/support/holders.rs:2964:5:
 the log kept 64000 bytes, 64 of the host's 100 filler lines, and ends with "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
---- /motor-home/tmp/thalamus-tests/harness-holder-log-drain-6795-1794712713256512437-3/data/holders/test-host.holder.log:
-holder_host_log_not_rotated: /motor-home/tmp/thalamus-tests/harness-holder-log-drain-6795-1794712713256512437-3/data/holders/test-host.host.log: Is a directory (os error 21); appending to it
+--- /work/thalamus/test-temp/holder-log-drain/data/holders/test-host.holder.log:
+holder_host_log_not_rotated: /work/thalamus/test-temp/holder-log-drain/data/holders/test-host.host.log: Is a directory (os error 21); appending to it
 holder_host_ended: phase=unexpected status=Some(0)
 
---- /motor-home/tmp/thalamus-tests/harness-holder-log-drain-6795-1794712713256512437-3/data/holders/test-host.host.log: not a plain file
---- /motor-home/tmp/thalamus-tests/harness-holder-log-drain-6795-1794712713256512437-3/standin.log: not a plain file
-record: Some(HolderRecord { version: 1, host_id: "test-host", holder: HolderEntry { identity: ProcessIdentity { pid: 6812, start: "80c80f99-404c-4812-972c-66b38c24741c:13452", group: 0, uid: 999 }, exe_digest: "sha256:ba46584e448237396bd15c1bdb323be402f5c6258be0d3d66d391b4f1696f9d7", protocol: "thalamus-holder/1" }, keeper: Some(KeeperEntry { identity: ProcessIdentity { pid: 6831, start: "80c80f99-404c-4812-972c-66b38c24741c:13471", group: 0, uid: 999 }, protocol: "thalamus-host-supervisor/3" }), host: Some(HostEntry { identity: ProcessIdentity { pid: 6836, start: "80c80f99-404c-4812-972c-66b38c24741c:13472", group: 0, uid: 999 }, kind: "test" }), control_endpoint: "127.0.0.1:34135", launch_digest: "", digest_algorithm: None, plugin: PluginEntry { path: None, digest: "", protocols_in_use: {} }, highest_generation: 1, instance: Some("instance"), pi: None, pin: "/motor-home/tmp/thalamus-tests/harness-holder-log-drain-6795-1794712713256512437-3/bin/ckdev-thalamus-harness", stopped: true, exit_reason: Some(HostExited), exit_status: Some(0) })
+--- /work/thalamus/test-temp/holder-log-drain/data/holders/test-host.host.log: not a plain file
+--- /work/thalamus/test-temp/holder-log-drain/standin.log: not a plain file
+record: Some(HolderRecord { version: 1, host_id: "test-host", holder: HolderEntry { identity: ProcessIdentity { pid: <holder-pid>, start: "<boot-id>:<holder-start>", group: 0, uid: <uid> }, exe_digest: "sha256:<digest>", protocol: "thalamus-holder/1" }, keeper: Some(KeeperEntry { identity: ProcessIdentity { pid: <keeper-pid>, start: "<boot-id>:<keeper-start>", group: 0, uid: <uid> }, protocol: "thalamus-host-supervisor/3" }), host: Some(HostEntry { identity: ProcessIdentity { pid: <host-pid>, start: "<boot-id>:<host-start>", group: 0, uid: <uid> }, kind: "test" }), control_endpoint: "127.0.0.1:<port>", launch_digest: "", digest_algorithm: None, plugin: PluginEntry { path: None, digest: "", protocols_in_use: {} }, highest_generation: 1, instance: Some("instance"), pi: None, pin: "/work/thalamus/test-temp/holder-log-drain/bin/ckdev-thalamus-harness", stopped: true, exit_reason: Some(HostExited), exit_status: Some(0) })
 processes: []
 
 ---- holders::a_keeper_lost_before_its_start_acknowledgement_leaves_no_host_running stdout ----
 
-thread 'holders::a_keeper_lost_before_its_start_acknowledgement_leaves_no_host_running' (6798) panicked at crates/thalamus-harness-module/tests/support/holders.rs:1314:5:
+thread 'holders::a_keeper_lost_before_its_start_acknowledgement_leaves_no_host_running' (<thread-id>) panicked at crates/thalamus-harness-module/tests/support/holders.rs:1314:5:
 the host 6851 still runs 4.5s after its keeper's death, its holder gone; its parent is now Some(1); the holder's log:
 holder_failed: host_supervisor_startup_failed: before exec acknowledgement: failed to fill whole buffer; supervisor signal: 9 (SIGKILL)
 
---- /motor-home/tmp/thalamus-tests/harness-holder-keeper-lost-before-ack-6795-1794712713256515974-2/data/holders/test-host.holder.log:
+--- /work/thalamus/test-temp/holder-keeper-lost-before-ack/data/holders/test-host.holder.log:
 holder_failed: host_supervisor_startup_failed: before exec acknowledgement: failed to fill whole buffer; supervisor signal: 9 (SIGKILL)
 
---- /motor-home/tmp/thalamus-tests/harness-holder-keeper-lost-before-ack-6795-1794712713256515974-2/data/holders/test-host.host.log:
+--- /work/thalamus/test-temp/holder-keeper-lost-before-ack/data/holders/test-host.host.log:
 
---- /motor-home/tmp/thalamus-tests/harness-holder-keeper-lost-before-ack-6795-1794712713256515974-2/standin.log:
+--- /work/thalamus/test-temp/holder-keeper-lost-before-ack/standin.log:
 
 running 1 test
 
-record: Some(HolderRecord { version: 1, host_id: "test-host", holder: HolderEntry { identity: ProcessIdentity { pid: 6824, start: "80c80f99-404c-4812-972c-66b38c24741c:13453", group: 0, uid: 999 }, exe_digest: "sha256:ba46584e448237396bd15c1bdb323be402f5c6258be0d3d66d391b4f1696f9d7", protocol: "thalamus-holder/1" }, keeper: Some(KeeperEntry { identity: ProcessIdentity { pid: 6849, start: "80c80f99-404c-4812-972c-66b38c24741c:13473", group: 0, uid: 999 }, protocol: "thalamus-host-supervisor/3" }), host: Some(HostEntry { identity: ProcessIdentity { pid: 6851, start: "80c80f99-404c-4812-972c-66b38c24741c:13473", group: 0, uid: 999 }, kind: "test" }), control_endpoint: "127.0.0.1:42235", launch_digest: "", digest_algorithm: None, plugin: PluginEntry { path: None, digest: "", protocols_in_use: {} }, highest_generation: 0, instance: None, pi: None, pin: "/motor-home/tmp/thalamus-tests/harness-holder-keeper-lost-before-ack-6795-1794712713256515974-2/bin/ckdev-thalamus-harness", stopped: false, exit_reason: None, exit_status: None })
-processes: [(ProcessIdentity { pid: 6851, start: "80c80f99-404c-4812-972c-66b38c24741c:13473", group: 0, uid: 999 }, 1, "/motor-home/tmp/thalamus-tests/harness-holder-keeper-lost-before-ack-6795-1794712713256515974-2/bin/host-sleep")]
+record: Some(HolderRecord { version: 1, host_id: "test-host", holder: HolderEntry { identity: ProcessIdentity { pid: <holder-pid>, start: "<boot-id>:<holder-start>", group: 0, uid: <uid> }, exe_digest: "sha256:<digest>", protocol: "thalamus-holder/1" }, keeper: Some(KeeperEntry { identity: ProcessIdentity { pid: <keeper-pid>, start: "<boot-id>:<keeper-start>", group: 0, uid: <uid> }, protocol: "thalamus-host-supervisor/3" }), host: Some(HostEntry { identity: ProcessIdentity { pid: <host-pid>, start: "<boot-id>:<host-start>", group: 0, uid: <uid> }, kind: "test" }), control_endpoint: "127.0.0.1:<port>", launch_digest: "", digest_algorithm: None, plugin: PluginEntry { path: None, digest: "", protocols_in_use: {} }, highest_generation: 0, instance: None, pi: None, pin: "/work/thalamus/test-temp/holder-keeper-lost-before-ack/bin/ckdev-thalamus-harness", stopped: false, exit_reason: None, exit_status: None })
+processes: [(ProcessIdentity { pid: <host-pid>, start: "<boot-id>:<host-start>", group: 0, uid: <uid> }, 1, "/work/thalamus/test-temp/holder-keeper-lost-before-ack/bin/host-sleep")]
 
 
 failures:
