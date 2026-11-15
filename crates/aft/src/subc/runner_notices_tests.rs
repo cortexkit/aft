@@ -1310,6 +1310,33 @@ fn runner_notices_retry_unknown_outcome_with_same_id_and_dedupe() {
 }
 
 #[test]
+fn runner_notices_session_unconverted_is_final_but_transient_retries() {
+    let request = request("aft:bash:bash-7".into(), "completion".into(), true, false);
+    for (code, final_refusal) in [("session_unconverted", true), ("transient", false)] {
+        let mut runner = FakeRunner {
+            refuse: Some(code),
+            ..Default::default()
+        };
+        let outcome = runner.call(&envelope(&request));
+        if final_refusal {
+            assert!(
+                matches!(&outcome, Outcome::Final(failure) if failure.code.as_deref() == Some(code))
+            );
+        } else {
+            assert!(
+                matches!(&outcome, Outcome::Retry(failure) if failure.code.as_deref() == Some(code))
+            );
+        }
+        let next = deliver(&request.send_id, 0, true, outcome, &mut false);
+        assert_eq!(matches!(next, Next::Done), final_refusal);
+        if !final_refusal {
+            assert!(matches!(next, Next::Retry(delay) if delay == Duration::from_millis(250)));
+        }
+        assert_eq!(runner.calls.len(), 1);
+    }
+}
+
+#[test]
 fn runner_notices_final_refusals_stop_without_retry() {
     for code in [
         "scope_owner_mismatch",

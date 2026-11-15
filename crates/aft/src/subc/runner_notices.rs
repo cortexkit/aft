@@ -860,6 +860,7 @@ fn refusal(code: &str) -> Outcome {
         "scope_owner_mismatch"
         | "expired"
         | "session_released"
+        | "session_unconverted"
         | "send_id_reuse"
         | "delivery_unsupported"
         | "invalid_params" => Outcome::Final(Failure::coded(FailureClass::PeerRefusal, code, code)),
