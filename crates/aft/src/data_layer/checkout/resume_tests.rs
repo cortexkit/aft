@@ -434,6 +434,35 @@ fn a_build_never_resumes_what_another_executable_image_wrote() {
 }
 
 #[test]
+fn a_build_killed_while_it_starts_fresh_still_starts_fresh_only_once() {
+    let root = tempfile::tempdir().unwrap();
+    project(root.path());
+    let store = tempfile::tempdir().unwrap();
+    let checkout = Checkout::bind(layer(), store.path(), family(), root.path()).unwrap();
+    let dir = builds(&checkout);
+    drop(checkout);
+
+    killed_build(store.path(), root.path(), "stage.sites");
+    let first = workspaces(&dir);
+    killed_build(store.path(), root.path(), "stage.sites");
+    // The third attempt starts fresh and dies once its new workspace has its
+    // identity, before it records the attempt as running there.
+    killed_build(store.path(), root.path(), "claim.restarting");
+    let fresh = workspaces(&dir);
+    assert_ne!(fresh, first, "the old workspace was deleted");
+    // Two more deaths there: the fresh start was used, so the build still
+    // resumes.
+    killed_build(store.path(), root.path(), "stage.sites");
+    assert_eq!(workspaces(&dir), fresh, "the new workspace was adopted");
+    killed_build(store.path(), root.path(), "stage.sites");
+    let (resumed, report) = build(store.path(), root.path());
+    assert!(report.resumed_passes, "no second fresh start: {report:?}");
+    let reference_store = tempfile::tempdir().unwrap();
+    let (reference, _) = build(reference_store.path(), root.path());
+    assert_same(&published(&reference), &published(&resumed), "after deaths");
+}
+
+#[test]
 fn a_build_from_another_executable_or_a_damaged_stage_is_not_reused() {
     let root = tempfile::tempdir().unwrap();
     project(root.path());

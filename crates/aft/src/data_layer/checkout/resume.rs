@@ -599,9 +599,12 @@ pub(crate) fn snapshot_digest(inputs: &super::super::callgraph::CheckoutInputs) 
 /// The checkout's record of its build attempts, `builds/<checkout>/attempts`.
 /// It lives beside `checkout.lock`, outside every workspace, so it survives
 /// a workspace's deletion; it is deleted when a build publishes or stands
-/// down.
+/// down. It names the build identity it applies to: a build of another
+/// identity starts a record of its own.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Attempts {
+    /// The digest of the build identity the attempts belong to.
+    pub(crate) identity: Digest,
     /// The workspace folder the attempts worked in.
     pub(crate) build: String,
     /// An attempt started and has not ended. Found so at the start of the
@@ -613,6 +616,10 @@ pub(crate) struct Attempts {
     pub(crate) deaths: u32,
     /// Whether a fresh start was already made because attempts kept dying.
     pub(crate) fresh_used: bool,
+    /// A fresh start was decided and `build` is condemned: written before
+    /// the workspace is deleted, so a build killed during the fresh start
+    /// finishes it instead of counting deaths anew.
+    pub(crate) restarting: bool,
 }
 
 const ATTEMPTS: &str = "attempts";
@@ -620,12 +627,13 @@ const ATTEMPTS: &str = "attempts";
 impl Attempts {
     fn encode(&self) -> Vec<u8> {
         format!(
-            "build={}\nrunning={}\ndeath_stage={}\ndeaths={}\nfresh_used={}\n",
+            "build={}\nrunning={}\ndeath_stage={}\ndeaths={}\nfresh_used={}\nrestarting={}\n",
             self.build,
             u8::from(self.running),
             self.death_stage,
             self.deaths,
-            u8::from(self.fresh_used)
+            u8::from(self.fresh_used),
+            u8::from(self.restarting)
         )
         .into_bytes()
     }
@@ -643,15 +651,16 @@ impl Attempts {
                 "death_stage" => attempts.death_stage = value.parse().map_err(|_| malformed())?,
                 "deaths" => attempts.deaths = value.parse().map_err(|_| malformed())?,
                 "fresh_used" => attempts.fresh_used = value == "1",
+                "restarting" => attempts.restarting = value == "1",
                 _ => return Err(malformed()),
             }
         }
         Ok(attempts)
     }
 
-    fn header() -> Header {
+    fn header(identity: Digest) -> Header {
         Header {
-            identity: [0; 32],
+            identity,
             snapshot: None,
             stage: ATTEMPTS.to_string(),
             members: Vec::new(),
@@ -669,14 +678,47 @@ impl Attempts {
             return Ok(None);
         }
         let (header, body) = read_framed(&path)?;
-        if header != Self::header() {
+        if header != Self::header(header.identity) {
             return Err(io::Error::other("the attempts record is malformed"));
         }
-        Self::decode(&body).map(Some)
+        let mut attempts = Self::decode(&body)?;
+        attempts.identity = header.identity;
+        Ok(Some(attempts))
     }
 
     fn write(&self, dir: &Path) -> io::Result<()> {
-        write_framed(&dir.join(ATTEMPTS), &Self::header(), &self.encode()).map(drop)
+        write_framed(
+            &dir.join(ATTEMPTS),
+            &Self::header(self.identity),
+            &self.encode(),
+        )
+        .map(drop)
+    }
+
+    /// What the attempts read from disk (`read`) say about the build whose
+    /// identity is `identity`, given the names of the workspaces earlier
+    /// builds left (`leftovers`). A record of another identity is not this
+    /// build's. Once the workspace a record names is gone (expired or
+    /// reclaimed, not condemned by a fresh start), nothing the record
+    /// counted applies any more, the fresh start included.
+    fn applying_to(read: Option<Self>, identity: Digest, leftovers: &[String]) -> Self {
+        let fresh = Self {
+            identity,
+            ..Self::default()
+        };
+        let Some(read) = read else {
+            return fresh;
+        };
+        if read.identity != identity {
+            log::info!(
+                "callgraph build resume: reset the attempts record: it belongs to another build"
+            );
+            return fresh;
+        }
+        if !read.restarting && !read.build.is_empty() && !leftovers.contains(&read.build) {
+            return fresh;
+        }
+        read
     }
 }
 
@@ -761,6 +803,14 @@ pub(crate) fn discard(claim: ScratchClaim) {
     remove_attempts(claim.dir());
 }
 
+/// The folder name of `workspace`.
+fn workspace_name(workspace: &Path) -> String {
+    workspace
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// Why a leftover workspace cannot be adopted, or `None` when it can.
 fn adoption_refusal(workspace: &Path, identity: &BuildIdentity) -> Option<String> {
     if !identity.complete {
@@ -843,23 +893,27 @@ pub(crate) fn claim(
 ) -> Result<Claimed, DataError> {
     let store = |error: aft_store::family::FamilyError| DataError::Store(error.to_string());
     let attempts_dir = claim.dir().to_path_buf();
+    let leftovers = claim.leftovers().map_err(store)?;
+    let names = leftovers
+        .iter()
+        .map(|path| workspace_name(path))
+        .collect::<Vec<_>>();
     let (mut attempts, readable) = match Attempts::read(&attempts_dir) {
-        Ok(found) => (found.unwrap_or_default(), true),
+        Ok(found) => (Attempts::applying_to(found, identity.digest, &names), true),
         Err(error) => {
             log_attempts_failure("read", &error);
-            (Attempts::default(), false)
+            (Attempts::applying_to(None, identity.digest, &names), false)
         }
     };
     // The newest workspace this build may adopt; every other leftover is
     // deleted when one is adopted or a new one made.
     let mut candidate = None;
-    for leftover in claim.leftovers().map_err(store)?.into_iter().rev() {
-        let name = leftover
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
+    for leftover in leftovers.into_iter().rev() {
+        let name = workspace_name(&leftover);
         let refusal = if candidate.is_some() {
             Some("a newer workspace is adopted".to_string())
+        } else if attempts.restarting && attempts.build == name {
+            Some("a fresh start condemned it and did not finish".to_string())
         } else {
             adoption_refusal(&leftover, &identity)
         };
@@ -897,8 +951,18 @@ pub(crate) fn claim(
             log::info!(
                 "callgraph build resume: discarded workspace {name}: two attempts died with {complete} stage(s) complete, so the build starts fresh once"
             );
-            attempts.fresh_used = true;
-            attempts.deaths = 0;
+            // Recorded before the workspace is deleted, so the fresh start
+            // happens once even when this attempt dies during it.
+            attempts = Attempts {
+                identity: identity.digest,
+                build: name.clone(),
+                fresh_used: true,
+                restarting: true,
+                ..Attempts::default()
+            };
+            if let Err(error) = attempts.write(&attempts_dir) {
+                log_attempts_failure("write", &error);
+            }
         } else {
             let mut keep = HashSet::new();
             for marker in [&records, &passes].into_iter().flatten() {
@@ -940,11 +1004,10 @@ pub(crate) fn claim(
             ws::write_identity(scratch.path(), &identity.workspace_identity()).map_err(
                 |error| DataError::Store(format!("the build workspace's identity: {error}")),
             )?;
-            let name = scratch
-                .path()
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            if attempts.restarting {
+                kill_point("claim.restarting");
+            }
+            let name = workspace_name(scratch.path());
             (scratch, None, None, name)
         }
     };
@@ -953,8 +1016,10 @@ pub(crate) fn claim(
         attempts.deaths = 0;
         attempts.death_stage = 0;
     }
+    attempts.identity = identity.digest;
     attempts.build = build;
     attempts.running = true;
+    attempts.restarting = false;
     if let Err(error) = attempts.write(&attempts_dir) {
         log_attempts_failure("write", &error);
     }
@@ -1116,15 +1181,63 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(Attempts::read(dir.path()).unwrap(), None);
         let attempts = Attempts {
+            identity: [3; 32],
             build: "abc".to_string(),
             running: true,
             death_stage: 1,
             deaths: 2,
             fresh_used: true,
+            restarting: true,
         };
         attempts.write(dir.path()).unwrap();
         assert_eq!(Attempts::read(dir.path()).unwrap(), Some(attempts));
         std::fs::write(dir.path().join(ATTEMPTS), b"garbage").unwrap();
         assert!(Attempts::read(dir.path()).is_err());
+    }
+
+    #[test]
+    fn attempts_of_another_identity_or_a_vanished_workspace_no_longer_apply() {
+        let used = Attempts {
+            identity: [3; 32],
+            build: "old".to_string(),
+            running: true,
+            death_stage: 2,
+            deaths: 1,
+            fresh_used: true,
+            restarting: false,
+        };
+        let names = ["old".to_string()];
+        let applying = |read: &Attempts, identity, names: &[String]| {
+            Attempts::applying_to(Some(read.clone()), identity, names)
+        };
+        assert_eq!(applying(&used, [3; 32], &names), used, "still this build's");
+        let fresh = Attempts {
+            identity: [4; 32],
+            ..Attempts::default()
+        };
+        assert_eq!(applying(&used, [4; 32], &names), fresh, "another identity");
+        let reset = Attempts {
+            identity: [3; 32],
+            ..Attempts::default()
+        };
+        assert_eq!(
+            applying(&used, [3; 32], &[]),
+            reset,
+            "its workspace expired"
+        );
+        let restarting = Attempts {
+            restarting: true,
+            ..used.clone()
+        };
+        assert_eq!(
+            applying(&restarting, [3; 32], &[]),
+            restarting,
+            "a fresh start in progress keeps counting as used"
+        );
+        assert_eq!(
+            Attempts::applying_to(None, [3; 32], &names),
+            reset,
+            "no record"
+        );
     }
 }
