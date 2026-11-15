@@ -260,8 +260,8 @@ pub(super) fn tools(disabled: &[String], powershell_available: bool) -> Vec<Cata
 }
 
 /// The named catalog variants AFT serves. A consumer's plan item names one
-/// (`tool.catalog` `preset`); an absent preset is `Head`, the catalog AFT
-/// served before presets existed. Each preset fixes the tool set, the
+/// (`tool.catalog` `preset`); an absent preset defaults from the route's role,
+/// falling back to the legacy `Head` catalog. Each preset fixes the tool set, the
 /// per-tool descriptions and the system text, so a runner that freezes one
 /// answer gets a consistent surface for the role it launched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -733,7 +733,14 @@ impl HeadSettings {
 }
 
 pub(super) fn validate_catalog_request(
+    body: Value,
+) -> Result<(CatalogRequest, CatalogPreset), ErrorBody> {
+    validate_catalog_request_with_default(body, CatalogPreset::Head)
+}
+
+pub(super) fn validate_catalog_request_with_default(
     mut body: Value,
+    default: CatalogPreset,
 ) -> Result<(CatalogRequest, CatalogPreset), ErrorBody> {
     // Decode facts separately so malformed values name the contract's `facts`
     // field rather than the generic catalog arguments field.
@@ -762,7 +769,10 @@ pub(super) fn validate_catalog_request(
             "missing field `preset`",
         ));
     }
-    let preset = CatalogPreset::parse("preset", request.preset.as_deref())?;
+    let preset = match request.preset.as_deref() {
+        Some(preset) => CatalogPreset::parse("preset", Some(preset))?,
+        None => default,
+    };
     // `model` is the one parameter this validator accepts: AFT advertises
     // `tool-catalog-model/v1`, and a `head` catalog picks its edit tools by
     // it (see `runner_head_keeps`). A malformed selector is refused by name.
@@ -5404,6 +5414,26 @@ mod tests {
         let answer = catalog(json!({}), &[], false).unwrap();
         assert_eq!(answer["presets"], json!(["head", "worker", "reader"]));
         println!("PRESETLESS_CATALOG_JSON={answer}");
+    }
+
+    #[test]
+    fn route_default_preserves_discovery_and_validates_matching_system_text() {
+        let (request, preset) = validate_catalog_request_with_default(
+            json!({"system_text":{"preset":"worker"}}),
+            CatalogPreset::Worker,
+        )
+        .unwrap();
+        assert_eq!(preset, CatalogPreset::Worker);
+        assert!(request.preset.is_none());
+        for explicit in ["head", "reader"] {
+            let (request, preset) = validate_catalog_request_with_default(
+                preset_request(explicit),
+                CatalogPreset::Worker,
+            )
+            .unwrap();
+            assert_eq!(preset.name(), explicit);
+            assert_eq!(request.preset.as_deref(), Some(explicit));
+        }
     }
 
     #[test]

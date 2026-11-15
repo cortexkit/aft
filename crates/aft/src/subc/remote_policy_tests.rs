@@ -815,6 +815,161 @@ fn context_without_database(root: &Path, storage: &Path) -> AppContext {
     AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config)
 }
 
+mod catalog_preset_tests {
+    use super::*;
+
+    struct Fixture {
+        _root: tempfile::TempDir,
+        _storage: tempfile::TempDir,
+        ctx: AppContext,
+        route: RouteIdentity,
+    }
+
+    fn fixture(kind: Option<&str>, attributes: Value, codemode: bool) -> Fixture {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = context(root.path(), storage.path(), None);
+        let mut route = identity(root.path(), "catalog-session", 7, kind.is_some());
+        let data = Arc::get_mut(&mut route.0).unwrap();
+        if let Some(kind) = kind {
+            data.scope = Some(
+                serde_json::from_value(json!({
+                    "owner": {"kind": "reserved", "module_id": "basal"},
+                    "ref": "catalog-scope", "scope_epoch": 7, "kind": kind,
+                    "attributes": attributes, "owner_authorized": true,
+                    "parent": {"owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+                        "ref": "invoking-scope", "scope_epoch": 3},
+                    "parent_state": "linked",
+                }))
+                .unwrap(),
+            );
+        }
+        if codemode {
+            data.call_mode = subc_protocol::call_mode::CallMode::Codemode;
+        }
+        Fixture {
+            _root: root,
+            _storage: storage,
+            ctx,
+            route,
+        }
+    }
+
+    fn tool<'a>(answer: &'a Value, name: &str) -> Option<&'a Value> {
+        answer["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+    }
+
+    fn check_default(f: &Fixture, preset: &str) -> Value {
+        let (answer, logs) =
+            crate::logging::capture_log_lines(|| catalog(json!({}), &f.route, &f.ctx).unwrap());
+        let line = logs
+            .iter()
+            .find(|line| line.contains("catalog runon:"))
+            .unwrap();
+        assert!(
+            line.split_whitespace()
+                .any(|field| field == format!("preset={preset}")),
+            "{line}"
+        );
+        let named = catalog(json!({"preset": preset}), &f.route, &f.ctx).unwrap();
+        assert_eq!(answer["tools"], named["tools"]);
+        assert_eq!(answer["presets"], json!(["head", "worker", "reader"]));
+        assert!(named.get("presets").is_none());
+        answer
+    }
+
+    #[test]
+    fn presetless_worker_scope_serves_worker_tools_and_wording() {
+        let f = fixture(Some("worker"), json!({}), false);
+        let answer = check_default(&f, "worker");
+        let watch = tool(&answer, "bash_watch").unwrap();
+        assert!(watch["description"]
+            .as_str()
+            .unwrap()
+            .contains("never wakes you"));
+        assert_ne!(
+            answer["tools"],
+            catalog(json!({"preset":"head"}), &f.route, &f.ctx).unwrap()["tools"]
+        );
+    }
+
+    #[test]
+    fn presetless_worker_owned_codemode_run_serves_worker_tools() {
+        let f = fixture(
+            Some("ephemeral"),
+            json!({"on_behalf_of_agent":"head-a", "run_id":"run-1"}),
+            true,
+        );
+        let answer = check_default(&f, "worker");
+        assert!(tool(&answer, "bash_watch").is_some());
+    }
+
+    #[test]
+    fn presetless_head_owned_codemode_run_keeps_head_tools() {
+        let f = fixture(
+            Some("ephemeral"),
+            json!({"agent_id":"head-a", "run_id":"run-1"}),
+            true,
+        );
+        let answer = check_default(&f, "head");
+        assert!(tool(&answer, "bash_watch").is_none());
+    }
+
+    #[test]
+    fn presetless_head_and_legacy_unscoped_routes_keep_head_tools() {
+        for kind in [Some("head"), None] {
+            let f = fixture(kind, json!({"agent_id":"head-a"}), false);
+            check_default(&f, "head");
+        }
+    }
+
+    #[test]
+    fn presetless_unclassified_run_stamps_keep_head_default() {
+        for attributes in [
+            json!({}),
+            json!({"on_behalf_of_agent":"head-a"}),
+            json!({"agent_id":"head-a", "on_behalf_of_agent":"head-a", "run_id":"run-1"}),
+            json!({"on_behalf_of_agent":"", "run_id":"run-1"}),
+            json!({"on_behalf_of_agent":"head-a", "run_id":""}),
+        ] {
+            let f = fixture(Some("ephemeral"), attributes, true);
+            check_default(&f, "head");
+        }
+        let f = fixture(
+            Some("ephemeral"),
+            json!({"on_behalf_of_agent":"head-a", "run_id":"run-1"}),
+            false,
+        );
+        check_default(&f, "head");
+    }
+
+    #[test]
+    fn explicit_head_and_reader_override_worker_defaults() {
+        for (kind, attributes, codemode) in [
+            ("worker", json!({}), false),
+            (
+                "ephemeral",
+                json!({"on_behalf_of_agent":"head-a", "run_id":"run-1"}),
+                true,
+            ),
+        ] {
+            let f = fixture(Some(kind), attributes, codemode);
+            let head = catalog(json!({"preset":"head"}), &f.route, &f.ctx).unwrap();
+            assert!(tool(&head, "bash").is_some());
+            assert!(tool(&head, "bash_watch").is_none());
+            let reader = catalog(json!({"preset":"reader"}), &f.route, &f.ctx).unwrap();
+            assert!(tool(&reader, "read").is_some());
+            assert!(tool(&reader, "bash").is_none());
+            assert!(head.get("presets").is_none());
+            assert!(reader.get("presets").is_none());
+        }
+    }
+}
+
 #[test]
 fn confine_lookup_without_configured_persistence_is_unconfined() {
     let root = tempfile::tempdir().unwrap();
