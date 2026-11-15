@@ -233,12 +233,10 @@ impl<'a, S: StepSource + ?Sized> Steps<'a, S> {
 
     /// Append the next step to `buffer`; the returned count is 0 at the end.
     /// `buffer` has room for two steps, which holds a step and the partial
-    /// line carried before it. A line longer than that grows it once, to
-    /// everything the rest of the file could need: one copy of the carried
-    /// bytes instead of one per doubling. The carried bytes were read from
-    /// this file and are not yet dropped, so the buffer never holds more than
-    /// the file's size at open: no more than a whole read reserves. Only the
-    /// bytes the line fills are touched.
+    /// line carried before it. A longer line grows it once, up to the smaller
+    /// of the file's remaining size and the read ceiling plus one probe byte.
+    /// The scanner uses that byte to distinguish a line at the ceiling from
+    /// one exceeding it, without doubling a large carried buffer.
     ///
     /// The reservation is exact and fallible: an allocation the system
     /// refuses is the same `io::Error::other` a whole read's

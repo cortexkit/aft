@@ -3865,7 +3865,19 @@ fn presence_check(path: &Path, normalized: &str, deadline: Instant) -> PresenceC
                     large = Some(stat);
                     return Err(std::io::Error::other("read in steps"));
                 }
-                Ok((crate::bounded_io::read(path, None)?, stat))
+                let mut reader = crate::bounded_io::reader(path, None)?;
+                if crate::large_read::is_large(reader.size_at_open()) {
+                    large = Some(stat.unwrap_or(request_files::FileStat {
+                        size: reader.size_at_open(),
+                        modified: None,
+                        file_id: None,
+                    }));
+                    return Err(std::io::Error::other("read in steps"));
+                }
+                Ok((
+                    reader.append(Vec::new(), reader.size_at_open() as usize)?,
+                    stat,
+                ))
             });
             if let Some(stat) = large {
                 return stream_presence_check(

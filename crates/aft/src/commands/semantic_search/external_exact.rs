@@ -50,7 +50,7 @@ pub(super) const SWEEP_BUDGET: Duration = crate::grep_executor::FALLBACK_WALK_BU
 /// captured logs and dumps routinely exceed that limit, and an exact pass that
 /// silently skipped them would not match what grep finds. The time budget, not
 /// this cap, bounds the total work.
-pub(super) const SWEEP_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+pub(super) const SWEEP_MAX_FILE_BYTES: u64 = crate::large_read::WHOLE_READ_CEILING;
 
 /// Lines longer than this never supply a spelling-variant hit. A line this
 /// long is embedded content (a captured request body, a minified bundle), and
@@ -381,6 +381,11 @@ pub(super) fn sweep(
             continue;
         };
         if metadata.len() > SWEEP_MAX_FILE_BYTES {
+            let _ = crate::large_read::allow_whole(
+                crate::large_read::Site::ExternalSweep,
+                path,
+                metadata.len(),
+            );
             outcome.oversized_skipped += 1;
             continue;
         }

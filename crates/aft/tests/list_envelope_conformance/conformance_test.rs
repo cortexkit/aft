@@ -55,7 +55,7 @@ fn registered_cause_sets_have_pinned_kind_bounds_and_units() {
     let expected_case_count = SURFACE_SPECS
         .iter()
         .map(|surface| {
-            if surface.command == "search" {
+            if surface.command == "search" && surface.list_id == "payload.results" {
                 5
             } else {
                 (1usize << surface.reasons.len()) - 1

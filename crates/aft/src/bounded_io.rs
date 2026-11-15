@@ -563,7 +563,6 @@ pub(crate) fn note_large_read_skip(path: &Path) {
 }
 
 pub(crate) fn disclose_large_read_skips(response: &mut Response) {
-    use crate::list_envelope::{ListEnvelope, Reason, Total, Unit};
     if response.data.get("skipped_files").is_some() {
         return;
     }
@@ -584,17 +583,7 @@ pub(crate) fn disclose_large_read_skips(response: &mut Response) {
         .map(|path| serde_json::json!({"file": path, "reason": reason}))
         .collect::<Vec<_>>());
     response.data["skipped_files_remaining"] = serde_json::json!(total - names.len());
-    let envelope = ListEnvelope::new(
-        names.len(),
-        Total::Exact(total),
-        Unit::Files,
-        if names.len() < total {
-            vec![Reason::Cap]
-        } else {
-            vec![]
-        },
-        &["path"],
-    );
+    let envelope = crate::list_surfaces::search::skipped_files_envelope(names.len(), total);
     response.data["skipped_files_list_envelope"] = serde_json::json!(envelope);
     let mut gap = format!(
         "{reason}\n{}",
@@ -604,8 +593,14 @@ pub(crate) fn disclose_large_read_skips(response: &mut Response) {
             .collect::<Vec<_>>()
             .join("\n")
     );
-    if let Some(trailer) = crate::list_envelope::render_trailer(&envelope) {
-        gap.push('\n');
+    let trailer = crate::ndjson_text::build_ndjson_text(
+        "",
+        &response.data,
+        Some("payload.skipped_files"),
+        false,
+    );
+    if !trailer.is_empty() {
+        gap.push_str("\n\n");
         gap.push_str(&trailer);
     }
     let text = response.data["text"].as_str().unwrap_or_default();

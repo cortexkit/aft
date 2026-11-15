@@ -828,6 +828,24 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal reconstructible cache ownership only; complete verified results still feed ranking and oversized entries are served without retention, while evicted literal-presence answers are recomputed; no agent-visible result is cut",
     },
     ExclusionEntry {
+        file: "commands/semantic_search/data_file.rs",
+        enclosing_item: "is_data_file",
+        location_or_primitive: "io::Read::take(DATA_FILE_MIN_BYTES)",
+        reason: "classification needs only the size threshold or a long line in a smaller file; reaching the byte threshold classifies the file as data, without cutting a result list",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/memo.rs",
+        enclosing_item: "digest_open_file",
+        location_or_primitive: "io::Read::take(LARGE_READ_BYTES + 1)",
+        reason: "a bounded prefix selects retained small bytes or a streamed digest of the remaining descriptor; no hash input or result is omitted",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/request_files.rs",
+        enclosing_item: "read_whole_file_at",
+        location_or_primitive: "io::Read::take(stat.size)",
+        reason: "reads the descriptor's size at open; files above the whole-read ceiling are separately disclosed as skipped, not silently cut from a result list",
+    },
+    ExclusionEntry {
         file: "bash_background/remote.rs",
         enclosing_item: "append_executor_environment_disclosure",
         location_or_primitive: "executor environment name preview min(10)",

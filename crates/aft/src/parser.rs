@@ -1170,6 +1170,25 @@ pub(crate) fn read_source(path: &Path) -> std::io::Result<String> {
     Ok(source)
 }
 
+#[cfg(test)]
+#[test]
+fn stage2_parse_source_obeys_whole_read_ceiling() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("large.rs");
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(crate::large_read::WHOLE_READ_CEILING + 1)
+        .unwrap();
+    assert!(crate::large_read::is_ceiling_error(
+        &read_source(&path).unwrap_err()
+    ));
+    file.set_len(crate::large_read::WHOLE_READ_CEILING - 1)
+        .unwrap();
+    assert_eq!(
+        read_source(&path).unwrap().len() as u64,
+        crate::large_read::WHOLE_READ_CEILING - 1
+    );
+}
+
 /// Keep the completed read's allocation; an Arc<str> conversion copies its bytes.
 fn captured_source(source: String) -> Arc<String> {
     Arc::new(source)

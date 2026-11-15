@@ -1999,7 +1999,11 @@ fn format_grep(data: &Value) -> String {
         }
     };
 
-    let base = append_ast_skipped_files(base, data.get("skipped_files"));
+    let base = if data.get("skipped_files_list_envelope").is_some() {
+        base
+    } else {
+        append_ast_skipped_files(base, data.get("skipped_files"))
+    };
     if let Some(env) = envelope {
         if let Some(trailer) = render_envelope_trailer(&env) {
             if base.is_empty() {

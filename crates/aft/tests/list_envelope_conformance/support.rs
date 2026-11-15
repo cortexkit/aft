@@ -217,6 +217,30 @@ const OUTLINE_REASONS: &[ReasonSpec] = &[
 
 pub const SURFACE_SPECS: &[SurfaceSpec] = &[
     SurfaceSpec {
+        requires: None,
+        command: "search",
+        mode: "",
+        list_id: "payload.skipped_files",
+        unit: Unit::Files,
+        narrow: &["path"],
+        reasons: &[ReasonSpec {
+            reason: Reason::Cap,
+            kind: ReasonKind::Selecting,
+        }],
+    },
+    SurfaceSpec {
+        requires: None,
+        command: "grep",
+        mode: "",
+        list_id: "payload.skipped_files",
+        unit: Unit::Files,
+        narrow: &["path"],
+        reasons: &[ReasonSpec {
+            reason: Reason::Cap,
+            kind: ReasonKind::Selecting,
+        }],
+    },
+    SurfaceSpec {
         requires: Some("tool-result/v1"),
         command: "ast_search",
         mode: "matches",
@@ -380,6 +404,9 @@ pub struct KindBoundCase {
 }
 
 pub fn surface_name(surface: SurfaceSpec) -> String {
+    if surface.list_id == "payload.skipped_files" {
+        return format!("{}.skipped_files", surface.command);
+    }
     if surface.mode.is_empty() {
         surface.command.to_string()
     } else {
@@ -413,6 +440,9 @@ fn build_case_envelope(surface: SurfaceSpec, fired: &[Reason]) -> Option<ListEnv
                 &["includeTests"],
             )
         });
+    }
+    if surface.list_id == "payload.skipped_files" {
+        return Some(aft::list_surfaces::search::skipped_files_envelope(20, 23));
     }
     let has = |reason| fired.contains(&reason);
     match (surface.command, surface.mode) {
@@ -530,6 +560,9 @@ fn build_case_envelope(surface: SurfaceSpec, fired: &[Reason]) -> Option<ListEnv
 fn expected_total(surface: SurfaceSpec, fired: &[Reason]) -> Total {
     if surface.list_id == "payload.unresolved_callers.sites" {
         return Total::Exact(7);
+    }
+    if surface.list_id == "payload.skipped_files" {
+        return Total::Exact(23);
     }
     let has = |reason| fired.contains(&reason);
     match (surface.command, surface.mode) {
@@ -892,7 +925,11 @@ fn render(command: &str, mode: &str, data: &Value) -> String {
 fn registered_surface(command: &str, mode: &str) -> SurfaceSpec {
     *SURFACE_SPECS
         .iter()
-        .find(|surface| surface.command == command && surface.mode == mode)
+        .find(|surface| {
+            surface.command == command
+                && surface.mode == mode
+                && surface.list_id != "payload.skipped_files"
+        })
         .unwrap_or_else(|| panic!("missing test surface {command}.{mode}"))
 }
 
@@ -908,7 +945,12 @@ fn push_root_fixture(
     let rendered = render(command, mode, &reply);
     fixtures.push(FixtureRecord {
         name: name.to_string(),
-        surface: registered_surface(command, mode),
+        surface: *SURFACE_SPECS
+            .iter()
+            .find(|surface| {
+                surface.command == command && surface.mode == mode && surface.list_id == list_id
+            })
+            .expect("registered fixture surface"),
         list_id: list_id.to_string(),
         reply,
         owner_path: Vec::new(),
@@ -917,8 +959,37 @@ fn push_root_fixture(
     });
 }
 
+fn skipped_files_fixture() -> Value {
+    let envelope = aft::list_surfaces::search::skipped_files_envelope(20, 23);
+    let mut reply = json!({
+        "complete": false,
+        "skipped_files": (0..20).map(|at| json!({"file": format!("large-{at:02}.txt"), "reason": "read ceiling"})).collect::<Vec<_>>(),
+        "skipped_files_remaining": 3,
+        "skipped_files_list_envelope": envelope,
+        "results": [], "matches": [],
+    });
+    reply["text"] = json!(build_ndjson_text(
+        "Read ceiling: 20 named files skipped, 3 more omitted",
+        &reply,
+        Some("payload.skipped_files"),
+        false
+    ));
+    reply
+}
+
 pub fn capped_fixtures() -> Vec<FixtureRecord> {
     let mut fixtures = Vec::new();
+    for command in ["search", "grep"] {
+        push_root_fixture(
+            &mut fixtures,
+            &format!("{command}/skipped_files"),
+            command,
+            "",
+            "payload.skipped_files",
+            skipped_files_fixture(),
+            "skipped_files_list_envelope",
+        );
+    }
     for mode in ["changed_files", "diff_lines"] {
         let reply = changed_files_fixture(mode);
         fixtures.push(FixtureRecord {
@@ -1795,6 +1866,20 @@ pub fn capped_parity_fixtures() -> Vec<CappedParityFixture> {
             }),
         },
         CappedParityFixture {
+            name: "search/skipped_files",
+            command: "search",
+            mode: "",
+            list_id: "payload.skipped_files",
+            reply: skipped_files_fixture(),
+        },
+        CappedParityFixture {
+            name: "grep/skipped_files",
+            command: "grep",
+            mode: "",
+            list_id: "payload.skipped_files",
+            reply: skipped_files_fixture(),
+        },
+        CappedParityFixture {
             name: "ast_search/result_budget",
             command: "ast_search",
             mode: "matches",
@@ -1936,7 +2021,13 @@ pub fn validate_capped_parity_coverage(fixtures: &[CappedParityFixture]) -> Vec<
 
 pub fn render_transports(fixture: &CappedParityFixture) -> (String, String) {
     let subc_text = render(fixture.command, fixture.mode, &fixture.reply);
-    let base_text = if fixture.command == "bash" {
+    let base_text = if fixture.list_id == "payload.skipped_files" {
+        let trailer = build_ndjson_text("", &fixture.reply, Some(fixture.list_id), false);
+        subc_text
+            .strip_suffix(&format!("\n\n{trailer}"))
+            .unwrap_or(&subc_text)
+            .to_string()
+    } else if fixture.command == "bash" {
         fixture
             .reply
             .get("output")
