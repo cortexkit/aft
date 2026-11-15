@@ -3745,6 +3745,25 @@ async fn run_deferred_bash_wait(
         return;
     };
     let registry = wait_ctx.bash_background().clone();
+    // Arming takes the task-state lock, so keep it off the loop that processes
+    // protocol frames, just like status reads. The one-shot retains an exit
+    // that precedes our first select.
+    let (exit_tx, exit_rx) = oneshot::channel();
+    let observer_registry = registry.clone();
+    let observer_task = task_id.clone();
+    let observer_session = session_id.clone();
+    let exit_observer = tokio::task::spawn_blocking(move || {
+        observer_registry.observe_foreground_exit(&observer_task, &observer_session, move || {
+            let _ = exit_tx.send(());
+        })
+    })
+    .await
+    .ok()
+    .flatten();
+    let mut exit_rx = exit_observer.as_ref().map(|_| exit_rx);
+    // Check once after arming, closing the gap between the spawn's initial
+    // status read and installing the kernel observer (including arm failures).
+    let mut initial_observation = true;
     let mut progress = wait_ctx.request_handles_progress(&request_id).then(|| {
         crate::bash_background::progress::BashProgressPump::new(
             &wait_ctx,
@@ -3854,10 +3873,19 @@ async fn run_deferred_bash_wait(
                 break;
             }
             observation = async {
-                tokio::select! {
-                    _ = registry.terminal_transition_notified() => {}
-                    _ = tokio::time::sleep(PENDING_POLL_INTERVAL) => {}
+                if !initial_observation {
+                    tokio::select! {
+                        _ = async {
+                            match &mut exit_rx {
+                                Some(rx) => { let _ = rx.await; }
+                                None => std::future::pending::<()>().await,
+                            }
+                        } => { exit_rx = None; }
+                        _ = registry.terminal_transition_notified() => {}
+                        _ = tokio::time::sleep(foreground_bash_poll_interval()) => {}
+                    }
                 }
+                initial_observation = false;
                 observe_deferred_bash_wait(
                     registry.clone(),
                     task_id.clone(),
@@ -4249,6 +4277,17 @@ async fn run_deferred_bash_wait(
             }
         }
     }
+}
+
+fn foreground_bash_poll_interval() -> Duration {
+    #[cfg(feature = "test-hooks")]
+    if let Some(millis) = std::env::var("AFT_TEST_BASH_EXIT_POLL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_millis(millis.max(1));
+    }
+    PENDING_POLL_INTERVAL
 }
 
 async fn submit_bash_promote(

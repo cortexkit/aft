@@ -64,6 +64,46 @@ const SESSION_ID: &str = "bash-reply-timing-contract";
 const ROUTE_CHANNEL: u16 = 1;
 
 #[test]
+fn foreground_bash_exit_wakes_without_observation_ticks() {
+    // Stretch both observation timers beyond the reply deadline. The delayed
+    // command cannot finish in the spawn's immediate status check, so only its
+    // kernel exit event can make this foreground call answer in time.
+    run_subc_with_env(
+        &[
+            ("AFT_TEST_BASH_EXIT_POLL_MS", "30000"),
+            ("AFT_TEST_BASH_WATCHDOG_INTERVAL_MS", "30000"),
+        ],
+        |mut h| async move {
+            for (corr, command, code) in [
+                (1900, "true", 0),
+                (1901, "sleep 0.2; printf final-output; true", 0),
+                (1902, "sleep 0.2; printf final-output; exit 7", 7),
+            ] {
+                send_tool_call(
+                    &mut h.stream,
+                    corr,
+                    "bash",
+                    json!({"command": command, "wait": true}),
+                )
+                .await;
+                let reply = read_tool_response(&mut h.stream, corr, Duration::from_secs(10)).await;
+                let result = tool_response_json(&reply);
+                assert_eq!(result["status"], "completed", "{}", frame_body(&reply));
+                assert_eq!(result["exit_code"], code, "{}", frame_body(&reply));
+                if command.contains("printf") {
+                    assert!(
+                        tool_response_text(&reply).contains("final-output"),
+                        "{}",
+                        frame_body(&reply)
+                    );
+                }
+            }
+            h
+        },
+    );
+}
+
+#[test]
 #[ignore = "foreground latency measurement; run explicitly with --ignored --nocapture"]
 fn foreground_bash_exit_latency_measurement() {
     run_subc(|mut h| async move {

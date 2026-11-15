@@ -464,7 +464,17 @@ fn observe_raw_bash_response(
 pub fn build_bash_outcome(
     req: &RawRequest,
     ctx: &AppContext,
+    spawn_response: Response,
+) -> DispatchOutcome {
+    let wake = crate::response_finalize::deferred_completion_wake();
+    build_bash_outcome_with_wake(req, ctx, spawn_response, move || drop(wake))
+}
+
+pub fn build_bash_outcome_with_wake(
+    req: &RawRequest,
+    ctx: &AppContext,
     mut spawn_response: Response,
+    wake: impl FnOnce() + Send + 'static,
 ) -> DispatchOutcome {
     if !spawn_response.success {
         return DispatchOutcome::Immediate(spawn_response);
@@ -594,7 +604,12 @@ pub fn build_bash_outcome(
         )
     });
 
+    let mut exit_observer =
+        ctx.bash_background()
+            .observe_foreground_exit(&task_id, &session_id, wake);
+
     let mut poll: PendingResponsePoll = Box::new(move |ctx| {
+        let _keep_exit_observer = &exit_observer;
         let _keep_flush_budget = &flush_budget;
         // All blocking calls have a wait cap, but only delegated workers renew
         // the default hard kill. A primary session keeps its original limit.
@@ -692,6 +707,7 @@ pub fn build_bash_outcome(
 
         if response.is_some() {
             wait_registration.take();
+            exit_observer.take();
         }
         if let Some(progress) = &mut progress {
             progress.poll(response.is_some(), &mut |frame| ctx.emit_progress(frame));
@@ -703,8 +719,8 @@ pub fn build_bash_outcome(
         return DispatchOutcome::Immediate(response);
     }
 
-    // This state-based producer resolves inside its poll, including hand-backs
-    // before the task exits. A task-completion wake alone cannot drive deadlines.
+    // Exit readiness wakes the transport to run this same poll. Retain its
+    // timer for missed wakes and foreground waits that detach before exit.
     DispatchOutcome::Deferred(PendingResponse::polling(
         request_id,
         session_id,
