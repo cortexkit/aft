@@ -64,6 +64,8 @@ struct Fixture {
 
 fn fixture(ready: bool) -> Fixture {
     let dir = PathBuf::from(std::env::var_os("AFT_S4_AUDIT_ROOT").unwrap());
+    #[cfg(unix)]
+    let dir = std::fs::canonicalize(dir).unwrap();
     let root = dir.join("project");
     std::fs::create_dir_all(&root).unwrap();
     let storage = dir.join("storage");
@@ -94,6 +96,22 @@ fn fixture(ready: bool) -> Fixture {
         registry,
         wasm,
     }
+}
+
+fn graph_ask(f: &Fixture, params: Value) -> Response {
+    use crate::subc_translate::{subc_translate_with_context, TranslateContext};
+    let translated = subc_translate_with_context(
+        "callgraph",
+        &params,
+        &f.root,
+        TranslateContext {
+            diagnostics_on_edit: false,
+            preview: false,
+            effective_hashline: false,
+        },
+    )
+    .unwrap();
+    ask(&f.ctx, &translated.command, Value::Object(translated.args))
 }
 
 fn until<T>(mut get: impl FnMut() -> Option<T>, why: &str) -> T {
@@ -355,10 +373,9 @@ fn trace_gaps() {
     );
     let runtime = f.ctx.data_checkout().unwrap();
     runtime.wait_for_memory_profile_idle_for_test();
-    let clean = ask(
-        &f.ctx,
-        "trace_to_symbol",
-        json!({"file":origin,"symbol":"origin","toSymbol":"target","toFile":target}),
+    let clean = graph_ask(
+        &f,
+        json!({"op":"trace_to_symbol","path":origin,"symbol":"origin","toSymbol":"target","toPath":target}),
     );
     assert_eq!(
         serde_json::to_string(&clean).unwrap(),
@@ -381,19 +398,19 @@ fn trace_gaps() {
     runtime.wait_for_memory_profile_idle_for_test();
     for (params, reason) in [
         (
-            json!({"file":origin,"symbol":"origin","toSymbol":"target","toFile":target}),
+            json!({"op":"trace_to_symbol","path":origin,"symbol":"origin","toSymbol":"target","toPath":target}),
             "no_path_found",
         ),
         (
-            json!({"file":origin,"symbol":"origin","toSymbol":"hidden"}),
+            json!({"op":"trace_to_symbol","path":origin,"symbol":"origin","toSymbol":"hidden"}),
             "target_symbol_not_found",
         ),
         (
-            json!({"file":origin,"symbol":"origin","toSymbol":"target"}),
+            json!({"op":"trace_to_symbol","path":origin,"symbol":"origin","toSymbol":"target"}),
             "ambiguous_target",
         ),
     ] {
-        let response = ask(&f.ctx, "trace_to_symbol", params);
+        let response = graph_ask(&f, params);
         assert_eq!(
             response.data[if response.success { "reason" } else { "code" }],
             reason,
