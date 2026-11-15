@@ -772,7 +772,6 @@ pub fn separator() -> char {
             "create",
             "NestedRunner::create",
             "Runner::new",
-            "Host for Runner::held_calls",
         ] {
             let request = request("zoom", serde_json::json!({"file": file, "symbol": symbol}));
             let warm_answer = crate::commands::zoom::handle_zoom(&request, &stored);
