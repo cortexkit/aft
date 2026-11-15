@@ -1389,11 +1389,14 @@ isolated!(
             .registry
             .force_unavailable_for_test(crate::grammar::GrammarState::NetworkRetry);
         let build = test_gates::hold(&f.root, test_gates::Point::BuildPublication);
+        let subscription = test_gates::hold(&f.root, test_gates::Point::GrammarSubscription);
         let runtime = f.ctx.data_checkout().unwrap();
         build.wait_entered();
         let failed = test_gates::fail_next_grammar_retry(&f.root);
-        drop(forced);
         drop(build);
+        subscription.wait_entered();
+        drop(forced);
+        drop(subscription);
         until(
             || {
                 failed

@@ -492,10 +492,6 @@ impl GrammarRegistry {
         let entry = self.entry.lock();
         if entry.language.is_some() {
             let _ = tx.send(self.identity().into());
-            return ReadinessSubscription {
-                receiver: rx,
-                registration: None,
-            };
         }
         let id = self
             .next_listener

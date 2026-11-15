@@ -64,6 +64,12 @@ fn luau_s4_readiness_subscriptions_are_pruned_on_drop() {
     registry.stored().unwrap();
     let ready = registry.subscribe();
     assert_eq!(ready.recv().unwrap(), registry.identity());
+    assert_eq!(registry.listeners.lock().len(), 1);
+    assert_eq!(
+        ready.recv_timeout(Duration::from_millis(1)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    );
+    drop(ready);
     assert!(registry.listeners.lock().is_empty());
 }
 

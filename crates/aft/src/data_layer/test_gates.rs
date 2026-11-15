@@ -12,6 +12,8 @@ pub(crate) enum Point {
     FillSurvey,
     #[cfg(feature = "wasm-grammars")]
     GrammarRetryRead,
+    #[cfg(feature = "wasm-grammars")]
+    GrammarSubscription,
 }
 
 #[cfg(feature = "wasm-grammars")]
