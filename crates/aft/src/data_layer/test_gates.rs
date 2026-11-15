@@ -10,6 +10,34 @@ pub(crate) enum Point {
     BuildPublication,
     DeltaPublication,
     FillSurvey,
+    #[cfg(feature = "wasm-grammars")]
+    GrammarRetryRead,
+}
+
+#[cfg(feature = "wasm-grammars")]
+static RETRY_FAILURES: LazyLock<Mutex<HashMap<PathBuf, Arc<std::sync::atomic::AtomicBool>>>> =
+    LazyLock::new(Mutex::default);
+
+#[cfg(feature = "wasm-grammars")]
+pub(crate) fn fail_next_grammar_retry(root: &Path) -> Arc<std::sync::atomic::AtomicBool> {
+    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    RETRY_FAILURES
+        .lock()
+        .unwrap()
+        .insert(root.to_path_buf(), failed.clone());
+    failed
+}
+
+#[cfg(feature = "wasm-grammars")]
+pub(crate) fn fail_grammar_retry(root: &Path) -> bool {
+    RETRY_FAILURES
+        .lock()
+        .unwrap()
+        .remove(root)
+        .is_some_and(|failed| {
+            failed.store(true, std::sync::atomic::Ordering::Release);
+            true
+        })
 }
 
 #[derive(Default)]

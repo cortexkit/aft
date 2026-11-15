@@ -103,6 +103,36 @@ fn wait_meaning(ctx: &AppContext) {
     }
 }
 
+#[test]
+fn luau_s4_round4_non_luau_failures_preserve_main_search_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap().join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    write(
+        &root,
+        "a.ts",
+        "export function searchable() { return 1; }\n",
+    );
+    write(&root, "b.rs", b"pub fn broken() {\n //\xff\n}\n");
+    let ctx = context(&root, &dir.path().join("storage"));
+    let _fill = enable_meaning(&ctx, &root);
+    ctx.data_checkout()
+        .unwrap()
+        .wait_for_memory_profile_idle_for_test();
+    let response = meaning_query(&ctx);
+    assert!(response.success, "{:?}", response.data);
+    assert_eq!(response.data["complete"], true, "{:?}", response.data);
+    assert!(
+        response.data.get("semantic_gap").is_none(),
+        "{:?}",
+        response.data
+    );
+    let text = response.data["text"].as_str().unwrap();
+    assert!(!text.contains("b.rs"), "{text}");
+    assert!(!text.contains("utf-8"), "{text}");
+    assert!(text.contains("searchable"));
+}
+
 #[cfg(feature = "wasm-grammars")]
 fn callers(view: &CheckoutView, file: &str) -> Value {
     serde_json::to_value(

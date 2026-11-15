@@ -1336,6 +1336,13 @@ impl Checkout {
         if paths.is_empty() || crate::grammar::registry().stored().is_err() {
             return Ok(false);
         }
+        #[cfg(all(test, feature = "wasm-grammars"))]
+        {
+            super::test_gates::arrive(&self.root, super::test_gates::Point::GrammarRetryRead);
+            if super::test_gates::fail_grammar_retry(&self.root) {
+                return Err(DataError::Scan("injected grammar reread failure".into()));
+            }
+        }
         self.record_paths_inner(&paths, true)?;
         Ok(true)
     }
