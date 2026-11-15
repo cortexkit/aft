@@ -593,7 +593,7 @@ fn assert_stage2_ceiling_reply(indexed: bool, search: bool) {
     }
     let request = |pattern: &str| {
         if search {
-            json!({"id":"ceiling-search", "command":"semantic_search", "query":pattern, "pattern":pattern, "include_tests":true, "top_k":10})
+            json!({"id":"ceiling-search", "command":"semantic_search", "pattern":pattern, "include_tests":true, "top_k":10})
         } else {
             json!({"id":"ceiling-grep", "command":"grep", "pattern":pattern, "include_tests":true})
         }
