@@ -56,7 +56,7 @@ pub(crate) fn render_memory_census_with_roots(
     // phys_footprint already excludes MADV_FREE allocator slack (that is why it
     // is preferred), so slack is subtracted only on the RSS fallback. On that
     // fallback (Linux) slack is address space, not residency: it also counts
-    // free pages malloc_trim already returned, so subtracting it can
+    // free pages the allocator already returned, so subtracting it can
     // understate the remainder. Attribution is an estimate, so the remainder
     // floors at zero rather than rendering a negative "unattributed" line.
     let unattributed_bytes = match (process.phys_footprint_bytes, process.rss_bytes) {
@@ -104,6 +104,10 @@ pub(crate) fn render_memory_census_with_roots(
         },
         "process_io": process_io,
     });
+    #[cfg(target_os = "linux")]
+    if let Some(stats) = &process.allocator.jemalloc {
+        result["process"]["jemalloc"] = json!(stats);
+    }
     // The data layer's block cache is shared by every checkout, so it is
     // attributed once here, never on a root row. Present only once a
     // checkout of this process has bound.
@@ -573,6 +577,16 @@ mod tests {
         let response = handle_memory_census(&request, &ctx);
 
         assert!(response.data.is_object());
+        #[cfg(target_os = "linux")]
+        {
+            let stats = &response.data["process"]["jemalloc"];
+            assert_eq!(stats["accounting_source"], "jemalloc");
+            let allocated = stats["allocated"].as_u64().unwrap();
+            let active = stats["active"].as_u64().unwrap();
+            let resident = stats["resident"].as_u64().unwrap();
+            assert!(allocated > 0 && allocated <= active && active <= resident);
+            assert!(stats["retained"].is_u64());
+        }
         assert_eq!(
             crate::memory::allocator_snapshot_calls_for_test(),
             before + 1

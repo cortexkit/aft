@@ -18262,10 +18262,12 @@ mod tests {
             retained_slack_bytes: Some(4 * 1024 * 1024),
             retained_slack_label: crate::memory::ALLOCATOR_SLACK_LABEL,
             not_estimated: None,
+            #[cfg(target_os = "linux")]
+            jemalloc: None,
         };
         let relief = crate::memory::AllocatorPressureRelief {
             allocator_accounting_bytes: 3 * 1024 * 1024,
-            allocator_accounting_source: crate::memory::RELIEF_ACCOUNTING_SOURCE_GLIBC,
+            allocator_accounting_source: crate::memory::RELIEF_ACCOUNTING_SOURCE_JEMALLOC,
             rss_drop_bytes: Some(3 * 1024 * 1024),
             phys_footprint_drop_bytes: None,
             rss_before_bytes: Some(20 * 1024 * 1024),
@@ -18284,9 +18286,7 @@ mod tests {
         assert!(message.contains("phys footprint dropped not estimated"));
         assert!(message.contains("allocated 12.0 MB -> 9.0 MB"));
         assert!(message.contains("address-space slack 4.0 MB -> 1.0 MB"));
-        assert!(
-            message.contains("allocator accounting 3.0 MB (glibc_mallinfo2_size_allocated_drop)")
-        );
+        assert!(message.contains("allocator accounting 3.0 MB (jemalloc_stats_resident_drop)"));
         assert!(!message.contains("released"));
     }
 

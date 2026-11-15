@@ -15,6 +15,10 @@ static GLOBAL_ALLOCATOR: aft::alloc_trace::TracingAllocator = aft::alloc_trace::
 #[no_mangle]
 pub static mut malloc_conf: *const std::ffi::c_char = b"background_thread:true\0".as_ptr().cast();
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "alloc_trace/linux_allocator_tests.rs"]
+mod linux_allocator_tests;
+
 // The tests read frames back through the unix loader, and only unix
 // targets record frames at all.
 #[cfg(all(test, unix))]

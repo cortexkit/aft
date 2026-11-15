@@ -267,6 +267,16 @@ impl lsp_types::notification::Notification for RustAnalyzerRunFlycheck {
     const METHOD: &'static str = "rust-analyzer/runFlycheck";
 }
 
+#[cfg(target_os = "linux")]
+fn check_spawn_parent(parent_pid: libc::pid_t) -> io::Result<()> {
+    if parent_pid == 1 {
+        // This runs after fork: an errno-backed error needs no heap allocation.
+        Err(io::Error::from_raw_os_error(libc::ESRCH))
+    } else {
+        Ok(())
+    }
+}
+
 /// Spawn on a process-lifetime thread on Linux: PR_SET_PDEATHSIG observes the
 /// creating thread's death, even when the rest of the parent process is alive.
 /// Keep initialization outside this queue so slow handshakes do not serialize
@@ -1258,9 +1268,7 @@ impl LspClient {
                     if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
                         return Err(io::Error::last_os_error());
                     }
-                    if libc::getppid() == 1 {
-                        return Err(io::Error::other("parent died before LSP spawn completed"));
-                    }
+                    check_spawn_parent(libc::getppid())?;
                 }
                 if libc::setsid() == -1 {
                     return Err(io::Error::last_os_error());
@@ -3215,6 +3223,15 @@ fn parse_diagnostic_capabilities(value: &Value) -> ServerDiagnosticCapabilities 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_parent_death_error_is_errno_backed_without_boxed_payload() {
+        let error = check_spawn_parent(1).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
+        assert!(error.get_ref().is_none());
+        assert!(check_spawn_parent(2).is_ok());
+    }
 
     #[test]
     fn node_fs_exception_is_the_short_cause_instead_of_a_source_location() {
