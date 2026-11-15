@@ -1463,6 +1463,15 @@ fn report(
             largest.sites,
             largest.methods,
         );
+        // The name rides in the measurement's label, which callers without
+        // a logger still print.
+        memory.push((
+            format!(
+                "pass4.largest_group_name={}",
+                name.as_deref().unwrap_or("(no member)")
+            ),
+            1,
+        ));
         memory.push((
             "pass4.largest_group_files".to_string(),
             largest.touches.files.len(),
