@@ -744,14 +744,17 @@ pub fn separator() -> char {
         ] {
             let start = lines
                 .iter()
-                .position(|line| line.trim_start().starts_with(owner))
+                .position(|line| line.trim_start().trim_start_matches('.').starts_with(owner))
                 .unwrap_or_else(|| panic!("{owner}: {text}"));
+            let indent = lines[start].len() - lines[start].trim_start().len();
+            let member_indent = " ".repeat(indent + 2);
             for method in methods {
                 assert!(
                     lines[start + 1..]
                         .iter()
-                        .take_while(|line| line.starts_with("    "))
-                        .any(|line| line.starts_with("    .") && line.contains(method)),
+                        .take_while(|line| line.starts_with(&member_indent))
+                        .any(|line| line.contains(method)
+                            && (indent != 2 || line.starts_with("    ."))),
                     "{owner} must nest {method}: {text}"
                 );
             }
