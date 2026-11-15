@@ -2420,7 +2420,12 @@ fn format_search(data: &Value) -> String {
         .get("results_list_envelope")
         .and_then(|v| serde_json::from_value::<crate::list_envelope::ListEnvelope>(v.clone()).ok());
 
-    let note = if envelope.is_some() {
+    // The named skip disclosure already explains incomplete coverage and ends
+    // with its own list trailer; do not append the same partial-status notice.
+    let note = if data.get("skipped_files_list_envelope").is_some() {
+        (data.get("fully_degraded").and_then(Value::as_bool) == Some(true))
+            .then(|| format!("Search status: {FILESYSTEM_SCAN_STATUS}."))
+    } else if envelope.is_some() {
         search_status_only_note(data)
     } else {
         extra_honesty_note(data)

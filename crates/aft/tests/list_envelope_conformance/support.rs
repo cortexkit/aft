@@ -217,30 +217,6 @@ const OUTLINE_REASONS: &[ReasonSpec] = &[
 
 pub const SURFACE_SPECS: &[SurfaceSpec] = &[
     SurfaceSpec {
-        requires: None,
-        command: "search",
-        mode: "",
-        list_id: "payload.skipped_files",
-        unit: Unit::Files,
-        narrow: &["path"],
-        reasons: &[ReasonSpec {
-            reason: Reason::Cap,
-            kind: ReasonKind::Selecting,
-        }],
-    },
-    SurfaceSpec {
-        requires: None,
-        command: "grep",
-        mode: "",
-        list_id: "payload.skipped_files",
-        unit: Unit::Files,
-        narrow: &["path"],
-        reasons: &[ReasonSpec {
-            reason: Reason::Cap,
-            kind: ReasonKind::Selecting,
-        }],
-    },
-    SurfaceSpec {
         requires: Some("tool-result/v1"),
         command: "ast_search",
         mode: "matches",
@@ -326,6 +302,30 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         unit: Unit::Rows,
         narrow: &["offset", "path", "include"],
         reasons: GREP_REASONS,
+    },
+    SurfaceSpec {
+        requires: None,
+        command: "search",
+        mode: "",
+        list_id: "payload.skipped_files",
+        unit: Unit::Files,
+        narrow: &["path"],
+        reasons: &[ReasonSpec {
+            reason: Reason::Cap,
+            kind: ReasonKind::Selecting,
+        }],
+    },
+    SurfaceSpec {
+        requires: None,
+        command: "grep",
+        mode: "",
+        list_id: "payload.skipped_files",
+        unit: Unit::Files,
+        narrow: &["path"],
+        reasons: &[ReasonSpec {
+            reason: Reason::Cap,
+            kind: ReasonKind::Selecting,
+        }],
     },
     SurfaceSpec {
         requires: None,
