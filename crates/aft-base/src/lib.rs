@@ -30,6 +30,7 @@
     clippy::unnecessary_lazy_evaluations,
     clippy::unnecessary_map_or
 )]
+// Mirror the main crate's lint policy so moved code retains its lint baseline.
 
 // Private fixture helpers can compile with test-support without their unit tests. Their local
 // non-test dead-code allowances keep them private while preserving diagnostics in the unit harness.

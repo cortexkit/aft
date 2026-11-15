@@ -177,9 +177,6 @@ pub(crate) fn protect_secret_process() -> Result<(), ProxyError> {
 }
 }
 
-/// Test-build record of `protect_secret_process` calls, so fakes can check that
-/// hardening ran before resolution without hardening the shared test process.
-
 pub(crate) struct State {
     approvals: crate::secret::requests::RequestSecrets,
     config: ProxyConfig,
@@ -741,6 +738,8 @@ pub(crate) fn refusal(label: &str, host: &str) -> Response<Body> {
     response
 }
 
+/// Test-build record of `protect_secret_process` calls, so fakes can check that
+/// hardening ran before resolution without hardening the shared test process.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_hardening {
     use std::cell::Cell;
