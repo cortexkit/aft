@@ -484,6 +484,90 @@ mod tests {
 
     use crate::search_index::IndexStatus;
 
+    /// Ranked collection retains rows from every examined file, not just one
+    /// worker batch. Account for full matched strings and caller-kept rows in
+    /// its request-wide text term; the displayed line window is a separate,
+    /// smaller string and cannot stand in for match_text's bytes.
+    #[test]
+    fn audit1432_ranked_collection_documents_request_wide_retained_text_bound() {
+        use crate::pattern_compile::{compile, CompileOpts, CompileResult};
+        use crate::search_index::{PathFilters, SearchIndex};
+        const FILES: usize = 6;
+        const LINES: usize = 12;
+        const KEEP: usize = 3;
+        const MATCH_BYTES: usize = 256 << 10;
+        let project = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let line = "x".repeat(MATCH_BYTES);
+        let content = format!("{line}\n").repeat(LINES);
+        for at in 0..FILES {
+            std::fs::write(root.join(format!("file-{at:02}.rs")), &content).unwrap();
+        }
+        let index = SearchIndex::build_with_limit(&root, (content.len() + 1) as u64).snapshot();
+        let CompileResult::Ok(pattern) = compile(".+", CompileOpts::default()) else {
+            panic!("line-local regex");
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        for keep_extra in [false, true] {
+            let collection = pool
+                .install(|| {
+                    index.collect_grep_matches_by_file(
+                        &pattern,
+                        &PathFilters::default(),
+                        &root,
+                        None,
+                        GrepExaminationLimits {
+                            max_files: FILES,
+                            budget: Duration::from_secs(60),
+                            max_lines_per_file: KEEP,
+                        },
+                        &examine_priority,
+                        &|row| keep_extra && row.line == LINES as u32,
+                    )
+                })
+                .unwrap();
+            let kept = KEEP + usize::from(keep_extra);
+            assert!(!collection.examination_capped);
+            assert_eq!(
+                (
+                    collection.candidate_files,
+                    collection.files_examined,
+                    collection.files.len()
+                ),
+                (FILES, FILES, FILES)
+            );
+            for file in &collection.files {
+                assert_eq!(file.matched_lines, LINES);
+                assert_eq!(file.matches.len(), kept);
+                assert!(file.matches.iter().all(|row| row.match_text == line));
+            }
+            let match_bytes: usize = collection
+                .files
+                .iter()
+                .flat_map(|file| &file.matches)
+                .map(|row| row.match_text.len())
+                .sum();
+            let text_bytes: usize = collection
+                .files
+                .iter()
+                .flat_map(|file| &file.matches)
+                .map(|row| row.match_text.len() + row.line_text.len())
+                .sum();
+            let window_bytes = crate::commands::grep::GREP_MAX_LINE_CHARS
+                + crate::commands::grep::GREP_LINE_TRUNCATED_MARKER.len();
+            assert_eq!(match_bytes, FILES * kept * MATCH_BYTES);
+            assert!(text_bytes <= FILES * kept * (MATCH_BYTES + window_bytes));
+            assert!(
+                match_bytes > kept * MATCH_BYTES,
+                "retention is across files, not limited to the one worker"
+            );
+            eprintln!("ranked collection: files={FILES}, retained_rows={}, match_bytes={match_bytes}, total_text_bytes={text_bytes}, concurrency=1", FILES * kept);
+        }
+    }
+
     fn grep_match(file: &str, line_text: &str, match_text: &str) -> GrepMatch {
         GrepMatch {
             file: PathBuf::from(file),
