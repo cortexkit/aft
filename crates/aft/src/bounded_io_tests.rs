@@ -1,4 +1,37 @@
 use super::*;
+
+#[test]
+fn stage2_skip_disclosure_is_sorted_bounded_deduplicated_and_non_failing() {
+    let root = tempfile::tempdir().unwrap();
+    let readable = root.path().join("readable.txt");
+    std::fs::write(&readable, b"still readable").unwrap();
+    let response = with_budget(Some(Budget::after(Duration::from_secs(30))), || {
+        for at in (0..23).rev() {
+            let path = root.path().join(format!("large-{at:02}.txt"));
+            note_large_read_skip(&path);
+            note_large_read_skip(&path);
+        }
+        assert_eq!(read(&readable, None).unwrap(), b"still readable");
+        finish_response(Response::success(
+            "skips",
+            serde_json::json!({"complete":true,"text":"results"}),
+        ))
+    });
+    assert!(response.success);
+    assert_eq!(response.data["complete"], false);
+    let skips = response.data["skipped_files"].as_array().unwrap();
+    assert_eq!(skips.len(), 20);
+    assert!(skips[0]["file"].as_str().unwrap().ends_with("large-00.txt"));
+    assert!(skips[19]["file"]
+        .as_str()
+        .unwrap()
+        .ends_with("large-19.txt"));
+    assert_eq!(response.data["skipped_files_remaining"], 3);
+    assert!(response.data["text"]
+        .as_str()
+        .unwrap()
+        .contains("shown 20 of 23 files (cap) · narrow: path"));
+}
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 struct HelperGate {

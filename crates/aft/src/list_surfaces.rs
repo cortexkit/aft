@@ -65,6 +65,24 @@ pub struct SurfaceEntry {
 pub static LIST_SURFACES: &[SurfaceEntry] = &[
     SurfaceEntry {
         requires: None,
+        command: "search",
+        mode: "",
+        list_id: "payload.skipped_files",
+        unit: Unit::Files,
+        narrow: &["path"],
+        reasons: &[ReasonEntry { reason: Reason::Cap, kind: ReasonKind::Selecting, predicate_name: "disclose_large_read_skips" }],
+    },
+    SurfaceEntry {
+        requires: None,
+        command: "grep",
+        mode: "",
+        list_id: "payload.skipped_files",
+        unit: Unit::Files,
+        narrow: &["path"],
+        reasons: &[ReasonEntry { reason: Reason::Cap, kind: ReasonKind::Selecting, predicate_name: "disclose_large_read_skips" }],
+    },
+    SurfaceEntry {
+        requires: None,
         command: "callgraph",
         mode: "impact",
         list_id: "payload.sites",
@@ -206,7 +224,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
                 kind: ReasonKind::Bounding,
                 // The regex route sets engine_capped in rank_collection when its
                 // file-count or time bound left candidate files unexamined.
-                predicate_name: "engine_capped, rank_collection",
+                predicate_name: "engine_capped, rank_collection, read_degraded_grep_file",
             },
             // from_matches is the regex route's per-result line allowance: a
             // file lists its first matching lines and reports the rest in

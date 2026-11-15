@@ -387,7 +387,7 @@ pub(super) fn sweep(
         outcome.files_read += 1;
         outcome.files_checked += 1;
         // Binary and non-UTF-8 files are checked but cannot hold a text hit.
-        if let Some(content) = read_searchable_text(path) {
+        if let Some(content) = read_searchable_text(path, crate::large_read::Site::ExternalSweep) {
             crate::large_read::record_whole(crate::large_read::Site::ExternalSweep, content.len());
             scan_content(path, &content, *class, terms, &mut hits);
         }

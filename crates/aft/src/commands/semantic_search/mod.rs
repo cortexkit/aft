@@ -2803,7 +2803,7 @@ fn lexical_candidate_exactness(
         request_files::read_through(files.as_deref(), file, |path| {
             crate::large_read::counted(
                 crate::large_read::Site::LexicalExactness,
-                read_whole_source_file(path),
+                read_whole_source_file_at(path, crate::large_read::Site::LexicalExactness),
             )
         })
     }) else {
@@ -2845,9 +2845,16 @@ fn lexical_candidate_exactness(
 fn read_whole_source_file(
     path: &Path,
 ) -> std::io::Result<(Vec<u8>, Option<request_files::FileStat>)> {
+    read_whole_source_file_at(path, crate::large_read::Site::SourceFile)
+}
+
+fn read_whole_source_file_at(
+    path: &Path,
+    site: crate::large_read::Site,
+) -> std::io::Result<(Vec<u8>, Option<request_files::FileStat>)> {
     #[cfg(test)]
     crate::search_hot_path_measurements::record_file_read_path(path);
-    request_files::read_whole_file(path)
+    request_files::read_whole_file_at(path, site)
 }
 
 fn exact_phrase(query: &str) -> &str {
@@ -3829,7 +3836,9 @@ fn presence_check(path: &Path, normalized: &str, deadline: Instant) -> PresenceC
             if stamp.is_some_and(|(size, _)| crate::large_read::is_large(size)) {
                 return stream_presence_check(path, stamp, normalized, deadline);
             }
-            let Some(text) = crate::search_index::read_searchable_text(path) else {
+            let Some(text) =
+                crate::search_index::read_searchable_text(path, crate::large_read::Site::Presence)
+            else {
                 return PresenceCheck::Unknown;
             };
             crate::large_read::record_whole(crate::large_read::Site::Presence, text.len());
@@ -4094,6 +4103,22 @@ fn matching_line_from_source(
     query: &str,
     symbol_range: Option<SymbolOffsetRange>,
 ) -> Option<(u32, String)> {
+    if request_files::current()
+        .and_then(|files| files.kept(file))
+        .is_none()
+        && fs::metadata(file).is_ok_and(|metadata| crate::large_read::is_large(metadata.len()))
+    {
+        let find = || matching_line_streamed(file, query, symbol_range);
+        return match request_files::current() {
+            Some(files) => files.matching_line(
+                file,
+                query,
+                symbol_range.map(|range| (range.start, range.end)),
+                find,
+            ),
+            None => find().ok().flatten(),
+        };
+    }
     let Some(files) = request_files::current() else {
         let read_cost = telemetry::CostPhase::start("matching_read");
         let source = waits::timed(waits::SearchWait::FileRead, || {
@@ -4131,6 +4156,86 @@ fn matching_line_from_source(
                 .and_then(|source| matching_line_in_text(source, query, symbol_range)))
         },
     )
+}
+
+fn matching_line_streamed(
+    file: &Path,
+    query: &str,
+    symbol_range: Option<SymbolOffsetRange>,
+) -> std::io::Result<Option<(u32, String)>> {
+    let phrase = exact_lane::normalize_exact_phrase(exact_lane::exact_phrase(query));
+    let content_tokens = query_shape::extract_content_tokens(query);
+    let tokens = content_tokens
+        .iter()
+        .map(|token| {
+            token
+                .chars()
+                .filter(|ch| ch.is_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect::<String>()
+        })
+        .filter(|token| token.len() >= 3)
+        .collect::<Vec<_>>();
+    let mut valid = true;
+    let mut phrase_line = None;
+    let mut best = None;
+    let mut best_score = 0usize;
+    let mut fallback = None;
+    crate::large_read::visit_lines(
+        file,
+        crate::large_read::Site::MatchingLine,
+        |index, offset, bytes| {
+            let Ok(source) = std::str::from_utf8(bytes) else {
+                valid = false;
+                return;
+            };
+            if let Some(range) = symbol_range {
+                if range.start >= offset
+                    && (range.start < offset + bytes.len() || !bytes.ends_with(b"\n"))
+                {
+                    fallback = line_at_offset(source, range.start.saturating_sub(offset))
+                        .map(|(_, text)| (index as u32, text));
+                }
+            }
+            if phrase_line.is_some() {
+                return;
+            }
+            if !phrase.is_empty() {
+                if let Some((_, line)) = matching_phrase_line(source, &phrase) {
+                    let anchor = phrase
+                        .split(' ')
+                        .next()
+                        .and_then(|word| snippet_bounds::find_ascii_case_insensitive(line, word))
+                        .unwrap_or(0);
+                    phrase_line = Some((
+                        index as u32,
+                        snippet_bounds::window_snippet_line(line, anchor),
+                    ));
+                    return;
+                }
+            }
+            if let Some((score, _, line)) = MatchingSource::new(source).best_line(source, &tokens) {
+                if score > best_score {
+                    best_score = score;
+                    let anchor = content_tokens
+                        .iter()
+                        .filter_map(|token| {
+                            snippet_bounds::find_ascii_case_insensitive(
+                                line,
+                                &token.to_ascii_lowercase(),
+                            )
+                        })
+                        .min()
+                        .unwrap_or(0);
+                    best = Some((
+                        index as u32,
+                        snippet_bounds::window_snippet_line(line, anchor),
+                    ));
+                }
+            }
+        },
+    )?;
+    Ok(valid.then(|| phrase_line.or(best).or(fallback)).flatten())
 }
 
 /// Preparation is addressed by the bytes just read, not a path or watcher
@@ -7596,6 +7701,7 @@ fn execute_degraded_grep_fallback(
     let cancellation = crate::executor::current_job_cancellation();
     let rayon_wait = waits::time(waits::SearchWait::Rayon);
     let alloc_label = crate::alloc_trace::carry();
+    let io_budget = crate::bounded_io::current();
     let mut readable_files = files
         .par_iter()
         .enumerate()
@@ -7611,13 +7717,10 @@ fn execute_degraded_grep_fallback(
                 read_budget_reached.store(true, Ordering::Relaxed);
                 return None;
             }
-            crate::search_index::read_searchable_text(file).map(|content| {
-                crate::large_read::record_whole(
-                    crate::large_read::Site::DegradedGrep,
-                    content.len(),
-                );
-                (index, file.clone(), content)
+            crate::bounded_io::with_budget(io_budget.clone(), || {
+                read_degraded_grep_file(file, &compiled, max_results)
             })
+            .map(|outcome| (index, file.clone(), outcome))
         })
         .collect::<Vec<_>>();
     drop(rayon_wait);
@@ -7628,7 +7731,7 @@ fn execute_degraded_grep_fallback(
     // original walker order before applying the existing result-cap semantics.
     readable_files.sort_by_key(|(index, _, _)| *index);
 
-    for (_, file, content) in readable_files {
+    for (_, _file, (rows, count)) in readable_files {
         if search_cancellation_requested() {
             return Err(cancelled_search_response_from_id(request_id));
         }
@@ -7639,15 +7742,11 @@ fn execute_degraded_grep_fallback(
 
         files_searched += 1;
 
-        if search_degraded_grep_file(
-            &file,
-            &content,
-            &compiled,
-            max_results,
-            &mut total_matches,
-            &mut truncated,
-            &mut matches,
-        ) {
+        let remaining = max_results.saturating_sub(matches.len());
+        total_matches += count.min(remaining + 1);
+        truncated = count > remaining;
+        matches.extend(rows.into_iter().take(remaining));
+        if count > 0 {
             files_with_matches += 1;
         }
     }
@@ -7684,6 +7783,158 @@ fn execute_degraded_grep_fallback(
         candidate_files,
         walk_budget_reached,
     })
+}
+
+fn read_degraded_grep_file(
+    file: &Path,
+    compiled: &pattern_compile::CompiledPattern,
+    max_results: usize,
+) -> Option<(Vec<GrepMatch>, usize)> {
+    use crate::large_read::{LineMatcher, MatchVisit, ScanLines};
+    let mut reader = crate::bounded_io::reader(file, None).ok()?;
+    let size = reader.size_at_open();
+    let line_matcher = match compiled {
+        pattern_compile::CompiledPattern::Literal(literal)
+            if crate::large_read::literal_is_line_local(&literal.needle) =>
+        {
+            Some(LineMatcher::Literal {
+                needle: &literal.needle,
+                case_insensitive_ascii: literal.case_insensitive_ascii,
+            })
+        }
+        pattern_compile::CompiledPattern::Regex { compiled, .. }
+            if crate::large_read::regex_is_line_local(compiled) =>
+        {
+            Some(LineMatcher::Regex(compiled))
+        }
+        _ => None,
+    };
+    if !crate::large_read::is_large(size) || line_matcher.is_none() {
+        crate::large_read::allow_whole(crate::large_read::Site::DegradedGrep, file, size).ok()?;
+        let bytes = reader.append(Vec::new(), size as usize).ok()?;
+        if crate::search_index::is_binary_bytes(&bytes) {
+            return None;
+        }
+        let content = std::str::from_utf8(&bytes).ok()?;
+        crate::large_read::record_whole(crate::large_read::Site::DegradedGrep, bytes.len());
+        let mut matches = Vec::new();
+        let mut total = 0;
+        search_degraded_grep_file(
+            file,
+            content,
+            compiled,
+            max_results,
+            &mut total,
+            &mut false,
+            &mut matches,
+        );
+        return Some((matches, total));
+    }
+    let head = reader.chunk(Vec::new(), 1024).ok()?;
+    if crate::search_index::is_binary_bytes(&head) {
+        return None;
+    }
+    let mut utf8 = crate::large_read::Utf8Check::default();
+    let mut valid = true;
+    let mut rows = Vec::new();
+    let mut total = 0usize;
+    let mut reported_end = 0usize;
+    let mut read = 0u64;
+    let token = crate::executor::current_job_cancellation();
+    let scan = crate::large_read::scan_lines(
+        crate::large_read::Site::DegradedGrep,
+        file,
+        &mut reader,
+        size,
+        head,
+        &line_matcher?,
+        true,
+        |bytes| {
+            read += bytes.len() as u64;
+            valid &= utf8.feed(bytes, |_| {});
+            token
+                .as_ref()
+                .filter(|token| token.cancel_requested_before_commit())
+                .map(|_| {
+                    crate::large_read::ScanEnd::Interrupted(
+                        crate::large_read::Interrupted::Cancelled,
+                    )
+                })
+        },
+        |lines, start, end| {
+            if start < reported_end {
+                return MatchVisit::SameLine;
+            }
+            let (line, column, line_text, next_line_start) = lines.line_details(start);
+            reported_end = next_line_start;
+            if total <= max_results {
+                total += 1;
+            }
+            if rows.len() < max_results {
+                rows.push(GrepMatch {
+                    file: file.to_path_buf(),
+                    line,
+                    column,
+                    line_text,
+                    match_text: lines.match_text(start, end),
+                });
+            }
+            MatchVisit::Recorded { next_line_start }
+        },
+    );
+    crate::large_read::record(crate::large_read::Site::DegradedGrep, size, read);
+    if scan
+        .as_ref()
+        .is_err_and(|error| !crate::large_read::is_ceiling_error(error))
+        || !valid
+        || !utf8.finish()
+    {
+        return None;
+    }
+    Some((rows, total))
+}
+
+#[cfg(test)]
+#[test]
+fn stage2_degraded_streamed_rows_match_whole_read() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("degraded.txt");
+    let pattern_compile::CompileResult::Ok(compiled) = pattern_compile::compile(
+        "foo",
+        CompileOpts {
+            literal: true,
+            ..CompileOpts::default()
+        },
+    ) else {
+        panic!("literal");
+    };
+    for content in [
+        "foo foo\r\nhead\nFoo tail\r\r\nfoo é\n",
+        "head\nno match\r\n",
+        "foo\r",
+    ] {
+        fs::write(&path, content).unwrap();
+        for cap in [0, 1, 10] {
+            let mut rows = Vec::new();
+            let mut total = 0;
+            search_degraded_grep_file(
+                &path, content, &compiled, cap, &mut total, &mut false, &mut rows,
+            );
+            let streamed = crate::large_read::with_test_steps(3, 0, || {
+                read_degraded_grep_file(&path, &compiled, cap)
+            });
+            assert_eq!(
+                streamed,
+                Some((rows, total)),
+                "cap={cap}, content={content:?}"
+            );
+        }
+    }
+    fs::write(&path, b"foo\nlater\xff").unwrap();
+    assert!(
+        crate::large_read::with_test_steps(3, 0, || read_degraded_grep_file(&path, &compiled, 10))
+            .is_none()
+    );
 }
 
 fn collect_degraded_grep_files(
@@ -9111,10 +9362,12 @@ fn enrich_snippets_from_source(results: &mut [HybridResult], project_root: &Path
     enrich_snippets_from_source_with_context(results, project_root, None)
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct SnippetReadPlan {
     fixed_last_line: Option<usize>,
     summary_nonempty_lines: usize,
+    ranges: Vec<std::ops::Range<usize>>,
+    doc_targets: Vec<usize>,
 }
 
 impl SnippetReadPlan {
@@ -9162,10 +9415,15 @@ fn snippet_read_plans(
         }
 
         plan.include_through(result.end_line);
+        plan.ranges.push(
+            result.start_line as usize
+                ..(result.end_line as usize + 1).min(result.start_line as usize + budget),
+        );
         if should_expand_rank0_snippet(rank, result, project_root) {
             let target =
                 symbol_for_rank0_render(result, ctx).unwrap_or_else(|| symbol_from_result(result));
             plan.include_through(target.range.end_line);
+            plan.doc_targets.push(target.range.start_line as usize);
             rank0_targets.insert(rank, target);
         }
     }
@@ -9173,7 +9431,7 @@ fn snippet_read_plans(
     (plans, rank0_targets)
 }
 
-fn read_bounded_snippet_lines(path: &Path, plan: SnippetReadPlan) -> Option<Vec<String>> {
+fn read_bounded_snippet_lines(path: &Path, plan: SnippetReadPlan) -> Option<SnippetLines> {
     // A file an earlier phase of this request read is cut into lines from
     // those bytes; otherwise only the lines the plan needs are read.
     if let Some(file) = request_files::current().and_then(|files| files.kept(path)) {
@@ -9214,17 +9472,82 @@ impl std::io::Read for CountedRead {
 fn bounded_snippet_lines_from(
     reader: &mut impl std::io::BufRead,
     plan: SnippetReadPlan,
-) -> Option<Vec<String>> {
-    let mut lines = Vec::new();
+) -> Option<SnippetLines> {
+    let mut lines = SnippetLines::default();
     let mut nonempty_lines = 0usize;
+    let mut summary_kept = 0usize;
+    let mut doc_start = 0usize;
+    let mut doc_head = Vec::new();
+    let mut ranges = plan.ranges.clone();
     while let Some((line, nonempty)) = read_bounded_snippet_line(reader).ok()? {
+        let index = lines.len;
+        if plan.doc_targets.contains(&index) {
+            lines.doc_starts.insert(index, doc_start);
+            ranges.push(doc_start..doc_start.saturating_add(RANK0_FULL_SNIPPET_MAX_LINES));
+            lines.text.extend(doc_head.iter().cloned());
+        }
+        let summary = summary_kept < plan.summary_nonempty_lines && !line.trim().is_empty();
+        summary_kept += usize::from(summary);
+        if summary || ranges.iter().any(|range| range.contains(&index)) {
+            lines.text.insert(index, line.clone());
+        }
+        if crate::commands::symbol_render::is_doc_comment_line(&line) {
+            if doc_head.len() < RANK0_FULL_SNIPPET_MAX_LINES {
+                doc_head.push((index, line));
+            }
+        } else {
+            doc_head.clear();
+            doc_start = index + 1;
+        }
         nonempty_lines += usize::from(nonempty);
-        lines.push(line);
-        if plan.is_satisfied(lines.len() - 1, nonempty_lines) {
+        lines.len += 1;
+        if plan.is_satisfied(index, nonempty_lines) {
             break;
         }
     }
     Some(lines)
+}
+
+#[derive(Default)]
+struct SnippetLines {
+    len: usize,
+    text: std::collections::BTreeMap<usize, String>,
+    doc_starts: HashMap<usize, usize>,
+}
+
+impl SnippetLines {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn iter(&self) -> impl Iterator<Item = &String> {
+        self.text.values()
+    }
+    fn joined(&self, range: std::ops::Range<usize>) -> String {
+        range
+            .map(|at| self.text.get(&at).expect("planned snippet line").as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+impl crate::commands::symbol_render::SymbolLines for SnippetLines {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn line(&self, index: usize) -> &str {
+        self.text.get(&index).expect("planned symbol line")
+    }
+    fn doc_start(&self, start: usize) -> usize {
+        self.doc_starts.get(&start).copied().unwrap_or(start)
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Index<usize> for SnippetLines {
+    type Output = String;
+    fn index(&self, index: usize) -> &String {
+        &self.text[&index]
+    }
 }
 
 #[derive(Default)]
@@ -9321,6 +9644,8 @@ fn audit01_snippet_long_line_has_bounded_allocation_work() {
     let plan = SnippetReadPlan {
         fixed_last_line: Some(0),
         summary_nonempty_lines: 0,
+        ranges: vec![0..1],
+        ..Default::default()
     };
     let (lines, bytes) =
         crate::test_allocations::count_bytes(|| read_bounded_snippet_lines(&file, plan).unwrap());
@@ -9452,7 +9777,7 @@ fn enrich_snippets_from_source_with_context(
 
         let range_len = end - start;
         let shown = range_len.min(budget);
-        let mut snippet = lines[start..start + shown].join("\n");
+        let mut snippet = lines.joined(start..start + shown);
         let remaining = range_len - shown;
         if remaining > 0 {
             // "lines" is load-bearing: a bare "+N more" reads as "N more
@@ -9557,7 +9882,7 @@ fn enrich_snippets_from_source_reference(
 
 fn render_rank0_symbol_snippet(
     result: &HybridResult,
-    lines: &[String],
+    lines: &(impl crate::commands::symbol_render::SymbolLines + ?Sized),
     ctx: Option<&AppContext>,
     planned_target: Option<&Symbol>,
 ) -> crate::commands::symbol_render::BudgetedSymbolRender {
@@ -14582,6 +14907,82 @@ mod tests {
     }
 
     #[test]
+    fn stage2_sparse_symbol_render_matches_full_vector() {
+        let root = tempfile::tempdir().unwrap();
+        for (docs, body, tail) in [(600, 300, 2), (3, 400, 0), (2, 4, 0)] {
+            let mut full = vec!["prior code".to_string(); 20_000];
+            full.extend((0..docs).map(|at| {
+                if at % 2 == 0 {
+                    format!("/// doc {at}")
+                } else {
+                    "#[inline]".to_string()
+                }
+            }));
+            let start = full.len();
+            full.extend((0..body).map(|at| format!("body {at}")));
+            let end = full.len() - 1;
+            full.extend((0..tail).map(|_| "neighbor".to_string()));
+            let hit = snippet_hit(
+                root.path().join("target.rs"),
+                "target",
+                SymbolKind::Function,
+                start as u32,
+                end as u32,
+                HIGH_CONFIDENCE_COSINE_FLOOR,
+            );
+            let symbol = symbol_from_result(&hit);
+            let plan = SnippetReadPlan {
+                fixed_last_line: Some(end),
+                summary_nonempty_lines: 0,
+                ranges: vec![start..(start + 20).min(end + 1)],
+                doc_targets: vec![start],
+            };
+            let text = full.join("\n");
+            let sparse = bounded_snippet_lines_from(&mut text.as_bytes(), plan).unwrap();
+            assert!(
+                sparse.text.len() <= RANK0_FULL_SNIPPET_MAX_LINES + 20,
+                "retained {} lines",
+                sparse.text.len()
+            );
+            let expected = render_rank0_symbol_snippet(&hit, &full, None, Some(&symbol));
+            let actual = render_rank0_symbol_snippet(&hit, &sparse, None, Some(&symbol));
+            assert_eq!(actual.content, expected.content);
+            assert_eq!(actual.status, expected.status);
+        }
+    }
+
+    #[test]
+    fn stage2_matching_line_windows_match_whole_text() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("source.rs");
+        let sources = [
+            "head\r\nfn snake_case() {}\r\nlast needle é\r".to_string(),
+            format!("head\n{}\tneedle\nother\n", "é".repeat(40_000)),
+            "first\npartial nee match\nfinal\n".to_string(),
+        ];
+        for source in sources {
+            fs::write(&file, &source).unwrap();
+            for query in ["needle", "snake_case", "last needle", "unmatched", "é", ""] {
+                for range in [
+                    None,
+                    Some(SymbolOffsetRange {
+                        start: source.len().saturating_sub(2),
+                        end: source.len(),
+                    }),
+                ] {
+                    assert_eq!(
+                        matching_line_streamed(&file, query, range).unwrap(),
+                        matching_line_in_text(&source, query, range),
+                        "query={query:?}, range={range:?}"
+                    );
+                }
+            }
+        }
+        fs::write(&file, b"needle\ninvalid\xff").unwrap();
+        assert_eq!(matching_line_streamed(&file, "needle", None).unwrap(), None);
+    }
+
+    #[test]
     fn bounded_snippet_reader_stops_before_later_marker() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("bounded.rs");
@@ -14590,11 +14991,16 @@ mod tests {
         let plan = SnippetReadPlan {
             fixed_last_line: Some(2),
             summary_nonempty_lines: 0,
+            ranges: vec![0..3],
+            ..Default::default()
         };
 
         let lines = read_bounded_snippet_lines(&path, plan).expect("bounded read");
 
-        assert_eq!(lines, vec!["line0", "line1", "line2"]);
+        assert_eq!(
+            lines.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["line0", "line1", "line2"]
+        );
     }
 
     #[test]

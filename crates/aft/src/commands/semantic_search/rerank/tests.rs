@@ -272,6 +272,61 @@ fn candidate_text_is_bounded_relative_and_repeatable() {
 // ---- served path ---------------------------------------------------------
 
 #[test]
+fn stage2_candidate_line_windows_match_whole_read() {
+    let project = tempfile::tempdir().unwrap();
+    let file = project.path().join("window.rs");
+    for invalid in [false, true] {
+        let mut source = b"// head\r\n\r\n".to_vec();
+        if invalid {
+            source.extend_from_slice(b"// invalid \xff\r\n");
+        }
+        source.extend_from_slice("#[inline]\r\npub fn later_identifier() {\r\n".as_bytes());
+        source.extend_from_slice(
+            format!("    {} earlier_identifier();\r\n", "é".repeat(40_000)).as_bytes(),
+        );
+        source.extend_from_slice(b"}\r\nlast\r");
+        std::fs::write(&file, &source).unwrap();
+        let symbol_start = source
+            .windows(9)
+            .position(|bytes| bytes == b"#[inline]")
+            .unwrap();
+        let unicode = source.iter().position(|byte| *byte == 0xc3).unwrap();
+        for range in [
+            None,
+            Some(super::super::comparator::SymbolOffsetRange::new(
+                symbol_start,
+                source.len(),
+            )),
+            Some(super::super::comparator::SymbolOffsetRange::new(
+                unicode + 1,
+                unicode + 17,
+            )),
+            Some(super::super::comparator::SymbolOffsetRange::new(
+                source.len() + 10,
+                source.len() + 20,
+            )),
+        ] {
+            let candidate = CandidateResult::new_exact(
+                file.clone(),
+                range,
+                super::super::evidence_descriptor::EvidenceDescriptor::for_e1(1, true, false),
+            );
+            for prose in [
+                "earlier_identifier later_identifier",
+                "missing_identifier",
+                "how does the last line work",
+            ] {
+                assert_eq!(
+                    streamed_candidate_text(project.path(), &candidate, prose),
+                    candidate_text(project.path(), &candidate, prose),
+                    "invalid={invalid}, range={range:?}, prose={prose}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn candidate_text_reuses_raw_source_without_lossy_matching_or_stale_lines() {
     let project = tempfile::tempdir().unwrap();
     let file = project.path().join("raw.rs");

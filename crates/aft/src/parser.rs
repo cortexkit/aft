@@ -1157,7 +1157,15 @@ pub(crate) mod work_counters {
 pub(crate) fn read_source(path: &Path) -> std::io::Result<String> {
     #[cfg(test)]
     work_counters::SOURCE_READS.with(|count| count.set(count.get() + 1));
-    let source = crate::bounded_io::read_to_string(path)?;
+    let mut reader = crate::bounded_io::reader(path, None)?;
+    crate::large_read::allow_whole(
+        crate::large_read::Site::ParseSource,
+        path,
+        reader.size_at_open(),
+    )?;
+    let bytes = reader.append(Vec::new(), reader.size_at_open() as usize)?;
+    let source = String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     crate::large_read::record_whole(crate::large_read::Site::ParseSource, source.len());
     Ok(source)
 }

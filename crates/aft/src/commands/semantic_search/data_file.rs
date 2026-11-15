@@ -103,13 +103,16 @@ pub fn is_data_file(project_root: &Path, path: &Path) -> bool {
     // Below the size threshold the whole file is small, so reading it to
     // measure its longest line is cheap.
     let read = super::request_files::read_through(files.as_deref(), path, |path| {
-        let mut file = std::fs::File::open(path)?;
+        let file = std::fs::File::open(path)?;
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        file.read_to_end(&mut bytes)?;
+        file.take(DATA_FILE_MIN_BYTES).read_to_end(&mut bytes)?;
         crate::large_read::record_whole(crate::large_read::Site::DataFile, bytes.len());
         Ok((bytes, Some(super::request_files::FileStat::of(&metadata))))
     });
-    read.is_ok_and(|fetched| has_long_line(fetched.file.bytes()))
+    read.is_ok_and(|fetched| {
+        fetched.file.bytes().len() as u64 >= DATA_FILE_MIN_BYTES
+            || has_long_line(fetched.file.bytes())
+    })
 }
 
 fn has_long_line(bytes: &[u8]) -> bool {

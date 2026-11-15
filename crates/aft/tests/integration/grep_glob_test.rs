@@ -567,6 +567,123 @@ fn grep_uses_index_when_configured() {
     assert!(status.success());
 }
 
+fn stage2_ceiling_fixture() -> tempfile::TempDir {
+    let project = setup_project(&[]);
+    for (name, size) in [
+        ("under.txt", 16 * 1024 * 1024 - 1),
+        ("over.txt", 16 * 1024 * 1024 + 1),
+    ] {
+        let mut bytes = vec![b'x'; size];
+        for at in (127..size).step_by(128) {
+            bytes[at] = b'\n';
+        }
+        bytes[..12].copy_from_slice(b"needle\ntail\n");
+        fs::write(project.path().join(name), bytes).unwrap();
+    }
+    project
+}
+
+fn assert_stage2_ceiling_reply(indexed: bool, search: bool) {
+    let project = stage2_ceiling_fixture();
+    let mut aft = AftProcess::spawn();
+    if indexed {
+        configure_with_index(&mut aft, project.path());
+    } else {
+        configure(&mut aft, project.path());
+    }
+    let request = |pattern: &str| {
+        if search {
+            json!({"id":"ceiling-search", "command":"semantic_search", "query":pattern, "hint":"literal", "include_tests":true, "top_k":10})
+        } else {
+            json!({"id":"ceiling-grep", "command":"grep", "pattern":pattern, "include_tests":true})
+        }
+    };
+    if indexed {
+        wait_for_index_ready(
+            &mut aft,
+            || json!({"id":"ceiling-bind", "command":"grep", "pattern":"not_in_any_file"}),
+        );
+    }
+    let skipped = send(&mut aft, request(r"needle\s+tail"));
+    assert_eq!(skipped["success"], true, "{skipped}");
+    assert_eq!(skipped["complete"], false, "{skipped}");
+    let skips = skipped["skipped_files"].as_array().expect("named skips");
+    assert_eq!(skips.len(), 1, "{skipped}");
+    assert!(
+        skips[0]["file"].as_str().unwrap().ends_with("over.txt"),
+        "{skipped}"
+    );
+    assert!(
+        skips[0]["reason"].as_str().unwrap().contains("16 MiB"),
+        "{skipped}"
+    );
+    let rows = skipped[if search { "results" } else { "matches" }]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "just-under-ceiling file is still searched whole: {skipped}"
+    );
+    assert!(
+        rows[0]["file"].as_str().unwrap().ends_with("under.txt"),
+        "{skipped}"
+    );
+    let streamed = send(&mut aft, request("needle"));
+    assert_eq!(streamed["success"], true, "{streamed}");
+    assert!(streamed.get("skipped_files").is_none(), "{streamed}");
+    assert_eq!(
+        streamed[if search { "results" } else { "matches" }]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "line-local matches remain searchable above the ceiling: {streamed}"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn stage2_indexed_grep_discloses_large_whole_read_skip() {
+    assert_stage2_ceiling_reply(true, false);
+}
+
+#[test]
+fn stage2_fallback_grep_discloses_large_whole_read_skip() {
+    assert_stage2_ceiling_reply(false, false);
+}
+
+#[test]
+fn stage2_aft_search_discloses_large_whole_read_skip() {
+    assert_stage2_ceiling_reply(true, true);
+}
+
+#[test]
+fn stage2_single_line_over_ceiling_is_named_and_skipped() {
+    let project = setup_project(&[]);
+    let mut bytes = vec![b'x'; 17 * 1024 * 1024];
+    let end = bytes.len();
+    bytes[end - 6..].copy_from_slice(b"needle");
+    fs::write(project.path().join("single-line.txt"), bytes).unwrap();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+    let response = send(
+        &mut aft,
+        json!({"id":"long-line", "command":"grep", "pattern":"needle"}),
+    );
+    assert_eq!(response["success"], true, "{response}");
+    assert_eq!(response["complete"], false, "{response}");
+    assert_eq!(response["total_matches"], 0, "{response}");
+    assert!(
+        response["skipped_files"][0]["file"]
+            .as_str()
+            .unwrap()
+            .ends_with("single-line.txt"),
+        "{response}"
+    );
+    assert!(aft.shutdown().success());
+}
+
 #[test]
 fn grep_text_uses_relative_paths_and_compact_format() {
     let project = setup_project(&[

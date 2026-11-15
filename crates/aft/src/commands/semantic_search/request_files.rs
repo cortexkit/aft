@@ -508,15 +508,24 @@ pub(crate) fn read_through(
 /// Read the whole file the way `std::fs::read` does, with the stat of the
 /// opened file.
 pub(crate) fn read_whole_file(path: &Path) -> io::Result<(Vec<u8>, Option<FileStat>)> {
+    read_whole_file_at(path, crate::large_read::Site::SourceFile)
+}
+
+pub(crate) fn read_whole_file_at(
+    path: &Path,
+    site: crate::large_read::Site,
+) -> io::Result<(Vec<u8>, Option<FileStat>)> {
     use std::io::Read as _;
     let mut file = std::fs::File::open(path)?;
-    let stat = file.metadata().ok().map(|metadata| FileStat::of(&metadata));
+    let stat = FileStat::of(&file.metadata()?);
+    crate::large_read::allow_whole(site, path, stat.size)?;
     let mut bytes = Vec::new();
-    if let Some(stat) = stat {
-        bytes.reserve(usize::try_from(stat.size).unwrap_or(0));
-    }
-    file.read_to_end(&mut bytes)?;
-    Ok((bytes, stat))
+    bytes
+        .try_reserve_exact(stat.size as usize)
+        .map_err(io::Error::other)?;
+    (&mut file).take(stat.size).read_to_end(&mut bytes)?;
+    crate::large_read::allow_whole(site, path, bytes.len() as u64)?;
+    Ok((bytes, Some(stat)))
 }
 
 /// Test probe: every read of file content a search does, by path, whether

@@ -2587,18 +2587,21 @@ fn fallback_search_file(
         return Vec::new();
     }
 
-    let opened =
-        match crate::search_index::open_grep_file(file, deadline, authorized_task_artifact, || {
-            fallback_line_matcher(pattern).is_some()
-        }) {
-            Ok(opened) => opened,
-            Err(error) => {
-                if error.kind() == std::io::ErrorKind::TimedOut {
-                    engine_capped.store(true, Ordering::Relaxed);
-                }
-                return Vec::new();
+    let opened = match crate::search_index::open_grep_file(
+        file,
+        deadline,
+        authorized_task_artifact,
+        crate::large_read::Site::GrepFallback,
+        || fallback_line_matcher(pattern).is_some(),
+    ) {
+        Ok(opened) => opened,
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                engine_capped.store(true, Ordering::Relaxed);
             }
-        };
+            return Vec::new();
+        }
+    };
     let bytes = match opened {
         crate::search_index::GrepFileRead::Whole(bytes) => bytes,
         crate::search_index::GrepFileRead::Large(large) => {
@@ -2851,6 +2854,8 @@ fn fallback_search_file_streamed(
     let mut same_line = 0usize;
     let mut reported_line_end = 0usize;
     let scan = crate::large_read::scan_lines(
+        crate::large_read::Site::GrepFallback,
+        file,
         &mut large.reader,
         size,
         std::mem::take(&mut large.head),
@@ -2925,6 +2930,7 @@ fn fallback_search_file_streamed(
             engine_capped.store(true, Ordering::Relaxed);
             return Vec::new();
         }
+        Err(error) if crate::large_read::is_ceiling_error(&error) => {}
         Err(error) => {
             if error.kind() == std::io::ErrorKind::TimedOut {
                 engine_capped.store(true, Ordering::Relaxed);

@@ -576,6 +576,15 @@ fn short_reason(reason: &str) -> String {
 pub(crate) fn candidate_text(project_root: &Path, result: &CandidateResult, prose: &str) -> String {
     let _cost = super::telemetry::CostPhase::start("candidate_text");
     let files = super::request_files::current();
+    if files
+        .as_ref()
+        .and_then(|files| files.kept(&result.path))
+        .is_none()
+        && std::fs::metadata(&result.path)
+            .is_ok_and(|metadata| crate::large_read::is_large(metadata.len()))
+    {
+        return streamed_candidate_text(project_root, result, prose);
+    }
     let file = super::request_files::read_through(files.as_deref(), &result.path, |path| {
         #[cfg(test)]
         crate::search_hot_path_measurements::record_file_read_path(path);
@@ -653,6 +662,104 @@ pub(crate) fn candidate_text(project_root: &Path, result: &CandidateResult, pros
     text
 }
 
+fn streamed_candidate_text(project_root: &Path, result: &CandidateResult, prose: &str) -> String {
+    let mut name = None;
+    let mut raw_line = 0usize;
+    let mut saw_code = false;
+    let identifiers = identifier_words(prose).collect::<Vec<_>>();
+    let mut found = vec![false; identifiers.len()];
+    let scan = crate::large_read::visit_lines(
+        &result.path,
+        crate::large_read::Site::CandidateText,
+        |index, offset, bytes| {
+            if let Some(range) = result.symbol_range {
+                if offset <= range.start {
+                    raw_line = index
+                        + usize::from(
+                            range.start >= offset + bytes.len() && bytes.ends_with(b"\n"),
+                        );
+                }
+                let selected = selected_line(bytes, offset, range);
+                if !selected.is_empty() && !saw_code {
+                    let source = String::from_utf8_lossy(selected).replace("\r\n", "\n");
+                    for line in source.lines() {
+                        if is_code_line(line.trim()) {
+                            saw_code = true;
+                            name = declared_name(&[line]);
+                            break;
+                        }
+                    }
+                }
+            } else {
+                let source = String::from_utf8_lossy(bytes);
+                for (needle, found) in identifiers.iter().zip(&mut found) {
+                    *found |= source.contains(needle);
+                }
+            }
+        },
+    );
+    let matched = if scan.is_ok() && result.symbol_range.is_none() {
+        super::matching_line_from_source(&result.path, prose, None).map(|(line, _)| line as usize)
+    } else {
+        None
+    };
+    let line = if result.symbol_range.is_some() {
+        raw_line
+    } else {
+        matched.unwrap_or(0)
+    };
+    if result.symbol_range.is_none() {
+        name = identifiers
+            .iter()
+            .zip(found)
+            .find(|(_, found)| *found)
+            .map(|(word, _)| bounded_name(word));
+    }
+    let name = name.unwrap_or_else(|| file_stem(&result.path));
+    let mut text = format!(
+        "{}:{}\n{name}",
+        display_path(project_root, &result.path),
+        line + 1
+    );
+    if scan.is_err() {
+        return text;
+    }
+    let first = matched.map_or(0, |line| line.saturating_sub(FILE_CONTEXT_LINES_ABOVE));
+    let _ = crate::large_read::visit_lines(
+        &result.path,
+        crate::large_read::Site::CandidateText,
+        |index, offset, bytes| {
+            let selected = match result.symbol_range {
+                Some(range) => selected_line(bytes, offset, range),
+                None if index >= first => bytes,
+                None => return,
+            };
+            let source = String::from_utf8_lossy(selected).replace("\r\n", "\n");
+            for line in source.lines() {
+                append_candidate_line(&mut text, line);
+            }
+        },
+    );
+    text
+}
+
+fn selected_line(bytes: &[u8], offset: usize, range: super::SymbolOffsetRange) -> &[u8] {
+    let start = floor_raw_boundary(bytes, range.start.saturating_sub(offset).min(bytes.len()));
+    let end =
+        floor_raw_boundary(bytes, range.end.saturating_sub(offset).min(bytes.len())).max(start);
+    &bytes[start..end]
+}
+
+fn append_candidate_line(text: &mut String, line: &str) {
+    let line = line.trim_end();
+    if line.trim().is_empty() || text.len() + 1 >= CANDIDATE_TEXT_BUDGET_BYTES {
+        return;
+    }
+    text.push('\n');
+    let room = CANDIDATE_TEXT_BUDGET_BYTES - text.len();
+    text.push_str(&line[..floor_char_boundary(line, line.len().min(room))]);
+}
+
 fn floor_raw_boundary(bytes: &[u8], mut at: usize) -> usize {
     while at > 0 && at < bytes.len() && bytes[at] & 0xc0 == 0x80 {
         at -= 1;
@@ -724,12 +831,10 @@ fn declared_name(lines: &[&str]) -> Option<String> {
         "declare",
         "readonly",
     ];
-    let code = lines.iter().map(|line| line.trim()).find(|line| {
-        !line.is_empty()
-            && !["#[", "#!", "@", "//", "/*", "*", "#", "--", "\"\"\""]
-                .iter()
-                .any(|prefix| line.starts_with(prefix))
-    })?;
+    let code = lines
+        .iter()
+        .map(|line| line.trim())
+        .find(|line| is_code_line(line))?;
     if let Some(captures) = DECLARATION.captures(code) {
         return Some(bounded_name(&captures[1]));
     }
@@ -743,6 +848,19 @@ fn declared_name(lines: &[&str]) -> Option<String> {
 /// The first code identifier of the prose (a word with an underscore, `::`,
 /// `$`, or an inner capital) that occurs in `source`.
 fn matched_identifier(prose: &str, source: &str) -> Option<String> {
+    identifier_words(prose)
+        .find(|word| source.contains(word))
+        .map(bounded_name)
+}
+
+fn is_code_line(line: &str) -> bool {
+    !line.is_empty()
+        && !["#[", "#!", "@", "//", "/*", "*", "#", "--", "\"\"\""]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+}
+
+fn identifier_words(prose: &str) -> impl Iterator<Item = &str> {
     prose
         .split(|character: char| {
             !(character.is_alphanumeric() || matches!(character, '_' | ':' | '$'))
@@ -754,8 +872,6 @@ fn matched_identifier(prose: &str, source: &str) -> Option<String> {
                 || word.contains('$')
                 || word.chars().skip(1).any(char::is_uppercase)
         })
-        .find(|word| source.contains(word))
-        .map(bounded_name)
 }
 
 fn floor_char_boundary(text: &str, mut index: usize) -> usize {

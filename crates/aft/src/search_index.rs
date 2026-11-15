@@ -2076,9 +2076,13 @@ impl SearchIndexSnapshot {
                     let fetched = crate::commands::semantic_search::request_files::read_through(
                         request_files,
                         &file.path,
-                        |path| match open_grep_file(path, deadline, false, || {
-                            matcher.line_matcher().is_some()
-                        })? {
+                        |path| match open_grep_file(
+                            path,
+                            deadline,
+                            false,
+                            crate::large_read::Site::GrepCollect,
+                            || matcher.line_matcher().is_some(),
+                        )? {
                             GrepFileRead::Whole(bytes) => Ok((bytes, None)),
                             GrepFileRead::Large(opened) => {
                                 large = Some(opened);
@@ -2098,10 +2102,8 @@ impl SearchIndexSnapshot {
                             keep_past_limit,
                             job_cancellation.as_ref(),
                         );
-                        // A file not read to its end gives no rows, as a
-                        // whole read that hit its deadline or failed. Such a
-                        // read still counted as examined here, and so does
-                        // this one.
+                        // I/O failures give no rows. A ceiling skip keeps the
+                        // earlier, complete lines and discloses the missing tail.
                         files_examined.fetch_add(1, Ordering::Relaxed);
                         match end {
                             Ok(crate::large_read::ScanEnd::Interrupted(_)) => {
@@ -2109,6 +2111,7 @@ impl SearchIndexSnapshot {
                                 return None;
                             }
                             Ok(_) => {}
+                            Err(error) if crate::large_read::is_ceiling_error(&error) => {}
                             Err(error) => {
                                 if error.kind() == std::io::ErrorKind::TimedOut {
                                     stopped_early.store(true, Ordering::Relaxed);
@@ -2537,9 +2540,13 @@ fn search_candidate_file(
         }
         Vec::new()
     };
-    let opened = match open_grep_file(&file.path, deadline.read_at, false, || {
-        matcher.line_matcher().is_some()
-    }) {
+    let opened = match open_grep_file(
+        &file.path,
+        deadline.read_at,
+        false,
+        crate::large_read::Site::GrepIndexed,
+        || matcher.line_matcher().is_some(),
+    ) {
         Ok(opened) => opened,
         Err(error) => return read_failed(error),
     };
@@ -2731,6 +2738,8 @@ fn search_candidate_file_streamed(
     let mut state = CandidateScan::new(file);
     let mut read = 0u64;
     let scan = crate::large_read::scan_lines(
+        crate::large_read::Site::GrepIndexed,
+        &file.path,
         &mut large.reader,
         size,
         std::mem::take(&mut large.head),
@@ -2787,6 +2796,9 @@ fn search_candidate_file_streamed(
         Ok(crate::large_read::ScanEnd::Interrupted(_)) => {
             engine_capped.store(true, Ordering::Relaxed);
             None
+        }
+        Err(error) if crate::large_read::is_ceiling_error(&error) => {
+            return Ok(state.finish(files_with_matches));
         }
         Err(error) => Some(error),
     };
@@ -2891,6 +2903,8 @@ fn matching_lines_streamed(
     let mut state = LineCollect::default();
     let mut read = 0u64;
     let end = crate::large_read::scan_lines(
+        crate::large_read::Site::GrepCollect,
+        path,
         &mut large.reader,
         size,
         std::mem::take(&mut large.head),
@@ -3690,8 +3704,12 @@ where
     Ok(files)
 }
 
-pub(crate) fn read_searchable_text(path: &Path) -> Option<String> {
-    let bytes = crate::bounded_io::read(path, None).ok()?;
+pub(crate) fn read_searchable_text(path: &Path, site: crate::large_read::Site) -> Option<String> {
+    let mut reader = crate::bounded_io::reader(path, None).ok()?;
+    crate::large_read::allow_whole(site, path, reader.size_at_open()).ok()?;
+    let bytes = reader
+        .append(Vec::new(), reader.size_at_open() as usize)
+        .ok()?;
     if is_binary_bytes(&bytes) {
         return None;
     }
@@ -3703,7 +3721,13 @@ pub(crate) fn read_searchable_text(path: &Path) -> Option<String> {
 /// distinguish a missing entry from blocked access or a scan timeout.
 #[cfg(test)]
 fn read_indexed_file_bytes(path: &Path, deadline: Option<Instant>) -> std::io::Result<Vec<u8>> {
-    match open_grep_file(path, deadline, false, || false)? {
+    match open_grep_file(
+        path,
+        deadline,
+        false,
+        crate::large_read::Site::GrepIndexed,
+        || false,
+    )? {
         GrepFileRead::Whole(bytes) => Ok(bytes),
         GrepFileRead::Large(_) => unreachable!("a large read was not asked for"),
     }
@@ -3733,6 +3757,7 @@ pub(crate) fn open_grep_file(
     path: &Path,
     deadline: Option<Instant>,
     authorized_task_artifact: bool,
+    site: crate::large_read::Site,
     stream: impl FnOnce() -> bool,
 ) -> std::io::Result<GrepFileRead> {
     let mut reader =
@@ -3753,7 +3778,13 @@ pub(crate) fn open_grep_file(
             head: prefix,
         }));
     }
-    reader.rest(prefix).map(GrepFileRead::Whole)
+    crate::large_read::allow_whole(site, path, reader.size_at_open())?;
+    if crate::large_read::is_large(reader.size_at_open()) {
+        let remaining = reader.size_at_open().saturating_sub(prefix.len() as u64) as usize;
+        reader.append(prefix, remaining).map(GrepFileRead::Whole)
+    } else {
+        reader.rest(prefix).map(GrepFileRead::Whole)
+    }
 }
 
 #[cfg(test)]
@@ -7043,9 +7074,14 @@ mod streamed_scan_tests {
                     let line_matcher = matcher.line_matcher().unwrap();
                     for step in STEPS {
                         let streamed = crate::large_read::with_test_steps(step, 0, || {
-                            let GrepFileRead::Large(large) =
-                                open_grep_file(&path, None, false, || true).unwrap()
-                            else {
+                            let GrepFileRead::Large(large) = open_grep_file(
+                                &path,
+                                None,
+                                false,
+                                crate::large_read::Site::GrepCollect,
+                                || true,
+                            )
+                            .unwrap() else {
                                 panic!("a large read");
                             };
                             matching_lines_streamed(
@@ -7085,6 +7121,8 @@ mod streamed_scan_tests {
                         let mut source = crate::large_read::source(&bytes, short);
                         let mut state = LineCollect::default();
                         let end = crate::large_read::scan_lines(
+                            crate::large_read::Site::GrepCollect,
+                            path,
                             &mut source,
                             bytes.len() as u64,
                             Vec::new(),
@@ -7117,7 +7155,14 @@ mod streamed_scan_tests {
         let opened = |threshold| {
             crate::large_read::with_test_steps(4, threshold, || {
                 matches!(
-                    open_grep_file(&path, None, false, || true).unwrap(),
+                    open_grep_file(
+                        &path,
+                        None,
+                        false,
+                        crate::large_read::Site::GrepCollect,
+                        || true
+                    )
+                    .unwrap(),
                     GrepFileRead::Large(_)
                 )
             })
@@ -7126,7 +7171,14 @@ mod streamed_scan_tests {
         assert!(opened(2047));
         // A pattern that is not line-local keeps the whole read.
         assert!(!crate::large_read::with_test_steps(4, 0, || matches!(
-            open_grep_file(&path, None, false, || false).unwrap(),
+            open_grep_file(
+                &path,
+                None,
+                false,
+                crate::large_read::Site::GrepCollect,
+                || false
+            )
+            .unwrap(),
             GrepFileRead::Large(_)
         )));
     }
@@ -7286,9 +7338,14 @@ mod streamed_scan_tests {
             let whole = matching_lines_in_content(&path, &bytes, &matcher, 3, &keep_past_limit);
             let line_matcher = matcher.line_matcher().unwrap();
             let streamed = crate::large_read::with_test_steps(step, 0, || {
-                let GrepFileRead::Large(large) =
-                    open_grep_file(&path, None, false, || true).unwrap()
-                else {
+                let GrepFileRead::Large(large) = open_grep_file(
+                    &path,
+                    None,
+                    false,
+                    crate::large_read::Site::GrepCollect,
+                    || true,
+                )
+                .unwrap() else {
                     panic!("a large read");
                 };
                 matching_lines_streamed(&path, large, &line_matcher, 3, &keep_past_limit, None)
