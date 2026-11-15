@@ -292,8 +292,19 @@
     "operation": "callers",
     "file": "fixture.cpp",
     "symbol": "Foo::bar",
-    "reason": "C++ method calls on typed receivers now resolve by type match; main left them unresolved",
+    "reason": "C++ method calls on typed receivers now resolve by type match; main left them unresolved; zero-resolved callers now report same-name unresolved candidates without confirming targets",
     "data_layer": {
+      "unresolved_callers": {
+        "name": "bar",
+        "total": 1,
+        "sites": [
+          {
+            "file": "fixture.cpp",
+            "line": 9,
+            "calling_function": "caller"
+          }
+        ]
+      },
       "symbol": "Foo::bar",
       "file": "fixture.cpp",
       "callers": [],
@@ -901,6 +912,526 @@
         }
       ],
       "complete": true
+    }
+  },
+  {
+    "case": "javascript-dynamic",
+    "operation": "callers",
+    "file": "dynamic.js",
+    "symbol": "B::m",
+    "reason": "Zero-resolved callers now report same-name unresolved candidate locations without confirming targets",
+    "data_layer": {
+      "unresolved_callers": {
+        "name": "m",
+        "total": 1,
+        "sites": [
+          {
+            "file": "dynamic.js",
+            "line": 3,
+            "calling_function": "caller"
+          }
+        ]
+      },
+      "symbol": "B::m",
+      "file": "dynamic.js",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 2,
+      "incomplete_reason": "Incomplete: 2 call sites in the analyzed JavaScript code could not be resolved, so a dynamic or indirect call may still reach `m`."
+    }
+  },
+  {
+    "case": "javascript-dynamic",
+    "operation": "callers",
+    "file": "dynamic.js",
+    "symbol": "A::m",
+    "reason": "Zero-resolved callers now report same-name unresolved candidate locations without confirming targets",
+    "data_layer": {
+      "unresolved_callers": {
+        "name": "m",
+        "total": 1,
+        "sites": [
+          {
+            "file": "dynamic.js",
+            "line": 3,
+            "calling_function": "caller"
+          }
+        ]
+      },
+      "symbol": "A::m",
+      "file": "dynamic.js",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 2,
+      "incomplete_reason": "Incomplete: 2 call sites in the analyzed JavaScript code could not be resolved, so a dynamic or indirect call may still reach `m`."
+    }
+  },
+  {
+    "case": "kotlin-property",
+    "operation": "callers",
+    "file": "Handler.kt",
+    "symbol": "BillingService::find",
+    "reason": "Zero-resolved callers now report same-name unresolved candidate locations without confirming targets",
+    "data_layer": {
+      "unresolved_callers": {
+        "name": "find",
+        "total": 2,
+        "sites": [
+          {
+            "file": "Handler.kt",
+            "line": 5,
+            "calling_function": "Handler::handle"
+          },
+          {
+            "file": "Handler.kt",
+            "line": 9,
+            "calling_function": "Handler::handle"
+          }
+        ]
+      },
+      "symbol": "BillingService::find",
+      "file": "Handler.kt",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 2,
+      "incomplete_reason": "Incomplete: 2 call sites in the analyzed Kotlin code could not be resolved, so a dynamic or indirect call may still reach `find`."
+    }
+  },
+  {
+    "case": "kotlin-property",
+    "operation": "callers",
+    "file": "Handler.kt",
+    "symbol": "AuditService::find",
+    "reason": "Zero-resolved callers now report same-name unresolved candidate locations without confirming targets",
+    "data_layer": {
+      "unresolved_callers": {
+        "name": "find",
+        "total": 2,
+        "sites": [
+          {
+            "file": "Handler.kt",
+            "line": 5,
+            "calling_function": "Handler::handle"
+          },
+          {
+            "file": "Handler.kt",
+            "line": 9,
+            "calling_function": "Handler::handle"
+          }
+        ]
+      },
+      "symbol": "AuditService::find",
+      "file": "Handler.kt",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 2,
+      "incomplete_reason": "Incomplete: 2 call sites in the analyzed Kotlin code could not be resolved, so a dynamic or indirect call may still reach `find`."
+    }
+  },
+  {
+    "case": "python-dynamic",
+    "operation": "callers",
+    "file": "dynamic.py",
+    "symbol": "B::m",
+    "reason": "Zero-resolved callers now report same-name unresolved candidate locations without confirming targets",
+    "data_layer": {
+      "unresolved_callers": {
+        "name": "m",
+        "total": 1,
+        "sites": [
+          {
+            "file": "dynamic.py",
+            "line": 7,
+            "calling_function": "caller"
+          }
+        ]
+      },
+      "symbol": "B::m",
+      "file": "dynamic.py",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 3,
+      "incomplete_reason": "Incomplete: 3 call sites in the analyzed Python code could not be resolved, so a dynamic or indirect call may still reach `m`."
+    }
+  },
+  {
+    "case": "python-dynamic",
+    "operation": "callers",
+    "file": "dynamic.py",
+    "symbol": "A::m",
+    "reason": "Zero-resolved callers now report same-name unresolved candidate locations without confirming targets",
+    "data_layer": {
+      "unresolved_callers": {
+        "name": "m",
+        "total": 1,
+        "sites": [
+          {
+            "file": "dynamic.py",
+            "line": 7,
+            "calling_function": "caller"
+          }
+        ]
+      },
+      "symbol": "A::m",
+      "file": "dynamic.py",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 3,
+      "incomplete_reason": "Incomplete: 3 call sites in the analyzed Python code could not be resolved, so a dynamic or indirect call may still reach `m`."
+    }
+  },
+  {
+    "case": "receiver-python",
+    "operation": "callers",
+    "file": "receiver.py",
+    "symbol": "C",
+    "reason": "Zero-resolved callers now report same-name unresolved candidate locations without confirming targets",
+    "data_layer": {
+      "unresolved_callers": {
+        "name": "C",
+        "total": 1,
+        "sites": [
+          {
+            "file": "receiver.py",
+            "line": 8,
+            "calling_function": "C::f"
+          }
+        ]
+      },
+      "symbol": "C",
+      "file": "receiver.py",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 1,
+      "incomplete_reason": "Incomplete: 1 call site in the analyzed Python code could not be resolved, so a dynamic or indirect call may still reach `C`."
+    }
+  },
+  {
+    "case": "smoke-java",
+    "operation": "callers",
+    "file": "a.java",
+    "symbol": "C::f",
+    "reason": "Zero-resolved callers now report same-name unresolved candidate locations without confirming targets",
+    "data_layer": {
+      "unresolved_callers": {
+        "name": "f",
+        "total": 1,
+        "sites": [
+          {
+            "file": "a.java",
+            "line": 1,
+            "calling_function": "C::g"
+          }
+        ]
+      },
+      "symbol": "C::f",
+      "file": "a.java",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 1,
+      "incomplete_reason": "Incomplete: 1 call site in the analyzed Java code could not be resolved, so a dynamic or indirect call may still reach `f`."
+    }
+  },
+  {
+    "case": "solidity-contract",
+    "operation": "callers",
+    "file": "Vault.sol",
+    "symbol": "IERC20::transfer",
+    "reason": "Zero-resolved callers now report same-name unresolved candidate locations without confirming targets",
+    "data_layer": {
+      "unresolved_callers": {
+        "name": "transfer",
+        "total": 1,
+        "sites": [
+          {
+            "file": "Vault.sol",
+            "line": 43,
+            "calling_function": "Vault::withdraw"
+          }
+        ]
+      },
+      "symbol": "IERC20::transfer",
+      "file": "Vault.sol",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 1,
+      "incomplete_reason": "Incomplete: 1 call site in the analyzed Solidity code could not be resolved, so a dynamic or indirect call may still reach `transfer`."
+    }
+  },
+  {
+    "case": "typescript-callback",
+    "operation": "callers",
+    "file": "callback.ts",
+    "symbol": "Service::method",
+    "reason": "Zero-resolved callers now report same-name unresolved candidate locations without confirming targets",
+    "data_layer": {
+      "unresolved_callers": {
+        "name": "method",
+        "total": 1,
+        "sites": [
+          {
+            "file": "callback.ts",
+            "line": 1,
+            "calling_function": "entry"
+          }
+        ]
+      },
+      "symbol": "Service::method",
+      "file": "callback.ts",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 2,
+      "incomplete_reason": "Incomplete: 2 call sites in the analyzed TypeScript code could not be resolved, so a dynamic or indirect call may still reach `method`."
+    }
+  },
+  {
+    "case": "typescript-dynamic",
+    "operation": "callers",
+    "file": "dynamic.ts",
+    "symbol": "A::m",
+    "reason": "Zero-resolved callers now report same-name unresolved candidate locations without confirming targets",
+    "data_layer": {
+      "unresolved_callers": {
+        "name": "m",
+        "total": 1,
+        "sites": [
+          {
+            "file": "dynamic.ts",
+            "line": 3,
+            "calling_function": "caller"
+          }
+        ]
+      },
+      "symbol": "A::m",
+      "file": "dynamic.ts",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 2,
+      "incomplete_reason": "Incomplete: 2 call sites in the analyzed TypeScript code could not be resolved, so a dynamic or indirect call may still reach `m`."
+    }
+  },
+  {
+    "case": "typescript-dynamic",
+    "operation": "callers",
+    "file": "dynamic.ts",
+    "symbol": "B::m",
+    "reason": "Zero-resolved callers now report same-name unresolved candidate locations without confirming targets",
+    "data_layer": {
+      "unresolved_callers": {
+        "name": "m",
+        "total": 1,
+        "sites": [
+          {
+            "file": "dynamic.ts",
+            "line": 3,
+            "calling_function": "caller"
+          }
+        ]
+      },
+      "symbol": "B::m",
+      "file": "dynamic.ts",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 2,
+      "incomplete_reason": "Incomplete: 2 call sites in the analyzed TypeScript code could not be resolved, so a dynamic or indirect call may still reach `m`."
+    }
+  },
+  {
+    "case": "typescript-external",
+    "operation": "callers",
+    "file": "external.ts",
+    "symbol": "A::m",
+    "reason": "Zero-resolved callers now report same-name unresolved candidate locations without confirming targets",
+    "data_layer": {
+      "unresolved_callers": {
+        "name": "m",
+        "total": 1,
+        "sites": [
+          {
+            "file": "external.ts",
+            "line": 2,
+            "calling_function": "caller"
+          }
+        ]
+      },
+      "symbol": "A::m",
+      "file": "external.ts",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 1,
+      "incomplete_reason": "Incomplete: 1 call site in the analyzed TypeScript code could not be resolved, so a dynamic or indirect call may still reach `m`."
+    }
+  },
+  {
+    "case": "typescript-private",
+    "operation": "callers",
+    "file": "private.ts",
+    "symbol": "A::m",
+    "reason": "Zero-resolved callers now report same-name unresolved candidate locations without confirming targets",
+    "data_layer": {
+      "unresolved_callers": {
+        "name": "m",
+        "total": 1,
+        "sites": [
+          {
+            "file": "private.ts",
+            "line": 3,
+            "calling_function": "caller"
+          }
+        ]
+      },
+      "symbol": "A::m",
+      "file": "private.ts",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 1,
+      "incomplete_reason": "Incomplete: 1 call site in the analyzed TypeScript code could not be resolved, so a dynamic or indirect call may still reach `m`."
+    }
+  },
+  {
+    "case": "typescript-private",
+    "operation": "callers",
+    "file": "private.ts",
+    "symbol": "B::m",
+    "reason": "Zero-resolved callers now report same-name unresolved candidate locations without confirming targets",
+    "data_layer": {
+      "unresolved_callers": {
+        "name": "m",
+        "total": 1,
+        "sites": [
+          {
+            "file": "private.ts",
+            "line": 3,
+            "calling_function": "caller"
+          }
+        ]
+      },
+      "symbol": "B::m",
+      "file": "private.ts",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 1,
+      "incomplete_reason": "Incomplete: 1 call site in the analyzed TypeScript code could not be resolved, so a dynamic or indirect call may still reach `m`."
+    }
+  },
+  {
+    "case": "typescript-top-level",
+    "operation": "callers",
+    "file": "top.ts",
+    "symbol": "C::m",
+    "reason": "Zero-resolved callers now report same-name unresolved candidate locations without confirming targets",
+    "data_layer": {
+      "unresolved_callers": {
+        "name": "m",
+        "total": 1,
+        "sites": [
+          {
+            "file": "top.ts",
+            "line": 2,
+            "calling_function": "<top-level>"
+          }
+        ]
+      },
+      "symbol": "C::m",
+      "file": "top.ts",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 1,
+      "incomplete_reason": "Incomplete: 1 call site in the analyzed TypeScript code could not be resolved, so a dynamic or indirect call may still reach `m`."
+    }
+  },
+  {
+    "case": "zig-methods",
+    "operation": "callers",
+    "file": "fixture.zig",
+    "symbol": "Obj::method",
+    "reason": "Zero-resolved callers now report same-name unresolved candidate locations without confirming targets",
+    "data_layer": {
+      "unresolved_callers": {
+        "name": "method",
+        "total": 1,
+        "sites": [
+          {
+            "file": "fixture.zig",
+            "line": 8,
+            "calling_function": "caller"
+          }
+        ]
+      },
+      "symbol": "Obj::method",
+      "file": "fixture.zig",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 2,
+      "incomplete_reason": "Incomplete: 2 call sites in the analyzed Zig code could not be resolved, so a dynamic or indirect call may still reach `method`."
     }
   }
 ]
