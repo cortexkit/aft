@@ -1173,12 +1173,24 @@ pub fn request_exclusive_rerun() -> bool {
 
 #[derive(Debug, Clone)]
 struct RunningJob {
+    #[cfg(any(test, feature = "test-support"))]
+    pub root_id: ProjectRootId,
+    #[cfg(not(any(test, feature = "test-support")))]
     root_id: ProjectRootId,
+    #[cfg(any(test, feature = "test-support"))]
+    pub request_id: String,
+    #[cfg(not(any(test, feature = "test-support")))]
     request_id: String,
     command: String,
     job_class: JobClass,
     lane: Lane,
+    #[cfg(any(test, feature = "test-support"))]
+    pub started_at: Instant,
+    #[cfg(not(any(test, feature = "test-support")))]
     started_at: Instant,
+    #[cfg(any(test, feature = "test-support"))]
+    pub execution_started: Arc<AtomicBool>,
+    #[cfg(not(any(test, feature = "test-support")))]
     execution_started: Arc<AtomicBool>,
     completion_ownership: Weak<JobCompletionOwnership>,
     occupancy_reported: bool,
