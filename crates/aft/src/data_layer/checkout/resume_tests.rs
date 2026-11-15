@@ -435,8 +435,8 @@ fn a_refused_admission_writes_no_workspace() {
     let checkout = Checkout::bind(layer(), store.path(), family(), root.path()).unwrap();
     checkout.build().unwrap();
     let dir = builds(&checkout);
-    // Exactly at the floor: the build starts, and its workspace's first
-    // write, the identity, is refused.
+    // Exactly at the floor: the build starts, and the first write into a
+    // new workspace (the file naming which build it belongs to) is refused.
     let _low = crate::disk_floor::set_free_space_for_test(
         store.path(),
         crate::disk_floor::MIN_FREE_BYTES,
