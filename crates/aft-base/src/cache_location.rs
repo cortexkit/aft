@@ -680,17 +680,14 @@ fn registered_cache_path(path: &Path) -> io::Result<Option<(PathBuf, Identity)>>
     Ok(None)
 }
 
-#[rustfmt::skip]
-test_support_visibility! {
 /// A cache pathname is only a label. Keep the admitted directory open while
 /// resolving descendants so replacement ancestors cannot redirect an operation.
-pub(crate) struct CachePath {
+pub struct CachePath {
     pub(crate) root: PinnedDir,
     pub(crate) relative: PathBuf,
 }
-}
 impl CachePath {
-    pub(crate) fn directory(&self, create: bool) -> io::Result<PinnedDir> {
+    pub fn directory(&self, create: bool) -> io::Result<PinnedDir> {
         self.root.repair_descendant(&self.relative, create)
     }
     #[rustfmt::skip]
@@ -710,10 +707,7 @@ impl CachePath {
     }
 }
 
-#[rustfmt::skip]
-test_support_visibility! {
-
-pub(crate) fn pin_cache_path(path: &Path) -> io::Result<Option<CachePath>> {
+pub fn pin_cache_path(path: &Path) -> io::Result<Option<CachePath>> {
     // A nested alias must not replace the enclosing registered namespace as
     // the admission boundary. The pathname selects a candidate; its open
     // handle still has to match that registration before it grants access.
@@ -753,7 +747,6 @@ pub(crate) fn pin_cache_path(path: &Path) -> io::Result<Option<CachePath>> {
         .map_err(io::Error::other)?
         .to_path_buf();
     Ok(Some(CachePath { root, relative }))
-}
 }
 
 pub fn check_cache_access(path: &Path) -> io::Result<Option<PathBuf>> {
@@ -849,7 +842,7 @@ pub(crate) fn refuse_new_durable_cache_entry(path: &Path) -> io::Result<()> {
 
 /// Existing legacy cache databases may be inspected or removed, but a writable
 /// open could grow them and create WAL/SHM on the primary volume again.
-pub(crate) fn refuse_durable_cache_write(path: &Path) -> io::Result<()> {
+pub fn refuse_durable_cache_write(path: &Path) -> io::Result<()> {
     let split = STATUS
         .get_or_init(Default::default)
         .lock()

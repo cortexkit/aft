@@ -661,7 +661,7 @@ impl PinnedDir {
         }
     }
 
-    pub(crate) fn repair_new_file(&self, name: &OsStr) -> io::Result<File> {
+    pub fn repair_new_file(&self, name: &OsStr) -> io::Result<File> {
         #[cfg(unix)]
         {
             self.open_new_file(name)
@@ -674,7 +674,7 @@ impl PinnedDir {
         }
     }
 
-    pub(crate) fn repair_read_file(&self, name: &OsStr) -> io::Result<File> {
+    pub fn repair_read_file(&self, name: &OsStr) -> io::Result<File> {
         #[cfg(unix)]
         {
             self.open_file(name, false)
@@ -687,7 +687,7 @@ impl PinnedDir {
         }
     }
 
-    pub(crate) fn repair_remove_file(&self, name: &OsStr) -> io::Result<()> {
+    pub fn repair_remove_file(&self, name: &OsStr) -> io::Result<()> {
         #[cfg(unix)]
         {
             self.remove_file(name)
