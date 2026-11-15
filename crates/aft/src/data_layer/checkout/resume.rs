@@ -1178,7 +1178,7 @@ fn hide_root(point: &str) {
     let hidden = format!("{root}.hidden");
     let moved = match point {
         "stage.resolve" => std::fs::rename(&root, &hidden),
-        "stage.write" => std::fs::rename(&hidden, &root),
+        "stage.publish" => std::fs::rename(&hidden, &root),
         _ => return,
     };
     moved.expect("the checkout's root can be moved");

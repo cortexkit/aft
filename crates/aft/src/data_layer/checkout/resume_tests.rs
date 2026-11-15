@@ -525,6 +525,20 @@ fn bless(workspace: &Path, stage: &str) {
     .unwrap();
 }
 
+/// Damages the first staging segment in `workspace` as if it had been
+/// written so: its whole-file sum matches, and its records fail their own
+/// checks when read. A build that adopts it fails.
+fn poison(workspace: &Path) {
+    let segment = files_ending(&workspace.join("records"), ".seg").remove(0);
+    let mut bytes = std::fs::read(&segment).unwrap();
+    let middle = bytes.len() / 2;
+    for byte in &mut bytes[middle..middle + 64] {
+        *byte ^= 0xff;
+    }
+    std::fs::write(&segment, bytes).unwrap();
+    bless(workspace, super::resume::RECORDS);
+}
+
 /// The one workspace in the checkout's build folder `dir`.
 fn only_workspace(dir: &Path) -> PathBuf {
     let names = workspaces(dir);
@@ -550,17 +564,7 @@ fn a_stage_that_fails_the_build_that_adopted_it_is_built_again() {
     let store = tempfile::tempdir().unwrap();
     killed_build(store.path(), root.path(), "stage.sites");
     let checkout = Checkout::bind(layer(), store.path(), family(), root.path()).unwrap();
-    let workspace = only_workspace(&builds(&checkout));
-    // A staging segment damaged as it was written: its whole-file sum
-    // matches, and its records fail their own checks when read.
-    let segment = files_ending(&workspace.join("records"), ".seg").remove(0);
-    let mut bytes = std::fs::read(&segment).unwrap();
-    let middle = bytes.len() / 2;
-    for byte in &mut bytes[middle..middle + 64] {
-        *byte ^= 0xff;
-    }
-    std::fs::write(&segment, bytes).unwrap();
-    bless(&workspace, super::resume::RECORDS);
+    poison(&only_workspace(&builds(&checkout)));
     assert!(
         checkout.build().is_err(),
         "the damaged records fail the build"
@@ -668,29 +672,76 @@ fn a_build_of_a_checkout_another_build_holds_is_busy() {
     checkout.build().unwrap();
 }
 
-/// Inputs that are not parsed files but that resolution reads: a
-/// configuration file's bytes, a symlink's target and the set of paths.
+/// Inputs that are not parsed files but that resolution reads, each
+/// changed so that a call resolves to another function: a configuration
+/// file's bytes, a symlink's target and a path that is not parsed (a link
+/// that appears). Passes 2-3 resumed stale would publish the old edge.
 #[test]
 fn inputs_besides_parsed_files_changed_between_kill_and_resume_are_resolved_again() {
-    let changes: [(&str, fn(&Path)); 3] = [
-        ("a configuration file's bytes", |root| {
-            write(root, "package.json", "{\"name\": \"renamed\"}\n");
-        }),
-        // Both targets hold the same bytes: only the link changes.
-        ("a symlink's target", |root| {
-            std::fs::remove_file(root.join("gen/link.txt")).unwrap();
-            std::os::unix::fs::symlink("b.txt", root.join("gen/link.txt")).unwrap();
-        }),
-        ("a path that is not parsed", |root| {
-            std::fs::rename(root.join("notes.txt"), root.join("gen/notes.txt")).unwrap();
-        }),
-    ];
+    /// `main` calls `run` through a tsconfig path alias, `via` through a
+    /// symlinked folder and `later` through a link that is not there yet:
+    /// all three reach `old/lib.ts` or nothing.
+    fn aliased(root: &Path) {
+        project(root);
+        write(
+            root,
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@lib/*\":[\"old/*\"]}}}\n",
+        );
+        write(root, "old/lib.ts", "export function run() { return 1; }\n");
+        write(root, "new/lib.ts", "export function run() { return 2; }\n");
+        write(
+            root,
+            "main.ts",
+            "import { run } from '@lib/lib';\nexport function main() { run(); }\n",
+        );
+        write(
+            root,
+            "via.ts",
+            "import { run } from './linked/lib';\nexport function via() { run(); }\n",
+        );
+        write(
+            root,
+            "later.ts",
+            "import { run } from './alias/lib';\nexport function later() { run(); }\n",
+        );
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("old", root.join("linked")).unwrap();
+    }
+    let mut changes: Vec<(&str, fn(&Path))> = vec![("a configuration file's bytes", |root| {
+        write(
+            root,
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@lib/*\":[\"new/*\"]}}}\n",
+        );
+    })];
+    // Windows creates symlinks only with a privilege tests cannot count on.
+    #[cfg(unix)]
+    {
+        let retarget: fn(&Path) = |root| {
+            std::fs::remove_file(root.join("linked")).unwrap();
+            std::os::unix::fs::symlink("new", root.join("linked")).unwrap();
+        };
+        let appear: fn(&Path) = |root| {
+            std::os::unix::fs::symlink("new", root.join("alias")).unwrap();
+        };
+        changes.push(("a symlink's target", retarget));
+        changes.push(("a path that is not parsed", appear));
+    }
+    fn graph(published: &[(String, Vec<u8>)]) -> Vec<&(String, Vec<u8>)> {
+        published
+            .iter()
+            .filter(|(name, _)| name.starts_with("section 03"))
+            .collect()
+    }
+    let unchanged = tempfile::tempdir().unwrap();
+    aliased(unchanged.path());
+    let before_store = tempfile::tempdir().unwrap();
+    let (before, _) = build(before_store.path(), unchanged.path());
+    let before = published(&before);
     for (what, change) in changes {
         let root = tempfile::tempdir().unwrap();
-        project(root.path());
-        write(root.path(), "gen/a.txt", "same\n");
-        write(root.path(), "gen/b.txt", "same\n");
-        std::os::unix::fs::symlink("a.txt", root.path().join("gen/link.txt")).unwrap();
+        aliased(root.path());
         let store = tempfile::tempdir().unwrap();
         killed_build(store.path(), root.path(), "passes.committed");
         change(root.path());
@@ -699,7 +750,13 @@ fn inputs_besides_parsed_files_changed_between_kill_and_resume_are_resolved_agai
         assert!(!report.resumed_passes, "{what}: {report:?}");
         let reference_store = tempfile::tempdir().unwrap();
         let (reference, _) = build(reference_store.path(), root.path());
-        assert_same(&published(&reference), &published(&resumed), what);
+        let reference = published(&reference);
+        assert_ne!(
+            graph(&reference),
+            graph(&before),
+            "{what}: the change moved a call edge"
+        );
+        assert_same(&reference, &published(&resumed), what);
     }
 }
 
@@ -812,14 +869,21 @@ fn a_build_from_another_executable_or_a_damaged_stage_is_not_reused() {
     let report = checkout.build().unwrap();
     assert!(report.resumed_records > 0, "{report:?}");
     assert!(!report.resumed_passes, "{report:?}");
+    let reference_store = tempfile::tempdir().unwrap();
+    let (reference, _) = build(reference_store.path(), root.path());
+    let expected = published(&reference);
+    assert_same(&expected, &published(&checkout), "after a damaged range");
     drop(checkout);
 
-    // A workspace whose identity names another build is never adopted.
+    // A workspace whose identity names another build is never adopted, so
+    // what it holds never reaches the publication: here records a build
+    // that adopted them would fail on.
     let store = tempfile::tempdir().unwrap();
     killed_build(store.path(), root.path(), "stage.sites");
     let checkout = Checkout::bind(layer(), store.path(), family(), root.path()).unwrap();
     let dir = builds(&checkout);
     let workspace = dir.join(&workspaces(&dir)[0]);
+    poison(&workspace);
     let mut identity = aft_store::family::workspace::read_identity(&workspace).unwrap();
     identity.payload = String::from_utf8(identity.payload)
         .unwrap()
@@ -830,39 +894,52 @@ fn a_build_from_another_executable_or_a_damaged_stage_is_not_reused() {
     assert_eq!(report.resumed_records, 0, "{report:?}");
     assert!(!report.resumed_passes, "{report:?}");
     assert!(!workspace.exists(), "the foreign workspace was deleted");
+    assert_same(
+        &expected,
+        &published(&checkout),
+        "after a foreign workspace",
+    );
 }
 
+/// The child moves the checkout away once it is scanned and back once the
+/// segment is written: every stage between, resolution and the write
+/// included, reads only what the scan captured. Run on a fresh build and on
+/// one that resumes passes 2-3 from their spool.
 #[test]
 fn no_stage_after_the_scan_reads_the_checkout() {
-    let root = tempfile::tempdir().unwrap();
-    let checkout_root = root.path().join("checkout");
-    project(&checkout_root);
-    let store = tempfile::tempdir().unwrap();
-    // The child moves the checkout away once it is scanned and back before
-    // the segment is written: every stage between reads only what the scan
-    // captured.
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args([CHILD, "--exact", "--nocapture", "--test-threads", "1"])
-        .env("AFT_TEST_RESUME_CHILD", "1")
-        .env("AFT_TEST_RESUME_STORE", store.path())
-        .env("AFT_TEST_RESUME_ROOT", &checkout_root)
+    for resumed in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let checkout_root = root.path().join("checkout");
+        project(&checkout_root);
+        let store = tempfile::tempdir().unwrap();
+        if resumed {
+            killed_build(store.path(), &checkout_root, "passes.committed");
+        }
+        let output = child(
+            &std::env::current_exe().unwrap(),
+            store.path(),
+            &checkout_root,
+        )
         .env("AFT_TEST_HIDE_ROOT", &checkout_root)
-        .env_remove("AFT_TEST_KILL_AT")
         .output()
         .unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stderr}");
-    assert!(stderr.contains("HIDE ROOT at stage.resolve"), "{stderr}");
-    assert!(stderr.contains("HIDE ROOT at stage.write"), "{stderr}");
-    assert!(stderr.contains("CHILD BUILD FINISHED"), "{stderr}");
-    let hidden = Checkout::bind(layer(), store.path(), family(), &checkout_root).unwrap();
-    let reference_store = tempfile::tempdir().unwrap();
-    let (reference, _) = build(reference_store.path(), &checkout_root);
-    assert_same(
-        &published(&reference),
-        &published(&hidden),
-        "with the checkout hidden after the scan",
-    );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert!(stderr.contains("HIDE ROOT at stage.resolve"), "{stderr}");
+        assert!(stderr.contains("HIDE ROOT at stage.publish"), "{stderr}");
+        assert!(
+            stderr.contains(&format!("resumed_passes: {resumed}")),
+            "{stderr}"
+        );
+        let hidden = Checkout::bind(layer(), store.path(), family(), &checkout_root).unwrap();
+        let reference_store = tempfile::tempdir().unwrap();
+        let (reference, _) = build(reference_store.path(), &checkout_root);
+        assert_same(
+            &published(&reference),
+            &published(&hidden),
+            "with the checkout hidden after the scan",
+        );
+    }
 }
 
 #[test]
