@@ -11,8 +11,12 @@ fn impact_profile() {
         &root,
         &output.join("store"),
         None,
-        crate::data_layer::checkout::Planes { text: false, callgraph: true },
-    ).unwrap();
+        crate::data_layer::checkout::Planes {
+            text: false,
+            callgraph: true,
+        },
+    )
+    .unwrap();
     let start = std::time::Instant::now();
     let view = match checkout.fresh_view(std::time::Duration::from_secs(900)) {
         crate::data_layer::runtime::Fresh::Ready(view) => view,
@@ -20,15 +24,30 @@ fn impact_profile() {
         crate::data_layer::runtime::Fresh::Failed(reason) => panic!("graph failed: {reason}"),
     };
     eprintln!("PROFILE build_ms={}", start.elapsed().as_millis());
-    for symbol in ["isString", "isUndefined", "assertType"] {
+    for symbol in ["isBoolean", "isNumber", "isString"] {
         eprintln!("PROFILE symbol={symbol}");
         let start = std::time::Instant::now();
-        let result = impact_result(&view.callgraph(), Path::new("src/vs/base/common/types.ts"), symbol, 5, true).unwrap();
+        let result = impact_result(
+            &view.callgraph(),
+            Path::new("src/vs/base/common/types.ts"),
+            symbol,
+            5,
+            true,
+        )
+        .unwrap();
         let phase = std::time::Instant::now();
         let value = serde_json::to_value(result).unwrap();
         let text = crate::subc_format::format_callgraph("impact", &value, false);
-        eprintln!("PROFILE symbol={symbol} render_us={} total_ms={}", phase.elapsed().as_micros(), start.elapsed().as_millis());
-        std::fs::write(output.join(format!("{symbol}.json")), serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        eprintln!(
+            "PROFILE symbol={symbol} render_us={} total_ms={}",
+            phase.elapsed().as_micros(),
+            start.elapsed().as_millis()
+        );
+        std::fs::write(
+            output.join(format!("{symbol}.json")),
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .unwrap();
         std::fs::write(output.join(format!("{symbol}.txt")), text).unwrap();
     }
 }

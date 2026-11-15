@@ -495,6 +495,90 @@ impl<S: SliceSource> SliceReader<S> {
         sites
     }
 
+    /// Scan each candidate file once for the whole frontier. Targets shared by
+    /// many call sites are resolved once, rather than once per matching edge.
+    fn callers_of_targets(
+        &self,
+        targets: &[(String, String)],
+        limit: usize,
+    ) -> (HashMap<(String, String), Vec<StoreCallSite>>, bool, usize) {
+        let wanted = targets
+            .iter()
+            .map(|(file, symbol)| (file.as_str(), symbol.as_str()))
+            .collect::<BTreeSet<_>>();
+        let mut files = BTreeSet::new();
+        let mut grouped: BTreeMap<_, Vec<(CallerKey, StoreCallSite)>> = BTreeMap::new();
+        for &(file, symbol) in &wanted {
+            files.extend(self.source.caller_files(file, symbol));
+            grouped.insert((file.to_string(), symbol.to_string()), Vec::new());
+        }
+        let mut resolved_targets = HashMap::new();
+        let mut examined = 0;
+        let mut exhausted = false;
+        'files: for file in files {
+            let Some(slice) = self.source.slice(&file) else {
+                continue;
+            };
+            for edge in slice.edges() {
+                if !wanted.contains(&(edge.target_file(), edge.target_symbol())) {
+                    continue;
+                }
+                let kind = self.edge_kind(edge);
+                if !matches!(kind, "call" | "callback_ref") {
+                    continue;
+                }
+                let (Some(reference), Some(source)) = (edge.reference(), slice.node(edge.source()))
+                else {
+                    continue;
+                };
+                if examined >= limit {
+                    exhausted = true;
+                    break 'files;
+                }
+                examined += 1;
+                let key = (
+                    edge.target_file().to_string(),
+                    edge.target_symbol().to_string(),
+                );
+                let (target_node, target) = resolved_targets
+                    .entry((key.clone(), edge.lookup()))
+                    .or_insert_with(|| self.target_of(&key.0, &key.1, edge.lookup()));
+                grouped.get_mut(&key).expect("requested target").push((
+                    CallerKey {
+                        source_node: source.id().to_string(),
+                        byte_start: reference.byte_start(),
+                        line: reference.line(),
+                        ref_id: reference.ref_id(),
+                        target_node: target_node.clone(),
+                        provenance: edge.provenance(),
+                        kind,
+                    },
+                    StoreCallSite {
+                        kind: kind.to_string(),
+                        caller_is_test: source.is_test(),
+                        caller: store_node(&slice, source),
+                        target_file: key.0,
+                        target_symbol: key.1,
+                        target: target.clone(),
+                        line: edge.line(),
+                        byte_start: usize::try_from(reference.byte_start()).unwrap_or(usize::MAX),
+                        byte_end: usize::try_from(reference.byte_end()).unwrap_or(usize::MAX),
+                        resolved: reference.resolved(),
+                        provenance: edge.provenance().to_string(),
+                    },
+                ));
+            }
+        }
+        let result = grouped
+            .into_iter()
+            .map(|(key, mut sites)| {
+                sites.sort_by(|a, b| a.0.cmp(&b.0));
+                (key, sites.into_iter().map(|(_, site)| site).collect())
+            })
+            .collect();
+        (result, exhausted, examined)
+    }
+
     /// Edges whose source is `node`, of kind `call`, in the database's
     /// outgoing order, with their target nodes.
     fn outgoing_of(&self, node: &StoreNode) -> Vec<(OutgoingKey, StoreCallSite)> {
@@ -783,36 +867,21 @@ impl<S: SliceSource> CallGraphRead for SliceReader<S> {
         &self,
         targets: &[(String, String)],
     ) -> Result<HashMap<(String, String), Vec<StoreCallSite>>> {
-        Ok(targets
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .map(|target| {
-                let sites = self
-                    .callers_of_target(&target.0, &target.1)
-                    .into_iter()
-                    .map(|(_, site)| site)
-                    .collect();
-                (target, sites)
-            })
-            .collect())
+        Ok(self.callers_of_targets(targets, usize::MAX).0)
     }
 
     fn direct_caller_counts_of(
         &self,
         targets: &[(String, String)],
     ) -> Result<HashMap<(String, String), usize>> {
-        Ok(targets
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>()
+        Ok(self
+            .callers_of_targets(targets, usize::MAX)
+            .0
             .into_iter()
-            .map(|target| {
-                let groups = self
-                    .callers_of_target(&target.0, &target.1)
+            .map(|(target, sites)| {
+                let groups = sites
                     .into_iter()
-                    .map(|(key, site)| (site.caller.file, site.line, key.kind))
+                    .map(|site| (site.caller.file, site.line, site.kind))
                     .collect::<BTreeSet<_>>();
                 (target, groups.len())
             })
