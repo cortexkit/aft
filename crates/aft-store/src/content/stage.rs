@@ -79,6 +79,38 @@ pub struct StagedUnit {
     codec: u8,
 }
 
+impl StagedUnit {
+    /// The bytes [`Self::to_bytes`] writes.
+    pub const BYTES: usize = 21;
+
+    /// The unit as fixed-width little-endian bytes, for a table kept on
+    /// disk beside its staging segment so a later build can find each
+    /// record again.
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; Self::BYTES] {
+        let mut out = [0u8; Self::BYTES];
+        out[0..8].copy_from_slice(&self.offset.to_le_bytes());
+        out[8..12].copy_from_slice(&self.surface.to_le_bytes());
+        out[12..16].copy_from_slice(&self.body.to_le_bytes());
+        out[16..20].copy_from_slice(&self.unpacked.to_le_bytes());
+        out[20] = self.codec;
+        out
+    }
+
+    /// The unit [`Self::to_bytes`] wrote. Reading it back checks nothing:
+    /// the codec and lengths are checked when the record is read.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8; Self::BYTES]) -> Self {
+        Self {
+            offset: crate::le::u64_at(bytes, 0),
+            surface: crate::le::u32_at(bytes, 8),
+            body: crate::le::u32_at(bytes, 12),
+            unpacked: crate::le::u32_at(bytes, 16),
+            codec: bytes[20],
+        }
+    }
+}
+
 /// Appends records to a new staging segment.
 #[derive(Debug)]
 pub struct StageWriter {

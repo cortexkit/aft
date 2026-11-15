@@ -45,10 +45,11 @@ pub struct PendingSegment {
 }
 
 /// Private build files that outlive a write session and, when the build
-/// fails or pauses, the build too: dropping the workspace never deletes it.
-/// The build deletes it with [`BuildScratch::remove`] once it published or
-/// stood down; a later writer's sweep deletes a workspace whose build is no
-/// longer live.
+/// fails, pauses or dies, the build too: dropping the workspace never
+/// deletes it. The build deletes it with [`BuildScratch::remove`] once it
+/// published or stood down. A later build of the same checkout may adopt it
+/// (see [`ScratchClaim`]); a later writer's sweep deletes a dead one that no
+/// build may adopt any more (see [`crate::family::workspace::worth_keeping`]).
 ///
 /// A build is live while it holds its checkout's `checkout.lock`, which sits
 /// beside the workspace, never inside it: the lock file must outlive every
@@ -127,6 +128,36 @@ impl<E> BuildScratch<E> {
             workspace: Arc::clone(self),
             path,
         })
+    }
+
+    /// [`Self::subdir`], or the folder an earlier build left when the
+    /// workspace was adopted (see [`ScratchClaim::adopt`]).
+    ///
+    /// # Errors
+    ///
+    /// When the folder cannot be made.
+    pub fn subdir_existing(self: &Arc<Self>, name: &str) -> std::io::Result<ScratchDir<E>> {
+        let path = self.path.join(name);
+        match private_dir_builder().create(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => return Err(error),
+            _ => {}
+        }
+        Ok(ScratchDir {
+            workspace: Arc::clone(self),
+            path,
+        })
+    }
+
+    /// Records that the build stopped because the disk was short, so the
+    /// workspace outlives other dead ones when disk is reclaimed (see
+    /// [`WriteSession::reclaim_dead_workspaces`]). Adopting it clears the
+    /// mark.
+    ///
+    /// # Errors
+    ///
+    /// When the mark cannot be written.
+    pub fn mark_paused(&self) -> std::io::Result<()> {
+        std::fs::File::create(self.path.join(crate::family::workspace::PAUSED)).map(drop)
     }
 
     /// Asks the caller's storage admission policy before writing a run.
@@ -305,6 +336,149 @@ mod build_scratch_tests {
     }
 
     #[test]
+    fn a_workspace_with_an_identity_is_kept_for_its_checkout_to_adopt() {
+        let dir = tempfile::tempdir().unwrap();
+        let family =
+            Family::open(dir.path(), FamilyId::from_digest(Digest128::of(b"adopt"))).unwrap();
+        let root = dir.path().join("checkout-root");
+        std::fs::create_dir(&root).unwrap();
+        let scratch = family
+            .try_write()
+            .unwrap()
+            .unwrap()
+            .create_scratch(checkout(b"checkout"), |_| Ok::<_, ()>(()))
+            .unwrap();
+        let kept = scratch.path().to_path_buf();
+        crate::family::workspace::write_identity(
+            &kept,
+            &crate::family::workspace::WorkspaceIdentity {
+                root: root.clone(),
+                payload: b"one".to_vec(),
+            },
+        )
+        .unwrap();
+        std::fs::write(kept.join("staged"), b"work").unwrap();
+        scratch.mark_paused().unwrap();
+        drop(scratch);
+        drop(family.try_write().unwrap().unwrap());
+        assert!(kept.join("staged").exists(), "the sweep keeps it");
+
+        let claim = family
+            .try_write()
+            .unwrap()
+            .unwrap()
+            .claim_scratch(checkout(b"checkout"))
+            .unwrap();
+        let torn = claim.dir().join("torn");
+        std::fs::create_dir(&torn).unwrap();
+        assert_eq!(claim.leftovers().unwrap().len(), 2);
+        assert!(
+            family
+                .try_write()
+                .unwrap()
+                .unwrap()
+                .claim_scratch(checkout(b"checkout"))
+                .is_err(),
+            "one claim at a time"
+        );
+        let adopted = claim.adopt(&kept, |_| Ok::<_, ()>(())).unwrap();
+        assert_eq!(adopted.path(), kept);
+        assert!(!torn.exists(), "adoption deletes the other leftovers");
+        assert!(!crate::family::workspace::is_paused(&kept));
+        assert!(kept.join(crate::family::workspace::ADOPTED).exists());
+        let again = Arc::new(adopted);
+        let records = again.subdir_existing("records").unwrap();
+        assert!(again.subdir_existing("records").is_ok());
+        drop(records);
+        drop(again);
+
+        // Its checkout gone, the next writer deletes it.
+        std::fs::remove_dir(&root).unwrap();
+        drop(family.try_write().unwrap().unwrap());
+        assert!(!kept.exists());
+    }
+
+    #[test]
+    fn disk_reclaim_deletes_other_dead_workspaces_oldest_first_and_paused_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let family =
+            Family::open(dir.path(), FamilyId::from_digest(Digest128::of(b"reclaim"))).unwrap();
+        let root = dir.path().join("checkout-root");
+        std::fs::create_dir(&root).unwrap();
+        let mut made = Vec::new();
+        for (name, paused) in [
+            (b"old".as_slice(), false),
+            (b"paused", true),
+            (b"new", false),
+        ] {
+            let scratch = family
+                .try_write()
+                .unwrap()
+                .unwrap()
+                .create_scratch(checkout(name), |_| Ok::<_, ()>(()))
+                .unwrap();
+            crate::family::workspace::write_identity(
+                scratch.path(),
+                &crate::family::workspace::WorkspaceIdentity {
+                    root: root.clone(),
+                    payload: Vec::new(),
+                },
+            )
+            .unwrap();
+            if paused {
+                scratch.mark_paused().unwrap();
+            }
+            made.push(scratch.path().to_path_buf());
+            // Distinct modification times, oldest first.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let own = family
+            .try_write()
+            .unwrap()
+            .unwrap()
+            .create_scratch(checkout(b"own"), |_| Ok::<_, ()>(()))
+            .unwrap();
+        let mut asked = 0;
+        let removed = family
+            .try_write()
+            .unwrap()
+            .unwrap()
+            .reclaim_dead_workspaces(
+                checkout(b"own"),
+                || {
+                    asked += 1;
+                    asked <= 1
+                },
+                || false,
+            )
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert!(!made[0].exists(), "the oldest dead one goes first");
+        assert!(made[1].exists() && made[2].exists());
+        let removed = family
+            .try_write()
+            .unwrap()
+            .unwrap()
+            .reclaim_dead_workspaces(checkout(b"own"), || true, || false)
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert!(made[1].exists(), "a paused one stays above the floor");
+        assert!(!made[2].exists());
+        let removed = family
+            .try_write()
+            .unwrap()
+            .unwrap()
+            .reclaim_dead_workspaces(checkout(b"own"), || true, || true)
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert!(!made[1].exists(), "below the floor a paused one goes too");
+        assert!(
+            own.path().exists(),
+            "a live build's workspace is never reclaimed"
+        );
+    }
+
+    #[test]
     fn build_scratch_subdirs_share_one_workspace() {
         let dir = tempfile::tempdir().unwrap();
         let scratch = Arc::new(
@@ -355,22 +529,128 @@ fn try_checkout_lock(dir: &Path) -> Result<Option<File>, FamilyError> {
     }
 }
 
-/// Deletes every workspace folder of a checkout whose `checkout.lock` the
-/// caller holds, so none of them belongs to a live build. The lock file
+/// Deletes the workspace folders of a checkout whose `checkout.lock` the
+/// caller holds, so none of them belongs to a live build, except those a
+/// later build of that checkout may still adopt (see
+/// [`crate::family::workspace::worth_keeping`]). Only the build for that checkout
+/// compares a workspace's identity with its own; any other process judges
+/// it by liveness, its checkout's existence and its age. The lock file
 /// itself stays: another process may be about to open it.
 fn remove_dead_workspaces(dir: &Path) -> Result<(), FamilyError> {
+    let now = SystemTime::now();
     for workspace in read_dir(dir)? {
-        if !workspace.is_dir() {
+        if !workspace.is_dir() || crate::family::workspace::worth_keeping(&workspace, now) {
             continue;
         }
-        match std::fs::remove_dir_all(&workspace) {
+        remove_workspace_dir(&workspace)?;
+    }
+    Ok(())
+}
+
+fn remove_workspace_dir(workspace: &Path) -> Result<(), FamilyError> {
+    match std::fs::remove_dir_all(workspace) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(FamilyError::io(workspace)(error))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// A checkout's build folder, `builds/<checkout>/`, with its
+/// `checkout.lock` held: no other build of the checkout runs while the claim
+/// or the workspace made from it lives. The claimant looks at the
+/// workspaces earlier builds left ([`Self::leftovers`]) and either adopts
+/// one ([`Self::adopt`]) or starts a new one ([`Self::fresh`]).
+#[derive(Debug)]
+pub struct ScratchClaim {
+    dir: PathBuf,
+    lock: File,
+}
+
+impl ScratchClaim {
+    /// `builds/<checkout>/`, which holds the lock and the workspaces.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The workspace folders earlier builds of the checkout left, oldest
+    /// first by when they were last made or adopted.
+    ///
+    /// # Errors
+    ///
+    /// When the folder cannot be listed.
+    pub fn leftovers(&self) -> Result<Vec<PathBuf>, FamilyError> {
+        let mut found = read_dir(&self.dir)?
+            .into_iter()
+            .filter(|path| path.is_dir())
+            .map(|path| (crate::family::workspace::last_used(&path), path))
+            .collect::<Vec<_>>();
+        found.sort();
+        Ok(found.into_iter().map(|(_, path)| path).collect())
+    }
+
+    /// Deletes `workspace`, one of [`Self::leftovers`].
+    ///
+    /// # Errors
+    ///
+    /// When it exists and cannot be deleted.
+    pub fn remove(&self, workspace: &Path) -> Result<(), FamilyError> {
+        if workspace.parent() != Some(self.dir.as_path()) {
+            return Err(FamilyError::Misuse("not a workspace of this checkout"));
+        }
+        remove_workspace_dir(workspace)
+    }
+
+    /// Continues in `workspace`, one of [`Self::leftovers`], deleting every
+    /// other one. Marks it adopted now and clears its pause mark.
+    ///
+    /// # Errors
+    ///
+    /// When `workspace` is not one of this checkout's, or a file cannot be
+    /// written or deleted.
+    pub fn adopt<E>(
+        self,
+        workspace: &Path,
+        admit: impl Fn(u64) -> Result<(), E> + Send + Sync + 'static,
+    ) -> Result<BuildScratch<E>, FamilyError> {
+        if workspace.parent() != Some(self.dir.as_path()) || !workspace.is_dir() {
+            return Err(FamilyError::Misuse("not a workspace of this checkout"));
+        }
+        for other in self.leftovers()? {
+            if other != workspace {
+                remove_workspace_dir(&other)?;
+            }
+        }
+        crate::family::workspace::mark_adopted(workspace).map_err(FamilyError::io(workspace))?;
+        let paused = workspace.join(crate::family::workspace::PAUSED);
+        match std::fs::remove_file(&paused) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                return Err(FamilyError::io(&workspace)(error));
+                return Err(FamilyError::io(&paused)(error));
             }
             _ => {}
         }
+        Ok(BuildScratch {
+            path: workspace.to_path_buf(),
+            _lock: Some(self.lock),
+            admit: Box::new(admit),
+        })
     }
-    Ok(())
+
+    /// Starts a new workspace, after deleting every leftover no later build
+    /// may adopt (see [`remove_dead_workspaces`]); a caller that adopts
+    /// none of them deletes them with [`Self::remove`] first.
+    ///
+    /// # Errors
+    ///
+    /// When a folder cannot be made or deleted.
+    pub fn fresh<E>(
+        self,
+        admit: impl Fn(u64) -> Result<(), E> + Send + Sync + 'static,
+    ) -> Result<BuildScratch<E>, FamilyError> {
+        remove_dead_workspaces(&self.dir)?;
+        BuildScratch::create_in(&self.dir, Some(self.lock), admit)
+    }
 }
 
 fn sweep_build_scratch(builds: &Path) -> Result<(), FamilyError> {
@@ -538,9 +818,10 @@ impl<'f> WriteSession<'f> {
     }
 
     /// Allocates `builds/<checkout>/<build-id>/` and takes the checkout's
-    /// `builds/<checkout>/checkout.lock`, first deleting any workspace an
-    /// earlier build of the checkout left. The build deletes the new one with
-    /// [`BuildScratch::remove`]; one it leaves is deleted by the next writer
+    /// `builds/<checkout>/checkout.lock`, first deleting every workspace an
+    /// earlier build of the checkout left that no later build may adopt
+    /// (see [`ScratchClaim::fresh`]). The build deletes the new one with
+    /// [`BuildScratch::remove`]; one it leaves is judged by the next writer
     /// that finds the lock free. Creation is under `writer.lock`; a checkout
     /// can have only one live workspace, shared by its builders.
     ///
@@ -553,6 +834,19 @@ impl<'f> WriteSession<'f> {
         checkout: CheckoutId,
         admit: impl Fn(u64) -> Result<(), E> + Send + Sync + 'static,
     ) -> Result<BuildScratch<E>, FamilyError> {
+        self.claim_scratch(checkout)?.fresh(admit)
+    }
+
+    /// Takes `builds/<checkout>/checkout.lock` for a build that may adopt
+    /// a workspace an earlier build of the checkout left (see
+    /// [`ScratchClaim`]). Creation is under `writer.lock`; the claim
+    /// outlives the session.
+    ///
+    /// # Errors
+    ///
+    /// When the directory or the lock file cannot be created, or the
+    /// checkout already has a live build.
+    pub fn claim_scratch(&mut self, checkout: CheckoutId) -> Result<ScratchClaim, FamilyError> {
         let parent = self
             .family
             .layout
@@ -569,8 +863,68 @@ impl<'f> WriteSession<'f> {
             ));
         };
         // Holding the lock, no workspace left here belongs to a live build.
-        remove_dead_workspaces(&parent)?;
-        BuildScratch::create_in(&parent, Some(lock), admit)
+        Ok(ScratchClaim { dir: parent, lock })
+    }
+
+    /// Deletes dead workspaces of checkouts other than `keep`, oldest first,
+    /// while `short` says the disk is still short of what the next build
+    /// needs. A workspace a build left when it stopped for lack of disk goes
+    /// only after every other one, and only while `below_floor` says the
+    /// disk is below the free-space floor itself. Returns how many were
+    /// deleted.
+    ///
+    /// # Errors
+    ///
+    /// When a folder cannot be listed or deleted.
+    pub fn reclaim_dead_workspaces(
+        &mut self,
+        keep: CheckoutId,
+        mut short: impl FnMut() -> bool,
+        mut below_floor: impl FnMut() -> bool,
+    ) -> Result<usize, FamilyError> {
+        let builds = self.family.layout.dir.join("builds");
+        if !builds.exists() {
+            return Ok(0);
+        }
+        let keep = keep.to_string();
+        let mut dead = Vec::new();
+        for checkout in read_dir(&builds)? {
+            if !checkout.is_dir()
+                || checkout.file_name().and_then(|name| name.to_str()) == Some(keep.as_str())
+            {
+                continue;
+            }
+            // Held only while listing: a build of that checkout that starts
+            // meanwhile is noticed again before each deletion.
+            if try_checkout_lock(&checkout)?.is_none() {
+                continue;
+            }
+            for workspace in read_dir(&checkout)? {
+                if workspace.is_dir() {
+                    let paused = crate::family::workspace::is_paused(&workspace);
+                    dead.push((
+                        paused,
+                        crate::family::workspace::last_used(&workspace),
+                        checkout.clone(),
+                        workspace,
+                    ));
+                }
+            }
+        }
+        dead.sort();
+        let mut removed = 0;
+        for (paused, _, checkout, workspace) in dead {
+            let wanted = if paused { below_floor() } else { short() };
+            if !wanted {
+                continue;
+            }
+            let Some(_lock) = try_checkout_lock(&checkout)? else {
+                continue;
+            };
+            remove_workspace_dir(&workspace)?;
+            removed += 1;
+        }
+        Ok(removed)
     }
 
     /// Finishes a segment and stages it for publication.

@@ -29,7 +29,8 @@ mod sections;
 mod stage;
 
 pub use sections::{
-    ContentReadError, ContentSectionsBuilder, ContentSegment, EncodedRecord, KNOWN, write_folded,
+    ContentReadError, ContentSectionsBuilder, ContentSegment, EncodedRecord, KNOWN,
+    SECTIONS_VERSION, write_folded,
 };
 pub use stage::{PackedRecord, Stage, StageWriter, StagedUnit, write_staged};
 

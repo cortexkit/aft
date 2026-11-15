@@ -44,6 +44,7 @@ mod lease;
 mod manifest;
 pub(crate) mod record;
 mod snapshot;
+pub mod workspace;
 mod writer;
 
 #[cfg(test)]
@@ -59,8 +60,8 @@ use std::sync::{Arc, Mutex};
 pub use manifest::{Manifest, SegmentEntry, StateRef};
 pub use snapshot::Snapshot;
 pub use writer::{
-    BuildScratch, PendingSegment, Publication, ReclaimOutcome, ReclaimReport, ScratchDir,
-    WriteSession,
+    BuildScratch, PendingSegment, Publication, ReclaimOutcome, ReclaimReport, ScratchClaim,
+    ScratchDir, WriteSession,
 };
 
 use crate::ids::{CheckoutId, FamilyId, Generation, SegmentId};

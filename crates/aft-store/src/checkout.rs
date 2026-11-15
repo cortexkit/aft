@@ -628,6 +628,9 @@ impl CheckoutState {
 /// that do not know this section flag rebuild only that checkout instead of
 /// refusing the family. Gap-free states keep their original bytes and flags.
 const STATE_FORMAT: u8 = 3;
+/// The checkout state's format, for a build that names what its saved
+/// work depends on.
+pub const STATE_FORMAT_VERSION: u8 = STATE_FORMAT;
 
 /// How much of a state record [`newer_state_format`] reads to find the
 /// payload's format byte: the record header and the payload's string table,

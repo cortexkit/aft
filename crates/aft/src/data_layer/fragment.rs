@@ -23,6 +23,9 @@ use crate::callgraph_store::join::{BlobRefKind, DerivedRow, ResolutionStatus};
 mod strings;
 
 const FORMAT: u8 = 2;
+/// The fragment format, for a build that names what its saved work
+/// depends on.
+pub(crate) const FORMAT_VERSION: u8 = FORMAT;
 
 const KINDS: [BlobRefKind; 9] = [
     BlobRefKind::Construction,

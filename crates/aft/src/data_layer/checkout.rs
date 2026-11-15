@@ -40,16 +40,20 @@ use super::query::{SliceReader, SliceSource};
 use super::refresh_budget::{RefreshBudget, RefreshLimit};
 use super::slice::FileSlice;
 use crate::callgraph_store::join::{CallgraphBlob, ParseBlob};
+use staged_records::StagedKind;
 
 mod engines;
 #[cfg(feature = "test-hooks")]
 pub mod exactness;
 mod fold;
+pub(crate) mod resume;
 pub(crate) mod staged_records;
 mod text_build;
 use text_build::TextBuild;
 #[cfg(test)]
 pub(super) mod publication_tests;
+#[cfg(all(test, unix))]
+mod resume_tests;
 #[cfg(test)]
 mod todo_tests;
 
@@ -906,6 +910,12 @@ pub struct BuildReport {
     /// Content records the build's scan read from the store instead of
     /// parsing their files again.
     pub stored_records: usize,
+    /// Records an earlier attempt of the same build staged, used instead of
+    /// extracting the files again.
+    pub resumed_records: usize,
+    /// Whether passes 2-3 were taken from an earlier attempt of the same
+    /// build instead of resolved again.
+    pub resumed_passes: bool,
     /// Files the reclamation after publishing removed, or why it could not
     /// run (the publication stands either way).
     pub reclaimed_files: usize,
@@ -1601,6 +1611,9 @@ impl Checkout {
         // one's publication rather than building cold.
         if unpublished && self.planes.text && self.planes.callgraph {
             if let Some(report) = self.start_from_sibling(build_started)? {
+                // Published from a sibling, or by another process: there
+                // is no cold build left to resume.
+                self.discard_build_workspace();
                 return Ok(report);
             }
         }
@@ -1638,20 +1651,59 @@ impl Checkout {
             .manifest()
             .checkout(self.checkout)
             .cloned();
-        let started = Instant::now();
         // The build's one workspace: the text index's posting runs, the
         // graph sections' spill and the resolutions spool each keep their
-        // own folder in it, and it is removed once the last of them is done.
+        // own folder in it. An earlier attempt's is adopted when this build
+        // is the same build, with the stages it completed (see `resume`).
         let paused = DiskPause::default();
-        let scratch = self.build_scratch_noting(Arc::clone(&paused))?;
+        let claimed = self.claim_build_workspace(Arc::clone(&paused))?;
+        let result = self.build_cold(measure, report, covered, started_from, &paused, &claimed);
+        if let Err(error) = &result {
+            claimed.ended(error);
+        }
+        result
+    }
+
+    /// The cold build [`Self::build_inner`] runs in the workspace it
+    /// claimed: scan, resolve, write and publish, reusing the stages an
+    /// earlier attempt completed there.
+    fn build_cold(
+        &self,
+        measure: bool,
+        mut report: BuildReport,
+        covered: u64,
+        started_from: Option<aft_store::family::StateRef>,
+        paused: &DiskPause,
+        claimed: &resume::Claimed,
+    ) -> Result<BuildReport, DataError> {
+        let started = Instant::now();
+        let scratch = Arc::clone(&claimed.scratch);
+        // The records an earlier attempt staged, found by key instead of
+        // extracted again.
+        let adopted = match &claimed.records {
+            Some(marker) => match staged_records::AdoptedRecords::load(scratch.path(), marker) {
+                Ok(adopted) => adopted,
+                Err(error) => {
+                    log::info!(
+                        "callgraph build resume: discarded stage {}: {error}",
+                        resume::RECORDS
+                    );
+                    let _ = resume::discard_stage(scratch.path(), marker);
+                    staged_records::AdoptedRecords::default()
+                }
+            },
+            None => staged_records::AdoptedRecords::default(),
+        };
         // Each extracted record goes to a staging segment in the workspace as
         // it is extracted, rather than staying in memory until the segment
         // is written (see `staged_records`).
         let stage = staged_records::RecordStage::new(
             scratch
-                .subdir("records")
+                .subdir_existing(staged_records::FOLDER)
                 .map_err(|error| DataError::Store(error.to_string()))?,
             self.family.id(),
+            claimed.identity.digest,
+            adopted,
         );
         let sink = BuildSink {
             skip_text: !self.planes.text,
@@ -1686,6 +1738,7 @@ impl Checkout {
         report.text_units = collected.text.len();
         report.extract_failures = collected.failures;
         report.stored_records = collected.reused;
+        report.resumed_records = collected.resumed;
         report.scan_ms = elapsed_ms(started);
 
         #[cfg(feature = "test-hooks")]
@@ -1759,6 +1812,17 @@ impl Checkout {
         let taking = Instant::now();
         let (mut inputs, content) = collected.take_inputs(&state);
         report.parsed_files = inputs.parses.len();
+        // What resolution reads is now fixed: an earlier attempt's passes 2-3
+        // are reused only when they were resolved from exactly these inputs.
+        let snapshot = resume::snapshot_digest(&inputs);
+        let passes = claimed.passes.as_ref().filter(|marker| {
+            let matches = resume::passes_match(marker, snapshot);
+            if !matches {
+                let _ = resume::discard_stage(scratch.path(), marker);
+            }
+            matches
+        });
+        report.resumed_passes = passes.is_some();
         // A stage boundary: the scan's staging and text runs are written.
         scratch
             .check_space(0)
@@ -1815,6 +1879,7 @@ impl Checkout {
             .map(|record| record.stat.size)
             .sum::<u64>()
             .saturating_mul(8);
+        self.reclaim_disk_for(estimate);
         let reserve = Arc::new(std::sync::atomic::AtomicU64::new(estimate));
         let remaining = reserve.clone();
         let admission = Arc::clone(&scratch);
@@ -1845,6 +1910,7 @@ impl Checkout {
             })?;
         spill.estimate_space(inputs.parses.len(), estimate, reserve);
         sections.stream(spill);
+        resume::kill_point("stage.resolve");
         let _census = super::callgraph::resolve_checkout_into(
             &mut inputs,
             self.layer.threads,
@@ -1852,7 +1918,13 @@ impl Checkout {
             &scratch,
             super::callgraph::KeyOrderBudget::configured(),
             super::callgraph::bind_cache_bytes(),
+            super::callgraph::PassesCheckpoint {
+                identity: claimed.identity.digest,
+                snapshot,
+                adopted: passes,
+            },
             &mut |inputs, files| {
+                resume::kill_point("assembly.batch");
                 sections
                     .add_batch(inputs, files)
                     .map_err(crate::callgraph_store::join::ManifestJoinError::Parse)
@@ -1883,7 +1955,7 @@ impl Checkout {
             drop(session);
             // The graph spill's files close before its folder is deleted.
             drop(sections);
-            remove_workspace(&scratch);
+            claimed.finished();
             report.superseded = true;
             self.adopt_newest()?;
             return Ok(report);
@@ -1896,6 +1968,7 @@ impl Checkout {
             .map_err(|error| graph_spill_error(DataError::Store(error), &paused))?;
         #[cfg(feature = "test-hooks")]
         super::refresh_probe::stage("write");
+        resume::kill_point("stage.write");
         let mut pending = session.create_segment().map_err(DataError::store)?;
         collected.text.write(pending.writer())?;
         let fragments = sections
@@ -1913,6 +1986,7 @@ impl Checkout {
 
         #[cfg(feature = "test-hooks")]
         super::refresh_probe::stage("publish");
+        resume::kill_point("stage.publish");
         let started = Instant::now();
         let per_path = state
             .paths()
@@ -1947,7 +2021,7 @@ impl Checkout {
             .map_err(DataError::store)?;
         // The publication is in the manifest, so nothing in the workspace is
         // needed any more; every builder closed its files when it finished.
-        remove_workspace(&scratch);
+        claimed.finished();
         // Removes what no generation at or above the horizon names. A view
         // still reading an older generation holds a lease on it, so its
         // files stay until the view drops.
@@ -2270,17 +2344,84 @@ impl Checkout {
         &self,
         paused: DiskPause,
     ) -> Result<Arc<aft_store::family::BuildScratch<DataError>>, DataError> {
-        let dir = self.family.dir().to_path_buf();
         self.writer()?
-            .create_scratch(self.checkout, move |bytes| {
-                let result = check_disk_floor_at(&dir, bytes);
-                if let Err(DataError::DiskFloor(message)) = &result {
-                    *paused.lock().expect("disk pause lock") = Some(message.clone());
-                }
-                result
-            })
+            .create_scratch(self.checkout, self.admission(paused))
             .map(Arc::new)
             .map_err(DataError::store)
+    }
+
+    /// A build workspace's disk admission: the free-disk floor, with each
+    /// refusal also kept in `paused`.
+    fn admission(
+        &self,
+        paused: DiskPause,
+    ) -> impl Fn(u64) -> Result<(), DataError> + Send + Sync + 'static {
+        let dir = self.family.dir().to_path_buf();
+        move |bytes| {
+            let result = check_disk_floor_at(&dir, bytes);
+            if let Err(DataError::DiskFloor(message)) = &result {
+                *paused.lock().expect("disk pause lock") = Some(message.clone());
+            }
+            result
+        }
+    }
+
+    /// The workspace of a cold build: the one an earlier attempt of the same
+    /// build left, adopted with the stages it completed, or a new one (see
+    /// [`resume::claim`]).
+    fn claim_build_workspace(&self, paused: DiskPause) -> Result<resume::Claimed, DataError> {
+        let identity = resume::BuildIdentity::of(
+            self.family.id(),
+            self.checkout,
+            &self.root,
+            self.planes,
+            &self.layer.policy,
+        );
+        let claim = self
+            .writer()?
+            .claim_scratch(self.checkout)
+            .map_err(DataError::store)?;
+        resume::claim(claim, identity, self.admission(paused))
+    }
+
+    /// Deletes what an earlier cold build of this checkout left to resume
+    /// from, once the checkout no longer needs a cold build. Best effort: a
+    /// live build keeps its own, and a later writer's sweep deletes the
+    /// rest.
+    fn discard_build_workspace(&self) {
+        let claim = match self.family.try_write() {
+            Ok(Some(mut session)) => session.claim_scratch(self.checkout),
+            _ => return,
+        };
+        if let Ok(claim) = claim {
+            resume::discard(claim);
+        }
+    }
+
+    /// Below the free-disk floor plus `reserve`, what the next stage of the
+    /// build may write, deletes other checkouts' dead build workspaces,
+    /// oldest first, until there is room; one a paused build left goes only
+    /// below the floor itself. Best effort: the build's own admission still
+    /// refuses what does not fit.
+    fn reclaim_disk_for(&self, reserve: u64) {
+        let dir = self.family.dir().to_path_buf();
+        if check_disk_floor_at(&dir, reserve).is_ok() {
+            return;
+        }
+        let Ok(Some(mut session)) = self.family.try_write() else {
+            return;
+        };
+        match session.reclaim_dead_workspaces(
+            self.checkout,
+            || check_disk_floor_at(&dir, reserve).is_err(),
+            || check_disk_floor_at(&dir, 0).is_err(),
+        ) {
+            Ok(0) => {}
+            Ok(removed) => log::info!(
+                "callgraph build: deleted {removed} dead build workspace(s) of other checkouts to make room"
+            ),
+            Err(error) => log::warn!("callgraph build: reclaiming dead build workspaces: {error}"),
+        }
     }
 
     #[cfg(test)]
@@ -5089,6 +5230,8 @@ struct BuildSink {
     /// file again, and how many were.
     stored: StoredRecords,
     reused: std::sync::atomic::AtomicUsize,
+    /// Records found among those an earlier attempt of the build staged.
+    resumed: std::sync::atomic::AtomicUsize,
 }
 
 /// The content records the family stores, which a build reads instead of
@@ -5131,40 +5274,6 @@ struct StagedEntry {
     kind: StagedKind,
 }
 
-enum StagedKind {
-    /// A configuration file's record, with its bytes, which the resolver
-    /// reads from memory.
-    Config(Arc<[u8]>),
-    /// A parsed file's record, and whether its parse converts for the call
-    /// graph (one that does not is left out of the resolver's inputs), with
-    /// the parse's kinds the resolver lists files by
-    /// ([`super::callgraph::list_kinds`]).
-    Parsed {
-        converts: bool,
-        kinds: (bool, bool),
-    },
-    Markers,
-}
-
-impl StagedKind {
-    fn of(record: &ContentRecord) -> Self {
-        match &record.data {
-            RecordBody::Config { source } => Self::Config(Arc::from(source.as_slice())),
-            RecordBody::Parsed { .. } => match blob_from_record(record) {
-                Ok(CallgraphBlob::Parse(parse)) => Self::Parsed {
-                    converts: true,
-                    kinds: super::callgraph::list_kinds(&parse),
-                },
-                _ => Self::Parsed {
-                    converts: false,
-                    kinds: (false, false),
-                },
-            },
-            RecordBody::Markers => Self::Markers,
-        }
-    }
-}
-
 /// A build sink's results, after the scan.
 struct Collected {
     text: TextBuild,
@@ -5180,6 +5289,8 @@ struct Collected {
     failures: usize,
     /// Records read from the store rather than parsed.
     reused: usize,
+    /// Records found among an earlier attempt's staged ones.
+    resumed: usize,
 }
 
 impl BuildSink {
@@ -5198,6 +5309,7 @@ impl BuildSink {
             failures: std::sync::atomic::AtomicUsize::default(),
             stored: StoredRecords::default(),
             reused: std::sync::atomic::AtomicUsize::default(),
+            resumed: std::sync::atomic::AtomicUsize::default(),
         }
     }
 
@@ -5242,6 +5354,7 @@ impl BuildSink {
             staged,
             failures: self.failures.into_inner(),
             reused: self.reused.into_inner(),
+            resumed: self.resumed.into_inner(),
         })
     }
 }
@@ -5320,6 +5433,24 @@ impl ContentSink for BuildSink {
         if held {
             return;
         }
+        // A record an earlier attempt of this build staged is used where it
+        // lies, exactly as if this scan had staged it.
+        if let Some((stage, _)) = &self.stage {
+            if let Some((at, kind)) = stage.adopted(record_key) {
+                self.resumed
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.staged
+                    .lock()
+                    .expect("no panics while holding it")
+                    .entry(parse_key)
+                    .or_insert(StagedEntry {
+                        key: record_key,
+                        at,
+                        kind,
+                    });
+                return;
+            }
+        }
         let extracted = match self.stored.record(record_key) {
             Some(record) => {
                 self.reused
@@ -5344,7 +5475,8 @@ impl ContentSink for BuildSink {
                 {
                     return;
                 }
-                match stage.append(&record) {
+                let kind = StagedKind::of(&record);
+                match stage.append(record_key, &record, &kind) {
                     Ok(at) => {
                         self.staged
                             .lock()
@@ -5353,7 +5485,7 @@ impl ContentSink for BuildSink {
                             .or_insert_with(|| StagedEntry {
                                 key: record_key,
                                 at,
-                                kind: StagedKind::of(&record),
+                                kind,
                             });
                     }
                     Err(error) => {
@@ -9247,21 +9379,32 @@ pub fn other() { callee(); }
         checkout.build().unwrap();
         assert_eq!(listing(&builds), ["checkout.lock"]);
 
-        // One byte above the floor: the build starts, and the text index's
-        // first run is refused once the workspace exists.
+        // A megabyte above the floor: the build starts and writes its
+        // workspace's identity, and the scan's first staging write, which
+        // asks for 64 MiB, is refused.
         let low = crate::disk_floor::set_free_space_for_test(
             store.path(),
-            crate::disk_floor::MIN_FREE_BYTES + 1,
+            crate::disk_floor::MIN_FREE_BYTES + (1 << 20),
             10 * 1024 * 1024 * 1024,
         );
         let error = checkout.build().unwrap_err();
         assert!(matches!(error, DataError::DiskFloor(_)), "{error}");
+        // The workspace stays, marked paused, beside the checkout's lock and
+        // its attempts record, which says the attempt ended without dying.
+        let listed = listing(&builds);
         assert_eq!(
-            listing(&builds).len(),
-            2,
-            "a paused build keeps its workspace: {:?}",
-            listing(&builds)
+            listed.len(),
+            3,
+            "a paused build keeps its workspace: {listed:?}"
         );
+        assert!(listed.contains(&"attempts".to_string()), "{listed:?}");
+        let workspace = listed
+            .iter()
+            .find(|name| *name != "attempts" && *name != "checkout.lock")
+            .unwrap();
+        assert!(aft_store::family::workspace::is_paused(
+            &builds.join(workspace)
+        ));
 
         drop(low);
         checkout.build().unwrap();

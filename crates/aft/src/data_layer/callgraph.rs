@@ -49,6 +49,7 @@ mod spool;
 
 pub(crate) use key_order::Budget as KeyOrderBudget;
 
+use super::checkout::resume;
 use super::checkout::staged_records::{StagedAt, StagedRecords};
 use super::graph_rows::references_by_key;
 use super::graph_store::StoredSlices;
@@ -1590,6 +1591,7 @@ pub(crate) fn resolve_checkout_bounded(
         &workspace,
         budget,
         bind_bytes,
+        PassesCheckpoint::NONE,
         &mut |_, files| {
             resolved.extend(files);
             Ok(())
@@ -1605,6 +1607,62 @@ pub(crate) fn resolve_checkout_bounded(
 /// must never run on a resolution that is missing or changed.
 fn spool_error(error: std::io::Error) -> ManifestJoinError {
     ManifestJoinError::Parse(format!("spooled resolutions: {error}"))
+}
+
+/// What a cold build does with its `passes-2-3` checkpoint (see
+/// `checkout::resume`).
+#[derive(Clone, Copy)]
+pub(crate) struct PassesCheckpoint<'m> {
+    /// The build's identity digest and the digest of the scanned inputs,
+    /// which every spooled range names.
+    pub(crate) identity: resume::Digest,
+    pub(crate) snapshot: resume::Digest,
+    /// The complete stage an earlier attempt left for these inputs, if any.
+    pub(crate) adopted: Option<&'m resume::Marker>,
+}
+
+impl PassesCheckpoint<'_> {
+    /// For a build no later attempt resumes.
+    pub(crate) const NONE: Self = Self {
+        identity: [0; 32],
+        snapshot: [0; 32],
+        adopted: None,
+    };
+}
+
+/// Each file's pass-4 inputs, rebuilt from its parse and its spooled
+/// pass-2/3 resolution exactly as passes 2-3 build them, a batch at a time.
+///
+/// # Errors
+///
+/// When a range cannot be read back or a resolution decoded.
+fn sites_from_spool(
+    inputs: &mut CheckoutInputs,
+    spool: &spool::ResolutionSpool,
+    paths: &[String],
+) -> Result<Vec<(String, Arc<SiteFile>)>, ManifestJoinError> {
+    let mut sites = Vec::with_capacity(paths.len());
+    for (range, batch) in paths.chunks(BATCH).enumerate() {
+        let encoded = spool.read_range(range).map_err(spool_error)?;
+        let parses = &inputs.parses;
+        let carry = crate::alloc_trace::carry();
+        let built = batch
+            .par_iter()
+            .zip(encoded.into_par_iter())
+            .map(|(path, bytes)| {
+                let _label = carry.enter();
+                let (key, parse) = parses.read(path).ok_or_else(|| {
+                    ManifestJoinError::Parse(format!("no parse of {path} to resume from"))
+                })?;
+                let resolution = super::fragment::decode(&key, path, &bytes)
+                    .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
+                Ok((path.clone(), Arc::new(SiteFile::new(&parse, &resolution))))
+            })
+            .collect::<Result<Vec<_>, ManifestJoinError>>()?;
+        sites.extend(built);
+        inputs.parses.release_decoded();
+    }
+    Ok(sites)
 }
 
 /// How many files each stage of [`resolve_checkout_into`] takes before it
@@ -1645,6 +1703,7 @@ pub(crate) fn resolve_checkout_into(
     workspace: &Arc<aft_store::family::BuildScratch<super::checkout::DataError>>,
     budget: KeyOrderBudget,
     bind_bytes: usize,
+    checkpoint: PassesCheckpoint<'_>,
     sink: &mut (dyn FnMut(&CheckoutInputs, Vec<(String, FileResolution)>) -> Result<(), ManifestJoinError>
               + Send),
 ) -> Result<BuildCensus, ManifestJoinError> {
@@ -1675,107 +1734,148 @@ pub(crate) fn resolve_checkout_into(
     };
     crate::alloc_trace::install(&pool(threads)?, || {
         let paths = inputs.parses.keys().cloned().collect::<Vec<_>>();
-        // Bound files are kept up to a byte budget, and one read again after
-        // it was let go is bound again (see `BindCache::bounded`).
-        let bound = BindCache::bounded(bind_bytes);
-        #[cfg(feature = "test-hooks")]
-        super::refresh_probe::stage("binding");
-        // The whole-checkout lists read every parse's kinds: noted as each
-        // record was staged, or else read a batch at a time, each parse
-        // decoded without keeping it.
-        let kinds = match inputs.parses.staged_kinds() {
-            Some(kinds) => kinds,
-            None => {
-                let mut kinds = Vec::with_capacity(paths.len());
-                for batch in paths.chunks(BATCH) {
-                    let parses = &inputs.parses;
-                    let carry = crate::alloc_trace::carry();
-                    kinds.par_extend(batch.par_iter().map(|path| {
-                        let _label = carry.enter();
-                        parses
-                            .read(path)
-                            .map_or((false, false), |(_, parse)| FileLists::kinds(&parse))
-                    }));
+        // An earlier attempt of the build that resolved passes 2-3 from these
+        // same inputs left them as a complete stage: adopted, binding and
+        // passes 2-3 are skipped (see `checkout::resume`).
+        let adopted = checkpoint.adopted.and_then(|marker| {
+            match spool::ResolutionSpool::adopt(
+                workspace,
+                marker,
+                checkpoint.identity,
+                checkpoint.snapshot,
+                paths.chunks(BATCH),
+            ) {
+                Ok(spool) => Some(spool),
+                Err(error) => {
+                    log::info!(
+                        "callgraph build resume: discarded stage {}: {error}",
+                        resume::PASSES
+                    );
+                    let _ = resume::discard_stage(workspace.path(), marker);
+                    None
                 }
-                kinds
             }
+        });
+        let (spool, sites) = if let Some(spool) = adopted {
+            let sites = sites_from_spool(inputs, &spool, &paths)?;
+            lap(&mut memory, "resume");
+            boundary(inputs)?;
+            (spool, sites)
+        } else {
+            // Bound files are kept up to a byte budget, and one read again after
+            // it was let go is bound again (see `BindCache::bounded`).
+            let bound = BindCache::bounded(bind_bytes);
+            #[cfg(feature = "test-hooks")]
+            super::refresh_probe::stage("binding");
+            // The whole-checkout lists read every parse's kinds: noted as each
+            // record was staged, or else read a batch at a time, each parse
+            // decoded without keeping it.
+            let kinds = match inputs.parses.staged_kinds() {
+                Some(kinds) => kinds,
+                None => {
+                    let mut kinds = Vec::with_capacity(paths.len());
+                    for batch in paths.chunks(BATCH) {
+                        let parses = &inputs.parses;
+                        let carry = crate::alloc_trace::carry();
+                        kinds.par_extend(batch.par_iter().map(|path| {
+                            let _label = carry.enter();
+                            parses
+                                .read(path)
+                                .map_or((false, false), |(_, parse)| FileLists::kinds(&parse))
+                        }));
+                    }
+                    kinds
+                }
+            };
+            let mut lists = FileLists::default();
+            for (path, (rust, declaring)) in paths.iter().zip(kinds) {
+                if rust {
+                    lists.rust.push(path.clone());
+                }
+                if declaring {
+                    lists.module_declaring.push(path.clone());
+                }
+            }
+            bound.set_lists(lists);
+            // Resolving a Rust file asks each module's parent; with every
+            // module-declaring file bound once here, resolvers read the parents
+            // from one index instead of binding those files again.
+            let module_parents = bound.index_module_parents(inputs)?;
+            relieve_allocator();
+            if let Some(memory) = memory.as_deref_mut() {
+                memory.push(("resolve.module_parents".to_string(), module_parents));
+            }
+            lap(&mut memory, "bind");
+            boundary(inputs)?;
+            // Each batch's encoded resolutions go to the spool, one range per
+            // batch, and come back a batch at a time in pass 4, which visits the
+            // files in the same batches.
+            let mut spool =
+                spool::ResolutionSpool::new(workspace, checkpoint.identity, checkpoint.snapshot)
+                    .map_err(spool_error)?;
+            let mut sites = Vec::with_capacity(paths.len());
+            #[cfg(feature = "test-hooks")]
+            super::refresh_probe::stage("resolution");
+            for batch in paths.chunks(BATCH) {
+                let parses = &inputs.parses;
+                // Pass 1 for the batch: each parse is decoded once and kept for
+                // the batch, and each file not bound yet is bound in parallel.
+                let carry = crate::alloc_trace::carry();
+                batch.par_iter().for_each(|path| {
+                    let _label = carry.enter();
+                    let _ = parses.get(path);
+                });
+                bound.bind_missing(inputs, &refs(batch))?;
+                let resolved =
+                    resolve_files_with(inputs, &bound, &refs(batch), &|path, resolution| {
+                        let (_, parse) = &parses[path];
+                        let site = Arc::new(SiteFile::new(parse, &resolution));
+                        (site, super::fragment::encode(&resolution))
+                    })?;
+                let mut encoded = Vec::with_capacity(resolved.len());
+                let mut range_paths = Vec::with_capacity(resolved.len());
+                for (path, (site, bytes)) in resolved {
+                    range_paths.push(path.clone());
+                    sites.push((path, site));
+                    encoded.push(bytes);
+                }
+                spool
+                    .write_range(&range_paths, &encoded)
+                    .map_err(spool_error)?;
+                inputs.parses.release_decoded();
+            }
+            if let Some(memory) = memory.as_deref_mut() {
+                use aft_store::heap::HeapBytes as _;
+                let mut seen = aft_store::heap::Seen::new();
+                // The parses are counted by the caller; mark them seen so the
+                // parts below count only what they hold besides.
+                let _ = inputs.parses.heap_bytes(&mut seen);
+                memory.push(("resolve.bound".to_string(), bound.heap_bytes(&mut seen)));
+                let counts = bound.counts();
+                memory.extend([
+                    ("resolve.bind_cache_bound".to_string(), counts.bound),
+                    ("resolve.bind_cache_evicted".to_string(), counts.evicted),
+                    ("resolve.bind_cache_held".to_string(), counts.held),
+                ]);
+                memory.push((
+                    "resolve.spooled_resolution_bytes".to_string(),
+                    usize::try_from(spool.bytes()).unwrap_or(usize::MAX),
+                ));
+                memory.push(("resolve.spool_table".to_string(), spool.table_bytes()));
+            }
+            lap(&mut memory, "resolve");
+            boundary(inputs)?;
+            // Every resolution is spooled and no staged read failed: passes 2-3
+            // are a complete stage a later attempt may adopt.
+            spool
+                .commit()
+                .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
+            // Pass 4 reads each file's own inputs, built above from its parse
+            // and resolution, and never the bound surfaces.
+            drop(bound);
+            relieve_allocator();
+            (spool, sites)
         };
-        let mut lists = FileLists::default();
-        for (path, (rust, declaring)) in paths.iter().zip(kinds) {
-            if rust {
-                lists.rust.push(path.clone());
-            }
-            if declaring {
-                lists.module_declaring.push(path.clone());
-            }
-        }
-        bound.set_lists(lists);
-        // Resolving a Rust file asks each module's parent; with every
-        // module-declaring file bound once here, resolvers read the parents
-        // from one index instead of binding those files again.
-        let module_parents = bound.index_module_parents(inputs)?;
-        relieve_allocator();
-        if let Some(memory) = memory.as_deref_mut() {
-            memory.push(("resolve.module_parents".to_string(), module_parents));
-        }
-        lap(&mut memory, "bind");
-        boundary(inputs)?;
-        // Each batch's encoded resolutions go to the spool, one range per
-        // batch, and come back a batch at a time in pass 4, which visits the
-        // files in the same batches.
-        let mut spool = spool::ResolutionSpool::new(workspace).map_err(spool_error)?;
-        let mut sites = Vec::with_capacity(paths.len());
-        #[cfg(feature = "test-hooks")]
-        super::refresh_probe::stage("resolution");
-        for batch in paths.chunks(BATCH) {
-            let parses = &inputs.parses;
-            // Pass 1 for the batch: each parse is decoded once and kept for
-            // the batch, and each file not bound yet is bound in parallel.
-            let carry = crate::alloc_trace::carry();
-            batch.par_iter().for_each(|path| {
-                let _label = carry.enter();
-                let _ = parses.get(path);
-            });
-            bound.bind_missing(inputs, &refs(batch))?;
-            let resolved =
-                resolve_files_with(inputs, &bound, &refs(batch), &|path, resolution| {
-                    let (_, parse) = &parses[path];
-                    let site = Arc::new(SiteFile::new(parse, &resolution));
-                    (site, super::fragment::encode(&resolution))
-                })?;
-            let mut encoded = Vec::with_capacity(resolved.len());
-            for (path, (site, bytes)) in resolved {
-                sites.push((path, site));
-                encoded.push(bytes);
-            }
-            spool.write_range(&encoded).map_err(spool_error)?;
-            inputs.parses.release_decoded();
-        }
-        if let Some(memory) = memory.as_deref_mut() {
-            use aft_store::heap::HeapBytes as _;
-            let mut seen = aft_store::heap::Seen::new();
-            // The parses are counted by the caller; mark them seen so the
-            // parts below count only what they hold besides.
-            let _ = inputs.parses.heap_bytes(&mut seen);
-            memory.push(("resolve.bound".to_string(), bound.heap_bytes(&mut seen)));
-            let counts = bound.counts();
-            memory.extend([
-                ("resolve.bind_cache_bound".to_string(), counts.bound),
-                ("resolve.bind_cache_evicted".to_string(), counts.evicted),
-                ("resolve.bind_cache_held".to_string(), counts.held),
-            ]);
-            memory.push((
-                "resolve.spooled_resolution_bytes".to_string(),
-                usize::try_from(spool.bytes()).unwrap_or(usize::MAX),
-            ));
-            memory.push(("resolve.spool_table".to_string(), spool.table_bytes()));
-        }
-        lap(&mut memory, "resolve");
-        boundary(inputs)?;
-        // Pass 4 reads each file's own inputs, built above from its parse
-        // and resolution, and never the bound surfaces.
-        drop(bound);
-        relieve_allocator();
         let calls = MethodCallInputs::of_files(sites);
         if let Some(memory) = memory.as_deref_mut() {
             use aft_store::heap::HeapBytes as _;
@@ -1795,6 +1895,7 @@ pub(crate) fn resolve_checkout_into(
         let mut records = site_records::RecordWriter::new(workspace)?;
         #[cfg(feature = "test-hooks")]
         super::refresh_probe::stage("projection");
+        resume::kill_point("stage.projection");
         for batch in paths.chunks(BATCH) {
             site_records::project_batch(inputs, &calls, &refs(batch), &mut records)?;
             inputs.parses.release_decoded();
@@ -1816,6 +1917,7 @@ pub(crate) fn resolve_checkout_into(
         }
         #[cfg(feature = "test-hooks")]
         super::refresh_probe::stage("sites");
+        resume::kill_point("stage.sites");
         // Pass 4, second step: every distinct resolution key resolved once,
         // member name first, with each site's result going to a sorted run
         // (see `key_order`).

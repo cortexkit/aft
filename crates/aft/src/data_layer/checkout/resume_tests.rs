@@ -1,0 +1,451 @@
+//! A cold build killed with SIGKILL at each stage boundary and in the
+//! middle of stages, then resumed, publishes exactly what an uninterrupted
+//! build publishes; inputs that changed in between are never reused stale.
+//!
+//! Each killed build runs in a child process: this test binary again,
+//! running only [`resume_child_build`], with `AFT_TEST_KILL_AT` naming the
+//! point it kills itself at (see `resume::kill_point`).
+
+use std::os::unix::process::ExitStatusExt as _;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+
+use aft_store::ids::{Digest128, FamilyId};
+
+use super::{BuildReport, Checkout, DataError, DataLayer};
+
+/// Files in the generated part of the project: past the resolver's batch
+/// of 1,024, so passes 2-3 spool more than one range.
+const GENERATED: usize = 1_100;
+
+const CHILD: &str = "data_layer::checkout::resume_tests::resume_child_build";
+
+fn family() -> FamilyId {
+    FamilyId::from_digest(Digest128::of(b"resume"))
+}
+
+fn write(root: &Path, path: &str, text: &str) {
+    let path = root.join(path);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+/// A project with Rust modules, TypeScript calls across many files and
+/// configuration files.
+fn project(root: &Path) {
+    write(root, "Cargo.toml", "[package]\nname = \"demo\"\n");
+    write(
+        root,
+        "src/lib.rs",
+        "mod util;\npub fn caller() { util::callee(); util::other(); }\n",
+    );
+    write(
+        root,
+        "src/util.rs",
+        "pub fn callee() { other(); }\npub fn other() {}\n",
+    );
+    write(root, "package.json", "{\"name\": \"demo\"}\n");
+    for index in 0..GENERATED {
+        let previous = index.saturating_sub(1);
+        write(
+            root,
+            &format!("gen/f{index:04}.ts"),
+            &format!(
+                "import {{ f{previous:04} }} from \"./f{previous:04}\";\n\
+                 export class C{index} {{ run() {{ return f{previous:04}(); }} }}\n\
+                 export function f{index:04}() {{ return new C{index}().run(); }}\n"
+            ),
+        );
+    }
+    write(root, "notes.txt", "nothing to see\n");
+}
+
+fn layer() -> Arc<DataLayer> {
+    Arc::new(DataLayer::new(8 << 20, 2))
+}
+
+fn build(store: &Path, root: &Path) -> (Checkout, BuildReport) {
+    let checkout = Checkout::bind(layer(), store, family(), root).unwrap();
+    let report = checkout.build().unwrap();
+    assert!(!report.superseded, "{report:?}");
+    (checkout, report)
+}
+
+/// Everything the build published for the checkout: each path's content,
+/// language and fragment, and every section's bytes. Segment files carry
+/// ids and times of their own, so they are compared by section.
+fn published(checkout: &Checkout) -> Vec<(String, Vec<u8>)> {
+    let view = checkout.view().expect("a publication");
+    let published = &view.published;
+    assert!(published.graph_built, "the call graph was published");
+    let mut out = Vec::new();
+    for (index, record) in published.state.paths().iter().enumerate() {
+        out.push((
+            format!("path {}", String::from_utf8_lossy(&record.path)),
+            format!(
+                "{:?} {:?} {:?}",
+                record.content,
+                record.language,
+                published.state.fragment(index)
+            )
+            .into_bytes(),
+        ));
+    }
+    for segment in &published.segments {
+        for (handle, info) in segment.sections() {
+            let mut bytes = vec![0; usize::try_from(info.len).unwrap()];
+            segment.read(handle, 0, &mut bytes).unwrap();
+            out.push((
+                format!(
+                    "section {:04x}-{:04x} v{} n{}",
+                    info.id.kind.get(),
+                    info.id.key_space.get(),
+                    info.version,
+                    info.item_count
+                ),
+                bytes,
+            ));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Asserts two publications are equal, naming the first part that differs.
+fn assert_same(left: &[(String, Vec<u8>)], right: &[(String, Vec<u8>)], what: &str) {
+    let names = |list: &[(String, Vec<u8>)]| {
+        list.iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        names(left),
+        names(right),
+        "{what}: the published parts differ"
+    );
+    for ((name, a), (_, b)) in left.iter().zip(right) {
+        assert!(a == b, "{what}: {name} differs");
+    }
+    assert!(
+        left.iter().any(|(name, _)| name.starts_with("section 03")),
+        "{what}: graph sections were compared"
+    );
+}
+
+/// Runs the build of `root` into `store` in a child process that kills
+/// itself at `point`, and checks that it died there.
+fn killed_build(store: &Path, root: &Path, point: &str) {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([CHILD, "--exact", "--nocapture", "--test-threads", "1"])
+        .env("AFT_TEST_RESUME_CHILD", "1")
+        .env("AFT_TEST_RESUME_STORE", store)
+        .env("AFT_TEST_RESUME_ROOT", root)
+        .env("AFT_TEST_KILL_AT", point)
+        .env_remove("AFT_TEST_HIDE_ROOT")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.signal(),
+        Some(libc::SIGKILL),
+        "the build was killed at {point}: {:?}\n{stderr}",
+        output.status
+    );
+    assert!(
+        stderr.contains(&format!("KILL POINT {point}")),
+        "{point}: {stderr}"
+    );
+}
+
+/// Run alone by [`killed_build`] and [`no_stage_after_the_scan_reads_the_checkout`]
+/// in a child process; a no-op otherwise.
+#[test]
+fn resume_child_build() {
+    if std::env::var_os("AFT_TEST_RESUME_CHILD").is_none() {
+        return;
+    }
+    let store = PathBuf::from(std::env::var_os("AFT_TEST_RESUME_STORE").unwrap());
+    let root = PathBuf::from(std::env::var_os("AFT_TEST_RESUME_ROOT").unwrap());
+    let checkout = Checkout::bind(layer(), &store, family(), &root).unwrap();
+    let report = checkout.build().unwrap();
+    eprintln!("CHILD BUILD FINISHED {report:?}");
+}
+
+/// The checkout's build folder in `store`, holding its lock, attempts
+/// record and workspaces.
+fn builds(checkout: &Checkout) -> PathBuf {
+    checkout
+        .family
+        .dir()
+        .join("builds")
+        .join(checkout.checkout.to_string())
+}
+
+fn workspaces(dir: &Path) -> Vec<String> {
+    let mut names = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_build_killed_at_any_stage_resumes_to_the_same_publication() {
+    let root = tempfile::tempdir().unwrap();
+    project(root.path());
+    let reference_store = tempfile::tempdir().unwrap();
+    let (reference, fresh) = build(reference_store.path(), root.path());
+    assert_eq!(fresh.resumed_records, 0);
+    assert!(!fresh.resumed_passes);
+    let expected = published(&reference);
+    drop(reference);
+
+    // Each point, with whether the resumed build reuses the staged records
+    // and passes 2-3.
+    let points = [
+        ("records.append:50", false, false),
+        ("records.committed", true, false),
+        ("passes.range:1", true, false),
+        ("passes.committed", true, true),
+        ("stage.projection", true, true),
+        ("stage.sites", true, true),
+        ("assembly.batch:2", true, true),
+        ("stage.write", true, true),
+        ("stage.publish", true, true),
+    ];
+    let mut log = Vec::new();
+    for (point, records, passes) in points {
+        let store = tempfile::tempdir().unwrap();
+        killed_build(store.path(), root.path(), point);
+        let (checkout, report) = build(store.path(), root.path());
+        assert_eq!(report.resumed_records > 0, records, "{point}: {report:?}");
+        assert_eq!(report.resumed_passes, passes, "{point}: {report:?}");
+        assert_same(&expected, &published(&checkout), point);
+        assert_eq!(
+            std::fs::read_dir(builds(&checkout))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["checkout.lock"],
+            "{point}: publishing deletes the workspace and the attempts record"
+        );
+        log.push(format!(
+            "{point}: killed, resumed with records={} passes={}, publication identical",
+            report.resumed_records, report.resumed_passes
+        ));
+    }
+    eprintln!("RESUME KILL TEST\n{}", log.join("\n"));
+}
+
+#[test]
+fn an_edit_between_kill_and_resume_is_resolved_again() {
+    let root = tempfile::tempdir().unwrap();
+    project(root.path());
+    let store = tempfile::tempdir().unwrap();
+    killed_build(store.path(), root.path(), "passes.committed");
+    // The edit adds a call: the old passes 2-3 would miss it.
+    write(
+        root.path(),
+        "src/util.rs",
+        "pub fn callee() { other(); }\npub fn other() { callee(); }\n",
+    );
+    let (resumed, report) = build(store.path(), root.path());
+    assert!(report.resumed_records > 0, "unchanged records are reused");
+    assert!(!report.resumed_passes, "passes 2-3 are resolved again");
+    let reference_store = tempfile::tempdir().unwrap();
+    let (reference, _) = build(reference_store.path(), root.path());
+    assert_same(
+        &published(&reference),
+        &published(&resumed),
+        "after an edit",
+    );
+}
+
+fn git(root: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00+0000")
+        .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00+0000")
+        .status()
+        .expect("git runs");
+    assert!(status.success(), "git {args:?}");
+}
+
+#[test]
+fn a_branch_switch_between_kill_and_resume_is_resolved_again() {
+    let root = tempfile::tempdir().unwrap();
+    project(root.path());
+    git(root.path(), &["init", "-q", "-b", "main"]);
+    git(root.path(), &["add", "-A"]);
+    git(root.path(), &["commit", "-q", "-m", "main"]);
+    git(root.path(), &["checkout", "-q", "-b", "other"]);
+    std::fs::remove_file(root.path().join("gen/f0007.ts")).unwrap();
+    write(
+        root.path(),
+        "src/lib.rs",
+        "mod util;\npub fn caller() { util::other(); }\n",
+    );
+    write(
+        root.path(),
+        "gen/extra.ts",
+        "export function extra() { return 1; }\n",
+    );
+    git(root.path(), &["add", "-A"]);
+    git(root.path(), &["commit", "-q", "-m", "other"]);
+    git(root.path(), &["checkout", "-q", "main"]);
+
+    let store = tempfile::tempdir().unwrap();
+    killed_build(store.path(), root.path(), "stage.sites");
+    git(root.path(), &["checkout", "-q", "other"]);
+    let (resumed, report) = build(store.path(), root.path());
+    assert!(!report.resumed_passes, "passes 2-3 are resolved again");
+    assert!(report.resumed_records > 0, "unchanged records are reused");
+    let reference_store = tempfile::tempdir().unwrap();
+    let (reference, _) = build(reference_store.path(), root.path());
+    assert_same(
+        &published(&reference),
+        &published(&resumed),
+        "after a branch switch",
+    );
+}
+
+#[test]
+fn two_deaths_at_the_same_stage_start_fresh_once() {
+    let root = tempfile::tempdir().unwrap();
+    project(root.path());
+    let store = tempfile::tempdir().unwrap();
+    let checkout = Checkout::bind(layer(), store.path(), family(), root.path()).unwrap();
+    let dir = builds(&checkout);
+    drop(checkout);
+
+    killed_build(store.path(), root.path(), "stage.sites");
+    let first = workspaces(&dir);
+    killed_build(store.path(), root.path(), "stage.sites");
+    assert_eq!(workspaces(&dir), first, "the second attempt resumed");
+    // Two deaths with the same stages complete: the third attempt starts
+    // from nothing in a new workspace.
+    killed_build(store.path(), root.path(), "stage.sites");
+    let fresh = workspaces(&dir);
+    assert_eq!(fresh.len(), 1);
+    assert_ne!(fresh, first, "the third attempt started fresh");
+    // Only once: two more deaths there and the build still resumes.
+    killed_build(store.path(), root.path(), "stage.sites");
+    assert_eq!(workspaces(&dir), fresh);
+    let (resumed, report) = build(store.path(), root.path());
+    assert!(report.resumed_passes, "{report:?}");
+    let reference_store = tempfile::tempdir().unwrap();
+    let (reference, _) = build(reference_store.path(), root.path());
+    assert_same(&published(&reference), &published(&resumed), "after deaths");
+}
+
+#[test]
+fn a_build_from_another_executable_or_a_damaged_stage_is_not_reused() {
+    let root = tempfile::tempdir().unwrap();
+    project(root.path());
+    let store = tempfile::tempdir().unwrap();
+    killed_build(store.path(), root.path(), "stage.sites");
+    let checkout = Checkout::bind(layer(), store.path(), family(), root.path()).unwrap();
+    let dir = builds(&checkout);
+    let workspace = dir.join(&workspaces(&dir)[0]);
+    // A damaged spooled range drops passes 2-3 but keeps the records.
+    let runs = workspace.join("runs");
+    let range = std::fs::read_dir(&runs)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.to_string_lossy().contains("resolutions-"))
+        .unwrap();
+    let mut bytes = std::fs::read(&range).unwrap();
+    bytes[10] ^= 1;
+    std::fs::write(&range, bytes).unwrap();
+    let report = checkout.build().unwrap();
+    assert!(report.resumed_records > 0, "{report:?}");
+    assert!(!report.resumed_passes, "{report:?}");
+    drop(checkout);
+
+    // A workspace whose identity names another build is never adopted.
+    let store = tempfile::tempdir().unwrap();
+    killed_build(store.path(), root.path(), "stage.sites");
+    let checkout = Checkout::bind(layer(), store.path(), family(), root.path()).unwrap();
+    let dir = builds(&checkout);
+    let workspace = dir.join(&workspaces(&dir)[0]);
+    let mut identity = aft_store::family::workspace::read_identity(&workspace).unwrap();
+    identity.payload = String::from_utf8(identity.payload)
+        .unwrap()
+        .replace("executable=", "executable=another-")
+        .into_bytes();
+    aft_store::family::workspace::write_identity(&workspace, &identity).unwrap();
+    let report = checkout.build().unwrap();
+    assert_eq!(report.resumed_records, 0, "{report:?}");
+    assert!(!report.resumed_passes, "{report:?}");
+    assert!(!workspace.exists(), "the foreign workspace was deleted");
+}
+
+#[test]
+fn no_stage_after_the_scan_reads_the_checkout() {
+    let root = tempfile::tempdir().unwrap();
+    let checkout_root = root.path().join("checkout");
+    project(&checkout_root);
+    let store = tempfile::tempdir().unwrap();
+    // The child moves the checkout away once it is scanned and back before
+    // the segment is written: every stage between reads only what the scan
+    // captured.
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([CHILD, "--exact", "--nocapture", "--test-threads", "1"])
+        .env("AFT_TEST_RESUME_CHILD", "1")
+        .env("AFT_TEST_RESUME_STORE", store.path())
+        .env("AFT_TEST_RESUME_ROOT", &checkout_root)
+        .env("AFT_TEST_HIDE_ROOT", &checkout_root)
+        .env_remove("AFT_TEST_KILL_AT")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("HIDE ROOT at stage.resolve"), "{stderr}");
+    assert!(stderr.contains("HIDE ROOT at stage.write"), "{stderr}");
+    assert!(stderr.contains("CHILD BUILD FINISHED"), "{stderr}");
+    let hidden = Checkout::bind(layer(), store.path(), family(), &checkout_root).unwrap();
+    let reference_store = tempfile::tempdir().unwrap();
+    let (reference, _) = build(reference_store.path(), &checkout_root);
+    assert_same(
+        &published(&reference),
+        &published(&hidden),
+        "with the checkout hidden after the scan",
+    );
+}
+
+#[test]
+fn a_refused_admission_writes_no_workspace() {
+    let root = tempfile::tempdir().unwrap();
+    project(root.path());
+    let store = tempfile::tempdir().unwrap();
+    let checkout = Checkout::bind(layer(), store.path(), family(), root.path()).unwrap();
+    checkout.build().unwrap();
+    let dir = builds(&checkout);
+    // Exactly at the floor: the build starts, and its workspace's first
+    // write, the identity, is refused.
+    let _low = crate::disk_floor::set_free_space_for_test(
+        store.path(),
+        crate::disk_floor::MIN_FREE_BYTES,
+        10 * 1024 * 1024 * 1024,
+    );
+    std::fs::write(root.path().join("src/util.rs"), "pub fn callee() {}\n").unwrap();
+    let error = checkout.build().unwrap_err();
+    assert!(matches!(error, DataError::DiskFloor(_)), "{error}");
+    assert_eq!(
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        ["checkout.lock"],
+        "nothing was written"
+    );
+}
