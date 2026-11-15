@@ -688,7 +688,8 @@ fn a_build_of_a_checkout_another_build_holds_is_busy() {
 /// Inputs that are not parsed files but that resolution reads, each
 /// changed so that a call resolves to another function: a configuration
 /// file's bytes, a symlink's target and a path that is not parsed (a link
-/// that appears). Passes 2-3 resumed stale would publish the old edge.
+/// that appears). Resolutions (passes 2-3) resumed stale would publish the
+/// old edge.
 #[test]
 fn inputs_besides_parsed_files_changed_between_kill_and_resume_are_resolved_again() {
     /// `main` calls `run` through a tsconfig path alias, `via` through a
@@ -918,7 +919,7 @@ fn a_build_from_another_executable_or_a_damaged_stage_is_not_reused() {
 /// The child moves the checkout away once it is scanned and back once the
 /// segment is written: every stage between, resolution and the write
 /// included, reads only what the scan captured. Run on a fresh build and on
-/// one that resumes passes 2-3 from their spool.
+/// one that resumes its resolutions (passes 2-3) from their spool.
 #[test]
 fn no_stage_after_the_scan_reads_the_checkout() {
     for resumed in [false, true] {
@@ -1076,8 +1077,8 @@ fn a_resumed_scan_with_nothing_new_keeps_the_records_marker() {
     let root = tempfile::tempdir().unwrap();
     project(root.path());
     let store = tempfile::tempdir().unwrap();
-    // Killed during passes 2-3, then during assembly: two deaths at
-    // different stages, so the last build still resumes.
+    // Killed while resolving (passes 2-3), then while assembling the graph:
+    // two deaths at different stages, so the last build still resumes.
     killed_build(store.path(), root.path(), "passes.range:1");
     let checkout = Checkout::bind(layer(), store.path(), family(), root.path()).unwrap();
     let marker = only_workspace(&builds(&checkout)).join("STAGE-records");

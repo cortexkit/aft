@@ -501,7 +501,7 @@ mod build_scratch_tests {
             // Distinct modification times, oldest first.
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        // The newest, held by a live build of another checkout than `keep`.
+        // The newest, held by a live build of a third checkout.
         let live = family
             .try_write()
             .unwrap()

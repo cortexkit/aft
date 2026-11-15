@@ -233,8 +233,8 @@ fn main() {
         startup_phase("nonce_capture_done");
     }
     // Every mode, not only the supervised one, holds its startup executable
-    // open now (macOS): a cold build's resume checkpoints are tied to the
-    // image this process runs, which must be read before an upgrade can
+    // open now (macOS): a build's resume checkpoints are tied to the image
+    // this process runs, which must be read before an upgrade can
     // place another binary at the same path.
     aft::pinned_executable::capture_at_startup();
     startup_phase("executable_source_captured");
