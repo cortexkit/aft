@@ -240,6 +240,7 @@ fn runner_notices_not_delivered_restart_replays_persisted_new_id() {
     task.restart();
     let scheduler = Scheduler::default();
     task.offer(&scheduler, clock.clone());
+    due = std::time::Instant::now();
     assert!(matches!(step(&scheduler, due), Next::Retry(left) if left == delay));
     assert!(
         capture.receiver.try_recv().is_err(),
@@ -457,6 +458,7 @@ fn runner_notices_pending_restart_keeps_next_check_and_never_resends() {
     task.restart();
     let scheduler = Scheduler::default();
     task.offer(&scheduler, clock.clone());
+    due = std::time::Instant::now();
     assert!(matches!(step(&scheduler, due), Next::Retry(delay) if delay == Duration::from_secs(5)));
     assert!(capture.receiver.try_recv().is_err());
     assert!(matches!(
