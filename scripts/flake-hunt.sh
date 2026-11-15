@@ -15,7 +15,7 @@ Options:
   -h, --help   Show this help.
 
 Environment:
-  AFT_FLAKE_HUNT_PACKAGE   Cargo package to test (default: agent-file-tools).
+  AFT_FLAKE_HUNT_PACKAGE   Cargo package override (default: agent-file-tools and aft-base).
   AFT_FLAKE_HUNT_LOG_DIR   Directory for per-iteration logs and results.tsv
                            (default: target/flake-hunt/<timestamp>-<pid>).
   AFT_FLAKE_HUNT_HOGS      Default hog count for --pressure (max 4).
@@ -99,7 +99,13 @@ else
   hogs=0
 fi
 
-package="${AFT_FLAKE_HUNT_PACKAGE:-agent-file-tools}"
+package="${AFT_FLAKE_HUNT_PACKAGE:-}"
+if [[ -n "$package" ]]; then
+  package_args=(-p "$package")
+else
+  package="agent-file-tools + aft-base"
+  package_args=(-p agent-file-tools -p aft-base)
+fi
 timestamp="$(date -u '+%Y%m%dT%H%M%SZ')"
 log_dir="${AFT_FLAKE_HUNT_LOG_DIR:-target/flake-hunt/${timestamp}-$$}"
 mkdir -p "$log_dir"
@@ -179,7 +185,7 @@ for (( iteration = 1; iteration <= iterations; iteration++ )); do
   nextest_cmd=(
     cargo nextest run
     --features test-hooks
-    -p "$package"
+    "${package_args[@]}"
     --no-fail-fast
     --failure-output immediate-final
     --no-capture

@@ -8,7 +8,7 @@
 # exec assessment), where the local full gate is the only gate that can see them.
 #
 # Usage: scripts/gated-push.sh [--remote origin] [--branch main] -- <gate command...>
-# Example: scripts/gated-push.sh -- cargo test -p agent-file-tools --lib
+# Example: scripts/gated-push.sh -- cargo test -p agent-file-tools -p aft-base --lib
 set -euo pipefail
 
 # Run the entire gate at reduced scheduling priority so saturated test
