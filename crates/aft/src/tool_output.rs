@@ -340,6 +340,8 @@ fn stores() -> &'static Mutex<Vec<std::sync::Weak<OutputFiles>>> {
 pub(crate) struct CleanupReport {
     pub session_entries: usize,
     pub file_entries: usize,
+    pub read_dirs: usize,
+    pub remove_dirs: usize,
     pub removed: usize,
     pub errors: usize,
     pub steps: usize,
@@ -358,8 +360,10 @@ pub(crate) fn cleanup_expired(harness: &Path, retention: std::time::Duration) ->
     let root = crate::access_policy::policy_path(&harness.join("tool-results"));
     static CURSORS: std::sync::OnceLock<Mutex<HashMap<PathBuf, CleanupCursor>>> =
         std::sync::OnceLock::new();
+    let mut report = CleanupReport::default();
     let mut cursors = CURSORS.get_or_init(Default::default).lock();
     if !cursors.contains_key(&root) {
+        report.read_dirs += 1;
         match std::fs::read_dir(&root) {
             Ok(sessions) => {
                 cursors.insert(
@@ -374,7 +378,7 @@ pub(crate) fn cleanup_expired(harness: &Path, retention: std::time::Duration) ->
                 let report = CleanupReport {
                     errors: usize::from(error.kind() != io::ErrorKind::NotFound),
                     complete: true,
-                    ..Default::default()
+                    ..report
                 };
                 log::debug!(
                     "tool result cleanup root={} examined={report:?}",
@@ -393,7 +397,6 @@ pub(crate) fn cleanup_expired(harness: &Path, retention: std::time::Duration) ->
             .and_then(|time| time.elapsed().ok())
             .is_some_and(|age| age >= retention)
     };
-    let mut report = CleanupReport::default();
     let mut removed = Vec::new();
     // Retain the two directory iterators across passes. A fresh iterator would
     // revisit unexpired entries forever and starve later sessions or files.
@@ -421,6 +424,7 @@ pub(crate) fn cleanup_expired(harness: &Path, retention: std::time::Duration) ->
                 None => {
                     let (session, entries) = cursor.files.take().unwrap();
                     drop(entries);
+                    report.remove_dirs += 1;
                     let _ = std::fs::remove_dir(session);
                 }
             }
@@ -429,6 +433,7 @@ pub(crate) fn cleanup_expired(harness: &Path, retention: std::time::Duration) ->
                 Some(Ok(session)) => {
                     report.session_entries += 1;
                     if session.file_type().is_ok_and(|kind| kind.is_dir()) {
+                        report.read_dirs += 1;
                         match std::fs::read_dir(session.path()) {
                             Ok(files) => cursor.files = Some((session.path(), files)),
                             Err(_) => report.errors += 1,

@@ -1761,6 +1761,65 @@ fn watchdog_cost_inactive_harness_store_is_swept_without_binding_its_worktree() 
     );
 }
 
+fn shared_tool_output_store(registry_count: usize) -> (tempfile::TempDir, Vec<BgTaskRegistry>) {
+    let base = tempfile::tempdir().unwrap();
+    let store = base.path().join("runner");
+    for index in 0..217 {
+        let session = store
+            .join("tool-results")
+            .join(format!("session-{}", index % 163));
+        fs::create_dir_all(&session).unwrap();
+        fs::write(session.join(format!("1-1-{index}.txt")), "retained output").unwrap();
+    }
+    let registries = (0..registry_count)
+        .map(|_| {
+            let registry = BgTaskRegistry::default();
+            registry
+                .inner
+                .persisted_gc_storage
+                .lock()
+                .unwrap()
+                .insert(store.clone());
+            registry
+        })
+        .collect();
+    (base, registries)
+}
+
+fn wait_for_shared_store_gc(store: &Path) {
+    let key = canonicalized_path(store);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while persisted_gc_slots()
+        .lock()
+        .unwrap()
+        .get(&key)
+        .is_some_and(|slot| slot.running)
+    {
+        assert!(Instant::now() < deadline, "shared store GC did not finish");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Measures the calling thread only; persisted-task GC runs on a separate worker.
+#[cfg(unix)]
+#[test]
+#[ignore = "measurement: 67 registries, 163 sessions, 217 retained files"]
+fn watchdog_cost_shared_tool_output_cleanup_measurement() {
+    let (base, registries) = shared_tool_output_store(67);
+    let cpu = cleanup_cpu_ns();
+    let start = Instant::now();
+    let work = super::super::watchdog::run_cleanup(registries.iter().cloned());
+    let elapsed = start.elapsed();
+    let cpu = cleanup_cpu_ns() - cpu;
+    eprintln!(
+        "bash periodic cleanup elapsed_ms={:.3} cpu_ms={:.3} registries={} sessions=163 files=217 gc_requests={} tool_output_walks={} tool_output_read_dirs={} tool_output_remove_dirs={}",
+        elapsed.as_secs_f64() * 1000.0, cpu as f64 / 1_000_000.0,
+        work.registries, work.gc_requests, work.tool_output_walks,
+        work.tool_output_read_dirs, work.tool_output_remove_dirs,
+    );
+    wait_for_shared_store_gc(&base.path().join("runner"));
+}
+
 #[test]
 fn watchdog_cost_terminal_reply_ack_fences_a_late_completion_snapshot() {
     let storage = tempfile::tempdir().unwrap();

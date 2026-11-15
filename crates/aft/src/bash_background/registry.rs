@@ -10394,7 +10394,13 @@ impl BgTaskRegistry {
         }
         super::watchdog::record_cleanup_work(|work| work.gc_requests += requested.len());
         for root in requested {
-            crate::tool_output::cleanup_expired(&root, super::watchdog::FINISHED_RETENTION);
+            let report =
+                crate::tool_output::cleanup_expired(&root, super::watchdog::FINISHED_RETENTION);
+            super::watchdog::record_cleanup_work(|work| {
+                work.tool_output_walks += 1;
+                work.tool_output_read_dirs += report.read_dirs;
+                work.tool_output_remove_dirs += report.remove_dirs;
+            });
             self.request_persisted_gc(&root);
         }
     }
