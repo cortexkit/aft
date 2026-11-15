@@ -2623,12 +2623,21 @@ struct SchedulerState<C: ExecutorContext> {
     idle_workers: usize,
     interactive_inflight: usize,
     maintenance_inflight: usize,
+    #[cfg(any(test, feature = "test-support"))]
+    pub provider_inflight: usize,
+    #[cfg(not(any(test, feature = "test-support")))]
     provider_inflight: usize,
     #[cfg(any(test, feature = "test-support"))]
     pub binds_inflight: usize,
     #[cfg(not(any(test, feature = "test-support")))]
     binds_inflight: usize,
+    #[cfg(any(test, feature = "test-support"))]
+    pub config: EffectiveConfig,
+    #[cfg(not(any(test, feature = "test-support")))]
     config: EffectiveConfig,
+    #[cfg(any(test, feature = "test-support"))]
+    pub running_jobs: HashMap<u64, RunningJob>,
+    #[cfg(not(any(test, feature = "test-support")))]
     running_jobs: HashMap<u64, RunningJob>,
     next_job_id: u64,
     /// Set when a bind was queued again with a retry time, so the loop knows
@@ -2826,132 +2835,135 @@ impl<C: ExecutorContext> SchedulerState<C> {
         "not_found"
     }
 
+    test_support_visibility! {
     fn bind_blocker_snapshot(
-        &self,
-        root_id: &ProjectRootId,
-        request_id: &str,
-    ) -> BindBlockerSnapshot {
-        let configure_state = self.mutating_job_state_label(root_id, request_id);
-        let now = Instant::now();
-        let actor = self.actors.get(root_id);
-        let oldest_queued_writer_at = actor.and_then(ActorState::<C>::oldest_queued_writer_at);
-        let oldest_queued_writer_age_ms = oldest_queued_writer_at
-            .map(|queued_at| duration_millis_u64(now.saturating_duration_since(queued_at)));
-        let mut in_flight_readers = self
-            .running_jobs
-            .values()
-            .filter(|job| {
-                job.root_id == *root_id
-                    && matches!(job.lane, Lane::PureRead | Lane::SerialLspStatus)
-            })
-            .map(|job| BindBlockerReaderSnapshot {
-                request_id: job.request_id.clone(),
-                command: job.command.clone(),
-                lane: job.lane,
-                started_age_ms: duration_millis_u64(now.saturating_duration_since(job.started_at)),
-                execution_started: job.execution_started.load(Ordering::Acquire),
-                started_before_oldest_writer: oldest_queued_writer_at
-                    .is_some_and(|queued_at| job.started_at <= queued_at),
-            })
-            .collect::<Vec<_>>();
-        in_flight_readers.sort_by(|left, right| left.request_id.cmp(&right.request_id));
-        // The bind's own configure job can hold the mutating slot while it
-        // runs. It is not a blocker of the bind; reporting it as one would
-        // tell the caller to wait for a different job when the bind's own
-        // configure is what is slow.
-        let in_flight_writer = actor
-            .and_then(|actor| actor.mutating_inflight.as_ref())
-            .filter(|job| job.request_id != request_id)
-            .map(|job| MutatingLaneSnapshot {
-                root_id: root_id.clone(),
-                request_id: job.request_id.clone(),
-                command: job.command.clone(),
-                started_age_ms: duration_millis_u64(now.saturating_duration_since(job.started_at)),
-            });
+            &self,
+            root_id: &ProjectRootId,
+            request_id: &str,
+        ) -> BindBlockerSnapshot {
+            let configure_state = self.mutating_job_state_label(root_id, request_id);
+            let now = Instant::now();
+            let actor = self.actors.get(root_id);
+            let oldest_queued_writer_at = actor.and_then(ActorState::<C>::oldest_queued_writer_at);
+            let oldest_queued_writer_age_ms = oldest_queued_writer_at
+                .map(|queued_at| duration_millis_u64(now.saturating_duration_since(queued_at)));
+            let mut in_flight_readers = self
+                .running_jobs
+                .values()
+                .filter(|job| {
+                    job.root_id == *root_id
+                        && matches!(job.lane, Lane::PureRead | Lane::SerialLspStatus)
+                })
+                .map(|job| BindBlockerReaderSnapshot {
+                    request_id: job.request_id.clone(),
+                    command: job.command.clone(),
+                    lane: job.lane,
+                    started_age_ms: duration_millis_u64(now.saturating_duration_since(job.started_at)),
+                    execution_started: job.execution_started.load(Ordering::Acquire),
+                    started_before_oldest_writer: oldest_queued_writer_at
+                        .is_some_and(|queued_at| job.started_at <= queued_at),
+                })
+                .collect::<Vec<_>>();
+            in_flight_readers.sort_by(|left, right| left.request_id.cmp(&right.request_id));
+            // The bind's own configure job can hold the mutating slot while it
+            // runs. It is not a blocker of the bind; reporting it as one would
+            // tell the caller to wait for a different job when the bind's own
+            // configure is what is slow.
+            let in_flight_writer = actor
+                .and_then(|actor| actor.mutating_inflight.as_ref())
+                .filter(|job| job.request_id != request_id)
+                .map(|job| MutatingLaneSnapshot {
+                    root_id: root_id.clone(),
+                    request_id: job.request_id.clone(),
+                    command: job.command.clone(),
+                    started_age_ms: duration_millis_u64(now.saturating_duration_since(job.started_at)),
+                });
 
-        let mut blockers = Vec::new();
-        if let Some(actor) = actor {
-            if configure_state == "queued" {
-                let configure_count = actor.pending_configure_count();
-                if configure_count > 0 {
-                    blockers.push(format!("queued_behind_configure({configure_count})"));
-                }
-                if actor.read_inflight > 0 || actor.lsp_inflight {
-                    let zombie_readers = in_flight_readers
-                        .iter()
-                        .filter(|reader| !reader.execution_started)
-                        .map(format_bind_blocker_reader)
-                        .collect::<Vec<_>>();
-                    let stuck_readers = in_flight_readers
-                        .iter()
-                        .filter(|reader| {
-                            reader.execution_started
-                                && reader.started_age_ms
-                                    >= duration_millis_u64(READER_STUCK_CENSUS_AGE)
-                        })
-                        .map(format_bind_blocker_reader)
-                        .collect::<Vec<_>>();
-                    if !zombie_readers.is_empty() {
-                        blockers.push(format!("zombie_reader({})", zombie_readers.join("; ")));
-                    } else if !stuck_readers.is_empty() {
-                        blockers.push(format!(
-                            "waiting_on_readers_stuck({})",
-                            stuck_readers.join("; ")
-                        ));
-                    } else {
-                        blockers.push("waiting_on_readers".to_string());
+            let mut blockers = Vec::new();
+            if let Some(actor) = actor {
+                if configure_state == "queued" {
+                    let configure_count = actor.pending_configure_count();
+                    if configure_count > 0 {
+                        blockers.push(format!("queued_behind_configure({configure_count})"));
+                    }
+                    if actor.read_inflight > 0 || actor.lsp_inflight {
+                        let zombie_readers = in_flight_readers
+                            .iter()
+                            .filter(|reader| !reader.execution_started)
+                            .map(format_bind_blocker_reader)
+                            .collect::<Vec<_>>();
+                        let stuck_readers = in_flight_readers
+                            .iter()
+                            .filter(|reader| {
+                                reader.execution_started
+                                    && reader.started_age_ms
+                                        >= duration_millis_u64(READER_STUCK_CENSUS_AGE)
+                            })
+                            .map(format_bind_blocker_reader)
+                            .collect::<Vec<_>>();
+                        if !zombie_readers.is_empty() {
+                            blockers.push(format!("zombie_reader({})", zombie_readers.join("; ")));
+                        } else if !stuck_readers.is_empty() {
+                            blockers.push(format!(
+                                "waiting_on_readers_stuck({})",
+                                stuck_readers.join("; ")
+                            ));
+                        } else {
+                            blockers.push("waiting_on_readers".to_string());
+                        }
                     }
                 }
             }
-        }
 
-        if configure_state == "queued" {
-            let maintenance: Vec<_> = self
-                .running_jobs
-                .values()
-                .filter(|job| job.job_class == JobClass::Maintenance)
-                .collect();
-            if !maintenance.is_empty() {
+            if configure_state == "queued" {
+                let maintenance: Vec<_> = self
+                    .running_jobs
+                    .values()
+                    .filter(|job| job.job_class == JobClass::Maintenance)
+                    .collect();
+                if !maintenance.is_empty() {
+                    blockers.push(format!(
+                        "queued_behind_maintenance({})",
+                        format_running_jobs(&maintenance)
+                    ));
+                }
+            }
+
+            if let Some(actor) = actor {
+                if configure_state == "queued" && actor.interactive.first_bind_is_forced_exclusive() {
+                    blockers.push("rerun_as_exclusive_writer".to_string());
+                }
+                if actor.detached_writers.load(Ordering::Acquire) > 0 {
+                    blockers.push("detached_view_publication_writer_waiting".to_string());
+                }
+                // Name the configure-tail stage in progress on this root, so a
+                // bind held up by a long tail unit says which one.
+                if let Some(stage) = actor.ctx.configure_tail_stage_snapshot() {
+                    blockers.push(format!("configure_tail_stage({stage})"));
+                }
+            }
+
+            if self.idle_workers == 0 {
+                let running: Vec<_> = self.running_jobs.values().collect();
                 blockers.push(format!(
-                    "queued_behind_maintenance({})",
-                    format_running_jobs(&maintenance)
+                    "idle_workers==0({})",
+                    format_running_jobs(&running)
                 ));
             }
-        }
 
-        if let Some(actor) = actor {
-            if configure_state == "queued" && actor.interactive.first_bind_is_forced_exclusive() {
-                blockers.push("rerun_as_exclusive_writer".to_string());
-            }
-            if actor.detached_writers.load(Ordering::Acquire) > 0 {
-                blockers.push("detached_view_publication_writer_waiting".to_string());
-            }
-            // Name the configure-tail stage in progress on this root, so a
-            // bind held up by a long tail unit says which one.
-            if let Some(stage) = actor.ctx.configure_tail_stage_snapshot() {
-                blockers.push(format!("configure_tail_stage({stage})"));
+            BindBlockerSnapshot {
+                configure_state,
+                configure_phase_timings: actor.map(|actor| actor.ctx.configure_ack_phase_snapshot()),
+                blockers,
+                oldest_queued_writer_age_ms,
+                in_flight_readers,
+                in_flight_writer,
+                reader_admissions_while_promoted_writer_waited: actor
+                    .map(|actor| actor.reader_admissions_while_promoted_writer_waited)
+                    .unwrap_or(0),
             }
         }
 
-        if self.idle_workers == 0 {
-            let running: Vec<_> = self.running_jobs.values().collect();
-            blockers.push(format!(
-                "idle_workers==0({})",
-                format_running_jobs(&running)
-            ));
-        }
-
-        BindBlockerSnapshot {
-            configure_state,
-            configure_phase_timings: actor.map(|actor| actor.ctx.configure_ack_phase_snapshot()),
-            blockers,
-            oldest_queued_writer_age_ms,
-            in_flight_readers,
-            in_flight_writer,
-            reader_admissions_while_promoted_writer_waited: actor
-                .map(|actor| actor.reader_admissions_while_promoted_writer_waited)
-                .unwrap_or(0),
-        }
     }
 }
 
@@ -3036,7 +3048,13 @@ fn duration_millis_u64(duration: Duration) -> u64 {
 test_support_visibility! {
 struct ActorState<C: ExecutorContext> {
     ctx: Arc<C>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub epoch: Arc<RwLock<()>>,
+    #[cfg(not(any(test, feature = "test-support")))]
     epoch: Arc<RwLock<()>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub read_inflight: usize,
+    #[cfg(not(any(test, feature = "test-support")))]
     read_inflight: usize,
     lsp_inflight: bool,
     actor_total_inflight: usize,
@@ -3056,10 +3074,22 @@ struct ActorState<C: ExecutorContext> {
     interactive: ClassQueues<C>,
     maintenance: ClassQueues<C>,
     fatal: bool,
+    #[cfg(any(test, feature = "test-support"))]
+    /// Number of queued interactive mutating jobs, shared with this actor's
+    /// running jobs through [`current_actor_writer_waiting`]. Kept equal to
+    /// `interactive.mutating.len()` by every method that changes that queue.
+    pub waiting_writers: Arc<AtomicUsize>,
+    #[cfg(not(any(test, feature = "test-support")))]
     /// Number of queued interactive mutating jobs, shared with this actor's
     /// running jobs through [`current_actor_writer_waiting`]. Kept equal to
     /// `interactive.mutating.len()` by every method that changes that queue.
     waiting_writers: Arc<AtomicUsize>,
+    #[cfg(any(test, feature = "test-support"))]
+    /// Detached threads (content-addressed view publication) waiting to write
+    /// this actor's epoch gate. Reported through
+    /// [`current_actor_writer_waiting`].
+    pub detached_writers: Arc<AtomicUsize>,
+    #[cfg(not(any(test, feature = "test-support")))]
     /// Detached threads (content-addressed view publication) waiting to write
     /// this actor's epoch gate. Reported through
     /// [`current_actor_writer_waiting`].
@@ -3106,8 +3136,10 @@ impl<C: ExecutorContext> ActorState<C> {
         }
     }
 
+    test_support_visibility! {
     fn has_queued_jobs(&self) -> bool {
-        self.interactive.has_queued_jobs() || self.maintenance.has_queued_jobs()
+            self.interactive.has_queued_jobs() || self.maintenance.has_queued_jobs()
+        }
     }
 
     fn is_idle(&self) -> bool {
@@ -3180,9 +3212,11 @@ impl<C: ExecutorContext> ActorState<C> {
         self.maintenance.cancel_queued_jobs() + self.interactive.cancel_queued_provider_jobs()
     }
 
+    test_support_visibility! {
     fn has_queued_mutating_job(&self, request_id: &str) -> bool {
-        self.interactive.has_queued_mutating_job(request_id)
-            || self.maintenance.has_queued_mutating_job(request_id)
+            self.interactive.has_queued_mutating_job(request_id)
+                || self.maintenance.has_queued_mutating_job(request_id)
+        }
     }
 
     test_support_visibility! {
