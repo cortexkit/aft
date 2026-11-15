@@ -255,7 +255,7 @@ fn append_tool_write_and_batch_creation_contracts() {
     );
     assert_eq!(response["success"], true, "{response:#}");
     assert_eq!(response["created"], true, "{response:#}");
-    assert_eq!(response["syntax_valid"], true, "{response:#}");
+    assert!(response.get("syntax_valid").is_none(), "{response:#}");
     assert_eq!(fs::read_to_string(&target).unwrap(), "# Written\n");
 
     let rejected = tool_call(
