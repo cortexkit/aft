@@ -4471,7 +4471,9 @@ fn walk_project_files_filtered_while_with_builder(
     configure_builder: impl FnOnce(&mut ignore::WalkBuilder),
 ) -> impl Iterator<Item = PathBuf> {
     walk_project_paths_filtered_while_with_builder(root, include, keep_walking, configure_builder)
-        .filter(|path| detect_language(path).is_some())
+        .filter(|path| {
+            crate::parser::detect_language_any(path, cfg!(feature = "wasm-grammars")).is_some()
+        })
 }
 
 fn walk_project_paths_filtered_while_with_builder(
@@ -4578,7 +4580,8 @@ pub fn walk_could_include(relative: &str) -> bool {
     if crate::os_metadata::is_os_metadata_file_name(std::ffi::OsStr::new(file_name)) {
         return false;
     }
-    detect_language(Path::new(file_name)).is_some()
+    crate::parser::detect_language_any(Path::new(file_name), cfg!(feature = "wasm-grammars"))
+        .is_some()
 }
 
 // ---------------------------------------------------------------------------

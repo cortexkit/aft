@@ -426,7 +426,7 @@ fn trace_gaps() {
         assert!(response.data["text"]
             .as_str()
             .unwrap()
-            .contains("and 3 more"));
+            .contains("shown 3 of 6 files (cap) · narrow: path"));
         assert!(!response.data["text"].as_str().unwrap().ends_with('\n'));
     }
     let mut response = Response::success("merge", json!({"gaps":[{"kind":"existing"}]}));
@@ -635,7 +635,7 @@ fn outline_guards() {
     let bad = write(
         &f.root,
         "nested/bad.luau",
-        "local function broken(\n return )\nend\n",
+        "local function broken()\n return @@@\nend\n",
     );
     let bad_source = std::fs::read_to_string(&bad).unwrap();
     let bad_tree = crate::parser::parse_luau_source(&bad, &bad_source).unwrap();
@@ -800,11 +800,12 @@ fn outline_rollup() {
 fn inspect_category(ctx: &AppContext, scope: &Path, category: &str) -> Response {
     until(
         || {
-            let response = ask(
-                ctx,
-                "inspect",
-                json!({"scope":[scope],"sections":[category]}),
-            );
+            let params = if category == "dead_code" {
+                json!({"sections":[category]})
+            } else {
+                json!({"scope":[scope],"sections":[category]})
+            };
+            let response = ask(ctx, "inspect", params);
             let deadline = response.data["code"] == "inspect_not_fresh"
                 && response.data["message"]
                     .as_str()
@@ -839,7 +840,7 @@ isolated!(
 );
 fn todo_gaps(terminal: bool) {
     use crate::grammar::GrammarState;
-    let f = fixture(true);
+    let f = fixture(terminal);
     write(
         &f.root,
         "plain.ts",
@@ -850,10 +851,9 @@ fn todo_gaps(terminal: bool) {
         "source.luau",
         format!("-- TODO: dynamic marker\n{SOURCE}"),
     );
-    let forced = f.registry.force_unavailable_for_test(if terminal {
-        GrammarState::AttemptsExhausted
-    } else {
-        GrammarState::NetworkRetry
+    let _forced = terminal.then(|| {
+        f.registry
+            .force_unavailable_for_test(GrammarState::AttemptsExhausted)
     });
     configure_inspect(&f);
     let runtime = f.ctx.data_checkout().unwrap();
@@ -889,7 +889,10 @@ fn todo_gaps(terminal: bool) {
                 && gap["reason"] == "no TODO record for this file in the index store"));
     }
     if !terminal {
-        drop(forced);
+        assert!(f.registry.wait_until_settled(Duration::from_secs(30)));
+        assert_eq!(f.registry.request_count(), 1);
+        write(&f.dir, "transport", &f.wasm);
+        write(&f.dir, "clock", "30000");
         until(
             || {
                 runtime.view().filter(|view| {
@@ -912,23 +915,27 @@ isolated!(
     dead_code_gaps
 );
 fn dead_code_gaps() {
-    let f = fixture(true);
+    let mut f = fixture(true);
     let _state = f
         .registry
         .force_unavailable_for_test(crate::grammar::GrammarState::AttemptsExhausted);
-    let path = write(&f.root, "source.luau", SOURCE);
-    write(
-        &f.root,
-        "plain.ts",
-        "export function searchable() { return 1; }\n",
-    );
-    configure_inspect(&f);
-    f.ctx
-        .data_checkout()
-        .unwrap()
-        .wait_for_memory_profile_idle_for_test();
-    for scope in [&path, &f.root] {
-        let response = inspect_category(&f.ctx, scope, "dead_code");
+    for mixed in [false, true] {
+        f.root = f.dir.join(if mixed { "mixed" } else { "luau-only" });
+        f.ctx = context(&f.root, &f.storage);
+        write(&f.root, "source.luau", SOURCE);
+        if mixed {
+            write(
+                &f.root,
+                "plain.ts",
+                "export function searchable() { return 1; }\n",
+            );
+        }
+        configure_inspect(&f);
+        f.ctx
+            .data_checkout()
+            .unwrap()
+            .wait_for_memory_profile_idle_for_test();
+        let response = inspect_category(&f.ctx, &f.root, "dead_code");
         assert!(response.success, "{:?}", response.data);
         let dead = &response.data["summary"]["dead_code"];
         assert_eq!(dead["complete"], false, "{:?}", response.data);
@@ -951,10 +958,7 @@ isolated!(
     publication_retry
 );
 fn publication_retry() {
-    let f = fixture(true);
-    let forced = f
-        .registry
-        .force_unavailable_for_test(crate::grammar::GrammarState::NetworkRetry);
+    let f = fixture(false);
     write(&f.root, "source.luau", SOURCE);
     write(
         &f.root,
@@ -965,9 +969,13 @@ fn publication_retry() {
     let runtime = f.ctx.data_checkout().unwrap();
     runtime.wait_for_memory_profile_idle_for_test();
     wait_meaning(&f.ctx);
+    assert!(f.registry.wait_until_settled(Duration::from_secs(30)));
+    assert_eq!(f.registry.request_count(), 1);
     let publication = test_gates::hold(&f.root, test_gates::Point::DeltaPublication);
-    drop(forced);
+    write(&f.dir, "transport", &f.wasm);
+    write(&f.dir, "clock", "30000");
     publication.wait_entered();
+    assert_eq!(f.registry.request_count(), 2);
     let low = crate::disk_floor::set_free_space_for_test(&f.storage, 1 << 30, 1 << 40);
     drop(publication);
     runtime.wait_for_memory_profile_idle_for_test();
