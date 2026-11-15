@@ -552,10 +552,11 @@ impl Meaning {
                 return self.fill_without_model_for_test(checkout, config, dimensions);
             }
             #[cfg(test)]
-            if let Some(dimensions) = lock(constant_vectors_for_test())
+            let constant_dimensions = lock(constant_vectors_for_test())
                 .get(checkout.root())
-                .copied()
-            {
+                .copied();
+            #[cfg(test)]
+            if let Some(dimensions) = constant_dimensions {
                 return self.fill_constant_vectors_for_test(checkout, config, dimensions);
             }
             match SemanticEmbeddingModel::from_config(config) {
@@ -630,9 +631,7 @@ impl Meaning {
     }
 }
 
-/// A fill round with no model, for a test whose checkout holds no file
-/// meaning search applies to: the plane is made for `dimensions` and the
-/// round finds nothing to embed.
+/// Fill implementations that exercise stored coverage without loading a model.
 #[cfg(test)]
 impl Meaning {
     fn fill_constant_vectors_for_test(
@@ -676,6 +675,8 @@ impl Meaning {
         }
     }
 
+    /// A fill for a checkout with no files meaning search applies to: the
+    /// plane is made for `dimensions` and nothing is embedded.
     fn fill_without_model_for_test(
         &self,
         checkout: &Arc<Checkout>,
