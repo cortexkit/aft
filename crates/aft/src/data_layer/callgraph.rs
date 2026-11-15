@@ -87,9 +87,18 @@ pub(crate) struct ParseSlot {
     /// The encoded content record the parse is decoded from, with its
     /// parse key.
     encoded: Option<(BlobKey, Arc<aft_store::content::EncodedRecord>)>,
-    /// The staged content record the parse is decoded from, with its parse
-    /// key: a cold build's records are on disk (see `staged_records`).
-    staged: Option<(BlobKey, StagedAt, Arc<StagedRecords>)>,
+    /// The staged content record the parse is decoded from: a cold build's
+    /// records are on disk (see `staged_records`).
+    staged: Option<StagedParse>,
+}
+
+/// A parse kept as a staged content record.
+pub(crate) struct StagedParse {
+    pub(crate) key: BlobKey,
+    pub(crate) at: StagedAt,
+    /// [`list_kinds`] of the parse, noted when it was extracted.
+    pub(crate) kinds: (bool, bool),
+    pub(crate) records: Arc<StagedRecords>,
 }
 
 impl ParseSlot {
@@ -120,7 +129,10 @@ impl ParseSlot {
                 })
                 .map_or_else(empty_parse, |parse| (key.clone(), Arc::new(parse)));
         }
-        if let Some((key, at, records)) = &self.staged {
+        if let Some(StagedParse {
+            key, at, records, ..
+        }) = &self.staged
+        {
             // A read or decode that fails is recorded, and the build fails
             // on it at its next stage boundary; until then it reads as an
             // empty parse, as a failed stored read does.
@@ -260,21 +272,18 @@ impl Parses {
     /// Entries kept as staged content records in `records`, each decoded on
     /// every read that does not find it decoded (see
     /// [`Self::release_decoded`]).
-    pub(crate) fn staged(
-        entries: impl IntoIterator<Item = (String, BlobKey, StagedAt)>,
-        records: &Arc<StagedRecords>,
-    ) -> Self {
+    pub(crate) fn staged(entries: impl IntoIterator<Item = (String, StagedParse)>) -> Self {
         Self {
             map: entries
                 .into_iter()
-                .map(|(path, key, at)| {
+                .map(|(path, staged)| {
                     (
                         path,
                         Arc::new(ParseSlot {
                             value: std::sync::OnceLock::new(),
                             stored: None,
                             encoded: None,
-                            staged: Some((key, at, Arc::clone(records))),
+                            staged: Some(staged),
                         }),
                     )
                 })
@@ -286,7 +295,16 @@ impl Parses {
     pub(crate) fn staged_records(&self) -> Option<&Arc<StagedRecords>> {
         self.map
             .values()
-            .find_map(|slot| slot.staged.as_ref().map(|(_, _, records)| records))
+            .find_map(|slot| slot.staged.as_ref().map(|staged| &staged.records))
+    }
+
+    /// [`list_kinds`] of every parse, in path order, when each was noted as
+    /// it was staged; `None` when any must be decoded to tell.
+    fn staged_kinds(&self) -> Option<Vec<(bool, bool)>> {
+        self.map
+            .values()
+            .map(|slot| slot.staged.as_ref().map(|staged| staged.kinds))
+            .collect()
     }
 
     /// How many entries that can be decoded again are decoded now.
@@ -390,8 +408,8 @@ impl Parses {
         if let Some((key, _)) = &slot.encoded {
             return Some(key.clone());
         }
-        if let Some((key, _, _)) = &slot.staged {
-            return Some(key.clone());
+        if let Some(staged) = &slot.staged {
+            return Some(staged.key.clone());
         }
         slot.stored
             .as_ref()
@@ -987,10 +1005,14 @@ struct FileLists {
     module_declaring: Vec<String>,
 }
 
+/// Whether `parse` is a Rust file, and whether it declares modules: as the
+/// store's `module_declaring_files`, a module reference with a module path.
+pub(crate) fn list_kinds(parse: &ParseBlob) -> (bool, bool) {
+    FileLists::kinds(parse)
+}
+
 impl FileLists {
-    /// Whether `parse` is a Rust file, and whether it declares modules: as
-    /// the store's `module_declaring_files`, a module reference with a
-    /// module path.
+    /// See [`list_kinds`].
     fn kinds(parse: &ParseBlob) -> (bool, bool) {
         (
             parse.language == "rust",
@@ -1017,22 +1039,165 @@ impl FileLists {
 /// update binds it again; an entry stays valid until an update binds the
 /// file again or removes it, since a file whose binding can have changed is
 /// always bound again (see `incremental`).
+///
+/// A cold build's cache is bounded ([`Self::bounded`]): past its byte limit
+/// it lets go of the files least recently used, and a file read again is
+/// bound again, which gives the same binding. The live engine's cache keeps
+/// every file, since an update diffs a file's new binding against its old
+/// one.
 #[derive(Debug, Default)]
 pub(crate) struct BindCache {
-    files: Mutex<HashMap<String, Arc<BoundFile>>>,
+    files: Mutex<BoundSet>,
     lists: Mutex<Option<Arc<FileLists>>>,
     /// Every file a resolver bound on first use: what resolution waited on
     /// that nothing bound beforehand.
     bound_on_first_use: FirstReads,
+    /// Each declared Rust module's parent over every module-declaring file,
+    /// once a cold build has found them all (see [`Self::index_module_parents`]).
+    module_parents: Mutex<Option<Arc<crate::callgraph_store::ModuleParents>>>,
+    /// Whether the cache is bounded, readable without its lock.
+    bounded: bool,
+}
+
+/// The bound files a [`BindCache`] holds, and what bounds them.
+#[derive(Debug, Default)]
+struct BoundSet {
+    map: HashMap<String, BoundEntry>,
+    /// The byte limit of a bounded cache, and its files in the order a
+    /// second-chance sweep visits them; empty when unbounded.
+    limit: Option<usize>,
+    order: std::collections::VecDeque<String>,
+    /// The bytes the files held count for, when bounded.
+    held: usize,
+    /// How many files were bound and how many let go, when bounded.
+    bound: usize,
+    evicted: usize,
+}
+
+#[derive(Debug)]
+struct BoundEntry {
+    bound: Arc<BoundFile>,
+    /// The file's heap bytes, counted when bounded.
+    bytes: usize,
+    /// Read since the sweep last passed it.
+    used: std::sync::atomic::AtomicBool,
+}
+
+impl BoundSet {
+    fn insert(&mut self, path: String, bound: Arc<BoundFile>) {
+        let bytes = match self.limit {
+            Some(_) => {
+                use aft_store::heap::HeapBytes as _;
+                bound.heap_bytes(&mut aft_store::heap::Seen::new()) + path.len()
+            }
+            None => 0,
+        };
+        let entry = BoundEntry {
+            bound,
+            bytes,
+            used: std::sync::atomic::AtomicBool::new(false),
+        };
+        if let Some(old) = self.map.insert(path.clone(), entry) {
+            self.held -= old.bytes;
+        } else if self.limit.is_some() {
+            self.order.push_back(path);
+        }
+        self.held += bytes;
+        if let Some(limit) = self.limit {
+            self.bound += 1;
+            self.evict_to(limit);
+        }
+    }
+
+    /// Lets go of files until those held count for at most `limit` bytes,
+    /// or one file is left. A file read since the sweep last passed it gets
+    /// a second chance.
+    fn evict_to(&mut self, limit: usize) {
+        while self.held > limit && self.map.len() > 1 {
+            let Some(path) = self.order.pop_front() else {
+                break;
+            };
+            let Some(entry) = self.map.get(&path) else {
+                continue;
+            };
+            if entry.used.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                self.order.push_back(path);
+                continue;
+            }
+            let entry = self.map.remove(&path).expect("found above");
+            self.held -= entry.bytes;
+            self.evicted += 1;
+        }
+    }
+
+    fn remove(&mut self, path: &str) {
+        if let Some(entry) = self.map.remove(path) {
+            self.held -= entry.bytes;
+        }
+    }
+}
+
+impl aft_store::heap::HeapBytes for BoundSet {
+    fn heap_bytes(&self, seen: &mut aft_store::heap::Seen) -> usize {
+        self.map
+            .iter()
+            .map(|(path, entry)| {
+                path.heap_bytes(seen)
+                    + std::mem::size_of::<(String, BoundEntry)>()
+                    + entry.bound.heap_bytes(seen)
+            })
+            .sum::<usize>()
+            + self.order.capacity() * std::mem::size_of::<String>()
+            + self
+                .order
+                .iter()
+                .map(|path| path.heap_bytes(seen))
+                .sum::<usize>()
+    }
+}
+
+/// What a bounded [`BindCache`] did: how many files it bound and let go,
+/// and the bytes its files count for now.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BindCacheCounts {
+    pub(crate) bound: usize,
+    pub(crate) evicted: usize,
+    pub(crate) held: usize,
 }
 
 impl BindCache {
+    /// A cold build's cache, holding bound files that count for at most
+    /// `bytes` (and always the last one bound).
+    pub(crate) fn bounded(bytes: usize) -> Self {
+        Self {
+            files: Mutex::new(BoundSet {
+                limit: Some(bytes),
+                ..BoundSet::default()
+            }),
+            bounded: true,
+            ..Self::default()
+        }
+    }
+
+    fn is_bounded(&self) -> bool {
+        self.bounded
+    }
+
+    /// The bounded cache's counts so far.
+    pub(crate) fn counts(&self) -> BindCacheCounts {
+        let files = self.files.lock().expect("no panics while holding it");
+        BindCacheCounts {
+            bound: files.bound,
+            evicted: files.evicted,
+            held: files.held,
+        }
+    }
+
     pub(crate) fn get(&self, path: &str) -> Option<Arc<BoundFile>> {
-        self.files
-            .lock()
-            .expect("no panics while holding it")
-            .get(path)
-            .cloned()
+        let files = self.files.lock().expect("no panics while holding it");
+        let entry = files.map.get(path)?;
+        entry.used.store(true, std::sync::atomic::Ordering::Relaxed);
+        Some(Arc::clone(&entry.bound))
     }
 
     /// Records `bound` as `path`'s binding, replacing any earlier one.
@@ -1048,13 +1213,13 @@ impl BindCache {
     /// Records `bound` unless another thread bound `path` first; the two are
     /// equal, since binding reads only the file and the checkout.
     fn set_new(&self, path: &str, bound: BoundFile) -> Arc<BoundFile> {
-        Arc::clone(
-            self.files
-                .lock()
-                .expect("no panics while holding it")
-                .entry(path.to_string())
-                .or_insert_with(|| Arc::new(bound)),
-        )
+        let mut files = self.files.lock().expect("no panics while holding it");
+        if let Some(entry) = files.map.get(path) {
+            return Arc::clone(&entry.bound);
+        }
+        let bound = Arc::new(bound);
+        files.insert(path.to_string(), Arc::clone(&bound));
+        bound
     }
 
     pub(crate) fn remove(&self, path: &str) {
@@ -1062,6 +1227,44 @@ impl BindCache {
             .lock()
             .expect("no panics while holding it")
             .remove(path);
+    }
+
+    /// Binds every module-declaring file of the lists, in batches, and
+    /// keeps each declared module's parent over all of them, so a resolver
+    /// reading through a bounded cache finds a parent without binding every
+    /// module-declaring file again (see `ProjectIndex::module_parent`). The
+    /// parents are what that scan finds: the smallest `(declaring file,
+    /// module name)` pair for each target.
+    ///
+    /// # Errors
+    ///
+    /// When binding fails on a file.
+    fn index_module_parents(&self, inputs: &CheckoutInputs) -> Result<usize, ManifestJoinError> {
+        let lists = self.lists(inputs);
+        let mut parents = crate::callgraph_store::ModuleParents::new();
+        for batch in lists.module_declaring.chunks(BATCH) {
+            let missing = batch
+                .iter()
+                .filter(|path| self.get(path).is_none())
+                .collect::<Vec<_>>();
+            let mut bound = bind_all(inputs, &missing)?;
+            for path in batch {
+                let surface = match bound.remove(path) {
+                    Some(fresh) => self.set_new(path, fresh).surface.clone(),
+                    None => match self.get(path) {
+                        Some(held) => held.surface.clone(),
+                        None => continue,
+                    },
+                };
+                crate::callgraph_store::note_module_parents(&mut parents, path, &surface);
+            }
+        }
+        let count = parents.len();
+        *self
+            .module_parents
+            .lock()
+            .expect("no panics while holding it") = Some(Arc::new(parents));
+        Ok(count)
     }
 
     /// Sets the whole-checkout lists, built by a caller that read every
@@ -1230,6 +1433,10 @@ pub(crate) struct BoundFiles<'a> {
     facts: ViewBindingFacts<'a>,
     lists: std::cell::OnceCell<Arc<FileLists>>,
     error: std::cell::RefCell<Option<ManifestJoinError>>,
+    /// With a bounded cache, the files read since [`Self::release_held`]:
+    /// one file's resolution reads the same files again and again, and a
+    /// cache that let one go would bind it again for each read.
+    held: std::cell::RefCell<HashMap<String, Arc<BoundFile>>>,
 }
 
 impl<'a> BoundFiles<'a> {
@@ -1240,11 +1447,32 @@ impl<'a> BoundFiles<'a> {
             facts: thread_facts(inputs),
             lists: std::cell::OnceCell::new(),
             error: std::cell::RefCell::new(None),
+            held: std::cell::RefCell::default(),
         }
+    }
+
+    /// Lets go of the files read since the last call, which a bounded cache
+    /// may then let go of too. Called after each file is resolved.
+    pub(crate) fn release_held(&self) {
+        self.held.borrow_mut().clear();
     }
 
     /// `path`'s pass-1 results, bound now if no thread has bound it yet.
     pub(crate) fn bound(&self, path: &str) -> Option<Arc<BoundFile>> {
+        let bound = self.bound_uncounted(path)?;
+        if self.cache.is_bounded() {
+            self.held
+                .borrow_mut()
+                .entry(path.to_string())
+                .or_insert_with(|| Arc::clone(&bound));
+        }
+        Some(bound)
+    }
+
+    fn bound_uncounted(&self, path: &str) -> Option<Arc<BoundFile>> {
+        if let Some(bound) = self.held.borrow().get(path) {
+            return Some(Arc::clone(bound));
+        }
         if let Some(bound) = self.cache.get(path) {
             return Some(bound);
         }
@@ -1295,6 +1523,14 @@ impl LoadedFileIndexes for BoundFiles<'_> {
     fn module_declaring_files(&self) -> Vec<String> {
         self.lists().module_declaring.clone()
     }
+
+    fn module_parents(&self) -> Option<Arc<crate::callgraph_store::ModuleParents>> {
+        self.cache
+            .module_parents
+            .lock()
+            .expect("no panics while holding it")
+            .clone()
+    }
 }
 
 /// Resolves every parsed file of a checkout on `threads` threads.
@@ -1319,6 +1555,20 @@ pub(crate) fn resolve_checkout_within(
     threads: usize,
     budget: KeyOrderBudget,
 ) -> Result<BTreeMap<String, FileResolution>, ManifestJoinError> {
+    resolve_checkout_bounded(inputs, threads, budget, bind_cache_bytes())
+}
+
+/// [`resolve_checkout_within`], keeping bound files up to `bind_bytes`.
+///
+/// # Errors
+///
+/// When the resolver fails on a file.
+pub(crate) fn resolve_checkout_bounded(
+    inputs: &CheckoutInputs,
+    threads: usize,
+    budget: KeyOrderBudget,
+    bind_bytes: usize,
+) -> Result<BTreeMap<String, FileResolution>, ManifestJoinError> {
     // A copy shares every parse with `inputs`, so the stream below lets
     // none of them go.
     let mut copy = inputs.clone();
@@ -1339,6 +1589,7 @@ pub(crate) fn resolve_checkout_within(
         None,
         &workspace,
         budget,
+        bind_bytes,
         &mut |_, files| {
             resolved.extend(files);
             Ok(())
@@ -1393,6 +1644,7 @@ pub(crate) fn resolve_checkout_into(
     mut memory: Option<&mut Vec<(String, usize)>>,
     workspace: &Arc<aft_store::family::BuildScratch<super::checkout::DataError>>,
     budget: KeyOrderBudget,
+    bind_bytes: usize,
     sink: &mut (dyn FnMut(&CheckoutInputs, Vec<(String, FileResolution)>) -> Result<(), ManifestJoinError>
               + Send),
 ) -> Result<BuildCensus, ManifestJoinError> {
@@ -1423,36 +1675,49 @@ pub(crate) fn resolve_checkout_into(
     };
     crate::alloc_trace::install(&pool(threads)?, || {
         let paths = inputs.parses.keys().cloned().collect::<Vec<_>>();
-        let bound = BindCache::default();
+        // Bound files are kept up to a byte budget, and one read again after
+        // it was let go is bound again (see `BindCache::bounded`).
+        let bound = BindCache::bounded(bind_bytes);
         #[cfg(feature = "test-hooks")]
         super::refresh_probe::stage("binding");
-        // The whole-checkout lists read every parse, so they are built here,
-        // a batch at a time: each parse is decoded once, for its kinds, and
-        // kept until binding (which keeps none it decodes) has read it.
-        let mut lists = FileLists::default();
-        for batch in paths.chunks(BATCH) {
-            let parses = &inputs.parses;
-            let carry = crate::alloc_trace::carry();
-            let kinds = batch
-                .par_iter()
-                .map(|path| {
-                    let _label = carry.enter();
-                    FileLists::kinds(&parses[path].1)
-                })
-                .collect::<Vec<_>>();
-            bound.bind_missing(inputs, &refs(batch))?;
-            for (path, (rust, declaring)) in batch.iter().zip(kinds) {
-                if rust {
-                    lists.rust.push(path.clone());
+        // The whole-checkout lists read every parse's kinds: noted as each
+        // record was staged, or else read a batch at a time, each parse
+        // decoded without keeping it.
+        let kinds = match inputs.parses.staged_kinds() {
+            Some(kinds) => kinds,
+            None => {
+                let mut kinds = Vec::with_capacity(paths.len());
+                for batch in paths.chunks(BATCH) {
+                    let parses = &inputs.parses;
+                    let carry = crate::alloc_trace::carry();
+                    kinds.par_extend(batch.par_iter().map(|path| {
+                        let _label = carry.enter();
+                        parses
+                            .read(path)
+                            .map_or((false, false), |(_, parse)| FileLists::kinds(&parse))
+                    }));
                 }
-                if declaring {
-                    lists.module_declaring.push(path.clone());
-                }
+                kinds
             }
-            inputs.parses.release_decoded();
+        };
+        let mut lists = FileLists::default();
+        for (path, (rust, declaring)) in paths.iter().zip(kinds) {
+            if rust {
+                lists.rust.push(path.clone());
+            }
+            if declaring {
+                lists.module_declaring.push(path.clone());
+            }
         }
         bound.set_lists(lists);
+        // Resolving a Rust file asks each module's parent; with every
+        // module-declaring file bound once here, resolvers read the parents
+        // from one index instead of binding those files again.
+        let module_parents = bound.index_module_parents(inputs)?;
         relieve_allocator();
+        if let Some(memory) = memory.as_deref_mut() {
+            memory.push(("resolve.module_parents".to_string(), module_parents));
+        }
         lap(&mut memory, "bind");
         boundary(inputs)?;
         // Each batch's encoded resolutions go to the spool, one range per
@@ -1464,6 +1729,14 @@ pub(crate) fn resolve_checkout_into(
         super::refresh_probe::stage("resolution");
         for batch in paths.chunks(BATCH) {
             let parses = &inputs.parses;
+            // Pass 1 for the batch: each parse is decoded once and kept for
+            // the batch, and each file not bound yet is bound in parallel.
+            let carry = crate::alloc_trace::carry();
+            batch.par_iter().for_each(|path| {
+                let _label = carry.enter();
+                let _ = parses.get(path);
+            });
+            bound.bind_missing(inputs, &refs(batch))?;
             let resolved =
                 resolve_files_with(inputs, &bound, &refs(batch), &|path, resolution| {
                     let (_, parse) = &parses[path];
@@ -1485,6 +1758,12 @@ pub(crate) fn resolve_checkout_into(
             // parts below count only what they hold besides.
             let _ = inputs.parses.heap_bytes(&mut seen);
             memory.push(("resolve.bound".to_string(), bound.heap_bytes(&mut seen)));
+            let counts = bound.counts();
+            memory.extend([
+                ("resolve.bind_cache_bound".to_string(), counts.bound),
+                ("resolve.bind_cache_evicted".to_string(), counts.evicted),
+                ("resolve.bind_cache_held".to_string(), counts.held),
+            ]);
             memory.push((
                 "resolve.spooled_resolution_bytes".to_string(),
                 usize::try_from(spool.bytes()).unwrap_or(usize::MAX),
@@ -1660,6 +1939,22 @@ pub(crate) fn resolve_checkout_into(
     })
 }
 
+/// The byte budget of a cold build's bound files (see [`BindCache::bounded`]).
+/// VS Code's bound surfaces average about 58 KB a file, so the default keeps
+/// about 4,500 files: a batch of 1,024 and the files it reaches. With
+/// `test-hooks`, `AFT_CALLGRAPH_BUILD_CACHE_BYTES` sets it, so a tiny budget
+/// can be checked to give the same graph.
+pub(crate) fn bind_cache_bytes() -> usize {
+    #[cfg(feature = "test-hooks")]
+    if let Some(bytes) = std::env::var("AFT_CALLGRAPH_BUILD_CACHE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        return bytes;
+    }
+    256 << 20
+}
+
 /// Hands the allocator's free pages back to the system between a build's
 /// stages, so what a finished stage let go stops counting as the process's
 /// memory while the next stage runs.
@@ -1694,6 +1989,67 @@ mod batch_trim_tests {
         }
         assert_eq!(batch_trim_cadence(Some("1")), 1);
         assert_eq!(batch_trim_cadence(Some("4")), 4);
+    }
+}
+
+#[cfg(test)]
+mod bounded_bind_tests {
+    use std::rc::Rc;
+
+    use super::*;
+    use crate::callgraph_store::ResolverIndex as _;
+
+    /// Each module target's parent, read through a resolver index over
+    /// `bound`, for every Rust file of the fixture.
+    fn parents(
+        inputs: &CheckoutInputs,
+        bound: &BindCache,
+        targets: &[&str],
+    ) -> Vec<Option<(String, String)>> {
+        let facts = Rc::new(thread_facts(inputs));
+        let (index, _files) = resolver_index(inputs, bound, &facts);
+        targets
+            .iter()
+            .map(|target| index.module_parent(target))
+            .collect()
+    }
+
+    /// A bounded cache that keeps one file finds every module's parent in
+    /// the index built once over the module-declaring files, the parent the
+    /// unbounded cache's scan finds, without binding those files again.
+    #[test]
+    fn a_bounded_cache_reads_module_parents_from_its_index() {
+        let inputs = super::super::incremental_tests::checkout(
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+                ),
+                ("src/lib.rs", "pub mod a;\npub mod b;\n"),
+                ("src/a.rs", "pub mod c;\npub fn f() {}\n"),
+                ("src/a/c.rs", "pub fn g() {}\n"),
+                ("src/b.rs", "pub fn h() {}\n"),
+            ],
+            &[],
+        );
+        let targets = ["src/a.rs", "src/b.rs", "src/a/c.rs", "src/lib.rs"];
+        let scanned = parents(&inputs, &BindCache::default(), &targets);
+        assert_eq!(
+            scanned[0],
+            Some(("src/lib.rs".to_string(), "a".to_string())),
+            "the fixture declares its modules"
+        );
+        let bounded = BindCache::bounded(1);
+        assert_eq!(bounded.index_module_parents(&inputs).unwrap(), 3);
+        let declaring = bounded.counts().bound;
+        assert_eq!(declaring, 2, "lib.rs and a.rs declare modules");
+        assert_eq!(parents(&inputs, &bounded, &targets), scanned);
+        assert_eq!(
+            bounded.counts().bound,
+            declaring,
+            "no module-declaring file is bound again to find a parent"
+        );
+        assert!(bounded.counts().evicted >= 1, "one byte keeps one file");
     }
 }
 
@@ -1853,6 +2209,7 @@ pub(crate) fn resolve_files_with<T: Send>(
                 // one built here.
                 binding.clear_surface();
                 let dispatch = dispatch_targets(path, parse, index, facts)?;
+                files.release_held();
                 if let Some(error) = files.take_error() {
                     return Err(error);
                 }
@@ -2705,6 +3062,11 @@ aft_store::heap_bytes_of_fields!(CheckoutInputs {
     configs,
 });
 aft_store::heap_bytes_of_fields!(Parses { map });
+impl aft_store::heap::HeapBytes for StagedParse {
+    fn heap_bytes(&self, seen: &mut aft_store::heap::Seen) -> usize {
+        self.key.heap_bytes(seen) + self.records.heap_bytes(seen)
+    }
+}
 aft_store::heap_bytes_of_fields!(ParseSlot {
     value,
     stored,
@@ -2737,11 +3099,15 @@ aft_store::heap_bytes_of_fields!(FileLists {
     rust,
     module_declaring,
 });
-aft_store::heap_bytes_of_fields!(BindCache {
-    files,
-    lists,
-    bound_on_first_use
-});
+impl aft_store::heap::HeapBytes for BindCache {
+    fn heap_bytes(&self, seen: &mut aft_store::heap::Seen) -> usize {
+        self.files.heap_bytes(seen)
+            + self.lists.heap_bytes(seen)
+            + self.bound_on_first_use.heap_bytes(seen)
+            + self.module_parents.heap_bytes(seen)
+    }
+}
+aft_store::heap_bytes_none!(BoundEntry);
 aft_store::heap_bytes_of_fields!(OrdinaryCalls {
     syntax,
     associated,

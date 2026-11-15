@@ -883,7 +883,7 @@ pub(crate) struct ProjectIndex<'a> {
     crate_scans: std::cell::OnceCell<CrateScanMemo>,
     /// The lazy index overlays fresh caller extracts on stored rows. Its parent
     /// map and caller paths belong to that immutable snapshot, not the worker.
-    lazy_module_parents: std::cell::OnceCell<HashMap<String, (String, String)>>,
+    lazy_module_parents: std::cell::OnceCell<Arc<ModuleParents>>,
     lazy_inline_candidates: std::cell::OnceCell<RustInlineCandidates>,
     rust_caller_paths: RefCell<HashMap<String, Vec<String>>>,
     go_packages: RefCell<GoPackageMemo>,
@@ -1407,8 +1407,16 @@ impl ResolverIndex for ProjectIndex<'_> {
 }
 
 impl ProjectIndex<'_> {
-    fn lazy_module_parents(&self) -> &HashMap<String, (String, String)> {
+    fn lazy_module_parents(&self) -> &ModuleParents {
         self.lazy_module_parents.get_or_init(|| {
+            // A loader that keeps the parents indexed answers for every
+            // file it loads; an index with files of its own in memory scans,
+            // since those replace the loader's.
+            if self.files.is_empty() {
+                if let Some(parents) = self.lazy.as_ref().and_then(|lazy| lazy.module_parents()) {
+                    return parents;
+                }
+            }
             #[cfg(test)]
             rust_module_work::note(|work| work.parent_scans += 1);
             let mut parents = HashMap::new();
@@ -1421,7 +1429,7 @@ impl ProjectIndex<'_> {
                     CrateScanMemo::note_module_parents(&mut parents, &file, &index);
                 }
             }
-            parents
+            Arc::new(parents)
         })
     }
 
@@ -4592,6 +4600,23 @@ pub(crate) trait LoadedFileIndexes {
     fn rust_files(&self) -> Vec<String>;
     /// Every indexed file that declares a module, in no order.
     fn module_declaring_files(&self) -> Vec<String>;
+    /// For each declared module target, its parent: the smallest
+    /// `(declaring file, module name)` pair over every module-declaring
+    /// file, as [`note_module_parents`] keeps it. `None` when the loader
+    /// does not keep them, and the index binds every module-declaring file
+    /// to find them.
+    fn module_parents(&self) -> Option<Arc<ModuleParents>> {
+        None
+    }
+}
+
+/// Each declared module target's parent, `(declaring file, module name)`.
+pub(crate) type ModuleParents = HashMap<String, (String, String)>;
+
+/// Notes in `parents` every module `index`, the index of `file`, declares
+/// with a target, keeping each target's smallest parent.
+pub(crate) fn note_module_parents(parents: &mut ModuleParents, file: &str, index: &DbFileIndex) {
+    CrateScanMemo::note_module_parents(parents, file, index);
 }
 
 impl DbFileIndex {

@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use super::callgraph::{resolve_checkout_within, CheckoutInputs, FileResolution, KeyOrderBudget};
+use super::callgraph::{resolve_checkout_bounded, CheckoutInputs, FileResolution, KeyOrderBudget};
 use super::incremental::LiveCheckout;
 use super::incremental_tests::checkout;
 
@@ -15,22 +15,25 @@ use super::incremental_tests::checkout;
 /// runs with a budget of one byte, where every key is resolved on its own,
 /// every group with more than one key is shared by every thread, and the
 /// sites of every key with more than one go through a scratch file; and
-/// with a few keys per flush. Returns the file-reading resolution.
+/// with a few keys per flush. Bound files are kept up to the default
+/// budget, and up to one byte, where every file but the last bound is let go
+/// and bound again when read again. Returns the file-reading resolution.
 fn records_match_files(inputs: &CheckoutInputs) -> BTreeMap<String, FileResolution> {
     let reference = LiveCheckout::cold(inputs.clone())
         .unwrap()
         .resolved
         .to_map();
     let budgets = [
-        KeyOrderBudget::default(),
-        KeyOrderBudget::of_bytes(1),
-        KeyOrderBudget::of_bytes(4096),
+        (KeyOrderBudget::default(), 256 << 20),
+        (KeyOrderBudget::default(), 1),
+        (KeyOrderBudget::of_bytes(1), 1),
+        (KeyOrderBudget::of_bytes(4096), 256 << 20),
     ];
-    for (threads, budget) in [1, 4]
+    for (threads, (budget, bind_bytes)) in [1, 4]
         .into_iter()
         .flat_map(|threads| budgets.map(|budget| (threads, budget)))
     {
-        let records = resolve_checkout_within(inputs, threads, budget).unwrap();
+        let records = resolve_checkout_bounded(inputs, threads, budget, bind_bytes).unwrap();
         assert_eq!(
             records.keys().collect::<Vec<_>>(),
             reference.keys().collect::<Vec<_>>()
@@ -39,13 +42,16 @@ fn records_match_files(inputs: &CheckoutInputs) -> BTreeMap<String, FileResoluti
             let theirs = &reference[path];
             assert_eq!(
                 ours.sites, theirs.sites,
-                "{path}: sites ({threads} threads, {budget:?})"
+                "{path}: sites ({threads} threads, {budget:?}, {bind_bytes} bind bytes)"
             );
             assert_eq!(
                 ours.site_dependencies, theirs.site_dependencies,
-                "{path}: site dependencies ({threads} threads, {budget:?})"
+                "{path}: site dependencies ({threads} threads, {budget:?}, {bind_bytes} bind bytes)"
             );
-            assert_eq!(ours, theirs, "{path} ({threads} threads, {budget:?})");
+            assert_eq!(
+                ours, theirs,
+                "{path} ({threads} threads, {budget:?}, {bind_bytes} bind bytes)"
+            );
         }
     }
     reference

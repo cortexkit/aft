@@ -1851,6 +1851,7 @@ impl Checkout {
             measure.then_some(&mut report.memory),
             &scratch,
             super::callgraph::KeyOrderBudget::configured(),
+            super::callgraph::bind_cache_bytes(),
             &mut |inputs, files| {
                 sections
                     .add_batch(inputs, files)
@@ -5135,9 +5136,12 @@ enum StagedKind {
     /// reads from memory.
     Config(Arc<[u8]>),
     /// A parsed file's record, and whether its parse converts for the call
-    /// graph; one that does not is left out of the resolver's inputs.
+    /// graph (one that does not is left out of the resolver's inputs), with
+    /// the parse's kinds the resolver lists files by
+    /// ([`super::callgraph::list_kinds`]).
     Parsed {
         converts: bool,
+        kinds: (bool, bool),
     },
     Markers,
 }
@@ -5146,8 +5150,15 @@ impl StagedKind {
     fn of(record: &ContentRecord) -> Self {
         match &record.data {
             RecordBody::Config { source } => Self::Config(Arc::from(source.as_slice())),
-            RecordBody::Parsed { .. } => Self::Parsed {
-                converts: matches!(blob_from_record(record), Ok(CallgraphBlob::Parse(_))),
+            RecordBody::Parsed { .. } => match blob_from_record(record) {
+                Ok(CallgraphBlob::Parse(parse)) => Self::Parsed {
+                    converts: true,
+                    kinds: super::callgraph::list_kinds(&parse),
+                },
+                _ => Self::Parsed {
+                    converts: false,
+                    kinds: (false, false),
+                },
             },
             RecordBody::Markers => Self::Markers,
         }
@@ -5455,12 +5466,26 @@ impl Collected {
                 StagedKind::Config(source) => {
                     configs.insert(record.path.clone(), Arc::clone(source));
                 }
-                StagedKind::Parsed { converts: true } => {
+                StagedKind::Parsed {
+                    converts: true,
+                    kinds,
+                } => {
                     if let Ok(path) = std::str::from_utf8(&record.path) {
-                        parses.push((path.to_string(), parse_key, entry.at));
+                        parses.push((
+                            path.to_string(),
+                            super::callgraph::StagedParse {
+                                key: parse_key,
+                                at: entry.at,
+                                kinds: *kinds,
+                                records: Arc::clone(&records),
+                            },
+                        ));
                     }
                 }
-                StagedKind::Parsed { converts: false } | StagedKind::Markers => {}
+                StagedKind::Parsed {
+                    converts: false, ..
+                }
+                | StagedKind::Markers => {}
             }
         }
         let units = entries
@@ -5470,7 +5495,7 @@ impl Collected {
         (
             CheckoutInputs {
                 state: state.clone(),
-                parses: super::callgraph::Parses::staged(parses, &records),
+                parses: super::callgraph::Parses::staged(parses),
                 configs,
             },
             InputsContent::Staged(super::graph_store::StagedContent { records, units }),
