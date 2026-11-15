@@ -768,15 +768,35 @@ pub(super) fn canonicalize_review_thread(
 /// Read `gh api graphql` argv that sends one review-thread mutation.
 ///
 /// Admitted: the `graphql` endpoint, an optional `POST` method, one inline
-/// `query` field, and the one variable the document uses for the thread id.
-/// Anything else (`--input`, headers, output flags, other variables, a typed
-/// field gh would expand or read from a file) is refused, because the bytes
-/// gh would send must be the bytes inspected here.
+/// `query` field, the one variable the document uses for the thread id, and at
+/// most one `--repo`/`-R` naming the repository. Anything else (`--input`,
+/// headers, output flags, other variables, a typed field gh would expand or
+/// read from a file) is refused, because the bytes gh would send must be the
+/// bytes inspected here.
+///
+/// The repository is not part of the GraphQL request. It selects the bot
+/// binding, and the route holder refuses the request unless the thread
+/// belongs to a pull request in that repository. It is also how the shim
+/// freezes the repository it resolved into the invocation the relay checks
+/// again in another process (`attach_invocation`), so refusing it here would
+/// make that check refuse every review-thread mutation.
 pub(super) fn review_thread_mutation(args: &[OsString]) -> Result<ReviewThreadMutation, String> {
+    let full = args;
     let args = api_args(args).ok_or("not a gh api invocation")?;
+    // Only the one repository read below may name the binding. A `--repo`
+    // before the verb is skipped by the command reader, so a second one there
+    // could select a binding this reader never compared.
+    if full[..full.len() - args.len()].iter().any(|arg| {
+        arg.to_str().is_none_or(|value| {
+            matches!(value, "--repo" | "-R") || attached_repo_value(value).is_some()
+        })
+    }) {
+        return Err("name the repository after `api graphql`, once".into());
+    }
     let mut query = None;
     let mut variables = BTreeMap::<String, String>::new();
     let mut endpoint_seen = false;
+    let mut repository_seen = false;
     let mut index = 1;
     while index < args.len() {
         let value = args[index]
@@ -785,6 +805,25 @@ pub(super) fn review_thread_mutation(args: &[OsString]) -> Result<ReviewThreadMu
         index += 1;
         if matches!(value, "graphql" | "/graphql") && !endpoint_seen {
             endpoint_seen = true;
+            continue;
+        }
+        let repository = if matches!(value, "--repo" | "-R") {
+            index += 1;
+            Some(
+                args.get(index - 1)
+                    .and_then(|arg| arg.to_str())
+                    .ok_or_else(|| format!("{value} requires a value"))?,
+            )
+        } else {
+            attached_repo_value(value)
+        };
+        if let Some(repository) = repository {
+            if std::mem::replace(&mut repository_seen, true) {
+                return Err("a review-thread mutation names one repository".into());
+            }
+            if canonical_repository_key(repository).is_none() {
+                return Err(format!("repository {repository} is not owner/name"));
+            }
             continue;
         }
         let method = if matches!(value, "-X" | "--method") {
