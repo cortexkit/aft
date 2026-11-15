@@ -1065,6 +1065,7 @@ pub fn impact_result(
     depth: usize,
     include_tests: bool,
 ) -> StoreAdapterResult<StoreImpactResult> {
+    let profile_start = std::time::Instant::now();
     let target = resolve_symbol_query(store, file, symbol)?;
     let effective_depth = depth.max(1);
     let mut visited = HashMap::new();
@@ -1076,6 +1077,8 @@ pub fn impact_result(
         &target.representative.symbol,
         effective_depth,
     )?;
+    eprintln!("IMPACT prefetch_ms={}", profile_start.elapsed().as_millis());
+    let phase = std::time::Instant::now();
 
     collect_callers_recursive(
         &callers_by_symbol,
@@ -1087,8 +1090,12 @@ pub fn impact_result(
         &mut sites,
         &mut boundary,
     )?;
+    eprintln!("IMPACT recursion_ms={} sites={} visited={} boundary={}", phase.elapsed().as_millis(), sites.len(), visited.len(), boundary.len());
+    let phase = std::time::Instant::now();
     let (depth_limited, truncated, boundary_counts) =
         omitted_boundary_callers(store, boundary, &visited)?;
+    eprintln!("IMPACT boundary_ms={}", phase.elapsed().as_millis());
+    let phase = std::time::Instant::now();
 
     let mut sites = dedup_call_sites(sites);
     sites.sort_by(|left, right| {
@@ -1113,6 +1120,8 @@ pub fn impact_result(
         .iter()
         .filter(|site| site.kind == "callback_ref")
         .count();
+    eprintln!("IMPACT dedup_ms={}", phase.elapsed().as_millis());
+    let phase = std::time::Instant::now();
 
     // Which affected callers are roots: nothing calls them, by the edges
     // this answer lists (calls and callback references). A caller whose own
@@ -1139,6 +1148,8 @@ pub fn impact_result(
         }
         root_kinds.insert(key, kind);
     }
+    eprintln!("IMPACT roots_ms={}", phase.elapsed().as_millis());
+    let phase = std::time::Instant::now();
 
     let summarize = hub_selector_activated(post_filter_count);
     let affected_files = visible_sites
@@ -1248,7 +1259,7 @@ pub fn impact_result(
             .then(left.line.cmp(&right.line))
     });
 
-    Ok(StoreImpactResult {
+    let result = StoreImpactResult {
         callback_dependencies,
         callback_reference_label: (callback_dependencies > 0).then_some(CALLBACK_REFERENCE_LABEL),
         test_filter_note,
@@ -1271,7 +1282,9 @@ pub fn impact_result(
         depth_limited,
         truncated,
         sites_list_envelope,
-    })
+    };
+    eprintln!("IMPACT assembly_ms={} total_ms={}", phase.elapsed().as_millis(), profile_start.elapsed().as_millis());
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -2853,7 +2866,10 @@ fn prefetch_callers(
         if targets.is_empty() {
             break;
         }
+        let phase = std::time::Instant::now();
+        eprintln!("IMPACT depth={} targets={} begin", depth + 1, targets.len());
         let fetched = store.direct_callers_for_symbols(&targets)?;
+        eprintln!("IMPACT depth={} sites={} ms={}", depth + 1, fetched.values().map(Vec::len).sum::<usize>(), phase.elapsed().as_millis());
         let mut next_frontier = BTreeSet::new();
         if depth + 1 < max_depth {
             for site in fetched.values().flatten() {
