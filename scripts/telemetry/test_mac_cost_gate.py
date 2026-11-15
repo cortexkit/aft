@@ -206,6 +206,7 @@ class ContaminationTests(unittest.TestCase):
 
 class WrapperTests(unittest.TestCase):
     def exercise(self, root, *, grant=True, fail=False, contaminate=False, now=NOW, build_delay=False):
+        root = root.resolve()
         script_dir = root / "checkout" / "scripts" / "telemetry"
         script_dir.mkdir(parents=True)
         baseline = {"schema": 1, "measured_on": {"platform": "linux-x86_64"}, "repos": {}}
