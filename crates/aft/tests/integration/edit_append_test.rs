@@ -156,7 +156,7 @@ fn append_tool_reports_nested_markdown_creation_and_identical_write() {
         "append wrote the file but failed: {response:#}"
     );
     assert_eq!(response["created"], true, "{response:#}");
-    assert_eq!(response["syntax_valid"], true, "{response:#}");
+    assert!(response.get("syntax_valid").is_none(), "{response:#}");
     assert!(
         response["text"]
             .as_str()
@@ -182,7 +182,7 @@ fn append_tool_reports_markdown_creation_with_existing_parent() {
     );
     assert_eq!(response["success"], true, "{response:#}");
     assert_eq!(response["created"], true, "{response:#}");
-    assert_eq!(response["syntax_valid"], true, "{response:#}");
+    assert!(response.get("syntax_valid").is_none(), "{response:#}");
     assert_eq!(response["bytes_written"], "# New file\n".len());
     assert_eq!(fs::read_to_string(&target).unwrap(), "# New file\n");
     assert!(aft.shutdown().success());
@@ -203,7 +203,7 @@ fn append_tool_reports_existing_markdown_append() {
     );
     assert_eq!(response["success"], true, "{response:#}");
     assert_eq!(response["created"], false, "{response:#}");
-    assert_eq!(response["syntax_valid"], true, "{response:#}");
+    assert!(response.get("syntax_valid").is_none(), "{response:#}");
     assert_eq!(response["bytes_written"], "\nMore text.\n".len());
     assert_eq!(
         fs::read_to_string(&target).unwrap(),

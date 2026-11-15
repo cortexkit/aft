@@ -167,6 +167,7 @@ fn make_callers_result(count: usize, depth_limited: bool, truncated: usize) -> S
     let callers_list_envelope = build_callgraph_envelope(Unit::Items, shown, count, truncated);
 
     StoreCallersResult {
+        unresolved_callers: None,
         callback_dependencies: 0,
         callback_reference_label: None,
         test_filter_note: None,

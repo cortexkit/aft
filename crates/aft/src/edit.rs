@@ -1154,9 +1154,13 @@ pub fn validate_syntax_with_parser(
 ///
 /// Uses a worker-local reusable parser to validate the proposed content.
 /// Returns `None` for
-/// unsupported languages, `Some(true)` for valid, `Some(false)` for invalid.
+/// unsupported languages and Markdown prose, `Some(true)` for valid,
+/// `Some(false)` for invalid.
 pub fn validate_syntax_str(content: &str, path: &Path) -> Option<bool> {
     let lang = detect_language(path)?;
+    if lang == LangId::Markdown {
+        return None;
+    }
     let tree = parse_source_with_cached_parser(path, content, lang).ok()?;
     Some(first_tree_syntax_error_line(&tree, content, lang).is_none())
 }
@@ -1167,7 +1171,7 @@ pub fn validate_syntax_str(content: &str, path: &Path) -> Option<bool> {
 /// path validates it. Outline keeps using [`validate_syntax`]: it only needs
 /// to know whether tree-sitter could recover the symbols.
 pub(crate) fn validate_edited_file_syntax(path: &Path) -> Result<Option<bool>, AftError> {
-    if detect_language(path).is_none() {
+    if matches!(detect_language(path), None | Some(LangId::Markdown)) {
         return Ok(None);
     }
     let verdict = validate_syntax(path)?;
@@ -1817,7 +1821,10 @@ pub fn compute_reformatted_excerpt(
 /// Returned by `write_format_validate` to give callers a single struct
 /// with all post-write signals for the response JSON.
 pub struct WriteResult {
-    /// Whether syntax validation passed. `None` if unsupported or unconfirmed.
+    /// A specific rendering hint, never a Markdown parse verdict or rollback reason.
+    pub markdown_table_advisory: Option<String>,
+    /// Whether syntax validation passed. `None` for Markdown prose, unsupported
+    /// languages, or unconfirmed syntax.
     pub syntax_valid: Option<bool>,
     /// Why a created file's compiler confirmation could not establish validity.
     pub syntax_skipped_reason: Option<&'static str>,
@@ -1905,6 +1912,9 @@ impl WriteResult {
     /// added.
     pub fn append_lsp_diagnostics_to(&self, result: &mut serde_json::Value) {
         result["rolled_back"] = serde_json::json!(self.rolled_back);
+        if let Some(advisory) = &self.markdown_table_advisory {
+            result["markdown_table_advisory"] = serde_json::json!(advisory);
+        }
         self.append_write_warnings_to(result);
 
         let Some(outcome) = self.lsp_outcome.as_ref() else {
@@ -2344,6 +2354,9 @@ fn write_format_validate_impl(
 
     crate::run_tool_call::progress::report();
     Ok(WriteResult {
+        markdown_table_advisory: final_text
+            .as_ref()
+            .and_then(|observed| markdown_table_advisory(path, &observed.text)),
         syntax_valid,
         syntax_skipped_reason,
         syntax_error_line,
@@ -2377,12 +2390,105 @@ fn parse_captured_syntax_with_lang(
     source: &str,
 ) -> Option<(tree_sitter::Tree, LangId)> {
     let lang = detect_language(path)?;
+    // Markdown renderers recover from block-grammar errors. They do not make
+    // the document invalid or justify undoing a prose edit.
+    if lang == LangId::Markdown {
+        return None;
+    }
     #[cfg(test)]
     A03_SYNTAX_PARSES.with(|count| count.set(count.get() + 1));
     let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Syntax);
     crate::parser::parse_source_with_cached_parser(path, source, lang)
         .ok()
         .map(|tree| (tree, lang))
+}
+
+/// Name the first table row containing an unescaped pipe inside a paired code
+/// span. GitHub-flavored Markdown splits cells at these pipes even inside
+/// backticks; ordinary cell delimiters and recoverable Markdown parser errors
+/// are not defects by themselves.
+pub(crate) fn markdown_table_advisory(path: &Path, source: &str) -> Option<String> {
+    if detect_language(path) != Some(LangId::Markdown) {
+        return None;
+    }
+    let tree = parse_source_with_cached_parser(path, source, LangId::Markdown).ok()?;
+    let lines: Vec<_> = source.lines().collect();
+    let mut cursor = tree.walk();
+    loop {
+        let node = cursor.node();
+        if matches!(node.kind(), "pipe_table_row" | "pipe_table_header") {
+            let row = node.start_position().row;
+            if lines
+                .get(row)
+                .is_some_and(|line| code_span_has_unescaped_pipe(line))
+            {
+                return Some(format!(
+                    "Markdown table at line {}: an unescaped `|` inside a cell splits it",
+                    row + 1,
+                ));
+            }
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return None;
+            }
+        }
+    }
+}
+
+fn code_span_has_unescaped_pipe(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let escaped = |index: usize| {
+        bytes[..index]
+            .iter()
+            .rev()
+            .take_while(|byte| **byte == b'\\')
+            .count()
+            % 2
+            == 1
+    };
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'`' || escaped(index) {
+            index += 1;
+            continue;
+        }
+        let open = index;
+        while index < bytes.len() && bytes[index] == b'`' {
+            index += 1;
+        }
+        let width = index - open;
+        let content_start = index;
+        let mut closed = false;
+        let mut pipe = false;
+        while index < bytes.len() {
+            if bytes[index] == b'|' && !escaped(index) {
+                pipe = true;
+            }
+            if bytes[index] == b'`' {
+                let close = index;
+                while index < bytes.len() && bytes[index] == b'`' {
+                    index += 1;
+                }
+                if index - close == width {
+                    if pipe {
+                        return true;
+                    }
+                    closed = true;
+                    break;
+                }
+            } else {
+                index += 1;
+            }
+        }
+        if !closed {
+            index = content_start;
+        }
+    }
+    false
 }
 
 /// Syntax verdict for a file the current call created.
@@ -2503,6 +2609,20 @@ thread_local! {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn markdown_parser_errors_are_not_edit_syntax_verdicts() {
+        let source = "| a | b |\n|---|---|\n| x | x || y |\n";
+        let path = Path::new("report.md");
+        let tree = parse_source_with_cached_parser(path, source, LangId::Markdown).unwrap();
+        assert!(
+            tree.root_node().has_error(),
+            "fixture must exercise a parser error"
+        );
+        assert_eq!(validate_syntax_str(source, path), None);
+        assert_eq!(validate_captured_syntax(path, source), None);
+        assert_eq!(markdown_table_advisory(path, source), None);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn swift_parser_accepts_tuple_metatype() {

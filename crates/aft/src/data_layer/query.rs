@@ -1025,6 +1025,54 @@ impl<S: SliceSource> CallGraphRead for SliceReader<S> {
             .collect())
     }
 
+    fn unresolved_call_sites_named(
+        &self,
+        name: &str,
+        language: LangId,
+        include_tests: bool,
+        limit: usize,
+    ) -> Result<(usize, Vec<StoreRefSite>)> {
+        let mut total = 0;
+        let mut sites = Vec::new();
+        self.visit_unresolved_spans(
+            lang_label(language),
+            Some(name),
+            false,
+            |file, _, references, slice| {
+                let first = references
+                    .iter()
+                    .map(|index| slice.reference(*index as usize))
+                    .filter(|reference| {
+                        include_tests
+                            || (!crate::inspect::job::is_test_file(file)
+                                && !reference
+                                    .caller()
+                                    .and_then(|handle| slice.node(handle))
+                                    .and_then(|node| node.is_test())
+                                    .unwrap_or(false))
+                    })
+                    .min_by_key(|reference| reference.ordinal());
+                if let Some(first) = first {
+                    total += 1;
+                    // The visitor walks sorted paths and byte spans, so this
+                    // bounded prefix is also ordered by path and line.
+                    if sites.len() < limit {
+                        let caller = first.caller().and_then(|handle| slice.node(handle));
+                        sites.push(StoreRefSite {
+                            is_test: caller.and_then(|node| node.is_test()),
+                            file: file.to_string(),
+                            caller_symbol: caller.map(|node| node.scoped_name().to_string()),
+                            line: first.line(),
+                            local_name: None,
+                        });
+                    }
+                }
+                ControlFlow::Continue(())
+            },
+        );
+        Ok((total, sites))
+    }
+
     fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
         Ok(self.count_unresolved(language, include_tests, None))
     }

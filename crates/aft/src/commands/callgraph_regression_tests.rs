@@ -206,13 +206,14 @@ fn callgraph_python_import_forms_and_unrelated_names() {
     let unrelated = callers(&store, "unrelated.py", "f", true);
     assert!(unrelated.starts_with("Incomplete:"), "{unrelated}");
     assert!(unrelated.contains("analyzed Python code"), "{unrelated}");
+    assert!(unrelated.contains("No resolved callers;"), "{unrelated}");
     assert!(
-        unrelated.ends_with("0 callers · 0 file groups"),
+        unrelated.contains("possible callers, targets not confirmed"),
         "{unrelated}"
     );
     let method = callers(&store, "method_only.py", "Only::f", true);
     assert!(method.starts_with("Incomplete:"), "{method}");
-    assert!(method.ends_with("0 callers · 0 file groups"), "{method}");
+    assert!(method.contains("No resolved callers;"), "{method}");
 }
 
 #[test]
@@ -405,6 +406,60 @@ fn callgraph_zero_callers_discloses_unresolved_sites_but_clean_zero_stays_clean(
     assert_eq!(
         callers(&store, "main.ts", "unused", false),
         "0 callers · 0 file groups"
+    );
+}
+
+#[test]
+fn callgraph_zero_callers_lists_same_name_candidates_with_exact_text() {
+    for (a_calls, z_calls, expected) in [
+        (0, 1, "No resolved callers; 1 unresolved call sites name `target` (possible callers, targets not confirmed).\n  z.py:4 — late"),
+        (2, 1, "No resolved callers; 3 unresolved call sites name `target` (possible callers, targets not confirmed).\n  a.py:4 — early\n  a.py:5 — early\n  z.py:4 — late"),
+        (4, 3, "No resolved callers; 7 unresolved call sites name `target` (possible callers, targets not confirmed).\n  a.py:4 — early\n  a.py:5 — early\n  a.py:6 — early\n  a.py:7 — early\n  z.py:4 — late\n2 more unresolved call sites.\nshown 5 of 7 sites (cap) · narrow: includeTests"),
+    ] {
+        let a = format!("from missing import target\n\ndef early():\n{}", "    target()\n".repeat(a_calls));
+        let z = format!("from missing import target\n\ndef late():\n{}    unrelated()\n", "    target()\n".repeat(z_calls));
+        let (_temp, store) = fixture(&[
+            ("target.py", "def target():\n    pass\n"),
+            ("z.py", &z),
+            ("a.py", &a),
+            ("tests/test_calls.py", "from missing import target\n\ndef test_hidden():\n    target()\n"),
+            ("other.ts", "function other() { target(); }\n"),
+        ]);
+        let general = format!("Incomplete: {} call sites in the analyzed Python code could not be resolved, so a dynamic or indirect call may still reach `target`.", a_calls + z_calls + 1);
+        assert_eq!(callers(&store, "target.py", "target", false), format!("{general}\n{expected}"));
+        let with_tests = callers_result(&store.callgraph(), Path::new("target.py"), "target", 1, true).unwrap();
+        assert_eq!(with_tests.unresolved_callers.unwrap().total, a_calls + z_calls + 1);
+    }
+}
+
+#[test]
+fn callgraph_zero_callers_named_total_is_not_the_general_warning_cap() {
+    let source = format!(
+        "from missing import target\n\ndef unknown():\n{}",
+        "    target()\n".repeat(1_017)
+    );
+    let (_temp, store) = fixture(&[
+        ("target.py", "def target():\n    pass\n"),
+        ("unknown.py", &source),
+    ]);
+    let result = callers_result(
+        &store.callgraph(),
+        Path::new("target.py"),
+        "target",
+        1,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        result.incomplete.as_ref().unwrap().unresolved_call_sites,
+        1_000
+    );
+    let candidates = result.unresolved_callers.unwrap();
+    assert_eq!(candidates.total, 1_017);
+    assert_eq!(candidates.sites.len(), 5);
+    assert_eq!(
+        candidates.sites_list_envelope.unwrap().total,
+        crate::list_envelope::Total::Exact(1_017)
     );
 }
 

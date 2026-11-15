@@ -528,6 +528,19 @@ pub trait CallGraphRead {
         let _ = (name, language);
         Ok(Vec::new())
     }
+    /// Count all unresolved invocation spans with this name and return up to
+    /// `limit` locations, ordered by file and source position. Unlike the
+    /// general warning count, this total is exact and respects the test filter.
+    fn unresolved_call_sites_named(
+        &self,
+        name: &str,
+        language: LangId,
+        include_tests: bool,
+        limit: usize,
+    ) -> Result<(usize, Vec<StoreRefSite>)> {
+        let _ = (name, language, include_tests, limit);
+        Ok((0, Vec::new()))
+    }
     /// Count unresolved invocation sites, stopping at `UNRESOLVED_CALL_SITE_COUNT_LIMIT`.
     /// A count at the limit is a lower bound, not an exact total.
     fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
@@ -1743,6 +1756,15 @@ impl<T: CallGraphRead + ?Sized> CallGraphRead for Arc<T> {
     }
     fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
         (**self).unresolved_call_site_count(language, include_tests)
+    }
+    fn unresolved_call_sites_named(
+        &self,
+        name: &str,
+        language: LangId,
+        include_tests: bool,
+        limit: usize,
+    ) -> Result<(usize, Vec<StoreRefSite>)> {
+        (**self).unresolved_call_sites_named(name, language, include_tests, limit)
     }
     fn unresolved_call_site_count_named(
         &self,

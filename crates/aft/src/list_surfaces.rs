@@ -106,6 +106,19 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
     SurfaceEntry {
         requires: None,
         command: "callgraph",
+        mode: "callers",
+        list_id: "payload.unresolved_callers.sites",
+        unit: Unit::Sites,
+        narrow: &["includeTests"],
+        reasons: &[ReasonEntry {
+            reason: Reason::Cap,
+            kind: ReasonKind::Selecting,
+            predicate_name: "UNRESOLVED_CALLER_SITES_LIMIT, unresolved_call_sites_named: sites.len() < limit",
+        }],
+    },
+    SurfaceEntry {
+        requires: None,
+        command: "callgraph",
         mode: "call_tree",
         list_id: "payload.tree",
         unit: Unit::Items,
