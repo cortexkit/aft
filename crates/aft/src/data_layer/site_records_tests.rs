@@ -314,19 +314,16 @@ fn an_untyped_call_from_many_files_is_resolved_once_per_language() {
             "{path}: {:?}",
             resolved[path].site_dependencies
         );
-        assert!(targets(&resolved, path, "dispose")
-            .iter()
-            .all(|(file, _, _)| file == "src/a.ts"));
     }
     let javascript = &resolved["lib/use.js"];
     assert_eq!(javascript.sites.len(), 1);
     assert_eq!(javascript.sites[0].site.member.as_deref(), Some("dispose"));
     assert!(javascript.site_dependencies.contains("m:dispose"));
-    let javascript_targets = targets(&resolved, "lib/use.js", "dispose");
-    assert!(!javascript_targets.is_empty());
-    assert!(javascript_targets
-        .iter()
-        .all(|(file, _, _)| file == "lib/b.js"));
+    // An untyped JavaScript receiver protects methods without claiming a callee.
+    let answer = &javascript.sites[0].resolution;
+    assert!(answer.targets.is_empty());
+    assert!(!answer.protected.is_empty());
+    assert!(answer.protected.iter().all(|(file, _)| file == "lib/b.js"));
 }
 
 /// The same comparison on a real tree, named by `AFT_SITE_RECORDS_ROOT`:

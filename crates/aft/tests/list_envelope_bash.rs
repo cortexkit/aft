@@ -561,7 +561,7 @@ fn cargo_failed_output(trailing: Option<&str>) -> String {
 #[test]
 fn cargo_failure_messages_survive_completion_preview_and_bash_output_envelope() {
     use aft::bash_background::output::{
-        cap_completion_output_with_marker, COMPLETION_FAILURE_PREVIEW_BYTES,
+        cap_completion_output, cap_completion_output_with_marker, COMPLETION_FAILURE_PREVIEW_BYTES,
     };
 
     let input = include_str!(
@@ -573,8 +573,16 @@ fn cargo_failure_messages_survive_completion_preview_and_bash_output_envelope() 
     // detail budget leaves room for the recovery marker, so failures are not cut.
     let marker = "[truncated output; +8 more warnings; full output: read \"/work/bash-tasks/job/io/stdout\"]";
     assert!(result.text.len() <= aft::bash_background::output::COMPLETION_FAILURE_TAIL_BYTES);
+    let unmarked = cap_completion_output(&result.text, false);
+    assert!(!unmarked.truncated);
+    assert_eq!(unmarked.text, result.text);
     let preview = cap_completion_output_with_marker(&result.text, marker, false);
-    assert!(!preview.truncated);
+    // A supplied marker sets the flag even when no command bytes are cut.
+    assert!(preview.truncated);
+    assert_eq!(
+        preview.text,
+        format!("{}\n{marker}", result.text.trim_end())
+    );
     assert!(preview.text.len() <= COMPLETION_FAILURE_PREVIEW_BYTES);
     let mut rendered = format!("Remote execution: linux\n{}", preview.text);
     for message in [

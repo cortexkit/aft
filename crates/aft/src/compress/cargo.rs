@@ -963,9 +963,13 @@ mod tests {
     #[test]
     fn cargo_test_preserves_same_failure_name_from_two_binaries() {
         let binary = "running 1 test\ntest tests::foo ... FAILED\n\nfailures:\n\n---- tests::foo stdout ----\nthread 'tests::foo' panicked at src/lib.rs:1:1:\nassertion failed\n\nfailures:\n    tests::foo\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n";
-        let raw = format!("{binary}{binary}error: test failed, to rerun pass `--lib`\n");
+        let raw = format!(
+            "{}{binary}{binary}error: test failed, to rerun pass `--lib`\n",
+            "   Compiling fixture v0.1.0\n".repeat(80)
+        );
         let registry = build_registry(builtin_filters::ALL, None, None);
         let result = compress_with_registry_exit_code("cargo test", &raw, Some(101), &registry);
+        assert!(result.bounded_cargo_test_details);
         assert_eq!(
             result
                 .text
@@ -996,22 +1000,26 @@ mod tests {
 
     #[test]
     fn cargo_test_printed_failure_header_is_not_a_failure_list() {
-        let raw = "running 1 test\ntest tests::foo ... FAILED\n\nfailures:\n\n---- tests::foo stdout ----\nthread 'tests::foo' panicked at src/lib.rs:1:1:\nfailures:\nnot_a_test\n\nfailures:\n    tests::foo\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\nerror: test failed, to rerun pass `--lib`\n";
+        let raw = format!("{}running 1 test\ntest tests::foo ... FAILED\n\nfailures:\n\n---- tests::foo stdout ----\nthread 'tests::foo' panicked at src/lib.rs:1:1:\nfailures:\nnot_a_test\n\nfailures:\n    tests::foo\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\nerror: test failed, to rerun pass `--lib`\n", "   Compiling fixture v0.1.0\n".repeat(80));
         let registry = build_registry(builtin_filters::ALL, None, None);
-        let result = compress_with_registry_exit_code("cargo test", raw, Some(101), &registry);
+        let result = compress_with_registry_exit_code("cargo test", &raw, Some(101), &registry);
+        assert!(result.bounded_cargo_test_details);
         assert!(
             result.text.contains("failures:\nnot_a_test\n"),
             "{}",
             result.text
         );
         assert!(!result.text.lines().any(|line| line == "    not_a_test"));
-        assert_eq!(failure_name_counts(raw).len(), 1);
-        assert_eq!(failure_name_counts(raw).get("tests::foo"), Some(&[1, 1, 1]));
+        assert_eq!(failure_name_counts(&raw).len(), 1);
+        assert_eq!(
+            failure_name_counts(&raw).get("tests::foo"),
+            Some(&[1, 1, 1])
+        );
         assert_eq!(
             failure_name_counts(&result.text).get("tests::foo"),
             Some(&[0, 1, 1])
         );
-        assert!(failure_summary_preserved(raw, &result.text));
+        assert!(failure_summary_preserved(&raw, &result.text));
     }
 
     #[test]
