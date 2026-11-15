@@ -22,7 +22,17 @@ pub(crate) fn prepare(
 pub(crate) fn error_response(id: &str, error: &AftError) -> crate::protocol::Response {
     let mut response = crate::protocol::Response::error(id, error.code(), error.to_string());
     response.data = error.to_error_json();
+    if is_grammar_error(error) {
+        response.data["complete"] = false.into();
+    }
     response
+}
+
+pub(crate) fn is_grammar_error(error: &AftError) -> bool {
+    matches!(
+        error,
+        AftError::GrammarUnavailable { .. } | AftError::GrammarParseTimeout { .. }
+    )
 }
 
 /// Starting a scan's Luau extraction is the download trigger. The parser
@@ -36,20 +46,15 @@ pub(super) fn request(language: &str) -> Result<(), ManifestJoinError> {
     Ok(())
 }
 
-/// Persist only typed, bounded host-owned fields. Timeout paths are supplied
-/// by the checkout when displayed, not embedded in every reason string.
+/// Persist only stable codes. Messages, retry countdowns and timeout budgets
+/// belong to the handling process and are reconstructed when a reply is made.
 pub(super) fn reason(error: &ManifestJoinError) -> Option<String> {
     let value = match error {
         ManifestJoinError::GrammarUnavailable(error) => {
-            AftError::from(error.clone()).to_error_json()
+            serde_json::json!({"code": "grammar_unavailable", "state": error.state})
         }
-        ManifestJoinError::GrammarParseTimeout {
-            language,
-            timeout_ms,
-            ..
-        } => {
-            serde_json::json!({"code": "grammar_parse_timeout", "language": language,
-                "state": "parse_timeout", "timeout_ms": timeout_ms})
+        ManifestJoinError::GrammarParseTimeout { .. } => {
+            serde_json::json!({"code": "grammar_parse_timeout", "state": "parse_timeout"})
         }
         _ => return None,
     };
@@ -61,43 +66,49 @@ pub(super) fn reason(error: &ManifestJoinError) -> Option<String> {
     Some(reason)
 }
 
-pub(super) fn message(reason: &str, path: &std::path::Path) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(reason).ok()?;
-    if value["code"] == "grammar_parse_timeout" {
-        return Some(
-            AftError::GrammarParseTimeout {
+/// One non-blocking registry observation shared by every gap in a reply.
+#[derive(Default)]
+pub(crate) struct GapReply {
+    unavailable: Option<crate::grammar::GrammarUnavailable>,
+}
+
+impl GapReply {
+    pub(crate) fn capture() -> Self {
+        #[cfg(feature = "wasm-grammars")]
+        let unavailable = crate::grammar::registry().status_snapshot();
+        #[cfg(not(feature = "wasm-grammars"))]
+        let unavailable = None;
+        Self { unavailable }
+    }
+
+    pub(crate) fn value(&self, stored: &str, path: &std::path::Path) -> Option<serde_json::Value> {
+        let saved: serde_json::Value = serde_json::from_str(stored).ok()?;
+        let mut value = match saved["code"].as_str()? {
+            "grammar_parse_timeout" => AftError::GrammarParseTimeout {
                 path: path.display().to_string(),
                 language: "luau".into(),
-                timeout_ms: value["timeout_ms"].as_u64()?,
+                timeout_ms: crate::parser::luau_parse_deadline()
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64,
             }
-            .to_string(),
-        );
-    }
-    value["message"].as_str().map(str::to_owned)
-}
-
-/// The stored reason records the scan's state. For `grammar_unavailable`,
-/// check the grammar registry again so replies do not keep reporting an
-/// in-flight download after it has failed.
-pub(super) fn current_reason(stored: &str) -> String {
-    if cfg!(feature = "wasm-grammars")
-        && serde_json::from_str::<serde_json::Value>(stored)
-            .is_ok_and(|value| value["code"] == "grammar_unavailable")
-    {
-        if let Err(error) = crate::grammar::registry().stored() {
-            return reason(&ManifestJoinError::GrammarUnavailable(error))
-                .expect("typed grammar reason");
+            .to_error_json(),
+            "grammar_unavailable" => {
+                let state = serde_json::from_value(saved["state"].clone()).ok()?;
+                let error = self
+                    .unavailable
+                    .clone()
+                    .unwrap_or_else(|| crate::grammar::GrammarUnavailable::new("luau", state));
+                AftError::from(error).to_error_json()
+            }
+            "callgraph_off" => saved,
+            _ => return None,
+        };
+        value["path"] = serde_json::json!(path);
+        if value["code"] == "grammar_parse_timeout" {
+            value["state"] = "parse_timeout".into();
         }
+        Some(value)
     }
-    stored.to_string()
-}
-
-pub(crate) fn gap_value(stored: &str, path: &std::path::Path) -> Option<serde_json::Value> {
-    let reason = current_reason(stored);
-    let mut value: serde_json::Value = serde_json::from_str(&reason).ok()?;
-    value["message"] = message(&reason, path)?.into();
-    value["path"] = serde_json::json!(path);
-    Some(value)
 }
 
 pub(super) fn extract(
@@ -113,15 +124,11 @@ pub(crate) fn response(
     reason: &str,
     path: &std::path::Path,
 ) -> Option<crate::protocol::Response> {
-    let current = current_reason(reason);
-    let reason = current.as_str();
-    let mut data: serde_json::Value = serde_json::from_str(reason).ok()?;
-    data["message"] = message(reason, path)?.into();
-    if data["code"] == "grammar_parse_timeout" {
-        data["path"] = path.display().to_string().into();
-    }
+    let data = GapReply::capture().value(reason, path)?;
     let mut response =
         crate::protocol::Response::error(id, data["code"].as_str()?, data["message"].as_str()?);
     response.data = data;
+    response.data["complete"] = false.into();
+    response.data["path"] = serde_json::json!(path);
     Some(response)
 }

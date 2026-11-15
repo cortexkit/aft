@@ -94,7 +94,13 @@ fn answer_impact(req: &RawRequest, ctx: &AppContext) -> Response {
     match outcome {
         Ok(result) => {
             note_callgraph_served(ctx, "impact", 0, "ok");
-            serialized_response_with_view(&req.id, "impact", &result, data_view.as_ref())
+            serialized_response_with_view(
+                &req.id,
+                "impact",
+                &result,
+                data_view.as_ref(),
+                &[&file_path],
+            )
         }
         Err(error) => store_error_response(&req.id, "impact", error),
     }

@@ -106,7 +106,13 @@ fn answer_callers(req: &RawRequest, ctx: &AppContext) -> Response {
                 elapsed_ms.min(u64::MAX as u128) as u64,
                 "ok",
             );
-            serialized_response_with_view(&req.id, "callers", &result, data_view.as_ref())
+            serialized_response_with_view(
+                &req.id,
+                "callers",
+                &result,
+                data_view.as_ref(),
+                &[&file_path],
+            )
         }
         Err(error) => {
             slog_warn!(

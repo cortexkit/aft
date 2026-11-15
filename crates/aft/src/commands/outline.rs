@@ -2229,15 +2229,22 @@ fn populate_rendered_file_symbols(
         }
         let path = entry.absolute_path.clone();
         if detect_language(&path) == Some(LangId::Luau) {
+            if !crate::bounded_io::metadata(&path)
+                .is_ok_and(|metadata| metadata.len() <= MAX_OUTLINE_FILE_BYTES)
+            {
+                entry.symbols = Some(0);
+                continue;
+            }
             let symbols = crate::data_layer::grammar::prepare(ctx, &path)
                 .and_then(|_| crate::parser::list_symbols_shared(ctx.provider(), &path, true));
             match symbols {
                 Ok(symbols) => entry.symbols = Some(symbols.len()),
-                Err(error) => {
+                Err(error) if crate::data_layer::grammar::is_grammar_error(&error) => {
                     let mut gap = error.to_error_json();
                     gap["path"] = serde_json::json!(path);
                     gaps.push(gap);
                 }
+                Err(_) => entry.symbols = Some(0),
             }
             continue;
         }
@@ -2784,8 +2791,15 @@ fn outline_many_files(
             }
             continue;
         };
-        if crate::bounded_io::metadata(&path).is_err() {
-            skipped_files.push((index, SkippedFile::new(file, "file_not_found")));
+        let metadata = match crate::bounded_io::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                skipped_files.push((index, SkippedFile::new(file, "file_not_found")));
+                continue;
+            }
+        };
+        if metadata.len() > MAX_OUTLINE_FILE_BYTES {
+            skipped_files.push((index, SkippedFile::new(rel_path, "too_large")));
             continue;
         }
 
@@ -2798,6 +2812,13 @@ fn outline_many_files(
                     .map(|_| ())
             });
             if let Err(error) = parsed {
+                if !crate::data_layer::grammar::is_grammar_error(&error) {
+                    skipped_files.push((
+                        index,
+                        SkippedFile::new(rel_path, outline_error_reason(&error)),
+                    ));
+                    continue;
+                }
                 writer.content_incomplete = true;
                 if !writer.push_text(
                     format!("{rel_path}\n{}", error),

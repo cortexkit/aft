@@ -21,7 +21,8 @@ use aft_store::ids::{FamilyId, SegmentId, WriterIncarnation};
 use aft_store::segment::{Segment, SegmentMeta};
 
 use super::callgraph::{resolve_checkout, CheckoutInputs, FileResolution};
-use super::content::{blob_from_record, extract, language_for, EXTRACTOR_VERSION};
+use super::content::{blob_from_record, language_for, record_key};
+use super::grammar::extract;
 use super::graph_store::{known_sections, write_segment, StoredSlices};
 use super::incremental::{LiveCheckout, UpdateStats};
 use super::overlay::OverlaySlices;
@@ -135,7 +136,7 @@ impl Files {
         let parsed = if language.is_empty() {
             None
         } else {
-            let key = RecordKey::new(content, &language, EXTRACTOR_VERSION);
+            let key = record_key(content, &language);
             if let Some(known) = self.records.get(&key) {
                 known.clone()
             } else {

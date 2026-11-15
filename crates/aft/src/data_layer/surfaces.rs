@@ -356,7 +356,7 @@ pub fn text_plane_ready(ctx: &AppContext) -> Option<bool> {
 
 const INDEX_GAP_NOTE: &str =
     "(Index skipped {folders}; results may miss files in them:\n{paths}\n)";
-const INDEX_GAP_PREVIEW: usize = 3;
+pub(crate) const INDEX_GAP_PREVIEW: usize = 3;
 
 fn folder_count(count: usize) -> String {
     format!(
@@ -465,12 +465,14 @@ pub(crate) fn disclose_parse_gaps(
     roots: &[PathBuf],
     response: &mut crate::protocol::Response,
 ) {
-    if !cfg!(feature = "wasm-grammars") {
+    if !cfg!(feature = "wasm-grammars") || view.current_state().skipped_parses().is_empty() {
         return;
     }
     let fence = crate::context::confinement::capture();
     let mut gaps = Vec::new();
-    let mut messages = std::collections::BTreeSet::new();
+    let mut lines = Vec::new();
+    let mut count = 0;
+    let reply = super::grammar::GapReply::capture();
     for (relative, reason) in view.current_state().skipped_parses() {
         let path = view.root().join(String::from_utf8_lossy(relative).as_ref());
         if !roots
@@ -480,28 +482,42 @@ pub(crate) fn disclose_parse_gaps(
         {
             continue;
         }
-        let reason = super::grammar::current_reason(reason);
-        if let (Ok(mut gap), Some(message)) = (
-            serde_json::from_str::<Value>(&reason),
-            super::grammar::message(&reason, &path),
-        ) {
-            gap["path"] = serde_json::json!(path);
-            gap["kind"] = "grammar_unavailable".into();
-            gap["message"] = message.clone().into();
-            gaps.push(gap);
-            messages.insert(message);
+        count += 1;
+        if gaps.len() < INDEX_GAP_PREVIEW {
+            if let Some(mut gap) = reply.value(reason, &path) {
+                gap["kind"] = gap["code"].clone();
+                lines.push(path.display().to_string());
+                lines.push(gap["message"].as_str().unwrap_or_default().to_string());
+                gaps.push(gap);
+            }
         }
     }
     if gaps.is_empty() {
         return;
     }
     response.data["complete"] = false.into();
-    response.data["gaps"] = serde_json::json!(gaps);
+    let omitted = count - gaps.len();
+    response.data["skipped_parses"] = count.into();
+    response.data["skipped_parses_omitted"] = omitted.into();
+    if omitted > 0 {
+        lines.push(format!("and {omitted} more"));
+    }
+    let existing = response
+        .data
+        .as_object_mut()
+        .expect("response body")
+        .entry("gaps")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Some(existing) = existing.as_array_mut() {
+        existing.extend(gaps);
+    }
     let text = response.data["text"].as_str().unwrap_or_default();
-    response.data["text"] = format!(
-        "{}\n\n{text}",
-        messages.into_iter().collect::<Vec<_>>().join("\n")
-    )
+    let note = lines.join("\n");
+    response.data["text"] = if text.is_empty() {
+        note
+    } else {
+        format!("{note}\n\n{text}")
+    }
     .into();
 }
 

@@ -1401,20 +1401,8 @@ pub(crate) fn retains_luau_parser_for_test() -> bool {
     REUSABLE_PARSERS.with(|parsers| parsers.borrow().contains_key(&LangId::Luau))
 }
 
-/// One parsing boundary for fresh and reused dynamic-language parsers.
-pub(crate) fn parse_with_parser(
-    parser: &mut tree_sitter::Parser,
-    path: &Path,
-    source: &str,
-    lang: LangId,
-    old_tree: Option<&Tree>,
-) -> Result<Tree, AftError> {
-    let no_tree = || AftError::ParseError {
-        message: format!("tree-sitter parse returned None for {}", path.display()),
-    };
-    if lang != LangId::Luau {
-        return parser.parse(source, old_tree).ok_or_else(no_tree);
-    }
+/// The process's Luau budget, also used to describe persisted timeout gaps.
+pub(crate) fn luau_parse_deadline() -> std::time::Duration {
     #[cfg(feature = "test-hooks")]
     let deadline = {
         static FROM_ENV: std::sync::LazyLock<Option<std::time::Duration>> =
@@ -1434,6 +1422,24 @@ pub(crate) fn parse_with_parser(
     };
     #[cfg(not(feature = "test-hooks"))]
     let deadline = LUAU_PARSE_DEADLINE;
+    deadline
+}
+
+/// One parsing boundary for fresh and reused dynamic-language parsers.
+pub(crate) fn parse_with_parser(
+    parser: &mut tree_sitter::Parser,
+    path: &Path,
+    source: &str,
+    lang: LangId,
+    old_tree: Option<&Tree>,
+) -> Result<Tree, AftError> {
+    let no_tree = || AftError::ParseError {
+        message: format!("tree-sitter parse returned None for {}", path.display()),
+    };
+    if lang != LangId::Luau {
+        return parser.parse(source, old_tree).ok_or_else(no_tree);
+    }
+    let deadline = luau_parse_deadline();
     let start = std::time::Instant::now();
     let mut expired = false;
     // This bounds host parsing, but cannot interrupt one lex or scanner call

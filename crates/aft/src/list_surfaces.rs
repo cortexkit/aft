@@ -1449,6 +1449,18 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         location_or_primitive: "INDEX_GAP_PREVIEW",
         reason: "coverage-gap preview, not a findings page; skipped_folders counts every relevant unreadable folder and skipped_folders_omitted counts names beyond the preview",
     },
+    ExclusionEntry {
+        file: "data_layer/surfaces.rs",
+        enclosing_item: "disclose_parse_gaps",
+        location_or_primitive: "INDEX_GAP_PREVIEW",
+        reason: "non-pageable parse-coverage preview; skipped_parses counts every relevant file, skipped_parses_omitted counts names beyond the preview, and the text says and N more",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/mod.rs",
+        enclosing_item: "CheckoutSemanticGaps::disclose",
+        location_or_primitive: ".take(crate::data_layer::surfaces::INDEX_GAP_PREVIEW)",
+        reason: "non-pageable semantic parse-coverage preview; skipped_files_count and skipped_files_omitted retain the full counts, and the text says and N more",
+    },
 ];
 
 /// Look up a surface by command, mode, and list id.

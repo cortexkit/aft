@@ -85,6 +85,18 @@ pub(crate) fn from_environment(mut registry: Arc<GrammarRegistry>) -> Arc<Gramma
 }
 
 impl GrammarRegistry {
+    #[cfg(test)]
+    pub(crate) fn force_unavailable_for_test(&self, state: GrammarState) -> impl Drop + '_ {
+        struct Guard<'a>(&'a GrammarRegistry);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                *self.0.forced_unavailable.lock() = None;
+            }
+        }
+        *self.forced_unavailable.lock() = Some(GrammarUnavailable::new("luau", state));
+        Guard(self)
+    }
+
     pub fn with_test_options(options: TestOptions) -> Arc<Self> {
         let transport = OnceLock::new();
         let _ = transport.set(Ok(options.transport));
@@ -97,7 +109,10 @@ impl GrammarRegistry {
             transport,
             queries: options.queries,
             fault: RwLock::new(options.fault),
-            listeners: Mutex::new(Vec::new()),
+            listeners: Mutex::new(std::collections::BTreeMap::new()),
+            next_listener: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            forced_unavailable: Mutex::new(None),
             load_hook: Mutex::new(None),
         })
     }

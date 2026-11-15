@@ -1340,6 +1340,35 @@ impl Checkout {
         Ok(true)
     }
 
+    #[cfg(feature = "wasm-grammars")]
+    pub(crate) fn has_grammar_gaps(&self) -> bool {
+        self.view().is_some_and(|view| {
+            view.current_state()
+                .skipped_parses()
+                .values()
+                .any(|reason| {
+                    serde_json::from_str::<serde_json::Value>(reason)
+                        .is_ok_and(|v| v["code"] == "grammar_unavailable")
+                })
+        })
+    }
+
+    pub(crate) fn has_unpublished_luau_changes(&self) -> bool {
+        cfg!(feature = "wasm-grammars")
+            && self
+                .live
+                .read()
+                .expect("no panics while holding it")
+                .changes
+                .keys()
+                .any(|path| {
+                    super::vectors::native_path(path).is_some_and(|path| {
+                        crate::parser::detect_language_any(&path, true)
+                            == Some(crate::parser::LangId::Luau)
+                    })
+                })
+    }
+
     fn record_paths_inner(&self, paths: &[Vec<u8>], retry_grammar: bool) -> Result<(), DataError> {
         if paths.is_empty() {
             return Ok(());
@@ -4517,6 +4546,38 @@ impl CheckoutView {
     #[must_use]
     pub fn text_generation(&self) -> String {
         format!("{}:{}", self.published.identity, self.sequence)
+    }
+
+    /// Parsing can record a gap without changing text or publishing. Meaning
+    /// coverage caches must distinguish those views too.
+    pub(crate) fn parse_gaps_identity(&self) -> Digest128 {
+        let mut hash = blake3::Hasher::new_derive_key("AFT checkout parse coverage");
+        for (path, reason) in self.current_state().skipped_parses() {
+            hash.update(&(path.len() as u64).to_le_bytes());
+            hash.update(path);
+            hash.update(&(reason.len() as u64).to_le_bytes());
+            hash.update(reason.as_bytes());
+        }
+        Digest128::from_hash(&hash.finalize())
+    }
+
+    pub(crate) fn awaits_parse_publication(&self, path: &[u8]) -> bool {
+        if self.callgraph_pending.contains(path) {
+            return true;
+        }
+        match (
+            self.published.state.get(path),
+            self.current_state().get(path),
+        ) {
+            (Some(before), Some(now))
+                if same_member(before, now) && before.language == now.language =>
+            {
+                self.published.state.skipped_parses().contains_key(path)
+                    && !self.current_state().skipped_parses().contains_key(path)
+            }
+            (_, Some(_)) => true,
+            _ => false,
+        }
     }
 
     /// The paths changed since the publication, which queries answer from

@@ -127,7 +127,7 @@ impl Producer {
 /// `path` (relative to the root, `/`-separated) in the platform's own form,
 /// as today's index names files and builds their embedded text. `None` for
 /// a path this platform cannot name.
-fn native_path(path: &[u8]) -> Option<PathBuf> {
+pub(super) fn native_path(path: &[u8]) -> Option<PathBuf> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt as _;
@@ -164,17 +164,27 @@ fn map_content(content: ContentKey, path: &[u8]) -> ContentKey {
     ContentKey::from_digest(aft_store::ids::Digest128::from_hash(&hash.finalize()))
 }
 
+const LUAU_OUTLINE_FAILED: &str =
+    "Meaning search skipped this Luau file because AFT could not extract its outline.";
+
 fn cut_stored(
     view: &CheckoutView,
     path: &[u8],
     bytes: &[u8],
     caps: EmbedTextCaps,
-) -> Result<Option<Cut>, DataError> {
+) -> Result<Cut, DataError> {
     let Some(relative) = native_path(path).filter(|path| is_luau(path)) else {
-        return Ok(None);
+        return Ok(Cut::Failed(LUAU_OUTLINE_FAILED.into()));
     };
+    if view
+        .current_state()
+        .get(path)
+        .is_none_or(|record| record.language != "luau")
+    {
+        return Ok(Cut::Failed(LUAU_OUTLINE_FAILED.into()));
+    }
     let Some(outline) = view.outline_symbols(path)? else {
-        return Ok(None);
+        return Ok(Cut::Failed(LUAU_OUTLINE_FAILED.into()));
     };
     let symbols = outline
         .symbols
@@ -183,7 +193,7 @@ fn cut_stored(
         .collect::<Vec<_>>();
     let source = match std::str::from_utf8(bytes) {
         Ok(text) => text,
-        Err(error) => return Ok(Some(Cut::Failed(error.to_string()))),
+        Err(error) => return Ok(Cut::Failed(error.to_string())),
     };
     let chunks = crate::semantic_index::symbols_to_chunks_with_caps(
         &view.root().join(relative),
@@ -192,7 +202,7 @@ fn cut_stored(
         view.root(),
         caps,
     );
-    Ok(Some(Cut::Chunks(
+    Ok(Cut::Chunks(
         chunks
             .into_iter()
             .map(|chunk| CutChunk {
@@ -209,7 +219,7 @@ fn cut_stored(
                 text: chunk.embed_text,
             })
             .collect(),
-    )))
+    ))
 }
 
 /// The code a chunk's kind is stored as.
@@ -383,7 +393,11 @@ fn survey(
     let mut files = Vec::new();
     let mut applicable = 0;
     for record in state.paths() {
-        if record.kind == PathKind::Symlink || !is_semantic_path(&record.path) {
+        if record.kind == PathKind::Symlink
+            || (record.kind == PathKind::Binary
+                && native_path(&record.path).is_some_and(|path| is_luau(&path)))
+            || !is_semantic_path(&record.path)
+        {
             continue;
         }
         let gap = if !view.planes().callgraph
@@ -549,6 +563,7 @@ struct Members {
     /// The view's text generation, and the generation the members were
     /// read from: the cache key.
     view: String,
+    parse_gaps: aft_store::ids::Digest128,
     generation: Generation,
     files: Vec<SearchFile>,
     /// Every chunk with a vector, in path then chunk order.
@@ -617,6 +632,7 @@ impl Members {
         let mut members = Self {
             memory_epoch: view.memory_epoch_counter(),
             view: view.text_generation(),
+            parse_gaps: view.parse_gaps_identity(),
             generation: loaded.generation,
             files: Vec::new(),
             members: Vec::new(),
@@ -1047,6 +1063,10 @@ pub struct FillReport {
     /// Files whose bytes on disk no longer match the checkout's state, left
     /// for the fill after the change is recorded.
     pub files_changed: usize,
+    /// Luau files waiting for the refresh's forced publication. That
+    /// publication starts the next fill; they do not spin a fill job chain.
+    #[serde(skip_serializing_if = "no_files")]
+    pub files_awaiting_publication: usize,
     /// Files not finished when the fill stopped early.
     pub files_left: usize,
     /// Chunks of the files this fill cut, how many of their texts already
@@ -1079,6 +1099,10 @@ pub struct FillReport {
     pub merge_ms: f64,
     /// Why the fill stopped before finishing; what it published stands.
     pub error: Option<String>,
+}
+
+fn no_files(value: &usize) -> bool {
+    *value == 0
 }
 
 /// Vector segments of the plane's model a family keeps before a fill round
@@ -1237,10 +1261,11 @@ impl VectorPlane {
     fn members(&self, view: &CheckoutView, loaded: &Loaded) -> Result<Arc<Members>, DataError> {
         let key = view.text_generation();
         let mut cached = self.members.lock().expect("no panics while holding it");
-        if let Some(members) = cached
-            .as_ref()
-            .filter(|members| members.view == key && members.generation == loaded.generation)
-        {
+        if let Some(members) = cached.as_ref().filter(|members| {
+            members.view == key
+                && members.parse_gaps == view.parse_gaps_identity()
+                && members.generation == loaded.generation
+        }) {
             return Ok(Arc::clone(members));
         }
         let members = Arc::new(Members::build(view, loaded, self.max_files)?);
@@ -1285,7 +1310,9 @@ impl VectorPlane {
         let loaded = Arc::clone(&*self.loaded.try_lock().ok()?);
         let cached = self.members.try_lock().ok()?;
         let members = cached.as_ref().filter(|members| {
-            members.view == view.text_generation() && members.generation == loaded.generation
+            members.view == view.text_generation()
+                && members.parse_gaps == view.parse_gaps_identity()
+                && members.generation == loaded.generation
         })?;
         Some(MeaningSnapshot {
             loaded,
@@ -1434,6 +1461,10 @@ impl VectorPlane {
                 }
                 if file.done(index.as_ref()) {
                     report.files_already_embedded += 1;
+                } else if native_path(&file.path).is_some_and(|path| is_luau(&path))
+                    && view.awaits_parse_publication(&file.path)
+                {
+                    report.files_awaiting_publication += 1;
                 } else {
                     queue.push((file.path, file.content));
                 }
@@ -1487,12 +1518,7 @@ impl VectorPlane {
                     };
                     let started = Instant::now();
                     let cut = if native_path(&path).is_some_and(|path| is_luau(&path)) {
-                        let Some(cut) = cut_stored(&view, &path, &bytes, self.producer.caps)?
-                        else {
-                            files_done += 1;
-                            continue;
-                        };
-                        cut
+                        cut_stored(&view, &path, &bytes, self.producer.caps)?
                     } else {
                         cut_file(parts.root, &path, &bytes, self.producer.caps)
                     };
@@ -2145,6 +2171,7 @@ aft_store::heap_bytes_of_fields!(Subset { set, positions });
 aft_store::heap_bytes_of_fields!(Members {
     memory_epoch,
     view,
+    parse_gaps,
     generation,
     files,
     members,

@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use crate::commands::callgraph_store_adapter::{
-    ensure_symbol_resolves, note_callgraph_served, serialized_response_with_view, serialized_value,
-    store_error_response, trace_to_symbol_candidates, trace_to_symbol_result,
+    ensure_symbol_resolves, note_callgraph_served, response_with_view,
+    serialized_response_with_view, serialized_value, store_error_response,
+    trace_to_symbol_candidates, trace_to_symbol_result,
 };
 use crate::context::AppContext;
 use crate::inspect::job::is_test_file;
@@ -92,8 +93,12 @@ fn answer_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         Ok(graph) => graph,
         Err(response) => return response,
     };
+    let queried = std::iter::once(file_path.as_path())
+        .chain(to_file_path.as_deref())
+        .collect::<Vec<_>>();
+    let respond = |response| response_with_view(response, data_view.as_ref(), &queried);
     if let Err(error) = ensure_symbol_resolves(&store, &file_path, symbol) {
-        return store_error_response(&req.id, "trace_to_symbol", error);
+        return respond(store_error_response(&req.id, "trace_to_symbol", error));
     }
 
     let include_tests = include_tests_param(req);
@@ -119,7 +124,7 @@ fn answer_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
                     Ok(value) => value,
                     Err(response) => return response,
                 };
-            return Response::error_with_data(
+            return respond(Response::error_with_data(
                 &req.id,
                 "target_symbol_not_in_file",
                 format!(
@@ -128,16 +133,16 @@ fn answer_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
                     to_file_arg.unwrap_or("<unknown>")
                 ),
                 serde_json::json!({ "candidates": candidates_json }),
-            );
+            ));
         }
     } else {
         match target_candidates.len() {
             0 => {
-                return Response::error(
+                return respond(Response::error(
                     &req.id,
                     "target_symbol_not_found",
                     format!("trace_to_symbol: target symbol '{}' not found", to_symbol),
-                );
+                ));
             }
             1 => {}
             _ => {
@@ -149,7 +154,7 @@ fn answer_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
                     Ok(value) => value,
                     Err(response) => return response,
                 };
-                return Response::error_with_data(
+                return respond(Response::error_with_data(
                     &req.id,
                     "ambiguous_target",
                     format!(
@@ -157,7 +162,7 @@ fn answer_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
                         to_symbol
                     ),
                     serde_json::json!({ "candidates": candidates_json }),
-                );
+                ));
             }
         }
     }
@@ -181,7 +186,13 @@ fn answer_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     match outcome {
         Ok(result) => {
             note_callgraph_served(ctx, "trace_to_symbol", 0, "ok");
-            serialized_response_with_view(&req.id, "trace_to_symbol", &result, data_view.as_ref())
+            serialized_response_with_view(
+                &req.id,
+                "trace_to_symbol",
+                &result,
+                data_view.as_ref(),
+                &queried,
+            )
         }
         Err(error) => store_error_response(&req.id, "trace_to_symbol", error),
     }

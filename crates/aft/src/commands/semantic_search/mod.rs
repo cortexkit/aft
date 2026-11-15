@@ -3431,14 +3431,17 @@ impl CheckoutSemanticGaps {
             }
         };
         let mut lines = Vec::new();
+        let reply = if self.skipped.is_empty() {
+            crate::data_layer::grammar::GapReply::default()
+        } else {
+            crate::data_layer::grammar::GapReply::capture()
+        };
         let skipped = self
             .skipped
             .iter()
+            .take(crate::data_layer::surfaces::INDEX_GAP_PREVIEW)
             .filter_map(|(path, reason)| {
-                crate::data_layer::grammar::gap_value(
-                    reason,
-                    &project_relative_path(path, project_root),
-                )
+                reply.value(reason, &project_relative_path(path, project_root))
             })
             .collect::<Vec<_>>();
         for message in skipped
@@ -3477,6 +3480,13 @@ impl CheckoutSemanticGaps {
         });
         if !skipped.is_empty() {
             gap["skipped_files"] = serde_json::json!(skipped);
+            gap["skipped_files_count"] = serde_json::json!(self.skipped.len());
+            let omitted =
+                self.skipped.len() - gap["skipped_files"].as_array().expect("skip preview").len();
+            gap["skipped_files_omitted"] = serde_json::json!(omitted);
+            if omitted > 0 {
+                lines.push(format!("and {omitted} more"));
+            }
         }
         if let Some(error) = &self.fill_failure {
             gap["fill_failure"] = serde_json::json!(error);

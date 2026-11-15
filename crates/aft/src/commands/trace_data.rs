@@ -138,6 +138,7 @@ fn answer_trace_data(req: &RawRequest, ctx: &AppContext) -> Response {
                     crate::commands::callgraph_store_adapter::response_with_view(
                         Response::success(&req.id, value),
                         data_view.as_ref(),
+                        &[&file_path],
                     )
                 }
                 Err(response) => response,

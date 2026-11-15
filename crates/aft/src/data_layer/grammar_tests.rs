@@ -341,6 +341,7 @@ fn scenario(phase: &str) {
         "callers",
         &callers(&view, "b.luau"),
         Some(&view),
+        &[&root.join("b.luau")],
     );
     assert_eq!(response.data["complete"], false);
     assert_eq!(
@@ -362,6 +363,7 @@ fn scenario(phase: &str) {
         "callers",
         &builtin,
         Some(&view),
+        &[&root.join("plain.ts")],
     );
     assert_eq!(old.data, new.data, "built-in answers cannot gain Luau gaps");
     assert_eq!(super::content::parses_of_for_test(b.as_bytes()), 0);
@@ -383,7 +385,15 @@ fn scenario(phase: &str) {
     );
     assert!(pending_zoom.success, "{:?}", pending_zoom.data);
     assert_eq!(pending_zoom.data["complete"], false);
-    assert_eq!(pending_zoom.data["targets"].as_array().unwrap().len(), 1);
+    assert_eq!(pending_zoom.data["targets"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        pending_zoom.data["targets"][1]["response"]["complete"],
+        false
+    );
+    assert_eq!(
+        pending_zoom.data["targets"][1]["response"]["gaps"][0]["path"],
+        json!(root.join("a.luau"))
+    );
     assert_eq!(pending_zoom.data["gaps"][0]["code"], "grammar_unavailable");
     let runtime = super::runtime::DataCheckout::open(&root, &storage, None).unwrap();
     let wait = Instant::now();
@@ -404,8 +414,6 @@ fn scenario(phase: &str) {
     assert!(!coverage.pending.iter().any(|path| path.ends_with("a.luau")));
     write(&dir, "transport", wasm);
     write(&dir, "clock", "30000");
-    let _ = registry.request();
-    assert!(registry.wait_until_settled(Duration::from_secs(30)));
     let started = Instant::now();
     let ready = loop {
         if let Some(view) = runtime.view() {
