@@ -637,6 +637,13 @@ fn outline_guards() {
         "nested/bad.luau",
         "local function broken(\n return )\nend\n",
     );
+    let bad_source = std::fs::read_to_string(&bad).unwrap();
+    let bad_tree = crate::parser::parse_luau_source(&bad, &bad_source).unwrap();
+    assert!(
+        bad_tree.root_node().has_error(),
+        "fixture must reach a real Tree-sitter syntax error: {}",
+        bad_tree.root_node().to_sexp()
+    );
     let files = ask(&f.ctx, "outline", json!({"file":f.root,"files":true}));
     assert!(files.success, "{:?}", files.data);
     assert_eq!(files.data["complete"], false, "{:?}", files.data);
@@ -645,9 +652,13 @@ fn outline_guards() {
     assert!(skipped
         .iter()
         .any(|row| row["file"] == "large.luau" && row["reason"] == "too_large"));
-    assert!(skipped
-        .iter()
-        .any(|row| row["file"] == "nested/bad.luau" && row["reason"] == "parse_error"));
+    assert!(
+        skipped
+            .iter()
+            .any(|row| row["file"] == "nested/bad.luau" && row["reason"] == "parse_error"),
+        "{:?}",
+        files.data
+    );
     let batch = ask(&f.ctx, "outline", json!({"files":[large,bad]}));
     assert!(batch.success, "{:?}", batch.data);
     assert_eq!(batch.data["complete"], false);
@@ -804,6 +815,20 @@ fn inspect_category(ctx: &AppContext, scope: &Path, category: &str) -> Response 
     )
 }
 
+fn configure_inspect(f: &Fixture) {
+    let request: RawRequest = serde_json::from_value(json!({
+        "id":"luau-s4-configure", "command":"configure", "harness":"opencode",
+        "project_root":f.root, "storage_dir":f.storage,
+        "config":[{"tier":"user","source":f.dir.join("aft.jsonc"),"doc":json!({
+            "indexes":{"trigram":true,"semantic":false,"callgraph":true},
+            "inspect":{"categories":{"diagnostics":false}}
+        }).to_string()}]
+    }))
+    .unwrap();
+    let response = crate::commands::configure::handle_configure(&request, &f.ctx);
+    assert!(response.success, "{:?}", response.data);
+}
+
 isolated!(
     luau_s4_inspect_todos_terminal_gaps_are_final_not_pending,
     || todo_gaps(true)
@@ -830,6 +855,7 @@ fn todo_gaps(terminal: bool) {
     } else {
         GrammarState::NetworkRetry
     });
+    configure_inspect(&f);
     let runtime = f.ctx.data_checkout().unwrap();
     runtime.wait_for_memory_profile_idle_for_test();
     assert_eq!(
@@ -896,6 +922,7 @@ fn dead_code_gaps() {
         "plain.ts",
         "export function searchable() { return 1; }\n",
     );
+    configure_inspect(&f);
     f.ctx
         .data_checkout()
         .unwrap()
@@ -939,9 +966,9 @@ fn publication_retry() {
     runtime.wait_for_memory_profile_idle_for_test();
     wait_meaning(&f.ctx);
     let publication = test_gates::hold(&f.root, test_gates::Point::DeltaPublication);
-    let low = crate::disk_floor::set_free_space_for_test(&f.storage, 1 << 30, 1 << 40);
     drop(forced);
     publication.wait_entered();
+    let low = crate::disk_floor::set_free_space_for_test(&f.storage, 1 << 30, 1 << 40);
     drop(publication);
     runtime.wait_for_memory_profile_idle_for_test();
     assert!(runtime.checkout().has_unpublished_luau_changes());

@@ -5865,7 +5865,8 @@ impl Collected {
             if record.language.is_empty() {
                 continue;
             }
-            let record_key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
+            let record_key =
+                crate::data_layer::content::record_key(record.content, &record.language);
             let parse_key = record_key.digest().to_string();
             let Some(entry) = entries.get(&parse_key) else {
                 continue;
