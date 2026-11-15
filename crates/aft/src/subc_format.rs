@@ -3722,7 +3722,7 @@ fn format_callers_sections(record: &serde_json::Map<String, Value>) -> Vec<Strin
     let callback_note = callback_reference_count_suffix(record);
     let unresolved = record.get("unresolved_callers").and_then(Value::as_object);
     let mut sections = if let Some(unresolved) = unresolved {
-        let total = number_field(unresolved, "total").unwrap_or(0);
+        let total = number_field(unresolved, "total").unwrap_or(0).max(0) as usize;
         let name = string_field(unresolved, "name").unwrap_or_default();
         let mut lines = vec![format!(
             "No resolved callers; {total} unresolved call sites name `{name}` (possible callers, targets not confirmed)."
