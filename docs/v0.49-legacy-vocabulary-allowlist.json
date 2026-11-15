@@ -216,7 +216,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/compress/biome.rs",
+      "path": "crates/aft-base/src/compress/biome.rs",
       "line": 183,
       "column": 47,
       "token": "filePath",
@@ -227,7 +227,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/compress/eslint.rs",
+      "path": "crates/aft-base/src/compress/eslint.rs",
       "line": 73,
       "column": 39,
       "token": "filePath",
@@ -238,7 +238,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/compress/eslint.rs",
+      "path": "crates/aft-base/src/compress/eslint.rs",
       "line": 132,
       "column": 40,
       "token": "filePath",
@@ -249,7 +249,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/compress/eslint.rs",
+      "path": "crates/aft-base/src/compress/eslint.rs",
       "line": 394,
       "column": 28,
       "token": "filePath",
@@ -260,7 +260,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/compress/mod.rs",
+      "path": "crates/aft-base/src/compress/mod.rs",
       "line": 1902,
       "column": 23,
       "token": "filePath",
@@ -271,7 +271,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/compress/mod.rs",
+      "path": "crates/aft-base/src/compress/mod.rs",
       "line": 2238,
       "column": 19,
       "token": "filePath",
