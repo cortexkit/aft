@@ -23,7 +23,7 @@ impl Drop for DeferredWakeScope {
     }
 }
 
-pub(crate) struct DeferredCompletionWake(Option<DeferredResponseWake>);
+pub struct DeferredCompletionWake(Option<DeferredResponseWake>);
 
 impl Drop for DeferredCompletionWake {
     fn drop(&mut self) {
@@ -52,7 +52,7 @@ impl DeferredResponseWake {
 
 /// Capture before spawning, and keep the guard inside the producer until after
 /// sending its response. Drop also wakes the transport when a producer panics.
-pub(crate) fn deferred_completion_wake() -> DeferredCompletionWake {
+pub fn deferred_completion_wake() -> DeferredCompletionWake {
     DeferredCompletionWake(DEFERRED_WAKE.with(|slot| slot.borrow().clone()))
 }
 

@@ -45,7 +45,7 @@ struct FreeSpaceOverride {
 #[derive(Clone)]
 enum Probe {
     Fixed(Option<(u64, u64)>),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     Computed(std::sync::Arc<dyn Fn() -> Option<(u64, u64)> + Send + Sync>),
 }
 static FREE_SPACE: Mutex<FreeSpaceOverrides> = Mutex::new(FreeSpaceOverrides {
@@ -83,8 +83,8 @@ pub fn set_free_space_for_test(storage: &Path, free: u64, capacity: u64) -> Free
 
 /// [`set_free_space_for_test`], with `probe` computing the free space and
 /// capacity at each probe; `None` is a probe that fails.
-#[cfg(test)]
-pub(crate) fn set_free_space_fn_for_test(
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_free_space_fn_for_test(
     storage: &Path,
     probe: impl Fn() -> Option<(u64, u64)> + Send + Sync + 'static,
 ) -> FreeSpaceTestGuard {
@@ -184,7 +184,7 @@ pub fn free_space(path: &Path) -> Option<(u64, u64)> {
     // at the disk, and nothing it calls may wait on them.
     match value {
         Some(Probe::Fixed(value)) => return value,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         Some(Probe::Computed(probe)) => return probe(),
         None => {}
     }

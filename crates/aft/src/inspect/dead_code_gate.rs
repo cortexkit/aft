@@ -381,7 +381,7 @@ fn aggregate_from_view(
 #[cfg(feature = "test-hooks")]
 pub(crate) fn exactness_rows(view: &CheckoutView, storage: &Path) -> Result<Value, String> {
     let snapshot = view
-        .dead_code_snapshot_in(None)
+        .dead_code_snapshot_in(None, &super::InspectEntryPoints)
         .map_err(|error| error.to_string())?;
     let job = job(view.root(), storage);
     let entry_points = snapshot.entry_points.iter().cloned().collect::<Vec<_>>();

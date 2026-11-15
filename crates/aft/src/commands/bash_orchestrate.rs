@@ -461,7 +461,7 @@ pub fn build_bash_outcome(
     ctx: &AppContext,
     spawn_response: Response,
 ) -> DispatchOutcome {
-    let wake = crate::response_finalize::deferred_completion_wake();
+    let wake = crate::pending_response::deferred_completion_wake();
     build_bash_outcome_with_wake(req, ctx, spawn_response, move || drop(wake))
 }
 

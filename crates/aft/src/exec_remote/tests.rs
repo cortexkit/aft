@@ -952,7 +952,7 @@ fn siblings_busy_grant_store_preserves_read_error_instead_of_missing_grant_refus
         epoch: 1,
     };
     let grant = AccessGrant {
-        path: crate::access_policy::policy_path(&sibling),
+        path: crate::policy_path::policy_path(&sibling),
         kind: GrantKind::Subtree,
         operation: AccessOperation::Read,
     };
@@ -1014,7 +1014,7 @@ fn siblings_busy_grant_store_preserves_read_error_instead_of_missing_grant_refus
     for preflight in [
         vec![],
         vec![AccessGrant {
-            path: crate::access_policy::policy_path(&sibling),
+            path: crate::policy_path::policy_path(&sibling),
             kind: GrantKind::Subtree,
             operation: AccessOperation::Read,
         }],

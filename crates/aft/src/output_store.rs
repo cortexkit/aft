@@ -32,10 +32,10 @@ pub(crate) struct Artifact {
 
 #[derive(Default)]
 pub(crate) struct OutputFiles {
-    files: Mutex<HashMap<PathBuf, Artifact>>,
+    pub(crate) files: Mutex<HashMap<PathBuf, Artifact>>,
     roots: Mutex<HashMap<PathBuf, PathBuf>>,
     #[cfg(test)]
-    canonicalizations: std::sync::atomic::AtomicUsize,
+    pub(crate) canonicalizations: std::sync::atomic::AtomicUsize,
 }
 
 /// A deferred daemon (subc) tool reply can be sent after its AppContext is evicted.
@@ -44,9 +44,9 @@ pub(crate) struct OutputFiles {
 pub(crate) struct OutputScope {
     storage: PathBuf,
     directory: PathBuf,
-    session: String,
-    files: std::sync::Arc<OutputFiles>,
-    bash: crate::bash_background::BgTaskRegistry,
+    pub(crate) session: String,
+    pub(crate) files: std::sync::Arc<OutputFiles>,
+    pub(crate) bash: crate::bash_background::BgTaskRegistry,
 }
 
 impl std::fmt::Debug for OutputScope {
@@ -106,7 +106,7 @@ impl OutputFiles {
             .join(crate::backup::hash_session(session))
     }
 
-    fn save(&self, scope: &OutputScope, text: &str) -> io::Result<PathBuf> {
+    pub(crate) fn save(&self, scope: &OutputScope, text: &str) -> io::Result<PathBuf> {
         if text.len() > SAVED_FILE_LIMIT {
             return Err(io::Error::other(
                 "full tool result exceeds the 64 MiB saved-file limit",

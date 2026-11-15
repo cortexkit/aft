@@ -2258,7 +2258,7 @@ fn regular_open(path: &Path, no_follow: bool) -> io::Result<std::fs::File> {
 
 /// Open project content without waiting for a FIFO writer. Judge the opened
 /// handle so replacing an admitted path cannot bypass the regular-file check.
-pub(crate) fn open_content_file(path: &Path) -> io::Result<std::fs::File> {
+pub fn open_content_file(path: &Path) -> io::Result<std::fs::File> {
     open_content_file_sized(path, false).map(|(file, _)| file)
 }
 

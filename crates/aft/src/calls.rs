@@ -1828,7 +1828,7 @@ mod tests {
 
     #[test]
     fn rust_macro_fragment_cache_preserves_dead_code_fact_bytes() {
-        use crate::inspect::scanners::dead_code::StoredFileFacts;
+        use crate::parser::dead_code_facts::StoredFileFacts;
         let source = r#"
 macro_rules! top { ($f:expr) => { wrap!(nested!($f())) }; }
 #[attribute_macro(callback = "hook")]
