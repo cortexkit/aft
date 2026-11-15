@@ -88,9 +88,6 @@ impl FrozenParams {
                         // An unreadable grant store is not evidence that the
                         // session lacks a grant. Preserve the file tool's error,
                         // even when an unsaved preflight grant covers the path.
-                        Err(response) if read_policy_unavailable(&response) => {
-                            return Err(SiblingValidationError::Unavailable(response));
-                        }
                         Err(_) if preflight_covers(preflight_grants, &path) => path,
                         Err(_) => {
                             // A confined session keeps link targets outside its
