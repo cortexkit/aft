@@ -1970,6 +1970,101 @@ async fn consent_folder_grant_settles_and_withdraws_covered_sibling() {
 }
 
 #[cfg(unix)]
+#[test]
+fn consent_folder_grant_logs_card_withdrawal_separately_from_call_resumption() {
+    let grant = Permission::File(AccessGrant {
+        path: crate::access_policy::policy_path(Path::new("/tmp/scope/a.txt")),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    });
+    let ((), lines) = crate::logging::capture_log_lines(|| {
+        log_consent(
+            "worker",
+            ConsentEvent::Settled(&Settlement::Refused("access_withdrawn".into())),
+            "acc_718",
+            &grant,
+        );
+        log_consent("worker", ConsentEvent::CoveredByGrant, "acc_718", &grant);
+    });
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[0].contains("consent answer settled ask=acc_718 outcome=access_withdrawn"),
+        "{lines:?}"
+    );
+    assert!(
+        lines[1].contains("consent call resumed ask=acc_718 outcome=covered_by_grant"),
+        "{lines:?}"
+    );
+    assert!(lines.iter().all(|line| !line.contains("/tmp/scope")));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_folder_grant_resumes_all_three_parallel_covered_reads_once() {
+    use std::sync::atomic::AtomicUsize;
+
+    static SUCCESSFUL_READS: AtomicUsize = AtomicUsize::new(0);
+    fn counted_read(request: RawRequest, ctx: &AppContext) -> Response {
+        let response = read_dispatch(request, ctx);
+        if response.success {
+            SUCCESSFUL_READS.fetch_add(1, Ordering::SeqCst);
+        }
+        response
+    }
+
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let _probe = DirectoryScopeProbeBudgetOverride::generous();
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_secs(5)));
+    SUCCESSFUL_READS.store(0, Ordering::SeqCst);
+    let folder = f.head_root.join("parallel");
+    std::fs::create_dir_all(&folder).unwrap();
+    let mut reads = Vec::new();
+    for (index, name) in ["a.txt", "b.txt", "c.txt", "d.txt"].into_iter().enumerate() {
+        let path = folder.join(name);
+        let contents = format!("parallel read {name} contents\n");
+        std::fs::write(&path, &contents).unwrap();
+        let replies = f
+            .send_tool(
+                &f.worker,
+                "read",
+                json!({"path": path}),
+                910 + index as u64,
+                counted_read,
+            )
+            .await;
+        reads.push((contents, replies));
+    }
+    wait_for(|| {
+        f.asks()
+            .iter()
+            .filter(|ask| ask.elicitation_id.is_some())
+            .count()
+            == 4
+    })
+    .await;
+    assert_eq!(SUCCESSFUL_READS.load(Ordering::SeqCst), 0);
+    let key = call_key_for_file(&f.fake.calls("consent.request"), "a.txt");
+    f.fake.answer(
+        &key,
+        json!({"state":"settled", "outcome":"allow_scope", "answered_by":"user"}),
+    );
+    for (contents, mut replies) in reads {
+        let reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+            .await
+            .expect("every covered read resumes without another answer")
+            .expect("writer stays open");
+        let value: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert!(text(&value).contains(contents.trim()), "{value}");
+    }
+    assert_eq!(SUCCESSFUL_READS.load(Ordering::SeqCst), 4);
+    assert_eq!(f.fake.calls("consent.request").len(), 4, "no second card");
+    assert_eq!(f.fake.calls("consent.withdraw").len(), 3);
+    assert_eq!(f.fake.state.lock().unwrap().withdrawn.len(), 3);
+    assert!(f.asks().is_empty(), "all four approvals were consumed");
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn consent_folder_grant_recovery_resends_the_unreceipted_sibling_key() {
     folder_grant_settles_and_withdraws_covered_sibling(true).await;

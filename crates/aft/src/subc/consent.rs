@@ -1129,6 +1129,12 @@ async fn try_apply_covering_grant(
         original: None,
         elicitation: elicitation.to_owned(),
     });
+    log_consent(
+        &call.identity.session,
+        ConsentEvent::CoveredByGrant,
+        elicitation,
+        &prep.grant,
+    );
     Some(Hold::Run {
         once,
         claim: Some(claim),
@@ -2370,6 +2376,7 @@ enum ConsentEvent<'a> {
     Filed { tool: &'a str, epoch: u64 },
     Settled(&'a Settlement),
     Granted { epoch: u64 },
+    CoveredByGrant,
 }
 
 fn log_consent(session: &str, event: ConsentEvent<'_>, ask: &str, grant: &Permission) {
@@ -2400,6 +2407,9 @@ fn log_consent(session: &str, event: ConsentEvent<'_>, ask: &str, grant: &Permis
                 Settlement::Allow { scope: true, .. } => "allow_scope",
                 Settlement::Allow { scope: false, .. } => "allow_once",
                 Settlement::Deny { .. } => "deny",
+                // Withdrawal settles the card, not necessarily the call: a
+                // saved folder grant can still authorize the waiting read.
+                Settlement::Refused(code) if code == "access_withdrawn" => "access_withdrawn",
                 Settlement::Refused(_) => "refused",
                 Settlement::Pending => "pending",
             };
@@ -2409,6 +2419,11 @@ fn log_consent(session: &str, event: ConsentEvent<'_>, ask: &str, grant: &Permis
         }
         ConsentEvent::Granted { epoch } => {
             crate::slog_info!("consent grant inserted ask={ask} kind={kind} scope_epoch={epoch} path_hash={path_hash:.12}");
+        }
+        ConsentEvent::CoveredByGrant => {
+            crate::slog_info!(
+                "consent call resumed ask={ask} outcome=covered_by_grant path_hash={path_hash:.12}"
+            );
         }
     });
 }
