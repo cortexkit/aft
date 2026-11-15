@@ -79,12 +79,14 @@ impl<T> TrackedMutex<T> {
         Arc::clone(&self.diagnostics)
     }
 
+    test_support_visibility! {
     #[track_caller]
-    pub(crate) fn lock(&self) -> TrackedGuard<'_, T> {
-        let guard = self.mutex.lock();
-        TrackedGuard {
-            _hold: self.diagnostics.hold(),
-            guard,
+        pub(crate) fn lock(&self) -> TrackedGuard<'_, T> {
+            let guard = self.mutex.lock();
+            TrackedGuard {
+                _hold: self.diagnostics.hold(),
+                guard,
+            }
         }
     }
 

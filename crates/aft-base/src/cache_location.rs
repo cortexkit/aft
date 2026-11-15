@@ -1381,6 +1381,9 @@ fn prepare_cache_root_with_floor_hooks(
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RecordedRoot {
+    #[cfg(any(test, feature = "test-support"))]
+    pub path: PathBuf,
+    #[cfg(not(any(test, feature = "test-support")))]
     path: PathBuf,
     #[cfg(any(test, feature = "test-support"))]
     pub identity: Option<Identity>,
