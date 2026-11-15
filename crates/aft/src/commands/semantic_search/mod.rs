@@ -3468,7 +3468,7 @@ impl CheckoutSemanticGaps {
         }
         let preview =
             crate::data_layer::surfaces::parse_gap_preview(skipped.len(), self.skipped.len());
-        if let Some(trailer) = crate::list_envelope::render_trailer(&preview) {
+        if let Some(trailer) = crate::subc_format::render_envelope_trailer(&preview) {
             lines.push(trailer);
         }
         if let Some(reason) = &self.unavailable {

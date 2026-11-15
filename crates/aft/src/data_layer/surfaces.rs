@@ -448,11 +448,9 @@ pub(crate) fn disclose_index_gaps(
         return;
     }
     let omitted = count - gaps.len();
-    let preview = parse_gap_preview(gaps.len(), count);
-    if let Some(trailer) = crate::list_envelope::render_trailer(&preview) {
-        lines.push(trailer);
+    if omitted > 0 {
+        lines.push(format!("and {omitted} more"));
     }
-    response.data["parse_gaps_list"] = serde_json::json!(preview);
     let note = INDEX_GAP_NOTE
         .replace("{folders}", &folder_count(count))
         .replace("{paths}", &lines.join("\n"));
@@ -516,9 +514,11 @@ pub(crate) fn disclose_parse_gaps(
     let omitted = count - gaps.len();
     response.data["skipped_parses"] = count.into();
     response.data["skipped_parses_omitted"] = omitted.into();
-    if omitted > 0 {
-        lines.push(format!("and {omitted} more"));
+    let preview = parse_gap_preview(gaps.len(), count);
+    if let Some(trailer) = crate::subc_format::render_envelope_trailer(&preview) {
+        lines.push(trailer);
     }
+    response.data["parse_gaps_list"] = serde_json::json!(preview);
     let existing = response
         .data
         .as_object_mut()

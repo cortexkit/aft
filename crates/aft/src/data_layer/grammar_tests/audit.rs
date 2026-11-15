@@ -427,6 +427,12 @@ fn trace_gaps() {
             .as_str()
             .unwrap()
             .contains("shown 3 of 6 files (cap) · narrow: path"));
+        assert!(!response.data["text"]
+            .as_str()
+            .unwrap()
+            .contains("and 3 more"));
+        assert_eq!(response.data["parse_gaps_list"]["shown"], 3);
+        assert_eq!(response.data["parse_gaps_list"]["total"]["value"], 6);
         assert!(!response.data["text"].as_str().unwrap().ends_with('\n'));
     }
     let mut response = Response::success("merge", json!({"gaps":[{"kind":"existing"}]}));
