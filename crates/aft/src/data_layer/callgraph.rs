@@ -1455,6 +1455,8 @@ pub(crate) fn resolve_checkout_into(
         let (answers, mut results) =
             key_order::resolve(&source, &paths, spool.dir(), budget, memory.as_deref_mut())?;
         let sites_ms = started.elapsed().as_millis();
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("assembly");
         // The key order's units and sorted keys are gone; only the answers
         // and the run of site results remain.
         relieve_allocator();

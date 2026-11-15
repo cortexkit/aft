@@ -1675,6 +1675,8 @@ impl Checkout {
         report.stored_records = collected.reused;
         report.scan_ms = elapsed_ms(started);
 
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("inputs");
         collected.text.spill()?;
 
         // The state, with each parsed path's language.
@@ -1845,6 +1847,8 @@ impl Checkout {
         sections
             .prepare_finish()
             .map_err(|error| graph_spill_error(DataError::Store(error), &paused))?;
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("write");
         let mut pending = session.create_segment().map_err(DataError::store)?;
         collected.text.write(pending.writer())?;
         let fragments = sections
@@ -1860,6 +1864,8 @@ impl Checkout {
         let segment = session.finish_segment(pending).map_err(DataError::store)?;
         report.write_ms = elapsed_ms(started);
 
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("publish");
         let started = Instant::now();
         let per_path = state
             .paths()
