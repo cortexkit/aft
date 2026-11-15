@@ -9619,7 +9619,7 @@ async fn remote_job_id_foreign_and_unknown_refuse_like_unknown_task_ids() {
     for tool in ["bash_status", "bash_watch", "bash_kill"] {
         for (reference, session) in [
             (id().to_string(), "foreign"),
-            (uuid::Uuid::new_v4().to_string(), "session"),
+            (Uuid::from_bytes([0xaa; 16]).to_string(), "session"),
             ("bash-ffffffffffffffff".to_string(), "session"),
         ] {
             let response =

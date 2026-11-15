@@ -3216,7 +3216,7 @@ impl BgTaskRegistry {
         session: &str,
         storage_dir: &Path,
     ) -> String {
-        let Ok(job_id) = uuid::Uuid::parse_str(reference) else {
+        let Ok(job_id) = crate::exec_remote::types::Uuid::parse_str(reference) else {
             return reference.to_owned();
         };
         let matches = |metadata: &PersistedTask| {

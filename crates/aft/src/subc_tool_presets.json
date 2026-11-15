@@ -5,7 +5,7 @@
       "type": "object",
       "properties": {
         "taskId": {
-          "description": "Background task ID returned by bash({ background: true }).",
+          "description": "Background task ID returned by bash({ background: true }), or its remote job ID.",
           "type": "string"
         },
         "pattern": {
@@ -37,7 +37,7 @@
       "required": [
         "taskId"
       ],
-      "description": "Watch a background bash task. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit. In a main session sync waits are for a short remaining wait on a task; for anything longer, first do the work that doesn't need the result, end the turn only when everything left needs it, and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. Never loop bash_status to wait."
+      "description": "Watch a background bash task; a remote job ID works too. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit. In a main session sync waits are for a short remaining wait on a task; for anything longer, first do the work that doesn't need the result, end the turn only when everything left needs it, and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. Never loop bash_status to wait."
     }
   },
   "worker": {
@@ -125,7 +125,7 @@
       "type": "object",
       "properties": {
         "taskId": {
-          "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+          "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
           "type": "string"
         },
         "outputOffset": {
@@ -153,14 +153,14 @@
       "required": [
         "taskId"
       ],
-      "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion. To wait, use bash_watch."
+      "description": "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion. To wait, use bash_watch."
     },
     "bash_watch": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "object",
       "properties": {
         "taskId": {
-          "description": "Background task ID returned by bash({ background: true }).",
+          "description": "Background task ID returned by bash({ background: true }), or its remote job ID.",
           "type": "string"
         },
         "pattern": {
@@ -205,7 +205,7 @@
       "required": [
         "taskId"
       ],
-      "description": "Watch a background bash task and wait until it exits or prints a pattern. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit. A background task never wakes you, so wait on it before you report a result. Call bash_watch again to keep waiting; don't report a result until the command finishes. Never loop bash_status to wait."
+      "description": "Watch a background bash task and wait until it exits or prints a pattern; a remote job ID works too. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit. A background task never wakes you, so wait on it before you report a result. Call bash_watch again to keep waiting; don't report a result until the command finishes. Never loop bash_status to wait."
     },
     "powershell": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
