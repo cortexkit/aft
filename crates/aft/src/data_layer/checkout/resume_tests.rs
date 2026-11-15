@@ -62,7 +62,12 @@ fn project(root: &Path) {
 }
 
 fn layer() -> Arc<DataLayer> {
-    Arc::new(DataLayer::new(8 << 20, 2))
+    // A measurement on a real project sets more threads; the tests use two.
+    let threads = std::env::var("AFT_TEST_RESUME_THREADS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2);
+    Arc::new(DataLayer::new(8 << 20, threads))
 }
 
 fn build(store: &Path, root: &Path) -> (Checkout, BuildReport) {
@@ -448,4 +453,43 @@ fn a_refused_admission_writes_no_workspace() {
         ["checkout.lock"],
         "nothing was written"
     );
+}
+
+/// Times a cold build of the checkout `AFT_TEST_RESUME_PROJECT` names, then
+/// for each of several kill points a build killed there and the build that
+/// resumes it, and checks each resumed publication equals the cold one.
+#[test]
+#[ignore = "measurement; AFT_TEST_RESUME_PROJECT names a checkout to build"]
+fn measure_resume_on_a_project() {
+    let root = PathBuf::from(
+        std::env::var_os("AFT_TEST_RESUME_PROJECT").expect("AFT_TEST_RESUME_PROJECT"),
+    );
+    let reference_store = tempfile::tempdir().unwrap();
+    let started = std::time::Instant::now();
+    let (reference, fresh) = build(reference_store.path(), &root);
+    let fresh_ms = started.elapsed().as_millis();
+    let expected = published(&reference);
+    drop(reference);
+    eprintln!(
+        "RESUME MEASURE cold files={} parsed={} wall_ms={fresh_ms} scan_ms={:.0} resolve_ms={:.0} write_ms={:.0}",
+        fresh.files, fresh.parsed_files, fresh.scan_ms, fresh.resolve_ms, fresh.write_ms
+    );
+    for point in ["records.committed", "passes.committed", "stage.sites"] {
+        let store = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        killed_build(store.path(), &root, point);
+        let killed_ms = started.elapsed().as_millis();
+        let started = std::time::Instant::now();
+        let (checkout, report) = build(store.path(), &root);
+        let resumed_ms = started.elapsed().as_millis();
+        assert_same(&expected, &published(&checkout), point);
+        eprintln!(
+            "RESUME MEASURE point={point} killed_after_ms={killed_ms} resumed_wall_ms={resumed_ms} scan_ms={:.0} resolve_ms={:.0} write_ms={:.0} resumed_records={} resumed_passes={} identical=yes",
+            report.scan_ms,
+            report.resolve_ms,
+            report.write_ms,
+            report.resumed_records,
+            report.resumed_passes
+        );
+    }
 }
