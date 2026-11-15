@@ -341,7 +341,10 @@ pub(crate) fn raw_quote_start(line: &str, cursor: usize) -> Option<(QuoteState, 
     ))
 }
 
-pub(crate) fn comment_prefix_at(line: &str, cursor: usize) -> Option<(&'static str, Option<&'static str>)> {
+pub(crate) fn comment_prefix_at(
+    line: &str,
+    cursor: usize,
+) -> Option<(&'static str, Option<&'static str>)> {
     let rest = &line[cursor..];
     if rest.starts_with("<!--") {
         Some(("<!--", Some("-->")))
@@ -365,7 +368,11 @@ pub(crate) fn next_char_len(line: &str, cursor: usize) -> usize {
         .unwrap_or_default()
 }
 
-pub(crate) fn scan_line(line: &str, line_number: usize, in_block_comment: &mut bool) -> Option<TodoMarker> {
+pub(crate) fn scan_line(
+    line: &str,
+    line_number: usize,
+    in_block_comment: &mut bool,
+) -> Option<TodoMarker> {
     if *in_block_comment {
         let item = parse_todo_body(strip_block_comment_prefix(line), line_number);
         if line.contains("*/") {
@@ -407,7 +414,10 @@ pub(crate) struct CommentPrefixMatch {
     pub(crate) starts_block_comment: bool,
 }
 
-pub(crate) fn find_next_comment_prefix(line: &str, search_start: usize) -> Option<CommentPrefixMatch> {
+pub(crate) fn find_next_comment_prefix(
+    line: &str,
+    search_start: usize,
+) -> Option<CommentPrefixMatch> {
     let prefixes = ["<!--", "//", "/*", "#", "--"];
     prefixes
         .iter()
@@ -415,7 +425,11 @@ pub(crate) fn find_next_comment_prefix(line: &str, search_start: usize) -> Optio
         .min_by_key(|prefix_match| prefix_match.body_start)
 }
 
-pub(crate) fn find_prefix_match(line: &str, search_start: usize, prefix: &str) -> Option<CommentPrefixMatch> {
+pub(crate) fn find_prefix_match(
+    line: &str,
+    search_start: usize,
+    prefix: &str,
+) -> Option<CommentPrefixMatch> {
     let mut cursor = search_start;
     while cursor < line.len() {
         let offset = line[cursor..].find(prefix)?;

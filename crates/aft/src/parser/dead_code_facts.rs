@@ -831,7 +831,10 @@ pub(crate) fn split_cfg_predicates(input: &str) -> Vec<&str> {
     parts
 }
 
-pub(crate) fn rust_macro_token_refs(source: &str, root: tree_sitter::Node) -> Vec<MacroTokenRefContribution> {
+pub(crate) fn rust_macro_token_refs(
+    source: &str,
+    root: tree_sitter::Node,
+) -> Vec<MacroTokenRefContribution> {
     let mut refs = BTreeSet::new();
     let mut scope_stack = Vec::new();
     collect_rust_macro_token_refs(source, root, &mut scope_stack, &mut refs);
@@ -985,7 +988,9 @@ pub(crate) fn rust_template_token_tree(
 /// Whether a template token tree, at any depth, invokes a macro named by a
 /// metavariable: a `$name` token followed by `!`, with comments and whitespace
 /// allowed in between, as in `$callback /* note */ !(..)`.
-pub(crate) fn rust_token_tree_invokes_metavariable_macro(token_tree: tree_sitter::Node<'_>) -> bool {
+pub(crate) fn rust_token_tree_invokes_metavariable_macro(
+    token_tree: tree_sitter::Node<'_>,
+) -> bool {
     let mut stack = vec![token_tree];
     while let Some(node) = stack.pop() {
         let mut cursor = node.walk();
@@ -1223,7 +1228,10 @@ pub(crate) fn rust_macro_path_before(tokens: &[RustMacroToken<'_>], index: usize
     segments
 }
 
-pub(crate) fn rust_macro_next_after_optional_turbofish(tokens: &[RustMacroToken<'_>], index: usize) -> usize {
+pub(crate) fn rust_macro_next_after_optional_turbofish(
+    tokens: &[RustMacroToken<'_>],
+    index: usize,
+) -> usize {
     if tokens.get(index).is_none_or(|token| token.text != "::")
         || tokens.get(index + 1).is_none_or(|token| token.text != "<")
     {
@@ -1759,7 +1767,11 @@ pub(crate) fn rust_collect_api_facts(
 /// The project-relative file of the out-of-line module at `nested` (its
 /// module path inside the declaring file), declared in the file at `file`,
 /// with `path_override` from its `#[path]` attribute.
-pub(crate) fn rust_module_file(file: &str, nested: &[String], path_override: Option<&str>) -> String {
+pub(crate) fn rust_module_file(
+    file: &str,
+    nested: &[String],
+    path_override: Option<&str>,
+) -> String {
     let base = Path::new(file);
     let dir = base.parent().unwrap_or(Path::new(""));
     let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("");
@@ -1809,7 +1821,11 @@ pub(crate) fn rust_collect_api_macro_items(
 // Expand simple ident/path captures used by re-export macros. Repetition and
 // procedural macros require compiler expansion; unresolved templates are not
 // evidence that every item in their module is public.
-pub(crate) fn rust_api_macro_expansion(pattern: &str, template: &str, input: &str) -> Option<String> {
+pub(crate) fn rust_api_macro_expansion(
+    pattern: &str,
+    template: &str,
+    input: &str,
+) -> Option<String> {
     let interior = |text: &str| {
         text.get(1..text.len().checked_sub(1)?)
             .map(str::trim)
@@ -1877,7 +1893,11 @@ pub(crate) fn rust_api_type_path(text: &str) -> String {
 /// memory.
 pub(crate) const MAX_RUST_USE_GROUP_NESTING: usize = 64;
 
-pub(crate) fn rust_api_use_paths(text: &str, prefix: &[String], emit: &mut impl FnMut(Vec<String>, String)) {
+pub(crate) fn rust_api_use_paths(
+    text: &str,
+    prefix: &[String],
+    emit: &mut impl FnMut(Vec<String>, String),
+) {
     rust_api_use_paths_at(text, prefix, emit, 0);
 }
 

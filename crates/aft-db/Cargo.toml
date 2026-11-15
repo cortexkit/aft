@@ -24,9 +24,8 @@ getrandom = "0.3"
 tokio = { version = "1", features = ["sync"] }
 blake3 = "1"
 parking_lot = "0.12"
-tokio = { version = "1", features = ["sync"] }
-subc-protocol = "=0.35.0"
-cortexkit-role-tool-provider = "=0.15.7"
+subc-protocol = "=0.37.0"
+cortexkit-role-tool-provider = "=0.15.8"
 tempfile = { version = "3", optional = true }
 
 [target.'cfg(windows)'.dependencies]

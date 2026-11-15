@@ -64,11 +64,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rustls-platform-verifier = "0.6"
 htmd = "0.5.4"
 markup5ever_rcdom = "0.38"
-cortexkit-role-tool-provider = "=0.15.7"
-subc-protocol = "=0.35.0"
-subc-transport = { version = "=0.16.0", optional = true }
-subc-client-rs = "=0.35.0"
-subc-os = "=0.1.30"
+cortexkit-role-tool-provider = "=0.15.8"
+subc-protocol = "=0.37.0"
+subc-transport = { version = "=0.18.0", optional = true }
+subc-client-rs = "=0.40.3"
+subc-os = { version = "=0.1.38", features = ["tokio"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 vt100 = "0.16"
 jsonc-parser = { version = "0.33", features = ["cst"] }
@@ -99,5 +99,5 @@ windows-sys = { version = "0.61", features = [
 crc32fast = "1"
 tempfile = "3"
 filetime = "0.2"
-subc-transport = "=0.16.0"
+subc-transport = "=0.18.0"
 tokio = { version = "1", features = ["test-util"] }
