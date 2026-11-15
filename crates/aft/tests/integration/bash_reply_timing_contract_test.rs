@@ -64,6 +64,46 @@ const SESSION_ID: &str = "bash-reply-timing-contract";
 const ROUTE_CHANNEL: u16 = 1;
 
 #[test]
+fn standalone_foreground_bash_exit_wakes_without_pending_ticks() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut aft = AftProcess::spawn_with_env(&[
+        (
+            "AFT_TEST_PENDING_POLL_INTERVAL_MS",
+            std::ffi::OsStr::new("30000"),
+        ),
+        (
+            "AFT_TEST_BASH_WATCHDOG_INTERVAL_MS",
+            std::ffi::OsStr::new("30000"),
+        ),
+    ]);
+    configure(&mut aft, dir.path(), &dir.path().join("storage"));
+    for (id, command) in [
+        ("standalone-exit-true", "true"),
+        (
+            "standalone-exit-delayed",
+            "sleep 0.2; printf final-output; true",
+        ),
+    ] {
+        let response = aft.send_with_timeout(
+            &bash_request(
+                id,
+                json!({"command": command, "foreground_orchestrate": true, "wait": true}),
+            ),
+            Duration::from_secs(10),
+        );
+        assert_eq!(response["status"], "completed", "{response:?}");
+        assert_eq!(response["exit_code"], 0, "{response:?}");
+        if command.contains("printf") {
+            assert!(response["output"]
+                .as_str()
+                .unwrap()
+                .contains("final-output"));
+        }
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn foreground_bash_exit_wakes_without_observation_ticks() {
     // Stretch both observation timers beyond the reply deadline. The delayed
     // command cannot finish in the spawn's immediate status check, so only its
