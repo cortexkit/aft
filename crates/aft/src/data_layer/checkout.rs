@@ -6586,13 +6586,20 @@ mod tests {
     }
 
     fn callers_of(view: &CheckoutView, file: &str, symbol: &str) -> String {
+        // Resolved callers only: `callers` also lists unresolved call sites
+        // that merely share the name, and those would make a negative check
+        // ("main.ts is not a caller yet") match on the candidate list.
         let callers = crate::commands::callgraph_store_adapter::callers_result(
             &view.callgraph(),
             &view.root().join(file),
             symbol,
             1,
             true,
-        );
+        )
+        .map(|mut result| {
+            result.unresolved_callers = None;
+            result
+        });
         format!("{callers:?}")
     }
 
