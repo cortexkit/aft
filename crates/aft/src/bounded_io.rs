@@ -466,7 +466,6 @@ fn access_error(req_id: &str, path: &Path, error: io::Error) -> Response {
 
 pub(crate) fn finish_response(mut response: Response) -> Response {
     response = finish_response_without_skips(response);
-    disclose_large_read_skips(&mut response);
     response
 }
 
@@ -610,6 +609,17 @@ pub(crate) fn with_skip_disclosure(run: impl FnOnce() -> Response) -> Response {
         disclose_large_read_skips(&mut response);
     }
     response
+}
+
+pub(crate) fn skip_disclosure_active() -> bool {
+    capture().is_some_and(|budget| {
+        budget
+            .large_read_skips
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .scopes
+            != 0
+    })
 }
 
 pub(crate) fn disclose_large_read_skips(response: &mut Response) {
@@ -873,14 +883,6 @@ thread_local! {
 }
 
 pub(crate) fn command(
-    req: &RawRequest,
-    ctx: &AppContext,
-    work: impl FnOnce(&RawRequest, &AppContext) -> Response,
-) -> Response {
-    with_skip_disclosure(|| command_without_skip_scope(req, ctx, work))
-}
-
-fn command_without_skip_scope(
     req: &RawRequest,
     ctx: &AppContext,
     work: impl FnOnce(&RawRequest, &AppContext) -> Response,

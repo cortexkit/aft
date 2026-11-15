@@ -2424,8 +2424,7 @@ fn format_search(data: &Value) -> String {
     // The named skip disclosure already explains incomplete coverage and ends
     // with its own list trailer; do not append the same partial-status notice.
     let note = if data.get("skipped_files_list_envelope").is_some() {
-        (data.get("fully_degraded").and_then(Value::as_bool) == Some(true))
-            .then(|| format!("Search status: {FILESYSTEM_SCAN_STATUS}."))
+        semantic_honesty_note_with_partial(data, false)
     } else if envelope.is_some() {
         search_status_only_note(data)
     } else {
@@ -2443,7 +2442,7 @@ fn format_search(data: &Value) -> String {
             None => text.to_string(),
         }
     } else if data.get("skipped_files_list_envelope").is_some() {
-        match semantic_honesty_note(data) {
+        match note {
             Some(note) => format!("No results.\n{note}"),
             None => "No results.".to_string(),
         }
@@ -2492,6 +2491,10 @@ fn search_status_only_note(data: &Value) -> Option<String> {
 }
 
 fn semantic_honesty_note(data: &Value) -> Option<String> {
+    semantic_honesty_note_with_partial(data, true)
+}
+
+fn semantic_honesty_note_with_partial(data: &Value, include_partial: bool) -> Option<String> {
     let mut notes = Vec::new();
     if data.get("more_available").and_then(Value::as_bool) == Some(true) {
         notes.push("more results available");
@@ -2502,7 +2505,7 @@ fn semantic_honesty_note(data: &Value) -> Option<String> {
     if data.get("fully_degraded").and_then(Value::as_bool) == Some(true) {
         notes.push(FILESYSTEM_SCAN_STATUS);
     }
-    if data.get("complete").and_then(Value::as_bool) == Some(false) {
+    if include_partial && data.get("complete").and_then(Value::as_bool) == Some(false) {
         notes.push("partial/incomplete");
     }
     if notes.is_empty() {

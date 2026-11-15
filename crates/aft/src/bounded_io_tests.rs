@@ -22,10 +22,12 @@ fn stage2_disclosure_scope_has_no_deadline_or_sticky_read_failure() {
         },
         || {},
     );
-    let response = finish_response(Response::success(
-        "native",
-        serde_json::json!({"complete":true}),
-    ));
+    let response = with_skip_disclosure(|| {
+        finish_response(Response::success(
+            "native",
+            serde_json::json!({"complete":true}),
+        ))
+    });
     assert!(response.success);
     assert_eq!(response.data["complete"], false);
     assert_eq!(response.data["skipped_files"].as_array().unwrap().len(), 1);
@@ -43,10 +45,12 @@ fn stage2_skip_disclosure_is_sorted_bounded_deduplicated_and_non_failing() {
             note_large_read_skip(&path);
         }
         assert_eq!(read(&readable, None).unwrap(), b"still readable");
-        finish_response(Response::success(
-            "skips",
-            serde_json::json!({"complete":true,"text":"results"}),
-        ))
+        with_skip_disclosure(|| {
+            finish_response(Response::success(
+                "skips",
+                serde_json::json!({"complete":true,"text":"results"}),
+            ))
+        })
     });
     assert!(response.success);
     assert_eq!(response.data["complete"], false);
@@ -1254,7 +1258,9 @@ fn audit1432_zero_result_search_keeps_no_results_and_independent_honesty_notes()
         let mut response = Response::success(
             "empty-search",
             serde_json::json!({
-                "text":"", "results":[], "more_available":true, "engine_capped":true
+                "text":"", "results":[], "more_available":true, "engine_capped":true,
+                "fully_degraded":true,
+                "results_list_envelope":{"shown":0,"total":{"kind":"exact","value":0},"unit":"results","causes":[],"narrow":["query"]}
             }),
         );
         disclose_large_read_skips(&mut response);
@@ -1263,12 +1269,120 @@ fn audit1432_zero_result_search_keeps_no_results_and_independent_honesty_notes()
             "No results.",
             "more results available",
             "enumeration capped",
+            "answered by a filesystem scan",
             "large.log",
             crate::large_read::WHOLE_READ_SKIP_REASON,
         ] {
             assert!(text.contains(expected), "missing {expected:?}: {text}");
         }
     });
+}
+
+#[test]
+fn audit1432_round2_nonempty_search_keeps_independent_honesty_with_skips() {
+    with_budget(Some(Budget::after(Duration::from_secs(30))), || {
+        note_large_read_skip(Path::new("large.log"));
+        let mut response = Response::success(
+            "rows-search",
+            serde_json::json!({"text":"retained row", "more_available":true, "engine_capped":true, "fully_degraded":true}),
+        );
+        disclose_large_read_skips(&mut response);
+        let text = crate::subc_format::format_response("search", &response, false);
+        for expected in [
+            "retained row",
+            "more results available",
+            "enumeration capped",
+            "answered by a filesystem scan",
+            "large.log",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}: {text}");
+        }
+    });
+}
+
+fn round2_context(root: &Path) -> AppContext {
+    let mut config = crate::config::Config::default();
+    config.project_root = Some(root.to_path_buf());
+    config.restrict_to_project_root = false;
+    config.storage_dir = Some(root.join(".store"));
+    config.backup.enabled = Some(false);
+    AppContext::new(Box::new(crate::language::StubProvider), config)
+}
+
+fn round2_nonsearch_reply(
+    command_name: &str,
+    body: serde_json::Value,
+    floors: &[PathBuf],
+) -> Response {
+    let root = tempfile::tempdir().unwrap();
+    let ctx = round2_context(root.path());
+    let req: RawRequest =
+        serde_json::from_value(serde_json::json!({"id":"main-contract","command":command_name}))
+            .unwrap();
+    crate::context::confinement::with_floor_disclosure(|| {
+        command(&req, &ctx, |_, _| {
+            for path in floors {
+                crate::context::confinement::capture().record_matched_floor(path);
+            }
+            Response::success("main-contract", body)
+        })
+    })
+}
+
+#[test]
+fn audit1432_round2_outline_directory_reply_keeps_main_skip_contract_bytes() {
+    let skips = (0..23).rev().map(|at| serde_json::json!({"file":format!("unsupported-{at:02}.odd"),"reason":"unsupported_language"})).collect::<Vec<_>>();
+    let body = serde_json::json!({"text":"directory outline\nstructure footer", "structure_footer":"structure footer", "discovered":true,"complete":true,"skipped_files":skips});
+    let expected = Response::success("main-contract", body.clone());
+    let response = round2_nonsearch_reply("outline", body, &[]);
+    assert_eq!(
+        serde_json::to_vec(&response).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+    assert_eq!(
+        crate::subc_format::format_response("outline", &response, false),
+        crate::subc_format::format_response("outline", &expected, false)
+    );
+}
+
+#[test]
+fn audit1432_round2_glob_floor_only_reply_keeps_main_skip_contract_bytes() {
+    let floors = (0..23)
+        .map(|at| PathBuf::from(format!("denied-{at:02}.log")))
+        .collect::<Vec<_>>();
+    let mut expected_body = serde_json::json!({"text":"visible.rs", "files":["visible.rs"]});
+    let response = round2_nonsearch_reply("glob", expected_body.clone(), &floors);
+    expected_body["skipped_files"] = serde_json::json!(floors
+        .iter()
+        .map(|path| serde_json::json!({"file":path,"reason":"denied_floor"}))
+        .collect::<Vec<_>>());
+    expected_body["complete"] = serde_json::json!(false);
+    let expected = Response::success("main-contract", expected_body);
+    assert_eq!(
+        serde_json::to_vec(&response).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+    assert_eq!(
+        crate::subc_format::format_response("glob", &response, false),
+        crate::subc_format::format_response("glob", &expected, false)
+    );
+}
+
+#[test]
+fn audit1432_round2_nested_dead_code_reply_keeps_main_skip_contract_bytes() {
+    let skips = (0..23)
+        .rev()
+        .map(
+            |at| serde_json::json!({"file":format!("large-{at:02}.rs"),"reason":"graph_too_large"}),
+        )
+        .collect::<Vec<_>>();
+    let body = serde_json::json!({"dead_code":{"complete":false,"skipped_files_count":23,"skipped_files":skips}});
+    let expected = Response::success("main-contract", body.clone());
+    let response = round2_nonsearch_reply("inspect", body, &[]);
+    assert_eq!(
+        serde_json::to_vec(&response).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
 }
 
 #[test]
@@ -1298,10 +1412,12 @@ fn audit1432_walk_gap_precedes_the_entire_skipped_files_block() {
         for at in 0..23 {
             note_large_read_skip(Path::new(&format!("large-{at:02}.log")));
         }
-        let response = finish_response(Response::success(
-            "walk-and-skips",
-            serde_json::json!({"text":"rows"}),
-        ));
+        let response = with_skip_disclosure(|| {
+            finish_response(Response::success(
+                "walk-and-skips",
+                serde_json::json!({"text":"rows"}),
+            ))
+        });
         let text = response.data["text"].as_str().unwrap();
         assert!(
             text.find(WALK_PARTIAL_GAP).unwrap()

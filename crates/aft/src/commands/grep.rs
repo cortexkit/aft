@@ -136,8 +136,10 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
     let config = ctx.config();
     let _pin = false.then(|| ctx.pin_config_to(config));
     ctx.with_read_policy_snapshot(&req.id, || {
-        crate::context::confinement::with_floor_disclosure(|| {
-            crate::bounded_io::command(req, ctx, handle_grep_inner)
+        crate::bounded_io::with_skip_disclosure(|| {
+            crate::context::confinement::with_floor_disclosure(|| {
+                crate::bounded_io::command(req, ctx, handle_grep_inner)
+            })
         })
     })
 }
