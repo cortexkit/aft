@@ -101,7 +101,7 @@ impl Daemon {
                                 loop {
                                     let request = tokio::select! {
                                         Ok(()) = disconnected.changed(), if connection == 1 => break,
-                                        request = subc_transport::read_frame(&mut stream) => match request {
+                                        request = crate::subc_fake::read_frame(&mut stream) => match request {
                                             Ok(Some(request)) => request,
                                             _ => break,
                                         },

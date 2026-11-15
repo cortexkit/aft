@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use subc_protocol::{Flags, Frame, FrameType, Priority, PROTOCOL_VERSION};
 use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
-use subc_transport::{authenticate_server, read_frame, write_frame};
+use subc_transport::{authenticate_server, write_frame};
 use tempfile::TempDir;
 use tokio::net::TcpStream;
 
@@ -177,7 +177,7 @@ async fn drive_profile_memory_daemon(
 }
 
 async fn read_request(stream: &mut TcpStream, label: &str) -> Frame {
-    let frame = tokio::time::timeout(Duration::from_secs(5), read_frame(stream))
+    let frame = tokio::time::timeout(Duration::from_secs(5), crate::subc_fake::read_frame(stream))
         .await
         .unwrap_or_else(|_| panic!("timed out reading {label}"))
         .unwrap_or_else(|error| panic!("failed reading {label}: {error}"))

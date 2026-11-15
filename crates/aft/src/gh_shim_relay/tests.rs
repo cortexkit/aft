@@ -1359,7 +1359,7 @@ async fn fake_daemon(script: DaemonScript) -> FakeDaemon {
                 let mut scope_ended = false;
                 let mut held = None;
                 let mut deferred = Vec::new();
-                while let Ok(Some(frame)) = subc_transport::read_frame(&mut stream).await {
+                while let Ok(Some(frame)) = crate::subc_fake::read_frame(&mut stream).await {
                     let header = frame.header;
                     let mut replies = Vec::new();
                     match header.ty {
@@ -1771,11 +1771,12 @@ async fn a_retried_scope_refusal_that_outlasts_the_deadline_keeps_its_code() {
     // A paused clock still jumps to the next timer whenever the runtime has
     // nothing to run, which includes waiting on a socket. A running blocking
     // task stops those jumps (see `tokio::time::pause`), so the clock moves
-    // only through `advance` below. Dropping `_release`, also on a panic, ends
-    // the blocking task.
+    // only through `advance` below. A real-time watchdog releases the clock
+    // even if a missing daemon reply prevents the notice from arriving;
+    // dropping `_release`, also on a panic, releases it sooner.
     let (_release, held) = std::sync::mpsc::channel::<()>();
     let _hold_clock = tokio::task::spawn_blocking(move || {
-        let _ = held.recv();
+        let _ = held.recv_timeout(std::time::Duration::from_secs(5));
     });
     for code in ["scope_not_synced", "scope_changed"] {
         let daemon = fake_daemon(DaemonScript {
@@ -1797,10 +1798,14 @@ async fn a_retried_scope_refusal_that_outlasts_the_deadline_keeps_its_code() {
                 tokio::time::advance(DEADLINE).await;
             }
         };
-        let ((reply, _), ()) = tokio::join!(
-            relay_stamped(&transport, "ses-scope-retried", "nonce-retried"),
-            expire
-        );
+        let ((reply, _), ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                relay_stamped(&transport, "ses-scope-retried", "nonce-retried"),
+                expire
+            )
+        })
+        .await
+        .expect("the scoped refusal and its notice must both arrive");
         assert!(!reply.ok, "{code}");
         assert_eq!(reply.data["refusal_code"], code, "{:?}", reply.data);
         assert_eq!(reply.data["retryable"], true, "{code}");

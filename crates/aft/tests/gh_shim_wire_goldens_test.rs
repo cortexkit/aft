@@ -607,7 +607,7 @@ async fn serve_connection(
     {
         return;
     }
-    while let Ok(Some(frame)) = subc_transport::read_frame(&mut stream).await {
+    while let Ok(Some(frame)) = crate::subc_fake::read_frame(&mut stream).await {
         let response = match frame.header.ty {
             FrameType::Hello => Some(
                 Frame::build(

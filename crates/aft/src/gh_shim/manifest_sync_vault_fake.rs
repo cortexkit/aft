@@ -109,7 +109,7 @@ async fn serve(
         return;
     }
     let samples = samples();
-    while let Ok(Some(request)) = subc_transport::read_frame(&mut stream).await {
+    while let Ok(Some(request)) = crate::subc_fake::read_frame(&mut stream).await {
         if request.header.ty == FrameType::Ping {
             let pong = Frame::build(
                 FrameType::Pong,

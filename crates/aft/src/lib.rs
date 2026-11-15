@@ -209,6 +209,9 @@ pub(crate) mod status_push;
 mod storage_permissions_tests;
 pub mod subc;
 pub mod subc_config;
+#[cfg(test)]
+#[path = "../tests/helpers/subc_fake.rs"]
+mod subc_fake;
 pub mod subc_format;
 pub mod subc_translate;
 pub mod symbol_diff;

@@ -387,7 +387,7 @@ impl FakeClaustrum {
                                 if subc_transport::authenticate_server(&mut stream, &key, &daemon_id, "0.39.0", Duration::from_secs(2)).await.is_err() { return; }
                                 state.lock().unwrap().connections += 1;
                                 let mut principal = String::new();
-                                while let Ok(Some(request)) = subc_transport::read_frame(&mut stream).await {
+                                while let Ok(Some(request)) = crate::subc_fake::read_frame(&mut stream).await {
                                     if request.header.ty == FrameType::Ping {
                                         let pong = Frame::build(FrameType::Pong, flags(), 0, 0, request.header.corr, Vec::new()).unwrap();
                                         if subc_transport::write_frame(&mut stream, &pong).await.is_err() { break; }
@@ -395,12 +395,7 @@ impl FakeClaustrum {
                                     }
                                     if request.header.ty != FrameType::Request { continue; }
                                     let value: Value = serde_json::from_slice(&request.body).unwrap();
-                                    let (reply, error) = if value["op"] == "server.describe" {
-                                        // This fake predates reason-bearing closes; the SDK
-                                        // may probe, but must not infer extra capabilities.
-                                        (json!({"op":"server.describe", "protocol_ver":2,
-                                            "subc_ops":[], "capabilities":[], "connected_clients":1}), false)
-                                    } else if value["op"] == "route.open" {
+                                    let (reply, error) = if value["op"] == "route.open" {
                                         assert_eq!(value["target"], json!({"kind":"management_surface","module_id":"claustrum"}));
                                         assert!(value.get("scope").is_some());
                                         let (hold, error) = {

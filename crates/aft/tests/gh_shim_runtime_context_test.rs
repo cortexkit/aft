@@ -2374,7 +2374,7 @@ impl SlowTestDaemon {
                                 }
 
                                 loop {
-                                    let frame = match subc_transport::read_frame(&mut stream).await {
+                                    let frame = match crate::subc_fake::read_frame(&mut stream).await {
                                         Ok(Some(frame)) => frame,
                                         _ => break,
                                     };

@@ -378,6 +378,15 @@ pub(crate) async fn daemon_with_capabilities(
             let mut producers = Vec::new();
             let mut cancelled = false;
             while let Ok(Some(frame)) = subc_transport::read_frame(&mut reader).await {
+                if let Some(reply) = crate::subc_fake::server_describe_reply(&frame) {
+                    if subc_transport::write_frame(&mut *writer.lock().await, &reply)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
                 let header = frame.header;
                 let body: Value = serde_json::from_slice(&frame.body).unwrap_or(Value::Null);
                 server_log.lock().unwrap().push((header, body.clone()));
@@ -412,12 +421,6 @@ pub(crate) async fn daemon_with_capabilities(
                         }));
                     },
                     Some("route.open") => replies.push(reply(FrameType::Response, json!({"op":"route.open", "route_channel":40, "route_epoch":1}))),
-                    // subc-client 0.40 probes server.describe before it opens a
-                    // route; this fake advertises nothing beyond the old protocol.
-                    Some("server.describe") => replies.push(reply(
-                        FrameType::Response,
-                        json!({"op":"server.describe", "protocol_ver":2, "subc_ops":[], "capabilities":[], "connected_clients":1}),
-                    )),
                     _ => panic!("unexpected control request {body}"),
                 },
                 FrameType::Request => {
@@ -1365,6 +1368,12 @@ async fn outage_daemon_with(
                 connects.send_modify(|count| *count += 1);
                 let (mut reader, mut writer) = tokio::io::split(socket);
                 while let Ok(Some(frame)) = subc_transport::read_frame(&mut reader).await {
+                    if let Some(reply) = crate::subc_fake::server_describe_reply(&frame) {
+                        if subc_transport::write_frame(&mut writer, &reply).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                     let header = frame.header;
                     let body: Value = serde_json::from_slice(&frame.body).unwrap_or(Value::Null);
                     let frame_of = |ty, bytes: Vec<u8>| {

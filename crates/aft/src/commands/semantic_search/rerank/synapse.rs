@@ -346,18 +346,18 @@ pub(crate) mod tests {
                     let listener = tokio::net::TcpListener::from_std(listener).unwrap();
                     let (mut stream, _) = listener.accept().await.unwrap();
                     subc_transport::authenticate_server(&mut stream, &key, &daemon_id, "0.39.0", Duration::from_secs(30)).await.unwrap();
-                    let catalog = subc_transport::read_frame(&mut stream).await.unwrap().unwrap();
+                    let catalog = crate::subc_fake::read_frame(&mut stream).await.unwrap().unwrap();
                     let modules = if registered { json!([{"module_id":"synapse","module_version":"1","roles":[{"role":"management_surface","operations":[{"name":"models.list","kind":"query"},{"name":"rerank.score","kind":"query"}],"config_schema":{"type":"object"},"observability":[],"identity_scope":[]}],"control_ops":[]}]) } else { json!([]) };
                     respond(&mut stream, &catalog, json!({"op":"catalog.list","generation":1,"modules":modules,"subc_ops":["catalog.list","route.open"]})).await;
                     if !registered { return Vec::new(); }
-                    let route = subc_transport::read_frame(&mut stream).await.unwrap().unwrap();
+                    let route = crate::subc_fake::read_frame(&mut stream).await.unwrap().unwrap();
                     let route_body: Value = serde_json::from_slice(&route.body).unwrap();
                     assert_eq!(route_body["target"], json!({"kind":"management_surface","module_id":"synapse"}));
                     respond(&mut stream, &route, json!({"op":"route.open","route_channel":7,"route_epoch":1})).await;
                     let mut requests = Vec::new();
                     let mut gate = gate;
                     for response in responses {
-                        let request = subc_transport::read_frame(&mut stream).await.unwrap().unwrap();
+                        let request = crate::subc_fake::read_frame(&mut stream).await.unwrap().unwrap();
                         requests.push(serde_json::from_slice(&request.body).unwrap());
                         if let Some((entered, release)) = gate.take() {
                             entered.send(()).unwrap();

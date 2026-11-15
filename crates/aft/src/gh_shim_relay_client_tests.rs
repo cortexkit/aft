@@ -1169,7 +1169,7 @@ impl FakeRelayDaemon {
                                 ).await.is_err() {
                                     return;
                                 }
-                                while let Ok(Some(frame)) = subc_transport::read_frame(&mut stream).await {
+                                while let Ok(Some(frame)) = crate::subc_fake::read_frame(&mut stream).await {
                                     let reply = match frame.header.ty {
                                         FrameType::Hello => Frame::build(
                                             FrameType::HelloAck, control_flags(), 0, 0, frame.header.corr,

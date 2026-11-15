@@ -1779,7 +1779,7 @@ mod tests {
                     {
                         return;
                     }
-                    while let Ok(Some(frame)) = subc_transport::read_frame(&mut stream).await {
+                    while let Ok(Some(frame)) = crate::subc_fake::read_frame(&mut stream).await {
                         let header = frame.header;
                         let reply = match header.ty {
                             FrameType::Hello => Frame::build(
@@ -1801,27 +1801,6 @@ mod tests {
                             FrameType::Request if header.channel == 0 => {
                                 let body: Value =
                                     serde_json::from_slice(&frame.body).unwrap_or(Value::Null);
-                                if body.get("op").and_then(Value::as_str) == Some("server.describe")
-                                {
-                                    let reply = Frame::build(
-                                            FrameType::Response,
-                                            flags,
-                                            0,
-                                            0,
-                                            header.corr,
-                                            serde_json::to_vec(&json!({
-                                                "op": "server.describe", "protocol_ver": 2,
-                                                "subc_ops": [], "capabilities": [], "connected_clients": 1,
-                                            })).unwrap(),
-                                        ).unwrap();
-                                    if subc_transport::write_frame(&mut stream, &reply)
-                                        .await
-                                        .is_err()
-                                    {
-                                        return;
-                                    }
-                                    continue;
-                                }
                                 if body.get("op").and_then(Value::as_str) != Some("route.open") {
                                     continue;
                                 }
