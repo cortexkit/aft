@@ -214,6 +214,8 @@ impl Default for LockConfig {
     }
 }
 
+#[rustfmt::skip]
+test_support_visibility! {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProcessIdentity {
     #[cfg(any(test, feature = "test-support"))]
@@ -225,6 +227,7 @@ struct ProcessIdentity {
     pub exited: bool,
     #[cfg(not(any(test, feature = "test-support")))]
     exited: bool,
+}
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
