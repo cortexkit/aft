@@ -290,9 +290,7 @@ fn an_untyped_call_from_many_files_is_resolved_once_per_language() {
         .map(|index| {
             (
                 format!("src/caller{index:02}.ts"),
-                format!(
-                    "export function run{index}(x) {{\n  x.dispose();\n  x.dispose();\n}}\n"
-                ),
+                format!("export function run{index}(x) {{\n  x.dispose();\n  x.dispose();\n}}\n"),
             )
         })
         .collect::<Vec<_>>();
