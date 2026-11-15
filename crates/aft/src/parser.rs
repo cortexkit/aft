@@ -4422,7 +4422,7 @@ pub(crate) fn complete_rust_trait_members(
     // the same order; navigation always appends members in source order.
     let mut members = members.into_iter().collect::<Vec<_>>();
     members.sort_by_key(|member| (member.range.start_line, member.range.start_col));
-    for member in members {
+    for mut member in members {
         if member.kind != SymbolKind::Method
             || !symbols.iter().any(|owner| {
                 owner.kind == SymbolKind::Interface
@@ -4432,13 +4432,18 @@ pub(crate) fn complete_rust_trait_members(
                     && (member.range.end_line, member.range.end_col)
                         <= (owner.range.end_line, owner.range.end_col)
             })
-            || symbols.iter().any(|existing| {
-                existing.kind == member.kind
-                    && existing.name == member.name
-                    && existing.range == member.range
-                    && existing.scope_chain == member.scope_chain
-            })
         {
+            continue;
+        }
+        // Like impl members, navigation names trait members as Trait::method,
+        // even inside a module. Stored call-graph identities keep module scope.
+        member.scope_chain = member.parent.iter().cloned().collect();
+        if symbols.iter().any(|existing| {
+            existing.kind == member.kind
+                && existing.name == member.name
+                && existing.range == member.range
+                && existing.scope_chain == member.scope_chain
+        }) {
             continue;
         }
         symbols.push(member);

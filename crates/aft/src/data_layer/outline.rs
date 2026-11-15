@@ -707,10 +707,11 @@ pub fn separator() -> char {
         for (owner, name, scope) in [
             ("Host", "context_ceiling", vec!["Host"]),
             ("Host", "held_calls", vec!["Host"]),
-            ("Nested", "default_method", vec!["nested", "Nested"]),
-            ("Nested", "required_method", vec!["nested", "Nested"]),
+            ("Nested", "default_method", vec!["Nested"]),
+            ("Nested", "required_method", vec!["Nested"]),
             ("Runner", "new", vec!["Runner"]),
             ("Runner", "held_calls", vec!["Host for Runner"]),
+            ("NestedRunner", "create", vec!["NestedRunner"]),
         ] {
             let matches = warm
                 .iter()
@@ -719,7 +720,7 @@ pub fn separator() -> char {
             assert_eq!(matches.len(), 1, "{owner}::{name}: {warm:?}");
             assert_eq!(matches[0].kind, SymbolKind::Method);
             assert_eq!(matches[0].scope_chain, scope);
-            if owner != "Runner" {
+            if owner == "Host" || owner == "Nested" {
                 assert!(
                     !matches[0].exported,
                     "trait members are reached through their owner"
@@ -764,8 +765,12 @@ pub fn separator() -> char {
             "Host::context_ceiling",
             "held_calls",
             "Host::held_calls",
+            "default_method",
             "Nested::default_method",
-            "nested::Nested::required_method",
+            "required_method",
+            "Nested::required_method",
+            "create",
+            "NestedRunner::create",
             "Runner::new",
             "Host for Runner::held_calls",
         ] {

@@ -28,4 +28,12 @@ mod nested {
 
         fn required_method(&self);
     }
+
+    pub struct NestedRunner;
+
+    impl NestedRunner {
+        pub fn create() -> Self {
+            Self
+        }
+    }
 }
