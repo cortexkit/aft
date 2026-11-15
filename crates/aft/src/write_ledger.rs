@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(hidden_glob_reexports))]
 pub use aft_db::write_ledger::*;
 
 #[cfg(test)]

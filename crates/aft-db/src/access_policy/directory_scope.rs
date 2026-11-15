@@ -88,10 +88,16 @@ pub(crate) const DIRECTORY_SCOPE_MEMO_TTL: Duration = Duration::from_secs(60);
 }
 pub(crate) type DirectoryScopeAnswer = Result<bool, &'static str>;
 
+#[rustfmt::skip]
+test_support_visibility! {
 #[derive(Default)]
 pub(crate) struct DirectoryScopeProbe {
+    #[cfg(any(test, feature = "test-support"))]
+    pub answer: std::sync::Mutex<Option<(Instant, DirectoryScopeAnswer)>>,
+    #[cfg(not(any(test, feature = "test-support")))]
     pub(crate) answer: std::sync::Mutex<Option<(Instant, DirectoryScopeAnswer)>>,
     pub(crate) ready: std::sync::Condvar,
+}
 }
 
 impl DirectoryScopeProbe {
@@ -435,10 +441,13 @@ pub(crate) fn scan<F>(&self, scan: F) -> Option<bool>
 }
 }
 
+#[rustfmt::skip]
+test_support_visibility! {
 pub(crate) struct ScopeProbePermit(
     Arc<std::sync::atomic::AtomicBool>,
     Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
 );
+}
 
 impl Drop for ScopeProbePermit {
     fn drop(&mut self) {

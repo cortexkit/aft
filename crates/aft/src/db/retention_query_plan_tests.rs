@@ -1,8 +1,6 @@
 use super::*;
 use aft_db::db::bash_tasks::query_plan_tests::*;
-use rusqlite::ffi;
 use rusqlite::params;
-use std::ffi::{c_int, c_void, CStr};
 
 #[test]
 fn retention_and_hot_query_plans_on_unanalyzed_history() {

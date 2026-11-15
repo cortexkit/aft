@@ -541,7 +541,7 @@ pub fn pending_for_test(domain: Domain, root_id: &str) -> (u64, u64) {
         .map_or((0, 0), |entry| entry.pending())
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub(crate) fn seam_labels_for_test(domain: Domain, root_id: &str) -> Vec<String> {
     registry()
         .entries
@@ -560,7 +560,7 @@ pub(crate) fn seam_labels_for_test(domain: Domain, root_id: &str) -> Vec<String>
         .unwrap_or_default()
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub(crate) fn unmeasurable_for_test(root_id: &str) -> Vec<UnmeasurableSeam> {
     unmeasurable_entries_snapshot()
         .into_iter()

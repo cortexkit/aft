@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(hidden_glob_reexports))]
 pub use aft_db::db::*;
 
 #[cfg(test)]
@@ -32,7 +33,6 @@ mod tests {
 
     use super::*;
 
-    use rusqlite::params;
     use tempfile::tempdir;
 
     #[test]

@@ -21,6 +21,7 @@ pub fn record_store_write(result: rusqlite::Result<usize>) -> rusqlite::Result<u
 
 #[cfg(any(test, feature = "test-support"))]
 #[path = "retention_query_plan_tests.rs"]
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
 pub mod query_plan_tests;
 
 pub const TERMINAL_ROW_RETENTION_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;

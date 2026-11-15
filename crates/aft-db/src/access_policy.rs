@@ -24,7 +24,7 @@ pub fn scope_grants_guard(denial: Option<ScopeGrantsDenial>) -> ScopeGrantsGuard
     )
 }
 
-pub(crate) struct ScopeGrantsGuard(
+pub struct ScopeGrantsGuard(
     Option<ScopeGrantsDenial>,
     std::marker::PhantomData<*const ()>,
 );
@@ -47,13 +47,10 @@ pub fn with_scope<R>(
     run()
 }
 
-#[rustfmt::skip]
-test_support_visibility! {
-pub(crate) struct ScopeGuard(
+pub struct ScopeGuard(
     Option<crate::db::access_grants::ScopeKey>,
     std::marker::PhantomData<*const ()>,
 );
-}
 
 impl Drop for ScopeGuard {
     fn drop(&mut self) {
@@ -340,10 +337,7 @@ thread_local! {
     static ASK_ROUTE_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-#[rustfmt::skip]
-test_support_visibility! {
-pub(crate) struct AskRouteGuard(Option<AskRoute>, std::marker::PhantomData<*const ()>);
-}
+pub struct AskRouteGuard(Option<AskRoute>, std::marker::PhantomData<*const ()>);
 
 impl Drop for AskRouteGuard {
     fn drop(&mut self) {
@@ -503,7 +497,7 @@ pub enum HeadPolicy {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum FloorRule {
+pub enum FloorRule {
     CredentialPath,
     CortexkitModuleData,
     CortexkitModuleState,
@@ -517,7 +511,7 @@ pub(crate) enum FloorRule {
 }
 
 impl FloorRule {
-    pub(crate) fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::CredentialPath => "credential_path",
             Self::CortexkitModuleData => "cortexkit_module_data",
@@ -532,7 +526,7 @@ impl FloorRule {
         }
     }
 
-    pub(crate) fn description(self) -> &'static str {
+    pub fn description(self) -> &'static str {
         match self {
             Self::CredentialPath => "credential path",
             Self::CortexkitModuleData => {
@@ -553,7 +547,7 @@ impl FloorRule {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PolicyFloor {
+pub struct PolicyFloor {
     pub path: PathBuf,
     pub rule: FloorRule,
 }
@@ -1257,7 +1251,7 @@ fn environment_private_store_floors(
     denies
 }
 
-#[cfg(all(any(test, feature = "test-support"), unix))]
+#[cfg(all(test, unix))]
 fn environment_private_store_denies(
     getenv: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Vec<PathBuf> {

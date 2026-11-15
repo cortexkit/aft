@@ -325,7 +325,7 @@ impl CompressionAggregateCache {
         *self.inner.lock() = CompressionAggregateCacheInner::default();
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     fn aggregate_scan_count_for_test(&self) -> usize {
         self.aggregate_scan_count.load(Ordering::Relaxed)
     }

@@ -345,7 +345,7 @@ pub mod test_hooks {
         state.waiting_at_gate -= 1;
     }
 
-    pub(crate) struct Gate {
+    pub struct Gate {
         _serial: MutexGuard<'static, ()>,
     }
 
@@ -357,7 +357,7 @@ pub mod test_hooks {
 
     /// Hold this database's checkpoint before I/O, but after a shared worker
     /// opens its temporary handle. Unrelated stores remain free to drain.
-    pub(crate) fn close_gate(path: &Path) -> Gate {
+    pub fn close_gate(path: &Path) -> Gate {
         static SERIAL: Mutex<()> = Mutex::new(());
         let serial = SERIAL
             .lock()
@@ -376,7 +376,7 @@ pub mod test_hooks {
     }
 
     /// Wait until a deferred checkpoint is held at the closed gate.
-    pub(crate) fn wait_until_held(timeout: Duration) -> bool {
+    pub fn wait_until_held(timeout: Duration) -> bool {
         let (lock, changed) = state();
         let deadline = Instant::now() + timeout;
         let mut state = lock.lock().unwrap();
@@ -391,7 +391,7 @@ pub mod test_hooks {
     }
 
     /// Deferred checkpoints of `path` finished so far.
-    pub(crate) fn finished(path: &Path) -> u64 {
+    pub fn finished(path: &Path) -> u64 {
         let (lock, _) = state();
         lock.lock()
             .unwrap()
@@ -401,7 +401,7 @@ pub mod test_hooks {
             .unwrap_or(0)
     }
 
-    pub(crate) fn wait_closed(path: &Path, timeout: Duration) -> bool {
+    pub fn wait_closed(path: &Path, timeout: Duration) -> bool {
         let (lock, changed) = state();
         let deadline = Instant::now() + timeout;
         let mut state = lock.lock().unwrap();
@@ -421,7 +421,7 @@ pub mod test_hooks {
     /// this. A handle the worker never releases still shows up afterwards.
     /// Only the Linux descriptor census needs it.
     #[cfg(target_os = "linux")]
-    pub(crate) fn drain(timeout: Duration) -> bool {
+    pub fn drain(timeout: Duration) -> bool {
         let (done, finished) = std::sync::mpsc::channel();
         super::close(move || {
             let _ = done.send(());
@@ -430,7 +430,7 @@ pub mod test_hooks {
     }
 
     /// Wait until more than `seen` deferred checkpoints of `path` finished.
-    pub(crate) fn wait_finished_after(path: &Path, seen: u64, timeout: Duration) -> bool {
+    pub fn wait_finished_after(path: &Path, seen: u64, timeout: Duration) -> bool {
         let path = key(path);
         let path = path.as_path();
         let (lock, changed) = state();

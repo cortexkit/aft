@@ -340,10 +340,13 @@ pub fn connection_snapshot() -> SqliteConnectionSnapshot {
     }
 }
 
+#[rustfmt::skip]
+test_support_visibility! {
 #[derive(Debug)]
 pub(crate) struct CheckpointStats {
     attempts: AtomicU64,
     mutex_hold_ns: AtomicU64,
+}
 }
 
 impl CheckpointStats {
@@ -932,7 +935,7 @@ pub(crate) fn checkpoint_stats(&self) -> Arc<CheckpointStats> {
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     fn enable_inline_checkpoint_for_attribution_test(&self) {
         self.wal_hook
             .inline_for_attribution_test
