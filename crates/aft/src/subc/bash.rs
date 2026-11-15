@@ -1774,14 +1774,6 @@ fn finish_bash_spawn_immediate(
     allow_bg_completions: bool,
     repeat: &mut Option<crate::run_tool_call::RepeatObservation>,
 ) -> Response {
-    #[cfg(all(feature = "test-hooks", target_os = "macos"))]
-    eprintln!(
-        "EXIT_TRACE event=finish_poll us={}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_micros()
-    );
     let result = finalized_bash_result(
         response,
         ctx,
@@ -3760,18 +3752,23 @@ async fn run_deferred_bash_wait(
     let observer_registry = registry.clone();
     let observer_task = task_id.clone();
     let observer_session = session_id.clone();
-    let exit_observer = tokio::task::spawn_blocking(move || {
-        observer_registry.observe_foreground_exit(&observer_task, &observer_session, move || {
-            let _ = exit_tx.send(());
-        })
+    let (exit_observer, mut initial_observation) = tokio::task::spawn_blocking(move || {
+        let local_task = !observer_registry.is_remote_task(&observer_task, &observer_session);
+        let observer = observer_registry.observe_foreground_exit(
+            &observer_task,
+            &observer_session,
+            move || {
+                let _ = exit_tx.send(());
+            },
+        );
+        (observer, local_task)
     })
     .await
-    .ok()
-    .flatten();
+    .unwrap_or((None, false));
     let mut exit_rx = exit_observer.as_ref().map(|_| exit_rx);
-    // Check once after arming, closing the gap between the spawn's initial
-    // status read and installing the kernel observer (including arm failures).
-    let mut initial_observation = true;
+    // Check local tasks once after arming, closing the gap between the spawn's
+    // initial status read and installing the observer (including arm failures).
+    // Remote tasks retain their existing observation cadence.
     let mut progress = wait_ctx.request_handles_progress(&request_id).then(|| {
         crate::bash_background::progress::BashProgressPump::new(
             &wait_ctx,
@@ -3888,19 +3885,9 @@ async fn run_deferred_bash_wait(
                                 Some(rx) => { let _ = rx.await; }
                                 None => std::future::pending::<()>().await,
                             }
-                        } => {
-                            #[cfg(all(feature = "test-hooks", target_os = "macos"))]
-                            eprintln!("EXIT_TRACE event=call_woke_exit task={task_id} us={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros());
-                            exit_rx = None;
-                        }
-                        _ = registry.terminal_transition_notified() => {
-                            #[cfg(all(feature = "test-hooks", target_os = "macos"))]
-                            eprintln!("EXIT_TRACE event=call_woke_terminal task={task_id} us={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros());
-                        }
-                        _ = tokio::time::sleep(foreground_bash_poll_interval()) => {
-                            #[cfg(all(feature = "test-hooks", target_os = "macos"))]
-                            eprintln!("EXIT_TRACE event=call_woke_timer task={task_id} us={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros());
-                        }
+                        } => { exit_rx = None; }
+                        _ = registry.terminal_transition_notified() => {}
+                        _ = tokio::time::sleep(foreground_bash_poll_interval()) => {}
                     }
                 }
                 initial_observation = false;

@@ -12726,10 +12726,7 @@ impl BgTaskRegistry {
                     if let Some(child) = child_slot.as_mut() {
                         #[cfg(test)]
                         self.inner.child_polls.fetch_add(1, Ordering::Relaxed);
-                        let polled = child.try_wait();
-                        #[cfg(all(feature = "test-hooks", target_os = "macos"))]
-                        eprintln!("EXIT_TRACE event=try_wait pid={} task={} us={} result={polled:?} marker_mtime_us={:?}", child.id(), task.task_id, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros(), std::fs::metadata(&task.paths.exit).ok().and_then(|m| m.modified().ok()).and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_micros()));
-                        if let Ok(Some(status)) = polled {
+                        if let Ok(Some(status)) = child.try_wait() {
                             *child_slot = None;
                             state.detached = true;
                             state.child_exit_observed = true;

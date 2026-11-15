@@ -64,42 +64,6 @@ const SESSION_ID: &str = "bash-reply-timing-contract";
 const ROUTE_CHANNEL: u16 = 1;
 
 #[test]
-#[ignore]
-fn macos_foreground_exit_trace() {
-    run_subc_with_env(&[("AFT_TEST_BASH_EXIT_TRACE", "1")], |mut h| async move {
-        for round in 0..10 {
-            for (index, command) in ["true", "sleep 0.06"].into_iter().enumerate() {
-                let corr = 3000 + round * 2 + index as u64;
-                eprintln!(
-                    "EXIT_TRACE event=call_start corr={corr} command={command:?} us={}",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_micros()
-                );
-                send_tool_call(
-                    &mut h.stream,
-                    corr,
-                    "bash",
-                    json!({"command": command, "wait": true}),
-                )
-                .await;
-                let reply = read_tool_response(&mut h.stream, corr, HANG_CATCH).await;
-                eprintln!(
-                    "EXIT_TRACE event=reply corr={corr} us={}",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_micros()
-                );
-                assert!(!tool_result_is_error(&reply), "{}", frame_body(&reply));
-            }
-        }
-        h
-    });
-}
-
-#[test]
 fn standalone_foreground_bash_exit_wakes_without_pending_ticks() {
     let dir = tempfile::tempdir().unwrap();
     let mut aft = AftProcess::spawn_with_env(&[
@@ -1379,12 +1343,6 @@ impl ModuleProcess {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         command.envs(env.iter().copied());
-        if env
-            .iter()
-            .any(|(key, _)| *key == "AFT_TEST_BASH_EXIT_TRACE")
-        {
-            command.stderr(Stdio::inherit());
-        }
         crate::test_helpers::assert_child_storage_isolated(&command);
         // Own process group, so Drop can kill the module and any bash children.
         unsafe {
