@@ -22,7 +22,86 @@ NOW = datetime(2026, 11, 20, 3, 5, tzinfo=timezone.utc)
 END = NOW.replace(hour=5, minute=0)
 
 
+@patch.dict(os.environ, {"GITHUB_RUN_ID": "1001"})
 class HoldTests(unittest.TestCase):
+    def test_owner_is_per_github_run_and_rejects_a_previous_runs_stale_grant(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = mac.Hold(root, END, root)
+            first.request()
+            mac.write_json(root / "granted.json", first.identity)
+            self.assertEqual(first.identity["owner"], "aft-nightly-1001")
+            first.release()
+            with patch.dict(os.environ, {"GITHUB_RUN_ID": "1002"}):
+                second = mac.Hold(root, END, root)
+            second.request()
+            self.assertEqual(second.identity["owner"], "aft-nightly-1002")
+            self.assertFalse(second.granted(), "a leftover grant with a different run owner must never admit measurement")
+            mac.write_json(root / "granted.json", second.identity)
+            self.assertTrue(second.granted())
+            second.release()
+
+    def test_owner_has_valid_characters_and_at_most_64_characters(self):
+        self.assertEqual(len(mac.hold_owner("9" * 52)), 64)
+        for invalid in (None, "", "9" * 53, "UPPERCASE", "space here", "bad/path", "123_456"):
+            with self.subTest(run_id=invalid), self.assertRaises(ValueError):
+                mac.hold_owner(invalid)
+
+    def test_hold_is_a_bounded_regular_record_published_by_same_folder_rename(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            hold = mac.Hold(root, END, root)
+            replace = Path.replace
+
+            def publish(source, destination):
+                self.assertEqual(source.parent, root)
+                self.assertNotEqual(source.name, "hold.json")
+                self.assertFalse(destination.exists(), "no partial hold may be visible before the rename")
+                self.assertTrue(source.is_file())
+                self.assertFalse(source.is_symlink())
+                self.assertLessEqual(source.stat().st_size, 4096)
+                self.assertEqual(set(json.loads(source.read_text())), {"owner", "expires_at"})
+                return replace(source, destination)
+
+            with patch.object(Path, "replace", autospec=True, side_effect=publish) as rename:
+                hold.request()
+            rename.assert_called_once()
+            self.assertEqual(mac.read_hold_record(root / "hold.json"), hold.identity)
+            self.assertEqual([path.name for path in root.iterdir()], ["hold.json"])
+            hold.release()
+
+    def test_grant_format_is_exact_regular_bounded_and_utc(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "granted.json"
+            hold = mac.Hold(root, END, root)
+            for expiry in ("2026-11-20T05:00:00Z", "2026-11-20T05:00:00+00:00"):
+                mac.write_json(path, hold.identity | {"expires_at": expiry})
+                self.assertTrue(hold.granted())
+            for invalid in ([], {}, hold.identity | {"extra": True},
+                            hold.identity | {"owner": "invalid_owner"},
+                            hold.identity | {"owner": "x" * 65},
+                            hold.identity | {"expires_at": "2026-11-20T05:00:00+01:00"},
+                            hold.identity | {"expires_at": "2026-11-20T05:00:00"},
+                            hold.identity | {"expires_at": "2026-11-31T05:00:00Z"}):
+                mac.write_json(path, invalid)
+                self.assertFalse(hold.granted(), invalid)
+            path.write_text('{"owner":"aft-nightly-1001","owner":"aft-nightly-1001","expires_at":"2026-11-20T05:00:00Z"}')
+            self.assertFalse(hold.granted(), "duplicate keys are not an exact two-field record")
+            contents = json.dumps(hold.identity).encode()
+            path.write_bytes(contents + b" " * (4096 - len(contents)))
+            self.assertTrue(hold.granted(), "the 4 KiB limit is inclusive")
+            path.write_bytes(contents + b" " * (4097 - len(contents)))
+            self.assertFalse(hold.granted(), "oversized records are refused")
+            path.unlink()
+            target = root / "real-record.json"
+            mac.write_json(target, hold.identity)
+            path.symlink_to(target)
+            self.assertFalse(hold.granted(), "a grant symlink is not a regular record")
+            path.unlink()
+            path.mkdir()
+            self.assertFalse(hold.granted(), "a directory is not a regular record")
+
     def test_distinct_hold_and_grant_paths_are_named(self):
         self.assertEqual(mac.HOLD_DIR, Path("/Users/Shared/motor-macos-hold"))
         self.assertEqual(mac.GRANT_DIR, Path("/Users/Shared/motor-macos-grant"))
@@ -36,7 +115,7 @@ class HoldTests(unittest.TestCase):
             hold = mac.Hold(holds, END, grants)
             hold.request()
             self.assertEqual(json.loads((holds / "hold.json").read_text()), {
-                "owner": "aft-nightly", "expires_at": "2026-11-20T05:00:00Z"})
+                "owner": "aft-nightly-1001", "expires_at": "2026-11-20T05:00:00Z"})
             (holds / "granted.json").write_text(json.dumps(hold.identity))
             self.assertFalse(hold.granted(), "the old co-located grant must not admit a run")
             for bad in ({}, {**hold.identity, "owner": "other"},
@@ -44,6 +123,8 @@ class HoldTests(unittest.TestCase):
                 mac.write_json(grants / "granted.json", bad)
                 self.assertFalse(hold.granted())
             mac.write_json(grants / "granted.json", hold.identity | {"diagnostic": "drained"})
+            self.assertFalse(hold.granted(), "MOTOR records have exactly two fields")
+            mac.write_json(grants / "granted.json", hold.identity)
             with patch.object(mac, "utcnow", return_value=NOW), patch.object(mac.time, "sleep") as sleep:
                 self.assertTrue(hold.wait())
             sleep.assert_not_called()
@@ -186,7 +267,7 @@ class WrapperTests(unittest.TestCase):
                 patch.object(mac.Hold, "wait", admit), \
                 patch.object(mac, "machine_facts", return_value={"model": "Macmini-test", "cpu": "test CPU", "macos": "test", "power_source": "AC"}), \
                 patch.object(mac, "measured_command", side_effect=measured), \
-                patch.dict(os.environ, {"AFT_COST_GATE_RESULTS_DIR": str(output)}, clear=True):
+                patch.dict(os.environ, {"AFT_COST_GATE_RESULTS_DIR": str(output), "GITHUB_RUN_ID": "1001"}, clear=True):
             if fail:
                 with self.assertRaisesRegex(RuntimeError, "fixture measurement failure"):
                     mac.run(args)

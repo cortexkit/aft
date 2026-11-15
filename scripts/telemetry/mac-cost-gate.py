@@ -10,8 +10,10 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -21,7 +23,8 @@ from typing import Any
 SCRIPT_DIR = Path(__file__).resolve().parent
 HOLD_DIR = Path("/Users/Shared/motor-macos-hold")
 GRANT_DIR = Path("/Users/Shared/motor-macos-grant")
-OWNER = "aft-nightly"
+OWNER_PREFIX = "aft-nightly-"
+MAX_HOLD_BYTES = 4096
 INITIAL_DURATION_SECONDS = 30 * 60
 VM_NAMES = ("com.apple.Virtualization.VirtualMachine", "Virtualization.VirtualMachine",
             "vfkit", "vmware-vmx", "prl_vm_app", "tart")
@@ -50,26 +53,92 @@ def read_json(path):
         return None
 
 
+def hold_owner(run_id):
+    owner = OWNER_PREFIX + str(run_id or "")
+    if not run_id or not re.fullmatch(r"[a-z0-9-]{1,64}", owner):
+        raise ValueError("GITHUB_RUN_ID must produce a nonempty hold owner of at most 64 lowercase letters, digits or hyphens")
+    return owner
+
+
+def validate_hold_record(record):
+    if not isinstance(record, dict) or set(record) != {"owner", "expires_at"}:
+        raise ValueError("MOTOR record must contain exactly owner and expires_at")
+    if not isinstance(record["owner"], str) or not re.fullmatch(r"[a-z0-9-]{1,64}", record["owner"]):
+        raise ValueError("invalid MOTOR hold owner")
+    expiry = record["expires_at"]
+    if not isinstance(expiry, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|\+00:00)", expiry):
+        raise ValueError("MOTOR expiry must be RFC 3339 UTC (Z or +00:00)")
+    parsed = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+    return {"owner": record["owner"], "expires_at": parsed.isoformat().replace("+00:00", "Z")}
+
+
+def unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate MOTOR record key")
+        result[key] = value
+    return result
+
+
+def read_hold_record(path):
+    """Read bounded regular records without following a grant symlink."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_HOLD_BYTES:
+                return None
+            contents = os.read(descriptor, MAX_HOLD_BYTES + 1)
+        finally:
+            os.close(descriptor)
+        if len(contents) > MAX_HOLD_BYTES:
+            return None
+        return validate_hold_record(json.loads(contents, object_pairs_hook=unique_json_object))
+    except (OSError, ValueError, UnicodeError):
+        return None
+
+
 class Hold:
-    def __init__(self, folder, end, grant_folder=GRANT_DIR):
+    def __init__(self, folder, end, grant_folder=GRANT_DIR, *, run_id=None):
         self.folder = folder
         self.grant_folder = grant_folder
         self.end = end
-        self.identity = {"owner": OWNER, "expires_at": end.isoformat(timespec="seconds").replace("+00:00", "Z")}
+        self.identity = validate_hold_record({
+            "owner": hold_owner(run_id or os.environ.get("GITHUB_RUN_ID")),
+            "expires_at": end.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        })
         self.created = False
 
     def request(self):
-        # Exclusive creation never overwrites a hold left by another owner.
-        # MOTOR provisions the shared directory; missing permissions are an
-        # operator problem, not a reason to install software or use sudo.
-        with (self.folder / "hold.json").open("x", encoding="utf-8") as handle:
+        # Publish a complete regular JSON record in one same-folder rename so
+        # MOTOR cannot observe a partially written hold. GitHub serializes the
+        # nightly jobs; an existing hold still belongs to its original owner.
+        destination = self.folder / "hold.json"
+        if os.path.lexists(destination):
+            raise FileExistsError(destination)
+        contents = json.dumps(self.identity).encode("utf-8")
+        if len(contents) > MAX_HOLD_BYTES:
+            raise ValueError("MOTOR hold exceeds 4 KiB")
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="wb", dir=self.folder, prefix=".aft-nightly-", delete=False) as handle:
+                temporary = Path(handle.name)
+                os.fchmod(handle.fileno(), 0o644)
+                handle.write(contents)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if os.path.lexists(destination):
+                raise FileExistsError(destination)
+            temporary.replace(destination)
             self.created = True
-            json.dump(self.identity, handle)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
         print(f"MOTOR hold requested: {self.identity}", flush=True)
 
     def granted(self):
-        grant = read_json(self.grant_folder / "granted.json")
-        return isinstance(grant, dict) and all(grant.get(key) == value for key, value in self.identity.items())
+        return read_hold_record(self.grant_folder / "granted.json") == self.identity
 
     def wait(self):
         while utcnow() < self.end:
@@ -81,8 +150,8 @@ class Hold:
 
     def release(self):
         if self.created:
-            current = read_json(self.folder / "hold.json")
-            if current == self.identity or current is None:
+            current = read_hold_record(self.folder / "hold.json")
+            if current == self.identity:
                 (self.folder / "hold.json").unlink(missing_ok=True)
             self.created = False
 
