@@ -1305,6 +1305,34 @@ describe("bash tool adapter", () => {
     }
   });
 
+  test("async bash_watch resolves a remote job ID before notification registration", async () => {
+    const job = "01234567-89ab-cdef-0123-456789abcdef";
+    const task = "bash-0123456789abcdef";
+    const calls: Array<{ command: string; params: Record<string, unknown> }> = [];
+    const bridge = {
+      send: async (command: string, params: Record<string, unknown>) => {
+        calls.push({ command, params });
+        return command === "bash_status"
+          ? { success: true, task_id: task, status: "running" }
+          : { success: true, watch_id: "watch-job" };
+      },
+    } as unknown as BinaryBridge;
+    const tools = new Map<string, MockToolDef>();
+    registerBashTool(makeMockApi(tools), makeMockContext(bridge));
+    const result = await tools
+      .get("bash_watch")!
+      .execute("call", { task_id: job, pattern: "READY", background: true }, undefined, undefined, {
+        cwd: projectRoot,
+        sessionManager: { getSessionId: () => "s-job-watch" },
+      });
+    expect(calls.filter(({ command }) => command === "bash_status")).toHaveLength(1);
+    expect(calls.find(({ command }) => command === "bash_status")?.params.task_id).toBe(job);
+    expect(calls.find(({ command }) => command === "bash_notify")?.params.task_id).toBe(task);
+    expect(result.content).toEqual([
+      { type: "text", text: expect.stringContaining(`on task ${task}`) },
+    ]);
+  });
+
   test("async bash_watch registration does not add synthetic outstanding task", async () => {
     __resetBgNotificationStateForTests();
     const tools = new Map<string, MockToolDef>();

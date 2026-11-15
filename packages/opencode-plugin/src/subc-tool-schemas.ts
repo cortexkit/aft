@@ -47,7 +47,7 @@ const STATUS_DESCRIPTION = "Show AFT status, index health, cache usage, and runt
  * waiting loop is implemented in the OpenCode and Pi plugins, not the module.
  */
 const BASH_STATUS_CATALOG_DESCRIPTION =
-  "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.";
+  "Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.";
 
 const STATUS_SCHEMA = {
   type: "object",

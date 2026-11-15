@@ -15,6 +15,7 @@ import {
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
   readShellToken,
+  resolveBashTaskId,
   resolveWatchTimeoutMs,
   taskKillDeadlineText,
   taskKillDeadlineWithinHandoffMargin,
@@ -23,6 +24,32 @@ import {
   workerBackgroundTaskNote,
   workerWatchStillRunning,
 } from "../bash-hints.js";
+
+describe("resolveBashTaskId", () => {
+  const job = "01234567-89ab-cdef-0123-456789abcdef";
+  const task = "bash-0123456789abcdef";
+
+  test("resolves a job ID once and leaves task IDs on the existing path", async () => {
+    const calls: string[] = [];
+    const status = async (reference: string) => {
+      calls.push(reference);
+      return { success: true, task_id: task };
+    };
+    expect(await resolveBashTaskId(task, status)).toBe(task);
+    expect(calls).toEqual([]);
+    expect(await resolveBashTaskId(job, status)).toBe(task);
+    expect(calls).toEqual([job]);
+  });
+
+  test("refuses failed or malformed status replies instead of registering an alias", async () => {
+    await expect(
+      resolveBashTaskId(job, async () => ({ success: false, message: "not found" })),
+    ).rejects.toThrow("not found");
+    await expect(
+      resolveBashTaskId(job, async () => ({ success: true, task_id: job })),
+    ).rejects.toThrow("did not return a background task ID");
+  });
+});
 
 const AFT_SEARCH_HINT =
   "DO NOT search code by running grep/rg in bash — it is unindexed, unranked, and serial. Use the `aft_search` tool instead (it auto-routes concepts, identifiers, regex, and literals).";

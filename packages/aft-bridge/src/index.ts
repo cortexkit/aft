@@ -46,6 +46,7 @@ export {
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
   outputTail,
+  resolveBashTaskId,
   resolveWatchTimeoutMs,
   runningTaskStatusHint,
   taskKillDeadlineText,

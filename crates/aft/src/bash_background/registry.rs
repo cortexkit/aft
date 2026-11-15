@@ -3208,6 +3208,48 @@ impl BgTaskRegistry {
         rendered_execution_note(&state.metadata)
     }
 
+    /// Resolve a runner job alias only within the caller's own task records.
+    /// Leave misses unchanged so the tool's ordinary task-not-found path applies.
+    pub(crate) fn resolve_task_reference(
+        &self,
+        reference: &str,
+        session: &str,
+        storage_dir: &Path,
+    ) -> String {
+        let Ok(job_id) = uuid::Uuid::parse_str(reference) else {
+            return reference.to_owned();
+        };
+        let matches = |metadata: &PersistedTask| {
+            metadata.session_id == session
+                && super::TaskIdentity::allows_current(metadata.launching_identity.as_ref())
+                && metadata.remote.as_ref().and_then(|remote| remote.job_id) == Some(job_id)
+        };
+        for task in self.task_arcs() {
+            if task.session_id == session {
+                if let Ok(state) = task.lock_state() {
+                    if matches(&state.metadata) {
+                        return task.task_id.clone();
+                    }
+                }
+            }
+        }
+        // Stored task files can be newer than the database or not loaded yet.
+        // Read only this session; resolving an alias must not start recovery.
+        let dir = session_tasks_dir(storage_dir, session);
+        if let Ok((task_ids, _)) = discover_task_ids(&dir) {
+            for task_id in task_ids {
+                if let Ok(metadata) =
+                    resolve_task_layout(&dir, &task_id).and_then(|task| read_task_at(&task))
+                {
+                    if metadata.task_id == task_id && matches(&metadata) {
+                        return task_id;
+                    }
+                }
+            }
+        }
+        reference.to_owned()
+    }
+
     /// `None` means this was not an explicit runon request. Local commands and
     /// commands routed remotely by legacy configuration retain immediate launches.
     pub(crate) fn runon_launch_pending(&self, task_id: &str, session: &str) -> Option<bool> {

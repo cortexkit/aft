@@ -375,6 +375,8 @@ pub(crate) fn handle_deferred_yieldable(
     let session = req.session().to_string();
     let shell_tool = req.host_tool_names().shell().to_string();
     let registry = ctx.bash_background().clone();
+    let storage_dir = crate::bash_background::task_storage_dir(&ctx);
+    let task_id = registry.resolve_task_reference(&task_id, req.session(), &storage_dir);
     let erased = if observation_only {
         registry.observed_erased_watch_reference(&task_id)
     } else {
@@ -387,7 +389,6 @@ pub(crate) fn handle_deferred_yieldable(
             format_erased_task_message(&task_id),
         ));
     }
-    let storage_dir = crate::bash_background::task_storage_dir(&ctx);
     let project_root = ctx.config().project_root.clone();
     let principal = crate::sandbox_spawn::current_authenticated_principal();
     let harness = crate::bash_background::route_harness()

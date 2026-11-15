@@ -9532,6 +9532,173 @@ fn remote_phase_comes_from_runner_evidence() {
     assert_eq!(RemotePhase::of(&remote), RemotePhase::Running);
 }
 
+fn remote_job_id_context(dir: &Path) -> Arc<crate::context::AppContext> {
+    ensure_git_fixture(dir);
+    Arc::new(crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(dir.into()),
+            storage_dir: Some(dir.into()),
+            ..Default::default()
+        },
+    ))
+}
+
+async fn remote_job_id_response(
+    ctx: Arc<crate::context::AppContext>,
+    tool: &str,
+    reference: &str,
+    session: &str,
+) -> crate::protocol::Response {
+    let request = serde_json::from_value(serde_json::json!({
+        "id": "alias", "command": tool, "session_id": session,
+        "params": { "task_id": reference, "timeout_ms": 1 },
+    }))
+    .unwrap();
+    if tool == "bash_status" {
+        return crate::commands::bash_status::handle(&request, &ctx);
+    }
+    if tool == "bash_kill" {
+        return tokio::task::spawn_blocking(move || {
+            crate::commands::bash_kill::handle(&request, &ctx)
+        })
+        .await
+        .unwrap();
+    }
+    let wake = crate::response_finalize::DeferredResponseWake::default();
+    let producer_wake = wake.clone();
+    let producer_ctx = Arc::clone(&ctx);
+    let outcome = tokio::task::spawn_blocking(move || {
+        let _wake = producer_wake.install();
+        crate::commands::bash_watch::handle_deferred(&request, producer_ctx)
+    })
+    .await
+    .unwrap();
+    match outcome {
+        crate::response_finalize::DispatchOutcome::Immediate(response) => response,
+        crate::response_finalize::DispatchOutcome::Deferred(mut pending) => {
+            tokio::time::timeout(Duration::from_secs(10), wake.notified())
+                .await
+                .expect("watch answers");
+            (pending.poll)(&ctx).expect("response queued before completion wake")
+        }
+    }
+}
+
+#[tokio::test]
+async fn remote_job_id_own_status_watch_and_kill_use_persisted_task_ids() {
+    let daemon = daemon(Script::Cancel, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (original, task_id, _) =
+        persist_accepted_with_snapshot(dir.path(), daemon.connection.clone(), "cargo test");
+    drop(original);
+    let ctx = remote_job_id_context(dir.path());
+    for tool in ["bash_status", "bash_watch", "bash_kill"] {
+        let response =
+            remote_job_id_response(Arc::clone(&ctx), tool, &id().to_string(), "session").await;
+        assert!(response.success, "{tool}: {response:?}");
+        assert_eq!(response.data["task_id"], task_id, "{tool}: {response:?}");
+    }
+    assert!(!cancel_requests(&daemon).is_empty());
+    ctx.bash_background().detach();
+}
+
+#[tokio::test]
+async fn remote_job_id_foreign_and_unknown_refuse_like_unknown_task_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let (original, _, paths) = persist_accepted_with_snapshot(
+        dir.path(),
+        dir.path().join("missing-connection"),
+        "cargo test",
+    );
+    drop(original);
+    let mut metadata = read_task(&paths.json).unwrap();
+    metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+    write_task(&paths.json, &metadata).unwrap();
+    let ctx = remote_job_id_context(dir.path());
+    for tool in ["bash_status", "bash_watch", "bash_kill"] {
+        for (reference, session) in [
+            (id().to_string(), "foreign"),
+            (uuid::Uuid::new_v4().to_string(), "session"),
+            ("bash-ffffffffffffffff".to_string(), "session"),
+        ] {
+            let response =
+                remote_job_id_response(Arc::clone(&ctx), tool, &reference, session).await;
+            assert!(!response.success, "{tool}: {response:?}");
+            assert_eq!(response.data["code"], "task_not_found", "{response:?}");
+            assert_eq!(
+                response.data["message"],
+                crate::commands::bash_status::format_unknown_polled_task_message(
+                    &reference, "bash"
+                )
+            );
+        }
+    }
+    ctx.bash_background().detach();
+}
+
+#[test]
+fn remote_job_id_lookup_rejects_foreign_identity_and_local_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, paths) = persist_accepted_with_snapshot(
+        dir.path(),
+        dir.path().join("missing-connection"),
+        "cargo test",
+    );
+    let owner = crate::bash_background::TaskIdentity {
+        principal: Some("owner".into()),
+        harness: "runner".into(),
+        session: "session".into(),
+    };
+    let task = registry.task(&task_id).unwrap();
+    let mut metadata = read_task(&paths.json).unwrap();
+    metadata.launching_identity = Some(owner.clone());
+    write_task(&paths.json, &metadata).unwrap();
+    task.state.lock().unwrap().metadata = metadata.clone();
+    let job = id().to_string();
+    {
+        let _identity = crate::bash_background::task_identity_scope(Some(owner.clone()));
+        assert_eq!(
+            registry.resolve_task_reference(&job, "session", dir.path()),
+            task_id
+        );
+        let cold = self::registry();
+        assert_eq!(
+            cold.resolve_task_reference(&job, "session", dir.path()),
+            task_id
+        );
+    }
+    {
+        let mut foreign = owner;
+        foreign.principal = Some("foreign".into());
+        let _identity = crate::bash_background::task_identity_scope(Some(foreign));
+        assert_eq!(
+            registry.resolve_task_reference(&job, "session", dir.path()),
+            job
+        );
+        assert_eq!(
+            self::registry().resolve_task_reference(&job, "session", dir.path()),
+            job
+        );
+    }
+    metadata.remote = None;
+    metadata.shell_remote_job_id = Some(job.clone());
+    write_task(&paths.json, &metadata).unwrap();
+    task.state.lock().unwrap().metadata = metadata;
+    assert_eq!(
+        registry.resolve_task_reference(&job, "session", dir.path()),
+        job
+    );
+    assert_eq!(
+        self::registry().resolve_task_reference(&job, "session", dir.path()),
+        job
+    );
+    assert_eq!(
+        registry.resolve_task_reference(&task_id, "session", dir.path()),
+        task_id
+    );
+}
+
 /// bash_status for `task_id` in `ctx`, rendered as the agent sees it.
 fn rendered_status(ctx: &crate::context::AppContext, task_id: &str) -> String {
     let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({

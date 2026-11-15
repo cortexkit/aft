@@ -1956,6 +1956,24 @@ describe("bash_status tool", () => {
     );
   });
 
+  test("async bash_watch resolves a remote job ID before notification registration", async () => {
+    const job = "01234567-89ab-cdef-0123-456789abcdef";
+    const task = "bash-0123456789abcdef";
+    const { watchTool, calls } = makeCtx((cmd) =>
+      cmd === "bash_status"
+        ? { success: true, task_id: task, status: "running" }
+        : { success: true, watch_id: "watch-job" },
+    );
+    const result = await watchTool.execute(
+      { taskId: job, pattern: "READY", background: true },
+      createMockSdkContext({ sessionID: "s-job-watch" }),
+    );
+    expect(calls.filter(({ cmd }) => cmd === "bash_status")).toHaveLength(1);
+    expect(calls.find(({ cmd }) => cmd === "bash_status")?.params.task_id).toBe(job);
+    expect(calls.find(({ cmd }) => cmd === "bash_notify")?.params.task_id).toBe(task);
+    expect(result).toContain(`on task ${task}`);
+  });
+
   test("async bash_watch registration does not add synthetic outstanding task", async () => {
     __resetBgNotificationStateForTests();
     const { watchTool } = makeCtx((cmd) =>
