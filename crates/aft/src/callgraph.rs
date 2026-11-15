@@ -2738,6 +2738,21 @@ pub(crate) fn rust_import_local_names(imp: &imports::ImportStatement) -> Vec<Str
         .collect()
 }
 
+/// The local name and full path of each explicit Rust use-tree leaf.
+pub(crate) fn rust_import_paths(raw: &str) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
+    if let Some(body) = rust_use_body(raw) {
+        expand_rust_use_tree(body.trim_start_matches("::"), &mut entries);
+    }
+    entries
+        .into_iter()
+        .filter_map(|entry| match entry.kind {
+            RustUseKind::Module => Some((entry.local_name, entry.module_path)),
+            RustUseKind::Item { .. } => None,
+        })
+        .collect()
+}
+
 fn rust_use_body(raw: &str) -> Option<&str> {
     let use_pos = raw.find("use ")?;
     let body = raw[use_pos + 4..].trim();

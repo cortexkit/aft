@@ -809,7 +809,12 @@ impl<'a> Resolver<'a> {
                             }
                         }
                         _ => {
-                            project(receiver);
+                            let projection = super::receiver_projection(
+                                language,
+                                receiver,
+                                site.member.as_deref().expect("typed site has a member"),
+                            );
+                            project(&projection);
                             typed_rust |= language == "rust";
                         }
                     }

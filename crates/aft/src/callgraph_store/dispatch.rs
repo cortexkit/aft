@@ -33,6 +33,8 @@ pub(crate) fn python_reexports(parse: &ParseBlob) -> Vec<(String, Vec<String>)> 
 
 #[path = "dispatch/projected.rs"]
 pub(crate) mod projected;
+#[path = "dispatch/smart_pointer.rs"]
+pub(super) mod smart_pointer;
 #[path = "dispatch/typescript.rs"]
 mod typescript;
 #[path = "dispatch/view.rs"]
@@ -352,6 +354,18 @@ fn type_name(raw: &str) -> String {
         .trim()
         .to_string()
 }
+
+fn receiver_projection<'a>(
+    language: &str,
+    receiver: &'a str,
+    member: &str,
+) -> std::borrow::Cow<'a, str> {
+    if language == "rust" && receiver.starts_with("@field:") {
+        format!("@method:{receiver}|{member}").into()
+    } else {
+        receiver.into()
+    }
+}
 const TYPES: &[&str] = &[
     "class_declaration",
     "class_definition",
@@ -652,6 +666,7 @@ pub(crate) fn extract_with<'tree>(
     let receiver_index = index_receivers
         .then(|| RustReceiverIndex::new(&all, source, rust_bindings.as_ref().unwrap(), nav));
     let rust_bindings = rust_bindings.as_ref();
+    let smart_fields = (language == "rust").then(|| smart_pointer::Fields::new(&all, source, nav));
     let class_fields = ClassFieldMemo::default();
     let go_index = (language == "go")
         .then(|| crate::callgraph_store::go_dispatch::SourceIndex::new(root, source, false));
@@ -701,7 +716,7 @@ pub(crate) fn extract_with<'tree>(
                                 container, source, &owner, nav,
                             ),
                             name: text(name, source).to_string(),
-                            ty: type_name(text(ty, source)),
+                            ty: smart_fields.as_ref().unwrap().field_type(ty, source, nav),
                         });
                     }
                 }
@@ -2426,11 +2441,12 @@ impl<'a> Resolver<'a> {
         if depth > 16 {
             return None;
         }
-        if let Some(expression) = name.strip_prefix("@field:") {
-            let (base, member) = expression.rsplit_once('|')?;
-            let (base_file, ty) = self.project_type_at_depth(file, base, depth + 1)?;
-            let field = self.known_file(&base_file).field(&ty.name, member)?;
-            return self.project_type_at_depth(&base_file, &field.ty, depth + 1);
+        if let Some(expression) = name.strip_prefix("@method:") {
+            let (receiver, member) = expression.rsplit_once('|')?;
+            return self.project_field_type(file, receiver, depth, Some(member));
+        }
+        if name.starts_with("@field:") {
+            return self.project_field_type(file, name, depth, None);
         }
         if let Some(expression) = name.strip_prefix("@return:") {
             let local;
@@ -2541,6 +2557,42 @@ impl<'a> Resolver<'a> {
             return None;
         }
         None
+    }
+    fn project_field_type(
+        &self,
+        file: &str,
+        receiver: &str,
+        depth: usize,
+        member: Option<&str>,
+    ) -> Option<(String, &TypeHint)> {
+        let expression = receiver.strip_prefix("@field:")?;
+        let (base, field_name) = expression.rsplit_once('|')?;
+        let (base_file, ty) = self.project_type_at_depth(file, base, depth + 1)?;
+        let field = self.known_file(&base_file).field(&ty.name, field_name)?;
+        self.project_smart_field(&base_file, &field.ty, depth + 1, member)
+    }
+
+    fn project_smart_field(
+        &self,
+        file: &str,
+        name: &str,
+        depth: usize,
+        member: Option<&str>,
+    ) -> Option<(String, &TypeHint)> {
+        if depth > 16 {
+            return None;
+        }
+        let Some((wrapper, outer, inner)) = smart_pointer::parts(name) else {
+            return self.project_type_at_depth(file, name, depth);
+        };
+        // Keep every pre-existing nominal binding before considering autoderef.
+        if let Some(found) = self.project_type_at_depth(file, outer, depth) {
+            return Some(found);
+        }
+        if member.is_some_and(|member| smart_pointer::owns_method(wrapper, member)) {
+            return None;
+        }
+        self.project_smart_field(file, inner, depth + 1, member)
     }
     fn methods(&self, file: &str, owner: &str, name: &str, associated: bool) -> Vec<Target> {
         let language = self.known_file(file).language();
@@ -2914,7 +2966,8 @@ impl<'a> Resolver<'a> {
                 return census_exit!(self, "python_super", self.python_super(file, owner, member));
             }
         }
-        let Some((type_file, ty)) = self.project_type(file, receiver) else {
+        let projection = receiver_projection(&parse.language, receiver, member);
+        let Some((type_file, ty)) = self.project_type(file, &projection) else {
             return census_exit!(
                 self,
                 "missing_type",

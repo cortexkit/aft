@@ -1382,7 +1382,14 @@ pub(super) fn dispatch_type_names(parse: &ParseBlob) -> BTreeSet<String> {
         names.insert(method.owner.clone());
         names.extend(method.trait_name.iter().cloned());
     }
-    names.extend(parse.dispatch.fields.iter().map(|f| f.ty.clone()));
+    for field in &parse.dispatch.fields {
+        let mut name = field.ty.as_str();
+        while let Some((_, outer, inner)) = dispatch::smart_pointer::parts(name) {
+            names.insert(outer.to_string());
+            name = inner;
+        }
+        names.insert(name.to_string());
+    }
     names.extend(parse.dispatch.returns.iter().map(|r| r.ty.clone()));
     for site in &parse.dispatch.sites {
         if let Some(receiver) = &site.receiver {
