@@ -1804,9 +1804,10 @@ impl TraceFileFacts {
             return Ok(cached.clone());
         }
         let source = std::fs::read_to_string(file)?;
-        let parsed = match detect_language_from_source(file, &source)
-            .or_else(|| crate::parser::detect_language_any(file, cfg!(feature = "wasm-grammars")))
-        {
+        let parsed = match detect_language_from_source(file, &source).or_else(|| {
+            crate::parser::detect_language_any(file, cfg!(feature = "wasm-grammars"))
+                .filter(|language| *language == crate::parser::LangId::Luau)
+        }) {
             Some(lang) => {
                 #[cfg(test)]
                 TRACE_FILE_PARSES.with(|count| count.set(count.get() + 1));
@@ -1931,6 +1932,29 @@ fn walk_for_data_flow(
     let luau_assignment = lang == crate::parser::LangId::Luau
         && matches!(kind, "local_variable_declaration" | "assignment_statement");
     if luau_assignment && luau_assignment_pair(node).is_none() {
+        // Calls on the right use the pre-assignment bindings even when field,
+        // index or parallel targets cannot be attributed to a plain binding.
+        if let Some(values) = find_child_by_kind(node, "expression_list") {
+            walk_for_data_flow(
+                store,
+                symbol_cache,
+                files,
+                values,
+                source,
+                lang,
+                current_calls,
+                tracked,
+                symbol,
+                rel_file,
+                max_depth,
+                current_depth,
+                control_flow_uncertain,
+                origin_function_seen,
+                hops,
+                depth_limited,
+                visited,
+            )?;
+        }
         // Parallel assignments are not attributed. Discard overwritten names
         // rather than claiming that their old values survive the assignment.
         if kind == "assignment_statement" {
