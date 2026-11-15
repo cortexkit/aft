@@ -1003,6 +1003,35 @@ fn siblings_busy_grant_store_preserves_read_error_instead_of_missing_grant_refus
     params
         .validate_siblings(&ctx, "runon", "worker", &[])
         .unwrap();
+    db.lock()
+        .unwrap()
+        .execute_batch("DROP TABLE access_grants")
+        .unwrap();
+    let read_error = ctx
+        .validate_read_path_without_approval("runon", "worker", &sibling)
+        .unwrap_err();
+    assert_eq!(read_error.data["code"], "grants_unavailable");
+    for preflight in [
+        vec![],
+        vec![AccessGrant {
+            path: crate::access_policy::policy_path(&sibling),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        }],
+    ] {
+        let error = params
+            .validate_siblings(&ctx, "runon", "worker", &preflight)
+            .unwrap_err();
+        let SiblingValidationError::Unavailable(response) = error else {
+            panic!(
+                "unavailable grant store was bypassed or reported as a missing grant: {error:?}"
+            );
+        };
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::to_value(&read_error).unwrap()
+        );
+    }
 }
 
 /// A plan preflight may count grants its own allow_paths validated but did not
