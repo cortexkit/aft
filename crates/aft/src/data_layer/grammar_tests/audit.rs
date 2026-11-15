@@ -1461,6 +1461,7 @@ isolated!(
             .outline_symbols(b"bad.luau")
             .unwrap()
             .unwrap()
+            .symbols
             .is_empty());
         let cache = f.ctx.symbol_cache();
         let generation = cache.write().unwrap().reset();
