@@ -425,6 +425,34 @@ async fn scope_watch_verification_shared_epochs_keep_one_ref_cooldown_across_rea
 }
 
 #[tokio::test(start_paused = true)]
+async fn scope_watch_verification_new_epoch_inherits_its_refs_existing_cooldown() {
+    let mut scopes: HashMap<_, _> = (0..2)
+        .map(|i| {
+            let scope = stamp(i);
+            (stamp_key(&scope), scope)
+        })
+        .collect();
+    let mut checks = scope_watch::Verifications::default();
+    checks.reconcile(&scopes.keys().cloned().collect(), &scopes);
+    tokio::time::advance(scope_watch::VERIFY_INTERVAL / 2).await;
+    let first = checks.take_due().unwrap();
+    checks.verified(std::iter::once(first.clone()));
+    let mut additional_epoch = scopes[&first].clone();
+    additional_epoch.scope_epoch += 1;
+    scopes.insert(stamp_key(&additional_epoch), additional_epoch);
+    checks.reconcile(&scopes.keys().cloned().collect(), &scopes);
+    tokio::time::advance(scope_watch::VERIFY_INTERVAL / 2).await;
+    assert_ne!(checks.take_due().unwrap().1, first.1);
+    tokio::time::advance(scope_watch::VERIFY_INTERVAL / 3).await;
+    assert!(
+        checks.take_due().is_none(),
+        "a newly retained epoch must not bypass the ref's fifteen-minute cooldown"
+    );
+    tokio::time::advance(scope_watch::VERIFY_INTERVAL / 6).await;
+    assert_eq!(checks.take_due().unwrap().1, first.1);
+}
+
+#[tokio::test(start_paused = true)]
 async fn scope_watch_probe_panic_releases_the_ref_and_pending_keys() {
     let (control, pending, mut frames) = control(&["scope.describe", "scope.watch"]);
     control.panic_next_describe.store(true, Ordering::Relaxed);

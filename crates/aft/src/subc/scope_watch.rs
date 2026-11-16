@@ -53,10 +53,21 @@ impl Verifications {
         keys.sort();
         let spacing = VERIFY_INTERVAL / keys.len() as u32;
         let now = tokio::time::Instant::now();
+        // When another epoch of an already-watched scope gains local state,
+        // it inherits that scope's next verification time.
+        let mut not_before: HashMap<(String, String), tokio::time::Instant> = HashMap::new();
+        for (key, due) in &self.due {
+            not_before
+                .entry((key.0.clone(), key.1.clone()))
+                .and_modify(|latest| *latest = (*latest).max(*due))
+                .or_insert(*due);
+        }
         for (index, key) in keys.into_iter().enumerate() {
-            self.due
-                .entry(key)
-                .or_insert(now + spacing * (index as u32 + 1));
+            let phase = now + spacing * (index as u32 + 1);
+            let next = not_before
+                .get(&(key.0.clone(), key.1.clone()))
+                .map_or(phase, |due| phase.max(*due));
+            self.due.entry(key).or_insert(next);
         }
     }
     pub(super) fn deadline(&self) -> Option<tokio::time::Instant> {
