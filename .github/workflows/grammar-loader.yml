@@ -75,7 +75,9 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2025, windows-11-arm]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # GitHub's macOS runners need 42-60 minutes for this job's three builds;
+    # 60 cancelled some runs just before the end.
+    timeout-minutes: 90
     defaults:
       run:
         shell: bash
@@ -96,9 +98,9 @@ jobs:
       - name: Process restart and concurrent publication
         run: cargo test --features wasm-grammars --locked -p agent-file-tools --features test-hooks --test integration -- grammar_loader
       # The no-Luau parity half needs a second, feature-less debug build of the
-      # whole crate. GitHub's macOS runners can't fit that third build inside the
-      # 60-minute job, and the parity it checks doesn't depend on the OS, so it
-      # runs on Linux and Windows; macOS still runs every Luau test.
+      # whole crate. On GitHub's macOS runners that third build would push the
+      # job past its time limit, and the parity it checks doesn't depend on the
+      # OS, so it runs on Linux and Windows; macOS still runs every Luau test.
       - name: Luau extraction tests (macOS)
         if: runner.os == 'macOS'
         run: cargo test --features wasm-grammars --locked -p agent-file-tools --features test-hooks --lib -- luau_s
