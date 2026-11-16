@@ -1,0 +1,122 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/src/commands/semantic_search/data_file.rs",
+    "crates/aft/src/commands/semantic_search/external_exact.rs",
+    "crates/aft/src/commands/semantic_search/memo.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/commands/semantic_search/nearest_names.rs",
+    "crates/aft/src/commands/semantic_search/regex_route.rs",
+    "crates/aft/src/commands/semantic_search/request_files.rs",
+    "crates/aft/src/commands/semantic_search/rerank/mod.rs",
+    "crates/aft/src/commands/semantic_search/rerank/synapse.rs",
+    "crates/aft/src/commands/semantic_search/rerank/tests.rs",
+    "crates/aft/src/data_layer/grammar_tests.rs",
+    "crates/aft/src/lib.rs",
+    "crates/aft/src/parser.rs",
+    "crates/aft/src/search_index.rs",
+    "crates/aft/src/semantic_index.rs",
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "remaining-large-file-streaming-and-16mib-ceiling",
+    "luau-s4-index-store-wiring",
+    "callgraph-cold-build-memory-and-resume",
+    "linux-jemalloc"
+  ],
+  "note": "Batch 15 combines two engine_unwired slices that touch the ranking fence, each with its own descriptor in this folder: search-large-file-ceiling.json (#1432 stage 2: streamed reads and the 16 MiB ceiling, final-source 6,897-query parity with main) and alfonso-task-bg_dispatch_b087668d07699d9c1ea0bef1-s4-views-wiring.json (Luau S4: dynamic grammar identity and chunking apply only to .luau, which no benchmark repository contains). lib.rs changes only module declarations and the Linux global allocator; no ranking code moves. pattern_counts are copied unchanged from both slice descriptors (identical): inherited pre-0.64 reference transitions, not newly authorized differences. No new count or ranking difference is authorized.",
+  "pattern_counts": {
+    "followup-census:910002": {
+      "candidate_files": {
+        "before": 3,
+        "after": 6
+      },
+      "files_examined": {
+        "before": 3,
+        "after": 6
+      }
+    },
+    "followup-census:910003": {
+      "candidate_files": {
+        "before": 972,
+        "after": 860
+      },
+      "files_examined": {
+        "before": 972,
+        "after": 860
+      }
+    },
+    "followup-census:910004": {
+      "candidate_files": {
+        "before": 972,
+        "after": 860
+      },
+      "files_examined": {
+        "before": 972,
+        "after": 860
+      }
+    },
+    "followup-census:910005": {
+      "candidate_files": {
+        "before": 194,
+        "after": 141
+      },
+      "files_examined": {
+        "before": 194,
+        "after": 141
+      }
+    },
+    "followup-census:910010": {
+      "candidate_files": {
+        "before": 6,
+        "after": 19
+      },
+      "files_examined": {
+        "before": 6,
+        "after": 19
+      }
+    },
+    "followup-census:910011": {
+      "candidate_files": {
+        "before": 942,
+        "after": 729
+      },
+      "files_examined": {
+        "before": 942,
+        "after": 729
+      }
+    },
+    "followup-census:910012": {
+      "candidate_files": {
+        "before": 1031,
+        "after": 730
+      },
+      "files_examined": {
+        "before": 1031,
+        "after": 730
+      }
+    },
+    "followup-census:910013": {
+      "candidate_files": {
+        "before": 908,
+        "after": 45
+      },
+      "files_examined": {
+        "before": 908,
+        "after": 45
+      }
+    },
+    "followup-census:910014": {
+      "candidate_files": {
+        "before": 1011,
+        "after": 24
+      },
+      "files_examined": {
+        "before": 1011,
+        "after": 24
+      }
+    }
+  }
+}
