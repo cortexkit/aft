@@ -9668,7 +9668,11 @@ async fn remote_job_id_own_status_watch_and_kill_use_persisted_task_ids() {
         assert_eq!(response.data["task_id"], task_id, "{tool}: {response:?}");
         assert_eq!(
             response.data["status"],
-            if tool == "bash_kill" { "killed" } else { "running" },
+            if tool == "bash_kill" {
+                "killed"
+            } else {
+                "running"
+            },
             "{tool}: {response:?}; worker logs: {:?}",
             capture.lock().unwrap()
         );
