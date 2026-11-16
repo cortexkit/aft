@@ -872,7 +872,7 @@ mod catalog_preset_tests {
     }
 
     #[test]
-    fn presetless_worker_runon_uses_only_its_frozen_policy() {
+    fn presetless_worker_runon_requires_user_switch_and_its_frozen_policy() {
         for head_enabled in [false, true] {
             for worker_enabled in [None, Some(false), Some(true)] {
                 for (kind, attributes, codemode) in [
@@ -897,7 +897,7 @@ mod catalog_preset_tests {
                         .is_some();
                     assert_eq!(
                         runon,
-                        cfg!(unix) && worker_enabled == Some(true),
+                        cfg!(unix) && head_enabled && worker_enabled == Some(true),
                         "head={head_enabled}, worker={worker_enabled:?}, kind={kind}"
                     );
                     assert_eq!(
@@ -1451,6 +1451,8 @@ mod catalog_runon_log_tests {
     #[test]
     fn disabled_head_user_policy_gate() {
         let mut case = Case::enabled();
+        case.ctx
+            .update_config(|config| config.remote_exec.enabled = false);
         case.request = json!({"preset":"head"});
         case.check("remote_exec", "absent", "missing:preset", false);
     }
@@ -2059,7 +2061,7 @@ fn exec_remote_catalog_paramless_and_unscoped_parity() {
     let storage = tempfile::tempdir().unwrap();
     let sibling = root.path().join("sibling");
     std::fs::create_dir_all(sibling.join(".git")).unwrap();
-    let ctx = context(root.path(), storage.path(), None);
+    let ctx = context_with_user_remote(root.path(), storage.path(), None, false);
     let bind = identity(root.path(), "one", 7, false);
     for preset in ["head", "worker", "reader"] {
         let body = json!({"preset":preset});
