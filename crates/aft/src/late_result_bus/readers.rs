@@ -31,6 +31,8 @@ pub(super) struct ReaderHealth {
     events_handled: u64,
     malformed_events: u64,
     mismatched_ids: u64,
+    #[serde(skip)]
+    warned: std::collections::HashSet<&'static str>,
 }
 
 pub(crate) fn cards_attached() -> bool {
@@ -63,6 +65,11 @@ impl Kind {
 fn attached(value: bool, reason: Option<&'static str>) {
     status(Kind::Cards, value, reason);
 }
+pub(super) fn unavailable(reason: &'static str) {
+    status(Kind::Cards, false, Some(reason));
+    status(Kind::SendState, false, Some(reason));
+    super::views::unavailable(reason);
+}
 fn status(kind: Kind, value: bool, reason: Option<&'static str>) {
     let mut snapshot = HEALTH.lock();
     let health = kind.health(&mut snapshot);
@@ -74,8 +81,10 @@ fn status(kind: Kind, value: bool, reason: Option<&'static str>) {
             if value { "attached" } else { "detached" }
         );
     }
-    if reason.is_some() && reason != health.reason {
-        log::warn!("bus {} reader failure: {}", kind.label(), reason.unwrap());
+    if let Some(reason) = reason {
+        if health.warned.insert(reason) {
+            log::warn!("bus {} reader failure: {}", kind.label(), reason);
+        }
     }
     health.reader_attached = value;
     health.reason = reason;
@@ -252,7 +261,7 @@ async fn reader(client: Arc<BusClient>, kind: Kind) {
                     })
                 })
         })
-        .expect("naming declares AFT cards");
+        .expect("naming declares AFT readers");
     let durable = row.durable_name().expect("reviewed durable");
     let mut delay = Duration::from_secs(1);
     loop {

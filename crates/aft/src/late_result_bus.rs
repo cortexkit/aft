@@ -45,6 +45,8 @@ struct BusHealth {
     cards: readers::ReaderHealth,
     sendstate: readers::ReaderHealth,
     views: views::ViewsHealth,
+    #[serde(skip)]
+    warned: std::collections::HashSet<&'static str>,
 }
 
 pub(crate) fn health() -> serde_json::Value {
@@ -53,9 +55,28 @@ pub(crate) fn health() -> serde_json::Value {
 
 fn failure(code: &'static str) {
     let mut health = HEALTH.lock();
+    if health.warned.insert(code) {
+        log::warn!("bus failure: {code}");
+    }
     health.connected = false;
     health.publish_failures = health.publish_failures.saturating_add(1);
     health.last_error = Some(code);
+    drop(health);
+    if matches!(
+        code,
+        "bus_runtime"
+            | "bus_worker"
+            | "bus_consumer_connect"
+            | "bus_consumer_disconnected"
+            | "bus_connect_timeout"
+            | "bus_refused"
+            | "bus_transport"
+            | "bus_reply"
+            | "bus_naming"
+            | "bus_client"
+    ) {
+        readers::unavailable(code);
+    }
 }
 
 pub(crate) fn settled() {
@@ -201,11 +222,14 @@ async fn drive(
             }
         }
         let client = bus.as_ref().expect("connected above");
-        if services.is_none() {
+        let connected = client.connection().client().connection_state()
+            == async_nats::connection::State::Connected;
+        if !connected {
+            services = None;
+        } else if services.is_none() {
             services = Some(readers::Services::start(Arc::clone(client)));
         }
-        HEALTH.lock().connected = client.connection().client().connection_state()
-            == async_nats::connection::State::Connected;
+        HEALTH.lock().connected = connected;
         let mut publisher = RealPublisher(client);
         let due = state.due();
         if !due.is_empty() {

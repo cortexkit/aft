@@ -14,6 +14,8 @@ pub(super) struct ViewsHealth {
     reason: Option<&'static str>,
     writes: u64,
     skips: u64,
+    #[serde(skip)]
+    warned: HashSet<&'static str>,
 }
 
 fn declaration() -> &'static ModuleBucket {
@@ -43,8 +45,10 @@ fn status(attached: bool, reason: Option<&'static str>) {
             if attached { "attached" } else { "detached" }
         );
     }
-    if reason.is_some() && health.reason != reason {
-        log::warn!("bus views KV failure: {}", reason.unwrap());
+    if let Some(reason) = reason {
+        if health.warned.insert(reason) {
+            log::warn!("bus views KV failure: {reason}");
+        }
     }
     health.attached = attached;
     health.reason = reason;
@@ -148,4 +152,7 @@ pub(super) async fn run(client: Arc<BusClient>) {
 
 pub(super) fn detached() {
     status(false, Some("bus_disconnected"));
+}
+pub(super) fn unavailable(reason: &'static str) {
+    status(false, Some(reason));
 }
