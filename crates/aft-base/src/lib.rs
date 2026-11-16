@@ -177,6 +177,8 @@ pub mod url_fetch;
 pub mod view_storage_reserve;
 pub mod volume;
 pub mod walk_boundary;
+#[cfg(any(test, feature = "test-support"))]
+pub mod walk_profile;
 pub mod watcher_markers;
 pub mod windows_command;
 pub mod windows_path;
