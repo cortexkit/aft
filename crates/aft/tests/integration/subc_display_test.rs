@@ -4,9 +4,10 @@ use std::time::Duration;
 
 use cortexkit_role_tool_display::{validate_write, DisplayKind, DisplayLimits, DisplayWrite};
 use serde_json::{json, Value};
+use subc_protocol::session::{ModuleControlRequest, ModuleControlResponse};
 use subc_protocol::{
-    BindIdentity, Flags, Frame, FrameType, ModuleControlRequest, ModuleControlResponse,
-    ModuleHelloAckBody, Principal, Priority, RouteTarget, PROTOCOL_VERSION,
+    BindIdentity, Flags, Frame, FrameType, ModuleHelloAckBody, Principal, Priority, RouteTarget,
+    PROTOCOL_VERSION,
 };
 use subc_transport::authenticate_server;
 use tokio::net::{TcpListener, TcpStream};
