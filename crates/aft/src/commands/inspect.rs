@@ -5726,6 +5726,89 @@ mod status_bar_refresh_tests {
 mod render_text_tests {
     use super::*;
 
+    #[test]
+    fn inspect_gap_fixture_golden() {
+        use crate::inspect::oxc_engine::{analyze_files, AnalyzeOptions};
+        use crate::inspect::scanners::{complexity, cycles, metrics, unused_exports};
+        use crate::inspect::{InspectJob, JobKey};
+
+        let root = tempfile::tempdir().unwrap();
+        let files = [
+            ("broken.mjs", "return;\n".repeat(8)),
+            ("script.js", "return;\n".to_string()),
+            ("script.cjs", "return;\n".to_string()),
+            ("large.rs", "// handwritten source\n".repeat(50_000)),
+        ];
+        let paths = files
+            .iter()
+            .map(|(name, source)| {
+                let path = root.path().join(name);
+                std::fs::write(&path, source).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let graph = analyze_files(root.path(), &paths, AnalyzeOptions::default()).unwrap();
+        let mut job = InspectJob {
+            job_id: 1,
+            key: JobKey::for_project_category(InspectCategory::Complexity),
+            category: InspectCategory::Complexity,
+            scope_files: paths,
+            project_root: root.path().to_path_buf(),
+            inspect_dir: root.path().join(".aft"),
+            config: Arc::new(Config::default()),
+            symbol_cache: Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new())),
+            inspect_writer: true,
+            callgraph_writer: true,
+            callgraph_snapshot: None,
+        };
+        let mut summary = Map::new();
+        let details = summary_map(serde_json::json!({"cycles": []}));
+        for category in [
+            InspectCategory::Complexity,
+            InspectCategory::Metrics,
+            InspectCategory::UnusedExports,
+            InspectCategory::Cycles,
+        ] {
+            job.category = category;
+            job.key = JobKey::for_project_category(category);
+            let result = match category {
+                InspectCategory::Complexity => complexity::run_complexity_scan(&job),
+                InspectCategory::Metrics => metrics::run_metrics_scan(&job),
+                InspectCategory::UnusedExports => {
+                    unused_exports::run_unused_exports_scan_with_oxc(&job, Some(&graph))
+                }
+                InspectCategory::Cycles => cycles::run_cycles_scan_with_oxc(&job, Some(&graph)),
+                _ => unreachable!(),
+            };
+            let payload = result.outcome.unwrap().aggregate;
+            let mut value = summary_for(category, &payload);
+            if category_is_incomplete(&payload) {
+                value["complete"] = Value::Bool(false);
+                value["gaps"] = serde_json::json!(incomplete_category_gaps(category, &payload));
+                for key in ["parse_errors", "skipped_files", "skipped_files_count"] {
+                    if let Some(field) = payload.get(key) {
+                        value[key] = field.clone();
+                    }
+                }
+            }
+            summary.insert(category.as_str().to_string(), value);
+        }
+        let text = render_inspect_text(&summary, &details, None, &Sections::summary_only());
+        println!("INSPECT FIXTURE BEFORE\n{text}\nEND INSPECT FIXTURE BEFORE");
+        assert_eq!(graph.errors.len(), 3);
+        assert!(text.contains("large.rs") == false, "{text}");
+        assert_eq!(
+            text.matches("Incomplete cycles: 3 files could not be parsed")
+                .count(),
+            1
+        );
+        assert_eq!(
+            text.matches("Incomplete unused_exports: 3 files could not be parsed")
+                .count(),
+            1
+        );
+    }
+
     fn summary_map(value: Value) -> Map<String, Value> {
         value.as_object().cloned().unwrap_or_default()
     }
