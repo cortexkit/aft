@@ -314,6 +314,26 @@ describe("health sentinel pure detectors", () => {
     expect(detectIndexes(input)).toEqual([]);
   });
 
+  test("grouped health roots preserve per-root findings without hiding process liveness", () => {
+    const path = "/repo/previously-stuck";
+    const prior = { last_alerted_at: NOW, last_seen_at: NOW, severity: "CRITICAL" as const, rule: "index.stuck", text: "last measured stuck index" };
+    const state: SentinelState = { findings: { [`index:${path}:search`]: prior }, previous: { watcher: { [path]: [1, 1] } } };
+    for (const gap of [
+      { root_count: 100, root_details_omitted: 100, root_detail_gap: { summarized: 100 }, root_groups: [{ count: 100, examples: [path], examples_omitted: 99 }] },
+      { root_details_omitted: 3 },
+    ]) {
+      const input = sample({ health: { metrics: { ...gap, roots: [], stale: false,
+        dispatch_liveness: { executor_zombie_reader: 1, running: { interactive: 0, maintenance: 0 } },
+      } } });
+      const findings = detectAll(input, state);
+      expect(findings.some((value) => value.fingerprint === "instrument:health-census")).toBe(true);
+      expect(rules(findings)).toContain("executor.phantom");
+      expect(reconcile(findings, state.findings, NOW).cleared).toEqual([]);
+      expect(nextPrevious(input, state)?.watcher).toEqual(state.previous?.watcher);
+      expect(healthMemoryCensus(input).roots).toBeNull();
+    }
+  });
+
   test("overlong tier2 pass requires an unmatched old acquisition", () => {
     const root = "/repo/worktree";
     expect(detectTier2Overlong(sample({ log_lines: [`2026-09-17T14:00:00Z [aft] inspect-triggered cold-build slot acquired after 1ms wait: request=inspect:${root}:1 kind=explicit inspect Tier-2 run`] }))[0].fingerprint).toBe(`tier2:${root}`);
