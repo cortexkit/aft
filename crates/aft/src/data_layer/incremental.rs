@@ -749,7 +749,7 @@ impl LiveCheckout {
 
     /// The files whose recorded method-call sites read the method `name`:
     /// what a change to a declaration of it admits. For measurement.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn method_site_readers(&self, name: &str) -> BTreeSet<String> {
         self.reverse.sites_of(
             &[crate::callgraph_store::join::dispatch::dependency::method(
