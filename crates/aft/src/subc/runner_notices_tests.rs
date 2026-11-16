@@ -82,6 +82,59 @@ fn notice_templates_rewritten_bash_sends_once_without_footers() {
     }
 }
 
+fn shared_send_sample(name: &str) -> Vec<u8> {
+    let body = std::fs::read(
+        Path::new(crate::test_support::manifest_dir())
+            .join("tests/fixtures/llm-runner")
+            .join(name),
+    )
+    .unwrap();
+    // The published bodies omit the transport envelope; preserve their bytes.
+    [br#"{"result":"#.as_slice(), &body, b"}"].concat()
+}
+
+#[test]
+fn runner_notices_shared_send_samples_have_pinned_bytes() {
+    use sha2::{Digest, Sha256};
+    let root = Path::new(crate::test_support::manifest_dir()).join("tests/fixtures/llm-runner");
+    for (folder, digest, count) in [
+        (
+            "send-unknown-v2",
+            "8991bba0732b9c511c84ed714d14ba0ceb8caae19d1b25baaf79336fdd6332d5",
+            9,
+        ),
+        (
+            "send-answers-early-v1",
+            "5d6241426bf86020d36106fcf75a981d10d7f87376b50be5fa640250c06c8485",
+            4,
+        ),
+        (
+            "send-not-delivered-v2",
+            "e770d026b020b1c0ae5eb935f00af7969c7fe135499e75e0467ee62b650c5815",
+            8,
+        ),
+    ] {
+        let root = root.join(folder);
+        let manifest = std::fs::read(root.join("SHA256SUMS")).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&manifest)),
+            digest,
+            "{folder}"
+        );
+        let manifest = std::str::from_utf8(&manifest).unwrap();
+        assert_eq!(manifest.lines().count(), count, "{folder}");
+        for line in manifest.lines() {
+            let (digest, name) = line.split_once("  ").unwrap();
+            let bytes = std::fs::read(root.join(name)).unwrap();
+            assert_eq!(
+                format!("{:x}", Sha256::digest(bytes)),
+                digest,
+                "{folder}/{name}"
+            );
+        }
+    }
+}
+
 #[test]
 fn notice_templates_repeat_observations_send_typed_counts_without_appending() {
     install(PathBuf::from("unused-test-notice-connection"));
@@ -526,6 +579,226 @@ fn code_search_nudge_runner_drops_refused_undelivered_and_missing_address() {
         assert!(
             capture.receiver.try_recv().is_err(),
             "{case} never retries or appends"
+        );
+    }
+}
+
+#[test]
+fn runner_notices_shared_send_samples_follow_until_receipt_or_not_delivered() {
+    let _guard = DELIVERY_COUNTER_TEST.lock().unwrap();
+    let samples = [
+        (
+            "send-answers-early-v1/01-opencode2-send-reply.json",
+            "pending",
+        ),
+        ("send-answers-early-v1/02-pi-send-reply.json", "pending"),
+        (
+            "send-answers-early-v1/03-claude-code-send-reply.json",
+            "pending",
+        ),
+        ("send-unknown-v2/01-head-send-reply.json", "pending"),
+        (
+            "send-unknown-v2/02-head-send-status-unknown.json",
+            "accepted",
+        ),
+        (
+            "send-unknown-v2/03-head-send-resend-same-id.json",
+            "accepted",
+        ),
+        ("send-unknown-v2/04-steer-send-reply.json", "pending"),
+        (
+            "send-unknown-v2/05-steer-send-status-unknown.json",
+            "accepted",
+        ),
+        (
+            "send-unknown-v2/06-steer-send-resend-same-id.json",
+            "accepted",
+        ),
+        (
+            "send-unknown-v2/07-head-send-status-pending.json",
+            "pending",
+        ),
+        (
+            "send-unknown-v2/08-head-send-status-delivered.json",
+            "accepted",
+        ),
+        (
+            "send-not-delivered-v2/01-send-reply-pending.json",
+            "pending",
+        ),
+        (
+            "send-not-delivered-v2/02-send-status-not-delivered-handover-failed.json",
+            "not_delivered",
+        ),
+        (
+            "send-not-delivered-v2/03-send-resend-same-id-not-delivered.json",
+            "not_delivered",
+        ),
+        (
+            "send-not-delivered-v2/07-send-status-not-delivered-withdrawn.json",
+            "not_delivered",
+        ),
+    ];
+    let pending = read_reply::<SendReply>(&shared_send_sample(samples[0].0)).unwrap();
+    let delivered = read_reply::<SendReply>(&shared_send_sample(
+        "send-unknown-v2/08-head-send-status-delivered.json",
+    ))
+    .unwrap();
+    let not_delivered = read_reply::<SendReply>(&shared_send_sample(
+        "send-not-delivered-v2/02-send-status-not-delivered-handover-failed.json",
+    ))
+    .unwrap();
+    for (index, (name, expected)) in samples.into_iter().enumerate() {
+        let bytes = shared_send_sample(name);
+        let input: Value = serde_json::from_slice(&bytes).unwrap();
+        let reply: SendReply = read_reply(&bytes).unwrap();
+        assert_eq!(
+            serde_json::to_value(&reply).unwrap().get("run_id"),
+            input["result"].get("run_id"),
+            "{name}"
+        );
+        let observed = match decode_send_reply(&bytes) {
+            Outcome::Accepted => "accepted",
+            Outcome::Pending => "pending",
+            Outcome::NotDelivered(reason) => {
+                assert_eq!(Some(reason.as_str()), input["result"]["reason"].as_str());
+                "not_delivered"
+            }
+            other => panic!("{name}: unexpected outcome {other:?}"),
+        };
+        assert_eq!(observed, expected, "{name}");
+        for (mode, (following, typed)) in [(false, true), (true, true), (true, false)]
+            .into_iter()
+            .enumerate()
+        {
+            let task = Completion::new_runner(
+                &format!("bash-00000000001{index:03x}{mode:02x}"),
+                0,
+                "reserved:thalamus-harness",
+                "thalamus-harness",
+            );
+            let capture = test_endpoint::capture(&task.task, false);
+            capture.send_status(typed);
+            if following {
+                capture.reply(pending.clone());
+            }
+            capture.reply(reply.clone());
+            let scheduler = Scheduler::default();
+            let clock = Arc::new(AtomicU64::new(task.finished));
+            task.offer(&scheduler, clock.clone());
+            let mut due = std::time::Instant::now();
+            let mut next = step(&scheduler, due);
+            let first = capture.receiver.try_recv().unwrap();
+            assert_eq!(first.request["method"], "session.send", "{name}");
+            if following {
+                assert!(matches!(next, Next::Retry(delay) if delay == Duration::from_secs(5)));
+                assert!(!task.delivered(), "{name}");
+                next = advance_notice(&scheduler, &clock, &mut due, Duration::from_secs(5));
+                assert_sample_followup(&capture.receiver.try_recv().unwrap(), &first, typed, name);
+            }
+            if expected == "pending" {
+                let delay = Duration::from_secs(if following { 30 } else { 5 });
+                assert!(
+                    matches!(next, Next::Retry(actual) if actual == delay),
+                    "{name}"
+                );
+                assert!(
+                    !task.delivered(),
+                    "{name}: a run ID is not a delivery receipt"
+                );
+                let _scope =
+                    crate::bash_background::task_identity_scope(Some(task.route.task_identity()));
+                let progress = task
+                    .registry
+                    .notice_metadata(&task.task)
+                    .unwrap()
+                    .runner_completion_delivery
+                    .unwrap();
+                assert_eq!(progress.generation, 1, "{name}");
+                assert!(
+                    matches!(progress.phase, RunnerCompletionPhase::Pending { .. }),
+                    "{name}"
+                );
+                assert_eq!(
+                    task.frozen().send_id,
+                    first.request["params"]["send_id"].as_str().unwrap()
+                );
+                // An unresolved first reply must still observe a later failed hand-over.
+                capture.reply(not_delivered.clone());
+                next = advance_notice(&scheduler, &clock, &mut due, delay);
+                assert_sample_followup(&capture.receiver.try_recv().unwrap(), &first, typed, name);
+            }
+            if expected != "accepted" {
+                assert!(
+                    matches!(next, Next::Retry(delay) if delay == Duration::from_millis(250)),
+                    "{name}"
+                );
+                assert!(!task.delivered(), "{name}");
+                assert_eq!(
+                    task.frozen().send_id,
+                    format!("aft:bash:{}:2", task.task),
+                    "{name}"
+                );
+                capture.reply(delivered.clone());
+                next = advance_notice(&scheduler, &clock, &mut due, Duration::from_millis(250));
+                let resent = capture.receiver.try_recv().unwrap();
+                let mut expected_request = first.request.clone();
+                expected_request["params"]["send_id"] = json!(task.frozen().send_id);
+                assert_eq!(
+                    resent.request, expected_request,
+                    "{name}: only send_id may change"
+                );
+            }
+            assert!(matches!(next, Next::Done), "{name}");
+            assert!(task.delivered(), "{name}");
+            assert!(scheduler.entries.lock().unwrap().is_empty(), "{name}");
+            assert!(
+                capture.receiver.try_recv().is_err(),
+                "{name}: no extra send"
+            );
+        }
+        let task = Completion::new_runner(
+            &format!("bash-00000000001{index:03x}03"),
+            0,
+            "reserved:thalamus-harness",
+            "thalamus-harness",
+        );
+        let capture = test_endpoint::capture(&task.task, false);
+        capture.reply(reply);
+        let scheduler = Scheduler::default();
+        assert!(offer(
+            &scheduler,
+            task.registry.clone(),
+            task.reminder(600_000),
+            PathBuf::new(),
+            false,
+            || 0
+        ));
+        assert!(
+            matches!(step(&scheduler, std::time::Instant::now()), Next::Done),
+            "{name}: reminders must not follow or resend"
+        );
+        assert_eq!(capture.receiver.try_iter().count(), 1, "{name}");
+        assert!(scheduler.entries.lock().unwrap().is_empty(), "{name}");
+    }
+}
+
+fn assert_sample_followup(
+    check: &test_endpoint::Received,
+    first: &test_endpoint::Received,
+    typed: bool,
+    name: &str,
+) {
+    if typed {
+        assert_eq!(
+            check.request,
+            json!({"method":"session.send_status", "params":{"send_id":first.request["params"]["send_id"]}}),
+            "{name}"
+        );
+    } else {
+        assert_eq!(
+            check.bytes, first.bytes,
+            "{name}: same-ID follow-up must preserve the request"
         );
     }
 }
@@ -1259,20 +1532,20 @@ fn runner_notices_pending_status_failures_retry_once_then_resume_schedule() {
 fn runner_notices_pending_followup_stops_only_on_receipt_or_contract_final_state() {
     for state in ["finished", "superseded", "expired", "template_part_gone"] {
         assert!(matches!(
-            decode_reply(&reply_body(&SendReply::new(state)).unwrap(), true),
+            decode_send_reply(&reply_body(&SendReply::new(state)).unwrap()),
             Outcome::Accepted
         ));
     }
     for state in ["pending", "active", "paused", "future_state"] {
         assert!(matches!(
-            decode_reply(&reply_body(&SendReply::new(state)).unwrap(), true),
+            decode_send_reply(&reply_body(&SendReply::new(state)).unwrap()),
             Outcome::Pending
         ));
     }
     let reply = SendReply::new("active")
         .with_delivered(cortexkit_role_llm_runner::send::Delivered::new("step").with_ref("row-1"));
     assert!(matches!(
-        decode_reply(&reply_body(&reply).unwrap(), true),
+        decode_send_reply(&reply_body(&reply).unwrap()),
         Outcome::Accepted
     ));
 }
@@ -1895,22 +2168,16 @@ fn runner_notices_recovered_notice_fallback_survives_restart_observation() {
 
 #[test]
 fn runner_notices_distinguishes_queued_submission_from_delivered_notice() {
-    for following in [false, true] {
-        assert!(matches!(
-            decode_reply(
-                br#"{"result":{"state":"pending","submission_id":"notice-1"}}"#,
-                following,
-            ),
-            Outcome::Pending
-        ));
-        assert!(matches!(
-            decode_reply(
-                br#"{"result":{"state":"active","delivered":{"as":"step","ref":"notice-1"}}}"#,
-                following,
-            ),
-            Outcome::Accepted
-        ));
-    }
+    assert!(matches!(
+        decode_send_reply(br#"{"result":{"state":"pending","submission_id":"notice-1"}}"#),
+        Outcome::Pending
+    ));
+    assert!(matches!(
+        decode_send_reply(
+            br#"{"result":{"state":"active","delivered":{"as":"step","ref":"notice-1"}}}"#,
+        ),
+        Outcome::Accepted
+    ));
 }
 
 #[test]
@@ -1932,9 +2199,9 @@ fn runner_notices_decode_open_states_and_error_envelopes() {
             matches!(decode_send_reply(&bytes), Outcome::NotDelivered(reason) if reason == expected)
         );
     }
-    for state in ["active", "finished", "paused", "future_notice_state"] {
+    for state in ["active", "paused", "future_notice_state"] {
         let bytes = serde_json::to_vec(&json!({"result":{"state":state,"notice":true}})).unwrap();
-        assert!(matches!(decode_send_reply(&bytes), Outcome::Accepted));
+        assert!(matches!(decode_send_reply(&bytes), Outcome::Pending));
     }
     assert!(
         matches!(decode_send_reply(br#"{"result":{"state":"not_delivered"}}"#), Outcome::Retry(failure) if failure.class == FailureClass::ReplyDecode)

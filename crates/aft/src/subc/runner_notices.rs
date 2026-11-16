@@ -1120,7 +1120,11 @@ pub(super) mod test_endpoint {
             .pop_front()
             .or_else(|| states.get(&key).cloned())
             .unwrap_or_else(|| {
-                cortexkit_role_llm_runner::wire::reply_body(&SendReply::new("active")).unwrap()
+                cortexkit_role_llm_runner::wire::reply_body(
+                    &SendReply::new("active")
+                        .with_delivered(cortexkit_role_llm_runner::send::Delivered::new("step")),
+                )
+                .unwrap()
             });
         states.insert(key, response.clone());
         if new && !matches!(decode_send_reply(&response), Outcome::NotDelivered(_)) {
@@ -1329,7 +1333,7 @@ async fn check_send(path: &Path, address: &Address, request: &SendRequest) -> Ou
         envelope(request)
     };
     match call(path, address, bytes).await {
-        Ok(bytes) => decode_reply(&bytes, true),
+        Ok(bytes) => decode_send_reply(&bytes),
         Err(outcome) => outcome,
     }
 }
@@ -1364,10 +1368,6 @@ fn flush_delivery_update(
 }
 
 fn decode_send_reply(bytes: &[u8]) -> Outcome {
-    decode_reply(bytes, false)
-}
-
-fn decode_reply(bytes: &[u8], following: bool) -> Outcome {
     match cortexkit_role_llm_runner::wire::read_reply::<SendReply>(bytes) {
         Ok(reply) => {
             // llm-runner 0.8.53 CONTRACT §9: not_delivered is final for this
@@ -1376,8 +1376,9 @@ fn decode_reply(bytes: &[u8], following: bool) -> Outcome {
                 return Outcome::NotDelivered(reply.reason.unwrap_or_else(|| "unknown".into()));
             }
             // CONTRACT §9 and §9.7 list finished, superseded, expired
-            // and template_part_gone as final. Active/paused (or future states)
-            // without a receipt do not end follow-up of a previously pending send.
+            // and template_part_gone as final. A run's active/paused state (or
+            // a future state) does not prove notice delivery: without a receipt,
+            // both the first reply and later status replies need follow-up.
             let terminal = matches!(
                 reply.state.as_str(),
                 states::FINISHED
@@ -1385,7 +1386,7 @@ fn decode_reply(bytes: &[u8], following: bool) -> Outcome {
                     | states::EXPIRED
                     | states::TEMPLATE_PART_GONE
             );
-            if reply.delivered.is_none() && !terminal && (following || reply.state == "pending") {
+            if reply.delivered.is_none() && !terminal {
                 Outcome::Pending
             } else {
                 Outcome::Accepted
