@@ -10,6 +10,8 @@
 //! - `payload.details.diagnostics` (auto-emitted or selected)
 //! - `payload.details.diagnostics_uncovered_files` (auto-emitted when scoped files have no
 //!   authoritative diagnostics; the per-file rows in `gaps` stay complete)
+//! - `payload.details.complexity_skipped_files` (auto-emitted under the skipped-file
+//!   cap, with bounded line counts only for the displayed size-skipped paths)
 //! - Summary previews `top`, `test_only_top`, and `generated_top` use
 //!   `inspect::manager::scoped_top_preview` with `TOP_PREVIEW_ITEMS` only after
 //!   scope filtering. They are examples, not enumerations; their sibling counts

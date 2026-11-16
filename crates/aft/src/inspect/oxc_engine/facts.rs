@@ -4,7 +4,7 @@ use std::path::Path;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
 use oxc_ast_visit::{walk, Visit};
-use oxc_parser::Parser;
+use oxc_parser::{ParseOptions, Parser};
 use oxc_semantic::SemanticBuilder;
 use oxc_span::{GetSpan, SourceType, Span};
 use rustc_hash::FxHashSet;
@@ -13,6 +13,69 @@ use super::types::{
     DecoratorFact, DynamicImportFact, ExportFact, ExportName, ExportUsage, FileFacts, FileId,
     ImportFact, ImportKind, ReExportFact, ReExportKind,
 };
+
+#[cfg(test)]
+mod inspect_parse_tests {
+    use super::*;
+
+    #[test]
+    fn inspect_script_return_fallback_keeps_modules_strict() {
+        for name in [
+            "body.js", "body.cjs", "body.mjs", "body.ts", "body.mts", "body.jsx",
+        ] {
+            let path = Path::new(name);
+            let facts = parse_file_facts(
+                FileId(0),
+                path,
+                "return;\n",
+                String::new(),
+                SourceType::from_path(path).unwrap(),
+            );
+            assert_eq!(
+                facts.parse_error.is_none(),
+                matches!(name, "body.js" | "body.cjs"),
+                "{name}: {:?}",
+                facts.parse_error
+            );
+            assert!(facts.exports.is_empty());
+        }
+        let path = Path::new("module.js");
+        let facts = parse_file_facts(
+            FileId(0),
+            path,
+            "export const value = 1;\n",
+            String::new(),
+            SourceType::from_path(path).unwrap(),
+        );
+        assert!(facts.parse_error.is_none());
+        assert_eq!(facts.exports.len(), 1);
+        let facts = parse_file_facts(
+            FileId(0),
+            path,
+            "export const value = 1; return;\n",
+            String::new(),
+            SourceType::from_path(path).unwrap(),
+        );
+        assert!(facts.parse_error.is_some());
+    }
+
+    #[test]
+    fn inspect_parse_messages_count_duplicates_in_first_seen_order() {
+        let path = Path::new("broken.mjs");
+        let facts = parse_file_facts(
+            FileId(0),
+            path,
+            "return; break; return;",
+            String::new(),
+            SourceType::from_path(path).unwrap(),
+        );
+        let error = facts.parse_error.unwrap();
+        assert_eq!(error.matches("'return'").count(), 1, "{error}");
+        assert_eq!(error.matches("'break'").count(), 1, "{error}");
+        assert!(error.contains("(×2)"), "{error}");
+        assert!(error.find("'return'") < error.find("'break'"), "{error}");
+    }
+}
 
 #[derive(Debug, Clone)]
 struct PendingLocalExportSpecifier {
@@ -72,12 +135,43 @@ pub fn parse_file_facts(
     source_type: SourceType,
 ) -> FileFacts {
     let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, source, source_type).parse();
+    let mut parsed = Parser::new(&allocator, source, source_type).parse();
+    if !parsed.errors.is_empty() && permits_script_return(path) {
+        // CommonJS and function-body scripts permit a top-level return. Only
+        // adopt the fallback if it is valid; module diagnostics remain useful
+        // for malformed ES modules, and .mjs/TypeScript stay strict.
+        let script = Parser::new(&allocator, source, source_type.with_script(true))
+            .with_options(ParseOptions {
+                allow_return_outside_function: true,
+                ..ParseOptions::default()
+            })
+            .parse();
+        if script.errors.is_empty() {
+            parsed = script;
+        }
+    }
     if !parsed.errors.is_empty() {
-        let joined = parsed
-            .errors
-            .iter()
-            .map(ToString::to_string)
+        let mut messages = Vec::<(String, usize)>::new();
+        let mut indices = BTreeMap::new();
+        for error in &parsed.errors {
+            let message = error.to_string();
+            let next = messages.len();
+            let index = *indices.entry(message.clone()).or_insert(next);
+            if index == next {
+                messages.push((message, 1));
+            } else {
+                messages[index].1 += 1;
+            }
+        }
+        let joined = messages
+            .into_iter()
+            .map(|(message, count)| {
+                if count > 1 {
+                    format!("{message} (×{count})")
+                } else {
+                    message
+                }
+            })
             .collect::<Vec<_>>()
             .join("; ");
         return FileFacts::empty(file_id, path.to_path_buf(), content_hash, joined);
@@ -120,6 +214,13 @@ pub fn parse_file_facts(
         value_referenced_import_bindings: semantic_usage.value_referenced,
         parse_error: None,
     }
+}
+
+pub(super) fn permits_script_return(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("js" | "cjs")
+    )
 }
 
 impl Extractor {

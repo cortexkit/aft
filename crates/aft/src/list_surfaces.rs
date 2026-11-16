@@ -375,7 +375,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         reasons: &[ReasonEntry {
             reason: Reason::Cap,
             kind: ReasonKind::Selecting,
-            predicate_name: "details_for, generated_details_for, test_only_details_for, uncovered_files_details_for, topk_limiting, write_skipped_files, filter_payload_for_scope, SKIPPED_FILES_LIMIT",
+            predicate_name: "details_for, generated_details_for, test_only_details_for, uncovered_files_details_for, topk_limiting, write_skipped_files, filter_payload_for_scope, SKIPPED_FILES_LIMIT, attach_complexity_size_skips",
         }],
     },
     SurfaceEntry {

@@ -31,7 +31,7 @@ pub use types::{
     ReExportKind, ResolverConfigInput, OXC_PROVENANCE,
 };
 
-pub(crate) const FACTS_FORMAT_VERSION: u32 = 6;
+pub(crate) const FACTS_FORMAT_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, Default)]
 pub struct AnalyzeOptions {
@@ -152,7 +152,11 @@ impl OxcFactsCache {
         let content_hash = crate::cache_freshness::hash_bytes(source.as_bytes())
             .to_hex()
             .to_string();
-        let cache_key = format!("v{FACTS_FORMAT_VERSION}:{source_type_key}:{content_hash}");
+        // The same bytes in .js and .mjs can have different validity because
+        // only .js permits the function-body script fallback.
+        let script_return = facts::permits_script_return(path);
+        let cache_key =
+            format!("v{FACTS_FORMAT_VERSION}:{source_type_key}:{script_return}:{content_hash}");
         if let Some(cached) = self.entries_by_hash.get(&cache_key) {
             stats.hits += 1;
             let facts = rebind_facts(cached, file_id, path, &content_hash);
@@ -491,6 +495,38 @@ fn is_ts_js_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod audit_tests {
+    #[test]
+    fn inspect_script_return_cache_keeps_strict_extensions_separate_when_warm() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let paths = ["a.js", "b.mjs", "c.cjs", "d.ts"].map(|name| {
+            let path = root.path().join(name);
+            std::fs::write(&path, "return;\n").unwrap();
+            path
+        });
+        let mut cache = OxcFactsCache::new();
+        for warm in [false, true] {
+            let result = analyze_files_with_cache(
+                root.path(),
+                &paths,
+                AnalyzeOptions::default(),
+                &mut cache,
+            )
+            .unwrap();
+            assert_eq!(result.errors.len(), 2);
+            for fact in &result.facts {
+                let name = fact.path.file_name().unwrap().to_str().unwrap();
+                assert_eq!(
+                    fact.parse_error.is_none(),
+                    matches!(name, "a.js" | "c.cjs"),
+                    "{name}"
+                );
+            }
+            if warm {
+                assert_eq!(result.stats.cache_hits, 4);
+            }
+        }
+    }
     use super::*;
 
     #[test]
