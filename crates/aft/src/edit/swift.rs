@@ -898,6 +898,7 @@ mod tests {
             };
             Ok(SubprocessOutcome {
                 stdout,
+                stdout_utf8_valid: true,
                 stderr: String::new(),
                 status,
                 truncated,
@@ -952,6 +953,7 @@ mod tests {
             assert!(matches!(
                 xcrun_lookup_outcome(Ok(SubprocessOutcome {
                     stdout: String::new(),
+                    stdout_utf8_valid: true,
                     stderr: String::new(),
                     status: std::process::ExitStatus::from_raw(libc::SIGKILL),
                     truncated: false,

@@ -376,6 +376,9 @@ fn run(
     if result.truncated {
         return Err(Failure::InvalidOutput("over 256 KiB".into()));
     }
+    if !result.stdout_utf8_valid {
+        return Err(Failure::InvalidOutput("not a JSON object".into()));
+    }
     parse_export(result.stdout.as_bytes())
 }
 
@@ -1107,6 +1110,44 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "invalid provider output: over 256 KiB"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_env_provider_rejects_invalid_utf8_inside_json_strings() {
+        let project = tempfile::tempdir().unwrap();
+        let mut provider = ShellEnvProvider {
+            kind: ShellEnvProviderKind::Custom,
+            command: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                r#"printf '{"VALUE":"\377"}'"#.into(),
+            ]),
+            timeout_ms: 2000,
+            watch: vec![],
+        };
+        assert_eq!(
+            run(
+                &provider,
+                &SpawnPlan::Unsandboxed,
+                project.path(),
+                &HashMap::new()
+            )
+            .unwrap_err()
+            .to_string(),
+            "invalid provider output: not a JSON object"
+        );
+        provider.command.as_mut().unwrap()[2] = "printf '{\"VALUE\":\"�\"}'".into();
+        assert_eq!(
+            run(
+                &provider,
+                &SpawnPlan::Unsandboxed,
+                project.path(),
+                &HashMap::new()
+            )
+            .unwrap()["VALUE"],
+            Some("�".into())
         );
     }
 }
