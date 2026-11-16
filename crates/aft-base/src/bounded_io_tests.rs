@@ -968,3 +968,35 @@ fn read_admission_keeps_the_queue_cap_outside_mutations() {
     assert_eq!(timeout_code(&error), "read_io_queue_timeout", "{error}");
     assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
 }
+
+#[test]
+fn audit1432_walk_gap_precedes_the_entire_skipped_files_block() {
+    with_budget(Some(Budget::after(Duration::from_secs(30))), || {
+        let budget = current().unwrap();
+        budget.walk_partial.store(true, Ordering::Release);
+        budget
+            .walk_time_limit_reached
+            .store(true, Ordering::Release);
+        for at in 0..23 {
+            note_large_read_skip(Path::new(&format!("large-{at:02}.log")));
+        }
+        let response = with_skip_disclosure(|| {
+            finish_response(Response::success(
+                "walk-and-skips",
+                serde_json::json!({"text":"rows"}),
+            ))
+        });
+        let text = response.data["text"].as_str().unwrap();
+        assert!(
+            text.find(WALK_PARTIAL_GAP).unwrap()
+                < text
+                    .find(crate::large_read_counts::WHOLE_READ_SKIP_REASON)
+                    .unwrap(),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("shown 20 of 23 files (cap) · narrow: path"),
+            "{text}"
+        );
+    });
+}

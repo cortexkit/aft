@@ -81,7 +81,7 @@ pub(crate) fn assignment_pairs(node: Node<'_>) -> Vec<(Node<'_>, Option<Node<'_>
 }
 
 /// Value-flow follows only one plain binding, not parallel assignments.
-pub(crate) fn single_assignment_pair(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+pub fn single_assignment_pair(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
     let value = single(child(node, "expression_list")?)?;
     let pairs = assignment_pairs(node);
     match pairs.as_slice() {

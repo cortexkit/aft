@@ -490,38 +490,6 @@ fn audit1432_grep_without_producer_text_still_renders_named_skips() {
 }
 
 #[test]
-fn audit1432_walk_gap_precedes_the_entire_skipped_files_block() {
-    with_budget(Some(Budget::after(Duration::from_secs(30))), || {
-        let budget = current().unwrap();
-        budget.walk_partial.store(true, Ordering::Release);
-        budget
-            .walk_time_limit_reached
-            .store(true, Ordering::Release);
-        for at in 0..23 {
-            note_large_read_skip(Path::new(&format!("large-{at:02}.log")));
-        }
-        let response = with_skip_disclosure(|| {
-            finish_response(Response::success(
-                "walk-and-skips",
-                serde_json::json!({"text":"rows"}),
-            ))
-        });
-        let text = response.data["text"].as_str().unwrap();
-        assert!(
-            text.find(WALK_PARTIAL_GAP).unwrap()
-                < text
-                    .find(crate::large_read::WHOLE_READ_SKIP_REASON)
-                    .unwrap(),
-            "{text}"
-        );
-        assert!(
-            text.ends_with("shown 20 of 23 files (cap) · narrow: path"),
-            "{text}"
-        );
-    });
-}
-
-#[test]
 fn audit1432_skip_collector_is_order_independent_and_deduplicates_paths_with_both_reasons() {
     let collect = |command_name: &str, reverse: bool| {
         let root = tempfile::tempdir().unwrap();

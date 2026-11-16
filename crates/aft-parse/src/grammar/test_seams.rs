@@ -86,11 +86,11 @@ pub fn from_environment(mut registry: Arc<GrammarRegistry>) -> Arc<GrammarRegist
 
 impl GrammarRegistry {
     #[cfg(all(
-        test,
+        any(test, feature = "test-support"),
         feature = "test-hooks",
         not(all(target_os = "windows", target_arch = "aarch64"))
     ))]
-    pub(crate) fn force_unavailable_for_test(&self, state: GrammarState) -> impl Drop + '_ {
+    pub fn force_unavailable_for_test(&self, state: GrammarState) -> impl Drop + '_ {
         struct Guard<'a>(&'a GrammarRegistry);
         impl Drop for Guard<'_> {
             fn drop(&mut self) {
@@ -115,7 +115,7 @@ impl GrammarRegistry {
             fault: RwLock::new(options.fault),
             listeners: Mutex::new(std::collections::BTreeMap::new()),
             next_listener: std::sync::atomic::AtomicU64::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             forced_unavailable: Mutex::new(None),
             load_hook: Mutex::new(None),
         })
