@@ -19,7 +19,7 @@ describe("search OpenCode 2 scenarios", () => {
         const scenarios = await loadScenarios(resolve(import.meta.dir, owner === "search" ? "." : "../grep"));
         const scenario = scenarios.find((row) => row.id === `${owner}/T6/${owner}-payload-skipped-files/${fixture}`);
         if (!scenario) throw new Error(`${owner} ${fixture} skipped-files fixture missing`);
-        const scratch = resolve(import.meta.dir, "../../../../../..", "target/scratch");
+        const scratch = resolve(import.meta.dir, "../../../../..", "target/scratch");
         await mkdir(scratch, { recursive: true });
         const root = await mkdtemp(join(scratch, "read-ceiling-"));
         const context: ScenarioLifecycleContext = {
