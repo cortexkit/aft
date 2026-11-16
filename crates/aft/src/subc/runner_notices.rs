@@ -668,8 +668,8 @@ pub(super) mod test_endpoint {
         stored: std::sync::Mutex<HashMap<String, Vec<u8>>>,
         delivery_order: std::sync::Mutex<Option<bool>>,
         send_status: AtomicBool,
-        replies: std::sync::Mutex<std::collections::VecDeque<SendReply>>,
-        states: std::sync::Mutex<HashMap<String, SendReply>>,
+        replies: std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>,
+        states: std::sync::Mutex<HashMap<String, Vec<u8>>>,
         lose_response: AtomicBool,
         effects: Arc<AtomicU64>,
         retries: std::sync::Mutex<u64>,
@@ -713,6 +713,16 @@ pub(super) mod test_endpoint {
                 .store(supported, Ordering::Relaxed);
         }
         pub(super) fn reply(&self, reply: SendReply) {
+            self.endpoint
+                .replies
+                .lock()
+                .unwrap()
+                .push_back(cortexkit_role_llm_runner::wire::reply_body(&reply).unwrap());
+        }
+        pub(super) fn reply_fixture(&self, body: &[u8]) {
+            let mut reply = b"{\"result\":".to_vec();
+            reply.extend_from_slice(body);
+            reply.push(b'}');
             self.endpoint.replies.lock().unwrap().push_back(reply);
         }
         pub(super) fn refuse(&self, code: &str, field: Option<&str>) {
@@ -877,22 +887,18 @@ pub(super) mod test_endpoint {
             .unwrap()
             .pop_front()
             .or_else(|| states.get(&key).cloned())
-            .unwrap_or_else(|| SendReply::new("active"));
+            .unwrap_or_else(|| {
+                cortexkit_role_llm_runner::wire::reply_body(&SendReply::new("active")).unwrap()
+            });
         states.insert(key, response.clone());
-        if new
-            && !matches!(
-                decode_send_reply(&cortexkit_role_llm_runner::wire::reply_body(&response).unwrap()),
-                Outcome::NotDelivered(_)
-            )
-        {
+        if new && !matches!(decode_send_reply(&response), Outcome::NotDelivered(_)) {
             endpoint.effects.fetch_add(1, Ordering::Relaxed);
         }
         if endpoint.lose_response.swap(false, Ordering::Relaxed) {
             return Some(Err(retry(FailureClass::TestEndpoint, "response lost")));
         }
-        let reply = cortexkit_role_llm_runner::wire::reply_body(&response).unwrap();
-        cortexkit_role_llm_runner::wire::read_reply::<SendReply>(&reply).unwrap();
-        Some(Ok(reply))
+        cortexkit_role_llm_runner::wire::read_reply::<SendReply>(&response).unwrap();
+        Some(Ok(response))
     }
 }
 
@@ -1747,7 +1753,11 @@ fn offer(
                 NOT_DELIVERED.fetch_add(1, Ordering::Relaxed);
                 if completion {
                     let mut request = current_request.expect("send reply has a frozen request");
-                    let (next_generation, phase) = if generation < MAX_GENERATIONS {
+                    // llm-runner 0.8.58 defines host_refused as permanent: resending cannot help.
+                    let (next_generation, phase) = if reason == "host_refused" {
+                        crate::slog_info!("runner notice task={task_id} session={} not_delivered reason={reason}; retired", owner.session);
+                        (generation, RunnerCompletionPhase::Retired)
+                    } else if generation < MAX_GENERATIONS {
                         let next_generation = generation + 1;
                         request.send_id = format!("{id}:{next_generation}");
                         crate::slog_info!("runner notice task={task_id} session={} not_delivered reason={reason}; retrying generation={next_generation}", owner.session);
@@ -1760,7 +1770,7 @@ fn offer(
                     if flush_delivery_update(&registry, &owner.session, &task_id, &mut delivery_update).is_err() {
                         return Next::Retry(retry_delay(0));
                     }
-                    if generation < MAX_GENERATIONS {
+                    if next_generation != generation {
                         *work_follow.send_id.lock().unwrap() = None;
                         receipt.applied();
                         let delay = retry_delay(*attempt);

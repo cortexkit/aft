@@ -305,6 +305,91 @@ fn undelivered(reason: &str) -> SendReply {
 static DELIVERY_COUNTER_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
+fn runner_notices_host_refused_retires_completion_without_new_generation() {
+    let _guard = DELIVERY_COUNTER_TEST.lock().unwrap();
+    let before = NOT_DELIVERED.load(Ordering::Relaxed);
+    for (index, checking) in [false, true].into_iter().enumerate() {
+        let mut task = Completion::new(&format!("bash-00000000000f002{index}"), 0);
+        let capture = test_endpoint::capture(&task.task, false);
+        if checking {
+            capture.send_status(true);
+            capture.reply(SendReply::new("pending"));
+            capture.reply_fixture(include_bytes!(
+                "../../tests/fixtures/runner-notices/send-status-host-refused.json"
+            ));
+        } else {
+            capture.reply_fixture(include_bytes!(
+                "../../tests/fixtures/runner-notices/send-host-refused.json"
+            ));
+        }
+        let scheduler = Scheduler::default();
+        let clock = Arc::new(AtomicU64::new(task.finished));
+        task.offer(&scheduler, clock.clone());
+        let mut due = std::time::Instant::now();
+        let (next, logs) = if checking {
+            assert!(
+                matches!(step(&scheduler, due), Next::Retry(delay) if delay == Duration::from_secs(5))
+            );
+            let first = capture.receiver.try_recv().unwrap();
+            assert_eq!(first.request["method"], "session.send");
+            assert_eq!(
+                first.request["params"]["send_id"],
+                format!("aft:bash:{}", task.task)
+            );
+            crate::logging::capture_log_lines(|| {
+                advance_notice(&scheduler, &clock, &mut due, Duration::from_secs(5))
+            })
+        } else {
+            crate::logging::capture_log_lines(|| step(&scheduler, due))
+        };
+        let last = capture.receiver.try_recv().unwrap();
+        assert_eq!(
+            last.request["method"],
+            if checking {
+                "session.send_status"
+            } else {
+                "session.send"
+            }
+        );
+        assert_eq!(
+            last.request["params"]["send_id"],
+            format!("aft:bash:{}", task.task)
+        );
+        assert!(matches!(next, Next::Done), "host refusal must not retry");
+        assert!(scheduler.entries.lock().unwrap().is_empty());
+        assert!(
+            capture.receiver.try_recv().is_err(),
+            "must not send generation :2"
+        );
+        assert_eq!(capture.effects.load(Ordering::Relaxed), u64::from(checking));
+        assert!(task.delivered());
+        assert_eq!(task.frozen().send_id, format!("aft:bash:{}", task.task));
+        assert_eq!(
+            logs,
+            vec![format!(
+                "INFO runner notice task={} session={} not_delivered reason=host_refused; retired",
+                task.task, task.task
+            )]
+        );
+        task.restart();
+        let _scope = crate::bash_background::task_identity_scope(Some(task.route.task_identity()));
+        let delivery = task
+            .registry
+            .notice_metadata(&task.task)
+            .unwrap()
+            .runner_completion_delivery
+            .unwrap();
+        assert_eq!(delivery.generation, 1);
+        assert!(matches!(delivery.phase, RunnerCompletionPhase::Retired));
+        assert!(task
+            .registry
+            .pending_completions_for_session(&task.task)
+            .is_empty());
+    }
+    assert_eq!(NOT_DELIVERED.load(Ordering::Relaxed) - before, 2);
+}
+
+#[test]
 fn runner_notices_not_delivered_completion_uses_new_generation_and_same_body() {
     let _guard = DELIVERY_COUNTER_TEST.lock().unwrap();
     let before = NOT_DELIVERED.load(Ordering::Relaxed);
@@ -322,6 +407,10 @@ fn runner_notices_not_delivered_completion_uses_new_generation_and_same_body() {
     assert_eq!(delay, Duration::from_millis(250));
     assert!(!task.delivered());
     let first = capture.receiver.try_recv().unwrap();
+    assert_eq!(
+        first.request["params"]["send_id"],
+        format!("aft:bash:{}", task.task)
+    );
     let frozen = task.frozen();
     assert_eq!(frozen.send_id, format!("aft:bash:{}:2", task.task));
     assert!(matches!(
@@ -329,6 +418,10 @@ fn runner_notices_not_delivered_completion_uses_new_generation_and_same_body() {
         Next::Done
     ));
     let second = capture.receiver.try_recv().unwrap();
+    assert_eq!(
+        second.request["params"]["send_id"],
+        format!("aft:bash:{}:2", task.task)
+    );
     assert_ne!(
         first.request["params"]["send_id"],
         second.request["params"]["send_id"]
