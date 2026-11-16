@@ -216,6 +216,7 @@ where
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut secret_authorizations: HashSet<(String, String, u64)> = HashSet::new();
         let mut inflight = tokio::task::JoinSet::new();
+        let mut inflight_refs = HashSet::new();
         let mut fanout = tokio::task::JoinSet::new();
         let mut next_scan = tokio::time::Instant::now() + interval;
         let mut next_backstop = tokio::time::Instant::now() + scope_watch::BACKSTOP;
@@ -252,20 +253,43 @@ where
                 let _ = std::fs::write(path, serde_json::to_vec(&watches.health).unwrap());
             }
             while inflight.len() < 4 && !queued.is_empty() {
-                let key = queued.keys().next().cloned().unwrap();
+                let Some(key) = queued
+                    .keys()
+                    .find(|key| !inflight_refs.contains(&(key.0.clone(), key.1.clone())))
+                    .cloned()
+                else {
+                    break;
+                };
                 let stamp: ScopeStamp = queued.remove(&key).unwrap();
                 if confirmed.contains(&key) {
                     pending.remove(&key);
                     continue;
                 }
+                // scope.describe selects owner/ref, not an epoch. One answer
+                // confirms every retained epoch that existed when it was sent.
+                let reference = (key.0.clone(), key.1.clone());
+                inflight_refs.insert(reference.clone());
+                let mut group: HashMap<_, _> = held_scopes
+                    .iter()
+                    .filter(|(key, _)| (key.0.clone(), key.1.clone()) == reference)
+                    .map(|(key, stamp)| (key.clone(), stamp.clone()))
+                    .collect();
+                group.entry(key).or_insert(stamp.clone());
+                let group: Vec<_> = group
+                    .into_iter()
+                    .map(|(key, stamp)| {
+                        queued.remove(&key);
+                        pending.insert(key.clone());
+                        let full = inventory.sources[0].contains_key(&key)
+                            || inventory.sources[3].contains_key(&key);
+                        (key, stamp, full)
+                    })
+                    .collect();
                 let control = control.clone();
                 // Persisted grants and held rows have only owner/ref/epoch,
                 // not a full speech authority stamp. Their ordinary cleanup
                 // still requires the daemon's definitive describe answer.
-                let speech = (inventory.sources[0].contains_key(&key)
-                    || inventory.sources[3].contains_key(&key))
-                .then(|| speech.clone())
-                .flatten();
+                let speech = speech.clone();
                 inflight.spawn(async move {
                     let sent = std::time::Instant::now();
                     let generation = speech
@@ -273,24 +297,26 @@ where
                         .map(|service| service.generation())
                         .unwrap_or_default();
                     let reply = control.describe(&stamp).await;
-                    control
-                        .metrics
-                        .scope_descriptions
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .record(&stamp, reply.as_ref().ok(), Instant::now());
-                    if let Some(service) = &speech {
-                        service.remember_probe(
-                            &stamp,
-                            &generation,
-                            sent,
-                            reply
-                                .as_ref()
-                                .map(Clone::clone)
-                                .map_err(ToString::to_string),
-                        );
+                    for (_, stamp, full) in &group {
+                        control
+                            .metrics
+                            .scope_descriptions
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .record(&stamp, reply.as_ref().ok(), Instant::now());
+                        if let Some(service) = speech.as_ref().filter(|_| *full) {
+                            service.remember_probe(
+                                &stamp,
+                                &generation,
+                                sent,
+                                reply
+                                    .as_ref()
+                                    .map(Clone::clone)
+                                    .map_err(ToString::to_string),
+                            );
+                        }
                     }
-                    (key, stamp, reply, generation)
+                    (reference, group, reply, generation)
                 });
             }
             let routed_now = routed
@@ -394,8 +420,10 @@ where
                     }
                 }
                 Some(result) = inflight.join_next(), if !inflight.is_empty() => {
-                    if let Ok((key, stamp, reply,generation)) = result {
+                    if let Ok((reference, group, reply,generation)) = result {
+                        inflight_refs.remove(&reference);
                         watches.health.descriptions += 1;
+                        for (key, stamp, full_stamp) in group {
                         if let Ok(ModuleControlResponseToModule::ScopeDescribe { status: subc_protocol::scope::ScopeStatus::Live, scope_epoch: Some(epoch), .. }) = &reply {
                             if watches.rebind(&key, *epoch) { dirty = true; }
                         }
@@ -411,7 +439,6 @@ where
                                 for ctx in executor.actor_contexts() { ctx.bash_background().revoke_secret_authorization(&described); }
                             }).await;
                         }
-                        let full_stamp = inventory.sources[0].contains_key(&key) || inventory.sources[3].contains_key(&key);
                         if reply.as_ref().is_ok_and(describe_answer_ends_scope) {
                             #[cfg(feature = "test-timing-hooks")]
                             crate::slog_info!("scope diagnostic phase=describe_ended scope_epoch={}", stamp.scope_epoch);
@@ -446,6 +473,7 @@ where
                         // Non-definitive answers and errors retry only on the
                         // regular poll, never in a reconnect-induced busy loop.
                         pending.remove(&key);
+                        }
                     }
                 }
                 else => break,

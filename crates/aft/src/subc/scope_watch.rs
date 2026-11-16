@@ -50,7 +50,7 @@ pub(super) fn notifier() -> &'static tokio::sync::Notify {
 pub(super) fn revisions() -> [u64; 4] {
     std::array::from_fn(|i| REVISIONS[i].load(Ordering::Acquire))
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn revision(source: Source) -> u64 {
     REVISIONS[source.index()].load(Ordering::Acquire)
 }

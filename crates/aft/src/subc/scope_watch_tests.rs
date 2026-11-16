@@ -709,6 +709,75 @@ async fn scope_watch_indeterminate_confirmation_holds_state_and_falls_back() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn scope_watch_retained_epochs_share_one_describe_for_a_real_end() {
+    let (control, pending, mut frames) = control(&["scope.describe", "scope.watch"]);
+    let first = stamp(0);
+    let mut second = first.clone();
+    second.scope_epoch = 2;
+    let source = vec![first.clone(), second.clone()];
+    let (_handle, mut ended, worker) = start_with_scope_source(
+        control.clone(),
+        Arc::new(Executor::new()),
+        Duration::from_secs(60),
+        move || std::future::ready(source.clone()),
+    );
+    let watch = request(&mut frames, "scope.watch").await;
+    assert_eq!(snapshot(&pending, &watch), 2);
+    let query = request(&mut frames, "scope.describe").await;
+    response(
+        &pending,
+        &query,
+        answer(&first, subc_protocol::scope::ScopeStatus::Live, 2),
+    );
+    let rebound = request(&mut frames, "scope.watch").await;
+    assert_eq!(
+        snapshot(&pending, &rebound),
+        1,
+        "retained epochs share the current epoch selector after a rebind"
+    );
+    let query = request(&mut frames, "scope.describe").await;
+    response(
+        &pending,
+        &query,
+        answer(&first, subc_protocol::scope::ScopeStatus::Live, 2),
+    );
+    turns().await;
+    assert!(frames.try_recv().is_err());
+    push(&pending, &rebound, &second, ScopeWatchEvent::Ended);
+    let query = request(&mut frames, "scope.describe").await;
+    response(
+        &pending,
+        &query,
+        answer(&first, subc_protocol::scope::ScopeStatus::Ended, 2),
+    );
+    let mut epochs = HashSet::new();
+    for _ in 0..2 {
+        epochs.insert(ended.recv().await.unwrap().stamp.scope_epoch);
+    }
+    assert_eq!(epochs, HashSet::from([1, 2]));
+    turns().await;
+    while let Ok(frame) = frames.try_recv() {
+        assert_eq!(
+            frame.header.ty,
+            FrameType::Cancel,
+            "one real ref end must not describe each retained epoch separately"
+        );
+    }
+    assert_eq!(
+        control
+            .metrics
+            .scope_descriptions
+            .lock()
+            .unwrap()
+            .scope_watch_health()["descriptions"],
+        3,
+        "one initial ref probe, one re-arm probe, one confirming end probe"
+    );
+    worker.abort();
+    let _ = worker.await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn scope_watch_five_minute_backstop_repairs_unnotified_membership() {
     let (control, pending, mut frames) = control(&["scope.describe", "scope.watch"]);
     let scopes = Arc::new(StdMutex::new(vec![stamp(0)]));
