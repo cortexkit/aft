@@ -10,6 +10,7 @@ fn notice_route(session: &str) -> CodeSearchNotice {
         }),
         call_key: "notice-call".into(),
         preset: "worker".into(),
+        remaining: Arc::new(std::sync::Mutex::new(CODE_SEARCH_NOTICE_TIMEOUT)),
     }
 }
 
@@ -219,6 +220,43 @@ fn notice_templates_legacy_runner_keeps_plain_send() {
 }
 
 #[test]
+fn notice_templates_fallback_and_later_notices_share_two_second_budget() {
+    install(PathBuf::from("unused-test-notice-connection"));
+    let capture = test_endpoint::capture("notice-shared-budget", false);
+    capture.delivery_order(Some(true));
+    capture.refuse("invalid_params", Some("template"));
+    capture.delay_reply(Duration::from_millis(1200));
+    let route = notice_route("notice-shared-budget");
+    let notice = crate::notice_templates::Notice::template(
+        crate::notice_templates::PREFER_TOOL,
+        json!({"tool":"read", "shell":"bash"}),
+        "Prefer `read` tool over bash.".into(),
+        crate::notice_templates::Target::Text,
+    );
+    let start = std::time::Instant::now();
+    route.send(&notice);
+    route
+        .clone()
+        .send(&crate::notice_templates::Notice::diagnostic(
+            "diagnostic".into(),
+        ));
+    assert!((Duration::from_millis(1800)..Duration::from_secs(3)).contains(&start.elapsed()));
+    assert_eq!(
+        capture.receiver.try_recv().unwrap().request["params"]["template"]["id"],
+        "aft.bash.prefer_tool"
+    );
+    assert_eq!(
+        capture.receiver.try_recv().unwrap().request["params"]["delivery"],
+        json!(["tool_result"])
+    );
+    assert!(
+        capture.receiver.try_recv().is_err(),
+        "no fresh deadline for later notices"
+    );
+    assert_eq!(capture.effects.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn notice_templates_diagnostics_remain_free_text_tool_result_sends() {
     install(PathBuf::from("unused-test-notice-connection"));
     let session = "notice-diagnostics";
@@ -285,6 +323,7 @@ fn code_search_nudge_runner_send_is_once_and_leaves_result_bytes_unchanged() {
         }),
         call_key: "call-17".into(),
         preset: "worker".into(),
+        remaining: Arc::new(std::sync::Mutex::new(CODE_SEARCH_NOTICE_TIMEOUT)),
     };
     let context = crate::subc_format::BashCodeSearchHint {
         command: "echo marker; rg foo".into(),
@@ -405,6 +444,7 @@ fn code_search_nudge_runner_deadline_preserves_result_bytes_and_drops_once() {
                         }),
                         call_key: "call-deadline".into(),
                         preset: "worker".into(),
+                        remaining: Arc::new(std::sync::Mutex::new(CODE_SEARCH_NOTICE_TIMEOUT)),
                     }),
                 }),
                 ..format_context
@@ -469,6 +509,7 @@ fn code_search_nudge_runner_drops_refused_undelivered_and_missing_address() {
                 }),
                 call_key: format!("call-{case}"),
                 preset: "worker".into(),
+                remaining: Arc::new(std::sync::Mutex::new(CODE_SEARCH_NOTICE_TIMEOUT)),
             }),
         };
         let mut response = crate::protocol::Response::success(

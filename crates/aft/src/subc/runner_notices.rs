@@ -388,12 +388,22 @@ struct Address {
 
 /// A runner route remains a runner route even when its notice address is
 /// unavailable. Such nudges are dropped, never appended to command output.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CodeSearchNotice {
     address: Option<Address>,
     call_key: String,
     preset: String,
+    remaining: Arc<std::sync::Mutex<Duration>>,
 }
+
+impl PartialEq for CodeSearchNotice {
+    fn eq(&self, other: &Self) -> bool {
+        self.address == other.address
+            && self.call_key == other.call_key
+            && self.preset == other.preset
+    }
+}
+impl Eq for CodeSearchNotice {}
 
 pub(super) fn code_search_notice(
     route: &RouteIdentity,
@@ -414,6 +424,7 @@ pub(super) fn code_search_notice(
         address: Address::new(&route.task_identity(), raw, route.scope.as_ref()),
         call_key: call_key.to_owned(),
         preset: "head".into(),
+        remaining: Arc::new(std::sync::Mutex::new(CODE_SEARCH_NOTICE_TIMEOUT)),
     })
 }
 
@@ -493,10 +504,19 @@ impl CodeSearchNotice {
     /// template (for example, the session plan omitted it), retry once as
     /// free text at tool-result authority, within the same deadline; never append.
     pub(crate) fn send(&self, notice: &crate::notice_templates::Notice) {
+        // Cloned render contexts belong to the same call. All its nudges,
+        // capability probes and the one allowed fallback share this budget.
+        let mut remaining = self.remaining.lock().unwrap();
+        let budget = *remaining;
+        let started = std::time::Instant::now();
         // Rendering can run on either an actor thread or a Tokio worker. Keep
         // the synchronous send's runtime off both callers' runtime stacks.
-        let outcome = std::thread::scope(|scope| scope.spawn(|| self.send_once(notice)).join())
-            .unwrap_or_else(|_| retry(FailureClass::Runtime, "code-search notice sender panicked"));
+        let outcome =
+            std::thread::scope(|scope| scope.spawn(|| self.send_once(notice, budget)).join())
+                .unwrap_or_else(|_| {
+                    retry(FailureClass::Runtime, "code-search notice sender panicked")
+                });
+        *remaining = remaining.saturating_sub(started.elapsed());
         match outcome {
             Outcome::Accepted | Outcome::Pending => {}
             Outcome::NotDelivered(reason) => log::info!(
@@ -513,7 +533,13 @@ impl CodeSearchNotice {
         }
     }
 
-    fn send_once(&self, notice: &crate::notice_templates::Notice) -> Outcome {
+    fn send_once(&self, notice: &crate::notice_templates::Notice, remaining: Duration) -> Outcome {
+        if remaining.is_zero() {
+            return Outcome::Final(Failure::new(
+                FailureClass::Timeout,
+                "tool notice send budget exhausted",
+            ));
+        }
         (|| {
             let address = self
                 .address
@@ -538,7 +564,7 @@ impl CodeSearchNotice {
                 .as_millis() as u64;
             Ok::<_, Outcome>(runtime.block_on(async {
                 tokio::time::timeout(
-                    CODE_SEARCH_NOTICE_TIMEOUT,
+                    remaining,
                     async {
                         let modern = runner_delivery_order(&path, address).await == Some(true);
                         let cleared = modern && runner_capability(&path, address, "delivery_order_modes:turn_system_cleared").await == Some(true);

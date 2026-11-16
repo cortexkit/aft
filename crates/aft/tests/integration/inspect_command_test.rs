@@ -312,8 +312,8 @@ fn inspect_as_opencode(
         aft::protocol::Response {
             id: "inspect".into(),
             success: value["success"] == true,
-        data: value,
-        notices: Default::default(),
+            data: value,
+            notices: Default::default(),
         }
     })
     .data

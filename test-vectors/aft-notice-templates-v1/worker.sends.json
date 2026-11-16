@@ -1,0 +1,88 @@
+[
+  {
+    "method": "session.send",
+    "params": {
+      "send_id": "aft:nudge:aft.bash.code_search:example-call",
+      "delivery": [
+        "turn_system_cleared",
+        "tool_result"
+      ],
+      "dedupe_key": "aft:nudge:aft.bash.code_search",
+      "expires_at_ms": 1700000060000,
+      "template": {
+        "id": "aft.bash.code_search",
+        "digest": "43f3caebf95698c12db9681aeeb90600f1cf8664b6b7cc282f4ef9499071c9ad",
+        "slots": {
+          "shell": "bash",
+          "redirect": "Use the `search` tool instead (it auto-routes concepts, identifiers, regex, and literals)."
+        }
+      },
+      "notice": true
+    }
+  },
+  {
+    "method": "session.send",
+    "params": {
+      "send_id": "aft:nudge:aft.bash.prefer_tool:example-call",
+      "delivery": [
+        "turn_system_cleared",
+        "tool_result"
+      ],
+      "dedupe_key": "aft:nudge:aft.bash.prefer_tool",
+      "expires_at_ms": 1700000060000,
+      "template": {
+        "id": "aft.bash.prefer_tool",
+        "digest": "3d406a218b3d6d9a37a134c4cf5293559837b014187f2efb03bb448f7d455663",
+        "slots": {
+          "tool": "read",
+          "shell": "bash"
+        }
+      },
+      "notice": true
+    }
+  },
+  {
+    "method": "session.send",
+    "params": {
+      "send_id": "aft:nudge:aft.repeat_call.identical:example-call",
+      "delivery": [
+        "turn_system_cleared",
+        "tool_result"
+      ],
+      "dedupe_key": "aft:nudge:aft.repeat_call.identical",
+      "expires_at_ms": 1700000060000,
+      "template": {
+        "id": "aft.repeat_call.identical",
+        "digest": "5ad948cda47d6ccacb45ea7279d425d0d821bc2eee060fefab7862b2820a1c03",
+        "slots": {
+          "count": 3,
+          "span": 42,
+          "instruction": "If you are waiting on a task or CI run, wait with a watch on its background task (for example bash_watch on the task ID you already hold) instead of repeating this call. If you are already watching, let the watch return before calling again."
+        }
+      },
+      "notice": true
+    }
+  },
+  {
+    "method": "session.send",
+    "params": {
+      "send_id": "aft:nudge:aft.repeat_call.drifting:example-call",
+      "delivery": [
+        "turn_system_cleared",
+        "tool_result"
+      ],
+      "dedupe_key": "aft:nudge:aft.repeat_call.drifting",
+      "expires_at_ms": 1700000060000,
+      "template": {
+        "id": "aft.repeat_call.drifting",
+        "digest": "eb8733fe3db66d83a310fbe43f6e976ddc4b35d3243794e3fe7ed07af32df9c7",
+        "slots": {
+          "count": 3,
+          "span": 42,
+          "instruction": "If you are waiting on a task or CI run, wait with a watch on its background task (for example bash_watch on the task ID you already hold) instead of repeating this call. If you are already watching, let the watch return before calling again."
+        }
+      },
+      "notice": true
+    }
+  }
+]
