@@ -7084,13 +7084,12 @@ mod fresh_payload_tests {
         let response = header_response(&payloads, &Sections::summary_only());
         assert_header(
             &response,
-            "PARTIAL — unused exports incomplete: 1 file could not be parsed: a.ts (parse failed); retry aft_inspect.",
+            "PARTIAL — unused exports incomplete: 1 file could not be parsed; retry aft_inspect.",
             false,
         );
-        assert!(response.data["text"]
-            .as_str()
-            .unwrap()
-            .contains("1 file could not be parsed"));
+        assert!(response.data["text"].as_str().unwrap().contains(
+            "Incomplete unused_exports: 1 file could not be parsed: a.ts (parse failed)"
+        ));
     }
 
     #[test]

@@ -61,19 +61,10 @@ mod inspect_parse_tests {
 
     #[test]
     fn inspect_parse_messages_count_duplicates_in_first_seen_order() {
-        let path = Path::new("broken.mjs");
-        let facts = parse_file_facts(
-            FileId(0),
-            path,
-            "return; break; return;",
-            String::new(),
-            SourceType::from_path(path).unwrap(),
+        assert_eq!(
+            summarize_parse_messages(["first", "second", "first"].map(str::to_string)),
+            "first (×2); second"
         );
-        let error = facts.parse_error.unwrap();
-        assert_eq!(error.matches("'return'").count(), 1, "{error}");
-        assert_eq!(error.matches("'break'").count(), 1, "{error}");
-        assert!(error.contains("(×2)"), "{error}");
-        assert!(error.find("'return'") < error.find("'break'"), "{error}");
     }
 }
 
@@ -146,34 +137,24 @@ pub fn parse_file_facts(
                 ..ParseOptions::default()
             })
             .parse();
-        if script.errors.is_empty() {
+        // Oxc leaves some script early errors to its semantic checker. ES
+        // import/export declarations must not turn a failed module parse into
+        // a valid function-body script just because return was relaxed.
+        let has_module_declaration = script.program.body.iter().any(|statement| {
+            matches!(
+                statement,
+                Statement::ImportDeclaration(_)
+                    | Statement::ExportAllDeclaration(_)
+                    | Statement::ExportDefaultDeclaration(_)
+                    | Statement::ExportNamedDeclaration(_)
+            )
+        });
+        if script.errors.is_empty() && !has_module_declaration {
             parsed = script;
         }
     }
     if !parsed.errors.is_empty() {
-        let mut messages = Vec::<(String, usize)>::new();
-        let mut indices = BTreeMap::new();
-        for error in &parsed.errors {
-            let message = error.to_string();
-            let next = messages.len();
-            let index = *indices.entry(message.clone()).or_insert(next);
-            if index == next {
-                messages.push((message, 1));
-            } else {
-                messages[index].1 += 1;
-            }
-        }
-        let joined = messages
-            .into_iter()
-            .map(|(message, count)| {
-                if count > 1 {
-                    format!("{message} (×{count})")
-                } else {
-                    message
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
+        let joined = summarize_parse_messages(parsed.errors.iter().map(ToString::to_string));
         return FileFacts::empty(file_id, path.to_path_buf(), content_hash, joined);
     }
 
@@ -221,6 +202,31 @@ pub(super) fn permits_script_return(path: &Path) -> bool {
         path.extension().and_then(|ext| ext.to_str()),
         Some("js" | "cjs")
     )
+}
+
+fn summarize_parse_messages(errors: impl IntoIterator<Item = String>) -> String {
+    let mut messages = Vec::<(String, usize)>::new();
+    let mut indices = BTreeMap::new();
+    for message in errors {
+        let next = messages.len();
+        let index = *indices.entry(message.clone()).or_insert(next);
+        if index == next {
+            messages.push((message, 1));
+        } else {
+            messages[index].1 += 1;
+        }
+    }
+    messages
+        .into_iter()
+        .map(|(message, count)| {
+            if count > 1 {
+                format!("{message} (×{count})")
+            } else {
+                message
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 impl Extractor {
