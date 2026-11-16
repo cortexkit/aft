@@ -102,6 +102,7 @@ pub(crate) fn code_search_nudge(
         return None;
     }
     if let Some(root) = project_root.filter(|root| !root.to_string_lossy().trim().is_empty()) {
+        let root = root.to_str().map(str::trim).map(Path::new).unwrap_or(root);
         let root = resolve(Path::new(""), root);
         let mut cwd = Some(resolve(&root, Path::new(workdir.unwrap_or("."))));
         let mut suppress = true;
@@ -210,9 +211,8 @@ fn inside(root: &Path, path: &Path) -> bool {
     root.components().all(|r| {
         path.next().is_some_and(|p| {
             if cfg!(windows) {
-                r.as_os_str()
-                    .to_string_lossy()
-                    .eq_ignore_ascii_case(&p.as_os_str().to_string_lossy())
+                r.as_os_str().to_string_lossy().to_lowercase()
+                    == p.as_os_str().to_string_lossy().to_lowercase()
             } else {
                 r == p
             }
@@ -221,8 +221,15 @@ fn inside(root: &Path, path: &Path) -> bool {
 }
 
 fn next_cwd(cwd: Option<&Path>, stage: &str, mut at: usize, windows: bool) -> Option<PathBuf> {
-    while let Some((part, end)) = token(stage, at, windows) {
-        if end <= at || part.is_empty() {
+    loop {
+        at = skip_spaces(stage, at);
+        if at == stage.len() {
+            break;
+        }
+        let Some((part, end)) = token(stage, at, windows) else {
+            break;
+        };
+        if end <= at {
             break;
         }
         at = end;
@@ -258,8 +265,15 @@ fn operands(stage: &str, mut at: usize, windows: bool) -> Vec<String> {
     let mut pattern = false;
     let mut options_ended = false;
     let mut option_value = None;
-    while let Some((part, end)) = token(stage, at, windows) {
-        if end <= at || part.is_empty() {
+    loop {
+        at = skip_spaces(stage, at);
+        if at == stage.len() {
+            break;
+        }
+        let Some((part, end)) = token(stage, at, windows) else {
+            break;
+        };
+        if end <= at {
             break;
         }
         at = end;
@@ -316,6 +330,13 @@ fn operands(stage: &str, mut at: usize, windows: bool) -> Vec<String> {
         }
     }
     paths
+}
+
+fn skip_spaces(input: &str, start: usize) -> usize {
+    input[start..]
+        .char_indices()
+        .find(|(_, c)| !c.is_whitespace())
+        .map_or(input.len(), |(at, _)| start + at)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -692,11 +713,16 @@ mod tests {
             "grep -n foo src/missing.ts | head -5",
             "grep -n foo src/app.ts | head -5",
             "grep -n foo src/app.ts src/ | head -5",
+            "grep '' src/app.ts",
             "grep -rn foo /etc/hosts 2>/dev/null",
         ] {
             assert_eq!(decide("hit", command, root, None), None, "{command}");
         }
         assert_eq!(decide("hit", "rg foo $DIR", None, None), None);
+        assert_eq!(
+            decide("hit", "cd '' && rg foo src", root, None).as_deref(),
+            Some(SEARCH_HINT)
+        );
     }
 
     #[test]

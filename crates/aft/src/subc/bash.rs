@@ -2199,6 +2199,10 @@ pub(super) fn submit_deferred_bash(
         .as_ref()
         .map(|identity| identity.disabled_tools.as_slice())
         .unwrap_or_default();
+    let search_registered = server_completion
+        || executor
+            .actor_context(&root)
+            .is_some_and(|ctx| ctx.config().aft_search_registered);
     format_context.bash_code_search_hint = arguments
         .get("command")
         .and_then(Value::as_str)
@@ -2212,14 +2216,15 @@ pub(super) fn submit_deferred_bash(
                 .get("workdir")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            search_tool: crate::tool_gate::catalog_keeps("search", disabled).then(|| {
-                if worker_preset {
-                    "search"
-                } else {
-                    "aft_search"
-                }
-                .into()
-            }),
+            search_tool: (search_registered && crate::tool_gate::catalog_keeps("search", disabled))
+                .then(|| {
+                    if worker_preset {
+                        "search"
+                    } else {
+                        "aft_search"
+                    }
+                    .into()
+                }),
             grep_tool: crate::tool_gate::catalog_keeps("grep", disabled).then(|| "grep".into()),
             shell_tool: format_context
                 .host_tool_names
