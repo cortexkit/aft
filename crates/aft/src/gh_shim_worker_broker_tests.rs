@@ -265,14 +265,52 @@ async fn gh_shim_broker_t4_frame_and_rate_and_upstream_budgets_are_bounded() {
         requests: 29,
         upstream: 599,
     };
-    assert!(limits.take(true));
-    assert!(!limits.take(true));
+    assert_eq!(limits.take(true), Ok(()));
+    assert_eq!(limits.take(true), Err("command_budget_exceeded"));
     limits.window = Instant::now() - Duration::from_secs(2);
-    assert!(limits.take(false));
-    assert!(
-        !limits.take(true),
-        "upstream budget does not refill with request rate"
-    );
+    assert_eq!(limits.take(false), Ok(()));
+    assert_eq!(limits.take(true), Err("command_budget_exceeded"));
+}
+
+#[test]
+fn gh_shim_broker_refusal_texts_are_pinned() {
+    for (code, text) in [
+        ("broker_busy", "gh read refused: too many gh commands are running at once in this shell. Retry in 1 second, or run fewer in parallel."),
+        ("request_rate_exceeded", "gh read refused: more than 30 gh reads in one second. Retry in 1 second."),
+        ("command_budget_exceeded", "gh read refused: this bash command has used its 600 gh reads. Start a new bash command."),
+        ("broker_timeout", "gh read timed out. Retry, or run fewer gh commands in parallel."),
+        ("broker_unavailable", "gh reads are unavailable in this bash command. Start a new bash command."),
+        ("command_ended", "gh read failed: command_ended. Start a new bash command."),
+    ] {
+        assert_eq!(failure_text(code), text);
+        assert_eq!(refusal(code).data["message"], text);
+    }
+}
+
+#[tokio::test]
+async fn gh_shim_broker_rate_limit_recovers_without_reissuing_capability() {
+    let grant = Grant::new();
+    let transport = Transport::default();
+    let limits = budget();
+    limits.lock().unwrap().requests = REQUESTS_PER_SECOND;
+    let bytes = grant.envelope(Operation::SessionContext);
+    let request = || {
+        dispatch(
+            &bytes,
+            &grant.socket,
+            &transport,
+            |cap| crate::gh_shim_ticket::redeem_worker_read(cap, &grant.socket),
+            |_| true,
+            |_| std::future::ready(Ok(Some(stamp()))),
+            &limits,
+        )
+    };
+    let reply = request().await;
+    assert_eq!(reply.data["refusal_code"], "request_rate_exceeded");
+    assert_eq!(reply.data["message"], failure_text("request_rate_exceeded"));
+    limits.lock().unwrap().window = Instant::now() - Duration::from_secs(2);
+    let reply = request().await;
+    assert!(reply.ok, "the same capability must recover: {reply:?}");
 }
 
 #[tokio::test]
@@ -426,10 +464,12 @@ async fn gh_shim_broker_t4_real_listener_bounds_connections_and_read_deadlines()
     .await
     .expect("real accepted connections must reserve bounded global slots");
     let mut excess = tokio::net::UnixStream::connect(&socket).await.unwrap();
-    let closed = tokio::time::timeout(Duration::from_millis(500), excess.read_u8())
+    let reply = tokio::time::timeout(Duration::from_millis(500), read_reply(&mut excess))
         .await
-        .expect("excess connection must close without waiting for frame deadline");
-    assert!(closed.is_err());
+        .expect("excess connection must receive a refusal without waiting for a frame")
+        .unwrap();
+    assert_eq!(reply["data"]["refusal_code"], "broker_busy");
+    assert_eq!(reply["data"]["message"], failure_text("broker_busy"));
     for mut client in clients {
         assert!(
             tokio::time::timeout(FRAME_DEADLINE + Duration::from_secs(1), client.read_u8())
@@ -444,6 +484,74 @@ async fn gh_shim_broker_t4_real_listener_bounds_connections_and_read_deadlines()
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn gh_shim_broker_four_admitted_connections_queue_instead_of_eof() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("broker.sock");
+    let (service, _receiver) = optional_service(root.path());
+    let tasks = crate::bash_background::BgTaskRegistry::default();
+    let upstream = Arc::new(Semaphore::new(2));
+    let occupied = upstream.clone().acquire_many_owned(2).await.unwrap();
+    let budget = Arc::new(budget());
+    let mut clients = Vec::new();
+    let mut connections = tokio::task::JoinSet::new();
+    for _ in 0..CONNECTIONS {
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        // The invalid bearer still traverses admission and must receive the
+        // authentication refusal, rather than losing the connection to load.
+        write_frame(
+            &mut client,
+            &serde_json::to_vec(&Envelope {
+                capability: "invalid-bearer".into(),
+                operation: Operation::SessionContext,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        clients.push(client);
+        let (socket, service, tasks, upstream, budget) = (
+            socket.clone(),
+            service.clone(),
+            tasks.clone(),
+            upstream.clone(),
+            budget.clone(),
+        );
+        connections.spawn(async move {
+            connection(server, &socket, &service, &tasks, &upstream, &budget).await;
+        });
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), read_reply(&mut clients[0]))
+            .await
+            .is_err(),
+        "an admitted request must wait for an upstream slot, not close with EOF"
+    );
+    drop(occupied);
+    for client in &mut clients {
+        let reply = tokio::time::timeout(Duration::from_secs(1), read_reply(client))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply["data"]["refusal_code"], "capability_unknown");
+    }
+    while let Some(result) = connections.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(
+        upstream.available_permits(),
+        2,
+        "burst must release all slots"
+    );
+    let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+    write_frame(&mut client, b"{}").await.unwrap();
+    connection(server, &socket, &service, &tasks, &upstream, &budget).await;
+    assert_eq!(
+        read_reply(&mut client).await.unwrap()["data"]["refusal_code"],
+        "request_malformed"
+    );
 }
 
 #[tokio::test]

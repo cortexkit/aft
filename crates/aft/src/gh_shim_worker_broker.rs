@@ -52,7 +52,24 @@ const CALL_DEADLINE: Duration = Duration::from_secs(20);
 #[cfg(unix)]
 const CONNECTIONS: usize = 4;
 #[cfg(unix)]
+const REQUESTS_PER_SECOND: u32 = 30;
+#[cfg(unix)]
+const READS_PER_COMMAND: u32 = 600;
+#[cfg(unix)]
 static GLOBAL: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(64)));
+
+// Keep overload and transport failures actionable at every lookup/read boundary.
+#[cfg(unix)]
+fn failure_text(code: &str) -> String {
+    match code {
+        "broker_busy" => "gh read refused: too many gh commands are running at once in this shell. Retry in 1 second, or run fewer in parallel.",
+        "request_rate_exceeded" => "gh read refused: more than 30 gh reads in one second. Retry in 1 second.",
+        "command_budget_exceeded" => "gh read refused: this bash command has used its 600 gh reads. Start a new bash command.",
+        "broker_timeout" => "gh read timed out. Retry, or run fewer gh commands in parallel.",
+        "broker_unavailable" => "gh reads are unavailable in this bash command. Start a new bash command.",
+        _ => return format!("gh read failed: {code}. Start a new bash command."),
+    }.into()
+}
 
 /// Serde's closed enum rejects unknown operations and authority-bearing fields
 /// before registry access. A connection contains exactly one length-prefixed JSON
@@ -204,7 +221,7 @@ pub(crate) fn install(relay: Arc<GhRelay>) -> (ServiceGuard, mpsc::Receiver<Scop
 fn refusal(code: &str) -> RelayReply {
     RelayReply {
         ok: false,
-        data: json!({"refusal_code": code, "stage": "worker_broker", "message": code}),
+        data: json!({"refusal_code": code, "stage": "worker_broker", "message": failure_text(code)}),
     }
 }
 
@@ -247,17 +264,20 @@ struct Budget {
 
 #[cfg(unix)]
 impl Budget {
-    fn take(&mut self, read: bool) -> bool {
+    fn take(&mut self, read: bool) -> Result<(), &'static str> {
         if self.window.elapsed() >= Duration::from_secs(1) {
             self.window = Instant::now();
             self.requests = 0;
         }
-        if self.requests >= 30 || (read && self.upstream >= 600) {
-            return false;
+        if read && self.upstream >= READS_PER_COMMAND {
+            return Err("command_budget_exceeded");
+        }
+        if self.requests >= REQUESTS_PER_SECOND {
+            return Err("request_rate_exceeded");
         }
         self.requests += 1;
         self.upstream += u32::from(read);
-        true
+        Ok(())
     }
 }
 
@@ -461,9 +481,20 @@ async fn serve(
             _ = tokio::time::sleep_until(deadline.into()) => {},
             Some(_) = connections.join_next(), if !connections.is_empty() => {},
             accepted = listener.accept() => {
-                let Ok((stream, _)) = accepted else { break; };
-                if !ingress.take(false) { continue; }
-                let (Ok(local), Ok(global)) = (local.clone().try_acquire_owned(), service.connection_slots.clone().try_acquire_owned()) else { continue; };
+                let Ok((mut stream, _)) = accepted else { break; };
+                let admission = ingress.take(false).and_then(|()| {
+                    let local = local.clone().try_acquire_owned().map_err(|_| "broker_busy")?;
+                    let global = service.connection_slots.clone().try_acquire_owned().map_err(|_| "broker_busy")?;
+                    Ok((local, global))
+                });
+                let (local, global) = match admission {
+                    Ok(permits) => permits,
+                    Err(code) => {
+                        // Do not allocate an unbounded rejection task under load.
+                        let _ = tokio::time::timeout(FRAME_DEADLINE, write_reply(&mut stream, refusal(code))).await;
+                        continue;
+                    }
+                };
                 let service = service.clone();
                 let socket = socket.clone();
                 let tasks = tasks.clone();
@@ -500,11 +531,12 @@ async fn connection(
     else {
         return;
     };
-    let Ok(_permit) = upstream.clone().try_acquire_owned() else {
-        return;
-    };
-    let response = tokio::time::timeout(
-        CALL_DEADLINE,
+    let response = tokio::time::timeout(CALL_DEADLINE, async {
+        // The admitted connection slots bound this queue. A four-process burst
+        // must not lose its third and fourth requests to a silent EOF.
+        let Ok(_permit) = upstream.acquire().await else {
+            return refusal("broker_unavailable");
+        };
         dispatch(
             &bytes,
             socket,
@@ -520,12 +552,11 @@ async fn connection(
                 receive.await.map_err(|_| ())
             },
             budget,
-        ),
-    )
+        )
+        .await
+    })
     .await;
-    let Ok(response) = response else {
-        return;
-    };
+    let response = response.unwrap_or_else(|_| refusal("broker_timeout"));
     let _ = tokio::time::timeout(FRAME_DEADLINE, write_reply(&mut stream, response)).await;
 }
 
@@ -670,7 +701,7 @@ impl std::fmt::Display for ClientError {
             #[cfg(not(unix))]
             Self::UnsupportedPlatform(platform) => write!(f, "gh_shim_worker_read_platform_unsupported_{platform}: worker read broker is unavailable on {platform}"),
             #[cfg(unix)]
-            Self::MissingPath(key) => write!(f, "worker read broker requires {key}"),
+            Self::MissingPath(key) => write!(f, "worker read broker requires {key}. Start a new bash command."),
         }
     }
 }
@@ -731,71 +762,76 @@ pub(crate) fn request(
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(&client.capability_file)
-            .map_err(|_| "worker read capability file unavailable")?;
+            .map_err(|_| failure_text("capability_file_unavailable"))?;
         if !file
             .metadata()
-            .map_err(|_| "worker read capability metadata unavailable")?
+            .map_err(|_| failure_text("capability_metadata_unavailable"))?
             .is_file()
         {
-            return Err("worker read capability must be a regular file".into());
+            return Err(failure_text("capability_not_regular_file"));
         }
         let mut capability = String::new();
         file.by_ref()
             .take(33)
             .read_to_string(&mut capability)
-            .map_err(|_| "worker read capability unavailable")?;
+            .map_err(|_| failure_text("capability_unavailable"))?;
         if capability.len() != 32 || !capability.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err("worker read capability malformed".into());
+            return Err(failure_text("capability_malformed"));
         }
         let bytes = serde_json::to_vec(&Envelope {
             capability,
             operation,
         })
-        .map_err(|_| "worker broker request malformed")?;
+        .map_err(|_| failure_text("request_malformed"))?;
         if bytes.len() > MAX_FRAME {
-            return Err("worker broker request too large".into());
+            return Err(failure_text("request_too_large"));
         }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| failure_text(&e.to_string()))?;
         runtime.block_on(async {
             tokio::time::timeout(budget.min(CALL_DEADLINE), async {
                 let mut stream = tokio::net::UnixStream::connect(&client.socket)
                     .await
-                    .map_err(|_| "worker read broker unavailable")?;
+                    .map_err(|_| failure_text("broker_unavailable"))?;
                 let peer = stream
                     .peer_cred()
-                    .map_err(|_| "worker read broker peer unavailable")?;
+                    .map_err(|_| failure_text("peer_unavailable"))?;
                 if peer.uid() != unsafe { libc::geteuid() } {
-                    return Err("worker read broker peer mismatch".to_string());
+                    return Err(failure_text("peer_mismatch"));
                 }
                 write_frame(&mut stream, &bytes)
                     .await
-                    .map_err(|_| "worker read broker write failed")?;
-                let reply = read_reply(&mut stream).await?;
+                    .map_err(|_| failure_text("broker_unavailable"))?;
+                let reply = read_reply(&mut stream)
+                    .await
+                    .map_err(|error| failure_text(&error))?;
                 match reply["status"].as_str() {
                     Some("ok") => reply
                         .get("data")
                         .cloned()
-                        .ok_or_else(|| "worker read broker omitted data".into()),
+                        .ok_or_else(|| failure_text("reply_omitted_data")),
                     Some("error") => {
                         // Keep the daemon's explanation (for example, which
                         // query keys are allowed) so a refused command can be
                         // corrected without inspecting broker traffic.
                         let code = reply["data"]["refusal_code"].as_str().unwrap_or("refused");
                         Err(match reply["data"]["message"].as_str() {
+                            Some(message) if reply["data"]["stage"] == "worker_broker" => {
+                                message.to_string()
+                            }
                             Some(message) if !message.is_empty() => {
                                 format!("worker read broker refused: {code}: {message}")
                             }
-                            _ => format!("worker read broker refused: {code}"),
+                            _ => failure_text(code),
                         })
                     }
-                    _ => Err("worker read broker reply has unknown status".into()),
+                    _ => Err(failure_text("reply_unknown_status")),
                 }
             })
             .await
-            .map_err(|_| "worker read broker timed out".to_string())?
+            .map_err(|_| failure_text("broker_timeout"))?
         })
     }
 }
@@ -861,8 +897,8 @@ where
     let read = matches!(envelope.operation, Operation::ReadRequest { .. });
     let sequence = {
         let mut limits = budget.lock().unwrap_or_else(|p| p.into_inner());
-        if !limits.take(read) {
-            return refusal("read_budget_exceeded");
+        if let Err(code) = limits.take(read) {
+            return refusal(code);
         }
         limits.requests
     };

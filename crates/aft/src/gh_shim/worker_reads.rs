@@ -247,12 +247,27 @@ pub(super) fn dispatch(
     let relay = RelayContext::from_process();
     match identity(args, manifest, paths, &relay) {
         Ok(Some(false) | None) => return None,
-        Err(_) => return None,
+        Err(text) => {
+            let signals = native_guard::ShellSignals::from_process();
+            if relay.worker_broker.is_some() || signals.sandboxed || signals.worker_marked {
+                // A failed identity lookup does not change a read into native gh.
+                return Some(refuse(
+                    RefusalCode::GovernanceUnavailable,
+                    &format!("gh read failed: {text}"),
+                ));
+            }
+            return None;
+        }
         Ok(Some(true)) => {}
     }
     let repository = match relay_client::worker_repository(&relay) {
         Ok(repository) => repository,
-        Err(text) => return Some(refuse(RefusalCode::UnboundTarget, &text)),
+        Err(text) => {
+            return Some(refuse(
+                RefusalCode::GovernanceUnavailable,
+                &format!("gh read failed: {text}"),
+            ))
+        }
     };
     let binding = match ticket_bound_repository(args, manifest, &repository) {
         Ok(binding) => binding,
