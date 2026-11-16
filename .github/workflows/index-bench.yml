@@ -84,8 +84,9 @@ jobs:
       - name: Cold builds at Linux matrix pins
         env:
           # Elasticsearch alone on the Mac, after reclaiming stale temp files; the
-          # other projects already have two Mac samples.
-          BENCH_PROJECTS: ${{ github.ref_name == 'bench/index-mac' && 'elasticsearch' || '' }}
+          # other projects already have two Mac samples. Chromium alone on narli:
+          # its first run timed out on the harness's status wait.
+          BENCH_PROJECTS: ${{ github.ref_name == 'bench/index-mac' && 'elasticsearch' || 'chromium' }}
         run: |
           python3 scripts/telemetry/index-bench/run.py run \
             --work target/index-bench-work \

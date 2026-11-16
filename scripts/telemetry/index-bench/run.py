@@ -130,7 +130,10 @@ class Client:
                     pass
             self.frames.put(None)
 
-    def request(self, command, timeout_s=30, **params):
+    # The first status after configure got no reply within 30 s on Chromium on
+    # NTFS, for both versions, while configure's first walk ran. The run
+    # deadline still bounds every request.
+    def request(self, command, timeout_s=300, **params):
         self.next_id += 1
         request_id = str(self.next_id)
         payload = {"id": request_id, "command": command, **params}
