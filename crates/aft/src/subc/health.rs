@@ -2095,6 +2095,11 @@ fn reduce_health_root_details(root: &mut Value) -> bool {
                         | "/data_store/skipped_folder_note"
                         | "/views/pinned"
                         | "/views/callgraph_readiness_deferred"
+                        | "/semantic_index/reason"
+                        | "/semantic_index/since_ms"
+                        | "/semantic_index/next_retry_ms"
+                        | "/watcher/directory_arrivals_total"
+                        | "/watcher/overflows_total"
                 )
                 || (health_failure_field(key) && health_nondefault(value))
             {
@@ -2301,6 +2306,27 @@ fn budget_health_metrics_with_limits(
     budget: usize,
     hard_limit: usize,
 ) {
+    if let Some(roots) = metrics.get_mut("roots").and_then(Value::as_array_mut) {
+        for root in roots {
+            compact_health_root(root);
+        }
+    }
+    let project_size = metrics
+        .iter()
+        .filter(|(key, _)| HEALTH_PROJECT_FIELDS.contains(&key.as_str()))
+        .map(|(key, value)| {
+            serde_json::to_vec(&(key, value)).map_or(usize::MAX, |bytes| bytes.len())
+        })
+        .fold(0usize, usize::saturating_add);
+    if metrics
+        .get("roots")
+        .and_then(Value::as_array)
+        .is_none_or(|roots| roots.len() <= 1)
+        && project_size <= HEALTH_PROJECT_BUDGET_BYTES
+        && refresh_metrics_bytes(metrics) <= budget
+    {
+        return;
+    }
     let mut projects = serde_json::Map::new();
     for key in HEALTH_PROJECT_FIELDS {
         if let Some(value) = metrics.remove(key) {
@@ -2315,11 +2341,28 @@ fn budget_health_metrics_with_limits(
     );
     let mut mandatory = projects.clone();
     mandatory.remove("root_groups");
+    let last_identity = projects
+        .get("root_groups")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty)
+        && projects
+            .get("roots")
+            .and_then(Value::as_array)
+            .is_some_and(|roots| roots.len() == 1);
     let has_mandatory = mandatory
         .get_mut("roots")
         .and_then(Value::as_array_mut)
         .is_some_and(|roots| {
-            roots.retain(|root| !progressing_health_root(root, health_now_ms()));
+            roots.retain(|root| last_identity || !progressing_health_root(root, health_now_ms()));
+            if !last_identity
+                || roots
+                    .iter()
+                    .any(|root| !progressing_health_root(root, health_now_ms()))
+            {
+                for root in roots.iter_mut() {
+                    reduce_health_root_details(root);
+                }
+            }
             !roots.is_empty()
         });
     let mandatory_bytes = if has_mandatory {
@@ -2330,7 +2373,17 @@ fn budget_health_metrics_with_limits(
     // Process sections come first, with project detail limited to the remainder
     // and at most 6 KiB. Failed/refused/degraded identities outrank only optional
     // process detail: use each process section's own summaries before cutting
-    // those identities. Repeated ready/building roots never displace telemetry.
+    // those identities (or the last distinct root identity). Repeated ready/building
+    // roots can yield an LSP cost preview, but never displace a process section.
+    if projects
+        .get("root_groups")
+        .and_then(Value::as_array)
+        .is_some_and(|groups| !groups.is_empty())
+        && encoded_health_metrics_len(metrics).saturating_add(encoded_health_metrics_len(&projects))
+            > budget
+    {
+        compact_health_lsp_preview(metrics);
+    }
     fit_health_metrics(metrics, budget.saturating_sub(mandatory_bytes), hard_limit);
     if !projects.is_empty() {
         let process_bytes = refresh_metrics_bytes(metrics);
@@ -2642,6 +2695,11 @@ fn fit_health_metrics(
                         .unwrap_or(0)
                         .saturating_add(1);
                     metrics.insert("root_details_omitted".into(), json!(omitted));
+                    let gap = metrics
+                        .entry("root_detail_gap")
+                        .or_insert_with(|| json!({}));
+                    gap["omitted"] = json!(true);
+                    gap["count"] = json!(omitted);
                     continue;
                 }
                 // Bound long paths and free text before removing any abnormal
@@ -2815,8 +2873,8 @@ fn gap_largest_ancillary_health_field(
 
 fn enforce_health_hard_limit(metrics: &mut serde_json::Map<String, Value>, hard_limit: usize) {
     let previous_omitted = metrics
-        .get("root_detail_gap")
-        .and_then(|gap| gap["count"].as_u64())
+        .get("root_details_omitted")
+        .and_then(Value::as_u64)
         .unwrap_or(0);
     let mut omitted_ids = Vec::new();
     while refresh_metrics_bytes(metrics) > hard_limit {
@@ -5876,6 +5934,9 @@ mod tests {
                 .collect::<Vec<_>>();
             metrics.insert("roots".into(), json!(roots));
             metrics.insert("root_count".into(), json!(count));
+            metrics.insert("actor_count".into(), json!(count));
+            metrics.insert("healthy_roots".into(), json!(0));
+            metrics.insert("warming_roots".into(), json!(count));
             metrics.insert("root_details_omitted".into(), json!(0));
             let process = [
                 "memory",
@@ -6398,7 +6459,13 @@ mod tests {
         assert_eq!(oversized["roots"].as_array().unwrap().len(), 8);
         assert_eq!(oversized["root_details_omitted"], 2);
         assert_eq!(oversized["write_ledger_top_10m"][0]["root_id"], "root");
-        assert_eq!(oversized["storage_retention_reports_omitted"], 20);
+        assert_eq!(
+            oversized["storage_retention_reports_omitted"]
+                .as_u64()
+                .unwrap() as usize
+                + oversized["storage_retention"].as_object().unwrap().len(),
+            20
+        );
         assert_eq!(
             oversized["metrics_bytes"],
             serde_json::to_vec(&oversized).unwrap().len()
