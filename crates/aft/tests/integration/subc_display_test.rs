@@ -148,10 +148,13 @@ async fn run_display_case(switch: Option<&str>) {
                         ).await else { return; };
                         if first.header.ty == FrameType::Hello {
                             modules.send((stream, first)).unwrap();
-                        } else if serde_json::from_slice::<Value>(&first.body).unwrap()["op"] == "catalog.list" {
-                            fake_display(stream, first, writes).await;
                         } else {
-                            crate::subc_fake::serve_without_modules(stream, first).await;
+                            let body: Value = serde_json::from_slice(&first.body).unwrap();
+                            if body["op"] == "catalog.list" || body["target"]["module_id"] == "occipital" {
+                                fake_display(stream, first, writes).await;
+                            } else {
+                                crate::subc_fake::serve_without_modules(stream, first).await;
+                            }
                         }
                     });
                 }
