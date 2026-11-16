@@ -9,11 +9,12 @@
 //! ```
 //!
 //! `AFT_TEST_REFRESH_COST_PROJECT` names the checkout to copy (AFT's own by
-//! default), `AFT_TEST_REFRESH_COST_LANG` (`ts` or `java`) writes the probe files
-//! in that language rather than Rust, `AFT_TEST_REFRESH_COST_TYPE_FILE` names a
-//! file of the checkout whose last class gains a `get` method, and `AFT_TEST_REFRESH_COST_THREADS` sets the
-//! data layer's threads (8 by default). Each refresh prints its wall and CPU
-//! time and what its budget admitted, stage by stage.
+//! default), `AFT_TEST_REFRESH_COST_LANG` (`ts` or `java`) writes the probe
+//! files in that language rather than Rust, `AFT_TEST_REFRESH_COST_TYPE_FILE`
+//! names a file of the checkout whose last class gains a `get` method, and
+//! `AFT_TEST_REFRESH_COST_THREADS` sets the data layer's threads (8 by
+//! default). Each step prints its wall and CPU time and its peak resident
+//! size, and each refresh what its budget admitted, stage by stage.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -414,8 +415,9 @@ fn measure_method_reader_refreshes() {
     write(&checkout, &path, &text);
     refresh(&checkout, "new file declaring get and new");
     publish(&checkout, "get and new");
-    // A method added to a type an existing, published file declares: the
-    // precise per-name diff applies.
+    // Methods added to a type in a file that is already published: only the
+    // readers of the added method names are reached, not those of every
+    // method the file declares (as for a new file).
     let (_, text) = declaring_file(lang, 102, &["probe_only".to_string()]);
     write(&checkout, warm, &text);
     refresh(

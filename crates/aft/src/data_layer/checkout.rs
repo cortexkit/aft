@@ -3540,8 +3540,8 @@ impl Checkout {
             });
             for (file, made) in files.into_iter().zip(made) {
                 // The next refresh's budget counts this file in the class
-                // this one admitted it to; full work once outweighs any
-                // later sites-only pass until the publication.
+                // this one admitted it to. A file any refresh since the
+                // publication resolved in full stays counted as full work.
                 if made.is_some() && !budget.full_work(file) {
                     if !engine.refreshed.replaced.contains_key(file) {
                         engine.refreshed.sites_only.insert(file.clone());
