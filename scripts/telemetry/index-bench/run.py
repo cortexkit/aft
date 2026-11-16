@@ -18,7 +18,6 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.request
 
 from native import Child, GIB
 
@@ -226,8 +225,10 @@ def download(work):
     base = "https://github.com/cortexkit/aft/releases/download/v0.65.0/"
     for filename in ("checksums.sha256", name):
         print(f"download {base + filename}", flush=True)
-        with urllib.request.urlopen(base + filename, timeout=120) as source, (directory / filename).open("wb") as target:
-            shutil.copyfileobj(source, target)
+        # curl uses the operating system's certificate store; the python.org
+        # macOS build ships without one, so urllib fails TLS verification there.
+        subprocess.run(["curl", "--fail", "--silent", "--show-error", "--location", "--max-time", "300",
+                        "--output", str(directory / filename), base + filename], check=True)
     expected = checksum_for((directory / "checksums.sha256").read_text(), name)
     actual = MATRIX.sha256(directory / name)
     if actual != expected:
