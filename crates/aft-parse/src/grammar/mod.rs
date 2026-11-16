@@ -10,14 +10,18 @@ pub use manifest::initialize_test_identity;
 pub use manifest::{extractor_version, manifest, GrammarManifest, PRODUCTION_MANIFEST};
 pub use state::{FailureCause, GrammarState, GrammarUnavailable};
 
+test_support_visibility! {
 #[cfg(feature = "wasm-grammars")]
 mod download;
+}
 test_support_visibility! {
     #[cfg(feature = "wasm-grammars")]
     mod runtime;
 }
+test_support_visibility! {
 #[cfg(feature = "wasm-grammars")]
 mod storage;
+}
 #[cfg(feature = "wasm-grammars")]
 pub use runtime::*;
 

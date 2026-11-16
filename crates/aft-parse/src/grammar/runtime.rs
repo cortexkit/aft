@@ -11,6 +11,7 @@ use std::time::Instant;
 use parking_lot::{Condvar, Mutex, RwLock};
 use tree_sitter::Language;
 
+test_support_visibility! {
 static ENGINE: LazyLock<Result<tree_sitter::wasmtime::Engine, String>> = LazyLock::new(|| {
     let mut config = tree_sitter::wasmtime::Config::new();
     config.parallel_compilation(false);
@@ -26,6 +27,7 @@ static ENGINE: LazyLock<Result<tree_sitter::wasmtime::Engine, String>> = LazyLoc
     }
     Ok(engine)
 });
+}
 
 /// Report the target family from Wasmtime's actual engine, not the requested
 /// configuration. Wasmtime's public query distinguishes Pulley from native.
@@ -38,9 +40,11 @@ pub fn engine_target() -> Result<&'static str, GrammarUnavailable> {
     })
 }
 
+test_support_visibility! {
 fn engine_failure(error: &str) -> GrammarUnavailable {
     log::warn!("Pulley grammar engine unavailable: {error}");
     GrammarUnavailable::new(&manifest().language, GrammarState::UnsupportedPlatform)
+}
 }
 
 pub trait Clock: Send + Sync {
@@ -54,18 +58,35 @@ impl Clock for MonotonicClock {
     }
 }
 
+test_support_visibility! {
 struct Entry {
     #[cfg(feature = "test-hooks")]
     attempts_started: usize,
+    #[cfg(any(test, feature = "test-support"))]
+    pub root_generation: u64,
+    #[cfg(not(any(test, feature = "test-support")))]
     root_generation: u64,
     loading: bool,
     language: Option<Language>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub state: GrammarState,
+    #[cfg(not(any(test, feature = "test-support")))]
     state: GrammarState,
+    #[cfg(any(test, feature = "test-support"))]
+    pub failures: u8,
+    #[cfg(not(any(test, feature = "test-support")))]
     failures: u8,
+    #[cfg(any(test, feature = "test-support"))]
+    pub cause: Option<FailureCause>,
+    #[cfg(not(any(test, feature = "test-support")))]
     cause: Option<FailureCause>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub retry_at: u64,
+    #[cfg(not(any(test, feature = "test-support")))]
     retry_at: u64,
     compiles: usize,
     compile_ms: f64,
+}
 }
 
 impl Default for Entry {
@@ -94,7 +115,13 @@ struct Loaded {
 
 pub struct GrammarRegistry {
     manifest: GrammarManifest,
+    #[cfg(any(test, feature = "test-support"))]
+    pub storage_root: RwLock<Option<std::path::PathBuf>>,
+    #[cfg(not(any(test, feature = "test-support")))]
     storage_root: RwLock<Option<std::path::PathBuf>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub entry: Mutex<Entry>,
+    #[cfg(not(any(test, feature = "test-support")))]
     entry: Mutex<Entry>,
     changed: Condvar,
     clock: Arc<dyn Clock>,
@@ -106,7 +133,7 @@ pub struct GrammarRegistry {
     #[cfg(any(test, feature = "test-support"))]
     forced_unavailable: Mutex<Option<GrammarUnavailable>>,
     #[cfg(any(any(test, feature = "test-support"), feature = "test-hooks"))]
-    load_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    pub load_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// A readiness receiver whose registration ends with the receiver's lifetime.
@@ -149,7 +176,8 @@ pub fn registry() -> &'static Arc<GrammarRegistry> {
 }
 
 impl GrammarRegistry {
-    fn new(root: Option<std::path::PathBuf>) -> Arc<Self> {
+    test_support_visibility! {
+fn new(root: Option<std::path::PathBuf>) -> Arc<Self> {
         #[cfg(feature = "test-hooks")]
         let root = std::env::var_os("AFT_TEST_GRAMMAR_STORAGE")
             .map(std::path::PathBuf::from)
@@ -180,6 +208,7 @@ impl GrammarRegistry {
         #[cfg(not(feature = "test-hooks"))]
         registry
     }
+}
 
     pub fn identity(&self) -> &str {
         &self.manifest.sha256
@@ -211,7 +240,8 @@ impl GrammarRegistry {
                 ) && self.clock.now_ms() >= entry.retry_at)
     }
 
-    fn set_storage_root(&self, root: std::path::PathBuf) {
+    test_support_visibility! {
+fn set_storage_root(&self, root: std::path::PathBuf) {
         let mut entry = self.entry.lock();
         let mut current = self.storage_root.write();
         if current.as_ref() != Some(&root) {
@@ -230,8 +260,10 @@ impl GrammarRegistry {
             self.changed.notify_all();
         }
     }
+}
 
-    fn storage(&self) -> Option<storage::Storage> {
+    test_support_visibility! {
+fn storage(&self) -> Option<storage::Storage> {
         self.storage_root
             .read()
             .clone()
@@ -240,8 +272,10 @@ impl GrammarRegistry {
                 fault: *self.fault.read(),
             })
     }
+}
 
-    fn unavailable(&self, entry: &Entry) -> GrammarUnavailable {
+    test_support_visibility! {
+fn unavailable(&self, entry: &Entry) -> GrammarUnavailable {
         let state = if entry.loading {
             GrammarState::Downloading
         } else {
@@ -259,6 +293,7 @@ impl GrammarRegistry {
         }
         result
     }
+}
 
     /// Verify and compile a stored grammar without holding the state mutex.
     /// Waiters release that mutex and have a finite wait; command-level request
@@ -381,7 +416,8 @@ impl GrammarRegistry {
         }
     }
 
-    fn download(&self, storage: storage::Storage, generation: u64) {
+    test_support_visibility! {
+fn download(&self, storage: storage::Storage, generation: u64) {
         let transport = self.transport.get_or_init(|| {
             download::HttpsTransport::new()
                 .map(|transport| Arc::new(transport) as Arc<dyn download::Transport>)
@@ -427,6 +463,7 @@ impl GrammarRegistry {
         }
         self.changed.notify_all();
     }
+}
 
     fn compile_language(&self, bytes: &[u8]) -> Loaded {
         #[cfg(any(any(test, feature = "test-support"), feature = "test-hooks"))]
