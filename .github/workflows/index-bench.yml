@@ -34,9 +34,9 @@ jobs:
         with:
           persist-credentials: false
 
+      # The setup phase gives cargo a writable home on narli; the shared Rust
+      # installation and its registry cache are read-only to jobs there.
       - uses: ./.github/actions/native-ci-state
-        with:
-          phase: python
 
       # narli's Rust installation is administrator-managed and read-only to jobs.
       - uses: dtolnay/rust-toolchain@stable
@@ -88,6 +88,11 @@ jobs:
       - name: Delete clones, isolated stores, downloads and candidate build folder
         if: always()
         run: python3 scripts/telemetry/index-bench/run.py cleanup --work target/index-bench-work
+
+      - uses: ./.github/actions/native-ci-state
+        if: always()
+        with:
+          phase: cleanup
 
       - name: Upload results and raw logs
         if: always()
