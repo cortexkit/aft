@@ -130,7 +130,9 @@ fn shell_env_provider_host_approval_freezes_environment_and_refuses_changed_inpu
     assert_eq!(asked["code"], "permission_required", "{asked}");
     let grant = asked["asks"][0]["grant_id"].as_str().unwrap();
     let mut retry = params.clone();
-    retry["permissions_granted"] = json!([grant]);
+    // Escalation and the command scanner are separate authorization boundaries.
+    retry["permissions_granted"] =
+        json!([grant, "project-node", "printf '%s' \"$GIT_AUTHOR_NAME\""]);
     let ran = call(&mut aft, "provider-host-retry", retry);
     assert_eq!(ran["status"], "completed", "{ran}");
     assert!(
@@ -155,7 +157,8 @@ fn shell_env_provider_host_approval_freezes_environment_and_refuses_changed_inpu
     let asked = call(&mut aft, "provider-host-ask-changed", params.clone());
     let grant = asked["asks"][0]["grant_id"].as_str().unwrap();
     let mut changed = params;
-    changed["permissions_granted"] = json!([grant]);
+    changed["permissions_granted"] =
+        json!([grant, "project-node", "printf '%s' \"$GIT_AUTHOR_NAME\""]);
     changed["env"] = json!({"EXTRA":"changed after approval"});
     let refused = call(&mut aft, "provider-host-changed", changed);
     assert_eq!(refused["code"], "sandbox_escalation_denied", "{refused}");
