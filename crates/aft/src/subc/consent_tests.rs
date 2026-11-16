@@ -8245,9 +8245,18 @@ fn worker_suffix_file(f: &Fixture, relative: &str) -> PathBuf {
 }
 
 fn build_suffix_inventory(f: &Fixture) {
-    f.ctx
-        .set_canonical_cache_root(f.worker.project_root.clone());
-    f.ctx.data_checkout().unwrap().checkout().build().unwrap();
+    let checkout = crate::data_layer::runtime::DataCheckout::open_planes(
+        &f.worker.project_root,
+        &f.dir.path().join("suffix-index"),
+        None,
+        crate::data_layer::checkout::Planes::ALL,
+    )
+    .unwrap();
+    assert!(matches!(
+        checkout.fresh_view(Duration::from_secs(120)),
+        crate::data_layer::runtime::Fresh::Ready(_)
+    ));
+    f.ctx.pin_data_checkout(checkout);
     assert!(f.ctx.data_view().is_some());
 }
 
@@ -8345,6 +8354,20 @@ async fn consent_worker_one_component_indexed_suffix_still_asks() {
     worker_suffix_file(&f, "crates/broca-session-loop/src/run.rs");
     build_suffix_inventory(&f);
     let requested = f.dir.path().join("not-src/run.rs");
+
+    let reply = f.read(&f.worker, &requested, 7).await;
+
+    assert_worker_outside_read_denied(&f, &reply);
+    assert!(!text(&reply).contains("did you mean"));
+}
+
+#[tokio::test]
+async fn consent_worker_unready_indexed_suffix_still_asks() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = suffix_fixture();
+    set_hold_budget_for_test(Some(Duration::from_millis(300)));
+    worker_suffix_file(&f, "crates/broca-session-loop/src/run.rs");
+    let requested = f.dir.path().join("broca-session-loop/src/run.rs");
 
     let reply = f.read(&f.worker, &requested, 7).await;
 
