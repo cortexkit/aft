@@ -1,5 +1,16 @@
 pub use aft_parse::imports::quotes::*;
 
+// Shared import scope for the unit tests below.
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::parser::{parse_source_with_cached_parser, LangId};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::io::Read;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::Path;
+
 #[cfg(test)]
 mod tests {
     use super::*;

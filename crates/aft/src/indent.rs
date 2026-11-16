@@ -1,5 +1,10 @@
 pub use aft_parse::indent::*;
 
+// Shared import scope for the unit tests below.
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::parser::LangId;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,5 +1,19 @@
 pub use aft_parse::calls::*;
 
+// Shared import scope for the unit tests below.
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::callgraph_store::join::syntax_index::{Direct, Nav};
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::parser::LangId;
+#[cfg(test)]
+#[allow(unused_imports)]
+use rustc_hash::{FxHashMap, FxHashSet};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::{BTreeSet, HashSet};
+
 #[cfg(test)]
 mod tests {
     use super::*;

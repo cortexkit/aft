@@ -1,5 +1,10 @@
 pub use aft_parse::callgraph_store::resolution_facts::*;
 
+// Shared import scope for the unit tests below.
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::BTreeMap;
+
 #[cfg(test)]
 mod tests {
     use super::*;

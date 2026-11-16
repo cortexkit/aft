@@ -1,5 +1,22 @@
 pub use aft_parse::ast_grep_lang::*;
 
+// Shared import scope for the unit tests below.
+#[cfg(test)]
+#[allow(unused_imports)]
+use ast_grep_core::language::Language;
+#[cfg(test)]
+#[allow(unused_imports)]
+use ast_grep_core::matcher::PatternError;
+#[cfg(test)]
+#[allow(unused_imports)]
+use ast_grep_core::tree_sitter::{LanguageExt, StrDoc, TSLanguage};
+#[cfg(test)]
+#[allow(unused_imports)]
+use ast_grep_core::Pattern;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::borrow::Cow;
+
 #[cfg(test)]
 mod tests {
     use super::*;

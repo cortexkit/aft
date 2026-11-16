@@ -9858,3 +9858,39 @@ impl crate::language::LanguageProvider for TreeSitterProvider {
         self
     }
 }
+#[cfg(any(test, feature = "test-support"))]
+pub mod work_counters {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Tree-sitter parses of whole files done through `FileParser`.
+        pub static TREE_PARSES: Cell<usize> = const { Cell::new(0) };
+        /// Parser allocations with a grammar load.
+        pub static GRAMMAR_LOADS: Cell<usize> = const { Cell::new(0) };
+        /// Source reads the language provider does to inspect a file's tree.
+        pub static PARSED_FILE_READS: Cell<usize> = const { Cell::new(0) };
+        /// Reads performed by FileParser to construct a tree, not by a provider.
+        pub static TREE_SOURCE_READS: Cell<usize> = const { Cell::new(0) };
+        /// Copies of a cached symbol list handed out by `FileParser`.
+        pub static CACHED_SYMBOL_COPIES: Cell<usize> = const { Cell::new(0) };
+        pub static FILE_PARSE_READS: Cell<usize> = const { Cell::new(0) };
+        pub static SOURCE_READS: Cell<usize> = const { Cell::new(0) };
+        pub static OWNED_SYMBOL_COPIES: Cell<usize> = const { Cell::new(0) };
+        pub static RUST_MODULE_SCANS: Cell<usize> = const { Cell::new(0) };
+        /// Tree-sitter parses through this thread's retained parsers, by any
+        /// caller (FileParser, semantic chunking, symbol extraction).
+        pub static CACHED_PARSER_PARSES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub fn cached_parser_parses() -> usize {
+        CACHED_PARSER_PARSES.with(Cell::get)
+    }
+
+    pub fn tree_parses() -> usize {
+        TREE_PARSES.with(Cell::get)
+    }
+
+    pub fn grammar_loads() -> usize {
+        GRAMMAR_LOADS.with(Cell::get)
+    }
+}

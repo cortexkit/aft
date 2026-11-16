@@ -1,5 +1,13 @@
 pub use aft_parse::grammar::disabled::*;
 
+// Shared import scope for the unit tests below.
+#[cfg(test)]
+#[allow(unused_imports)]
+use super::{manifest, GrammarState, GrammarUnavailable};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::{Arc, LazyLock};
+
 #[cfg(test)]
 mod tests {
     use super::*;

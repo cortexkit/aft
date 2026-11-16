@@ -1,5 +1,19 @@
 pub use aft_parse::callgraph_store::rust_bindings::*;
 
+// Shared import scope for the unit tests below.
+#[cfg(test)]
+#[allow(unused_imports)]
+use super::join::syntax_index::Nav;
+#[cfg(test)]
+#[allow(unused_imports)]
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::ops::Range;
+#[cfg(test)]
+#[allow(unused_imports)]
+use tree_sitter::Node;
+
 #[cfg(test)]
 mod tests {
     use super::*;

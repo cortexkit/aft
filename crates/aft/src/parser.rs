@@ -1,41 +1,50 @@
 pub use aft_parse::parser::*;
 
+// Shared import scope for the unit tests below.
 #[cfg(test)]
-pub(crate) mod work_counters {
-    use std::cell::Cell;
-
-    thread_local! {
-        /// Tree-sitter parses of whole files done through `FileParser`.
-        pub(crate) static TREE_PARSES: Cell<usize> = const { Cell::new(0) };
-        /// Parser allocations with a grammar load.
-        pub(crate) static GRAMMAR_LOADS: Cell<usize> = const { Cell::new(0) };
-        /// Source reads the language provider does to inspect a file's tree.
-        pub(crate) static PARSED_FILE_READS: Cell<usize> = const { Cell::new(0) };
-        /// Reads performed by FileParser to construct a tree, not by a provider.
-        pub(crate) static TREE_SOURCE_READS: Cell<usize> = const { Cell::new(0) };
-        /// Copies of a cached symbol list handed out by `FileParser`.
-        pub(crate) static CACHED_SYMBOL_COPIES: Cell<usize> = const { Cell::new(0) };
-        pub(crate) static FILE_PARSE_READS: Cell<usize> = const { Cell::new(0) };
-        pub(crate) static SOURCE_READS: Cell<usize> = const { Cell::new(0) };
-        pub(crate) static OWNED_SYMBOL_COPIES: Cell<usize> = const { Cell::new(0) };
-        pub(crate) static RUST_MODULE_SCANS: Cell<usize> = const { Cell::new(0) };
-        /// Tree-sitter parses through this thread's retained parsers, by any
-        /// caller (FileParser, semantic chunking, symbol extraction).
-        pub(crate) static CACHED_PARSER_PARSES: Cell<usize> = const { Cell::new(0) };
-    }
-
-    pub(crate) fn cached_parser_parses() -> usize {
-        CACHED_PARSER_PARSES.with(Cell::get)
-    }
-
-    pub(crate) fn tree_parses() -> usize {
-        TREE_PARSES.with(Cell::get)
-    }
-
-    pub(crate) fn grammar_loads() -> usize {
-        GRAMMAR_LOADS.with(Cell::get)
-    }
-}
+#[allow(unused_imports)]
+use crate::cache_freshness::{self};
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::callgraph::resolve_module_path;
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::callgraph_store::join::syntax_index::{Direct, Nav};
+#[cfg(test)]
+#[allow(unused_imports)]
+#[cfg(test)]
+use crate::callgraph_store::join::Parser;
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::error::AftError;
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::symbols::{Range, Symbol, SymbolKind, SymbolMatch};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::cell::RefCell;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::time::SystemTime;
+#[cfg(test)]
+#[allow(unused_imports)]
+use streaming_iterator::StreamingIterator;
+#[cfg(test)]
+#[allow(unused_imports)]
+#[cfg(not(test))]
+use tree_sitter::Parser;
+#[cfg(test)]
+#[allow(unused_imports)]
+use tree_sitter::{Language, Node, Query, QueryCursor, Tree};
 
 #[cfg(test)]
 // Some tests here are `cfg(debug_assertions)` (they lean on debug-only seams);

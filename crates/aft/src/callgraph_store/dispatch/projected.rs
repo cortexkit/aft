@@ -1,5 +1,13 @@
 pub use aft_parse::callgraph_store::join::dispatch::projected::*;
 
+// Shared import scope for the unit tests below.
+#[cfg(test)]
+#[allow(unused_imports)]
+use super::{dependency, DispatchFacts, MethodHint, ParseBlob, Resolver, SiteHint, TypeHint};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::{BTreeMap, BTreeSet};
+
 #[cfg(test)]
 mod scratch_tests {
     use super::*;

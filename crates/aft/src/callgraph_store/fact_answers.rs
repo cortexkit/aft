@@ -1,5 +1,16 @@
 pub use aft_parse::callgraph_store::fact_answers::*;
 
+// Shared import scope for the unit tests below.
+#[cfg(test)]
+#[allow(unused_imports)]
+use super::facts::{EntryKind, ProjectFacts};
+#[cfg(test)]
+#[allow(unused_imports)]
+use serde::{Deserialize, Serialize};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::BTreeMap;
+
 #[cfg(test)]
 mod tests {
     use super::*;

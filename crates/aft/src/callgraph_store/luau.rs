@@ -1,5 +1,16 @@
 pub use aft_parse::callgraph_store::luau::*;
 
+// Shared import scope for the unit tests below.
+#[cfg(test)]
+#[allow(unused_imports)]
+use super::{join::dispatch::dependency, FileCallData, ResolverIndex};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::{BTreeSet, HashMap};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::Arc;
+
 #[cfg(all(
     test,
     feature = "wasm-grammars",

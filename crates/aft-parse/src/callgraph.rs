@@ -22,8 +22,6 @@ use crate::callgraph_store::join::syntax_index::{Direct, Nav, SyntaxIndex};
 #[cfg(any(test, feature = "test-support"))]
 use crate::calls::{call_node_kinds, extract_callee_name, extract_calls_full, extract_full_callee};
 use crate::calls::{extract_calls_full_with, extract_rust_value_references_with};
-#[cfg(any(test, feature = "test-support"))]
-use crate::edit::line_col_to_byte;
 use crate::error::AftError;
 use crate::imports::{self, ImportBlock};
 #[cfg(any(test, feature = "test-support"))]

@@ -1,5 +1,13 @@
 pub use aft_parse::callgraph_store::join::syntax_index::*;
 
+// Shared import scope for the unit tests below.
+#[cfg(test)]
+#[allow(unused_imports)]
+use rustc_hash::FxHashMap;
+#[cfg(test)]
+#[allow(unused_imports)]
+use tree_sitter::Node;
+
 #[cfg(test)]
 mod tests {
     use super::*;

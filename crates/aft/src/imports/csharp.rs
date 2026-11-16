@@ -1,5 +1,16 @@
 pub use aft_parse::imports::csharp::*;
 
+// Shared import scope for the unit tests below.
+#[cfg(test)]
+#[allow(unused_imports)]
+use super::{
+    import_byte_range, ImportBlock, ImportForm, ImportGroup, ImportKind, ImportRequest,
+    ImportStatement, ImportSyntax,
+};
+#[cfg(test)]
+#[allow(unused_imports)]
+use tree_sitter::{Node, Tree};
+
 #[cfg(test)]
 mod tests {
     use super::*;

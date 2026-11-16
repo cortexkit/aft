@@ -1,5 +1,16 @@
 pub use aft_parse::imports::*;
 
+// Shared import scope for the unit tests below.
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::parser::LangId;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::ops::Range;
+#[cfg(test)]
+#[allow(unused_imports)]
+use tree_sitter::{Node, Tree};
+
 #[cfg(test)]
 mod tests {
     use super::*;

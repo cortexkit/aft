@@ -14,6 +14,10 @@ pub mod dispatch;
 pub mod record;
 
 #[cfg(any(test, feature = "test-support"))]
+#[path = "extraction_work.rs"]
+pub mod extraction_work;
+
+#[cfg(any(test, feature = "test-support"))]
 pub use extraction_work::CountingParser as Parser;
 use serde::{Deserialize, Serialize};
 #[cfg(not(any(test, feature = "test-support")))]

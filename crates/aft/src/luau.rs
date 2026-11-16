@@ -1,5 +1,19 @@
 pub use aft_parse::luau::*;
 
+// Shared import scope for the unit tests below.
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::imports::{ImportBlock, ImportForm, ImportGroup, ImportKind, ImportStatement};
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::symbols::SymbolKind;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::{BTreeMap, HashMap};
+#[cfg(test)]
+#[allow(unused_imports)]
+use tree_sitter::Node;
+
 #[cfg(all(
     test,
     feature = "wasm-grammars",

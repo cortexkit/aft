@@ -1,5 +1,71 @@
 pub use aft_parse::callgraph::*;
 
+// Shared import scope for the unit tests below.
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::callgraph_store::disk_facts::DiskFacts;
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::callgraph_store::facts::{byte_path, EntryKind, FactPaths};
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::callgraph_store::join::syntax_index::{Direct, Nav, SyntaxIndex};
+#[cfg(test)]
+#[allow(unused_imports)]
+#[cfg(test)]
+use crate::callgraph_store::join::Parser;
+#[cfg(test)]
+#[allow(unused_imports)]
+#[cfg(test)]
+use crate::calls::{call_node_kinds, extract_callee_name, extract_calls_full, extract_full_callee};
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::calls::{extract_calls_full_with, extract_rust_value_references_with};
+#[cfg(test)]
+#[allow(unused_imports)]
+#[cfg(test)]
+use crate::edit::line_col_to_byte;
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::error::AftError;
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::imports::{self, ImportBlock};
+#[cfg(test)]
+#[allow(unused_imports)]
+#[cfg(test)]
+use crate::parser::grammar_for;
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::parser::{detect_language, detect_language_from_source, LangId};
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::symbols::{Range, Symbol, SymbolKind};
+#[cfg(test)]
+#[allow(unused_imports)]
+use globset::{Glob, GlobSet, GlobSetBuilder};
+#[cfg(test)]
+#[allow(unused_imports)]
+use serde::Serialize;
+#[cfg(test)]
+#[allow(unused_imports)]
+use serde_json::Value;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::cell::RefCell;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::{Arc, LazyLock, OnceLock, RwLock};
+#[cfg(test)]
+#[allow(unused_imports)]
+use tree_sitter::Node;
+
 #[cfg(test)]
 mod tests {
     use super::*;

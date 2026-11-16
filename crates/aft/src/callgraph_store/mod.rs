@@ -1,119 +1,66 @@
 pub use aft_parse::callgraph_store::*;
 
+// Shared import scope for the unit tests below.
 #[cfg(test)]
-pub(crate) mod work_counts {
-    use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, OnceLock};
+#[allow(unused_imports)]
+use crate::callgraph::{self, FileCallData, TraceToSymbolCandidate};
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::error::AftError;
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::imports::{ImportForm, ImportGroup, ImportKind, ImportStatement};
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::parser::{parse_source_with_cached_parser, LangId};
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::symbols::SymbolKind;
+#[cfg(test)]
+#[allow(unused_imports)]
+#[cfg(test)]
+use disk_facts::DiskFacts;
+#[cfg(test)]
+#[allow(unused_imports)]
+use facts::{byte_path, EntryKind, FactPaths, ProjectFacts};
+#[cfg(test)]
+#[allow(unused_imports)]
+use join::syntax_index::{Direct, Nav};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::cell::RefCell;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::fmt;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::rc::Rc;
+#[cfg(test)]
+#[allow(unused_imports)]
+#[cfg(test)]
+use std::sync::Mutex;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::{Arc, OnceLock};
+#[cfg(test)]
+#[allow(unused_imports)]
+#[cfg(test)]
+use std::time::{Duration, Instant};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+#[allow(unused_imports)]
+use tree_sitter::Node;
 
-    static PARSES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
-    static FINGERPRINT_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
-    static CONFIG_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
-    static STAGING_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
-    static DIRECTORY_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
-    static GO_PACKAGE_BUILDS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
-    static CANONICAL_PATHS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
-    static REALPATHS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
-    static WORKSPACE_DIRECTORIES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
-    static CORPUS_LOOKUPS: OnceLock<Mutex<HashMap<PathBuf, (usize, usize, u128)>>> =
-        OnceLock::new();
-
-    fn note(map: &OnceLock<Mutex<HashMap<PathBuf, usize>>>, path: &Path) {
-        *map.get_or_init(Default::default)
-            .lock()
-            .expect("work counter mutex poisoned")
-            .entry(path.to_path_buf())
-            .or_default() += 1;
-    }
-
-    fn under(
-        map: &OnceLock<Mutex<HashMap<PathBuf, usize>>>,
-        root: &Path,
-        file_name: Option<&str>,
-    ) -> usize {
-        map.get_or_init(Default::default)
-            .lock()
-            .expect("work counter mutex poisoned")
-            .iter()
-            .filter(|(path, _)| path.starts_with(root))
-            .filter(|(path, _)| {
-                file_name.is_none_or(|name| path.file_name().is_some_and(|file| file == name))
-            })
-            .map(|(_, count)| *count)
-            .sum()
-    }
-
-    pub(crate) fn note_config_read(path: &Path) {
-        note(&CONFIG_READS, path);
-    }
-
-    pub(crate) fn note_directory_read(path: &Path) {
-        note(&DIRECTORY_READS, path);
-    }
-
-    pub(crate) fn directory_reads_under(root: &Path) -> usize {
-        under(&DIRECTORY_READS, root, None)
-    }
-
-    pub(crate) fn note_canonical_path(path: &Path) {
-        note(&CANONICAL_PATHS, path);
-    }
-
-    pub(crate) fn note_realpath(path: &Path) {
-        note(&REALPATHS, path);
-    }
-
-    pub(crate) fn note_workspace_directory(path: &Path) {
-        note(&WORKSPACE_DIRECTORIES, path);
-    }
-
-    pub(crate) fn filesystem_counts(root: &Path) -> (usize, usize, usize, usize) {
-        let paths = CANONICAL_PATHS
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap();
-        let unique = paths.keys().filter(|path| path.starts_with(root)).count();
-        let calls = paths
-            .iter()
-            .filter(|(path, _)| path.starts_with(root))
-            .map(|(_, count)| count)
-            .sum();
-        (
-            calls,
-            unique,
-            under(&WORKSPACE_DIRECTORIES, root, None),
-            directory_reads_under(root),
-        )
-    }
-
-    pub(crate) fn note_go_package_build(path: &Path) {
-        note(&GO_PACKAGE_BUILDS, path);
-    }
-
-    pub(crate) fn reset_under(root: &Path) {
-        CORPUS_LOOKUPS
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap()
-            .retain(|path, _| !path.starts_with(root));
-        for map in [
-            &PARSES,
-            &FINGERPRINT_READS,
-            &CONFIG_READS,
-            &STAGING_READS,
-            &DIRECTORY_READS,
-            &GO_PACKAGE_BUILDS,
-            &CANONICAL_PATHS,
-            &REALPATHS,
-            &WORKSPACE_DIRECTORIES,
-        ] {
-            map.get_or_init(Default::default)
-                .lock()
-                .expect("work counter mutex poisoned")
-                .retain(|path, _| !path.starts_with(root));
-        }
-    }
-}
+#[cfg(test)]
+pub(crate) mod dead_code_projection;
 
 #[cfg(test)]
 #[path = "../../tests/store_diet/harness.rs"]
@@ -204,81 +151,6 @@ mod local_symbol_memo_tests {
             scan_elapsed.as_nanos() / queries.len() as u128,
             memo_elapsed.as_nanos() / (queries.len() * 8) as u128,
         );
-    }
-}
-
-#[cfg(test)]
-mod rust_module_work {
-    use super::*;
-
-    #[derive(Debug, Default)]
-    pub(super) struct Work {
-        pub resolved_refs: usize,
-        pub resolved_files: BTreeSet<String>,
-        pub parent_lookups: usize,
-        pub parent_scans: usize,
-        pub parent_file_visits: usize,
-        pub inline_file_visits: usize,
-        pub caller_requests: usize,
-        pub caller_walks: usize,
-        pub parent_time: Duration,
-        pub caller_time: Duration,
-    }
-
-    thread_local! {
-        static ACTIVE: RefCell<Option<Work>> = const { RefCell::new(None) };
-        static DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-
-    pub(super) fn disabled() -> bool {
-        DISABLED.with(std::cell::Cell::get)
-    }
-
-    pub(super) fn note(update: impl FnOnce(&mut Work)) {
-        ACTIVE.with(|active| {
-            if let Some(work) = active.borrow_mut().as_mut() {
-                update(work);
-            }
-        });
-    }
-
-    pub(super) struct Timing {
-        started: Option<Instant>,
-        parent: bool,
-    }
-
-    impl Timing {
-        pub fn parent() -> Self {
-            note(|work| work.parent_lookups += 1);
-            Self::start(true)
-        }
-
-        pub fn caller() -> Self {
-            note(|work| work.caller_requests += 1);
-            Self::start(false)
-        }
-
-        fn start(parent: bool) -> Self {
-            Self {
-                started: ACTIVE.with(|active| active.borrow().is_some().then(Instant::now)),
-                parent,
-            }
-        }
-    }
-
-    impl Drop for Timing {
-        fn drop(&mut self) {
-            if let Some(started) = self.started {
-                let elapsed = started.elapsed();
-                note(|work| {
-                    if self.parent {
-                        work.parent_time += elapsed;
-                    } else {
-                        work.caller_time += elapsed;
-                    }
-                });
-            }
-        }
     }
 }
 

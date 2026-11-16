@@ -1,5 +1,34 @@
 pub use aft_parse::callgraph_store::join::single_walk::*;
 
+// Shared import scope for the unit tests below.
+#[cfg(test)]
+#[allow(unused_imports)]
+use super::syntax_index::SyntaxIndex;
+#[cfg(test)]
+#[allow(unused_imports)]
+use super::{
+    assign_ordinals, blob_imports, blob_refs, blob_symbols, dispatch, language_id, structural_ref,
+    AstPreorderNode, BlobRef, BlobRefKind, CallgraphBlob, ManifestJoinError, ParseBlob, Parser,
+};
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::callgraph;
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::callgraph_store::facts::{FactPaths, NoProjectFacts};
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::parser::LangId;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::borrow::Cow;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::HashMap;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::Path;
+
 #[cfg(test)]
 mod tests {
     use super::*;

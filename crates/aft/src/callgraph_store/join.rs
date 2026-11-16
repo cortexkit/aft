@@ -1,5 +1,54 @@
 pub use aft_parse::callgraph_store::join::*;
 
+// Shared import scope for the unit tests below.
+#[cfg(test)]
+#[allow(unused_imports)]
+use super::facts::{BlobKey, FactPaths, NoProjectFacts, ProjectFacts};
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::callgraph::{self, FileCallData, SymbolMeta};
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::imports::{ImportBlock, ImportForm, ImportGroup, ImportKind, ImportStatement};
+#[cfg(test)]
+#[allow(unused_imports)]
+#[cfg(test)]
+use crate::parser::grammar_for;
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::parser::LangId;
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::symbols::SymbolKind;
+#[cfg(test)]
+#[allow(unused_imports)]
+use serde::{Deserialize, Serialize};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::borrow::Cow;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::HashMap;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::fmt;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::Path;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::rc::Rc;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::Arc;
+#[cfg(test)]
+#[allow(unused_imports)]
+#[cfg(not(test))]
+use tree_sitter::Parser;
+
 #[cfg(test)]
 #[path = "extraction_work.rs"]
 pub(crate) mod extraction_work;
