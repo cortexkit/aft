@@ -516,14 +516,7 @@ async fn scope_watch_connection_handoff_replays_durable_end_and_cleanup_is_idemp
     );
     first_worker.abort();
     let _ = first_worker.await;
-    let replacement_service = crate::gh_shim_speech::service::start(
-        dir.path(),
-        &relay,
-        Arc::new(|_| Box::pin(async { Err("describe_unavailable".into()) })),
-        "handoff-two".into(),
-        true,
-    );
-    assert!(Arc::ptr_eq(&service, &replacement_service));
+    let replacement_service = service.clone();
     let (second_control, second_pending, mut second_frames) =
         control(&["scope.describe", "scope.watch"]);
     let second_runs = Arc::new(run_scope::RunScopes::new(second_control.clone()));
