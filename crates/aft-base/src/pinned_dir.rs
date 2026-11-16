@@ -154,7 +154,7 @@ impl PinnedDir {
     /// that spelling opens the resolved directory and refuses if its device
     /// and inode are no longer the ones recorded then. Every component below
     /// such a root is still opened without following symlinks.
-    pub(crate) fn repair_open_path(path: &Path) -> io::Result<Self> {
+    pub fn repair_open_path(path: &Path) -> io::Result<Self> {
         if !path.is_absolute() {
             return Err(io::Error::other("repair requires an absolute directory"));
         }
