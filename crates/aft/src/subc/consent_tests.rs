@@ -3551,6 +3551,13 @@ async fn worker_read_repository_scope_covers_manifest_tests_and_open_asks() {
             operation: AccessOperation::Read,
         }]
     );
+    let requests = f.fake.calls("consent.request");
+    let distinct_card_keys: std::collections::HashSet<_> = requests
+        .iter()
+        .map(|request| request["call_key"].as_str().unwrap())
+        .collect();
+    assert_eq!(distinct_card_keys.len(), 3);
+    let request_count = requests.len();
     for (path, expected, corr) in [
         (&manifest, "manifest contents", 904),
         (&test, "test contents", 905),
@@ -3558,7 +3565,7 @@ async fn worker_read_repository_scope_covers_manifest_tests_and_open_asks() {
         let reply = f.read(&f.worker, path, corr).await;
         assert!(text(&reply).contains(expected), "{reply}");
     }
-    assert_eq!(f.fake.calls("consent.request").len(), 3);
+    assert_eq!(f.fake.calls("consent.request").len(), request_count);
 }
 
 #[cfg(unix)]
@@ -3575,7 +3582,7 @@ async fn worker_read_repository_scope_leaves_write_asks_at_the_folder() {
     let reply = f
         .tool(
             "write",
-            json!({"filePath": target, "content":"new contents"}),
+            json!({"path": target, "content":"new contents"}),
             901,
         )
         .await;
