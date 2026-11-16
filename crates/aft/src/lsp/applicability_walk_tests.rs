@@ -1406,14 +1406,22 @@ fn legacy_scoped_walk(
         builder.add(root);
     }
     builder.same_file_system(true).standard_filters(true);
-    let walker = crate::context::apply_project_ignore_rules(&mut builder, project_root)
-        .filter_entry(|entry| {
-            !crate::lsp::roots::skip_in_server_walk(
-                entry.file_name().to_string_lossy().as_ref(),
-                entry.depth(),
-            )
-        })
-        .build();
+    let walker = crate::context::apply_project_ignore_rules(
+        &mut builder,
+        project_root,
+        if crate::data_layer::read_fence::active() {
+            crate::project_walk::IgnoreFileAccess::Fenced
+        } else {
+            crate::project_walk::IgnoreFileAccess::Allowed
+        },
+    )
+    .filter_entry(|entry| {
+        !crate::lsp::roots::skip_in_server_walk(
+            entry.file_name().to_string_lossy().as_ref(),
+            entry.depth(),
+        )
+    })
+    .build();
     for entry in walker {
         let entry = entry.unwrap();
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {

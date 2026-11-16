@@ -1096,7 +1096,15 @@ fn handle_inspect_payload(
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_else(|| {
-                    crate::callgraph::walk_project_files(&snapshot.project_root).collect()
+                    crate::callgraph::walk_project_files(
+                        &snapshot.project_root,
+                        if crate::data_layer::read_fence::active() {
+                            crate::project_walk::IgnoreFileAccess::Fenced
+                        } else {
+                            crate::project_walk::IgnoreFileAccess::Allowed
+                        },
+                    )
+                    .collect()
                 });
             let files = files
                 .into_iter()
@@ -1227,6 +1235,11 @@ fn scoped_in_root_file_count(
             let walk_budget = budget.clone();
             let count = crate::callgraph::walk_project_files_in_scope_while(
                 project_root,
+                if crate::data_layer::read_fence::active() {
+                    crate::project_walk::IgnoreFileAccess::Fenced
+                } else {
+                    crate::project_walk::IgnoreFileAccess::Allowed
+                },
                 scope_roots,
                 move || walk_budget.keep_walking(),
             )
@@ -8543,8 +8556,14 @@ mod deferred_terminal_tests {
         let budget_expired = Arc::clone(&expired_at_nested_entry);
         let nested_for_budget = nested_dir.clone();
         // Sorting makes a-nested the first visible entry after src's hidden and ignored siblings.
-        let files =
-            crate::callgraph::walk_project_files_while_sorted_for_test(root.path(), move || {
+        let files = crate::callgraph::walk_project_files_while_sorted_for_test(
+            root.path(),
+            if crate::data_layer::read_fence::active() {
+                crate::project_walk::IgnoreFileAccess::Fenced
+            } else {
+                crate::project_walk::IgnoreFileAccess::Allowed
+            },
+            move || {
                 if budget_expired.load(Ordering::Relaxed) {
                     return false;
                 }
@@ -8565,8 +8584,9 @@ mod deferred_terminal_tests {
                     }
                 }
                 true
-            })
-            .collect::<Vec<_>>();
+            },
+        )
+        .collect::<Vec<_>>();
         let filtered_paths =
             crate::callgraph::PROJECT_WALK_FILTER_ENTRIES.with(|entries| entries.borrow().clone());
         let accepted_paths = crate::callgraph::PROJECT_WALK_ACCEPTED_FILTER_ENTRIES

@@ -1340,25 +1340,33 @@ fn collect_ts_js_files(root: &Path, out: &mut Vec<PathBuf>, source_path: &Path, 
     // Prevent a disappearing child mount from making ReadDir::drop abort on ENXIO.
     let mut builder = WalkBuilder::new(root);
     builder.same_file_system(true).hidden(false); // include .storybook/, .config/, etc. (tracked consumers)
-    let walker = crate::context::apply_project_ignore_rules(&mut builder, root)
-        .filter_entry(|entry| {
-            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                return !matches!(
-                    entry.file_name().to_string_lossy().as_ref(),
-                    "node_modules"
-                        | "target"
-                        | ".git"
-                        | "__pycache__"
-                        | ".tox"
-                        | ".venv"
-                        | "venv"
-                        | "dist"
-                        | "build"
-                );
-            }
-            true
-        })
-        .build();
+    let walker = crate::context::apply_project_ignore_rules(
+        &mut builder,
+        root,
+        if crate::data_layer::read_fence::active() {
+            crate::project_walk::IgnoreFileAccess::Fenced
+        } else {
+            crate::project_walk::IgnoreFileAccess::Allowed
+        },
+    )
+    .filter_entry(|entry| {
+        if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+            return !matches!(
+                entry.file_name().to_string_lossy().as_ref(),
+                "node_modules"
+                    | "target"
+                    | ".git"
+                    | "__pycache__"
+                    | ".tox"
+                    | ".venv"
+                    | "venv"
+                    | "dist"
+                    | "build"
+            );
+        }
+        true
+    })
+    .build();
 
     for entry in walker.filter_map(|e| e.ok()) {
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {

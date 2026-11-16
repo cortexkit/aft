@@ -5247,7 +5247,14 @@ mod tests {
         let mut parser = crate::parser::FileParser::new();
         let mut requests: Vec<PathBuf> = Vec::new();
         let mut files = 0;
-        for path in crate::callgraph::walk_project_files(&root) {
+        for path in crate::callgraph::walk_project_files(
+            &root,
+            if crate::data_layer::read_fence::active() {
+                crate::project_walk::IgnoreFileAccess::Fenced
+            } else {
+                crate::project_walk::IgnoreFileAccess::Allowed
+            },
+        ) {
             if let Ok(symbols) = parser.extract_symbols(&path) {
                 files += 1;
                 requests.extend(symbols.iter().map(|_| path.clone()));

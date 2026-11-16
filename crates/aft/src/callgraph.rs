@@ -4381,8 +4381,11 @@ const WALK_EXCLUDED_DIR_NAMES: [&str; 9] = [
 /// Walk project files respecting .gitignore, excluding common non-source dirs.
 ///
 /// Returns an iterator of file paths for supported source file types.
-pub fn walk_project_files(root: &Path) -> impl Iterator<Item = PathBuf> {
-    walk_project_files_filtered(root, |_| true)
+pub fn walk_project_files(
+    root: &Path,
+    access: crate::project_walk::IgnoreFileAccess,
+) -> impl Iterator<Item = PathBuf> {
+    walk_project_files_filtered(root, access, |_| true)
 }
 
 /// Walk the requested project subtrees, stopping before the next raw walker
@@ -4391,12 +4394,14 @@ pub fn walk_project_files(root: &Path) -> impl Iterator<Item = PathBuf> {
 /// rules; pruning before descent avoids traversing unrelated subtrees.
 pub(crate) fn walk_project_files_in_scope_while(
     root: &Path,
+    access: crate::project_walk::IgnoreFileAccess,
     scope_roots: &[PathBuf],
     keep_walking: impl Fn() -> bool + Send + Sync + 'static,
 ) -> impl Iterator<Item = PathBuf> {
     let roots = scope_roots.to_vec();
     walk_project_files_filtered_while(
         root,
+        access,
         move |path| {
             roots
                 .iter()
@@ -4408,18 +4413,20 @@ pub(crate) fn walk_project_files_in_scope_while(
 
 fn walk_project_files_filtered(
     root: &Path,
+    access: crate::project_walk::IgnoreFileAccess,
     include: impl Fn(&Path) -> bool + Send + Sync + 'static,
 ) -> impl Iterator<Item = PathBuf> {
-    walk_project_files_filtered_while(root, include, || true)
+    walk_project_files_filtered_while(root, access, include, || true)
 }
 
 /// Stop before advancing the directory iterator, not just between source files.
 /// Unsupported files and directories still consume a caller's walk budget.
 pub(crate) fn walk_project_files_while(
     root: &Path,
+    access: crate::project_walk::IgnoreFileAccess,
     keep_walking: impl Fn() -> bool + Send + Sync + 'static,
 ) -> impl Iterator<Item = PathBuf> {
-    walk_project_files_filtered_while(root, |_| true, keep_walking)
+    walk_project_files_filtered_while(root, access, |_| true, keep_walking)
 }
 
 #[cfg(test)]
@@ -4431,10 +4438,14 @@ fn audit01_walk_cancellation_observes_unsupported_entries() {
     }
     let checks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let observed = checks.clone();
-    let files = walk_project_files_while(root.path(), move || {
-        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        false
-    })
+    let files = walk_project_files_while(
+        root.path(),
+        crate::project_walk::IgnoreFileAccess::Allowed,
+        move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            false
+        },
+    )
     .collect::<Vec<_>>();
     assert!(files.is_empty());
     assert_eq!(
@@ -4449,27 +4460,31 @@ fn audit01_walk_cancellation_observes_unsupported_entries() {
 /// before descent.
 pub(crate) fn walk_project_paths_while(
     root: &Path,
+    access: crate::project_walk::IgnoreFileAccess,
     include: impl Fn(&Path) -> bool + Send + Sync + 'static,
     keep_walking: impl Fn() -> bool + Send + Sync + 'static,
 ) -> impl Iterator<Item = PathBuf> {
-    walk_project_paths_filtered_while_with_builder(root, include, keep_walking, |_| {})
+    walk_project_paths_filtered_while_with_builder(root, access, include, keep_walking, |_| {})
 }
 
 fn walk_project_files_filtered_while(
     root: &Path,
+    access: crate::project_walk::IgnoreFileAccess,
     include: impl Fn(&Path) -> bool + Send + Sync + 'static,
     keep_walking: impl Fn() -> bool + Send + Sync + 'static,
 ) -> impl Iterator<Item = PathBuf> {
-    walk_project_files_filtered_while_with_builder(root, include, keep_walking, |_| {})
+    walk_project_files_filtered_while_with_builder(root, access, include, keep_walking, |_| {})
 }
 
 #[cfg(test)]
 pub(crate) fn walk_project_files_while_sorted_for_test(
     root: &Path,
+    access: crate::project_walk::IgnoreFileAccess,
     keep_walking: impl Fn() -> bool + Send + Sync + 'static,
 ) -> impl Iterator<Item = PathBuf> {
     walk_project_files_filtered_while_with_builder(
         root,
+        access,
         |_| true,
         keep_walking,
         |builder| {
@@ -4480,18 +4495,26 @@ pub(crate) fn walk_project_files_while_sorted_for_test(
 
 fn walk_project_files_filtered_while_with_builder(
     root: &Path,
+    access: crate::project_walk::IgnoreFileAccess,
     include: impl Fn(&Path) -> bool + Send + Sync + 'static,
     keep_walking: impl Fn() -> bool + Send + Sync + 'static,
     configure_builder: impl FnOnce(&mut ignore::WalkBuilder),
 ) -> impl Iterator<Item = PathBuf> {
-    walk_project_paths_filtered_while_with_builder(root, include, keep_walking, configure_builder)
-        .filter(|path| {
-            crate::parser::detect_language_any(path, cfg!(feature = "wasm-grammars")).is_some()
-        })
+    walk_project_paths_filtered_while_with_builder(
+        root,
+        access,
+        include,
+        keep_walking,
+        configure_builder,
+    )
+    .filter(|path| {
+        crate::parser::detect_language_any(path, cfg!(feature = "wasm-grammars")).is_some()
+    })
 }
 
 fn walk_project_paths_filtered_while_with_builder(
     root: &Path,
+    access: crate::project_walk::IgnoreFileAccess,
     include: impl Fn(&Path) -> bool + Send + Sync + 'static,
     keep_walking: impl Fn() -> bool + Send + Sync + 'static,
     configure_builder: impl FnOnce(&mut ignore::WalkBuilder),
@@ -4510,7 +4533,7 @@ fn walk_project_paths_filtered_while_with_builder(
     // Skip nested linked worktrees of this repository: their files are indexed
     // under their own roots. The walk root itself is always admitted (depth 0).
     let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(root);
-    let mut walker = crate::context::apply_project_ignore_rules(&mut builder, root)
+    let mut walker = crate::project_walk::apply_project_ignore_rules(&mut builder, root, access)
         .filter_entry(move |entry| {
             #[cfg(test)]
             crate::inspect::walk_profile::entry();
@@ -4549,7 +4572,7 @@ pub(crate) fn project_walk_entry_is_included(
 ) -> bool {
     let file_type = entry.file_type();
     if crate::project_content::is_excluded_with_file_type(entry.path(), file_type.as_ref())
-        || crate::search_index::is_nested_worktree_entry(entry, worktrees)
+        || crate::project_walk::is_nested_worktree_entry(entry, worktrees)
     {
         return false;
     }
@@ -5398,10 +5421,14 @@ export function main() {
         let scope = dir.path().join("src");
         let visited = Arc::new(std::sync::Mutex::new(Vec::new()));
         let observations = visited.clone();
-        let files = walk_project_files_filtered(dir.path(), move |path| {
-            observations.lock().unwrap().push(path.to_path_buf());
-            path.starts_with(&scope) || scope.starts_with(path)
-        })
+        let files = walk_project_files_filtered(
+            dir.path(),
+            crate::project_walk::IgnoreFileAccess::Allowed,
+            move |path| {
+                observations.lock().unwrap().push(path.to_path_buf());
+                path.starts_with(&scope) || scope.starts_with(path)
+            },
+        )
         .collect::<Vec<_>>();
         assert_eq!(files, vec![dir.path().join("src/main.ts")]);
         // Recording the traversal predicate distinguishes pruning a directory
@@ -5448,7 +5475,9 @@ export function main() {
             .output()
             .unwrap();
 
-        let files: Vec<PathBuf> = walk_project_files(dir.path()).collect();
+        let files: Vec<PathBuf> =
+            walk_project_files(dir.path(), crate::project_walk::IgnoreFileAccess::Allowed)
+                .collect();
         let file_names: Vec<String> = files
             .iter()
             .map(|f| f.file_name().unwrap().to_string_lossy().to_string())
@@ -5479,7 +5508,11 @@ export function main() {
         fixture::write(plain.path(), false);
         fixture::write(git.path(), true);
         let walked = |root: &Path| {
-            fixture::relative_set(root, &walk_project_files(root).collect::<Vec<_>>())
+            fixture::relative_set(
+                root,
+                &walk_project_files(root, crate::project_walk::IgnoreFileAccess::Allowed)
+                    .collect::<Vec<_>>(),
+            )
         };
 
         let plain_files = walked(plain.path());
@@ -5501,7 +5534,9 @@ export function main() {
         )
         .unwrap();
 
-        let files: Vec<PathBuf> = walk_project_files(dir.path()).collect();
+        let files: Vec<PathBuf> =
+            walk_project_files(dir.path(), crate::project_walk::IgnoreFileAccess::Allowed)
+                .collect();
         let file_names: Vec<String> = files
             .iter()
             .map(|f| f.file_name().unwrap().to_string_lossy().to_string())
@@ -5540,7 +5575,9 @@ export function main() {
         fs::write(dir.path().join("readme.md"), "# Hello").unwrap();
         fs::write(dir.path().join("data.json"), "{}").unwrap();
 
-        let files: Vec<PathBuf> = walk_project_files(dir.path()).collect();
+        let files: Vec<PathBuf> =
+            walk_project_files(dir.path(), crate::project_walk::IgnoreFileAccess::Allowed)
+                .collect();
         let file_names: Vec<String> = files
             .iter()
             .map(|f| f.file_name().unwrap().to_string_lossy().to_string())

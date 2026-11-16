@@ -77,7 +77,17 @@ fn project_walk_skips_git_pointer_files() {
 fn callgraph_walk_skips_nested_worktrees() {
     let (_dir, fixture) = fixture();
     let root = &fixture.root;
-    let walked = relative_set(root, crate::callgraph::walk_project_files(root));
+    let walked = relative_set(
+        root,
+        crate::callgraph::walk_project_files(
+            root,
+            if crate::data_layer::read_fence::active() {
+                crate::project_walk::IgnoreFileAccess::Fenced
+            } else {
+                crate::project_walk::IgnoreFileAccess::Allowed
+            },
+        ),
+    );
     assert!(
         walked.contains("src/main.rs"),
         "missing main file: {walked:?}"

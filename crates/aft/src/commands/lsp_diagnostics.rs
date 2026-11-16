@@ -715,16 +715,24 @@ fn compute_unchecked_files(ctx: &AppContext, dir: &Path) -> (Vec<String>, bool) 
     // Prevent a disappearing child mount from making ReadDir::drop abort on ENXIO.
     let mut builder = ignore::WalkBuilder::new(dir);
     builder.same_file_system(true).standard_filters(true); // hidden-file rules
-    let walker = crate::context::apply_project_ignore_rules(&mut builder, dir)
-        .filter_entry(|e| {
-            // Skip noisy directories that explode walk time on real repos.
-            let name = e.file_name().to_string_lossy();
-            !matches!(
-                name.as_ref(),
-                ".git" | "node_modules" | "target" | "dist" | "build" | ".next" | ".turbo"
-            )
-        })
-        .build();
+    let walker = crate::context::apply_project_ignore_rules(
+        &mut builder,
+        dir,
+        if crate::data_layer::read_fence::active() {
+            crate::project_walk::IgnoreFileAccess::Fenced
+        } else {
+            crate::project_walk::IgnoreFileAccess::Allowed
+        },
+    )
+    .filter_entry(|e| {
+        // Skip noisy directories that explode walk time on real repos.
+        let name = e.file_name().to_string_lossy();
+        !matches!(
+            name.as_ref(),
+            ".git" | "node_modules" | "target" | "dist" | "build" | ".next" | ".turbo"
+        )
+    })
+    .build();
 
     let mut walk_truncated = false;
     for entry in walker {

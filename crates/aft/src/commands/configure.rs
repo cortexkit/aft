@@ -1708,11 +1708,16 @@ impl ConfigureWarningWork {
         let started = Instant::now();
         let flag = self.generation_flag.clone();
         let generation = self.generation;
-        let files: Vec<PathBuf> =
-            crate::callgraph::walk_project_files_while(&self.root, move || {
-                flag.load(Ordering::SeqCst) == generation
-            })
-            .collect();
+        let files: Vec<PathBuf> = crate::callgraph::walk_project_files_while(
+            &self.root,
+            if crate::data_layer::read_fence::active() {
+                crate::project_walk::IgnoreFileAccess::Fenced
+            } else {
+                crate::project_walk::IgnoreFileAccess::Allowed
+            },
+            move || flag.load(Ordering::SeqCst) == generation,
+        )
+        .collect();
         slog_info!(
             "configure warning files walked: reason={} files={} ms={} root={}",
             miss.as_str(),

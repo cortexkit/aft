@@ -208,6 +208,7 @@ pub use aft_base::process_io;
 pub(crate) use aft_base::process_spawn;
 pub(crate) mod production_storage;
 pub(crate) mod project_content;
+pub use aft_base::project_walk;
 pub use aft_base::protocol;
 pub(crate) mod provisional_identity_retry;
 pub use aft_base::pty_render;

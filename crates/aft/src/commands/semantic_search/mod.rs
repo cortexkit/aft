@@ -8350,54 +8350,57 @@ fn collect_degraded_grep_files(
     let permission_root = project_root.to_path_buf();
     let mut builder = ignore::WalkBuilder::new(project_root);
     builder.same_file_system(true).hidden(false);
-    let walker = crate::context::apply_project_ignore_rules(&mut builder, project_root)
-        .filter_entry({
-            let skipped_foreign_mounts = Arc::clone(&skipped_foreign_mounts);
-            move |entry| {
-                let file_type = entry.file_type();
-                if entry.depth() > 0
-                    && file_type.is_some_and(|file_type| file_type.is_dir())
-                    && matches!(
-                        boundary
-                            .as_ref()
-                            .map(|boundary| boundary.should_descend(entry.path())),
-                        Some(Ok(false))
-                    )
-                {
-                    skipped_foreign_mounts.fetch_add(1, Ordering::Relaxed);
-                    return false;
-                }
-                if crate::project_content::is_excluded_with_file_type(
-                    entry.path(),
-                    file_type.as_ref(),
-                ) || crate::search_index::is_nested_worktree_entry(entry, &worktrees)
-                {
-                    return false;
-                }
-                let name = entry.file_name().to_string_lossy();
-                if file_type.is_some_and(|file_type| file_type.is_dir()) {
-                    return !matches!(
-                        name.as_ref(),
-                        "node_modules"
-                            | "target"
-                            | "venv"
-                            | ".venv"
-                            | ".git"
-                            | "__pycache__"
-                            | ".tox"
-                            | "dist"
-                            | "build"
-                    ) && (!cfg!(target_os = "macos")
-                        || crate::bounded_io::probe_walk_directory(
-                            &permission_root,
-                            entry.path(),
-                        )
-                        .is_ok());
-                }
-                !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
+    let walker = crate::context::apply_project_ignore_rules(
+        &mut builder,
+        project_root,
+        if crate::data_layer::read_fence::active() {
+            crate::project_walk::IgnoreFileAccess::Fenced
+        } else {
+            crate::project_walk::IgnoreFileAccess::Allowed
+        },
+    )
+    .filter_entry({
+        let skipped_foreign_mounts = Arc::clone(&skipped_foreign_mounts);
+        move |entry| {
+            let file_type = entry.file_type();
+            if entry.depth() > 0
+                && file_type.is_some_and(|file_type| file_type.is_dir())
+                && matches!(
+                    boundary
+                        .as_ref()
+                        .map(|boundary| boundary.should_descend(entry.path())),
+                    Some(Ok(false))
+                )
+            {
+                skipped_foreign_mounts.fetch_add(1, Ordering::Relaxed);
+                return false;
             }
-        })
-        .build();
+            if crate::project_content::is_excluded_with_file_type(entry.path(), file_type.as_ref())
+                || crate::search_index::is_nested_worktree_entry(entry, &worktrees)
+            {
+                return false;
+            }
+            let name = entry.file_name().to_string_lossy();
+            if file_type.is_some_and(|file_type| file_type.is_dir()) {
+                return !matches!(
+                    name.as_ref(),
+                    "node_modules"
+                        | "target"
+                        | "venv"
+                        | ".venv"
+                        | ".git"
+                        | "__pycache__"
+                        | ".tox"
+                        | "dist"
+                        | "build"
+                ) && (!cfg!(target_os = "macos")
+                    || crate::bounded_io::probe_walk_directory(&permission_root, entry.path())
+                        .is_ok());
+            }
+            !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
+        }
+    })
+    .build();
 
     let mut files = Vec::new();
     for entry in walker.filter_map(Result::ok) {

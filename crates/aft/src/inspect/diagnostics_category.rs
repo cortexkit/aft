@@ -1026,6 +1026,11 @@ fn scoped_coverage_candidates_with_budget(
         let walk_root = root.clone();
         let walker = crate::callgraph::walk_project_paths_while(
             &root,
+            if crate::data_layer::read_fence::active() {
+                crate::project_walk::IgnoreFileAccess::Fenced
+            } else {
+                crate::project_walk::IgnoreFileAccess::Allowed
+            },
             move |path| {
                 let depth = path
                     .strip_prefix(&walk_root)

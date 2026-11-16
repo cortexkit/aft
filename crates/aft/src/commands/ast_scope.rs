@@ -254,7 +254,16 @@ fn walk_root(
     let mut builder = WalkBuilder::new(&root.path);
     // Prevent a disappearing child mount from making ReadDir::drop abort on ENXIO.
     builder.same_file_system(true).hidden(true);
-    crate::context::apply_project_ignore_rules(&mut builder, &root.path).filter_entry(|entry| {
+    crate::context::apply_project_ignore_rules(
+        &mut builder,
+        &root.path,
+        if crate::data_layer::read_fence::active() {
+            crate::project_walk::IgnoreFileAccess::Fenced
+        } else {
+            crate::project_walk::IgnoreFileAccess::Allowed
+        },
+    )
+    .filter_entry(|entry| {
         if entry.depth() == 0 {
             return true;
         }

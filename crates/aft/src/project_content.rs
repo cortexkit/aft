@@ -52,7 +52,15 @@ mod tests {
         register_storage_root(&storage);
         std::fs::write(storage.join("internal.rs"), "fn internal() {}\n").unwrap();
         assert!(is_excluded(&storage));
-        let mut walked = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        let mut walked = crate::callgraph::walk_project_files(
+            &root,
+            if crate::data_layer::read_fence::active() {
+                crate::project_walk::IgnoreFileAccess::Fenced
+            } else {
+                crate::project_walk::IgnoreFileAccess::Allowed
+            },
+        )
+        .collect::<Vec<_>>();
         walked.sort();
         expected.sort();
         assert_eq!(walked, expected);

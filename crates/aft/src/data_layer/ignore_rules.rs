@@ -4,62 +4,7 @@ use std::sync::Arc;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
-/// Apply the ignore rules every AFT project traversal honours to `builder`.
-///
-/// This is the one definition the project walkers share (search index build
-/// and refresh, semantic collection, grep/glob fallback, call graph, inspect
-/// scans, views membership, LSP applicability and ignore-file discovery), so
-/// a folder is indexed the same way whether or not it is a git repository:
-///
-/// - `.gitignore` files at the walk root, below it, and in its ancestors;
-/// - `.aftignore` files, layered on top with higher precedence;
-/// - Git's global excludes file (`core.excludesFile`);
-/// - `.git/info/exclude`, which only exists inside a repository.
-///
-/// The `ignore` crate applies the git-family sources only inside a repository
-/// unless `require_git` is off. Inside a git or jj work tree the crate default
-/// is kept, so git roots walk exactly as they always have (including where a
-/// nested repository starts its own rule scope). In a folder that is not a
-/// repository it is switched off so `.gitignore` files and the global excludes
-/// file still apply, matching the shared matcher that filters watcher events
-/// ([`IgnoreInputSnapshot::build_matcher`]), which reads both regardless of
-/// git. `.git/info/exclude` has nothing to contribute there.
-///
-/// Call it after `standard_filters`, which would otherwise reset these flags.
-pub(crate) fn apply_project_ignore_rules<'a>(
-    builder: &'a mut ignore::WalkBuilder,
-    walk_root: &Path,
-) -> &'a mut ignore::WalkBuilder {
-    if crate::data_layer::read_fence::active() {
-        // Ignore files can themselves be symlinks to another checkout. A
-        // confined walk must not read those files, even to filter its results.
-        return builder
-            .ignore(false)
-            .git_ignore(false)
-            .git_global(false)
-            .git_exclude(false)
-            .parents(false)
-            .require_git(false);
-    }
-    builder
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .add_custom_ignore_filename(".aftignore")
-        .require_git(is_inside_vcs_work_tree(walk_root))
-}
-
-/// Whether `path` or one of its ancestors holds `.git` (a directory, or the
-/// file a linked worktree or submodule uses) or `.jj`. This is the same test
-/// the `ignore` crate uses to decide that git rules apply, run on the same
-/// canonical ancestors it inspects, so keeping `require_git` on exactly when
-/// this is true leaves the crate's own decision unchanged for git roots.
-fn is_inside_vcs_work_tree(path: &Path) -> bool {
-    let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    absolute
-        .ancestors()
-        .any(|dir| dir.join(".git").exists() || dir.join(".jj").exists())
-}
+pub(crate) use crate::project_walk::apply_project_ignore_rules;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct IgnoreInput {

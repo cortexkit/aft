@@ -76,7 +76,15 @@ mod tests {
             return;
         };
         let root = std::path::PathBuf::from(&repo);
-        let files: Vec<std::path::PathBuf> = crate::callgraph::walk_project_files(&root).collect();
+        let files: Vec<std::path::PathBuf> = crate::callgraph::walk_project_files(
+            &root,
+            if crate::data_layer::read_fence::active() {
+                crate::project_walk::IgnoreFileAccess::Fenced
+            } else {
+                crate::project_walk::IgnoreFileAccess::Allowed
+            },
+        )
+        .collect();
 
         // Cold pass: collect freshness records (this is the cold-build cost, not
         // what we're optimizing — just needed to seed the warm comparison).
@@ -151,9 +159,16 @@ mod warm_reload_tests {
         let root = PathBuf::from(
             std::env::var("AFT_BENCH_REPO").expect("AFT_BENCH_REPO must name a repository"),
         );
-        let records = crate::callgraph::walk_project_files(&root)
-            .filter_map(|path| collect(&path).ok().map(|freshness| (path, freshness)))
-            .collect::<Vec<_>>();
+        let records = crate::callgraph::walk_project_files(
+            &root,
+            if crate::data_layer::read_fence::active() {
+                crate::project_walk::IgnoreFileAccess::Fenced
+            } else {
+                crate::project_walk::IgnoreFileAccess::Allowed
+            },
+        )
+        .filter_map(|path| collect(&path).ok().map(|freshness| (path, freshness)))
+        .collect::<Vec<_>>();
         let artifact_dir = tempfile::tempdir().unwrap();
         let artifact = artifact_dir.path().join("cache.bin");
         fs::write(&artifact, b"stable-generation").unwrap();

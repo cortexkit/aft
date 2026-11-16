@@ -4137,9 +4137,16 @@ pub(crate) fn scope_files(project_root: &Path, scope: &JobScope) -> Vec<PathBuf>
     #[cfg(test)]
     SCOPE_FILE_WALKS.with(|walks| walks.set(walks.get() + 1));
     let started = Instant::now();
-    let mut files = crate::callgraph::walk_project_files(project_root)
-        .filter(|path| scope.contains(path))
-        .collect::<Vec<_>>();
+    let mut files = crate::callgraph::walk_project_files(
+        project_root,
+        if crate::data_layer::read_fence::active() {
+            crate::project_walk::IgnoreFileAccess::Fenced
+        } else {
+            crate::project_walk::IgnoreFileAccess::Allowed
+        },
+    )
+    .filter(|path| scope.contains(path))
+    .collect::<Vec<_>>();
     files.sort();
     crate::slog_info!(
         "inspect scope files walked: reason={} files={} ms={} root={}",
@@ -6182,7 +6189,15 @@ mod guard_tests {
             std::os::unix::fs::symlink("src/main.rs", root.join("link.rs")).unwrap();
             std::os::unix::fs::symlink("src", root.join("linked_src")).unwrap();
         }
-        let mut walked = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        let mut walked = crate::callgraph::walk_project_files(
+            &root,
+            if crate::data_layer::read_fence::active() {
+                crate::project_walk::IgnoreFileAccess::Fenced
+            } else {
+                crate::project_walk::IgnoreFileAccess::Allowed
+            },
+        )
+        .collect::<Vec<_>>();
         walked.sort();
         for kept in ["src/main.rs", "src/lib.ts", "vendor/independent/inner.rs"] {
             assert!(walked.contains(&root.join(kept)), "{kept}: {walked:?}");
@@ -6361,13 +6376,20 @@ mod guard_tests {
         let bind_ms = bind_started.elapsed().as_millis();
         let checkout = ctx.data_checkout().expect("bound");
         let project = JobScope::for_project(root.clone());
-        let targets = crate::callgraph::walk_project_files(&root)
-            .filter(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "rs" || extension == "ts")
-            })
-            .take(64)
-            .collect::<Vec<_>>();
+        let targets = crate::callgraph::walk_project_files(
+            &root,
+            if crate::data_layer::read_fence::active() {
+                crate::project_walk::IgnoreFileAccess::Fenced
+            } else {
+                crate::project_walk::IgnoreFileAccess::Allowed
+            },
+        )
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "rs" || extension == "ts")
+        })
+        .take(64)
+        .collect::<Vec<_>>();
         assert!(!targets.is_empty(), "no source file to edit");
         let added_dir = root.join("crates/replay_added");
         std::fs::create_dir_all(&added_dir).unwrap();
@@ -6397,9 +6419,16 @@ mod guard_tests {
             checkout.note_paths(&changed);
 
             let (cpu, started) = (thread_cpu_ms(), Instant::now());
-            let mut walked = crate::callgraph::walk_project_files(&root)
-                .filter(|path| project.contains(path))
-                .collect::<Vec<_>>();
+            let mut walked = crate::callgraph::walk_project_files(
+                &root,
+                if crate::data_layer::read_fence::active() {
+                    crate::project_walk::IgnoreFileAccess::Fenced
+                } else {
+                    crate::project_walk::IgnoreFileAccess::Allowed
+                },
+            )
+            .filter(|path| project.contains(path))
+            .collect::<Vec<_>>();
             walked.sort();
             walk_cpu += thread_cpu_ms() - cpu;
             walk_ms += started.elapsed().as_secs_f64() * 1000.0;
@@ -6640,7 +6669,15 @@ mod guard_tests {
         std::fs::write(&undecodable, b"\xff\xfe<\x00?\x00p\x00h\x00p\x00")
             .expect("write undecodable file");
         let inspect_dir = root.join(".aft-cache").join("inspect");
-        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        let files = crate::callgraph::walk_project_files(
+            &root,
+            if crate::data_layer::read_fence::active() {
+                crate::project_walk::IgnoreFileAccess::Fenced
+            } else {
+                crate::project_walk::IgnoreFileAccess::Allowed
+            },
+        )
+        .collect::<Vec<_>>();
         assert!(
             files.contains(&undecodable),
             "the walk must reach the undecodable file for this test to mean anything"
@@ -7273,7 +7310,15 @@ mod guard_tests {
         let dir = write_ts_project(3);
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let inspect_dir = root.join(".aft-cache").join("inspect");
-        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        let files = crate::callgraph::walk_project_files(
+            &root,
+            if crate::data_layer::read_fence::active() {
+                crate::project_walk::IgnoreFileAccess::Fenced
+            } else {
+                crate::project_walk::IgnoreFileAccess::Allowed
+            },
+        )
+        .collect::<Vec<_>>();
         // The index store's call graph stays building until the hold drops.
         let hold = crate::data_layer::checkout::hold_call_graph_for_test(&root);
         let storage = tempfile::tempdir().expect("storage");
@@ -8058,13 +8103,20 @@ export function bannerUnused() {}
             let name = spec["name"].as_str().unwrap();
             let root = std::fs::canonicalize(spec["root"].as_str().unwrap()).unwrap();
             let prefix = spec["prefix"].as_str().unwrap_or("");
-            let files = crate::callgraph::walk_project_files(&root)
-                .filter(|path| {
-                    path.strip_prefix(&root)
-                        .is_ok_and(|path| path.starts_with(prefix))
-                        && crate::parser::detect_language(path).is_some_and(is_js_ts_language)
-                })
-                .collect::<Vec<_>>();
+            let files = crate::callgraph::walk_project_files(
+                &root,
+                if crate::data_layer::read_fence::active() {
+                    crate::project_walk::IgnoreFileAccess::Fenced
+                } else {
+                    crate::project_walk::IgnoreFileAccess::Allowed
+                },
+            )
+            .filter(|path| {
+                path.strip_prefix(&root)
+                    .is_ok_and(|path| path.starts_with(prefix))
+                    && crate::parser::detect_language(path).is_some_and(is_js_ts_language)
+            })
+            .collect::<Vec<_>>();
             assert!(!files.is_empty(), "empty corpus: {name}");
             let excluded = files
                 .iter()
@@ -8913,9 +8965,16 @@ export function bannerUnused() {}
             "{aggregate:#}"
         );
 
-        let walked = crate::callgraph::walk_project_files(&root)
-            .map(|path| relative_cache_key(&root, &path))
-            .collect::<BTreeSet<_>>();
+        let walked = crate::callgraph::walk_project_files(
+            &root,
+            if crate::data_layer::read_fence::active() {
+                crate::project_walk::IgnoreFileAccess::Fenced
+            } else {
+                crate::project_walk::IgnoreFileAccess::Allowed
+            },
+        )
+        .map(|path| relative_cache_key(&root, &path))
+        .collect::<BTreeSet<_>>();
         let cache = manager
             .cache_for_snapshot(&snapshot)
             .expect("inspect cache");
@@ -9657,7 +9716,15 @@ mod dead_code_projection_tests {
     }
 
     fn project_files(root: &Path) -> Vec<PathBuf> {
-        walk_project_files(root).collect()
+        walk_project_files(
+            root,
+            if crate::data_layer::read_fence::active() {
+                crate::project_walk::IgnoreFileAccess::Fenced
+            } else {
+                crate::project_walk::IgnoreFileAccess::Allowed
+            },
+        )
+        .collect()
     }
 
     fn canonical_root(root: &Path) -> PathBuf {

@@ -1592,71 +1592,78 @@ fn target_walk_builder(
     // explicitly named ignored directory.
     let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(search_root);
     let permission_root = search_root.to_path_buf();
-    crate::data_layer::ignore_rules::apply_project_ignore_rules(&mut builder, search_root)
-        .parents(!crate::data_layer::read_fence::active())
-        .filter_entry(move |entry| {
-            if !crate::bounded_io::walk_path(entry.path()) {
-                return false;
-            }
-            let file_type = entry.file_type();
-            if crate::project_content::is_excluded_with_file_type(entry.path(), file_type.as_ref())
+    crate::data_layer::ignore_rules::apply_project_ignore_rules(
+        &mut builder,
+        search_root,
+        if crate::data_layer::read_fence::active() {
+            crate::project_walk::IgnoreFileAccess::Fenced
+        } else {
+            crate::project_walk::IgnoreFileAccess::Allowed
+        },
+    )
+    .parents(!crate::data_layer::read_fence::active())
+    .filter_entry(move |entry| {
+        if !crate::bounded_io::walk_path(entry.path()) {
+            return false;
+        }
+        let file_type = entry.file_type();
+        if crate::project_content::is_excluded_with_file_type(entry.path(), file_type.as_ref()) {
+            floor_disclosure.record_source_exclusion(entry.path());
+            return false;
+        }
+        if crate::search_index::is_nested_worktree_entry(entry, &worktrees) {
+            floor_disclosure.record_source_exclusion(entry.path());
+            return false;
+        }
+        if !crate::bash_background::registry::safe_task_entry(entry.path()) {
+            return false;
+        }
+        let is_dir = file_type.as_ref().is_some_and(std::fs::FileType::is_dir);
+        if entry.depth() > 0 && is_dir {
+            match boundary
+                .as_ref()
+                .map(|boundary| boundary.should_descend(entry.path()))
             {
-                floor_disclosure.record_source_exclusion(entry.path());
-                return false;
-            }
-            if crate::search_index::is_nested_worktree_entry(entry, &worktrees) {
-                floor_disclosure.record_source_exclusion(entry.path());
-                return false;
-            }
-            if !crate::bash_background::registry::safe_task_entry(entry.path()) {
-                return false;
-            }
-            let is_dir = file_type.as_ref().is_some_and(std::fs::FileType::is_dir);
-            if entry.depth() > 0 && is_dir {
-                match boundary
-                    .as_ref()
-                    .map(|boundary| boundary.should_descend(entry.path()))
-                {
-                    Some(Ok(false)) => {
-                        skipped_foreign_mounts.fetch_add(1, Ordering::Relaxed);
-                        return false;
-                    }
-                    Some(Err(_)) => return false,
-                    _ => {}
-                }
-            }
-            let name = entry.file_name().to_string_lossy();
-            let keep = if is_dir {
-                !is_fallback_skipped_directory_name(&name)
-            } else {
-                !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
-            };
-            if !keep {
-                return false;
-            }
-            // Checked before the directory is opened, and only for entries
-            // the walk would otherwise keep, so a denial is never counted for
-            // a path the walk skips anyway. Symlinks are never followed, so
-            // they need no read check.
-            if let Some(confined) = &confined {
-                let is_file = file_type.as_ref().is_some_and(std::fs::FileType::is_file);
-                if entry.depth() > 0
-                    && (is_dir || is_file)
-                    && (match &ignore_root {
-                        Some(root) => confined.is_ignored_below(entry.path(), is_dir, root),
-                        None => confined.is_ignored(entry.path(), is_dir),
-                    } || !confined.admits(entry.path()))
-                {
+                Some(Ok(false)) => {
+                    skipped_foreign_mounts.fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
+                Some(Err(_)) => return false,
+                _ => {}
             }
-            // A directory at the depth limit is only named, never opened.
-            // Probing its contents would turn a shallow ignore comparison
-            // into extra reads below the searched folder.
-            !is_dir
-                || max_depth.is_some_and(|depth| entry.depth() >= depth)
-                || crate::bounded_io::probe_walk_directory(&permission_root, entry.path()).is_ok()
-        });
+        }
+        let name = entry.file_name().to_string_lossy();
+        let keep = if is_dir {
+            !is_fallback_skipped_directory_name(&name)
+        } else {
+            !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
+        };
+        if !keep {
+            return false;
+        }
+        // Checked before the directory is opened, and only for entries
+        // the walk would otherwise keep, so a denial is never counted for
+        // a path the walk skips anyway. Symlinks are never followed, so
+        // they need no read check.
+        if let Some(confined) = &confined {
+            let is_file = file_type.as_ref().is_some_and(std::fs::FileType::is_file);
+            if entry.depth() > 0
+                && (is_dir || is_file)
+                && (match &ignore_root {
+                    Some(root) => confined.is_ignored_below(entry.path(), is_dir, root),
+                    None => confined.is_ignored(entry.path(), is_dir),
+                } || !confined.admits(entry.path()))
+            {
+                return false;
+            }
+        }
+        // A directory at the depth limit is only named, never opened.
+        // Probing its contents would turn a shallow ignore comparison
+        // into extra reads below the searched folder.
+        !is_dir
+            || max_depth.is_some_and(|depth| entry.depth() >= depth)
+            || crate::bounded_io::probe_walk_directory(&permission_root, entry.path()).is_ok()
+    });
     if ignored_target {
         // Like outline, an explicitly ignored target also honors Git rules
         // without stopping at a nested repository's boundary, even inside a

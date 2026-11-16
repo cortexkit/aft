@@ -1775,7 +1775,7 @@ fn unused_exports_incremental_oxc_benchmark() {
         return;
     };
     let root = fs::canonicalize(Path::new(&repo)).expect("canonical bench repo");
-    let mut paths = walk_project_files(&root)
+    let mut paths = walk_project_files(&root, aft::project_walk::IgnoreFileAccess::Allowed)
         .filter(|path| {
             path.extension()
                 .and_then(|ext| ext.to_str())

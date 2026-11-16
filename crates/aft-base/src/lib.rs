@@ -137,6 +137,7 @@ pub mod process_io;
 pub mod process_spawn;
 pub mod production_storage;
 pub mod project_content;
+pub mod project_walk;
 pub mod protocol;
 pub mod pty_render;
 pub mod query_shape;

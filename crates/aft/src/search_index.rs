@@ -3630,31 +3630,24 @@ fn project_walk_builder_pruned(
     // The named root itself is always admitted (depth 0), so an explicitly
     // targeted walk inside a worktree still reads it.
     let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(search_root);
-    crate::context::apply_project_ignore_rules(&mut builder, search_root).filter_entry(
-        move |entry| {
-            project_walk_admits_entry(entry, excludes)
-                && descend(entry.path())
-                && !is_nested_worktree_entry(entry, &worktrees)
+    crate::context::apply_project_ignore_rules(
+        &mut builder,
+        search_root,
+        if crate::data_layer::read_fence::active() {
+            crate::project_walk::IgnoreFileAccess::Fenced
+        } else {
+            crate::project_walk::IgnoreFileAccess::Allowed
         },
-    );
+    )
+    .filter_entry(move |entry| {
+        project_walk_admits_entry(entry, excludes)
+            && descend(entry.path())
+            && !is_nested_worktree_entry(entry, &worktrees)
+    });
     builder
 }
 
-/// True when `entry` is a directory below the walk root that is itself a
-/// nested linked worktree of this repository, which the walk must prune.
-/// Shared by every walker built on the project walk; the depth check keeps
-/// an explicitly named root (depth 0) admitted.
-pub(crate) fn is_nested_worktree_entry(
-    entry: &ignore::DirEntry,
-    worktrees: &crate::project_content::NestedWorktreeBoundary,
-) -> bool {
-    entry.depth() > 0
-        && entry
-            .file_type()
-            .as_ref()
-            .is_some_and(std::fs::FileType::is_dir)
-        && worktrees.is_nested_worktree_root(entry.path())
-}
+pub(crate) use crate::project_walk::is_nested_worktree_entry;
 
 /// The membership rule the project walk applies to each entry on top of the
 /// ignore rules: content exclusions, skipped directory names and OS metadata
@@ -4544,7 +4537,16 @@ fn collect_ignore_rule_files(
     builder.same_file_system(true).hidden(false);
     // Same rules as the project walk, so rule files inside ignored trees
     // (which cannot change what is indexed) are not discovered.
-    crate::context::apply_project_ignore_rules(&mut builder, root).filter_entry(|entry| {
+    crate::context::apply_project_ignore_rules(
+        &mut builder,
+        root,
+        if crate::data_layer::read_fence::active() {
+            crate::project_walk::IgnoreFileAccess::Fenced
+        } else {
+            crate::project_walk::IgnoreFileAccess::Allowed
+        },
+    )
+    .filter_entry(|entry| {
         let name = entry.file_name().to_string_lossy();
         if entry.file_type().map_or(false, |ft| ft.is_dir()) {
             return !matches!(
@@ -4594,7 +4596,15 @@ pub(crate) fn count_ignore_rule_discovery_dirs(root: &Path) -> usize {
     let mut dirs = 0usize;
     let mut builder = WalkBuilder::new(root);
     builder.same_file_system(true).hidden(false);
-    crate::context::apply_project_ignore_rules(&mut builder, root);
+    crate::context::apply_project_ignore_rules(
+        &mut builder,
+        root,
+        if crate::data_layer::read_fence::active() {
+            crate::project_walk::IgnoreFileAccess::Fenced
+        } else {
+            crate::project_walk::IgnoreFileAccess::Allowed
+        },
+    );
     for entry in builder.build().filter_map(|entry| entry.ok()) {
         if entry.file_type().map_or(false, |ft| ft.is_dir()) {
             dirs += 1;

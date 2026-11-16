@@ -2578,32 +2578,40 @@ fn walk_resolver_config_files(project_root: &Path) -> BTreeSet<PathBuf> {
     // Resolver configs inside a nested linked worktree of this repository
     // belong to that checkout's own scope, not this one.
     let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(project_root);
-    let walker = crate::context::apply_project_ignore_rules(&mut builder, project_root)
-        .filter_entry(move |entry| {
-            if crate::search_index::is_nested_worktree_entry(entry, &worktrees) {
-                return false;
-            }
-            let name = entry.file_name().to_string_lossy();
-            if entry
-                .file_type()
-                .is_some_and(|file_type| file_type.is_dir())
-            {
-                return !matches!(
-                    name.as_ref(),
-                    "node_modules"
-                        | "target"
-                        | "venv"
-                        | ".venv"
-                        | ".git"
-                        | "__pycache__"
-                        | ".tox"
-                        | "dist"
-                        | "build"
-                );
-            }
-            true
-        })
-        .build();
+    let walker = crate::context::apply_project_ignore_rules(
+        &mut builder,
+        project_root,
+        if crate::data_layer::read_fence::active() {
+            crate::project_walk::IgnoreFileAccess::Fenced
+        } else {
+            crate::project_walk::IgnoreFileAccess::Allowed
+        },
+    )
+    .filter_entry(move |entry| {
+        if crate::search_index::is_nested_worktree_entry(entry, &worktrees) {
+            return false;
+        }
+        let name = entry.file_name().to_string_lossy();
+        if entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_dir())
+        {
+            return !matches!(
+                name.as_ref(),
+                "node_modules"
+                    | "target"
+                    | "venv"
+                    | ".venv"
+                    | ".git"
+                    | "__pycache__"
+                    | ".tox"
+                    | "dist"
+                    | "build"
+            );
+        }
+        true
+    })
+    .build();
 
     walker
         .filter_map(Result::ok)

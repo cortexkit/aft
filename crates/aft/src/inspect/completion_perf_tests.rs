@@ -2,7 +2,7 @@ fn duplicate_perf_job(root: &Path) -> InspectJob {
     let mut job = snapshot_job(root, &root.join(".aft-cache/inspect"), true);
     job.category = InspectCategory::Duplicates;
     job.key = JobKey::for_project_category(InspectCategory::Duplicates);
-    job.scope_files = crate::callgraph::walk_project_files(root).collect();
+    job.scope_files = crate::callgraph::walk_project_files(root, if crate::data_layer::read_fence::active() { crate::project_walk::IgnoreFileAccess::Fenced } else { crate::project_walk::IgnoreFileAccess::Allowed }).collect();
     job
 }
 
