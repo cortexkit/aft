@@ -2572,7 +2572,14 @@ impl LspClient {
         }
 
         if let Err(err) = self.send_notification::<lsp_types::notification::Exit>(()) {
-            return self.abort_live_child_after_shutdown_error(err);
+            // A server may exit as soon as it has answered `shutdown`, closing
+            // its stdin before `exit` is written. That is still a clean
+            // shutdown, so wait for the exit below instead of failing it.
+            let closed_after_answer =
+                matches!(&err, LspError::Io(io) if io.kind() == std::io::ErrorKind::BrokenPipe);
+            if !closed_after_answer {
+                return self.abort_live_child_after_shutdown_error(err);
+            }
         }
         self.state = ServerState::ShuttingDown;
 
