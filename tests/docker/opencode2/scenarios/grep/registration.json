@@ -248,6 +248,98 @@
           "expected_trailer": "shown 40 of 140 rows (cap) · narrow: offset, path, include"
         }
       }
+    },
+    {
+      "schema_version": 1,
+      "id": "grep/T6/grep-payload-skipped-files/complete",
+      "tool": "grep",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the complete grep..payload.skipped_files fixture.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "grep-t6-grep-payload-skipped-files-complete",
+                "name": "grep",
+                "arguments": {
+                  "pattern": "readCeiling\\s+ScenarioMarker",
+                  "path": "read-ceiling"
+                },
+                "non_mutating_evidence": {
+                  "reason": "the multiline grep only observes the generated read-ceiling fixture"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": { "kind": "text", "content": "done" }
+        }
+      ],
+      "expected_turns": ["call-tool", "finish"],
+      "compare_call_id": "grep-t6-grep-payload-skipped-files-complete",
+      "metadata": {
+        "t6": {
+          "surface_id": "grep..payload.skipped_files",
+          "owner": "grep",
+          "call_id": "grep-t6-grep-payload-skipped-files-complete",
+          "fixture": "complete"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "grep/T6/grep-payload-skipped-files/incomplete",
+      "tool": "grep",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the incomplete grep..payload.skipped_files fixture.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "grep-t6-grep-payload-skipped-files-incomplete",
+                "name": "grep",
+                "arguments": {
+                  "pattern": "readCeiling\\s+ScenarioMarker",
+                  "path": "read-ceiling"
+                },
+                "non_mutating_evidence": {
+                  "reason": "the multiline grep only observes the generated read-ceiling fixture"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": { "kind": "text", "content": "done" }
+        }
+      ],
+      "expected_turns": ["call-tool", "finish"],
+      "compare_call_id": "grep-t6-grep-payload-skipped-files-incomplete",
+      "metadata": {
+        "t6": {
+          "surface_id": "grep..payload.skipped_files",
+          "owner": "grep",
+          "call_id": "grep-t6-grep-payload-skipped-files-incomplete",
+          "fixture": "incomplete",
+          "triggered_reason": "cap",
+          "expected_trailer": "shown 20 of 21 files (cap) · narrow: path"
+        }
+      }
     }
   ]
 }
