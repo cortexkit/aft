@@ -512,7 +512,7 @@ fn database_fixture(
 ) -> (
     tempfile::TempDir,
     Arc<AppContext>,
-    Arc<StdMutex<rusqlite::Connection>>,
+    Arc<StdMutex<crate::db::TrackedConnection>>,
     Arc<Executor>,
 ) {
     let (dir, root) = test_support::test_root(name);
