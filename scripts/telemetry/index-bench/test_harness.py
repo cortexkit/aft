@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = Path(__file__).resolve().parent
@@ -71,6 +73,14 @@ class NativeTests(unittest.TestCase):
             self.assertGreaterEqual(len(rows), 2)
             self.assertGreater(float(rows[-1]["cpu_seconds"]), 0.5)
             self.assertGreater(result["rusage"]["user_seconds"], 0.5)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "reads /proc")
+    def test_linux_thread_groups_sum_cpu_by_name_without_numbers(self):
+        end = time.process_time() + 0.3
+        while time.process_time() < end:
+            pass
+        groups = native.linux_thread_groups(os.getpid())
+        self.assertGreater(sum(groups.values()), 0.2)
 
     def test_ps_time_parsing(self):
         self.assertEqual(native.ps_cpu_seconds("0:01.50"), 1.5)

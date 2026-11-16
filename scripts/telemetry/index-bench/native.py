@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import os
+import re
 import signal
 from pathlib import Path
 import subprocess
@@ -24,6 +26,25 @@ def ps_cpu_seconds(text):
     for part in text.split(":"):
         seconds = seconds * 60 + float(part)
     return days * 86400 + seconds
+
+
+def linux_thread_groups(pid):
+    """CPU seconds per thread-name group of a Linux process (``aft-resolve-3`` counts as ``aft-resolve``).
+
+    A thread that exits between listing and reading is skipped; its time is then missing from
+    every later reading, so groups are compared by their increase over short stretches.
+    """
+    groups, tick = {}, os.sysconf("SC_CLK_TCK")
+    for task in Path(f"/proc/{pid}/task").iterdir():
+        try:
+            text = (task / "stat").read_text()
+        except OSError:
+            continue
+        name = text[text.index("(") + 1:text.rindex(")")]
+        fields = text[text.rindex(")") + 1:].split()
+        group = re.sub(r"[-_ ]?\d+$", "", name) or name
+        groups[group] = groups.get(group, 0.0) + (int(fields[11]) + int(fields[12])) / tick
+    return groups
 
 
 def guard_metrics(platform, rss, commit, limit):
@@ -97,6 +118,10 @@ class Child:
         # With a timeline path, one CSV row per second records RSS, process CPU seconds and
         # (on Linux) the thread count, so wall time can be split into busy and idle stretches.
         self.timeline = Path(timeline).open("w", encoding="utf-8") if timeline else None
+        # On Linux, every 5 s also the CPU seconds per thread-name group, to tell stages apart.
+        self.thread_groups = (Path(timeline).with_name("threads.jsonl").open("w", encoding="utf-8")
+                              if timeline and self.platform == "linux" else None)
+        self.last_groups = -5.0
         self.last_row = -1.0
         if self.timeline:
             self.timeline.write("seconds,rss_bytes,cpu_seconds,threads\n")
@@ -140,6 +165,11 @@ class Child:
             self.last_row = seconds
             self.timeline.write(f"{seconds:.2f},{rss},{'' if cpu is None else f'{cpu:.2f}'},{'' if threads is None else threads}\n")
             self.timeline.flush()
+        if self.thread_groups and seconds - self.last_groups >= 5.0:
+            self.last_groups = seconds
+            self.thread_groups.write(json.dumps({"seconds": round(seconds, 2),
+                                                 "cpu_seconds": linux_thread_groups(self.proc.pid)}) + "\n")
+            self.thread_groups.flush()
         return rss, commit
 
     def kill(self):
@@ -204,6 +234,8 @@ class Child:
             self.cpu_seconds = self.usage.ru_utime + self.usage.ru_stime
         if self.timeline:
             self.timeline.close()
+        if self.thread_groups:
+            self.thread_groups.close()
         if self.proc.stdin:
             self.proc.stdin.close()
         usage = getattr(self, "usage", None)

@@ -76,6 +76,8 @@ guarded and timed-out runs remain usable measurements, not silently green runs.
 
 - `timeline.csv`: one row per second with RSS, process CPU seconds and (Linux)
   the thread count. The CPU slope over a stretch is its average parallelism.
+- `threads.jsonl` (Linux only): every 5 s, the CPU seconds of each thread-name
+  group (`aft-resolve-3` counts as `aft-resolve`).
 - `profile.json`: each moment a string or boolean field of the
   `search_index` or `callgraph_store` status changes, in seconds since AFT
   started, and the record of each stack sample.
