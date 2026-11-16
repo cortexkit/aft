@@ -142,7 +142,7 @@ async fn fake_display(
             other => panic!("unexpected display request {other:?}: {body}"),
         };
         respond(&mut stream, &frame, reply).await;
-        let Ok(Some(next)) = subc_transport::read_frame(&mut stream).await else {
+        let Ok(Some(next)) = crate::subc_fake::read_frame(&mut stream).await else {
             return;
         };
         frame = next;
@@ -157,6 +157,13 @@ async fn run_display_case(switch: Option<&str>) {
     let data = tempfile::tempdir().unwrap();
     write_user_config(config.path(), storage.path());
     let listener: TcpListener = write_raw_connection_file(conn.path()).await;
+    let connection_path = conn.path().join("subc-connection.json");
+    let mut connection =
+        subc_transport::connection_file::read_for_client(&connection_path).unwrap();
+    // The SDK gates route.open on a semver daemon version, including for a
+    // fake store. The raw module-only fixture uses a non-version test label.
+    connection.daemon_ver = "0.39.0".into();
+    subc_transport::connection_file::write_atomic(&connection_path, &connection).unwrap();
     let (modules_tx, mut modules) = tokio::sync::mpsc::unbounded_channel();
     let (writes_tx, mut writes) = tokio::sync::mpsc::unbounded_channel();
     let daemon = tokio::spawn(async move {
@@ -169,13 +176,13 @@ async fn run_display_case(switch: Option<&str>) {
                     let writes = writes_tx.clone();
                     connections.spawn(async move {
                         if authenticate_server(&mut stream, &[0x42; subc_transport::KEY_LEN],
-                            &[0x24; subc_transport::DAEMON_ID_LEN], "subc-detach-test", Duration::from_secs(5)).await.is_err() {
+                            &[0x24; subc_transport::DAEMON_ID_LEN], "0.39.0", Duration::from_secs(5)).await.is_err() {
                             return;
                         }
                         // Startup probes can authenticate and close without a
                         // frame. They are not module or display connections.
                         let Ok(Ok(Some(first))) = tokio::time::timeout(
-                            Duration::from_secs(5), subc_transport::read_frame(&mut stream)
+                            Duration::from_secs(5), crate::subc_fake::read_frame(&mut stream)
                         ).await else { return; };
                         if first.header.ty == FrameType::Hello {
                             modules.send((stream, first)).unwrap();
