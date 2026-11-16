@@ -3188,9 +3188,13 @@ async fn large_queued_runon_recovers_after_the_small_queue_deadline() {
     let run = &daemon.methods("exec.run")[0];
     assert_eq!(run["params"]["weight_hint"], 16);
     assert_eq!(run["params"]["timeout"], 1800);
-    assert!(
-        run["params"].get("queue_wait_limit_s").is_none(),
-        "the runner owns admission policy"
+    // An explicit timeout now carries the same queue wait limit.
+    assert_eq!(
+        run["params"]
+            .get("queue_wait_limit_s")
+            .and_then(serde_json::Value::as_u64),
+        Some(1800),
+        "an explicit timeout also bounds admission"
     );
 
     // Pass the old 5m queue + 30m run + 5m grace deadline without real waiting.
@@ -7981,6 +7985,63 @@ async fn runon_timeout_uses_the_task_limit_and_preserves_long_explicit_timeouts(
 }
 
 #[tokio::test]
+async fn runon_queue_wait_limit_follows_only_explicit_timeouts() {
+    for background in [false, true] {
+        for (timeout_ms, expected_seconds) in [
+            (None, None),
+            (Some(5_400_000), Some(5_400)),
+            (Some(5_400_001), Some(5_401)),
+            (Some(30_001), Some(31)),
+        ] {
+            let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+            let dir = tempfile::tempdir().unwrap();
+            ensure_git_fixture(dir.path());
+            let ctx = crate::context::AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                crate::config::Config {
+                    project_root: Some(dir.path().into()),
+                    experimental_bash_background: true,
+                    bash: crate::config::BashConfig {
+                        runon_enabled: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            let mut params = serde_json::json!({
+                "command": "printf queue-timeout-proof",
+                "runon": "linux,4c",
+                "background": background,
+                "compressed": false
+            });
+            if let Some(timeout_ms) = timeout_ms {
+                params["timeout"] = serde_json::json!(timeout_ms);
+            }
+
+            let response =
+                handle_with_policy(&ctx, Some(launch(daemon.connection.clone())), params);
+            assert!(response.success, "{response:?}");
+            let done = terminal(
+                ctx.bash_background(),
+                response.data["task_id"].as_str().unwrap(),
+            )
+            .await;
+            assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+
+            let runs = exec_runs(&daemon);
+            assert_eq!(runs.len(), 1);
+            let captured: RunRequest = serde_json::from_value(runs[0].clone()).unwrap();
+            assert_eq!(captured.queue_wait_limit_s, expected_seconds, "{runs:?}");
+            assert_eq!(
+                runs[0].get("queue_wait_limit_s").cloned(),
+                expected_seconds.map(serde_json::Value::from),
+                "background={background}, timeout_ms={timeout_ms:?}: {runs:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn local_bash_keeps_its_caller_timeout_without_remote_dispatch() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = restarted_context_with_runon(dir.path(), false);
@@ -10576,7 +10637,15 @@ async fn runon_retry_backoff_large_hints_are_not_shortened() {
         let dir = tempfile::tempdir().unwrap();
         let mut clock = PausedDrainingClock::new(dir.path());
         let registry = registry();
-        let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+        let mut remote = launch(daemon.connection.clone());
+        remote.explicit_runon = true;
+        // An explicit timeout also caps hinted retries, so allow the 30s hint to finish.
+        let task = start_with_launch(
+            &registry,
+            dir.path(),
+            remote,
+            crate::bash_background::HardKill::After(Duration::from_secs(60)),
+        );
         let first = clock.now();
         clock
             .expect_sleep(first, first + if signer { 30_000 } else { 1000 })
@@ -10590,6 +10659,34 @@ async fn runon_retry_backoff_large_hints_are_not_shortened() {
         assert_eq!(terminal(&registry, &task).await.exit_code, Some(0));
         assert_eq!(exec_runs(&daemon).len(), 2);
     }
+}
+
+#[tokio::test]
+async fn runon_explicit_timeout_prevents_a_hinted_retry_at_the_queue_deadline() {
+    let daemon = daemon(retry_backoff_script(true, 30_000), "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let first = clock.now();
+    clock.expect_sleep(first, first + 30_000).await;
+    let runs = exec_runs(&daemon);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["timeout"], 30);
+    assert_eq!(runs[0]["queue_wait_limit_s"], 30);
+
+    clock.advance(29_999);
+    assert_eq!(exec_runs(&daemon).len(), 1, "must honour the runner's hint");
+    clock.advance(1);
+    let done = terminal(&registry, &task).await;
+    assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
+    assert_runon_refusal(&refusal_response(done), SIGNER_REFUSED);
+    assert_eq!(
+        exec_runs(&daemon).len(),
+        1,
+        "no request at the queue deadline"
+    );
+    assert_no_retry_sleep(&mut clock);
 }
 
 #[tokio::test]
