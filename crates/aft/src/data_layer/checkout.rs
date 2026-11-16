@@ -39,7 +39,7 @@ use super::graph_store::{Held, SectionsWriter, StoredSlices};
 use super::incremental::{LiveCheckout, UpdateError, UpdateStats};
 use super::overlay::{CacheKey, OverlaySlices, PreparedSlice};
 use super::query::{SliceReader, SliceSource};
-use super::refresh_budget::{RefreshBudget, RefreshLimit};
+use super::refresh_budget::{RefreshBudget, RefreshLimit, Stage};
 use super::slice::FileSlice;
 use crate::callgraph_store::join::{CallgraphBlob, ParseBlob};
 use staged_records::StagedKind;
@@ -56,6 +56,8 @@ use text_build::TextBuild;
 mod grammar_parity_tests;
 #[cfg(test)]
 pub(super) mod publication_tests;
+#[cfg(test)]
+mod refresh_cost_measure;
 #[cfg(test)]
 mod resume_tests;
 #[cfg(test)]
@@ -470,6 +472,7 @@ impl GraphEngine {
                 state: to.state.clone(),
                 replaced: BTreeMap::new(),
                 removed: BTreeSet::new(),
+                sites_only: BTreeSet::new(),
                 records: BTreeMap::new(),
                 dead_code: DeadCodeMemo::new(Arc::clone(&to.dead_code.memory_epoch)),
             },
@@ -574,6 +577,9 @@ struct Refreshed {
     replaced: BTreeMap<String, RefreshedFile>,
     /// Files the publication has that the checkout no longer parses.
     removed: BTreeSet<String>,
+    /// Files of `replaced` that only had their method-call sites resolved
+    /// again, which a refresh's budget counts apart (see `refresh_budget`).
+    sites_only: BTreeSet<String>,
     /// The content record of each file whose content changed since the
     /// publication, which dead code reads its stored facts from: the
     /// publication holds the file's old record. Kept encoded and shared
@@ -3233,16 +3239,26 @@ impl Checkout {
                 .state
                 .clone()
                 .unwrap_or_else(|| Arc::new(published.state.clone()));
+            // What earlier refreshes since the publication resolved again,
+            // each file in the class its budget admitted it to.
             let invalidated = live
                 .refreshed
                 .as_ref()
-                .map_or_else(BTreeSet::new, |refreshed| {
-                    refreshed
+                .map_or_else(Default::default, |refreshed| {
+                    let full = refreshed
                         .replaced
                         .keys()
+                        .filter(|file| !refreshed.sites_only.contains(*file))
                         .chain(&refreshed.removed)
                         .cloned()
-                        .collect()
+                        .collect::<BTreeSet<_>>();
+                    let sites = refreshed
+                        .sites_only
+                        .iter()
+                        .filter(|file| refreshed.replaced.contains_key(*file))
+                        .cloned()
+                        .collect::<BTreeSet<_>>();
+                    (full, sites)
                 });
             (
                 published,
@@ -3273,7 +3289,7 @@ impl Checkout {
             || published.graph.parsed_files().count(),
             |engine| engine.live.inputs.parses.len(),
         );
-        let mut budget = RefreshBudget::new(parsed, invalidated);
+        let mut budget = RefreshBudget::new(parsed, invalidated.0, invalidated.1);
         // A damaged stored record or fragment can stop the update where it
         // expects one (every file the engine lists has a parse and a
         // resolution). Such a stop fails this refresh as damage, and the
@@ -3296,11 +3312,8 @@ impl Checkout {
                     return Ok(None);
                 }
                 crate::slog_info!(
-                    "data layer cold refresh: root={} invalidated={} threshold={} parsed={}",
-                    self.root.display(),
-                    limit.invalidated,
-                    limit.threshold,
-                    limit.parsed
+                    "data layer cold refresh: root={} {limit}",
+                    self.root.display()
                 );
                 let started = Instant::now();
                 let rebuilt = if let Some(reservation) = reservation {
@@ -3424,14 +3437,14 @@ impl Checkout {
     ) -> Result<EngineUpdate, DataError> {
         // This test needs neither extraction nor an engine start. A single
         // watcher batch can already be larger than incremental admission.
-        if let Err(limit) = budget.check(changes.len()) {
+        if let Err(limit) = budget.check_changed(changes.len()) {
             return Ok(EngineUpdate::Cold(limit));
         }
         let changed_members = changes
             .keys()
             .filter_map(|path| std::str::from_utf8(path).ok().map(str::to_owned))
             .collect::<BTreeSet<_>>();
-        if let Err(limit) = budget.include(&changed_members) {
+        if let Err(limit) = budget.include(Stage::Changed, &changed_members) {
             return Ok(EngineUpdate::Cold(limit));
         }
         self.ensure_engine(slot, published)?;
@@ -3525,6 +3538,16 @@ impl Checkout {
                     .collect::<Vec<_>>()
             });
             for (file, made) in files.into_iter().zip(made) {
+                // The next refresh's budget counts this file in the class
+                // this one admitted it to; full work once outweighs any
+                // later sites-only pass until the publication.
+                if made.is_some() && !budget.full_work(file) {
+                    if !engine.refreshed.replaced.contains_key(file) {
+                        engine.refreshed.sites_only.insert(file.clone());
+                    }
+                } else {
+                    engine.refreshed.sites_only.remove(file);
+                }
                 match made {
                     Some((slice, refreshed)) => {
                         engine.overlay.replace_encoded(file, slice);
@@ -4251,6 +4274,7 @@ impl Checkout {
                 state: published.state.clone(),
                 replaced: BTreeMap::new(),
                 removed: BTreeSet::new(),
+                sites_only: BTreeSet::new(),
                 records: BTreeMap::new(),
                 dead_code: DeadCodeMemo::new(Arc::clone(&self.memory_epoch)),
             },
@@ -6135,12 +6159,14 @@ impl MemoryParts {
             state,
             replaced,
             removed,
+            sites_only,
             records,
             dead_code,
         } = refreshed;
         self.shared += state.heap_bytes(seen);
         self.callgraph += replaced.heap_bytes(seen)
             + removed.heap_bytes(seen)
+            + sites_only.heap_bytes(seen)
             + records.heap_bytes(seen)
             + dead_code.heap_bytes(seen);
     }
@@ -6335,11 +6361,13 @@ impl Checkout {
                 state,
                 replaced: _,
                 removed,
+                sites_only,
                 records,
                 dead_code,
             } = refreshed;
             state.heap_bytes(&mut seen)
                 + removed.heap_bytes(&mut seen)
+                + sites_only.heap_bytes(&mut seen)
                 + records.heap_bytes(&mut seen)
                 + dead_code.heap_bytes(&mut seen)
         }));
@@ -7544,7 +7572,11 @@ pub fn other() { callee(); }
                 &published,
                 &state,
                 &changes,
-                &mut RefreshBudget::new(published.graph.parsed_files().count(), BTreeSet::new())
+                &mut RefreshBudget::new(
+                    published.graph.parsed_files().count(),
+                    BTreeSet::new(),
+                    BTreeSet::new()
+                )
             ),
             Err(DataError::Damaged(_))
         ));
@@ -8939,6 +8971,111 @@ pub fn other() { callee(); }
         cold.build().unwrap();
         let compared = super::super::checkout_gate::compare_engines(checkout, &cold).unwrap();
         assert_eq!(compared.files, 1102);
+    }
+
+    /// A checkout whose engine was let go after a publication starts it
+    /// again from that publication on its next edit and applies only that
+    /// edit: no cold build, and the graph a cold build of the same files
+    /// gives.
+    #[test]
+    fn an_engine_let_go_after_a_publication_restarts_without_a_cold_build() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout =
+            Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        edit(
+            &checkout,
+            "src/util.rs",
+            "pub fn callee() {}\npub fn other() { callee(); }\n",
+        );
+        checkout.refresh_callgraph().unwrap().expect("applied");
+        checkout.publish_changes().unwrap().expect("published");
+        assert_eq!(checkout.engine_starts(), 1);
+        let before = source_work_for_test(root.path()).cold_builds;
+        // Let the engine go the way an idle one goes, then keep the next one.
+        layer.set_engine_idle(std::time::Duration::from_millis(50));
+        wait_until_not(|| checkout.engine_census_bytes().is_some());
+        layer.set_engine_idle(std::time::Duration::from_secs(600));
+        edit(
+            &checkout,
+            "src/lib.rs",
+            "mod util;\npub fn caller() { util::callee(); util::other(); }\n",
+        );
+        let restarted = checkout.refresh_callgraph().unwrap().expect("applied");
+        assert!(!restarted.cold_build, "{restarted:?}");
+        assert_eq!(restarted.changed_paths, 1, "{restarted:?}");
+        assert_eq!(checkout.engine_starts(), 2);
+        assert_eq!(source_work_for_test(root.path()).cold_builds, before);
+        let cold_store = tempfile::tempdir().unwrap();
+        let cold =
+            Checkout::bind(Arc::clone(&layer), cold_store.path(), family(), root.path()).unwrap();
+        cold.build().unwrap();
+        super::super::checkout_gate::compare_engines(&checkout, &cold).unwrap();
+        let ours = callers_of(&checkout.view().unwrap(), "src/util.rs", "other");
+        assert!(ours.contains("caller"), "{ours}");
+        assert_eq!(
+            ours,
+            callers_of(&cold.view().unwrap(), "src/util.rs", "other")
+        );
+    }
+
+    /// Adding a type that declares a method more than a quarter of the files
+    /// call reaches every one of those callers, but only for their
+    /// method-call sites: the refresh stays incremental, as does the next
+    /// edit before the publication (which carries those callers over), and
+    /// the graph is the one a cold build gives.
+    #[test]
+    fn a_method_name_fan_out_past_a_quarter_of_the_files_refreshes_without_a_cold_build() {
+        const CALLERS: usize = 1_100;
+        let store = tempfile::tempdir().unwrap();
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let mut files = BTreeMap::new();
+        files.insert(
+            "store.ts".to_string(),
+            "export class Store { get(): number { return 1; } }\n".to_string(),
+        );
+        for i in 0..CALLERS {
+            files.insert(
+                format!("c{i}.ts"),
+                format!("export function c{i}(x: any) {{ return x.get(); }}\n"),
+            );
+        }
+        let worktree = Worktree::new(&layer, store.path(), files);
+        let root = worktree.dir.path();
+        let checkout = &worktree.checkout;
+        let before = source_work_for_test(root).cold_builds;
+        write(
+            root,
+            "extra.ts",
+            "export class Extra { get(): number { return 2; } }\n",
+        );
+        checkout.record_paths(&[b"extra.ts".to_vec()]).unwrap();
+        let added = checkout.refresh_callgraph().unwrap().expect("applied");
+        assert!(!added.cold_build, "{added:?}");
+        // Past the limit for full work: the old single count went cold here.
+        assert!(
+            added.touched.len() > 1024,
+            "touched {}",
+            added.touched.len()
+        );
+        assert_eq!(source_work_for_test(root).cold_builds, before);
+        write(
+            root,
+            "c0.ts",
+            "export function c0(x: any) { return x.get() + 1; }\n",
+        );
+        checkout.record_paths(&[b"c0.ts".to_vec()]).unwrap();
+        let next = checkout.refresh_callgraph().unwrap().expect("applied");
+        assert!(!next.cold_build, "{next:?}");
+        assert_eq!(source_work_for_test(root).cold_builds, before);
+        let cold_store = tempfile::tempdir().unwrap();
+        let cold = Checkout::bind(Arc::clone(&layer), cold_store.path(), family(), root).unwrap();
+        cold.build().unwrap();
+        let compared = super::super::checkout_gate::compare_engines(checkout, &cold).unwrap();
+        assert_eq!(compared.files, CALLERS + 2);
     }
 
     fn record_many_notes(checkout: &Checkout, root: &Path, generation: usize) {

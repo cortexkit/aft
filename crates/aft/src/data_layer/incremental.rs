@@ -48,7 +48,7 @@ use super::callgraph::{
     CheckoutInputs, FileResolution, MethodCallInputs, Resolutions,
 };
 use super::graph_store::StoredSlices;
-use super::refresh_budget::{RefreshBudget, RefreshLimit};
+use super::refresh_budget::{RefreshBudget, RefreshLimit, Stage};
 use super::subjects::{affected_by, subjects, Subject};
 
 /// What one update did, for measurement.
@@ -103,10 +103,11 @@ impl From<ManifestJoinError> for UpdateError {
 
 fn admit<'a>(
     budget: &mut Option<&mut RefreshBudget>,
+    stage: Stage,
     files: impl IntoIterator<Item = &'a String>,
 ) -> Result<(), UpdateError> {
     if let Some(budget) = budget.as_deref_mut() {
-        budget.include(files).map_err(UpdateError::Limit)?;
+        budget.include(stage, files).map_err(UpdateError::Limit)?;
     }
     Ok(())
 }
@@ -746,6 +747,17 @@ impl LiveCheckout {
         )
     }
 
+    /// The files whose recorded method-call sites read the method `name`:
+    /// what a change to a declaration of it admits. For measurement.
+    #[cfg(test)]
+    pub(crate) fn method_site_readers(&self, name: &str) -> BTreeSet<String> {
+        self.reverse.sites_of(
+            &[crate::callgraph_store::join::dispatch::dependency::method(
+                name,
+            )],
+        )
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "the four passes run in order and each reads the previous one's results"
@@ -756,7 +768,7 @@ impl LiveCheckout {
         changed: &BTreeSet<String>,
         mut budget: Option<&mut RefreshBudget>,
     ) -> Result<UpdateStats, UpdateError> {
-        admit(&mut budget, changed)?;
+        admit(&mut budget, Stage::Changed, changed)?;
         let mut stats = UpdateStats {
             changed_paths: changed.len(),
             ..UpdateStats::default()
@@ -818,7 +830,7 @@ impl LiveCheckout {
             // method-call sites are processed.
             let keys = MethodCallInputs::changed_parse_method_keys(&old, inputs, &contents);
             let readers = self.reverse.sites_of(&keys);
-            admit(&mut budget, &readers)?;
+            admit(&mut budget, Stage::MethodReaders, &readers)?;
         }
         // Configuration files added or removed. A content change of an
         // existing one reaches its readers through their recorded field
@@ -960,7 +972,11 @@ impl LiveCheckout {
         rebind.extend(contents.iter().cloned());
         rebind.extend(stale.binding.iter().cloned());
         rebind.retain(|path| inputs.parses.contains_key(path));
-        admit(&mut budget, rebind.iter().chain(&removed_parses))?;
+        admit(
+            &mut budget,
+            Stage::Rebind,
+            rebind.iter().chain(&removed_parses),
+        )?;
         let rebind = rebind.into_iter().collect::<Vec<_>>();
         let rebind_refs = rebind.iter().collect::<Vec<_>>();
         let new_bound = bind_all(inputs, &rebind_refs)?;
@@ -1092,7 +1108,7 @@ impl LiveCheckout {
                 resolve.insert(path.clone());
             }
         }
-        admit(&mut budget, &resolve)?;
+        admit(&mut budget, Stage::Resolve, &resolve)?;
         // Resolving a Rust file reads the module tree, which the resolver
         // builds by binding every module-declaring file; bind those in
         // parallel first (see `BindCache::bind_module_declaring`).
@@ -1165,7 +1181,7 @@ impl LiveCheckout {
         }
         drop(answers);
         drop(trace_answers);
-        admit(&mut budget, &resolve)?;
+        admit(&mut budget, Stage::Resolve, &resolve)?;
         #[cfg(feature = "test-hooks")]
         self.profile_refresh("replay", &mut profile_clock);
         #[cfg(feature = "test-hooks")]
@@ -1232,7 +1248,7 @@ impl LiveCheckout {
             }
         }
         recompute.extend(traces_changed);
-        admit(&mut budget, &recompute)?;
+        admit(&mut budget, Stage::Dispatch, &recompute)?;
         for path in &recompute {
             let (_, parse) = &inputs.parses[path.as_str()];
             let dispatch = dispatch_targets(path, parse, &index, &facts)?;
@@ -1284,7 +1300,7 @@ impl LiveCheckout {
         }
         sites.extend(self.reverse.sites_of(&site_keys));
         sites.retain(|path| inputs.parses.contains_key(path));
-        admit(&mut budget, &sites)?;
+        admit(&mut budget, Stage::Sites, &sites)?;
         let paths = sites.iter().collect::<Vec<_>>();
         for (path, kept, dependencies) in
             self.calls.resolve_sites(inputs, &self.resolved, &paths)?
