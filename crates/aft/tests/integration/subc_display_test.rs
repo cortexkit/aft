@@ -107,6 +107,34 @@ async fn fake_display(
 ) {
     let limits = DisplayLimits::new(16_384, 3_145_728, 16_384, 0);
     loop {
+        if frame.header.ty == FrameType::Goodbye {
+            return;
+        }
+        if frame.header.ty == FrameType::Ping {
+            send_frame(
+                &mut stream,
+                Frame::build(
+                    FrameType::Pong,
+                    frame.header.flags,
+                    0,
+                    0,
+                    frame.header.corr,
+                    vec![],
+                )
+                .unwrap(),
+            )
+            .await;
+            let Ok(Some(next)) = crate::subc_fake::read_frame(&mut stream).await else {
+                return;
+            };
+            frame = next;
+            continue;
+        }
+        assert_eq!(
+            frame.header.ty,
+            FrameType::Request,
+            "unexpected fake display frame type"
+        );
         let body: Value = serde_json::from_slice(&frame.body).unwrap();
         let reply = match body["op"].as_str().or(body["name"].as_str()) {
             Some("catalog.list") => json!({
