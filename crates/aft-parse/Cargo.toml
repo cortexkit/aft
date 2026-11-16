@@ -13,7 +13,7 @@ test-support = ["aft-base/test-support", "dep:tempfile", "dep:rayon"]
 test-hooks = ["aft-base/test-hooks"]
 test-timing-hooks = ["aft-base/test-timing-hooks"]
 callgraph-shape-census = ["aft-base/callgraph-shape-census"]
-wasm-grammars = ["tree-sitter/wasm", "dep:wasmtime", "dep:wasmtime-c-api-impl", "dep:reqwest"]
+wasm-grammars = ["tree-sitter/wasm", "dep:wasmtime", "dep:wasmtime-c-api-impl", "dep:reqwest", "dep:getrandom"]
 
 [dependencies]
 aft-base = { path = "../aft-base", version = "0.65.0" }
@@ -60,6 +60,7 @@ ignore = "0.4"
 regex = "1"
 sha2 = { version = "0.10", features = ["compress"] }
 blake3 = "1"
+getrandom = { version = "0.3", optional = true }
 globset = "0.4"
 rustc-hash = "2"
 notify = "8"

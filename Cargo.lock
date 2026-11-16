@@ -108,6 +108,7 @@ dependencies = [
  "blake3",
  "cortexkit-tree-sitter-scss",
  "dekobon-tree-sitter-groovy",
+ "getrandom 0.3.4",
  "globset",
  "ignore",
  "libc",
