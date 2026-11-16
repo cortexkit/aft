@@ -69,6 +69,37 @@ async fn request(stream: &mut TcpStream, channel: u16, corr: u64, value: Value) 
     }
 }
 
+async fn wait_for_ready_root(stream: &mut TcpStream, root: &std::path::Path) {
+    let root = std::fs::canonicalize(root).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut corr = 1000;
+    loop {
+        let frame = request(
+            stream,
+            0,
+            corr,
+            serde_json::to_value(ModuleControlRequest::HealthCheck {}).unwrap(),
+        )
+        .await;
+        corr += 1;
+        let report: Value = serde_json::from_slice(&frame.body).unwrap();
+        if report["metrics"]["stale"] != true
+            && report["metrics"]["roots"].as_array().is_some_and(|roots| {
+                roots
+                    .iter()
+                    .any(|entry| entry["project_root"] == json!(root) && entry["state"] == "ready")
+            })
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "root never became ready: {report}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn fake_display(
     mut stream: TcpStream,
     mut frame: Frame,
@@ -240,6 +271,7 @@ async fn run_display_case(switch: Option<&str>) {
         .unwrap();
         bind["identity"]["project_root"] = json!(project.path());
         request(&mut stream, 0, 10 + index as u64, bind).await;
+        wait_for_ready_root(&mut stream, project.path()).await;
         let call_key = format!("display-lineage:{index}");
         let response = request(&mut stream, channel, 20 + index as u64, json!({
             "op":"tool.call", "name":"bash", "arguments":{"command":"printf display-ok","compressed":false},
@@ -269,7 +301,8 @@ async fn run_display_case(switch: Option<&str>) {
                     .await;
                     panic!(
                         "runner record never reached the display module: {}",
-                        String::from_utf8_lossy(&report.body)
+                        serde_json::from_slice::<Value>(&report.body).unwrap()["metrics"]
+                            ["display"]
                     );
                 }
             };

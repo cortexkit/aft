@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 use subc_protocol::Principal;
 
 pub(super) mod counters;
+mod diagnostics;
 use counters::{count, Counter::*};
 
 struct Writer {
@@ -108,7 +109,7 @@ pub(crate) fn health() -> Value {
     } else {
         Some("not_started")
     };
-    json!({"enabled": enabled, "reason": reason, "zero_counters_omitted": true,
+    json!({"enabled": enabled, "reason": reason, "last_error": diagnostics::health(), "zero_counters_omitted": true,
         "counters": counters::snapshot()})
 }
 
@@ -802,7 +803,7 @@ async fn send_loop(connection_file: PathBuf, mut receiver: tokio::sync::mpsc::Re
                 }
             };
             if let Some(module_id) = module_id {
-                if let Ok(route) = client
+                match client
                     .open_route(
                         subc_protocol::RouteTarget::ToolProvider { module_id },
                         BindIdentity::new("aft", "tool-display"),
@@ -810,60 +811,65 @@ async fn send_loop(connection_file: PathBuf, mut receiver: tokio::sync::mpsc::Re
                     )
                     .await
                 {
-                    let description = client
-                        .request(
-                            &route,
-                            br#"{"name":"role.describe","arguments":{}}"#.to_vec(),
-                            CallOptions::default(),
-                        )
-                        .await;
-                    let limits = match description {
-                        Ok(bytes) => display_limits(&bytes),
-                        Err(_) => {
-                            count(WriterDescribe);
-                            None
-                        }
-                    };
-                    if let Some(limits) = limits {
-                        if let Ok(mut cached) = writer.limits.lock() {
-                            *cached = limits.clone();
-                        } else {
-                            count(WriterLimitsLock);
-                        }
-                        // An admitted body cannot be rebuilt for a smaller store.
-                        // Lose that optional kind rather than change its first bytes.
-                        if entry.body.len() as u64 <= limits.max_bytes(&entry.kind).unwrap_or(0) {
-                            match client
-                                .request(&route, entry.frame.clone(), CallOptions::default())
-                                .await
-                            {
-                                Ok(bytes) => {
-                                    retry = retry_reply(&bytes);
-                                }
-                                Err(subc_client_rs::CallError::Module(error)) => {
-                                    retry = error.code == "module_warming";
-                                    count(if retry {
-                                        WriterModuleWarming
-                                    } else {
-                                        WriterModuleRefused
-                                    });
-                                }
-                                Err(_) => count(WriterRequest),
+                    Ok(route) => {
+                        let description = client
+                            .request(
+                                &route,
+                                br#"{"name":"role.describe","arguments":{}}"#.to_vec(),
+                                CallOptions::default(),
+                            )
+                            .await;
+                        let limits = match description {
+                            Ok(bytes) => display_limits(&bytes),
+                            Err(_) => {
+                                count(WriterDescribe);
+                                None
                             }
-                        } else {
-                            count(WriterTooLarge);
-                            retry = false;
+                        };
+                        if let Some(limits) = limits {
+                            if let Ok(mut cached) = writer.limits.lock() {
+                                *cached = limits.clone();
+                            } else {
+                                count(WriterLimitsLock);
+                            }
+                            // An admitted body cannot be rebuilt for a smaller store.
+                            // Lose that optional kind rather than change its first bytes.
+                            if entry.body.len() as u64 <= limits.max_bytes(&entry.kind).unwrap_or(0)
+                            {
+                                match client
+                                    .request(&route, entry.frame.clone(), CallOptions::default())
+                                    .await
+                                {
+                                    Ok(bytes) => {
+                                        retry = retry_reply(&bytes);
+                                    }
+                                    Err(subc_client_rs::CallError::Module(error)) => {
+                                        retry = error.code == "module_warming";
+                                        count(if retry {
+                                            WriterModuleWarming
+                                        } else {
+                                            WriterModuleRefused
+                                        });
+                                    }
+                                    Err(_) => count(WriterRequest),
+                                }
+                            } else {
+                                count(WriterTooLarge);
+                                retry = false;
+                            }
+                        }
+                        if client
+                            .close_handle(&route, CloseRouteOptions::default())
+                            .await
+                            .is_err()
+                        {
+                            count(WriterCloseRoute);
                         }
                     }
-                    if client
-                        .close_handle(&route, CloseRouteOptions::default())
-                        .await
-                        .is_err()
-                    {
-                        count(WriterCloseRoute);
+                    Err(error) => {
+                        count(WriterOpenRoute);
+                        diagnostics::route_open(&error);
                     }
-                } else {
-                    count(WriterOpenRoute);
                 }
             }
         }
