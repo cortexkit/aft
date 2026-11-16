@@ -415,7 +415,7 @@ mod tests {
             .unwrap();
             paths.push(path);
         }
-        let ordinary = Parent::open(fixture.path())
+        let ordinary = Parent::open(&fixture.path().join("ordinary"))
             .unwrap()
             .allocate(Path::new(""))
             .unwrap();
