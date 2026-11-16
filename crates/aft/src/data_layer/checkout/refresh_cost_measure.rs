@@ -9,8 +9,9 @@
 //! ```
 //!
 //! `AFT_TEST_REFRESH_COST_PROJECT` names the checkout to copy (AFT's own by
-//! default), `AFT_TEST_REFRESH_COST_LANG=ts` writes the probe files in
-//! TypeScript rather than Rust, and `AFT_TEST_REFRESH_COST_THREADS` sets the
+//! default), `AFT_TEST_REFRESH_COST_LANG` (`ts` or `java`) writes the probe files
+//! in that language rather than Rust, `AFT_TEST_REFRESH_COST_TYPE_FILE` names a
+//! file of the checkout whose last class gains a `get` method, and `AFT_TEST_REFRESH_COST_THREADS` sets the
 //! data layer's threads (8 by default). Each refresh prints its wall and CPU
 //! time and what its budget admitted, stage by stage.
 
@@ -57,15 +58,28 @@ fn cpu_ms() -> f64 {
     ms(usage.ru_utime) + ms(usage.ru_stime)
 }
 
+/// A line of `/proc/self/status`, in MiB; `None` off Linux.
+fn status_mib(field: &str) -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|line| line.starts_with(field))?;
+    let kib = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    Some(kib >> 10)
+}
+
 fn timed<T>(run: impl FnOnce() -> T) -> (T, String) {
+    // Resets the process's peak resident size to its current one (Linux),
+    // so the peak read afterwards is this step's.
+    let _ = std::fs::write("/proc/self/clear_refs", "5");
+    let rss = status_mib("VmRSS:");
     let (wall, cpu) = (Instant::now(), cpu_ms());
     let value = run();
     (
         value,
         format!(
-            "wall_ms={} cpu_ms={:.0}",
+            "wall_ms={} cpu_ms={:.0} rss_before_mib={rss:?} peak_rss_mib={:?}",
             wall.elapsed().as_millis(),
-            cpu_ms() - cpu
+            cpu_ms() - cpu,
+            status_mib("VmHWM:")
         ),
     )
 }
@@ -173,26 +187,100 @@ fn ident(name: &str) -> bool {
         && !RUST_KEYWORDS.contains(&name)
 }
 
-fn declaring_file(ts: bool, n: usize, names: &[String]) -> (String, String) {
-    if ts {
-        let methods = names
-            .iter()
-            .map(|name| format!("  {name}(): number {{ return 0; }}\n"))
-            .collect::<String>();
-        (
-            format!("probe_fan/probe_fan_{n}.ts"),
-            format!("export class ProbeFan{n} {{\n{methods}}}\n"),
-        )
-    } else {
-        let methods = names
-            .iter()
-            .map(|name| format!("    pub fn {name}(&self) -> usize {{ 0 }}\n"))
-            .collect::<String>();
-        (
-            format!("probe_fan/probe_fan_{n}.rs"),
-            format!("pub struct ProbeFan{n};\nimpl ProbeFan{n} {{\n{methods}}}\n"),
-        )
+/// The language the probe files are written in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lang {
+    Rust,
+    TypeScript,
+    Java,
+}
+
+impl Lang {
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Rust => "rs",
+            Self::TypeScript => "ts",
+            Self::Java => "java",
+        }
     }
+
+    /// A method `name` declared in this language, for inserting into a
+    /// class body.
+    fn method(self, name: &str) -> String {
+        match self {
+            Self::Rust => format!("    pub fn {name}(&self) -> usize {{ 0 }}\n"),
+            Self::TypeScript => format!("  {name}(): number {{ return 0; }}\n"),
+            Self::Java => format!("    public int {name}() {{ return 0; }}\n"),
+        }
+    }
+}
+
+const JAVA_KEYWORDS: &[&str] = &[
+    "abstract",
+    "assert",
+    "boolean",
+    "break",
+    "byte",
+    "case",
+    "catch",
+    "char",
+    "class",
+    "const",
+    "continue",
+    "default",
+    "do",
+    "double",
+    "else",
+    "enum",
+    "extends",
+    "final",
+    "finally",
+    "float",
+    "for",
+    "goto",
+    "if",
+    "implements",
+    "import",
+    "instanceof",
+    "int",
+    "interface",
+    "long",
+    "native",
+    "new",
+    "package",
+    "private",
+    "protected",
+    "public",
+    "return",
+    "short",
+    "static",
+    "strictfp",
+    "super",
+    "switch",
+    "synchronized",
+    "this",
+    "throw",
+    "throws",
+    "transient",
+    "try",
+    "void",
+    "volatile",
+    "while",
+];
+
+fn declaring_file(lang: Lang, n: usize, names: &[String]) -> (String, String) {
+    let methods = names
+        .iter()
+        .filter(|name| lang != Lang::Java || !JAVA_KEYWORDS.contains(&name.as_str()))
+        .map(|name| lang.method(name))
+        .collect::<String>();
+    let path = format!("probe_fan/ProbeFan{n}.{}", lang.extension());
+    let text = match lang {
+        Lang::Rust => format!("pub struct ProbeFan{n};\nimpl ProbeFan{n} {{\n{methods}}}\n"),
+        Lang::TypeScript => format!("export class ProbeFan{n} {{\n{methods}}}\n"),
+        Lang::Java => format!("package probe_fan;\n\npublic class ProbeFan{n} {{\n{methods}}}\n"),
+    };
+    (path, text)
 }
 
 #[test]
@@ -202,7 +290,11 @@ fn measure_method_reader_refreshes() {
         || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."),
         PathBuf::from,
     );
-    let ts = std::env::var("AFT_TEST_REFRESH_COST_LANG").is_ok_and(|lang| lang == "ts");
+    let lang = match std::env::var("AFT_TEST_REFRESH_COST_LANG").as_deref() {
+        Ok("ts") => Lang::TypeScript,
+        Ok("java") => Lang::Java,
+        _ => Lang::Rust,
+    };
     let threads = std::env::var("AFT_TEST_REFRESH_COST_THREADS")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -219,11 +311,7 @@ fn measure_method_reader_refreshes() {
         report.files, report.parsed_files
     );
     let parsed = report.parsed_files;
-    let warm = if ts {
-        "probe_fan/warm.ts"
-    } else {
-        "probe_fan/warm.rs"
-    };
+    let warm = &format!("probe_fan/Warm.{}", lang.extension());
     write(&checkout, warm, "// warm 0\n");
     refresh(&checkout, "engine start + one new file");
     publish(&checkout, "warm");
@@ -302,7 +390,7 @@ fn measure_method_reader_refreshes() {
             union.len(),
             chosen.len()
         );
-        let (path, text) = declaring_file(ts, n, &chosen);
+        let (path, text) = declaring_file(lang, n, &chosen);
         write(&checkout, &path, &text);
         refresh(&checkout, &format!("{label} add file"));
         publish(&checkout, &label);
@@ -318,29 +406,29 @@ fn measure_method_reader_refreshes() {
         "remove", "push", "clear", "close",
     ]
     .map(str::to_string);
-    let (path, text) = declaring_file(ts, 100, &common);
+    let (path, text) = declaring_file(lang, 100, &common);
     write(&checkout, &path, &text);
     refresh(&checkout, "new file declaring common method names");
     publish(&checkout, "common names");
-    let (path, text) = declaring_file(ts, 101, &["get".to_string(), "new".to_string()]);
+    let (path, text) = declaring_file(lang, 101, &["get".to_string(), "new".to_string()]);
     write(&checkout, &path, &text);
     refresh(&checkout, "new file declaring get and new");
     publish(&checkout, "get and new");
     // A method added to a type an existing, published file declares: the
     // precise per-name diff applies.
-    let (_, text) = declaring_file(ts, 102, &["probe_only".to_string()]);
+    let (_, text) = declaring_file(lang, 102, &["probe_only".to_string()]);
     write(&checkout, warm, &text);
     refresh(
         &checkout,
         "existing file gains a type with one unique method",
     );
     publish(&checkout, "existing file");
-    let (_, text) = declaring_file(ts, 102, &["probe_only".to_string(), "get".to_string()]);
+    let (_, text) = declaring_file(lang, 102, &["probe_only".to_string(), "get".to_string()]);
     write(&checkout, warm, &text);
     refresh(&checkout, "existing type gains method get");
     publish(&checkout, "existing get");
     let (_, text) = declaring_file(
-        ts,
+        lang,
         102,
         &[
             "probe_only".to_string(),
@@ -351,4 +439,16 @@ fn measure_method_reader_refreshes() {
     write(&checkout, warm, &text);
     refresh(&checkout, "existing type gains method new");
     publish(&checkout, "existing new");
+
+    // `get` added to a widely used class of the checkout itself, before its
+    // closing brace.
+    if let Ok(path) = std::env::var("AFT_TEST_REFRESH_COST_TYPE_FILE") {
+        let full = checkout.root().join(&path);
+        let mut text = std::fs::read_to_string(&full).unwrap();
+        let end = text.rfind('}').expect("a closing brace");
+        text.insert_str(end, &lang.method("get"));
+        write(&checkout, &path, &text);
+        refresh(&checkout, &format!("{path} gains method get"));
+        publish(&checkout, "type file");
+    }
 }

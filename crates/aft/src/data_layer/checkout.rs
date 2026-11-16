@@ -9040,7 +9040,7 @@ pub fn other() { callee(); }
         for i in 0..CALLERS {
             files.insert(
                 format!("c{i}.ts"),
-                format!("export function c{i}(x: any) {{ return x.get(); }}\n"),
+                format!("export function c{i}(x) {{ return x.get(); }}\n"),
             );
         }
         let worktree = Worktree::new(&layer, store.path(), files);
@@ -9065,7 +9065,7 @@ pub fn other() { callee(); }
         write(
             root,
             "c0.ts",
-            "export function c0(x: any) { return x.get() + 1; }\n",
+            "export function c0(x) { return x.get() + 1; }\n",
         );
         checkout.record_paths(&[b"c0.ts".to_vec()]).unwrap();
         let next = checkout.refresh_callgraph().unwrap().expect("applied");
