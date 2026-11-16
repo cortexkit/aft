@@ -32,10 +32,10 @@ mod tests {
             let app = App::default_shared();
             let executor = Arc::new(Executor::new());
             let (writer, mut replies) = mpsc::channel(8);
-            let (completion, _completed) = mpsc::channel(8);
+            let (completion, mut completed) = mpsc::channel(8);
             let (lossy_tx, _lossy_rx) = mpsc::channel(8);
             let (reliable_tx, _reliable_rx) = mpsc::unbounded_channel();
-            let mut management_routes = HashMap::new();
+            let a0 = A0Egress::new(writer.clone(), completion.clone());
             let senders = PushSenders {
                 lossy_tx,
                 reliable_tx,
@@ -79,7 +79,7 @@ mod tests {
             handle_control_request(
                 &writer,
                 &writer,
-                &A0Egress::new(writer.clone(), completion.clone()),
+                &a0,
                 &frame,
                 &app,
                 &executor,
@@ -88,7 +88,7 @@ mod tests {
                 &mut HashMap::new(),
                 &mut HashMap::new(),
                 &mut HashMap::new(),
-                &mut management_routes,
+                &mut HashMap::new(),
                 &mut HashMap::new(),
                 &mut HashMap::new(),
                 &mut HashMap::new(),
@@ -114,12 +114,23 @@ mod tests {
             )
             .await
             .unwrap();
-            let reply = replies.try_recv().expect("management bind answer");
+            let mut reply = replies.try_recv().expect("management bind answer");
             assert_eq!(reply.header.corr, 91);
-            (
-                reply.frame.clone(),
-                management_routes.remove(&route_key(7, 1)),
-            )
+            let identity = if reply.header.ty == FrameType::Response {
+                assert!(reply.begin_ack_write());
+                reply.finish_ack_write(true);
+                let ControlCompletion::ManagementAckWritten {
+                    route, identity, ..
+                } = completed.recv().await.expect("written management ack")
+                else {
+                    panic!("management bind must publish a management ack");
+                };
+                assert_eq!(route, route_key(7, 1));
+                Some(identity)
+            } else {
+                None
+            };
+            (reply.frame.clone(), identity)
         })
     }
 
@@ -203,6 +214,16 @@ mod tests {
                 }
             });
         }
+        let flow = ManagementIdentity {
+            admission: ManagementAdmission::FlowOnly,
+            ..Default::default()
+        };
+        assert_eq!(
+            admit_management_flow_request(&flow, Some(&json!({"op": "display.read"})))
+                .unwrap_err()
+                .code,
+            "flow_scope_not_supported"
+        );
     }
 
     #[test]

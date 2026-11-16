@@ -6118,6 +6118,15 @@ where
                         if let Ok(body) = decoded.body() {
                             if body.get("name").or_else(|| body.get("op")).and_then(Value::as_str)
                                 == Some(cortexkit_role_tool_display::DISPLAY_READ) {
+                                if let Some(identity) = management_routes.get(&route) {
+                                    if let Err(error) = admit_management_flow_request(identity, Some(body)) {
+                                        log_management_refusal(identity, &decoded.frame, &error);
+                                        if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await {
+                                            break Err(error);
+                                        }
+                                        continue;
+                                    }
+                                }
                                 let principal = management_routes.get(&route)
                                     .filter(|identity| !matches!(identity.admission, ManagementAdmission::ProjectFree { .. }))
                                     .and_then(|identity| identity.principal.clone());

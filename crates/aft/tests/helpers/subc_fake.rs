@@ -118,6 +118,55 @@ where
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn auxiliary_consumer_stays_connected_after_refused_routes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut consumer = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let request = Frame::build(
+            FrameType::Request,
+            subc_protocol::Flags::new(false, subc_protocol::Priority::Interactive, false),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&serde_json::json!({
+                "op": "route.open",
+                "target": {"kind": "management_surface", "module_id": "ckbus"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let server = tokio::spawn(serve_without_modules(stream, request.clone()));
+        for attempt in 0..2 {
+            if attempt > 0 {
+                subc_transport::write_frame(&mut consumer, &request)
+                    .await
+                    .unwrap();
+            }
+            let reply = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                subc_transport::read_frame(&mut consumer),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            assert_eq!(reply.header.ty, FrameType::Error);
+            assert_eq!(reply.header.corr, 1);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&reply.body).unwrap()["code"],
+                "target_unavailable"
+            );
+        }
+        drop(consumer);
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[test]
     fn bus_refusal_preserves_correlation_and_does_not_hide_other_route_opens() {
         for module in ["ckbus", "claustrum", "prefrontal-core"] {
