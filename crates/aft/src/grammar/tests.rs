@@ -280,6 +280,33 @@ fn grammar_detection_golden_builtins_and_opt_in() {
             (extension == "luau").then_some(Luau)
         );
     }
+    // The read-free Luau test agrees with full detection for every name above,
+    // including headers that would otherwise be read and parsed.
+    let mut names: Vec<String> = mappings
+        .iter()
+        .flat_map(|(extensions, _)| extensions.split_whitespace())
+        .map(|extension| format!("nonexistent.{extension}"))
+        .collect();
+    names.extend(
+        [
+            "f.luau",
+            "f.LUAU",
+            "f.unknown",
+            "Jenkinsfile",
+            "no_extension",
+        ]
+        .map(String::from),
+    );
+    for name in &names {
+        let path = std::path::Path::new(name);
+        for dynamic in [false, true] {
+            assert_eq!(
+                crate::parser::is_luau_path(path, dynamic),
+                detect_language_any(path, dynamic) == Some(Luau),
+                "{name} dynamic={dynamic}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -122,8 +122,7 @@ pub(super) fn graph_version(
 ) -> std::borrow::Cow<'static, str> {
     if state.paths().iter().any(|record| {
         std::str::from_utf8(&record.path).is_ok_and(|path| {
-            crate::parser::detect_language_any(Path::new(path), cfg!(feature = "wasm-grammars"))
-                == Some(LangId::Luau)
+            crate::parser::is_luau_path(Path::new(path), cfg!(feature = "wasm-grammars"))
         })
     }) {
         format!("{EXTRACTOR_VERSION}+{}", keyed_language("luau")).into()
@@ -134,8 +133,7 @@ pub(super) fn graph_version(
 
 fn source_language(path: &Path) -> Option<LangId> {
     crate::callgraph_extractor::source_language(path).or_else(|| {
-        crate::parser::detect_language_any(path, cfg!(feature = "wasm-grammars"))
-            .filter(|language| *language == LangId::Luau)
+        crate::parser::is_luau_path(path, cfg!(feature = "wasm-grammars")).then_some(LangId::Luau)
     })
 }
 
