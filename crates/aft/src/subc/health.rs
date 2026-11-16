@@ -2510,6 +2510,7 @@ fn priority_health_field(field: &str, value: &Value) -> bool {
             | "sqlite"
             | "runner_notices"
             | "manifest_sync"
+            | "bus"
             | "indexing"
             | "gh_speech"
             | "embedding_backend"
