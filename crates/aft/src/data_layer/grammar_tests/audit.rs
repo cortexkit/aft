@@ -64,7 +64,6 @@ struct Fixture {
 
 fn fixture(ready: bool) -> Fixture {
     let dir = PathBuf::from(std::env::var_os("AFT_S4_AUDIT_ROOT").unwrap());
-    #[cfg(unix)]
     let dir = std::fs::canonicalize(dir).unwrap();
     let root = dir.join("project");
     std::fs::create_dir_all(&root).unwrap();
@@ -784,7 +783,7 @@ fn outline_rollup() {
     let _state = f
         .registry
         .force_unavailable_for_test(crate::grammar::GrammarState::NetworkRetry);
-    let path = write(&f.root, "nested/deeper/source.luau", SOURCE);
+    let path = write(&f.root.join("nested").join("deeper"), "source.luau", SOURCE);
     write(
         &f.root,
         "plain.ts",
@@ -1233,7 +1232,11 @@ isolated!(
             .unwrap();
         assert_eq!(warm_row["symbols"], 1, "{:?}", response.data);
         let manifest = response.data["content_files"].as_array().unwrap();
-        assert!(manifest.contains(&json!(warm)), "{:?}", response.data);
+        assert!(
+            manifest.contains(&json!(crate::inspect::job::normalize_path(&warm))),
+            "{:?}",
+            response.data
+        );
         assert_eq!(response.data["complete"], false, "{:?}", response.data);
         assert!(
             response.data["gaps"]
@@ -1477,7 +1480,10 @@ isolated!(
             cold.data["skipped_files"],
             json!([{"file":"bad.luau","reason":"parse_error"}])
         );
-        assert_eq!(cold.data["content_files"], json!([valid]));
+        assert_eq!(
+            cold.data["content_files"],
+            json!([crate::inspect::job::normalize_path(&valid)])
+        );
 
         let checkout = f.ctx.data_checkout().unwrap();
         checkout.wait_for_memory_profile_idle_for_test();
@@ -1557,7 +1563,10 @@ isolated!(
                 "{:?}",
                 response.data
             );
-            assert_eq!(response.data["content_files"], json!([root.join("a.ts")]));
+            assert_eq!(
+                response.data["content_files"],
+                json!([crate::inspect::job::normalize_path(&root.join("a.ts"))])
+            );
         }
     }
 );
@@ -1636,7 +1645,10 @@ isolated!(
         let cold = ask(&f.ctx, "outline", json!({"file":f.root,"files":true}));
         assert!(cold.success, "{:?}", cold.data);
         assert_eq!(cold.data["complete"], true);
-        assert_eq!(cold.data["content_files"], json!([path]));
+        assert_eq!(
+            cold.data["content_files"],
+            json!([crate::inspect::job::normalize_path(&path)])
+        );
         assert_eq!(cold.data["files"][0]["symbols"], 1);
         assert_eq!(crate::parser::work_counters::tree_parses() - before, 1);
         let warm = ask(&f.ctx, "outline", json!({"file":f.root,"files":true}));

@@ -3608,11 +3608,7 @@ fn display_file_for_error(store: &impl CallGraphRead, file: &Path) -> String {
 
 fn relative_file(store: &impl CallGraphRead, file: &Path) -> String {
     let absolute = absolute_file(store, file);
-    absolute
-        .strip_prefix(store.project_root())
-        .unwrap_or(&absolute)
-        .to_string_lossy()
-        .replace('\\', "/")
+    crate::callgraph_store::relative_path(store.project_root(), &absolute)
 }
 
 fn absolute_file(store: &impl CallGraphRead, file: &Path) -> PathBuf {
@@ -3632,6 +3628,28 @@ mod trace_to_tests {
         StoreImpactResult as RawImpactResult, StoredEdge,
     };
     use std::cell::RefCell;
+
+    #[cfg(windows)]
+    #[test]
+    fn luau_s4_relative_keys_match_plain_and_verbatim_windows_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let verbatim = std::fs::canonicalize(dir.path()).unwrap();
+        let plain = crate::windows_path::normalize_windows_path(&verbatim);
+        assert_ne!(plain, verbatim);
+        std::fs::write(plain.join("source.luau"), "local answer = 42\n").unwrap();
+
+        for root in [&plain, &verbatim] {
+            let mut store = CountingStore::new();
+            store.root = root.clone();
+            for file in [
+                PathBuf::from("source.luau"),
+                plain.join("source.luau"),
+                verbatim.join("source.luau"),
+            ] {
+                assert_eq!(relative_file(&store, &file), "source.luau");
+            }
+        }
+    }
 
     struct CountingStore {
         root: PathBuf,
