@@ -367,7 +367,7 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
                 manifest = fixture / "packages" / package / "package.json"
                 manifest.parent.mkdir(parents=True)
                 manifest.write_text(json.dumps({"version": "0.65.0"}))
-            crates = ("aft", "aft-base", "aft-db", "aft-store", "aft-tokenizer", "secret-rules")
+            crates = ("aft", "aft-base", "aft-db", "aft-parse", "aft-store", "aft-tokenizer", "secret-rules")
             for crate in crates:
                 manifest = fixture / "crates" / crate / "Cargo.toml"
                 manifest.parent.mkdir(parents=True)
@@ -461,7 +461,7 @@ class ReleaseRehearsalWorkflowTests(unittest.TestCase):
         publish = next(step["run"] for step in steps if step.get("name") == "Rehearse crates.io publishing")
         self.assertEqual(
             publish,
-            "cargo publish --dry-run --locked --allow-dirty -p aft-tokenizer -p aft-secret-rules -p aft-store -p aft-base -p aft-db -p agent-file-tools",
+            "cargo publish --dry-run --locked --allow-dirty -p aft-tokenizer -p aft-secret-rules -p aft-store -p aft-base -p aft-db -p aft-parse -p agent-file-tools",
         )
         self.assertNotIn("--no-verify", publish)
         names = [step.get("name") for step in steps]
@@ -531,22 +531,26 @@ class ReleaseRehearsalWorkflowTests(unittest.TestCase):
             target = Path(temporary)
             directory = target / "package"
             directory.mkdir()
-            packages = [{"name": name, "version": "0.63.5-rehearsal.1.1"} for name in ("aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "agent-file-tools")]
+            packages = [{"name": name, "version": "0.63.5-rehearsal.1.1"} for name in ("aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "aft-parse", "agent-file-tools")]
             files = [directory / f"{package['name']}-{package['version']}.crate" for package in packages]
             for file in files:
                 file.write_bytes(b"crate")
             metadata = json.dumps({"target_directory": str(target), "packages": packages})
             with mock.patch("subprocess.check_output", return_value=metadata):
                 exec(script, {})
-                for size in (10 * 1024 * 1024, 10 * 1024 * 1024 + 1):
-                    with self.subTest(size=size):
-                        with files[-1].open("wb") as archive:
-                            archive.truncate(size)
-                        with self.assertRaisesRegex(SystemExit, "must be under 10485760 bytes"):
-                            exec(script, {})
-                files[-1].unlink()
-                with self.assertRaisesRegex(AssertionError, "agent-file-tools"):
-                    exec(script, {})
+                for name in ("agent-file-tools", "aft-parse"):
+                    archive = next(file for file in files if file.name.startswith(name + "-"))
+                    for size in (10 * 1024 * 1024, 10 * 1024 * 1024 + 1):
+                        with self.subTest(package=name, size=size):
+                            with archive.open("wb") as contents:
+                                contents.truncate(size)
+                            with self.assertRaisesRegex(SystemExit, "must be under 10485760 bytes"):
+                                exec(script, {})
+                    archive.write_bytes(b"crate")
+                    archive.unlink()
+                    with self.assertRaisesRegex(AssertionError, name):
+                        exec(script, {})
+                    archive.write_bytes(b"crate")
 
     def test_crate_size_check_finds_multi_package_archives_and_checks_every_copy(self):
         script = inline_python(self.rehearsal, "Check packaged crate sizes")
@@ -554,7 +558,7 @@ class ReleaseRehearsalWorkflowTests(unittest.TestCase):
         scratch.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=scratch) as temporary:
             target = Path(temporary)
-            packages = [{"name": name, "version": "0.63.5-rehearsal.1.1"} for name in ("aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "agent-file-tools")]
+            packages = [{"name": name, "version": "0.63.5-rehearsal.1.1"} for name in ("aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "aft-parse", "agent-file-tools")]
             metadata = json.dumps({"target_directory": str(target), "packages": packages})
             with mock.patch("subprocess.check_output", return_value=metadata):
                 copies = []

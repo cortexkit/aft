@@ -259,13 +259,18 @@ results.push(updateCargoPathDep(cargoPath, "aft-store", version, dryRun));
 // Layered libraries publish after their local dependencies and before AFT.
 const basePath = join(root, "crates", "aft-base", "Cargo.toml");
 const dbPath = join(root, "crates", "aft-db", "Cargo.toml");
+const parsePath = join(root, "crates", "aft-parse", "Cargo.toml");
 results.push(updateCargoToml(basePath, version, dryRun));
 results.push(updateCargoToml(dbPath, version, dryRun));
+results.push(updateCargoToml(parsePath, version, dryRun));
 results.push(updateCargoPathDep(basePath, "aft-store", version, dryRun));
 results.push(updateCargoPathDep(basePath, "secret-rules", version, dryRun));
 results.push(updateCargoPathDep(dbPath, "aft-base", version, dryRun));
+results.push(updateCargoPathDep(parsePath, "aft-base", version, dryRun));
+results.push(updateCargoPathDep(parsePath, "aft-store", version, dryRun));
 results.push(updateCargoPathDep(cargoPath, "aft-base", version, dryRun));
 results.push(updateCargoPathDep(cargoPath, "aft-db", version, dryRun));
+results.push(updateCargoPathDep(cargoPath, "aft-parse", version, dryRun));
 
 // Report
 let updateCount = 0;
