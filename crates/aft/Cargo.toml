@@ -286,7 +286,7 @@ subc-client-rs = "=0.41.0"
 # The one reader of the daemon's launch nonce (pipe first, environment copy
 # second). subc-client-rs reads through the same cached accessor, so this pin
 # must match the version subc-client-rs depends on.
-subc-os = { version = "=0.1.39", features = ["tokio"] }
+subc-os = { version = "=0.1.40", features = ["tokio"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 vt100 = "0.16"
 jsonc-parser = { version = "0.33", features = ["cst"] }

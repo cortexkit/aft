@@ -5281,9 +5281,9 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.39"
+version = "0.1.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47304270d356c5c1edf9fc778aa8a8666aeabd2a64104d5c59a8a471ec723e9c"
+checksum = "40dad45881b7449d2d55429e2117a7aea18cef401a3fb3f8c3a0f9bd58cd661f"
 dependencies = [
  "libc",
  "rustix",
