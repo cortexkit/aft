@@ -315,7 +315,8 @@ async fn scope_watch_real_daemon_confirms_end_after_route_close_without_polling(
     )
     .await
     .unwrap();
-    let reply = request(&consumer, &route, json!({"name":"bash", "arguments":{"command":"sleep 120", "background":true, "timeout":150000}})).await.unwrap();
+    let reply = request(&consumer, &route, json!({"name":"bash", "arguments":{"command":"sleep 120", "background":true, "timeout":150000}})).await
+        .unwrap_or_else(|error| panic!("background bash request: {error}; fixture logs:\n{}", fixture_logs(&home)));
     let reply: Value = serde_json::from_slice(&reply).unwrap();
     assert_ne!(reply["isError"], true, "bash launch refused: {reply}");
     let initial = health_at(&health_file, 1, 1).await;
