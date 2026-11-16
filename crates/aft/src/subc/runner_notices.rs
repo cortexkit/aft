@@ -569,10 +569,10 @@ impl CodeSearchNotice {
                         let modern = runner_delivery_order(&path, address).await == Some(true);
                         let cleared = modern && runner_capability(&path, address, "delivery_order_modes:turn_system_cleared").await == Some(true);
                         let request = nudge_request(&self.call_key, notice, &self.preset, now, modern, cleared, false);
-                        let outcome = send(&path, address, &request).await;
+                        let outcome = send(&path, address, &request, modern).await;
                         let refused = matches!(&outcome, Outcome::Final(failure) | Outcome::Retry(failure) if failure.code.as_deref() == Some("invalid_params") && failure.field.as_deref() == Some("template"));
                         if request.runner_params.contains_key("template") && refused {
-                            send(&path, address, &nudge_request(&self.call_key, notice, &self.preset, now, true, false, true)).await
+                            send(&path, address, &nudge_request(&self.call_key, notice, &self.preset, now, true, false, true), true).await
                         } else { outcome }
                     },
                 )
