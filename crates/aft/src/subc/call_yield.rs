@@ -342,6 +342,7 @@ fn copy_watch_response(response: &crate::protocol::Response) -> crate::protocol:
         id: response.id.clone(),
         success: response.success,
         data: response.data.clone(),
+        notices: response.notices.clone(),
     }
 }
 
