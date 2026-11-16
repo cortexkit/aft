@@ -632,18 +632,21 @@ async fn scope_watch_confirmed_grant_cleanup_keeps_retrying_under_full_coverage(
     let (control, pending, mut frames) = control(&["scope.describe", "scope.watch"]);
     let runs = Arc::new(run_scope::RunScopes::new(control.clone()));
     let (_handle, mut ended, worker) = start(control.clone(), executor, runs);
-    let watch = request(&mut frames, "scope.watch").await;
+    let watch = opening_watch(&pending, &mut frames).await;
     snapshot(&pending, &watch);
-    let query = request(&mut frames, "scope.describe").await;
-    response(
-        &pending,
-        &query,
-        answer(&scope, subc_protocol::scope::ScopeStatus::Ended, 1),
-    );
-    tokio::time::timeout(Duration::from_secs(5), ended.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                Some(_) = ended.recv() => break,
+                Some(query) = frames.recv() => {
+                    if query.header.ty == FrameType::Cancel { continue; }
+                    let body: Value = serde_json::from_slice(&query.body).unwrap();
+                    assert_eq!(body["op"], "scope.describe");
+                    response(&pending, &query, answer(&scope, subc_protocol::scope::ScopeStatus::Ended, 1));
+                }
+            }
+        }
+    }).await.unwrap();
     tokio::time::sleep(Duration::from_secs(9)).await;
     assert_eq!(grants::list(&db.lock().unwrap(), &key).unwrap().len(), 1);
     assert!(

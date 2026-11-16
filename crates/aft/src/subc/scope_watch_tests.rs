@@ -483,7 +483,7 @@ async fn scope_watch_connection_handoff_replays_durable_end_and_cleanup_is_idemp
     let first_runs = Arc::new(run_scope::RunScopes::new(first_control.clone()));
     let (_first_handle, _first_ended, first_worker) =
         start_for_speech(first_control, executor.clone(), first_runs, service.clone());
-    let watch = request(&mut first_frames, "scope.watch").await;
+    let watch = opening_watch(&first_pending, &mut first_frames).await;
     snapshot(&first_pending, &watch);
     let query = request(&mut first_frames, "scope.describe").await;
     response(
@@ -493,19 +493,21 @@ async fn scope_watch_connection_handoff_replays_durable_end_and_cleanup_is_idemp
     );
     turns().await;
     push(&first_pending, &watch, &scope, ScopeWatchEvent::Ended);
-    let query = request(&mut first_frames, "scope.describe").await;
-    response(
-        &first_pending,
-        &query,
-        answer(&scope, subc_protocol::scope::ScopeStatus::Ended, 1),
-    );
     tokio::time::timeout(Duration::from_secs(5), async {
         while !service.store.scope_ended(&scope).unwrap()
             || executor
                 .queued_lane_for_test(&root, "scope-ended")
                 .is_none()
         {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            tokio::select! {
+                Some(query) = first_frames.recv() => {
+                    if query.header.ty == FrameType::Cancel { continue; }
+                    let body: Value = serde_json::from_slice(&query.body).unwrap();
+                    assert_eq!(body["op"], "scope.describe");
+                    response(&first_pending, &query, answer(&scope, subc_protocol::scope::ScopeStatus::Ended, 1));
+                }
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
         }
     })
     .await
@@ -684,6 +686,32 @@ async fn request(frames: &mut mpsc::Receiver<WriterFrame>, op: &str) -> WriterFr
         return frame;
     }
 }
+async fn opening_watch(
+    pending: &readiness::PendingControlReplies,
+    frames: &mut mpsc::Receiver<WriterFrame>,
+) -> WriterFrame {
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if frame.header.ty == FrameType::Cancel {
+            continue;
+        }
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        match body["op"].as_str().unwrap() {
+            "scope.watch" => return frame,
+            // Coverage begins at the snapshot, so pre-open fallback requests
+            // are valid and must not be mistaken for post-registration probes.
+            "scope.describe" => response(
+                pending,
+                &frame,
+                answer(&stamp(0), subc_protocol::scope::ScopeStatus::Live, 1),
+            ),
+            op => panic!("unexpected opening op {op}"),
+        }
+    }
+}
 fn control(
     ops: &[&str],
 ) -> (
@@ -749,8 +777,39 @@ async fn scope_watch_healthy_does_not_poll_and_rearm_describes_each_scope_once()
         .unwrap()
     ));
     turns().await;
-    let rearm = request(&mut frames, "scope.watch").await;
+    let mut opening_probes = Vec::new();
+    let rearm = loop {
+        let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if frame.header.ty == FrameType::Cancel {
+            continue;
+        }
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        if body["op"] == "scope.watch" {
+            break frame;
+        }
+        assert_eq!(body["op"], "scope.describe");
+        opening_probes.push(frame);
+    };
+    turns().await;
+    while let Ok(frame) = frames.try_recv() {
+        if frame.header.ty != FrameType::Cancel {
+            opening_probes.push(frame);
+        }
+    }
+    let opening_count = opening_probes.len();
     snapshot(&pending, &rearm);
+    turns().await;
+    for query in opening_probes {
+        response(
+            &pending,
+            &query,
+            answer(&scopes[0], subc_protocol::scope::ScopeStatus::Live, 1),
+        );
+        describes += 1;
+    }
     refs.clear();
     for _ in 0..3 {
         let query = request(&mut frames, "scope.describe").await;
@@ -765,8 +824,8 @@ async fn scope_watch_healthy_does_not_poll_and_rearm_describes_each_scope_once()
     }
     turns().await;
     assert_eq!(
-        describes, 6,
-        "exactly one re-arm describe per selected scope"
+        describes, 6 + opening_count,
+        "one fresh re-arm confirmation per scope, in addition to fallback requests sent before the snapshot"
     );
     assert!(frames.try_recv().is_err());
     worker.abort();
@@ -1003,7 +1062,7 @@ async fn scope_watch_five_minute_backstop_repairs_unnotified_membership() {
     turns().await;
     scopes.lock().unwrap().push(stamp(1));
     tokio::time::advance(scope_watch::BACKSTOP).await;
-    let repaired = request(&mut frames, "scope.watch").await;
+    let repaired = opening_watch(&pending, &mut frames).await;
     assert_eq!(
         snapshot(&pending, &repaired),
         2,
