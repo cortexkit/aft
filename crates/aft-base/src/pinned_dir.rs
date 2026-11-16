@@ -3715,3 +3715,36 @@ mod tests {
         fs::remove_dir(&junction).unwrap();
     }
 }
+pub const METADATA_OPEN_ATTEMPTS: u32 = 8;
+
+/// Retry a complete read attempt so validation never reuses an unlinked handle.
+/// Other errors, including hard-link and symlink refusals, remain failures.
+pub fn retry_artifact_read<T>(mut read: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match read() {
+            Err(error)
+                if attempts < METADATA_OPEN_ATTEMPTS
+                    && error.kind() == io::ErrorKind::Interrupted
+                    && error.to_string().contains(ARTIFACT_CONCURRENTLY_REPLACED) =>
+            {
+                // Retrying in a tight loop samples one instant several times:
+                // every attempt can land inside the same scheduling quantum, so
+                // eight of them are worth about one whenever the writer is
+                // descheduled mid-rename -- exactly the case on a loaded
+                // machine, which is the case this retry exists for. Yield first,
+                // then sleep in growing steps, so the attempts span the rename
+                // rather than racing it. The total stays under ~2ms, and losing
+                // here is not cosmetic: a caller that reads this as a damaged
+                // layout can quarantine a live task's whole bundle.
+                if attempts <= 2 {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(Duration::from_micros(50 << (attempts - 3).min(5)));
+                }
+            }
+            other => return other,
+        }
+    }
+}

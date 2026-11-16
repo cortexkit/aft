@@ -18,6 +18,7 @@ use crate::error::AftError;
 use crate::symbols::{Range, Symbol, SymbolKind, SymbolMatch};
 
 pub(crate) mod dead_code_facts;
+pub mod outline_facts;
 pub(crate) mod todo_markers;
 
 const MAX_REEXPORT_DEPTH: usize = 10;
@@ -1098,15 +1099,18 @@ pub(crate) fn read_source(path: &Path) -> std::io::Result<String> {
         return crate::bounded_io::read_to_string(path);
     }
     let mut reader = crate::bounded_io::reader(path, None)?;
-    crate::large_read::allow_whole(
-        crate::large_read::Site::ParseSource,
+    crate::large_read_counts::allow_whole(
+        crate::large_read_counts::Site::ParseSource,
         path,
         reader.size_at_open(),
     )?;
     let bytes = reader.append(Vec::new(), reader.size_at_open() as usize)?;
     let source = String::from_utf8(bytes)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    crate::large_read::record_whole(crate::large_read::Site::ParseSource, source.len());
+    crate::large_read_counts::record_whole(
+        crate::large_read_counts::Site::ParseSource,
+        source.len(),
+    );
     Ok(source)
 }
 
@@ -1117,16 +1121,16 @@ fn stage2_search_scoped_parse_source_obeys_whole_read_ceiling() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("large.rs");
         let file = std::fs::File::create(&path).unwrap();
-        file.set_len(crate::large_read::WHOLE_READ_CEILING + 1)
+        file.set_len(crate::large_read_counts::WHOLE_READ_CEILING + 1)
             .unwrap();
-        assert!(crate::large_read::is_ceiling_error(
+        assert!(crate::large_read_counts::is_ceiling_error(
             &read_source(&path).unwrap_err()
         ));
-        file.set_len(crate::large_read::WHOLE_READ_CEILING - 1)
+        file.set_len(crate::large_read_counts::WHOLE_READ_CEILING - 1)
             .unwrap();
         assert_eq!(
             read_source(&path).unwrap().len() as u64,
-            crate::large_read::WHOLE_READ_CEILING - 1
+            crate::large_read_counts::WHOLE_READ_CEILING - 1
         );
         crate::protocol::Response::success("parse-ceiling", serde_json::json!({}))
     });
@@ -1174,7 +1178,7 @@ mod large_source_scope_tests {
             assert!(!response
                 .data
                 .to_string()
-                .contains(crate::large_read::WHOLE_READ_SKIP_REASON));
+                .contains(crate::large_read_counts::WHOLE_READ_SKIP_REASON));
         }
     }
 
@@ -1197,7 +1201,7 @@ mod large_source_scope_tests {
                 let search_worker = threads.spawn(move || {
                     crate::bounded_io::with_budget(budget, || {
                         assert!(crate::bounded_io::skip_disclosure_active());
-                        assert!(crate::large_read::is_ceiling_error(
+                        assert!(crate::large_read_counts::is_ceiling_error(
                             &read_source(&worker_path).unwrap_err()
                         ));
                     })
@@ -1631,7 +1635,7 @@ struct CachedSymbols {
     /// Structure-map facts (test regions, trait method previews) that the
     /// multi-file outline derived from the same tree. They share this entry's
     /// freshness key and are dropped with it when the file's content changes.
-    outline_facts: Option<Arc<crate::commands::outline::OutlineParseFacts>>,
+    outline_facts: Option<Arc<outline_facts::OutlineParseFacts>>,
     /// The symbols are a table shared with other checkouts' caches, whose
     /// memory the process-wide table cache counts once (see
     /// [`SymbolCache::insert_shared_table`]); this cache leaves them out of
@@ -1645,7 +1649,7 @@ pub(crate) struct CachedOutline {
     pub(crate) symbols: Arc<Vec<Symbol>>,
     pub(crate) modules: Option<Arc<Vec<RustModule>>>,
     pub(crate) has_error: bool,
-    pub(crate) facts: Arc<crate::commands::outline::OutlineParseFacts>,
+    pub(crate) facts: Arc<outline_facts::OutlineParseFacts>,
 }
 
 /// The content hash a symbol-cache entry records for `source`: none (zero)
@@ -2500,7 +2504,7 @@ impl FileParser {
         &self,
         path: &Path,
         parsed: &ParsedFile,
-        facts: Arc<crate::commands::outline::OutlineParseFacts>,
+        facts: Arc<outline_facts::OutlineParseFacts>,
     ) {
         let Ok(mut cache) = self.symbol_cache.write() else {
             return;

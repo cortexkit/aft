@@ -39,7 +39,8 @@ pub mod parent_session;
 #[cfg(test)]
 mod publication_tests;
 pub(crate) mod query;
-pub(crate) mod read_fence;
+#[doc(hidden)]
+pub mod read_fence;
 mod refresh_budget;
 mod refresh_memory;
 #[cfg(feature = "test-hooks")]

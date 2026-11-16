@@ -4479,3 +4479,24 @@ mod in_place_write_tests {
         assert_eq!(recovery_entries(dir.path()), Vec::<String>::new());
     }
 }
+/// Capture the mutation baseline together with the text used to parse imports.
+pub(crate) fn parse_file_imports_observed(
+    path: &std::path::Path,
+    lang: crate::parser::LangId,
+) -> Result<
+    (
+        String,
+        tree_sitter::Tree,
+        crate::imports::ImportBlock,
+        EditObservation,
+    ),
+    crate::error::AftError,
+> {
+    let (source, observation) =
+        read_edit_source(path).map_err(|error| crate::error::AftError::FileNotFound {
+            path: format!("{}: {error}", path.display()),
+        })?;
+    let tree = crate::parser::parse_source_with_cached_parser(path, &source, lang)?;
+    let block = crate::imports::parse_imports(&source, &tree, lang);
+    Ok((source, tree, block, observation))
+}

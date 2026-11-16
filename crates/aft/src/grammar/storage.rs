@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
 
-use crate::bash_background::persistence::PinnedDir;
+use crate::pinned_dir::PinnedDir;
 
 use super::GrammarManifest;
 
@@ -50,9 +50,7 @@ impl Storage {
     }
 
     fn read_at(&self, dir: &PinnedDir, manifest: &GrammarManifest) -> io::Result<Option<Vec<u8>>> {
-        crate::bash_background::persistence::retry_artifact_read(|| {
-            self.read_at_once(dir, manifest)
-        })
+        crate::pinned_dir::retry_artifact_read(|| self.read_at_once(dir, manifest))
     }
 
     fn read_at_once(
@@ -143,10 +141,12 @@ impl Storage {
             // A valid artifact at this hash-named entry is byte-identical to
             // these verified bytes. Replacing the entry is therefore safe even
             // if another process published first, and never follows a symlink target.
-            crate::bash_background::persistence::randomized_atomic_replace(
+            crate::atomic_replace::atomic_replace_with_hooks(
                 &dir,
                 OsStr::new(&dest),
                 bytes,
+                crate::atomic_replace::ReplaceSync::None,
+                &mut crate::atomic_replace::NoReplaceHooks,
             )
             .map_err(|error| {
                 io::Error::new(

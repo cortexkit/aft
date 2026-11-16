@@ -570,7 +570,7 @@ fn finish_response_without_skips(mut response: Response) -> Response {
 /// A ceiling skip is a coverage gap, not a sticky I/O failure: other files
 /// in the same request must still be readable.
 pub(crate) fn note_large_read_skip(path: &Path) {
-    note_skipped_file(path, crate::large_read::WHOLE_READ_SKIP_REASON);
+    note_skipped_file(path, crate::large_read_counts::WHOLE_READ_SKIP_REASON);
 }
 
 pub(crate) fn note_skipped_file(path: &Path, reason: &str) {

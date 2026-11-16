@@ -40,20 +40,7 @@ thread_local! {
     static TABLE_RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// A single entry in the outline tree.
-///
-/// Top-level symbols have an empty `members` vec. Classes/structs contain
-/// their methods and nested types in `members`, forming a recursive tree.
-#[derive(Debug, Clone, Serialize)]
-pub struct OutlineEntry {
-    pub name: String,
-    pub kind: String,
-    pub range: Range,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub signature: Option<String>,
-    pub exported: bool,
-    pub members: Vec<OutlineEntry>,
-}
+pub use crate::parser::outline_facts::OutlineEntry;
 
 /// Handle an `outline` request.
 ///
@@ -632,67 +619,7 @@ struct FileOutline {
     language: Option<LangId>,
 }
 
-#[derive(Clone)]
-struct TestSummary {
-    name: String,
-    range: Range,
-    items: usize,
-    unknown_reason: Option<&'static str>,
-}
-
-#[derive(Clone)]
-struct TestRegion {
-    summary: TestSummary,
-    included_path: Option<String>,
-    implicit_include: bool,
-    module_scope: Vec<String>,
-    standalone: bool,
-}
-
-/// What the multi-file structure map needs from one parse of a file beyond
-/// its symbols: the test regions it collapses and, for Rust, the methods
-/// declared in each trait it previews. Both depend only on the file's own
-/// text, so they are stored next to the symbols in the shared symbol cache
-/// under the same freshness key, and a warm outline renders the file without
-/// reading or parsing it. Test includes are resolved at render time, because
-/// they depend on other files and on the caller's read policy.
-pub(crate) struct OutlineParseFacts {
-    test_regions: Vec<TestRegion>,
-    trait_previews: Vec<(Range, Vec<OutlineEntry>)>,
-}
-
-impl OutlineParseFacts {
-    /// Rough resident size, for the symbol cache's memory estimate.
-    pub(crate) fn estimated_bytes(&self) -> u64 {
-        fn entry_bytes(entry: &OutlineEntry) -> u64 {
-            (std::mem::size_of::<OutlineEntry>()
-                + entry.name.len()
-                + entry.kind.len()
-                + entry.signature.as_ref().map_or(0, String::len)) as u64
-                + entry.members.iter().map(entry_bytes).sum::<u64>()
-        }
-        let regions = self
-            .test_regions
-            .iter()
-            .map(|region| {
-                (std::mem::size_of::<TestRegion>()
-                    + region.summary.name.len()
-                    + region.included_path.as_ref().map_or(0, String::len)
-                    + region.module_scope.iter().map(String::len).sum::<usize>())
-                    as u64
-            })
-            .sum::<u64>();
-        let previews = self
-            .trait_previews
-            .iter()
-            .map(|(_, methods)| {
-                std::mem::size_of::<(Range, Vec<OutlineEntry>)>() as u64
-                    + methods.iter().map(entry_bytes).sum::<u64>()
-            })
-            .sum::<u64>();
-        std::mem::size_of::<Self>() as u64 + regions + previews
-    }
-}
+use crate::parser::outline_facts::{OutlineParseFacts, TestRegion, TestSummary};
 
 /// Languages whose structure map collapses test code into summary rows.
 fn structure_language(path: &Path) -> Option<LangId> {

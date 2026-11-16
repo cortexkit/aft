@@ -338,13 +338,13 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // --- Parse file and imports ---
-    let (source, tree, block, observation) = match imports::parse_file_imports_observed(&path, lang)
-    {
-        Ok(result) => result,
-        Err(e) => {
-            return Response::error(&req.id, e.code(), e.to_string());
-        }
-    };
+    let (source, tree, block, observation) =
+        match crate::edit::parse_file_imports_observed(&path, lang) {
+            Ok(result) => result,
+            Err(e) => {
+                return Response::error(&req.id, e.code(), e.to_string());
+            }
+        };
 
     let block = if matches!(lang, LangId::C | LangId::Cpp) {
         imports::c_insertion_block(&source, &tree, &block)

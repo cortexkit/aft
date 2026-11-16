@@ -413,3 +413,5 @@ mod tests {
         );
     }
 }
+#[cfg(windows)]
+pub(crate) mod readiness;

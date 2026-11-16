@@ -7,7 +7,7 @@
 //!   Pass 4: Normalize Unicode punctuation + trim
 //!   Pass 5: Reflowed line wraps/joins with whitespace-normalized content
 
-use crate::patch::matcher::{find_nearest_miss, NearestMissSearch, ReflowCandidates};
+use crate::line_matcher::{find_nearest_miss, NearestMissSearch, ReflowCandidates};
 
 // A half-match floor keeps diagnostics useful for a likely stale edit while
 // suppressing suggestions for candidates that share too little of the needle.
@@ -324,7 +324,7 @@ where
 {
     let compare = |line: &str, expected: &str| {
         #[cfg(test)]
-        crate::patch::matcher::count_line_comparison(line, expected);
+        crate::line_matcher::count_line_comparison(line, expected);
         compare(line, expected)
     };
     let mut matches = Vec::new();
@@ -1041,7 +1041,7 @@ fn find_reflow_matches(
 
 fn normalize_reflow_whitespace(s: &str) -> String {
     #[cfg(test)]
-    crate::patch::matcher::REFLOW_WORK.with(|work| work.set(work.get() + s.len()));
+    crate::line_matcher::REFLOW_WORK.with(|work| work.set(work.get() + s.len()));
     let mut normalized = String::new();
     let mut in_whitespace = false;
 
@@ -1388,8 +1388,8 @@ mod tests {
     /// included, as the old start-by-start scan on generated inputs with
     /// duplicate, empty and whitespace-only lines, CRLF, and repeated blocks.
     fn assert_line_pass_matches_scan(seed: u64, pass: u8) {
-        use crate::patch::matcher::line_test_support::{file_lines, pattern_lines};
-        use crate::patch::matcher::reflow_test_support::Rng;
+        use crate::line_matcher::line_test_support::{file_lines, pattern_lines};
+        use crate::line_matcher::reflow_test_support::Rng;
         let mut rng = Rng::new(seed);
         let (mut cases_with_matches, mut matches_total) = (0, 0);
         for case in 0..10_000 {
@@ -1488,9 +1488,9 @@ mod tests {
     fn line_pass_work_is_linear_on_repetitive_near_misses() {
         let haystack = "a b\n".repeat(25_000);
         let needle = "a b\n".repeat(6_999) + "ab";
-        crate::patch::matcher::LINE_MATCH_WORK.with(|work| work.set(0));
+        crate::line_matcher::LINE_MATCH_WORK.with(|work| work.set(0));
         assert!(find_all_fuzzy(&haystack, &needle).is_empty());
-        let work = crate::patch::matcher::LINE_MATCH_WORK.with(std::cell::Cell::get);
+        let work = crate::line_matcher::LINE_MATCH_WORK.with(std::cell::Cell::get);
         let size = haystack.len() + needle.len();
         assert!(work <= 32 * size, "{work} units of work for {size} bytes");
     }
@@ -1510,10 +1510,10 @@ mod tests {
         let haystack_lines: Vec<&str> = haystack.lines().collect();
         let needle_lines: Vec<&str> = needle.lines().collect();
         let offsets = compute_line_offsets(&haystack);
-        crate::patch::matcher::REFLOW_WORK.with(|work| work.set(0));
+        crate::line_matcher::REFLOW_WORK.with(|work| work.set(0));
         let matches =
             find_reflow_matches(&haystack_lines, &needle_lines, &offsets, &haystack, &needle);
-        let work = crate::patch::matcher::REFLOW_WORK.with(std::cell::Cell::get);
+        let work = crate::line_matcher::REFLOW_WORK.with(std::cell::Cell::get);
         assert!(matches.is_empty());
         let size = haystack.len() + needle.len();
         assert!(work <= 4 * size, "{work} units of work for {size} bytes");
@@ -1526,7 +1526,7 @@ mod tests {
     /// characters off, and needles at either end of the file.
     #[test]
     fn linear_reflow_matches_equal_the_window_scan_on_generated_inputs() {
-        use crate::patch::matcher::reflow_test_support::{file_lines, needle_text, Rng};
+        use crate::line_matcher::reflow_test_support::{file_lines, needle_text, Rng};
         let mut rng = Rng::new(0x5eed_0002);
         let (mut cases_with_matches, mut matches_total) = (0, 0);
         for case in 0..10_000 {

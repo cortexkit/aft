@@ -2096,25 +2096,31 @@ impl InspectManager {
         let observer = self.cache_writer_watch_observer.lock().unwrap().clone();
         #[cfg(test)]
         let event_observer = observer.clone();
-        let watcher = crate::callgraph_store::watch_readiness_directory(&dir, move |event| {
-            if let Ok(event) = event {
-                let release = crate::callgraph_store::refresh_lease_release_event(&event, &lease);
-                if release {
-                    wake_cache_writer_if_available(&watched_identity, &waits, &caches);
+        let watcher = crate::callgraph_store::watch_readiness_directory(
+            &dir,
+            move |event| {
+                if let Ok(event) = event {
+                    let release =
+                        crate::callgraph_store::refresh_lease_release_event(&event, &lease);
+                    if release {
+                        wake_cache_writer_if_available(&watched_identity, &waits, &caches);
+                    }
+                    #[cfg(test)]
+                    if let Some(observer) = &event_observer {
+                        let _ = observer.send(CacheWriterWatchObservation::Activity {
+                            release,
+                            detail: format!(
+                                "event={event:?} lease={} exists={}",
+                                lease.display(),
+                                lease.exists()
+                            ),
+                        });
+                    }
                 }
-                #[cfg(test)]
-                if let Some(observer) = &event_observer {
-                    let _ = observer.send(CacheWriterWatchObservation::Activity {
-                        release,
-                        detail: format!(
-                            "event={event:?} lease={} exists={}",
-                            lease.display(),
-                            lease.exists()
-                        ),
-                    });
-                }
-            }
-        });
+            },
+            #[cfg(windows)]
+            &crate::watcher_backend::readiness::NativeReadinessWatcherFactory,
+        );
         match watcher {
             Ok(watcher) => {
                 watches.insert(identity, watcher);

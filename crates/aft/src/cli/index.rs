@@ -331,10 +331,10 @@ fn prepare_snapshot(
 fn collect_semantic_files(root: &Path, max_files: usize) -> Result<Vec<PathBuf>, IndexError> {
     let mut files = callgraph::walk_project_files(
         root,
-        if crate::data_layer::read_fence::active() {
-            crate::project_walk::IgnoreFileAccess::Fenced
+        if aft::data_layer::read_fence::active() {
+            aft::project_walk::IgnoreFileAccess::Fenced
         } else {
-            crate::project_walk::IgnoreFileAccess::Allowed
+            aft::project_walk::IgnoreFileAccess::Allowed
         },
     )
     .filter(|path| aft::semantic_index::is_semantic_indexed_extension(path))

@@ -78,6 +78,8 @@ pub mod bash_rewrite;
 pub(crate) use aft_base::bounded_io;
 pub(crate) mod bounded_io_command;
 pub mod build_breaker;
+pub use aft_base::atomic_replace;
+pub use aft_base::build_state;
 pub mod cache_freshness;
 pub mod cache_location;
 pub mod callgraph;
@@ -156,7 +158,9 @@ pub(crate) mod io_accounting;
 pub use aft_base::jsonc;
 pub use aft_base::jsonc_edit;
 pub mod lang_id;
+pub(crate) mod line_matcher;
 pub use aft_base::language;
+pub(crate) use aft_base::large_read_counts;
 pub(crate) mod large_read;
 pub(crate) mod late_result_bus;
 #[doc(hidden)]

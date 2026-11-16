@@ -50,8 +50,10 @@ macro_rules! test_support_visibility {
 pub mod agent_commands;
 pub mod alert_records;
 pub mod alloc_trace;
+pub mod atomic_replace;
 pub mod bash_env;
 pub mod bounded_io;
+pub mod build_state;
 pub mod cache_freshness;
 pub mod cache_location;
 pub mod clock;
@@ -97,6 +99,7 @@ pub mod jsonc;
 pub mod jsonc_edit;
 pub mod lang_id;
 pub mod language;
+pub mod large_read_counts;
 #[doc(hidden)]
 pub mod launch_fds;
 pub mod launch_nonce;

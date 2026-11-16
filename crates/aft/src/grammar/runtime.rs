@@ -138,7 +138,7 @@ static REGISTRY: OnceLock<Arc<GrammarRegistry>> = OnceLock::new();
 /// compiling a grammar. Call only when the caller opts into dynamic parsing;
 /// callers using built-in grammars only must not consult grammar storage.
 pub fn configure(config: &crate::config::Config) -> Arc<GrammarRegistry> {
-    let root = crate::root_cache::cache_root(config);
+    let root = crate::cache_location::cache_root(config);
     let registry = REGISTRY.get_or_init(|| GrammarRegistry::new(None));
     registry.set_storage_root(root);
     Arc::clone(registry)

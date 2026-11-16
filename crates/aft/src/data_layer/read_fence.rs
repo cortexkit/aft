@@ -249,7 +249,7 @@ pub(crate) fn ask_calls() -> usize {
     ASK_CALLS.with(|calls| calls.get())
 }
 
-pub(crate) fn active() -> bool {
+pub fn active() -> bool {
     FENCE.with(|fence| fence.borrow().active())
 }
 

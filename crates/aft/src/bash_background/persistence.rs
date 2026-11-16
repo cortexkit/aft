@@ -1521,7 +1521,6 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// of attempts outlasts even a writer republishing metadata in a loop —
 /// provided the attempts actually sample different moments, which is what the
 /// yield between them is for.
-const METADATA_OPEN_ATTEMPTS: u32 = 8;
 
 /// Open a task's metadata file by name, tolerating a concurrent atomic replace.
 ///
@@ -1545,38 +1544,6 @@ fn open_metadata_through_replacement(dir: &PinnedDir, name: &OsStr) -> io::Resul
         work_counts::record_metadata_open();
         dir.open_file(name, false)
     })
-}
-
-/// Retry a complete read attempt so validation never reuses an unlinked handle.
-/// Other errors, including hard-link and symlink refusals, remain failures.
-pub(crate) fn retry_artifact_read<T>(mut read: impl FnMut() -> io::Result<T>) -> io::Result<T> {
-    let mut attempts = 0;
-    loop {
-        attempts += 1;
-        match read() {
-            Err(error)
-                if attempts < METADATA_OPEN_ATTEMPTS
-                    && error.kind() == io::ErrorKind::Interrupted
-                    && error.to_string().contains(ARTIFACT_CONCURRENTLY_REPLACED) =>
-            {
-                // Retrying in a tight loop samples one instant several times:
-                // every attempt can land inside the same scheduling quantum, so
-                // eight of them are worth about one whenever the writer is
-                // descheduled mid-rename -- exactly the case on a loaded
-                // machine, which is the case this retry exists for. Yield first,
-                // then sleep in growing steps, so the attempts span the rename
-                // rather than racing it. The total stays under ~2ms, and losing
-                // here is not cosmetic: a caller that reads this as a damaged
-                // layout can quarantine a live task's whole bundle.
-                if attempts <= 2 {
-                    std::thread::yield_now();
-                } else {
-                    std::thread::sleep(Duration::from_micros(50 << (attempts - 3).min(5)));
-                }
-            }
-            other => return other,
-        }
-    }
 }
 
 pub fn read_task(path: &Path) -> io::Result<PersistedTask> {
@@ -1678,19 +1645,7 @@ fn write_task_at_with(
     write_task_in_dir(&task.dirs.control, &name, metadata, sync)
 }
 
-/// How much of an atomic file replacement is synced to disk.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReplaceSync {
-    /// Nothing is synced. The rename still protects readers from a partly
-    /// written file after a process kill, but not after a power loss.
-    None,
-    /// The new file's contents are synced before the rename; the directory
-    /// entry is not synced after it.
-    File,
-    /// The new file is synced before the rename and its directory after it,
-    /// so the replacement itself survives a power loss.
-    FileAndDirectory,
-}
+use crate::atomic_replace::ReplaceSync;
 
 /// Kept only while a registry owns the task. The file is still compared on
 /// every request: another registry can replace or acknowledge its metadata.
@@ -2678,43 +2633,19 @@ pub(crate) fn sync_task_file(file: &File, path: &Path) -> io::Result<()> {
     result
 }
 
-fn sync_task_directory(dir: &PinnedDir) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        sync_task_file(&dir.file, &dir.path)
+struct TaskReplaceHooks;
+
+impl crate::atomic_replace::ReplaceHooks for TaskReplaceHooks {
+    fn sync_file(&mut self, file: &File, path: &Path) -> io::Result<()> {
+        sync_task_file(file, path)
     }
-    #[cfg(windows)]
-    {
-        // FlushFileBuffers requires GENERIC_WRITE even for a directory. Keep
-        // ordinary pinned opens read-only; acquire write access only to flush,
-        // and verify that the reopened handle still names the pinned folder.
-        let writable = PinnedDir::from_open_file(
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-                .open(&dir.path)?,
-            dir.path.clone(),
-            {
-                #[cfg(test)]
-                {
-                    dir.cache_device_override
-                }
-                #[cfg(not(test))]
-                {
-                    None
-                }
-            },
-        );
-        validate_directory_handle(&writable.file)?;
-        if !dir.same_identity(&writable)? {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "pinned directory path identity changed",
-            ));
-        }
-        sync_task_file(&writable.file, &dir.path)?;
-        dir.ensure_current_identity()
+    fn before_rename(&mut self) {
+        #[cfg(test)]
+        atomic_replace_crash_for_test(false);
+    }
+    fn after_rename(&mut self) {
+        #[cfg(test)]
+        atomic_replace_crash_for_test(true);
     }
 }
 
@@ -2724,40 +2655,13 @@ fn atomic_replace(
     content: &[u8],
     sync: ReplaceSync,
 ) -> io::Result<()> {
-    for _ in 0..32 {
-        let temporary = random_temp_name()?;
-        let mut file = match dir.open_new_file(&temporary) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        };
-        let result = (|| {
-            file.write_all(content)?;
-            if sync != ReplaceSync::None {
-                sync_task_file(&file, &dir.path.join(&temporary))?;
-            }
-            // Atomic replacement protects readers after a daemon kill. Task
-            // history is mirrored in a weaker database and is not a durable log.
-            validate_regular_handle(&file)?;
-            #[cfg(test)]
-            atomic_replace_crash_for_test(false);
-            dir.rename(&temporary, name)?;
-            #[cfg(test)]
-            atomic_replace_crash_for_test(true);
-            if sync == ReplaceSync::FileAndDirectory {
-                sync_task_directory(dir)?;
-            }
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = dir.remove_file(&temporary);
-        }
-        return result;
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "failed to allocate a randomized atomic-write name",
-    ))
+    crate::atomic_replace::atomic_replace_with_hooks(
+        dir,
+        name,
+        content,
+        sync,
+        &mut TaskReplaceHooks,
+    )
 }
 
 #[cfg(test)]

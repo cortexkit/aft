@@ -81,7 +81,7 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // --- Parse file and imports ---
     let (source, _tree, block, observation) =
-        match imports::parse_file_imports_observed(&path, lang) {
+        match crate::edit::parse_file_imports_observed(&path, lang) {
             Ok(result) => result,
             Err(e) => {
                 return Response::error(&req.id, e.code(), e.to_string());
