@@ -10,9 +10,9 @@
     },
     {
       "name": "cortexkit-role-tool-display",
-      "version": "0.1.6",
+      "version": "0.1.8",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "73ba4cec0564b072acf1b853e66ddee383decf3dce87b713041da8364956afaa",
+      "checksum": "83a306df220aa43062c4e2d6f06995cbe7cb7d94021f454dabfd455940c2ea3e",
       "dependency_kind": "normal"
     },
     {

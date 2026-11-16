@@ -1676,7 +1676,7 @@ enum ManagementAdmission {
     PermissionsOnly,
     /// Phone and simulator operator routes have read-only shell authority only.
     ShellsOnly,
-    /// Modules outside the first-party allowlist may request display reads;
+    /// The catalog's display module may request display reads;
     /// each read still checks the caller against the catalog's single module
     /// declaring the display capability.
     DisplayOnly,
@@ -8666,6 +8666,10 @@ async fn handle_control_request(
                 matches!(target, RouteTarget::ToolProvider { .. }) && bind_project_root.is_none();
             schedule_scope_workdir_comparison(&identity, legacy_root.as_deref(), scope.as_ref());
             if matches!(target, RouteTarget::ManagementSurface { .. }) || project_free {
+                let display_reader = crate::late_result_bus::display_reader().ok().flatten();
+                let display_admitted =
+                    rich_ui::display::check_reader(principal.as_ref(), display_reader.as_deref())
+                        .is_ok();
                 if !project_free
                     && matches!(principal.as_ref(), Some(Principal::Reserved { module_id }) if module_id == "callosum")
                     && !shells::operator(
@@ -8705,7 +8709,7 @@ async fn handle_control_request(
                     && diagnostics_findings::admit_flow(scope.as_ref()).is_err()
                     && !permissions::is_cingulate(principal.as_ref())
                     && !user_commands::is_occipital(principal.as_ref())
-                    && !matches!(principal.as_ref(), Some(Principal::Reserved { .. }))
+                    && !display_admitted
                     && !shells::operator(
                         principal.as_ref(),
                         Some(&identity.harness),
@@ -8756,9 +8760,7 @@ async fn handle_control_request(
                     // Cingulate is not a first-party AFT principal: it binds
                     // only to list and revoke the person's saved grants.
                     ManagementAdmission::PermissionsOnly
-                } else if !matches!(bind_trust, BindTrust::FirstParty)
-                    && matches!(principal.as_ref(), Some(Principal::Reserved { .. }))
-                {
+                } else if !matches!(bind_trust, BindTrust::FirstParty) && display_admitted {
                     ManagementAdmission::DisplayOnly
                 } else {
                     ManagementAdmission::FirstParty

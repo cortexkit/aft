@@ -1000,7 +1000,7 @@ pub(super) fn write_user_config(config_home: &Path, storage: &Path) {
     .expect("write user config");
 }
 
-pub(super) async fn write_connection_file(conn_dir: &Path) -> TcpListener {
+pub(super) async fn write_raw_connection_file(conn_dir: &Path) -> TcpListener {
     // The connection-file contract rejects writable shared parents, even
     // when a permissive runner umask gives its temporary directories 0775.
     #[cfg(unix)]
@@ -1028,6 +1028,135 @@ pub(super) async fn write_connection_file(conn_dir: &Path) -> TcpListener {
     };
     connection_file::write_atomic(&conn_path, &conn).expect("write connection file");
     TcpListener::from_std(std_listener).expect("tokio listener")
+}
+
+pub(super) struct ModuleListener {
+    modules: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<(TcpStream, Frame)>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ModuleListener {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+pub(super) async fn write_connection_file(conn_dir: &Path) -> ModuleListener {
+    let listener = write_raw_connection_file(conn_dir).await;
+    let (modules, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (mut stream, _) = accepted.expect("accept daemon connection");
+                    let modules = modules.clone();
+                    connections.spawn(async move {
+                        // Authentication is shared by modules and consumers. Only
+                        // the first framed message identifies a module registration.
+                        if authenticate_server(
+                            &mut stream,
+                            &[0x42; subc_transport::KEY_LEN],
+                            &[0x24; subc_transport::DAEMON_ID_LEN],
+                            "0.39.0",
+                            Duration::from_secs(5),
+                        ).await.is_err() {
+                            return;
+                        }
+                        let Ok(Ok(Some(first))) = tokio::time::timeout(
+                            Duration::from_secs(5), read_frame(&mut stream)
+                        ).await else { return; };
+                        if first.header.ty == FrameType::Hello && first.header.channel == 0 {
+                            let _ = modules.send((stream, first));
+                        } else {
+                            crate::subc_fake::serve_without_modules(stream, first).await;
+                        }
+                    });
+                }
+                Some(result) = connections.join_next() => result.expect("daemon connection handler"),
+            }
+        }
+    });
+    ModuleListener {
+        modules: tokio::sync::Mutex::new(receiver),
+        task,
+    }
+}
+
+#[tokio::test]
+async fn module_listener_refuses_bus_consumers_without_consuming_module_restarts() {
+    let directory = tempfile::tempdir().unwrap();
+    let listener = write_connection_file(directory.path()).await;
+    let connection =
+        connection_file::read_for_client(&directory.path().join("subc-connection.json")).unwrap();
+    let address = format!("127.0.0.1:{}", connection.endpoints[0].port);
+
+    // An abandoned startup socket must not become the next module session.
+    drop(TcpStream::connect(&address).await.unwrap());
+    let mut consumer = TcpStream::connect(&address).await.unwrap();
+    subc_transport::authenticate_client(&mut consumer, &connection, Duration::from_secs(5))
+        .await
+        .unwrap();
+    for module in ["ckbus", "absent-module"] {
+        send_frame(
+            &mut consumer,
+            Frame::build(
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                77,
+                serde_json::to_vec(&json!({
+                    "op": "route.open",
+                    "target": {"kind": "management_surface", "module_id": module},
+                    "identity": {"harness": "aft", "session": "bus"}
+                }))
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .await;
+        let refusal = read_any_frame_timeout(&mut consumer, "consumer route refusal").await;
+        assert_eq!(refusal.header.ty, FrameType::Error);
+        assert_eq!(refusal.header.channel, 0);
+        assert_eq!(refusal.header.corr, 77);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&refusal.body).unwrap()["code"],
+            "target_unavailable"
+        );
+    }
+
+    for _ in 0..2 {
+        let mut module = TcpStream::connect(&address).await.unwrap();
+        subc_transport::authenticate_client(&mut module, &connection, Duration::from_secs(5))
+            .await
+            .unwrap();
+        send_frame(
+            &mut module,
+            Frame::build(
+                FrameType::Hello,
+                control_flags(),
+                0,
+                0,
+                1,
+                serde_json::to_vec(&ModuleHelloBody {
+                    manifest: subc_protocol::manifest::ModuleManifest::builder("aft", "0.0.0")
+                        .build(),
+                    protocol_ver: PROTOCOL_VERSION,
+                    control_ops: None,
+                    launch_nonce: None,
+                })
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .await;
+        let stream = accept_module(&listener).await;
+        let ack = read_any_frame_timeout(&mut module, "module hello ack").await;
+        assert_eq!(ack.header.ty, FrameType::HelloAck);
+        assert_eq!(ack.header.corr, 1);
+        drop(stream);
+    }
 }
 
 pub(super) struct ModuleProcess {
@@ -1269,7 +1398,7 @@ impl Drop for ModuleProcess {
 }
 
 async fn accept_module_with_diagnostics(
-    listener: &TcpListener,
+    listener: &ModuleListener,
     child: &mut Child,
     stderr_path: &Path,
 ) -> TcpStream {
@@ -1330,22 +1459,13 @@ fn subc_startup_failure_diagnostics_include_exit_status_and_stderr() {
     );
 }
 
-pub(super) async fn accept_module(listener: &TcpListener) -> TcpStream {
-    let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
-        .await
-        .expect("timed out accepting module connection")
-        .expect("accept module connection");
-    authenticate_server(
-        &mut stream,
-        &[0x42; subc_transport::KEY_LEN],
-        &[0x24; subc_transport::DAEMON_ID_LEN],
-        "subc-detach-test",
-        Duration::from_secs(5),
-    )
+pub(super) async fn accept_module(listener: &ModuleListener) -> TcpStream {
+    let (mut stream, hello) = tokio::time::timeout(Duration::from_secs(10), async {
+        listener.modules.lock().await.recv().await
+    })
     .await
-    .expect("authenticate module");
-
-    let hello = read_any_frame_timeout(&mut stream, "ModuleHello").await;
+    .expect("timed out accepting module connection")
+    .expect("accept module connection");
     assert_eq!(hello.header.ty, FrameType::Hello);
     let _hello_body: ModuleHelloBody = serde_json::from_slice(&hello.body).expect("hello body");
     send_frame(

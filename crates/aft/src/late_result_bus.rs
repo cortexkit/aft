@@ -24,6 +24,8 @@ use crate::context::App;
 use crate::db::call_ledger::{Key, LATE_RESULTS_PAGE_MAX, UNACKED_RESULTS_MAX};
 
 mod display;
+#[cfg(test)]
+pub(crate) use display::with_test_reader;
 pub(crate) mod readers;
 mod views;
 

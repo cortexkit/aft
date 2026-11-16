@@ -8422,6 +8422,10 @@ async fn accept_status_consumer(
         .await
         .expect("authenticate consumer");
         let first = read_raw_inventory_frame(&mut stream, "consumer request").await;
+        if crate::subc_fake::ckbus_route_refusal(&first).is_some() {
+            tokio::spawn(crate::subc_fake::serve_without_modules(stream, first));
+            continue;
+        }
         if frame_operation(&first).as_deref() == Some("route.open") {
             // The default-enabled GitHub shim also connects at startup. This
             // daemon has no vault; refuse its manifest route, not the fleet dial.
@@ -13345,6 +13349,7 @@ async fn drive_module_hello_health_manifest_daemon(input: FakeDaemonInput) {
             "page.collect",
             "page.read",
             "page.release",
+            "display.read",
             "diagnostics.findings",
             "permissions.list",
             "permissions.revoke",

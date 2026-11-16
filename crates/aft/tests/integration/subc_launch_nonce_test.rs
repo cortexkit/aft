@@ -22,7 +22,8 @@ use tokio::net::{TcpListener, TcpStream};
 use super::subc_detach_test::{
     bind_route, control_flags, extract_task_id, frame_body, read_any_frame_timeout,
     read_tool_response, send_connection_goodbye, send_frame, send_tool_call, tool_result_is_error,
-    wait_for_status, write_connection_file, write_user_config, ModuleProcess,
+    wait_for_status, write_raw_connection_file as write_connection_file, write_user_config,
+    ModuleProcess,
 };
 
 const PIPE_NONCE: &str = "pipe-launch-nonce-0123456789abcdef";

@@ -35,11 +35,33 @@ pub(super) fn invalidate_reader() {
 }
 
 pub(super) fn reader() -> Result<Option<String>, subc_protocol::ErrorBody> {
+    #[cfg(test)]
+    if let Some(reader) = TEST_READER.with(|reader| reader.borrow().clone()) {
+        return Ok(reader);
+    }
     READER
         .lock()
         .module
         .clone()
         .ok_or_else(cortexkit_role_tool_display::not_ready)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_READER: std::cell::RefCell<Option<Option<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_reader<T>(reader: Option<&str>, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Option<String>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_READER.with(|reader| *reader.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore =
+        Restore(TEST_READER.with(|value| value.replace(Some(reader.map(str::to_owned)))));
+    run()
 }
 
 pub(super) async fn watch_reader(
