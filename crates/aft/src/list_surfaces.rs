@@ -396,9 +396,9 @@ pub struct ExclusionEntry {
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
         file: "late_result_bus.rs",
-        enclosing_item: "scan",
-        location_or_primitive: "SCAN_BATCH (64), SQL LIMIT",
-        reason: "internal terminal-feed wake replay visits a fixed rowid batch before collecting, continues at the last visited row, and periodically restarts the scan; it does not shorten a command result list",
+        enclosing_item: "scan,replay,read_batch,capacity,due,deliver",
+        location_or_primitive: "SCAN_BATCH (64), LATE_RESULTS_PAGE_MAX, UNACKED_RESULTS_MAX, SQL LIMIT",
+        reason: "internal bus wakes use index-seeked settlement batches and startup-only custodian feed pages; the retry set stops cursor advancement at the existing feed retention cap, leaving overflow durable in the ledger rather than shortening a command result list",
     },
     #[cfg(feature = "callgraph-shape-census")]
     ExclusionEntry {

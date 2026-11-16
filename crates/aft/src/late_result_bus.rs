@@ -4,7 +4,7 @@
 //! restart replays retained entries with the same message id. A duplicate after
 //! JetStream's deduplication window is harmless because the notice is only a wake.
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashMap},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -15,17 +15,20 @@ use std::{
 
 use cortexkit_bus_client::{BusClient, BusClientOptions};
 use cortexkit_bus_naming::{validate_token, TokenKind};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use subc_client_rs::{ConnectionState, ConsumerOptions, SubcConsumer};
 use tokio::sync::{oneshot, Notify};
 
 use crate::context::App;
+use crate::db::call_ledger::{Key, LATE_RESULTS_PAGE_MAX, UNACKED_RESULTS_MAX};
 
 const SCAN_BATCH: usize = 64;
-const RECHECK: Duration = Duration::from_secs(60);
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+const OVERLAP_MS: i64 = 10_000;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const EVENT: &str = "late_result_ready";
+const LIVE_SCAN_SQL: &str = "SELECT rowid,settled_at,seq,CASE WHEN acked=0 AND late_entry IS NOT NULL AND seq>COALESCE((SELECT through_seq FROM call_ledger_ack WHERE custodian=call_ledger.custodian),0) THEN custodian END,carrier,call_key,event_id,outcome FROM call_ledger WHERE state='Settled' AND (settled_at,rowid)>(?1,?2) ORDER BY settled_at,rowid LIMIT ?3";
 static SETTLED: LazyLock<Notify> = LazyLock::new(Notify::new);
 static HEALTH: LazyLock<parking_lot::Mutex<BusHealth>> = LazyLock::new(Default::default);
 
@@ -100,7 +103,7 @@ pub(crate) fn start(app: Arc<App>, connection: PathBuf, database: PathBuf) -> Op
 }
 
 fn backoff(delay: Duration) -> Duration {
-    (delay * 2).min(RECHECK)
+    (delay * 2).min(MAX_BACKOFF)
 }
 
 async fn run(app: Arc<App>, path: PathBuf, database: PathBuf, mut stopped: oneshot::Receiver<()>) {
@@ -147,8 +150,7 @@ async fn drive(
     let mut state = DeliveryState::default();
     let mut bus = None;
     let mut delay = Duration::from_secs(1);
-    let mut next_check = tokio::time::Instant::now();
-    let mut cycle_failed = false;
+    let mut scan_pending = true;
     loop {
         if !daemon_connected.load(Ordering::Relaxed) {
             failure("bus_consumer_disconnected");
@@ -167,7 +169,10 @@ async fn drive(
             match tokio::time::timeout(IO_TIMEOUT, BusClient::connect(consumer.clone(), options))
                 .await
             {
-                Ok(Ok(client)) => bus = Some(client),
+                Ok(Ok(client)) => {
+                    bus = Some(client);
+                    delay = Duration::from_secs(1);
+                }
                 Ok(Err(error)) => {
                     failure(error_code(&error));
                     tokio::time::sleep(delay).await;
@@ -185,61 +190,79 @@ async fn drive(
         let client = bus.as_ref().expect("connected above");
         HEALTH.lock().connected = client.connection().client().connection_state()
             == async_nats::connection::State::Connected;
-        if tokio::time::Instant::now() >= next_check || state.after != 0 {
+        let mut publisher = RealPublisher(client);
+        let due = state.due();
+        if !due.is_empty() {
             let app = app.clone();
             let database = database.clone();
-            let after = state.after;
-            let batch = tokio::task::spawn_blocking(move || {
+            let retained = tokio::task::spawn_blocking(move || {
                 let db = app.open_db(&database).map_err(|_| "bus_ledger_open")?;
                 let conn = db.try_lock().map_err(|_| "bus_ledger_busy")?;
-                scan(&conn, after).map_err(|_| "bus_ledger_read")
+                due.into_iter()
+                    .map(|notice| {
+                        let retained =
+                            is_retained(&conn, &notice).map_err(|_| "bus_ledger_read")?;
+                        Ok((notice, retained))
+                    })
+                    .collect::<Result<Vec<_>, &'static str>>()
             })
             .await;
-            let batch = match batch {
-                Ok(Ok(batch)) => batch,
-                other => {
-                    failure(
-                        other
-                            .ok()
-                            .and_then(Result::err)
-                            .unwrap_or("bus_ledger_worker"),
-                    );
+            match retained {
+                Ok(Ok(retained)) => state.retry(&mut publisher, retained).await,
+                _ => {
+                    failure("bus_retry_ledger");
                     tokio::time::sleep(delay).await;
                     delay = backoff(delay);
                     continue;
                 }
-            };
-            match state.deliver(&mut RealPublisher(client), batch).await {
-                Ok(_) => {}
-                Err(code) => {
-                    failure(code);
-                    cycle_failed = true;
+            }
+        }
+        let capacity = state.capacity();
+        if scan_pending && capacity > 0 {
+            let app = app.clone();
+            let database = database.clone();
+            let position = state.position.clone();
+            let batch = tokio::task::spawn_blocking(move || {
+                let db = app.open_db(&database).map_err(|_| "bus_ledger_open")?;
+                let conn = db.try_lock().map_err(|_| "bus_ledger_busy")?;
+                read_batch(&conn, &position, capacity).map_err(|_| "bus_ledger_read")
+            })
+            .await;
+            match batch {
+                Ok(Ok(batch)) => {
+                    scan_pending = state.deliver(&mut publisher, batch).await;
+                    delay = Duration::from_secs(1);
+                    if scan_pending {
+                        continue;
+                    }
+                }
+                _ => {
+                    failure("bus_ledger_read");
+                    tokio::time::sleep(delay).await;
+                    delay = backoff(delay);
+                    continue;
                 }
             }
-            if state.after != 0 {
-                continue;
-            }
-            if cycle_failed {
-                tokio::time::sleep(delay).await;
-                delay = backoff(delay);
-                cycle_failed = false;
-                next_check = tokio::time::Instant::now();
-                continue;
-            }
-            delay = Duration::from_secs(1);
-            next_check = tokio::time::Instant::now() + RECHECK;
         }
-        // The short tick only samples connection health. Ledger work occurs on
-        // a committed-settlement hint or the independent 60-second re-check.
-        wait_for_work(&SETTLED, &mut next_check).await;
+        // Only hints read newly settled rows. Retries read their own bounded
+        // set of ledger keys; idle waits never start a ledger scan.
+        if wait_for_work(&SETTLED, state.next_retry()).await {
+            if !scan_pending {
+                state.hint();
+            }
+            scan_pending = true;
+        }
     }
 }
 
-async fn wait_for_work(settled: &Notify, next_check: &mut tokio::time::Instant) {
+async fn wait_for_work(settled: &Notify, retry: Option<tokio::time::Instant>) -> bool {
     tokio::select! {
-        _ = settled.notified() => *next_check = tokio::time::Instant::now(),
-        _ = tokio::time::sleep_until(*next_check) => {},
-        _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+        _ = settled.notified() => true,
+        _ = async {
+            if let Some(deadline) = retry { tokio::time::sleep_until(deadline).await; }
+            else { std::future::pending::<()>().await; }
+        } => false,
+        _ = tokio::time::sleep(Duration::from_secs(1)) => false,
     }
 }
 
@@ -258,6 +281,8 @@ fn error_code(error: &cortexkit_bus_client::Error) -> &'static str {
 
 #[derive(Clone, Debug)]
 struct Notice {
+    key: Key,
+    settled_at: i64,
     reader: String,
     event_id: String,
     body: Body,
@@ -275,50 +300,173 @@ impl Notice {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct Cursor {
+    settled_at: i64,
+    rowid: i64,
+}
+
+#[derive(Clone, Debug, Default)]
+enum Position {
+    #[default]
+    Start,
+    Replay {
+        boundary: Cursor,
+        reader: String,
+        seq: u64,
+    },
+    Live(Cursor),
+}
+
 struct Batch {
-    after: i64,
-    full: bool,
+    position: Position,
+    high_water: Cursor,
+    more: bool,
+    visited: usize,
     notices: Vec<Notice>,
 }
 
-fn scan(conn: &Connection, after: i64) -> rusqlite::Result<Batch> {
-    // Limit visited rows, not a filtered/collected result. The rowid seek walks
-    // at most one fixed batch, even when almost every call is still running.
-    // No result body or scope/path metadata is loaded into the bus worker.
-    let mut stmt = conn.prepare("SELECT rowid, CASE WHEN state='Settled' AND late_entry IS NOT NULL THEN custodian END, call_key, event_id, outcome FROM call_ledger WHERE rowid>?1 ORDER BY rowid LIMIT ?2")?;
-    let mut rows = stmt.query(params![after, SCAN_BATCH])?;
+fn notice(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<Notice>> {
+    let custodian: Option<String> = row.get(3)?;
+    let Some(reader) = custodian
+        .as_deref()
+        .and_then(|id| id.strip_prefix("reserved:"))
+    else {
+        return Ok(None);
+    };
+    if validate_token(TokenKind::ModuleId, reader).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(Notice {
+        key: Key {
+            carrier: row.get(4)?,
+            call_key: row.get(5)?,
+        },
+        settled_at: row.get(1)?,
+        reader: reader.into(),
+        event_id: row.get(6)?,
+        body: Body {
+            call_key: row.get(5)?,
+            outcome: row
+                .get::<_, Option<String>>(7)?
+                .unwrap_or_else(|| "unknown".into()),
+        },
+    }))
+}
+
+fn read_batch(conn: &Connection, position: &Position, capacity: usize) -> rusqlite::Result<Batch> {
+    match position {
+        Position::Start => {
+            // The retention index yields the startup boundary without walking
+            // the ledger. Older entries are replayed through each reader's feed.
+            let boundary = conn.query_row("SELECT settled_at,rowid FROM call_ledger WHERE state='Settled' ORDER BY settled_at DESC,rowid DESC LIMIT 1", [], |row| Ok(Cursor { settled_at: row.get(0)?, rowid: row.get(1)? })).optional()?.unwrap_or_default();
+            Ok(Batch {
+                position: Position::Replay {
+                    boundary,
+                    reader: String::new(),
+                    seq: 0,
+                },
+                high_water: boundary,
+                more: true,
+                visited: 0,
+                notices: Vec::new(),
+            })
+        }
+        Position::Replay {
+            boundary,
+            reader,
+            seq,
+        } => replay(conn, *boundary, reader, *seq, capacity),
+        Position::Live(after) => scan(conn, *after, capacity),
+    }
+}
+
+fn scan(conn: &Connection, after: Cursor, capacity: usize) -> rusqlite::Result<Batch> {
+    let limit = SCAN_BATCH.min(capacity);
+    // The existing (state, settled_at) index also orders equal timestamps by
+    // rowid. LIMIT bounds rows before collecting, not after a whole-ledger walk.
+    let mut stmt = conn.prepare(LIVE_SCAN_SQL)?;
+    let mut rows = stmt.query(params![after.settled_at, after.rowid, limit])?;
     let mut batch = Batch {
-        after,
-        full: false,
+        position: Position::Live(after),
+        high_water: after,
+        more: false,
+        visited: 0,
         notices: Vec::new(),
     };
-    let mut visited = 0;
     while let Some(row) = rows.next()? {
-        visited += 1;
-        batch.after = row.get(0)?;
-        let custodian: Option<String> = row.get(1)?;
-        let Some(reader) = custodian
-            .as_deref()
-            .and_then(|id| id.strip_prefix("reserved:"))
-        else {
-            continue;
+        batch.visited += 1;
+        let cursor = Cursor {
+            settled_at: row.get(1)?,
+            rowid: row.get(0)?,
         };
-        if validate_token(TokenKind::ModuleId, reader).is_err() {
-            continue;
+        batch.high_water = cursor;
+        batch.position = Position::Live(cursor);
+        if let Some(notice) = notice(row)? {
+            batch.notices.push(notice);
         }
-        batch.notices.push(Notice {
-            reader: reader.into(),
-            event_id: row.get(3)?,
-            body: Body {
-                call_key: row.get(2)?,
-                outcome: row
-                    .get::<_, Option<String>>(4)?
-                    .unwrap_or_else(|| "unknown".into()),
-            },
-        });
     }
-    batch.full = visited == SCAN_BATCH;
+    batch.more = batch.visited == limit;
     Ok(batch)
+}
+
+fn replay(
+    conn: &Connection,
+    boundary: Cursor,
+    reader: &str,
+    seq: u64,
+    capacity: usize,
+) -> rusqlite::Result<Batch> {
+    let mut batch = Batch {
+        position: Position::Live(Cursor {
+            settled_at: boundary.settled_at.saturating_sub(OVERLAP_MS),
+            rowid: 0,
+        }),
+        high_water: boundary,
+        more: true,
+        visited: 0,
+        notices: Vec::new(),
+    };
+    // Terminal feed ack deletes call_ledger rows (ack_through -> ack). Only
+    // non-terminal call_ledger_updates keep dedup rows with a NULL entry.
+    // through_seq and acked are checked too, so retained ack markers never wake.
+    let current = if seq == 0 {
+        conn.query_row("SELECT custodian,through_seq FROM call_ledger_ack WHERE custodian>?1 AND custodian>='reserved:' AND custodian<'reserved;' ORDER BY custodian LIMIT 1", [reader], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))).optional()?
+    } else {
+        Some((reader.to_owned(), seq))
+    };
+    let Some((reader, seq)) = current else {
+        return Ok(batch);
+    };
+    let limit = SCAN_BATCH.min(LATE_RESULTS_PAGE_MAX as usize).min(capacity);
+    // This is the terminal half of late_results' custodian/seq seek, without
+    // loading result bodies or the separate non-terminal held-update entries.
+    let mut stmt = conn.prepare("SELECT rowid,settled_at,seq,custodian,carrier,call_key,event_id,outcome FROM call_ledger WHERE custodian=?1 AND seq>?2 AND late_entry IS NOT NULL AND acked=0 AND (settled_at,rowid)<=(?3,?4) ORDER BY seq LIMIT ?5")?;
+    let mut rows = stmt.query(params![
+        reader,
+        seq,
+        boundary.settled_at,
+        boundary.rowid,
+        limit
+    ])?;
+    let mut last = seq;
+    while let Some(row) = rows.next()? {
+        batch.visited += 1;
+        last = row.get(2)?;
+        if let Some(notice) = notice(row)? {
+            batch.notices.push(notice);
+        }
+    }
+    batch.position = Position::Replay {
+        boundary,
+        reader,
+        seq: if batch.visited == limit { last } else { 0 },
+    };
+    Ok(batch)
+}
+
+fn is_retained(conn: &Connection, notice: &Notice) -> rusqlite::Result<bool> {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM call_ledger WHERE carrier=?1 AND call_key=?2 AND event_id=?3 AND state='Settled' AND acked=0 AND late_entry IS NOT NULL AND seq>COALESCE((SELECT through_seq FROM call_ledger_ack WHERE custodian=call_ledger.custodian),0))", params![notice.key.carrier, notice.key.call_key, notice.event_id], |row| row.get(0))
 }
 
 trait Publisher {
@@ -350,51 +498,131 @@ impl Publisher for RealPublisher<'_> {
 
 #[derive(Default)]
 struct DeliveryState {
-    after: i64,
-    acknowledged: HashSet<String>,
-    retained: HashSet<String>,
+    position: Position,
+    high_water: Cursor,
+    acknowledged: HashMap<String, i64>,
+    pending: BTreeMap<String, Retry>,
+}
+
+struct Retry {
+    notice: Notice,
+    at: tokio::time::Instant,
+    delay: Duration,
 }
 
 impl DeliveryState {
-    async fn deliver(
-        &mut self,
-        publisher: &mut impl Publisher,
-        batch: Batch,
-    ) -> Result<bool, &'static str> {
-        for notice in &batch.notices {
-            self.retained.insert(notice.msg_id());
-        }
-        let result = self.publish_batch(publisher, &batch).await;
-        self.after = if batch.full { batch.after } else { 0 };
-        if !batch.full {
-            // Feed acknowledgements delete ledger entries. Forget their bus
-            // acknowledgements after a full scan so process memory follows retention.
-            self.acknowledged.retain(|id| self.retained.contains(id));
-            self.retained.clear();
-        }
-        result.map(|()| batch.full)
+    fn capacity(&self) -> usize {
+        UNACKED_RESULTS_MAX - self.pending.len()
     }
 
-    async fn publish_batch(
-        &mut self,
-        publisher: &mut impl Publisher,
-        batch: &Batch,
-    ) -> Result<(), &'static str> {
-        for notice in &batch.notices {
+    fn hint(&mut self) {
+        // A ten-second overlap catches older rowids committed in the same
+        // millisecond and small backward wall-clock steps. Larger clock jumps
+        // can delay a wake, but late_results polling still retrieves the result.
+        self.position = Position::Live(Cursor {
+            settled_at: self.high_water.settled_at.saturating_sub(OVERLAP_MS),
+            rowid: 0,
+        });
+        self.prune();
+    }
+
+    fn prune(&mut self) {
+        let oldest = self.high_water.settled_at.saturating_sub(OVERLAP_MS);
+        self.acknowledged
+            .retain(|_, settled_at| *settled_at >= oldest);
+    }
+
+    fn next_retry(&self) -> Option<tokio::time::Instant> {
+        self.pending.values().map(|retry| retry.at).min()
+    }
+
+    fn due(&self) -> Vec<Notice> {
+        let now = tokio::time::Instant::now();
+        let mut retries: Vec<_> = self
+            .pending
+            .values()
+            .filter(|retry| retry.at <= now)
+            .collect();
+        retries.sort_unstable_by_key(|retry| retry.at);
+        let mut due = Vec::new();
+        for retry in retries {
+            due.push(retry.notice.clone());
+            if due.len() == SCAN_BATCH {
+                break;
+            }
+        }
+        due
+    }
+
+    async fn deliver(&mut self, publisher: &mut impl Publisher, batch: Batch) -> bool {
+        // read_batch never reads more candidates than available retry slots.
+        // If the bounded set fills, stop advancing the cursor; the unread
+        // settlements stay in the ledger rather than being dropped from memory.
+        assert!(batch.notices.len() <= self.capacity());
+        for notice in batch.notices {
             let id = notice.msg_id();
-            if self.acknowledged.contains(&id) {
+            if self.acknowledged.contains_key(&id) || self.pending.contains_key(&id) {
                 continue;
             }
-            let body = serde_json::to_vec(&notice.body).map_err(|_| "bus_body_encode")?;
-            tokio::time::timeout(IO_TIMEOUT, publisher.publish(&notice.reader, &id, body))
-                .await
-                .map_err(|_| "bus_publish_timeout")??;
-            self.acknowledged.insert(id);
+            if send(publisher, &notice).await {
+                self.acknowledged.insert(id, notice.settled_at);
+            } else {
+                self.pending.insert(
+                    id,
+                    Retry {
+                        notice,
+                        at: tokio::time::Instant::now() + Duration::from_secs(1),
+                        delay: Duration::from_secs(1),
+                    },
+                );
+            }
+        }
+        self.high_water = self.high_water.max(batch.high_water);
+        self.position = batch.position;
+        self.prune();
+        batch.more
+    }
+
+    async fn retry(&mut self, publisher: &mut impl Publisher, retained: Vec<(Notice, bool)>) {
+        for (notice, retained) in retained {
+            let id = notice.msg_id();
+            if !retained {
+                self.pending.remove(&id);
+                continue;
+            }
+            if send(publisher, &notice).await {
+                self.pending.remove(&id);
+                self.acknowledged.insert(id, notice.settled_at);
+            } else if let Some(retry) = self.pending.get_mut(&id) {
+                retry.delay = backoff(retry.delay);
+                retry.at = tokio::time::Instant::now() + retry.delay;
+            }
+        }
+        self.prune();
+    }
+}
+
+async fn send(publisher: &mut impl Publisher, notice: &Notice) -> bool {
+    let result = match serde_json::to_vec(&notice.body) {
+        Ok(body) => tokio::time::timeout(
+            IO_TIMEOUT,
+            publisher.publish(&notice.reader, &notice.msg_id(), body),
+        )
+        .await
+        .unwrap_or(Err("bus_publish_timeout")),
+        Err(_) => Err("bus_body_encode"),
+    };
+    match result {
+        Ok(()) => {
             let mut health = HEALTH.lock();
             health.published = health.published.saturating_add(1);
             health.last_error = None;
+            true
         }
-        Ok(())
+        Err(code) => {
+            failure(code);
+            false
+        }
     }
 }
 
