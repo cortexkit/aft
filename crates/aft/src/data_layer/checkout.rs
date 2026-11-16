@@ -56,7 +56,8 @@ use text_build::TextBuild;
 mod grammar_parity_tests;
 #[cfg(test)]
 pub(super) mod publication_tests;
-#[cfg(test)]
+// CPU time comes from `getrusage`, which Windows lacks.
+#[cfg(all(test, unix))]
 mod refresh_cost_measure;
 #[cfg(test)]
 mod resume_tests;
