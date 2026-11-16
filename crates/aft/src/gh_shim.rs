@@ -17007,7 +17007,7 @@ fn run_captured_protected(
     cwd: &Path,
     now: u64,
 ) -> i32 {
-    use crate::gh_shim_speech::{Code, Refusal};
+    use crate::gh_shim_speech::Code;
     // Background writes retain a signed policy snapshot from command launch,
     // but still require the current manifest. Report its absence before dispatch.
     if matches!(
@@ -17044,10 +17044,36 @@ fn run_captured_protected(
         |_| {
             refuse(
                 RefusalCode::SeamRefusal,
-                &Refusal::new(Code::PolicyDenied, "not_r3").agent_text(),
+                &captured_rung_refusal(&rung).agent_text(),
             )
         },
     )
+}
+
+fn captured_rung_refusal(rung: &RungRecord) -> crate::gh_shim_speech::Refusal {
+    use crate::gh_shim_speech::{Code, Refusal};
+    // Discovery records survive module restarts. A missing daemon or relay is
+    // retryable; missing policy configuration or ambient credentials are not.
+    let temporary = match rung.rung {
+        Rung::R1 => [R1Reason::Unreachable, R1Reason::DiscoveryBudgetExhausted]
+            .into_iter()
+            .any(|reason| {
+                rung.inputs.get("connection_file").map(String::as_str) == Some(reason.diagnostic())
+            }),
+        Rung::R2 => [
+            R2Reason::DaemonUnreachable,
+            R2Reason::CatalogGhRouteAbsent,
+            R2Reason::GhRouteHolderUnbound,
+        ]
+        .into_iter()
+        .any(|reason| rung.inputs.get(reason.diagnostic()).map(String::as_str) == Some("failed")),
+        Rung::R3 => false,
+    };
+    if temporary {
+        Refusal::new(Code::AuthorityUnavailable, "relay_unavailable")
+    } else {
+        Refusal::new(Code::PolicyDenied, "not_r3")
+    }
 }
 
 fn captured_plan(
@@ -17078,7 +17104,7 @@ fn captured_plan(
         .ok_or_else(|| Refusal::new(Code::PolicyDenied, "repository_denied"))?;
     let determination = determine_rung(paths, target, cwd, now);
     if determination.record.rung != Rung::R3 {
-        return Err(Refusal::new(Code::PolicyDenied, "not_r3"));
+        return Err(captured_rung_refusal(&determination.record));
     }
     Ok((manifest, classification, binding, determination.record))
 }
