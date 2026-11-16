@@ -350,25 +350,23 @@ impl RequestFiles {
     }
 
     /// The matching line of `path` for `query` within `range`, computed once
-    /// per request: the ranking and the reranker's candidate text pick the
-    /// same line from the same bytes. A `compute` that could not read the
-    /// file answers `None` and leaves nothing behind, so a later phase tries
-    /// again.
-    pub(crate) fn matching_line(
+    /// per request. Successful no-match results are cached; failed computations
+    /// are returned without caching, so a later phase can retry the read.
+    pub(crate) fn matching_line_checked(
         &self,
         path: &Path,
         query: &str,
         range: Option<(usize, usize)>,
         compute: impl FnOnce() -> io::Result<Option<(u32, String)>>,
-    ) -> Option<(u32, String)> {
+    ) -> io::Result<Option<(u32, String)>> {
         let key = (path.to_path_buf(), query.to_string(), range);
         if let Some(found) = self.matching_lines.lock().get(&key) {
             self.matching_line_hits.fetch_add(1, Ordering::Relaxed);
-            return found.clone();
+            return Ok(found.clone());
         }
-        let found = compute().ok()?;
+        let found = compute()?;
         self.matching_lines.lock().insert(key, found.clone());
-        found
+        Ok(found)
     }
 
     pub(crate) fn report(&self) -> RequestFilesReport {
@@ -526,6 +524,58 @@ pub(crate) fn read_whole_file_at(
     (&mut file).take(stat.size).read_to_end(&mut bytes)?;
     crate::large_read::allow_whole(site, path, bytes.len() as u64)?;
     Ok((bytes, Some(stat)))
+}
+
+#[cfg(test)]
+mod matching_line_completion_tests {
+    use super::*;
+
+    #[test]
+    fn audit1432_round4_failed_selection_is_uncached_and_complete_no_match_is_cached() {
+        let files = RequestFiles::default();
+        let path = Path::new("/request-files/selection.rs");
+        let computes = std::cell::Cell::new(0);
+        let error = files
+            .matching_line_checked(path, "subject", None, || {
+                computes.set(computes.get() + 1);
+                Err(io::Error::other("selection read failed"))
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "selection read failed");
+        let found = Some((12, "fn subject() {}".to_string()));
+        assert_eq!(
+            files
+                .matching_line_checked(path, "subject", None, || {
+                    computes.set(computes.get() + 1);
+                    Ok(found.clone())
+                })
+                .unwrap(),
+            found
+        );
+        assert_eq!(
+            files
+                .matching_line_checked(path, "subject", None, || panic!(
+                    "successful result was not cached"
+                ))
+                .unwrap(),
+            found
+        );
+        assert_eq!(computes.get(), 2);
+        assert!(files
+            .matching_line_checked(path, "missing", None, || {
+                computes.set(computes.get() + 1);
+                Ok(None)
+            })
+            .unwrap()
+            .is_none());
+        assert!(files
+            .matching_line_checked(path, "missing", None, || panic!(
+                "complete no-match was not cached"
+            ))
+            .unwrap()
+            .is_none());
+        assert_eq!(computes.get(), 3);
+    }
 }
 
 /// Test probe: every read of file content a search does, by path, whether

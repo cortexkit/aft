@@ -103,6 +103,17 @@ pub(crate) fn visit_lines(
                 tap(read);
             }
         });
+        #[cfg(test)]
+        if LINE_SCAN_FAILURE.with(|failure| {
+            if failure.get() == Some(site) {
+                failure.take();
+                true
+            } else {
+                false
+            }
+        }) {
+            return Err(io::Error::other("injected line scan failure"));
+        }
         if lf.is_some() {
             visit(index, offset, &line);
             offset += line.len();
@@ -119,6 +130,7 @@ pub(crate) const STEP_BYTES: usize = 1024 * 1024;
 
 #[cfg(test)]
 thread_local! {
+    static LINE_SCAN_FAILURE: std::cell::Cell<Option<Site>> = const { std::cell::Cell::new(None) };
     /// Replaces [`STEP_BYTES`] on this thread, so tests can put step edges
     /// anywhere in small generated files.
     static STEP_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
@@ -132,6 +144,26 @@ thread_local! {
     /// A [`Steps`] reservation that would grow its buffer past this many
     /// bytes fails on this thread, as a refused allocation does.
     static REFUSE_RESERVE_OVER: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// Fail one raw-line scan at `site` after it consumes its first chunk. The
+/// assertion prevents a regression test from passing without reaching the read.
+#[cfg(test)]
+pub(crate) fn with_line_scan_failure<T>(site: Site, work: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            LINE_SCAN_FAILURE.with(|failure| failure.set(None));
+        }
+    }
+    LINE_SCAN_FAILURE.with(|failure| failure.set(Some(site)));
+    let _reset = Reset;
+    let value = work();
+    assert!(
+        LINE_SCAN_FAILURE.with(|failure| failure.get().is_none()),
+        "injected line scan failure was never reached"
+    );
+    value
 }
 
 /// Run `work` with `tap` called after every step or raw-line chunk on this thread.

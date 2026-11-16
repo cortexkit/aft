@@ -4118,11 +4118,24 @@ fn disclose_anchored_admission(
 /// line number and display text. The text is bounded by `snippet_bounds`: a
 /// long line (minified code, a single-line JSON document) yields a window
 /// around the match, never the whole line.
+/// This best-effort Option form is only for presentation. Callers that feed a
+/// cross-request memo must use the checked form so failed reads stay distinct.
 fn matching_line_from_source(
     file: &Path,
     query: &str,
     symbol_range: Option<SymbolOffsetRange>,
 ) -> Option<(u32, String)> {
+    matching_line_from_source_checked(file, query, symbol_range)
+        .ok()
+        .flatten()
+}
+
+/// Keep source-reading errors separate from a successful read with no matching line.
+fn matching_line_from_source_checked(
+    file: &Path,
+    query: &str,
+    symbol_range: Option<SymbolOffsetRange>,
+) -> std::io::Result<Option<(u32, String)>> {
     if request_files::current()
         .and_then(|files| files.kept(file))
         .is_none()
@@ -4130,13 +4143,13 @@ fn matching_line_from_source(
     {
         let find = || matching_line_streamed(file, query, symbol_range);
         return match request_files::current() {
-            Some(files) => files.matching_line(
+            Some(files) => files.matching_line_checked(
                 file,
                 query,
                 symbol_range.map(|range| (range.start, range.end)),
                 find,
             ),
-            None => find().ok().flatten(),
+            None => find(),
         };
     }
     let Some(files) = request_files::current() else {
@@ -4148,14 +4161,16 @@ fn matching_line_from_source(
                     read_whole_source_file(path),
                 )
             })
-        })
-        .ok()?;
+        })?;
         drop(read_cost);
-        return matching_line_in_text(source.file.utf8()?, query, symbol_range);
+        return Ok(source
+            .file
+            .utf8()
+            .and_then(|source| matching_line_in_text(source, query, symbol_range)));
     };
     // The reranker's candidate text asks for the same line of the same file;
     // the request's set answers both from one search of the text.
-    files.matching_line(
+    files.matching_line_checked(
         file,
         query,
         symbol_range.map(|range| (range.start, range.end)),

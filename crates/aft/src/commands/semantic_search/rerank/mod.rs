@@ -647,7 +647,7 @@ fn candidate_text_checked(
             super::request_files::read_whole_file(path),
         )
     });
-    let completion = candidate_completion(read.is_ok());
+    let mut completion = candidate_completion(read.is_ok());
     let file = read.ok().map(|fetched| fetched.file);
     let bytes = file.as_ref().map_or(&[][..], |file| file.bytes());
     let (raw_line, selected) = if let Some(range) = result.symbol_range {
@@ -681,11 +681,17 @@ fn candidate_text_checked(
             };
             let matched = match (&files, &file) {
                 (Some(files), Some(_)) => {
-                    files.matching_line(&result.path, prose, None, || Ok(find()))
+                    files.matching_line_checked(&result.path, prose, None, || Ok(find()))
                 }
-                _ => find(),
-            }
-            .map(|(line, _)| line as usize);
+                _ => Ok(find()),
+            };
+            let matched = match matched {
+                Ok(found) => found.map(|(line, _)| line as usize),
+                Err(_) => {
+                    completion = candidate_completion(false);
+                    None
+                }
+            };
             let first = matched.map_or(0, |line| line.saturating_sub(FILE_CONTEXT_LINES_ABOVE));
             let name =
                 matched_identifier(prose, &source).unwrap_or_else(|| file_stem(&result.path));
@@ -771,11 +777,15 @@ fn streamed_candidate_text_checked(
             }
         },
     );
-    let matched = if scan.is_ok() && result.symbol_range.is_none() {
-        super::matching_line_from_source(&result.path, prose, None).map(|(line, _)| line as usize)
+    let selection = if scan.is_ok() && result.symbol_range.is_none() {
+        super::matching_line_from_source_checked(&result.path, prose, None)
     } else {
-        None
+        Ok(None)
     };
+    // A successful no-match is complete; a failed selection must not be hidden
+    // by a later successful read of the body.
+    let selection_complete = selection.is_ok();
+    let matched = selection.ok().flatten().map(|(line, _)| line as usize);
     let line = if result.symbol_range.is_some() {
         raw_line
     } else {
@@ -818,7 +828,7 @@ fn streamed_candidate_text_checked(
     );
     CandidateText {
         text,
-        completion: candidate_completion(scan.is_ok()),
+        completion: candidate_completion(selection_complete && scan.is_ok()),
     }
 }
 

@@ -700,6 +700,124 @@ fn tiny_list(project: &Path, count: usize) -> CanonicalList {
 }
 
 #[test]
+fn audit1432_round4_middle_selection_failure_never_scores_or_commits_and_retries_fresh() {
+    for with_request_files in [false, true] {
+        let project = tempfile::tempdir().unwrap();
+        let mut list = tiny_list(project.path(), 2);
+        let path = list.blocks[0].entries[0].result.path.clone();
+        let mut source = b"// padding\n".repeat((5 << 20) / 11);
+        source.extend_from_slice(b"fn scan_subject() {}\n");
+        std::fs::write(&path, &source).unwrap();
+        assert!(list.blocks[0]
+            .entries
+            .iter()
+            .all(|entry| entry.result.symbol_range.is_none()));
+        let _files = with_request_files.then(super::super::request_files::install);
+        let backend = NumberedBackend::new(Vec::new());
+        let selected = Ok(SelectedBackend {
+            backend: backend.clone(),
+            fail_closed: false,
+        });
+        let prose = "how does scan_subject work";
+        let identity = memo_identity(
+            &list.key,
+            prose,
+            None,
+            &backend.fingerprint(),
+            2,
+            list.blocks[0].entries.iter().map(|entry| &entry.result),
+        );
+        let search = SearchConfig::default();
+        let settings = RerankSettings::resolve(&search);
+        let request = head_request(&search, project.path(), Some(prose), None);
+        let before = names(&list);
+        let outcome = crate::large_read::with_line_scan_failure(
+            crate::large_read::Site::MatchingLine,
+            || rerank_block_zero(&mut list, &selected, &settings, &request),
+        )
+        .unwrap();
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            0,
+            "a failure in selection alone must prevent scoring, request cache={with_request_files}"
+        );
+        assert!(
+            memo().lookup(&identity).is_none(),
+            "failed selection must not commit an outcome"
+        );
+        assert_eq!(
+            outcome,
+            HeadOutcome::Skipped("candidate source incomplete".into())
+        );
+        assert_eq!(names(&list), before);
+        assert_eq!(
+            super::super::matching_line_from_source(&path, prose, None)
+                .unwrap()
+                .0,
+            source.iter().filter(|&&byte| byte == b'\n').count() as u32 - 1,
+            "a failed request-cache lookup must be retried, not cached as no-match"
+        );
+        assert_eq!(
+            rerank_block_zero(&mut list, &selected, &settings, &request).unwrap(),
+            HeadOutcome::Reordered
+        );
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            1,
+            "retry must compute a fresh outcome"
+        );
+        assert!(memo().lookup(&identity).is_some());
+    }
+}
+
+#[test]
+fn audit1432_round4_complete_no_match_candidate_still_memoizes() {
+    let project = tempfile::tempdir().unwrap();
+    let list = tiny_list(project.path(), 2);
+    let path = list.blocks[0].entries[0].result.path.clone();
+    std::fs::write(
+        &path,
+        format!("{}\n", "7".repeat(127)).repeat((5 << 20) / 128),
+    )
+    .unwrap();
+    let _files = super::super::request_files::install();
+    let backend = NumberedBackend::new(Vec::new());
+    let selected = Ok(SelectedBackend {
+        backend: backend.clone(),
+        fail_closed: false,
+    });
+    let prose = "how does zqxwv_missing_identifier work";
+    let identity = memo_identity(
+        &list.key,
+        prose,
+        None,
+        &backend.fingerprint(),
+        2,
+        list.blocks[0].entries.iter().map(|entry| &entry.result),
+    );
+    assert!(
+        super::super::matching_line_from_source_checked(&path, prose, None)
+            .unwrap()
+            .is_none()
+    );
+    let search = SearchConfig::default();
+    let settings = RerankSettings::resolve(&search);
+    let request = head_request(&search, project.path(), Some(prose), None);
+    for _ in 0..2 {
+        assert_eq!(
+            rerank_block_zero(&mut list.clone(), &selected, &settings, &request).unwrap(),
+            HeadOutcome::Reordered
+        );
+        assert!(memo().lookup(&identity).is_some());
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            1,
+            "a complete no-match result must remain memoizable"
+        );
+    }
+}
+
+#[test]
 fn audit1432_round3_cancelled_candidate_scan_never_commits_and_next_request_is_fresh() {
     for cancel_pass in [1, 2] {
         let project = tempfile::tempdir().unwrap();
