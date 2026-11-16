@@ -42,6 +42,7 @@ struct BusHealth {
     publish_failures: u64,
     last_error: Option<&'static str>,
     cards: readers::ReaderHealth,
+    sendstate: readers::ReaderHealth,
 }
 
 pub(crate) fn health() -> serde_json::Value {

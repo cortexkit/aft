@@ -268,7 +268,7 @@ pub(crate) mod result_body;
 mod retained_result;
 pub(crate) mod rich_ui;
 mod run_scope;
-mod runner_notices;
+pub(crate) mod runner_notices;
 
 #[cfg(feature = "test-scope-owner")]
 #[doc(hidden)]

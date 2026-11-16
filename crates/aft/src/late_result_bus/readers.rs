@@ -1,7 +1,10 @@
 //! Optional bus wakes. Answer ownership stays with the original consent call.
 use std::{
     collections::HashMap,
-    sync::{Arc, LazyLock, Weak},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, LazyLock, Weak,
+    },
     time::Duration,
 };
 
@@ -17,6 +20,7 @@ pub(crate) const LIVE_BACKSTOP: Duration = Duration::from_secs(30);
 // Cingulate authors incoming card message ids as {elicitation_id}:aft.
 const CARD_ID_SUFFIX: &str = ":aft";
 static ATTACHED: LazyLock<watch::Sender<bool>> = LazyLock::new(|| watch::channel(false).0);
+static SEND_ATTACHED: AtomicBool = AtomicBool::new(false);
 static CARDS: LazyLock<parking_lot::Mutex<HashMap<String, Vec<Weak<Wake>>>>> =
     LazyLock::new(Default::default);
 
@@ -32,22 +36,65 @@ pub(super) struct ReaderHealth {
 pub(crate) fn cards_attached() -> bool {
     *ATTACHED.borrow()
 }
+pub(crate) fn sendstate_attached() -> bool {
+    SEND_ATTACHED.load(Ordering::Relaxed)
+}
+
+#[derive(Clone, Copy)]
+enum Kind {
+    Cards,
+    SendState,
+}
+impl Kind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cards => "cards",
+            Self::SendState => "sendstate",
+        }
+    }
+    fn health(self, health: &mut super::BusHealth) -> &mut ReaderHealth {
+        match self {
+            Self::Cards => &mut health.cards,
+            Self::SendState => &mut health.sendstate,
+        }
+    }
+}
 
 fn attached(value: bool, reason: Option<&'static str>) {
-    let mut health = HEALTH.lock();
-    let health = &mut health.cards;
+    status(Kind::Cards, value, reason);
+}
+fn status(kind: Kind, value: bool, reason: Option<&'static str>) {
+    let mut snapshot = HEALTH.lock();
+    let health = kind.health(&mut snapshot);
+    let changed = value != health.reader_attached;
     if value != health.reader_attached {
         log::info!(
-            "bus cards reader {}",
+            "bus {} reader {}",
+            kind.label(),
             if value { "attached" } else { "detached" }
         );
     }
     if reason.is_some() && reason != health.reason {
-        log::warn!("bus cards reader failure: {}", reason.unwrap());
+        log::warn!("bus {} reader failure: {}", kind.label(), reason.unwrap());
     }
     health.reader_attached = value;
     health.reason = reason;
-    ATTACHED.send_replace(value);
+    drop(snapshot);
+    match kind {
+        Kind::Cards => {
+            ATTACHED.send_if_modified(|old| {
+                let changed = *old != value;
+                *old = value;
+                changed
+            });
+        }
+        Kind::SendState => {
+            SEND_ATTACHED.store(value, Ordering::Relaxed);
+            if changed {
+                crate::subc::runner_notices::bus_attachment_changed(value);
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -167,15 +214,43 @@ async fn card_wake(body: &[u8], msg_id: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-async fn cards(client: Arc<BusClient>) {
+/// Extract only a send identity, never delivery state. An absent or unusable id
+/// wakes the bounded follow queue for authoritative session.send_status reads.
+fn send_id(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()?
+        .as_object()?
+        .get("send_id")?
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
+async fn send_wake(body: &[u8]) -> Result<(), &'static str> {
+    if !serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|value| value.is_object()) {
+        HEALTH.lock().sendstate.malformed_events += 1;
+        status(
+            Kind::SendState,
+            sendstate_attached(),
+            Some("send_state_body_malformed"),
+        );
+    }
+    crate::subc::runner_notices::bus_wake(send_id(body).as_deref()).await?;
+    HEALTH.lock().sendstate.events_handled += 1;
+    Ok(())
+}
+
+async fn reader(client: Arc<BusClient>, kind: Kind) {
     let row = EVENT_CONSUMERS
         .iter()
         .find(|row| {
             row.module_id == "aft"
-                && row
-                    .filter_subjects
-                    .iter()
-                    .any(|s| s.contains("card_settled"))
+                && row.filter_subjects.iter().any(|s| {
+                    s.contains(match kind {
+                        Kind::Cards => "card_settled",
+                        Kind::SendState => "send_state",
+                    })
+                })
         })
         .expect("naming declares AFT cards");
     let durable = row.durable_name().expect("reviewed durable");
@@ -185,13 +260,13 @@ async fn cards(client: Arc<BusClient>) {
         let mut reader = match result {
             Ok(Ok(reader)) => reader,
             _ => {
-                attached(false, Some("card_attach"));
+                status(kind, false, Some("reader_attach"));
                 tokio::time::sleep(delay).await;
                 delay = backoff(delay);
                 continue;
             }
         };
-        attached(true, None);
+        status(kind, true, None);
         delay = Duration::from_secs(1);
         loop {
             let next = reader.next();
@@ -205,20 +280,22 @@ async fn cards(client: Arc<BusClient>) {
                 }
             };
             let result = match result {
-                Ok(EventItem::Delivery(event)) => match card_wake(&event.body, &event.msg_id).await
-                {
-                    Ok(()) => event.ack().await.map_err(|_| "card_ack"),
+                Ok(EventItem::Delivery(event)) => match match kind {
+                    Kind::Cards => card_wake(&event.body, &event.msg_id).await,
+                    Kind::SendState => send_wake(&event.body).await,
+                } {
+                    Ok(()) => event.ack().await.map_err(|_| "event_ack"),
                     Err(code) => Err(code),
                 },
                 Ok(EventItem::Malformed(event)) => {
-                    HEALTH.lock().cards.malformed_events += 1;
-                    attached(true, Some("card_envelope_malformed"));
-                    event.term().await.map_err(|_| "card_term")
+                    kind.health(&mut HEALTH.lock()).malformed_events += 1;
+                    status(kind, true, Some("event_envelope_malformed"));
+                    event.term().await.map_err(|_| "event_term")
                 }
-                _ => Err("card_read"),
+                _ => Err("event_read"),
             };
             if let Err(reason) = result {
-                attached(false, Some(reason));
+                status(kind, false, Some(reason));
                 break;
             }
         }
@@ -236,7 +313,10 @@ pub(super) async fn sweep_parked() {
 }
 impl Services {
     pub(super) fn start(client: Arc<BusClient>) -> Self {
-        Self(vec![tokio::spawn(cards(client))])
+        Self(vec![
+            tokio::spawn(reader(client.clone(), Kind::Cards)),
+            tokio::spawn(reader(client, Kind::SendState)),
+        ])
     }
 }
 impl Drop for Services {
@@ -245,5 +325,6 @@ impl Drop for Services {
             task.abort();
         }
         attached(false, Some("bus_disconnected"));
+        status(Kind::SendState, false, Some("bus_disconnected"));
     }
 }
