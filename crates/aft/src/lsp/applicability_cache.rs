@@ -309,6 +309,11 @@ struct State {
     input_identities: HashSet<(u64, u64)>,
     marker_names: HashSet<String>,
     cause: Option<InvalidationCause>,
+    // Only a positively matched selection input is named. Topology batches
+    // retain their size, not a guessed path that might be unrelated to the walk.
+    // These describe the latest invalidation; a scan can absorb other triggers.
+    trigger_path: Option<PathBuf>,
+    trigger_path_candidates: usize,
     /// The configuration the cached result was walked with, for resolving
     /// created files the same way the walk would.
     config: Option<Arc<Config>>,
@@ -467,9 +472,9 @@ impl ApplicabilityCache {
             return None;
         }
         let mut known = false;
-        let mut input_changed = paths
+        let mut changed_input = paths
             .iter()
-            .any(|path| super::typescript_project::path_affects_typescript_selection(path));
+            .find(|path| super::typescript_project::path_affects_typescript_selection(path));
         let mut ready = true;
         let mut active_configurations = 0;
         let mut roots = HashSet::from([root.to_path_buf()]);
@@ -511,17 +516,20 @@ impl ApplicabilityCache {
                         active_configurations += 1;
                         ready &= state.result.is_some() && state.running.is_none();
                     }
-                    input_changed |= normalized_paths.iter().any(|path| {
-                        state.inputs.contains(path)
-                            || state
-                                .marker_names
-                                .iter()
-                                .any(|marker| path.ends_with(marker))
+                    changed_input = changed_input.or_else(|| {
+                        normalized_paths.iter().find(|&path| {
+                            state.inputs.contains(path)
+                                || state
+                                    .marker_names
+                                    .iter()
+                                    .any(|marker| path.ends_with(marker))
+                        })
                     });
-                    input_changed |= file_states.iter().any(|state_of_path| {
+                    changed_input = changed_input.or_else(|| normalized_paths.iter().zip(&file_states).find_map(|(path, state_of_path)| {
                         matches!(state_of_path, PathState::Present { identity: Some(identity), is_file: true, .. }
                             if state.input_identities.contains(identity))
-                    });
+                            .then_some(path)
+                    }));
                     if let (Some(walk), Some(config)) = (&state.result, &state.config) {
                         bases.push(TopologyBasis {
                             flight: Arc::clone(flight),
@@ -536,6 +544,7 @@ impl ApplicabilityCache {
                 }
             }
         }
+        let input_changed = changed_input.is_some();
         // Only a positively identified data modification is safe. Missing paths,
         // directories, unreadable paths and kind-less backend events remain conservative.
         let content_only = content_only
@@ -578,7 +587,12 @@ impl ApplicabilityCache {
         } else {
             InvalidationCause::CreateRemoveRename
         };
-        self.invalidate(root, cause);
+        self.invalidate_with_trigger(
+            root,
+            cause,
+            changed_input.map(PathBuf::as_path),
+            paths.len(),
+        );
         Some(cause)
     }
 
@@ -825,6 +839,8 @@ impl ApplicabilityCache {
                 self.record_invalidation(root, InvalidationCause::DependencyValidation);
                 state.result = None;
                 state.cause = Some(InvalidationCause::DependencyValidation);
+                state.trigger_path = None;
+                state.trigger_path_candidates = 0;
                 state.generation = state.generation.wrapping_add(1);
                 state.pending_triggers += 1;
             }
@@ -891,6 +907,14 @@ impl ApplicabilityCache {
                     .cause
                     .take()
                     .map_or("cold_or_config", InvalidationCause::label);
+                let trigger_path = serde_json::to_string(
+                    &state
+                        .trigger_path
+                        .take()
+                        .map(|path| path.display().to_string()),
+                )
+                .expect("display paths serialize");
+                let trigger_path_candidates = std::mem::take(&mut state.trigger_path_candidates);
                 drop(state);
                 let start = Instant::now();
                 let capture = Capture::start(root);
@@ -913,8 +937,8 @@ impl ApplicabilityCache {
                     metrics.absorbed_triggers += absorbed_triggers;
                 }
                 crate::slog_info!(
-                "LSP applicability full walk root={} cause={} root_walk_number={} duration_micros={} dependencies={} success={} absorbed_triggers={}",
-                root.display(), cause, root_walk_number, elapsed.as_micros(), inputs.len(), result.is_ok(), absorbed_triggers
+                "LSP applicability full walk root={} cause={} root_walk_number={} duration_micros={} dependencies={} success={} absorbed_triggers={} trigger_path={} trigger_path_candidates={}",
+                root.display(), cause, root_walk_number, elapsed.as_micros(), inputs.len(), result.is_ok(), absorbed_triggers, trigger_path, trigger_path_candidates
             );
                 let input_dirs = Arc::new(input_directories(
                     &crate::inspect::job::normalize_path(root),
@@ -976,6 +1000,16 @@ impl ApplicabilityCache {
     }
 
     pub(super) fn invalidate(&self, root: &Path, cause: InvalidationCause) {
+        self.invalidate_with_trigger(root, cause, None, 0);
+    }
+
+    pub(super) fn invalidate_with_trigger(
+        &self,
+        root: &Path,
+        cause: InvalidationCause,
+        trigger_path: Option<&Path>,
+        trigger_path_candidates: usize,
+    ) {
         let mut affected = std::collections::HashSet::new();
         affected.insert(root.to_path_buf());
         for ((cached_root, _), flight) in self.entries.lock().iter() {
@@ -987,6 +1021,8 @@ impl ApplicabilityCache {
                 state.pending_triggers += 1;
                 state.result = None;
                 state.cause = Some(cause);
+                state.trigger_path = trigger_path.map(crate::inspect::job::normalize_path);
+                state.trigger_path_candidates = trigger_path_candidates;
                 affected.insert(cached_root.clone());
             }
         }

@@ -1685,7 +1685,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     // itself from the changed paths, so the data layer hears
                     // of it only here; recording it rescans its folder.
                     ctx.data_note_paths(&paths);
-                    ctx.lsp_note_watcher_ignore_change();
+                    ctx.lsp_note_watcher_ignore_change(&paths);
                     if state.rescan_required {
                         state.rescan_ignore_checked = false;
                     }
@@ -2455,6 +2455,35 @@ mod tests {
         let metrics = crate::lsp::manager::applicability_metrics(&root);
         assert_eq!(metrics.full_walks - before, 0);
         assert_eq!(metrics.retained_content_batches, 50);
+        assert!(metrics.invalidations.is_empty());
+    }
+
+    #[test]
+    fn watcher_drain_source_only_over_cap_batch_starts_no_full_applicability_walk() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let mut paths = Vec::new();
+        for n in 0..500.max(WATCHER_BATCH_INLINE_CAP + 1) {
+            let path = root.join(format!("source{n}.py"));
+            std::fs::write(&path, "print(0)").unwrap();
+            paths.push(path);
+        }
+        let (ctx, tx) = watcher_context(&root);
+        let config = ctx.config();
+        crate::lsp::manager::walk_applicable_area(&root, None, &config, None).unwrap();
+        let before = crate::lsp::manager::applicability_metrics(&root).full_walks;
+        tx.send(WatcherDispatchEvent::Paths(paths)).unwrap();
+        for slice in 0..4096 {
+            if !drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more {
+                break;
+            }
+            assert!(slice < 4095, "over-cap batch must finish draining");
+        }
+        assert!(ctx.wait_for_project_applicability(Duration::from_secs(10)));
+        crate::lsp::manager::walk_applicable_area(&root, None, &config, None).unwrap();
+        let metrics = crate::lsp::manager::applicability_metrics(&root);
+        println!("source_only_over_cap={metrics:?}");
+        assert_eq!(metrics.full_walks - before, 0);
         assert!(metrics.invalidations.is_empty());
     }
 

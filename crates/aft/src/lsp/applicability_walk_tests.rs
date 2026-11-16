@@ -603,6 +603,59 @@ fn applicability_walk_package_json_content_invalidates() {
 }
 
 #[test]
+fn applicability_walk_log_names_only_a_matched_trigger_path() {
+    let fixture = WatcherWalkFixture::new();
+    fixture.walk();
+    let source = fixture.root.join("main.py");
+    let marker = fixture.root.join("go.mod");
+    fixture.batch(&[source.clone(), marker.clone()], data_modify());
+    let (_, lines) = crate::logging::capture_log_lines(|| fixture.walk());
+    let walks: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("LSP applicability full walk "))
+        .collect();
+    assert_eq!(walks.len(), 1, "{lines:?}");
+    assert!(walks[0].contains(" cause=marker_ignore_config_or_ts_install "));
+    assert!(
+        walks[0].ends_with(&format!(
+            " trigger_path={} trigger_path_candidates=2",
+            serde_json::to_string(&marker.display().to_string()).unwrap(),
+        )),
+        "{}",
+        walks[0]
+    );
+
+    // A directory batch cannot identify which subtree entry needs a walk.
+    let directory = fixture.root.join("new directory");
+    std::fs::create_dir(&directory).unwrap();
+    fixture.batch(&[source, directory], notify::EventKind::Any);
+    let (_, lines) = crate::logging::capture_log_lines(|| fixture.walk());
+    let line = lines
+        .iter()
+        .find(|line| line.contains("LSP applicability full walk "))
+        .unwrap();
+    assert!(line.contains(" cause=create_remove_rename_or_directory "));
+    assert!(
+        line.ends_with(" trigger_path=null trigger_path_candidates=2"),
+        "{line}"
+    );
+
+    fixture
+        .cache
+        .invalidate(&fixture.root, InvalidationCause::OverflowLostEvents);
+    let (_, lines) = crate::logging::capture_log_lines(|| fixture.walk());
+    let line = lines
+        .iter()
+        .find(|line| line.contains("LSP applicability full walk "))
+        .unwrap();
+    assert!(line.contains(" cause=overflow_or_lost_events "));
+    assert!(
+        line.ends_with(" trigger_path=null trigger_path_candidates=0"),
+        "{line}"
+    );
+}
+
+#[test]
 fn applicability_walk_gitignore_content_invalidates() {
     let fixture = WatcherWalkFixture::new();
     fixture.walk();

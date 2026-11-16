@@ -10345,6 +10345,22 @@ pub(crate) fn invalidate_applicability_walk(root: &Path, cause: InvalidationCaus
     super::applicability_cache::shared().invalidate(&root, cause);
 }
 
+pub(crate) fn invalidate_applicability_walk_with_trigger(
+    root: &Path,
+    cause: InvalidationCause,
+    trigger_path: Option<&Path>,
+    trigger_path_candidates: usize,
+) {
+    let root = crate::inspect::job::canonicalize_normalized(root);
+    super::typescript_project::clear_typescript_selection();
+    super::applicability_cache::shared().invalidate_with_trigger(
+        &root,
+        cause,
+        trigger_path,
+        trigger_path_candidates,
+    );
+}
+
 pub(crate) fn invalidate_applicability_batch(
     root: &Path,
     paths: &[PathBuf],
