@@ -138,6 +138,8 @@ pub(crate) enum Script {
     },
     Restart,
     Cancel,
+    /// Keep an existing job's attach stream open until `exec.cancel` reaches it.
+    AttachUntilCancelled,
     /// Hold the run stream open until cancellation; attach returns this terminal.
     CancelTerminal {
         terminal: fn() -> TerminalRecord,
@@ -561,6 +563,7 @@ pub(crate) async fn daemon_with_capabilities(
                                 replies.push(reply(FrameType::StreamEnd, Value::Null));
                             }
                         }
+                        "exec.attach" if matches!(script, Script::AttachUntilCancelled) && !cancelled => {},
                         "exec.run" | "exec.attach" => {
                             let attaching = body["method"] == "exec.attach";
                             if !attaching { runs += 1; }
@@ -759,7 +762,7 @@ pub(crate) async fn daemon_with_capabilities(
                         _ => panic!("unexpected caller operation {body}"),
                     }
                 },
-                FrameType::Cancel if matches!(script, Script::DetachSafeStages { .. } | Script::PlacementWait { .. }) => {},
+                FrameType::Cancel if matches!(script, Script::DetachSafeStages { .. } | Script::PlacementWait { .. } | Script::AttachUntilCancelled) => {},
                 FrameType::Cancel => {cancelled = true; stop.store(true,std::sync::atomic::Ordering::SeqCst);},
                 _ => {},
             }

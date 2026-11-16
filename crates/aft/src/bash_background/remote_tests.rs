@@ -9648,7 +9648,9 @@ async fn remote_job_id_response(
 
 #[tokio::test]
 async fn remote_job_id_own_status_watch_and_kill_use_persisted_task_ids() {
-    let daemon = daemon(Script::Cancel, "exec-remote/v1").await;
+    // Replay follows an existing job with exec.attach, not exec.run. Keep that
+    // job running until exec.cancel so a natural exit cannot race the kill.
+    let daemon = daemon(Script::AttachUntilCancelled, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
     let (original, task_id, _) =
         persist_accepted_with_snapshot(dir.path(), daemon.connection.clone(), "cargo test");
@@ -9662,33 +9664,30 @@ async fn remote_job_id_own_status_watch_and_kill_use_persisted_task_ids() {
     for tool in ["bash_status", "bash_watch", "bash_kill"] {
         let response =
             remote_job_id_response(Arc::clone(&ctx), tool, &id().to_string(), "session").await;
-        eprintln!("{tool}: {response:?}");
         assert!(response.success, "{tool}: {response:?}");
         assert_eq!(response.data["task_id"], task_id, "{tool}: {response:?}");
+        assert_eq!(
+            response.data["status"],
+            if tool == "bash_kill" { "killed" } else { "running" },
+            "{tool}: {response:?}; worker logs: {:?}",
+            capture.lock().unwrap()
+        );
+        if tool == "bash_status" {
+            daemon.wait_for_requests("exec.attach", 1).await;
+        }
     }
-    eprintln!("worker logs: {:?}", capture.lock().unwrap());
-    eprintln!("daemon log: {:?}", daemon.log.lock().unwrap());
-    eprintln!(
-        "connection={} canonical={} connections={}",
-        daemon.connection.display(),
-        daemon.connection.canonicalize().unwrap().display(),
-        daemon.connections.load(Ordering::SeqCst)
-    );
-    // A kill reaches the build server either as an `exec.cancel` request or,
-    // while a follower holds the job's stream, as a stream Cancel frame, and
-    // the fake can log it after the kill reply returns.
-    wait_for("bash_kill by job id reached the build server", || {
-        daemon
-            .log
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(header, body)| {
-                body["method"] == "exec.cancel" || header.ty == subc_protocol::FrameType::Cancel
-            })
-            .then_some(())
-    })
-    .await;
+    // Request-level Cancel only detaches a follower; require the job-id cancel
+    // itself, addressed to the saved job, rather than accepting a stream drop.
+    daemon.wait_for_requests("exec.cancel", 1).await;
+    let log = daemon.log.lock().unwrap();
+    let cancels: Vec<_> = log
+        .iter()
+        .filter(|(_, body)| body["method"] == "exec.cancel")
+        .collect();
+    assert_eq!(cancels.len(), 1, "{log:?}");
+    assert_eq!(cancels[0].1["params"]["job_id"], id().to_string());
+    assert_eq!(daemon.connections.load(Ordering::SeqCst), 1);
+    drop(log);
     ctx.bash_background().detach();
 }
 
