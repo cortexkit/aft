@@ -12,7 +12,7 @@ use crate::bash_background::TaskIdentityAuth;
 #[cfg(all(test, unix))]
 use std::ffi::CString;
 use std::ffi::{OsStr, OsString};
-#[cfg(any(windows, test))]
+#[cfg(all(test, unix))]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -23,10 +23,10 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 #[cfg(windows)]
-use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
