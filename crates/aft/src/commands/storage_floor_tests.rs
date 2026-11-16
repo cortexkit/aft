@@ -98,6 +98,9 @@ fn audit1432_mixed_floor_and_ceiling_grep_preserves_both_omissions() {
         "{response:?}"
     );
     let skipped = response.data["skipped_files"].as_array().unwrap();
+    // macOS temp folders sit behind the /var -> /private/var link, and grep
+    // reports the resolved path.
+    let large = std::fs::canonicalize(&large).unwrap();
     assert!(
         skipped.iter().any(|entry| entry["file"] == json!(large)
             && entry["reason"] == crate::large_read::WHOLE_READ_SKIP_REASON),
