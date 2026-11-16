@@ -167,7 +167,7 @@ fn subc_module_reads_the_pipe_nonce_and_no_child_inherits_it() {
 
         assert_eq!(
             manifest["provenance"]["wire_crate_version"],
-            json!("0.37.0")
+            json!("0.37.2")
         );
         // Binary builders may provide a revision explicitly. Ordinary Cargo
         // builds omit it; the nonce and child checks do not depend on provenance.

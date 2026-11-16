@@ -1964,12 +1964,62 @@ const WRITE_FILE_SCOPE_REASON: &str = "Allow scope: read/write access for all AF
 fn scope_reason(grant: &AccessGrant) -> String {
     match (grant.operation, grant.kind) {
         (AccessOperation::Read, GrantKind::Subtree) => {
-            READ_TREE_SCOPE_REASON.replace("{path}", &grant.path.to_string_lossy())
+            let budget = 160 - READ_TREE_SCOPE_REASON.replace("{path}", "").chars().count();
+            let path = scope_reason_path(&grant.path, &super::permissions::home_folders(), budget);
+            READ_TREE_SCOPE_REASON.replace("{path}", &path)
         }
         (AccessOperation::Read, GrantKind::File) => READ_FILE_SCOPE_REASON.into(),
         (AccessOperation::Write, GrantKind::Subtree) => WRITE_TREE_SCOPE_REASON.into(),
         (AccessOperation::Write, GrantKind::File) => WRITE_FILE_SCOPE_REASON.into(),
     }
+}
+
+fn scope_reason_path(path: &Path, homes: &[PathBuf], budget: usize) -> String {
+    let displayed = super::permissions::display_path(path, homes);
+    if displayed.chars().count() <= budget {
+        return displayed;
+    }
+    let separator = std::path::MAIN_SEPARATOR;
+    let parts = displayed
+        .split(separator)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let repository = parts.last().copied().unwrap_or(&displayed);
+    if repository.chars().count() > budget {
+        // The card's fixed sentence leaves limited space even for one folder.
+        let leading = (budget - 1).div_ceil(2);
+        let trailing = budget - leading - 1;
+        let end = repository.chars().count() - trailing;
+        return format!(
+            "{}…{}",
+            repository.chars().take(leading).collect::<String>(),
+            repository.chars().skip(end).collect::<String>()
+        );
+    }
+    let first = if displayed.starts_with(separator) {
+        format!("{separator}{}", parts[0])
+    } else {
+        parts[0].to_owned()
+    };
+    let keep_first = parts.len() > 1
+        && format!("{first}{separator}…{separator}{repository}")
+            .chars()
+            .count()
+            <= budget;
+    let mut result = repository.to_owned();
+    for start in (1..parts.len()).rev() {
+        let suffix = parts[start..].join(&separator.to_string());
+        let candidate = if keep_first {
+            format!("{first}{separator}…{separator}{suffix}")
+        } else {
+            format!("…{separator}{suffix}")
+        };
+        if candidate.chars().count() > budget {
+            break;
+        }
+        result = candidate;
+    }
+    result
 }
 
 /// Offer a file ask's immediate directory, for reads and writes alike, only

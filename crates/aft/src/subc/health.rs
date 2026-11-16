@@ -9091,6 +9091,7 @@ mod tests {
         let metrics = report.metrics.unwrap();
         assert!(metrics["root_details_omitted"].as_u64().unwrap() > 0);
         assert!(metrics["cache_unavailable_omitted"].as_u64().unwrap() > 0);
+        health_section_sizes("200-root diagnostic report", metrics.as_object().unwrap());
         assert!(metrics["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
         let findings = serde_json::to_value(cache.findings(1_000_000, 60_000)).unwrap();
         assert!(findings.as_array().unwrap().is_empty(), "{findings}");

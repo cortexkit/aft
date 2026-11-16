@@ -288,7 +288,7 @@ fn declaring_file(lang: Lang, n: usize, names: &[String]) -> (String, String) {
 #[ignore = "measurement; AFT_TEST_REFRESH_COST_PROJECT names a checkout to copy"]
 fn measure_method_reader_refreshes() {
     let source = std::env::var_os("AFT_TEST_REFRESH_COST_PROJECT").map_or_else(
-        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."),
+        || Path::new(crate::test_support::manifest_dir()).join("../.."),
         PathBuf::from,
     );
     let lang = match std::env::var("AFT_TEST_REFRESH_COST_LANG").as_deref() {
