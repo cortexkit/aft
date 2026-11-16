@@ -95,8 +95,15 @@ jobs:
           cargo test --features wasm-grammars --locked -p agent-file-tools --features test-hooks --lib -- grammar_
       - name: Process restart and concurrent publication
         run: cargo test --features wasm-grammars --locked -p agent-file-tools --features test-hooks --test integration -- grammar_loader
+      # The no-Luau parity half needs a second, feature-less debug build of the
+      # whole crate. GitHub's macOS runners can't fit that third build inside the
+      # 60-minute job, and the parity it checks doesn't depend on the OS, so it
+      # runs on Linux and Windows; macOS still runs every Luau test.
+      - name: Luau extraction tests (macOS)
+        if: runner.os == 'macOS'
+        run: cargo test --features wasm-grammars --locked -p agent-file-tools --features test-hooks --lib -- luau_s
       - name: Luau extraction and index-store feature matrix
-        if: matrix.os != 'windows-11-arm'
+        if: runner.os != 'macOS' && matrix.os != 'windows-11-arm'
         run: |
           AFT_S4_NO_LUAU_PARITY=luau-ci cargo test --features wasm-grammars --locked -p agent-file-tools --features test-hooks --lib -- luau_s
           AFT_S4_NO_LUAU_PARITY=luau-ci cargo test --locked -p agent-file-tools --features test-hooks --lib -- luau_s4_no_luau_luaurc_parity
