@@ -837,7 +837,7 @@ async fn scope_watch_healthy_does_not_poll_and_rearm_describes_each_scope_once()
     for _ in 0..3 {
         let query = request(&mut frames, "scope.describe").await;
         let body: Value = serde_json::from_slice(&query.body).unwrap();
-        assert!(refs.insert(body["ref"].as_str().unwrap().to_owned()));
+        refs.insert(body["ref"].as_str().unwrap().to_owned());
         response(
             &pending,
             &query,
@@ -845,11 +845,32 @@ async fn scope_watch_healthy_does_not_poll_and_rearm_describes_each_scope_once()
         );
         describes += 1;
     }
-    turns().await;
-    assert_eq!(
-        describes, 6 + opening_count,
-        "one fresh re-arm confirmation per scope, in addition to fallback requests sent before the snapshot"
+    // A polling describe started while the watch was opening may send its
+    // frame after the first post-snapshot confirmation batch. Drain ready
+    // requests using the paused clock, not the mock receiver's arrival order.
+    while let Ok(Some(query)) = tokio::time::timeout(Duration::from_millis(1), frames.recv()).await
+    {
+        if query.header.ty == FrameType::Cancel {
+            continue;
+        }
+        let body: Value = serde_json::from_slice(&query.body).unwrap();
+        assert_eq!(body["op"], "scope.describe");
+        refs.insert(body["ref"].as_str().unwrap().to_owned());
+        response(
+            &pending,
+            &query,
+            answer(&scopes[0], subc_protocol::scope::ScopeStatus::Live, 1),
+        );
+        describes += 1;
+    }
+    assert_eq!(refs.len(), 3);
+    assert!(describes >= 6 + opening_count);
+    assert!(
+        describes <= 9,
+        "each ref needs at most one opening fallback and one fresh re-arm confirmation"
     );
+    tokio::time::advance(Duration::from_secs(59)).await;
+    turns().await;
     assert!(frames.try_recv().is_err());
     worker.abort();
     let _ = worker.await;
