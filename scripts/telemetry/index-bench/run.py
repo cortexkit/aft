@@ -18,8 +18,10 @@ import subprocess
 import sys
 import threading
 import time
+import zipfile
 
 from native import Child, GIB
+import sampling
 
 HERE = Path(__file__).resolve().parent
 MATRIX_DIR = HERE.parent / "index-matrix"
@@ -105,10 +107,10 @@ def checkout(entry, destination, logs, windows=False):
 
 class Client:
     """A reader thread works for Windows pipes; select() on pipes does not."""
-    def __init__(self, binary, root, env, folder, guard_gib, deadline):
+    def __init__(self, binary, root, env, folder, guard_gib, deadline, timeline=None):
         self.log = (folder / "stderr.log").open("w", encoding="utf-8")
         try:
-            self.child = Child([str(binary)], root, env, self.log, guard_gib)
+            self.child = Child([str(binary)], root, env, self.log, guard_gib, timeline)
         except BaseException:
             self.log.close()
             raise
@@ -166,16 +168,30 @@ def store_bytes(path):
     return sum(file.stat().st_size for file in path.rglob("*") if file.is_file())
 
 
-def measure(binary, root, folder, logs, guard_gib, timeout_s):
+def dwarf_for(binary):
+    """The DWARF file of the ``<binary>.dSYM`` bundle next to a macOS binary, if there is one."""
+    dwarf = binary.parent / (binary.name + ".dSYM") / "Contents" / "Resources" / "DWARF"
+    files = sorted(dwarf.iterdir()) if dwarf.is_dir() else []
+    return {binary.name: files[0]} if len(files) == 1 else None
+
+
+def measure(binary, root, folder, logs, guard_gib, timeout_s, profile=False, rust_log=None):
     folder.mkdir(parents=True)
     logs.mkdir(parents=True)
     env = MATRIX.isolated_environment(folder)
+    if rust_log:
+        env["RUST_LOG"] = rust_log
     # Windows configuration discovery also consults these native profile paths.
     for key, relative in {"USERPROFILE": "home", "APPDATA": "appdata", "LOCALAPPDATA": "localappdata"}.items():
         env[key] = str(folder / relative)
         Path(env[key]).mkdir(exist_ok=True)
     started = time.monotonic()
-    client = Client(binary, root, env, logs, guard_gib, started + timeout_s)
+    client = Client(binary, root, env, logs, guard_gib, started + timeout_s,
+                    timeline=logs / "timeline.csv" if profile else None)
+    sampler = None
+    if profile:
+        sampler = sampling.Sampler(client.child.proc.pid, logs / "samples", client.child.started,
+                                        dwarf=dwarf_for(Path(binary))).start()
     outcome, error = "ready", ""
     try:
         MATRIX.configure(client, root, env, "callgraph", min(60, timeout_s))
@@ -188,6 +204,7 @@ def measure(binary, root, folder, logs, guard_gib, timeout_s):
     except Exception as exception:
         outcome, error = "crashed" if client.child.done.is_set() else "failed", str(exception)
     wall = time.monotonic() - started
+    samples = sampler.stop() if sampler else None
     measurement = client.close()
     if measurement["guard_triggered"]:
         outcome = "killed_by_guard"
@@ -196,6 +213,11 @@ def measure(binary, root, folder, logs, guard_gib, timeout_s):
     result = {**measurement, "outcome": outcome, "error": error, "wall_seconds": wall,
               "store_bytes": store_bytes(folder / "storage"), "guard_gib": guard_gib, "timeout_seconds": timeout_s}
     save(logs / "measurement.json", result)
+    if profile:
+        status = logs / "status.jsonl"
+        save(logs / "profile.json", {
+            "samples": samples, "sampler_available": sampler.available,
+            "stage_changes": sampling.stage_changes(status, int(client.child.started * 1e9)) if status.exists() else []})
     if outcome == "interrupted":
         raise KeyboardInterrupt
     return result
@@ -216,7 +238,7 @@ def checksum_for(text, name):
     return matches[0]
 
 
-def download(work):
+def download(work, dsym=False):
     work.mkdir(parents=True, exist_ok=True)
     (work / ".index-bench-work").touch()
     directory = work / "bin"
@@ -238,6 +260,16 @@ def download(work):
     binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
     save(directory / "release.json", {"tag": "v0.65.0", "asset": name, "url": base + name,
                                        "checksum_url": base + "checksums.sha256", "sha256": actual})
+    if dsym and host_platform() == "macos":
+        # The release's line-table dSYM lets `sample` name frames in the stripped binary.
+        archive = name + "-dsym.zip"
+        subprocess.run(["curl", "--fail", "--silent", "--show-error", "--location", "--max-time", "300",
+                        "--output", str(directory / archive), base + archive], check=True)
+        if MATRIX.sha256(directory / archive) != checksum_for((directory / "checksums.sha256").read_text(), archive):
+            raise ValueError(f"release checksum mismatch for {archive}")
+        with zipfile.ZipFile(directory / archive) as bundle:
+            bundle.extractall(directory / "dsym-0.65.0")
+        (directory / "dsym-0.65.0" / "aft.dSYM").replace(directory / (binary.name + ".dSYM"))
     return binary
 
 
@@ -246,14 +278,15 @@ def binary_identity(path):
     return {"path": str(path), "reported_version": version, "binary_sha256": MATRIX.sha256(path)}
 
 
-def plan(system, requested=None):
+def plan(system, requested=None, profile=False):
     if requested and len(set(requested)) != len(requested):
         raise ValueError("projects must not contain duplicates")
     projects = requested or (["neovim"] if system == "linux" else
                              ["vscode", "kubernetes", "elasticsearch", "linux"] + (["chromium"] if system == "windows" else []))
     if system == "macos" and "chromium" in projects:
         raise ValueError("Chromium is excluded on the rented Mac to preserve disk space")
-    if system == "linux" and projects != ["neovim"]:
+    # A profiling run on Linux separates platform effects from version effects for one project.
+    if system == "linux" and projects != ["neovim"] and not profile:
         raise ValueError("Linux mode is only the Neovim driving-logic proof; use index-matrix for big Linux projects")
     projects = [project for project in projects if project != "chromium"] + (["chromium"] if "chromium" in projects else [])
     return [(project, list(("0.65.0", "0.66-candidate") if number % 2 == 0 else ("0.66-candidate", "0.65.0")))
@@ -298,15 +331,16 @@ def run(args):
     shutil.copy2(release, output / "release.json")
     shutil.copy2(work / "bin/checksums.sha256", output / "release-checksums.sha256")
     entries = {entry["repository"]: entry for entry in json.loads((MATRIX_DIR / "manifest.json").read_text())["repositories"]}
-    selected = plan(system, args.projects)
+    selected = plan(system, args.projects, args.profile)
     guard_gib = {"windows": 26, "macos": 13, "linux": 13}[system]
     save(output / "identity.json", {"binaries": identities, "source_commit": subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=HERE, text=True).strip(), "host": platform.uname()._asdict(),
         "logical_cpus": os.cpu_count(), "python": sys.version, "runner_name": os.environ.get("RUNNER_NAME"),
         "run_id": os.environ.get("GITHUB_RUN_ID"), "guard_gib": guard_gib,
         "plan": selected, "free_disk_bytes": shutil.disk_usage(work).free,
+        "profile": args.profile, "rust_log": args.rust_log,
         "manifest_sha256": MATRIX.sha256(MATRIX_DIR / "manifest.json"),
-        "harness_sha256": {name: MATRIX.sha256(HERE / name) for name in ("run.py", "native.py")}})
+        "harness_sha256": {name: MATRIX.sha256(HERE / name) for name in ("run.py", "native.py", "sampling.py")}})
     save(output / "pins.json", [entries[PROJECTS[project]] for project, _ in selected])
     rows = []
     write_tables(output, rows)
@@ -335,7 +369,7 @@ def run(args):
                     folder = work / "run"
                     try:
                         row.update(measure(binaries[version], root, folder, logs / version, guard_gib,
-                                           5400 if project == "chromium" else 2700))
+                                           5400 if project == "chromium" else 2700, args.profile, args.rust_log))
                     except Exception as error:
                         row.update(outcome="failed", error=str(error))
                     finally:
@@ -359,14 +393,19 @@ def main():
     for command in ("download", "cleanup", "run"):
         child = sub.add_parser(command)
         child.add_argument("--work", type=Path, required=True)
+        if command == "download":
+            child.add_argument("--dsym", action="store_true", help="also fetch the macOS dSYM for stack samples")
         if command == "run":
             child.add_argument("--output", type=Path, required=True)
             child.add_argument("--baseline", type=Path, required=True)
             child.add_argument("--candidate", type=Path, required=True)
             child.add_argument("--projects", nargs="+", choices=PROJECTS)
+            child.add_argument("--profile", action="store_true",
+                               help="record a CPU timeline, status stage changes and (macOS) stack samples")
+            child.add_argument("--rust-log", help="RUST_LOG for the measured AFT process instead of info")
     args = parser.parse_args()
     if args.command == "download":
-        download(args.work.resolve())
+        download(args.work.resolve(), args.dsym)
         return 0
     if args.command == "cleanup":
         if args.work.exists() and not (args.work / ".index-bench-work").is_file():

@@ -13,6 +13,19 @@ import time
 GIB = 1024 ** 3
 
 
+def ps_cpu_seconds(text):
+    """Parse ``ps -o time=`` ([[dd-]hh:]mm:ss[.ss]) into seconds."""
+    text = text.strip()
+    days = 0
+    if "-" in text:
+        day_text, text = text.split("-", 1)
+        days = int(day_text)
+    seconds = 0.0
+    for part in text.split(":"):
+        seconds = seconds * 60 + float(part)
+    return days * 86400 + seconds
+
+
 def guard_metrics(platform, rss, commit, limit):
     """Commit can exhaust Windows before its resident working set reaches the cap."""
     return [name for name, value in (("peak_working_set_bytes" if platform == "windows" else "rss_bytes", rss),
@@ -64,9 +77,10 @@ class WindowsCounters:
 
 class Child:
     """Only the waiter reaps POSIX children, preserving wait4's per-child rusage."""
-    def __init__(self, command, cwd, env, stderr, guard_gib):
+    def __init__(self, command, cwd, env, stderr, guard_gib, timeline=None):
         self.platform = "windows" if os.name == "nt" else "macos" if sys.platform == "darwin" else "linux"
         self.started = time.monotonic()
+        self.started_wall = time.time()
         self.proc = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=stderr, text=True, encoding="utf-8", bufsize=1)
         assert self.proc.stdout is not None and self.proc.stdin is not None
@@ -80,6 +94,12 @@ class Child:
         self.guard_triggered = []
         self.guard_peak = None
         self.gaps = []
+        # With a timeline path, one CSV row per second records RSS, process CPU seconds and
+        # (on Linux) the thread count, so wall time can be split into busy and idle stretches.
+        self.timeline = Path(timeline).open("w", encoding="utf-8") if timeline else None
+        self.last_row = -1.0
+        if self.timeline:
+            self.timeline.write("seconds,rss_bytes,cpu_seconds,threads\n")
         try:
             self.windows = WindowsCounters(self.proc.pid) if self.platform == "windows" else None
         except BaseException:
@@ -93,18 +113,33 @@ class Child:
         self.sampler.start()
 
     def _sample(self):
+        cpu = threads = None
         if self.windows:
             rss, commit = self.windows.sample()
+            if self.timeline:
+                cpu = self.windows.cpu()
         elif self.platform == "linux":
             fields = dict(line.split(":", 1) for line in Path(f"/proc/{self.proc.pid}/status").read_text().splitlines() if ":" in line)
             rss = max(int(fields.get(name, "0 kB").split()[0]) for name in ("VmRSS", "VmHWM")) * 1024
             commit = None
+            if self.timeline:
+                stat = Path(f"/proc/{self.proc.pid}/stat").read_text().rsplit(")", 1)[1].split()
+                cpu = (int(stat[11]) + int(stat[12])) / os.sysconf("SC_CLK_TCK")
+                threads = int(fields.get("Threads", "0").strip())
         else:
-            value = subprocess.check_output(["ps", "-o", "rss=", "-p", str(self.proc.pid)], text=True)
-            rss, commit = int(value.strip()) * 1024, None
+            value = subprocess.check_output(["ps", "-o", "rss=,time=", "-p", str(self.proc.pid)], text=True).split()
+            if len(value) != 2:
+                raise ValueError(f"unexpected ps output: {value}")
+            rss, commit = int(value[0]) * 1024, None
+            cpu = ps_cpu_seconds(value[1])
         self.peak_rss = max(self.peak_rss, rss)
         if commit is not None:
             self.peak_commit = max(self.peak_commit or 0, commit)
+        seconds = time.monotonic() - self.started
+        if self.timeline and seconds - self.last_row >= 1.0:
+            self.last_row = seconds
+            self.timeline.write(f"{seconds:.2f},{rss},{'' if cpu is None else f'{cpu:.2f}'},{'' if threads is None else threads}\n")
+            self.timeline.flush()
         return rss, commit
 
     def kill(self):
@@ -167,10 +202,19 @@ class Child:
             # Darwin reports bytes, whereas Linux reports KiB.
             self.peak_rss = max(self.peak_rss, self.usage.ru_maxrss * (1 if self.platform == "macos" else 1024))
             self.cpu_seconds = self.usage.ru_utime + self.usage.ru_stime
+        if self.timeline:
+            self.timeline.close()
         if self.proc.stdin:
             self.proc.stdin.close()
+        usage = getattr(self, "usage", None)
+        rusage = None if usage is None else {
+            "user_seconds": usage.ru_utime, "system_seconds": usage.ru_stime,
+            "voluntary_context_switches": usage.ru_nvcsw, "involuntary_context_switches": usage.ru_nivcsw,
+            "block_input_operations": usage.ru_inblock, "block_output_operations": usage.ru_oublock,
+            "major_page_faults": usage.ru_majflt, "minor_page_faults": usage.ru_minflt}
         return {"peak_memory_bytes": self.peak_rss, "peak_commit_bytes": self.peak_commit,
                 "cpu_seconds": self.cpu_seconds, "process_wall_seconds": self.exited - self.started,
+                "started_unix_seconds": self.started_wall, "rusage": rusage,
                 "exit_code": self.returncode, "guard_triggered": self.guard_triggered, "peak_at_guard": self.guard_peak,
                 "counter_errors": self.gaps,
                 "peak_source": "GetProcessMemoryInfo" if self.windows else "wait4.ru_maxrss"}

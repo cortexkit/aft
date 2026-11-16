@@ -13,6 +13,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import native
 import run as bench
+import sampling
 
 
 class NativeTests(unittest.TestCase):
@@ -54,6 +55,60 @@ class NativeTests(unittest.TestCase):
             self.assertTrue(result["guard_triggered"])
             self.assertGreater(result["peak_at_guard"]["peak_memory_bytes"], 1024 * 1024)
 
+    def test_timeline_records_cpu_and_rusage_counters(self):
+        scratch = HERE.parents[2] / "target/scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            timeline = Path(directory) / "timeline.csv"
+            with (Path(directory) / "stderr.log").open("w") as log:
+                child = native.Child([sys.executable, "-c", "import time\nend = time.time() + 2.5\nwhile time.time() < end: pass"],
+                                     directory, None, log, 1, timeline)
+                self.assertTrue(child.done.wait(10))
+                result = child.finish()
+                child.stdout.close()
+            with timeline.open() as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertGreaterEqual(len(rows), 2)
+            self.assertGreater(float(rows[-1]["cpu_seconds"]), 0.5)
+            self.assertGreater(result["rusage"]["user_seconds"], 0.5)
+
+    def test_ps_time_parsing(self):
+        self.assertEqual(native.ps_cpu_seconds("0:01.50"), 1.5)
+        self.assertEqual(native.ps_cpu_seconds(" 12:03.25 "), 723.25)
+        self.assertEqual(native.ps_cpu_seconds("1:00:00"), 3600)
+        self.assertEqual(native.ps_cpu_seconds("2-00:00:01"), 2 * 86400 + 1)
+
+
+class SamplingTests(unittest.TestCase):
+    def test_stage_changes_report_only_moments_a_field_changes(self):
+        with tempfile.TemporaryDirectory(dir=HERE.parents[2] / "target") as directory:
+            path = Path(directory) / "status.jsonl"
+            records = [(1_000_000_000, {"search_index": {"status": "building", "files": 1}, "other": {"status": "x"}}),
+                       (1_500_000_000, {"search_index": {"status": "building", "files": 9}}),
+                       (3_000_000_000, {"search_index": {"status": "ready", "files": 9},
+                                        "callgraph_store": {"status": "building", "stage": {"name": "pass4"}}})]
+            path.write_text("".join(json.dumps({"monotonic_ns": ns, "response": response}) + "\n"
+                                    for ns, response in records))
+            self.assertEqual(sampling.stage_changes(path, 500_000_000), [
+                {"seconds": 0.5, "field": "search_index.status", "value": "building"},
+                {"seconds": 2.5, "field": "callgraph_store.stage.name", "value": "pass4"},
+                {"seconds": 2.5, "field": "callgraph_store.status", "value": "building"},
+                {"seconds": 2.5, "field": "search_index.status", "value": "ready"}])
+
+    def test_symbolize_replaces_only_unresolved_frames_of_known_images(self):
+        text = ("    5 ???  (in aft-candidate)  load address 0x100000000 + 0x10  [0x100000010]\n"
+                "    3 ???  (in libsystem_kernel.dylib)  load address 0x180000000 + 0x20  [0x180000020]\n"
+                "    2 main  (in aft-candidate) + 4  [0x100000004]\n")
+        calls = []
+        def fake_atos(command, **_):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout="aft::build::run (in aft) (build.rs:7)\n")
+        resolved, count = sampling.symbolize(text, {"aft-candidate": Path("aft.dSYM/DWARF/aft")}, run=fake_atos)
+        self.assertEqual(count, 1)
+        self.assertEqual(calls, [["atos", "-o", "aft.dSYM/DWARF/aft", "-l", "0x100000000", "0x100000010"]])
+        self.assertIn("5 aft::build::run  (in aft-candidate)  [0x100000010]", resolved)
+        self.assertIn("???  (in libsystem_kernel.dylib)", resolved)
+
 
 class HarnessTests(unittest.TestCase):
     def setUp(self):
@@ -76,7 +131,19 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(bench.plan("windows", ["chromium", "linux"])[-1][0], "chromium")
         self.assertEqual(bench.plan("linux"), [("neovim", ["0.65.0", "0.66-candidate"])])
         with self.assertRaises(ValueError):
+            bench.plan("linux", ["linux"])
+        self.assertEqual(bench.plan("linux", ["linux"], profile=True), [("linux", ["0.65.0", "0.66-candidate"])])
+        with self.assertRaises(ValueError):
             bench.plan("macos", ["chromium"])
+
+    def test_dwarf_lookup_needs_a_dsym_next_to_the_binary(self):
+        binary = self.root / "aft-candidate"
+        binary.write_bytes(b"")
+        self.assertIsNone(bench.dwarf_for(binary))
+        dwarf = self.root / "aft-candidate.dSYM/Contents/Resources/DWARF"
+        dwarf.mkdir(parents=True)
+        (dwarf / "aft").write_bytes(b"")
+        self.assertEqual(bench.dwarf_for(binary), {"aft-candidate": dwarf / "aft"})
 
     def test_release_asset_names_and_exact_checksum_selection(self):
         self.assertEqual(bench.release_asset("windows", "AMD64"), "aft-win32-x64.exe")

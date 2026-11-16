@@ -62,7 +62,7 @@ jobs:
           df -h "$TMPDIR" | tail -1
 
       - name: Download and checksum official 0.65.0
-        run: python3 scripts/telemetry/index-bench/run.py download --work target/index-bench-work
+        run: python3 scripts/telemetry/index-bench/run.py download --work target/index-bench-work --dsym
 
       - name: Build pushed candidate in shipped release profile
         timeout-minutes: 120
@@ -79,20 +79,29 @@ jobs:
 
       - name: Keep candidate executable and reclaim build disk before cloning
         run: |
+          # The dSYM (macOS) lets `sample` name frames in the stripped candidate; cargo's
+          # aft.dSYM is a symlink into deps/, which ditto follows.
+          if [[ "$BENCH_PLATFORM" == macos ]]; then
+            ditto "$CARGO_TARGET_DIR/release/aft.dSYM" target/index-bench-work/bin/aft-candidate.dSYM
+          fi
           python3 -c 'import os, pathlib, shutil; build = pathlib.Path(os.environ["CARGO_TARGET_DIR"]); shutil.copy2(build / "release" / ("aft" + os.environ["BENCH_EXE"]), build.parent / "bin" / ("aft-candidate" + os.environ["BENCH_EXE"])); shutil.rmtree(build)'
 
       - name: Cold builds at Linux matrix pins
         env:
-          # Elasticsearch alone on the Mac, after reclaiming stale temp files; the
-          # other projects already have two Mac samples.
-          BENCH_PROJECTS: ${{ github.ref_name == 'bench/index-mac' && 'elasticsearch' || '' }}
+          # The Linux kernel alone on the Mac, profiled: it is the one project whose
+          # 0.66 wall time on macOS exceeds 1.5x of 0.65.0.
+          BENCH_PROJECTS: ${{ github.ref_name == 'bench/index-mac' && 'linux' || '' }}
+          BENCH_PROFILE: ${{ github.ref_name == 'bench/index-mac' && '--profile' || '' }}
+          BENCH_RUST_LOG: ""
         run: |
           python3 scripts/telemetry/index-bench/run.py run \
             --work target/index-bench-work \
             --output target/index-bench-results \
             --baseline "target/index-bench-work/bin/aft-0.65.0${BENCH_EXE}" \
             --candidate "target/index-bench-work/bin/aft-candidate${BENCH_EXE}" \
-            ${BENCH_PROJECTS:+--projects $BENCH_PROJECTS}
+            ${BENCH_PROJECTS:+--projects $BENCH_PROJECTS} \
+            ${BENCH_PROFILE} \
+            ${BENCH_RUST_LOG:+--rust-log "$BENCH_RUST_LOG"}
 
       - name: Publish table in job summary
         if: always()

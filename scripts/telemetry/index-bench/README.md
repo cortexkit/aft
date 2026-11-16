@@ -70,6 +70,27 @@ binary's own SHA-256 and `--version` output, the host, guard and timeout policy.
 It fails after saving results if any attempted build did not reach readiness;
 guarded and timed-out runs remain usable measurements, not silently green runs.
 
+## Profiling
+
+`run --profile` adds, per measured version folder:
+
+- `timeline.csv`: one row per second with RSS, process CPU seconds and (Linux)
+  the thread count. The CPU slope over a stretch is its average parallelism.
+- `profile.json`: each moment a string or boolean field of the
+  `search_index` or `callgraph_store` status changes, in seconds since AFT
+  started, and the record of each stack sample.
+- `samples/sample-NNNNs.txt.gz` (macOS only): `sample` output for a 3 s window
+  every 15 s, per thread. `download --dsym` places the release dSYM next to the
+  0.65.0 binary, and the workflow copies the candidate's dSYM next to it, so
+  `sample` names frames in both stripped binaries; `atos` resolves any frame it
+  leaves unnamed. Both versions pay the same sampling cost.
+
+`--rust-log` replaces the measured process's `RUST_LOG=info`. Every
+`measurement.json` also carries the start time (Unix seconds), to align log
+lines, and the child's `rusage` counters (context switches, block I/O, faults).
+With `--profile`, Linux runs accept any project, so one project can be compared
+across platforms with the same instrumentation.
+
 Offline harness checks:
 
 ```sh
