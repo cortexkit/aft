@@ -1157,6 +1157,9 @@ pub(crate) mod work_counters {
 pub(crate) fn read_source(path: &Path) -> std::io::Result<String> {
     #[cfg(test)]
     work_counters::SOURCE_READS.with(|count| count.set(count.get() + 1));
+    if !crate::bounded_io::skip_disclosure_active() {
+        return crate::bounded_io::read_to_string(path);
+    }
     let mut reader = crate::bounded_io::reader(path, None)?;
     crate::large_read::allow_whole(
         crate::large_read::Site::ParseSource,
@@ -1172,21 +1175,102 @@ pub(crate) fn read_source(path: &Path) -> std::io::Result<String> {
 
 #[cfg(test)]
 #[test]
-fn stage2_parse_source_obeys_whole_read_ceiling() {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("large.rs");
-    let file = std::fs::File::create(&path).unwrap();
-    file.set_len(crate::large_read::WHOLE_READ_CEILING + 1)
-        .unwrap();
-    assert!(crate::large_read::is_ceiling_error(
-        &read_source(&path).unwrap_err()
-    ));
-    file.set_len(crate::large_read::WHOLE_READ_CEILING - 1)
-        .unwrap();
-    assert_eq!(
-        read_source(&path).unwrap().len() as u64,
-        crate::large_read::WHOLE_READ_CEILING - 1
-    );
+fn stage2_search_scoped_parse_source_obeys_whole_read_ceiling() {
+    crate::bounded_io::with_skip_disclosure(|| {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("large.rs");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(crate::large_read::WHOLE_READ_CEILING + 1)
+            .unwrap();
+        assert!(crate::large_read::is_ceiling_error(
+            &read_source(&path).unwrap_err()
+        ));
+        file.set_len(crate::large_read::WHOLE_READ_CEILING - 1)
+            .unwrap();
+        assert_eq!(
+            read_source(&path).unwrap().len() as u64,
+            crate::large_read::WHOLE_READ_CEILING - 1
+        );
+        crate::protocol::Response::success("parse-ceiling", serde_json::json!({}))
+    });
+}
+
+#[cfg(test)]
+mod large_source_scope_tests {
+    use super::*;
+    use crate::language::LanguageProvider;
+
+    fn large_typescript(path: &Path) {
+        let mut source = "/*".to_string();
+        source.push_str(&"x".repeat(17 << 20));
+        source.push_str(
+            "*/\n\n\n\n\n\n\n\n\n\n\nexport function large_member(): number { return 7; }\n",
+        );
+        std::fs::write(path, source).unwrap();
+    }
+
+    #[test]
+    fn audit1432_round3_supported_large_source_reaches_real_outline_and_zoom() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("large.ts");
+        large_typescript(&path);
+        let ctx = crate::context::AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.path().to_path_buf()),
+                storage_dir: Some(root.path().join(".store")),
+                ..Default::default()
+            },
+        );
+        for command in ["outline", "zoom"] {
+            let req: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+                "id":"large-source", "command":command, "file":path, "symbol":"large_member", "context_lines":0
+            })).unwrap();
+            let response = if command == "outline" {
+                crate::commands::outline::handle_outline(&req, &ctx)
+            } else {
+                crate::commands::zoom::handle_zoom(&req, &ctx)
+            };
+            assert!(response.success, "{command}: {response:?}");
+            let rendered = crate::subc_format::format_response(command, &response, false);
+            assert!(rendered.contains("large_member"), "{command}: {response:?}");
+            assert!(!response
+                .data
+                .to_string()
+                .contains(crate::large_read::WHOLE_READ_SKIP_REASON));
+        }
+    }
+
+    #[test]
+    fn audit1432_round3_background_parser_does_not_inherit_another_threads_search_ceiling() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("large.ts");
+        large_typescript(&path);
+        crate::bounded_io::with_skip_disclosure(|| {
+            assert!(crate::bounded_io::skip_disclosure_active());
+            let budget = crate::bounded_io::capture();
+            let worker_path = path.clone();
+            std::thread::scope(|threads| {
+                let background = threads.spawn(|| {
+                    assert!(!crate::bounded_io::skip_disclosure_active());
+                    assert!(read_source(&path).unwrap().len() > 17 << 20);
+                    let symbols = TreeSitterProvider::new().list_symbols(&path).unwrap();
+                    assert!(symbols.iter().any(|symbol| symbol.name == "large_member"));
+                });
+                let search_worker = threads.spawn(move || {
+                    crate::bounded_io::with_budget(budget, || {
+                        assert!(crate::bounded_io::skip_disclosure_active());
+                        assert!(crate::large_read::is_ceiling_error(
+                            &read_source(&worker_path).unwrap_err()
+                        ));
+                    })
+                });
+                search_worker.join().unwrap();
+                background.join().unwrap();
+            });
+            crate::protocol::Response::success("background-parse", serde_json::json!({}))
+        });
+    }
 }
 
 /// Keep the completed read's allocation; an Arc<str> conversion copies its bytes.
