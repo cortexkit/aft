@@ -82,3 +82,6 @@ test-vectors/** -text
 # The vendored user-command corpus includes the publisher's SHA256SUMS, which
 # checks every file's exact bytes, including README.md, on every platform.
 crates/aft/tests/fixtures/user-commands-v1/** -text
+# Status command samples are compared byte-for-byte with the pretty JSON the
+# tests encode, so they must stay LF on Windows too.
+crates/aft/tests/fixtures/aft-user-commands-v1/** text eol=lf
