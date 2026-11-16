@@ -30,6 +30,7 @@ mod display;
 #[cfg(test)]
 pub(crate) use display::with_test_reader;
 pub(crate) mod readers;
+pub(crate) mod status;
 mod views;
 
 const SCAN_BATCH: usize = 64;
@@ -55,6 +56,7 @@ struct BusHealth {
     cards: readers::ReaderHealth,
     sendstate: readers::ReaderHealth,
     views: views::ViewsHealth,
+    status: status::StatusHealth,
     #[serde(skip)]
     warned: std::collections::HashSet<&'static str>,
 }
@@ -134,6 +136,7 @@ impl Drop for Worker {
 /// Start after the provider has attached to the daemon. Neither the frame loop
 /// nor a request executor runs credential issuance, database scans or publishes.
 pub(crate) fn start(app: Arc<App>, connection: PathBuf, database: PathBuf) -> Option<Worker> {
+    status::initialize();
     let (stop, stopped) = oneshot::channel();
     let thread = std::thread::Builder::new()
         .name("aft-late-result-bus".into())

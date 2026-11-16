@@ -69,6 +69,7 @@ pub(super) fn unavailable(reason: &'static str) {
     status(Kind::Cards, false, Some(reason));
     status(Kind::SendState, false, Some(reason));
     super::views::unavailable(reason);
+    super::status::unavailable(reason);
 }
 fn status(kind: Kind, value: bool, reason: Option<&'static str>) {
     let mut snapshot = HEALTH.lock();
@@ -412,7 +413,8 @@ impl Services {
         Self(vec![
             tokio::spawn(reader(client.clone(), Kind::Cards)),
             tokio::spawn(reader(client.clone(), Kind::SendState)),
-            tokio::spawn(super::views::run(client)),
+            tokio::spawn(super::views::run(client.clone())),
+            tokio::spawn(super::status::run(client)),
         ])
     }
 }
@@ -424,5 +426,6 @@ impl Drop for Services {
         attached(false, Some("bus_disconnected"));
         status(Kind::SendState, false, Some("bus_disconnected"));
         super::views::detached();
+        super::status::unavailable("bus_disconnected");
     }
 }

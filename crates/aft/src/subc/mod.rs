@@ -2423,6 +2423,10 @@ fn quiesce_connection_roots(
     }
 
     for route in routes.values() {
+        crate::late_result_bus::status::route_unbound(
+            Arc::as_ptr(&route.0) as usize,
+            &route.session,
+        );
         runner_notices::route_unbound(route);
     }
     routes.clear();
@@ -3950,6 +3954,10 @@ fn remove_route_channel(
 ) -> Option<RouteIdentity> {
     let removed = routes.remove(&channel);
     if let Some(identity) = &removed {
+        crate::late_result_bus::status::route_unbound(
+            Arc::as_ptr(&identity.0) as usize,
+            &identity.session,
+        );
         runner_notices::route_unbound(identity);
         remove_root_channel(root_channels, &identity.root, channel);
         release_semantic_opener_if_unrouted(routes, identity);
@@ -3982,7 +3990,15 @@ fn insert_route_channel(
     if crate::semantic_admission::harness_opens_root(&identity.harness) {
         crate::semantic_admission::note_opened(&identity.session, identity.root.as_path());
     }
+    crate::late_result_bus::status::route_bound(
+        Arc::as_ptr(&identity.0) as usize,
+        &identity.session,
+    );
     if let Some(previous) = routes.insert(channel, identity.clone()) {
+        crate::late_result_bus::status::route_unbound(
+            Arc::as_ptr(&previous.0) as usize,
+            &previous.session,
+        );
         runner_notices::route_unbound(&previous);
         remove_root_channel(root_channels, &previous.root, channel);
         release_semantic_opener_if_unrouted(routes, &previous);
@@ -19178,6 +19194,58 @@ mod tests {
             "the session's last route on the root is gone"
         );
         remove_route_channel(&mut routes, &mut root_channels, runner);
+    }
+
+    #[test]
+    fn status_kv_tracks_installed_routes_and_channel_replacement() {
+        use crate::late_result_bus::status;
+        let (_dir, root) = test_root("status-kv-routes");
+        let session = "status-kv:installed/runner";
+        let other = "status-kv:replacement/runner";
+        let mut routes = HashMap::new();
+        let mut roots = HashMap::new();
+        let first = route_key(51, 1);
+        let second = route_key(52, 1);
+        insert_route_channel(
+            &mut routes,
+            &mut roots,
+            first,
+            route_identity(&root, session),
+        );
+        insert_route_channel(
+            &mut routes,
+            &mut roots,
+            second,
+            route_identity(&root, session),
+        );
+        let client = crate::fleet_status::FleetStatusClient::dial_channel(4).0;
+        client.publish(root.as_path(), "opencode", session, "[AFT E0 W0 | T1]");
+        assert_eq!(
+            status::test_value(session).unwrap()["segment"],
+            "[AFT E0 W0 | T1]"
+        );
+        remove_route_channel(&mut routes, &mut roots, first);
+        assert!(status::test_value(session).is_some());
+        insert_route_channel(
+            &mut routes,
+            &mut roots,
+            second,
+            route_identity(&root, other),
+        );
+        assert!(
+            status::test_value(session).is_none(),
+            "replacement ends the last old-session route"
+        );
+        assert!(
+            status::test_value(other).is_none(),
+            "a bound route alone does not publish a segment"
+        );
+        client.publish(root.as_path(), "opencode", session, "late completion");
+        assert!(status::test_value(session).is_none());
+        client.publish(root.as_path(), "opencode", other, "[AFT E1 W0 | T2]");
+        assert!(status::test_value(other).is_some());
+        remove_route_channel(&mut routes, &mut roots, second);
+        assert!(status::test_value(other).is_none());
     }
 
     #[test]
