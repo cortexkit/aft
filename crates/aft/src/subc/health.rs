@@ -2099,6 +2099,10 @@ fn reduce_health_root_details(root: &mut Value) -> bool {
                         | "/semantic_index/reason"
                         | "/semantic_index/since_ms"
                         | "/semantic_index/next_retry_ms"
+                        | "/callgraph_store/reason"
+                        | "/callgraph_store/since_ms"
+                        | "/callgraph_store/last_progress_at_ms"
+                        | "/callgraph_store/stalled"
                         | "/watcher/directory_arrivals_total"
                         | "/watcher/overflows_total"
                 )
@@ -6032,6 +6036,34 @@ mod tests {
             &advanced,
             HEALTH_BUILD_STALL_MS + 2
         ));
+    }
+
+    #[test]
+    fn health_callgraph_stall_evidence_survives_reduction_and_rebudgeting() {
+        let plane = json!({"status": "building", "since_ms": 1,
+            "last_progress_at_ms": 2, "reason": "waiting for a worker"});
+        let mut root = json!({"project_root": "/projects/stalled-a", "state": "warming", "actor_count": 1,
+            "search_index": {"status": "ready"}, "semantic_index": {"status": "disabled"},
+            "tier2": {"status": "ready"}, "callgraph_store": plane});
+        assert!(reduce_health_root_details(&mut root));
+        assert_eq!(root["callgraph_store"], plane);
+        assert!(!progressing_health_root(&root, HEALTH_BUILD_STALL_MS + 3));
+        let mut other = root.clone();
+        other["project_root"] = json!("/projects/stalled-b");
+        other["callgraph_store"]["stalled"] = json!(true);
+        reduce_health_root_details(&mut other);
+        assert_eq!(other["callgraph_store"]["stalled"], true);
+        let mut metrics =
+            json!({"root_count": 2, "root_details_omitted": 0, "roots": [root, other]})
+                .as_object()
+                .unwrap()
+                .clone();
+        budget_health_metrics(&mut metrics);
+        assert_eq!(metrics["roots"].as_array().unwrap().len(), 2);
+        assert!(!metrics.contains_key("root_groups"));
+        let once = metrics.clone();
+        budget_health_metrics(&mut metrics);
+        assert_eq!(metrics, once);
     }
 
     #[test]
