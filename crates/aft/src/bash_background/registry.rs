@@ -6251,6 +6251,7 @@ impl BgTaskRegistry {
             .lock()
             .map_err(|_| "background task registry lock poisoned".to_string())?
             .insert(task_id.clone(), Arc::clone(&task));
+        crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
         #[cfg(all(test, unix))]
         self.wait_before_watchdog_registration_for_test(&task_id);
         self.inner
@@ -6700,6 +6701,7 @@ impl BgTaskRegistry {
             .lock()
             .map_err(|_| "background task registry lock poisoned".to_string())?
             .insert(task_id.clone(), Arc::clone(&task));
+        crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
         self.inner
             .cleanup_queue
             .lock()
@@ -7056,6 +7058,7 @@ impl BgTaskRegistry {
             .lock()
             .map_err(|_| "background task registry lock poisoned".to_string())?
             .insert(task_id.clone(), Arc::clone(&task));
+        crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
         self.inner
             .cleanup_queue
             .lock()
@@ -13176,8 +13179,9 @@ impl BgTaskRegistry {
             .min_by_key(|task| task.age)
     }
 
-    /// Find live shell tasks with a persisted daemon scope identity. Keep
-    /// this off the subc frame loop: locks and process sampling may block.
+    /// Find held task scopes, including published tasks whose process is still
+    /// starting. Run away from daemon frame dispatch: acquiring registry locks
+    /// and checking whether descendant processes remain alive can block.
     pub(crate) fn live_scope_stamps(&self) -> Vec<subc_protocol::scope::ScopeStamp> {
         // Snapshot in spawn's publication order without holding both locks.
         let published = self.task_arcs();
@@ -13198,8 +13202,9 @@ impl BgTaskRegistry {
             .into_iter()
             .filter_map(|task| {
                 let scope = task.lock_state().ok()?.metadata.scope.clone()?;
-                self.has_live_task_processes(&task.task_id, &task.session_id)
-                    .then_some(scope)
+                (!task.is_terminal()
+                    || self.has_live_task_processes(&task.task_id, &task.session_id))
+                .then_some(scope)
             })
             .collect();
         #[cfg(unix)]
@@ -19820,6 +19825,35 @@ mod tests {
                 .load(Ordering::SeqCst),
             1
         );
+    }
+
+    #[test]
+    fn scope_watch_nonterminal_publication_keeps_scope_before_process_discovery() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let scope = subc_protocol::scope::ScopeStamp::new(
+            subc_protocol::Principal::Direct,
+            "starting-scope",
+            1,
+            subc_protocol::scope::ScopeKind::Head,
+        );
+        let (_, task) = insert_terminal_piped_task(&registry, &dir, "true", "", "", false);
+        {
+            let mut state = task.lock_state().unwrap();
+            state.metadata.scope = Some(scope.clone());
+            state.metadata.status = BgTaskStatus::Running;
+            state.metadata.pgid = None;
+        }
+        assert_eq!(registry.live_scope_stamps(), vec![scope]);
+        assert_eq!(
+            registry
+                .inner
+                .process_group_sample_count
+                .load(Ordering::SeqCst),
+            0
+        );
+        task.lock_state().unwrap().metadata.status = BgTaskStatus::Completed;
+        assert!(registry.live_scope_stamps().is_empty());
     }
 
     pub(super) fn insert_terminal_piped_task(

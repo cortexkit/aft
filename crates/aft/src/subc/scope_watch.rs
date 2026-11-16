@@ -502,7 +502,7 @@ impl Watches {
                 shard.healthy = true;
                 self.health.opens += 1;
                 self.warned_fallback = false;
-                log::info!("scope.watch opened selectors={}", shard.keys.len());
+                log::info!("scope.watch opened scope_epochs={}", shard.keys.len());
                 shard.keys.clone()
             }
             Event::Observe(_, _, key) => vec![key],
