@@ -36,10 +36,9 @@ fn code_search_nudge_runner_send_is_once_and_leaves_result_bytes_unchanged() {
             ..Default::default()
         },
     );
-    let before = serde_json::to_vec(&response).unwrap();
     let format_context = crate::subc_format::FormatContext::default();
     let expected = super::super::bash::finalized_bash_result(
-        serde_json::from_slice(&before).unwrap(),
+        crate::protocol::Response::success("call-17", response.data.clone()),
         &ctx,
         session,
         &format_context,

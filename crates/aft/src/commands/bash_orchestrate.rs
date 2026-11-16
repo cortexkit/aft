@@ -28,6 +28,8 @@ pub(crate) fn worker_kill_deadline_within_handoff_margin(remaining: Option<Durat
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct BashOrchestrateParams {
+    command: String,
+    workdir: Option<String>,
     foreground_orchestrate: bool,
     block_to_completion: bool,
     wait: bool,
