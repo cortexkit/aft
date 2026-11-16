@@ -9660,7 +9660,21 @@ async fn remote_job_id_own_status_watch_and_kill_use_persisted_task_ids() {
         assert!(response.success, "{tool}: {response:?}");
         assert_eq!(response.data["task_id"], task_id, "{tool}: {response:?}");
     }
-    assert!(!cancel_requests(&daemon).is_empty());
+    // A kill reaches the build server either as an `exec.cancel` request or,
+    // while a follower holds the job's stream, as a stream Cancel frame, and
+    // the fake can log it after the kill reply returns.
+    wait_for("bash_kill by job id reached the build server", || {
+        daemon
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(header, body)| {
+                body["method"] == "exec.cancel" || header.ty == subc_protocol::FrameType::Cancel
+            })
+            .then_some(())
+    })
+    .await;
     ctx.bash_background().detach();
 }
 
