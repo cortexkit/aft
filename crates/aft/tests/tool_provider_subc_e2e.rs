@@ -200,8 +200,28 @@ fn fixture_logs(directory: &Path) -> String {
     feature = "test-timing-hooks"
 ))]
 #[tokio::test]
-#[ignore = "requires CK_SUBC_BIN built from the explicitly authorized scope.watch daemon revision"]
+#[ignore = "requires CK_SUBC_BIN pointing to a daemon that serves scope.watch"]
 async fn scope_watch_real_daemon_confirms_end_after_route_close_without_polling() {
+    scope_watch_daemon_case("CK_SUBC_BIN", true).await;
+}
+
+#[cfg(all(
+    target_os = "linux",
+    feature = "test-scope-owner",
+    feature = "test-timing-hooks"
+))]
+#[tokio::test]
+#[ignore = "requires the pinned v0.21.3 archive via AFT_TEST_SUBC_CORE_BINARY"]
+async fn scope_watch_pinned_daemon_keeps_polling_and_confirms_end() {
+    scope_watch_daemon_case("AFT_TEST_SUBC_CORE_BINARY", false).await;
+}
+
+#[cfg(all(
+    target_os = "linux",
+    feature = "test-scope-owner",
+    feature = "test-timing-hooks"
+))]
+async fn scope_watch_daemon_case(binary_env: &str, expect_watch: bool) {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     use subc_client_rs::CloseRouteOptions;
@@ -233,26 +253,26 @@ async fn scope_watch_real_daemon_confirms_end_after_route_close_without_polling(
         }
         None
     }
-    async fn health_at(path: &Path, descriptions: u64, watched: u64) -> Value {
+    async fn health_at(path: &Path, expected: impl Fn(&Value) -> bool) -> Value {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
             if let Ok(bytes) = std::fs::read(path) {
                 if let Ok(health) = serde_json::from_slice::<Value>(&bytes) {
-                    if health["descriptions"] == descriptions && health["watched"] == watched {
+                    if expected(&health) {
                         return health;
                     }
                 }
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "watch health did not reach descriptions={descriptions}, watched={watched}: {:?}",
+                "scope lifecycle health did not reach the expected state: {:?}",
                 std::fs::read_to_string(path)
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
     let binary = PathBuf::from(
-        std::env::var_os("CK_SUBC_BIN").expect("provide the explicitly built daemon"),
+        std::env::var_os(binary_env).unwrap_or_else(|| panic!("provide {binary_env}")),
     );
     let binary = crate::test_helpers::executable_cache::cached_executable_named(
         &std::fs::read(binary).unwrap(),
@@ -287,7 +307,7 @@ async fn scope_watch_real_daemon_confirms_end_after_route_close_without_polling(
                 std::fs::File::create(home.join("daemon.stderr")).unwrap(),
             ))
             .spawn()
-            .expect("start isolated source-built daemon"),
+            .expect("start isolated fixture daemon"),
     );
     let connection = home.join("runtime/subc-connection.json");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
@@ -307,6 +327,17 @@ async fn scope_watch_real_daemon_confirms_end_after_route_close_without_polling(
     let consumer = SubcConsumer::connect(&connection, ConsumerOptions::default())
         .await
         .unwrap();
+    if !expect_watch {
+        assert_eq!(
+            consumer
+                .server_describe()
+                .await
+                .unwrap()
+                .build_git_sha
+                .as_deref(),
+            Some("b86f6d159cd7286e5edd3baa9b9671cdd9d73f7a")
+        );
+    }
     let route = open(
         &consumer,
         &project,
@@ -321,24 +352,57 @@ async fn scope_watch_real_daemon_confirms_end_after_route_close_without_polling(
         .unwrap_or_else(|error| panic!("background bash request: {error}; fixture logs:\n{}", fixture_logs(&home)));
     let reply: Value = serde_json::from_slice(&reply).unwrap();
     assert_ne!(reply["isError"], true, "bash launch refused: {reply}");
-    let initial = health_at(&health_file, 1, 1).await;
-    assert_eq!(initial["polled"], 0);
+    let initial = health_at(&health_file, |health| {
+        if expect_watch {
+            health["descriptions"] == 1 && health["watched"] == 1 && health["polled"] == 0
+        } else {
+            health["opens"] == 0
+                && health["polled"] == 1
+                && health["descriptions"].as_u64().unwrap_or(0) >= 1
+        }
+    })
+    .await;
+    let initial_descriptions = initial["descriptions"].as_u64().unwrap();
+    if !expect_watch {
+        assert!(initial["fallbacks"].as_u64().unwrap() >= 1);
+    }
     consumer
         .close_handle(&route, CloseRouteOptions::default())
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(5500)).await;
-    let before_end = health_at(&health_file, 1, 1).await;
-    assert_eq!(
-        before_end["descriptions"], 1,
-        "route close and 55 fallback intervals must not poll a healthy watch"
-    );
+    let before_end = health_at(&health_file, |health| {
+        if expect_watch {
+            health["descriptions"] == 1 && health["watched"] == 1
+        } else {
+            health["opens"] == 0
+                && health["polled"] == 1
+                && health["descriptions"].as_u64().unwrap_or(0) > initial_descriptions
+        }
+    })
+    .await;
+    let before_end_descriptions = before_end["descriptions"].as_u64().unwrap();
+    if expect_watch {
+        assert_eq!(
+            before_end_descriptions, 1,
+            "route close and 55 fallback intervals must not poll a healthy watch"
+        );
+    }
     assert_eq!(
         record(&home).expect("background task metadata")["status"],
         "running"
     );
     std::fs::write(home.join("scope-owner.end"), b"end").unwrap();
-    let final_health = health_at(&health_file, 2, 0).await;
+    let final_health = health_at(&health_file, |health| {
+        health["watched"] == 0
+            && health["polled"] == 0
+            && if expect_watch {
+                health["descriptions"] == 2
+            } else {
+                health["descriptions"].as_u64().unwrap_or(0) > before_end_descriptions
+            }
+    })
+    .await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let task = record(&home).expect("background task metadata");
@@ -353,8 +417,12 @@ async fn scope_watch_real_daemon_confirms_end_after_route_close_without_polling(
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert_eq!(final_health["descriptions"], 2);
-    println!("real daemon scope.watch: 1 initial describe; 0 describes across route close and 55 fallback intervals; 1 confirming describe for the end; killed (scope revoked)");
+    if expect_watch {
+        assert_eq!(final_health["descriptions"], 2);
+        println!("real daemon scope.watch: 1 initial describe; 0 describes across route close and 55 fallback intervals; 1 confirming describe for the end; killed (scope revoked)");
+    } else {
+        println!("pinned daemon scope.watch fallback: initial describes={initial_descriptions}; describes after route close and 55 intervals={before_end_descriptions}; after confirmed end={}; watches opened=0; killed (scope revoked)", final_health["descriptions"]);
+    }
     consumer.close().await;
 }
 
