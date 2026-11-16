@@ -18,11 +18,15 @@ recordings, not live user data.
 `runner_notices_shared_send_samples_have_pinned_bytes` pins these manifests and
 checks every entry, including the upstream READMEs. The delivery-decision test
 feeds all fifteen `session.send` / `session.send_status` bodies through AFT's
-shared decoder and scheduler, as initial replies, follow-up replies (typed
+shared decoder and scheduler with negotiated `delivery_order` receipt semantics,
+as initial replies, follow-up replies (typed
 status and same-ID replay), and best-effort reminders. A run ID without a receipt
 does not settle delivery. A receipt, including `delivered.as: "unknown"`, settles
 tracking without authorizing a resend; `not_delivered` permits a new generation
-only for a completion.
+only for a completion. Legacy sends without the capability, and compatibility
+fallbacks that strip the optional delivery members, retain first-reply acceptance
+for `active` without a receipt. Ordered completions expire at the end of AFT's
+24-hour follow window; `expired` and `superseded` settle without a new generation.
 
 The three other JSON bodies in `send-not-delivered-v2` describe `run.status`,
 `run.result`, and `session.subscribe`. Their bytes are verified, but AFT does not

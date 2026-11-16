@@ -657,7 +657,7 @@ fn runner_notices_shared_send_samples_follow_until_receipt_or_not_delivered() {
             input["result"].get("run_id"),
             "{name}"
         );
-        let observed = match decode_send_reply(&bytes) {
+        let observed = match decode_send_reply(&bytes, true) {
             Outcome::Accepted => "accepted",
             Outcome::Pending => "pending",
             Outcome::NotDelivered(reason) => {
@@ -678,6 +678,7 @@ fn runner_notices_shared_send_samples_follow_until_receipt_or_not_delivered() {
                 "thalamus-harness",
             );
             let capture = test_endpoint::capture(&task.task, false);
+            capture.delivery_order(Some(true));
             capture.send_status(typed);
             if following {
                 capture.reply(pending.clone());
@@ -764,6 +765,7 @@ fn runner_notices_shared_send_samples_follow_until_receipt_or_not_delivered() {
             "thalamus-harness",
         );
         let capture = test_endpoint::capture(&task.task, false);
+        capture.delivery_order(Some(true));
         capture.reply(reply);
         let scheduler = Scheduler::default();
         assert!(offer(
@@ -800,6 +802,217 @@ fn assert_sample_followup(
             check.bytes, first.bytes,
             "{name}: same-ID follow-up must preserve the request"
         );
+    }
+}
+
+#[test]
+fn runner_notices_active_first_reply_tracks_only_negotiated_receipts() {
+    let active = read_reply::<SendReply>(&shared_send_sample(
+        "send-unknown-v2/04-steer-send-reply.json",
+    ))
+    .unwrap();
+    let delivered = read_reply::<SendReply>(&shared_send_sample(
+        "send-unknown-v2/08-head-send-status-delivered.json",
+    ))
+    .unwrap();
+    for (index, capability) in [None, Some(false), Some(true)].into_iter().enumerate() {
+        for (mode, typed) in [true, false].into_iter().enumerate() {
+            let task = Completion::new(&format!("bash-00000000002{index:03x}{mode:02x}"), 0);
+            let capture = test_endpoint::capture(&task.task, false);
+            capture.delivery_order(capability);
+            capture.send_status(typed);
+            capture.reply(active.clone());
+            let scheduler = Scheduler::default();
+            let clock = Arc::new(AtomicU64::new(task.finished));
+            task.offer(&scheduler, clock.clone());
+            let mut due = std::time::Instant::now();
+            let next = step(&scheduler, due);
+            let first = capture.receiver.try_recv().unwrap();
+            // Even legacy requests have delivery modes; only the negotiated
+            // capability promises receipts for unresolved active sends.
+            assert!(first.request["params"]["delivery"].is_array());
+            if capability == Some(true) {
+                assert!(matches!(next, Next::Retry(delay) if delay == Duration::from_secs(5)));
+                assert!(!task.delivered());
+                if typed {
+                    capture.reply(delivered.clone());
+                    assert!(matches!(
+                        advance_notice(&scheduler, &clock, &mut due, Duration::from_secs(5)),
+                        Next::Done
+                    ));
+                } else {
+                    // Broca's same-ID replay can remain active without a receipt.
+                    capture.reply(active.clone());
+                    assert!(
+                        matches!(advance_notice(&scheduler, &clock, &mut due, Duration::from_secs(5)), Next::Retry(delay) if delay == Duration::from_secs(30))
+                    );
+                    assert!(!task.delivered());
+                    assert_sample_followup(
+                        &capture.receiver.try_recv().unwrap(),
+                        &first,
+                        false,
+                        "legacy status fallback",
+                    );
+                    capture.reply(delivered.clone());
+                    assert!(matches!(
+                        advance_notice(&scheduler, &clock, &mut due, Duration::from_secs(30)),
+                        Next::Done
+                    ));
+                }
+                assert_sample_followup(
+                    &capture.receiver.try_recv().unwrap(),
+                    &first,
+                    typed,
+                    "negotiated status transport",
+                );
+            } else {
+                assert!(
+                    matches!(next, Next::Done),
+                    "plain active replies must not wait for a receipt"
+                );
+            }
+            assert!(task.delivered());
+            assert!(scheduler.entries.lock().unwrap().is_empty());
+            assert!(
+                capture.receiver.try_recv().is_err(),
+                "no new send or extra status check"
+            );
+        }
+    }
+}
+
+#[test]
+fn runner_notices_optional_member_fallback_accepts_plain_active_reply() {
+    let active = read_reply::<SendReply>(&shared_send_sample(
+        "send-unknown-v2/04-steer-send-reply.json",
+    ))
+    .unwrap();
+    for (index, field) in ["dedupe_key", "expires_at_ms"].into_iter().enumerate() {
+        let task = Completion::new(&format!("bash-00000000002f000{index}"), 0);
+        let capture = test_endpoint::capture(&task.task, false);
+        capture.delivery_order(Some(true));
+        capture.send_status(true);
+        capture.refuse("invalid_params", Some(field));
+        capture.reply(active.clone());
+        let scheduler = Scheduler::default();
+        task.offer(&scheduler, Arc::new(AtomicU64::new(task.finished)));
+        assert!(matches!(
+            step(&scheduler, std::time::Instant::now()),
+            Next::Done
+        ));
+        let first = capture.receiver.try_recv().unwrap();
+        assert!(first.request["params"]["dedupe_key"].is_string());
+        assert_eq!(
+            first.request["params"]["expires_at_ms"],
+            task.finished + MAX_AGE_MS
+        );
+        let fallback = capture.receiver.try_recv().unwrap();
+        let mut expected = first.request;
+        expected["params"]
+            .as_object_mut()
+            .unwrap()
+            .remove("dedupe_key");
+        expected["params"]
+            .as_object_mut()
+            .unwrap()
+            .remove("expires_at_ms");
+        assert_eq!(fallback.request, expected);
+        assert_eq!(envelope(&task.frozen()), fallback.bytes);
+        let _scope = crate::bash_background::task_identity_scope(Some(task.route.task_identity()));
+        assert!(
+            task.registry
+                .notice_metadata(&task.task)
+                .unwrap()
+                .runner_notice_policy
+                .unwrap()
+                .dedupe
+        );
+        assert!(!tracks_delivery_receipt(&task.frozen(), true));
+        assert!(task.delivered());
+        assert!(scheduler.entries.lock().unwrap().is_empty());
+        assert!(
+            capture.receiver.try_recv().is_err(),
+            "plain fallback must not be followed or resent"
+        );
+    }
+}
+
+#[test]
+fn runner_notices_completion_expiry_uses_finish_or_start_and_saturates() {
+    let policy = crate::bash_background::persistence::RunnerNoticePolicy {
+        dedupe: true,
+        reminder_interval_ms: 600_000,
+    };
+    for (finished, expected) in [
+        (Some(500), 500 + MAX_AGE_MS),
+        (None, 100 + MAX_AGE_MS),
+        (Some(u64::MAX - 1), u64::MAX),
+    ] {
+        let request = task_request(
+            request("notice".into(), "completion".into(), true, true),
+            "bash-1",
+            100,
+            finished,
+            None,
+            policy,
+        );
+        assert_eq!(
+            request.delivery_order().unwrap().unwrap().expires_at_ms,
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn runner_notices_expired_and_superseded_completions_settle_without_resend() {
+    for (index, state) in ["expired", "superseded"].into_iter().enumerate() {
+        for (mode, following) in [false, true].into_iter().enumerate() {
+            let task = Completion::new(&format!("bash-00000000003{index:03x}{mode:02x}"), 0);
+            let capture = test_endpoint::capture(&task.task, false);
+            capture.delivery_order(Some(true));
+            capture.send_status(true);
+            if following {
+                capture.reply(SendReply::new("pending"));
+            }
+            capture.reply(SendReply::new(state));
+            let scheduler = Scheduler::default();
+            let clock = Arc::new(AtomicU64::new(task.finished));
+            task.offer(&scheduler, clock.clone());
+            let mut due = std::time::Instant::now();
+            let mut next = step(&scheduler, due);
+            let first = capture.receiver.try_recv().unwrap();
+            assert_eq!(
+                first.request["params"]["expires_at_ms"],
+                task.finished + MAX_AGE_MS
+            );
+            if following {
+                assert!(matches!(next, Next::Retry(delay) if delay == Duration::from_secs(5)));
+                assert!(!task.delivered());
+                next = advance_notice(&scheduler, &clock, &mut due, Duration::from_secs(5));
+                assert_sample_followup(&capture.receiver.try_recv().unwrap(), &first, true, state);
+            }
+            assert!(matches!(next, Next::Done), "{state}");
+            assert!(task.delivered(), "{state}");
+            assert_eq!(
+                task.frozen().send_id,
+                first.request["params"]["send_id"].as_str().unwrap()
+            );
+            let _scope =
+                crate::bash_background::task_identity_scope(Some(task.route.task_identity()));
+            assert_eq!(
+                task.registry
+                    .notice_metadata(&task.task)
+                    .unwrap()
+                    .runner_completion_delivery
+                    .map_or(1, |progress| progress.generation),
+                1
+            );
+            assert!(scheduler.entries.lock().unwrap().is_empty());
+            assert!(
+                capture.receiver.try_recv().is_err(),
+                "{state}: no new generation"
+            );
+        }
     }
 }
 
@@ -1532,20 +1745,20 @@ fn runner_notices_pending_status_failures_retry_once_then_resume_schedule() {
 fn runner_notices_pending_followup_stops_only_on_receipt_or_contract_final_state() {
     for state in ["finished", "superseded", "expired", "template_part_gone"] {
         assert!(matches!(
-            decode_send_reply(&reply_body(&SendReply::new(state)).unwrap()),
+            decode_send_reply(&reply_body(&SendReply::new(state)).unwrap(), true),
             Outcome::Accepted
         ));
     }
     for state in ["pending", "active", "paused", "future_state"] {
         assert!(matches!(
-            decode_send_reply(&reply_body(&SendReply::new(state)).unwrap()),
+            decode_send_reply(&reply_body(&SendReply::new(state)).unwrap(), true),
             Outcome::Pending
         ));
     }
     let reply = SendReply::new("active")
         .with_delivered(cortexkit_role_llm_runner::send::Delivered::new("step").with_ref("row-1"));
     assert!(matches!(
-        decode_send_reply(&reply_body(&reply).unwrap()),
+        decode_send_reply(&reply_body(&reply).unwrap(), true),
         Outcome::Accepted
     ));
 }
@@ -2169,12 +2382,16 @@ fn runner_notices_recovered_notice_fallback_survives_restart_observation() {
 #[test]
 fn runner_notices_distinguishes_queued_submission_from_delivered_notice() {
     assert!(matches!(
-        decode_send_reply(br#"{"result":{"state":"pending","submission_id":"notice-1"}}"#),
+        decode_send_reply(
+            br#"{"result":{"state":"pending","submission_id":"notice-1"}}"#,
+            true
+        ),
         Outcome::Pending
     ));
     assert!(matches!(
         decode_send_reply(
             br#"{"result":{"state":"active","delivered":{"as":"step","ref":"notice-1"}}}"#,
+            true,
         ),
         Outcome::Accepted
     ));
@@ -2183,7 +2400,7 @@ fn runner_notices_distinguishes_queued_submission_from_delivered_notice() {
 #[test]
 fn runner_notices_decode_open_states_and_error_envelopes() {
     assert!(matches!(
-        decode_send_reply(br#"{"result":{"state":"pending"}}"#),
+        decode_send_reply(br#"{"result":{"state":"pending"}}"#, true),
         Outcome::Pending
     ));
     for (reason, expected) in [
@@ -2196,31 +2413,35 @@ fn runner_notices_decode_open_states_and_error_envelopes() {
         }
         let bytes = cortexkit_role_llm_runner::wire::reply_body(&reply).unwrap();
         assert!(
-            matches!(decode_send_reply(&bytes), Outcome::NotDelivered(reason) if reason == expected)
+            matches!(decode_send_reply(&bytes, true), Outcome::NotDelivered(reason) if reason == expected)
         );
     }
     for state in ["active", "paused", "future_notice_state"] {
         let bytes = serde_json::to_vec(&json!({"result":{"state":state,"notice":true}})).unwrap();
-        assert!(matches!(decode_send_reply(&bytes), Outcome::Pending));
+        assert!(matches!(decode_send_reply(&bytes, true), Outcome::Pending));
+        assert!(matches!(
+            decode_send_reply(&bytes, false),
+            Outcome::Accepted
+        ));
     }
     assert!(
-        matches!(decode_send_reply(br#"{"result":{"state":"not_delivered"}}"#), Outcome::Retry(failure) if failure.class == FailureClass::ReplyDecode)
+        matches!(decode_send_reply(br#"{"result":{"state":"not_delivered"}}"#, true), Outcome::Retry(failure) if failure.class == FailureClass::ReplyDecode)
     );
     for body in [
         json!({"error":{"code":"session_released","message":"gone"}}),
         json!({"code":"session_released","message":"gone"}),
     ] {
         assert!(
-            matches!(decode_send_reply(&serde_json::to_vec(&body).unwrap()),
+            matches!(decode_send_reply(&serde_json::to_vec(&body).unwrap(), true),
             Outcome::Final(failure) if failure.code.as_deref() == Some("session_released") && failure.detail.contains("gone"))
         );
     }
     assert!(
-        matches!(decode_send_reply(br#"{"error":{"code":"module_warming","message":"starting"}}"#),
+        matches!(decode_send_reply(br#"{"error":{"code":"module_warming","message":"starting"}}"#, true),
         Outcome::Retry(failure) if failure.code.as_deref() == Some("module_warming"))
     );
     assert!(
-        matches!(decode_send_reply(br#"{"result":{"status":"pending"}}"#),
+        matches!(decode_send_reply(br#"{"result":{"status":"pending"}}"#, true),
         Outcome::Retry(failure) if failure.class == FailureClass::ReplyDecode && failure.detail.contains("state"))
     );
 }
@@ -2311,7 +2532,7 @@ impl FakeRunner {
             cortexkit_role_llm_runner::send::Delivered::new("step").with_ref("send-7"),
         ))
         .unwrap();
-        decode_send_reply(&response)
+        decode_send_reply(&response, true)
     }
 }
 
@@ -2513,8 +2734,8 @@ fn runner_notices_delivery_refusal_decodes_field_from_wire_and_module_errors() {
         let error =
             json!({"code": "invalid_params", "message": "refused", "detail": {"field": field}});
         let outcomes = [
-            decode_send_reply(&serde_json::to_vec(&error).unwrap()),
-            decode_send_reply(&serde_json::to_vec(&json!({"error": error})).unwrap()),
+            decode_send_reply(&serde_json::to_vec(&error).unwrap(), true),
+            decode_send_reply(&serde_json::to_vec(&json!({"error": error})).unwrap(), true),
             request_failure(CallError::Module(serde_json::from_value(error).unwrap())),
         ];
         for outcome in outcomes {
@@ -2900,12 +3121,16 @@ fn runner_notices_optional_members_are_gated_and_task_choice_is_frozen() {
             "notice":true,"delivery":["tool_result","steer"]});
         if capability == Some(true) {
             expected["dedupe_key"] = json!(format!("aft:bash-task:{}", task.task));
+            expected["expires_at_ms"] = json!(task.finished + MAX_AGE_MS);
         }
         assert_eq!(
             completion.request,
             json!({"method":"session.send","params":expected})
         );
-        assert!(completion.request["params"].get("expires_at_ms").is_none());
+        assert_eq!(
+            completion.request["params"].get("expires_at_ms").is_some(),
+            capability == Some(true)
+        );
         assert_eq!(
             completion.request["params"].get("dedupe_key"),
             reminder.request["params"].get("dedupe_key")

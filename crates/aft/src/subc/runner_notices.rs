@@ -364,7 +364,7 @@ pub(super) fn warning(
                     &request.send_id,
                     attempt,
                     false,
-                    runtime.block_on(send(&path, &address, &request)),
+                    runtime.block_on(send(&path, &address, &request, false)),
                     &mut retry_logged,
                 );
                 attempt += 1;
@@ -696,6 +696,7 @@ fn task_request(
     request: SendRequest,
     task_id: &str,
     started_at: u64,
+    finished_at: Option<u64>,
     reminder_elapsed_ms: Option<u64>,
     policy: crate::bash_background::persistence::RunnerNoticePolicy,
 ) -> SendRequest {
@@ -704,12 +705,25 @@ fn task_request(
     }
     let mut order = request.delivery_order().unwrap().unwrap();
     order.dedupe_key = Some(format!("aft:bash-task:{task_id}"));
-    order.expires_at_ms = reminder_elapsed_ms.map(|elapsed| {
-        started_at
+    order.expires_at_ms = Some(match reminder_elapsed_ms {
+        Some(elapsed) => started_at
             .saturating_add(elapsed)
-            .saturating_add(policy.reminder_interval_ms)
+            .saturating_add(policy.reminder_interval_ms),
+        None => finished_at.unwrap_or(started_at).saturating_add(MAX_AGE_MS),
     });
     request.with_delivery_order(&order)
+}
+
+fn tracks_delivery_receipt(request: &SendRequest, delivery_order: bool) -> bool {
+    // The base delivery modes predate receipt semantics. A compatibility fallback
+    // removes both optional members and must keep the legacy acceptance behavior,
+    // even though the frozen runner policy still declares delivery_order.
+    delivery_order
+        && request
+            .delivery_order()
+            .ok()
+            .flatten()
+            .is_some_and(|order| order.dedupe_key.is_some() || order.expires_at_ms.is_some())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1127,7 +1141,12 @@ pub(super) mod test_endpoint {
                 .unwrap()
             });
         states.insert(key, response.clone());
-        if new && !matches!(decode_send_reply(&response), Outcome::NotDelivered(_)) {
+        if new
+            && !matches!(
+                decode_send_reply(&response, false),
+                Outcome::NotDelivered(_)
+            )
+        {
             endpoint.effects.fetch_add(1, Ordering::Relaxed);
         }
         if endpoint.lose_response.swap(false, Ordering::Relaxed) {
@@ -1307,9 +1326,14 @@ mod recovery_fixture;
 #[cfg(feature = "test-scope-owner")]
 pub use recovery_fixture::RunnerNoticeRecoveryForTest;
 
-async fn send(path: &Path, address: &Address, request: &SendRequest) -> Outcome {
+async fn send(
+    path: &Path,
+    address: &Address,
+    request: &SendRequest,
+    delivery_order: bool,
+) -> Outcome {
     let outcome = match call(path, address, envelope(request)).await {
-        Ok(bytes) => decode_send_reply(&bytes),
+        Ok(bytes) => decode_send_reply(&bytes, tracks_delivery_receipt(request, delivery_order)),
         Err(outcome) => outcome,
     };
     if matches!(outcome, Outcome::Accepted) {
@@ -1324,7 +1348,12 @@ async fn send(path: &Path, address: &Address, request: &SendRequest) -> Outcome 
     outcome
 }
 
-async fn check_send(path: &Path, address: &Address, request: &SendRequest) -> Outcome {
+async fn check_send(
+    path: &Path,
+    address: &Address,
+    request: &SendRequest,
+    delivery_order: bool,
+) -> Outcome {
     // The send_status group promises a read-only lookup. Older runners instead
     // answer an identical session.send from the durable idempotency record.
     let bytes = if runner_capability(path, address, "send_status").await == Some(true) {
@@ -1333,7 +1362,7 @@ async fn check_send(path: &Path, address: &Address, request: &SendRequest) -> Ou
         envelope(request)
     };
     match call(path, address, bytes).await {
-        Ok(bytes) => decode_send_reply(&bytes),
+        Ok(bytes) => decode_send_reply(&bytes, tracks_delivery_receipt(request, delivery_order)),
         Err(outcome) => outcome,
     }
 }
@@ -1367,7 +1396,7 @@ fn flush_delivery_update(
     Ok(())
 }
 
-fn decode_send_reply(bytes: &[u8]) -> Outcome {
+fn decode_send_reply(bytes: &[u8], receipt_semantics: bool) -> Outcome {
     match cortexkit_role_llm_runner::wire::read_reply::<SendReply>(bytes) {
         Ok(reply) => {
             // llm-runner 0.8.53 CONTRACT §9: not_delivered is final for this
@@ -1377,8 +1406,9 @@ fn decode_send_reply(bytes: &[u8]) -> Outcome {
             }
             // CONTRACT §9 and §9.7 list finished, superseded, expired
             // and template_part_gone as final. A run's active/paused state (or
-            // a future state) does not prove notice delivery: without a receipt,
-            // both the first reply and later status replies need follow-up.
+            // a future state) does not prove ordered notice delivery: without a
+            // receipt, both first and later replies need follow-up. Legacy sends
+            // never get receipts, so only explicit pending keeps them followed.
             let terminal = matches!(
                 reply.state.as_str(),
                 states::FINISHED
@@ -1386,7 +1416,10 @@ fn decode_send_reply(bytes: &[u8]) -> Outcome {
                     | states::EXPIRED
                     | states::TEMPLATE_PART_GONE
             );
-            if reply.delivered.is_none() && !terminal {
+            if reply.delivered.is_none()
+                && !terminal
+                && (receipt_semantics || reply.state == "pending")
+            {
                 Outcome::Pending
             } else {
                 Outcome::Accepted
@@ -1492,17 +1525,13 @@ pub(super) async fn transport_for_test(path: &Path, session: &str, scope: ScopeS
         true,
         true,
     );
-    let request = task_request(
-        request,
-        session,
-        0,
-        None,
-        crate::bash_background::persistence::RunnerNoticePolicy {
-            dedupe: runner_delivery_order(path, &address).await == Some(true),
-            reminder_interval_ms: 600_000,
-        },
-    );
-    let outcome = send(path, &address, &request).await;
+    let policy = crate::bash_background::persistence::RunnerNoticePolicy {
+        dedupe: runner_delivery_order(path, &address).await == Some(true),
+        reminder_interval_ms: 600_000,
+    };
+    let now = crate::bash_background::persistence::unix_millis();
+    let request = task_request(request, session, now, Some(now), None, policy);
+    let outcome = send(path, &address, &request, policy.dedupe).await;
     let mut result = match &outcome {
         Outcome::Accepted => json!({"outcome":"accepted"}),
         Outcome::Pending => json!({"outcome":"pending"}),
@@ -1872,6 +1901,7 @@ fn offer(
                         Err(error) => return retry(FailureClass::Runtime, error),
                     };
                     let mut request = request(id.clone(), text.clone(), completion, address.worker);
+                    let mut delivery_order = false;
                     if completion || reminder_elapsed_ms.is_some() {
                         let policy = if let Some(policy) = metadata.runner_notice_policy.filter(|_| {
                             reminder_elapsed_ms <= metadata.runner_reminder_elapsed_ms
@@ -1885,7 +1915,8 @@ fn offer(
                                 Err(error) => return retry(FailureClass::Persistence, error),
                             }
                         };
-                        request = task_request(request, &task_id, metadata.started_at, reminder_elapsed_ms, policy);
+                        delivery_order = policy.dedupe;
+                        request = task_request(request, &task_id, metadata.started_at, metadata.finished_at, reminder_elapsed_ms, policy);
                     }
                     let request = if let Some(request) = metadata
                         .runner_completion_notice
@@ -1912,7 +1943,7 @@ fn offer(
                     };
                     current_request = Some(request.clone());
                     if checking {
-                        return runtime.block_on(check_send(&path, &address, &request));
+                        return runtime.block_on(check_send(&path, &address, &request, delivery_order));
                     }
                     if completion {
                         let Some(offers) = registry.reserve_runner_completion_offer(&task_id)
@@ -1934,11 +1965,11 @@ fn offer(
                         if completion {
                             registry
                                 .send_runner_completion(&task_id, || {
-                                    runtime.block_on(send(&path, &address, request))
+                                    runtime.block_on(send(&path, &address, request, delivery_order))
                                 })
                                 .unwrap_or(Outcome::Accepted)
                         } else {
-                            runtime.block_on(send(&path, &address, request))
+                            runtime.block_on(send(&path, &address, request, delivery_order))
                         }
                     };
                     let mut outcome = send_request(&request);

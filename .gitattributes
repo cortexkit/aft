@@ -54,8 +54,7 @@ crates/aft/tests/fixtures/rich_ui/** -text
 # Published agent-data project/session vectors are pinned by SHA-256 of their
 # exact bytes; Windows checkout conversion must not rewrite their line endings.
 crates/aft/tests/fixtures/agent_data/** -text
-# Runner send samples are pinned by their published SHA-256 manifests;
-# preserve their exact bytes on Windows checkouts as well.
+# Preserve checksum-pinned runner send samples byte-for-byte on Windows too.
 crates/aft/tests/fixtures/llm-runner/** -text
 # Secret-approval and Cingulate secret_use vectors are pinned by the owners'
 # sha256 sums of their exact published bytes; Windows autocrlf would rewrite
