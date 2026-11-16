@@ -280,6 +280,7 @@ fn gh_shim_broker_refusal_texts_are_pinned() {
         ("command_budget_exceeded", "gh read refused: this bash command has used its 600 gh reads. Start a new bash command."),
         ("broker_timeout", "gh read timed out. Retry, or run fewer gh commands in parallel."),
         ("broker_unavailable", "gh reads are unavailable in this bash command. Start a new bash command."),
+        ("watch_interval", "--interval must be a positive number of seconds"),
         ("command_ended", "gh read failed: command_ended. Start a new bash command."),
     ] {
         assert_eq!(failure_text(code), text);

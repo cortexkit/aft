@@ -59,14 +59,14 @@ const READS_PER_COMMAND: u32 = 600;
 static GLOBAL: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(64)));
 
 // Keep overload and transport failures actionable at every lookup/read boundary.
-#[cfg(unix)]
-fn failure_text(code: &str) -> String {
+pub(crate) fn failure_text(code: &str) -> String {
     match code {
         "broker_busy" => "gh read refused: too many gh commands are running at once in this shell. Retry in 1 second, or run fewer in parallel.",
         "request_rate_exceeded" => "gh read refused: more than 30 gh reads in one second. Retry in 1 second.",
         "command_budget_exceeded" => "gh read refused: this bash command has used its 600 gh reads. Start a new bash command.",
         "broker_timeout" => "gh read timed out. Retry, or run fewer gh commands in parallel.",
         "broker_unavailable" => "gh reads are unavailable in this bash command. Start a new bash command.",
+        "watch_interval" => "--interval must be a positive number of seconds",
         _ => return format!("gh read failed: {code}. Start a new bash command."),
     }.into()
 }

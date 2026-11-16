@@ -2344,10 +2344,20 @@ fn v20_worker_lookup_failures_keep_cause_and_plain_reads_recover() {
         ("gh_shim.read_request", get(json!({"jobs":[]}))),
         ("gh_shim.session_context", refused("broker_busy", busy)),
         ("gh_shim.session_context", context.clone()),
-        ("gh_shim.session_context", context),
+        ("gh_shim.session_context", context.clone()),
         (
             "gh_shim.read_request",
             get(json!({"number":7,"title":"Title","user":{"login":"author"},"state":"open"})),
+        ),
+        ("gh_shim.session_context", context.clone()),
+        ("gh_shim.session_context", context),
+        (
+            "gh_shim.read_request",
+            get(json!({"status":"completed","conclusion":"failure"})),
+        ),
+        (
+            "gh_shim.read_request",
+            get(json!({"jobs":[{"name":"test","conclusion":"failure"}]})),
         ),
     ];
     let listener = UnixListener::bind(&socket).unwrap();
@@ -2428,5 +2438,153 @@ fn v20_worker_lookup_failures_keep_cause_and_plain_reads_recover() {
         0,
         "an explicit repository read must also recover"
     );
+    lines.lock().unwrap().clear();
+    assert_eq!(
+        run(&[
+            "run",
+            "watch",
+            "43863185628",
+            "-R",
+            "cortexkit/aft",
+            "--exit-status"
+        ]),
+        1
+    );
+    assert!(
+        lines.lock().unwrap().is_empty(),
+        "watch must use the worker read path, not a native-gh refusal"
+    );
     broker.join().unwrap();
+}
+
+#[test]
+fn v20_watch_polls_status_then_reports_conclusion_and_failed_jobs() {
+    let plan = planned(&[
+        "run",
+        "watch",
+        "43863185628",
+        "--exit-status",
+        "--interval",
+        "3",
+    ]);
+    let mut replies = vec![
+        json!({"status":"queued","conclusion":null}),
+        json!({"status":"in_progress","conclusion":null}),
+        json!({"status":"completed","conclusion":"failure"}),
+        json!({"jobs":[{"name":"build","conclusion":"success"},{"name":"unit tests","conclusion":"failure"}]}),
+    ].into_iter();
+    let mut requests = Vec::new();
+    let mut sleeps = Vec::new();
+    let mut output = Vec::new();
+    let status = render::run_with_sleep(
+        &plan,
+        &mut |request| {
+            requests.push(request.clone());
+            Ok(reply(
+                replies
+                    .next()
+                    .expect("one request per poll plus final jobs"),
+            ))
+        },
+        &mut output,
+        &mut |duration| sleeps.push(duration),
+    )
+    .unwrap();
+    assert_eq!(status, 1);
+    assert_eq!(String::from_utf8(output).unwrap(), "43863185628\tqueued\n43863185628\tin_progress\n43863185628\tcompleted\n43863185628\tfailure\nunit tests\tfailure\n");
+    assert_eq!(sleeps, vec![Duration::from_secs(10); 2]);
+    assert_eq!(
+        requests[..3],
+        vec![
+            ReadRequest::Get {
+                path: "/repos/cortexkit/aft/actions/runs/43863185628".into(),
+                accept: None
+            };
+            3
+        ]
+    );
+    assert_eq!(
+        requests[3],
+        ReadRequest::Get {
+            path: "/repos/cortexkit/aft/actions/runs/43863185628/jobs".into(),
+            accept: None
+        }
+    );
+    assert!(replies.next().is_none());
+}
+
+#[test]
+fn v20_watch_interval_exit_codes_and_signed_read_authorization() {
+    let manifest = manifest();
+    assert!(candidate(&args(&["run", "watch", "7"]), &manifest, "linux"));
+    let mut no_view = manifest;
+    no_view.worker_reads.retain(|row| row.tuple() != "run view");
+    assert!(!candidate(&args(&["run", "watch", "7"]), &no_view, "linux"));
+    for value in ["0", "-1", "NaN"] {
+        assert_eq!(
+            plan(
+                &args(&["run", "watch", "7", "--interval", value]),
+                "cortexkit/aft"
+            )
+            .unwrap_err(),
+            "--interval must be a positive number of seconds"
+        );
+    }
+    for (flags, interval) in [
+        (vec![], 10),
+        (vec!["--interval", "1"], 10),
+        (vec!["-i", "25"], 25),
+    ] {
+        let mut raw = vec!["run", "watch", "7", "--exit-status"];
+        raw.extend(flags);
+        for conclusion in [
+            "success",
+            "neutral",
+            "skipped",
+            "failure",
+            "cancelled",
+            "timed_out",
+            "action_required",
+        ] {
+            let mut calls = 0;
+            let mut sleeps = Vec::new();
+            let result = render::run_with_sleep(
+                &planned(&raw),
+                &mut |_| {
+                    calls += 1;
+                    Ok(reply(match calls {
+                        1 | 2 => json!({"status":"in_progress","conclusion":null}),
+                        3 => json!({"status":"completed","conclusion":conclusion}),
+                        4 => json!({"jobs":[]}),
+                        _ => panic!("unexpected poll"),
+                    }))
+                },
+                &mut Vec::new(),
+                &mut |duration| sleeps.push(duration),
+            )
+            .unwrap();
+            assert_eq!(sleeps, vec![Duration::from_secs(interval); 2]);
+            assert_eq!(
+                result,
+                i32::from(!matches!(conclusion, "success" | "neutral" | "skipped")),
+                "{conclusion}"
+            );
+            assert_eq!(calls, 4);
+        }
+    }
+    let mut responses = [
+        json!({"status":"completed","conclusion":"failure"}),
+        json!({"jobs":[]}),
+    ]
+    .into_iter();
+    assert_eq!(
+        render::run_with_sleep(
+            &planned(&["run", "watch", "7"]),
+            &mut |_| Ok(reply(responses.next().unwrap())),
+            &mut Vec::new(),
+            &mut |_| panic!("completed run must not sleep")
+        )
+        .unwrap(),
+        0
+    );
 }
