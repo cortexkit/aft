@@ -1,18 +1,22 @@
 //! Offline smallest-enclosing-range lookup. Sweeping starts and querying a
 //! reversed-end Fenwick tree avoids scanning every syntax node for every ref.
 
+test_support_visibility! {
 pub(super) struct Preorder<'tree> {
     cursor: tree_sitter::TreeCursor<'tree>,
     started: bool,
     finished: bool,
 }
+}
 
+test_support_visibility! {
 pub(super) fn preorder(root: tree_sitter::Node<'_>) -> Preorder<'_> {
     Preorder {
         cursor: root.walk(),
         started: false,
         finished: false,
     }
+}
 }
 
 impl<'tree> Iterator for Preorder<'tree> {
@@ -35,10 +39,12 @@ impl<'tree> Iterator for Preorder<'tree> {
     }
 }
 
+test_support_visibility! {
 #[derive(Clone, Copy)]
 pub(super) enum LookupWork {
     Ordinal,
     Dispatch,
+}
 }
 
 impl LookupWork {
@@ -51,6 +57,7 @@ impl LookupWork {
     }
 }
 
+test_support_visibility! {
 /// Return the index of the shortest enclosing range, breaking ties by input
 /// order. This also handles empty ranges, shared spans and error-recovery nodes;
 /// using a parent walk alone would miss adjacent nodes at an empty-range boundary.
@@ -105,4 +112,6 @@ pub(super) fn range_minima(
         }
     }
     results
+}
+
 }

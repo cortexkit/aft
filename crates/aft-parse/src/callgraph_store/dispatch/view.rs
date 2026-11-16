@@ -125,23 +125,28 @@ impl<'r, 'a> File<'r, 'a> {
     }
 }
 
+test_support_visibility! {
 /// A method-group capability carries only facts covered by its `m:` key.
 #[derive(Clone, Copy)]
 pub(super) struct MethodGroup<'a> {
     parse: &'a ParseBlob,
 }
+}
 
 impl<'a> MethodGroup<'a> {
-    pub(super) fn new(parse: &'a ParseBlob) -> Self {
+    test_support_visibility! {
+pub(super) fn new(parse: &'a ParseBlob) -> Self {
         Self { parse }
     }
+}
     pub(super) fn language(&self) -> &'a str {
         &self.parse.language
     }
     pub(super) fn go_package(&self) -> Option<&'a str> {
         self.parse.dispatch.go_package.as_deref()
     }
-    pub(super) fn owner_type(
+    test_support_visibility! {
+pub(super) fn owner_type(
         &self,
         resolver: &Resolver<'a>,
         path: &str,
@@ -151,8 +156,10 @@ impl<'a> MethodGroup<'a> {
         // additionally needs its t: key for precise changes to the type.
         File::new(resolver, path, self.parse).type_named(owner)
     }
+}
 
-    pub(super) fn implements(
+    test_support_visibility! {
+pub(super) fn implements(
         &self,
         owner: &str,
         required: &std::collections::BTreeSet<(&str, &str)>,
@@ -170,7 +177,8 @@ impl<'a> MethodGroup<'a> {
             })
         })
     }
-}
+
+}}
 
 /// Directory membership and a single type name cover this scan's reads.
 pub(super) struct Directory<'r, 'a> {

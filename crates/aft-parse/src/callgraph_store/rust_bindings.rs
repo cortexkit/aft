@@ -9,12 +9,14 @@ use tree_sitter::Node;
 
 use super::join::syntax_index::Nav;
 
+test_support_visibility! {
 #[derive(Clone, Debug)]
 pub(super) struct Declaration {
     pub symbol: String,
     pub owner: Option<String>,
     pub return_type: Option<String>,
     pub bytes: Range<usize>,
+}
 }
 
 pub(super) fn has_self_parameter(node: Node<'_>, source: &str) -> bool {
@@ -41,12 +43,14 @@ pub(super) enum Initializer {
 }
 }
 
+test_support_visibility! {
 #[derive(Clone, Debug)]
 pub(super) struct Binding {
     start: usize,
     scope: Range<usize>,
     pub annotation: Option<String>,
     pub initializer: Option<Initializer>,
+}
 }
 
 test_support_visibility! {

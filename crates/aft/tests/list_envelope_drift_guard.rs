@@ -16,6 +16,10 @@ fn base_src_dir() -> PathBuf {
     crate::test_helpers::manifest_dir().join("../aft-base/src")
 }
 
+fn parse_src_dir() -> PathBuf {
+    crate::test_helpers::manifest_dir().join("../aft-parse/src")
+}
+
 /// Recursively collect all `.rs` files under a directory.
 fn collect_rs_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -68,6 +72,7 @@ pub(crate) fn find_enclosing_item(lines: &[&str], target_idx: usize) -> String {
 pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     let src_dir = aft_src_dir();
     let base_dir = base_src_dir();
+    let parse_dir = parse_src_dir();
     let mut files_to_scan = Vec::new();
 
     // 1. crates/aft/src/commands/**
@@ -88,8 +93,8 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     files_to_scan.push(src_dir.join("file_read_exact.rs"));
     files_to_scan.push(src_dir.join("runtime_drain.rs"));
     files_to_scan.push(src_dir.join("parent_search/mod.rs"));
-    files_to_scan.push(src_dir.join("parser/todo_markers.rs"));
-    files_to_scan.push(src_dir.join("parser/dead_code_facts.rs"));
+    files_to_scan.push(parse_dir.join("parser/todo_markers.rs"));
+    files_to_scan.push(parse_dir.join("parser/dead_code_facts.rs"));
     files_to_scan.push(src_dir.join("edit.rs"));
     files_to_scan.push(src_dir.join("bash_permissions/scan.rs"));
     // 4. crates/aft-base/src/compress/**
@@ -127,6 +132,7 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
         let rel_path = registry_file_key(
             file.strip_prefix(&src_dir)
                 .or_else(|_| file.strip_prefix(&base_dir))
+                .or_else(|_| file.strip_prefix(&parse_dir))
                 .unwrap_or(&file),
         );
 

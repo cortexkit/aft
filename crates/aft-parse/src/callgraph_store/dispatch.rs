@@ -1483,63 +1483,68 @@ struct RustReceiverIndex<'nodes, 'tree> {
 }
 
 impl<'nodes, 'tree> RustReceiverIndex<'nodes, 'tree> {
+    test_support_visibility! {
     fn new(
-        nodes: &'nodes [Node<'tree>],
-        source: &str,
-        bindings: &'nodes RustBindings,
-        nav: impl Nav<'tree>,
-    ) -> Self {
-        #[cfg(any(test, feature = "test-support"))]
-        super::extraction_work::note(|work| {
-            work.receiver_index_passes += 1;
-            work.receiver_index_nodes += nodes.len();
-        });
-        let mut index = Self {
-            nodes,
-            functions: HashMap::new(),
-            constructors: HashSet::new(),
-            bindings,
-        };
-        let mut ancestors = Vec::<(Node<'tree>, usize, usize)>::new();
-        for (position, &node) in nodes.iter().enumerate() {
-            // Named-child counts close subtrees without parent searches or
-            // ambiguous byte containment at identical and zero-width spans.
-            while ancestors
-                .last()
-                .is_some_and(|(_, _, remaining)| *remaining == 0)
-            {
-                let (ancestor, start, _) = ancestors.pop().unwrap();
-                if FUNCTIONS.contains(&nav.kind(ancestor)) {
-                    index.functions.insert(ancestor.id(), (start, position));
+            nodes: &'nodes [Node<'tree>],
+            source: &str,
+            bindings: &'nodes RustBindings,
+            nav: impl Nav<'tree>,
+        ) -> Self {
+            #[cfg(any(test, feature = "test-support"))]
+            super::extraction_work::note(|work| {
+                work.receiver_index_passes += 1;
+                work.receiver_index_nodes += nodes.len();
+            });
+            let mut index = Self {
+                nodes,
+                functions: HashMap::new(),
+                constructors: HashSet::new(),
+                bindings,
+            };
+            let mut ancestors = Vec::<(Node<'tree>, usize, usize)>::new();
+            for (position, &node) in nodes.iter().enumerate() {
+                // Named-child counts close subtrees without parent searches or
+                // ambiguous byte containment at identical and zero-width spans.
+                while ancestors
+                    .last()
+                    .is_some_and(|(_, _, remaining)| *remaining == 0)
+                {
+                    let (ancestor, start, _) = ancestors.pop().unwrap();
+                    if FUNCTIONS.contains(&nav.kind(ancestor)) {
+                        index.functions.insert(ancestor.id(), (start, position));
+                    }
                 }
-            }
-            if let Some((_, _, remaining)) = ancestors.last_mut() {
-                *remaining -= 1;
-            }
-            ancestors.push((node, position, node.named_child_count()));
-            if nav.kind(node) == "function_item"
-                && named(node, source, nav).as_deref() == Some("new")
-            {
-                if let Some((owner, _)) = owner(node, source, "rust", nav) {
-                    if field(node, &["return_type"])
-                        .is_some_and(|ty| ["Self", owner.as_str()].contains(&text(ty, source)))
-                    {
-                        index.constructors.insert(owner);
+                if let Some((_, _, remaining)) = ancestors.last_mut() {
+                    *remaining -= 1;
+                }
+                ancestors.push((node, position, node.named_child_count()));
+                if nav.kind(node) == "function_item"
+                    && named(node, source, nav).as_deref() == Some("new")
+                {
+                    if let Some((owner, _)) = owner(node, source, "rust", nav) {
+                        if field(node, &["return_type"])
+                            .is_some_and(|ty| ["Self", owner.as_str()].contains(&text(ty, source)))
+                        {
+                            index.constructors.insert(owner);
+                        }
                     }
                 }
             }
-        }
-        for (ancestor, start, _) in ancestors {
-            if FUNCTIONS.contains(&nav.kind(ancestor)) {
-                index.functions.insert(ancestor.id(), (start, nodes.len()));
+            for (ancestor, start, _) in ancestors {
+                if FUNCTIONS.contains(&nav.kind(ancestor)) {
+                    index.functions.insert(ancestor.id(), (start, nodes.len()));
+                }
             }
+            index
         }
-        index
     }
 
+    test_support_visibility! {
     fn function_nodes(&self, function: Node<'tree>) -> Option<&'nodes [Node<'tree>]> {
-        let &(start, end) = self.functions.get(&function.id())?;
-        self.nodes.get(start..end)
+            let &(start, end) = self.functions.get(&function.id())?;
+            self.nodes.get(start..end)
+        }
+
     }
 }
 

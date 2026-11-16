@@ -1427,6 +1427,7 @@ pub fn search_parse_count_for_test() -> u64 {
     SEARCH_PARSE_COUNT.with(std::cell::Cell::get)
 }
 
+test_support_visibility! {
 /// Cached parse result: mtime at parse time + the tree.
 struct CachedTree {
     mtime: SystemTime,
@@ -1434,7 +1435,11 @@ struct CachedTree {
     content_hash: blake3::Hash,
     tree: Tree,
     lang: LangId,
+    #[cfg(any(test, feature = "test-support"))]
+    pub source: Option<Arc<String>>,
+    #[cfg(not(any(test, feature = "test-support")))]
     source: Option<Arc<String>>,
+}
 }
 
 /// Outline-only module containers; these never enter the extracted symbol table.
@@ -1496,9 +1501,13 @@ pub struct ParsedFile {
     content_hash: blake3::Hash,
 }
 
+test_support_visibility! {
 /// Cached symbol extraction result: mtime at extraction time + symbols.
 #[derive(Clone)]
 struct CachedSymbols {
+    #[cfg(any(test, feature = "test-support"))]
+    pub mtime: SystemTime,
+    #[cfg(not(any(test, feature = "test-support")))]
     mtime: SystemTime,
     size: u64,
     content_hash: blake3::Hash,
@@ -1506,6 +1515,9 @@ struct CachedSymbols {
     /// reference-count bump, and copy the symbols only after the lock is
     /// released and only if the entry turns out to be fresh.
     symbols: Arc<Vec<Symbol>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub modules: Option<Arc<Vec<RustModule>>>,
+    #[cfg(not(any(test, feature = "test-support")))]
     modules: Option<Arc<Vec<RustModule>>>,
     /// Whether the tree these symbols were extracted from had syntax errors.
     /// `None` when the symbols arrived without a tree (a disk load or a
@@ -1520,6 +1532,7 @@ struct CachedSymbols {
     /// [`SymbolCache::insert_shared_table`]); this cache leaves them out of
     /// its own estimate.
     shared_table: bool,
+}
 }
 
 /// A fresh cache entry with everything a multi-file outline needs to render
@@ -3070,6 +3083,7 @@ fn variable_declarator_has_function_value(node: &Node) -> bool {
     })
 }
 
+test_support_visibility! {
 /// Byte ranges of every `export_statement` in a TS/JS tree, reduced to the
 /// outermost ones and sorted, plus the names those statements export.
 ///
@@ -3078,8 +3092,15 @@ fn variable_declarator_has_function_value(node: &Node) -> bool {
 /// on top of this walk, and `is_exported` then compared every symbol with every
 /// export statement.
 struct ExportIndex {
+    #[cfg(any(test, feature = "test-support"))]
+    pub ranges: Vec<std::ops::Range<usize>>,
+    #[cfg(not(any(test, feature = "test-support")))]
     ranges: Vec<std::ops::Range<usize>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub names: HashSet<String>,
+    #[cfg(not(any(test, feature = "test-support")))]
     names: HashSet<String>,
+}
 }
 
 test_support_visibility! {

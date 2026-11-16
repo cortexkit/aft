@@ -1,3 +1,4 @@
+#[allow(unused_imports)]
 pub use aft_parse::callgraph_store::luau::*;
 
 // Shared import scope for the unit tests below.

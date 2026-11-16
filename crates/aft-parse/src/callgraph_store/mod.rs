@@ -651,6 +651,7 @@ struct NodeRecord {
     kind: String,
 }
 
+test_support_visibility! {
 #[derive(Debug, Clone)]
 struct RawRef {
     ref_id: String,
@@ -669,6 +670,7 @@ struct RawRef {
     byte_start: usize,
     byte_end: usize,
     dependencies: BTreeSet<String>,
+}
 }
 
 #[derive(Debug, Clone)]
@@ -775,15 +777,20 @@ pub struct ProjectIndex<'a> {
     local_symbols: RefCell<CallerSymbolMemo>,
 }
 
+test_support_visibility! {
 /// Symbol-query answers for the active caller. Resolution visits references in
 /// caller order, so retaining only one file avoids a corpus-sized name cache.
 /// The caller's symbol set is immutable for the lifetime of a resolver index.
 #[derive(Clone, Default)]
 struct CallerSymbolMemo {
+    #[cfg(any(test, feature = "test-support"))]
+    pub file: Option<String>,
+    #[cfg(not(any(test, feature = "test-support")))]
     file: Option<String>,
     symbols: HashMap<String, Option<String>>,
     #[cfg(any(test, feature = "test-support"))]
-    builds: usize,
+    pub builds: usize,
+}
 }
 
 impl CallerSymbolMemo {

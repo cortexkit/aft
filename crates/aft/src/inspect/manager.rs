@@ -4096,13 +4096,7 @@ fn render_no_projection_suffix(reason: &'static str) -> String {
 /// dead-code snapshot verdict. `reason` is omitted for spliced and reused
 /// projections.
 fn render_projection_suffix(verdict: ProjectionVerdict) -> String {
-    let kind = match verdict.kind {
-        #[cfg(test)]
-        ProjectionKind::Spliced => "spliced",
-        ProjectionKind::Full => "full",
-        #[cfg(test)]
-        ProjectionKind::Reused => "reused",
-    };
+    let kind = verdict.kind.as_str();
     let reason = match verdict.reason {
         Some("journal_oversize") => format!(" reason=journal_oversize:{MAX_DELTA_BYTES}"),
         Some(reason) => format!(" reason={reason}"),

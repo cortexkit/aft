@@ -10,7 +10,13 @@ test_support_visibility! {
 #[derive(Default)]
 pub(super) struct SourceIndex {
     pub(super) package: Option<String>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub calls: HashMap<(usize, usize), Option<String>>,
+    #[cfg(not(any(test, feature = "test-support")))]
     calls: HashMap<(usize, usize), Option<String>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub calls_by_line: HashMap<u32, HashMap<(String, String), Option<String>>>,
+    #[cfg(not(any(test, feature = "test-support")))]
     calls_by_line: HashMap<u32, HashMap<(String, String), Option<String>>>,
     methods: HashSet<(String, String)>,
 }
@@ -215,7 +221,8 @@ fn initializer_type(
 }
 
 impl SourceIndex {
-    pub(super) fn new(root: Node<'_>, source: &str, by_line: bool) -> Self {
+    test_support_visibility! {
+pub(super) fn new(root: Node<'_>, source: &str, by_line: bool) -> Self {
         let mut index = Self {
             package: package(root, source),
             ..Self::default()
@@ -429,8 +436,11 @@ impl SourceIndex {
         }
         index
     }
+}
 
-    pub(super) fn receiver(&self, start: usize, end: usize) -> Option<&str> {
+    test_support_visibility! {
+pub(super) fn receiver(&self, start: usize, end: usize) -> Option<&str> {
         self.calls.get(&(start, end))?.as_deref()
     }
-}
+
+}}

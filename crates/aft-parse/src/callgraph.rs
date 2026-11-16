@@ -148,18 +148,26 @@ pub struct RustCrateRootMemo {
 
 test_support_visibility! {
 struct BoundedMemo<K, V> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub entries: HashMap<K, (V, usize)>,
+    #[cfg(not(any(test, feature = "test-support")))]
     entries: HashMap<K, (V, usize)>,
     order: std::collections::VecDeque<K>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub retained_weight: usize,
+    #[cfg(not(any(test, feature = "test-support")))]
     retained_weight: usize,
     max_entries: usize,
     max_retained_weight: usize,
 }
 }
 
+test_support_visibility! {
 /// Heap bytes of a memo key, charged once more for the copy the eviction
 /// order keeps alongside the map entry.
 trait MemoKeyWeight {
     fn key_weight(&self) -> usize;
+}
 }
 
 impl MemoKeyWeight for (PathBuf, String) {
@@ -181,46 +189,53 @@ impl MemoKeyWeight for String {
 }
 
 impl<K: Eq + std::hash::Hash + Clone + MemoKeyWeight, V> BoundedMemo<K, V> {
+    test_support_visibility! {
     fn new(max_entries: usize, max_retained_weight: usize) -> Self {
-        Self {
-            entries: HashMap::new(),
-            order: std::collections::VecDeque::new(),
-            retained_weight: 0,
-            max_entries,
-            max_retained_weight,
+            Self {
+                entries: HashMap::new(),
+                order: std::collections::VecDeque::new(),
+                retained_weight: 0,
+                max_entries,
+                max_retained_weight,
+            }
         }
     }
 
+    test_support_visibility! {
     fn get<Q>(&self, key: &Q) -> Option<&V>
-    where
-        K: std::borrow::Borrow<Q>,
-        Q: Eq + std::hash::Hash + ?Sized,
-    {
-        self.entries.get(key).map(|(value, _)| value)
+        where
+            K: std::borrow::Borrow<Q>,
+            Q: Eq + std::hash::Hash + ?Sized,
+        {
+            self.entries.get(key).map(|(value, _)| value)
+        }
     }
 
+    test_support_visibility! {
     fn insert(&mut self, key: K, value: V, retained_weight: usize) {
-        // The eviction order owns a second copy of the key, so charge its bytes
-        // too; the retained-byte ceiling then still covers everything held.
-        let retained_weight = retained_weight.saturating_add(key.key_weight());
-        if self.entries.contains_key(&key)
-            || self.max_entries == 0
-            || retained_weight > self.max_retained_weight
-        {
-            return;
+            // The eviction order owns a second copy of the key, so charge its bytes
+            // too; the retained-byte ceiling then still covers everything held.
+            let retained_weight = retained_weight.saturating_add(key.key_weight());
+            if self.entries.contains_key(&key)
+                || self.max_entries == 0
+                || retained_weight > self.max_retained_weight
+            {
+                return;
+            }
+            // FIFO eviction keeps later resolution windows cacheable without
+            // relaxing either bound or flushing unrelated entries together.
+            while self.entries.len() >= self.max_entries
+                || self.retained_weight.saturating_add(retained_weight) > self.max_retained_weight
+            {
+                let oldest = self.order.pop_front().expect("full memo has an entry");
+                let (_, weight) = self.entries.remove(&oldest).expect("ordered memo entry");
+                self.retained_weight -= weight;
+            }
+            self.retained_weight += retained_weight;
+            self.order.push_back(key.clone());
+            self.entries.insert(key, (value, retained_weight));
         }
-        // FIFO eviction keeps later resolution windows cacheable without
-        // relaxing either bound or flushing unrelated entries together.
-        while self.entries.len() >= self.max_entries
-            || self.retained_weight.saturating_add(retained_weight) > self.max_retained_weight
-        {
-            let oldest = self.order.pop_front().expect("full memo has an entry");
-            let (_, weight) = self.entries.remove(&oldest).expect("ordered memo entry");
-            self.retained_weight -= weight;
-        }
-        self.retained_weight += retained_weight;
-        self.order.push_back(key.clone());
-        self.entries.insert(key, (value, retained_weight));
+
     }
 }
 
@@ -688,10 +703,15 @@ pub enum EdgeResolution {
     Unresolved { callee_name: String },
 }
 
+test_support_visibility! {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedSymbol {
     file: PathBuf,
+    #[cfg(any(test, feature = "test-support"))]
+    pub symbol: String,
+    #[cfg(not(any(test, feature = "test-support")))]
     symbol: String,
+}
 }
 
 #[derive(Debug, Clone)]
@@ -2381,12 +2401,12 @@ fn find_child_by_kind<'a>(
 
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone)]
-struct CallSiteWithRange {
-    full: String,
-    short: String,
-    line: u32,
-    byte_start: usize,
-    byte_end: usize,
+pub struct CallSiteWithRange {
+    pub full: String,
+    pub short: String,
+    pub line: u32,
+    pub byte_start: usize,
+    pub byte_end: usize,
 }
 
 #[cfg(any(test, feature = "test-support"))]

@@ -22,6 +22,18 @@ pub enum ProjectionKind {
     Reused,
 }
 
+impl ProjectionKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Spliced => "spliced",
+            Self::Full => "full",
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Reused => "reused",
+        }
+    }
+}
+
 /// Why a projection took the path it did, plus the journal/corpus counts that
 /// let an operator see the cost without re-deriving it from timings.
 ///

@@ -1743,6 +1743,7 @@ pub fn view_resolution_config(path: &[u8]) -> bool {
     )
 }
 
+test_support_visibility! {
 /// Field identities are generation-owned. Raw-read paths are transient validation
 /// evidence, cleared after classifying a caller so memo-hit timing is not persisted.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -1751,18 +1752,22 @@ struct ConfigConsultations {
     reads: BTreeSet<String>,
     unattributed: bool,
 }
+}
 impl ConfigConsultations {
     fn extend(&mut self, other: &Self) {
         self.facts.extend(other.facts.iter().cloned());
         self.reads.extend(other.reads.iter().cloned());
         self.unattributed |= other.unattributed;
     }
+    test_support_visibility! {
     fn unattributed(&self) -> bool {
-        self.unattributed
-            || self
-                .reads
-                .iter()
-                .any(|path| !self.facts.iter().any(|(input, _)| input == path))
+            self.unattributed
+                || self
+                    .reads
+                    .iter()
+                    .any(|path| !self.facts.iter().any(|(input, _)| input == path))
+        }
+
     }
 }
 
