@@ -778,8 +778,6 @@ pub struct BashConfig {
     /// Permit plugin-side break-glass execution when its AFT transport is unavailable.
     /// Rust accepts this for cross-language config parity but never acts on it.
     pub host_fallback: bool,
-    /// User-only live safety gate for explicit whole-line remote runs.
-    pub runon_enabled: bool,
     /// Whether the hosting plugin detaches wait:true bash calls on user messages.
     /// Rust accepts this for cross-language config parity but never acts on it.
     #[serde(default = "default_bash_detach_on_user_message")]
@@ -902,7 +900,6 @@ impl Default for BashConfig {
             changed_files: BashChangedFiles::Off,
             enabled: true,
             host_fallback: false,
-            runon_enabled: false,
             detach_on_user_message: default_bash_detach_on_user_message(),
             db_schema_hints: true,
             watch_sync_max_ms: default_bash_watch_sync_max_ms(),

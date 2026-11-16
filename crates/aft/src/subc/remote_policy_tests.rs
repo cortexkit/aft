@@ -772,7 +772,7 @@ fn identity(root: &Path, session: &str, epoch: u64, scoped: bool) -> RouteIdenti
 }
 
 fn context(root: &Path, storage: &Path, connection: Option<PathBuf>) -> AppContext {
-    context_with_user_remote(root, storage, connection, false)
+    context_with_user_remote(root, storage, connection, true)
 }
 
 fn context_with_user_remote(
@@ -781,23 +781,12 @@ fn context_with_user_remote(
     connection: Option<PathBuf>,
     enabled: bool,
 ) -> AppContext {
-    context_with_switch(root, storage, connection, enabled, true)
-}
-
-fn context_with_switch(
-    root: &Path,
-    storage: &Path,
-    connection: Option<PathBuf>,
-    enabled: bool,
-    runon_enabled: bool,
-) -> AppContext {
     let mut config = crate::config::Config::default();
     config.project_root = Some(root.into());
     config.storage_dir = Some(storage.into());
     config.experimental_bash_background = true;
     config.sandbox.profile.head = crate::config::SandboxMode::Off;
     config.remote_exec.enabled = enabled;
-    config.bash.runon_enabled = runon_enabled;
     config.semantic.subc_connection_file = connection;
     let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
     ctx.set_db(Arc::new(StdMutex::new(
@@ -1215,7 +1204,7 @@ mod catalog_runon_log_tests {
             // Preserve the pre-diagnostic predicate as an independent snapshot
             // oracle: logging must not change tools, descriptions or digests.
             let offered = cfg!(unix)
-                && self.ctx.config().bash.runon_enabled
+                && self.ctx.config().remote_exec.enabled
                 && !self.ctx.config().remote_exec.project_off
                 && matches!(self.route.trust, BindTrust::FirstParty)
                 && lookup(&self.ctx, &source(&self.route, Some(preset))).is_some_and(|launch| {
@@ -1282,7 +1271,7 @@ mod catalog_runon_log_tests {
                 format!("remote_exec_param={remote_exec_param}"),
                 format!("key={key_status}"),
                 format!("offered={offered}"),
-                format!("runon_enabled={}", self.ctx.config().bash.runon_enabled),
+                format!("remote_exec={}", self.ctx.config().remote_exec.enabled),
                 format!("project_off={}", self.ctx.config().remote_exec.project_off),
                 format!(
                     "bind={}",
@@ -1384,11 +1373,11 @@ mod catalog_runon_log_tests {
     }
 
     #[test]
-    fn runon_enabled_gate() {
+    fn user_remote_exec_gate() {
         let case = Case::enabled();
         case.ctx
-            .update_config(|config| config.bash.runon_enabled = false);
-        case.check("runon_enabled", "enabled", "complete", false);
+            .update_config(|config| config.remote_exec.enabled = false);
+        case.check("remote_exec", "enabled", "complete", false);
     }
 
     #[test]
@@ -1640,7 +1629,7 @@ fn sessions_without_remote_execution_omit_runon_and_guidance() {
         catalog(
             json!({"preset":"head"}),
             &identity(root.path(), "head", 7, false),
-            &ctx,
+            &context_with_user_remote(root.path(), storage.path(), None, false),
         )
         .unwrap(),
     ] {
@@ -1661,7 +1650,7 @@ fn sessions_without_remote_execution_omit_runon_and_guidance() {
 fn safety_switch_hides_runon_without_disabling_the_persisted_old_prefix_plan() {
     let root = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
-    let ctx = context_with_switch(root.path(), storage.path(), None, true, false);
+    let ctx = context_with_user_remote(root.path(), storage.path(), None, false);
     let worker = identity(root.path(), "old-worker", 7, true);
     let mut old = plan("broca-worker");
     old["tool_items"][0]["params"]["remote_exec"] =

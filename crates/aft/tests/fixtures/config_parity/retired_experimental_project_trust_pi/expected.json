@@ -1,8 +1,5 @@
 {
   "aft_search_registered": true,
-  "bash": {
-    "runon_enabled": false
-  },
   "disabled_tools": [
     "aft_delete",
     "aft_move"

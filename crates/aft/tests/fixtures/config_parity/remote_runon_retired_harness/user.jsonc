@@ -1,0 +1,12 @@
+{
+  "remote_exec": {
+    "enabled": true
+  },
+  "harnesses": {
+    "pi": {
+      "bash": {
+        "runon_enabled": false
+      }
+    }
+  }
+}

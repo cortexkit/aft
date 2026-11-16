@@ -70,7 +70,7 @@ import {
   deliverConfigLoadNotices,
   formatConfigParseFailureMessage,
   getConfigLoadErrors,
-  resolveBashConfig,
+  remoteRunsOffered,
   resolveBridgePoolTransportOptions,
 } from "./config.js";
 import { bridgeLogger, error, flushLogs, log, warn } from "./logger.js";
@@ -652,8 +652,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     initialSourceTexts: bootstrap.sourceTexts,
     getConfig: () => ctx.config,
     setConfig: (next) => {
-      const remoteGateChanged =
-        resolveBashConfig(ctx.config).runon_enabled !== resolveBashConfig(next).runon_enabled;
+      const remoteGateChanged = remoteRunsOffered(ctx.config) !== remoteRunsOffered(next);
       ctx.config = next;
       if (remoteGateChanged && surface.hoistBash) {
         // Pi copies schema metadata into its registry, so replace the bash

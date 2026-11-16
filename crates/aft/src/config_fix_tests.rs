@@ -975,6 +975,67 @@ fn doctor_fix_removes_opencode_prompt_transport_keys() {
 
 const DATA_LAYER_FILE: &str = "{\n  // index settings\n  \"views\": {\"enabled\": true, \"callgraph_copies\": 2, \"idle_checkout_hours\": 9000},\n  \"worktree\": {\"ram_overlay\": false},\n  \"idle\": {\"root_ttl_minutes\": 20},\n  \"harnesses\": {\"pi\": {\"views\": {\"idle_checkout_hours\": 12, \"enabled\": false}, \"edit_mode\": \"hashline\"}}\n}\n";
 
+#[test]
+fn retired_runon_user_rewrite_preserves_comments_harnesses_and_backup() {
+    let input = r#"{
+  // remote preference
+  "remote_exec": {"enabled": true, "default_demand": "linux"},
+  "bash": {"runon_enabled": false, "enabled": true},
+  "harnesses": {
+    // pi preference
+    "pi": {"remote_exec": {"enabled": true}, "bash": {"runon_enabled": true}},
+    "opencode": {"remote_exec": {"enabled": true}, "bash": {"runon_enabled": false}}
+  }
+}"#;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.jsonc");
+    std::fs::write(&path, input).unwrap();
+    let outcome = auto_migrate_user_config(&path).unwrap();
+    let UserConfigMigration::Migrated { notice, backup, .. } = outcome else {
+        panic!("expected user migration");
+    };
+    assert_eq!(std::fs::read_to_string(backup).unwrap(), input);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("// remote preference"));
+    assert!(text.contains("// pi preference"));
+    assert!(!text.contains("runon_enabled"));
+    let value: Value = serde_json::from_str(&crate::jsonc::strip_jsonc(&text)).unwrap();
+    assert_eq!(
+        value["remote_exec"],
+        json!({"enabled":false,"default_demand":"linux"})
+    );
+    assert_eq!(value["bash"], json!({"enabled":true}));
+    assert_eq!(value["harnesses"]["pi"]["remote_exec"]["enabled"], true);
+    assert_eq!(
+        value["harnesses"]["opencode"]["remote_exec"]["enabled"],
+        false
+    );
+    assert!(notice.contains("AFT updated"), "{notice}");
+    for key in [
+        "bash.runon_enabled",
+        "harnesses.pi.bash.runon_enabled",
+        "harnesses.opencode.bash.runon_enabled",
+    ] {
+        assert!(notice.contains(key), "{notice}");
+    }
+    assert_eq!(auto_migrate_user_config(&path), None);
+    let current = r#"{"remote_exec":{"enabled":true}}"#;
+    assert!(!migrate_user_config_text(current).unwrap().changed);
+}
+
+#[test]
+fn retired_runon_project_fix_only_drops_the_old_gate() {
+    let migration = migrate_config_text(
+        r#"{"remote_exec":{"enabled":true},"bash":{"runon_enabled":false}}"#,
+        FixTier::Project,
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&migration.text).unwrap(),
+        json!({"remote_exec":{"enabled":true}})
+    );
+}
+
 /// `doctor --fix` rewrites `views.idle_checkout_hours` to `idle.checkout_hours`
 /// (clamped like the load-time translation) and deletes the removed
 /// data-layer keys, leaving a file that uses none of them.

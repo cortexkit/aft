@@ -1,0 +1,8 @@
+{
+  "remote_exec": {
+    "enabled": true
+  },
+  "bash": {
+    "runon_enabled": false
+  }
+}

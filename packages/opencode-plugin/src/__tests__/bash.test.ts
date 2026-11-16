@@ -219,17 +219,19 @@ describe("OpenCode bash adapter", () => {
       calls,
     } = createHarness(() => ({ success: true, output: "" }), undefined, false, {
       subc: { connection_file: "/run/subc-connection.json" },
-      remote_exec: { enabled: true },
+      remote_exec: { enabled: false },
     } as PluginContext["config"]);
     expect(bash.args.runon).toBeUndefined();
-    ctx.config = { ...ctx.config, bash: { runon_enabled: true } };
+    ctx.config = { ...ctx.config, remote_exec: { enabled: true } };
     expect(bash.args.runon).toBeDefined();
-    ctx.config = { ...ctx.config, bash: { runon_enabled: false } };
+    ctx.config = { ...ctx.config, remote_exec: { enabled: false } };
     expect(bash.args.runon).toBeUndefined();
     expect(bash.description).not.toContain("runon");
     await expect(
       bash.execute({ command: "echo never", runon: "linux" }, createMockSdkContext()),
-    ).rejects.toThrow("runon refused");
+    ).rejects.toThrow(
+      "runon refused: remote_exec.enabled is off or remote execution is unavailable in this session",
+    );
     expect(calls).toHaveLength(0);
   });
   test("schema accepts valid unified bash params and rejects invalid shapes", () => {
@@ -309,7 +311,6 @@ describe("OpenCode bash adapter", () => {
       const bash = createHarness(() => ({ success: true, output: "" }), undefined, false, {
         subc: { connection_file: "/run/subc-connection.json" },
         remote_exec: { enabled: true },
-        bash: { runon_enabled: true },
       } as PluginContext["config"]).tool;
       expect(bash.args.runon).toBeDefined();
       expect(bash.description).toContain('When remote runs are available, put `runon: "linux"`');
@@ -333,7 +334,6 @@ describe("OpenCode bash adapter", () => {
       const bash = createHarness(() => ({ success: true, output: "" }), undefined, false, {
         subc: { connection_file: "/run/subc-connection.json" },
         remote_exec: { enabled: true },
-        bash: { runon_enabled: true },
       } as PluginContext["config"]).tool;
       expect(bash.args.runon).toBeUndefined();
       expect(bash.description).not.toContain("runon");
@@ -351,7 +351,6 @@ describe("OpenCode bash adapter", () => {
         } as PluginContext["config"]).tool.args;
       const subc = {
         subc: { connection_file: "/run/subc-connection.json" },
-        bash: { runon_enabled: true },
       };
       expect(offered({ ...subc, remote_exec: { enabled: true } })).toBe(true);
       // No user-tier switch, or standalone transport: never offered.
@@ -367,7 +366,6 @@ describe("OpenCode bash adapter", () => {
         {
           ...subc,
           remote_exec: { enabled: true },
-          bash: { runon_enabled: true },
         } as PluginContext["config"],
       );
       expect(safeParse(bash.args.runon, "linux").success).toBe(true);
@@ -390,7 +388,6 @@ describe("OpenCode bash adapter", () => {
       {
         subc: { connection_file: "/run/subc-connection.json" },
         remote_exec: { enabled: true },
-        bash: { runon_enabled: true },
       } as PluginContext["config"],
     );
     for (const runon of ["linux", "linux,net", "linux,4c,net", "linux,net,4c"]) {
@@ -408,7 +405,7 @@ describe("OpenCode bash adapter", () => {
       undefined,
       false,
       {
-        bash: { host_fallback: true, runon_enabled: true },
+        bash: { host_fallback: true },
         subc: { connection_file: "/run/subc-connection.json" },
         remote_exec: { enabled: true },
       } as PluginContext["config"],
@@ -435,7 +432,6 @@ describe("OpenCode bash adapter", () => {
       {
         subc: { connection_file: "/run/subc-connection.json" },
         remote_exec: { enabled: true },
-        bash: { runon_enabled: true },
       } as PluginContext["config"],
     );
     for (const [runon, timeout, expected] of [
@@ -700,7 +696,7 @@ describe("OpenCode bash adapter", () => {
       {
         subc: { connection_file: "/run/subc-connection.json" },
         remote_exec: { enabled: true },
-        bash: { runon_enabled: true, host_fallback: true },
+        bash: { host_fallback: true },
       } as PluginContext["config"],
     );
     let captured: unknown;
@@ -3460,7 +3456,6 @@ describe("OpenCode bash adapter — subagent gating", () => {
     const remoteConfig = {
       subc: { connection_file: "/run/subc-connection.json" },
       remote_exec: { enabled: true },
-      bash: { runon_enabled: true },
     } as PluginContext["config"];
     _resetSubagentCacheForTest();
     const primary = createHarness(
@@ -3498,7 +3493,6 @@ describe("OpenCode bash adapter — subagent gating", () => {
     const config = {
       subc: { connection_file: "/run/subc-connection.json" },
       remote_exec: { enabled: true },
-      bash: { runon_enabled: true },
     } as PluginContext["config"];
     __resetBgNotificationStateForTests();
     _resetSubagentCacheForTest();
@@ -3563,7 +3557,7 @@ describe("OpenCode bash adapter — subagent gating", () => {
     const config = {
       subc: { connection_file: "/run/subc-connection.json" },
       remote_exec: { enabled: true },
-      bash: { runon_enabled: true, worker_wait_max_ms: 250 },
+      bash: { worker_wait_max_ms: 250 },
     } as PluginContext["config"];
     for (const worker of [false, true]) {
       for (const timeout of [100, 5_000]) {

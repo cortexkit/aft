@@ -1031,7 +1031,7 @@ mod tests {
             config.project_root = Some(root.path().into());
             config.storage_dir = Some(storage.path().into());
             config.remote_exec.enabled = enabled;
-            config.bash.runon_enabled = true;
+            config.remote_exec.enabled = true;
             config.sandbox.profile.head = crate::config::SandboxMode::Off;
             let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
             let marker = root.path().join("must-not-run-locally");

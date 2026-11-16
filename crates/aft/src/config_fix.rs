@@ -281,6 +281,13 @@ fn migrate_block(
         }
     }
 
+    if tier == FixTier::User && get_bool(raw, "bash", "runon_enabled") == Some(false) {
+        doc.set(
+            &path_of(prefix, &["remote_exec", "enabled"]),
+            &Value::Bool(false),
+        )?;
+    }
+
     let removed_paths: &[&str] = match removed_keys {
         RemovedKeys::Delete => &feature_config::REMOVED_DATA_LAYER_PATHS,
         RemovedKeys::Keep => &[],
@@ -291,6 +298,7 @@ fn migrate_block(
         .chain(feature_config::REMOVED_NO_EFFECT_PATHS)
         .chain(feature_config::REMOVED_OPENCODE_PATHS)
         .chain([feature_config::RETIRED_IDLE_CHECKOUT_HOURS])
+        .chain([("bash.runon_enabled", "remote_exec.enabled")])
         .chain(removed_paths.iter().map(|path| (*path, "")))
     {
         let segments: Vec<&str> = path.split('.').collect();

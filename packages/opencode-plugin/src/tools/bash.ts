@@ -634,7 +634,7 @@ export function createBashTool(
       const returnPaths = args.return_paths;
       if (runon !== undefined && !remoteRunsOffered(ctx.config)) {
         throw new Error(
-          "runon refused: remote execution or bash.runon_enabled is unavailable in this session",
+          "runon refused: remote_exec.enabled is off or remote execution is unavailable in this session",
         );
       }
       const foregroundWaitMs = resolveForegroundWaitMs(bashCfg.foreground_wait_window_ms);

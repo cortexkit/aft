@@ -366,8 +366,8 @@ environment, minus the secret-shaped and AFT/CortexKit control variables AFT str
 off-host request (the reply names them). New plans require `runon` to send a line away. Deployed
 worker plans with an enabled `commands` prefix list retain their existing automatic routing: every
 literal command must match an allowed prefix, and unsupported syntax stays local.
-Explicit whole-line `runon` also requires the user-only live safety switch
-`bash.runon_enabled: true` (default false); projects cannot enable it. Turning that switch off
+Explicit whole-line `runon` requires the user-only live switch
+`remote_exec.enabled: true` (default false); projects cannot enable it. Turning that switch off
 hides and refuses `runon` without disabling legacy prefix routing.
 
 When remote runs are available, put `runon: "linux"` on build and test lines (cargo, bun test), including chains and pipes. A runon job's file changes are not copied back; only output, the exit code and return_paths files return. Edit locally first; name a file in return_paths to regenerate it remotely. Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs this machine's own operating system or hardware (its sandbox, code signing, service manager, permission prompts or GUI frameworks) or runs a binary that already exists on this machine; a build or test that needs only macOS (its sandbox, code signing or file watching) can use runon: "macos" instead; building and testing still go remote, and a remote build leaves no binaries or target/ output here.
@@ -376,12 +376,12 @@ The job sees exactly the CPUs it gets, so ask for what the command uses: 2c (the
 Who is offered `runon`:
 
 - OpenCode and Pi sessions on macOS or Linux in subc mode, when the user config sets
-  `remote_exec.enabled: true`, the user safety switch `bash.runon_enabled: true`, and the project
+  `remote_exec.enabled: true`, and the project
   has not turned remote runs off (see
   [Configuration](config.md#remote-runs)). The decision is made once when the tool is built;
   provider discovery happens at call time, without a startup round trip.
 - Head catalogs follow the same user setting. Broca worker catalogs instead use that session's
-  persisted plan, and offer `runon` only when its `remote_exec.enabled` and the user safety switch
+  persisted plan, and offer `runon` only when its `remote_exec.enabled` and the user's `remote_exec.enabled`
   are true, including after
   a paramless refetch or restart.
 

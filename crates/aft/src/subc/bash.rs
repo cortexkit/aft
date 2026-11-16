@@ -6518,7 +6518,7 @@ mod grant_path_tests {
         let ctx = super::super::test_support::test_ctx();
         ctx.update_config(|config| {
             config.project_root = Some(dir.path().into());
-            config.bash.runon_enabled = true;
+            config.remote_exec.enabled = true;
             config.sandbox.profile.head = crate::config::SandboxMode::Off;
         });
         let executor = Arc::new(Executor::new());
@@ -7016,7 +7016,7 @@ mod grant_path_tests {
         let ctx = super::super::test_support::test_ctx();
         ctx.update_config(|config| {
             config.project_root = Some(dir.path().into());
-            config.bash.runon_enabled = true;
+            config.remote_exec.enabled = true;
             config.sandbox.profile.head = crate::config::SandboxMode::Off;
             config.foreground_wait_window_ms = 15_000;
             config.experimental_bash_background = true;

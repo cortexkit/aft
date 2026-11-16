@@ -30,6 +30,43 @@ import {
 } from "../feature-config.js";
 import { deliverMigrationNoticeOnce } from "../migration-notices.js";
 
+test("retired runon gate translates user blocks and drops project gates with a notice", () => {
+  for (const [legacy, enabled, expected] of [
+    [false, true, false],
+    [true, true, true],
+    [true, false, false],
+    [undefined, true, true],
+  ] as const) {
+    const map = {
+      remote_exec: { enabled },
+      ...(legacy === undefined ? {} : { bash: { runon_enabled: legacy } }),
+    };
+    const translated = translateConfigDocument(map, "user");
+    expect(map.remote_exec.enabled).toBe(expected);
+    expect(map.bash?.runon_enabled).toBeUndefined();
+    expect(translated.retiredKeys).toEqual(legacy === undefined ? [] : ["bash.runon_enabled"]);
+  }
+  const user = {
+    remote_exec: { enabled: true },
+    harnesses: { pi: { bash: { runon_enabled: false } } },
+  };
+  const translated = translateConfigDocument(user, "user");
+  expect(user).toEqual({
+    remote_exec: { enabled: true },
+    harnesses: { pi: { remote_exec: { enabled: false } } },
+  });
+  expect(translated.retiredKeys).toEqual(["harnesses.pi.bash.runon_enabled"]);
+  const project = { remote_exec: { enabled: true }, bash: { runon_enabled: false } };
+  const dropped = translateConfigDocument(project, "project");
+  expect(project).toEqual({ remote_exec: { enabled: true } });
+  expect(legacyConfigNoticeMessage("/project/aft.jsonc", dropped)).toBe(
+    "/project/aft.jsonc uses retired keys (bash.runon_enabled); AFT applied their current equivalents, with the same limits a project config has for those keys. Run `npx @cortexkit/aft doctor --fix` to update the file.",
+  );
+  expect(noticeDigest(noticeProjection({}))).not.toBe(
+    noticeDigest(noticeProjection({ bash: { runon_enabled: true } })),
+  );
+});
+
 const fixtures = JSON.parse(
   readFileSync(
     new URL(

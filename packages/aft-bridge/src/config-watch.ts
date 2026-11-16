@@ -51,7 +51,6 @@ export interface ResolvedBashForLiveReload {
   changed_files?: "off" | "list" | "diff";
   foreground_wait_window_ms: number;
   host_fallback: boolean;
-  runon_enabled?: boolean;
   subagent_background: boolean;
   watch_sync_max_ms: number;
   worker_wait_max_ms: number;
@@ -143,7 +142,7 @@ export function aftLiveConfigKeys<C>(
     ].map((category) => pathKey<C>(`inspect.categories.${category}`)),
     bashKey<C>("foreground_wait_window_ms", resolveBash),
     bashKey<C>("host_fallback", resolveBash),
-    bashKey<C>("runon_enabled", resolveBash),
+    pathKey<C>("remote_exec.enabled"),
     bashKey<C>("subagent_background", resolveBash),
     bashKey<C>("watch_sync_max_ms", resolveBash),
     bashKey<C>("worker_wait_max_ms", resolveBash),
@@ -570,7 +569,7 @@ export function aftLiveSecurityKeys<C>(keys: readonly LiveConfigKey<C>[]): LiveS
       loosens: (current, next) => current === true && next !== true,
     },
     {
-      key: pick("bash.runon_enabled"),
+      key: pick("remote_exec.enabled"),
       loosens: (current, next) => current !== true && next === true,
     },
     {

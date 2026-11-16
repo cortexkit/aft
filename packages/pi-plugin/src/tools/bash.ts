@@ -821,7 +821,7 @@ export function registerBashTool(
     async execute(_toolCallId, params: Static<typeof BashParams>, signal, onUpdate, extCtx) {
       if (params.runon !== undefined && !remoteRuns()) {
         throw new Error(
-          "runon refused: remote execution or bash.runon_enabled is unavailable in this session",
+          "runon refused: remote_exec.enabled is off or remote execution is unavailable in this session",
         );
       }
       const bridge = bridgeFor(ctx, extCtx.cwd);

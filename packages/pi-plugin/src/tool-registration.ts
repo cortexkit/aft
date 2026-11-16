@@ -315,7 +315,7 @@ export function registerLatePowershellTool(
 
 /**
  * Replace the `bash` slot when a live config reload flips
- * `bash.runon_enabled`: Pi copies a tool's schema into its registry, so the
+ * `remote_exec.enabled`: Pi copies a tool's schema into its registry, so the
  * slot is registered again with the new schema. Through the funnel, so on OMP
  * the replacement keeps `loadMode` and its approval tier.
  */

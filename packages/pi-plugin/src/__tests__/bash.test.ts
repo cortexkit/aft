@@ -334,16 +334,16 @@ describe("bash tool adapter", () => {
     const { bridge, calls } = makeTrackableMockBridge({ output: "" });
     const ctx = makeMockContext(bridge, {
       subc: { connection_file: "/run/subc-connection.json" },
-      remote_exec: { enabled: true },
+      remote_exec: { enabled: false },
     } as PluginContext["config"]);
     registerBashTool(makeMockApi(tools), ctx);
     const bash = tools.get("bash")!;
     const offered = () =>
       (bash.parameters as { properties: Record<string, unknown> }).properties.runon;
     expect(offered()).toBeUndefined();
-    ctx.config = { ...ctx.config, bash: { runon_enabled: true } };
+    ctx.config = { ...ctx.config, remote_exec: { enabled: true } };
     expect(offered()).toBeDefined();
-    ctx.config = { ...ctx.config, bash: { runon_enabled: false } };
+    ctx.config = { ...ctx.config, remote_exec: { enabled: false } };
     expect(offered()).toBeUndefined();
     expect(bash.description).not.toContain("runon");
     await expect(
@@ -351,7 +351,9 @@ describe("bash tool adapter", () => {
         cwd: projectRoot,
         hasUI: false,
       }),
-    ).rejects.toThrow("runon refused");
+    ).rejects.toThrow(
+      "runon refused: remote_exec.enabled is off or remote execution is unavailable in this session",
+    );
     expect(calls).toHaveLength(0);
   });
 
@@ -379,7 +381,6 @@ describe("bash tool adapter", () => {
       const bash = remoteConfiguredBash({
         subc: { connection_file: "/run/subc-connection.json" },
         remote_exec: { enabled: true },
-        bash: { runon_enabled: true },
       });
       expect(
         (bash.parameters as { properties: Record<string, unknown> }).properties.runon,
@@ -405,7 +406,6 @@ describe("bash tool adapter", () => {
       const bash = remoteConfiguredBash({
         subc: { connection_file: "/run/subc-connection.json" },
         remote_exec: { enabled: true },
-        bash: { runon_enabled: true },
       });
       expect(
         (bash.parameters as { properties: Record<string, unknown> }).properties.runon,
@@ -434,7 +434,6 @@ describe("bash tool adapter", () => {
       };
       const subc = {
         subc: { connection_file: "/run/subc-connection.json" },
-        bash: { runon_enabled: true },
       };
       expect(properties({ ...subc, remote_exec: { enabled: true } }).runon).toMatchObject({
         type: "string",
@@ -460,7 +459,6 @@ describe("bash tool adapter", () => {
       makeMockContext(bridge, {
         subc: { connection_file: "/run/subc-connection.json" },
         remote_exec: { enabled: true },
-        bash: { runon_enabled: true },
       } as PluginContext["config"]),
     );
     for (const runon of ["linux", "linux,net", "linux,4c,net", "linux,net,4c"]) {
@@ -483,7 +481,6 @@ describe("bash tool adapter", () => {
       makeMockContext(bridge, {
         subc: { connection_file: "/run/subc-connection.json" },
         remote_exec: { enabled: true },
-        bash: { runon_enabled: true },
       } as PluginContext["config"]),
     );
     const bash = tools.get("bash")!;
@@ -527,7 +524,7 @@ describe("bash tool adapter", () => {
       makeMockContext(bridge, {
         subc: { connection_file: "/run/subc-connection.json" },
         remote_exec: { enabled: true },
-        bash: { host_fallback: true, runon_enabled: true },
+        bash: { host_fallback: true },
       } as PluginContext["config"]),
     );
 
@@ -562,7 +559,6 @@ describe("bash tool adapter", () => {
       makeMockContext(bridge, {
         subc: { connection_file: "/run/subc-connection.json" },
         remote_exec: { enabled: true },
-        bash: { runon_enabled: true },
       } as PluginContext["config"]),
     );
     for (const [runon, timeout, expected] of [
@@ -605,7 +601,6 @@ describe("bash tool adapter", () => {
         makeMockContext(bridge, {
           subc: { connection_file: "/run/subc-connection.json" },
           remote_exec: { enabled: true },
-          bash: { runon_enabled: true },
         } as PluginContext["config"]),
       );
       await tools
@@ -641,7 +636,6 @@ describe("bash tool adapter", () => {
     const config = {
       subc: { connection_file: "/run/subc-connection.json" },
       remote_exec: { enabled: true },
-      bash: { runon_enabled: true },
     } as PluginContext["config"];
     const ctx = makeMockContext(bridge, config);
     registerBashTool(makeMockApi(tools), ctx);
@@ -720,7 +714,7 @@ describe("bash tool adapter", () => {
           makeMockContext(bridge, {
             subc: { connection_file: "/run/subc-connection.json" },
             remote_exec: { enabled: true },
-            bash: { runon_enabled: true, worker_wait_max_ms: 250 },
+            bash: { worker_wait_max_ms: 250 },
           } as PluginContext["config"]),
         );
         await tools
@@ -1564,7 +1558,7 @@ describe("bash tool adapter", () => {
       makeMockContext(bridge, {
         subc: { connection_file: "/run/subc-connection.json" },
         remote_exec: { enabled: true },
-        bash: { runon_enabled: true, host_fallback: true },
+        bash: { host_fallback: true },
       } as PluginContext["config"]),
     );
     let captured: unknown;
