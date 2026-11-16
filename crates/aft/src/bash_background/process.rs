@@ -1053,16 +1053,28 @@ pub fn terminate_pgid(pgid: i32, mut child: Option<&mut Child>) {
 
 #[cfg(unix)]
 pub(crate) fn terminate_pgid_with(pgid: i32, mut reap_leader: impl FnMut() -> bool) {
+    terminate_pgid_until(pgid, || {
+        // Reap our wrapper before probing: signal 0 still sees zombies. Its
+        // exit alone says nothing about the command's descendants, which need
+        // the rest of the grace period to finish their TERM handlers.
+        reap_leader();
+        termination_group_exited(pgid)
+    });
+}
+
+#[cfg(unix)]
+pub(crate) fn terminate_pgid_leader_grace(pgid: i32, child: &mut Child) {
+    terminate_pgid_until(pgid, || matches!(child.try_wait(), Ok(Some(_))));
+}
+
+#[cfg(unix)]
+fn terminate_pgid_until(pgid: i32, mut exited: impl FnMut() -> bool) {
     unsafe {
         libc::killpg(pgid, libc::SIGTERM);
     }
     let grace_started = Instant::now();
     while grace_started.elapsed() < TERMINATE_GRACE {
-        // Reap our wrapper before probing: signal 0 still sees zombies. Its
-        // exit alone says nothing about the command's descendants, which need
-        // the rest of the grace period to finish their TERM handlers.
-        reap_leader();
-        if termination_group_exited(pgid) {
+        if exited() {
             break;
         }
         thread::sleep(Duration::from_millis(50));
@@ -1763,6 +1775,36 @@ mod tests {
         assert!(stopping.elapsed() >= TERMINATE_GRACE);
         assert!(stopping.elapsed() < Duration::from_secs(15));
         assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_pgid_lsp_leader_grace_ends_when_leader_exits() {
+        let root = tempfile::tempdir().unwrap();
+        let mut child = termination_wrapper(
+            "trap '' TERM; echo $$ > pid; touch ready; exec sleep 30",
+            root.path(),
+        );
+        wait_for_termination_file(&root.path().join("ready"));
+        let descendant: u32 = std::fs::read_to_string(root.path().join("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let stopping = Instant::now();
+        crate::lsp::client::kill_lsp_child_group(&mut child);
+        assert!(
+            stopping.elapsed() < TERMINATE_GRACE,
+            "LSP cleanup must not wait for a descendant after its leader exits"
+        );
+        let killed = Instant::now();
+        while is_process_alive(descendant) && killed.elapsed() < Duration::from_secs(10) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !is_process_alive(descendant),
+            "LSP cleanup must still kill descendants"
+        );
     }
 }
 
