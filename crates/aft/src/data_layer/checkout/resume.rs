@@ -483,7 +483,10 @@ impl BuildIdentity {
                     format!("unknown-{}-{now}", std::process::id())
                 }),
             ),
-            ("extractor", super::EXTRACTOR_VERSION.to_string()),
+            (
+                "extractor",
+                crate::data_layer::content::EXTRACTOR_VERSION.to_string(),
+            ),
             (
                 "fragment_format",
                 super::super::fragment::FORMAT_VERSION.to_string(),
