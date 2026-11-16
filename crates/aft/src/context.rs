@@ -3287,7 +3287,11 @@ fn relative_components_under_root(path: &Path) -> Option<PathBuf> {
     Some(relative)
 }
 
-fn checkout_counterpart(original: &Path, checkout: &Path) -> Option<PathBuf> {
+fn checkout_counterpart(
+    original: &Path,
+    checkout: &Path,
+    indexed: Option<&crate::data_layer::runtime::DataCheckout>,
+) -> Option<PathBuf> {
     let relative = relative_components_under_root(original)?;
     if relative.as_os_str().is_empty() {
         return None;
@@ -3307,10 +3311,70 @@ fn checkout_counterpart(original: &Path, checkout: &Path) -> Option<PathBuf> {
         return None;
     }
 
-    let canonical_candidate = std::fs::canonicalize(&candidate).ok()?;
-    canonical_candidate
-        .starts_with(&checkout)
-        .then_some(canonical_candidate)
+    if let Ok(canonical_candidate) = std::fs::canonicalize(&candidate) {
+        return canonical_candidate
+            .starts_with(&checkout)
+            .then_some(canonical_candidate);
+    }
+
+    // Suffix recovery must not turn a traversal or an escaping symlink into
+    // a suggestion. Only an already-published inventory of this checkout is
+    // consulted; a denied read must not start a filesystem scan.
+    if original
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return None;
+    }
+    let indexed = indexed?;
+    if normalize_path(indexed.root()) != normalize_path(&checkout) {
+        return None;
+    }
+    let view = indexed.view()?;
+    let relative = unique_indexed_checkout_suffix(original, view.current_state().paths())?;
+    let candidate = std::fs::canonicalize(checkout.join(relative)).ok()?;
+    (candidate.starts_with(&checkout) && candidate.is_file()).then_some(candidate)
+}
+
+fn unique_indexed_checkout_suffix(
+    original: &Path,
+    paths: &[aft_store::checkout::PathRecord],
+) -> Option<PathBuf> {
+    // Refuse recovery outside these work budgets rather than claim uniqueness
+    // from an incomplete inventory. Ordinary permission handling remains safe.
+    const MAX_PATHS: usize = 100_000;
+    const MAX_COMPONENTS: usize = 64;
+    if paths.len() > MAX_PATHS {
+        return None;
+    }
+    let mut components = Vec::new();
+    for component in original.components() {
+        if let Component::Normal(component) = component {
+            if components.len() == MAX_COMPONENTS {
+                return None;
+            }
+            components.push(component.to_str()?);
+        }
+    }
+    for start in 0..components.len().saturating_sub(1) {
+        let suffix = components[start..].join("/");
+        let mut found = None;
+        for record in paths {
+            if record.path.ends_with(suffix.as_bytes())
+                && (record.path.len() == suffix.len()
+                    || record.path[record.path.len() - suffix.len() - 1] == b'/')
+            {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(record.path.as_slice());
+            }
+        }
+        if let Some(path) = found {
+            return Some(PathBuf::from(std::str::from_utf8(path).ok()?));
+        }
+    }
+    None
 }
 
 fn resolve_with_existing_ancestors(path: &Path) -> PathBuf {
@@ -11783,19 +11847,26 @@ impl AppContext {
         ))
     }
 
-    fn checkout_path_suggestion(&self, original: &Path) -> Option<PathBuf> {
+    fn checkout_path_suggestion(
+        &self,
+        original: &Path,
+        operation: crate::access_policy::AccessOperation,
+    ) -> Option<PathBuf> {
         if !original.has_root() || !self.current_call_is_worker() {
             return None;
         }
         let checkout = self.checkout_root_for_message()?;
+        let indexed = (operation == crate::access_policy::AccessOperation::Read)
+            .then(|| self.data_checkout.lock().clone())
+            .flatten();
         if crate::bounded_io::current().is_some() {
             crate::bounded_io::run(original, None, move |path| {
-                Ok(checkout_counterpart(&path, &checkout))
+                Ok(checkout_counterpart(&path, &checkout, indexed.as_deref()))
             })
             .ok()
             .flatten()
         } else {
-            checkout_counterpart(original, &checkout)
+            checkout_counterpart(original, &checkout, indexed.as_deref())
         }
     }
 
@@ -11937,9 +12008,9 @@ impl AppContext {
                 return Ok(());
             }
         }
-        // A worker naming the head's path for a file its own checkout has is
-        // pointed at its checkout instead of being asked about the head's.
-        if let Some(suggestion) = self.checkout_path_suggestion(original) {
+        // Missing outside paths with an unambiguous checkout counterpart need
+        // correction, not permission to read the missing location.
+        if let Some(suggestion) = self.checkout_path_suggestion(original, operation) {
             return Err(crate::protocol::Response::error(
                 req_id,
                 "path_not_found_did_you_mean",

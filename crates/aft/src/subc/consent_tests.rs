@@ -912,8 +912,17 @@ fn fixture_with_executor(
     dir: tempfile::TempDir,
     executor: Arc<Executor>,
 ) -> Fixture {
+    fixture_with_worker_directory(fake, dir, executor, "worker")
+}
+
+fn fixture_with_worker_directory(
+    fake: Arc<FakeCingulate>,
+    dir: tempfile::TempDir,
+    executor: Arc<Executor>,
+    worker_directory: &str,
+) -> Fixture {
     let head_root = crate::access_policy::policy_path(&dir.path().join("head"));
-    let worker_root = crate::access_policy::policy_path(&dir.path().join("worker"));
+    let worker_root = crate::access_policy::policy_path(&dir.path().join(worker_directory));
     std::fs::create_dir_all(&head_root).unwrap();
     std::fs::create_dir_all(&worker_root).unwrap();
     std::fs::write(head_root.join("shared.txt"), "head-owned contents\n").unwrap();
@@ -8217,6 +8226,128 @@ async fn consent_worker_glob_suggests_existing_checkout_path_without_asking() {
         )
     );
     assert!(f.fake.calls("consent.request").is_empty());
+}
+
+fn suffix_fixture() -> Fixture {
+    fixture_with_worker_directory(
+        FakeCingulate::up(),
+        tempfile::tempdir().unwrap(),
+        Arc::new(Executor::new()),
+        "broca-call-yield",
+    )
+}
+
+fn worker_suffix_file(f: &Fixture, relative: &str) -> PathBuf {
+    let path = f.worker.project_root.join(relative);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "pub fn suffix_marker() {}\n").unwrap();
+    path
+}
+
+fn build_suffix_inventory(f: &Fixture) {
+    f.ctx.data_checkout().unwrap().checkout().build().unwrap();
+    assert!(f.ctx.data_view().is_some());
+}
+
+#[tokio::test]
+async fn consent_worker_read_suggests_unique_longest_indexed_suffix_without_asking() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = suffix_fixture();
+    set_hold_budget_for_test(Some(Duration::from_millis(300)));
+    let counterpart = worker_suffix_file(&f, "crates/broca-session-loop/src/run.rs");
+    worker_suffix_file(&f, "crates/another-crate/src/run.rs");
+    build_suffix_inventory(&f);
+    let requested = f.dir.path().join("broca-session-loop/src/run.rs");
+    assert!(!requested.exists());
+
+    let reply = f.read(&f.worker, &requested, 7).await;
+
+    assert_eq!(code(&reply), "path_not_found_did_you_mean", "{reply}");
+    assert_eq!(
+        text(&reply),
+        format!(
+            "path not found: {}; did you mean {}?",
+            requested.display(),
+            counterpart.display()
+        )
+    );
+    assert!(f.fake.calls("consent.request").is_empty());
+    assert!(f.asks().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_worker_read_family_suggests_unique_indexed_suffix_without_asking() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = suffix_fixture();
+    set_hold_budget_for_test(Some(Duration::from_millis(300)));
+    let counterpart = worker_suffix_file(&f, "crates/broca-session-loop/src/run.rs");
+    build_suffix_inventory(&f);
+    let requested = f.dir.path().join("broca-session-loop/src/run.rs");
+    for (index, (name, arguments)) in [
+        ("outline", json!({"target": requested})),
+        (
+            "zoom",
+            json!({"batch": [{"target": requested, "symbols": "suffix_marker"}]}),
+        ),
+        (
+            "grep",
+            json!({"path": requested, "pattern": "suffix_marker"}),
+        ),
+        ("glob", json!({"path": requested, "pattern": "*.rs"})),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let reply = f.tool(name, arguments, 7 + index as u64).await;
+        assert_eq!(
+            code(&reply),
+            "path_not_found_did_you_mean",
+            "{name}: {reply}"
+        );
+        assert_eq!(
+            text(&reply),
+            format!(
+                "path not found: {}; did you mean {}?",
+                requested.display(),
+                counterpart.display()
+            ),
+            "{name}: {reply}"
+        );
+    }
+    assert!(f.fake.calls("consent.request").is_empty());
+    assert!(f.asks().is_empty());
+}
+
+#[tokio::test]
+async fn consent_worker_ambiguous_longest_indexed_suffix_still_asks() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = suffix_fixture();
+    set_hold_budget_for_test(Some(Duration::from_millis(300)));
+    worker_suffix_file(&f, "crates/broca-session-loop/src/run.rs");
+    worker_suffix_file(&f, "other/broca-session-loop/src/run.rs");
+    build_suffix_inventory(&f);
+    let requested = f.dir.path().join("broca-session-loop/src/run.rs");
+
+    let reply = f.read(&f.worker, &requested, 7).await;
+
+    assert_worker_outside_read_denied(&f, &reply);
+    assert!(!text(&reply).contains("did you mean"));
+}
+
+#[tokio::test]
+async fn consent_worker_one_component_indexed_suffix_still_asks() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = suffix_fixture();
+    set_hold_budget_for_test(Some(Duration::from_millis(300)));
+    worker_suffix_file(&f, "crates/broca-session-loop/src/run.rs");
+    build_suffix_inventory(&f);
+    let requested = f.dir.path().join("not-src/run.rs");
+
+    let reply = f.read(&f.worker, &requested, 7).await;
+
+    assert_worker_outside_read_denied(&f, &reply);
+    assert!(!text(&reply).contains("did you mean"));
 }
 
 #[tokio::test]
