@@ -469,6 +469,8 @@ struct Work {
     refreshing: Arc<AtomicBool>,
     #[cfg(test)]
     refreshes_started: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    refresh_hold: Arc<AtomicBool>,
     /// Timer requests survive a refresh already running when they arrive.
     publish_requested: parking_lot::Mutex<Publish>,
     settle: Arc<QuietTimer>,
@@ -535,8 +537,10 @@ impl Work {
     /// wait that doubles each time, until one succeeds or the checkout is
     /// dropped; the wait uses the shared timer, never an executor worker.
     /// Returns whether this call queued a build, so its cause is logged once.
-    fn start_build(self: &Arc<Self>) -> bool {
-        if self.stopped.load(Ordering::Acquire) {
+    fn start_build(self: &Arc<Self>, requested: bool) -> bool {
+        if self.stopped.load(Ordering::Acquire)
+            || (!requested && !self.background_refresh.load(Ordering::Acquire))
+        {
             return false;
         }
         {
@@ -599,8 +603,8 @@ impl Work {
                         report.shared.records,
                         report.shared.fragments
                     );
-                    // Changes recorded while the build ran stay laid over its
-                    // publication and wait for the call graph.
+                    // Finish the build's follow-up refresh: a call-graph query
+                    // may already be waiting for changes recorded while it ran.
                     work.start_refresh(
                         if retried_grammar {
                             Publish::Always
@@ -614,13 +618,13 @@ impl Work {
                 }
                 // Runs again when the root is bound and asks for it.
                 Err(DataError::Cancelled) => {}
-                Err(error) => work.retry_build_later(&error),
+                Err(error) => work.retry_build_later(&error, requested),
             }
         });
         true
     }
 
-    fn retry_build_later(self: &Arc<Self>, error: &DataError) {
+    fn retry_build_later(self: &Arc<Self>, error: &DataError, requested: bool) {
         let (wait, at) = {
             let mut retry = self
                 .retry
@@ -640,7 +644,7 @@ impl Work {
         let weak = Arc::downgrade(self);
         let timer = crate::shared_timer::Timer::at(at, move || {
             if let Some(work) = weak.upgrade() {
-                work.start_build();
+                work.start_build(requested);
             }
             None
         })
@@ -673,7 +677,7 @@ impl Work {
             // many have piled up.
             let changed = self.checkout.changed_paths();
             if changed > 0 && (publish == Publish::Always || changed >= PUBLISH_AT) {
-                self.start_build();
+                self.start_build(requested);
             }
             return;
         }
@@ -705,6 +709,8 @@ impl Work {
         // A refresh changes only the checkout, behind its own lock, so it
         // runs beside the root's reads and edits, one at a time per root
         // (the `refreshing` flag), in the refresh pool.
+        // Removing the last non-worker route prevents later refreshes from
+        // starting, but this refresh must finish for queries already waiting.
         self.runner.run(REFRESH_REQUEST, Pool::Refresh, move || {
             if work.stopped.load(Ordering::Acquire) {
                 return;
@@ -712,23 +718,16 @@ impl Work {
             let mut flag = Some(flag);
             let mut requested = false;
             #[cfg(test)]
-            if work.background_refresh.load(Ordering::Acquire)
-                || work.refresh_requested.load(Ordering::Acquire)
             {
                 work.refreshes_started.fetch_add(1, Ordering::SeqCst);
+                while work.refresh_hold.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
             }
             loop {
                 requested |= work.refresh_requested.swap(false, Ordering::AcqRel);
-                if !requested && !work.background_refresh.load(Ordering::Acquire) {
-                    // An exact reader may have joined just after the check.
-                    // Release admission before checking its request again.
-                    drop(flag.take());
-                    if work.refresh_requested.load(Ordering::Acquire) {
-                        work.start_refresh(Publish::WhenMany, true);
-                    }
-                    return;
-                }
                 let result = work.checkout.refresh_callgraph();
+                requested |= work.refresh_requested.swap(false, Ordering::AcqRel);
                 if work.checkout.is_building() {
                     return;
                 }
@@ -769,7 +768,7 @@ impl Work {
                             *requested = (*requested).max(publish);
                             continue;
                         }
-                        if !work.maybe_publish(publish) {
+                        if !work.maybe_publish(publish, requested) {
                             return;
                         }
                     }
@@ -777,7 +776,7 @@ impl Work {
                 drop(flag.take());
                 match result {
                     Err(DataError::Damaged(_)) => {
-                        work.start_build();
+                        work.start_build(requested);
                         return;
                     }
                     // The changes stay pending; the next change or query
@@ -799,7 +798,7 @@ impl Work {
     /// and folds the checkout's segments once publications of changes have
     /// piled up. Returns false when a failed publication is deferred to the
     /// settle timer, so the refresh worker yields rather than retrying at once.
-    fn maybe_publish(self: &Arc<Self>, publish: Publish) -> bool {
+    fn maybe_publish(self: &Arc<Self>, publish: Publish, requested: bool) -> bool {
         let changed = self.checkout.changed_paths();
         let refreshed = self.checkout.refreshed_files();
         let many = changed >= PUBLISH_AT || refreshed >= PUBLISH_AT_REFRESHED;
@@ -866,7 +865,7 @@ impl Work {
             }
             Ok(None) | Err(DataError::Cancelled) => {}
             Err(error @ DataError::Damaged(_)) => {
-                if self.start_build() {
+                if self.start_build(requested) {
                     crate::slog_warn!(
                         "data layer could not publish changes for {}: {error}; rebuilding its stored call graph",
                         self.checkout.root().display()
@@ -1014,14 +1013,12 @@ impl Work {
                     work.start_refresh(Publish::WhenMany, false);
                 }
                 Ok(Folded::NeedsBuild(why)) => {
-                    if !work.background_refresh.load(Ordering::Acquire) {
-                        return;
+                    if work.start_build(false) {
+                        crate::slog_info!(
+                            "data layer cannot fold the segments of {} ({why}); building it again whole",
+                            work.checkout.root().display()
+                        );
                     }
-                    crate::slog_info!(
-                        "data layer cannot fold the segments of {} ({why}); building it again whole",
-                        work.checkout.root().display()
-                    );
-                    work.start_build();
                 }
                 Err(DataError::Cancelled) => {}
                 // The next publication that leaves too many segments tries
@@ -1044,7 +1041,7 @@ impl Work {
         if self.checkout.needs_build() {
             // Nothing published, or only the text index: a build that
             // published it first stopped before the call graph.
-            self.start_build();
+            self.start_build(requested);
         } else {
             self.start_refresh(publish, requested);
         }
@@ -1533,6 +1530,8 @@ impl DataCheckout {
             refreshing: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             refreshes_started: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            refresh_hold: Arc::new(AtomicBool::new(false)),
             publish_requested: parking_lot::Mutex::new(Publish::WhenMany),
             settle: Arc::new(QuietTimer::new(settle_period, {
                 let work = weak.clone();
@@ -2845,6 +2844,33 @@ mod tests {
     }
 
     #[test]
+    fn an_admitted_refresh_finishes_after_routes_become_worker_only_without_rearming_quiet() {
+        let quiet = Duration::from_millis(100);
+        let fixture = PublicationFixture::new(quiet, quiet);
+        let ctx = fixture.context();
+        let before = fixture.refreshes();
+        fixture
+            .handle
+            .work
+            .refresh_hold
+            .store(true, Ordering::Release);
+        let release = ClearOnDrop(Arc::clone(&fixture.handle.work.refresh_hold));
+        fixture.add("admitted_edit", 1);
+        wait_until(|| fixture.refreshes() > before);
+        ctx.set_worker_only_routes(true);
+        assert!(pending(fixture.handle.checkout()));
+        drop(release);
+        wait_until(|| !pending(fixture.handle.checkout()) && !fixture.handle.work.running());
+        assert_eq!(fixture.refreshes(), before + 1);
+
+        fixture.add("worker_after_admission", 1);
+        std::thread::sleep(quiet * 3);
+        assert_eq!(fixture.refreshes(), before + 1);
+        assert!(pending(fixture.handle.checkout()));
+        assert!(!fixture.handle.quiet.armed.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn standing_roots_keep_quiet_refresh_with_worker_only_routes() {
         let quiet = Duration::from_millis(100);
         let fixture = PublicationFixture::new(quiet, quiet);
@@ -3075,7 +3101,7 @@ mod tests {
         fixture.add("threshold", PUBLISH_AT);
         fixture.refresh();
         fixture.add("pending_edit", 1);
-        fixture.handle.work.maybe_publish(Publish::Always);
+        fixture.handle.work.maybe_publish(Publish::Always, false);
         assert_eq!(fixture.publications(), 0);
         assert!(pending(fixture.handle.checkout()));
         fixture.refresh();
