@@ -159,7 +159,19 @@ static BUILD: BuildDeclaration = BuildDeclaration(OnceLock::new());
 /// Returns false if facts were already declared, including an unknown revision;
 /// startup cannot replace an identity that has already been reported.
 pub fn initialize_binary_build_revision(revision: Option<&str>) -> bool {
+    let _ = BUILD_REVISION.set(revision.map(str::to_owned));
     BUILD.initialize(revision)
+}
+
+static BUILD_REVISION: OnceLock<Option<String>> = OnceLock::new();
+
+/// The revision the binary was built from, as installed by
+/// [`initialize_binary_build_revision`]; `None` for unstamped builds and for
+/// library code (tests) that never ran the binary's startup.
+pub(crate) fn binary_build_revision() -> Option<&'static str> {
+    BUILD_REVISION
+        .get()
+        .and_then(|revision| revision.as_deref())
 }
 
 /// Build facts are declared on every HELLO, even when no launch nonce was

@@ -467,7 +467,9 @@ impl BuildIdentity {
             (
                 "source_commit",
                 // Unstamped local builds are told apart by the executable.
-                option_env!("AFT_BUILD_GIT_SHA")
+                // The binary installs its revision at startup; the library
+                // never compiles it in (see `launch_nonce`).
+                crate::launch_nonce::binary_build_revision()
                     .unwrap_or("unstamped")
                     .to_string(),
             ),
