@@ -5458,8 +5458,9 @@ mod tests {
         );
         assert!(
             serde_json::to_vec(&actual).unwrap() == serde_json::to_vec(&fixture["reply"]).unwrap(),
-            "full catalog bytes differ for {}; regenerate with: {}",
+            "full catalog bytes differ for {}: {}; regenerate with: {}",
             fixture["name"],
+            catalog_golden_difference(&fixture["reply"], &actual, "reply"),
             REGENERATE_CATALOG
         );
         assert_eq!(actual["generation"], actual["catalog_digest"]);
@@ -5473,6 +5474,42 @@ mod tests {
             catalog(fixture["request"].clone(), &disabled, available).unwrap(),
             actual
         );
+    }
+
+    fn catalog_golden_difference(expected: &Value, actual: &Value, path: &str) -> String {
+        match (expected, actual) {
+            (Value::Object(left), Value::Object(right)) => {
+                for key in left.keys().chain(right.keys()) {
+                    if key == "generation" || key == "digest" || key.ends_with("_digest") {
+                        continue;
+                    }
+                    if left.get(key) != right.get(key) {
+                        if let (Some(left), Some(right)) = (left.get(key), right.get(key)) {
+                            return catalog_golden_difference(
+                                left,
+                                right,
+                                &format!("{path}.{key}"),
+                            );
+                        }
+                        return format!("{path}.{key}: member presence differs");
+                    }
+                }
+                format!("{path}: only digest members or serialized order differ")
+            }
+            (Value::Array(left), Value::Array(right)) => {
+                for (index, (left, right)) in left.iter().zip(right).enumerate() {
+                    if left != right {
+                        return catalog_golden_difference(left, right, &format!("{path}[{index}]"));
+                    }
+                }
+                format!(
+                    "{path}: expected {} items, actual {}",
+                    left.len(),
+                    right.len()
+                )
+            }
+            _ => format!("{path}: expected {expected}, actual {actual}"),
+        }
     }
 
     #[test]
