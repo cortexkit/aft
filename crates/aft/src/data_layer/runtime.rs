@@ -8,7 +8,8 @@
 //! Text queries see a change at once. The call graph is refreshed lazily,
 //! since agents edit far more often than they read it (about 14 edits per
 //! call-graph read in mason sessions): once when a checkout is bound or
-//! built, once [`QUIET`] after the last recorded change, and whenever a
+//! built, once [`QUIET`] after the last recorded change unless only worker
+//! routes bind the root, and whenever a
 //! reader that needs exact answers waits for it ([`DataCheckout::fresh_view`]).
 //! A refresh resolves every change recorded since the last one in one pass,
 //! so a burst of edits costs one update.
@@ -452,6 +453,10 @@ struct Work {
     checkout: Arc<Checkout>,
     runner: Runner,
     stopped: AtomicBool,
+    /// Worker-only routes leave changes pending until a bind or exact read.
+    background_refresh: AtomicBool,
+    /// An exact reader can join a refresh already queued by maintenance.
+    refresh_requested: AtomicBool,
     /// A build is queued or running.
     building: Arc<AtomicBool>,
     /// Counts build tasks through their final follow-up scheduling, including
@@ -462,6 +467,8 @@ struct Work {
     folding: Arc<AtomicBool>,
     /// A call-graph refresh is queued or running.
     refreshing: Arc<AtomicBool>,
+    #[cfg(test)]
+    refreshes_started: std::sync::atomic::AtomicUsize,
     /// Timer requests survive a refresh already running when they arrive.
     publish_requested: parking_lot::Mutex<Publish>,
     settle: Arc<QuietTimer>,
@@ -594,11 +601,14 @@ impl Work {
                     );
                     // Changes recorded while the build ran stay laid over its
                     // publication and wait for the call graph.
-                    work.start_refresh(if retried_grammar {
-                        Publish::Always
-                    } else {
-                        Publish::WhenMany
-                    });
+                    work.start_refresh(
+                        if retried_grammar {
+                            Publish::Always
+                        } else {
+                            Publish::WhenMany
+                        },
+                        true,
+                    );
                     // Meaning search fills what the published files need.
                     work.start_fill();
                 }
@@ -649,8 +659,11 @@ impl Work {
     /// while it runs is picked up by its next pass, or, if it was just
     /// ending, by the check after it lets go of the flag. A refresh that
     /// finds the stored call graph damaged starts a build, which replaces it.
-    fn start_refresh(self: &Arc<Self>, publish: Publish) {
-        if self.stopped.load(Ordering::Acquire) {
+    /// `requested` keeps binds and exact reads eligible on worker-only roots.
+    fn start_refresh(self: &Arc<Self>, publish: Publish, requested: bool) {
+        if self.stopped.load(Ordering::Acquire)
+            || (!requested && !self.background_refresh.load(Ordering::Acquire))
+        {
             return;
         }
         if !self.checkout.planes().callgraph {
@@ -674,6 +687,9 @@ impl Work {
         if !(pending(&self.checkout) || unpublished) {
             return;
         }
+        if requested {
+            self.refresh_requested.store(true, Ordering::Release);
+        }
         {
             let mut requested = self.publish_requested.lock();
             *requested = (*requested).max(publish);
@@ -694,7 +710,24 @@ impl Work {
                 return;
             }
             let mut flag = Some(flag);
+            let mut requested = false;
+            #[cfg(test)]
+            if work.background_refresh.load(Ordering::Acquire)
+                || work.refresh_requested.load(Ordering::Acquire)
+            {
+                work.refreshes_started.fetch_add(1, Ordering::SeqCst);
+            }
             loop {
+                requested |= work.refresh_requested.swap(false, Ordering::AcqRel);
+                if !requested && !work.background_refresh.load(Ordering::Acquire) {
+                    // An exact reader may have joined just after the check.
+                    // Release admission before checking its request again.
+                    drop(flag.take());
+                    if work.refresh_requested.load(Ordering::Acquire) {
+                        work.start_refresh(Publish::WhenMany, true);
+                    }
+                    return;
+                }
                 let result = work.checkout.refresh_callgraph();
                 if work.checkout.is_building() {
                     return;
@@ -787,7 +820,9 @@ impl Work {
             && !capped
             && (publish == Publish::WhenMany || !self.settle.due())
         {
-            self.settle.arm();
+            if self.background_refresh.load(Ordering::Acquire) {
+                self.settle.arm();
+            }
             return true;
         }
         // A change can arrive after the worker's final refresh, including
@@ -972,13 +1007,16 @@ impl Work {
                     work.notify_status_change();
                     // Changes recorded meanwhile are resolved again over the
                     // new publication.
-                    work.start_refresh(Publish::WhenMany);
+                    work.start_refresh(Publish::WhenMany, false);
                 }
                 Ok(Folded::Superseded) => {
                     work.notify_status_change();
-                    work.start_refresh(Publish::WhenMany);
+                    work.start_refresh(Publish::WhenMany, false);
                 }
                 Ok(Folded::NeedsBuild(why)) => {
+                    if !work.background_refresh.load(Ordering::Acquire) {
+                        return;
+                    }
                     crate::slog_info!(
                         "data layer cannot fold the segments of {} ({why}); building it again whole",
                         work.checkout.root().display()
@@ -998,14 +1036,17 @@ impl Work {
 
     /// Builds the checkout if it needs it, and refreshes its call graph
     /// otherwise.
-    fn catch_up(self: &Arc<Self>, publish: Publish) {
+    fn catch_up(self: &Arc<Self>, publish: Publish, requested: bool) {
+        if !requested && !self.background_refresh.load(Ordering::Acquire) {
+            return;
+        }
         self.ensure_grammar_driver();
         if self.checkout.needs_build() {
             // Nothing published, or only the text index: a build that
             // published it first stopped before the call graph.
             self.start_build();
         } else {
-            self.start_refresh(publish);
+            self.start_refresh(publish, requested);
         }
     }
 
@@ -1052,7 +1093,7 @@ impl Work {
                         match event {
                             Ok(_) => {
                                 if work.checkout.retry_grammar_gaps().unwrap_or(false) {
-                                    work.start_refresh(Publish::Always);
+                                    work.start_refresh(Publish::Always, false);
                                 }
                                 if !work.checkout.has_grammar_gaps() {
                                     break;
@@ -1066,7 +1107,7 @@ impl Work {
                                 // after transient scan or read failures too.
                                 if registry.status_snapshot().is_none() {
                                     if work.checkout.retry_grammar_gaps().unwrap_or(false) {
-                                        work.start_refresh(Publish::Always);
+                                        work.start_refresh(Publish::Always, false);
                                     }
                                     continue;
                                 }
@@ -1103,7 +1144,7 @@ impl Work {
     /// unreported, then catches up as a bind does. The checkout reports its
     /// call graph building from now until the rescan ends, so a query made
     /// right after the bind waits for it.
-    fn start_rescan(self: &Arc<Self>) {
+    fn start_rescan(self: &Arc<Self>, requested: bool) {
         if self.rescanning.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -1130,7 +1171,7 @@ impl Work {
             }
             drop(ended);
             work.settle.note_change();
-            work.catch_up(Publish::WhenMany);
+            work.catch_up(Publish::WhenMany, requested);
         });
     }
 
@@ -1478,6 +1519,8 @@ impl DataCheckout {
         };
         let work = Arc::new_cyclic(|weak: &Weak<Work>| Work {
             stopped: AtomicBool::new(false),
+            background_refresh: AtomicBool::new(true),
+            refresh_requested: AtomicBool::new(false),
             runner: Runner {
                 root: checkout.root().to_path_buf(),
                 executor: parking_lot::Mutex::new(executor),
@@ -1488,12 +1531,14 @@ impl DataCheckout {
             build_tasks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             folding: Arc::new(AtomicBool::new(false)),
             refreshing: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            refreshes_started: std::sync::atomic::AtomicUsize::new(0),
             publish_requested: parking_lot::Mutex::new(Publish::WhenMany),
             settle: Arc::new(QuietTimer::new(settle_period, {
                 let work = weak.clone();
                 move || {
                     if let Some(work) = work.upgrade() {
-                        work.start_refresh(Publish::Settled);
+                        work.start_refresh(Publish::Settled, false);
                     }
                 }
             })),
@@ -1518,7 +1563,7 @@ impl DataCheckout {
             let work = Arc::downgrade(&work);
             let timer = QuietTimer::new(quiet_period, move || {
                 if let Some(work) = work.upgrade() {
-                    work.start_refresh(Publish::Always);
+                    work.start_refresh(Publish::Always, false);
                     // Edited files wait for vectors of their new content.
                     work.start_fill();
                 }
@@ -1535,7 +1580,7 @@ impl DataCheckout {
         });
         crate::write_intent::register_listener(&listener);
         // A bind may have recorded what changed while nothing watched.
-        work.catch_up(Publish::WhenMany);
+        work.catch_up(Publish::WhenMany, true);
         let checkout = Arc::new(Self {
             disk_measurement: super::surfaces::DiskMeasurement::for_family(
                 work.checkout.family_dir(),
@@ -1616,7 +1661,23 @@ impl DataCheckout {
     /// Compares the checkout's files with its state and records what
     /// changed, for a watcher that lost events (see [`Work::start_rescan`]).
     pub(crate) fn rescan(&self) {
-        self.work.start_rescan();
+        self.work.start_rescan(false);
+    }
+
+    /// Updates automatic maintenance when bound routes change. A non-worker
+    /// route starts a quiet window for edits left pending by worker-only routes.
+    pub(crate) fn set_background_refresh(&self, allowed: bool) {
+        if self.work.background_refresh.swap(allowed, Ordering::AcqRel) == allowed {
+            return;
+        }
+        self.quiet.set_enabled(allowed);
+        self.work.settle.set_enabled(allowed);
+        if allowed {
+            self.work.ensure_grammar_driver();
+            if self.checkout().changed_paths() > 0 || pending(self.checkout()) {
+                self.quiet.changed();
+            }
+        }
     }
 
     /// Records the watcher's changed `paths` (absolute).
@@ -1631,7 +1692,7 @@ impl DataCheckout {
     /// call-graph refresh runs if any change is pending: when the root is
     /// bound, and for a query about to wait for the call graph.
     pub(crate) fn request_refresh(&self) {
-        self.work.catch_up(Publish::WhenMany);
+        self.work.catch_up(Publish::WhenMany, true);
     }
 
     /// A view whose call graph covers every recorded change, for a reader
@@ -1671,6 +1732,7 @@ struct QuietTimer {
     /// When the last change was recorded, in milliseconds since `epoch`.
     last_change_ms: AtomicU64,
     armed: AtomicBool,
+    enabled: AtomicBool,
     epoch: Instant,
     fire: Box<dyn Fn() + Send + Sync>,
     /// Also fences dispatch against checkout shutdown.
@@ -1686,6 +1748,7 @@ impl QuietTimer {
             quiet,
             last_change_ms: AtomicU64::new(0),
             armed: AtomicBool::new(false),
+            enabled: AtomicBool::new(true),
             epoch: Instant::now(),
             fire: Box::new(fire),
             stopped: std::sync::Mutex::new(false),
@@ -1705,6 +1768,22 @@ impl QuietTimer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+    }
+
+    /// Pause route-driven deadlines without permanently stopping the timer.
+    fn set_enabled(&self, enabled: bool) {
+        let _stopped = self
+            .stopped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.enabled.store(enabled, Ordering::Release);
+        if !enabled {
+            self.timer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            self.armed.store(false, Ordering::Release);
+        }
     }
 
     fn now_ms(&self) -> u64 {
@@ -1757,7 +1836,10 @@ impl QuietTimer {
             .stopped
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *stopped || self.armed.swap(true, Ordering::AcqRel) {
+        if *stopped
+            || !self.enabled.load(Ordering::Acquire)
+            || self.armed.swap(true, Ordering::AcqRel)
+        {
             return;
         }
         let timer = Arc::downgrade(self);
@@ -1772,7 +1854,7 @@ impl QuietTimer {
                 .stopped
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if *stopped {
+            if *stopped || !timer.enabled.load(Ordering::Acquire) {
                 return None;
             }
             #[cfg(feature = "test-timing-hooks")]
@@ -1851,7 +1933,7 @@ pub(crate) fn rebind_configured(ctx: &crate::context::AppContext) {
     use crate::data_layer::surfaces::DataCheckoutProbe;
     if let Some(DataCheckoutProbe::Bound(checkout)) = ctx.probe_data_checkout() {
         if checkout.bound_once.load(Ordering::Acquire) {
-            checkout.work.start_rescan();
+            checkout.work.start_rescan(true);
         }
     }
 }
@@ -1884,7 +1966,7 @@ pub(crate) fn root_bound(ctx: &crate::context::AppContext) {
     }
     if let Some(checkout) = ctx.data_checkout() {
         if checkout.bound_once.swap(true, Ordering::AcqRel) {
-            checkout.work.start_rescan();
+            checkout.work.start_rescan(true);
         } else {
             checkout.request_refresh();
         }
@@ -2463,6 +2545,26 @@ mod tests {
         fn publications(&self) -> usize {
             self.handle.work.publications_started.load(Ordering::SeqCst)
         }
+
+        fn context(&self) -> crate::context::AppContext {
+            let ctx = crate::context::AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                crate::config::Config {
+                    project_root: Some(self.handle.root().to_path_buf()),
+                    storage_dir: Some(self._storage.path().to_path_buf()),
+                    harness: Some("opencode".into()),
+                    ..crate::config::Config::default()
+                },
+            );
+            ctx.set_canonical_cache_root(self.handle.root().to_path_buf());
+            ctx.set_harness(crate::harness::Harness::Opencode);
+            ctx.pin_data_checkout(Arc::clone(&self.handle));
+            ctx
+        }
+
+        fn refreshes(&self) -> usize {
+            self.handle.work.refreshes_started.load(Ordering::SeqCst)
+        }
     }
 
     fn wait_until(ready: impl Fn() -> bool) {
@@ -2677,6 +2779,179 @@ mod tests {
             fixture.handle.fresh_view(Duration::ZERO),
             Fresh::Ready(_)
         ));
+    }
+
+    #[test]
+    fn worker_only_edits_wait_for_callers_then_refresh_once() {
+        let quiet = Duration::from_millis(100);
+        let fixture = PublicationFixture::new(quiet, quiet);
+        let ctx = fixture.context();
+        ctx.set_worker_only_routes(true);
+        let before = fixture.refreshes();
+        let lib = fixture.handle.root().join("src/lib.rs");
+        let extra = fixture.handle.root().join("src/extra.rs");
+        std::fs::write(&extra, "pub fn new_caller() { crate::original(); }\n").unwrap();
+        fixture.handle.note_paths(std::slice::from_ref(&extra));
+        std::fs::write(&lib, "mod extra;\npub fn original() {}\n").unwrap();
+        fixture
+            .handle
+            ._listener
+            .record_change(&WriteIntent::Paths(vec![lib.clone()]), WritePhase::After);
+        std::thread::sleep(quiet * 3);
+        assert_eq!(fixture.refreshes(), before);
+        assert!(pending(fixture.handle.checkout()));
+        assert!(!fixture.handle.quiet.armed.load(Ordering::Acquire));
+
+        let response = crate::commands::callers::handle_callers(
+            &crate::protocol::RawRequest {
+                id: "worker-callers".into(),
+                command: "callers".into(),
+                lsp_hints: None,
+                session_id: None,
+                params: serde_json::json!({"file": lib, "symbol": "original"}),
+            },
+            &ctx,
+        );
+        assert!(response.success, "{:?}", response.data);
+        assert!(
+            response.data.to_string().contains("new_caller"),
+            "{:?}",
+            response.data
+        );
+        wait_until(|| !fixture.handle.work.running());
+        assert_eq!(fixture.refreshes(), before + 1);
+        assert!(!pending(fixture.handle.checkout()));
+    }
+
+    #[test]
+    fn a_head_joining_worker_only_routes_arms_pending_changes_and_leaving_cancels_them() {
+        let quiet = Duration::from_millis(100);
+        let fixture = PublicationFixture::new(quiet, quiet);
+        let ctx = fixture.context();
+        ctx.set_worker_only_routes(true);
+        fixture.add("worker_pending", 1);
+        ctx.set_worker_only_routes(false);
+        wait_until(|| fixture.handle.checkout().changed_paths() == 0);
+        wait_until(|| !fixture.handle.work.running());
+        let before = fixture.refreshes();
+
+        fixture.add("mixed_pending", 1);
+        assert!(fixture.handle.quiet.armed.load(Ordering::Acquire));
+        ctx.set_worker_only_routes(true);
+        std::thread::sleep(quiet * 3);
+        assert_eq!(fixture.refreshes(), before);
+        assert!(pending(fixture.handle.checkout()));
+        assert!(!fixture.handle.quiet.armed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn standing_roots_keep_quiet_refresh_with_worker_only_routes() {
+        let quiet = Duration::from_millis(100);
+        let fixture = PublicationFixture::new(quiet, quiet);
+        let ctx = fixture.context();
+        ctx.set_worker_only_routes(true);
+        ctx.set_standing_artifact_exempt(true);
+        fixture.add("standing_edit", 1);
+        wait_until(|| fixture.handle.checkout().changed_paths() == 0);
+        wait_until(|| !fixture.handle.work.running());
+        assert_eq!(fixture.publications(), 1);
+        ctx.set_standing_artifact_exempt(false);
+        let before = fixture.refreshes();
+        fixture.add("no_longer_standing", 1);
+        std::thread::sleep(quiet * 3);
+        assert_eq!(fixture.refreshes(), before);
+        assert!(pending(fixture.handle.checkout()));
+    }
+
+    #[test]
+    fn worker_only_publication_thresholds_do_not_schedule_follow_up_refreshes() {
+        let quiet = Duration::from_millis(100);
+        let fixture = PublicationFixture::new(quiet, quiet);
+        let ctx = fixture.context();
+        ctx.set_worker_only_routes(true);
+        fixture.add("threshold", PUBLISH_AT_REFRESHED);
+        fixture.refresh();
+        assert!(fixture.handle.checkout().changed_paths() >= PUBLISH_AT);
+        assert!(fixture.handle.checkout().refreshed_files() >= PUBLISH_AT_REFRESHED);
+        assert!(!fixture.handle.work.settle.armed.load(Ordering::Acquire));
+        let before = fixture.refreshes();
+        fixture.add("after_threshold", 1);
+        std::thread::sleep(quiet * 3);
+        assert_eq!(fixture.refreshes(), before);
+        assert!(pending(fixture.handle.checkout()));
+    }
+
+    #[test]
+    fn worker_only_rescans_refresh_only_when_a_bind_requests_them() {
+        let quiet = Duration::from_millis(100);
+        let fixture = PublicationFixture::new(quiet, quiet);
+        let ctx = fixture.context();
+        ctx.set_worker_only_routes(true);
+        let before = fixture.refreshes();
+        std::fs::write(
+            fixture.handle.root().join("src/lib.rs"),
+            "pub fn changed_without_a_watcher_event() {}\n",
+        )
+        .unwrap();
+        fixture.handle.rescan();
+        wait_until(|| !fixture.handle.work.rescanning.load(Ordering::Acquire));
+        std::thread::sleep(quiet * 3);
+        assert_eq!(fixture.refreshes(), before);
+        assert!(pending(fixture.handle.checkout()));
+
+        fixture.handle.work.start_rescan(true);
+        wait_until(|| !pending(fixture.handle.checkout()) && !fixture.handle.work.running());
+        assert_eq!(fixture.refreshes(), before + 1);
+        assert!(!pending(fixture.handle.checkout()));
+    }
+
+    #[test]
+    fn worker_only_edits_with_tier2_enabled_do_not_refresh_the_callgraph() {
+        use crate::inspect::tier2_scheduler::{
+            TIER2_REFRESH_COLD_CACHE_DELAY, TIER2_REFRESH_DEBOUNCE, TIER2_REFRESH_MIN_INTERVAL,
+        };
+        use crate::inspect::Tier2TriggerReason;
+
+        let quiet = Duration::from_millis(100);
+        let fixture = PublicationFixture::new(quiet, quiet);
+        let ctx = fixture.context();
+        ctx.set_worker_only_routes(true);
+        assert!(ctx.config().inspect.enabled);
+        let configured_at = Instant::now()
+            .checked_sub(TIER2_REFRESH_COLD_CACHE_DELAY + Duration::from_secs(1))
+            .unwrap();
+        ctx.reset_tier2_refresh_scheduler_at(configured_at);
+        let now = Instant::now();
+        assert_eq!(
+            ctx.tick_tier2_refresh_scheduler_at(now, 0),
+            Some(Tier2TriggerReason::ConfigureWarm)
+        );
+        wait_until(|| {
+            crate::runtime_drain::drain_inspect_events(&ctx);
+            ctx.status_bar_count_values().todos == Some(0)
+        });
+        let before = fixture.refreshes();
+        let path = fixture.handle.root().join("src/lib.rs");
+        std::fs::write(
+            &path,
+            "// TODO: keep the count current\npub fn original() {}\n",
+        )
+        .unwrap();
+        fixture.handle.note_paths(std::slice::from_ref(&path));
+        ctx.add_pending_tier2_paths([path]);
+        let edited_at = now + TIER2_REFRESH_MIN_INTERVAL;
+        assert_eq!(ctx.tick_tier2_refresh_scheduler_at(edited_at, 1), None);
+        assert_eq!(
+            ctx.tick_tier2_refresh_scheduler_at(edited_at + TIER2_REFRESH_DEBOUNCE, 0),
+            Some(Tier2TriggerReason::Debounce)
+        );
+        wait_until(|| {
+            crate::runtime_drain::drain_inspect_events(&ctx);
+            ctx.status_bar_count_values().todos == Some(1)
+        });
+        std::thread::sleep(quiet * 3);
+        assert_eq!(fixture.refreshes(), before);
+        assert!(pending(fixture.handle.checkout()));
     }
 
     #[test]

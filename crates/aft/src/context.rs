@@ -4199,6 +4199,8 @@ pub struct AppContext {
     /// Standing roots retain artifacts across idle session reaping, but they
     /// remain subject to every verification and publication fence.
     standing_artifact_exempt: AtomicBool,
+    /// Reconciled from the daemon's installed routes, never from root paths.
+    worker_only_routes: AtomicBool,
     cold_build_limiter: RwLock<Arc<crate::cold_build_limiter::ColdBuildLimiter>>,
     /// This root's checkout in the data layer that replaces the views and
     /// legacy stores; only with `AFT_DATA_LAYER=1` (see
@@ -4789,6 +4791,7 @@ impl AppContext {
             degraded_reasons: parking_lot::Mutex::new(Vec::new()),
             heavy_root_work_allowed: Arc::clone(&heavy_root_work_allowed),
             standing_artifact_exempt: AtomicBool::new(false),
+            worker_only_routes: AtomicBool::new(false),
             cold_build_limiter: RwLock::new(crate::cold_build_limiter::global_limiter()),
             data_checkout: parking_lot::Mutex::new(None),
             data_checkout_pinned: AtomicBool::new(false),
@@ -8086,6 +8089,7 @@ impl AppContext {
                 planes,
             ) {
                 Ok(checkout) => {
+                    checkout.set_background_refresh(self.background_callgraph_refresh_allowed());
                     *self.data_bind_failure.lock() = None;
                     // Status pushes follow the data layer's builds and
                     // refreshes. Only a context its transport owns can push.
@@ -8817,6 +8821,24 @@ impl AppContext {
     pub(crate) fn set_standing_artifact_exempt(&self, exempt: bool) {
         self.standing_artifact_exempt
             .store(exempt, Ordering::Release);
+        self.sync_background_callgraph_refresh();
+    }
+
+    pub(crate) fn set_worker_only_routes(&self, worker_only: bool) {
+        self.worker_only_routes
+            .store(worker_only, Ordering::Release);
+        self.sync_background_callgraph_refresh();
+    }
+
+    pub(crate) fn background_callgraph_refresh_allowed(&self) -> bool {
+        !self.worker_only_routes.load(Ordering::Acquire)
+            || self.standing_artifact_exempt.load(Ordering::Acquire)
+    }
+
+    fn sync_background_callgraph_refresh(&self) {
+        if let Some(checkout) = self.data_checkout.lock().as_ref() {
+            checkout.set_background_refresh(self.background_callgraph_refresh_allowed());
+        }
     }
 
     pub(crate) fn cold_build_limiter(&self) -> Arc<crate::cold_build_limiter::ColdBuildLimiter> {
