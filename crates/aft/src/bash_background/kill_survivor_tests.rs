@@ -155,7 +155,7 @@ fn scope_end_stops_three_commands_in_one_grace_window() {
     for task_id in tasks {
         let snapshot = registry.status(&task_id, SESSION, None, None, 0).unwrap();
         assert_eq!(snapshot.info.status, BgTaskStatus::Killed);
-        assert_eq!(snapshot.info.exit_code, Some(137));
+        assert_eq!(snapshot.exit_code, Some(137));
     }
 }
 

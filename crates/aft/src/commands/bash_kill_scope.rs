@@ -101,8 +101,18 @@ pub(crate) fn handle_bash_kill_scope_with_saved_tasks(
             }
             deadline = Instant::now() + Duration::from_secs(10);
         }
-        for ((registry, from_saved_record), members) in all_registries.iter().zip(&members) {
-            match registry.pause_scope(&params.scope, remote, members) {
+        let stopped = crate::bash_background::registry::stop_tasks_in_parallel(
+            all_registries.iter().zip(&members),
+            |((registry, from_saved_record), members)| {
+                (
+                    registry,
+                    from_saved_record,
+                    registry.pause_scope(&params.scope, remote, members),
+                )
+            },
+        );
+        for (registry, from_saved_record, result) in stopped {
+            match result {
                 Ok(report) => {
                     for mut task in report.killed {
                         task.from_saved_record = *from_saved_record;

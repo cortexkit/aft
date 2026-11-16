@@ -387,7 +387,7 @@ fn terminate_piped_task(
 
 /// Stop independent commands concurrently so a batch shares one grace window.
 /// Callers collect targets before entering here, without registry/task locks.
-fn stop_tasks_in_parallel<T: Send, R: Send>(
+pub(crate) fn stop_tasks_in_parallel<T: Send, R: Send>(
     tasks: impl IntoIterator<Item = T>,
     stop: impl Fn(T) -> R + Sync,
 ) -> Vec<R> {
@@ -6139,13 +6139,19 @@ impl BgTaskRegistry {
         let child_pid = child.id();
         child.declare_agent();
         if let Err(error) = self.arm_secret_proxy(&spawn_plan, &task_id, child_pid) {
-            super::process::terminate_pgid(child_pid as i32, None);
+            drop(_admission);
+            super::process::terminate_pgid_with(child_pid as i32, || {
+                matches!(child.try_wait(), Ok(Some(_)))
+            });
             let _ = child.wait();
             return Err(error.into());
         }
         if let Some(mut monitor) = memory_monitor.take() {
             if let Err(error) = monitor.attach(child_pid) {
-                super::process::terminate_pgid(child_pid as i32, None);
+                drop(_admission);
+                super::process::terminate_pgid_with(child_pid as i32, || {
+                    matches!(child.try_wait(), Ok(Some(_)))
+                });
                 let _ = child.wait();
                 self.fail_memory_spawn(&mut metadata, &paths, &error, canonical_project_root);
                 return Err(error.into());

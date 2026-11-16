@@ -886,6 +886,8 @@ async fn revoke(executor: Arc<Executor>, stamp: &ScopeStamp) -> ScopeRevokeResul
     fence_confirmed_end(&executor, stamp);
     let mut keys = Vec::new();
     let mut complete = true;
+    #[cfg(unix)]
+    let mut pending_kills = Vec::new();
     for (root, _) in entries {
         #[cfg(feature = "test-timing-hooks")]
         let submitted_at = std::time::Instant::now();
@@ -994,6 +996,19 @@ async fn revoke(executor: Arc<Executor>, stamp: &ScopeStamp) -> ScopeRevokeResul
                 Response::success("scope-ended-kill", json!({}))
             }),
         );
+        #[cfg(unix)]
+        pending_kills.push(kill);
+        #[cfg(not(unix))]
+        {
+            complete &= await_executor_response(kill, "scope-ended-kill".into())
+                .await
+                .success;
+        }
+    }
+    // Submit every root's kill before waiting: different actor lanes can
+    // give their command groups the grace period concurrently.
+    #[cfg(unix)]
+    for kill in pending_kills {
         complete &= await_executor_response(kill, "scope-ended-kill".into())
             .await
             .success;
@@ -1422,6 +1437,8 @@ mod tests {
 async fn kill_only(executor: Arc<Executor>, stamp: &ScopeStamp) {
     // This fallback may wait behind actor work, but authority fencing must not.
     fence_confirmed_end(&executor, stamp);
+    #[cfg(unix)]
+    let mut pending_kills = Vec::new();
     for (root, _) in executor.actor_entries() {
         let stamp = stamp.clone();
         let job = executor.submit_async(
@@ -1433,6 +1450,13 @@ async fn kill_only(executor: Arc<Executor>, stamp: &ScopeStamp) {
                 Response::success("speech-end-safety-kill", json!({}))
             }),
         );
+        #[cfg(unix)]
+        pending_kills.push(job);
+        #[cfg(not(unix))]
+        let _ = await_executor_response(job, "speech-end-safety-kill".into()).await;
+    }
+    #[cfg(unix)]
+    for job in pending_kills {
         let _ = await_executor_response(job, "speech-end-safety-kill".into()).await;
     }
 }
