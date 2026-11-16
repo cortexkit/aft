@@ -8311,13 +8311,18 @@ async fn consent_worker_read_family_suggests_unique_indexed_suffix_without_askin
     .enumerate()
     {
         let reply = f.tool(name, arguments, 7 + index as u64).await;
+        let (reply_code, message) = if name == "zoom" {
+            let response = &reply["structuredContent"]["targets"][0]["response"];
+            (
+                response["code"].as_str().unwrap(),
+                response["message"].as_str().unwrap().to_owned(),
+            )
+        } else {
+            (code(&reply), text(&reply))
+        };
+        assert_eq!(reply_code, "path_not_found_did_you_mean", "{name}: {reply}");
         assert_eq!(
-            code(&reply),
-            "path_not_found_did_you_mean",
-            "{name}: {reply}"
-        );
-        assert_eq!(
-            text(&reply),
+            message,
             format!(
                 "path not found: {}; did you mean {}?",
                 requested.display(),
