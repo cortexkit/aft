@@ -1171,8 +1171,16 @@ pub(crate) fn kill_point(point: &str) {
     eprintln!("KILL POINT {wanted}");
     #[cfg(unix)]
     // SAFETY: sending a signal to this process has no memory effects here.
+    // On macOS SIGKILL to a multi-threaded process can land after `kill`
+    // returns, so wait for it rather than racing it with `abort` below
+    // (which would end the process with SIGABRT instead). `abort` is left
+    // only for a `kill` that failed outright.
     unsafe {
-        libc::kill(libc::getpid(), libc::SIGKILL);
+        if libc::kill(libc::getpid(), libc::SIGKILL) == 0 {
+            loop {
+                libc::pause();
+            }
+        }
     }
     // As abruptly as SIGKILL: no destructor, buffer flush or exit handler
     // runs. The exit code tells the test the process died here.

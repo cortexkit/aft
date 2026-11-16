@@ -204,7 +204,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
       XDG_CACHE_HOME="$GRAMMAR_SMOKE/cache" XDG_STATE_HOME="$GRAMMAR_SMOKE/state" \
       XDG_DATA_HOME="$GRAMMAR_SMOKE/data" TMPDIR="$GRAMMAR_SMOKE/tmp" \
       python3 - "$TMP" "$GRAMMAR_SMOKE" <<'PY'
-import json, pathlib, signal, subprocess, sys
+import json, pathlib, signal, subprocess, sys, time
 binary, root = sys.argv[1], pathlib.Path(sys.argv[2]).resolve()
 def timed_out(*_):
     raise TimeoutError("signed outline smoke timed out")
@@ -214,20 +214,32 @@ with open(root / "outline-stderr.log", "w") as stderr:
     process = subprocess.Popen(["sandbox-exec", "-p", "(version 1) (allow default) (deny network*)", binary],
                                cwd=root / "project", stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr, text=True)
     try:
-        def request(value):
-            process.stdin.write(json.dumps(value) + "\n")
-            process.stdin.flush()
-            for line in process.stdout:
-                reply = json.loads(line)
-                if reply.get("id") == value["id"]:
-                    assert reply.get("success"), reply
-                    return reply
-            raise RuntimeError("signed card exited before replying")
+        def request(value, retry_unavailable=False):
+            while True:
+                process.stdin.write(json.dumps(value) + "\n")
+                process.stdin.flush()
+                reply = None
+                for line in process.stdout:
+                    candidate = json.loads(line)
+                    if candidate.get("id") == value["id"]:
+                        reply = candidate
+                        break
+                if reply is None:
+                    raise RuntimeError("signed card exited before replying")
+                # The first Luau request starts loading the stored grammar in the
+                # background and answers grammar_unavailable ("retry in a few
+                # seconds") until it is ready; the 45 s alarm bounds the wait.
+                if retry_unavailable and reply.get("code") == "grammar_unavailable":
+                    time.sleep(0.5)
+                    continue
+                assert reply.get("success"), reply
+                return reply
         request({"id": "signed-configure", "command": "configure", "harness": "runner",
                  "project_root": str(root / "project"), "storage_dir": str(root / "storage"),
                  "config": [{"tier": "user", "source": str(root / "config" / "aft.jsonc"),
                              "doc": json.dumps({"storage": {"cache_dir": None}, "indexes": {"semantic": False}})}]})
-        reply = request({"id": "signed-outline", "command": "outline", "file": str(root / "project" / "smoke.luau")})
+        reply = request({"id": "signed-outline", "command": "outline", "file": str(root / "project" / "smoke.luau")},
+                        retry_unavailable=True)
         assert "signed_outline_fixture" in reply.get("text", ""), reply
         (root / "outline-result.json").write_text(json.dumps(reply))
     finally:
