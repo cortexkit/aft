@@ -67,6 +67,7 @@ pub(crate) fn failure_text(code: &str) -> String {
         "broker_timeout" => "gh read timed out. Retry, or run fewer gh commands in parallel.",
         "broker_unavailable" => "gh reads are unavailable in this bash command. Start a new bash command.",
         "watch_interval" => "--interval must be a positive number of seconds",
+        "run_download" => "gh run download isn't available in worker shells; ask your head agent to download the artifacts",
         _ => return format!("gh read failed: {code}. Start a new bash command."),
     }.into()
 }

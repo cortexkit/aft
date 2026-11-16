@@ -243,6 +243,22 @@ pub(super) fn last_lookup(paths: &StatePaths) -> Option<LookupRecord> {
     serde_json::from_slice(&fs::read(paths.root.join("read-session-lookup.json")).ok()?).ok()
 }
 
+pub(super) fn refuse_unavailable_command(args: &[OsString]) -> Option<i32> {
+    if tuple(args).as_deref() != Some("run download") {
+        return None;
+    }
+    let relay = RelayContext::from_process();
+    let signals = native_guard::ShellSignals::from_process();
+    if relay.worker_broker.is_none() && !signals.sandboxed && !signals.worker_marked {
+        return None;
+    }
+    // Artifact archives cannot fit the worker broker's 1 MiB typed replies.
+    Some(refuse(
+        RefusalCode::WorkerNativeGh,
+        &crate::gh_shim_worker_broker::failure_text("run_download"),
+    ))
+}
+
 pub(super) fn dispatch(
     args: &[OsString],
     manifest: &Manifest,

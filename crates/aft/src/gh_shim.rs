@@ -796,6 +796,9 @@ fn run_with(
 
     let now = unix_seconds();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if let Some(status) = worker_reads::refuse_unavailable_command(args) {
+        return status;
+    }
 
     // Agents run `gh auth status` to learn whether they can write. Upstream
     // `gh` would describe the operator's login, which is not the identity a

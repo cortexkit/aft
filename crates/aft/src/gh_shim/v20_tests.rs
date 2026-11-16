@@ -2588,3 +2588,35 @@ fn v20_watch_interval_exit_codes_and_signed_read_authorization() {
         0
     );
 }
+
+#[test]
+fn v20_worker_download_refusal_names_the_supported_alternative() {
+    use crate::gh_shim::tests::ScopedTestEnvVar;
+    let _state = crate::test_env::gh_shim_state_guard();
+    let _worker = ScopedTestEnvVar::set(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV, Some("1"));
+    let paths = StatePaths::from_process();
+    for contents in [None, Some("invalid manifest")] {
+        if let Some(contents) = contents {
+            fs::write(&paths.manifest, contents).unwrap();
+        }
+        let (_capture, lines) = capture_refusals_for_test();
+        assert_eq!(
+            run_with(
+                &args(&[
+                    "run",
+                    "download",
+                    "43863185628",
+                    "-R",
+                    "cortexkit/common-auth",
+                    "-D",
+                    "artifacts"
+                ]),
+                |_| panic!("worker download reached native gh"),
+                |_, _, _, _| panic!("unsupported downloads must not query the broker"),
+            ),
+            REFUSAL_EXIT_STATUS
+        );
+        assert_eq!(*lines.lock().unwrap(), vec![refusal_line(RefusalCode::WorkerNativeGh,
+            "gh run download isn't available in worker shells; ask your head agent to download the artifacts")]);
+    }
+}

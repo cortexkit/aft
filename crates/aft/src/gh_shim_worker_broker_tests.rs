@@ -281,6 +281,7 @@ fn gh_shim_broker_refusal_texts_are_pinned() {
         ("broker_timeout", "gh read timed out. Retry, or run fewer gh commands in parallel."),
         ("broker_unavailable", "gh reads are unavailable in this bash command. Start a new bash command."),
         ("watch_interval", "--interval must be a positive number of seconds"),
+        ("run_download", "gh run download isn't available in worker shells; ask your head agent to download the artifacts"),
         ("command_ended", "gh read failed: command_ended. Start a new bash command."),
     ] {
         assert_eq!(failure_text(code), text);
@@ -489,9 +490,35 @@ async fn gh_shim_broker_t4_real_listener_bounds_connections_and_read_deadlines()
 
 #[tokio::test]
 async fn gh_shim_broker_four_admitted_connections_queue_instead_of_eof() {
+    let _state = installed_worker_manifest();
     let root = tempfile::tempdir().unwrap();
+    for arguments in [
+        vec!["init", "-q"],
+        vec!["config", "remote.origin.url", "cortexkit/aft"],
+    ] {
+        let mut command = std::process::Command::new("git");
+        command.arg("-C").arg(root.path()).args(arguments);
+        assert!(crate::test_env::apply_hermetic_git_env(&mut command)
+            .status()
+            .unwrap()
+            .success());
+    }
     let socket = root.path().join("broker.sock");
-    let (service, _receiver) = optional_service(root.path());
+    let ticket = PendingTicket::issue("concurrent-worker-reads", root.path().to_str().unwrap());
+    ticket.reserve_task("concurrent-worker-command");
+    let (capability, _) = ticket
+        .worker_read_capability(
+            socket.clone(),
+            Instant::now() + Duration::from_secs(60),
+            &stamp(),
+        )
+        .unwrap();
+    let (service, mut receiver) = optional_service(root.path());
+    let scopes = tokio::spawn(async move {
+        while let Some(query) = receiver.recv().await {
+            let _ = query.reply.send(Some(stamp()));
+        }
+    });
     let tasks = crate::bash_background::BgTaskRegistry::default();
     let upstream = Arc::new(Semaphore::new(2));
     let occupied = upstream.clone().acquire_many_owned(2).await.unwrap();
@@ -500,12 +527,10 @@ async fn gh_shim_broker_four_admitted_connections_queue_instead_of_eof() {
     let mut connections = tokio::task::JoinSet::new();
     for _ in 0..CONNECTIONS {
         let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
-        // The invalid bearer still traverses admission and must receive the
-        // authentication refusal, rather than losing the connection to load.
         write_frame(
             &mut client,
             &serde_json::to_vec(&Envelope {
-                capability: "invalid-bearer".into(),
+                capability: capability.clone(),
                 operation: Operation::SessionContext,
             })
             .unwrap(),
@@ -536,7 +561,8 @@ async fn gh_shim_broker_four_admitted_connections_queue_instead_of_eof() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(reply["data"]["refusal_code"], "capability_unknown");
+        assert_eq!(reply["status"], "ok", "{reply}");
+        assert_eq!(reply["data"]["repository"], "cortexkit/aft");
     }
     while let Some(result) = connections.join_next().await {
         result.unwrap();
@@ -547,12 +573,20 @@ async fn gh_shim_broker_four_admitted_connections_queue_instead_of_eof() {
         "burst must release all slots"
     );
     let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
-    write_frame(&mut client, b"{}").await.unwrap();
+    write_frame(
+        &mut client,
+        &serde_json::to_vec(&Envelope {
+            capability,
+            operation: Operation::SessionContext,
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
     connection(server, &socket, &service, &tasks, &upstream, &budget).await;
-    assert_eq!(
-        read_reply(&mut client).await.unwrap()["data"]["refusal_code"],
-        "request_malformed"
-    );
+    assert_eq!(read_reply(&mut client).await.unwrap()["status"], "ok");
+    scopes.abort();
+    assert!(scopes.await.unwrap_err().is_cancelled());
 }
 
 #[tokio::test]
@@ -1039,11 +1073,10 @@ async fn gh_shim_broker_audit_excludes_capability_file_and_query_secrets() {
     );
 }
 
-#[tokio::test]
-async fn gh_shim_broker_raw_request_uses_real_signed_manifest_binding() {
+fn installed_worker_manifest() -> crate::test_env::GhShimStateGuard {
     use base64::Engine;
     use ring::signature::Ed25519KeyPair;
-    let _state = crate::test_env::gh_shim_state_guard();
+    let state = crate::test_env::gh_shim_state_guard();
     let root = PathBuf::from(std::env::var_os(STATE_ENV).unwrap());
     let mut manifest: Value =
         serde_json::from_str(include_str!("../tests/fixtures/gh_shim/v20-manifest.json")).unwrap();
@@ -1060,6 +1093,12 @@ async fn gh_shim_broker_raw_request_uses_real_signed_manifest_binding() {
     let bytes = serde_json::to_vec(&manifest).unwrap();
     let key = Ed25519KeyPair::from_seed_unchecked(&SEED).unwrap();
     std::fs::write(root.join("gh-routing-manifest.json"),serde_json::to_vec(&json!({"artifact_id":"gh-routing-manifest","envelope_version":2,"key_id":"gh-routing-dev-test-key-v1","fetched_at_unix_secs":now,"signature":base64::engine::general_purpose::STANDARD.encode(key.sign(&bytes).as_ref()),"manifest_bytes":String::from_utf8(bytes).unwrap()})).unwrap()).unwrap();
+    state
+}
+
+#[tokio::test]
+async fn gh_shim_broker_raw_request_uses_real_signed_manifest_binding() {
+    let _state = installed_worker_manifest();
     struct SignedTransport(AtomicUsize);
     impl RelayTransport for SignedTransport {
         fn opens_scoped_routes(&self) -> bool {
