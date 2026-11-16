@@ -1,0 +1,1 @@
+- AFT announces tool-display records on the CortexKit bus for fetching during delivery and for at least ten minutes after the wake, subject to bounded-memory eviction; shed details and records lost on restart are unavailable, and existing display pushes are unchanged.

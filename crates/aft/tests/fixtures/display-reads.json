@@ -1,0 +1,17 @@
+{
+  "request":{"name":"display.read","arguments":{"record_id":"record:1"}},
+  "reply":{"runner":{"kind":"reserved","module_id":"runner"},"call_key":"call:1","kind":"record","schema_pin":"pin:1","body":{"durationMs":1,"outcome":"success"}},
+  "refusals":[
+    {"code":"display_read_denied","message":"display reads are restricted to the discovered display server"},
+    {"code":"display_record_unknown","message":"display record is unknown"},
+    {"code":"invalid_params","message":"invalid display params","detail":{"field":"record_id"}},
+    {"code":"module_warming","message":"provider is not ready"}
+  ],
+  "event":{
+    "name":"display_record_ready",
+    "version":1,
+    "subject":"event.provider.display_record_ready.v1",
+    "headers":{"Nats-Msg-Id":"record:1"},
+    "body":{"record_id":"record:1"}
+  }
+}

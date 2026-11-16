@@ -457,9 +457,15 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "subc/rich_ui/outbox.rs",
-        enclosing_item: "admit, retry, pop_due",
+        enclosing_item: "admit, retry, pop_due, ReadCache::insert, ReadCache::prune",
         location_or_primitive: "MAX_CALLS, MAX_BYTES, EXPIRY, attempts",
         reason: "Optional display delivery quotas bound pending snapshots and retries, never a tool's result list or execution.",
+    },
+    ExclusionEntry {
+        file: "subc/rich_ui/outbox/reads.rs",
+        enclosing_item: "ReadCache::insert, ReadCache::prune",
+        location_or_primitive: "MAX_CALLS, MAX_BYTES, MIN_READ_WINDOW, EXPIRY",
+        reason: "Process-local display pull copies have bounded count, bytes and retention; early pressure eviction is counted in bus health and missing records return the protocol's unknown refusal, not a truncated tool result.",
     },
     ExclusionEntry {
         file: "subc/rich_ui/display.rs",

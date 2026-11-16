@@ -23,6 +23,7 @@ use tokio::sync::{oneshot, Notify};
 use crate::context::App;
 use crate::db::call_ledger::{Key, LATE_RESULTS_PAGE_MAX, UNACKED_RESULTS_MAX};
 
+mod display;
 pub(crate) mod readers;
 mod views;
 
@@ -33,6 +34,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const EVENT: &str = "late_result_ready";
 const LIVE_SCAN_SQL: &str = "SELECT rowid,settled_at,seq,CASE WHEN acked=0 AND late_entry IS NOT NULL AND seq>COALESCE((SELECT through_seq FROM call_ledger_ack WHERE custodian=call_ledger.custodian),0) THEN custodian END,carrier,call_key,event_id,outcome FROM call_ledger WHERE state='Settled' AND (settled_at,rowid)>(?1,?2) ORDER BY settled_at,rowid LIMIT ?3";
 static SETTLED: LazyLock<Notify> = LazyLock::new(Notify::new);
+static DISPLAY: LazyLock<Notify> = LazyLock::new(Notify::new);
 static HEALTH: LazyLock<parking_lot::Mutex<BusHealth>> = LazyLock::new(Default::default);
 
 #[derive(Default, Serialize)]
@@ -42,6 +44,10 @@ struct BusHealth {
     published: u64,
     publish_failures: u64,
     last_error: Option<&'static str>,
+    display_published: u64,
+    display_publish_failures: u64,
+    display_last_error: Option<&'static str>,
+    display_read_evicted_early: u64,
     cards: readers::ReaderHealth,
     sendstate: readers::ReaderHealth,
     views: views::ViewsHealth,
@@ -82,6 +88,22 @@ fn failure(code: &'static str) {
 pub(crate) fn settled() {
     // Coalesced hints carry no payload and never wait for the publisher.
     SETTLED.notify_one();
+}
+
+pub(crate) fn display_committed() {
+    DISPLAY.notify_one();
+}
+
+pub(crate) fn display_read_evicted_early(reason: &'static str) {
+    let mut health = HEALTH.lock();
+    health.display_read_evicted_early = health.display_read_evicted_early.saturating_add(1);
+    if health.warned.insert(reason) {
+        log::warn!("display pull retention shortened by pressure: {reason}");
+    }
+}
+
+pub(crate) fn display_reader() -> Result<Option<String>, subc_protocol::ErrorBody> {
+    display::reader()
 }
 
 pub(crate) struct Worker {
@@ -159,6 +181,7 @@ async fn run(app: Arc<App>, path: PathBuf, database: PathBuf, mut stopped: onesh
     let daemon_connected = Arc::new(AtomicBool::new(true));
     let state = daemon_connected.clone();
     consumer.on_connection_state(move |event| {
+        display::invalidate_reader();
         state.store(
             matches!(event, ConnectionState::Restored { .. }),
             Ordering::Relaxed,
@@ -166,10 +189,12 @@ async fn run(app: Arc<App>, path: PathBuf, database: PathBuf, mut stopped: onesh
     });
     tokio::select! {
         _ = &mut stopped => {},
-        _ = drive(app, database, consumer.clone(), daemon_connected) => {},
+        _ = drive(app, database, consumer.clone(), daemon_connected.clone()) => {},
+        _ = display::watch_reader(consumer.clone(), daemon_connected) => {},
     }
     // Bound transport cleanup even if the daemon or NATS stopped responding.
     let _ = tokio::time::timeout(IO_TIMEOUT, consumer.close()).await;
+    display::invalidate_reader();
     HEALTH.lock().connected = false;
 }
 
@@ -230,6 +255,7 @@ async fn drive(
             services = Some(readers::Services::start(Arc::clone(client)));
         }
         HEALTH.lock().connected = connected;
+        display::publish_one(client).await;
         let mut publisher = RealPublisher(client);
         let due = state.due();
         if !due.is_empty() {
@@ -298,6 +324,7 @@ async fn drive(
 async fn wait_for_work(settled: &Notify, retry: Option<tokio::time::Instant>) -> bool {
     tokio::select! {
         _ = settled.notified() => true,
+        _ = DISPLAY.notified() => false,
         _ = async {
             if let Some(deadline) = retry { tokio::time::sleep_until(deadline).await; }
             else { std::future::pending::<()>().await; }

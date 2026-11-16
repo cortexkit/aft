@@ -1676,6 +1676,10 @@ enum ManagementAdmission {
     PermissionsOnly,
     /// Phone and simulator operator routes have read-only shell authority only.
     ShellsOnly,
+    /// Modules outside the first-party allowlist may request display reads;
+    /// each read still checks the caller against the catalog's single module
+    /// declaring the display capability.
+    DisplayOnly,
     /// Occipital relays person commands and reads provider metadata, but has no
     /// general management authority or project-tool access on this route.
     Occipital,
@@ -6112,6 +6116,14 @@ where
                         let route = route_key(frame.header.channel, frame.header.epoch);
                         let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies };
                         if let Ok(body) = decoded.body() {
+                            if body.get("name").or_else(|| body.get("op")).and_then(Value::as_str)
+                                == Some(cortexkit_role_tool_display::DISPLAY_READ) {
+                                let principal = management_routes.get(&route)
+                                    .filter(|identity| !matches!(identity.admission, ManagementAdmission::ProjectFree { .. }))
+                                    .and_then(|identity| identity.principal.clone());
+                                dispatch_display_read(&writer_tx, &dispatch_path_metrics, &decoded.frame, principal, body);
+                                continue;
+                            }
                             if user_commands::is_request(body) {
                                 let principal = management_routes.get(&route).and_then(|identity| identity.principal.as_ref());
                                 if let Err(error) = user_commands::dispatch(&writer_tx, &dispatch_path_metrics, &decoded.frame, principal, body, &routes, &executor).await {
@@ -8693,6 +8705,7 @@ async fn handle_control_request(
                     && diagnostics_findings::admit_flow(scope.as_ref()).is_err()
                     && !permissions::is_cingulate(principal.as_ref())
                     && !user_commands::is_occipital(principal.as_ref())
+                    && !matches!(principal.as_ref(), Some(Principal::Reserved { .. }))
                     && !shells::operator(
                         principal.as_ref(),
                         Some(&identity.harness),
@@ -8743,6 +8756,10 @@ async fn handle_control_request(
                     // Cingulate is not a first-party AFT principal: it binds
                     // only to list and revoke the person's saved grants.
                     ManagementAdmission::PermissionsOnly
+                } else if !matches!(bind_trust, BindTrust::FirstParty)
+                    && matches!(principal.as_ref(), Some(Principal::Reserved { .. }))
+                {
+                    ManagementAdmission::DisplayOnly
                 } else {
                     ManagementAdmission::FirstParty
                 };
@@ -9269,6 +9286,52 @@ async fn handle_control_request(
             .await
         }
     }
+}
+
+fn dispatch_display_read(
+    tx: &WriterSender,
+    metrics: &Arc<DispatchPathMetrics>,
+    frame: &Frame,
+    principal: Option<Principal>,
+    body: &Value,
+) {
+    let arguments = if body.get("op").is_some() {
+        let mut arguments = body.clone();
+        arguments
+            .as_object_mut()
+            .expect("named request")
+            .remove("op");
+        arguments
+    } else {
+        body.get("arguments").cloned().unwrap_or(Value::Null)
+    };
+    let (tx, metrics, frame) = (tx.clone(), metrics.clone(), frame.clone());
+    let guard = ResponseTaskGuard::new(&metrics);
+    tokio::spawn(async move {
+        let _guard = guard;
+        let result = match rich_ui::display::read(principal.as_ref(), arguments).await {
+            Ok(bytes) => match Frame::build_with_version(
+                frame.header.ver,
+                FrameType::Response,
+                frame.header.flags,
+                frame.header.channel,
+                frame.header.epoch,
+                frame.header.corr,
+                bytes,
+            )
+            .map_err(SubcError::FrameBuild)
+            {
+                Ok(response) => {
+                    send_reliable_writer_frame(&tx, &metrics, response, "display read").await
+                }
+                Err(error) => Err(error),
+            },
+            Err(error) => send_provider_error(&tx, &metrics, &frame, error).await,
+        };
+        if let Err(error) = result {
+            log::warn!("display read reply: {error}");
+        }
+    });
 }
 
 /// Metadata needs no project. Only rootless provider routes also retain the
@@ -10416,6 +10479,7 @@ fn log_management_refusal(identity: &ManagementIdentity, frame: &Frame, error: &
         ManagementAdmission::FlowOnly => "FlowOnly",
         ManagementAdmission::PermissionsOnly => "PermissionsOnly",
         ManagementAdmission::ShellsOnly => "ShellsOnly",
+        ManagementAdmission::DisplayOnly => "DisplayOnly",
         ManagementAdmission::Occipital => "Occipital",
         ManagementAdmission::ProjectFree { .. } => "ProjectFree",
     };
@@ -10431,6 +10495,21 @@ fn admit_management_flow_request(
     identity: &ManagementIdentity,
     body: Option<&Value>,
 ) -> Result<(), ErrorBody> {
+    if identity.admission == ManagementAdmission::DisplayOnly {
+        return if body.is_some_and(|body| {
+            body.get("name")
+                .or_else(|| body.get("op"))
+                .and_then(Value::as_str)
+                == Some(cortexkit_role_tool_display::DISPLAY_READ)
+        }) {
+            Ok(())
+        } else {
+            Err(ErrorBody::new(
+                "route_not_admitted",
+                "this route serves only display reads",
+            ))
+        };
+    }
     if identity.admission == ManagementAdmission::Occipital {
         return if body.is_some_and(|body| {
             user_commands::is_request(body)
@@ -15743,6 +15822,77 @@ mod tests {
         test_root, wait_for_actor_root_count, wait_for_watcher_count,
     };
     use super::*;
+
+    #[test]
+    fn display_read_only_admission_preserves_other_management_and_occipital_limits() {
+        let display = ManagementIdentity {
+            principal: Some(Principal::Reserved {
+                module_id: "third-party-display".into(),
+            }),
+            admission: ManagementAdmission::DisplayOnly,
+            ..Default::default()
+        };
+        assert_eq!(
+            trust_for_principal(&display.principal),
+            BindTrust::Untrusted
+        );
+        let manifest = manifest::build_manifest();
+        for role in manifest.provides {
+            if let subc_protocol::manifest::ProviderRole::ManagementSurface { operations, .. } =
+                role
+            {
+                for op in operations {
+                    let request = json!({"name":op.name,"arguments":{}});
+                    let admitted = admit_management_flow_request(&display, Some(&request)).is_ok();
+                    assert_eq!(
+                        admitted,
+                        op.name == cortexkit_role_tool_display::DISPLAY_READ,
+                        "{}",
+                        op.name
+                    );
+                }
+            }
+        }
+        let occipital = ManagementIdentity {
+            admission: ManagementAdmission::Occipital,
+            ..Default::default()
+        };
+        for name in ["role.describe", "tool.views", "tool.catalog"] {
+            assert!(admit_management_flow_request(&occipital, Some(&json!({"name":name}))).is_ok());
+        }
+        for name in ["health.digest", "late_results", "memory.census"] {
+            assert!(
+                admit_management_flow_request(&occipital, Some(&json!({"name":name}))).is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn display_read_dispatch_uses_final_denied_for_non_display_routes() {
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (tx, mut rx) = mpsc::channel(4);
+        let body = json!({"name":cortexkit_role_tool_display::DISPLAY_READ,"arguments":{"record_id":"record:1"}});
+        let request = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            9,
+            1,
+            42,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap();
+        dispatch_display_read(&tx, &metrics, &request, None, &body);
+        let response = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.header.ty, FrameType::Error);
+        assert_eq!(response.header.corr, 42);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&response.body).unwrap()["code"],
+            cortexkit_role_tool_display::DISPLAY_READ_DENIED
+        );
+    }
 
     #[test]
     fn subc_startup_takes_storage_lease_before_connecting() {
