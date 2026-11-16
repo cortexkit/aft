@@ -265,10 +265,7 @@ async fn scope_watch_grant_and_held_mutations_update_selectors_without_census_ti
     );
     turns().await;
     grants::revoke(&db.lock().unwrap(), &key, &grant.path).unwrap();
-    let cancel = tokio::time::timeout(Duration::from_secs(2), frames.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let cancel = cancellation(&pending, &mut frames, watch.header.corr).await;
     assert_eq!(
         cancel.header.ty,
         FrameType::Cancel,
@@ -308,10 +305,7 @@ async fn scope_watch_grant_and_held_mutations_update_selectors_without_census_ti
         ledger::now_ms(),
     )
     .unwrap();
-    let cancel = tokio::time::timeout(Duration::from_secs(2), frames.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let cancel = cancellation(&pending, &mut frames, watch.header.corr).await;
     assert_eq!(
         cancel.header.ty,
         FrameType::Cancel,
@@ -531,18 +525,24 @@ async fn scope_watch_connection_handoff_replays_durable_end_and_cleanup_is_idemp
         second_runs,
         replacement_service,
     );
-    let rearm = request(&mut second_frames, "scope.watch").await;
+    let rearm = opening_watch(&second_pending, &mut second_frames).await;
     snapshot_status(&second_pending, &rearm, ScopeWatchStatus::Ended);
-    let query = request(&mut second_frames, "scope.describe").await;
-    response(
-        &second_pending,
-        &query,
-        answer(&scope, subc_protocol::scope::ScopeStatus::Ended, 1),
-    );
     turns().await;
     release.send(()).unwrap();
     blocker.await.unwrap();
-    let end = tokio::time::timeout(Duration::from_secs(5), second_ended.recv())
+    let end = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                notice = second_ended.recv() => break notice,
+                Some(query) = second_frames.recv() => {
+                    if query.header.ty == FrameType::Cancel { continue; }
+                    let body: Value = serde_json::from_slice(&query.body).unwrap();
+                    assert_eq!(body["op"], "scope.describe");
+                    response(&second_pending, &query, answer(&scope, subc_protocol::scope::ScopeStatus::Ended, 1));
+                }
+            }
+        }
+    })
         .await
         .unwrap()
         .unwrap();
@@ -710,6 +710,29 @@ async fn opening_watch(
             ),
             op => panic!("unexpected opening op {op}"),
         }
+    }
+}
+async fn cancellation(
+    pending: &readiness::PendingControlReplies,
+    frames: &mut mpsc::Receiver<WriterFrame>,
+    corr: u64,
+) -> WriterFrame {
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if frame.header.ty == FrameType::Cancel {
+            assert_eq!(frame.header.corr, corr);
+            return frame;
+        }
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(body["op"], "scope.describe");
+        response(
+            pending,
+            &frame,
+            answer(&stamp(0), subc_protocol::scope::ScopeStatus::Live, 1),
+        );
     }
 }
 fn control(

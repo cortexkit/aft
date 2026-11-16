@@ -52,6 +52,29 @@ fn listed(db: &Db) -> Value {
 }
 
 #[tokio::test]
+async fn saved_grant_sweep_rechecks_coverage_before_each_describe() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let (dir, db) = fixture();
+    save(&db, dir.path(), "first", 1);
+    save(&db, dir.path(), "second", 1);
+    let protected = AtomicBool::new(false);
+    let calls = AtomicUsize::new(0);
+    let stats = tick_unwatched(
+        db,
+        &mut None,
+        |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            protected.store(true, Ordering::Relaxed);
+            std::future::ready(Ok(reply(ScopeStatus::Live, true)))
+        },
+        |_| protected.load(Ordering::Relaxed),
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.described, 1);
+}
+
+#[tokio::test]
 async fn saved_grant_sweep_only_deletes_definite_ends() {
     let (dir, db) = fixture();
     for (name, expected_end) in [

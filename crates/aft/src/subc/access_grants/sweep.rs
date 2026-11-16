@@ -55,17 +55,18 @@ where
         Output = Result<ModuleControlResponseToModule, readiness::ControlError>,
     >,
 {
-    tick_unwatched(db, cursor, describe, &Default::default()).await
+    tick_unwatched(db, cursor, describe, |_| false).await
 }
 
-async fn tick_unwatched<F, Fut>(
+async fn tick_unwatched<F, Fut, C>(
     db: Db,
     cursor: &mut Option<store::ScopeKey>,
     describe: F,
-    covered: &super::super::scope_watch::Coverage,
+    covered: C,
 ) -> Stats
 where
     F: Fn(ScopeStamp) -> Fut,
+    C: Fn(&ScopeStamp) -> bool,
     Fut: std::future::Future<
         Output = Result<ModuleControlResponseToModule, readiness::ControlError>,
     >,
@@ -102,7 +103,7 @@ where
             }
         };
         let reference = (key.owner.clone(), key.scope_ref.clone());
-        if covered.keys.contains(&scope_describe::stamp_key(&request)) {
+        if covered(&request) {
             continue;
         }
         if !replies.contains_key(&reference) {
@@ -157,7 +158,6 @@ pub(in crate::subc) async fn run(
                 return;
             }
         }
-        let coverage = covered.borrow().clone();
         let executor = executor.clone();
         let dbs = tokio::task::spawn_blocking(move || {
             let mut dbs = BTreeMap::new();
@@ -186,7 +186,12 @@ pub(in crate::subc) async fn run(
                         let control = control.clone();
                         async move { control.describe(&stamp).await }
                     },
-                    &coverage,
+                    |stamp| {
+                        // A snapshot may arrive while the database batch is
+                        // being read. Check coverage at the actual RPC boundary.
+                        let latest = covered.borrow();
+                        latest.all || latest.keys.contains(&scope_describe::stamp_key(stamp))
+                    },
                 )
                 .await;
                 report(&control.metrics, stats);
