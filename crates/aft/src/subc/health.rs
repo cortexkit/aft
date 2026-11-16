@@ -1895,8 +1895,9 @@ pub(super) fn route_bind_deadline_refusal(
 const HEALTH_ROOT_DETAIL_CAP: usize = crate::memory::MEMORY_SNAPSHOT_ROOT_DETAIL_CAP;
 // SUBC caches at most 16 KiB; reserve 4 KiB for its envelope and future counters.
 const HEALTH_METRICS_BUDGET_BYTES: usize = 12 * 1024;
-// The 95-root fixture needs 5,197 bytes for its five actionable rows alone.
-// A 6 KiB (one-half) project share keeps those facts, unlike a one-third share.
+// Before grouping, the 95-root fixture retained 5,197 bytes for its five
+// actionable rows alone. A 6 KiB (one-half) ceiling leaves room for those facts
+// and a small status summary, unlike a one-third ceiling.
 // Repeated rebuilds used 11,129 bytes for 52 roots and 21,401 for 100 roots,
 // displacing even memory and runtime. Group them within this share; process
 // telemetry is allocated first; this is a ceiling, not reserved project space.
@@ -6233,10 +6234,32 @@ mod tests {
         assert!(refresh_metrics_bytes(&mut metrics) > HEALTH_METRICS_BUDGET_BYTES);
         budget_health_metrics(&mut metrics);
         assert!(serde_json::to_vec(&metrics).unwrap().len() <= HEALTH_METRICS_BUDGET_BYTES);
+        let retained = metrics["roots"].as_array().unwrap();
+        assert_eq!(retained.len(), roots.as_array().unwrap().len());
+        for (row, original) in retained.iter().zip(roots.as_array().unwrap()) {
+            assert_eq!(row["project_root"], original["project_root"]);
+            assert_eq!(row["state"], original["state"]);
+            for component in ["search_index", "semantic_index", "callgraph_store", "tier2"] {
+                assert_eq!(row[component]["status"], original[component]["status"]);
+            }
+            for field in [
+                "reason",
+                "since_ms",
+                "next_retry_ms",
+                "files_failed",
+                "chunks_failed",
+            ] {
+                assert_eq!(
+                    row["semantic_index"][field], original["semantic_index"][field],
+                    "{field}"
+                );
+            }
+        }
         assert_eq!(
-            metrics["roots"], roots,
-            "bounded failure evidence fits within the project share"
+            metrics["roots"][0]["semantic_index"],
+            roots[0]["semantic_index"]
         );
+        assert_eq!(metrics["root_details_reduced"], 3);
         assert_eq!(metrics["root_details_omitted"], 0);
         assert_eq!(
             metrics["roots"][0]["semantic_index"]["reason"],
