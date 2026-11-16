@@ -504,8 +504,29 @@ async fn gh_shim_broker_four_admitted_connections_queue_instead_of_eof() {
             .success());
     }
     let socket = root.path().join("broker.sock");
+    let tasks = crate::bash_background::BgTaskRegistry::default();
+    let release = root.path().join("release-command");
+    let task_id = tasks
+        .spawn_with_shell_in_slot(
+            crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+            &crate::test_gate::gate(&format!("'{}'", release.display()), "sleep 0.01"),
+            crate::bash_background::BashShell::Bash,
+            PathBuf::from("/bin/bash"),
+            "concurrent-worker-reads".into(),
+            root.path().to_path_buf(),
+            Default::default(),
+            crate::bash_background::HardKill::After(Duration::from_secs(10)),
+            None,
+            root.path().to_path_buf(),
+            crate::bash_background::TaskSlot::Foreground,
+            false,
+            false,
+            Some(root.path().to_path_buf()),
+        )
+        .unwrap();
+    assert!(!tasks.is_task_terminal(&task_id));
     let ticket = PendingTicket::issue("concurrent-worker-reads", root.path().to_str().unwrap());
-    ticket.reserve_task("concurrent-worker-command");
+    ticket.reserve_task(&task_id);
     let (capability, _) = ticket
         .worker_read_capability(
             socket.clone(),
@@ -519,7 +540,6 @@ async fn gh_shim_broker_four_admitted_connections_queue_instead_of_eof() {
             let _ = query.reply.send(Some(stamp()));
         }
     });
-    let tasks = crate::bash_background::BgTaskRegistry::default();
     let upstream = Arc::new(Semaphore::new(2));
     let occupied = upstream.clone().acquire_many_owned(2).await.unwrap();
     let budget = Arc::new(budget());
@@ -587,6 +607,14 @@ async fn gh_shim_broker_four_admitted_connections_queue_instead_of_eof() {
     assert_eq!(read_reply(&mut client).await.unwrap()["status"], "ok");
     scopes.abort();
     assert!(scopes.await.unwrap_err().is_cancelled());
+    std::fs::write(release, b"run").unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !tasks.is_task_terminal(&task_id) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the fixture's real command must end");
 }
 
 #[tokio::test]
