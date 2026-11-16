@@ -76,7 +76,14 @@ async fn scope_watch_end_kills_only_after_confirmation_and_live_rebind_kills_not
     assert!(executor.register_actor(root.clone(), ctx.clone()));
     let (control, pending, mut frames) = control(&["scope.describe", "scope.watch"]);
     let runs = Arc::new(run_scope::RunScopes::new(control.clone()));
-    let speech = crate::gh_shim_speech::service::record_service(dir.path());
+    let relay = crate::gh_shim_relay::GhRelay::new(dir.path().join("unused-connection.json"));
+    let speech = crate::gh_shim_speech::service::start(
+        dir.path(),
+        &relay,
+        Arc::new(|_| Box::pin(async { Err("describe_unavailable".into()) })),
+        "watch-speech-generation".into(),
+        true,
+    );
     let (_handle, mut ended, worker) = start_for_speech(control.clone(), executor, runs, speech);
     turns().await;
     let scope = stamp(0);
@@ -394,6 +401,200 @@ async fn scope_watch_shell_terminal_notification_removes_selector_without_end_pr
     worker.abort();
     let _ = worker.await;
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn scope_watch_connection_handoff_replays_durable_end_and_cleanup_is_idempotent() {
+    use crate::db::{access_grants as grants, call_ledger as ledger};
+    let (dir, root) = test_support::test_root("scope-watch-handoff");
+    let ctx = test_support::test_ctx();
+    ctx.update_config(|config| {
+        config.project_root = Some(root.as_path().into());
+        config.storage_dir = Some(dir.path().join("store"));
+    });
+    let db = Arc::new(StdMutex::new(
+        crate::db::open(&dir.path().join("aft.db")).unwrap(),
+    ));
+    ctx.set_db(db.clone());
+    let executor = Arc::new(Executor::new());
+    executor.register_actor(root.clone(), ctx.clone());
+    let scope = stamp(12);
+    let task = spawn_scoped(&ctx, &root, &scope, "sleep 30");
+    let grant_key = grants::ScopeKey::from_stamp(&scope);
+    let ledger_key = ledger::Key {
+        carrier: "direct".into(),
+        call_key: "handoff-held".into(),
+    };
+    {
+        let conn = db.lock().unwrap();
+        grants::register_scope(&conn, &grant_key, None, &crate::config::Config::default()).unwrap();
+        grants::insert(
+            &conn,
+            &grant_key,
+            &crate::access_policy::AccessGrant {
+                path: root.as_path().join("grant"),
+                kind: crate::access_policy::GrantKind::File,
+                operation: crate::access_policy::AccessOperation::Read,
+            },
+        )
+        .unwrap();
+        ledger::admit(
+            &conn,
+            &ledger_key,
+            "digest",
+            Some(&ledger::ScopeIdentity {
+                owner: "direct".into(),
+                scope_ref: scope.scope_ref.clone(),
+                scope_epoch: 1,
+            }),
+            ledger::State::Prepared,
+        )
+        .unwrap();
+    }
+    let (entered, started) = oneshot::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    let blocker = executor.submit_async(
+        root.clone(),
+        Lane::CallLedger,
+        "handoff-block".into(),
+        Box::new(move |_| {
+            let _ = entered.send(());
+            let _ = held.recv_timeout(Duration::from_secs(20));
+            Response::success("handoff-block", json!({}))
+        }),
+    );
+    tokio::time::timeout(Duration::from_secs(5), started)
+        .await
+        .unwrap()
+        .unwrap();
+    let relay = crate::gh_shim_relay::GhRelay::new(dir.path().join("unused-connection.json"));
+    let service = crate::gh_shim_speech::service::start(
+        dir.path(),
+        &relay,
+        Arc::new(|_| Box::pin(async { Err("describe_unavailable".into()) })),
+        "handoff-one".into(),
+        true,
+    );
+    let (first_control, first_pending, mut first_frames) =
+        control(&["scope.describe", "scope.watch"]);
+    let first_runs = Arc::new(run_scope::RunScopes::new(first_control.clone()));
+    let (_first_handle, _first_ended, first_worker) =
+        start_for_speech(first_control, executor.clone(), first_runs, service.clone());
+    let watch = request(&mut first_frames, "scope.watch").await;
+    snapshot(&first_pending, &watch);
+    let query = request(&mut first_frames, "scope.describe").await;
+    response(
+        &first_pending,
+        &query,
+        answer(&scope, subc_protocol::scope::ScopeStatus::Live, 1),
+    );
+    turns().await;
+    push(&first_pending, &watch, &scope, ScopeWatchEvent::Ended);
+    let query = request(&mut first_frames, "scope.describe").await;
+    response(
+        &first_pending,
+        &query,
+        answer(&scope, subc_protocol::scope::ScopeStatus::Ended, 1),
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !service.store.scope_ended(&scope).unwrap()
+            || executor
+                .queued_lane_for_test(&root, "scope-ended")
+                .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        ledger::get(&db.lock().unwrap(), &ledger_key)
+            .unwrap()
+            .unwrap()
+            .state,
+        ledger::State::Prepared
+    );
+    first_worker.abort();
+    let _ = first_worker.await;
+    let replacement_service = crate::gh_shim_speech::service::start(
+        dir.path(),
+        &relay,
+        Arc::new(|_| Box::pin(async { Err("describe_unavailable".into()) })),
+        "handoff-two".into(),
+        true,
+    );
+    assert!(Arc::ptr_eq(&service, &replacement_service));
+    let (second_control, second_pending, mut second_frames) =
+        control(&["scope.describe", "scope.watch"]);
+    let second_runs = Arc::new(run_scope::RunScopes::new(second_control.clone()));
+    let (second_handle, mut second_ended, second_worker) = start_for_speech(
+        second_control,
+        executor.clone(),
+        second_runs,
+        replacement_service,
+    );
+    let rearm = request(&mut second_frames, "scope.watch").await;
+    snapshot_status(&second_pending, &rearm, ScopeWatchStatus::Ended);
+    let query = request(&mut second_frames, "scope.describe").await;
+    response(
+        &second_pending,
+        &query,
+        answer(&scope, subc_protocol::scope::ScopeStatus::Ended, 1),
+    );
+    turns().await;
+    release.send(()).unwrap();
+    blocker.await.unwrap();
+    let end = tokio::time::timeout(Duration::from_secs(5), second_ended.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stamp_key(&end.stamp), stamp_key(&scope));
+    let status = || {
+        ctx.bash_background()
+            .status(
+                &task,
+                "watch-session",
+                Some(root.as_path()),
+                Some(&ctx.storage_dir()),
+                0,
+            )
+            .unwrap()
+            .info
+    };
+    assert_eq!(
+        status().status,
+        crate::bash_background::BgTaskStatus::Killed
+    );
+    assert_eq!(status().status_reason.as_deref(), Some("scope_revoked"));
+    let sequence = ledger::get(&db.lock().unwrap(), &ledger_key)
+        .unwrap()
+        .unwrap()
+        .seq;
+    let replay = revoke(executor, &scope).await;
+    assert!(replay.complete && replay.keys.is_empty());
+    let conn = db.lock().unwrap();
+    let row = ledger::get(&conn, &ledger_key).unwrap().unwrap();
+    assert_eq!(row.state, ledger::State::Settled);
+    assert_eq!(
+        row.seq, sequence,
+        "repeated cleanup must not create another settlement"
+    );
+    assert!(grants::list(&conn, &grant_key).unwrap().is_empty());
+    drop(conn);
+    second_handle.observed.send(scope.clone()).unwrap();
+    second_handle.observed.send(scope).unwrap();
+    turns().await;
+    assert!(
+        second_ended.try_recv().is_err(),
+        "duplicate committed notices must not repeat cleanup notifications"
+    );
+    assert_eq!(
+        status().status,
+        crate::bash_background::BgTaskStatus::Killed
+    );
+    second_worker.abort();
+    let _ = second_worker.await;
+}
 fn response(
     pending: &readiness::PendingControlReplies,
     request: &Frame,
@@ -412,6 +613,13 @@ fn response(
     ));
 }
 fn snapshot(pending: &readiness::PendingControlReplies, request: &Frame) -> usize {
+    snapshot_status(pending, request, ScopeWatchStatus::Live)
+}
+fn snapshot_status(
+    pending: &readiness::PendingControlReplies,
+    request: &Frame,
+    status: ScopeWatchStatus,
+) -> usize {
     let body: Value = serde_json::from_slice(&request.body).unwrap();
     let selectors: Vec<subc_client_rs::ScopeWatchSelector> =
         serde_json::from_value(body["scopes"].clone()).unwrap();
@@ -426,7 +634,7 @@ fn snapshot(pending: &readiness::PendingControlReplies, request: &Frame) -> usiz
                 .map(|selector| ScopeWatchState {
                     scope_ref: selector.scope_ref,
                     epoch: selector.epoch,
-                    status: ScopeWatchStatus::Live,
+                    status: status.clone(),
                     by_epoch: None,
                 })
                 .collect(),

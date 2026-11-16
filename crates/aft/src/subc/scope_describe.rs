@@ -211,6 +211,7 @@ where
         let mut retry = HashMap::new();
         let mut pending = HashSet::new();
         let mut confirmed = HashSet::new();
+        let mut speech_pending = HashSet::new();
         let mut next_poll: HashMap<_, tokio::time::Instant> = HashMap::new();
         // Only unix refreshes the set from secret proxy authorizations.
         #[cfg_attr(not(unix), allow(unused_mut))]
@@ -355,7 +356,7 @@ where
                 }
                 () = &mut grant_sweep => unreachable!("saved grant sweep runs until cancelled"),
                 Some(stamp)=observations.recv()=>{
-                    if let Some(service)=&speech { if confirmed.insert(stamp_key(&stamp)) {
+                    if let Some(service)=&speech { if speech_pending.remove(&stamp_key(&stamp)) || confirmed.insert(stamp_key(&stamp)) {
                         accept_confirmed_end(&executor, run_scopes.as_deref(), &control.metrics, &stamp);
                         let service=service.clone();
                         let executor=executor.clone();
@@ -439,16 +440,27 @@ where
                                 for ctx in executor.actor_contexts() { ctx.bash_background().revoke_secret_authorization(&described); }
                             }).await;
                         }
+                        let strict_end = speech.as_ref().filter(|_| full_stamp).and_then(|service| {
+                            let role=if stamp.attributes.run_id.is_some(){crate::gh_shim_speech::ScopeRole::Run}else{crate::gh_shim_speech::ScopeRole::Authority};
+                            reply.as_ref().ok().and_then(|reply| match crate::gh_shim_speech::scope::validate_scope_identity(&stamp,role,reply,&service.generation(),&generation,crate::db::call_ledger::now_ms() as u64) {
+                                Ok(crate::gh_shim_speech::scope::Answer::Ended(proof)) => Some((service.clone(), proof)),
+                                _ => None,
+                            })
+                        });
                         if reply.as_ref().is_ok_and(describe_answer_ends_scope) {
                             #[cfg(feature = "test-timing-hooks")]
                             crate::slog_info!("scope diagnostic phase=describe_ended scope_epoch={}", stamp.scope_epoch);
                             if confirmed.insert(key.clone()) {
                                 accept_confirmed_end(&executor, run_scopes.as_deref(), &control.metrics, &stamp);
-                                let executor=executor.clone();
-                                let metrics=control.metrics.clone();
-                                let notices=ended.clone();
-                                let stamp=stamp.clone();
-                                fanout.spawn(async move { finish_confirmed_end(executor, stamp, metrics, notices).await });
+                                if strict_end.is_some() {
+                                    speech_pending.insert(key.clone());
+                                } else {
+                                    let executor=executor.clone();
+                                    let metrics=control.metrics.clone();
+                                    let notices=ended.clone();
+                                    let stamp=stamp.clone();
+                                    fanout.spawn(async move { finish_confirmed_end(executor, stamp, metrics, notices).await });
+                                }
                             }
                             retry.remove(&key);
                         } else if !matches!(reply, Ok(ModuleControlResponseToModule::ScopeDescribe { status: subc_protocol::scope::ScopeStatus::Live, .. })) {
@@ -456,18 +468,16 @@ where
                         } else {
                             retry.remove(&key);
                         }
-                        // A scope ref's confirmed end closes ordinary program
-                        // state across rebinds. Speech authority proofs remain
-                        // epoch-specific and must pass their stricter validator.
-                        if let (Some(service), Ok(reply)) = (speech.as_ref().filter(|_| full_stamp), &reply) {
-                            let role=if stamp.attributes.run_id.is_some(){crate::gh_shim_speech::ScopeRole::Run}else{crate::gh_shim_speech::ScopeRole::Authority};
-                            if let Ok(crate::gh_shim_speech::scope::Answer::Ended(proof)) = crate::gh_shim_speech::scope::validate_scope_identity(&stamp,role,reply,&service.generation(),&generation,crate::db::call_ledger::now_ms() as u64) {
+                        // Exact speech proofs retain persistence-before-ledger
+                        // cleanup ordering. If a ref moved to a newer live
+                        // epoch, its old stamp cannot mint that proof; a later
+                        // definitive ref end still closes its ordinary state.
+                        if let Some((service, proof)) = strict_end {
                                 if let Err(error)=service.record_end(&stamp,proof){
                                     log::warn!("speech scope-end persistence failed scope_ref={:?} scope_epoch={} code={:?} reason={}", stamp.scope_ref, stamp.scope_epoch, error.code, error.reason);
                                     control.metrics.scope_descriptions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).cleanup_result(&stamp, false);
                                     kill_only(executor.clone(),&stamp).await;
                                 }
-                            }
                         }
                         if retry.contains_key(&key) { watches.fallback(&key, interval); }
                         // Non-definitive answers and errors retry only on the
