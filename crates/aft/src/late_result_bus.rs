@@ -24,6 +24,7 @@ use crate::context::App;
 use crate::db::call_ledger::{Key, LATE_RESULTS_PAGE_MAX, UNACKED_RESULTS_MAX};
 
 pub(crate) mod readers;
+mod views;
 
 const SCAN_BATCH: usize = 64;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -43,6 +44,7 @@ struct BusHealth {
     last_error: Option<&'static str>,
     cards: readers::ReaderHealth,
     sendstate: readers::ReaderHealth,
+    views: views::ViewsHealth,
 }
 
 pub(crate) fn health() -> serde_json::Value {

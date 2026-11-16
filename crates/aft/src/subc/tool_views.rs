@@ -78,6 +78,21 @@ pub(super) fn answer(body: Value) -> Result<Value, ErrorBody> {
     Ok(serde_json::to_value(reply).expect("view response"))
 }
 
+/// The management route serializes this same answer value without an envelope.
+/// Definitions are immutable for a process; a catalog revision ships on restart.
+pub(crate) fn bus_snapshot() -> Vec<(String, Vec<u8>)> {
+    SHIPPED
+        .keys()
+        .map(|pin| {
+            let reply = answer(serde_json::json!({"pins":[pin]})).expect("shipped pin request");
+            (
+                pin.clone(),
+                serde_json::to_vec(&reply).expect("view response"),
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

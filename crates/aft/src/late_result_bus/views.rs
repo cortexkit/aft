@@ -1,0 +1,151 @@
+//! AFT is the only writer of its per-pin tool.views replies. ck-bus owns bucket
+//! provisioning, retention and permissions; AFT only attaches and puts.
+use std::{collections::HashSet, sync::Arc, time::Duration};
+
+use cortexkit_bus_client::BusClient;
+use cortexkit_bus_naming::{AccountNames, ModuleBucket, MODULE_BUCKETS};
+use serde::Serialize;
+
+use super::{backoff, HEALTH, IO_TIMEOUT};
+
+#[derive(Default, Serialize)]
+pub(super) struct ViewsHealth {
+    attached: bool,
+    reason: Option<&'static str>,
+    writes: u64,
+    skips: u64,
+}
+
+fn declaration() -> &'static ModuleBucket {
+    MODULE_BUCKETS
+        .iter()
+        .find(|row| row.owner == "aft" && row.name == "views")
+        .expect("naming declares AFT views")
+}
+
+/// Pins include tool identity and semantics as well as the schema digest.
+/// Encoding the full UTF-8 pin preserves those distinctions without KV's ':'.
+fn key(pin: &str) -> String {
+    use std::fmt::Write;
+    let mut key = String::with_capacity(pin.len() * 2);
+    for byte in pin.bytes() {
+        write!(&mut key, "{byte:02x}").expect("write to string");
+    }
+    key
+}
+
+fn status(attached: bool, reason: Option<&'static str>) {
+    let mut health = HEALTH.lock();
+    let health = &mut health.views;
+    if health.attached != attached {
+        log::info!(
+            "bus views KV {}",
+            if attached { "attached" } else { "detached" }
+        );
+    }
+    if reason.is_some() && health.reason != reason {
+        log::warn!("bus views KV failure: {}", reason.unwrap());
+    }
+    health.attached = attached;
+    health.reason = reason;
+}
+
+trait Writer {
+    async fn put(&mut self, key: &str, value: Vec<u8>) -> Result<(), &'static str>;
+}
+
+struct RealWriter(async_nats::jetstream::kv::Store);
+impl Writer for RealWriter {
+    async fn put(&mut self, key: &str, value: Vec<u8>) -> Result<(), &'static str> {
+        self.0
+            .put(key, value.into())
+            .await
+            .map(|_| ())
+            .map_err(|_| "views_put")
+    }
+}
+
+#[derive(Default)]
+struct Publication {
+    written: HashSet<(String, blake3::Hash)>,
+    skipped: HashSet<(String, blake3::Hash)>,
+}
+
+impl Publication {
+    async fn sync(
+        &mut self,
+        writer: &mut impl Writer,
+        values: Vec<(String, Vec<u8>)>,
+    ) -> Result<(), &'static str> {
+        for (pin, bytes) in values {
+            let identity = (pin.clone(), blake3::hash(&bytes));
+            if bytes.len() > declaration().max_value_bytes as usize {
+                if self.skipped.insert(identity) {
+                    HEALTH.lock().views.skips += 1;
+                    log::warn!(
+                        "bus views KV skipping oversized pin={} bytes={} cap={}",
+                        key(&pin),
+                        bytes.len(),
+                        declaration().max_value_bytes
+                    );
+                }
+                continue;
+            }
+            if self.written.contains(&identity) {
+                continue;
+            }
+            tokio::time::timeout(IO_TIMEOUT, writer.put(&key(&pin), bytes))
+                .await
+                .map_err(|_| "views_put_timeout")??;
+            self.written.insert(identity);
+            HEALTH.lock().views.writes += 1;
+        }
+        Ok(())
+    }
+}
+
+pub(super) async fn run(client: Arc<BusClient>) {
+    let names = AccountNames::derive(client.acct()).expect("issued account");
+    let row = declaration();
+    let bucket = names
+        .module_bucket_name(row.owner, row.name)
+        .expect("reviewed bucket");
+    let mut changes = client.connection_changes();
+    let mut publication = Publication::default();
+    let mut delay = Duration::from_secs(1);
+    loop {
+        changes.borrow_and_update();
+        let context = async_nats::jetstream::new(client.connection().client());
+        match tokio::time::timeout(IO_TIMEOUT, context.get_key_value(&bucket)).await {
+            Ok(Ok(store)) => {
+                status(true, None);
+                let mut writer = RealWriter(store);
+                loop {
+                    match publication
+                        .sync(&mut writer, crate::subc::tool_views::bus_snapshot())
+                        .await
+                    {
+                        Ok(()) => {
+                            delay = Duration::from_secs(1);
+                        }
+                        Err(reason) => {
+                            status(false, Some(reason));
+                            break;
+                        }
+                    }
+                    tokio::select! {
+                        _ = changes.changed() => { status(false, Some("views_connection_changed")); break; },
+                        _ = tokio::time::sleep(super::readers::BACKSTOP) => {},
+                    }
+                }
+            }
+            _ => status(false, Some("views_attach")),
+        }
+        tokio::time::sleep(delay).await;
+        delay = backoff(delay);
+    }
+}
+
+pub(super) fn detached() {
+    status(false, Some("bus_disconnected"));
+}

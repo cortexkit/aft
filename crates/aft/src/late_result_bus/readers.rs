@@ -315,7 +315,8 @@ impl Services {
     pub(super) fn start(client: Arc<BusClient>) -> Self {
         Self(vec![
             tokio::spawn(reader(client.clone(), Kind::Cards)),
-            tokio::spawn(reader(client, Kind::SendState)),
+            tokio::spawn(reader(client.clone(), Kind::SendState)),
+            tokio::spawn(super::views::run(client)),
         ])
     }
 }
@@ -326,5 +327,6 @@ impl Drop for Services {
         }
         attached(false, Some("bus_disconnected"));
         status(Kind::SendState, false, Some("bus_disconnected"));
+        super::views::detached();
     }
 }
