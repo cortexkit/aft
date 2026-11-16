@@ -1028,10 +1028,13 @@ function translateRunonEnabled(
   prefix: string,
   out: DocumentTranslation,
 ): void {
-  const retired = takeNested(map, "bash", "runon_enabled");
-  if (!retired.found) return;
+  if (!isRecord(map.bash) || !Object.hasOwn(map.bash, "runon_enabled")) return;
+  const retired = map.bash.runon_enabled;
+  // Keep an empty bash object so its normal defaults still override retired
+  // experimental bash flags, as they did before removing the old gate.
+  delete map.bash.runon_enabled;
   recordRetired(out, prefix, "bash.runon_enabled");
-  if (tier === "user" && retired.value === false) {
+  if (tier === "user" && retired === false) {
     if (map.remote_exec === undefined) map.remote_exec = {};
     if (isRecord(map.remote_exec)) map.remote_exec.enabled = false;
   }

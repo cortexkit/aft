@@ -1122,7 +1122,13 @@ fn translate_runon_enabled(
     prefix: &str,
     out: &mut DocumentTranslation,
 ) {
-    if let Some(value) = take_nested(map, "bash", "runon_enabled") {
+    // Keep an empty bash object: its normal defaults still take precedence
+    // over retired experimental bash flags, unlike an absent bash setting.
+    if let Some(value) = map
+        .get_mut("bash")
+        .and_then(Value::as_object_mut)
+        .and_then(|bash| bash.remove("runon_enabled"))
+    {
         record_retired(out, prefix, "bash.runon_enabled");
         if tier == DocumentTier::User && value == Value::Bool(false) {
             let remote = map

@@ -312,7 +312,9 @@ fn migrate_block(
         };
         if present {
             doc.remove(&path_of(prefix, &segments))?;
-            if segments.len() == 2 {
+            // An empty bash object keeps its precedence over retired
+            // experimental bash defaults after the old remote gate is gone.
+            if segments.len() == 2 && path != "bash.runon_enabled" {
                 doc.remove_if_empty_object(&path_of(prefix, &segments[..1]))?;
             }
         }

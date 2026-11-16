@@ -998,6 +998,14 @@ const CASES: ParityCase[] = [
     user: { remote_exec: { enabled: true } },
   },
   {
+    name: "remote_runon_retired_empty_bash",
+    user: {
+      remote_exec: { enabled: true },
+      bash: { runon_enabled: false },
+      experimental: { bash: { compress: false, background: false } },
+    },
+  },
+  {
     name: "remote_runon_retired_harness",
     harness: "pi",
     user: {

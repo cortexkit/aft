@@ -1032,7 +1032,7 @@ fn retired_runon_project_fix_only_drops_the_old_gate() {
     .unwrap();
     assert_eq!(
         serde_json::from_str::<Value>(&migration.text).unwrap(),
-        json!({"remote_exec":{"enabled":true}})
+        json!({"remote_exec":{"enabled":true},"bash":{}})
     );
 }
 

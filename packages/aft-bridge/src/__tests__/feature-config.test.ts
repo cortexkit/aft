@@ -53,12 +53,12 @@ test("retired runon gate translates user blocks and drops project gates with a n
   const translated = translateConfigDocument(user, "user");
   expect(user).toEqual({
     remote_exec: { enabled: true },
-    harnesses: { pi: { remote_exec: { enabled: false } } },
+    harnesses: { pi: { bash: {}, remote_exec: { enabled: false } } },
   });
   expect(translated.retiredKeys).toEqual(["harnesses.pi.bash.runon_enabled"]);
   const project = { remote_exec: { enabled: true }, bash: { runon_enabled: false } };
   const dropped = translateConfigDocument(project, "project");
-  expect(project).toEqual({ remote_exec: { enabled: true } });
+  expect(project).toEqual({ remote_exec: { enabled: true }, bash: {} });
   expect(legacyConfigNoticeMessage("/project/aft.jsonc", dropped)).toBe(
     "/project/aft.jsonc uses retired keys (bash.runon_enabled); AFT applied their current equivalents, with the same limits a project config has for those keys. Run `npx @cortexkit/aft doctor --fix` to update the file.",
   );
