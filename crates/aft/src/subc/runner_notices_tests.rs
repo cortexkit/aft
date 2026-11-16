@@ -80,6 +80,86 @@ fn code_search_nudge_runner_send_is_once_and_leaves_result_bytes_unchanged() {
 }
 
 #[test]
+fn code_search_nudge_runner_deadline_preserves_result_bytes_and_drops_once() {
+    install(PathBuf::from("unused-test-notice-connection"));
+    let session = "code-search-nudge-deadline";
+    let capture = test_endpoint::capture(session, false);
+    capture.delay_reply(Duration::from_secs(5));
+    let root = tempfile::tempdir().unwrap();
+    let ctx = AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(root.path().to_path_buf()),
+            ..Default::default()
+        },
+    );
+    let data = json!({
+        "task_id": "bash-native", "status": "completed", "exit_code": 0,
+        "output": "matches\n[task bash-native]"
+    });
+    let format_context = crate::subc_format::FormatContext::default();
+    let expected = super::super::bash::finalized_bash_result(
+        crate::protocol::Response::success("call-deadline", data.clone()),
+        &ctx,
+        session,
+        &format_context,
+        false,
+        None,
+    );
+    let started = std::time::Instant::now();
+    let (result, logs) = crate::logging::capture_log_lines(|| {
+        super::super::bash::finalized_bash_result(
+            crate::protocol::Response::success("call-deadline", data),
+            &ctx,
+            session,
+            &crate::subc_format::FormatContext {
+                bash_code_search_hint: Some(crate::subc_format::BashCodeSearchHint {
+                    command: "rg foo".into(),
+                    workdir: None,
+                    search_tool: Some("search".into()),
+                    grep_tool: Some("grep".into()),
+                    shell_tool: "bash".into(),
+                    runner_notice: Some(CodeSearchNotice {
+                        address: Some(Address {
+                            module: "broca".into(),
+                            identity: BindIdentity::new("broca", session),
+                            scope: None,
+                            worker: true,
+                        }),
+                        call_key: "call-deadline".into(),
+                    }),
+                }),
+                ..format_context
+            },
+            false,
+            None,
+        )
+    });
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(1800),
+        "deadline fired too early: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "slow runner held the tool result: {elapsed:?}"
+    );
+    assert_eq!(
+        serde_json::to_vec(&result.response).unwrap(),
+        serde_json::to_vec(&expected.response).unwrap()
+    );
+    assert_eq!(result.text, expected.text);
+    assert!(!result.text.contains("DO NOT search code"));
+    capture.receiver.try_recv().unwrap();
+    assert!(
+        capture.receiver.try_recv().is_err(),
+        "no retry after timeout"
+    );
+    assert_eq!(capture.effects.load(Ordering::Relaxed), 0);
+    assert_eq!(logs, vec!["INFO runner code-search nudge call_key=call-deadline dropped class=Timeout code=none detail=code-search notice send exceeded 2s total deadline"]);
+}
+
+#[test]
 fn code_search_nudge_runner_drops_refused_undelivered_and_missing_address() {
     install(PathBuf::from("unused-test-notice-connection"));
     let root = tempfile::tempdir().unwrap();

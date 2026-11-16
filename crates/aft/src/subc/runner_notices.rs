@@ -15,6 +15,9 @@ const MAX_ATTEMPTS: usize = 10;
 const MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_GENERATIONS: u8 = 5;
 const RUNNER_CARRIERS: &[&str] = &["reserved:thalamus-harness", "reserved:broca"];
+// The send must be accepted before the result returns to ride that result,
+// rather than the next. Two seconds caps how long a slow runner delays a tool call.
+const CODE_SEARCH_NOTICE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) fn known_runner(module_id: &str) -> bool {
     RUNNER_CARRIERS
@@ -435,7 +438,7 @@ impl CodeSearchNotice {
                 "runner code-search nudge call_key={} not_delivered reason={reason}; dropped",
                 self.call_key
             ),
-            Outcome::Final(failure) | Outcome::Retry(failure) => log::info!(
+            Outcome::Final(failure) | Outcome::Retry(failure) => crate::slog_info!(
                 "runner code-search nudge call_key={} dropped class={:?} code={} detail={}",
                 self.call_key,
                 failure.class,
@@ -468,11 +471,23 @@ impl CodeSearchNotice {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
-            Ok::<_, Outcome>(runtime.block_on(send(
-                &path,
-                address,
-                &code_search_request(&self.call_key, text, now),
-            )))
+            Ok::<_, Outcome>(runtime.block_on(async {
+                tokio::time::timeout(
+                    CODE_SEARCH_NOTICE_TIMEOUT,
+                    send(
+                        &path,
+                        address,
+                        &code_search_request(&self.call_key, text, now),
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Outcome::Final(Failure::new(
+                        FailureClass::Timeout,
+                        "code-search notice send exceeded 2s total deadline",
+                    ))
+                })
+            }))
         })()
         .unwrap_or_else(|outcome| outcome)
     }
@@ -771,6 +786,7 @@ pub(super) mod test_endpoint {
         refusals: std::sync::Mutex<std::collections::VecDeque<Value>>,
         active: AtomicU64,
         max_active: AtomicU64,
+        reply_delay_ms: AtomicU64,
         gate:
             std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     }
@@ -842,6 +858,11 @@ pub(super) mod test_endpoint {
         pub(super) fn max_active(&self) -> u64 {
             self.endpoint.max_active.load(Ordering::Relaxed)
         }
+        pub(super) fn delay_reply(&self, delay: Duration) {
+            self.endpoint
+                .reply_delay_ms
+                .store(delay.as_millis() as u64, Ordering::Relaxed);
+        }
     }
     impl Drop for Capture {
         fn drop(&mut self) {
@@ -865,6 +886,7 @@ pub(super) mod test_endpoint {
             refusals: Default::default(),
             active: AtomicU64::new(0),
             max_active: AtomicU64::new(0),
+            reply_delay_ms: AtomicU64::new(0),
             gate: Default::default(),
         });
         assert!(endpoints()
@@ -892,7 +914,7 @@ pub(super) mod test_endpoint {
         };
         Some(supported)
     }
-    pub(super) fn call(address: &Address, bytes: &[u8]) -> Option<Result<Vec<u8>, Outcome>> {
+    pub(super) async fn call(address: &Address, bytes: &[u8]) -> Option<Result<Vec<u8>, Outcome>> {
         let body: Value = serde_json::from_slice(bytes).unwrap();
         let key = body["params"]["send_id"]
             .as_str()
@@ -922,6 +944,10 @@ pub(super) mod test_endpoint {
             request: body.clone(),
             bytes: bytes.to_vec(),
         });
+        let delay_ms = endpoint.reply_delay_ms.load(Ordering::Relaxed);
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
         if body["method"] != "session.send"
             && body["method"] != cortexkit_role_llm_runner::ops::SESSION_SEND_STATUS
         {
@@ -1014,6 +1040,7 @@ enum FailureClass {
     Request,
     ReplyDecode,
     PeerRefusal,
+    Timeout,
     Runtime,
     Address,
     Persistence,
@@ -1435,7 +1462,7 @@ fn log_route_refusal(address: &Address, failure: &Failure) {
 
 async fn call(path: &Path, address: &Address, body: Vec<u8>) -> Result<Vec<u8>, Outcome> {
     #[cfg(test)]
-    if let Some(result) = test_endpoint::call(address, &body) {
+    if let Some(result) = test_endpoint::call(address, &body).await {
         return result;
     }
     let Some(_) = crate::launch_nonce::consumer_identity() else {
