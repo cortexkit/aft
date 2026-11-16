@@ -74,6 +74,7 @@ vt100 = "0.16"
 jsonc-parser = { version = "0.33", features = ["cst"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = { version = "=0.6.1", features = ["background_threads", "unprefixed_malloc_on_supported_platforms"] }
 tikv-jemalloc-ctl = { version = "=0.6.1", features = ["stats"] }
 tikv-jemalloc-sys = "=0.6.1"
 

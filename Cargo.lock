@@ -67,6 +67,7 @@ dependencies = [
  "tempfile",
  "tikv-jemalloc-ctl",
  "tikv-jemalloc-sys",
+ "tikv-jemallocator",
  "tokio",
  "tokio-rustls",
  "tokio-util",
