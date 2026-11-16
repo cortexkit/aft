@@ -2761,39 +2761,53 @@ fn rust_use_body(raw: &str) -> Option<&str> {
 }
 
 fn expand_rust_use_tree(path: &str, entries: &mut Vec<RustUseEntry>) {
-    let path = path.trim();
-    if path.is_empty() {
-        return;
+    enum Work {
+        Expand(String),
+        ModuleSelf(String),
     }
-
-    if let Some((prefix, inner)) = split_rust_use_braces(path) {
-        let prefix = prefix.trim().trim_end_matches("::").trim();
-        for part in split_top_level_commas(inner) {
-            let part = part.trim();
-            if part.is_empty() {
-                continue;
-            }
-            if part == "self" {
-                if let Some(local_name) = rust_last_path_segment(prefix) {
+    // Use trees can nest beyond the file walker's stack. Keep both subtrees
+    // and `self` entries on the heap, in reverse order, so popping them emits
+    // exactly the depth-first order stored by the recursive expansion.
+    let mut pending = vec![Work::Expand(path.to_string())];
+    while let Some(work) = pending.pop() {
+        let path = match work {
+            Work::ModuleSelf(prefix) => {
+                if let Some(local_name) = rust_last_path_segment(&prefix) {
                     entries.push(RustUseEntry {
-                        module_path: prefix.to_string(),
+                        module_path: prefix,
                         local_name,
                         kind: RustUseKind::Module,
                     });
                 }
                 continue;
             }
-            let combined = if prefix.is_empty() {
-                part.to_string()
-            } else {
-                format!("{prefix}::{part}")
-            };
-            expand_rust_use_tree(&combined, entries);
+            Work::Expand(path) => path,
+        };
+        let path = path.trim();
+        if path.is_empty() {
+            continue;
         }
-        return;
+        if let Some((prefix, inner)) = split_rust_use_braces(path) {
+            let prefix = prefix.trim().trim_end_matches("::").trim();
+            for part in split_top_level_commas(inner).into_iter().rev() {
+                let part = part.trim();
+                if part.is_empty() {
+                    continue;
+                }
+                if part == "self" {
+                    pending.push(Work::ModuleSelf(prefix.to_string()));
+                } else {
+                    pending.push(Work::Expand(if prefix.is_empty() {
+                        part.to_string()
+                    } else {
+                        format!("{prefix}::{part}")
+                    }));
+                }
+            }
+        } else {
+            add_rust_use_leaf(path, entries);
+        }
     }
-
-    add_rust_use_leaf(path, entries);
 }
 
 fn split_rust_use_braces(path: &str) -> Option<(&str, &str)> {

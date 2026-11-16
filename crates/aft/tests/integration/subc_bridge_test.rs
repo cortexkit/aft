@@ -8410,7 +8410,17 @@ async fn accept_status_consumer(
         )
         .await
         .expect("authenticate consumer");
-        let first = read_raw_inventory_frame(&mut stream, "consumer request").await;
+        let first = loop {
+            let frame = read_raw_inventory_frame(&mut stream, "consumer request").await;
+            if frame_operation(&frame).as_deref() != Some("catalog.watch") {
+                break frame;
+            }
+            assert_eq!(frame.header.ty, FrameType::Request);
+            assert_eq!(frame.header.channel, 0);
+            // This fake models a polling-only daemon. Refuse the optional
+            // watch explicitly so discovery takes the same fallback path.
+            send_channel_zero_error(&mut stream, frame.header.corr, "unknown_op").await;
+        };
         if frame_operation(&first).as_deref() == Some("route.open") {
             // The default-enabled GitHub shim also connects at startup. This
             // daemon has no vault; refuse its manifest route, not the fleet dial.
