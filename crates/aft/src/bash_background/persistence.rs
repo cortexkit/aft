@@ -1655,7 +1655,11 @@ pub(super) struct MetadataSync {
     sync: ReplaceSync,
 }
 
-impl ReplaceSync {
+trait TaskReplaceSync {
+    fn for_task(task: &PersistedTask) -> Self;
+}
+
+impl TaskReplaceSync for ReplaceSync {
     /// Remote tasks and local fallbacks of remote tasks resume from their
     /// metadata after a crash, so their records are written durably.
     fn for_task(task: &PersistedTask) -> Self {
@@ -2634,6 +2638,10 @@ pub(crate) fn sync_task_file(file: &File, path: &Path) -> io::Result<()> {
 }
 
 struct TaskReplaceHooks;
+
+fn sync_task_directory(dir: &PinnedDir) -> io::Result<()> {
+    crate::atomic_replace::sync_directory_with_hooks(dir, &mut TaskReplaceHooks)
+}
 
 impl crate::atomic_replace::ReplaceHooks for TaskReplaceHooks {
     fn sync_file(&mut self, file: &File, path: &Path) -> io::Result<()> {

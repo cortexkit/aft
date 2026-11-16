@@ -953,7 +953,7 @@ fn excludes_lf(hir: &regex_syntax::hir::Hir) -> bool {
 
 pub(crate) use crate::large_read_counts::{record, record_whole, with_counter, Site, SITES};
 #[cfg(test)]
-use crate::large_read_counts::{Counter, TEST_COUNTERS, ZERO};
+use crate::large_read_counts::{TEST_COUNTERS, ZERO};
 
 struct HealthSite {
     site: &'static str,

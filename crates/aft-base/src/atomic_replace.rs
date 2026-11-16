@@ -46,7 +46,7 @@ impl ReplaceHooks for NoReplaceHooks {
     fn after_rename(&mut self) {}
 }
 
-fn sync_directory(dir: &PinnedDir, hooks: &mut impl ReplaceHooks) -> io::Result<()> {
+pub fn sync_directory_with_hooks(dir: &PinnedDir, hooks: &mut impl ReplaceHooks) -> io::Result<()> {
     #[cfg(unix)]
     {
         hooks.sync_file(&dir.file, &dir.path)
@@ -112,7 +112,7 @@ pub fn atomic_replace_with_hooks(
             dir.rename(&temporary, name)?;
             hooks.after_rename();
             if sync == ReplaceSync::FileAndDirectory {
-                sync_directory(dir, hooks)?;
+                sync_directory_with_hooks(dir, hooks)?;
             }
             Ok(())
         })();

@@ -2,7 +2,7 @@ pub use crate::line_matcher::*;
 
 #[cfg(test)]
 mod reflow_linear {
-    use crate::line_matcher::reflow_test_support::Rng;
+    use super::*;
 
     /// A large reflowed hunk, which the old scan took seconds to search, is
     /// still found and applied.
