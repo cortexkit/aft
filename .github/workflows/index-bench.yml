@@ -91,7 +91,7 @@ jobs:
           # The Linux kernel alone on the Mac, profiled: it is the one project whose
           # 0.66 wall time on macOS exceeds 1.5x of 0.65.0.
           BENCH_PROJECTS: ${{ github.ref_name == 'bench/index-mac' && 'linux' || '' }}
-          BENCH_PROFILE: ${{ github.ref_name == 'bench/index-mac' && '--profile' || '' }}
+          BENCH_PROFILE: ${{ github.ref_name == 'bench/index-mac' && '--profile --cwd-outside-root' || '' }}
           BENCH_RUST_LOG: ""
         run: |
           python3 scripts/telemetry/index-bench/run.py run \

@@ -90,8 +90,13 @@ guarded and timed-out runs remain usable measurements, not silently green runs.
 `--rust-log` replaces the measured process's `RUST_LOG=info`. Every
 `measurement.json` also carries the start time (Unix seconds), to align log
 lines, and the child's `rusage` counters (context switches, block I/O, faults).
-With `--profile`, Linux runs accept any project, so one project can be compared
-across platforms with the same instrumentation.
+With `--profile`, Linux runs accept any project and the 0.65.0 baseline runs
+even where the default plan skips it, so one project can be compared across
+platforms with the same instrumentation. `--cwd-outside-root` adds a third
+measurement, `0.66-candidate-cwd-outside`: the candidate started in an empty
+folder instead of the checkout (AFT still gets the root in `configure`), which
+shows whether any build work resolves checkout-relative paths against the
+process's working directory.
 
 Offline harness checks:
 

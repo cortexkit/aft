@@ -34,6 +34,7 @@ PROJECTS = {"vscode": "microsoft/vscode", "kubernetes": "kubernetes/kubernetes",
             "chromium": "chromium/chromium", "neovim": "neovim/neovim"}
 BASELINE = {"macos": {"kubernetes", "linux"},
             "windows": {"vscode", "kubernetes", "linux", "chromium"}, "linux": {"neovim"}}
+OUTSIDE = "0.66-candidate-cwd-outside"
 FIELDS = ["project", "version", "reported_version", "binary_sha256", "revision", "platform",
           "peak_memory_bytes", "peak_commit_bytes", "wall_seconds", "cpu_seconds", "outcome",
           "store_bytes", "excluded_files", "guard_triggered", "peak_source", "exit_code", "error"]
@@ -107,10 +108,10 @@ def checkout(entry, destination, logs, windows=False):
 
 class Client:
     """A reader thread works for Windows pipes; select() on pipes does not."""
-    def __init__(self, binary, root, env, folder, guard_gib, deadline, timeline=None):
+    def __init__(self, binary, cwd, env, folder, guard_gib, deadline, timeline=None):
         self.log = (folder / "stderr.log").open("w", encoding="utf-8")
         try:
-            self.child = Child([str(binary)], root, env, self.log, guard_gib, timeline)
+            self.child = Child([str(binary)], cwd, env, self.log, guard_gib, timeline)
         except BaseException:
             self.log.close()
             raise
@@ -175,7 +176,7 @@ def dwarf_for(binary):
     return {binary.name: files[0]} if len(files) == 1 else None
 
 
-def measure(binary, root, folder, logs, guard_gib, timeout_s, profile=False, rust_log=None):
+def measure(binary, root, folder, logs, guard_gib, timeout_s, profile=False, rust_log=None, cwd_outside=False):
     folder.mkdir(parents=True)
     logs.mkdir(parents=True)
     env = MATRIX.isolated_environment(folder)
@@ -185,8 +186,13 @@ def measure(binary, root, folder, logs, guard_gib, timeout_s, profile=False, rus
     for key, relative in {"USERPROFILE": "home", "APPDATA": "appdata", "LOCALAPPDATA": "localappdata"}.items():
         env[key] = str(folder / relative)
         Path(env[key]).mkdir(exist_ok=True)
+    # AFT receives the project root in configure; its working directory is the root
+    # unless a variant starts it elsewhere, which shows whether any work resolves
+    # checkout-relative paths against the process's working directory.
+    cwd = folder / "cwd" if cwd_outside else root
+    cwd.mkdir(exist_ok=True)
     started = time.monotonic()
-    client = Client(binary, root, env, logs, guard_gib, started + timeout_s,
+    client = Client(binary, cwd, env, logs, guard_gib, started + timeout_s,
                     timeline=logs / "timeline.csv" if profile else None)
     sampler = None
     if profile:
@@ -323,6 +329,9 @@ def run(args):
         raise ValueError("use a fresh results directory for each comparison")
     binaries = {"0.65.0": args.baseline.resolve(), "0.66-candidate": args.candidate.resolve()}
     identities = {name: binary_identity(binary) for name, binary in binaries.items()}
+    if args.cwd_outside_root:
+        binaries[OUTSIDE] = binaries["0.66-candidate"]
+        identities[OUTSIDE] = identities["0.66-candidate"]
     if not re.search(r"\b0\.65\.0\b", identities["0.65.0"]["reported_version"]):
         raise ValueError("baseline does not report version 0.65.0")
     release = work / "bin/release.json"
@@ -332,6 +341,8 @@ def run(args):
     shutil.copy2(work / "bin/checksums.sha256", output / "release-checksums.sha256")
     entries = {entry["repository"]: entry for entry in json.loads((MATRIX_DIR / "manifest.json").read_text())["repositories"]}
     selected = plan(system, args.projects, args.profile)
+    if args.cwd_outside_root:
+        selected = [(project, versions + [OUTSIDE]) for project, versions in selected]
     guard_gib = {"windows": 26, "macos": 13, "linux": 13}[system]
     save(output / "identity.json", {"binaries": identities, "source_commit": subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=HERE, text=True).strip(), "host": platform.uname()._asdict(),
@@ -362,14 +373,17 @@ def run(args):
             for version in versions:
                 row = {"project": project, "version": version, **identities[version], "revision": entry["commit"],
                        "platform": system, "excluded_files": excluded}
-                if version == "0.65.0" and project not in BASELINE[system]:
+                # A profiled run measures the baseline wherever it was asked for: it
+                # exists to compare both versions on one project.
+                if version == "0.65.0" and project not in BASELINE[system] and not args.profile:
                     row["outcome"] = "skipped: exceeds machine"
                 else:
                     print(f"start {project} {version}", flush=True)
                     folder = work / "run"
                     try:
                         row.update(measure(binaries[version], root, folder, logs / version, guard_gib,
-                                           5400 if project == "chromium" else 2700, args.profile, args.rust_log))
+                                           5400 if project == "chromium" else 2700, args.profile, args.rust_log,
+                                           cwd_outside=version == OUTSIDE))
                     except Exception as error:
                         row.update(outcome="failed", error=str(error))
                     finally:
@@ -403,6 +417,8 @@ def main():
             child.add_argument("--profile", action="store_true",
                                help="record a CPU timeline, status stage changes and (macOS) stack samples")
             child.add_argument("--rust-log", help="RUST_LOG for the measured AFT process instead of info")
+            child.add_argument("--cwd-outside-root", action="store_true",
+                               help=f"also measure the candidate started outside the checkout, as '{OUTSIDE}'")
     args = parser.parse_args()
     if args.command == "download":
         download(args.work.resolve(), args.dsym)
