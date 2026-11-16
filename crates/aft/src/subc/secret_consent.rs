@@ -336,7 +336,11 @@ impl SubcSecretConsent {
                     watch.wait().await;
                 }
             }
-            let hold = if crate::late_result_bus::readers::cards_attached() {
+            let hold = if card
+                .bus_watch
+                .as_ref()
+                .is_some_and(|watch| watch.attached())
+            {
                 Duration::ZERO
             } else {
                 hold.min(SECRET_AWAIT_CAP)
@@ -363,6 +367,7 @@ impl SubcSecretConsent {
                     crate::slog_warn!("secret consent withdrawal failed");
                 }
                 card.answered = Some(ConsentOutcome::Cancelled);
+                if let Some(watch) = card.bus_watch.take() { watch.receipt().applied(); }
                 return ConsentOutcome::Cancelled;
             },
             response = await_card => response,
@@ -445,7 +450,13 @@ impl SubcSecretConsent {
             // A known id means the card was filed for the person. A failed
             // await is cancellation, never evidence of a decline or expiry.
             card.answered = Some(ConsentOutcome::Cancelled);
+            if let Some(watch) = card.bus_watch.take() {
+                watch.receipt().applied();
+            }
             return ConsentOutcome::Cancelled;
+        }
+        if outcome != ConsentOutcome::Pending {
+            card.bus_watch.take();
         }
         outcome
     }

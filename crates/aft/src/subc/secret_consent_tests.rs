@@ -15,6 +15,132 @@ use crate::secret::{
 use serde_json::json;
 use std::sync::Mutex as StdMutex;
 
+struct BusCardEndpoint {
+    id: &'static str,
+    answer: Arc<AtomicBool>,
+    changed: Arc<tokio::sync::Notify>,
+    calls: StdMutex<Vec<super::super::consent::ConsentCall>>,
+}
+impl BusCardEndpoint {
+    fn new(id: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            id,
+            answer: Arc::new(AtomicBool::new(false)),
+            changed: Arc::new(tokio::sync::Notify::new()),
+            calls: Default::default(),
+        })
+    }
+    fn awaits(&self) -> Vec<super::super::consent::ConsentCall> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.method == "consent.await")
+            .cloned()
+            .collect()
+    }
+}
+impl super::super::consent::ConsentTransport for BusCardEndpoint {
+    fn call(
+        &self,
+        call: super::super::consent::ConsentCall,
+    ) -> super::super::consent::ConsentFuture {
+        self.calls.lock().unwrap().push(call.clone());
+        let answer = self.answer.clone();
+        let changed = self.changed.clone();
+        let id = self.id;
+        Box::pin(async move {
+            match call.method {
+                "consent.request" => Ok(json!({"elicitation_id":id})),
+                "consent.await" => {
+                    let hold = call.params["timeout_ms"].as_u64().unwrap();
+                    if hold > 0 && !answer.load(std::sync::atomic::Ordering::SeqCst) {
+                        tokio::select! { _ = changed.notified() => {}, _ = tokio::time::sleep(Duration::from_millis(hold)) => {} }
+                    }
+                    filer_reply(if answer.load(std::sync::atomic::Ordering::SeqCst) {
+                        "allowed"
+                    } else {
+                        "pending"
+                    })
+                }
+                "consent.withdraw" => Ok(json!({})),
+                _ => panic!("unexpected card method"),
+            }
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn bus_secret_card_wake_applies_once_and_replay_ignores_message_id() {
+    let endpoint = BusCardEndpoint::new("el_bus_secret_apply");
+    let _attachment = crate::late_result_bus::readers::TestAttachment::new(endpoint.id, true);
+    let transport = Arc::new(SubcSecretConsent {
+        transport: endpoint.clone(),
+        runtime: tokio::runtime::Handle::current(),
+        cards: Default::default(),
+    });
+    let request = held_request(crate::secret::vault::now_ms() + 600_000);
+    let waiter = tokio::spawn(transport.clone().wait(request.clone(), Default::default()));
+    tokio::task::yield_now().await;
+    assert_eq!(endpoint.awaits().len(), 1);
+    assert_eq!(endpoint.awaits()[0].params["timeout_ms"], 0);
+    tokio::time::advance(SECRET_PENDING_BACKOFF).await;
+    tokio::task::yield_now().await;
+    endpoint
+        .answer
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let body = serde_json::to_vec(&json!({"elicitation_id":endpoint.id,"feed":"answers","seq":7}))
+        .unwrap();
+    crate::late_result_bus::readers::card_wake(&body, "mismatched-id")
+        .await
+        .unwrap();
+    assert_eq!(waiter.await.unwrap(), ConsentOutcome::Answered);
+    assert_eq!(endpoint.awaits().len(), 2);
+    crate::late_result_bus::readers::card_wake(&body, "different-transport-id")
+        .await
+        .unwrap();
+    assert_eq!(
+        transport
+            .file_cancellable(&request, Duration::ZERO, None)
+            .await,
+        ConsentOutcome::Answered
+    );
+    assert_eq!(
+        endpoint.awaits().len(),
+        2,
+        "terminal cache and duplicate wake cannot apply twice"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn bus_secret_detach_mid_wait_restores_existing_long_poll_and_answer() {
+    let endpoint = BusCardEndpoint::new("el_bus_secret_detach");
+    let attachment = crate::late_result_bus::readers::TestAttachment::new(endpoint.id, true);
+    let transport = Arc::new(SubcSecretConsent {
+        transport: endpoint.clone(),
+        runtime: tokio::runtime::Handle::current(),
+        cards: Default::default(),
+    });
+    let waiter = tokio::spawn(transport.wait(
+        held_request(crate::secret::vault::now_ms() + 600_000),
+        Default::default(),
+    ));
+    tokio::task::yield_now().await;
+    assert_eq!(endpoint.awaits()[0].params["timeout_ms"], 0);
+    tokio::time::advance(SECRET_PENDING_BACKOFF).await;
+    tokio::task::yield_now().await;
+    assert_eq!(endpoint.awaits().len(), 1);
+    attachment.state.send_replace(false);
+    tokio::task::yield_now().await;
+    assert_eq!(endpoint.awaits().len(), 2);
+    assert_eq!(endpoint.awaits()[1].params["timeout_ms"], 120_000);
+    endpoint
+        .answer
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    endpoint.changed.notify_one();
+    assert_eq!(waiter.await.unwrap(), ConsentOutcome::Answered);
+}
+
 // The route fields this file builds are the ones `subc` keeps for itself, so
 // name them once here rather than through the crate's re-exports.
 use crate::path_identity::ProjectRootId;

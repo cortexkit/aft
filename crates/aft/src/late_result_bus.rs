@@ -122,7 +122,7 @@ pub(crate) fn start(app: Arc<App>, connection: PathBuf, database: PathBuf) -> Op
             runtime.block_on(async {
                 tokio::select! {
                     _ = run(app, connection, database, stopped) => {},
-                    _ = readers::sweep_parked() => {},
+                    _ = readers::sweep_cards() => {},
                 }
             });
         })

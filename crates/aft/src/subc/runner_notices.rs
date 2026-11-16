@@ -55,6 +55,7 @@ struct Scheduled {
 struct Follow {
     send_id: std::sync::Mutex<Option<String>>,
     force: AtomicBool,
+    attached: AtomicBool,
     receipts: std::sync::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>,
 }
 
@@ -89,6 +90,10 @@ impl Scheduler {
         follow: Arc<Follow>,
     ) -> bool {
         let mut entries = self.entries.lock().unwrap();
+        follow.attached.store(
+            crate::late_result_bus::readers::sendstate_attached(),
+            Ordering::Relaxed,
+        );
         if let Some(entry) = entries.get_mut(&id) {
             if expedite {
                 if entry.work.is_some() {
@@ -143,6 +148,26 @@ impl Scheduler {
         }
         self.wake.notify_all();
         waits
+    }
+
+    fn attachment_changed(&self, attached: bool) {
+        for entry in self.entries.lock().unwrap().values_mut() {
+            entry.follow.attached.store(attached, Ordering::Relaxed);
+            if entry.follow.send_id.lock().unwrap().is_none() {
+                continue;
+            }
+            if attached {
+                entry.due = std::time::Instant::now() + crate::late_result_bus::readers::BACKSTOP;
+            } else {
+                entry.follow.force.store(true, Ordering::Relaxed);
+                if entry.work.is_some() {
+                    entry.due = std::time::Instant::now();
+                } else {
+                    entry.expedite = true;
+                }
+            }
+        }
+        self.wake.notify_all();
     }
 
     fn take(
@@ -224,22 +249,7 @@ pub(crate) fn bus_attachment_changed(attached: bool) {
     let Some(Ok(scheduler)) = SCHEDULER.get() else {
         return;
     };
-    for entry in scheduler.entries.lock().unwrap().values_mut() {
-        if entry.follow.send_id.lock().unwrap().is_none() {
-            continue;
-        }
-        if attached {
-            entry.due = std::time::Instant::now() + crate::late_result_bus::readers::BACKSTOP;
-        } else {
-            entry.follow.force.store(true, Ordering::Relaxed);
-            if entry.work.is_some() {
-                entry.due = std::time::Instant::now();
-            } else {
-                entry.expedite = true;
-            }
-        }
-    }
-    scheduler.wake.notify_all();
+    scheduler.attachment_changed(attached);
 }
 
 fn scheduler() -> Option<&'static Arc<Scheduler>> {
@@ -1039,6 +1049,7 @@ pub(crate) fn retry_held_notice_fallback(
             completion: false,
             retrying: false,
             expedite: false,
+            follow: Arc::new(Follow::default()),
         });
     scheduler.wake.notify_all();
 }
@@ -1085,9 +1096,6 @@ async fn check_send(path: &Path, address: &Address, request: &SendRequest) -> Ou
 }
 
 fn pending_delay(checks: u32) -> Duration {
-    if crate::late_result_bus::readers::sendstate_attached() {
-        return crate::late_result_bus::readers::BACKSTOP;
-    }
     Duration::from_secs(match checks {
         0 => 5,
         1 => 30,
@@ -1533,6 +1541,10 @@ fn offer(
     let mut settled = false;
     let mut delivery_update: Option<DeliveryUpdate> = None;
     let follow = Arc::new(Follow::default());
+    follow.attached.store(
+        crate::late_result_bus::readers::sendstate_attached(),
+        Ordering::Relaxed,
+    );
     let work_follow = Arc::clone(&follow);
     let queued = scheduler.offer_follow(
         id.clone(),
@@ -1769,7 +1781,7 @@ fn offer(
                     (checks, true, retry_delay(0))
                 } else {
                     let checks = if checking { checks.saturating_add(1) } else { checks };
-                    (checks, false, pending_delay(checks))
+                    (checks, false, if work_follow.attached.load(Ordering::Relaxed) { crate::late_result_bus::readers::BACKSTOP } else { pending_delay(checks) })
                 };
                 let delay = delay.min(Duration::from_millis(MAX_AGE_MS.saturating_sub(age)));
                 *work_follow.send_id.lock().unwrap() = current_request.as_ref().or(metadata.runner_completion_notice.as_ref()).map(|request| request.send_id.clone());

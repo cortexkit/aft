@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use cortexkit_bus_client::{BusClient, EventItem};
+use cortexkit_bus_client::{BusClient, EventDelivery, EventItem};
 use cortexkit_bus_naming::EVENT_CONSUMERS;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{oneshot, watch, Notify};
@@ -17,8 +17,8 @@ use super::{backoff, HEALTH, IO_TIMEOUT};
 
 pub(crate) const BACKSTOP: Duration = Duration::from_secs(600);
 pub(crate) const LIVE_BACKSTOP: Duration = Duration::from_secs(30);
-// Cingulate authors incoming card message ids as {elicitation_id}:aft.
-const CARD_ID_SUFFIX: &str = ":aft";
+// Cingulate authors incoming card message ids as {elicitation_id}:aft:{seq}.
+const CARD_ID_READER: &str = "aft";
 static ATTACHED: LazyLock<watch::Sender<bool>> = LazyLock::new(|| watch::channel(false).0);
 static SEND_ATTACHED: AtomicBool = AtomicBool::new(false);
 static CARDS: LazyLock<parking_lot::Mutex<HashMap<String, Vec<Weak<Wake>>>>> =
@@ -108,13 +108,15 @@ fn status(kind: Kind, value: bool, reason: Option<&'static str>) {
 
 #[derive(Default)]
 struct Wake {
-    pending: parking_lot::Mutex<Vec<oneshot::Sender<()>>>,
+    pending: parking_lot::Mutex<HashMap<u64, Vec<oneshot::Sender<()>>>>,
+    applied: parking_lot::Mutex<std::collections::HashSet<u64>>,
     ready: Notify,
 }
 
 pub(crate) struct CardWatch {
     id: String,
     wake: Arc<Wake>,
+    attachment: watch::Receiver<bool>,
 }
 
 pub(crate) fn watch_card(id: &str) -> CardWatch {
@@ -131,14 +133,18 @@ pub(crate) fn watch_card(id: &str) -> CardWatch {
     CardWatch {
         id: id.into(),
         wake,
+        attachment: attachment(id),
     }
 }
 
 impl CardWatch {
+    pub(crate) fn attached(&self) -> bool {
+        *self.attachment.borrow()
+    }
     /// Detach interrupts even an attached wait, restoring the long-poll path.
     pub(crate) async fn wait(&self) {
-        let mut changes = ATTACHED.subscribe();
-        if !*changes.borrow_and_update() || !self.wake.pending.lock().is_empty() {
+        let mut changes = self.attachment.clone();
+        if !*changes.borrow_and_update() {
             return;
         }
         tokio::select! {
@@ -149,7 +155,44 @@ impl CardWatch {
     }
 
     pub(crate) fn receipt(&self) -> Receipt {
-        Receipt(std::mem::take(&mut *self.wake.pending.lock()))
+        Receipt {
+            wake: self.wake.clone(),
+            pending: std::mem::take(&mut *self.wake.pending.lock()),
+        }
+    }
+}
+
+fn attachment(_id: &str) -> watch::Receiver<bool> {
+    #[cfg(test)]
+    if let Some(sender) = TEST_ATTACHMENTS.lock().get(_id) {
+        return sender.subscribe();
+    }
+    ATTACHED.subscribe()
+}
+
+#[cfg(test)]
+static TEST_ATTACHMENTS: LazyLock<parking_lot::Mutex<HashMap<String, watch::Sender<bool>>>> =
+    LazyLock::new(Default::default);
+#[cfg(test)]
+pub(crate) struct TestAttachment {
+    id: String,
+    pub(crate) state: watch::Sender<bool>,
+}
+#[cfg(test)]
+impl TestAttachment {
+    pub(crate) fn new(id: &str, value: bool) -> Self {
+        let state = watch::channel(value).0;
+        TEST_ATTACHMENTS.lock().insert(id.into(), state.clone());
+        Self {
+            id: id.into(),
+            state,
+        }
+    }
+}
+#[cfg(test)]
+impl Drop for TestAttachment {
+    fn drop(&mut self) {
+        TEST_ATTACHMENTS.lock().remove(&self.id);
     }
 }
 
@@ -164,30 +207,42 @@ impl Drop for CardWatch {
     }
 }
 
-pub(crate) struct Receipt(Vec<oneshot::Sender<()>>);
+pub(crate) struct Receipt {
+    wake: Arc<Wake>,
+    pending: HashMap<u64, Vec<oneshot::Sender<()>>>,
+}
 impl Receipt {
     pub(crate) fn applied(self) {
-        for receipt in self.0 {
-            let _ = receipt.send(());
+        for (seq, receipts) in self.pending {
+            self.wake.applied.lock().insert(seq);
+            for receipt in receipts {
+                let _ = receipt.send(());
+            }
         }
     }
 }
 
-async fn wake_live(id: &str) -> Result<bool, &'static str> {
-    let waits: Vec<_> = CARDS
+async fn wake_live(id: &str, seq: u64) -> Result<bool, &'static str> {
+    let watches: Vec<_> = CARDS
         .lock()
         .get(id)
         .into_iter()
         .flatten()
         .filter_map(Weak::upgrade)
-        .map(|wake| {
+        .collect();
+    let found = !watches.is_empty();
+    let waits: Vec<_> = watches
+        .into_iter()
+        .filter_map(|wake| {
+            if wake.applied.lock().contains(&seq) {
+                return None;
+            }
             let (done, wait) = oneshot::channel();
-            wake.pending.lock().push(done);
+            wake.pending.lock().entry(seq).or_default().push(done);
             wake.ready.notify_one();
-            wait
+            Some(wait)
         })
         .collect();
-    let found = !waits.is_empty();
     for wait in waits {
         wait.await.map_err(|_| "card_apply_interrupted")?;
     }
@@ -201,7 +256,7 @@ struct CardEvent {
     seq: u64,
 }
 
-async fn card_wake(body: &[u8], msg_id: &str) -> Result<(), &'static str> {
+pub(crate) async fn card_wake(body: &[u8], msg_id: &str) -> Result<(), &'static str> {
     let body = serde_json::from_slice::<CardEvent>(body)
         .ok()
         .filter(|event| {
@@ -212,13 +267,12 @@ async fn card_wake(body: &[u8], msg_id: &str) -> Result<(), &'static str> {
         attached(cards_attached(), Some("card_body_malformed"));
         return Ok(());
     };
-    if msg_id.strip_suffix(CARD_ID_SUFFIX) != Some(&event.elicitation_id) {
+    let expected_id = format!("{}:{CARD_ID_READER}:{}", event.elicitation_id, event.seq);
+    if msg_id != expected_id {
         HEALTH.lock().cards.mismatched_ids += 1;
         attached(cards_attached(), Some("card_message_id_mismatch"));
     }
-    if !wake_live(&event.elicitation_id).await? {
-        crate::subc::consent::bus_sweep(Some(&event.elicitation_id)).await?;
-    }
+    wake_live(&event.elicitation_id, event.seq).await?;
     HEALTH.lock().cards.events_handled += 1;
     Ok(())
 }
@@ -247,6 +301,32 @@ async fn send_wake(body: &[u8]) -> Result<(), &'static str> {
     crate::subc::runner_notices::bus_wake(send_id(body).as_deref()).await?;
     HEALTH.lock().sendstate.events_handled += 1;
     Ok(())
+}
+
+trait Delivery {
+    fn body(&self) -> &[u8];
+    fn msg_id(&self) -> &str;
+    async fn ack(&self) -> Result<(), &'static str>;
+}
+impl Delivery for EventDelivery {
+    fn body(&self) -> &[u8] {
+        &self.body
+    }
+    fn msg_id(&self) -> &str {
+        &self.msg_id
+    }
+    async fn ack(&self) -> Result<(), &'static str> {
+        EventDelivery::ack(self).await.map_err(|_| "event_ack")
+    }
+}
+async fn apply_delivery(delivery: &impl Delivery, kind: Kind) -> Result<(), &'static str> {
+    match kind {
+        Kind::Cards => card_wake(delivery.body(), delivery.msg_id()).await?,
+        Kind::SendState => send_wake(delivery.body()).await?,
+    }
+    tokio::time::timeout(IO_TIMEOUT, delivery.ack())
+        .await
+        .map_err(|_| "event_ack_timeout")?
 }
 
 async fn reader(client: Arc<BusClient>, kind: Kind) {
@@ -289,17 +369,14 @@ async fn reader(client: Arc<BusClient>, kind: Kind) {
                 }
             };
             let result = match result {
-                Ok(EventItem::Delivery(event)) => match match kind {
-                    Kind::Cards => card_wake(&event.body, &event.msg_id).await,
-                    Kind::SendState => send_wake(&event.body).await,
-                } {
-                    Ok(()) => event.ack().await.map_err(|_| "event_ack"),
-                    Err(code) => Err(code),
-                },
+                Ok(EventItem::Delivery(event)) => apply_delivery(&event, kind).await,
                 Ok(EventItem::Malformed(event)) => {
                     kind.health(&mut HEALTH.lock()).malformed_events += 1;
                     status(kind, true, Some("event_envelope_malformed"));
-                    event.term().await.map_err(|_| "event_term")
+                    tokio::time::timeout(IO_TIMEOUT, event.term())
+                        .await
+                        .map_err(|_| "event_term_timeout")
+                        .and_then(|result| result.map_err(|_| "event_term"))
                 }
                 _ => Err("event_read"),
             };
@@ -313,10 +390,20 @@ async fn reader(client: Arc<BusClient>, kind: Kind) {
     }
 }
 
+#[cfg(test)]
+mod tests;
+
 pub(super) struct Services(Vec<tokio::task::JoinHandle<()>>);
-pub(super) async fn sweep_parked() {
+pub(super) async fn sweep_cards() {
     loop {
-        let _ = crate::subc::consent::bus_sweep(None).await;
+        let ids: Vec<_> = CARDS.lock().keys().cloned().collect();
+        for id in ids {
+            if let Some(watches) = CARDS.lock().get(&id) {
+                for wake in watches.iter().filter_map(Weak::upgrade) {
+                    wake.ready.notify_one();
+                }
+            }
+        }
         tokio::time::sleep(BACKSTOP).await;
     }
 }

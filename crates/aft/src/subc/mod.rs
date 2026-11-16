@@ -218,7 +218,7 @@ mod bash_grant_tests;
 #[cfg(test)]
 mod bash_selector_tests;
 mod codemode;
-pub(crate) mod consent;
+mod consent;
 pub(crate) use consent::directory_scope;
 #[cfg(all(test, unix))]
 mod deleted_root_reclaim_tests;

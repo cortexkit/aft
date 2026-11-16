@@ -156,3 +156,6 @@ pub(super) fn detached() {
 pub(super) fn unavailable(reason: &'static str) {
     status(false, Some(reason));
 }
+
+#[cfg(test)]
+mod tests;

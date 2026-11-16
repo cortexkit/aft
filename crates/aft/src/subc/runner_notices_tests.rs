@@ -1,4 +1,129 @@
 use super::*;
+
+#[test]
+fn bus_runner_targeted_not_delivered_applies_before_ack_and_uses_new_id() {
+    let _guard = DELIVERY_COUNTER_TEST.lock().unwrap();
+    let task = Completion::new("bash-00000000000fb001", 0);
+    let capture = test_endpoint::capture(&task.task, false);
+    capture.send_status(true);
+    capture.reply(SendReply::new("pending"));
+    let scheduler = Scheduler::default();
+    let clock = Arc::new(AtomicU64::new(task.finished));
+    task.offer(&scheduler, clock.clone());
+    let mut due = std::time::Instant::now();
+    assert!(matches!(step(&scheduler, due), Next::Retry(delay) if delay == Duration::from_secs(5)));
+    let first = capture.receiver.try_recv().unwrap();
+    scheduler.attachment_changed(true);
+    capture.reply(undelivered("handover_failed"));
+    let mut receipts = scheduler.bus_wake(Some(&task.frozen().send_id));
+    assert_eq!(receipts.len(), 1);
+    assert!(matches!(
+        receipts[0].try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    let Next::Retry(delay) = step(&scheduler, std::time::Instant::now()) else {
+        panic!("new generation remains scheduled")
+    };
+    assert_eq!(receipts[0].try_recv(), Ok(()));
+    let status = capture.receiver.try_recv().unwrap();
+    assert_eq!(status.request["method"], "session.send_status");
+    assert_eq!(
+        status.request["params"]["send_id"],
+        first.request["params"]["send_id"]
+    );
+    assert_eq!(task.frozen().send_id, format!("aft:bash:{}:2", task.task));
+    due = std::time::Instant::now();
+    assert!(matches!(
+        advance_notice(&scheduler, &clock, &mut due, delay),
+        Next::Done
+    ));
+    let resent = capture.receiver.try_recv().unwrap();
+    assert_ne!(
+        resent.request["params"]["send_id"],
+        first.request["params"]["send_id"]
+    );
+    assert!(task.delivered());
+}
+
+#[test]
+fn bus_runner_unknown_or_absent_id_wakes_bounded_queue_and_detach_restores_schedule() {
+    let first = Completion::new("bash-00000000000fb002", 0);
+    let second = Completion::new("bash-00000000000fb003", 0);
+    let a = test_endpoint::capture(&first.task, false);
+    let b = test_endpoint::capture(&second.task, false);
+    for capture in [&a, &b] {
+        capture.send_status(true);
+        capture.reply(SendReply::new("pending"));
+    }
+    let scheduler = Scheduler::default();
+    let clock = Arc::new(AtomicU64::new(first.finished.max(second.finished)));
+    first.offer(&scheduler, clock.clone());
+    second.offer(&scheduler, clock.clone());
+    let due = std::time::Instant::now();
+    for _ in 0..2 {
+        assert!(
+            matches!(step(&scheduler, due), Next::Retry(delay) if delay == Duration::from_secs(5))
+        );
+    }
+    a.receiver.try_recv().unwrap();
+    b.receiver.try_recv().unwrap();
+    scheduler.attachment_changed(true);
+    let mut targeted = scheduler.bus_wake(Some(&first.frozen().send_id));
+    a.reply(SendReply::new("pending"));
+    assert!(
+        matches!(step(&scheduler, std::time::Instant::now()), Next::Retry(delay) if delay == Duration::from_secs(600))
+    );
+    assert_eq!(targeted[0].try_recv(), Ok(()));
+    a.receiver.try_recv().unwrap();
+    assert!(
+        b.receiver.try_recv().is_err(),
+        "known send id narrows the lookup"
+    );
+    scheduler.attachment_changed(false);
+    a.reply(SendReply::new("pending"));
+    b.reply(SendReply::new("pending"));
+    let mut restored = Vec::new();
+    for _ in 0..2 {
+        let Next::Retry(delay) = step(&scheduler, std::time::Instant::now()) else {
+            panic!("pending sends stay followed")
+        };
+        restored.push(delay.as_secs());
+    }
+    restored.sort_unstable();
+    assert_eq!(
+        restored,
+        vec![30, 120],
+        "detach restores each send's original follow schedule"
+    );
+    a.receiver.try_recv().unwrap();
+    b.receiver.try_recv().unwrap();
+    scheduler.attachment_changed(true);
+    for id in [Some("unknown"), None] {
+        let mut receipts = scheduler.bus_wake(id);
+        assert_eq!(receipts.len(), 2);
+        a.reply(SendReply::new("pending"));
+        b.reply(SendReply::new("pending"));
+        for _ in 0..2 {
+            assert!(
+                matches!(step(&scheduler, std::time::Instant::now()), Next::Retry(delay) if delay == Duration::from_secs(600))
+            );
+        }
+        for receipt in &mut receipts {
+            assert_eq!(receipt.try_recv(), Ok(()));
+        }
+        assert_eq!(
+            a.receiver.try_recv().unwrap().request["method"],
+            "session.send_status"
+        );
+        assert_eq!(
+            b.receiver.try_recv().unwrap().request["method"],
+            "session.send_status"
+        );
+    }
+    assert_eq!(pending_delay(0), Duration::from_secs(5));
+    assert_eq!(pending_delay(1), Duration::from_secs(30));
+    assert_eq!(pending_delay(2), Duration::from_secs(120));
+}
 use cortexkit_role_llm_runner::{
     send::SendReply,
     wire::{read_reply, reply_body},

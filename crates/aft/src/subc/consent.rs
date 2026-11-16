@@ -2843,7 +2843,6 @@ async fn hold(
     // Await at least once, even with no budget left, so an ask that already
     // settled (a retry after the answer) is applied rather than parked.
     let mut first = true;
-    let bus_watch = crate::late_result_bus::readers::watch_card(&elicitation);
     loop {
         let now = Instant::now();
         if run_permission_budget(call).is_some_and(|budget| budget.remaining().is_zero()) {
@@ -2854,8 +2853,8 @@ async fn hold(
             park(call, &prep, &elicitation);
             return Hold::Answer(pending_answer(call, &prep.grant));
         }
-        let wait_for_wake = !first;
         first = false;
+        let wait = deadline.saturating_duration_since(now).min(MAX_AWAIT);
         let applied = Arc::new(StdMutex::new(None));
         let settled_received = Arc::new(AtomicBool::new(false));
         let receipt_settled = Arc::clone(&settled_received);
@@ -2866,18 +2865,7 @@ async fn hold(
         let receipt_call = call.clone();
         let receipt_prep = prep.clone();
         let ask_id = elicitation.clone();
-        let awaited = async {
-            if wait_for_wake {
-                bus_watch.wait().await;
-            }
-            let wait = if crate::late_result_bus::readers::cards_attached() {
-                Duration::ZERO
-            } else {
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(MAX_AWAIT)
-            };
-            transport.call_with_receipt(
+        let awaited = transport.call_with_receipt(
             consent_call(
                 call,
                 &prep,
@@ -2923,8 +2911,7 @@ async fn hold(
                     Ok(record)
                 })
             }),
-            ).await
-        };
+        );
         tokio::pin!(awaited);
         let mut local_deadline = None;
         let reply = loop {
@@ -2952,7 +2939,6 @@ async fn hold(
                             let received_settlement = received_settlement && tests::SETTLED_DEADLINE_ENABLED.load(Ordering::SeqCst);
                             if received_settlement {
                                 if let Some(result) = applied.lock().unwrap().take() {
-                                    acknowledge_bus_answer(&bus_watch, &result);
                                     return result;
                                 }
                                 let bound = local_deadline.get_or_insert_with(|| (Instant::now() + settled_wait_budget()).min(call.reply_deadline));
@@ -2982,32 +2968,15 @@ async fn hold(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
         {
-            acknowledge_bus_answer(&bus_watch, &result);
             return result;
         }
         match reply.map(|reply| reply.and_then(|record| decode_record(&record))) {
             None | Some(Ok(Settlement::Pending)) => {}
             Some(Ok(settled)) => {
-                let result = finish(call, &prep, settled, retry_after_deadline, &elicitation).await;
-                acknowledge_bus_answer(&bus_watch, &result);
-                return result;
+                return finish(call, &prep, settled, retry_after_deadline, &elicitation).await
             }
             Some(Err(error)) => return failed(call, &prep, error).await,
         }
-    }
-}
-
-fn acknowledge_bus_answer(watch: &crate::late_result_bus::readers::CardWatch, result: &Hold) {
-    let applied = match result {
-        Hold::Run { .. } | Hold::Shared(_) => true,
-        Hold::Answer(response) => !matches!(
-            response.data["code"].as_str(),
-            Some("access_unavailable" | "access_retry")
-        ),
-        Hold::Abandoned => false,
-    };
-    if applied {
-        watch.receipt().applied();
     }
 }
 
@@ -3335,9 +3304,6 @@ fn approval_origin_ended(
 /// A run-scoped call that ends with `access_pending` leaves its ask with the
 /// run, so the ask is withdrawn when the run's scope ends.
 fn park(call: &HeldCall, prep: &Prepared, elicitation: &str) {
-    if let Some(ctx) = call.executor.actor_context(&call.identity.root) {
-        remember_bus_scope(&ctx, &call.identity);
-    }
     let Some(scope) = call.identity.run_scope.get() else {
         return;
     };
@@ -3389,87 +3355,6 @@ pub(super) async fn withdraw_parked(parked: Vec<ParkedAsk>) {
 
 static REATTACHED: LazyLock<StdMutex<HashSet<(String, String, u64)>>> =
     LazyLock::new(|| StdMutex::new(HashSet::new()));
-
-type BusScope = (
-    std::sync::Weak<AppContext>,
-    std::sync::Weak<RouteIdentityData>,
-);
-static BUS_SCOPES: LazyLock<StdMutex<HashMap<(String, String, u64), BusScope>>> =
-    LazyLock::new(Default::default);
-
-fn remember_bus_scope(ctx: &Arc<AppContext>, identity: &RouteIdentity) {
-    let scope = access_grants::scope_key(identity);
-    BUS_SCOPES.lock().unwrap().insert(
-        (scope.owner, scope.scope_ref, scope.epoch),
-        (Arc::downgrade(ctx), Arc::downgrade(&identity.0)),
-    );
-}
-
-/// One-time approvals and refusals must be handled by retrying the original call.
-/// Only scope approvals can be applied without running that original call.
-pub(crate) async fn bus_sweep(id: Option<&str>) -> Result<(), &'static str> {
-    let scopes: Vec<_> = {
-        let mut scopes = BUS_SCOPES.lock().unwrap();
-        scopes.retain(|_, (ctx, identity)| ctx.strong_count() > 0 && identity.strong_count() > 0);
-        scopes
-            .values()
-            .filter_map(|(ctx, identity)| {
-                Some((ctx.upgrade()?, RouteIdentity(identity.upgrade()?)))
-            })
-            .collect()
-    };
-    for (ctx, identity) in scopes {
-        let Some(db) = ctx.db() else { continue };
-        let scope = access_grants::scope_key(&identity);
-        let records = tokio::task::spawn_blocking(move || {
-            let conn = db.lock().map_err(|_| "card_database")?;
-            asks::for_scope(&conn, &scope).map_err(|_| "card_database")
-        })
-        .await
-        .map_err(|_| "card_database")??;
-        for record in records {
-            if id.is_some_and(|id| record.elicitation_id.as_deref() != Some(id)) {
-                continue;
-            }
-            if LIVE_COVERABLE
-                .lock()
-                .unwrap()
-                .values()
-                .any(|live| live.key == record.key)
-            {
-                continue;
-            }
-            let Some((prep, Some(elicitation))) = open_prepared(record) else {
-                continue;
-            };
-            let transport = transport().ok_or("card_transport")?;
-            let reply = transport
-                .call(ConsentCall {
-                    scope: prep.selector.clone(),
-                    project_root: identity.project_root.clone(),
-                    session: identity.session.clone(),
-                    method: "consent.await",
-                    params: json!({"elicitation_id":elicitation,"timeout_ms":0}),
-                    timeout: UNARY_TIMEOUT,
-                })
-                .await
-                .map_err(|_| "card_answer_read")?;
-            match decode_record(&reply).map_err(|_| "card_answer_decode")? {
-                Settlement::Pending if id.is_some() => return Err("card_answer_pending"),
-                Settlement::Allow { scope: true, .. } => {
-                    if reconcile_scope_answer(&ctx, &identity, prep, Some(elicitation), false)
-                        .await
-                        .is_none()
-                    {
-                        return Err("card_scope_apply");
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(())
-}
 
 fn open_prepared(record: asks::AskRecord) -> Option<(Prepared, Option<String>)> {
     Some((
@@ -3638,7 +3523,6 @@ pub(super) fn reattach(
     if !access_grants::alfonso_worker(identity) {
         return;
     }
-    remember_bus_scope(ctx, identity);
     let scope = access_grants::scope_key(identity);
     if !REATTACHED
         .lock()
