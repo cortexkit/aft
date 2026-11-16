@@ -603,7 +603,11 @@ mod tests {
         let command = vec![
             "cmd.exe".into(),
             "/C".into(),
-            format!("type \"{}\"", output.display()),
+            // Command quotes the path argument; embedded quotes in a command
+            // string would be escaped for C runtime argument parsing, which
+            // cmd.exe does not use.
+            "type".into(),
+            output.to_string_lossy().into_owned(),
         ];
         ShellEnvProvider {
             kind,
@@ -717,7 +721,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let nested = project.path().join("nested");
         std::fs::create_dir(&nested).unwrap();
-        let output = project.path().join("output.json");
+        let output = project.path().join("output with spaces.json");
         std::fs::write(&output, r#"{"VALUE":"first"}"#).unwrap();
         let mut provider = fake(ShellEnvProviderKind::Custom, &output);
         provider.watch = vec!["project.env".into()];
