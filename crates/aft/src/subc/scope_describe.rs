@@ -207,7 +207,7 @@ where
             grant_sweep.await;
             return;
         }
-        let mut queued = HashMap::new();
+        let mut queued: HashMap<scope_watch::Key, ScopeStamp> = HashMap::new();
         let mut retry = HashMap::new();
         let mut pending = HashSet::new();
         let mut confirmed = HashSet::new();
@@ -216,7 +216,7 @@ where
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut secret_authorizations: HashSet<(String, String, u64)> = HashSet::new();
         let mut inflight = tokio::task::JoinSet::new();
-        let mut inflight_refs = HashSet::new();
+        let mut inflight_refs: HashSet<(String, String)> = HashSet::new();
         let mut fanout = tokio::task::JoinSet::new();
         let mut next_scan = tokio::time::Instant::now() + interval;
         let mut next_backstop = tokio::time::Instant::now() + scope_watch::BACKSTOP;
