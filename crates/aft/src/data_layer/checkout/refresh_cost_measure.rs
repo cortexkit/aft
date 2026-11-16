@@ -1,7 +1,7 @@
 //! Measurement only: the cost of a refresh that re-resolves the method-call
 //! sites of a declaration change's readers, against a cold build and an
-//! engine start, on a copy of a real checkout. The figures behind
-//! `refresh_budget::SITE_READERS_PERCENT` came from it:
+//! engine start, on a copy of a real checkout. The figures in
+//! `refresh_budget`'s module documentation came from it:
 //!
 //! ```text
 //! cargo test --profile stage -p agent-file-tools --lib -- --ignored --nocapture \

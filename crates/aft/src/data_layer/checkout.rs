@@ -9022,46 +9022,69 @@ pub fn other() { callee(); }
         );
     }
 
-    /// Adding a type that declares a method more than a quarter of the files
-    /// call reaches every one of those callers, but only for their
-    /// method-call sites: the refresh stays incremental, as does the next
-    /// edit before the publication (which carries those callers over), and
-    /// the graph is the one a cold build gives.
-    #[test]
-    fn a_method_name_fan_out_past_a_quarter_of_the_files_refreshes_without_a_cold_build() {
-        const CALLERS: usize = 1_100;
-        let store = tempfile::tempdir().unwrap();
-        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+    /// A store of `callers` TypeScript files, each calling `get` on a value
+    /// of unknown type, and one class declaring `get`, built.
+    fn get_callers(layer: &Arc<DataLayer>, store: &Path, callers: usize) -> Worktree {
         let mut files = BTreeMap::new();
         files.insert(
             "store.ts".to_string(),
             "export class Store { get(): number { return 1; } }\n".to_string(),
         );
-        for i in 0..CALLERS {
+        for i in 0..callers {
             files.insert(
                 format!("c{i}.ts"),
                 format!("export function c{i}(x) {{ return x.get(); }}\n"),
             );
         }
-        let worktree = Worktree::new(&layer, store.path(), files);
-        let root = worktree.dir.path();
-        let checkout = &worktree.checkout;
-        let before = source_work_for_test(root).cold_builds;
+        Worktree::new(layer, store, files)
+    }
+
+    /// Adds a class declaring `get` to the checkout and refreshes.
+    fn add_get_declarer(worktree: &Worktree) -> UpdateStats {
         write(
-            root,
+            worktree.dir.path(),
             "extra.ts",
             "export class Extra { get(): number { return 2; } }\n",
         );
-        checkout.record_paths(&[b"extra.ts".to_vec()]).unwrap();
-        let added = checkout.refresh_callgraph().unwrap().expect("applied");
+        worktree
+            .checkout
+            .record_paths(&[b"extra.ts".to_vec()])
+            .unwrap();
+        worktree
+            .checkout
+            .refresh_callgraph()
+            .unwrap()
+            .expect("applied")
+    }
+
+    /// A type declaring a method many files call reaches each caller for
+    /// its method-call sites only. The refresh keeps those callers apart
+    /// from the files it resolved in full, so the next refresh's budget
+    /// counts each in its class; a caller edited later counts in full.
+    #[test]
+    fn method_name_readers_are_carried_over_as_sites_only_work() {
+        const CALLERS: usize = 600;
+        let store = tempfile::tempdir().unwrap();
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let worktree = get_callers(&layer, store.path(), CALLERS);
+        let (root, checkout) = (worktree.dir.path(), &worktree.checkout);
+        let before = source_work_for_test(root).cold_builds;
+        let added = add_get_declarer(&worktree);
         assert!(!added.cold_build, "{added:?}");
-        // Past the limit for full work: the old single count went cold here.
-        assert!(
-            added.touched.len() > 1024,
-            "touched {}",
-            added.touched.len()
-        );
-        assert_eq!(source_work_for_test(root).cold_builds, before);
+        assert!(added.touched.len() > CALLERS, "{added:?}");
+        let sites_only = |checkout: &Checkout| {
+            checkout
+                .live
+                .read()
+                .unwrap()
+                .refreshed
+                .as_ref()
+                .map(|refreshed| refreshed.sites_only.clone())
+                .unwrap_or_default()
+        };
+        let carried = sites_only(checkout);
+        assert_eq!(carried.len(), CALLERS, "{carried:?}");
+        assert!(carried.contains("c0.ts") && !carried.contains("extra.ts"));
         write(
             root,
             "c0.ts",
@@ -9070,11 +9093,36 @@ pub fn other() { callee(); }
         checkout.record_paths(&[b"c0.ts".to_vec()]).unwrap();
         let next = checkout.refresh_callgraph().unwrap().expect("applied");
         assert!(!next.cold_build, "{next:?}");
+        let carried = sites_only(checkout);
+        assert_eq!(carried.len(), CALLERS - 1);
+        assert!(!carried.contains("c0.ts"));
         assert_eq!(source_work_for_test(root).cold_builds, before);
         let cold_store = tempfile::tempdir().unwrap();
         let cold = Checkout::bind(Arc::clone(&layer), cold_store.path(), family(), root).unwrap();
         cold.build().unwrap();
         let compared = super::super::checkout_gate::compare_engines(checkout, &cold).unwrap();
+        assert_eq!(compared.files, CALLERS + 2);
+    }
+
+    /// Sites-only work counts against the same limit as full work: past a
+    /// quarter of the files (and 1,024), a method-name fan-out still gives
+    /// way to a cold build, which answers as before.
+    #[test]
+    fn a_method_name_fan_out_past_the_limit_still_builds_cold() {
+        const CALLERS: usize = 1_100;
+        let store = tempfile::tempdir().unwrap();
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let worktree = get_callers(&layer, store.path(), CALLERS);
+        let root = worktree.dir.path();
+        let before = source_work_for_test(root).cold_builds;
+        let added = add_get_declarer(&worktree);
+        assert!(added.cold_build, "{added:?}");
+        assert_eq!(source_work_for_test(root).cold_builds, before + 1);
+        let cold_store = tempfile::tempdir().unwrap();
+        let cold = Checkout::bind(Arc::clone(&layer), cold_store.path(), family(), root).unwrap();
+        cold.build().unwrap();
+        let compared =
+            super::super::checkout_gate::compare_engines(&worktree.checkout, &cold).unwrap();
         assert_eq!(compared.files, CALLERS + 2);
     }
 

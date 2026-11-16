@@ -1,18 +1,26 @@
 //! Decides whether an incremental update is cheaper than a cold build, by
-//! the files it has to work on since the publication.
+//! the files it has to work on since the publication: past a quarter of the
+//! parsed files (and at least 1,024) the update gives way to a cold build.
 //!
-//! Files are counted in two classes, each against its own limit:
+//! Files are counted in two classes, which the limit counts together and
+//! the log reports apart:
 //!
 //! - full work: the changed files and every file bound, resolved or traced
-//!   again (passes 1-3, which pass 4 follows). A cold build redoes all of
-//!   that for every file, so past a quarter of the parsed files a cold
-//!   build costs about as much;
+//!   again (passes 1-3);
 //! - method-call sites only: files whose call sites read a method name a
 //!   changed file declares or declared, and whose sites alone are resolved
 //!   again (pass 4). Adding a type with a `get` or `new` method reaches
-//!   every file that calls a method of that name, often a third of a
-//!   repository, yet redoing only their sites costs a fraction of a cold
-//!   build (see [`SITE_READERS_PERCENT`]).
+//!   every file that calls a method of that name, often a fifth or more of
+//!   a repository.
+//!
+//! Sites-only work costs far less CPU than a cold build (on Spring
+//! Framework, re-resolving the sites of 66% of the files took 75 s against
+//! 135 s for a cold build; on AFT 39% took 37 s against 279 s), but pass 4
+//! holds its whole working set in memory while a cold build is disk-backed.
+//! Its peak passed a cold build's from about a tenth of the files (AFT: 535
+//! readers peaked at 1.7 GiB against 0.9 GiB cold; Spring: 1,749 readers at
+//! 2.1 GiB against 0.8 GiB), so sites-only files count against the same
+//! limit as full work.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -63,38 +71,18 @@ impl Stage {
     }
 }
 
-/// How large a share of the parsed files, in percent, may have only their
-/// method-call sites resolved again before a cold build is cheaper.
-///
-/// Measured on a build optimized as a release (`--profile stage`, 8
-/// threads), with the CPU time of the refresh and of the publication of
-/// its changes against a cold build reusing the stored records:
-///
-/// - AFT (6,144 parsed files, mostly Rust): a cold build took 310 s of CPU
-///   (45 s wall). Re-resolving the sites of 888 readers (14%) took 27-51 s,
-///   of 1,652 (27%) 35 s, of 2,382 (39%, every reader of the 315 method
-///   names with ten or more) 39 s, each plus 8-12 s to publish. The cost
-///   grows by about 0.5 s per percent, so even every file would cost about
-///   a third of a cold build.
-/// - TypeORM (3,672 parsed TypeScript files): a cold build took 72 s of CPU
-///   (10 s wall); the sites of 960 readers (26%) took 3 s and of 1,245 (34%,
-///   every reader there is) 3.6 s, each plus 1.3-1.5 s to publish.
-///
-/// No share of the files reached a cold build's cost, so sites-only work
-/// never makes a cold build cheaper: the limit is every parsed file.
-const SITE_READERS_PERCENT: usize = 100;
-
 /// Why an update gave way to a cold build: what it had admitted by then.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RefreshLimit {
-    /// The stage whose files went over a limit.
+    /// The stage whose files went over the limit.
     pub(crate) stage: Stage,
-    /// Files needing full work.
+    /// Files counted against the limit: `full` and `sites_only` together.
     pub(crate) invalidated: usize,
     pub(crate) threshold: usize,
+    /// Files needing full work.
+    pub(crate) full: usize,
     /// Files needing only their method-call sites resolved again.
     pub(crate) sites_only: usize,
-    pub(crate) sites_threshold: usize,
     pub(crate) parsed: usize,
     /// Paths changed since the publication.
     pub(crate) changed: usize,
@@ -107,11 +95,11 @@ impl fmt::Display for RefreshLimit {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "invalidated={} threshold={} sites_only={} sites_threshold={} parsed={} changed={} crossed_at={} admitted: {}; stages after {} did not run, so their files are not counted",
+            "invalidated={} threshold={} full={} sites_only={} parsed={} changed={} crossed_at={} admitted: {}; stages after {} did not run, so their files are not counted",
             self.invalidated,
             self.threshold,
+            self.full,
             self.sites_only,
-            self.sites_threshold,
             self.parsed,
             self.changed,
             self.stage.name(),
@@ -161,14 +149,15 @@ impl RefreshBudget {
 
     pub(crate) fn set_parsed(&mut self, parsed: usize) -> Result<(), RefreshLimit> {
         self.parsed = parsed;
-        self.check(self.last, self.files.len())
+        self.check(self.last, None)
     }
 
-    /// Whether `changed` paths alone, each needing full work, stay within
-    /// the limit: checked before anything is extracted or started.
+    /// Whether `changed` paths alone stay within the limit: checked before
+    /// anything is extracted or started, so a single watcher batch larger
+    /// than the limit never starts an engine.
     pub(crate) fn check_changed(&mut self, changed: usize) -> Result<(), RefreshLimit> {
         self.changed = self.changed.max(changed);
-        self.check(Stage::Changed, changed.max(self.files.len()))
+        self.check(Stage::Changed, Some(changed))
     }
 
     /// Whether `file` was admitted for full work rather than for its
@@ -184,27 +173,22 @@ impl RefreshBudget {
             .count()
     }
 
-    fn thresholds(&self) -> (usize, usize) {
-        (
-            self.parsed.div_ceil(4).max(1024),
-            (self.parsed * SITE_READERS_PERCENT / 100).max(1024),
-        )
-    }
-
-    fn check(&self, stage: Stage, count: usize) -> Result<(), RefreshLimit> {
-        let (threshold, sites_threshold) = self.thresholds();
+    /// Checks the files admitted so far, or `count` instead when given.
+    fn check(&self, stage: Stage, count: Option<usize>) -> Result<(), RefreshLimit> {
+        let threshold = self.parsed.div_ceil(4).max(1024);
         let sites_only = self.sites_only();
+        let count = count.unwrap_or(self.files.len() + sites_only);
         #[cfg(test)]
         if RECORD.lock().unwrap().is_some() {
             return Ok(());
         }
-        if count > threshold || sites_only > sites_threshold {
+        if count > threshold {
             Err(RefreshLimit {
                 stage,
                 invalidated: count,
                 threshold,
+                full: self.files.len(),
                 sites_only,
-                sites_threshold,
                 parsed: self.parsed,
                 changed: self.changed,
                 counts: self.counts(),
@@ -235,7 +219,7 @@ impl RefreshBudget {
             self.changed = self.changed.max(offered);
         }
         self.last = stage;
-        self.check(stage, self.files.len())
+        self.check(stage, None)
     }
 
     /// Each class's carried-over count and each stage's.
@@ -263,5 +247,76 @@ impl Drop for RefreshBudget {
                 self.counts()
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(prefix: &str, count: usize) -> Vec<String> {
+        (0..count).map(|n| format!("{prefix}{n}.ts")).collect()
+    }
+
+    /// Sites-only files count against the same limit as full work, each
+    /// file once whichever classes admitted it, and the refusal says which
+    /// stage crossed and how many files each class held.
+    #[test]
+    fn both_classes_count_against_one_limit_and_the_refusal_reports_each() {
+        let mut budget = RefreshBudget::new(2_000, BTreeSet::new(), BTreeSet::new());
+        budget
+            .include(Stage::Changed, &names("changed", 1))
+            .unwrap();
+        let readers = names("reader", 900);
+        budget.include(Stage::MethodReaders, &readers).unwrap();
+        // Readers resolved in full count once.
+        budget.include(Stage::Resolve, &readers[..100]).unwrap();
+        let limit = budget
+            .include(Stage::Sites, &names("site", 200))
+            .unwrap_err();
+        assert_eq!(limit.stage, Stage::Sites);
+        assert_eq!(limit.threshold, 1024);
+        assert_eq!((limit.full, limit.sites_only), (101, 1_000));
+        assert_eq!(limit.invalidated, 1_101);
+        assert_eq!(limit.changed, 1);
+        let text = limit.to_string();
+        assert!(text.contains("crossed_at=sites"), "{text}");
+        assert!(
+            text.contains("changed=1 method_readers=900 rebind=0 resolve=100 dispatch=0 sites=200"),
+            "{text}"
+        );
+    }
+
+    /// Files earlier refreshes since the publication worked on count from
+    /// the start, in the class each was admitted to.
+    #[test]
+    fn carried_over_files_count_in_their_class() {
+        let full = names("full", 600).into_iter().collect::<BTreeSet<_>>();
+        let sites = names("site", 400).into_iter().collect::<BTreeSet<_>>();
+        let mut budget = RefreshBudget::new(2_000, full, sites);
+        budget.include(Stage::Changed, &names("full", 1)).unwrap();
+        assert!(budget.full_work("full0.ts"));
+        assert!(!budget.full_work("site0.ts"));
+        let limit = budget
+            .include(Stage::MethodReaders, &names("new", 30))
+            .unwrap_err();
+        assert_eq!((limit.full, limit.sites_only), (600, 430));
+        assert!(
+            limit
+                .to_string()
+                .contains("seeded_full=600 seeded_sites=400"),
+            "{limit}"
+        );
+    }
+
+    /// The check before anything is extracted counts the changed paths
+    /// alone, as it always has.
+    #[test]
+    fn the_first_check_counts_only_the_changed_paths() {
+        let seed = names("earlier", 1_000).into_iter().collect::<BTreeSet<_>>();
+        let mut budget = RefreshBudget::new(2_000, seed, BTreeSet::new());
+        budget.check_changed(30).unwrap();
+        let limit = budget.check_changed(1_025).unwrap_err();
+        assert_eq!((limit.stage, limit.invalidated), (Stage::Changed, 1_025));
     }
 }
