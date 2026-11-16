@@ -2345,7 +2345,15 @@ fn budget_health_metrics_with_limits(
         HEALTH_PROJECT_BUDGET_BYTES,
     );
     let mut mandatory = projects.clone();
-    mandatory.remove("root_groups");
+    if let Some(groups) = mandatory
+        .get_mut("root_groups")
+        .and_then(Value::as_array_mut)
+    {
+        for group in groups {
+            group.as_object_mut().unwrap().remove("examples");
+            group["examples_omitted"] = group["count"].clone();
+        }
+    }
     let last_identity = projects
         .get("root_groups")
         .and_then(Value::as_array)
@@ -2354,27 +2362,21 @@ fn budget_health_metrics_with_limits(
             .get("roots")
             .and_then(Value::as_array)
             .is_some_and(|roots| roots.len() == 1);
-    let has_mandatory = mandatory
-        .get_mut("roots")
-        .and_then(Value::as_array_mut)
-        .is_some_and(|roots| {
-            roots.retain(|root| last_identity || !progressing_health_root(root, health_now_ms()));
-            if !last_identity
-                || roots
-                    .iter()
-                    .any(|root| !progressing_health_root(root, health_now_ms()))
-            {
-                for root in roots.iter_mut() {
-                    reduce_health_root_details(root);
-                }
+    if let Some(roots) = mandatory.get_mut("roots").and_then(Value::as_array_mut) {
+        roots.retain(|root| last_identity || !progressing_health_root(root, health_now_ms()));
+        if !last_identity
+            || roots
+                .iter()
+                .any(|root| !progressing_health_root(root, health_now_ms()))
+        {
+            for root in roots.iter_mut() {
+                reduce_health_root_details(root);
             }
-            !roots.is_empty()
-        });
-    let mandatory_bytes = if has_mandatory {
-        refresh_metrics_bytes(&mut mandatory)
-    } else {
-        0
-    };
+        }
+    }
+    // Empty root lists still carry omission counts and group status. Reserve
+    // that bookkeeping before fitting process sections, not after merging it.
+    let mandatory_bytes = refresh_metrics_bytes(&mut mandatory);
     // Process sections come first, with project detail limited to the remainder
     // and at most 6 KiB. Failed/refused/degraded identities outrank only optional
     // process detail: use each process section's own summaries before cutting
@@ -2406,8 +2408,9 @@ fn budget_health_metrics_with_limits(
         }
     }
     if refresh_metrics_bytes(metrics) > budget {
-        metrics.insert("metrics_over_budget".into(), json!(true));
-    } else {
+        fit_health_metrics(metrics, budget, hard_limit.min(budget));
+    }
+    if refresh_metrics_bytes(metrics) <= budget {
         metrics.remove("metrics_over_budget");
     }
     enforce_health_hard_limit(metrics, hard_limit);
@@ -2548,20 +2551,12 @@ fn trim_health_root_groups(metrics: &mut serde_json::Map<String, Value>) -> bool
             return true;
         }
     }
-    let Some(group) = groups.pop() else {
-        return false;
-    };
-    for (key, count) in [
-        ("root_groups_omitted", 1),
-        (
-            "root_group_roots_omitted",
-            group["count"].as_u64().unwrap_or(0),
-        ),
-    ] {
-        let previous = metrics.get(key).and_then(Value::as_u64).unwrap_or(0);
-        metrics.insert(key.into(), json!(previous.saturating_add(count)));
+    for group in groups {
+        if group.as_object_mut().unwrap().remove("examples").is_some() {
+            return true;
+        }
     }
-    true
+    false
 }
 
 fn fit_health_metrics(
@@ -11922,6 +11917,15 @@ mod tests {
         std::fs::remove_file(&link).expect("replace standing symlink");
         std::os::unix::fs::symlink(retargeted.path(), &link).expect("retarget standing symlink");
 
+        let unbudgeted = build_health_diagnostic_rollup(&HealthRollupCache::new(), &executor, &app)
+            .expect("standing diagnostic rollup");
+        let mut project = unbudgeted.metrics.as_object().unwrap().clone();
+        project.retain(|key, _| HEALTH_PROJECT_FIELDS.contains(&key.as_str()));
+        for root in project["roots"].as_array_mut().unwrap() {
+            compact_health_root(root);
+        }
+        let project_bytes = encoded_health_metrics_len(&project);
+
         let metrics = DispatchPathMetrics::new();
         // A loaded runner can report scheduler contention instead of the root
         // rows; wait that out like the other health tests do.
@@ -11956,12 +11960,13 @@ mod tests {
             assert_eq!(root_row["standing_entry"], literal_path);
         }
         if long_paths {
-            // Ancillary telemetry yields first so the full standing refusal remains readable.
-            assert!(root_row.get("abbreviated").is_none());
-            assert!(!metrics["metrics_fields_omitted"]
-                .as_array()
-                .unwrap()
-                .is_empty());
+            // Process telemetry cannot force a path abbreviation by itself;
+            // the separate project ceiling can, while retaining refusal facts.
+            assert_eq!(
+                root_row["abbreviated"] == true,
+                project_bytes > HEALTH_PROJECT_BUDGET_BYTES,
+                "unbudgeted project bytes={project_bytes}"
+            );
         }
         assert_eq!(metrics["root_details_omitted"], 0);
         assert!(metrics["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);

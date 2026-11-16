@@ -5380,6 +5380,32 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "explicit fixture regeneration, not a verification gate"]
+    fn regenerate_tool_provider_system_text() {
+        let mut fixtures = serde_json::Map::new();
+        for (disabled, worker, name) in [
+            (vec![], false, "all_tools_worker_false"),
+            (vec![], true, "all_tools_worker_true"),
+            (vec!["bash".into()], false, "bash_disabled_worker_false"),
+        ] {
+            let reply = catalog(
+                json!({"system_text": {"preset": "broca", "params": {"worker": worker}}}),
+                &disabled,
+                true,
+            )
+            .unwrap();
+            fixtures.insert(name.into(), reply["system_text"]["text"].clone());
+        }
+        let path = Path::new(crate::test_support::manifest_dir())
+            .join("tests/fixtures/tool_provider_system_text.json");
+        std::fs::write(
+            path,
+            format!("{}\n", serde_json::to_string_pretty(&fixtures).unwrap()),
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn full_catalog_goldens_and_digest_only_have_exact_identity() {
         let mut presets_seen = BTreeSet::new();
         for (_, raw) in CATALOG_FIXTURES {
@@ -6189,8 +6215,9 @@ mod tests {
                 assert_eq!(unresolved_references(&reply), Vec::<String>::new());
                 let text = reply["system_text"]["text"].as_str().unwrap();
                 for line in [
-                    "start with aft_search;",
-                    "Then aft_outline for structure, aft_zoom for named symbols, read for line ranges.",
+                    "`aft_search` is the primary code-search tool:",
+                    "Then `aft_outline` for structure → `aft_zoom` for symbol(s).",
+                    "STOP — use aft_search (concepts, identifiers, regex, literals), read, aft_outline, or aft_zoom instead.",
                     "**Relationships**: aft_callgraph for callers",
                     "**After edits**: run aft_inspect for diagnostics;",
                     "Pass wait: true when you need a long command's result before anything else.",
