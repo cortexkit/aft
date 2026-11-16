@@ -3685,7 +3685,7 @@ fn head_sessions_take_remote_runs_from_the_user_config_only() {
         harness: "opencode".into(),
         session: "head".into(),
     };
-    let ctx = context(root.path(), storage.path(), None);
+    let ctx = context_with_user_remote(root.path(), storage.path(), None, false);
     assert!(lookup(&ctx, &head).is_none());
     let mut config = crate::config::Config::default();
     config.project_root = Some(root.path().into());
