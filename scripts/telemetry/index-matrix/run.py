@@ -165,7 +165,9 @@ def wait_ready(client, mode, deadline, output, sampler=None, phases=None):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise OSS.BudgetExceeded("readiness deadline exceeded")
-            status = checked(client.request("status", timeout_s=min(30, remaining)), "status")
+            # The first status can wait behind a huge checkout's first walk (Chromium on NTFS
+            # took over 30 s), so allow up to five minutes per status reply.
+            status = checked(client.request("status", timeout_s=min(300, remaining)), "status")
             statuses.write(json.dumps({"monotonic_ns": time.monotonic_ns(), "response": status}) + "\n")
             status_states = states(status, mode)
             if phases:
