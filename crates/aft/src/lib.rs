@@ -138,6 +138,7 @@ pub mod jsonc;
 pub mod jsonc_edit;
 pub mod language;
 pub(crate) mod large_read;
+pub(crate) mod late_result_bus;
 #[doc(hidden)]
 pub mod launch_fds;
 pub mod launch_nonce;

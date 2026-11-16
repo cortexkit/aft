@@ -275,6 +275,9 @@ cortexkit-role-agent-data = "=0.2.4"
 cortexkit-role-user-commands = "=0.1.4"
 cortexkit-project-identity = "=0.1.4"
 cortexkit-agent-identity = "=0.1.1"
+cortexkit-bus-client = "=0.1.1"
+cortexkit-bus-naming = "=0.4.1"
+async-nats = { version = "0.50", default-features = false, features = ["jetstream", "ring"] }
 jsonschema = { version = "0.33", default-features = false }
 subc-protocol = "=0.37.0"
 subc-transport = "=0.18.0"

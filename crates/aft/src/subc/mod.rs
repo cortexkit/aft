@@ -5469,6 +5469,11 @@ where
     // Stamped workers' permission asks go to Cingulate over this daemon.
     consent::install_subc_transport(connection_file_path);
     let _manifest_sync = crate::gh_shim::manifest_sync::start(connection_file_path.to_path_buf());
+    let bus_worker = crate::late_result_bus::start(
+        Arc::clone(&shared_app),
+        connection_file_path.to_path_buf(),
+        storage_dir.join("aft.db"),
+    );
     // Withdraw the macOS access cards earlier builds filed. It runs beside the
     // route loop, never before it: each withdrawal waits on Cingulate, and a
     // slow or absent Cingulate must not delay route binds.
@@ -7065,6 +7070,9 @@ where
         );
     }
     health_rollup_worker.shutdown();
+    if let Some(worker) = bus_worker {
+        worker.shutdown();
+    }
     // The flip retries until accepted; the connection ending is what stops it.
     scope_describe_task.abort();
     // Cancellation is not a join guarantee. If the monitor does not stop in

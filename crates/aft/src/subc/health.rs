@@ -4820,6 +4820,7 @@ fn assemble_health_report(
         "manifest_sync".into(),
         crate::gh_shim::manifest_sync::health(),
     );
+    metrics.insert("bus".into(), crate::late_result_bus::health());
     metrics.insert("age_ms".to_string(), json!(snapshot_age_ms));
     metrics.insert("generated_at_ms".to_string(), json!(rollup.generated_at_ms));
     metrics.insert("stale".to_string(), json!(stale_reason.is_some()));
@@ -10922,6 +10923,8 @@ mod tests {
             .collect::<Vec<_>>();
         let mut metrics = json!({
             "actor_count": 71,
+            "bus": {"connected": false, "connects": u64::MAX, "published": u64::MAX,
+                "publish_failures": u64::MAX, "last_error": "bus_consumer_disconnected"},
             "root_count": 71,
             "root_details_omitted": 0,
             "embedding_backend": { "available": true, "last_error": null, "since_ms": null },
@@ -10962,6 +10965,7 @@ mod tests {
             encoded.len()
         );
         assert_eq!(metrics["actor_count"], 71);
+        assert_eq!(metrics["bus"]["published"], u64::MAX);
         #[cfg(target_os = "linux")]
         assert_eq!(
             metrics["memory"]["jemalloc"]["accounting_source"],

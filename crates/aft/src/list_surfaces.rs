@@ -394,6 +394,12 @@ pub struct ExclusionEntry {
 
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
+    ExclusionEntry {
+        file: "late_result_bus.rs",
+        enclosing_item: "scan",
+        location_or_primitive: "SCAN_BATCH (64), SQL LIMIT",
+        reason: "internal terminal-feed wake replay visits a fixed rowid batch before collecting, continues at the last visited row, and periodically restarts the scan; it does not shorten a command result list",
+    },
     #[cfg(feature = "callgraph-shape-census")]
     ExclusionEntry {
         file: "data_layer/shape_census.rs",
