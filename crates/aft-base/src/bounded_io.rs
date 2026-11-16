@@ -567,13 +567,15 @@ fn finish_response_without_skips(mut response: Response) -> Response {
     }
 }
 
+test_support_visibility! {
 /// A ceiling skip is a coverage gap, not a sticky I/O failure: other files
 /// in the same request must still be readable.
 pub(crate) fn note_large_read_skip(path: &Path) {
     note_skipped_file(path, crate::large_read_counts::WHOLE_READ_SKIP_REASON);
 }
+}
 
-pub(crate) fn note_skipped_file(path: &Path, reason: &str) {
+pub fn note_skipped_file(path: &Path, reason: &str) {
     if let Some(budget) = capture() {
         budget
             .large_read_skips
@@ -589,7 +591,7 @@ pub(crate) fn note_skipped_file(path: &Path, reason: &str) {
 /// Keep all omission categories until the outer command has finished. Nested
 /// commands and workers that inherit the budget share the collector rather
 /// than adding a response field.
-pub(crate) fn with_skip_disclosure(run: impl FnOnce() -> Response) -> Response {
+pub fn with_skip_disclosure(run: impl FnOnce() -> Response) -> Response {
     let _scope = enter_disclosure_if_absent();
     let budget = capture().unwrap();
     let root = {
@@ -616,7 +618,7 @@ pub(crate) fn with_skip_disclosure(run: impl FnOnce() -> Response) -> Response {
     response
 }
 
-pub(crate) fn skip_disclosure_active() -> bool {
+pub fn skip_disclosure_active() -> bool {
     capture().is_some_and(|budget| {
         budget
             .large_read_skips
@@ -627,6 +629,7 @@ pub(crate) fn skip_disclosure_active() -> bool {
     })
 }
 
+test_support_visibility! {
 pub(crate) fn disclose_large_read_skips(response: &mut Response) {
     if !response.success {
         return;
@@ -679,7 +682,9 @@ pub(crate) fn disclose_large_read_skips(response: &mut Response) {
     }
 }
 
-pub(crate) fn append_skipped_files_text(text: String, data: &serde_json::Value) -> String {
+}
+
+pub fn append_skipped_files_text(text: String, data: &serde_json::Value) -> String {
     let gap = skipped_files_text(data);
     if gap.is_empty() {
         return text;
@@ -694,7 +699,7 @@ pub(crate) fn append_skipped_files_text(text: String, data: &serde_json::Value) 
     }
 }
 
-pub(crate) fn strip_skipped_files_text(text: &str, data: &serde_json::Value) -> String {
+pub fn strip_skipped_files_text(text: &str, data: &serde_json::Value) -> String {
     let gap = skipped_files_text(data);
     if gap.is_empty() {
         return text.to_string();
@@ -866,8 +871,10 @@ pub fn capture() -> Option<Budget> {
     CURRENT.with(|current| current.borrow().clone())
 }
 
+test_support_visibility! {
 pub(crate) fn enter_disclosure_if_absent() -> Scope {
     enter(capture().or_else(|| Some(Budget::disclosure_only())))
+}
 }
 
 /// Person approval has its own deadline; preserve the remaining filesystem and

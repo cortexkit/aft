@@ -159,7 +159,7 @@ static BUILD_REVISION: OnceLock<Option<String>> = OnceLock::new();
 /// The revision the binary was built from, as installed by
 /// [`initialize_binary_build_revision`]; `None` for unstamped builds and for
 /// library code (tests) that never ran the binary's startup.
-pub(crate) fn binary_build_revision() -> Option<&'static str> {
+pub fn binary_build_revision() -> Option<&'static str> {
     BUILD_REVISION
         .get()
         .and_then(|revision| revision.as_deref())

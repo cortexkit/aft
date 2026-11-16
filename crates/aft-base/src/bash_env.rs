@@ -218,7 +218,7 @@ pub(crate) fn is_blocked_env_key(key: &str) -> bool {
 // list for user configuration, which refuses module-control and startup names.
 const PROVIDER_PATH_EXCEPTION: &str = "PATH";
 
-pub(crate) fn is_blocked_provider_env_key(key: &str) -> bool {
+pub fn is_blocked_provider_env_key(key: &str) -> bool {
     !key.eq_ignore_ascii_case(PROVIDER_PATH_EXCEPTION) && is_blocked_env_key(key)
 }
 

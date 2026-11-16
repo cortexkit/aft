@@ -745,6 +745,7 @@ pub fn detect_language_any(path: &Path, dynamic_languages: bool) -> Option<LangI
     detect_language(path).or_else(|| dynamic_language_for_extension(path, dynamic_languages))
 }
 
+test_support_visibility! {
 /// Whether `path` is a Luau file, decided from its name alone. It gives the
 /// same answer as `detect_language_any(..) == Some(LangId::Luau)` but never
 /// opens the file: `detect_language` reads and parses every `.h` header to
@@ -754,6 +755,7 @@ pub fn detect_language_any(path: &Path, dynamic_languages: bool) -> Option<LangI
 pub(crate) fn is_luau_path(path: &Path, dynamic_languages: bool) -> bool {
     language_for_extension(path).is_none()
         && dynamic_language_for_extension(path, dynamic_languages) == Some(LangId::Luau)
+}
 }
 
 fn dynamic_language_for_extension(path: &Path, dynamic_languages: bool) -> Option<LangId> {

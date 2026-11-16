@@ -844,7 +844,7 @@ impl ShellEnvProvider {
         Ok(())
     }
 
-    pub(crate) fn argv(&self) -> Vec<String> {
+    pub fn argv(&self) -> Vec<String> {
         self.command.clone().unwrap_or_else(|| match self.kind {
             ShellEnvProviderKind::Mise => vec!["mise".into(), "env".into(), "--json".into()],
             ShellEnvProviderKind::Direnv => vec!["direnv".into(), "export".into(), "json".into()],
