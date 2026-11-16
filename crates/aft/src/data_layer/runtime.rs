@@ -2552,7 +2552,7 @@ mod tests {
                 crate::config::Config {
                     project_root: Some(self.handle.root().to_path_buf()),
                     storage_dir: Some(self._storage.path().to_path_buf()),
-                    harness: Some("opencode".into()),
+                    harness: Some(crate::harness::Harness::Opencode),
                     ..crate::config::Config::default()
                 },
             );
