@@ -13,7 +13,7 @@
     "trigram": true
   },
   "remote_exec": {
-    "enabled": true
+    "enabled": false
   },
   "restrict_to_project_root": false
 }

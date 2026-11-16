@@ -1,0 +1,14 @@
+{
+  "remote_exec": {
+    "enabled": true
+  },
+  "bash": {
+    "runon_enabled": false
+  },
+  "experimental": {
+    "bash": {
+      "compress": false,
+      "background": false
+    }
+  }
+}
