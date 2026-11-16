@@ -180,7 +180,7 @@ async fn scope_watch_secret_proxy_arm_and_stop_notify_without_strict_execution()
             vault: Vault::new(0),
             authorization_scope: authorization_scope.clone(),
             lifetime_scope: lifetime_scope.clone(),
-            scanned_labels: vec![],
+            scanned_labels: vec!["test".into()],
             consent_context: None,
             test_https_port: None,
             approval_clock: None,
