@@ -1052,18 +1052,17 @@ pub fn terminate_pgid(pgid: i32, mut child: Option<&mut Child>) {
 }
 
 #[cfg(unix)]
-pub(crate) fn terminate_pgid_with(pgid: i32, mut leader_exited: impl FnMut() -> bool) {
+pub(crate) fn terminate_pgid_with(pgid: i32, mut reap_leader: impl FnMut() -> bool) {
     unsafe {
         libc::killpg(pgid, libc::SIGTERM);
     }
     let grace_started = Instant::now();
     while grace_started.elapsed() < TERMINATE_GRACE {
-        if leader_exited() {
-            // The direct child (process-group leader) exited. Stop waiting,
-            // but still SIGKILL the whole group below — a descendant that
-            // ignored SIGTERM can outlive the leader (the wrapper-shell /
-            // CLI-spawns-child orphan class). killpg on an already-empty
-            // group is a harmless ESRCH.
+        // Reap our wrapper before probing: signal 0 still sees zombies. Its
+        // exit alone says nothing about the command's descendants, which need
+        // the rest of the grace period to finish their TERM handlers.
+        reap_leader();
+        if termination_group_exited(pgid) {
             break;
         }
         thread::sleep(Duration::from_millis(50));
@@ -1074,6 +1073,23 @@ pub(crate) fn terminate_pgid_with(pgid: i32, mut leader_exited: impl FnMut() -> 
     }
     unsafe {
         libc::killpg(pgid, libc::SIGKILL);
+    }
+}
+
+#[cfg(unix)]
+fn termination_group_exited(pgid: i32) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        // Orphans may remain zombies under their new parent even after our
+        // direct child is reaped. The platform listings exclude exited members
+        // and treat unreadable/incomplete listings conservatively.
+        process_group_gone(pgid)
+            || live_process_group_members(pgid).is_ok_and(|group| group.is_clean())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        (unsafe { libc::killpg(pgid, 0) } == -1)
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
     }
 }
 
@@ -1653,7 +1669,12 @@ mod tests {
             .expect("parse descendant pid");
         assert!(is_process_alive(desc_pid), "descendant should be alive");
 
+        let stopping = Instant::now();
         terminate_pgid(pgid, Some(&mut leader));
+        assert!(
+            stopping.elapsed() >= TERMINATE_GRACE,
+            "an ignoring descendant must receive the whole grace period"
+        );
 
         // The TERM-ignoring descendant must be gone (SIGKILL'd via the group).
         let start = Instant::now();
@@ -1664,6 +1685,84 @@ mod tests {
             !is_process_alive(desc_pid),
             "TERM-ignoring descendant must be SIGKILLed when the group is terminated"
         );
+    }
+
+    #[cfg(unix)]
+    fn termination_wrapper(command: &str, root: &Path) -> Child {
+        let wrapper = std::str::from_utf8(PAYLOAD_WRAPPER).unwrap();
+        let script = format!("exec 3>\"$8\"\n{wrapper}");
+        let mut command_builder = std::process::Command::new("/bin/sh");
+        command_builder
+            .args([
+                "-c",
+                &script,
+                "aft-termination-test",
+                "/bin/sh",
+                command,
+                "3",
+                "",
+                "",
+                "",
+                "",
+            ])
+            .arg(root.join("exit"))
+            .current_dir(root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        start_new_session(&mut command_builder);
+        command_builder.spawn().unwrap()
+    }
+
+    #[cfg(unix)]
+    fn wait_for_termination_file(path: &Path) {
+        let started = Instant::now();
+        while !path.exists() && started.elapsed() < Duration::from_secs(10) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(path.exists(), "command did not create {}", path.display());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_pgid_allows_term_cleanup_after_wrapper_exits() {
+        let root = tempfile::tempdir().unwrap();
+        let mut child = termination_wrapper(
+            "trap 'sleep 0.3; echo cleaned > marker; exit 0' TERM; touch ready; while :; do sleep 0.05; done",
+            root.path(),
+        );
+        wait_for_termination_file(&root.path().join("ready"));
+        let stopping = Instant::now();
+        terminate_process(&mut child);
+        assert!(
+            root.path().join("marker").exists(),
+            "TERM cleanup was killed early"
+        );
+        assert!(stopping.elapsed() >= Duration::from_millis(300));
+        assert!(
+            stopping.elapsed() < TERMINATE_GRACE,
+            "a group containing only exited processes must not use the entire grace period"
+        );
+        child.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_pgid_gives_term_ignoring_command_full_grace() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "trap '' TERM; touch ready; while :; do sleep 1; done"])
+            .current_dir(root.path());
+        start_new_session(&mut command);
+        let mut child = command.spawn().unwrap();
+        wait_for_termination_file(&root.path().join("ready"));
+        let stopping = Instant::now();
+        terminate_process(&mut child);
+        assert!(stopping.elapsed() >= TERMINATE_GRACE);
+        assert!(stopping.elapsed() < Duration::from_secs(15));
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
     }
 }
 

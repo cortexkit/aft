@@ -342,7 +342,7 @@ enum KillSignalPlan {
 }
 
 /// Signal a piped task: SIGTERM to its process group, a grace period that
-/// ends early once the direct child exits, then SIGKILL (Unix); `taskkill`
+/// ends early once the whole group exits, then SIGKILL (Unix); `taskkill`
 /// on the process tree (Windows).
 fn terminate_piped_task(
     task_id: &str,
@@ -383,6 +383,30 @@ fn terminate_piped_task(
             terminate_pid(pid);
         }
     }
+}
+
+/// Stop independent commands concurrently so a batch shares one grace window.
+/// Callers collect targets before entering here, without registry/task locks.
+fn stop_tasks_in_parallel<T: Send, R: Send>(
+    tasks: impl IntoIterator<Item = T>,
+    stop: impl Fn(T) -> R + Sync,
+) -> Vec<R> {
+    #[cfg(unix)]
+    {
+        std::thread::scope(|scope| {
+            let stop = &stop;
+            let workers: Vec<_> = tasks
+                .into_iter()
+                .map(|task| scope.spawn(move || stop(task)))
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("command stop worker panicked"))
+                .collect()
+        })
+    }
+    #[cfg(not(unix))]
+    tasks.into_iter().map(stop).collect()
 }
 
 // Sending a group signal and reaping its leader do not mean descendants have
@@ -2900,11 +2924,9 @@ impl BgTaskRegistry {
             state.pending.remove(session_id);
         }
 
-        let mut killed = 0;
-        let mut first_error = None;
-        for task_id in task_ids {
+        let results = stop_tasks_in_parallel(task_ids, |task_id| {
             let Some(task) = self.task_for_session(&task_id, session_id) else {
-                continue;
+                return Ok(false);
             };
             let is_terminal = task
                 .lock_state()
@@ -2912,7 +2934,7 @@ impl BgTaskRegistry {
                 .metadata
                 .is_terminal();
             if is_terminal {
-                continue;
+                return Ok(false);
             }
             let snapshot = match self.kill_with_status_reason(
                 &task_id,
@@ -2923,14 +2945,21 @@ impl BgTaskRegistry {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     self.register_foreground_task(session_id, &task_id);
-                    first_error.get_or_insert(error);
-                    continue;
+                    return Err(error);
                 }
             };
-            if snapshot.info.status == BgTaskStatus::Killed
-                && snapshot.info.status_reason.as_deref() == Some("call_aborted")
-            {
-                killed += 1;
+            Ok(snapshot.info.status == BgTaskStatus::Killed
+                && snapshot.info.status_reason.as_deref() == Some("call_aborted"))
+        });
+        let mut killed = 0;
+        let mut first_error = None;
+        for result in results {
+            match result {
+                Ok(true) => killed += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
             }
         }
         match first_error {
@@ -11279,13 +11308,17 @@ impl BgTaskRegistry {
             .collect();
 
         let mut killed = 0;
-        for (task_id, session_id) in targets {
-            match self.kill_with_status_reason(
+        for result in stop_tasks_in_parallel(targets, |(task_id, session_id)| {
+            let result = self.kill_with_status_reason(
                 &task_id,
                 &session_id,
                 BgTaskStatus::Killed,
                 Some(ROOT_RECLAIMED_REASON.to_string()),
-            ) {
+            );
+            (task_id, result)
+        }) {
+            let (task_id, result) = result;
+            match result {
                 Ok(_) => killed += 1,
                 Err(error) => crate::slog_warn!(
                     "failed to terminate background task {task_id} for reclaimed root {}: {error}",
@@ -12701,9 +12734,9 @@ impl BgTaskRegistry {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        for (task_id, session_id) in tasks {
+        stop_tasks_in_parallel(tasks, |(task_id, session_id)| {
             let _ = self.kill(&task_id, &session_id);
-        }
+        });
     }
 
     pub(crate) fn poll_task(&self, task: &Arc<BgTask>) -> Result<(), String> {
@@ -13894,6 +13927,7 @@ impl BgTaskRegistry {
     ) -> Result<ScopeKillReport, String> {
         let mut report = ScopeKillReport::default();
         let mut errors = Vec::new();
+        let mut targets = Vec::new();
         for task in self.task_arcs() {
             let stamp = task
                 .lock_state()
@@ -13935,44 +13969,50 @@ impl BgTaskRegistry {
                     }
                     continue;
                 }
-                // A run scope's tasks were started by a codemode program.
-                let killed = if paused {
-                    self.kill_with_status_reason(
-                        &task.task_id,
-                        &task.session_id,
-                        BgTaskStatus::Killed,
-                        Some(OWNER_PAUSED_REASON.into()),
-                    )
-                    .map_err(|error| error.to_string())
-                } else if stamp.attributes.run_id.is_some() {
-                    self.kill_for_run_end(&task.task_id, &task.session_id)
-                } else {
-                    self.kill_for_scope_revocation(&task.task_id, &task.session_id)
-                };
-                match killed {
-                    Ok(snapshot) if snapshot.info.status == BgTaskStatus::Killed => {
-                        if paused {
-                            self.report_paused_task(&task, &mut report)?;
-                        } else {
-                            report.killed.push(ScopeKilledTask {
-                                task_id: task.task_id.clone(),
-                                session_id: task.session_id.clone(),
-                                remote: scope_remote_cancel(&task),
-                                from_saved_record: false,
-                            });
-                        }
+                targets.push((task, stamp));
+            }
+        }
+        let stopped = stop_tasks_in_parallel(targets, |(task, stamp)| {
+            // A run scope's tasks were started by a codemode program.
+            let killed = if paused {
+                self.kill_with_status_reason(
+                    &task.task_id,
+                    &task.session_id,
+                    BgTaskStatus::Killed,
+                    Some(OWNER_PAUSED_REASON.into()),
+                )
+                .map_err(|error| error.to_string())
+            } else if stamp.attributes.run_id.is_some() {
+                self.kill_for_run_end(&task.task_id, &task.session_id)
+            } else {
+                self.kill_for_scope_revocation(&task.task_id, &task.session_id)
+            };
+            (task, killed)
+        });
+        for (task, killed) in stopped {
+            match killed {
+                Ok(snapshot) if snapshot.info.status == BgTaskStatus::Killed => {
+                    if paused {
+                        self.report_paused_task(&task, &mut report)?;
+                    } else {
+                        report.killed.push(ScopeKilledTask {
+                            task_id: task.task_id.clone(),
+                            session_id: task.session_id.clone(),
+                            remote: scope_remote_cancel(&task),
+                            from_saved_record: false,
+                        });
                     }
-                    Ok(snapshot) => {
-                        if let Some(cancel) = snapshot.remote_cancel.as_deref() {
-                            crate::slog_info!(
-                                "scope-end remote cancel task={}: {cancel}",
-                                task.task_id
-                            );
-                        }
-                        report.already_finished += 1;
-                    }
-                    Err(error) => errors.push(format!("{}: {error}", task.task_id)),
                 }
+                Ok(snapshot) => {
+                    if let Some(cancel) = snapshot.remote_cancel.as_deref() {
+                        crate::slog_info!(
+                            "scope-end remote cancel task={}: {cancel}",
+                            task.task_id
+                        );
+                    }
+                    report.already_finished += 1;
+                }
+                Err(error) => errors.push(format!("{}: {error}", task.task_id)),
             }
         }
         if errors.is_empty() {

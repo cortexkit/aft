@@ -103,6 +103,62 @@ fn task_pgid(registry: &BgTaskRegistry, task_id: &str) -> i32 {
         .unwrap()
 }
 
+#[test]
+fn scope_end_stops_three_commands_in_one_grace_window() {
+    let registry = registry();
+    let dir = tempfile::tempdir().unwrap();
+    let stamp = subc_protocol::scope::ScopeStamp::new(
+        subc_protocol::Principal::Reserved {
+            module_id: "owner".into(),
+        },
+        "cleanup-window",
+        1,
+        subc_protocol::scope::ScopeKind::Head,
+    )
+    .with_owner_authorized(true);
+    let mut tasks = Vec::new();
+    let mut reapers = Vec::new();
+    for index in 0..3 {
+        // Each handler records TERM before ignoring further signals. All
+        // handlers must start before any command receives the final SIGKILL.
+        let command = format!(
+            "trap 'trap \"\" TERM; touch term-{index}; while ! test -f term-0 || ! test -f term-1 || ! test -f term-2; do sleep 0.02; done; touch overlap-{index}; exec sleep 30' TERM; touch ready-{index}; while :; do sleep 0.05; done"
+        );
+        let task_id = with_scope_spawn(Some(stamp.clone()), || {
+            spawn_for_kill(&registry, dir.path(), &command)
+        });
+        reapers.push(ReapGroup(task_pgid(&registry, &task_id)));
+        tasks.push(task_id);
+    }
+    for index in 0..3 {
+        wait_for_file(
+            &dir.path().join(format!("ready-{index}")),
+            "command did not start",
+        );
+    }
+    let stopping = Instant::now();
+    registry.kill_scope(&stamp);
+    let elapsed = stopping.elapsed();
+    assert!(elapsed >= Duration::from_secs(2));
+    // The handler barrier proves overlap independently of scheduling speed;
+    // leave a wide wall-clock bound for loaded CI hosts.
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "scope stop took {elapsed:?}"
+    );
+    for index in 0..3 {
+        assert!(
+            dir.path().join(format!("overlap-{index}")).exists(),
+            "TERM waits were serialized"
+        );
+    }
+    for task_id in tasks {
+        let snapshot = registry.status(&task_id, SESSION, None, None, 0).unwrap();
+        assert_eq!(snapshot.info.status, BgTaskStatus::Killed);
+        assert_eq!(snapshot.info.exit_code, Some(137));
+    }
+}
+
 fn completion_for(registry: &BgTaskRegistry, task_id: &str) -> BgCompletion {
     let completions = registry
         .pending_completions_for_session(SESSION)
