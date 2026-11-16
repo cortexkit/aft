@@ -507,7 +507,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "parser/dead_code_facts.rs",
-        enclosing_item: "collect_rust_macro_token_refs",
+        enclosing_item: "collect_rust_macro_token_refs,Step",
         location_or_primitive: "scope_stack.truncate(scope_len)",
         reason: "Restores the syntax walk's lexical scope after leaving a node; it does not cut findings or stored references.",
     },
