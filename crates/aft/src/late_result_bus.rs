@@ -23,6 +23,8 @@ use tokio::sync::{oneshot, Notify};
 use crate::context::App;
 use crate::db::call_ledger::{Key, LATE_RESULTS_PAGE_MAX, UNACKED_RESULTS_MAX};
 
+pub(crate) mod readers;
+
 const SCAN_BATCH: usize = 64;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const OVERLAP_MS: i64 = 10_000;
@@ -39,6 +41,7 @@ struct BusHealth {
     published: u64,
     publish_failures: u64,
     last_error: Option<&'static str>,
+    cards: readers::ReaderHealth,
 }
 
 pub(crate) fn health() -> serde_json::Value {
@@ -92,7 +95,12 @@ pub(crate) fn start(app: Arc<App>, connection: PathBuf, database: PathBuf) -> Op
                 failure("bus_runtime");
                 return;
             };
-            runtime.block_on(run(app, connection, database, stopped));
+            runtime.block_on(async {
+                tokio::select! {
+                    _ = run(app, connection, database, stopped) => {},
+                    _ = readers::sweep_parked() => {},
+                }
+            });
         })
         .map_err(|_| failure("bus_worker"))
         .ok()?;
@@ -151,17 +159,19 @@ async fn drive(
     let mut bus = None;
     let mut delay = Duration::from_secs(1);
     let mut scan_pending = true;
+    let mut services = None;
     loop {
         if !daemon_connected.load(Ordering::Relaxed) {
+            services = None;
             failure("bus_consumer_disconnected");
             tokio::time::sleep(delay).await;
             delay = backoff(delay);
             continue;
         }
-        if bus
-            .as_ref()
-            .is_some_and(|client: &BusClient| client.connection_changes().has_changed().is_err())
-        {
+        if bus.as_ref().is_some_and(|client: &Arc<BusClient>| {
+            client.connection_changes().has_changed().is_err()
+        }) {
+            services = None;
             bus = None;
         }
         if bus.is_none() {
@@ -170,7 +180,7 @@ async fn drive(
                 .await
             {
                 Ok(Ok(client)) => {
-                    bus = Some(client);
+                    bus = Some(Arc::new(client));
                     delay = Duration::from_secs(1);
                 }
                 Ok(Err(error)) => {
@@ -188,6 +198,9 @@ async fn drive(
             }
         }
         let client = bus.as_ref().expect("connected above");
+        if services.is_none() {
+            services = Some(readers::Services::start(Arc::clone(client)));
+        }
         HEALTH.lock().connected = client.connection().client().connection_state()
             == async_nats::connection::State::Connected;
         let mut publisher = RealPublisher(client);
