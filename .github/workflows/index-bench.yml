@@ -1,0 +1,99 @@
+name: Native cold index benchmark
+
+on:
+  push:
+    branches:
+      - bench/index-windows
+      - bench/index-mac
+
+permissions:
+  contents: read
+
+concurrency:
+  group: index-bench-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  cold-index:
+    if: github.ref == 'refs/heads/bench/index-windows' || github.ref == 'refs/heads/bench/index-mac'
+    runs-on: [self-hosted, "${{ github.ref_name == 'bench/index-windows' && 'narli' || 'rented-mac' }}"]
+    # Chromium needs up to 90 minutes per binary on narli, after the smaller projects.
+    timeout-minutes: 480
+    defaults:
+      run:
+        shell: bash
+    env:
+      AFT_BUILD_GIT_SHA: ${{ github.sha }}
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: ""
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/index-bench-work/build
+      BENCH_EXE: ${{ github.ref_name == 'bench/index-windows' && '.exe' || '' }}
+      BENCH_PLATFORM: ${{ github.ref_name == 'bench/index-windows' && 'windows' || 'macos' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/native-ci-state
+        with:
+          phase: python
+
+      # narli's Rust installation is administrator-managed and read-only to jobs.
+      - uses: dtolnay/rust-toolchain@stable
+        if: runner.os == 'macOS'
+
+      - name: Verify native tools and prepare results
+        run: |
+          python3 --version
+          rustc --version
+          cargo --version
+          bash scripts/check-cmake.sh
+          mkdir -p target/index-bench-results
+
+      - name: Download and checksum official 0.65.0
+        run: python3 scripts/telemetry/index-bench/run.py download --work target/index-bench-work
+
+      - name: Build pushed candidate in shipped release profile
+        timeout-minutes: 120
+        run: |
+          cargo build --release --bin aft -p agent-file-tools --features wasm-grammars > target/index-bench-results/build.log 2>&1 &
+          build_pid=$!
+          trap 'kill "$build_pid" 2>/dev/null || true' EXIT
+          while kill -0 "$build_pid" 2>/dev/null; do
+            echo "Candidate release build running: $(date -u)"
+            sleep 30
+          done
+          wait "$build_pid"
+          trap - EXIT
+
+      - name: Keep candidate executable and reclaim build disk before cloning
+        run: |
+          python3 -c 'import os, pathlib, shutil; build = pathlib.Path(os.environ["CARGO_TARGET_DIR"]); shutil.copy2(build / "release" / ("aft" + os.environ["BENCH_EXE"]), build.parent / "bin" / ("aft-candidate" + os.environ["BENCH_EXE"])); shutil.rmtree(build)'
+
+      - name: Cold builds at Linux matrix pins
+        run: |
+          python3 scripts/telemetry/index-bench/run.py run \
+            --work target/index-bench-work \
+            --output target/index-bench-results \
+            --baseline "target/index-bench-work/bin/aft-0.65.0${BENCH_EXE}" \
+            --candidate "target/index-bench-work/bin/aft-candidate${BENCH_EXE}"
+
+      - name: Publish table in job summary
+        if: always()
+        run: |
+          if [[ -f target/index-bench-results/results.md ]]; then
+            python3 -c 'import os, pathlib; p = pathlib.Path("target/index-bench-results/results.md"); open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8").write(p.read_text(encoding="utf-8"))'
+          fi
+
+      - name: Delete clones, isolated stores, downloads and candidate build folder
+        if: always()
+        run: python3 scripts/telemetry/index-bench/run.py cleanup --work target/index-bench-work
+
+      - name: Upload results and raw logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cold-index-${{ env.BENCH_PLATFORM }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/index-bench-results/
+          if-no-files-found: warn
+          retention-days: 30
