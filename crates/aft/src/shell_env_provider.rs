@@ -723,14 +723,14 @@ mod tests {
         provider.watch = vec!["project.env".into()];
         let run = |provider: &ShellEnvProvider| {
             let mut env = HashMap::new();
-            assert!(apply(
+            let failure = apply(
                 Some(provider),
                 &mut SpawnPlan::Unsandboxed,
                 &nested,
                 &mut env,
-                false
-            )
-            .is_none());
+                false,
+            );
+            assert!(failure.is_none(), "{failure:?}");
             env["VALUE"].clone()
         };
         assert_eq!(run(&provider), "first");
