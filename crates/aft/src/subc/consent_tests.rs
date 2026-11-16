@@ -8245,6 +8245,8 @@ fn worker_suffix_file(f: &Fixture, relative: &str) -> PathBuf {
 }
 
 fn build_suffix_inventory(f: &Fixture) {
+    f.ctx
+        .set_canonical_cache_root(f.worker.project_root.clone());
     f.ctx.data_checkout().unwrap().checkout().build().unwrap();
     assert!(f.ctx.data_view().is_some());
 }
