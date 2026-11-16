@@ -635,7 +635,7 @@ fn validate_tool_result_source(
 /// calls without a route or a running shell task.
 pub(crate) fn unsettled_scopes(conn: &Connection) -> rusqlite::Result<Vec<ScopeIdentity>> {
     let mut statement = conn.prepare("SELECT DISTINCT owner,scope_ref,scope_epoch FROM call_ledger WHERE state<>'Settled' AND owner IS NOT NULL AND scope_ref IS NOT NULL AND scope_epoch IS NOT NULL")?;
-    statement
+    let scopes = statement
         .query_map([], |row| {
             Ok(ScopeIdentity {
                 owner: row.get(0)?,
@@ -643,7 +643,8 @@ pub(crate) fn unsettled_scopes(conn: &Connection) -> rusqlite::Result<Vec<ScopeI
                 scope_epoch: row.get(2)?,
             })
         })?
-        .collect()
+        .collect();
+    scopes
 }
 
 /// Atomically settle Prepared and Authorized calls as scope-ended.
