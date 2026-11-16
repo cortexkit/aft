@@ -358,7 +358,7 @@ async fn scope_watch_daemon_case(binary_env: &str, expect_watch: bool) {
         } else {
             health["opens"] == 0
                 && health["polled"] == 1
-                && health["descriptions"].as_u64().unwrap_or(0) >= 1
+                && health["fallbacks"].as_u64().unwrap_or(0) >= 1
         }
     })
     .await;
