@@ -2589,7 +2589,10 @@ mod tests {
             // Keep real retry registrations pending while all roots are bound.
             fixture.handle.work.retry.lock().unwrap().in_a_row = 10;
             fixture.handle.work.fill_retry.lock().unwrap().in_a_row = 10;
-            fixture.handle.work.retry_build_later(&DataError::Cancelled);
+            fixture
+                .handle
+                .work
+                .retry_build_later(&DataError::Cancelled, false);
             fixture
                 .handle
                 .work
@@ -2675,7 +2678,7 @@ mod tests {
         );
         // Even a pool job retaining Work cannot rearm an evicted checkout.
         for work in &works {
-            work.retry_build_later(&DataError::Cancelled);
+            work.retry_build_later(&DataError::Cancelled, false);
             work.retry_fill_later("evicted root");
             assert!(work.retry.lock().unwrap().timer.is_none());
             assert!(work.fill_retry.lock().unwrap().timer.is_none());
