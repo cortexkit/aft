@@ -6155,7 +6155,7 @@ mod tests {
         let description = watch["description"].as_str().unwrap();
         assert!(
             description.starts_with(
-                "Watch a background bash task. Sync waits default to 30s in a main session"
+                "Watch a background bash task; a remote job ID works too. Sync waits default to 30s in a main session"
             ),
             "{description}"
         );

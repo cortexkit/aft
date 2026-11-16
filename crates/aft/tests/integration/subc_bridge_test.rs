@@ -8381,11 +8381,14 @@ async fn drive_lossy_pressure_daemon(input: FakeDaemonInput) {
 }
 
 async fn read_raw_inventory_frame(stream: &mut tokio::net::TcpStream, label: &str) -> Frame {
-    tokio::time::timeout(Duration::from_secs(10), read_subc_frame(stream))
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
-        .expect("read inventory frame")
-        .unwrap_or_else(|| panic!("EOF waiting for {label}"))
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        crate::subc_fake::read_frame(stream),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
+    .expect("read inventory frame")
+    .unwrap_or_else(|| panic!("EOF waiting for {label}"))
 }
 
 async fn accept_status_consumer(
