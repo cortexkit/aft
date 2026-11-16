@@ -10,6 +10,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use subc_protocol::Principal;
 
+use super::display::counters::{count, Counter::*};
+
 mod reads;
 pub(crate) use reads::ReadCache;
 
@@ -60,6 +62,7 @@ impl Outbox {
         now: Instant,
     ) -> bool {
         let Some(map) = body.as_object() else {
+            count(AdmitNotObject);
             return false;
         };
         let write = DisplayWrite::new(
@@ -70,6 +73,7 @@ impl Outbox {
             map.clone(),
         );
         let Ok(bytes) = validate_write(&write, limits) else {
+            count(AdmitInvalidWrite);
             return false;
         };
         let Ok(key) = cortexkit_role_tool_display::idempotency_key(
@@ -78,10 +82,12 @@ impl Outbox {
             },
             &write,
         ) else {
+            count(AdmitInvalidKey);
             return false;
         };
         let record_id = format!("{:x}", Sha256::digest(key));
         let Ok(arguments) = canonical_body(&super::records::object(json!(write))) else {
+            count(AdmitArgumentsEncoding);
             return false;
         };
         if self.entries.iter().any(|e| {
@@ -89,14 +95,17 @@ impl Outbox {
                 && e.identity.call_key == identity.call_key
                 && e.kind == kind
         }) {
+            count(AdmitDuplicate);
             return false;
         }
         let Ok(frame) = canonical_body(&super::records::object(
             json!({"name":"display.write","arguments": write}),
         )) else {
+            count(AdmitFrameEncoding);
             return false;
         };
         if frame.len() >= 4 * 1024 * 1024 {
+            count(AdmitFrameTooLarge);
             return false;
         }
         let calls: std::collections::HashSet<_> = self
@@ -114,6 +123,7 @@ impl Outbox {
             identity.call_key.clone(),
         );
         if !calls.contains(&this_call) && calls.len() >= MAX_CALLS {
+            count(AdmitCallCap);
             return false;
         }
         let weight = frame.len().saturating_add(bytes.len());
@@ -128,12 +138,18 @@ impl Outbox {
                     break;
                 };
                 if let Some(entry) = self.entries.remove(index) {
+                    count(AdmitShedDetail);
                     self.bytes -= entry.frame.len() + entry.body.len();
                     self.reads.shed(&entry.record_id, now);
                 }
             }
         }
-        if self.entries.len() >= MAX_CALLS * 3 || self.bytes.saturating_add(weight) > MAX_BYTES {
+        if self.entries.len() >= MAX_CALLS * 3 {
+            count(AdmitEntryCap);
+            return false;
+        }
+        if self.bytes.saturating_add(weight) > MAX_BYTES {
+            count(AdmitByteCap);
             return false;
         }
         self.bytes += weight;
@@ -150,6 +166,7 @@ impl Outbox {
         // Queue admission is the process-local commit point. Only committed
         // snapshots become readable or eligible for a bus wake.
         self.reads.insert(record_id, arguments, weight, now);
+        count(Admitted);
         true
     }
 
@@ -158,6 +175,11 @@ impl Outbox {
         self.entries.retain(|entry| {
             let keep = now.duration_since(entry.admitted) < EXPIRY && entry.attempts < 8;
             if !keep {
+                count(if now.duration_since(entry.admitted) >= EXPIRY {
+                    Expired
+                } else {
+                    AttemptsExhausted
+                });
                 self.bytes -= entry.frame.len() + entry.body.len();
                 reads.push_finished(&entry.record_id, now);
             }
@@ -172,6 +194,11 @@ impl Outbox {
     pub(crate) fn retry(&mut self, mut entry: Entry, now: Instant) {
         entry.attempts += 1;
         if entry.attempts >= 8 || now.duration_since(entry.admitted) >= EXPIRY {
+            count(if entry.attempts >= 8 {
+                AttemptsExhausted
+            } else {
+                Expired
+            });
             self.reads.push_finished(&entry.record_id, now);
             return;
         }
@@ -184,7 +211,9 @@ impl Outbox {
         {
             self.bytes += entry.frame.len() + entry.body.len();
             self.entries.push_back(entry);
+            count(Retried);
         } else {
+            count(RetryCapacity);
             self.reads.push_finished(&entry.record_id, now);
         }
     }

@@ -2511,6 +2511,7 @@ fn priority_health_field(field: &str, value: &Value) -> bool {
             | "runner_notices"
             | "manifest_sync"
             | "bus"
+            | "display"
             | "indexing"
             | "gh_speech"
             | "embedding_backend"
@@ -4822,6 +4823,7 @@ fn assemble_health_report(
         crate::gh_shim::manifest_sync::health(),
     );
     metrics.insert("bus".into(), crate::late_result_bus::health());
+    metrics.insert("display".into(), super::rich_ui::display::health());
     metrics.insert("age_ms".to_string(), json!(snapshot_age_ms));
     metrics.insert("generated_at_ms".to_string(), json!(rollup.generated_at_ms));
     metrics.insert("stale".to_string(), json!(stale_reason.is_some()));
@@ -10864,6 +10866,27 @@ mod tests {
                 .expect("ready progress timestamp")
                 > building_progress
         );
+    }
+
+    #[test]
+    fn display_health_stays_inside_existing_budget() {
+        let display = super::super::rich_ui::display::health();
+        let mut metrics = json!({
+            "display": display,
+            "roots": (0..100).map(|i| json!({
+                "project_root": format!("/workspace/{i}/{}", "long-path".repeat(20)),
+                "state": "ready", "search_index": {"status": "ready"},
+                "semantic_index": {"status": "ready"}, "callgraph_store": {"status": "ready"},
+                "tier2": {"status": "ready"}
+            })).collect::<Vec<_>>()
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        budget_health_metrics(&mut metrics);
+        assert_eq!(metrics["display"], display);
+        assert!(metrics["root_details_omitted"].as_u64().unwrap() > 0);
+        assert!(encoded_health_metrics_len(&metrics) <= HEALTH_METRICS_BUDGET_BYTES);
     }
 
     #[test]

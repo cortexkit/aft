@@ -165,6 +165,7 @@ mod status_memory_test;
 mod subc_bridge_test;
 #[cfg(unix)]
 mod subc_detach_test;
+mod subc_display_test;
 mod subc_format_test;
 #[cfg(unix)]
 mod subc_launch_nonce_test;
