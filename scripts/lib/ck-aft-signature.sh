@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # macOS signing, signature checks and the ONNX Runtime smoke for the
-# supervised AFT module (ck-aft). Sourced by scripts/stage-card.sh and
-# scripts/verify-placed-card.sh so staging and placement check the same rule.
+# supervised AFT module (ck-aft) and npm binaries. Staging and placement require
+# a team signature; npm uses an ad-hoc signature with the stable identifier aft.
 #
 # The rule: identifier ck-aft, signed by a team identity (macOS permission
 # grants given to the module, such as Files & Folders access for its own read
@@ -35,20 +35,29 @@ ck_aft_sign_identity() {
   printf '%s\n' "$found"
 }
 
-# Sign in place with the team identity, the pinned identifier, hardened
-# runtime and the committed entitlements.
-ck_aft_sign() {
-  local binary="$1" identity
-  identity="$(ck_aft_sign_identity)" || return 1
-  codesign --force --sign "$identity" --identifier "$CK_AFT_IDENTIFIER" -o runtime \
+# Both distribution paths use the same hardened runtime and entitlements.
+ck_aft_sign_binary() {
+  local binary="$1" identity="$2" identifier="$3"
+  codesign --force --sign "$identity" --identifier "$identifier" -o runtime \
     --entitlements "$CK_AFT_ENTITLEMENTS" "$binary"
 }
 
-# Read the signature back from the file itself and refuse anything but the
-# rule above. Prints the codesign details and entitlements it judged.
-# Usage: ck_aft_check_signature <binary> <error-prefix>
-ck_aft_check_signature() {
-  local binary="$1" prefix="$2"
+# Sign daemon cards with their pinned identifier and team identity.
+ck_aft_sign() {
+  local identity
+  identity="$(ck_aft_sign_identity)" || return 1
+  ck_aft_sign_binary "$1" "$identity" "$CK_AFT_IDENTIFIER"
+}
+
+# npm has no team identity. Pin aft instead of codesign's content-derived ID.
+ck_aft_sign_npm() {
+  ck_aft_sign_binary "$1" - aft
+}
+
+# Read back the signed bytes, including all entitlements, before publication.
+# Usage: ck_aft_check_binary_signature <binary> <error-prefix> <identifier> <require-team>
+ck_aft_check_binary_signature() {
+  local binary="$1" prefix="$2" identifier="$3" require_team="$4"
   local details entitlements_xml flags plist keys key team
 
   if ! codesign --verify --strict "$binary" 2>/dev/null; then
@@ -59,14 +68,14 @@ ck_aft_check_signature() {
     echo "$prefix: signature unreadable: codesign -dv failed for $binary" >&2
     return 1
   }
-  printf '%s\n' "$details" | sed -n -e '/^Identifier=/p' -e '/^CodeDirectory/p' -e '/^Runtime Version=/p' | sed 's/^/    /'
+  printf '%s\n' "$details" | sed 's/^/    /'
 
-  if ! printf '%s\n' "$details" | grep -qx "Identifier=$CK_AFT_IDENTIFIER"; then
-    echo "$prefix: signature identifier is not $CK_AFT_IDENTIFIER" >&2
+  if ! printf '%s\n' "$details" | grep -qx "Identifier=$identifier"; then
+    echo "$prefix: signature identifier is not $identifier" >&2
     return 1
   fi
   team="$(printf '%s\n' "$details" | sed -n 's/^TeamIdentifier=//p')"
-  if [ -z "$team" ] || [ "$team" = "not set" ]; then
+  if [ "$require_team" = true ] && { [ -z "$team" ] || [ "$team" = "not set" ]; }; then
     echo "$prefix: signed ad hoc (no TeamIdentifier): macOS would ask for the module's permissions again after every card" >&2
     return 1
   fi
@@ -103,7 +112,17 @@ ck_aft_check_signature() {
       return 1
     fi
   done
-  echo "    signature ok: identifier $CK_AFT_IDENTIFIER, team $team, flags ($flags), exceptions: $CK_AFT_EXCEPTION"
+  echo "    signature ok: identifier $identifier, team $team, flags ($flags), exceptions: $CK_AFT_EXCEPTION"
+}
+
+# Daemon permissions are keyed to identifier plus team, so ad hoc is forbidden.
+ck_aft_check_signature() {
+  ck_aft_check_binary_signature "$1" "$2" "$CK_AFT_IDENTIFIER" true
+}
+
+# npm permits ad hoc, but never relaxes the runtime or entitlement checks.
+ck_aft_check_npm_signature() {
+  ck_aft_check_binary_signature "$1" "$2" aft false
 }
 
 # Run the one code path the exception exists for: a real ONNX Runtime load.

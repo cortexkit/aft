@@ -50,6 +50,42 @@ def inline_python(job, name):
 
 
 class NativeReleaseWorkflowTests(unittest.TestCase):
+    def test_macos_npm_signing_uses_shared_hardened_policy_after_strip(self):
+        jobs = self.workflow("release.yml")["jobs"]
+        for job_name, binary in (
+            ("build-darwin-arm64", "target/release/aft"),
+            ("build-darwin-x64", "target/x86_64-apple-darwin/release/aft"),
+        ):
+            with self.subTest(job=job_name):
+                steps = jobs[job_name]["steps"]
+                strip = next(i for i, step in enumerate(steps) if step.get("name") == "Strip binary")
+                sign = next(i for i, step in enumerate(steps) if f"ck_aft_sign_npm {binary}" in step.get("run", ""))
+                self.assertLess(strip, sign)
+                self.assertIn("source scripts/lib/ck-aft-signature.sh", steps[sign]["run"])
+                self.assertIn(f"ck_aft_check_npm_signature {binary} release", steps[sign]["run"])
+                self.assertNotIn("codesign -f -s -", commands(jobs[job_name]))
+
+    def test_macos_npm_smokes_share_card_checks_on_unchanged_shipped_bytes(self):
+        job = self.workflow("release.yml")["jobs"]["e2e-darwin-arm64"]
+        steps = job["steps"]
+        smoke = next(i for i, step in enumerate(steps) if step.get("name") == "Verify hardened ONNX and Pulley loads")
+        before = "\n".join(step.get("run", "") for step in steps[:smoke])
+        after = "\n".join(step.get("run", "") for step in steps[smoke + 1:])
+        self.assertIn("unpack-binary", before)
+        self.assertIn("ck_aft_check_npm_signature target/release/aft", before)
+        self.assertIn("bun run --cwd packages/aft-bridge build", before)
+        self.assertIn("verify-binary", after)
+        run = steps[smoke]["run"]
+        for expected in (
+            "ensureOnnxRuntime", 'dir.startsWith(`${root}/onnxruntime/`)',
+            'ck_aft_smoke_onnx "$PWD/target/release/aft"',
+            'ck_aft_smoke_grammar "$PWD/target/release/aft"',
+        ):
+            self.assertIn(expected, run)
+        stage_card = (ROOT / "scripts/stage-card.sh").read_text()
+        self.assertIn('ck_aft_smoke_onnx "$TMP" stage-card', stage_card)
+        self.assertIn('ck_aft_smoke_grammar "$TMP" stage-card', stage_card)
+
     def test_self_hosted_release_builds_prepare_node_and_system_python_before_invoking_them(self):
         jobs = self.workflow("release.yml")["jobs"]
         native = {name: job for name, job in jobs.items() if "self-hosted" in job.get("runs-on", [])}
