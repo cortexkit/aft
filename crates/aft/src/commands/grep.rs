@@ -1660,7 +1660,8 @@ fn line_windows_from(
     let mut pending = Vec::new();
     let mut buffer = Vec::new();
     loop {
-        buffer = reader.chunk(buffer, 64 << 10)?;
+        let remaining = reader.size_at_open().saturating_sub(*read);
+        buffer = reader.chunk(buffer, remaining.min(64 << 10) as usize)?;
         *read += buffer.len() as u64;
         let eof = buffer.is_empty();
         let mut start = 0;
@@ -1690,6 +1691,45 @@ fn line_windows_from(
         }
         if eof {
             return Ok(windows);
+        }
+    }
+}
+
+#[cfg(test)]
+mod opened_size_window_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn audit1432_round3_line_window_scan_never_reads_appends_after_open() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("growing.txt");
+        for opened in [Vec::new(), b"before".to_vec(), vec![b'x'; (64 << 10) + 7]] {
+            std::fs::write(&file, &opened).unwrap();
+            let mut reader = crate::project_content::reader_bounded(&file, None, false).unwrap();
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&file)
+                .unwrap()
+                .write_all(b"-appended\nnew appended line\n")
+                .unwrap();
+            let wanted = std::collections::BTreeMap::from([(1, 1), (2, 1)]);
+            let mut read = 0;
+            let windows =
+                line_windows_from(&mut reader, &mut read, wanted.into_iter().peekable()).unwrap();
+            assert_eq!(
+                read,
+                opened.len() as u64,
+                "the scan must stop at the opened size"
+            );
+            assert!(
+                !windows.contains_key(&2),
+                "an appended line must not become a snippet"
+            );
+            assert!(!windows.values().any(|window| window.contains("appended")));
+            if opened.as_slice() == b"before" {
+                assert_eq!(windows[&1], "before");
+            }
         }
     }
 }
