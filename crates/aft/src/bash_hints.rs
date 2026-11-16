@@ -25,11 +25,20 @@ impl CallContext {
         ) else {
             return;
         };
-        if let Some(notice) = &self.runner_notice {
-            notice.send(&hint);
-        } else {
-            append_nudge(response, &hint);
-        }
+        response.notices.route = self.runner_notice.clone();
+        response
+            .notices
+            .items
+            .push(crate::notice_templates::Notice::template(
+                crate::notice_templates::CODE_SEARCH,
+                crate::notice_templates::code_search_slots(
+                    self.search_tool.as_deref(),
+                    &self.shell_tool,
+                ),
+                hint,
+                crate::notice_templates::Target::BashOutput,
+            ));
+        crate::notice_templates::deliver(response, None);
     }
 }
 

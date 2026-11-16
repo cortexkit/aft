@@ -4,7 +4,7 @@
 use super::*;
 use crate::bash_background::persistence::{RunnerCompletionDelivery, RunnerCompletionPhase};
 use cortexkit_role_llm_runner::{
-    delivery_order::{DeliveryOrder, Mode},
+    delivery_order::{render, template_digest, DeliveryOrder, Mode, TemplateUse},
     send::{states, SendReply, SendRequest},
     send_status::SendStatusRequest,
 };
@@ -389,9 +389,10 @@ struct Address {
 /// A runner route remains a runner route even when its notice address is
 /// unavailable. Such nudges are dropped, never appended to command output.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CodeSearchNotice {
+pub struct CodeSearchNotice {
     address: Option<Address>,
     call_key: String,
+    preset: String,
 }
 
 pub(super) fn code_search_notice(
@@ -412,25 +413,89 @@ pub(super) fn code_search_notice(
     Some(CodeSearchNotice {
         address: Address::new(&route.task_identity(), raw, route.scope.as_ref()),
         call_key: call_key.to_owned(),
+        preset: "head".into(),
     })
 }
 
-fn code_search_request(call_key: &str, text: &str, now_ms: u64) -> SendRequest {
+pub(super) fn nudge_request(
+    call_key: &str,
+    notice: &crate::notice_templates::Notice,
+    preset: &str,
+    now_ms: u64,
+    modern: bool,
+    cleared: bool,
+    fallback: bool,
+) -> SendRequest {
+    let kind = notice
+        .template
+        .as_ref()
+        .map_or("aft.diagnostics", |(id, _)| *id);
+    let send_id = format!(
+        "aft:nudge:{kind}:{call_key}{}",
+        if fallback { ":fallback" } else { "" }
+    );
+    if !modern {
+        return SendRequest::new(&notice.text, send_id).with_notice(true);
+    }
     let mut order = DeliveryOrder::new(vec![Mode::ToolResult]);
-    order.dedupe_key = Some("aft:nudge:code_search".into());
+    order.dedupe_key = Some(format!("aft:nudge:{kind}"));
     order.expires_at_ms = Some(now_ms.saturating_add(60_000));
-    SendRequest::new(text, format!("aft:nudge:code_search:{call_key}"))
+    let templates = crate::notice_templates::templates(preset);
+    let mut text = notice.text.clone();
+    if let Some((id, slots)) = &notice.template {
+        if let Some(template) = templates.iter().find(|template| template.id == *id) {
+            let mut slots = slots.as_object().unwrap().clone();
+            if *id == crate::notice_templates::CODE_SEARCH
+                && preset == "worker"
+                && slots["redirect"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("`aft_search`"))
+            {
+                slots["redirect"] =
+                    crate::notice_templates::code_search_slots(Some("search"), "bash")["redirect"]
+                        .clone();
+            }
+            let use_ = TemplateUse::new(*id, template_digest(template), slots);
+            if let Ok(rendered) = render(&templates, &use_, |_| None) {
+                text = rendered;
+                if !fallback {
+                    order.modes.insert(
+                        0,
+                        if cleared {
+                            Mode::TurnSystemCleared
+                        } else {
+                            Mode::TurnSystem
+                        },
+                    );
+                    order.template = Some(use_);
+                    return SendRequest::template(send_id, &order).with_notice(true);
+                }
+            }
+        }
+    }
+    SendRequest::new(text, send_id)
         .with_notice(true)
         .with_delivery_order(&order)
 }
 
 impl CodeSearchNotice {
-    /// One best-effort send before returning the tool result. No retries or
-    /// append fallback: the runner owns when and how its notice is delivered.
-    pub(crate) fn send(&self, text: &str) {
+    pub(super) fn with_preset(mut self, role: super::tool_provider::CallerRole) -> Self {
+        self.preset = match role {
+            super::tool_provider::CallerRole::Head => "head",
+            super::tool_provider::CallerRole::Worker => "worker",
+            super::tool_provider::CallerRole::Reader => "reader",
+        }
+        .into();
+        self
+    }
+
+    /// Send before returning the tool result. If the runner refuses the
+    /// template (for example, the session plan omitted it), retry once as
+    /// free text at tool-result authority, within the same deadline; never append.
+    pub(crate) fn send(&self, notice: &crate::notice_templates::Notice) {
         // Rendering can run on either an actor thread or a Tokio worker. Keep
         // the synchronous send's runtime off both callers' runtime stacks.
-        let outcome = std::thread::scope(|scope| scope.spawn(|| self.send_once(text)).join())
+        let outcome = std::thread::scope(|scope| scope.spawn(|| self.send_once(notice)).join())
             .unwrap_or_else(|_| retry(FailureClass::Runtime, "code-search notice sender panicked"));
         match outcome {
             Outcome::Accepted | Outcome::Pending => {}
@@ -448,7 +513,7 @@ impl CodeSearchNotice {
         }
     }
 
-    fn send_once(&self, text: &str) -> Outcome {
+    fn send_once(&self, notice: &crate::notice_templates::Notice) -> Outcome {
         (|| {
             let address = self
                 .address
@@ -474,11 +539,16 @@ impl CodeSearchNotice {
             Ok::<_, Outcome>(runtime.block_on(async {
                 tokio::time::timeout(
                     CODE_SEARCH_NOTICE_TIMEOUT,
-                    send(
-                        &path,
-                        address,
-                        &code_search_request(&self.call_key, text, now),
-                    ),
+                    async {
+                        let modern = runner_delivery_order(&path, address).await == Some(true);
+                        let cleared = modern && runner_capability(&path, address, "delivery_order_modes:turn_system_cleared").await == Some(true);
+                        let request = nudge_request(&self.call_key, notice, &self.preset, now, modern, cleared, false);
+                        let outcome = send(&path, address, &request).await;
+                        let refused = matches!(&outcome, Outcome::Final(failure) | Outcome::Retry(failure) if failure.code.as_deref() == Some("invalid_params") && failure.field.as_deref() == Some("template"));
+                        if request.runner_params.contains_key("template") && refused {
+                            send(&path, address, &nudge_request(&self.call_key, notice, &self.preset, now, true, false, true)).await
+                        } else { outcome }
+                    },
                 )
                 .await
                 .unwrap_or_else(|_| {
@@ -679,6 +749,14 @@ fn described_delivery_order(bytes: &[u8]) -> Option<bool> {
 
 fn described_capability(bytes: &[u8], name: &str) -> Option<bool> {
     let description = cortexkit_role_llm_runner::wire::read_reply::<Value>(bytes).ok()?;
+    if let Some(mode) = name.strip_prefix("delivery_order_modes:") {
+        return Some(
+            description
+                .get("delivery_order_modes")
+                .and_then(Value::as_array)
+                .is_some_and(|modes| modes.iter().any(|item| item == mode)),
+        );
+    }
     let capabilities = description.get("capabilities")?.as_array()?;
     if !capabilities.iter().all(Value::is_string) {
         return None;
@@ -777,6 +855,7 @@ pub(super) mod test_endpoint {
         sender: std::sync::mpsc::Sender<Received>,
         stored: std::sync::Mutex<HashMap<String, Vec<u8>>>,
         delivery_order: std::sync::Mutex<Option<bool>>,
+        cleared: AtomicBool,
         send_status: AtomicBool,
         replies: std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>,
         states: std::sync::Mutex<HashMap<String, Vec<u8>>>,
@@ -814,6 +893,9 @@ pub(super) mod test_endpoint {
     impl Capture {
         pub(super) fn delivery_order(&self, supported: Option<bool>) {
             *self.endpoint.delivery_order.lock().unwrap() = supported;
+        }
+        pub(super) fn cleared(&self, supported: bool) {
+            self.endpoint.cleared.store(supported, Ordering::Relaxed);
         }
         pub(super) fn retry(&self, count: u64) {
             *self.endpoint.retries.lock().unwrap() = count;
@@ -877,6 +959,7 @@ pub(super) mod test_endpoint {
             sender,
             stored: Default::default(),
             delivery_order: Default::default(),
+            cleared: AtomicBool::new(false),
             send_status: AtomicBool::new(false),
             replies: Default::default(),
             states: Default::default(),
@@ -907,7 +990,9 @@ pub(super) mod test_endpoint {
             .unwrap()
             .get(&format!("aft:bash:{}", address.identity.session))
             .cloned()?;
-        let supported = if capability == "send_status" {
+        let supported = if capability == "delivery_order_modes:turn_system_cleared" {
+            Some(endpoint.cleared.load(Ordering::Relaxed))
+        } else if capability == "send_status" {
             Some(endpoint.send_status.load(Ordering::Relaxed))
         } else {
             *endpoint.delivery_order.lock().unwrap()

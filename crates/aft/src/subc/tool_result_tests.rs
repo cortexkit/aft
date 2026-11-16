@@ -33,6 +33,7 @@ fn tool_result_error_code_is_preserved_or_falls_back() {
                 id: "test".into(),
                 success: false,
                 data: json!({}),
+                notices: Default::default(),
             },
             "tool_error",
         ),
@@ -1451,6 +1452,7 @@ async fn assert_keyed_projection_replay_is_exact(
                 id: result.response.id.clone(),
                 success: result.response.success,
                 data: legacy_data,
+                notices: Default::default(),
             },
         },
         trust != BindTrust::Untrusted,
@@ -2148,6 +2150,7 @@ fn native_response(mut flat: Value) -> Response {
         id,
         success,
         data: flat,
+        notices: Default::default(),
     }
 }
 

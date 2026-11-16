@@ -1310,6 +1310,7 @@ pub(super) fn build_tool_response_frame_with_limit(
                     id: result.response.id.clone(),
                     success: result.response.success,
                     data: result.response.data.clone(),
+                    notices: Default::default(),
                 },
             };
             crate::tool_output::cap_with_scope(scope, "tool", &capped.response, &mut capped.text);
@@ -1342,6 +1343,7 @@ pub(super) fn build_tool_response_frame_with_limit(
             id: result.response.id.clone(),
             success: result.response.success,
             data: result.response.data.clone(),
+            notices: Default::default(),
         },
     };
     // Image paths are send-only metadata, not a change to the legacy structured
@@ -1482,6 +1484,7 @@ fn retained_tool_result(body: &[u8]) -> Result<ToolCallResult, SubcError> {
             id: data["id"].as_str().unwrap_or("retained-tool-reply").into(),
             success: envelope["isError"] != true,
             data,
+            notices: Default::default(),
         },
     })
 }
@@ -2331,6 +2334,7 @@ pub(super) mod tests {
                     "attachments": [{"kind":"image", "data":"AQID", "mime":"image/png", "width":1, "height":1, "alt":"fixture.png"}],
                     "metadata": {"diff": "private diff"},
                 }),
+                notices: Default::default(),
             },
         };
         let slim = projected_result_body(&result, &identity);

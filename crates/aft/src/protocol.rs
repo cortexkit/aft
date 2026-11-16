@@ -635,6 +635,9 @@ pub struct Response {
     pub success: bool,
     #[serde(flatten)]
     pub data: serde_json::Value,
+    /// Delivery decisions are internal and never appear in a tool response.
+    #[serde(skip)]
+    pub notices: crate::notice_templates::PendingNotices,
 }
 
 /// Parameters for the `echo` command.
@@ -650,6 +653,7 @@ impl Response {
             id: id.into(),
             success: true,
             data,
+            notices: Default::default(),
         }
     }
 
@@ -662,6 +666,7 @@ impl Response {
                 "code": code,
                 "message": message.into(),
             }),
+            notices: Default::default(),
         }
     }
 
@@ -685,6 +690,7 @@ impl Response {
             id: id.into(),
             success: false,
             data,
+            notices: Default::default(),
         }
     }
 }

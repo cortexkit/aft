@@ -38,6 +38,7 @@ fn format_callgraph_response(op: &str, data: &Value) -> String {
         id: "callgraph-test".to_string(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let mut context = FormatContext::default();
     context.callgraph_op = Some(op.to_string());

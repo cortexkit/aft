@@ -38,14 +38,7 @@ pub fn append_repeat_breaker_reminder(
     // that ends its turn has delivered its result and cannot be woken when the
     // awaited task finishes. It is told to wait on the task instead.
     let escalated = repeat_breaker::escalation_starts_at(count);
-    let instruction = match (worker_session, bash_watch_available, escalated) {
-        (false, _, true) => "The turn must end now with no further tool call. If you are waiting on a task or CI run, use a background task with a watch (or the background handle you already hold) and end the turn. If you are already watching, let the watch return before calling again.",
-        (false, _, false) => "If you are waiting on a task or CI run, use a background task with a watch (or the background handle you already hold) and end the turn. If you are already watching, let the watch return before calling again.",
-        (true, true, true) => "Stop now: make no further call with these arguments. If you are waiting on a task or CI run, wait with a watch on its background task (for example bash_watch on the task ID you already hold) instead of repeating this call. If you are already watching, let the watch return before calling again.",
-        (true, true, false) => "If you are waiting on a task or CI run, wait with a watch on its background task (for example bash_watch on the task ID you already hold) instead of repeating this call. If you are already watching, let the watch return before calling again.",
-        (true, false, true) => "Stop now: make no further call with these arguments. If you are waiting on a task or CI run, use bash_status on the task ID you already hold to inspect it, or bash_kill to stop it, instead of repeating this call.",
-        (true, false, false) => "If you are waiting on a task or CI run, use bash_status on the task ID you already hold to inspect it, or bash_kill to stop it, instead of repeating this call.",
-    };
+    let instruction = repeat_instruction(worker_session, bash_watch_available, escalated);
     let observation = if intervention.outputs_identical {
         format!(
             "This is the {ordinal} identical call (same command, same output) in {span_seconds}s. This call is not returning anything new."
@@ -56,12 +49,7 @@ pub fn append_repeat_breaker_reminder(
         )
     };
     let reminder = format!("<system-reminder>\n{observation} {instruction}\n</system-reminder>");
-    if text.is_empty() {
-        *text = reminder;
-    } else {
-        text.push_str("\n\n");
-        text.push_str(&reminder);
-    }
+    crate::notice_templates::append_text(text, &reminder);
     log::info!(
         "repeat_breaker fired session={} tool={} count={} span_ms={}",
         session_id,
@@ -69,6 +57,21 @@ pub fn append_repeat_breaker_reminder(
         count,
         intervention.span.as_millis()
     );
+}
+
+pub(crate) fn repeat_instruction(
+    worker_session: bool,
+    bash_watch_available: bool,
+    escalated: bool,
+) -> &'static str {
+    match (worker_session, bash_watch_available, escalated) {
+        (false, _, true) => "The turn must end now with no further tool call. If you are waiting on a task or CI run, use a background task with a watch (or the background handle you already hold) and end the turn. If you are already watching, let the watch return before calling again.",
+        (false, _, false) => "If you are waiting on a task or CI run, use a background task with a watch (or the background handle you already hold) and end the turn. If you are already watching, let the watch return before calling again.",
+        (true, true, true) => "Stop now: make no further call with these arguments. If you are waiting on a task or CI run, wait with a watch on its background task (for example bash_watch on the task ID you already hold) instead of repeating this call. If you are already watching, let the watch return before calling again.",
+        (true, true, false) => "If you are waiting on a task or CI run, wait with a watch on its background task (for example bash_watch on the task ID you already hold) instead of repeating this call. If you are already watching, let the watch return before calling again.",
+        (true, false, true) => "Stop now: make no further call with these arguments. If you are waiting on a task or CI run, use bash_status on the task ID you already hold to inspect it, or bash_kill to stop it, instead of repeating this call.",
+        (true, false, false) => "If you are waiting on a task or CI run, use bash_status on the task ID you already hold to inspect it, or bash_kill to stop it, instead of repeating this call.",
+    }
 }
 
 fn ordinal(count: u64) -> String {
@@ -107,6 +110,7 @@ pub fn finalize_response_with_bg_completions(
     attach_command: &str,
     allow_bg_completions: bool,
 ) {
+    crate::notice_templates::deliver(response, None);
     let (publish, counts) = finalize_prefix(
         response,
         ctx,
@@ -349,14 +353,11 @@ fn attach_alert_block(
     let Some(alert) = alerts.finalize(session_id, dispatch_root, command) else {
         return;
     };
-    let joined = if text.is_empty() {
-        alert.text
-    } else {
-        format!("{text}\n\n{}", alert.text)
-    };
-    if let Some(data) = response.data.as_object_mut() {
-        data.insert("text".to_string(), serde_json::Value::String(joined));
-    }
+    response
+        .notices
+        .items
+        .push(crate::notice_templates::Notice::diagnostic(alert.text));
+    crate::notice_templates::deliver(response, None);
 }
 
 pub enum DispatchOutcome {

@@ -74,6 +74,7 @@ fn executor_cap_fixture_renders_cap_trailer_and_envelope() {
         id: "cap-1".to_string(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
     let rendered = format_response_with_context("glob", &resp, &ctx);
@@ -116,6 +117,7 @@ fn walk_truncation_plus_cap_renders_one_walk_trailer_with_both_causes() {
         id: "walk-cap-1".to_string(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
     let rendered = format_response_with_context("glob", &resp, &ctx);
@@ -158,6 +160,7 @@ fn r25_skipped_foreign_mounts_alone_renders_walk_trailer() {
         id: "r25-mounts".to_string(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
     let rendered = format_response_with_context("glob", &resp, &ctx);
@@ -202,6 +205,7 @@ fn walk_truncated_alone_renders_walk_trailer() {
         id: "walk-only".to_string(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
     let rendered = format_response_with_context("glob", &resp, &ctx);
@@ -245,6 +249,7 @@ fn r24_display_selector_above_max_display_files_per_directory() {
         id: "r24-files-per-dir".to_string(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
     let rendered = format_response_with_context("glob", &resp, &ctx);
@@ -286,6 +291,7 @@ fn r24_display_selector_above_max_display_directories() {
         id: "r24-dirs".to_string(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
     let rendered = format_response_with_context("glob", &resp, &ctx);
@@ -325,6 +331,7 @@ fn complete_glob_replies_byte_identical_to_prespec_goldens() {
         id: "complete-1".to_string(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
     let rendered = format_response_with_context("glob", &resp, &ctx);

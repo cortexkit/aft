@@ -160,6 +160,7 @@ pub(crate) mod native_stat;
 pub mod ndjson_text;
 #[cfg(test)]
 mod nested_worktree_tests;
+pub(crate) mod notice_templates;
 pub mod ort_lifecycle;
 pub mod ort_pin;
 pub(crate) mod os_metadata;

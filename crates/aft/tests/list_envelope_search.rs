@@ -274,6 +274,7 @@ fn subc_format_search_more_available_only_suppresses_legacy_and_renders_trailer(
         id: "1".into(),
         success: true,
         data,
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
     let formatted = format_response_with_context(SEARCH_COMMAND, &resp, &ctx);
@@ -308,6 +309,7 @@ fn subc_format_search_engine_capped_only_suppresses_legacy_and_renders_trailer()
         id: "2".into(),
         success: true,
         data,
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
     let formatted = format_response_with_context(SEARCH_COMMAND, &resp, &ctx);
@@ -347,6 +349,7 @@ fn subc_format_search_both_flags_preserves_status_text_and_json_markers() {
         id: "3".into(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
     let formatted = format_response_with_context(SEARCH_COMMAND, &resp, &ctx);
@@ -395,6 +398,7 @@ fn complete_4_result_answer_is_byte_identical_to_pre_spec_golden() {
         id: "4".into(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
 
@@ -424,6 +428,7 @@ fn transport_parity_search_fixtures() {
             id: fixture_val["id"].as_str().unwrap().into(),
             success: true,
             data: data.clone(),
+            notices: Default::default(),
         };
         let ctx = FormatContext::default();
         let subc_text = format_response_with_context(SEARCH_COMMAND, &resp, &ctx);
@@ -528,6 +533,7 @@ fn complete_fixture_from_disk_stays_byte_identical() {
         id: val["id"].as_str().unwrap().into(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
     let formatted = format_response_with_context(SEARCH_COMMAND, &resp, &ctx);

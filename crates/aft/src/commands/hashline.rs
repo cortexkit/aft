@@ -306,6 +306,7 @@ fn response_from_payload(id: &str, mut payload: Value) -> Response {
         id: id.to_string(),
         success,
         data: payload,
+        notices: Default::default(),
     }
 }
 

@@ -53,6 +53,7 @@ fn format_subc(op: &str, data: &Value) -> String {
         id: "test-callgraph".into(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let mut ctx = FormatContext::default();
     ctx.callgraph_op = Some(op.to_string());

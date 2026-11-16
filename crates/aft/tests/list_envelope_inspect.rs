@@ -146,6 +146,7 @@ fn four_capped_lists_produces_four_sibling_envelopes_and_four_trailers() {
         id: "1".into(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
     let formatted = format_response_with_context("inspect", &resp, &ctx);
@@ -209,6 +210,7 @@ fn empty_capped_list_renders_heading_then_trailer() {
         id: "2".into(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
     let formatted = format_response_with_context("inspect", &resp, &ctx);
@@ -260,6 +262,7 @@ fn uncapped_inspect_replies_render_no_trailer_and_serialize_no_envelope() {
         id: "3".into(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
     let formatted = format_response_with_context("inspect", &resp, &ctx);
@@ -300,6 +303,7 @@ fn todos_capped_produces_envelope_and_trailer() {
         id: "4".into(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
     let formatted = format_response_with_context("inspect", &resp, &ctx);
@@ -335,6 +339,7 @@ fn duplicates_capped_produces_main_and_generated_envelopes() {
         id: "5".into(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
     let formatted = format_response_with_context("inspect", &resp, &ctx);
@@ -362,6 +367,7 @@ fn transport_parity_for_inspect_fixtures() {
             id: format!("transport-{fixture_name}"),
             success: true,
             data: data.clone(),
+            notices: Default::default(),
         };
         let ctx = FormatContext::default();
         let subc_text = format_response_with_context("inspect", &resp, &ctx);

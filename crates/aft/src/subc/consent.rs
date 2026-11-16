@@ -1374,6 +1374,7 @@ impl SettlementGroup {
                     id: call.request_id.clone(),
                     success: reply.success,
                     data: reply.data,
+                    notices: Default::default(),
                 },
                 reply.text,
             )),

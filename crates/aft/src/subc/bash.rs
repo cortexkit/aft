@@ -1325,6 +1325,8 @@ pub(super) fn finalized_bash_result(
     allow_bg_completions: bool,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
 ) -> ToolCallResult {
+    response.notices.route = format_context.runner_notice.clone();
+    crate::notice_templates::deliver(&mut response, None);
     if let Some(hint) = &format_context.bash_code_search_hint {
         let root = ctx.config().project_root.clone().unwrap_or_default();
         hint.deliver(&mut response, &root);
@@ -1336,7 +1338,7 @@ pub(super) fn finalized_bash_result(
     // Observe before finalizing: the status bar the finalizer appends carries
     // moving counts that would make identical results hash differently.
     if let Some(repeat) = repeat {
-        repeat.observe(ctx, &mut text);
+        repeat.observe(ctx, &mut response, &mut text);
     }
     crate::response_finalize::finalize_redisplayed_bash_response(
         &mut response,
@@ -1350,9 +1352,11 @@ pub(super) fn finalized_bash_result(
 }
 
 fn bash_result_from_response(
-    response: Response,
+    mut response: Response,
     format_context: &crate::subc_format::FormatContext,
 ) -> ToolCallResult {
+    response.notices.route = format_context.runner_notice.clone();
+    crate::notice_templates::deliver(&mut response, None);
     let mut text =
         crate::subc_format::format_response_with_context("bash", &response, format_context);
     if response.data["output"]
@@ -1382,7 +1386,7 @@ fn observe_completed_bash_result(
         .unwrap_or_default()
         .to_owned();
     if let Some(repeat) = repeat {
-        repeat.observe(ctx, &mut text);
+        repeat.observe(ctx, &mut result.response, &mut text);
     }
     text.push_str(&suffix);
     result.text = text;
@@ -1443,6 +1447,7 @@ fn copy_response(response: &Response) -> Response {
         id: response.id.clone(),
         success: response.success,
         data: response.data.clone(),
+        notices: response.notices.clone(),
     }
 }
 
@@ -2231,12 +2236,7 @@ pub(super) fn submit_deferred_bash(
                 .as_ref()
                 .map_or("bash", |names| names.shell())
                 .into(),
-            runner_notice: secret_identity.as_ref().and_then(|identity| {
-                super::runner_notices::code_search_notice(
-                    identity,
-                    call_key.as_deref().unwrap_or(&request_id),
-                )
-            }),
+            runner_notice: format_context.runner_notice.clone(),
         });
     let program_held = secret_identity.as_ref().is_some_and(running_hold_route);
     let task_identity = secret_identity
@@ -3422,7 +3422,7 @@ pub(super) fn submit_deferred_bash(
                             // Recording repeated calls only updates in-memory state.
                             let mut result = bash_result_from_response(response, &deadline_target.format_context);
                             if let Some(repeat) = repeat_for_deadline {
-                                repeat.observe(&spawn_ctx, &mut result.text);
+                                repeat.observe(&spawn_ctx, &mut result.response, &mut result.text);
                             }
                             detach_held_bash_in_background(deadline_target, false);
                             send_bash_deferred_completion(&completion_tx, &task_metrics, route, corr, flags, ver, root_for_task, request_id, Some(result), false).await;

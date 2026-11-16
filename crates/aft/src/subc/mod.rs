@@ -11982,6 +11982,9 @@ async fn handle_tool_call_with_capabilities(
     );
 
     let request_id = format!("subc-{}-{}", frame.header.channel, frame.header.corr);
+    format_context.runner_notice =
+        runner_notices::code_search_notice(&identity, call_key.as_deref().unwrap_or(&request_id))
+            .map(|notice| notice.with_preset(role));
     // Pin the response ID only for the fixture's exact probe inputs. Other
     // calls and frame correlation keep their ordinary identities; all native
     // handlers, formatters and wire rendering still run unchanged.

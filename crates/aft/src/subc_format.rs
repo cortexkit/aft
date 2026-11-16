@@ -56,6 +56,8 @@ pub struct FormatContext {
     pub host_tool_names: Option<crate::host_tool_names::HostToolNames>,
     /// Per-call native shell steering facts retained across deferred rendering.
     pub bash_code_search_hint: Option<BashCodeSearchHint>,
+    #[doc(hidden)]
+    pub runner_notice: Option<crate::subc::runner_notices::CodeSearchNotice>,
 }
 
 /// Native shell guidance facts carried with a deferred call's render context.
@@ -92,6 +94,7 @@ impl Default for FormatContext {
             bash_watch_available: None,
             host_tool_names: None,
             bash_code_search_hint: None,
+            runner_notice: None,
         }
     }
 }
@@ -121,6 +124,7 @@ impl FormatContext {
             bash_watch_available: None,
             host_tool_names: None,
             bash_code_search_hint: None,
+            runner_notice: None,
         }
     }
 }
@@ -5109,6 +5113,7 @@ mod safety_checkpoint_format_tests {
             id: "1".to_string(),
             success: true,
             data,
+            notices: Default::default(),
         };
         format_response_with_context("safety", &response, &ctx)
     }

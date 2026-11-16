@@ -444,6 +444,7 @@ fn observe_raw_bash_response(
     ctx: &AppContext,
     response: &mut Response,
 ) {
+    crate::notice_templates::deliver(response, None);
     let Some(data) = response.data.as_object_mut() else {
         return;
     };
@@ -459,8 +460,12 @@ fn observe_raw_bash_response(
     let Some(mut text) = data.get(field).and_then(Value::as_str).map(str::to_string) else {
         return;
     };
-    repeat.observe(ctx, &mut text);
-    data.insert(field.to_string(), Value::String(text));
+    repeat.observe(ctx, response, &mut text);
+    response
+        .data
+        .as_object_mut()
+        .unwrap()
+        .insert(field.to_string(), Value::String(text));
 }
 
 pub fn build_bash_outcome(
@@ -1107,6 +1112,7 @@ pub(crate) fn with_capture_warning(response: &Response) -> Response {
         id: response.id.clone(),
         success: response.success,
         data: response.data.clone(),
+        notices: response.notices.clone(),
     };
     if !reply_announces_live_task(&response) {
         return response;
@@ -1173,6 +1179,7 @@ pub(crate) fn runon_uncaptured_reply(
         id: response.id.clone(),
         success: response.success,
         data: response.data.clone(),
+        notices: response.notices.clone(),
     };
     if let Some(note) = registry
         .runon_launch_state(task_id, session)

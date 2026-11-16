@@ -93,14 +93,16 @@ pub fn try_rewrite(
     ctx: &AppContext,
     principal: &AuthenticatedPrincipal,
 ) -> Option<Response> {
-    try_rewrite_for_request(
+    let mut response = try_rewrite_for_request(
         command,
         "bash_rewrite",
         session_id,
         &crate::host_tool_names::HostToolNames::default(),
         ctx,
         principal,
-    )
+    )?;
+    crate::notice_templates::deliver(&mut response, None);
+    Some(response)
 }
 
 /// Make the rewrite decision for one public bash request. A native route is

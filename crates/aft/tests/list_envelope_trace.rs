@@ -64,6 +64,7 @@ fn test_depth_exhaustion_no_path_renders_trailer_and_no_dropped_count() {
         id: "trace-1".into(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext {
         callgraph_op: Some("trace_to".to_string()),
@@ -108,6 +109,7 @@ fn test_budget_exhaustion_renders_trailer_with_budget_reason() {
         id: "trace-2".into(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext {
         callgraph_op: Some("trace_to".to_string()),
@@ -140,6 +142,7 @@ fn test_budget_plus_max_depth_renders_depth_trailer_retains_both_flags() {
         id: "trace-3".into(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext {
         callgraph_op: Some("trace_to".to_string()),
@@ -177,6 +180,7 @@ fn test_r26_cap_only_renders_exact_cap_trailer_and_mutation_reds() {
         id: "trace-4".into(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext {
         callgraph_op: Some("trace_to".to_string()),
@@ -240,6 +244,7 @@ fn test_cap_plus_depth_renders_depth_trailer_with_both_causes() {
         id: "trace-5".into(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext {
         callgraph_op: Some("trace_to".to_string()),
@@ -272,6 +277,7 @@ fn test_trace_data_capped_renders_hops_unit_and_asserts_unit_equality() {
         id: "trace-data-1".into(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext {
         callgraph_op: Some("trace_data".to_string()),
@@ -321,6 +327,7 @@ fn test_complete_trace_replies_render_no_trailer_and_no_envelope_key() {
         id: "complete-trace-to".into(),
         success: true,
         data: complete_trace_to_data.clone(),
+        notices: Default::default(),
     };
     let ctx_trace_to = FormatContext {
         callgraph_op: Some("trace_to".to_string()),
@@ -351,6 +358,7 @@ fn test_complete_trace_replies_render_no_trailer_and_no_envelope_key() {
         id: "complete-trace-data".into(),
         success: true,
         data: complete_trace_data.clone(),
+        notices: Default::default(),
     };
     let ctx_trace_data = FormatContext {
         callgraph_op: Some("trace_data".to_string()),
@@ -399,6 +407,7 @@ fn test_transport_parity_across_ndjson_and_subc() {
             id: "parity-test".into(),
             success: true,
             data: data.clone(),
+            notices: Default::default(),
         };
         let ctx = FormatContext {
             callgraph_op: Some("trace_to".to_string()),
@@ -434,6 +443,7 @@ fn test_transport_parity_across_ndjson_and_subc() {
         id: "parity-trace-data".into(),
         success: true,
         data: data_td.clone(),
+        notices: Default::default(),
     };
     let ctx_td = FormatContext {
         callgraph_op: Some("trace_data".to_string()),

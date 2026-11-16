@@ -1,10 +1,281 @@
 use super::*;
 
+fn notice_route(session: &str) -> CodeSearchNotice {
+    CodeSearchNotice {
+        address: Some(Address {
+            module: "broca".into(),
+            identity: BindIdentity::new("broca", session),
+            scope: None,
+            worker: true,
+        }),
+        call_key: "notice-call".into(),
+        preset: "worker".into(),
+    }
+}
+
+#[test]
+fn notice_templates_rewritten_bash_sends_once_without_footers() {
+    install(PathBuf::from("unused-test-notice-connection"));
+    for (command, id) in [
+        ("cat fixture.txt", "aft.bash.prefer_tool"),
+        ("grep -rn needle .", "aft.bash.code_search"),
+    ] {
+        let session = format!("notice-rewrite-{id}");
+        let capture = test_endpoint::capture(&session, false);
+        capture.delivery_order(Some(true));
+        capture.cleared(true);
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("fixture.txt"), "needle\n").unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.path().into()),
+                ..Default::default()
+            },
+        );
+        std::fs::File::open(root.path())
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
+            .unwrap();
+        let response = crate::bash_rewrite::try_rewrite_for_request(
+            command,
+            "notice-call",
+            Some(&session),
+            &Default::default(),
+            &ctx,
+            &crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+        )
+        .unwrap();
+        assert_eq!(response.notices.items.len(), 1);
+        let mut result = super::super::bash::finalized_bash_result(
+            response,
+            &ctx,
+            &session,
+            &crate::subc_format::FormatContext {
+                runner_notice: Some(notice_route(&session)),
+                ..Default::default()
+            },
+            false,
+            None,
+        );
+        assert!(!result.text.contains("Prefer `"));
+        assert!(!result.text.contains("DO NOT search code"));
+        assert!(!serde_json::to_string(&result.response)
+            .unwrap()
+            .contains("aft.bash."));
+        let sent = capture.receiver.try_recv().unwrap().request;
+        assert_eq!(sent["params"]["template"]["id"], id);
+        assert_eq!(
+            sent["params"]["delivery"],
+            json!(["turn_system_cleared", "tool_result"])
+        );
+        if id == "aft.bash.prefer_tool" {
+            assert_eq!(
+                sent["params"]["template"]["slots"],
+                json!({"tool":"read", "shell":"bash"})
+            );
+        }
+        crate::notice_templates::deliver(&mut result.response, Some(&mut result.text));
+        assert!(capture.receiver.try_recv().is_err());
+    }
+}
+
+#[test]
+fn notice_templates_repeat_observations_send_typed_counts_without_appending() {
+    install(PathBuf::from("unused-test-notice-connection"));
+    for identical in [true, false] {
+        let session = format!("notice-repeat-{identical}");
+        let capture = test_endpoint::capture(&session, false);
+        capture.delivery_order(Some(true));
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+        let args = json!({"path":"fixture"});
+        let call = crate::response_finalize::repeat_breaker::RepeatCall::new("read", &args);
+        let hash = crate::response_finalize::repeat_breaker::output_hash("unchanged");
+        let now = std::time::Instant::now();
+        for ago in [40, 20] {
+            assert!(ctx
+                .repeat_breaker()
+                .observe_at(
+                    &session,
+                    &call,
+                    if identical {
+                        hash
+                    } else {
+                        hash.wrapping_add(ago)
+                    },
+                    now - Duration::from_secs(ago)
+                )
+                .is_none());
+        }
+        let mut response = Response::success("notice-call", json!({"text":"unchanged"}));
+        response.notices.route = Some(notice_route(&session));
+        let mut text = "unchanged".to_owned();
+        crate::run_tool_call::RepeatObservation::for_agent_call(
+            &session, "read", &args, false, true, true,
+        )
+        .unwrap()
+        .observe(&ctx, &mut response, &mut text);
+        assert_eq!(text, "unchanged");
+        let sent = capture.receiver.try_recv().unwrap().request;
+        assert_eq!(
+            sent["params"]["template"]["id"],
+            if identical {
+                "aft.repeat_call.identical"
+            } else {
+                "aft.repeat_call.drifting"
+            }
+        );
+        assert_eq!(sent["params"]["template"]["slots"]["count"], 3);
+        assert_eq!(sent["params"]["template"]["slots"]["span"], 40);
+        assert_eq!(
+            sent["params"]["template"]["slots"]["instruction"],
+            crate::response_finalize::repeat_instruction(true, true, false)
+        );
+        assert_eq!(
+            sent["params"]["delivery"],
+            json!(["turn_system", "tool_result"])
+        );
+        assert!(capture.receiver.try_recv().is_err());
+    }
+}
+
+#[test]
+fn notice_templates_refusal_falls_back_once_at_user_authority() {
+    install(PathBuf::from("unused-test-notice-connection"));
+    use crate::notice_templates::{self as notices, Notice, Target};
+    for id in [
+        notices::CODE_SEARCH,
+        notices::PREFER_TOOL,
+        notices::IDENTICAL,
+        notices::DRIFTING,
+    ] {
+        let session = format!("notice-refusal-{id}");
+        let capture = test_endpoint::capture(&session, false);
+        capture.delivery_order(Some(true));
+        capture.refuse("invalid_params", Some("template"));
+        let slots = match id {
+            notices::CODE_SEARCH => notices::code_search_slots(Some("search"), "bash"),
+            notices::PREFER_TOOL => json!({"tool":"read", "shell":"bash"}),
+            _ => {
+                json!({"count":3, "span":42, "instruction":crate::response_finalize::repeat_instruction(true, true, false)})
+            }
+        };
+        let mut response = Response::success("notice-call", json!({"text":"body"}));
+        response.notices.route = Some(notice_route(&session));
+        response.notices.items.push(Notice::template(
+            id,
+            slots,
+            "standalone-only text".into(),
+            Target::Text,
+        ));
+        notices::deliver(&mut response, None);
+        assert_eq!(response.data["text"], "body");
+        let template = capture.receiver.try_recv().unwrap().request;
+        let fallback = capture.receiver.try_recv().unwrap().request;
+        assert_eq!(template["params"]["template"]["id"], id);
+        assert!(template["params"].get("prompt").is_none());
+        assert!(fallback["params"].get("template").is_none());
+        assert_eq!(fallback["params"]["delivery"], json!(["tool_result"]));
+        assert_ne!(fallback["params"]["send_id"], template["params"]["send_id"]);
+        assert_eq!(
+            fallback["params"]["dedupe_key"],
+            template["params"]["dedupe_key"]
+        );
+        assert!(!fallback["params"]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("standalone-only"));
+        assert!(capture.receiver.try_recv().is_err());
+    }
+}
+
+#[test]
+fn notice_templates_legacy_runner_keeps_plain_send() {
+    install(PathBuf::from("unused-test-notice-connection"));
+    let capture = test_endpoint::capture("notice-legacy", false);
+    capture.delivery_order(Some(false));
+    let mut response = Response::success("notice-call", json!({"text":"body"}));
+    response.notices.route = Some(notice_route("notice-legacy"));
+    response
+        .notices
+        .items
+        .push(crate::notice_templates::Notice::template(
+            crate::notice_templates::PREFER_TOOL,
+            json!({"tool":"read", "shell":"bash"}),
+            "Prefer `read` tool over bash.".into(),
+            crate::notice_templates::Target::Text,
+        ));
+    crate::notice_templates::deliver(&mut response, None);
+    let sent = capture.receiver.try_recv().unwrap().request;
+    assert_eq!(sent["params"]["prompt"], "Prefer `read` tool over bash.");
+    for field in ["template", "delivery", "dedupe_key", "expires_at_ms"] {
+        assert!(sent["params"].get(field).is_none(), "{field}: {sent}");
+    }
+    assert_eq!(response.data["text"], "body");
+    assert!(capture.receiver.try_recv().is_err());
+}
+
+#[test]
+fn notice_templates_diagnostics_remain_free_text_tool_result_sends() {
+    install(PathBuf::from("unused-test-notice-connection"));
+    let session = "notice-diagnostics";
+    let capture = test_endpoint::capture(session, false);
+    capture.delivery_order(Some(true));
+    capture.cleared(true);
+    let root = tempfile::tempdir().unwrap();
+    let ctx = AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        Default::default(),
+    );
+    use crate::response_finalize::alert_render::{AlertDiagnostic, AlertEngine, AlertSeverity};
+    let mut alerts = AlertEngine::default();
+    alerts.observe_authoritative(session, root.path(), "rust-analyzer", vec![]);
+    alerts.observe_authoritative(
+        session,
+        root.path(),
+        "rust-analyzer",
+        vec![AlertDiagnostic {
+            file: "src/fixture.rs".into(),
+            line: 2,
+            column: 3,
+            end_line: 2,
+            end_column: 4,
+            severity: AlertSeverity::Error,
+            source: Some("rust-analyzer".into()),
+            code: None,
+            message: "expected fixture diagnostic".into(),
+        }],
+    );
+    let mut response = Response::success("notice-call", json!({"text":"body"}));
+    response.notices.route = Some(notice_route(session));
+    crate::response_finalize::finalize_response_for_dispatch_root(
+        &mut response,
+        &ctx,
+        &mut alerts,
+        session,
+        root.path(),
+        "read",
+        false,
+    );
+    assert_eq!(response.data["text"], "body");
+    let sent = capture.receiver.try_recv().unwrap().request;
+    assert_eq!(sent["params"]["delivery"], json!(["tool_result"]));
+    assert!(sent["params"].get("template").is_none());
+    let prompt = sent["params"]["prompt"].as_str().unwrap();
+    assert!(prompt.contains("src/fixture.rs"));
+    assert!(prompt.contains("expected fixture diagnostic"));
+    assert!(capture.receiver.try_recv().is_err());
+}
+
 #[test]
 fn code_search_nudge_runner_send_is_once_and_leaves_result_bytes_unchanged() {
     install(PathBuf::from("unused-test-notice-connection"));
     let session = "code-search-nudge-runner";
     let capture = test_endpoint::capture(session, false);
+    capture.delivery_order(Some(true));
     let notice = CodeSearchNotice {
         address: Some(Address {
             module: "broca".into(),
@@ -13,6 +284,7 @@ fn code_search_nudge_runner_send_is_once_and_leaves_result_bytes_unchanged() {
             worker: true,
         }),
         call_key: "call-17".into(),
+        preset: "worker".into(),
     };
     let context = crate::subc_format::BashCodeSearchHint {
         command: "echo marker; rg foo".into(),
@@ -68,15 +340,20 @@ fn code_search_nudge_runner_send_is_once_and_leaves_result_bytes_unchanged() {
     );
     assert_eq!(got.request["method"], "session.send");
     let params = &got.request["params"];
-    assert_eq!(params["send_id"], "aft:nudge:code_search:call-17");
-    assert_eq!(params["delivery"], json!(["tool_result"]));
-    assert_eq!(params["dedupe_key"], "aft:nudge:code_search");
+    assert_eq!(params["send_id"], "aft:nudge:aft.bash.code_search:call-17");
+    assert_eq!(params["delivery"], json!(["turn_system", "tool_result"]));
+    assert_eq!(params["dedupe_key"], "aft:nudge:aft.bash.code_search");
+    assert_eq!(params["template"]["id"], "aft.bash.code_search");
+    assert_eq!(
+        params["template"]["slots"],
+        json!({"shell":"bash", "redirect":"Use the `search` tool instead (it auto-routes concepts, identifiers, regex, and literals)."})
+    );
+    assert!(params.get("prompt").is_none());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
     assert!((now + 55_000..=now + 60_000).contains(&params["expires_at_ms"].as_u64().unwrap()));
-    assert!(serde_json::to_string(params).unwrap().contains("DO NOT search code by running grep/rg in bash — it is unindexed, unranked, and serial. Use the `search` tool instead (it auto-routes concepts, identifiers, regex, and literals)."));
 }
 
 #[test]
@@ -127,6 +404,7 @@ fn code_search_nudge_runner_deadline_preserves_result_bytes_and_drops_once() {
                             worker: true,
                         }),
                         call_key: "call-deadline".into(),
+                        preset: "worker".into(),
                     }),
                 }),
                 ..format_context
@@ -190,6 +468,7 @@ fn code_search_nudge_runner_drops_refused_undelivered_and_missing_address() {
                     worker: true,
                 }),
                 call_key: format!("call-{case}"),
+                preset: "worker".into(),
             }),
         };
         let mut response = crate::protocol::Response::success(

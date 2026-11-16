@@ -2964,6 +2964,7 @@ fn build_inspect_terminal(
             id: request_id.to_string(),
             success: false,
             data: serde_json::json!({"inspect_terminal": "interrupted", "completed_phases": phases}),
+            notices: Default::default(),
         },
         InspectTerminal::PhaseFailed {
             failed_phase,
@@ -2991,6 +2992,7 @@ fn build_inspect_terminal(
                 id: request_id.to_string(),
                 success: false,
                 data,
+                notices: Default::default(),
             }
         }
     }

@@ -136,6 +136,7 @@ fn cap_on_finished_walk_renders_at_least_floor() {
         id: "cap-1".into(),
         success: true,
         data: fixture.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
     let formatted = format_response_with_context("grep", &resp, &ctx);
@@ -181,6 +182,7 @@ fn walk_truncated_and_cap_renders_mixed_cause() {
         id: "walk-cap-1".into(),
         success: true,
         data: fixture,
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
     let formatted = format_response_with_context("grep", &resp, &ctx);
@@ -213,6 +215,7 @@ fn skipped_foreign_mounts_renders_walk_and_is_independent_of_walk_truncated() {
         id: "mounts-1".into(),
         success: true,
         data: fixture,
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
     let formatted = format_response_with_context("grep", &resp, &ctx);
@@ -268,6 +271,7 @@ fn display_selector_thinned_renders_exact_total() {
         id: "display-1".into(),
         success: true,
         data: fixture.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
     let formatted = format_response_with_context("grep", &resp, &ctx);
@@ -330,6 +334,7 @@ fn complete_reply_byte_identical_to_golden() {
         id: "comp-1".into(),
         success: true,
         data: fixture.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
     let formatted = format_response_with_context("grep", &resp, &ctx);
