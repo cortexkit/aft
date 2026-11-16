@@ -5,6 +5,7 @@ compile_error!("the rest test suite requires --features test-hooks");
 #[path = "../helpers/context_storage.rs"]
 mod context_storage;
 #[path = "../helpers/subc_fake.rs"]
+#[cfg(unix)]
 mod subc_fake;
 
 // Import `test_helpers` from `callgraph_store_test` rather than compiling a
