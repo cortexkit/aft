@@ -1645,10 +1645,16 @@ async fn consent_parked_ask_only_scope_goodbye_ended_withdraws_and_refuses_retry
         .unwrap()
     };
     let (ready, mut ready_rx) = mpsc::unbounded_channel();
+    let before_park =
+        super::super::scope_watch::revision(super::super::scope_watch::Source::Parked);
     let held = f.read(&f.worker, &target, 7).await;
     assert_eq!(code(&held), "access_pending", "{held}");
     assert_eq!(f.asks().len(), 1);
     assert_eq!(scopes.parked_scopes().len(), 1);
+    assert!(
+        super::super::scope_watch::revision(super::super::scope_watch::Source::Parked)
+            > before_park
+    );
     assert!(f.ctx.bash_background().live_scope_stamps().is_empty());
 
     let (describes, mut ended, worker) =
@@ -1668,6 +1674,8 @@ async fn consent_parked_ask_only_scope_goodbye_ended_withdraws_and_refuses_retry
         query.header.corr,
         subc_protocol::scope::ScopeStatus::Ended
     )));
+    let before_withdraw =
+        super::super::scope_watch::revision(super::super::scope_watch::Source::Parked);
     let confirmed = tokio::time::timeout(Duration::from_secs(2), ended.recv())
         .await
         .unwrap()
@@ -1676,6 +1684,10 @@ async fn consent_parked_ask_only_scope_goodbye_ended_withdraws_and_refuses_retry
     wait_for(|| !f.fake.calls("consent.withdraw").is_empty() && f.asks().is_empty()).await;
     assert!(f.worker.run_scope.get().unwrap().revoked());
     assert!(scopes.parked_scopes().is_empty());
+    assert!(
+        super::super::scope_watch::revision(super::super::scope_watch::Source::Parked)
+            > before_withdraw
+    );
 
     // A retry crosses the same run admission seam as a real incoming frame.
     // It must be refused before it can reach the tool or claim an approval.

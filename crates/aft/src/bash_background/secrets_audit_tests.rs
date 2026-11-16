@@ -418,12 +418,20 @@ fn audit_arm_failure_cleans_transferred_scratch() {
 fn audit_killing_revokes_before_term_grace() {
     isolated("audit_killing_revokes_before_term_grace", || {
         let f = Fixture::new();
+        use crate::subc::scope_watch::{revision, Source};
+        let before_arm = revision(Source::Shell);
         let command = format!(
             "trap ':' TERM; : > ready; {}; {}; : > term-request; while :; do sleep 0.05; done",
             crate::test_gate::gate("during-kill", "sleep 0.05"),
             f.curl()
         );
         let id = f.task(&f.launch(&command, false, json!({})));
+        assert!(revision(Source::Shell) > before_arm);
+        assert!(!f
+            .ctx
+            .bash_background()
+            .secret_authorization_scope_stamps()
+            .is_empty());
         f.wait_file("ready");
         let address = f
             .ctx
@@ -433,9 +441,16 @@ fn audit_killing_revokes_before_term_grace() {
         let (reached, release) =
             crate::bash_background::registry::install_kill_signal_gate_for_test(&id);
         let registry = f.ctx.bash_background().clone();
+        let before_stop = revision(Source::Shell);
         let killed_id = id.clone();
         let kill = std::thread::spawn(move || registry.kill(&killed_id, "secret-bash"));
         reached.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(revision(Source::Shell) > before_stop);
+        assert!(f
+            .ctx
+            .bash_background()
+            .secret_authorization_scope_stamps()
+            .is_empty());
         assert_eq!(
             f.ctx
                 .bash_background()

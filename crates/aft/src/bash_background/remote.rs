@@ -4853,6 +4853,7 @@ impl BgTaskRegistry {
         }
         let _ = self.post_terminal_transition(task, true);
         self.inner.terminal_transition.notify_waiters();
+        crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
         let _ = self.inner.wake_tx.try_send(());
     }
 
@@ -5001,6 +5002,7 @@ impl BgTaskRegistry {
         );
         let _ = self.post_terminal_transition(task, true);
         self.inner.terminal_transition.notify_waiters();
+        crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
         let _ = self.inner.wake_tx.try_send(());
     }
 

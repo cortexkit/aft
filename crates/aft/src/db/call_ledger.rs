@@ -374,6 +374,7 @@ pub fn admit_with_tool_result_source(
         params![key.carrier,key.call_key,digest,state.as_str(),scope.map(|s| &s.owner),scope.map(|s| &s.scope_ref),scope.map(|s| s.scope_epoch),new_event_id()])?;
     tx.commit()?;
     crash_point(state);
+    crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Held);
     Ok(Admission::New)
 }
 
@@ -384,6 +385,7 @@ pub fn transition(conn: &Connection, key: &Key, from: State, to: State) -> rusql
     )? == 1;
     if changed {
         crash_point(to);
+        crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Held);
     }
     Ok(changed)
 }
@@ -606,6 +608,7 @@ pub fn settle_with_tool_result_source(
     settle_row(&tx, &row, frame, outcome, reason, now, source)?;
     tx.commit()?;
     crate::late_result_bus::settled();
+    crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Held);
     Ok(true)
 }
 
@@ -626,6 +629,21 @@ fn validate_tool_result_source(
         )));
     }
     Ok(())
+}
+
+/// Scope identities retained by calls that have not settled, including held
+/// calls without a route or a running shell task.
+pub(crate) fn unsettled_scopes(conn: &Connection) -> rusqlite::Result<Vec<ScopeIdentity>> {
+    let mut statement = conn.prepare("SELECT DISTINCT owner,scope_ref,scope_epoch FROM call_ledger WHERE state<>'Settled' AND owner IS NOT NULL AND scope_ref IS NOT NULL AND scope_epoch IS NOT NULL")?;
+    statement
+        .query_map([], |row| {
+            Ok(ScopeIdentity {
+                owner: row.get(0)?,
+                scope_ref: row.get(1)?,
+                scope_epoch: row.get(2)?,
+            })
+        })?
+        .collect()
 }
 
 /// Atomically settle Prepared and Authorized calls as scope-ended.
@@ -660,6 +678,7 @@ pub fn end_scope(conn: &Connection, scope: &ScopeIdentity, now: i64) -> rusqlite
     }
     tx.commit()?;
     crate::late_result_bus::settled();
+    crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Held);
     Ok(keys)
 }
 

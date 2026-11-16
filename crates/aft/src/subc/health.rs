@@ -11460,6 +11460,11 @@ mod tests {
             "bus": {"connected": false, "connects": u64::MAX, "published": u64::MAX,
                 "publish_failures": u64::MAX, "last_error": "bus_consumer_disconnected"},
             "root_count": 71,
+            "route_ownership_summary": {"scope_watch": {
+                "watches": 16, "watched": 4096, "polled": usize::MAX,
+                "opens": u64::MAX, "fallbacks": u64::MAX,
+                "descriptions": u64::MAX, "drift_repairs": u64::MAX,
+            }},
             "root_details_omitted": 0,
             "embedding_backend": { "available": true, "last_error": null, "since_ms": null },
             "write_ledger_top_10m": ledger,

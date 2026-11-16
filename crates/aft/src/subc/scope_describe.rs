@@ -145,7 +145,21 @@ where
     F: Fn() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Vec<ScopeStamp>> + Send,
 {
-    start_with_scope_source_impl(control, executor, interval, scope_source, None, None)
+    start_with_scope_source_impl(
+        control,
+        executor,
+        interval,
+        move || {
+            let source = scope_source();
+            async move {
+                let mut inventory = scope_watch::Inventory::default();
+                inventory.add(scope_watch::Source::Shell, source.await);
+                inventory
+            }
+        },
+        None,
+        None,
+    )
 }
 
 fn start_with_scope_source_impl<F, Fut>(
@@ -162,7 +176,7 @@ fn start_with_scope_source_impl<F, Fut>(
 )
 where
     F: Fn() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = Vec<ScopeStamp>> + Send,
+    Fut: std::future::Future<Output = scope_watch::Inventory> + Send,
 {
     let (goodbye, mut closes) = mpsc::unbounded_channel();
     let (observed, mut observations) = mpsc::unbounded_channel();
@@ -180,8 +194,15 @@ where
         }));
     }
     let worker = tokio::spawn(async move {
-        let mut grant_sweep =
-            Box::pin(access_grants::sweep::run(control.clone(), executor.clone()));
+        let (coverage, covered) = tokio::sync::watch::channel(scope_watch::Coverage {
+            keys: HashSet::new(),
+            all: control.advertises(subc_control::ops::SCOPE_WATCH),
+        });
+        let mut grant_sweep = Box::pin(access_grants::sweep::run(
+            control.clone(),
+            executor.clone(),
+            covered,
+        ));
         if !control.advertises(subc_protocol::scope::SCOPE_DESCRIBE_OP) {
             grant_sweep.await;
             return;
@@ -197,7 +218,39 @@ where
         let mut inflight = tokio::task::JoinSet::new();
         let mut fanout = tokio::task::JoinSet::new();
         let mut next_scan = tokio::time::Instant::now() + interval;
+        let mut next_backstop = tokio::time::Instant::now() + scope_watch::BACKSTOP;
+        let mut inventory = scope_watch::Inventory::default();
+        let mut inventory_revision = scope_watch::revisions();
+        let mut dirty = true;
+        let mut watches = scope_watch::Watches::new(control.metrics.clone());
         loop {
+            let changed = scope_watch::notifier().notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            dirty |= scope_watch::revisions() != inventory_revision;
+            if dirty {
+                inventory_revision = scope_watch::revisions();
+                let mut refreshed = scope_source().await;
+                refreshed.retain_unread(&inventory);
+                inventory = refreshed;
+                dirty = false;
+            }
+            let mut held_scopes = inventory.scopes();
+            held_scopes.retain(|key, _| !confirmed.contains(key));
+            watches.reconcile(&held_scopes, &control, interval);
+            let protected = watches.coverage(held_scopes.len());
+            let protected_keys = &protected.keys;
+            coverage.send_replace(protected.clone());
+            control
+                .metrics
+                .scope_descriptions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .watch_health(&watches.health);
+            #[cfg(feature = "test-timing-hooks")]
+            if let Some(path) = std::env::var_os("AFT_TEST_SCOPE_WATCH_HEALTH_FILE") {
+                let _ = std::fs::write(path, serde_json::to_vec(&watches.health).unwrap());
+            }
             while inflight.len() < 4 && !queued.is_empty() {
                 let key = queued.keys().next().cloned().unwrap();
                 let stamp: ScopeStamp = queued.remove(&key).unwrap();
@@ -206,7 +259,13 @@ where
                     continue;
                 }
                 let control = control.clone();
-                let speech = speech.clone();
+                // Persisted grants and held rows have only owner/ref/epoch,
+                // not a full speech authority stamp. Their ordinary cleanup
+                // still requires the daemon's definitive describe answer.
+                let speech = (inventory.sources[0].contains_key(&key)
+                    || inventory.sources[3].contains_key(&key))
+                .then(|| speech.clone())
+                .flatten();
                 inflight.spawn(async move {
                     let sent = std::time::Instant::now();
                     let generation = speech
@@ -243,6 +302,7 @@ where
                 .filter(|(key, _)| {
                     !confirmed.contains(*key)
                         && !pending.contains(*key)
+                        && !protected_keys.contains(*key)
                         && (!routed_now.contains(*key)
                             || secret_authorizations.contains(*key)
                             || retry.contains_key(*key))
@@ -250,7 +310,23 @@ where
                 .map(|(_, due)| *due)
                 .min()
                 .map_or(next_scan, |due| due.min(next_scan));
+            let wake_at = if protected.all {
+                next_backstop
+            } else {
+                wake_at.min(next_backstop)
+            };
+            let wake_at = watches
+                .next_retry()
+                .map_or(wake_at, |retry| retry.min(wake_at));
             tokio::select! {
+                () = &mut changed => { dirty = true; }
+                Some(event) = watches.receiver.recv() => {
+                    for key in watches.event(event, held_scopes.len()) {
+                        if let Some(stamp) = held_scopes.get(&key) {
+                            if !confirmed.contains(&key) && pending.insert(key.clone()) { queued.insert(key, stamp.clone()); }
+                        }
+                    }
+                }
                 () = &mut grant_sweep => unreachable!("saved grant sweep runs until cancelled"),
                 Some(stamp)=observations.recv()=>{
                     if let Some(service)=&speech { if confirmed.insert(stamp_key(&stamp)) {
@@ -266,7 +342,7 @@ where
                 Some(stamp) = closes.recv() => {
                     // An idle route needs no RPC; parked consent asks still
                     // need a scope-end determination even without a process.
-                    let scopes = scope_source().await;
+                    let scopes: Vec<_> = scope_source().await.scopes().into_values().collect();
                     let key = stamp_key(&stamp);
                     // Let the test daemon observe the exact Goodbye snapshot,
                     // including a close that found no registered shell task.
@@ -275,14 +351,30 @@ where
                         let matches = scopes.iter().filter(|live| stamp_key(live) == key).count();
                         let _ = std::fs::write(path, matches.to_string());
                     }
-                    if !confirmed.contains(&key) && scopes.iter().any(|live| stamp_key(live) == key) && pending.insert(key.clone()) {
+                    dirty = true;
+                    if !protected_keys.contains(&key) && !confirmed.contains(&key) && scopes.iter().any(|live| stamp_key(live) == key) && pending.insert(key.clone()) {
                         #[cfg(feature = "test-timing-hooks")]
                         crate::slog_info!("scope diagnostic phase=goodbye_describe_queued scope_epoch={}", stamp.scope_epoch);
                         queued.insert(key, stamp);
                     }
                 }
                 _ = tokio::time::sleep_until(wake_at) => {
-                    let scopes = scope_source().await;
+                    if tokio::time::Instant::now() >= next_backstop {
+                        let now = scope_watch::revisions();
+                        let mut refreshed = scope_source().await;
+                        refreshed.retain_unread(&inventory);
+                        watches.health.drift_repairs += refreshed.warn_drift(&inventory, inventory_revision, now);
+                        inventory = refreshed;
+                        inventory_revision = now;
+                        next_backstop = tokio::time::Instant::now() + scope_watch::BACKSTOP;
+                        continue;
+                    }
+                    if tokio::time::Instant::now() < next_scan { continue; }
+                    inventory_revision = scope_watch::revisions();
+                    let mut refreshed = scope_source().await;
+                    refreshed.retain_unread(&inventory);
+                    inventory = refreshed;
+                    let scopes: Vec<_> = inventory.scopes().into_values().collect();
                     #[cfg(unix)]
                     {
                         let executor = executor.clone();
@@ -294,7 +386,7 @@ where
                     let routed = routed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
                     for stamp in scopes {
                         let key = stamp_key(&stamp);
-                        if !confirmed.contains(&key) && (!routed.contains(&key) || secret_authorizations.contains(&key) || retry.contains_key(&key))
+                        if !protected_keys.contains(&key) && !confirmed.contains(&key) && (!routed.contains(&key) || secret_authorizations.contains(&key) || retry.contains_key(&key))
                             && next_poll.get(&key).is_none_or(|due| tokio::time::Instant::now() >= *due)
                             && pending.insert(key.clone()) {
                             queued.insert(key, stamp);
@@ -303,6 +395,10 @@ where
                 }
                 Some(result) = inflight.join_next(), if !inflight.is_empty() => {
                     if let Ok((key, stamp, reply,generation)) = result {
+                        watches.health.descriptions += 1;
+                        if let Ok(ModuleControlResponseToModule::ScopeDescribe { status: subc_protocol::scope::ScopeStatus::Live, scope_epoch: Some(epoch), .. }) = &reply {
+                            if watches.rebind(&key, *epoch) { dirty = true; }
+                        }
                         // A Goodbye query can finish just before the connection's
                         // periodic tick. Wait a full interval after its answer
                         // before rechecking shell tasks with that owner/ref/epoch.
@@ -315,28 +411,8 @@ where
                                 for ctx in executor.actor_contexts() { ctx.bash_background().revoke_secret_authorization(&described); }
                             }).await;
                         }
-                        if let Some(service)=&speech{
-                            if let Ok(reply)=&reply{
-                                let role=if stamp.attributes.run_id.is_some(){crate::gh_shim_speech::ScopeRole::Run}else{crate::gh_shim_speech::ScopeRole::Authority};
-                                match crate::gh_shim_speech::scope::validate_scope_identity(&stamp,role,reply,&service.generation(),&generation,crate::db::call_ledger::now_ms() as u64){
-                                     Ok(crate::gh_shim_speech::scope::Answer::Ended(proof))=>{
-                                        // Ordinary program authority must close before a speech
-                                        // store write can block, fail, or wait for its own retry.
-                                        if !confirmed.contains(&key) {
-                                            accept_confirmed_end(&executor, run_scopes.as_deref(), &control.metrics, &stamp);
-                                        }
-                                        if let Err(error)=service.record_end(&stamp,proof){
-                                            log::warn!("speech scope-end persistence failed scope_ref={:?} scope_epoch={} code={:?} reason={}", stamp.scope_ref, stamp.scope_epoch, error.code, error.reason);
-                                            control.metrics.scope_descriptions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).cleanup_result(&stamp, false);
-                                            kill_only(executor.clone(),&stamp).await;
-                                        }
-                                        retry.remove(&key);
-                                    },
-                                    Ok(crate::gh_shim_speech::scope::Answer::Live(_))=>{retry.remove(&key);},
-                                    Err(_)=>{retry.insert(key.clone(),stamp);},
-                                }
-                            }else{retry.insert(key.clone(),stamp);}
-                        }else if reply.as_ref().is_ok_and(describe_answer_ends_scope) {
+                        let full_stamp = inventory.sources[0].contains_key(&key) || inventory.sources[3].contains_key(&key);
+                        if reply.as_ref().is_ok_and(describe_answer_ends_scope) {
                             #[cfg(feature = "test-timing-hooks")]
                             crate::slog_info!("scope diagnostic phase=describe_ended scope_epoch={}", stamp.scope_epoch);
                             if confirmed.insert(key.clone()) {
@@ -344,14 +420,29 @@ where
                                 let executor=executor.clone();
                                 let metrics=control.metrics.clone();
                                 let notices=ended.clone();
+                                let stamp=stamp.clone();
                                 fanout.spawn(async move { finish_confirmed_end(executor, stamp, metrics, notices).await });
                             }
                             retry.remove(&key);
                         } else if !matches!(reply, Ok(ModuleControlResponseToModule::ScopeDescribe { status: subc_protocol::scope::ScopeStatus::Live, .. })) {
-                            retry.insert(key.clone(), stamp);
+                            retry.insert(key.clone(), stamp.clone());
                         } else {
                             retry.remove(&key);
                         }
+                        // A scope ref's confirmed end closes ordinary program
+                        // state across rebinds. Speech authority proofs remain
+                        // epoch-specific and must pass their stricter validator.
+                        if let (Some(service), Ok(reply)) = (speech.as_ref().filter(|_| full_stamp), &reply) {
+                            let role=if stamp.attributes.run_id.is_some(){crate::gh_shim_speech::ScopeRole::Run}else{crate::gh_shim_speech::ScopeRole::Authority};
+                            if let Ok(crate::gh_shim_speech::scope::Answer::Ended(proof)) = crate::gh_shim_speech::scope::validate_scope_identity(&stamp,role,reply,&service.generation(),&generation,crate::db::call_ledger::now_ms() as u64) {
+                                if let Err(error)=service.record_end(&stamp,proof){
+                                    log::warn!("speech scope-end persistence failed scope_ref={:?} scope_epoch={} code={:?} reason={}", stamp.scope_ref, stamp.scope_epoch, error.code, error.reason);
+                                    control.metrics.scope_descriptions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).cleanup_result(&stamp, false);
+                                    kill_only(executor.clone(),&stamp).await;
+                                }
+                            }
+                        }
+                        if retry.contains_key(&key) { watches.fallback(&key, interval); }
                         // Non-definitive answers and errors retry only on the
                         // regular poll, never in a reconnect-induced busy loop.
                         pending.remove(&key);
@@ -395,18 +486,82 @@ async fn finish_fenced_notice(
 #[cfg(all(test, unix))]
 #[path = "scope_describe_speech_tests.rs"]
 mod speech_fanout_tests;
+#[cfg(test)]
+#[path = "scope_watch_tests.rs"]
+mod watch_tests;
 
 async fn work_scopes(
     executor: Arc<Executor>,
     run_scopes: Arc<super::run_scope::RunScopes>,
-) -> Vec<ScopeStamp> {
+) -> scope_watch::Inventory {
     tokio::task::spawn_blocking(move || {
-        let mut scopes: Vec<_> = executor
-            .actor_contexts()
-            .into_iter()
-            .flat_map(|ctx| ctx.bash_background().live_scope_stamps())
-            .collect();
-        scopes.extend(run_scopes.parked_scopes());
+        let mut scopes = scope_watch::Inventory::default();
+        scopes.add(
+            scope_watch::Source::Shell,
+            executor
+                .actor_contexts()
+                .into_iter()
+                .flat_map(|ctx| ctx.bash_background().live_scope_stamps())
+                .collect::<Vec<_>>(),
+        );
+        scopes.add(scope_watch::Source::Parked, run_scopes.parked_scopes());
+        let mut seen = HashSet::new();
+        for ctx in executor.actor_contexts() {
+            let Some(db) = ctx.db() else { continue };
+            if !seen.insert(Arc::as_ptr(&db)) {
+                continue;
+            }
+            let result = (|| -> Result<(), String> {
+                let conn = db
+                    .lock()
+                    .map_err(|_| "database lock poisoned".to_string())?;
+                let mut cursor = None;
+                loop {
+                    let keys =
+                        crate::db::access_grants::saved_scope_batch(&conn, cursor.as_ref(), 256)
+                            .map_err(|error| error.to_string())?;
+                    if keys.is_empty() {
+                        break;
+                    }
+                    cursor = keys.last().cloned();
+                    for key in keys {
+                        scopes.add(
+                            scope_watch::Source::Grants,
+                            [access_grants::sweep::stamp(&key)
+                                .map_err(|error| error.to_string())?],
+                        );
+                    }
+                }
+                for key in crate::db::call_ledger::unsettled_scopes(&conn)
+                    .map_err(|error| error.to_string())?
+                {
+                    let owner = match key.owner.as_str() {
+                        "direct" => subc_protocol::Principal::Direct,
+                        "unverified" => subc_protocol::Principal::Unverified,
+                        other => subc_protocol::Principal::Reserved {
+                            module_id: other
+                                .strip_prefix("reserved:")
+                                .ok_or_else(|| "invalid held scope owner".to_string())?
+                                .into(),
+                        },
+                    };
+                    scopes.add(
+                        scope_watch::Source::Held,
+                        [ScopeStamp::new(
+                            owner,
+                            key.scope_ref,
+                            key.scope_epoch,
+                            subc_protocol::scope::ScopeKind::Worker,
+                        )],
+                    );
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                scopes.failed.extend([1, 2]);
+                log::warn!("scope.watch selector census read failed source=grants,held: {error}");
+            }
+        }
         scopes
     })
     .await

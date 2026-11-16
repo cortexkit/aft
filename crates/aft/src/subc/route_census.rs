@@ -41,9 +41,17 @@ pub(super) struct ScopeDescriptions {
     cleanup_pending: HashSet<ScopeKey>,
     cleanup_failed_attempts: u64,
     saved_grant_sweep: access_grants::sweep::Stats,
+    watch: Value,
 }
 
 impl ScopeDescriptions {
+    pub(super) fn watch_health(&mut self, health: &scope_watch::Health) {
+        self.watch = serde_json::to_value(health).expect("scope watch counters are JSON");
+    }
+    #[cfg(test)]
+    pub(super) fn scope_watch_health(&self) -> Value {
+        self.watch.clone()
+    }
     pub(super) fn grant_sweep(&mut self, stats: access_grants::sweep::Stats) {
         self.saved_grant_sweep.add(stats);
     }
@@ -327,6 +335,7 @@ pub(super) fn snapshot(
             "scope_describe_cache_evicted": descriptions.evicted,
             "scope_cleanup": descriptions.cleanup_health(),
             "saved_grant_sweep": descriptions.grant_sweep_health(),
+            "scope_watch": descriptions.watch,
             "scoped": scoped.value(), "unscoped": unscoped.value(), "by_principal": by_principal,
             "principal_limit": PRINCIPAL_LIMIT, "principals_omitted": omitted_principals,
             "omitted_principal_routes": omitted_routes, "omitted_principal_roots": omitted_roots.len()}),

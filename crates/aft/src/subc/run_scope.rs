@@ -193,6 +193,7 @@ impl RunScope {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(ask);
+        super::scope_watch::changed(super::scope_watch::Source::Parked);
         if self.revoked() {
             self.withdraw_parked_asks();
         }
@@ -208,6 +209,7 @@ impl RunScope {
         if parked.is_empty() {
             return;
         }
+        super::scope_watch::changed(super::scope_watch::Source::Parked);
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(super::consent::withdraw_parked(parked));
         }

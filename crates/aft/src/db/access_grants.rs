@@ -397,11 +397,12 @@ pub fn insert_with_source(
          grant_id=coalesce(access_grants.grant_id,excluded.grant_id),
          mode=CASE WHEN excluded.mode='write' THEN 'write' ELSE access_grants.mode END",
         params![key.owner,key.scope_ref,key.epoch.to_string(),canonical.to_string_lossy(),match grant.kind {GrantKind::File=>"file",GrantKind::Subtree=>"subtree"},match grant.operation {AccessOperation::Read=>"read",AccessOperation::Write=>"write"},super::access_grant_rows::new_grant_id(),super::access_grant_rows::now_ms(),card_ref,source.map(|source| source.as_str())])?;
+    crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Grants);
     Ok(())
 }
 
 pub fn revoke(conn: &Connection, key: &ScopeKey, path: &Path) -> rusqlite::Result<usize> {
-    conn.execute(
+    let deleted = conn.execute(
         "DELETE FROM access_grants WHERE owner=?1 AND scope_ref=?2 AND epoch=?3 AND path=?4",
         params![
             key.owner,
@@ -409,7 +410,9 @@ pub fn revoke(conn: &Connection, key: &ScopeKey, path: &Path) -> rusqlite::Resul
             key.epoch.to_string(),
             path.to_string_lossy()
         ],
-    )
+    )?;
+    crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Grants);
+    Ok(deleted)
 }
 
 /// Whether `key` still holds a saved grant for exactly `path`, of any kind or
@@ -453,7 +456,9 @@ pub fn end_scope_grants(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<(
     }
     crate::db::remote_exec::forget_scope(&tx, &key.owner, &key.scope_ref, key.epoch)?;
     crate::db::catalog_edit_modes::forget_scope(&tx, &key.owner, &key.scope_ref, key.epoch)?;
-    tx.commit()
+    tx.commit()?;
+    crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Grants);
+    Ok(())
 }
 
 /// Keyset pagination bounds housekeeping work, not a tool's result list.
@@ -507,6 +512,7 @@ pub(crate) fn end_saved_scope(conn: &Connection, key: &ScopeKey) -> rusqlite::Re
         params![key.owner, key.scope_ref, key.epoch.to_string()],
     )?;
     tx.commit()?;
+    crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Grants);
     Ok(deleted)
 }
 
@@ -544,7 +550,9 @@ pub fn materialize(
     tx.execute("INSERT OR IGNORE INTO access_launch_params(project_root,harness,session,principal,owner,scope_ref,epoch,preset,params) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
         params![key.project_root,key.harness,key.session,key.principal,key.owner,key.scope_ref,key.epoch.to_string(),key.preset,raw.to_string()])?;
     materialize_on(&tx, &scope, grants)?;
-    tx.commit()
+    tx.commit()?;
+    crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Grants);
+    Ok(())
 }
 
 fn materialize_on(

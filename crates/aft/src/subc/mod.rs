@@ -286,6 +286,7 @@ pub async fn runner_notice_transport_for_test(
 }
 pub(crate) mod scope_background_tasks;
 mod scope_describe;
+pub(crate) mod scope_watch;
 mod shells;
 #[cfg(test)]
 mod stack_budget_tests;
@@ -6059,7 +6060,7 @@ where
                             break Err(error);
                         }
                     }
-                    FrameType::Response | FrameType::Error if frame.header.channel == 0 => {
+                    FrameType::Response | FrameType::Error | FrameType::StreamData | FrameType::StreamEnd if frame.header.channel == 0 => {
                         // Replies to AFT's own channel-0 requests (readiness).
                         let corr = frame.header.corr;
                         let ty = frame.header.ty;

@@ -255,6 +255,7 @@ fn register_on(
 ) -> Result<(), subc_protocol::ErrorBody> {
     register_scope_rows(conn, identity, ctx)?;
     scope_registered().notify_waiters();
+    super::scope_watch::changed(super::scope_watch::Source::Grants);
     Ok(())
 }
 

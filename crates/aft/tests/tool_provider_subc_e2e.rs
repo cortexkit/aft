@@ -194,6 +194,167 @@ fn fixture_logs(directory: &Path) -> String {
     logs
 }
 
+#[cfg(all(
+    target_os = "linux",
+    feature = "test-scope-owner",
+    feature = "test-timing-hooks"
+))]
+#[tokio::test]
+#[ignore = "requires CK_SUBC_BIN built from the explicitly authorized scope.watch daemon revision"]
+async fn scope_watch_real_daemon_confirms_end_after_route_close_without_polling() {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    use subc_client_rs::CloseRouteOptions;
+    struct ChildDaemon(std::process::Child);
+    impl Drop for ChildDaemon {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+            }
+            let _ = self.0.wait();
+        }
+    }
+    fn record(directory: &Path) -> Option<Value> {
+        for entry in std::fs::read_dir(directory).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(record) = record(&path) {
+                    return Some(record);
+                }
+            } else if path.file_name().and_then(|name| name.to_str()) == Some("metadata.json") {
+                if let Ok(bytes) = std::fs::read(path) {
+                    if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                        if value["session_id"] == "scope-watch-daemon" {
+                            return Some(value);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+    async fn health_at(path: &Path, descriptions: u64, watched: u64) -> Value {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Ok(health) = serde_json::from_slice::<Value>(&bytes) {
+                    if health["descriptions"] == descriptions && health["watched"] == watched {
+                        return health;
+                    }
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "watch health did not reach descriptions={descriptions}, watched={watched}: {:?}",
+                std::fs::read_to_string(path)
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+    let binary = PathBuf::from(
+        std::env::var_os("CK_SUBC_BIN").expect("provide the explicitly built daemon"),
+    );
+    let binary = crate::test_helpers::executable_cache::cached_executable_named(
+        &std::fs::read(binary).unwrap(),
+        "ckdev-subc",
+    )
+    .unwrap();
+    let (_temp, home, project) = hermetic_home();
+    let health_file = home.join("watch-health.json");
+    let config_path = home.join("config/cortexkit/subc.jsonc");
+    let mut config: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["port"] = json!(0);
+    config["modules"]["aft"]["env"]["AFT_TEST_SCOPE_POLL_MS"] = json!("100");
+    config["modules"]["aft"]["env"]["AFT_TEST_SCOPE_WATCH_HEALTH_FILE"] = json!(health_file);
+    config["modules"]["aft-test-scope-owner"]["env"]["AFT_TEST_SCOPE_WATCH_END"] = json!("1");
+    std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let mut daemon = ChildDaemon(
+        Command::new(binary)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("HOME", home.join("home"))
+            .env("XDG_RUNTIME_DIR", home.join("runtime"))
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("XDG_DATA_HOME", home.join("data"))
+            .env("XDG_STATE_HOME", home.join("state"))
+            .env("XDG_CACHE_HOME", home.join("cache"))
+            .env("TMPDIR", home.join("tmp"))
+            .env("SUBC_PORT", "0")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(
+                std::fs::File::create(home.join("daemon.stderr")).unwrap(),
+            ))
+            .spawn()
+            .expect("start isolated source-built daemon"),
+    );
+    let connection = home.join("runtime/subc-connection.json");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !connection.exists() {
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "daemon exited: {}",
+            fixture_logs(&home)
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "daemon startup deadline: {}",
+            fixture_logs(&home)
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let consumer = SubcConsumer::connect(&connection, ConsumerOptions::default())
+        .await
+        .unwrap();
+    let route = open(
+        &consumer,
+        &project,
+        "scope-watch-daemon",
+        Some(&[("tool-provider", "v1")]),
+    )
+    .await
+    .unwrap();
+    let reply = request(&consumer, &route, json!({"name":"bash", "arguments":{"command":"sleep 120", "background":true, "timeout":150000}})).await.unwrap();
+    let reply: Value = serde_json::from_slice(&reply).unwrap();
+    assert_ne!(reply["isError"], true, "bash launch refused: {reply}");
+    let initial = health_at(&health_file, 1, 1).await;
+    assert_eq!(initial["polled"], 0);
+    consumer
+        .close_handle(&route, CloseRouteOptions::default())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(5500)).await;
+    let before_end = health_at(&health_file, 1, 1).await;
+    assert_eq!(
+        before_end["descriptions"], 1,
+        "route close and 55 fallback intervals must not poll a healthy watch"
+    );
+    assert_eq!(
+        record(&home).expect("background task metadata")["status"],
+        "running"
+    );
+    std::fs::write(home.join("scope-owner.end"), b"end").unwrap();
+    let final_health = health_at(&health_file, 2, 0).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let task = record(&home).expect("background task metadata");
+        if task["status"] == "killed" {
+            assert_eq!(task["status_reason"], "scope_revoked");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "confirmed scope did not kill its task: {task}; {}",
+            fixture_logs(&home)
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(final_health["descriptions"], 2);
+    println!("real daemon scope.watch: 1 initial describe; 0 describes across route close and 55 fallback intervals; 1 confirming describe for the end; killed (scope revoked)");
+    consumer.close().await;
+}
+
 async fn wait_for_scope_owner(project: &Path) {
     let ready = project.parent().unwrap().join("scope-owner.ready");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);

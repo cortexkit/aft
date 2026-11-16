@@ -492,6 +492,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "Keyset pagination bounds background lifecycle probes, not permissions.list; every live grant remains listed and later maintenance ticks continue after the saved cursor.",
     },
     ExclusionEntry {
+        file: "subc/scope_watch.rs",
+        enclosing_item: "reconcile",
+        location_or_primitive: "SELECTORS_PER_WATCH (256), WATCHES_PER_CONNECTION (16)",
+        reason: "Daemon subscription limits partition internal lifecycle selectors; excess scopes retain polling coverage and are counted in health, never dropped from a tool result or from lifecycle monitoring.",
+    },
+    ExclusionEntry {
         file: "subc/held_task_recovery.rs",
         enclosing_item: "sessions",
         location_or_primitive: "RECOVERY_CHUNK (64), SQL LIMIT, keyset pagination",

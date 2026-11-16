@@ -3443,6 +3443,7 @@ impl BgTaskRegistry {
         if !survivors_at_exit {
             let result = self.finish_terminal_transition(task, emit_frame, token_policy);
             self.inner.terminal_transition.notify_waiters();
+            crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
             return result;
         }
 
@@ -3466,6 +3467,7 @@ impl BgTaskRegistry {
                     );
                 }
                 registry.inner.terminal_transition.notify_waiters();
+                crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
                 if settled.as_ref().is_some_and(|listing| !listing.is_clean()) {
                     std::thread::sleep(Duration::from_millis(1_700));
                     let _ = registry.sample_task_process_group(&task);
@@ -13339,6 +13341,7 @@ impl BgTaskRegistry {
         for runtime in stopped {
             runtime.lock().unwrap_or_else(|p| p.into_inner()).stop();
         }
+        crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
     }
 
     #[cfg(unix)]
@@ -13381,6 +13384,7 @@ impl BgTaskRegistry {
             proxy.arm(pid)?;
         }
         proxies.insert(task_id.to_owned(), runtime);
+        crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
         Ok(())
     }
 
@@ -13394,6 +13398,7 @@ impl BgTaskRegistry {
             .remove(task_id);
         if let Some(runtime) = runtime {
             runtime.lock().unwrap_or_else(|p| p.into_inner()).stop();
+            crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
         }
     }
 
@@ -13776,6 +13781,7 @@ impl BgTaskRegistry {
             }
             tasks.insert(task.task_id.clone(), Arc::clone(task));
         }
+        crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
         self.inner
             .cleanup_queue
             .lock()
@@ -14078,7 +14084,9 @@ impl BgTaskRegistry {
 
     pub(crate) fn retire_watchdog_task(&self, task_id: &str) {
         if let Ok(mut tasks) = self.inner.watchdog_tasks.lock() {
-            tasks.remove(task_id);
+            if tasks.remove(task_id).is_some() {
+                crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
+            }
         }
     }
 
@@ -14250,6 +14258,7 @@ impl BgTaskRegistry {
             tasks.insert(task_id.clone(), Arc::clone(&task));
             task
         };
+        crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
         self.inner
             .cleanup_queue
             .lock()
@@ -14987,6 +14996,7 @@ impl BgTaskRegistry {
             // terminal status stays Completed or Failed.
             self.finish_terminal_transition(&task, true, CompletionTokenPolicy::Skip)?;
             self.inner.terminal_transition.notify_waiters();
+            crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
         }
         snapshot.kill_signaled = kill_signaled;
         snapshot.kill_reached = kill_reached;

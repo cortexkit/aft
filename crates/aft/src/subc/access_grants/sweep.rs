@@ -39,7 +39,7 @@ impl Stats {
     }
 }
 
-fn stamp(key: &store::ScopeKey) -> Result<ScopeStamp, serde_json::Error> {
+pub(in crate::subc) fn stamp(key: &store::ScopeKey) -> Result<ScopeStamp, serde_json::Error> {
     serde_json::from_value(serde_json::json!({
         "owner": serde_json::from_str::<serde_json::Value>(&key.owner)?,
         "ref": key.scope_ref, "scope_epoch": key.epoch,
@@ -47,7 +47,23 @@ fn stamp(key: &store::ScopeKey) -> Result<ScopeStamp, serde_json::Error> {
     }))
 }
 
+#[cfg(test)]
 async fn tick<F, Fut>(db: Db, cursor: &mut Option<store::ScopeKey>, describe: F) -> Stats
+where
+    F: Fn(ScopeStamp) -> Fut,
+    Fut: std::future::Future<
+        Output = Result<ModuleControlResponseToModule, readiness::ControlError>,
+    >,
+{
+    tick_unwatched(db, cursor, describe, &Default::default()).await
+}
+
+async fn tick_unwatched<F, Fut>(
+    db: Db,
+    cursor: &mut Option<store::ScopeKey>,
+    describe: F,
+    covered: &super::super::scope_watch::Coverage,
+) -> Stats
 where
     F: Fn(ScopeStamp) -> Fut,
     Fut: std::future::Future<
@@ -86,6 +102,9 @@ where
             }
         };
         let reference = (key.owner.clone(), key.scope_ref.clone());
+        if covered.keys.contains(&scope_describe::stamp_key(&request)) {
+            continue;
+        }
         if !replies.contains_key(&reference) {
             stats.described += 1;
             let reply = tokio::time::timeout(scope_describe::describe_timeout(), describe(request))
@@ -125,10 +144,20 @@ where
 }
 
 /// Owned by the connection's scope worker: cancellation stops the sweep too.
-pub(in crate::subc) async fn run(control: Arc<readiness::DaemonControl>, executor: Arc<Executor>) {
+pub(in crate::subc) async fn run(
+    control: Arc<readiness::DaemonControl>,
+    executor: Arc<Executor>,
+    mut covered: tokio::sync::watch::Receiver<super::super::scope_watch::Coverage>,
+) {
     let mut cursors = HashMap::new();
     let mut database = 0usize;
     loop {
+        while covered.borrow_and_update().all {
+            if covered.changed().await.is_err() {
+                return;
+            }
+        }
+        let coverage = covered.borrow().clone();
         let executor = executor.clone();
         let dbs = tokio::task::spawn_blocking(move || {
             let mut dbs = BTreeMap::new();
@@ -150,13 +179,14 @@ pub(in crate::subc) async fn run(control: Arc<readiness::DaemonControl>, executo
             Ok(dbs) if !dbs.is_empty() => {
                 let (path, db) = &dbs[database % dbs.len()];
                 database = database.wrapping_add(1);
-                let stats = tick(
+                let stats = tick_unwatched(
                     db.clone(),
                     cursors.entry(path.clone()).or_default(),
                     |stamp| {
                         let control = control.clone();
                         async move { control.describe(&stamp).await }
                     },
+                    &coverage,
                 )
                 .await;
                 report(&control.metrics, stats);
