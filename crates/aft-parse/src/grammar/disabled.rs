@@ -15,8 +15,10 @@ pub fn configure(_config: &crate::config::Config) -> Arc<GrammarRegistry> {
     Arc::clone(registry())
 }
 
+test_support_visibility! {
 fn unavailable() -> GrammarUnavailable {
     GrammarUnavailable::new(&manifest().language, GrammarState::SupportDisabled)
+}
 }
 
 impl GrammarRegistry {

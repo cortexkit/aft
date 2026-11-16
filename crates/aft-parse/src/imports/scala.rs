@@ -4,9 +4,15 @@ use super::{
 };
 use tree_sitter::{Node, Tree};
 
+test_support_visibility! {
 const SCALA_WILDCARD_FLAT_MARKER: &str = "*";
+}
+test_support_visibility! {
 const SCALA_GIVEN_FLAT_MARKER: &str = "given";
+}
+test_support_visibility! {
 const SCALA2_DIALECT_MODIFIER: &str = "scala2";
+}
 
 pub fn classify_group_scala(module_path: &str) -> ImportGroup {
     if module_path == "scala"

@@ -35,4 +35,5 @@ mod name_key_tests;
 mod tests;
 
 #[path = "dispatch/projected.rs"]
+#[cfg(test)]
 pub mod projected;

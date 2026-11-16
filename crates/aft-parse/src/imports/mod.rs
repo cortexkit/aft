@@ -15,22 +15,38 @@ use tree_sitter::{Node, Tree};
 
 use crate::parser::LangId;
 
-mod c;
+test_support_visibility! {
+    mod c;
+}
 pub use c::{c_insertion_block, classify_group_c_import_kind, normalize_include_module};
-mod csharp;
-mod java;
-mod kotlin;
-mod lua;
+test_support_visibility! {
+    mod csharp;
+}
+test_support_visibility! {
+    mod java;
+}
+test_support_visibility! {
+    mod kotlin;
+}
+test_support_visibility! {
+    mod lua;
+}
 pub mod perl;
-mod php;
+test_support_visibility! {
+    mod php;
+}
 pub use php::{
     php_grouped_use_matches_module, php_grouped_use_shares_prefix, php_import_matches_module,
     rewrite_php_import_without_module,
 };
 pub mod ruby;
-mod scala;
+test_support_visibility! {
+    mod scala;
+}
 pub use scala::scala_block_uses_scala2_dialect;
-mod swift;
+test_support_visibility! {
+    mod swift;
+}
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -1160,12 +1176,14 @@ fn canonical_dedup_key(lang: LangId, mut key: ImportDedupKey) -> ImportDedupKey 
     key
 }
 
+test_support_visibility! {
 fn sort_named_specifiers(names: &mut [String]) {
     names.sort_by(|a, b| {
         specifier_imported_name(a)
             .cmp(specifier_imported_name(b))
             .then_with(|| a.cmp(b))
     });
+}
 }
 
 /// Find the byte offset where a new import should be inserted.
@@ -2192,6 +2210,7 @@ fn generate_ts_import_line_base(
     format!("import {module_path}")
 }
 
+test_support_visibility! {
 // ---------------------------------------------------------------------------
 // Python implementation
 // ---------------------------------------------------------------------------
@@ -2397,6 +2416,7 @@ const PYTHON_STDLIB: &[&str] = &[
     "zlib",
     "zoneinfo",
 ];
+}
 
 /// Classify a Python import into a group.
 pub fn classify_group_py(module_path: &str) -> ImportGroup {
@@ -2918,6 +2938,7 @@ pub fn generate_go_import_line_pub(
     generate_go_import_line(module_path, alias, in_group)
 }
 
+test_support_visibility! {
 /// Generate a Go import line (public API for command handler).
 ///
 /// `in_group` controls whether to generate a spec for insertion into an
@@ -2936,6 +2957,7 @@ fn generate_go_import_line(module_path: &str, alias: Option<&str>, in_group: boo
             None => format!("import \"{module_path}\""),
         }
     }
+}
 }
 
 /// Check if a Go import block has a grouped import declaration.
@@ -3063,6 +3085,7 @@ fn parse_solidity_imports(source: &str, tree: &Tree) -> ImportBlock {
     }
 }
 
+test_support_visibility! {
 fn strip_one_matching_solidity_quote_pair(value: &str) -> &str {
     if value.len() < 2 {
         return value;
@@ -3075,6 +3098,7 @@ fn strip_one_matching_solidity_quote_pair(value: &str) -> &str {
     } else {
         value
     }
+}
 }
 
 /// Parse one `import_directive`. The Solidity grammar emits a flat token
@@ -3241,5 +3265,5 @@ fn skip_newline(source: &str, pos: usize) -> usize {
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    static PYTHON_STDLIB_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static PYTHON_STDLIB_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

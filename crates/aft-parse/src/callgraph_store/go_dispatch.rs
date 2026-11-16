@@ -6,12 +6,14 @@ fn text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     &source[node.byte_range()]
 }
 
+test_support_visibility! {
 #[derive(Default)]
 pub(super) struct SourceIndex {
     pub(super) package: Option<String>,
     calls: HashMap<(usize, usize), Option<String>>,
     calls_by_line: HashMap<u32, HashMap<(String, String), Option<String>>>,
     methods: HashSet<(String, String)>,
+}
 }
 
 struct Binding {
@@ -29,7 +31,7 @@ enum Declarations<'tree> {
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    static WORK: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
+    pub static WORK: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
 }
 
 fn nominal_type(node: Node<'_>, source: &str) -> Option<String> {

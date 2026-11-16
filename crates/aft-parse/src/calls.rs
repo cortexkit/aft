@@ -22,13 +22,16 @@ const MAX_RUST_MACRO_CALL_DEPTH: u32 = 32;
 
 thread_local! {
     static RUST_FRAGMENT_PARSER: std::cell::RefCell<Option<tree_sitter::Parser>> = const { std::cell::RefCell::new(None) };
+    #[cfg(any(test, feature = "test-support"))]
+    pub static RUST_FRAGMENT_TREES: std::cell::RefCell<Option<FxHashMap<String, tree_sitter::Tree>>> = const { std::cell::RefCell::new(None) };
+    #[cfg(not(any(test, feature = "test-support")))]
     static RUST_FRAGMENT_TREES: std::cell::RefCell<Option<FxHashMap<String, tree_sitter::Tree>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    static RUST_FRAGMENT_PARSER_INITIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static RUST_FRAGMENT_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static RUST_FRAGMENT_PARSER_INITIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static RUST_FRAGMENT_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Keeps fragment trees only while one content record is extracted. Both the
@@ -110,6 +113,7 @@ pub fn call_node_kinds(lang: LangId) -> &'static [&'static str] {
     }
 }
 
+test_support_visibility! {
 /// Recursively walk tree nodes looking for call expressions within a byte range.
 ///
 /// Collects `(callee_name, line_number)` pairs into `results`.
@@ -122,6 +126,7 @@ fn walk_for_calls(
     results: &mut Vec<(String, u32)>,
 ) {
     walk_for_calls_at_depth(node, source, byte_start, byte_end, call_kinds, results, 0);
+}
 }
 
 fn walk_for_calls_at_depth(
@@ -293,6 +298,7 @@ pub fn extract_computed_member_name(node: &tree_sitter::Node, source: &str) -> O
     computed_member_literal(text)
 }
 
+test_support_visibility! {
 fn computed_member_literal(text: &str) -> Option<String> {
     if text.len() >= 2
         && ((text.starts_with('"') && text.ends_with('"'))
@@ -301,6 +307,7 @@ fn computed_member_literal(text: &str) -> Option<String> {
         return Some(text[1..text.len().saturating_sub(1)].to_string());
     }
     None
+}
 }
 
 /// Extract the last segment of a member expression (the method/property name).
@@ -369,6 +376,7 @@ pub fn extract_type_references(
     extract_type_references_in_range(source, root, 0, source.len(), lang)
 }
 
+test_support_visibility! {
 fn collect_type_references(
     node: tree_sitter::Node,
     source: &str,
@@ -378,6 +386,7 @@ fn collect_type_references(
     results: &mut BTreeSet<String>,
 ) {
     collect_type_references_at_depth(node, source, byte_start, byte_end, lang, results, 0);
+}
 }
 
 fn collect_type_references_at_depth(
@@ -813,7 +822,7 @@ pub fn extract_rust_value_references_with<'tree>(
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static LEGACY_VALUE_REFERENCES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static VALUE_BINDING_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static VALUE_BINDING_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 struct RustValueWalk<'tree, 'source, N> {
@@ -1012,7 +1021,7 @@ impl<'tree, N: Nav<'tree>> RustValueWalk<'tree, '_, N> {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn legacy_rust_value_references(
+pub fn legacy_rust_value_references(
     source: &str,
     root: tree_sitter::Node,
 ) -> Vec<(String, String, u32, usize, usize)> {
@@ -1520,6 +1529,7 @@ fn visit_rust_macro_node(
     true
 }
 
+test_support_visibility! {
 fn parse_rust_macro_fragment(fragment: &str) -> Option<tree_sitter::Tree> {
     if let Some(tree) = RUST_FRAGMENT_TREES.with(|trees| {
         trees
@@ -1552,6 +1562,7 @@ fn parse_rust_macro_fragment(fragment: &str) -> Option<tree_sitter::Tree> {
         }
     });
     Some(tree)
+}
 }
 
 fn collect_rust_token_tree_calls(

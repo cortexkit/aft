@@ -207,7 +207,7 @@ const PY_QUERY: &str = r#"
 "#;
 
 #[cfg(any(test, feature = "test-support"))]
-const RS_QUERY: &str = r#"
+pub const RS_QUERY: &str = r#"
 ;; free functions (with optional visibility)
 (function_item
   name: (identifier) @fn.name) @fn.def
@@ -996,6 +996,7 @@ fn compile_query(lang: LangId) -> Result<Query, String> {
         .map_err(|error| format!("query compile error for {lang:?}: {error}"))
 }
 
+test_support_visibility! {
 fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
     if lang == LangId::Luau {
         grammar_for(lang)?;
@@ -1046,10 +1047,14 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
         })
         .transpose()
 }
+}
 
 thread_local! {
     // A Parser is mutable and not Sync, so each semantic/rayon worker retains its
     // own language parsers without a global lock or cross-thread sharing.
+    #[cfg(any(test, feature = "test-support"))]
+    pub static REUSABLE_PARSERS: RefCell<HashMap<LangId, Parser>> = RefCell::new(HashMap::new());
+    #[cfg(not(any(test, feature = "test-support")))]
     static REUSABLE_PARSERS: RefCell<HashMap<LangId, Parser>> = RefCell::new(HashMap::new());
 }
 
@@ -1075,9 +1080,11 @@ pub fn read_source(path: &Path) -> std::io::Result<String> {
     Ok(source)
 }
 
+test_support_visibility! {
 /// Keep the completed read's allocation; an Arc<str> conversion copies its bytes.
 fn captured_source(source: String) -> Arc<String> {
     Arc::new(source)
+}
 }
 
 /// Parse source with a parser retained by the current worker thread.
@@ -1103,7 +1110,7 @@ static HEADER_PARSE_CACHE: LazyLock<Mutex<HeaderParseCache>> =
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    static HEADER_PARSE_ON_MISS: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    pub static HEADER_PARSE_ON_MISS: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
 /// Reuse a resolved header tree in path-free extraction without changing the
@@ -1189,6 +1196,7 @@ pub fn parse_resolved_source(
     Ok(resolved)
 }
 
+test_support_visibility! {
 fn parse_source_with_parser(path: &Path, source: &str, lang: LangId) -> Result<Tree, AftError> {
     parse_source_with_parser_deadline(path, source, lang, None)?.ok_or_else(|| {
         AftError::ParseError {
@@ -1196,7 +1204,9 @@ fn parse_source_with_parser(path: &Path, source: &str, lang: LangId) -> Result<T
         }
     })
 }
+}
 
+test_support_visibility! {
 // Optimized native parses on 8 Linux CPUs: 11,492 Zig and 10,733 Linux headers.
 // C++/Objective-C 99.9th-percentile parse times were 163.527/189.362 ms (Zig),
 // 13.268/16.352 ms (Linux). Take 10x the largest, rounded up to 50 ms, with a 250 ms
@@ -1204,7 +1214,9 @@ fn parse_source_with_parser(path: &Path, source: &str, lang: LangId) -> Result<T
 // selected trees changed. This is cooperative cancellation, not a memory cap
 // or a bound on one native lexer/scanner call between progress callbacks.
 const HEADER_FALLBACK_PARSE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1900);
+}
 
+test_support_visibility! {
 fn parse_source_with_parser_deadline(
     path: &Path,
     source: &str,
@@ -1268,6 +1280,7 @@ fn parse_source_with_parser_deadline(
         }
         result
     })
+}
 }
 
 // The five largest react-lua runtime modules took 3.4-7.3 s each on an
@@ -1530,11 +1543,12 @@ pub fn content_hash_for_source(source: &str) -> blake3::Hash {
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    static FRESHNESS_TEST_BARRIERS: std::cell::RefCell<Option<(std::sync::Arc<std::sync::Barrier>, std::sync::Arc<std::sync::Barrier>)>> = const { std::cell::RefCell::new(None) };
-    static CACHE_REFRESH_TEST_MUTATOR: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
-    static CACHE_REFRESH_TEST_BARRIERS: std::cell::RefCell<Option<(std::sync::Arc<std::sync::Barrier>, std::sync::Arc<std::sync::Barrier>)>> = const { std::cell::RefCell::new(None) };
+    pub static FRESHNESS_TEST_BARRIERS: std::cell::RefCell<Option<(std::sync::Arc<std::sync::Barrier>, std::sync::Arc<std::sync::Barrier>)>> = const { std::cell::RefCell::new(None) };
+    pub static CACHE_REFRESH_TEST_MUTATOR: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+    pub static CACHE_REFRESH_TEST_BARRIERS: std::cell::RefCell<Option<(std::sync::Arc<std::sync::Barrier>, std::sync::Arc<std::sync::Barrier>)>> = const { std::cell::RefCell::new(None) };
 }
 
+test_support_visibility! {
 fn cached_file_is_fresh(
     path: &Path,
     cached_mtime: SystemTime,
@@ -1572,11 +1586,15 @@ fn cached_file_is_fresh(
         Ok(Some(hash)) if hash == cached_content_hash
     )
 }
+}
 
 /// Shared symbol cache that can be pre-warmed in a background thread
 /// and read by all parser instances.
 #[derive(Clone, Default)]
 pub struct SymbolCache {
+    #[cfg(any(test, feature = "test-support"))]
+    pub entries: HashMap<PathBuf, CachedSymbols>,
+    #[cfg(not(any(test, feature = "test-support")))]
     entries: HashMap<PathBuf, CachedSymbols>,
     // Payload totals exclude the root, which is counted only for a nonempty map.
     entry_bytes: u64,
@@ -2027,7 +2045,13 @@ pub fn cached_symbol_count_shared(
 /// Core parsing engine. Handles language detection, parse tree caching,
 /// symbol table caching, and query pattern execution via tree-sitter.
 pub struct FileParser {
+    #[cfg(any(test, feature = "test-support"))]
+    pub cache: HashMap<PathBuf, CachedTree>,
+    #[cfg(not(any(test, feature = "test-support")))]
     cache: HashMap<PathBuf, CachedTree>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub symbol_cache: SharedSymbolCache,
+    #[cfg(not(any(test, feature = "test-support")))]
     symbol_cache: SharedSymbolCache,
     symbol_cache_generation: Option<u64>,
     capture_source: bool,
@@ -2429,76 +2453,78 @@ impl FileParser {
         ))
     }
 
+    test_support_visibility! {
     /// Like [`FileParser::parse`] but reuses caller-provided file contents and
-    /// metadata instead of reading + stat'ing the file again.
-    ///
-    /// `parse()` reads the file from disk to build the tree. A caller that has
-    /// ALREADY read the source (e.g. [`FileParser::extract_symbols`], which
-    /// reads it to hash + extract symbols) would otherwise pay a second
-    /// `read_to_string` for the exact same bytes on every cold-cache file — a
-    /// real cost when warming the symbol cache / call graph over a large repo.
-    /// This variant takes the already-read `source` and the already-computed
-    /// `current_mtime`/`size`/`content_hash` so the cold path does one read and
-    /// one hash. Tree-cache freshness semantics are identical to `parse()`.
-    fn parse_with_source(
-        &mut self,
-        path: &Path,
-        source: &str,
-        current_mtime: std::time::SystemTime,
-        size: u64,
-        content_hash: blake3::Hash,
-    ) -> Result<(&Tree, LangId), AftError> {
-        let lang = language_for_extension(path)
-            .or_else(|| {
-                self.dynamic_languages
-                    .then(|| detect_language_any(path, true))
-                    .flatten()
-            })
-            .ok_or_else(|| AftError::InvalidRequest {
-                message: format!(
-                    "unsupported file extension: {}",
-                    path.extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("<none>")
+        /// metadata instead of reading + stat'ing the file again.
+        ///
+        /// `parse()` reads the file from disk to build the tree. A caller that has
+        /// ALREADY read the source (e.g. [`FileParser::extract_symbols`], which
+        /// reads it to hash + extract symbols) would otherwise pay a second
+        /// `read_to_string` for the exact same bytes on every cold-cache file — a
+        /// real cost when warming the symbol cache / call graph over a large repo.
+        /// This variant takes the already-read `source` and the already-computed
+        /// `current_mtime`/`size`/`content_hash` so the cold path does one read and
+        /// one hash. Tree-cache freshness semantics are identical to `parse()`.
+        fn parse_with_source(
+            &mut self,
+            path: &Path,
+            source: &str,
+            current_mtime: std::time::SystemTime,
+            size: u64,
+            content_hash: blake3::Hash,
+        ) -> Result<(&Tree, LangId), AftError> {
+            let lang = language_for_extension(path)
+                .or_else(|| {
+                    self.dynamic_languages
+                        .then(|| detect_language_any(path, true))
+                        .flatten()
+                })
+                .ok_or_else(|| AftError::InvalidRequest {
+                    message: format!(
+                        "unsupported file extension: {}",
+                        path.extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("<none>")
+                    ),
+                })?;
+
+            let canon = path.to_path_buf();
+            let needs_reparse = match self.cache.get(&canon) {
+                Some(cached) => !cached_file_is_fresh(
+                    path,
+                    cached.mtime,
+                    cached.size,
+                    cached.content_hash,
+                    current_mtime,
                 ),
+                None => true,
+            };
+
+            if needs_reparse {
+                let (tree, lang) = parse_resolved_source(path, source, lang)?;
+                #[cfg(any(test, feature = "test-support"))]
+                work_counters::TREE_PARSES.with(|count| count.set(count.get() + 1));
+
+                self.cache.insert(
+                    canon.clone(),
+                    CachedTree {
+                        mtime: current_mtime,
+                        size,
+                        content_hash,
+                        tree,
+                        lang,
+                        source: self
+                            .capture_source
+                            .then(|| captured_source(source.to_owned())),
+                    },
+                );
+            }
+
+            let cached = self.cache.get(&canon).ok_or_else(|| AftError::ParseError {
+                message: format!("parser cache missing entry for {}", path.display()),
             })?;
-
-        let canon = path.to_path_buf();
-        let needs_reparse = match self.cache.get(&canon) {
-            Some(cached) => !cached_file_is_fresh(
-                path,
-                cached.mtime,
-                cached.size,
-                cached.content_hash,
-                current_mtime,
-            ),
-            None => true,
-        };
-
-        if needs_reparse {
-            let (tree, lang) = parse_resolved_source(path, source, lang)?;
-            #[cfg(any(test, feature = "test-support"))]
-            work_counters::TREE_PARSES.with(|count| count.set(count.get() + 1));
-
-            self.cache.insert(
-                canon.clone(),
-                CachedTree {
-                    mtime: current_mtime,
-                    size,
-                    content_hash,
-                    tree,
-                    lang,
-                    source: self
-                        .capture_source
-                        .then(|| captured_source(source.to_owned())),
-                },
-            );
+            Ok((&cached.tree, cached.lang))
         }
-
-        let cached = self.cache.get(&canon).ok_or_else(|| AftError::ParseError {
-            message: format!("parser cache missing entry for {}", path.display()),
-        })?;
-        Ok((&cached.tree, cached.lang))
     }
 
     /// Extract symbols from a file using language-specific query patterns.
@@ -3009,7 +3035,7 @@ fn is_adjacent_line(upper: &Node, lower: &Node, source: &str) -> bool {
 thread_local! {
     /// Source bytes `is_adjacent_line` examined on this thread, so a test can
     /// prove the check stays proportional to the gap rather than the file.
-    static ADJACENT_LINE_BYTES_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static ADJACENT_LINE_BYTES_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Extract the text of a node from source.
@@ -3056,6 +3082,7 @@ struct ExportIndex {
     names: HashSet<String>,
 }
 
+test_support_visibility! {
 fn collect_exports<'tree>(source: &str, root: &Node<'tree>, nav: impl Nav<'tree>) -> ExportIndex {
     let mut ranges = Vec::new();
     let names = walk_export_statements(source, root, nav, |node| ranges.push(node.byte_range()));
@@ -3079,7 +3106,9 @@ fn collect_exports<'tree>(source: &str, root: &Node<'tree>, nav: impl Nav<'tree>
         names,
     }
 }
+}
 
+test_support_visibility! {
 /// Check if a node's byte range is contained within any export statement.
 ///
 /// `export_ranges` comes from [`collect_exports`]: sorted, with no range
@@ -3095,17 +3124,18 @@ fn is_exported(node: &Node, export_ranges: &[std::ops::Range<usize>]) -> bool {
         .checked_sub(1)
         .is_some_and(|index| r.end <= export_ranges[index].end)
 }
+}
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Containment checks `is_exported` made on this thread.
-    static EXPORT_RANGE_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static EXPORT_RANGE_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Names exported by the tree's export statements. Symbol extraction gets
 /// them from [`collect_exports`]; tests use this to check that walk.
 #[cfg(any(test, feature = "test-support"))]
-fn collect_exported_symbol_names(source: &str, root: &Node) -> HashSet<String> {
+pub fn collect_exported_symbol_names(source: &str, root: &Node) -> HashSet<String> {
     walk_export_statements(source, root, Direct, |_| {})
 }
 
@@ -3213,6 +3243,7 @@ fn mark_named_exports(symbols: &mut [Symbol], exported_names: &HashSet<String>) 
     }
 }
 
+test_support_visibility! {
 /// Extract the first line of a node as its signature.
 fn extract_signature(source: &str, node: &Node) -> String {
     let text = node_text(source, node);
@@ -3221,6 +3252,7 @@ fn extract_signature(source: &str, node: &Node) -> String {
     let trimmed = first_line.trim_end();
     let trimmed = trimmed.strip_suffix('{').unwrap_or(trimmed).trim_end();
     trimmed.to_string()
+}
 }
 
 fn push_default_export_symbol<'tree>(
@@ -3631,8 +3663,8 @@ struct VariableNameIndex {
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    static VARIABLE_NAME_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static LEGACY_VARIABLE_NAMES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub static VARIABLE_NAME_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static LEGACY_VARIABLE_NAMES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl VariableNameIndex {
@@ -4021,6 +4053,7 @@ fn extract_py_symbols<'tree>(
     Ok(symbols)
 }
 
+test_support_visibility! {
 fn rust_mod_scope_chain<'tree>(
     node: &Node<'tree>,
     source: &str,
@@ -4040,6 +4073,7 @@ fn rust_mod_scope_chain<'tree>(
 
     scopes.reverse();
     scopes
+}
 }
 
 /// Rust function attributes that expose the function to code outside the Rust
@@ -4142,6 +4176,7 @@ fn rust_function_identity<'tree>(
     }
 }
 
+test_support_visibility! {
 fn rust_function_declaration_list_owner<'tree>(
     function_node: &Node<'tree>,
     nav: impl Nav<'tree>,
@@ -4150,7 +4185,9 @@ fn rust_function_declaration_list_owner<'tree>(
         .filter(|parent| nav.kind(*parent) == "declaration_list")
         .and_then(|parent| nav.parent(parent))
 }
+}
 
+test_support_visibility! {
 fn rust_impl_scope_name(impl_node: &Node, source: &str) -> String {
     let mut type_names: Vec<String> = Vec::new();
     let mut child_cursor = impl_node.walk();
@@ -4173,6 +4210,7 @@ fn rust_impl_scope_name(impl_node: &Node, source: &str) -> String {
     } else {
         String::new()
     }
+}
 }
 
 fn rust_entry_point_attribute_for_function<'tree>(
@@ -4366,6 +4404,7 @@ pub fn complete_rust_trait_members(
     }
 }
 
+test_support_visibility! {
 /// The type an impl block's methods belong to, as outlines name it: generic
 /// arguments and path qualifiers are dropped, so `impl<T> Trait for a::Box<T>`
 /// nests its methods under the `Box` struct instead of a name no symbol has.
@@ -4377,7 +4416,9 @@ fn rust_impl_parent_name(impl_target: &str) -> String {
         .unwrap_or(base_type)
         .to_string()
 }
+}
 
+test_support_visibility! {
 /// Extract symbols from Rust source without compiling a tree-sitter query.
 /// Handles: free functions, struct, enum, trait (as Interface), impl methods with scope chains.
 ///
@@ -4421,6 +4462,7 @@ fn extract_rs_symbols<'tree>(
     }
     dedup_symbols(&mut symbols);
     Ok(symbols)
+}
 }
 
 /// The byte span strictly inside a token tree's delimiters, or `None` when the
@@ -8885,9 +8927,10 @@ fn vue_opening_tag_signature(source: &str, node: &Node) -> Option<String> {
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    static HEADING_COLUMN_LINE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static HEADING_COLUMN_LINE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+test_support_visibility! {
 fn source_line_end_cols(source: &str) -> Vec<u32> {
     source
         .lines()
@@ -8897,6 +8940,7 @@ fn source_line_end_cols(source: &str) -> Vec<u32> {
             line.len() as u32
         })
         .collect()
+}
 }
 
 fn extract_html_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
@@ -9282,6 +9326,7 @@ fn extract_md_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError
     Ok(symbols)
 }
 
+test_support_visibility! {
 /// Remove duplicate symbols based on (name, kind, start_line).
 /// Class declarations can match both "class" and "method" patterns,
 /// producing duplicates.
@@ -9297,6 +9342,7 @@ fn dedup_symbols(symbols: &mut Vec<Symbol>) {
     };
     let mut keep = keep.into_iter();
     symbols.retain(|_| keep.next().unwrap_or(true));
+}
 }
 
 /// Provider that uses tree-sitter for real symbol extraction.

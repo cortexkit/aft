@@ -9,8 +9,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 
-#[cfg(any(test, feature = "test-support"))]
-use crate::callgraph_store::join::Parser;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Serialize;
 use serde_json::Value;
@@ -20,12 +18,10 @@ use crate::callgraph_store::disk_facts::DiskFacts;
 use crate::callgraph_store::facts::{byte_path, EntryKind, FactPaths};
 use crate::callgraph_store::join::syntax_index::{Direct, Nav, SyntaxIndex};
 #[cfg(any(test, feature = "test-support"))]
-use crate::calls::{call_node_kinds, extract_callee_name, extract_calls_full, extract_full_callee};
+use crate::calls::{call_node_kinds, extract_callee_name, extract_full_callee};
 use crate::calls::{extract_calls_full_with, extract_rust_value_references_with};
 use crate::error::AftError;
 use crate::imports::{self, ImportBlock};
-#[cfg(any(test, feature = "test-support"))]
-use crate::parser::grammar_for;
 use crate::parser::{detect_language, detect_language_from_source, LangId};
 use crate::symbols::{Range, Symbol, SymbolKind};
 
@@ -105,7 +101,7 @@ impl<'a> std::borrow::Borrow<dyn ModuleKeyParts + 'a> for ModuleResolutionKey {
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    static OWNED_MODULE_KEY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static OWNED_MODULE_KEY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn owned_module_key(from_dir: &Path, module_path: &str) -> ModuleResolutionKey {
@@ -150,12 +146,14 @@ pub struct RustCrateRootMemo {
     crate_targets: Arc<MemoCell<HashMap<PathBuf, Option<RustCrateTargets>>>>,
 }
 
+test_support_visibility! {
 struct BoundedMemo<K, V> {
     entries: HashMap<K, (V, usize)>,
     order: std::collections::VecDeque<K>,
     retained_weight: usize,
     max_entries: usize,
     max_retained_weight: usize,
+}
 }
 
 /// Heap bytes of a memo key, charged once more for the copy the eviction
@@ -281,36 +279,38 @@ impl Default for ModuleResolutionMemo {
 }
 
 impl ModuleResolutionMemo {
+    test_support_visibility! {
     fn resolve_module_path(
-        &self,
-        from_dir: &Path,
-        module_path: &str,
-        facts: &FactPaths<'_>,
-    ) -> Option<PathBuf> {
-        if self.enabled {
-            let borrowed = (from_dir, module_path);
-            if let Some(cached) = self
-                .module_paths
-                .borrow()
-                .get(&borrowed as &dyn ModuleKeyParts)
-            {
-                facts.facts.memo_replay(from_dir, "module", module_path);
-                return cached.clone();
+            &self,
+            from_dir: &Path,
+            module_path: &str,
+            facts: &FactPaths<'_>,
+        ) -> Option<PathBuf> {
+            if self.enabled {
+                let borrowed = (from_dir, module_path);
+                if let Some(cached) = self
+                    .module_paths
+                    .borrow()
+                    .get(&borrowed as &dyn ModuleKeyParts)
+                {
+                    facts.facts.memo_replay(from_dir, "module", module_path);
+                    return cached.clone();
+                }
             }
-        }
 
-        let key = owned_module_key(from_dir, module_path);
-        self.note_module_computation(&key);
-        facts.facts.memo_start(from_dir, "module", module_path);
-        let resolved = resolve_module_path_uncached(from_dir, module_path, Some(self), facts);
-        facts.facts.memo_finish(from_dir, "module", module_path);
-        if self.enabled {
-            let retained_weight = module_resolution_entry_weight(&key, resolved.as_deref());
-            self.module_paths
-                .borrow_mut()
-                .insert(key, resolved.clone(), retained_weight);
+            let key = owned_module_key(from_dir, module_path);
+            self.note_module_computation(&key);
+            facts.facts.memo_start(from_dir, "module", module_path);
+            let resolved = resolve_module_path_uncached(from_dir, module_path, Some(self), facts);
+            facts.facts.memo_finish(from_dir, "module", module_path);
+            if self.enabled {
+                let retained_weight = module_resolution_entry_weight(&key, resolved.as_deref());
+                self.module_paths
+                    .borrow_mut()
+                    .insert(key, resolved.clone(), retained_weight);
+            }
+            resolved
         }
-        resolved
     }
 
     fn json_value(&self, path: &Path, facts: &FactPaths<'_>) -> Option<Arc<Value>> {
@@ -478,7 +478,9 @@ fn json_retained_weight(value: &Value) -> usize {
         }
 }
 
+test_support_visibility! {
 const TOP_LEVEL_SYMBOL: &str = "<top-level>";
+}
 const JS_TS_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 const JS_TS_INDEX_FILES: &[&str] = &[
     "index.ts",
@@ -491,12 +493,14 @@ const JS_TS_INDEX_FILES: &[&str] = &[
     "index.cjs",
 ];
 
+test_support_visibility! {
 fn symbol_identity(symbol: &Symbol) -> String {
     if symbol.scope_chain.is_empty() {
         symbol.name.clone()
     } else {
         format!("{}::{}", symbol.scope_chain.join("::"), symbol.name)
     }
+}
 }
 
 fn symbol_unqualified_name(symbol: &str) -> &str {
@@ -1388,8 +1392,11 @@ struct SymbolCallRange {
     byte_end: usize,
 }
 
+test_support_visibility! {
 type SourceLineIndex = crate::callgraph_store::LineIndex;
+}
 
+test_support_visibility! {
 fn collect_calls_by_symbol<'tree>(
     source: &str,
     root: Node<'tree>,
@@ -1404,6 +1411,7 @@ fn collect_calls_by_symbol<'tree>(
         extract_calls_full_with(source, root, 0, source.len(), lang, nav),
         lang,
     )
+}
 }
 
 /// Separate calls written directly in a `macro_rules!` template from ordinary
@@ -1655,7 +1663,7 @@ struct CallSiteSyntax {
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    static CALL_SITE_KIND_NODE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static CALL_SITE_KIND_NODE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn classify_call_site_kinds<'tree>(
@@ -2382,7 +2390,7 @@ struct CallSiteWithRange {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn collect_calls_full_with_ranges(
+pub fn collect_calls_full_with_ranges(
     root: tree_sitter::Node,
     source: &str,
     byte_start: usize,
@@ -3343,8 +3351,10 @@ fn expand_rust_workspace_member(workspace_root: &Path, member: &str) -> Vec<Path
     }
 }
 
+test_support_visibility! {
 fn canonicalize_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
 }
 
 fn resolve_tsconfig_path(
@@ -3784,6 +3794,7 @@ pub fn parse_pnpm_workspace_patterns(bytes: &[u8]) -> Vec<String> {
     patterns
 }
 
+test_support_visibility! {
 fn expand_workspace_patterns(
     workspace_root: &Path,
     patterns: &[String],
@@ -3841,7 +3852,9 @@ fn expand_workspace_patterns(
     );
     members
 }
+}
 
+test_support_visibility! {
 fn build_glob_set(patterns: &[&str]) -> GlobSet {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
@@ -3852,6 +3865,7 @@ fn build_glob_set(patterns: &[&str]) -> GlobSet {
     builder
         .build()
         .unwrap_or_else(|_| GlobSetBuilder::new().build().unwrap())
+}
 }
 
 fn collect_workspace_member_dirs(
@@ -4079,6 +4093,7 @@ where
     .map(|target| (target.file, target.symbol))
 }
 
+test_support_visibility! {
 fn resolve_reexported_symbol<F, D>(
     file: &Path,
     symbol_name: &str,
@@ -4098,10 +4113,11 @@ where
         &mut visited,
     )
 }
+}
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    static REEXPORT_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static REEXPORT_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn parse_reexport_source(
@@ -4337,6 +4353,7 @@ fn resolve_aliased_import(
     None
 }
 
+test_support_visibility! {
 /// Parse import raw text to find the original name for an alias.
 /// Given raw text like `import { foo as bar, baz } from './utils'` and
 /// local_name "bar", returns Some("foo").
@@ -4354,6 +4371,7 @@ fn find_alias_original(raw_import: &str, local_name: &str) -> Option<String> {
         return Some(original.to_string());
     }
     None
+}
 }
 
 // ---------------------------------------------------------------------------
@@ -4406,12 +4424,14 @@ pub fn walk_project_files_in_scope_while(
     )
 }
 
+test_support_visibility! {
 fn walk_project_files_filtered(
     root: &Path,
     access: crate::project_walk::IgnoreFileAccess,
     include: impl Fn(&Path) -> bool + Send + Sync + 'static,
 ) -> impl Iterator<Item = PathBuf> {
     walk_project_files_filtered_while(root, access, include, || true)
+}
 }
 
 /// Stop before advancing the directory iterator, not just between source files.

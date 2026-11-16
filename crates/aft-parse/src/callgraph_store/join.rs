@@ -23,8 +23,10 @@ use serde::{Deserialize, Serialize};
 #[cfg(not(any(test, feature = "test-support")))]
 use tree_sitter::Parser;
 
+test_support_visibility! {
 #[path = "extraction_index.rs"]
 mod extraction_index;
+}
 
 #[path = "single_walk.rs"]
 pub mod single_walk;
@@ -35,8 +37,6 @@ pub mod syntax_index;
 use super::facts::{BlobKey, FactPaths, NoProjectFacts, ProjectFacts};
 use crate::callgraph::{self, FileCallData, SymbolMeta};
 use crate::imports::{ImportBlock, ImportForm, ImportGroup, ImportKind, ImportStatement};
-#[cfg(any(test, feature = "test-support"))]
-use crate::parser::grammar_for;
 use crate::parser::LangId;
 use crate::symbols::SymbolKind;
 use std::collections::HashMap;
@@ -576,11 +576,13 @@ fn ast_preorder_nodes(root: tree_sitter::Node<'_>) -> Vec<AstPreorderNode> {
     nodes
 }
 
+test_support_visibility! {
 fn blob_symbols(data: &FileCallData) -> Vec<BlobSymbol> {
     data.symbol_metadata
         .iter()
         .map(|(scoped_name, meta)| blob_symbol(scoped_name, meta, &data.default_export_symbol))
         .collect()
+}
 }
 
 fn sort_blob_symbols(symbols: &mut [BlobSymbol]) {
@@ -623,6 +625,7 @@ fn blob_symbol(
     }
 }
 
+test_support_visibility! {
 fn blob_imports(data: &FileCallData) -> Vec<BlobImport> {
     data.import_block
         .imports
@@ -641,7 +644,9 @@ fn blob_imports(data: &FileCallData) -> Vec<BlobImport> {
         })
         .collect()
 }
+}
 
+test_support_visibility! {
 fn blob_refs(line_index: &super::LineIndex, data: &FileCallData) -> Vec<BlobRef> {
     let mut refs = Vec::new();
     for (caller_symbol, calls) in ordered_symbol_sites(&data.calls_by_symbol) {
@@ -685,7 +690,9 @@ fn blob_refs(line_index: &super::LineIndex, data: &FileCallData) -> Vec<BlobRef>
     }
     refs
 }
+}
 
+test_support_visibility! {
 /// Reference construction must not depend on a hash map's randomized order.
 /// One source call can belong to several enclosing symbols, and each caller is
 /// distinct evidence even when the call's AST range is identical.
@@ -698,6 +705,7 @@ fn ordered_symbol_sites(
         .collect::<Vec<_>>();
     ordered.sort_unstable_by_key(|(caller, _)| *caller);
     ordered
+}
 }
 
 fn call_ref(caller_symbol: &str, call: &callgraph::CallSite, kind: BlobRefKind) -> BlobRef {
@@ -765,6 +773,7 @@ fn rust_module_refs(source: &str, lang: LangId, root: tree_sitter::Node<'_>) -> 
     refs
 }
 
+test_support_visibility! {
 fn assign_ordinals(
     ast_nodes: &[AstPreorderNode],
     lines: &super::LineIndex,
@@ -804,6 +813,7 @@ fn assign_ordinals(
         (left.ordinal, left.module_path.as_str()).cmp(&(right.ordinal, right.module_path.as_str()))
     });
 }
+}
 
 fn symbol_kind_name(kind: &SymbolKind) -> &'static str {
     match kind {
@@ -828,6 +838,7 @@ fn unqualified_symbol_name(scoped_name: &str) -> &str {
     scoped_name.rsplit("::").next().unwrap_or(scoped_name)
 }
 
+test_support_visibility! {
 fn structural_ref(raw: super::RawRef) -> BlobRef {
     BlobRef {
         ordinal: 0,
@@ -850,6 +861,7 @@ fn structural_ref(raw: super::RawRef) -> BlobRef {
         wildcard: raw.wildcard,
         import_kind: raw.import_kind,
     }
+}
 }
 
 fn bound_name(name: &str, path: &str) -> String {
@@ -1767,6 +1779,9 @@ type ConsultationMemoKey = (std::path::PathBuf, String, String);
 pub struct ViewBindingFacts<'a> {
     inner: Rc<dyn ProjectFacts + 'a>,
     probes: std::cell::RefCell<BTreeSet<String>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub consultations: std::cell::RefCell<ConfigConsultations>,
+    #[cfg(not(any(test, feature = "test-support")))]
     consultations: std::cell::RefCell<ConfigConsultations>,
     memo_stack: std::cell::RefCell<Vec<(ConsultationMemoKey, ConsultationTrace)>>,
     memo_traces: std::cell::RefCell<BTreeMap<ConsultationMemoKey, ConsultationTrace>>,
@@ -1894,11 +1909,13 @@ impl<'a> ViewBindingFacts<'a> {
         }
     }
 
+    test_support_visibility! {
     fn take_config(&self) -> ConfigConsultations {
-        let mut result = std::mem::take(&mut *self.consultations.borrow_mut());
-        result.unattributed = result.unattributed();
-        result.reads.clear();
-        result
+            let mut result = std::mem::take(&mut *self.consultations.borrow_mut());
+            result.unattributed = result.unattributed();
+            result.reads.clear();
+            result
+        }
     }
 
     fn config_event(&self, path: &[u8], name: Option<&str>) {
@@ -2480,92 +2497,96 @@ pub fn rust_crate_key(name: &str) -> String {
 }
 
 impl ViewSurfaceQuery {
+    test_support_visibility! {
     fn dependencies(&self) -> Vec<String> {
-        match self {
-            Self::Module(file, name) => {
-                vec![file.clone(), rust_module_name_key(file, name)]
-            }
-            // Both crate keys: today's views set the map's key, the data
-            // layer the looked-up name's.
-            Self::Crate(name) => vec![
-                VIEW_CONFIG_MEMBERSHIP_DOMAIN.into(),
-                VIEW_RUST_CRATES_DOMAIN.into(),
-                rust_crate_key(name),
-            ],
-            // The nearest `Cargo.toml` above the file decides its crate:
-            // today's views set the config domain when any is added or
-            // removed, the data layer the path of each one that was.
-            Self::CrateRoot(file) => {
-                let mut dependencies = vec![file.clone(), VIEW_CONFIG_MEMBERSHIP_DOMAIN.into()];
-                let mut directory = std::path::Path::new(file).parent();
-                while let Some(current) = directory {
-                    dependencies.push(if current.as_os_str().is_empty() {
-                        "Cargo.toml".to_string()
-                    } else {
-                        format!("{}/Cargo.toml", current.display())
-                    });
-                    directory = current.parent();
+            match self {
+                Self::Module(file, name) => {
+                    vec![file.clone(), rust_module_name_key(file, name)]
                 }
-                dependencies
+                // Both crate keys: today's views set the map's key, the data
+                // layer the looked-up name's.
+                Self::Crate(name) => vec![
+                    VIEW_CONFIG_MEMBERSHIP_DOMAIN.into(),
+                    VIEW_RUST_CRATES_DOMAIN.into(),
+                    rust_crate_key(name),
+                ],
+                // The nearest `Cargo.toml` above the file decides its crate:
+                // today's views set the config domain when any is added or
+                // removed, the data layer the path of each one that was.
+                Self::CrateRoot(file) => {
+                    let mut dependencies = vec![file.clone(), VIEW_CONFIG_MEMBERSHIP_DOMAIN.into()];
+                    let mut directory = std::path::Path::new(file).parent();
+                    while let Some(current) = directory {
+                        dependencies.push(if current.as_os_str().is_empty() {
+                            "Cargo.toml".to_string()
+                        } else {
+                            format!("{}/Cargo.toml", current.display())
+                        });
+                        directory = current.parent();
+                    }
+                    dependencies
+                }
+                // A file's parent changes only when a declaration naming it does;
+                // the incremental update then sets this file's key.
+                Self::Parent(file) => vec![file.clone()],
+                // An inline lookup checks the files whose module path is a
+                // proper prefix of the looked-up path, in the caller's source
+                // folder. A file appearing at, leaving or changing one of those
+                // paths sets that path's key.
+                Self::Inline(file, segments, _) => {
+                    let prefix = super::rust_src_prefix(file);
+                    let mut dependencies = vec![file.clone()];
+                    dependencies.extend(
+                        (0..segments.len()).map(|len| rust_module_key(&prefix, &segments[..len])),
+                    );
+                    dependencies
+                }
+                // Which directory an import path names comes from the module map,
+                // so a `go.mod` edit alone can change the answer.
+                Self::GoPackage(..) => {
+                    vec![VIEW_GO_PACKAGE_DOMAIN.into(), VIEW_GO_MODULES_DOMAIN.into()]
+                }
+                Self::Language(file)
+                | Self::MacroUse(file)
+                | Self::Reexports(file)
+                | Self::Node(file, _)
+                | Self::Callable(file, _)
+                | Self::Alias(file, _)
+                | Self::Export(file, _)
+                | Self::Default(file)
+                | Self::Contains(file) => vec![file.clone()],
             }
-            // A file's parent changes only when a declaration naming it does;
-            // the incremental update then sets this file's key.
-            Self::Parent(file) => vec![file.clone()],
-            // An inline lookup checks the files whose module path is a
-            // proper prefix of the looked-up path, in the caller's source
-            // folder. A file appearing at, leaving or changing one of those
-            // paths sets that path's key.
-            Self::Inline(file, segments, _) => {
-                let prefix = super::rust_src_prefix(file);
-                let mut dependencies = vec![file.clone()];
-                dependencies.extend(
-                    (0..segments.len()).map(|len| rust_module_key(&prefix, &segments[..len])),
-                );
-                dependencies
-            }
-            // Which directory an import path names comes from the module map,
-            // so a `go.mod` edit alone can change the answer.
-            Self::GoPackage(..) => {
-                vec![VIEW_GO_PACKAGE_DOMAIN.into(), VIEW_GO_MODULES_DOMAIN.into()]
-            }
-            Self::Language(file)
-            | Self::MacroUse(file)
-            | Self::Reexports(file)
-            | Self::Node(file, _)
-            | Self::Callable(file, _)
-            | Self::Alias(file, _)
-            | Self::Export(file, _)
-            | Self::Default(file)
-            | Self::Contains(file) => vec![file.clone()],
         }
     }
 
+    test_support_visibility! {
     /// Whether one of [`Self::dependencies`] is in `changed`, without
-    /// building the list for the queries whose dependencies are their file
-    /// and fixed domain keys: a replay asks this of every recorded query of
-    /// every file it replays, most of them naming one file.
-    fn depends_on_any(&self, changed: &BTreeSet<String>) -> bool {
-        match self {
-            Self::Module(file, name) => {
-                changed.contains(file) || changed.contains(&rust_module_name_key(file, name))
+        /// building the list for the queries whose dependencies are their file
+        /// and fixed domain keys: a replay asks this of every recorded query of
+        /// every file it replays, most of them naming one file.
+        fn depends_on_any(&self, changed: &BTreeSet<String>) -> bool {
+            match self {
+                Self::Module(file, name) => {
+                    changed.contains(file) || changed.contains(&rust_module_name_key(file, name))
+                }
+                Self::GoPackage(..) => {
+                    changed.contains(VIEW_GO_PACKAGE_DOMAIN) || changed.contains(VIEW_GO_MODULES_DOMAIN)
+                }
+                Self::Language(file)
+                | Self::MacroUse(file)
+                | Self::Parent(file)
+                | Self::Reexports(file)
+                | Self::Node(file, _)
+                | Self::Callable(file, _)
+                | Self::Alias(file, _)
+                | Self::Export(file, _)
+                | Self::Default(file)
+                | Self::Contains(file) => changed.contains(file),
+                Self::Crate(..) | Self::CrateRoot(..) | Self::Inline(..) => self
+                    .dependencies()
+                    .iter()
+                    .any(|dependency| changed.contains(dependency)),
             }
-            Self::GoPackage(..) => {
-                changed.contains(VIEW_GO_PACKAGE_DOMAIN) || changed.contains(VIEW_GO_MODULES_DOMAIN)
-            }
-            Self::Language(file)
-            | Self::MacroUse(file)
-            | Self::Parent(file)
-            | Self::Reexports(file)
-            | Self::Node(file, _)
-            | Self::Callable(file, _)
-            | Self::Alias(file, _)
-            | Self::Export(file, _)
-            | Self::Default(file)
-            | Self::Contains(file) => changed.contains(file),
-            Self::Crate(..) | Self::CrateRoot(..) | Self::Inline(..) => self
-                .dependencies()
-                .iter()
-                .any(|dependency| changed.contains(dependency)),
         }
     }
 

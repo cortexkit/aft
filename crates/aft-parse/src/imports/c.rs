@@ -4,8 +4,12 @@ use super::{
 };
 use tree_sitter::{Node, Tree};
 
+test_support_visibility! {
 const C_INCLUDE_SYSTEM_KIND: &str = "system";
+}
+test_support_visibility! {
 const C_INCLUDE_LOCAL_KIND: &str = "local";
+}
 
 /// Normalize an agent-supplied C/C++ include module.
 ///

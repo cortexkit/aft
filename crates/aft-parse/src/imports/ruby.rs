@@ -4,14 +4,22 @@ use super::{
 };
 use tree_sitter::{Node, Tree};
 
+test_support_visibility! {
 const RUBY_REQUIRE_KIND: &str = "require";
+}
+test_support_visibility! {
 const RUBY_REQUIRE_RELATIVE_KIND: &str = "require_relative";
+}
 /// Ruby's `load` re-runs the target every call, unlike the idempotent
 /// `require` family — organize must never drop a repeat as a duplicate.
 /// Exported so the organizer names this form rather than matching a literal.
 pub const RUBY_LOAD_KIND: &str = "load";
+test_support_visibility! {
 const RUBY_QUOTE_SINGLE: &str = "quote:single";
+}
+test_support_visibility! {
 const RUBY_QUOTE_DOUBLE: &str = "quote:double";
+}
 
 pub fn classify_group_ruby(_module_path: &str) -> ImportGroup {
     // Ruby has no conventional stdlib/external/internal declaration grouping for

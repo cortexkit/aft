@@ -60,7 +60,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tree_sitter::Node;
 
 #[cfg(test)]
-pub(crate) mod dead_code_projection;
+pub mod dead_code_projection;
 
 #[cfg(test)]
 #[path = "../../tests/store_diet/harness.rs"]
@@ -851,14 +851,20 @@ mod canonicalize_path_tests {
     }
 }
 
+#[cfg(test)]
 pub mod fact_answers;
 
+#[cfg(test)]
 pub mod go_dispatch;
 
+#[cfg(test)]
 pub mod join;
 
+#[cfg(test)]
 pub mod luau;
 
+#[cfg(test)]
 pub mod resolution_facts;
 
+#[cfg(test)]
 pub mod rust_bindings;

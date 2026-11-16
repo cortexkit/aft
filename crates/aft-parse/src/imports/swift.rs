@@ -141,6 +141,7 @@ fn parse_swift_modifiers(source: &str, node: &Node) -> Vec<String> {
     modifiers
 }
 
+test_support_visibility! {
 fn encode_swift_flat_marker(modifiers: &[String], import_kind: Option<&str>) -> Option<String> {
     let import_kind = import_kind.filter(|kind| !kind.is_empty());
     if modifiers.is_empty() && import_kind.is_none() {
@@ -153,6 +154,7 @@ fn encode_swift_flat_marker(modifiers: &[String], import_kind: Option<&str>) -> 
         modifiers.join(","),
         import_kind.unwrap_or("")
     ))
+}
 }
 
 fn decode_swift_flat_marker(marker: &str) -> Option<(Vec<String>, Option<String>)> {

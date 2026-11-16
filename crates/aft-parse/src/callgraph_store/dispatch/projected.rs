@@ -172,11 +172,13 @@ impl FileRecord {
     }
 }
 
+test_support_visibility! {
 /// The first byte of every scratch-encoded record (see
 /// [`FileRecord::encode_scratch`]). The encoding lives only in one build's
 /// scratch folder and is read back by the same process, so it needs no
 /// version history; the byte only catches bytes that are not a record.
 const SCRATCH_FORMAT: u8 = 1;
+}
 
 /// Appends the scratch encoding's parts: counts and lengths as
 /// little-endian `u32`, flags as one byte, text as its length and bytes.
@@ -560,6 +562,7 @@ fn declarations(parse: &ParseBlob) -> ParseBlob {
     )
 }
 
+test_support_visibility! {
 /// The facts a [`FileRecord`] keeps, from their parts: every other field
 /// of the parse is left empty.
 fn declarations_of(
@@ -587,6 +590,7 @@ fn declarations_of(
         python_bindings: Vec::new(),
         refs: Vec::new(),
     }
+}
 }
 
 /// Every name a Rust file's [`Resolver::project_type`] can answer other than

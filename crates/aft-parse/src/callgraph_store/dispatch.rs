@@ -37,8 +37,10 @@ pub mod projected;
 pub(super) mod smart_pointer;
 #[path = "dispatch/typescript.rs"]
 mod typescript;
+test_support_visibility! {
 #[path = "dispatch/view.rs"]
 mod view;
+}
 
 /// Complete the graph builder's owned symbols without changing navigation or
 /// semantic-search symbol tables supplied by the shared parser.
@@ -266,6 +268,7 @@ fn text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 fn field<'a>(node: Node<'a>, names: &[&str]) -> Option<Node<'a>> {
     names.iter().find_map(|name| node.child_by_field_name(name))
 }
+test_support_visibility! {
 fn descendants(node: Node<'_>) -> Vec<Node<'_>> {
     let mut result = Vec::new();
     let mut cursor = node.walk();
@@ -297,6 +300,7 @@ fn descendants(node: Node<'_>) -> Vec<Node<'_>> {
             depth -= 1;
         }
     }
+}
 }
 fn method_shape(node: Node<'_>, source: &str, language: &str) -> String {
     let parameters = field(node, &["parameters"])
@@ -375,6 +379,7 @@ const TYPES: &[&str] = &[
     "type_spec",
     "object_declaration",
 ];
+test_support_visibility! {
 const FUNCTIONS: &[&str] = &[
     "function_declaration",
     "function_definition",
@@ -390,6 +395,7 @@ const FUNCTIONS: &[&str] = &[
     "generator_function",
     "lambda_expression",
 ];
+}
 fn named<'tree>(node: Node<'tree>, source: &str, nav: impl Nav<'tree>) -> Option<String> {
     if let Some((_, name)) = typescript::object_member(node, source, nav) {
         return Some(name);
@@ -1464,6 +1470,7 @@ fn syntactic_dynamic(callee: Node<'_>, source: &str, language: &str) -> bool {
     }
 }
 
+test_support_visibility! {
 /// Rust receiver inference repeatedly consults the same function bodies and
 /// constructor declarations. Borrow subtree slices from the file's existing
 /// preorder instead of collecting another descendant vector for each receiver.
@@ -1472,6 +1479,7 @@ struct RustReceiverIndex<'nodes, 'tree> {
     functions: HashMap<usize, (usize, usize)>,
     constructors: HashSet<String>,
     bindings: &'nodes RustBindings,
+}
 }
 
 impl<'nodes, 'tree> RustReceiverIndex<'nodes, 'tree> {
@@ -1540,7 +1548,7 @@ thread_local! {
     static UNINDEXED_RECEIVERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Makes [`receiver_type`] walk a class for its declarations at every
     /// call, as it did before [`ClassFieldMemo`], so tests can compare.
-    static UNMEMOIZED_CLASS_FIELDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub static UNMEMOIZED_CLASS_FIELDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The field and property declarations of each class in one file, keyed by
@@ -2115,7 +2123,7 @@ pub struct Resolver<'a> {
     #[cfg(feature = "callgraph-shape-census")]
     pub census_exit: std::cell::Cell<&'static str>,
     #[cfg(any(test, feature = "test-support"))]
-    file_visits: std::cell::Cell<usize>,
+    pub file_visits: std::cell::Cell<usize>,
 }
 
 /// Keys naming what one resolution read. A resolution reads nothing else, so
@@ -2298,18 +2306,20 @@ impl<'a> Resolver<'a> {
                 .collect(),
         }
     }
+    test_support_visibility! {
     /// Whether some Go file declares an interface requiring a method named
-    /// `name` with `shape`.
-    fn go_interface_requires(&self, name: &str, shape: &str) -> bool {
-        self.depend(dependency::GO_INTERFACES.to_string());
-        let requires = |p: &ParseBlob| view::go_interface_requires(self, p, name, shape);
-        match self.source {
-            Some(source) => source
-                .go_files_requiring(name)
-                .iter()
-                .filter_map(|path| source.file(path))
-                .any(requires),
-            None => self.files.values().any(|p| requires(p)),
+        /// `name` with `shape`.
+        fn go_interface_requires(&self, name: &str, shape: &str) -> bool {
+            self.depend(dependency::GO_INTERFACES.to_string());
+            let requires = |p: &ParseBlob| view::go_interface_requires(self, p, name, shape);
+            match self.source {
+                Some(source) => source
+                    .go_files_requiring(name)
+                    .iter()
+                    .filter_map(|path| source.file(path))
+                    .any(requires),
+                None => self.files.values().any(|p| requires(p)),
+            }
         }
     }
     fn import_target(&self, file: &str, module: &str) -> Option<String> {
@@ -2389,44 +2399,48 @@ impl<'a> Resolver<'a> {
             std::sync::Arc::clone(&shared.methods),
         );
     }
+    test_support_visibility! {
     fn methods_named(&self, member: &str) -> NamedMethods<'a> {
-        self.depend(dependency::method(member));
-        if let Some(source) = self.source {
-            if let Some(found) = self.methods_loaded.borrow().get(member) {
-                return std::sync::Arc::clone(found);
-            }
-            let methods = self.load_methods(source, member);
-            self.methods_loaded
-                .borrow_mut()
-                .insert(member.to_string(), std::sync::Arc::clone(&methods));
-            return methods;
-        }
-        let index = self.methods_by_name.get_or_init(|| {
-            let mut index: HashMap<&'a str, Vec<(String, view::MethodGroup<'a>, &'a MethodHint)>> =
-                HashMap::new();
-            for (file, parse) in &self.files {
-                self.note_file_visit();
-                let parse: &'a ParseBlob = parse;
-                for (group, method) in view::methods(parse) {
-                    index.entry(method.name.as_str()).or_default().push((
-                        file.clone(),
-                        group,
-                        method,
-                    ));
+            self.depend(dependency::method(member));
+            if let Some(source) = self.source {
+                if let Some(found) = self.methods_loaded.borrow().get(member) {
+                    return std::sync::Arc::clone(found);
                 }
+                let methods = self.load_methods(source, member);
+                self.methods_loaded
+                    .borrow_mut()
+                    .insert(member.to_string(), std::sync::Arc::clone(&methods));
+                return methods;
             }
-            index
-                .into_iter()
-                .map(|(name, methods)| (name, std::sync::Arc::new(methods)))
-                .collect()
-        });
-        index.get(member).cloned().unwrap_or_default()
-    }
-    fn project_type(&self, file: &str, name: &str) -> Option<(String, &TypeHint)> {
-        if let Some(projections) = self.projections() {
-            return self.replay_projection(projections, file, name);
+            let index = self.methods_by_name.get_or_init(|| {
+                let mut index: HashMap<&'a str, Vec<(String, view::MethodGroup<'a>, &'a MethodHint)>> =
+                    HashMap::new();
+                for (file, parse) in &self.files {
+                    self.note_file_visit();
+                    let parse: &'a ParseBlob = parse;
+                    for (group, method) in view::methods(parse) {
+                        index.entry(method.name.as_str()).or_default().push((
+                            file.clone(),
+                            group,
+                            method,
+                        ));
+                    }
+                }
+                index
+                    .into_iter()
+                    .map(|(name, methods)| (name, std::sync::Arc::new(methods)))
+                    .collect()
+            });
+            index.get(member).cloned().unwrap_or_default()
         }
-        self.project_type_at_depth(file, name, 0)
+    }
+    test_support_visibility! {
+    fn project_type(&self, file: &str, name: &str) -> Option<(String, &TypeHint)> {
+            if let Some(projections) = self.projections() {
+                return self.replay_projection(projections, file, name);
+            }
+            self.project_type_at_depth(file, name, 0)
+        }
     }
     fn note_file_visit(&self) {
         #[cfg(any(test, feature = "test-support"))]
@@ -2673,50 +2687,52 @@ impl<'a> Resolver<'a> {
                 (f == base_file && t.name == base) || self.subtype(&f, t, base_file, base, seen)
             })
     }
+    test_support_visibility! {
     fn python_base_type(&self, file: &str, name: &str) -> Option<(String, &TypeHint)> {
-        let mut file = file.to_string();
-        let mut name = name.to_string();
-        let mut visited = BTreeSet::new();
-        loop {
-            if !visited.insert((file.clone(), name.clone())) {
-                return None;
-            }
-            let parse = self.file(&file)?;
-            if parse.language() != "python" {
-                return None;
-            }
-            if let Some(ty) = parse.type_named(&name) {
-                return Some((file, ty));
-            }
-            let imports = parse.python_imports_naming(&name);
-            let mut targets = BTreeSet::new();
-            for (module, names) in imports {
-                for specifier in names {
-                    if crate::imports::specifier_local_name(&specifier) != name {
-                        continue;
-                    }
-                    for candidate in crate::callgraph_store::python_module_candidates(
-                        std::path::Path::new(""),
-                        std::path::Path::new(&file),
-                        &module,
-                    ) {
-                        let path = candidate.to_string_lossy().replace('\\', "/");
-                        // Probe in Python's package-before-module order, keeping
-                        // missing higher-priority files as refresh dependencies.
-                        if self.file(&path).is_some() {
-                            targets.insert((
-                                path,
-                                crate::imports::specifier_imported_name(&specifier).to_string(),
-                            ));
-                            break;
+            let mut file = file.to_string();
+            let mut name = name.to_string();
+            let mut visited = BTreeSet::new();
+            loop {
+                if !visited.insert((file.clone(), name.clone())) {
+                    return None;
+                }
+                let parse = self.file(&file)?;
+                if parse.language() != "python" {
+                    return None;
+                }
+                if let Some(ty) = parse.type_named(&name) {
+                    return Some((file, ty));
+                }
+                let imports = parse.python_imports_naming(&name);
+                let mut targets = BTreeSet::new();
+                for (module, names) in imports {
+                    for specifier in names {
+                        if crate::imports::specifier_local_name(&specifier) != name {
+                            continue;
+                        }
+                        for candidate in crate::callgraph_store::python_module_candidates(
+                            std::path::Path::new(""),
+                            std::path::Path::new(&file),
+                            &module,
+                        ) {
+                            let path = candidate.to_string_lossy().replace('\\', "/");
+                            // Probe in Python's package-before-module order, keeping
+                            // missing higher-priority files as refresh dependencies.
+                            if self.file(&path).is_some() {
+                                targets.insert((
+                                    path,
+                                    crate::imports::specifier_imported_name(&specifier).to_string(),
+                                ));
+                                break;
+                            }
                         }
                     }
                 }
+                if targets.len() != 1 {
+                    return None;
+                }
+                (file, name) = targets.into_iter().next()?;
             }
-            if targets.len() != 1 {
-                return None;
-            }
-            (file, name) = targets.into_iter().next()?;
         }
     }
 
@@ -2862,55 +2878,57 @@ impl<'a> Resolver<'a> {
             },
         }
     }
+    test_support_visibility! {
     fn unknown(&self, language: &str, member: &str) -> Resolution {
-        // Through `methods_named`, which reads the source when there is one:
-        // a resolver over a source holds no files of its own.
-        let protected: BTreeSet<_> = self
-            .methods_named(member)
-            .iter()
-            .filter(|(_, parse, _)| parse.language() == language)
-            .map(|(file, _, method)| (file.clone(), method.symbol.clone()))
-            .collect();
-        if ["go", "python"].contains(&language) {
-            return Resolution {
+            // Through `methods_named`, which reads the source when there is one:
+            // a resolver over a source holds no files of its own.
+            let protected: BTreeSet<_> = self
+                .methods_named(member)
+                .iter()
+                .filter(|(_, parse, _)| parse.language() == language)
+                .map(|(file, _, method)| (file.clone(), method.symbol.clone()))
+                .collect();
+            if ["go", "python"].contains(&language) {
+                return Resolution {
+                    unresolved: usize::from(!protected.is_empty()),
+                    external: usize::from(protected.is_empty()),
+                    protected,
+                    ..Resolution::default()
+                };
+            }
+            let targets = protected
+                .iter()
+                .filter(|(file, symbol)| {
+                    let parse = self.known_file(file);
+                    parse
+                        .methods_named_here(member)
+                        .into_iter()
+                        .find(|m| &m.symbol == symbol)
+                        .is_some_and(|m| {
+                            m.trait_name.is_some()
+                                || self.project_type(file, &m.owner).is_some_and(|(_, t)| {
+                                    t.interface
+                                        || t.bases.iter().any(|base| {
+                                            self.project_type(file, base)
+                                                .is_some_and(|(_, b)| b.interface)
+                                        })
+                                })
+                                || language == "go" && self.go_interface_requires(&m.name, &m.shape)
+                        })
+                })
+                .map(|(file, symbol)| Target {
+                    file: file.clone(),
+                    symbol: symbol.clone(),
+                    provenance: "name_match",
+                })
+                .collect();
+            Resolution {
+                targets,
                 unresolved: usize::from(!protected.is_empty()),
                 external: usize::from(protected.is_empty()),
                 protected,
                 ..Resolution::default()
-            };
-        }
-        let targets = protected
-            .iter()
-            .filter(|(file, symbol)| {
-                let parse = self.known_file(file);
-                parse
-                    .methods_named_here(member)
-                    .into_iter()
-                    .find(|m| &m.symbol == symbol)
-                    .is_some_and(|m| {
-                        m.trait_name.is_some()
-                            || self.project_type(file, &m.owner).is_some_and(|(_, t)| {
-                                t.interface
-                                    || t.bases.iter().any(|base| {
-                                        self.project_type(file, base)
-                                            .is_some_and(|(_, b)| b.interface)
-                                    })
-                            })
-                            || language == "go" && self.go_interface_requires(&m.name, &m.shape)
-                    })
-            })
-            .map(|(file, symbol)| Target {
-                file: file.clone(),
-                symbol: symbol.clone(),
-                provenance: "name_match",
-            })
-            .collect();
-        Resolution {
-            targets,
-            unresolved: usize::from(!protected.is_empty()),
-            external: usize::from(protected.is_empty()),
-            protected,
-            ..Resolution::default()
+            }
         }
     }
     /// Resolves one method-call site of `file`. The caller's own facts are

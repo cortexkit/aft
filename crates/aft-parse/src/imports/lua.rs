@@ -4,7 +4,9 @@ use super::{
 };
 use tree_sitter::{Node, Tree};
 
+test_support_visibility! {
 const BARE_STRING_ARGUMENT_MODIFIER: &str = "bare_string_argument";
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequireArgumentStyle {

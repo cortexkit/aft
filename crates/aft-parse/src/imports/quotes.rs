@@ -128,6 +128,7 @@ fn majority<T: Copy + PartialEq>(values: &[T], a: T, b: T) -> Option<T> {
     }
 }
 
+test_support_visibility! {
 fn config_quote(file: &Path, root: Option<&Path>) -> Option<char> {
     config_setting(file, root, |name, json, text| {
         if name.starts_with("biome") {
@@ -143,7 +144,9 @@ fn config_quote(file: &Path, root: Option<&Path>) -> Option<char> {
         prettier_bool(name, json, text, "singleQuote").map(|single| if single { '\'' } else { '"' })
     })
 }
+}
 
+test_support_visibility! {
 fn config_semicolon(file: &Path, root: Option<&Path>) -> Option<bool> {
     config_setting(file, root, |name, json, text| {
         if name.starts_with("biome") {
@@ -158,6 +161,7 @@ fn config_semicolon(file: &Path, root: Option<&Path>) -> Option<bool> {
         }
         prettier_bool(name, json, text, "semi")
     })
+}
 }
 
 /// A boolean Prettier option from a config file, or from the `prettier` key

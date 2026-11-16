@@ -23,6 +23,7 @@ fn collect_php_imports(source: &str, root: Node, imports: &mut Vec<ImportStateme
     collect_php_imports_in_scope(source, root, imports);
 }
 
+test_support_visibility! {
 /// Collects the `use` declarations of `scope` and of the namespace blocks in
 /// it, in source order, and returns how many nodes it looked at. Only the
 /// children of scopes and of namespaces are looked at, so the walk skips
@@ -78,7 +79,9 @@ fn collect_php_imports_in_scope(
     }
     visited
 }
+}
 
+test_support_visibility! {
 fn parse_php_namespace_use_declaration(source: &str, node: &Node) -> Option<ImportStatement> {
     let clauses = direct_children(node, "namespace_use_clause");
     if !clauses.is_empty() {
@@ -90,6 +93,7 @@ fn parse_php_namespace_use_declaration(source: &str, node: &Node) -> Option<Impo
     }
 
     parse_php_payload_namespace_use_declaration(source, node)
+}
 }
 
 fn parse_php_clause_declaration(

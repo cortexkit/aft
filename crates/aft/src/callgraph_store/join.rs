@@ -51,7 +51,7 @@ use tree_sitter::Parser;
 
 #[cfg(test)]
 #[path = "extraction_work.rs"]
-pub(crate) mod extraction_work;
+pub mod extraction_work;
 
 #[cfg(test)]
 #[path = "extraction_tests.rs"]
@@ -245,10 +245,13 @@ mod consultation_tests {
 }
 
 #[path = "dispatch.rs"]
+#[cfg(test)]
 pub mod dispatch;
 
 #[path = "single_walk.rs"]
+#[cfg(test)]
 pub mod single_walk;
 
 #[path = "syntax_index.rs"]
+#[cfg(test)]
 pub mod syntax_index;

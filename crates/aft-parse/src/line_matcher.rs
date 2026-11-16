@@ -244,7 +244,7 @@ fn unicode_characters(input: &str) -> impl Iterator<Item = char> + '_ {
 /// Collapse whitespace runs to one space and drop leading and trailing
 /// whitespace, lazily. Only the reference scan in the tests still checks
 /// windows this way.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 fn collapsed_whitespace(chars: impl Iterator<Item = char>) -> impl Iterator<Item = char> {
     let mut started = false;
     let mut space = false;

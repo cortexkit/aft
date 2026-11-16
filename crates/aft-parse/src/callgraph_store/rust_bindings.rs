@@ -33,10 +33,12 @@ pub(super) fn has_self_parameter(node: Node<'_>, source: &str) -> bool {
         })
 }
 
+test_support_visibility! {
 #[derive(Clone, Debug)]
 pub(super) enum Initializer {
     Call { callee: String },
     Nominal(String),
+}
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +49,7 @@ pub(super) struct Binding {
     pub initializer: Option<Initializer>,
 }
 
+test_support_visibility! {
 #[derive(Default)]
 pub(super) struct RustBindings {
     declarations: HashMap<String, Option<usize>>,
@@ -58,6 +61,7 @@ pub(super) struct RustBindings {
     parameters: HashSet<(usize, String)>,
     generic_functions: HashSet<usize>,
     unit_structs: HashMap<String, bool>,
+}
 }
 
 fn text<'a>(node: Node<'_>, source: &'a str) -> &'a str {

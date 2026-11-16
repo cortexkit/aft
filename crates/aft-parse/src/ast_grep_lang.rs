@@ -222,6 +222,7 @@ fn php_snippet_selector(pattern: &str) -> Result<String, PatternError> {
     Ok(node.kind().into_owned())
 }
 
+test_support_visibility! {
 fn pascal_pattern_is_declaration(pattern: &str) -> bool {
     let trimmed = pattern.trim_start().to_lowercase();
     [
@@ -243,6 +244,7 @@ fn pascal_pattern_is_declaration(pattern: &str) -> bool {
                 .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_')
         })
     })
+}
 }
 
 fn pascal_snippet_selector(pattern: &str) -> Result<String, PatternError> {

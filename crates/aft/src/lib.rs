@@ -243,7 +243,6 @@ pub mod setup_plan;
 pub(crate) use aft_base::shared_timer;
 pub(crate) mod shell_env_provider;
 pub use aft_base::shell_format;
-pub(crate) use aft_base::stage_timer;
 pub mod standing_roots;
 pub(crate) mod status_push;
 pub use aft_base::storage_path;

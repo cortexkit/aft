@@ -122,6 +122,7 @@ pub fn detect_indent(source: &str, lang: LangId) -> IndentStyle {
     IndentStyle::default_for(lang)
 }
 
+test_support_visibility! {
 /// Determine the most likely space indent width from observed leading-space counts.
 ///
 /// Strategy: find the smallest observed indent width that forms a consistent
@@ -162,6 +163,7 @@ fn determine_space_width(widths: &[u32; 9]) -> u8 {
     }
 
     smallest as u8
+}
 }
 
 /// The line terminator generated text should use to match `source`: CRLF

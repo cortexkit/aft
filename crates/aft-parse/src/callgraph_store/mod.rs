@@ -8,15 +8,17 @@ pub mod access;
 pub mod disk_facts;
 pub mod fact_answers;
 pub mod facts;
-mod go_dispatch;
+test_support_visibility! {
+    mod go_dispatch;
+}
 pub mod join;
-mod luau;
+test_support_visibility! {
+    mod luau;
+}
 pub mod method_call_facts;
 #[cfg(target_os = "macos")]
 mod readiness_watch_macos;
 pub mod resolution_facts;
-#[cfg(any(test, feature = "test-support"))]
-use disk_facts::DiskFacts;
 use facts::{byte_path, EntryKind, FactPaths, ProjectFacts};
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::Mutex;
@@ -58,7 +60,9 @@ const JS_TS_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs
 /// under their own fixture root.
 pub mod dead_code_projection;
 
-mod rust_bindings;
+test_support_visibility! {
+    mod rust_bindings;
+}
 pub use dead_code_projection::{
     ProjectionCostEstimates, ProjectionKind, ProjectionVerdict, MAX_DELTA_BYTES,
 };
@@ -684,13 +688,22 @@ impl DbFileIndex {
 #[derive(Debug, Clone)]
 pub struct DbFileIndex {
     lang: Option<LangId>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub exports: HashSet<String>,
+    #[cfg(not(any(test, feature = "test-support")))]
     exports: HashSet<String>,
     default_export: Option<String>,
     export_aliases: HashMap<String, String>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub node_by_scoped: HashMap<String, String>,
+    #[cfg(not(any(test, feature = "test-support")))]
     node_by_scoped: HashMap<String, String>,
     node_by_bare: HashMap<String, String>,
     node_kind_by_id: HashMap<String, String>,
     module_targets: HashMap<String, Option<String>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub declared_module_targets: HashMap<String, Option<String>>,
+    #[cfg(not(any(test, feature = "test-support")))]
     declared_module_targets: HashMap<String, Option<String>>,
     macro_use_module_targets: BTreeSet<String>,
     reexports: Vec<ReexportIndex>,
@@ -726,6 +739,11 @@ aft_store::heap_bytes_of_fields!(ReexportIndex {
 pub struct ProjectIndex<'a> {
     facts: Rc<dyn ProjectFacts + 'a>,
     project_root: PathBuf,
+    #[cfg(any(test, feature = "test-support"))]
+    /// Shared, so several resolver threads can each wrap the same bound
+    /// surfaces in their own index with their own memos.
+    pub files: Arc<HashMap<String, DbFileIndex>>,
+    #[cfg(not(any(test, feature = "test-support")))]
     /// Shared, so several resolver threads can each wrap the same bound
     /// surfaces in their own index with their own memos.
     files: Arc<HashMap<String, DbFileIndex>>,
@@ -751,6 +769,9 @@ pub struct ProjectIndex<'a> {
     lazy_inline_candidates: std::cell::OnceCell<RustInlineCandidates>,
     rust_caller_paths: RefCell<HashMap<String, Vec<String>>>,
     go_packages: RefCell<GoPackageMemo>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub local_symbols: RefCell<CallerSymbolMemo>,
+    #[cfg(not(any(test, feature = "test-support")))]
     local_symbols: RefCell<CallerSymbolMemo>,
 }
 
@@ -1172,31 +1193,33 @@ impl ProjectIndex<'_> {
         )
     }
 
+    test_support_visibility! {
     /// `module_parent` by scanning every indexed file: the smallest
-    /// `(declaring file, module name)` pair whose declared target is
-    /// `target_file`.
-    fn module_parent_by_scan(&self, target_file: &str) -> Option<(String, String)> {
-        #[cfg(any(test, feature = "test-support"))]
-        rust_module_work::note(|work| work.parent_scans += 1);
-        let mut parents = self
-            .scan_paths(|lazy| lazy.module_declaring_files())
-            .into_iter()
-            .filter_map(|file| {
-                #[cfg(any(test, feature = "test-support"))]
-                rust_module_work::note(|work| work.parent_file_visits += 1);
-                let index = self.file_index(&file)?;
-                let modules = index
-                    .declared_module_targets
-                    .iter()
-                    .filter(|(_, target)| target.as_deref() == Some(target_file))
-                    .map(|(module, _)| (file.clone(), module.clone()))
-                    .collect::<Vec<_>>();
-                Some(modules)
-            })
-            .flatten()
-            .collect::<Vec<_>>();
-        parents.sort();
-        parents.into_iter().next()
+        /// `(declaring file, module name)` pair whose declared target is
+        /// `target_file`.
+        fn module_parent_by_scan(&self, target_file: &str) -> Option<(String, String)> {
+            #[cfg(any(test, feature = "test-support"))]
+            rust_module_work::note(|work| work.parent_scans += 1);
+            let mut parents = self
+                .scan_paths(|lazy| lazy.module_declaring_files())
+                .into_iter()
+                .filter_map(|file| {
+                    #[cfg(any(test, feature = "test-support"))]
+                    rust_module_work::note(|work| work.parent_file_visits += 1);
+                    let index = self.file_index(&file)?;
+                    let modules = index
+                        .declared_module_targets
+                        .iter()
+                        .filter(|(_, target)| target.as_deref() == Some(target_file))
+                        .map(|(module, _)| (file.clone(), module.clone()))
+                        .collect::<Vec<_>>();
+                    Some(modules)
+                })
+                .flatten()
+                .collect::<Vec<_>>();
+            parents.sort();
+            parents.into_iter().next()
+        }
     }
 
     /// Tries the caller first, then files whose path-derived module segments
@@ -1248,7 +1271,7 @@ impl ProjectIndex<'_> {
 
     /// `inline_scoped_target` by sorting and scanning every indexed path.
     #[cfg(any(test, feature = "test-support"))]
-    fn inline_scoped_target_by_scan(
+    pub fn inline_scoped_target_by_scan(
         &self,
         caller_file: &str,
         module_segments: &[String],
@@ -1859,6 +1882,7 @@ fn collect_rust_use_import(
     }
 }
 
+test_support_visibility! {
 fn rust_import_from_use_node(source: &str, node: Node<'_>) -> Option<ImportStatement> {
     let raw_text = source[node.byte_range()].to_string();
     let body = rust_use_body(&raw_text)?.to_string();
@@ -1881,6 +1905,7 @@ fn rust_import_from_use_node(source: &str, node: Node<'_>) -> Option<ImportState
             named: names,
         },
     })
+}
 }
 
 /// The leaf paths a `use` tree imports, each with the byte range of its
@@ -1976,6 +2001,7 @@ fn import_byte_range_from_imports(imports: &[ImportStatement]) -> Option<std::op
     Some(start..end)
 }
 
+test_support_visibility! {
 fn rust_use_visibility(raw_text: &str) -> Option<String> {
     let use_pos = raw_text.find("use ")?;
     let prefix = raw_text[..use_pos].trim();
@@ -1985,12 +2011,16 @@ fn rust_use_visibility(raw_text: &str) -> Option<String> {
         Some(prefix.to_string())
     }
 }
+}
 
+test_support_visibility! {
 fn rust_use_body(raw_text: &str) -> Option<&str> {
     let use_pos = raw_text.find("use ")?;
     Some(raw_text[use_pos + 4..].trim().trim_end_matches(';').trim())
 }
+}
 
+test_support_visibility! {
 fn rust_use_list_names(body: &str) -> Vec<String> {
     let Some(open) = body.find("::{") else {
         return Vec::new();
@@ -2009,6 +2039,7 @@ fn rust_use_list_names(body: &str) -> Vec<String> {
             }
         })
         .collect()
+}
 }
 
 fn classify_rust_import_group(body: &str) -> ImportGroup {
@@ -2197,6 +2228,7 @@ fn collect_rust_pub_use_reexport_refs(
     ReexportRefs { raw_refs }
 }
 
+test_support_visibility! {
 fn rust_pub_use_reexport_parts(
     import: &ImportStatement,
 ) -> Option<(String, HashMap<String, String>, bool)> {
@@ -2226,7 +2258,9 @@ fn rust_pub_use_reexport_parts(
     }
     Some((module_path.trim().to_string(), names, false))
 }
+}
 
+test_support_visibility! {
 fn rust_use_group_close(body: &str) -> Option<usize> {
     let bytes = body.as_bytes();
     let mut pos = 0;
@@ -2305,6 +2339,7 @@ fn rust_use_group_close(body: &str) -> Option<usize> {
     }
     None
 }
+}
 
 fn rust_use_char_literal(rest: &str) -> bool {
     // Apostrophes also introduce lifetimes. A character has either an escape or
@@ -2317,6 +2352,7 @@ fn rust_use_char_literal(rest: &str) -> bool {
         .is_some_and(|ch| rest.as_bytes().get(1 + ch.len_utf8()) == Some(&b'\''))
 }
 
+test_support_visibility! {
 fn rust_reexport_names_from_specs(specs: &str) -> HashMap<String, String> {
     let mut names = HashMap::new();
     for spec in specs.split(',') {
@@ -2335,6 +2371,7 @@ fn rust_reexport_names_from_specs(specs: &str) -> HashMap<String, String> {
         }
     }
     names
+}
 }
 
 fn rust_reexport_statement_for_index(named: &HashMap<String, String>, fallback: &str) -> String {
@@ -2355,6 +2392,7 @@ fn rust_reexport_statement_for_index(named: &HashMap<String, String>, fallback: 
     format!("pub use {{{}}};", specs.join(", "))
 }
 
+test_support_visibility! {
 fn quoted_module_path(statement: &str) -> Option<String> {
     let quote = match (statement.find('\''), statement.find('"')) {
         (Some(single), Some(double)) if single < double => '\'',
@@ -2366,6 +2404,7 @@ fn quoted_module_path(statement: &str) -> Option<String> {
     let start = statement.find(quote)? + 1;
     let end = statement[start..].find(quote)? + start;
     Some(statement[start..end].to_string())
+}
 }
 
 #[derive(Debug, Clone)]
@@ -3030,6 +3069,7 @@ fn resolve_js_ts_target<I: ResolverIndex>(
     resolve_local_target(index, caller_file, full_ref, short_name, caller_data)
 }
 
+test_support_visibility! {
 fn resolve_exported_symbol<I: ResolverIndex>(
     index: &I,
     file: &str,
@@ -3038,6 +3078,7 @@ fn resolve_exported_symbol<I: ResolverIndex>(
 ) -> Option<(String, String)> {
     let mut visited = std::collections::HashMap::new();
     resolve_exported_symbol_inner(index, file, requested, depth, &mut visited)
+}
 }
 
 /// Re-export graphs are frequently cyclic (barrel files re-exporting each
@@ -3352,6 +3393,7 @@ fn rust_macro_use_target<I: ResolverIndex>(
     None
 }
 
+test_support_visibility! {
 fn rust_unique_file_level_function<I: ResolverIndex>(
     _index: &I,
     caller_file: &str,
@@ -3383,6 +3425,7 @@ fn rust_unique_file_level_function<I: ResolverIndex>(
             symbol,
         )
     })
+}
 }
 
 fn rust_target_for_qualified<I: ResolverIndex>(
@@ -3912,12 +3955,15 @@ fn rust_resolve_segments_with_index<I: ResolverIndex>(
     rust_resolve_segments_from(rust_caller_module_segments(index, caller_file), segments)
 }
 
+test_support_visibility! {
 fn rust_caller_module_segments<I: ResolverIndex>(index: &I, caller_file: &str) -> Vec<String> {
     #[cfg(any(test, feature = "test-support"))]
     let _timing = rust_module_work::Timing::caller();
     index.rust_caller_module_segments(caller_file)
 }
+}
 
+test_support_visibility! {
 fn rust_caller_module_segments_uncached<I: ResolverIndex + ?Sized>(
     index: &I,
     caller_file: &str,
@@ -3930,6 +3976,7 @@ fn rust_caller_module_segments_uncached<I: ResolverIndex + ?Sized>(
         rust_registered_module_segments(index, caller_file)
             .unwrap_or_else(|| rust_module_segments_for_rel(caller_file))
     }
+}
 }
 
 fn rust_reference_module_segments<I: ResolverIndex>(
@@ -4152,20 +4199,22 @@ fn resolve_local_target<I: ResolverIndex>(
 }
 
 impl<'a> ProjectIndex<'a> {
+    test_support_visibility! {
     fn from_parts(
-        project_root: &Path,
-        files: HashMap<String, DbFileIndex>,
-        caller_data: HashMap<String, &'a FileCallData>,
-        workspace_crate_prefixes: WorkspaceCratePrefixCache,
-        facts: Rc<dyn ProjectFacts + 'a>,
-    ) -> Self {
-        Self::from_shared(
-            project_root,
-            Arc::new(files),
-            caller_data,
-            workspace_crate_prefixes,
-            facts,
-        )
+            project_root: &Path,
+            files: HashMap<String, DbFileIndex>,
+            caller_data: HashMap<String, &'a FileCallData>,
+            workspace_crate_prefixes: WorkspaceCratePrefixCache,
+            facts: Rc<dyn ProjectFacts + 'a>,
+        ) -> Self {
+            Self::from_shared(
+                project_root,
+                Arc::new(files),
+                caller_data,
+                workspace_crate_prefixes,
+                facts,
+            )
+        }
     }
 
     /// An index whose every file index comes from `loaded`, on first use.
@@ -4946,6 +4995,7 @@ fn reexport_index_from_raw(raw_ref: &RawRef, target_file: Option<String>) -> Ree
     }
 }
 
+test_support_visibility! {
 fn parse_reexport_names(statement: &str) -> HashMap<String, String> {
     let mut names = HashMap::new();
     let Some(open) = statement.find('{') else {
@@ -4969,6 +5019,7 @@ fn parse_reexport_names(statement: &str) -> HashMap<String, String> {
         }
     }
     names
+}
 }
 
 fn module_dependencies(
@@ -5323,7 +5374,7 @@ pub fn normalize_file_path(project_root: &Path, path: &Path) -> Result<PathBuf> 
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    static CANONICALIZE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static CANONICALIZE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// `std::fs::canonicalize`, counted in tests. Each call is a `realpath`, which
@@ -5336,6 +5387,7 @@ fn fs_canonicalize(path: &Path) -> std::io::Result<PathBuf> {
     std::fs::canonicalize(path)
 }
 
+test_support_visibility! {
 /// Canonicalize an existing path or the deepest existing ancestor of a deleted
 /// one. This keeps watcher deletion events in the same identity domain as the
 /// files indexed before the deletion.
@@ -5349,6 +5401,7 @@ fn canonicalize_path(path: &Path) -> PathBuf {
         return canonical;
     }
     canonicalize_missing_absolute_path(path).unwrap_or_else(|| canonicalize_missing_path(path))
+}
 }
 
 /// The deepest-existing-ancestor form of an absolute path made only of normal
@@ -5398,6 +5451,7 @@ fn canonicalize_missing_absolute_path(path: &Path) -> Option<PathBuf> {
     }
 }
 
+test_support_visibility! {
 /// Resolve a missing path component by component, keeping the unresolved tail
 /// and applying `..` to it lexically.
 fn canonicalize_missing_path(path: &Path) -> PathBuf {
@@ -5440,6 +5494,7 @@ fn canonicalize_missing_path(path: &Path) -> PathBuf {
     }
     resolved.extend(missing);
     resolved
+}
 }
 
 pub fn relative_path(project_root: &Path, path: &Path) -> String {
@@ -5501,9 +5556,11 @@ impl LineIndex {
         }
     }
 
+    test_support_visibility! {
     fn byte_to_line(&self, byte_offset: usize) -> u32 {
-        let byte_offset = byte_offset.min(self.source_len);
-        self.starts.partition_point(|start| *start <= byte_offset) as u32
+            let byte_offset = byte_offset.min(self.source_len);
+            self.starts.partition_point(|start| *start <= byte_offset) as u32
+        }
     }
 
     pub fn byte_offset(&self, line: u32, column: u32) -> usize {
@@ -5513,16 +5570,19 @@ impl LineIndex {
         start + (column as usize).min(self.ends[line as usize] - start)
     }
 
+    test_support_visibility! {
     fn inclusive_byte_offset(&self, line: u32, column: u32) -> usize {
-        let Some(&start) = self.starts.get(line as usize) else {
-            return self.source_len;
-        };
-        let end = self
-            .starts
-            .get(line as usize + 1)
-            .copied()
-            .unwrap_or(self.source_len);
-        start + (column as usize).min(end - start)
+            let Some(&start) = self.starts.get(line as usize) else {
+                return self.source_len;
+            };
+            let end = self
+                .starts
+                .get(line as usize + 1)
+                .copied()
+                .unwrap_or(self.source_len);
+            start + (column as usize).min(end - start)
+        }
+
     }
 }
 
@@ -5544,7 +5604,7 @@ pub fn unix_millis_now() -> u64 {
 
 #[cfg(any(test, feature = "test-support"))]
 impl DbFileIndex {
-    fn empty(lang: Option<LangId>) -> Self {
+    pub fn empty(lang: Option<LangId>) -> Self {
         Self {
             lang,
             exports: HashSet::new(),

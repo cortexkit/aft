@@ -23,6 +23,7 @@ use crate::callgraph;
 use crate::callgraph_store::facts::{FactPaths, NoProjectFacts};
 use crate::parser::LangId;
 
+test_support_visibility! {
 /// Parses `source` as `language` and extracts its parse output.
 pub(super) fn extract(
     source: &str,
@@ -33,6 +34,7 @@ pub(super) fn extract(
         .ok_or_else(|| ManifestJoinError::UnsupportedLanguage(language.to_string()))?;
     let tree = parse_source(source, lang)?;
     extract_tree(source, language, extractor_version, &tree, None)
+}
 }
 
 /// Extracts the parse output of `source` from `tree`, its syntax tree in
@@ -321,6 +323,7 @@ pub fn reparse_source(
     })
 }
 
+test_support_visibility! {
 /// The single edit that turns `old` into `new`: everything between their
 /// common prefix and their common suffix. `None` when they are equal.
 fn text_edit(old: &[u8], new: &[u8]) -> Option<tree_sitter::InputEdit> {
@@ -354,6 +357,7 @@ fn text_edit(old: &[u8], new: &[u8]) -> Option<tree_sitter::InputEdit> {
         old_end_position: point(old, old.len() - suffix),
         new_end_position: point(new, new.len() - suffix),
     })
+}
 }
 
 thread_local! {

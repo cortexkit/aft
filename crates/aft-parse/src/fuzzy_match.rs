@@ -1056,7 +1056,7 @@ fn normalize_reflow_whitespace(s: &str) -> String {
     normalized
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 fn strip_reflow_whitespace(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).collect()
 }

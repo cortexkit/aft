@@ -5,7 +5,9 @@ use super::{
 use tree_sitter::{Node, Tree};
 
 pub const PERL_USE_KIND: &str = "use";
+test_support_visibility! {
 const PERL_REQUIRE_KIND: &str = "require";
+}
 pub const PERL_NO_KIND: &str = "no";
 const PERL_FLAT_MARKER_PREFIX: &str = "perl:";
 
@@ -176,13 +178,16 @@ fn is_perl_import_kind(kind: &str) -> bool {
     matches!(kind, PERL_USE_KIND | PERL_REQUIRE_KIND | PERL_NO_KIND)
 }
 
+test_support_visibility! {
 fn perl_flat_marker(import_kind: &str, raw_args: &str) -> String {
     format!(
         "{PERL_FLAT_MARKER_PREFIX}{}:{import_kind}{raw_args}",
         import_kind.len()
     )
 }
+}
 
+test_support_visibility! {
 fn perl_marker_parts(marker: &str) -> Option<(&str, &str)> {
     let payload = marker.strip_prefix(PERL_FLAT_MARKER_PREFIX)?;
     let (kind_len, rest) = payload.split_once(':')?;
@@ -193,6 +198,7 @@ fn perl_marker_parts(marker: &str) -> Option<(&str, &str)> {
 
     let (kind, raw_args) = rest.split_at(kind_len);
     is_perl_import_kind(kind).then_some((kind, raw_args))
+}
 }
 
 fn perl_args_from_modifiers(modifiers: &[String]) -> Option<String> {

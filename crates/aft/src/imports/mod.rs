@@ -1358,24 +1358,35 @@ mod audit11_regressions {
     }
 }
 
+#[cfg(test)]
 pub mod quotes;
 
+#[cfg(test)]
 pub mod c;
 
+#[cfg(test)]
 pub mod csharp;
 
+#[cfg(test)]
 pub mod java;
 
+#[cfg(test)]
 pub mod kotlin;
 
+#[cfg(test)]
 pub mod lua;
 
+#[cfg(test)]
 pub mod perl;
 
+#[cfg(test)]
 pub mod php;
 
+#[cfg(test)]
 pub mod ruby;
 
+#[cfg(test)]
 pub mod scala;
 
+#[cfg(test)]
 pub mod swift;
