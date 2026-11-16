@@ -31,6 +31,7 @@ fn notice_templates_rewritten_bash_sends_once_without_footers() {
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.path().into()),
+                experimental_bash_rewrite: true,
                 ..Default::default()
             },
         );
