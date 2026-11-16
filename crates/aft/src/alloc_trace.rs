@@ -1,7 +1,7 @@
 //! Names the operation behind large or bursty heap use in the daemon.
 //!
 //! The `aft` binary installs [`TracingAllocator`] as its global allocator. It
-//! forwards every call to the system allocator and watches two things:
+//! forwards every call to the process allocator and watches two things:
 //!
 //! - One allocation or reallocation of [`LARGE_ALLOCATION_BYTES`] or more
 //!   records an event: its size, the old size for a reallocation, the
@@ -24,12 +24,16 @@
 //! libraries (SQLite, tree-sitter, ONNX Runtime) take from `malloc` directly
 //! is not seen here.
 
-use std::alloc::{GlobalAlloc, Layout, System};
+#[cfg(not(target_os = "linux"))]
+use std::alloc::System as ProcessAllocator;
+use std::alloc::{GlobalAlloc, Layout};
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
+#[cfg(target_os = "linux")]
+use tikv_jemallocator::Jemalloc as ProcessAllocator;
 
 mod capture;
 mod report;
@@ -256,13 +260,13 @@ thread_local! {
 }
 
 /// The global allocator wrapper the `aft` binary installs. It forwards to
-/// [`System`] and reports to this module after each call.
+/// jemalloc on Linux and the system allocator elsewhere, then reports each call.
 pub struct TracingAllocator;
 
 unsafe impl GlobalAlloc for TracingAllocator {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { System.alloc(layout) };
+        let ptr = unsafe { ProcessAllocator.alloc(layout) };
         if !ptr.is_null() {
             on_alloc(layout.size());
         }
@@ -271,7 +275,7 @@ unsafe impl GlobalAlloc for TracingAllocator {
 
     #[inline]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { System.alloc_zeroed(layout) };
+        let ptr = unsafe { ProcessAllocator.alloc_zeroed(layout) };
         if !ptr.is_null() {
             on_alloc(layout.size());
         }
@@ -280,13 +284,13 @@ unsafe impl GlobalAlloc for TracingAllocator {
 
     #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) };
+        unsafe { ProcessAllocator.dealloc(ptr, layout) };
         account(-(layout.size() as isize));
     }
 
     #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let next = unsafe { System.realloc(ptr, layout, new_size) };
+        let next = unsafe { ProcessAllocator.realloc(ptr, layout, new_size) };
         if !next.is_null() {
             if new_size >= LARGE_ALLOCATION_BYTES {
                 record_large(EventKind::Realloc, new_size, layout.size());

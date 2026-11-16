@@ -219,8 +219,9 @@ pub(super) fn remote_refusal(metadata: &super::PersistedTask) -> Option<super::R
 const REMOTE_REATTACH_GRACE: Duration = Duration::from_secs(5 * 60);
 
 /// ck-motor's queue wait for jobs eligible for Boat (at most eight vCPUs,
-/// without outbound networking). Hosted-only jobs may wait longer. AFT leaves
-/// `queue_wait_limit_s` unset so the runner chooses its capacity-aware default.
+/// without outbound networking). Hosted-only jobs may wait longer. Without an
+/// explicit caller timeout, AFT leaves `queue_wait_limit_s` unset so the runner
+/// chooses its capacity-aware default.
 /// This baseline also caps retries after a proven terminal refusal.
 #[cfg(unix)]
 const RUNNER_QUEUE_WAIT_LIMIT: Duration = Duration::from_secs(300);
@@ -3006,6 +3007,8 @@ impl BgTaskRegistry {
                     siblings: launch.params.siblings,
                     weight_hint: requested_vcpus,
                     memory_mib: launch.requested_memory_mib,
+                    queue_wait_limit_s: matches!(hard_kill, super::super::HardKill::After(_))
+                        .then_some(timeout_seconds),
                     network: launch.requested_network.then_some(Network::Outbound),
                     return_paths: launch.return_paths,
                     ..Default::default()

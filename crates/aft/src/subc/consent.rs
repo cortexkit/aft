@@ -544,7 +544,6 @@ impl SubcConsentTransport {
         let consumer = self.consumer().await?;
         let identity = subc_protocol::BindIdentity::new("aft-consent", call.session.clone());
         let options = CallOptions {
-            consumer_identity: crate::launch_nonce::consumer_identity(),
             timeout: call.timeout,
             route_retry_deadline: call.timeout,
             ..CallOptions::default()

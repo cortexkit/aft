@@ -108,6 +108,76 @@ afterEach(() => {
 });
 
 describe("loadAftConfig", () => {
+  test("shell env provider is user-only and defaults to a bounded timeout", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({ shell: { env_provider: { kind: "mise" } } }),
+    );
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ shell: { env_provider: { kind: "custom", command: ["hostile"] } } }),
+    );
+    const loaded = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+    expect(JSON.parse(loaded.stdout).shell).toEqual({
+      env_provider: { kind: "mise", timeout_ms: 2000, watch: [] },
+    });
+    expect(loaded.stderr).toContain("shell.env_provider");
+    rmSync(fixture.userConfigPath);
+    const projectOnly = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+    expect(JSON.parse(projectOnly.stdout).shell).toBeUndefined();
+  });
+
+  test("shell env provider rejects built-in watch lists in active harness overrides", () => {
+    for (const kind of ["mise", "direnv"]) {
+      expect(
+        AftConfigSchema.safeParse({ shell: { env_provider: { kind, watch: ["ignored.env"] } } })
+          .success,
+      ).toBe(false);
+    }
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({
+        harnesses: { pi: { shell: { env_provider: { kind: "mise", watch: ["ignored.env"] } } } },
+      }),
+    );
+    expect(
+      runRejectedConfigLoader(fixture.projectDirectory, {
+        HOME: join(fixture.root, "home"),
+        XDG_CONFIG_HOME: fixture.xdgConfigHome,
+      }).errors,
+    ).toContain("invalid_security_config:shell.env_provider.watch");
+  });
+
+  test("shell env provider validates argv and timeout", () => {
+    for (const env_provider of [
+      { kind: "custom" },
+      { kind: "custom", command: [] },
+      { kind: "mise", timeout_ms: 99 },
+      { kind: "mise", timeout_ms: 10001 },
+    ]) {
+      expect(AftConfigSchema.safeParse({ shell: { env_provider } }).success).toBe(false);
+    }
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({ shell: { env_provider: { kind: "custom" } } }),
+    );
+    expect(
+      runRejectedConfigLoader(fixture.projectDirectory, {
+        HOME: join(fixture.root, "home"),
+        XDG_CONFIG_HOME: fixture.xdgConfigHome,
+      }).errors,
+    ).toContain("shell.env_provider.command is required for custom");
+  });
+
   test("rejects malformed JSONC instead of applying defaults", () => {
     const fixture = createConfigFixture();
     writeFileSync(fixture.projectConfigPath, "{ invalid jsonc");

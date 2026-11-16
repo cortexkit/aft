@@ -17,6 +17,21 @@ pub const SEARCH_NARROW: &[&str] = &["offset", "topK", "path", "includeTests"];
 /// Wire key for the search results envelope beside `results` in the payload.
 pub const SEARCH_WIRE_KEY: &str = "results_list_envelope";
 
+/// The named files skipped by the read ceiling, with an exact omitted count.
+pub fn skipped_files_envelope(shown: usize, total: usize) -> ListEnvelope {
+    ListEnvelope::new(
+        shown,
+        Total::Exact(total),
+        Unit::Files,
+        if shown < total {
+            vec![Reason::Cap]
+        } else {
+            vec![]
+        },
+        &["path"],
+    )
+}
+
 /// Build the result envelope for a fallback search page.
 ///
 /// A walk-limited fallback reports `Walk`; when another result is known, its

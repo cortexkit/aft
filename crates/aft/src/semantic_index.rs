@@ -10406,7 +10406,7 @@ fn symbols_to_chunks(
     )
 }
 
-fn symbols_to_chunks_with_caps(
+pub(crate) fn symbols_to_chunks_with_caps(
     file: &Path,
     symbols: &[Symbol],
     source: &str,

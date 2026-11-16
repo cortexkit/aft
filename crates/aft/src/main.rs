@@ -9,6 +9,16 @@ mod backup_bookkeeping_dispatch_tests;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: aft::alloc_trace::TracingAllocator = aft::alloc_trace::TracingAllocator;
 
+// jemalloc reads this before main; MALLOC_CONF can still override the default.
+// Do not set decay options: the measured Linux configuration uses their defaults.
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub static mut malloc_conf: *const std::ffi::c_char = b"background_thread:true\0".as_ptr().cast();
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "alloc_trace/linux_allocator_tests.rs"]
+mod linux_allocator_tests;
+
 // The tests read frames back through the unix loader, and only unix
 // targets record frames at all.
 #[cfg(all(test, unix))]
@@ -231,9 +241,13 @@ fn main() {
         startup_phase("nonce_capture_start");
         aft::launch_nonce::capture_at_startup();
         startup_phase("nonce_capture_done");
-        aft::pinned_executable::capture_at_startup();
-        startup_phase("executable_source_captured");
     }
+    // Every mode, not only the supervised one, holds its startup executable
+    // open now (macOS): a build's resume checkpoints are tied to the image
+    // this process runs, which must be read before an upgrade can
+    // place another binary at the same path.
+    aft::pinned_executable::capture_at_startup();
+    startup_phase("executable_source_captured");
 
     // Only the binary embeds the per-commit revision. Declare it before CLI
     // dispatch or the subc HELLO can request the library's build provenance.

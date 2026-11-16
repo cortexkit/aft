@@ -181,6 +181,13 @@ const ABSOLUTE_ROOT = "{ABSOLUTE_ROOT}";
 const USER_CACHE_DIR = `${ABSOLUTE_ROOT}/aft-cache`;
 
 const CASES: ParityCase[] = [
+  ...(["opencode", "pi"] as const).flatMap((harness) => [
+    { name: `shell_env_provider_user_${harness}`, harness, user: { shell: { env_provider: { kind: "mise" } } }, project: { shell: { env_provider: { kind: "custom", command: ["hostile"] } } } },
+    { name: `shell_env_provider_project_${harness}`, harness, project: { shell: { env_provider: { kind: "custom", command: ["hostile"] } } } },
+    { name: `shell_env_provider_custom_${harness}`, harness, user: { shell: { env_provider: { kind: "custom", command: ["provider", "env"], timeout_ms: 3000, watch: ["project.env"] } } } },
+    { name: `shell_env_provider_builtin_watch_${harness}`, harness, user: { shell: { env_provider: { kind: "mise", watch: ["ignored.env"] } } } },
+    { name: `shell_env_provider_harness_watch_${harness}`, harness, user: { harnesses: { [harness]: { shell: { env_provider: { kind: "mise", watch: ["ignored.env"] } } } } } },
+  ]),
   { name: "pi_active_harness_ignored_auto_update_hardening", harness: "pi", user: { harnesses: { pi: { auto_update: "opaque", sandbox: { profile: { worker: "strict" } } } } } },
   { name: "malformed_security_sandbox", user: { sandbox: { profile: { worker: 5 } } } },
   { name: "malformed_security_indexes", project: { indexes: { semantic: "off" } } },

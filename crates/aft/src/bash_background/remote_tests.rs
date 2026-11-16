@@ -3188,9 +3188,13 @@ async fn large_queued_runon_recovers_after_the_small_queue_deadline() {
     let run = &daemon.methods("exec.run")[0];
     assert_eq!(run["params"]["weight_hint"], 16);
     assert_eq!(run["params"]["timeout"], 1800);
-    assert!(
-        run["params"].get("queue_wait_limit_s").is_none(),
-        "the runner owns admission policy"
+    // An explicit timeout now carries the same queue wait limit.
+    assert_eq!(
+        run["params"]
+            .get("queue_wait_limit_s")
+            .and_then(serde_json::Value::as_u64),
+        Some(1800),
+        "an explicit timeout also bounds admission"
     );
 
     // Pass the old 5m queue + 30m run + 5m grace deadline without real waiting.
@@ -7981,6 +7985,63 @@ async fn runon_timeout_uses_the_task_limit_and_preserves_long_explicit_timeouts(
 }
 
 #[tokio::test]
+async fn runon_queue_wait_limit_follows_only_explicit_timeouts() {
+    for background in [false, true] {
+        for (timeout_ms, expected_seconds) in [
+            (None, None),
+            (Some(5_400_000), Some(5_400)),
+            (Some(5_400_001), Some(5_401)),
+            (Some(30_001), Some(31)),
+        ] {
+            let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+            let dir = tempfile::tempdir().unwrap();
+            ensure_git_fixture(dir.path());
+            let ctx = crate::context::AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                crate::config::Config {
+                    project_root: Some(dir.path().into()),
+                    experimental_bash_background: true,
+                    bash: crate::config::BashConfig {
+                        runon_enabled: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            let mut params = serde_json::json!({
+                "command": "printf queue-timeout-proof",
+                "runon": "linux,4c",
+                "background": background,
+                "compressed": false
+            });
+            if let Some(timeout_ms) = timeout_ms {
+                params["timeout"] = serde_json::json!(timeout_ms);
+            }
+
+            let response =
+                handle_with_policy(&ctx, Some(launch(daemon.connection.clone())), params);
+            assert!(response.success, "{response:?}");
+            let done = terminal(
+                ctx.bash_background(),
+                response.data["task_id"].as_str().unwrap(),
+            )
+            .await;
+            assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+
+            let runs = exec_runs(&daemon);
+            assert_eq!(runs.len(), 1);
+            let captured: RunRequest = serde_json::from_value(runs[0].clone()).unwrap();
+            assert_eq!(captured.queue_wait_limit_s, expected_seconds, "{runs:?}");
+            assert_eq!(
+                runs[0].get("queue_wait_limit_s").cloned(),
+                expected_seconds.map(serde_json::Value::from),
+                "background={background}, timeout_ms={timeout_ms:?}: {runs:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn local_bash_keeps_its_caller_timeout_without_remote_dispatch() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = restarted_context_with_runon(dir.path(), false);
@@ -9532,6 +9593,187 @@ fn remote_phase_comes_from_runner_evidence() {
     assert_eq!(RemotePhase::of(&remote), RemotePhase::Running);
 }
 
+fn remote_job_id_context(dir: &Path) -> Arc<crate::context::AppContext> {
+    ensure_git_fixture(dir);
+    Arc::new(crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(dir.into()),
+            storage_dir: Some(dir.into()),
+            ..Default::default()
+        },
+    ))
+}
+
+async fn remote_job_id_response(
+    ctx: Arc<crate::context::AppContext>,
+    tool: &str,
+    reference: &str,
+    session: &str,
+) -> crate::protocol::Response {
+    let request = serde_json::from_value(serde_json::json!({
+        "id": "alias", "command": tool, "session_id": session,
+        "params": { "task_id": reference, "timeout_ms": 1 },
+    }))
+    .unwrap();
+    if tool == "bash_status" {
+        return crate::commands::bash_status::handle(&request, &ctx);
+    }
+    if tool == "bash_kill" {
+        return tokio::task::spawn_blocking(move || {
+            crate::commands::bash_kill::handle(&request, &ctx)
+        })
+        .await
+        .unwrap();
+    }
+    let wake = crate::response_finalize::DeferredResponseWake::default();
+    let producer_wake = wake.clone();
+    let producer_ctx = Arc::clone(&ctx);
+    let outcome = tokio::task::spawn_blocking(move || {
+        let _wake = producer_wake.install();
+        crate::commands::bash_watch::handle_deferred(&request, producer_ctx)
+    })
+    .await
+    .unwrap();
+    match outcome {
+        crate::response_finalize::DispatchOutcome::Immediate(response) => response,
+        crate::response_finalize::DispatchOutcome::Deferred(mut pending) => {
+            tokio::time::timeout(Duration::from_secs(10), wake.notified())
+                .await
+                .expect("watch answers");
+            (pending.poll)(&ctx).expect("response queued before completion wake")
+        }
+    }
+}
+
+#[tokio::test]
+async fn remote_job_id_own_status_watch_and_kill_use_persisted_task_ids() {
+    let daemon = daemon(Script::Cancel, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (original, task_id, _) =
+        persist_accepted_with_snapshot(dir.path(), daemon.connection.clone(), "cargo test");
+    drop(original);
+    let ctx = remote_job_id_context(dir.path());
+    for tool in ["bash_status", "bash_watch", "bash_kill"] {
+        let response =
+            remote_job_id_response(Arc::clone(&ctx), tool, &id().to_string(), "session").await;
+        assert!(response.success, "{tool}: {response:?}");
+        assert_eq!(response.data["task_id"], task_id, "{tool}: {response:?}");
+    }
+    // A kill reaches the build server either as an `exec.cancel` request or,
+    // while a follower holds the job's stream, as a stream Cancel frame, and
+    // the fake can log it after the kill reply returns.
+    wait_for("bash_kill by job id reached the build server", || {
+        daemon
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(header, body)| {
+                body["method"] == "exec.cancel" || header.ty == subc_protocol::FrameType::Cancel
+            })
+            .then_some(())
+    })
+    .await;
+    ctx.bash_background().detach();
+}
+
+#[tokio::test]
+async fn remote_job_id_foreign_and_unknown_refuse_like_unknown_task_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let (original, _, paths) = persist_accepted_with_snapshot(
+        dir.path(),
+        dir.path().join("missing-connection"),
+        "cargo test",
+    );
+    drop(original);
+    let mut metadata = read_task(&paths.json).unwrap();
+    metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+    write_task(&paths.json, &metadata).unwrap();
+    let ctx = remote_job_id_context(dir.path());
+    for tool in ["bash_status", "bash_watch", "bash_kill"] {
+        for (reference, session) in [
+            (id().to_string(), "foreign"),
+            (Uuid::from_bytes([0xaa; 16]).to_string(), "session"),
+            ("bash-ffffffffffffffff".to_string(), "session"),
+        ] {
+            let response =
+                remote_job_id_response(Arc::clone(&ctx), tool, &reference, session).await;
+            assert!(!response.success, "{tool}: {response:?}");
+            assert_eq!(response.data["code"], "task_not_found", "{response:?}");
+            assert_eq!(
+                response.data["message"],
+                crate::commands::bash_status::format_unknown_polled_task_message(
+                    &reference, "bash"
+                )
+            );
+        }
+    }
+    ctx.bash_background().detach();
+}
+
+#[test]
+fn remote_job_id_lookup_rejects_foreign_identity_and_local_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, paths) = persist_accepted_with_snapshot(
+        dir.path(),
+        dir.path().join("missing-connection"),
+        "cargo test",
+    );
+    let owner = crate::bash_background::TaskIdentity {
+        principal: Some("owner".into()),
+        harness: "runner".into(),
+        session: "session".into(),
+    };
+    let task = registry.task(&task_id).unwrap();
+    let mut metadata = read_task(&paths.json).unwrap();
+    metadata.launching_identity = Some(owner.clone());
+    write_task(&paths.json, &metadata).unwrap();
+    task.state.lock().unwrap().metadata = metadata.clone();
+    let job = id().to_string();
+    {
+        let _identity = crate::bash_background::task_identity_scope(Some(owner.clone()));
+        assert_eq!(
+            registry.resolve_task_reference(&job, "session", dir.path()),
+            task_id
+        );
+        let cold = self::registry();
+        assert_eq!(
+            cold.resolve_task_reference(&job, "session", dir.path()),
+            task_id
+        );
+    }
+    {
+        let mut foreign = owner;
+        foreign.principal = Some("foreign".into());
+        let _identity = crate::bash_background::task_identity_scope(Some(foreign));
+        assert_eq!(
+            registry.resolve_task_reference(&job, "session", dir.path()),
+            job
+        );
+        assert_eq!(
+            self::registry().resolve_task_reference(&job, "session", dir.path()),
+            job
+        );
+    }
+    metadata.remote = None;
+    metadata.shell_remote_job_id = Some(job.clone());
+    write_task(&paths.json, &metadata).unwrap();
+    task.state.lock().unwrap().metadata = metadata;
+    assert_eq!(
+        registry.resolve_task_reference(&job, "session", dir.path()),
+        job
+    );
+    assert_eq!(
+        self::registry().resolve_task_reference(&job, "session", dir.path()),
+        job
+    );
+    assert_eq!(
+        registry.resolve_task_reference(&task_id, "session", dir.path()),
+        task_id
+    );
+}
+
 /// bash_status for `task_id` in `ctx`, rendered as the agent sees it.
 fn rendered_status(ctx: &crate::context::AppContext, task_id: &str) -> String {
     let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
@@ -10409,7 +10651,15 @@ async fn runon_retry_backoff_large_hints_are_not_shortened() {
         let dir = tempfile::tempdir().unwrap();
         let mut clock = PausedDrainingClock::new(dir.path());
         let registry = registry();
-        let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+        let mut remote = launch(daemon.connection.clone());
+        remote.explicit_runon = true;
+        // An explicit timeout also caps hinted retries, so allow the 30s hint to finish.
+        let task = start_with_launch(
+            &registry,
+            dir.path(),
+            remote,
+            crate::bash_background::HardKill::After(Duration::from_secs(60)),
+        );
         let first = clock.now();
         clock
             .expect_sleep(first, first + if signer { 30_000 } else { 1000 })
@@ -10423,6 +10673,34 @@ async fn runon_retry_backoff_large_hints_are_not_shortened() {
         assert_eq!(terminal(&registry, &task).await.exit_code, Some(0));
         assert_eq!(exec_runs(&daemon).len(), 2);
     }
+}
+
+#[tokio::test]
+async fn runon_explicit_timeout_prevents_a_hinted_retry_at_the_queue_deadline() {
+    let daemon = daemon(retry_backoff_script(true, 30_000), "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let first = clock.now();
+    clock.expect_sleep(first, first + 30_000).await;
+    let runs = exec_runs(&daemon);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["timeout"], 30);
+    assert_eq!(runs[0]["queue_wait_limit_s"], 30);
+
+    clock.advance(29_999);
+    assert_eq!(exec_runs(&daemon).len(), 1, "must honour the runner's hint");
+    clock.advance(1);
+    let done = terminal(&registry, &task).await;
+    assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
+    assert_runon_refusal(&refusal_response(done), SIGNER_REFUSED);
+    assert_eq!(
+        exec_runs(&daemon).len(),
+        1,
+        "no request at the queue deadline"
+    );
+    assert_no_retry_sleep(&mut clock);
 }
 
 #[tokio::test]

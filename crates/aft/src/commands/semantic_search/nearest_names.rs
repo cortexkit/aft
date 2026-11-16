@@ -166,10 +166,21 @@ pub fn nearest_names<'a>(
                 }
                 let Ok(fetched) =
                     super::request_files::read_through(request_files.as_deref(), path, |path| {
-                        crate::large_read::counted(
-                            crate::large_read::Site::NearestNames,
-                            super::request_files::read_whole_file(path),
-                        )
+                        use std::io::Read;
+                        let file = std::fs::File::open(path)?;
+                        let stat = file
+                            .metadata()
+                            .ok()
+                            .map(|metadata| super::request_files::FileStat::of(&metadata));
+                        let mut bytes = Vec::new();
+                        file.take(NEAREST_NAME_MAX_FILE_BYTES + 1)
+                            .read_to_end(&mut bytes)?;
+                        if bytes.len() as u64 > NEAREST_NAME_MAX_FILE_BYTES {
+                            return Err(std::io::Error::other(
+                                "nearest-name input exceeds size limit",
+                            ));
+                        }
+                        Ok((bytes, stat))
                     })
                 else {
                     continue;

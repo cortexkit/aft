@@ -68,7 +68,11 @@ pub fn build_container_outline(
     resolved_file_path: &Path,
     target: &Symbol,
 ) -> Result<ContainerOutline, crate::error::AftError> {
-    let symbols = crate::parser::list_symbols_shared(ctx.provider(), resolved_file_path, false)?;
+    let symbols = crate::parser::list_symbols_shared(
+        ctx.provider(),
+        resolved_file_path,
+        cfg!(feature = "wasm-grammars"),
+    )?;
     let entries = build_outline_tree(&symbols);
     let entry = find_outline_entry(&entries, target)
         .cloned()
@@ -206,9 +210,32 @@ fn qualified_signature(name: &str, qualified_name: &str, signature: &str) -> Str
     format!("{qualified_name} — {signature}")
 }
 
+/// Source lines needed by a bounded symbol preview. Sparse sources may count
+/// omitted lines without retaining their text, and remember a leading doc run.
+pub trait SymbolLines {
+    fn len(&self) -> usize;
+    fn line(&self, index: usize) -> &str;
+    fn doc_start(&self, start: usize) -> usize {
+        let mut at = start;
+        while at > 0 && is_doc_comment_line(self.line(at - 1)) {
+            at -= 1;
+        }
+        at
+    }
+}
+
+impl<T: AsRef<[String]> + ?Sized> SymbolLines for T {
+    fn len(&self) -> usize {
+        self.as_ref().len()
+    }
+    fn line(&self, index: usize) -> &str {
+        &self.as_ref()[index]
+    }
+}
+
 pub fn render_symbol_within_budget(
     target: &Symbol,
-    lines: &[String],
+    lines: &(impl SymbolLines + ?Sized),
     lang: Option<LangId>,
     outline: Option<&ContainerOutline>,
     max_lines: usize,
@@ -231,11 +258,14 @@ pub fn render_symbol_within_budget(
         };
     }
 
-    let render_start = doc_comment_start(lines, start).min(end);
+    let render_start = lines.doc_start(start).min(end);
     let full_len = end.saturating_sub(render_start);
     if full_len <= max_lines {
         return BudgetedSymbolRender {
-            content: lines[render_start..end].join("\n"),
+            content: (render_start..end)
+                .map(|at| lines.line(at))
+                .collect::<Vec<_>>()
+                .join("\n"),
             status: BudgetedSymbolRenderStatus::Complete,
         };
     }
@@ -245,7 +275,10 @@ pub fn render_symbol_within_budget(
     let mut content = if shown == 0 {
         String::new()
     } else {
-        lines[render_start..render_start + shown].join("\n")
+        (render_start..render_start + shown)
+            .map(|at| lines.line(at))
+            .collect::<Vec<_>>()
+            .join("\n")
     };
     if !content.is_empty() {
         content.push('\n');
@@ -273,19 +306,22 @@ pub fn render_symbol_within_budget(
 pub fn doc_comment_start(lines: &[String], start: usize) -> usize {
     let mut s = start;
     while s > 0 {
-        let prev = lines[s - 1].trim_start();
-        let is_doc_or_attr = prev.starts_with("//")
-            || prev.starts_with("/*")
-            || prev.starts_with('*')
-            || is_hash_doc_or_attr(prev)
-            || prev.starts_with("--")
-            || prev.starts_with('@');
-        if !is_doc_or_attr {
+        if !is_doc_comment_line(&lines[s - 1]) {
             break;
         }
         s -= 1;
     }
     s
+}
+
+pub(crate) fn is_doc_comment_line(line: &str) -> bool {
+    let prev = line.trim_start();
+    prev.starts_with("//")
+        || prev.starts_with("/*")
+        || prev.starts_with('*')
+        || is_hash_doc_or_attr(prev)
+        || prev.starts_with("--")
+        || prev.starts_with('@')
 }
 
 fn is_hash_doc_or_attr(line: &str) -> bool {

@@ -121,9 +121,9 @@ pub fn current() -> Option<ModuleLaunchNonce> {
     }
 }
 
-/// The identity AFT presents when it opens a route as a consumer: its module
-/// id and the captured nonce. Passed explicitly on every route open so the
-/// subc client never has to find the identity on its own.
+/// AFT's own launch identity, for local checks before opening a route.
+/// Calls leave identity selection to the SDK: a connection claim when bound,
+/// otherwise the implicit identity from the same cached launch nonce.
 pub fn consumer_identity() -> Option<subc_client_rs::ConsumerIdentity> {
     let module_id = std::env::var(subc_protocol::SUBC_MODULE_ID_ENV)
         .ok()
@@ -159,7 +159,19 @@ static BUILD: BuildDeclaration = BuildDeclaration(OnceLock::new());
 /// Returns false if facts were already declared, including an unknown revision;
 /// startup cannot replace an identity that has already been reported.
 pub fn initialize_binary_build_revision(revision: Option<&str>) -> bool {
+    let _ = BUILD_REVISION.set(revision.map(str::to_owned));
     BUILD.initialize(revision)
+}
+
+static BUILD_REVISION: OnceLock<Option<String>> = OnceLock::new();
+
+/// The revision the binary was built from, as installed by
+/// [`initialize_binary_build_revision`]; `None` for unstamped builds and for
+/// library code (tests) that never ran the binary's startup.
+pub(crate) fn binary_build_revision() -> Option<&'static str> {
+    BUILD_REVISION
+        .get()
+        .and_then(|revision| revision.as_deref())
 }
 
 /// Build facts are declared on every HELLO, even when no launch nonce was
@@ -249,7 +261,7 @@ mod tests {
         let declared = build_facts(Some("not-a-git-sha"))
             .with_launch_nonce_source(Some(LaunchNonceSource::Fd));
         assert_eq!(declared.build_git_sha, None);
-        assert_eq!(declared.wire_crate_version.as_deref(), Some("0.35.0"));
+        assert_eq!(declared.wire_crate_version.as_deref(), Some("0.37.0"));
         assert_eq!(declared.launch_nonce_source, Some(LaunchNonceSource::Fd));
     }
 
@@ -258,7 +270,7 @@ mod tests {
         let _serial = serial();
         let _none = install_for_tests(None);
         let assert_build_facts = |declared: &ManifestProvenance| {
-            assert_eq!(declared.wire_crate_version.as_deref(), Some("0.35.0"));
+            assert_eq!(declared.wire_crate_version.as_deref(), Some("0.37.0"));
             assert_eq!(
                 declared.build_git_sha, None,
                 "the library has no binary startup revision"
@@ -287,7 +299,7 @@ mod tests {
         );
         assert_eq!(
             declaration.declared().wire_crate_version.as_deref(),
-            Some("0.35.0")
+            Some("0.37.0")
         );
         assert!(!declaration.initialize(Some(&"b".repeat(40))));
         assert_eq!(
@@ -304,7 +316,7 @@ mod tests {
         assert_eq!(declaration.declared().build_git_sha, None);
         assert_eq!(
             declaration.declared().wire_crate_version.as_deref(),
-            Some("0.35.0")
+            Some("0.37.0")
         );
     }
 

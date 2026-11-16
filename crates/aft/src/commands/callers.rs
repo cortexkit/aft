@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use crate::commands::callgraph_store_adapter::serialized_response;
+use crate::commands::callgraph_store_adapter::serialized_response_with_view;
 use crate::commands::callgraph_store_adapter::{
     callers_result, note_callgraph_served, store_error_response,
 };
@@ -106,7 +106,13 @@ fn answer_callers(req: &RawRequest, ctx: &AppContext) -> Response {
                 elapsed_ms.min(u64::MAX as u128) as u64,
                 "ok",
             );
-            serialized_response(&req.id, "callers", &result)
+            serialized_response_with_view(
+                &req.id,
+                "callers",
+                &result,
+                data_view.as_ref(),
+                &[&file_path],
+            )
         }
         Err(error) => {
             slog_warn!(

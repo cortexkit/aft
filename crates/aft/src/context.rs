@@ -4340,7 +4340,7 @@ pub struct AppContext {
     bash_background: BgTaskRegistry,
     output_files: Arc<crate::tool_output::OutputFiles>,
     #[cfg(unix)]
-    escalation_grants: parking_lot::Mutex<crate::sandbox_spawn::EscalationGrantStore>,
+    escalation_grants: Arc<parking_lot::Mutex<crate::sandbox_spawn::EscalationGrantStore>>,
     /// Thread-safe registry of TOML output filters. Lazy-built on first
     /// access; populated atomically via `RwLock`. Shared between command
     /// handlers (which use it through `filter_registry()` -> read guard) and
@@ -4637,6 +4637,8 @@ impl AppContext {
         provider: Box<dyn LanguageProvider>,
         config: Config,
     ) -> Self {
+        #[cfg(unix)]
+        crate::shell_env_provider::sweep_preflight_layouts_on_startup();
         #[cfg(test)]
         let config = app.isolate_test_config(config);
         let mut config = config;
@@ -4825,9 +4827,9 @@ impl AppContext {
             bash_background,
             output_files: crate::tool_output::OutputFiles::shared(),
             #[cfg(unix)]
-            escalation_grants: parking_lot::Mutex::new(
+            escalation_grants: Arc::new(parking_lot::Mutex::new(
                 crate::sandbox_spawn::EscalationGrantStore::default(),
-            ),
+            )),
             filter_registry: Arc::new(std::sync::RwLock::new(
                 crate::compress::toml_filter::FilterRegistry::default(),
             )),
@@ -6702,6 +6704,14 @@ impl AppContext {
         &self,
     ) -> &parking_lot::Mutex<crate::sandbox_spawn::EscalationGrantStore> {
         &self.escalation_grants
+    }
+
+    #[cfg(unix)]
+    /// The expiry timer must not keep a project's grant store alive after unbind.
+    pub(crate) fn escalation_grant_owner(
+        &self,
+    ) -> std::sync::Weak<parking_lot::Mutex<crate::sandbox_spawn::EscalationGrantStore>> {
+        Arc::downgrade(&self.escalation_grants)
     }
 
     pub fn drain_bg_completions(&self) -> Vec<BgCompletion> {
@@ -10371,10 +10381,21 @@ impl AppContext {
         )
     }
 
-    pub(crate) fn lsp_note_watcher_ignore_change(&self) {
-        self.invalidate_project_applicability(
-            crate::lsp::manager::InvalidationCause::SelectionInput,
-        );
+    pub(crate) fn lsp_note_watcher_ignore_change(&self, paths: &[PathBuf]) {
+        let config = self.config();
+        if let Some(root) = &config.project_root {
+            let trigger_path = match paths {
+                [path] => Some(path.as_path()),
+                _ => None,
+            };
+            crate::lsp::manager::invalidate_applicability_walk_with_trigger(
+                root,
+                crate::lsp::manager::InvalidationCause::SelectionInput,
+                trigger_path,
+                paths.len(),
+            );
+            self.refresh_project_applicability(config, false);
+        }
     }
 
     /// After the file watcher lost events (an overflow that needs a rescan),
@@ -15329,6 +15350,48 @@ mod configure_applicability_tests {
             storage_lease.upgrade().is_none(),
             "storage lease released synchronously"
         );
+    }
+
+    #[test]
+    fn configure_applicability_walk_ignore_events_record_only_unambiguous_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let path = root.join(".gitignore");
+        std::fs::write(&path, "# rules\n").unwrap();
+        let config = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config.clone(),
+        );
+        crate::lsp::manager::walk_applicable_area(&root, None, &config, None).unwrap();
+        let held = ctx.hold_project_applicability_walks_for_test();
+        for paths in [vec![path.clone()], vec![path.clone(), root.join(".ignore")]] {
+            ctx.lsp_note_watcher_ignore_change(&paths);
+            let (_, lines) = crate::logging::capture_log_lines(|| {
+                crate::lsp::manager::walk_applicable_area(&root, None, &config, None).unwrap()
+            });
+            let line = lines
+                .iter()
+                .find(|line| line.contains("LSP applicability full walk "))
+                .unwrap();
+            let trigger_path = if paths.len() == 1 {
+                serde_json::to_string(&path.display().to_string()).unwrap()
+            } else {
+                "null".to_string()
+            };
+            assert!(
+                line.ends_with(&format!(
+                    " trigger_path={trigger_path} trigger_path_candidates={}",
+                    paths.len()
+                )),
+                "{line}"
+            );
+        }
+        drop(held);
+        assert!(ctx.wait_for_project_applicability(Duration::from_secs(10)));
     }
 
     #[test]

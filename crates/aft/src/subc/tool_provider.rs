@@ -1851,6 +1851,10 @@ pub(super) fn note_native_outcome(
 /// The edge parks admission replies outside the frame loop. The executor
 /// commits admission before returning a frame to dispatch; terminal frames
 /// pass through the same edge and are committed before reaching the socket.
+/// Admission is asynchronous, so a yield that arrives right after its call
+/// waits up to this long for the call to become live before it is answered.
+const YIELD_ADMISSION_WAIT: Duration = Duration::from_secs(1);
+
 pub(super) struct LedgerEdge {
     calls: std::sync::Mutex<std::collections::HashMap<(super::RouteChannel, u64), LedgerCall>>,
     received: std::sync::Mutex<std::collections::HashMap<(super::RouteChannel, u64), ReceivedCall>>,
@@ -1860,6 +1864,8 @@ pub(super) struct LedgerEdge {
     recent_sweeps: std::sync::Mutex<
         std::collections::HashMap<crate::path_identity::ProjectRootId, std::time::Instant>,
     >,
+    // How long a yield waits for its call's admission before it is answered.
+    yield_admission_wait: Duration,
 }
 
 #[cfg(test)]
@@ -2399,6 +2405,15 @@ impl LedgerEdge {
         std::sync::Arc<Self>,
         tokio::sync::mpsc::UnboundedReceiver<super::DecodedFrame>,
     ) {
+        Self::with_yield_admission_wait(YIELD_ADMISSION_WAIT)
+    }
+
+    fn with_yield_admission_wait(
+        yield_admission_wait: Duration,
+    ) -> (
+        std::sync::Arc<Self>,
+        tokio::sync::mpsc::UnboundedReceiver<super::DecodedFrame>,
+    ) {
         let _ = crate::db::call_ledger::provider_incarnation();
         let (ready, receiver) = tokio::sync::mpsc::unbounded_channel();
         (
@@ -2409,9 +2424,22 @@ impl LedgerEdge {
                 recent_sweeps: Default::default(),
                 authorizing: Default::default(),
                 ready,
+                yield_admission_wait,
             }),
             receiver,
         )
+    }
+
+    /// A test that holds admission on purpose can't depend on finishing its
+    /// checks inside the production wait on a loaded machine.
+    #[cfg(test)]
+    pub(super) fn new_with_yield_admission_wait(
+        yield_admission_wait: Duration,
+    ) -> (
+        std::sync::Arc<Self>,
+        tokio::sync::mpsc::UnboundedReceiver<super::DecodedFrame>,
+    ) {
+        Self::with_yield_admission_wait(yield_admission_wait)
     }
 
     fn sweep_due(
@@ -3148,7 +3176,7 @@ impl LedgerEdge {
         let identity = identity.clone();
         let writer = writer.clone();
         let metrics = metrics.clone();
-        let admission_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let admission_deadline = tokio::time::Instant::now() + self.yield_admission_wait;
         tokio::spawn(async move {
             // Admission is asynchronous, so an immediately following yield can
             // arrive before the live call exists. Leave most of the five-second
@@ -6155,7 +6183,7 @@ mod tests {
         let description = watch["description"].as_str().unwrap();
         assert!(
             description.starts_with(
-                "Watch a background bash task. Sync waits default to 30s in a main session"
+                "Watch a background bash task; a remote job ID works too. Sync waits default to 30s in a main session"
             ),
             "{description}"
         );
@@ -11127,7 +11155,10 @@ mod ledger_terminal_tests {
         let route = route_key(42, 1);
         let key = LedgerEdge::key(&identity, "admission-watch");
         let routes = std::collections::HashMap::from([(route, identity)]);
-        let (edge, mut ready) = LedgerEdge::new();
+        // This test holds admission on purpose. On a loaded CI runner more than
+        // the production one-second wait can pass between the yield and the
+        // checks below, and the yield would then be answered by design.
+        let (edge, mut ready) = LedgerEdge::new_with_yield_admission_wait(Duration::from_secs(30));
         let (writer, mut receiver) = tokio::sync::mpsc::channel(10);
         let metrics = std::sync::Arc::new(DispatchPathMetrics::new());
         let signal = metrics.watch_yields.register(route, 7);

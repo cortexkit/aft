@@ -141,7 +141,6 @@ impl SubcRelayTransport {
             }
             let open_limit = route_open_deadline.unwrap_or(remaining).min(remaining);
             let options = subc_client_rs::CallOptions {
-                consumer_identity: crate::launch_nonce::consumer_identity(),
                 timeout: open_limit,
                 route_retry_deadline: open_limit.min(PRE_SEND_ROUTE_RETRY_TIMEOUT),
                 ..Default::default()

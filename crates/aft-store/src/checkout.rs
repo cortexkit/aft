@@ -115,6 +115,9 @@ pub struct CheckoutState {
     /// Relative folders the walk could not read, with their OS error text.
     /// A rescan retries them rather than treating their absence as complete.
     skipped_directories: Arc<std::collections::BTreeMap<Vec<u8>, String>>,
+    /// Files whose parse is unavailable, with a bounded, caller-owned reason.
+    /// Their text remains indexed; a later refresh can retry extraction.
+    skipped_parses: Arc<std::collections::BTreeMap<Vec<u8>, String>>,
     /// The Git tree and index the state was built from, when the checkout
     /// is in Git. Opaque to the store; compared byte for byte.
     pub git: Vec<u8>,
@@ -174,6 +177,7 @@ impl CheckoutState {
         }
         Ok(Self {
             skipped_directories: Arc::default(),
+            skipped_parses: Arc::default(),
             git,
             conversion,
             root: Vec::new(),
@@ -198,6 +202,19 @@ impl CheckoutState {
     pub fn with_root_of(mut self, from: &Self) -> Self {
         self.root.clone_from(&from.root);
         self.skipped_directories = Arc::clone(&from.skipped_directories);
+        self.skipped_parses = Arc::new(
+            from.skipped_parses
+                .iter()
+                .filter(|(path, _)| {
+                    self.get(path).is_some_and(|now| {
+                        from.get(path).is_some_and(|before| {
+                            before.content == now.content && before.kind == now.kind
+                        })
+                    })
+                })
+                .map(|(path, reason)| (path.clone(), reason.clone()))
+                .collect(),
+        );
         self
     }
 
@@ -205,6 +222,32 @@ impl CheckoutState {
     #[must_use]
     pub fn skipped_directories(&self) -> &std::collections::BTreeMap<Vec<u8>, String> {
         &self.skipped_directories
+    }
+
+    /// Files whose extraction was skipped, keyed as the state's path records.
+    #[must_use]
+    pub fn skipped_parses(&self) -> &std::collections::BTreeMap<Vec<u8>, String> {
+        &self.skipped_parses
+    }
+
+    /// Replaces extraction gaps. Reasons are opaque to the store and bounded
+    /// to 2 KiB so a diagnostic cannot grow the checkout state without limit.
+    ///
+    /// # Errors
+    ///
+    /// When a reason is too long or its path is not a member of this state.
+    pub fn with_skipped_parses(
+        mut self,
+        skipped: std::collections::BTreeMap<Vec<u8>, String>,
+    ) -> Result<Self, StateError> {
+        if skipped
+            .iter()
+            .any(|(path, reason)| reason.len() > 2048 || self.get(path).is_none())
+        {
+            return Err(StateError::TooLong);
+        }
+        self.skipped_parses = Arc::new(skipped);
+        Ok(self)
     }
 
     /// Replaces the walk's coverage gaps after a full or partial scan.
@@ -403,6 +446,10 @@ impl CheckoutState {
             previous = Some(record);
         }
         let has_gaps = !self.skipped_directories.is_empty();
+        let has_parse_gaps = !self.skipped_parses.is_empty();
+        if has_parse_gaps {
+            out.byte(4);
+        }
         if has_gaps {
             out.byte(3);
         }
@@ -428,6 +475,13 @@ impl CheckoutState {
         if has_gaps {
             out.usize(self.skipped_directories.len());
             for (path, reason) in self.skipped_directories.iter() {
+                out.blob(path);
+                out.str(reason);
+            }
+        }
+        if has_parse_gaps {
+            out.usize(self.skipped_parses.len());
+            for (path, reason) in self.skipped_parses.iter() {
                 out.blob(path);
                 out.str(reason);
             }
@@ -561,6 +615,10 @@ impl CheckoutState {
         let mut fragments = Vec::new();
         let mut graph_extractor = None;
         let mut flag = input.byte().map_err(invalid)?;
+        let has_parse_gaps = flag == 4 && coverage_gaps;
+        if has_parse_gaps {
+            flag = input.byte().map_err(invalid)?;
+        }
         let has_gaps = flag == 3 && coverage_gaps;
         if has_gaps {
             flag = input.byte().map_err(invalid)?;
@@ -601,9 +659,26 @@ impl CheckoutState {
                 skipped_directories.insert(path, reason);
             }
         }
+        let mut skipped_parses = std::collections::BTreeMap::new();
+        if has_parse_gaps {
+            let count = input.count_of(2).map_err(invalid)?;
+            for _ in 0..count {
+                let path = input.blob().map_err(invalid)?.to_vec();
+                let reason = input.str().map_err(invalid)?.to_string();
+                if reason.len() > 2048
+                    || paths
+                        .binary_search_by(|record| record.path.cmp(&path))
+                        .is_err()
+                {
+                    return Err(RecordError::Invalid("invalid parse gap"));
+                }
+                skipped_parses.insert(path, reason);
+            }
+        }
         input.finish().map_err(invalid)?;
         Ok(Self {
             skipped_directories: Arc::new(skipped_directories),
+            skipped_parses: Arc::new(skipped_parses),
             git,
             conversion,
             root,
@@ -627,7 +702,12 @@ impl CheckoutState {
 /// fragment section and appends skipped-directory paths and errors. Readers
 /// that do not know this section flag rebuild only that checkout instead of
 /// refusing the family. Gap-free states keep their original bytes and flags.
+/// Flag 4 wraps those sections and appends caller-owned per-file parse gaps,
+/// with the same checkout-only rebuild behavior for readers without it.
 const STATE_FORMAT: u8 = 3;
+/// The checkout state's format, for a build that names what its saved
+/// work depends on.
+pub const STATE_FORMAT_VERSION: u8 = STATE_FORMAT;
 
 /// How much of a state record [`newer_state_format`] reads to find the
 /// payload's format byte: the record header and the payload's string table,
@@ -713,6 +793,7 @@ crate::heap_bytes_of_fields!(PathRecord {
 });
 crate::heap_bytes_of_fields!(CheckoutState {
     skipped_directories,
+    skipped_parses,
     git,
     conversion,
     root,
@@ -848,6 +929,44 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn parse_gap_sections_preserve_old_states_and_round_trip() {
+        let state = CheckoutState::new(Vec::new(), Digest128::of(b""), vec![record("a.luau", "a")])
+            .unwrap();
+        let old = state.encode();
+        assert_eq!(CheckoutState::decode(&old).unwrap(), state);
+        assert_eq!(CheckoutState::decode_as_v064(&old).unwrap(), state);
+        assert_eq!(
+            state
+                .clone()
+                .with_skipped_parses(Default::default())
+                .unwrap()
+                .encode(),
+            old
+        );
+        let reason =
+            r#"{"code":"grammar_unavailable","language":"luau","state":"downloading"}"#.to_string();
+        let gaps = [(b"a.luau".to_vec(), reason)].into();
+        let state = state.with_skipped_parses(gaps).unwrap();
+        let encoded = state.encode();
+        assert_eq!(CheckoutState::decode(&encoded).unwrap(), state);
+        assert!(matches!(
+            CheckoutState::decode_as_v064(&encoded),
+            Err(RecordError::Invalid("fragment section flag"))
+        ));
+        assert!(
+            state
+                .clone()
+                .with_skipped_parses([(b"gone.luau".to_vec(), "reason".into())].into())
+                .is_err()
+        );
+        assert!(
+            state
+                .with_skipped_parses([(b"a.luau".to_vec(), "x".repeat(2049))].into())
+                .is_err()
+        );
     }
 
     fn record(path: &str, content: &str) -> PathRecord {

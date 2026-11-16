@@ -364,7 +364,7 @@ pub(crate) fn dead_code_supports_language(language: LangId) -> bool {
 }
 
 pub(crate) fn dead_code_skipped_language(file: &Path) -> Option<&'static str> {
-    let language = crate::parser::detect_language(file)?;
+    let language = crate::parser::detect_language_any(file, cfg!(feature = "wasm-grammars"))?;
     (!dead_code_supports_language(language)).then(|| language_name(language))
 }
 
@@ -377,7 +377,9 @@ pub(crate) fn attach_dead_code_language_coverage(
     let mut supported = 0usize;
     let mut unsupported = std::collections::BTreeMap::new();
     for file in files {
-        let Some(language) = crate::parser::detect_language(file) else {
+        let Some(language) =
+            crate::parser::detect_language_any(file, cfg!(feature = "wasm-grammars"))
+        else {
             continue;
         };
         if dead_code_supports_language(language) {

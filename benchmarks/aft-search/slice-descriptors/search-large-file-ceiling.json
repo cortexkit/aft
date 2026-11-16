@@ -1,0 +1,113 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/src/commands/semantic_search/data_file.rs",
+    "crates/aft/src/commands/semantic_search/external_exact.rs",
+    "crates/aft/src/commands/semantic_search/memo.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/commands/semantic_search/nearest_names.rs",
+    "crates/aft/src/commands/semantic_search/rerank/mod.rs",
+    "crates/aft/src/commands/semantic_search/rerank/tests.rs",
+    "crates/aft/src/commands/semantic_search/request_files.rs",
+    "crates/aft/src/parser.rs",
+    "crates/aft/src/search_index.rs"
+  ],
+  "slices": [
+    "remaining-large-file-streaming-and-16mib-ceiling"
+  ],
+  "note": "Copied ci-speed-post064-batch-4.json (engine_unwired, targeted_mechanism none), preserving the inherited pattern-count declarations. RANKING_FENCE_PREFIXES intersects semantic_search, parser.rs and search_index.rs in this change. Remaining source readers stream or retain only displayed line windows; whole reads and carried lines over 16 MiB are explicitly skipped. For every admitted file, routing, ordering, caps, verification claims, scores and rendered rows are intended to remain byte-identical. The Athena follow-up additionally bounds growth races, preserves opened digest stats, composes omission categories and limits degraded temporary rows to one CPU-width batch. Final-source 6,897-query evidence for both the census layout and frozen AFT source, along with regression and allocation evidence, is recorded in issue-1432-stage2-athena-remediation.md. No response differences are authorized by this descriptor; explicit ceiling skips are covered separately by regression fixtures, not benchmark row allowances.",
+  "pattern_counts": {
+    "followup-census:910002": {
+      "candidate_files": {
+        "before": 3,
+        "after": 6
+      },
+      "files_examined": {
+        "before": 3,
+        "after": 6
+      }
+    },
+    "followup-census:910003": {
+      "candidate_files": {
+        "before": 972,
+        "after": 860
+      },
+      "files_examined": {
+        "before": 972,
+        "after": 860
+      }
+    },
+    "followup-census:910004": {
+      "candidate_files": {
+        "before": 972,
+        "after": 860
+      },
+      "files_examined": {
+        "before": 972,
+        "after": 860
+      }
+    },
+    "followup-census:910005": {
+      "candidate_files": {
+        "before": 194,
+        "after": 141
+      },
+      "files_examined": {
+        "before": 194,
+        "after": 141
+      }
+    },
+    "followup-census:910010": {
+      "candidate_files": {
+        "before": 6,
+        "after": 19
+      },
+      "files_examined": {
+        "before": 6,
+        "after": 19
+      }
+    },
+    "followup-census:910011": {
+      "candidate_files": {
+        "before": 942,
+        "after": 729
+      },
+      "files_examined": {
+        "before": 942,
+        "after": 729
+      }
+    },
+    "followup-census:910012": {
+      "candidate_files": {
+        "before": 1031,
+        "after": 730
+      },
+      "files_examined": {
+        "before": 1031,
+        "after": 730
+      }
+    },
+    "followup-census:910013": {
+      "candidate_files": {
+        "before": 908,
+        "after": 45
+      },
+      "files_examined": {
+        "before": 908,
+        "after": 45
+      }
+    },
+    "followup-census:910014": {
+      "candidate_files": {
+        "before": 1011,
+        "after": 24
+      },
+      "files_examined": {
+        "before": 1011,
+        "after": 24
+      }
+    }
+  }
+}

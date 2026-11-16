@@ -10,6 +10,19 @@ use crate::context::AppContext;
 use crate::parser::TreeSitterProvider;
 use crate::protocol::RawRequest;
 
+#[test]
+fn shell_env_provider_changes_apply_to_the_next_call() {
+    let published = Config::default();
+    let mut candidate = published.clone();
+    candidate.shell = serde_json::from_value(json!({"env_provider":{"kind":"mise"}})).unwrap();
+    let applied = apply_live_config(&published, &candidate, &published);
+    assert_eq!(applied.next.shell, candidate.shell);
+    assert!(applied.applied.contains(&"shell.env_provider"));
+    let disabled = apply_live_config(&applied.next, &published, &published);
+    assert!(disabled.next.shell.env_provider.is_none());
+    assert!(disabled.applied.contains(&"shell.env_provider"));
+}
+
 struct Fixture {
     ctx: AppContext,
     root: PathBuf,

@@ -454,6 +454,9 @@ fn enqueue_snapshot(
     // No database, network, lock wait or queue wait is on the reply path.
     if let Ok(mut outbox) = writer.outbox.try_lock() {
         let admitted = outbox.admit(identity, kind, body, &limits, Instant::now());
+        if admitted {
+            crate::late_result_bus::display_committed();
+        }
         let _ = writer.wake.try_send(());
         admitted
     } else {
@@ -701,10 +704,7 @@ async fn send_loop(connection_file: PathBuf, mut receiver: tokio::sync::mpsc::Re
                     .open_route(
                         subc_protocol::RouteTarget::ToolProvider { module_id },
                         BindIdentity::new("aft", "tool-display"),
-                        CallOptions {
-                            consumer_identity: crate::launch_nonce::consumer_identity(),
-                            ..CallOptions::default()
-                        },
+                        CallOptions::default(),
                     )
                     .await
                 {
@@ -759,6 +759,8 @@ async fn send_loop(connection_file: PathBuf, mut receiver: tokio::sync::mpsc::Re
             if let Ok(mut outbox) = writer.outbox.lock() {
                 outbox.retry(entry, Instant::now());
             }
+        } else if let Ok(mut outbox) = writer.outbox.lock() {
+            outbox.reads.push_finished(&entry.record_id, Instant::now());
         }
     }
 }
@@ -993,15 +995,14 @@ pub(crate) fn bash_terminal(
     }
 }
 
-fn declared_display(modules: &[subc_client_rs::CatalogEntry]) -> Option<String> {
+pub(crate) fn declared_display(modules: &[subc_client_rs::CatalogEntry]) -> Option<String> {
     let mut claimants: Vec<_> = modules
         .iter()
         .filter(|module| {
             module.capabilities.as_ref().is_some_and(|capabilities| {
-                capabilities
-                    .provides
-                    .iter()
-                    .any(|capability| capability == "tool-display/v1")
+                capabilities.provides.iter().any(|capability| {
+                    capability == cortexkit_role_tool_display::TOOL_DISPLAY_CAPABILITY
+                })
             })
         })
         .map(|module| module.module_id.clone())
@@ -1009,6 +1010,57 @@ fn declared_display(modules: &[subc_client_rs::CatalogEntry]) -> Option<String> 
     claimants.sort();
     claimants.dedup();
     (claimants.len() == 1).then(|| claimants.remove(0))
+}
+
+pub(crate) fn with_outbox<T>(f: impl FnOnce(&mut Outbox) -> T) -> Option<T> {
+    let writer = SENDER.get()?;
+    let mut outbox = writer.outbox.try_lock().ok()?;
+    Some(f(&mut outbox))
+}
+
+pub(crate) fn check_reader(
+    principal: Option<&Principal>,
+    discovered: Option<&str>,
+) -> Result<(), subc_protocol::ErrorBody> {
+    if matches!((principal, discovered), (Some(Principal::Reserved { module_id }), Some(reader)) if module_id == reader)
+    {
+        Ok(())
+    } else {
+        Err(subc_protocol::ErrorBody::new(
+            cortexkit_role_tool_display::DISPLAY_READ_DENIED,
+            "display reads are restricted to the discovered display server",
+        ))
+    }
+}
+
+pub(crate) async fn read(
+    principal: Option<&Principal>,
+    arguments: Value,
+) -> Result<Vec<u8>, subc_protocol::ErrorBody> {
+    if !matches!(principal, Some(Principal::Reserved { .. })) {
+        return check_reader(principal, None).map(|_| Vec::new());
+    }
+    if SENDER.get().is_none() {
+        return Err(cortexkit_role_tool_display::not_ready());
+    }
+    let discovered = crate::late_result_bus::display_reader()?;
+    check_reader(principal, discovered.as_deref())?;
+    with_outbox(|outbox| read_retained(outbox, arguments, Instant::now()))
+        .ok_or_else(cortexkit_role_tool_display::not_ready)?
+}
+
+fn read_retained(
+    outbox: &Outbox,
+    arguments: Value,
+    now: Instant,
+) -> Result<Vec<u8>, subc_protocol::ErrorBody> {
+    use cortexkit_role_tool_display::{DisplayRead, InvalidParams, DISPLAY_RECORD_UNKNOWN};
+    let request: DisplayRead =
+        serde_json::from_value(arguments).map_err(|_| InvalidParams::new("record_id").refusal())?;
+    request.validate().map_err(|error| error.refusal())?;
+    outbox.reads.read(&request.record_id, now).ok_or_else(|| {
+        subc_protocol::ErrorBody::new(DISPLAY_RECORD_UNKNOWN, "display record is unknown")
+    })
 }
 
 #[cfg(test)]

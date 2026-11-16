@@ -138,6 +138,7 @@ pub mod jsonc;
 pub mod jsonc_edit;
 pub mod language;
 pub(crate) mod large_read;
+pub(crate) mod late_result_bus;
 #[doc(hidden)]
 pub mod launch_fds;
 pub mod launch_nonce;
@@ -201,6 +202,7 @@ pub mod semantic_admission;
 pub mod semantic_index;
 pub mod setup_plan;
 pub(crate) mod shared_timer;
+pub(crate) mod shell_env_provider;
 pub(crate) mod stage_timer;
 pub mod standing_roots;
 pub(crate) mod status_push;
@@ -208,6 +210,9 @@ pub(crate) mod status_push;
 mod storage_permissions_tests;
 pub mod subc;
 pub mod subc_config;
+#[cfg(test)]
+#[path = "../tests/helpers/subc_fake.rs"]
+mod subc_fake;
 pub mod subc_format;
 pub mod subc_translate;
 pub mod symbol_diff;

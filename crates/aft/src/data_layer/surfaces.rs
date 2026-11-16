@@ -356,7 +356,22 @@ pub fn text_plane_ready(ctx: &AppContext) -> Option<bool> {
 
 const INDEX_GAP_NOTE: &str =
     "(Index skipped {folders}; results may miss files in them:\n{paths}\n)";
-const INDEX_GAP_PREVIEW: usize = 3;
+pub(crate) const INDEX_GAP_PREVIEW: usize = 3;
+
+pub(crate) fn parse_gap_preview(shown: usize, total: usize) -> crate::list_envelope::ListEnvelope {
+    use crate::list_envelope::{ListEnvelope, Reason, Total, Unit};
+    ListEnvelope::new(
+        shown,
+        Total::Exact(total),
+        Unit::Files,
+        if shown < total {
+            vec![Reason::Cap]
+        } else {
+            Vec::new()
+        },
+        &["path"],
+    )
+}
 
 fn folder_count(count: usize) -> String {
     format!(
@@ -457,6 +472,70 @@ pub(crate) fn disclose_index_gaps(
     } else {
         format!("{note}\n\n{text}")
     });
+}
+
+/// Adds only host-owned grammar diagnostics, preserving gap-free responses.
+pub(crate) fn disclose_parse_gaps(
+    view: &super::checkout::CheckoutView,
+    roots: &[PathBuf],
+    response: &mut crate::protocol::Response,
+) {
+    if !cfg!(feature = "wasm-grammars") || view.current_state().skipped_parses().is_empty() {
+        return;
+    }
+    let fence = crate::context::confinement::capture();
+    let mut gaps = Vec::new();
+    let mut lines = Vec::new();
+    let mut count = 0;
+    let reply = super::grammar::GapReply::capture();
+    for (relative, reason) in view.current_state().skipped_parses() {
+        let path = view.root().join(String::from_utf8_lossy(relative).as_ref());
+        if !roots
+            .iter()
+            .any(|scope| path.starts_with(scope) || scope.starts_with(&path))
+            || !fence.admits_walk_entry(&path)
+        {
+            continue;
+        }
+        count += 1;
+        if gaps.len() < INDEX_GAP_PREVIEW {
+            if let Some(mut gap) = reply.value(reason, &path) {
+                gap["kind"] = gap["code"].clone();
+                lines.push(path.display().to_string());
+                lines.push(gap["message"].as_str().unwrap_or_default().to_string());
+                gaps.push(gap);
+            }
+        }
+    }
+    if gaps.is_empty() {
+        return;
+    }
+    response.data["complete"] = false.into();
+    let omitted = count - gaps.len();
+    response.data["skipped_parses"] = count.into();
+    response.data["skipped_parses_omitted"] = omitted.into();
+    let preview = parse_gap_preview(gaps.len(), count);
+    if let Some(trailer) = crate::subc_format::render_envelope_trailer(&preview) {
+        lines.push(trailer);
+    }
+    response.data["parse_gaps_list"] = serde_json::json!(preview);
+    let existing = response
+        .data
+        .as_object_mut()
+        .expect("response body")
+        .entry("gaps")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Some(existing) = existing.as_array_mut() {
+        existing.extend(gaps);
+    }
+    let text = response.data["text"].as_str().unwrap_or_default();
+    let note = lines.join("\n");
+    response.data["text"] = if text.is_empty() {
+        note
+    } else {
+        format!("{note}\n\n{text}")
+    }
+    .into();
 }
 
 pub(crate) fn report(ctx: &AppContext) -> Option<DataStoreReport> {
@@ -607,10 +686,12 @@ pub(crate) enum MeaningPlane {
 /// The meaning plane's coverage counts (see [`super::vectors::Coverage`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct MeaningCoverage {
+    pub(crate) files_skipped: usize,
     pub(crate) files: usize,
     pub(crate) files_embedded: usize,
     pub(crate) files_too_large: usize,
     pub(crate) files_failed: usize,
+    pub(crate) files_luau_outline_failed: usize,
     pub(crate) files_pending: usize,
     pub(crate) files_past_cap: usize,
     pub(crate) chunks: usize,
@@ -622,9 +703,11 @@ impl MeaningCoverage {
     fn of(coverage: &super::vectors::Coverage) -> Self {
         Self {
             files: coverage.files,
+            files_skipped: coverage.skipped_parses.len(),
             files_embedded: coverage.files_embedded,
             files_too_large: coverage.files_too_large,
             files_failed: coverage.files_failed.len(),
+            files_luau_outline_failed: coverage.luau_outline_failures().count(),
             files_pending: coverage.pending.len(),
             files_past_cap: coverage.past_cap,
             chunks: coverage.chunks,
@@ -661,6 +744,13 @@ impl MeaningReport {
                 });
                 if !ready {
                     value["stage"] = json!(super::meaning::FILLING_STAGE);
+                }
+                if coverage.files_skipped > 0 {
+                    value["files_skipped"] = json!(coverage.files_skipped);
+                    value["complete"] = false.into();
+                }
+                if coverage.files_luau_outline_failed > 0 {
+                    value["complete"] = false.into();
                 }
                 if let Some(error) = error {
                     value["error"] = json!(error);
@@ -2686,9 +2776,11 @@ mod tests {
         use crate::data_layer::meaning::FillTimes;
         let coverage = MeaningCoverage {
             files: 40,
+            files_skipped: 0,
             files_embedded: 30,
             files_too_large: 1,
             files_failed: 2,
+            files_luau_outline_failed: 0,
             files_pending: 7,
             files_past_cap: 0,
             chunks: 300,
@@ -2793,6 +2885,36 @@ mod tests {
             json!({"status": "building", "stage": "loading_embedding_model", "filling": true,
                 "since_ms": 3_000})
         );
+    }
+
+    #[test]
+    fn luau_s4_round5_meaning_report_marks_only_luau_outline_failures_incomplete() {
+        for luau_failed in [0, 1] {
+            let report = MeaningReport {
+                plane: MeaningPlane::Serving {
+                    complete: luau_failed == 0,
+                    refreshing: true,
+                    coverage: MeaningCoverage {
+                        files: 2,
+                        files_failed: 2,
+                        files_luau_outline_failed: luau_failed,
+                        ..MeaningCoverage::default()
+                    },
+                    error: None,
+                },
+                filling: false,
+                waiting: false,
+                times: super::super::meaning::FillTimes::default(),
+            };
+            let status = report.status_json();
+            assert_eq!(status["status"], "ready");
+            assert_eq!(status["files_failed"], 2);
+            if luau_failed == 1 {
+                assert_eq!(status.get("complete"), Some(&json!(false)));
+            } else {
+                assert!(status.get("complete").is_none(), "{status:?}");
+            }
+        }
     }
 
     #[test]

@@ -107,6 +107,9 @@ pub(crate) fn handle_with_observation_only(
     }
 
     let storage_dir = crate::bash_background::task_storage_dir(ctx);
+    let task_id =
+        ctx.bash_background()
+            .resolve_task_reference(&task_id, req.session(), &storage_dir);
     let config = ctx.config();
     let project_root = config.project_root.as_deref();
     let store_unavailable = ctx.database_runtime_unavailable_reason();

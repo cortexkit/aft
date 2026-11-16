@@ -144,11 +144,17 @@ pub(crate) fn with_floor_disclosure(run: impl FnOnce() -> Response) -> Response 
     let mut response = inherit(fence, run);
     let omissions = omissions.lock();
     if !omissions.paths.is_empty() {
-        response.data["skipped_files"] =
-            serde_json::json!(omissions.paths.iter().map(|path| {
-            serde_json::json!({"file": path.display().to_string(), "reason": "denied_floor"})
-        }).collect::<Vec<_>>());
-        response.data["complete"] = serde_json::json!(false);
+        if crate::bounded_io::skip_disclosure_active() {
+            for path in &omissions.paths {
+                crate::bounded_io::note_skipped_file(path, "denied_floor");
+            }
+        } else {
+            // Other commands own their skip order, completeness and rendering.
+            // Preserve their uncapped floor report: search/grep's 20-name cap
+            // and result-list trailer do not belong on these response surfaces.
+            response.data["skipped_files"] = serde_json::json!(omissions.paths.iter().map(|path| serde_json::json!({"file":path.display().to_string(),"reason":"denied_floor"})).collect::<Vec<_>>());
+            response.data["complete"] = serde_json::json!(false);
+        }
     }
     response
 }

@@ -7,7 +7,11 @@ use cortexkit_role_tool_display::{
     canonical_body, validate_write, DisplayKind, DisplayLimits, DisplayWrite,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use subc_protocol::Principal;
+
+mod reads;
+pub(crate) use reads::ReadCache;
 
 const MAX_CALLS: usize = 64;
 const MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -22,6 +26,7 @@ pub(crate) struct Identity {
 
 #[derive(Clone)]
 pub(crate) struct Entry {
+    pub record_id: String,
     pub identity: Identity,
     pub kind: DisplayKind,
     pub body: Vec<u8>,
@@ -34,6 +39,7 @@ pub(crate) struct Entry {
 pub(crate) struct Outbox {
     entries: VecDeque<Entry>,
     bytes: usize,
+    pub reads: ReadCache,
 }
 
 impl Outbox {
@@ -41,6 +47,7 @@ impl Outbox {
         Self {
             entries: VecDeque::new(),
             bytes: 0,
+            reads: ReadCache::default(),
         }
     }
 
@@ -63,6 +70,18 @@ impl Outbox {
             map.clone(),
         );
         let Ok(bytes) = validate_write(&write, limits) else {
+            return false;
+        };
+        let Ok(key) = cortexkit_role_tool_display::idempotency_key(
+            &Principal::Reserved {
+                module_id: "aft".into(),
+            },
+            &write,
+        ) else {
+            return false;
+        };
+        let record_id = format!("{:x}", Sha256::digest(key));
+        let Ok(arguments) = canonical_body(&super::records::object(json!(write))) else {
             return false;
         };
         if self.entries.iter().any(|e| {
@@ -110,6 +129,7 @@ impl Outbox {
                 };
                 if let Some(entry) = self.entries.remove(index) {
                     self.bytes -= entry.frame.len() + entry.body.len();
+                    self.reads.shed(&entry.record_id, now);
                 }
             }
         }
@@ -118,6 +138,7 @@ impl Outbox {
         }
         self.bytes += weight;
         self.entries.push_back(Entry {
+            record_id: record_id.clone(),
             identity,
             kind,
             body: bytes,
@@ -126,14 +147,19 @@ impl Outbox {
             attempts: 0,
             next: now,
         });
+        // Queue admission is the process-local commit point. Only committed
+        // snapshots become readable or eligible for a bus wake.
+        self.reads.insert(record_id, arguments, weight, now);
         true
     }
 
     pub(crate) fn pop_due(&mut self, now: Instant) -> Option<Entry> {
+        let reads = &mut self.reads;
         self.entries.retain(|entry| {
             let keep = now.duration_since(entry.admitted) < EXPIRY && entry.attempts < 8;
             if !keep {
                 self.bytes -= entry.frame.len() + entry.body.len();
+                reads.push_finished(&entry.record_id, now);
             }
             keep
         });
@@ -146,6 +172,7 @@ impl Outbox {
     pub(crate) fn retry(&mut self, mut entry: Entry, now: Instant) {
         entry.attempts += 1;
         if entry.attempts >= 8 || now.duration_since(entry.admitted) >= EXPIRY {
+            self.reads.push_finished(&entry.record_id, now);
             return;
         }
         let backoff = (250u64 << entry.attempts.saturating_sub(1)).min(30_000);
@@ -157,6 +184,8 @@ impl Outbox {
         {
             self.bytes += entry.frame.len() + entry.body.len();
             self.entries.push_back(entry);
+        } else {
+            self.reads.push_finished(&entry.record_id, now);
         }
     }
 }
@@ -285,6 +314,9 @@ mod tests {
             .iter()
             .filter(|entry| entry.kind == DisplayKind::Detail)
             .count();
+        let shed_id = outbox.entries.front().unwrap().record_id.clone();
+        outbox.reads.published(&shed_id, true, now);
+        assert!(outbox.reads.read(&shed_id, now).is_some());
         assert!(outbox.admit(
             identity("record"),
             DisplayKind::Record,
@@ -301,5 +333,9 @@ mod tests {
             before - 1
         );
         assert!(outbox.bytes <= MAX_BYTES);
+        assert!(
+            outbox.reads.read(&shed_id, now).is_none(),
+            "shed details are immediately unknown"
+        );
     }
 }

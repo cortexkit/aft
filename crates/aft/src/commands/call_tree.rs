@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::commands::callgraph_store_adapter::{
-    call_tree_result, note_callgraph_served, serialized_response, store_error_response,
+    call_tree_result, note_callgraph_served, serialized_response_with_view, store_error_response,
 };
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
@@ -93,7 +93,13 @@ fn answer_call_tree(req: &RawRequest, ctx: &AppContext) -> Response {
     match outcome {
         Ok(tree) => {
             note_callgraph_served(ctx, "call_tree", 0, "ok");
-            serialized_response(&req.id, "call_tree", &tree)
+            serialized_response_with_view(
+                &req.id,
+                "call_tree",
+                &tree,
+                data_view.as_ref(),
+                &[&file_path],
+            )
         }
         Err(error) => store_error_response(&req.id, "call_tree", error),
     }

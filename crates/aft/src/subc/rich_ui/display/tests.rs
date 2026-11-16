@@ -1,4 +1,53 @@
 use super::*;
+
+#[test]
+fn display_read_authorizes_only_the_single_attested_display_module() {
+    let display = Principal::Reserved {
+        module_id: "reader".into(),
+    };
+    let other = Principal::Reserved {
+        module_id: "other".into(),
+    };
+    assert!(check_reader(Some(&display), Some("reader")).is_ok());
+    for (principal, discovered) in [
+        (Some(&other), Some("reader")),
+        (Some(&display), None),
+        (None, Some("reader")),
+    ] {
+        assert_eq!(
+            check_reader(principal, discovered).unwrap_err().code,
+            cortexkit_role_tool_display::DISPLAY_READ_DENIED
+        );
+    }
+    for principal in [Principal::Unverified, Principal::Direct] {
+        assert_eq!(
+            check_reader(Some(&principal), Some("reader"))
+                .unwrap_err()
+                .code,
+            cortexkit_role_tool_display::DISPLAY_READ_DENIED
+        );
+    }
+}
+
+#[test]
+fn display_read_unknown_and_invalid_ids_have_contract_refusals() {
+    let outbox = Outbox::new();
+    assert_eq!(
+        read_retained(&outbox, json!({"record_id":"missing"}), Instant::now())
+            .unwrap_err()
+            .code,
+        cortexkit_role_tool_display::DISPLAY_RECORD_UNKNOWN
+    );
+    for arguments in [
+        json!({}),
+        json!({"record_id":"bad id"}),
+        json!({"record_id":"ok","extra":1}),
+    ] {
+        let error = read_retained(&outbox, arguments, Instant::now()).unwrap_err();
+        assert_eq!(error.code, cortexkit_role_tool_display::INVALID_PARAMS);
+        assert_eq!(error.detail.unwrap()["field"], "record_id");
+    }
+}
 use crate::bash_background::{persistence::PersistedTask, BgTaskStatus};
 use crate::db::call_ledger::Key;
 use std::time::Duration;

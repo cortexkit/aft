@@ -645,6 +645,10 @@ fn cancelled_search_response_from_id(request_id: &str) -> Response {
 }
 
 pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
+    crate::bounded_io::with_skip_disclosure(|| handle_semantic_search_with_disclosure(req, ctx))
+}
+
+fn handle_semantic_search_with_disclosure(req: &RawRequest, ctx: &AppContext) -> Response {
     let _cost = telemetry::CostRequest::start(&req.id);
     let mut response = handle_semantic_search_with_disk_fallback(req, ctx, false);
     if let Some(reason) = ctx.cache_unavailable_reason() {
@@ -667,6 +671,10 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
 /// Parent-folder children may have no publication yet. Their reader engines
 /// must still run the bounded exact/lexical scan while the indexes warm.
 pub(crate) fn handle_parent_child_search(req: &RawRequest, ctx: &AppContext) -> Response {
+    crate::bounded_io::with_skip_disclosure(|| handle_parent_child_search_with_disclosure(req, ctx))
+}
+
+fn handle_parent_child_search_with_disclosure(req: &RawRequest, ctx: &AppContext) -> Response {
     let config = ctx.config();
     let mut response = handle_semantic_search_with_disk_fallback(
         req,
@@ -2803,7 +2811,7 @@ fn lexical_candidate_exactness(
         request_files::read_through(files.as_deref(), file, |path| {
             crate::large_read::counted(
                 crate::large_read::Site::LexicalExactness,
-                read_whole_source_file(path),
+                read_whole_source_file_at(path, crate::large_read::Site::LexicalExactness),
             )
         })
     }) else {
@@ -2845,9 +2853,16 @@ fn lexical_candidate_exactness(
 fn read_whole_source_file(
     path: &Path,
 ) -> std::io::Result<(Vec<u8>, Option<request_files::FileStat>)> {
+    read_whole_source_file_at(path, crate::large_read::Site::SourceFile)
+}
+
+fn read_whole_source_file_at(
+    path: &Path,
+    site: crate::large_read::Site,
+) -> std::io::Result<(Vec<u8>, Option<request_files::FileStat>)> {
     #[cfg(test)]
     crate::search_hot_path_measurements::record_file_read_path(path);
-    request_files::read_whole_file(path)
+    request_files::read_whole_file_at(path, site)
 }
 
 fn exact_phrase(query: &str) -> &str {
@@ -3322,14 +3337,17 @@ fn auto_regex_literal_fallback_warning(reason: impl AsRef<str>) -> String {
     )
 }
 
-/// What a views-on semantic answer could not cover, named so an incomplete
+/// What an index-store semantic answer could not cover, named so an incomplete
 /// answer says which files it is missing instead of looking complete.
 struct CheckoutSemanticGaps {
+    /// Files excluded by grammar availability or parsing policy, with typed
+    /// reasons. They are not waiting for a fill and are not fill failures.
+    skipped: Vec<serde_json::Value>,
     /// Files whose current content has no vectors yet (awaiting a fill, or
     /// edited since the last one).
     pending: Vec<PathBuf>,
-    /// Files whose embedding failed for this content and producer.
-    failed: Vec<PathBuf>,
+    /// Terminal failures extracting a file's outline or embedding its chunks.
+    failed: Vec<(PathBuf, String)>,
     /// The watcher could not vouch for membership, so the checkout was
     /// re-walked and vectors may lag the disk.
     unvouched: bool,
@@ -3347,28 +3365,52 @@ impl CheckoutSemanticGaps {
     fn status(&self) -> &'static str {
         if self.unavailable.is_some() {
             "unavailable"
+        } else if self.pending.is_empty()
+            && !self.skipped.iter().any(|gap| {
+                matches!(
+                    gap["state"].as_str(),
+                    Some("not_downloaded" | "downloading" | "network_retry" | "storage_retry")
+                )
+            })
+            && !self.unvouched
+            && self.fill_failure.is_none()
+        {
+            "ready"
         } else {
             "refreshing"
         }
     }
 
-    /// What a data-layer meaning plane whose fill is under way does not
-    /// cover yet: the files waiting for vectors. Files that cannot be cut
-    /// into chunks are accounted for, as today's index leaves them out, and
-    /// chunks the embedder refused are disclosed as today's index discloses
-    /// them.
+    /// Pending work and recorded exclusions from data-layer semantic search.
     fn from_data(meaning: &crate::data_layer::tools::search::DataMeaning) -> Self {
+        let mut gaps = Self::from_coverage(meaning.coverage());
+        gaps.fill_failure = meaning.failure().map(str::to_string);
+        gaps
+    }
+
+    fn from_coverage(coverage: &crate::data_layer::vectors::Coverage) -> Self {
+        let reply = if coverage.skipped_parses.is_empty() {
+            crate::data_layer::grammar::GapReply::default()
+        } else {
+            crate::data_layer::grammar::GapReply::capture()
+        };
         Self {
-            pending: meaning.coverage().pending.clone(),
-            failed: Vec::new(),
+            skipped: coverage
+                .skipped_parses
+                .iter()
+                .filter_map(|(path, reason)| reply.value(reason, path))
+                .collect(),
+            pending: coverage.pending.clone(),
+            failed: coverage.luau_outline_failures().cloned().collect(),
             unvouched: false,
             unavailable: None,
-            fill_failure: meaning.failure().map(str::to_string),
+            fill_failure: None,
         }
     }
 
     fn unavailable(reason: String) -> Self {
         Self {
+            skipped: Vec::new(),
             pending: Vec::new(),
             failed: Vec::new(),
             unvouched: false,
@@ -3394,7 +3436,14 @@ impl CheckoutSemanticGaps {
                 .collect::<Vec<_>>()
         };
         let pending = relative(&self.pending);
-        let failed = relative(&self.failed);
+        let failed = relative(
+            &self
+                .failed
+                .iter()
+                .take(crate::data_layer::surfaces::INDEX_GAP_PREVIEW)
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>(),
+        );
         let named = |label: &str, paths: &[String]| {
             let shown = paths
                 .iter()
@@ -3413,14 +3462,44 @@ impl CheckoutSemanticGaps {
             }
         };
         let mut lines = Vec::new();
+        let skipped = self
+            .skipped
+            .iter()
+            .take(crate::data_layer::surfaces::INDEX_GAP_PREVIEW)
+            .map(|gap| {
+                let mut gap = gap.clone();
+                if let Some(path) = gap["path"].as_str() {
+                    gap["path"] =
+                        serde_json::json!(project_relative_path(Path::new(path), project_root));
+                }
+                gap
+            })
+            .collect::<Vec<_>>();
+        for gap in &skipped {
+            lines.push(format!(
+                "{}: {}",
+                gap["path"].as_str().unwrap_or_default(),
+                gap["message"].as_str().unwrap_or_default()
+            ));
+        }
+        let preview =
+            crate::data_layer::surfaces::parse_gap_preview(skipped.len(), self.skipped.len());
+        if let Some(trailer) = crate::subc_format::render_envelope_trailer(&preview) {
+            lines.push(trailer);
+        }
         if let Some(reason) = &self.unavailable {
             lines.push(format!("semantic: unavailable: {reason}"));
         }
         if !pending.is_empty() {
             lines.push(named("not yet embedded", &pending));
         }
-        if !failed.is_empty() {
-            lines.push(named("failed to embed", &failed));
+        for (path, (_, reason)) in failed.iter().zip(&self.failed) {
+            lines.push(format!("{path}: {reason}"));
+        }
+        let failed_preview =
+            crate::data_layer::surfaces::parse_gap_preview(failed.len(), self.failed.len());
+        if let Some(trailer) = crate::subc_format::render_envelope_trailer(&failed_preview) {
+            lines.push(trailer);
         }
         if self.unvouched {
             lines.push(
@@ -3440,6 +3519,25 @@ impl CheckoutSemanticGaps {
             "unvouched": self.unvouched,
             "unavailable": self.unavailable,
         });
+        if !failed.is_empty() {
+            gap["failed_files"] = serde_json::json!(self
+                .failed
+                .iter()
+                .zip(&failed)
+                .map(|((_, reason), path)| serde_json::json!({"path":path,"reason":reason}))
+                .collect::<Vec<_>>());
+            gap["failed_files_count"] = serde_json::json!(self.failed.len());
+            gap["failed_files_omitted"] = serde_json::json!(self.failed.len() - failed.len());
+            gap["failed_files_list"] = serde_json::json!(failed_preview);
+        }
+        if !skipped.is_empty() {
+            gap["skipped_files"] = serde_json::json!(skipped);
+            gap["skipped_files_count"] = serde_json::json!(self.skipped.len());
+            let omitted =
+                self.skipped.len() - gap["skipped_files"].as_array().expect("skip preview").len();
+            gap["skipped_files_omitted"] = serde_json::json!(omitted);
+            gap["skipped_files_list"] = serde_json::json!(preview);
+        }
         if let Some(error) = &self.fill_failure {
             gap["fill_failure"] = serde_json::json!(error);
         }
@@ -3729,6 +3827,15 @@ enum Settled {
 /// for later phases; `deadline` and the request's cancellation are checked
 /// before each step.
 fn presence_check(path: &Path, normalized: &str, deadline: Instant) -> PresenceCheck {
+    presence_check_after_unstamped_stat(path, normalized, deadline, || {})
+}
+
+fn presence_check_after_unstamped_stat(
+    path: &Path,
+    normalized: &str,
+    deadline: Instant,
+    after_stat: impl FnOnce(),
+) -> PresenceCheck {
     #[cfg(test)]
     PRESENCE_CHECK_STARTED.with(|hook| {
         if let Some(hook) = hook.borrow_mut().as_mut() {
@@ -3743,17 +3850,10 @@ fn presence_check(path: &Path, normalized: &str, deadline: Instant) -> PresenceC
             #[cfg(test)]
             request_files::record_disk_read(path);
             let stamp = file_stamp(path);
-            if stamp.is_some_and(|(size, _)| crate::large_read::is_large(size)) {
-                return stream_presence_check(path, stamp, normalized, deadline);
-            }
-            let Some(text) = crate::search_index::read_searchable_text(path) else {
-                return PresenceCheck::Unknown;
-            };
-            crate::large_read::record_whole(crate::large_read::Site::Presence, text.len());
-            return PresenceCheck::Read(
-                stamp,
-                exact_lane::normalize_exact_phrase(&text).contains(normalized),
-            );
+            after_stat();
+            // Reopen unstamped source through the streaming reader even when
+            // the earlier path stat was small: the file may have grown since.
+            return stream_presence_check(path, stamp, normalized, deadline);
         }
         None => {
             // A large file is read in steps instead, outside the request's
@@ -3769,7 +3869,19 @@ fn presence_check(path: &Path, normalized: &str, deadline: Instant) -> PresenceC
                     large = Some(stat);
                     return Err(std::io::Error::other("read in steps"));
                 }
-                Ok((crate::bounded_io::read(path, None)?, stat))
+                let mut reader = crate::bounded_io::reader(path, None)?;
+                if crate::large_read::is_large(reader.size_at_open()) {
+                    large = Some(stat.unwrap_or(request_files::FileStat {
+                        size: reader.size_at_open(),
+                        modified: None,
+                        file_id: None,
+                    }));
+                    return Err(std::io::Error::other("read in steps"));
+                }
+                Ok((
+                    reader.append(Vec::new(), reader.size_at_open() as usize)?,
+                    stat,
+                ))
             });
             if let Some(stat) = large {
                 return stream_presence_check(
@@ -4006,11 +4118,40 @@ fn disclose_anchored_admission(
 /// line number and display text. The text is bounded by `snippet_bounds`: a
 /// long line (minified code, a single-line JSON document) yields a window
 /// around the match, never the whole line.
+/// This best-effort Option form is only for presentation. Callers that feed a
+/// cross-request memo must use the checked form so failed reads stay distinct.
 fn matching_line_from_source(
     file: &Path,
     query: &str,
     symbol_range: Option<SymbolOffsetRange>,
 ) -> Option<(u32, String)> {
+    matching_line_from_source_checked(file, query, symbol_range)
+        .ok()
+        .flatten()
+}
+
+/// Keep source-reading errors separate from a successful read with no matching line.
+fn matching_line_from_source_checked(
+    file: &Path,
+    query: &str,
+    symbol_range: Option<SymbolOffsetRange>,
+) -> std::io::Result<Option<(u32, String)>> {
+    if request_files::current()
+        .and_then(|files| files.kept(file))
+        .is_none()
+        && fs::metadata(file).is_ok_and(|metadata| crate::large_read::is_large(metadata.len()))
+    {
+        let find = || matching_line_streamed(file, query, symbol_range);
+        return match request_files::current() {
+            Some(files) => files.matching_line_checked(
+                file,
+                query,
+                symbol_range.map(|range| (range.start, range.end)),
+                find,
+            ),
+            None => find(),
+        };
+    }
     let Some(files) = request_files::current() else {
         let read_cost = telemetry::CostPhase::start("matching_read");
         let source = waits::timed(waits::SearchWait::FileRead, || {
@@ -4020,14 +4161,16 @@ fn matching_line_from_source(
                     read_whole_source_file(path),
                 )
             })
-        })
-        .ok()?;
+        })?;
         drop(read_cost);
-        return matching_line_in_text(source.file.utf8()?, query, symbol_range);
+        return Ok(source
+            .file
+            .utf8()
+            .and_then(|source| matching_line_in_text(source, query, symbol_range)));
     };
     // The reranker's candidate text asks for the same line of the same file;
     // the request's set answers both from one search of the text.
-    files.matching_line(
+    files.matching_line_checked(
         file,
         query,
         symbol_range.map(|range| (range.start, range.end)),
@@ -4048,6 +4191,86 @@ fn matching_line_from_source(
                 .and_then(|source| matching_line_in_text(source, query, symbol_range)))
         },
     )
+}
+
+fn matching_line_streamed(
+    file: &Path,
+    query: &str,
+    symbol_range: Option<SymbolOffsetRange>,
+) -> std::io::Result<Option<(u32, String)>> {
+    let phrase = exact_lane::normalize_exact_phrase(exact_lane::exact_phrase(query));
+    let content_tokens = query_shape::extract_content_tokens(query);
+    let tokens = content_tokens
+        .iter()
+        .map(|token| {
+            token
+                .chars()
+                .filter(|ch| ch.is_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect::<String>()
+        })
+        .filter(|token| token.len() >= 3)
+        .collect::<Vec<_>>();
+    let mut valid = true;
+    let mut phrase_line = None;
+    let mut best = None;
+    let mut best_score = 0usize;
+    let mut fallback = None;
+    crate::large_read::visit_lines(
+        file,
+        crate::large_read::Site::MatchingLine,
+        |index, offset, bytes| {
+            let Ok(source) = std::str::from_utf8(bytes) else {
+                valid = false;
+                return;
+            };
+            if let Some(range) = symbol_range {
+                if range.start >= offset
+                    && (range.start < offset + bytes.len() || !bytes.ends_with(b"\n"))
+                {
+                    fallback = line_at_offset(source, range.start.saturating_sub(offset))
+                        .map(|(_, text)| (index as u32, text));
+                }
+            }
+            if phrase_line.is_some() {
+                return;
+            }
+            if !phrase.is_empty() {
+                if let Some((_, line)) = matching_phrase_line(source, &phrase) {
+                    let anchor = phrase
+                        .split(' ')
+                        .next()
+                        .and_then(|word| snippet_bounds::find_ascii_case_insensitive(line, word))
+                        .unwrap_or(0);
+                    phrase_line = Some((
+                        index as u32,
+                        snippet_bounds::window_snippet_line(line, anchor),
+                    ));
+                    return;
+                }
+            }
+            if let Some((score, _, line)) = MatchingSource::new(source).best_line(source, &tokens) {
+                if score > best_score {
+                    best_score = score;
+                    let anchor = content_tokens
+                        .iter()
+                        .filter_map(|token| {
+                            snippet_bounds::find_ascii_case_insensitive(
+                                line,
+                                &token.to_ascii_lowercase(),
+                            )
+                        })
+                        .min()
+                        .unwrap_or(0);
+                    best = Some((
+                        index as u32,
+                        snippet_bounds::window_snippet_line(line, anchor),
+                    ));
+                }
+            }
+        },
+    )?;
+    Ok(valid.then(|| phrase_line.or(best).or(fallback)).flatten())
 }
 
 /// Preparation is addressed by the bytes just read, not a path or watcher
@@ -7513,61 +7736,77 @@ fn execute_degraded_grep_fallback(
     let cancellation = crate::executor::current_job_cancellation();
     let rayon_wait = waits::time(waits::SearchWait::Rayon);
     let alloc_label = crate::alloc_trace::carry();
-    let mut readable_files = files
-        .par_iter()
-        .enumerate()
-        .filter_map(|(index, file)| {
-            let _alloc_label = alloc_label.enter();
-            if cancellation
-                .as_ref()
-                .is_some_and(|token| token.cancel_requested_before_commit())
-            {
-                return None;
-            }
-            if started.elapsed() >= DEGRADED_GREP_WALK_BUDGET {
-                read_budget_reached.store(true, Ordering::Relaxed);
-                return None;
-            }
-            crate::search_index::read_searchable_text(file).map(|content| {
-                crate::large_read::record_whole(
-                    crate::large_read::Site::DegradedGrep,
-                    content.len(),
-                );
-                (index, file.clone(), content)
+    let io_budget = crate::bounded_io::capture();
+    // One CPU-width batch holds at most concurrency × max_results temporary
+    // rows (including each path, line window and full match_text), plus the
+    // global max_results rows already kept for the reply. Read buffers are
+    // separate and bounded by the per-reader ceiling.
+    for batch in files.chunks(rayon::current_num_threads().max(1)) {
+        let mut readable_files = batch
+            .par_iter()
+            .enumerate()
+            .filter_map(|(index, file)| {
+                let _alloc_label = alloc_label.enter();
+                if cancellation
+                    .as_ref()
+                    .is_some_and(|token| token.cancel_requested_before_commit())
+                {
+                    return None;
+                }
+                if started.elapsed() >= DEGRADED_GREP_WALK_BUDGET {
+                    read_budget_reached.store(true, Ordering::Relaxed);
+                    return None;
+                }
+                crate::bounded_io::with_budget(io_budget.clone(), || {
+                    // Rayon does not inherit executor thread-local state. The
+                    // streamed reader must see cancellation after admission too.
+                    let _cancellation = cancellation
+                        .clone()
+                        .map(crate::executor::install_job_cancellation);
+                    read_degraded_grep_file(file, &compiled, max_results)
+                })
+                .map(|outcome| (index, file.clone(), outcome))
             })
-        })
-        .collect::<Vec<_>>();
-    drop(rayon_wait);
-    if search_cancellation_requested() {
-        return Err(cancelled_search_response_from_id(request_id));
-    }
-    // Rayon collection order is not part of the response contract; restore the
-    // original walker order before applying the existing result-cap semantics.
-    readable_files.sort_by_key(|(index, _, _)| *index);
-
-    for (_, file, content) in readable_files {
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        record_degraded_retained_rows(
+            project_root,
+            readable_files
+                .iter()
+                .map(|(_, _, (rows, _))| rows.len())
+                .sum(),
+        );
         if search_cancellation_requested() {
             return Err(cancelled_search_response_from_id(request_id));
         }
+        // Rayon collection order is not part of the response contract; restore the
+        // original walker order before applying the existing result-cap semantics.
+        readable_files.sort_by_key(|(index, _, _)| *index);
+
+        for (_, _file, (rows, count)) in readable_files {
+            if search_cancellation_requested() {
+                return Err(cancelled_search_response_from_id(request_id));
+            }
+            if truncated {
+                engine_capped = true;
+                break;
+            }
+
+            files_searched += 1;
+
+            let remaining = max_results.saturating_sub(matches.len());
+            total_matches += count.min(remaining + 1);
+            truncated = count > remaining;
+            matches.extend(rows.into_iter().take(remaining));
+            if count > 0 {
+                files_with_matches += 1;
+            }
+        }
         if truncated {
-            engine_capped = true;
             break;
         }
-
-        files_searched += 1;
-
-        if search_degraded_grep_file(
-            &file,
-            &content,
-            &compiled,
-            max_results,
-            &mut total_matches,
-            &mut truncated,
-            &mut matches,
-        ) {
-            files_with_matches += 1;
-        }
     }
+    drop(rayon_wait);
 
     if truncated {
         engine_capped = true;
@@ -7601,6 +7840,494 @@ fn execute_degraded_grep_fallback(
         candidate_files,
         walk_budget_reached,
     })
+}
+
+fn read_degraded_grep_file(
+    file: &Path,
+    compiled: &pattern_compile::CompiledPattern,
+    max_results: usize,
+) -> Option<(Vec<GrepMatch>, usize)> {
+    use crate::large_read::{LineMatcher, MatchVisit, ScanLines};
+    let mut reader = crate::bounded_io::reader(file, None).ok()?;
+    let size = reader.size_at_open();
+    let line_matcher = match compiled {
+        pattern_compile::CompiledPattern::Literal(literal)
+            if crate::large_read::literal_is_line_local(&literal.needle) =>
+        {
+            Some(LineMatcher::Literal {
+                needle: &literal.needle,
+                case_insensitive_ascii: literal.case_insensitive_ascii,
+            })
+        }
+        pattern_compile::CompiledPattern::Regex { compiled, .. }
+            if crate::large_read::regex_is_line_local(compiled) =>
+        {
+            Some(LineMatcher::Regex(compiled))
+        }
+        _ => None,
+    };
+    if !crate::large_read::is_large(size) || line_matcher.is_none() {
+        crate::large_read::allow_whole(crate::large_read::Site::DegradedGrep, file, size).ok()?;
+        let bytes = reader.append(Vec::new(), size as usize).ok()?;
+        if crate::search_index::is_binary_bytes(&bytes) {
+            return None;
+        }
+        let content = std::str::from_utf8(&bytes).ok()?;
+        crate::large_read::record_whole(crate::large_read::Site::DegradedGrep, bytes.len());
+        let mut matches = Vec::new();
+        let mut total = 0;
+        search_degraded_grep_file(
+            file,
+            content,
+            compiled,
+            max_results,
+            &mut total,
+            &mut false,
+            &mut matches,
+        );
+        return Some((matches, total));
+    }
+    let head = reader.chunk(Vec::new(), 1024).ok()?;
+    if crate::search_index::is_binary_bytes(&head) {
+        return None;
+    }
+    let mut utf8 = crate::large_read::Utf8Check::default();
+    let mut valid = true;
+    let mut rows = Vec::new();
+    let mut total = 0usize;
+    let mut reported_end = 0usize;
+    let mut read = 0u64;
+    let token = crate::executor::current_job_cancellation();
+    let scan = crate::large_read::scan_lines(
+        crate::large_read::Site::DegradedGrep,
+        file,
+        &mut reader,
+        size,
+        head,
+        &line_matcher?,
+        true,
+        |bytes| {
+            read += bytes.len() as u64;
+            #[cfg(test)]
+            observe_degraded_read_step(file, read);
+            valid &= utf8.feed(bytes, |_| {});
+            if !valid {
+                return Some(crate::large_read::ScanEnd::Stopped);
+            }
+            token
+                .as_ref()
+                .filter(|token| token.cancel_requested_before_commit())
+                .map(|_| {
+                    crate::large_read::ScanEnd::Interrupted(
+                        crate::large_read::Interrupted::Cancelled,
+                    )
+                })
+        },
+        |lines, start, end| {
+            if start < reported_end {
+                return MatchVisit::SameLine;
+            }
+            let (line, column, line_text, next_line_start) = lines.line_details(start);
+            reported_end = next_line_start;
+            if total <= max_results {
+                total += 1;
+            }
+            if rows.len() < max_results {
+                rows.push(GrepMatch {
+                    file: file.to_path_buf(),
+                    line,
+                    column,
+                    line_text,
+                    match_text: lines.match_text(start, end),
+                });
+            }
+            MatchVisit::Recorded { next_line_start }
+        },
+    );
+    crate::large_read::record(crate::large_read::Site::DegradedGrep, size, read);
+    let ceiling = scan
+        .as_ref()
+        .is_err_and(crate::large_read::is_ceiling_error);
+    // The ceiling probe can split a UTF-8 sequence on the skipped line. Only
+    // earlier complete lines produced rows; they need no EOF validation of
+    // the partial skipped line. A real cancellation still discards all rows.
+    if !valid
+        || matches!(scan, Ok(crate::large_read::ScanEnd::Interrupted(_)))
+        || scan
+            .as_ref()
+            .is_err_and(|error| !crate::large_read::is_ceiling_error(error))
+        || (!ceiling && !utf8.finish())
+    {
+        return None;
+    }
+    Some((rows, total))
+}
+
+#[cfg(test)]
+static DEGRADED_ROW_WATCHES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<AtomicUsize>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+struct DegradedReadWatch {
+    bytes: AtomicUsize,
+    paused: AtomicBool,
+    owner_paused: AtomicBool,
+    owner: std::sync::Mutex<Option<std::thread::ThreadId>>,
+    reached: std::sync::mpsc::SyncSender<u64>,
+    resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    resume_owner: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    worker: std::sync::Mutex<Option<std::thread::ThreadId>>,
+}
+
+#[cfg(test)]
+static DEGRADED_READ_WATCHES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<DegradedReadWatch>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+fn observe_degraded_read_step(path: &Path, read: u64) {
+    let watch = DEGRADED_READ_WATCHES.lock().unwrap().get(path).cloned();
+    if let Some(watch) = watch {
+        let owner = *watch.owner.lock().unwrap();
+        if Some(std::thread::current().id()) == owner {
+            if read >= crate::large_read::STEP_BYTES as u64
+                && !watch.owner_paused.swap(true, Ordering::Relaxed)
+            {
+                watch
+                    .resume_owner
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("caller releases the coordinating scan");
+            }
+            return;
+        }
+        watch.bytes.store(read as usize, Ordering::Relaxed);
+        if read >= crate::large_read::STEP_BYTES as u64
+            && !watch.paused.swap(true, Ordering::Relaxed)
+        {
+            *watch.worker.lock().unwrap() = Some(std::thread::current().id());
+            watch.reached.send(read).unwrap();
+            watch
+                .resume
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .expect("caller releases the paused Rayon scan");
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn audit1432_round2_degraded_rayon_scan_observes_caller_cancellation_mid_file() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = [root.path().join("a.rs"), root.path().join("b.rs")];
+    let mut source = b"// foo\n".to_vec();
+    source.extend(b"// padding without a match\n".repeat((24 << 20) / 27));
+    for path in &paths {
+        fs::write(path, &source).unwrap();
+    }
+    let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    let (owner_tx, owner_rx) = std::sync::mpsc::sync_channel(1);
+    let watch = Arc::new(DegradedReadWatch {
+        bytes: AtomicUsize::new(0),
+        paused: AtomicBool::new(false),
+        owner_paused: AtomicBool::new(false),
+        owner: std::sync::Mutex::new(None),
+        reached: reached_tx,
+        resume: std::sync::Mutex::new(resume_rx),
+        resume_owner: std::sync::Mutex::new(owner_rx),
+        worker: std::sync::Mutex::new(None),
+    });
+    for path in &paths {
+        DEGRADED_READ_WATCHES
+            .lock()
+            .unwrap()
+            .insert(path.clone(), watch.clone());
+    }
+    struct Reset(Vec<PathBuf>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                DEGRADED_READ_WATCHES.lock().unwrap().remove(path);
+            }
+        }
+    }
+    let _reset = Reset(paths.to_vec());
+    let token = crate::executor::JobCancellation::new();
+    let request_token = token.clone();
+    let path = root.path().to_path_buf();
+    let observer = watch.clone();
+    let request = std::thread::spawn(move || {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            *observer.owner.lock().unwrap() = Some(std::thread::current().id());
+            let _token = crate::executor::install_job_cancellation(request_token);
+            execute_degraded_grep_fallback("foo", &path, 10, true, "rayon-cancel")
+        })
+    });
+    let paused_at = reached_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the production Rayon worker reached a real file step");
+    assert_ne!(
+        *watch.worker.lock().unwrap(),
+        *watch.owner.lock().unwrap(),
+        "the test must cross the caller/worker thread boundary"
+    );
+    token.request_cancel();
+    resume_tx.send(()).unwrap();
+    owner_tx.send(()).unwrap();
+    let result = request.join().unwrap();
+    assert!(
+        result.is_err(),
+        "the cancelled request must not return rows"
+    );
+    let read = watch.bytes.load(Ordering::Relaxed);
+    assert!(read > 0);
+    assert!(
+        read <= paused_at as usize + crate::large_read::STEP_BYTES,
+        "worker read {read} bytes after cancellation at {paused_at}"
+    );
+    assert!(
+        read < source.len(),
+        "the scan read to EOF after cancellation"
+    );
+}
+
+#[cfg(test)]
+fn record_degraded_retained_rows(root: &Path, rows: usize) {
+    if let Some(peak) = DEGRADED_ROW_WATCHES.lock().unwrap().get(root) {
+        peak.fetch_max(rows, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+fn audit1432_degraded_literal() -> pattern_compile::CompiledPattern {
+    let pattern_compile::CompileResult::Ok(compiled) = pattern_compile::compile(
+        "foo",
+        CompileOpts {
+            literal: true,
+            ..CompileOpts::default()
+        },
+    ) else {
+        panic!("literal");
+    };
+    compiled
+}
+
+#[cfg(test)]
+#[test]
+fn audit1432_degraded_utf8_split_at_ceiling_keeps_earlier_complete_rows() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("utf8-split.txt");
+    let mut bytes = b"foo\n".to_vec();
+    bytes.extend(std::iter::repeat_n(
+        b'x',
+        crate::large_read::WHOLE_READ_CEILING as usize - 1,
+    ));
+    bytes.extend_from_slice("€\n".as_bytes());
+    fs::write(&file, bytes).unwrap();
+    let _scope = crate::bounded_io::enter_disclosure_if_absent();
+    let (rows, count) = read_degraded_grep_file(&file, &audit1432_degraded_literal(), 10)
+        .expect("complete earlier rows survive the ceiling skip");
+    assert_eq!(count, 1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].line, 1);
+    assert_eq!(rows[0].line_text, "foo");
+    let mut response = Response::success("utf8-split", serde_json::json!({}));
+    crate::bounded_io::disclose_large_read_skips(&mut response);
+    assert_eq!(
+        response.data["skipped_files"][0]["file"],
+        serde_json::json!(file)
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn audit1432_degraded_invalid_utf8_is_not_named_as_a_ceiling_skip() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("invalid.txt");
+    let mut bytes = b"foo\ninvalid\xff\n".to_vec();
+    bytes.extend(std::iter::repeat_n(b'x', 17 << 20));
+    fs::write(&file, bytes).unwrap();
+    let _scope = crate::bounded_io::enter_disclosure_if_absent();
+    assert!(read_degraded_grep_file(&file, &audit1432_degraded_literal(), 10).is_none());
+    let mut response = Response::success("invalid-utf8", serde_json::json!({}));
+    crate::bounded_io::disclose_large_read_skips(&mut response);
+    assert!(response.data.get("skipped_files").is_none(), "{response:?}");
+}
+
+#[cfg(test)]
+#[test]
+fn audit1432_degraded_mid_scan_cancellation_never_returns_partial_rows() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("cancel.txt");
+    fs::write(&file, b"foo\n".repeat(1024)).unwrap();
+    let token = crate::executor::JobCancellation::new();
+    let cancel = token.clone();
+    let _installed = crate::executor::install_job_cancellation(token);
+    let result = crate::large_read::with_test_steps(64, 0, || {
+        crate::large_read::with_step_tap(
+            move |_| cancel.request_cancel(),
+            || read_degraded_grep_file(&file, &audit1432_degraded_literal(), 10),
+        )
+    });
+    assert!(result.is_none(), "cancelled scan returned rows: {result:?}");
+}
+
+#[cfg(test)]
+#[test]
+fn audit1432_presence_unstamped_growth_streams_without_a_false_skip() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("presence.txt");
+    fs::write(&file, b"initial\n").unwrap();
+    let files = request_files::install();
+    files
+        .files()
+        .keep_read(&file, b"old unstamped\n".to_vec(), None);
+    let mut grown = b"x\n".repeat((17 << 20) / 2);
+    grown.extend_from_slice(b"needle_at_tail\n");
+    let _scope = crate::bounded_io::enter_disclosure_if_absent();
+    let answer = presence_check_after_unstamped_stat(
+        &file,
+        "needle_at_tail",
+        Instant::now() + Duration::from_secs(60),
+        || fs::write(&file, &grown).unwrap(),
+    );
+    assert!(
+        matches!(answer, PresenceCheck::Read(_, true)),
+        "growth must use the stream, not make a ceiling skip"
+    );
+    let mut response = Response::success("presence-growth", serde_json::json!({}));
+    crate::bounded_io::disclose_large_read_skips(&mut response);
+    assert!(response.data.get("skipped_files").is_none(), "{response:?}");
+}
+
+#[cfg(test)]
+#[test]
+fn audit1432_degraded_transient_rows_are_bounded_by_concurrency_not_all_files() {
+    let root = tempfile::tempdir().unwrap();
+    let query = format!("foo{}", "x".repeat(16 * 1024 - 3));
+    let modified = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    for at in 0..24 {
+        let path = root.path().join(format!("file-{at:02}.txt"));
+        let content = (1..=3)
+            .map(|line| format!("file-{at:02} row-{line:02} {query}\n"))
+            .collect::<String>();
+        fs::write(&path, content).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+    }
+    let (walk_order, file_cap, time_cap, _) =
+        collect_degraded_grep_files(root.path(), true, Instant::now());
+    assert_eq!(walk_order.len(), 24);
+    assert!(!file_cap && !time_cap);
+    // The walk is the input order, independent of how Rayon completes reads.
+    // Equal mtimes make the final reply sort by path, then line.
+    let mut expected = walk_order
+        .iter()
+        .flat_map(|path| (1..=3).map(move |line| (path.clone(), line)))
+        .take(10)
+        .collect::<Vec<_>>();
+    expected.sort();
+    let peak = Arc::new(AtomicUsize::new(0));
+    DEGRADED_ROW_WATCHES
+        .lock()
+        .unwrap()
+        .insert(root.path().to_path_buf(), peak.clone());
+    struct Reset(PathBuf);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            DEGRADED_ROW_WATCHES.lock().unwrap().remove(&self.0);
+        }
+    }
+    let _reset = Reset(root.path().to_path_buf());
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    let result = pool
+        .install(|| execute_degraded_grep_fallback(&query, root.path(), 10, true, "retained-rows"))
+        .unwrap();
+    assert!(result.grep.truncated);
+    assert_eq!(
+        result
+            .grep
+            .matches
+            .iter()
+            .map(|row| (row.file.clone(), row.line))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert!(result
+        .grep
+        .matches
+        .iter()
+        .all(|row| row.match_text == query));
+    for row in &result.grep.matches {
+        let name = row.file.file_stem().unwrap().to_str().unwrap();
+        assert!(
+            row.line_text
+                .starts_with(&format!("{name} row-{:02} ", row.line)),
+            "{row:?}"
+        );
+    }
+    let retained = peak.load(Ordering::Relaxed);
+    assert!(retained > 0, "the observer must have seen a real batch");
+    assert_eq!(retained, 2 * 3, "two workers retain at most the three distinct rows each file contains, not all files' rows");
+}
+
+#[cfg(test)]
+#[test]
+fn stage2_degraded_streamed_rows_match_whole_read() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("degraded.txt");
+    let pattern_compile::CompileResult::Ok(compiled) = pattern_compile::compile(
+        "foo",
+        CompileOpts {
+            literal: true,
+            ..CompileOpts::default()
+        },
+    ) else {
+        panic!("literal");
+    };
+    for content in [
+        "foo foo\r\nhead\nFoo tail\r\r\nfoo é\n",
+        "head\nno match\r\n",
+        "foo\r",
+    ] {
+        fs::write(&path, content).unwrap();
+        for cap in [0, 1, 10] {
+            let mut rows = Vec::new();
+            let mut total = 0;
+            search_degraded_grep_file(
+                &path, content, &compiled, cap, &mut total, &mut false, &mut rows,
+            );
+            let streamed = crate::large_read::with_test_steps(3, 0, || {
+                read_degraded_grep_file(&path, &compiled, cap)
+            });
+            assert_eq!(
+                streamed,
+                Some((rows, total)),
+                "cap={cap}, content={content:?}"
+            );
+        }
+    }
+    fs::write(&path, b"foo\nlater\xff").unwrap();
+    assert!(
+        crate::large_read::with_test_steps(3, 0, || read_degraded_grep_file(&path, &compiled, 10))
+            .is_none()
+    );
 }
 
 fn collect_degraded_grep_files(
@@ -7928,7 +8655,8 @@ fn data_meaning_search(
     ) {
         Ok(results) => (
             results,
-            (!meaning.complete()).then(|| CheckoutSemanticGaps::from_data(meaning)),
+            (!meaning.complete() || !meaning.coverage().skipped_parses.is_empty())
+                .then(|| CheckoutSemanticGaps::from_data(meaning)),
         ),
         Err(error) => (
             Vec::new(),
@@ -9027,10 +9755,12 @@ fn enrich_snippets_from_source(results: &mut [HybridResult], project_root: &Path
     enrich_snippets_from_source_with_context(results, project_root, None)
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct SnippetReadPlan {
     fixed_last_line: Option<usize>,
     summary_nonempty_lines: usize,
+    ranges: Vec<std::ops::Range<usize>>,
+    doc_targets: Vec<usize>,
 }
 
 impl SnippetReadPlan {
@@ -9078,10 +9808,15 @@ fn snippet_read_plans(
         }
 
         plan.include_through(result.end_line);
+        plan.ranges.push(
+            result.start_line as usize
+                ..(result.end_line as usize + 1).min(result.start_line as usize + budget),
+        );
         if should_expand_rank0_snippet(rank, result, project_root) {
             let target =
                 symbol_for_rank0_render(result, ctx).unwrap_or_else(|| symbol_from_result(result));
             plan.include_through(target.range.end_line);
+            plan.doc_targets.push(target.range.start_line as usize);
             rank0_targets.insert(rank, target);
         }
     }
@@ -9089,7 +9824,7 @@ fn snippet_read_plans(
     (plans, rank0_targets)
 }
 
-fn read_bounded_snippet_lines(path: &Path, plan: SnippetReadPlan) -> Option<Vec<String>> {
+fn read_bounded_snippet_lines(path: &Path, plan: SnippetReadPlan) -> Option<SnippetLines> {
     // A file an earlier phase of this request read is cut into lines from
     // those bytes; otherwise only the lines the plan needs are read.
     if let Some(file) = request_files::current().and_then(|files| files.kept(path)) {
@@ -9130,17 +9865,82 @@ impl std::io::Read for CountedRead {
 fn bounded_snippet_lines_from(
     reader: &mut impl std::io::BufRead,
     plan: SnippetReadPlan,
-) -> Option<Vec<String>> {
-    let mut lines = Vec::new();
+) -> Option<SnippetLines> {
+    let mut lines = SnippetLines::default();
     let mut nonempty_lines = 0usize;
+    let mut summary_kept = 0usize;
+    let mut doc_start = 0usize;
+    let mut doc_head = Vec::new();
+    let mut ranges = plan.ranges.clone();
     while let Some((line, nonempty)) = read_bounded_snippet_line(reader).ok()? {
+        let index = lines.len;
+        if plan.doc_targets.contains(&index) {
+            lines.doc_starts.insert(index, doc_start);
+            ranges.push(doc_start..doc_start.saturating_add(RANK0_FULL_SNIPPET_MAX_LINES));
+            lines.text.extend(doc_head.iter().cloned());
+        }
+        let summary = summary_kept < plan.summary_nonempty_lines && !line.trim().is_empty();
+        summary_kept += usize::from(summary);
+        if summary || ranges.iter().any(|range| range.contains(&index)) {
+            lines.text.insert(index, line.clone());
+        }
+        if crate::commands::symbol_render::is_doc_comment_line(&line) {
+            if doc_head.len() < RANK0_FULL_SNIPPET_MAX_LINES {
+                doc_head.push((index, line));
+            }
+        } else {
+            doc_head.clear();
+            doc_start = index + 1;
+        }
         nonempty_lines += usize::from(nonempty);
-        lines.push(line);
-        if plan.is_satisfied(lines.len() - 1, nonempty_lines) {
+        lines.len += 1;
+        if plan.is_satisfied(index, nonempty_lines) {
             break;
         }
     }
     Some(lines)
+}
+
+#[derive(Default)]
+struct SnippetLines {
+    len: usize,
+    text: std::collections::BTreeMap<usize, String>,
+    doc_starts: HashMap<usize, usize>,
+}
+
+impl SnippetLines {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn iter(&self) -> impl Iterator<Item = &String> {
+        self.text.values()
+    }
+    fn joined(&self, range: std::ops::Range<usize>) -> String {
+        range
+            .map(|at| self.text.get(&at).expect("planned snippet line").as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+impl crate::commands::symbol_render::SymbolLines for SnippetLines {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn line(&self, index: usize) -> &str {
+        self.text.get(&index).expect("planned symbol line")
+    }
+    fn doc_start(&self, start: usize) -> usize {
+        self.doc_starts.get(&start).copied().unwrap_or(start)
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Index<usize> for SnippetLines {
+    type Output = String;
+    fn index(&self, index: usize) -> &String {
+        &self.text[&index]
+    }
 }
 
 #[derive(Default)]
@@ -9237,6 +10037,8 @@ fn audit01_snippet_long_line_has_bounded_allocation_work() {
     let plan = SnippetReadPlan {
         fixed_last_line: Some(0),
         summary_nonempty_lines: 0,
+        ranges: vec![0..1],
+        ..Default::default()
     };
     let (lines, bytes) =
         crate::test_allocations::count_bytes(|| read_bounded_snippet_lines(&file, plan).unwrap());
@@ -9368,7 +10170,7 @@ fn enrich_snippets_from_source_with_context(
 
         let range_len = end - start;
         let shown = range_len.min(budget);
-        let mut snippet = lines[start..start + shown].join("\n");
+        let mut snippet = lines.joined(start..start + shown);
         let remaining = range_len - shown;
         if remaining > 0 {
             // "lines" is load-bearing: a bare "+N more" reads as "N more
@@ -9473,7 +10275,7 @@ fn enrich_snippets_from_source_reference(
 
 fn render_rank0_symbol_snippet(
     result: &HybridResult,
-    lines: &[String],
+    lines: &(impl crate::commands::symbol_render::SymbolLines + ?Sized),
     ctx: Option<&AppContext>,
     planned_target: Option<&Symbol>,
 ) -> crate::commands::symbol_render::BudgetedSymbolRender {
@@ -14498,6 +15300,82 @@ mod tests {
     }
 
     #[test]
+    fn stage2_sparse_symbol_render_matches_full_vector() {
+        let root = tempfile::tempdir().unwrap();
+        for (docs, body, tail) in [(600, 300, 2), (3, 400, 0), (2, 4, 0)] {
+            let mut full = vec!["prior code".to_string(); 20_000];
+            full.extend((0..docs).map(|at| {
+                if at % 2 == 0 {
+                    format!("/// doc {at}")
+                } else {
+                    "#[inline]".to_string()
+                }
+            }));
+            let start = full.len();
+            full.extend((0..body).map(|at| format!("body {at}")));
+            let end = full.len() - 1;
+            full.extend((0..tail).map(|_| "neighbor".to_string()));
+            let hit = snippet_hit(
+                root.path().join("target.rs"),
+                "target",
+                SymbolKind::Function,
+                start as u32,
+                end as u32,
+                HIGH_CONFIDENCE_COSINE_FLOOR,
+            );
+            let symbol = symbol_from_result(&hit);
+            let plan = SnippetReadPlan {
+                fixed_last_line: Some(end),
+                summary_nonempty_lines: 0,
+                ranges: vec![start..(start + 20).min(end + 1)],
+                doc_targets: vec![start],
+            };
+            let text = full.join("\n");
+            let sparse = bounded_snippet_lines_from(&mut text.as_bytes(), plan).unwrap();
+            assert!(
+                sparse.text.len() <= RANK0_FULL_SNIPPET_MAX_LINES + 20,
+                "retained {} lines",
+                sparse.text.len()
+            );
+            let expected = render_rank0_symbol_snippet(&hit, &full, None, Some(&symbol));
+            let actual = render_rank0_symbol_snippet(&hit, &sparse, None, Some(&symbol));
+            assert_eq!(actual.content, expected.content);
+            assert_eq!(actual.status, expected.status);
+        }
+    }
+
+    #[test]
+    fn stage2_matching_line_windows_match_whole_text() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("source.rs");
+        let sources = [
+            "head\r\nfn snake_case() {}\r\nlast needle é\r".to_string(),
+            format!("head\n{}\tneedle\nother\n", "é".repeat(40_000)),
+            "first\npartial nee match\nfinal\n".to_string(),
+        ];
+        for source in sources {
+            fs::write(&file, &source).unwrap();
+            for query in ["needle", "snake_case", "last needle", "unmatched", "é", ""] {
+                for range in [
+                    None,
+                    Some(SymbolOffsetRange {
+                        start: source.len().saturating_sub(2),
+                        end: source.len(),
+                    }),
+                ] {
+                    assert_eq!(
+                        matching_line_streamed(&file, query, range).unwrap(),
+                        matching_line_in_text(&source, query, range),
+                        "query={query:?}, range={range:?}"
+                    );
+                }
+            }
+        }
+        fs::write(&file, b"needle\ninvalid\xff").unwrap();
+        assert_eq!(matching_line_streamed(&file, "needle", None).unwrap(), None);
+    }
+
+    #[test]
     fn bounded_snippet_reader_stops_before_later_marker() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("bounded.rs");
@@ -14506,11 +15384,16 @@ mod tests {
         let plan = SnippetReadPlan {
             fixed_last_line: Some(2),
             summary_nonempty_lines: 0,
+            ranges: vec![0..3],
+            ..Default::default()
         };
 
         let lines = read_bounded_snippet_lines(&path, plan).expect("bounded read");
 
-        assert_eq!(lines, vec!["line0", "line1", "line2"]);
+        assert_eq!(
+            lines.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["line0", "line1", "line2"]
+        );
     }
 
     #[test]

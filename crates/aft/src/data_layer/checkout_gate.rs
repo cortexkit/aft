@@ -55,12 +55,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aft_store::content::RecordKey;
 use aft_store::ids::{Digest128, FamilyId};
 use aft_store::text::{plan_pattern, Scope};
 
 use super::checkout::{Checkout, CheckoutView, DataLayer, Folded, PlaneStatus, Planes};
-use super::content::EXTRACTOR_VERSION;
+use super::content::record_key;
 use super::edit_gate::{describe_question, Files};
 use super::incremental::LiveCheckout;
 use super::runtime::{DataCheckout, Fresh};
@@ -406,7 +405,7 @@ impl EngineInputs {
                             .state
                             .get(path.as_bytes())
                             .map_or_else(String::new, |record| {
-                                RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION)
+                                record_key(record.content, &record.language)
                                     .digest()
                                     .to_string()
                             });

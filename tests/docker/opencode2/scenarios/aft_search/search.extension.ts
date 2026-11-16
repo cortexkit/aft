@@ -2,8 +2,9 @@ import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { HarnessExtension, HarnessValidationContext } from "../../harness/types.js";
+import { readCeilingHooks } from "../read-ceiling-fixture.js";
 const here = dirname(fileURLToPath(import.meta.url));
-const expectedIds = ["search/T1/happy","search/T2/invalid_arguments","search/T2/missing_target","search/T6/search-payload-results/complete","search/T6/search-payload-results/incomplete","search/T7/happy"];
+const expectedIds = ["search/T1/happy","search/T2/invalid_arguments","search/T2/missing_target","search/T6/search-payload-results/complete","search/T6/search-payload-results/incomplete","search/T6/search-payload-skipped-files/complete","search/T6/search-payload-skipped-files/incomplete","search/T7/happy"];
 async function validate(context: HarnessValidationContext): Promise<void> {
   const scenarios = context.scenarios.filter((scenario) => scenario.tool === "search");
   const actual = scenarios.map((scenario) => scenario.id).sort();
@@ -15,5 +16,5 @@ async function validate(context: HarnessValidationContext): Promise<void> {
   const matrix = JSON.parse(await readFile(join(here, "matrix.json"), "utf8"));
   if (JSON.stringify(matrix.rows?.[0]?.trajectories) !== JSON.stringify({"T1":"applicable","T2":"applicable","T3":"n/a:no-permission-operation","T4":"n/a:no-abortable-operation","T5":"n/a:no-background-capability","T6":"applicable","T7":"applicable"})) throw new Error("search" + " applicability mismatch");
 }
-const extension: HarnessExtension = { name: "search-scenarios-v1", validate };
+const extension: HarnessExtension = { name: "search-scenarios-v1", validate, ...readCeilingHooks("search") };
 export default extension;

@@ -28,6 +28,9 @@ pub(super) const SURFACES: SectionKind = SectionKind::new(0x0201);
 pub(super) const BODIES: SectionKind = SectionKind::new(0x0202);
 pub(super) const BODY_INDEX: SectionKind = SectionKind::new(0x0203);
 const VERSION: u16 = 1;
+/// The content sections' version, for a build that names what its saved
+/// work depends on.
+pub const SECTIONS_VERSION: u16 = VERSION;
 const KEY_SPACE: KeySpace = KeySpace::new(0);
 const BODY_INDEX_LEN: usize = packed::INDEX_ENTRY_LEN;
 

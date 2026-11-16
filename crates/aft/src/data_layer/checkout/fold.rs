@@ -34,7 +34,7 @@ use aft_store::text::{Located, TextCopy, TextLocator, TextSegment};
 
 use super::{
     checkpoint, elapsed_ms, known_sections, Checkout, DataError, OtherStates, Planes, Published,
-    ReadByOthers, ReadUnit, SharedUnits, COMPACT_AT, EXTRACTOR_VERSION, READ_AT,
+    ReadByOthers, ReadUnit, SharedUnits, COMPACT_AT, READ_AT,
 };
 
 /// What folding a checkout's segments did.
@@ -471,7 +471,7 @@ impl Checkout {
             .collect::<Result<Vec<_>, _>>()?;
         for (position, record) in state.paths().iter().enumerate() {
             if !record.language.is_empty() {
-                let key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
+                let key = crate::data_layer::content::record_key(record.content, &record.language);
                 if let Some(holder) = newest(&contents, |content| content.find(key))? {
                     plan.records.insert(key, holder);
                 }

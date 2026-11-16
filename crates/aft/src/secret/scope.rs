@@ -36,6 +36,8 @@ impl SecretScope {
                 subc_protocol::scope::ScopeKind::Head => "head",
                 subc_protocol::scope::ScopeKind::Worker => "worker",
                 subc_protocol::scope::ScopeKind::Ephemeral => "ephemeral",
+                subc_protocol::scope::ScopeKind::Federated => "federated",
+                _ => "unsupported",
             }
             .to_string(),
             reference: stamp.scope_ref.clone(),
@@ -52,7 +54,7 @@ impl SecretScope {
         &self.owner
     }
 
-    /// The scope's kind: `head`, `worker` or `ephemeral`.
+    /// The scope's diagnostic kind, not a statement of eligibility for secrets.
     pub fn kind(&self) -> &str {
         &self.kind
     }

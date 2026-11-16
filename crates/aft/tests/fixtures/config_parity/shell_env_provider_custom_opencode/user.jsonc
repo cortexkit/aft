@@ -1,0 +1,15 @@
+{
+  "shell": {
+    "env_provider": {
+      "kind": "custom",
+      "command": [
+        "provider",
+        "env"
+      ],
+      "timeout_ms": 3000,
+      "watch": [
+        "project.env"
+      ]
+    }
+  }
+}

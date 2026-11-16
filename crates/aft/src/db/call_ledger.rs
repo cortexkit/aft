@@ -605,6 +605,7 @@ pub fn settle_with_tool_result_source(
     run_after_ledger_read(&tx);
     settle_row(&tx, &row, frame, outcome, reason, now, source)?;
     tx.commit()?;
+    crate::late_result_bus::settled();
     Ok(true)
 }
 
@@ -658,6 +659,7 @@ pub fn end_scope(conn: &Connection, scope: &ScopeIdentity, now: i64) -> rusqlite
         }
     }
     tx.commit()?;
+    crate::late_result_bus::settled();
     Ok(keys)
 }
 
@@ -1055,6 +1057,9 @@ pub fn withdraw(
         )?;
     }
     tx.commit()?;
+    if held_withdrawn {
+        crate::late_result_bus::settled();
+    }
     Ok(Withdrawal::Answer {
         body,
         kill_task,
@@ -1544,6 +1549,7 @@ pub fn observe_task_with_tool_result_source(
                     None,
                 )?;
                 tx.commit()?;
+                crate::late_result_bus::settled();
                 return Ok(TaskObservation {
                     recovered,
                     delivered_held_result: false,
@@ -1593,6 +1599,7 @@ pub fn observe_task_with_tool_result_source(
                 ))?;
             }
             tx.commit()?;
+            crate::late_result_bus::settled();
             return Ok(TaskObservation {
                 recovered,
                 delivered_held_result,
@@ -1605,6 +1612,7 @@ pub fn observe_task_with_tool_result_source(
         }
     }
     tx.commit()?;
+    crate::late_result_bus::settled();
     Ok(TaskObservation {
         recovered,
         delivered_held_result: false,

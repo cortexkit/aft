@@ -32,6 +32,9 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     let storage_dir = crate::bash_background::task_storage_dir(ctx);
+    let task_id =
+        ctx.bash_background()
+            .resolve_task_reference(&task_id, req.session(), &storage_dir);
     let result = ctx
         .bash_background()
         .kill_typed(&task_id, req.session())

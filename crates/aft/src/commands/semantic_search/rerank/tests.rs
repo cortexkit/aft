@@ -272,6 +272,114 @@ fn candidate_text_is_bounded_relative_and_repeatable() {
 // ---- served path ---------------------------------------------------------
 
 #[test]
+fn stage2_candidate_line_windows_match_whole_read() {
+    let project = tempfile::tempdir().unwrap();
+    let file = project.path().join("window.rs");
+    for invalid in [false, true] {
+        let mut source = b"// head\r\n\r\n".to_vec();
+        if invalid {
+            source.extend_from_slice(b"// invalid \xff\r\n");
+        }
+        source.extend_from_slice("#[inline]\r\npub fn later_identifier() {\r\n".as_bytes());
+        source.extend_from_slice(
+            format!("    {} earlier_identifier();\r\n", "é".repeat(40_000)).as_bytes(),
+        );
+        source.extend_from_slice(b"}\r\nlast\r");
+        std::fs::write(&file, &source).unwrap();
+        let symbol_start = source
+            .windows(9)
+            .position(|bytes| bytes == b"#[inline]")
+            .unwrap();
+        let unicode = source.iter().position(|byte| *byte == 0xc3).unwrap();
+        for range in [
+            None,
+            Some(super::super::comparator::SymbolOffsetRange::new(
+                symbol_start,
+                source.len(),
+            )),
+            Some(super::super::comparator::SymbolOffsetRange::new(
+                unicode + 1,
+                unicode + 17,
+            )),
+            Some(super::super::comparator::SymbolOffsetRange::new(
+                source.len() + 10,
+                source.len() + 20,
+            )),
+        ] {
+            let candidate = CandidateResult::new_exact(
+                file.clone(),
+                range,
+                super::super::evidence_descriptor::EvidenceDescriptor::for_e1(1, true, false),
+            );
+            for prose in [
+                "earlier_identifier later_identifier",
+                "missing_identifier",
+                "how does the last line work",
+            ] {
+                assert_eq!(
+                    streamed_candidate_text(project.path(), &candidate, prose),
+                    candidate_text(project.path(), &candidate, prose),
+                    "invalid={invalid}, range={range:?}, prose={prose}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn audit1432_candidate_windows_match_cached_whole_source_through_production_large_dispatch() {
+    let project = tempfile::tempdir().unwrap();
+    let file = project.path().join("large-window.rs");
+    for megabytes in [5, 9, 15] {
+        let mut bytes = b"// padding with unicode \xc3\xa9\r\n".repeat((megabytes << 20) / 28);
+        let start = bytes.len();
+        bytes.extend_from_slice(
+            b"#[inline]\r\npub fn tail_identifier() {\r\n    tail_identifier();\r\n}\r\n",
+        );
+        assert!(bytes.len() as u64 > crate::large_read::LARGE_READ_BYTES);
+        assert!((bytes.len() as u64) < crate::large_read::WHOLE_READ_CEILING);
+        std::fs::write(&file, &bytes).unwrap();
+        for range in [
+            None,
+            Some(super::super::comparator::SymbolOffsetRange::new(
+                start,
+                bytes.len(),
+            )),
+        ] {
+            let candidate = CandidateResult::new_exact(
+                file.clone(),
+                range,
+                super::super::evidence_descriptor::EvidenceDescriptor::for_e1(1, true, false),
+            );
+            for prose in [
+                "tail_identifier",
+                "missing_identifier",
+                "how does the last function work",
+            ] {
+                let expected = {
+                    let scope = super::super::request_files::install();
+                    scope.files().keep_read(&file, bytes.clone(), None);
+                    candidate_text(project.path(), &candidate, prose)
+                };
+                assert!(super::super::request_files::current().is_none());
+                let (streamed, _, largest) =
+                    crate::test_allocations::count_bytes_and_largest(|| {
+                        candidate_text(project.path(), &candidate, prose)
+                    });
+                assert!(
+                    (largest as u64) < crate::large_read::LARGE_READ_BYTES,
+                    "production dispatch retained a whole large file: largest allocation={largest}"
+                );
+                assert_eq!(
+                    streamed, expected,
+                    "MiB={megabytes}, range={range:?}, prose={prose}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn candidate_text_reuses_raw_source_without_lossy_matching_or_stale_lines() {
     let project = tempfile::tempdir().unwrap();
     let file = project.path().join("raw.rs");
@@ -292,6 +400,68 @@ fn candidate_text_reuses_raw_source_without_lossy_matching_or_stale_lines() {
     assert_eq!(
         candidate_text(project.path(), &whole, "target_name"),
         "raw.rs:1\ntarget_name\nfn target_name() {}"
+    );
+}
+
+#[test]
+fn stage2_candidate_invalid_leading_continuation_boundary_matches_whole() {
+    let project = tempfile::tempdir().unwrap();
+    let file = project.path().join("boundary.rs");
+    for prefix in [b"header\r\n".as_slice(), b"".as_slice()] {
+        let mut bytes = prefix.to_vec();
+        bytes.extend_from_slice(b"\x80\x80fn boundary_name() {}\r\n");
+        std::fs::write(&file, &bytes).unwrap();
+        for start in prefix.len()..=prefix.len() + 2 {
+            let candidate = CandidateResult::new_exact(
+                file.clone(),
+                Some(super::super::comparator::SymbolOffsetRange::new(
+                    start,
+                    bytes.len(),
+                )),
+                super::super::evidence_descriptor::EvidenceDescriptor::for_e1(1, true, false),
+            );
+            assert_eq!(
+                streamed_candidate_text(project.path(), &candidate, "boundary_name"),
+                candidate_text(project.path(), &candidate, "boundary_name"),
+                "prefix={}, start={start}",
+                prefix.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn stage2_candidate_text_skips_an_oversized_line_outside_symbol_range() {
+    use std::io::Write;
+    let project = tempfile::tempdir().unwrap();
+    let file = project.path().join("blob.rs");
+    let prefix = b"fn normal_symbol() {}\n";
+    let mut writer = std::fs::File::create(&file).unwrap();
+    writer.write_all(prefix).unwrap();
+    writer.write_all(&vec![b'x'; 17 * 1024 * 1024]).unwrap();
+    drop(writer);
+    let candidate = CandidateResult::new_exact(
+        file.clone(),
+        Some(super::super::comparator::SymbolOffsetRange::new(
+            0,
+            prefix.len(),
+        )),
+        super::super::evidence_descriptor::EvidenceDescriptor::for_e1(1, true, false),
+    );
+    let _scope = crate::bounded_io::enter_disclosure_if_absent();
+    let text = candidate_text(project.path(), &candidate, "normal_symbol");
+    assert_eq!(text, "blob.rs:1\nnormal_symbol");
+    let mut reply =
+        crate::protocol::Response::success("oversized-window", serde_json::json!({"text":text}));
+    crate::bounded_io::disclose_large_read_skips(&mut reply);
+    assert_eq!(reply.data["complete"], false);
+    assert_eq!(
+        reply.data["skipped_files"][0]["file"],
+        serde_json::json!(file)
+    );
+    assert_eq!(
+        reply.data["skipped_files"][0]["reason"],
+        crate::large_read::WHOLE_READ_SKIP_REASON
     );
 }
 
@@ -527,6 +697,327 @@ fn tiny_list(project: &Path, count: usize) -> CanonicalList {
             entries,
         }],
     }
+}
+
+#[test]
+fn audit1432_round4_middle_selection_failure_never_scores_or_commits_and_retries_fresh() {
+    for with_request_files in [false, true] {
+        let project = tempfile::tempdir().unwrap();
+        let mut list = tiny_list(project.path(), 2);
+        let path = list.blocks[0].entries[0].result.path.clone();
+        let mut source = b"// padding\n".repeat((5 << 20) / 11);
+        source.extend_from_slice(b"fn scan_subject() {}\n");
+        std::fs::write(&path, &source).unwrap();
+        assert!(list.blocks[0]
+            .entries
+            .iter()
+            .all(|entry| entry.result.symbol_range.is_none()));
+        let _files = with_request_files.then(super::super::request_files::install);
+        let backend = NumberedBackend::new(Vec::new());
+        let selected = Ok(SelectedBackend {
+            backend: backend.clone(),
+            fail_closed: false,
+        });
+        let prose = "how does scan_subject work";
+        let identity = memo_identity(
+            &list.key,
+            prose,
+            None,
+            &backend.fingerprint(),
+            2,
+            list.blocks[0].entries.iter().map(|entry| &entry.result),
+        );
+        let search = SearchConfig::default();
+        let settings = RerankSettings::resolve(&search);
+        let request = head_request(&search, project.path(), Some(prose), None);
+        let before = names(&list);
+        let outcome = crate::large_read::with_line_scan_failure(
+            crate::large_read::Site::MatchingLine,
+            || rerank_block_zero(&mut list, &selected, &settings, &request),
+        )
+        .unwrap();
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            0,
+            "a failure in selection alone must prevent scoring, request cache={with_request_files}"
+        );
+        assert!(
+            memo().lookup(&identity).is_none(),
+            "failed selection must not commit an outcome"
+        );
+        assert_eq!(
+            outcome,
+            HeadOutcome::Skipped("candidate source incomplete".into())
+        );
+        assert_eq!(names(&list), before);
+        assert_eq!(
+            super::super::matching_line_from_source(&path, prose, None)
+                .unwrap()
+                .0,
+            source.iter().filter(|&&byte| byte == b'\n').count() as u32 - 1,
+            "a failed request-cache lookup must be retried, not cached as no-match"
+        );
+        assert_eq!(
+            rerank_block_zero(&mut list, &selected, &settings, &request).unwrap(),
+            HeadOutcome::Reordered
+        );
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            1,
+            "retry must compute a fresh outcome"
+        );
+        assert!(memo().lookup(&identity).is_some());
+    }
+}
+
+#[test]
+fn audit1432_round4_complete_no_match_candidate_still_memoizes() {
+    let project = tempfile::tempdir().unwrap();
+    let list = tiny_list(project.path(), 2);
+    let path = list.blocks[0].entries[0].result.path.clone();
+    std::fs::write(
+        &path,
+        format!("{}\n", "7".repeat(127)).repeat((5 << 20) / 128),
+    )
+    .unwrap();
+    let _files = super::super::request_files::install();
+    let backend = NumberedBackend::new(Vec::new());
+    let selected = Ok(SelectedBackend {
+        backend: backend.clone(),
+        fail_closed: false,
+    });
+    let prose = "how does zqxwv_missing_identifier work";
+    let identity = memo_identity(
+        &list.key,
+        prose,
+        None,
+        &backend.fingerprint(),
+        2,
+        list.blocks[0].entries.iter().map(|entry| &entry.result),
+    );
+    assert!(
+        super::super::matching_line_from_source_checked(&path, prose, None)
+            .unwrap()
+            .is_none()
+    );
+    let search = SearchConfig::default();
+    let settings = RerankSettings::resolve(&search);
+    let request = head_request(&search, project.path(), Some(prose), None);
+    for _ in 0..2 {
+        assert_eq!(
+            rerank_block_zero(&mut list.clone(), &selected, &settings, &request).unwrap(),
+            HeadOutcome::Reordered
+        );
+        assert!(memo().lookup(&identity).is_some());
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            1,
+            "a complete no-match result must remain memoizable"
+        );
+    }
+}
+
+#[test]
+fn audit1432_round3_cancelled_candidate_scan_never_commits_and_next_request_is_fresh() {
+    for cancel_pass in [1, 2] {
+        let project = tempfile::tempdir().unwrap();
+        let mut list = tiny_list(project.path(), 2);
+        let path = list.blocks[0].entries[0].result.path.clone();
+        let mut source = b"fn scan_subject() {}\n".to_vec();
+        source.extend(b"// padding\n".repeat((5 << 20) / 11));
+        std::fs::write(&path, &source).unwrap();
+        list.blocks[0].entries[0].result.symbol_range =
+            Some(super::super::comparator::SymbolOffsetRange::new(0, 20));
+        let before = names(&list);
+        let backend = NumberedBackend::new(Vec::new());
+        let prose = "how does the streamed subject work";
+        let identity = memo_identity(
+            &list.key,
+            prose,
+            None,
+            &backend.fingerprint(),
+            2,
+            list.blocks[0].entries.iter().map(|entry| &entry.result),
+        );
+        assert!(memo().lookup(&identity).is_none());
+        let token = crate::executor::JobCancellation::new();
+        let worker_token = token.clone();
+        let worker_backend = backend.clone();
+        let root = project.path().to_path_buf();
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let _token = crate::executor::install_job_cancellation(worker_token);
+            let mut pass = 1;
+            let mut previous = 0;
+            let mut paused = false;
+            let outcome = crate::large_read::with_step_tap(
+                move |read| {
+                    if read < previous {
+                        pass += 1;
+                    }
+                    previous = read;
+                    if !paused && pass == cancel_pass && read >= 1 << 20 {
+                        paused = true;
+                        reached_tx.send((pass, read)).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                    }
+                },
+                || {
+                    let search = SearchConfig::default();
+                    rerank_block_zero(
+                        &mut list,
+                        &Ok(SelectedBackend {
+                            backend: worker_backend,
+                            fail_closed: false,
+                        }),
+                        &RerankSettings::resolve(&search),
+                        &head_request(&search, &root, Some(prose), None),
+                    )
+                },
+            );
+            (list, outcome)
+        });
+        let (pass, read) = reached_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(pass, cancel_pass);
+        assert!(read < source.len() as u64);
+        token.request_cancel();
+        release_tx.send(()).unwrap();
+        let (mut list, _) = worker.join().unwrap();
+        assert!(
+            memo().lookup(&identity).is_none(),
+            "cancelled pass {cancel_pass} established a cross-request memo entry"
+        );
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(names(&list), before);
+        let search = SearchConfig::default();
+        let outcome = rerank_block_zero(
+            &mut list,
+            &Ok(SelectedBackend {
+                backend: backend.clone(),
+                fail_closed: false,
+            }),
+            &RerankSettings::resolve(&search),
+            &head_request(&search, project.path(), Some(prose), None),
+        )
+        .unwrap();
+        assert_eq!(outcome, HeadOutcome::Reordered);
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            1,
+            "the next request must score complete candidates, not replay a cancelled outcome"
+        );
+        assert!(memo().lookup(&identity).is_some());
+    }
+}
+
+#[test]
+fn audit1432_round3_ceiling_incomplete_candidate_never_commits() {
+    let project = tempfile::tempdir().unwrap();
+    let mut list = tiny_list(project.path(), 2);
+    let path = list.blocks[0].entries[0].result.path.clone();
+    let mut source = b"fn scan_subject() {}\n".to_vec();
+    source.extend(vec![b'x'; 17 << 20]);
+    std::fs::write(path, source).unwrap();
+    list.blocks[0].entries[0].result.symbol_range =
+        Some(super::super::comparator::SymbolOffsetRange::new(0, 20));
+    let backend = NumberedBackend::new(Vec::new());
+    let prose = "how does the streamed subject work";
+    let identity = memo_identity(
+        &list.key,
+        prose,
+        None,
+        &backend.fingerprint(),
+        2,
+        list.blocks[0].entries.iter().map(|entry| &entry.result),
+    );
+    let search = SearchConfig::default();
+    let _ = rerank_block_zero(
+        &mut list,
+        &Ok(SelectedBackend {
+            backend: backend.clone(),
+            fail_closed: false,
+        }),
+        &RerankSettings::resolve(&search),
+        &head_request(&search, project.path(), Some(prose), None),
+    );
+    assert!(
+        memo().lookup(&identity).is_none(),
+        "a ceiling-skipped candidate must not be treated as a complete memo input"
+    );
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn audit1432_round3_cancelled_backend_result_never_commits() {
+    struct CancelAfterScoring {
+        backend: Arc<NumberedBackend>,
+        token: crate::executor::JobCancellation,
+    }
+    impl RerankBackend for CancelAfterScoring {
+        fn fingerprint(&self) -> RerankFingerprint {
+            self.backend.fingerprint()
+        }
+        fn max_batch(&self) -> usize {
+            self.backend.max_batch()
+        }
+        fn score(
+            &self,
+            query: &str,
+            docs: &[RerankDoc<'_>],
+            deadline: Instant,
+        ) -> Result<Vec<f32>, RerankError> {
+            let scores = self.backend.score(query, docs, deadline);
+            self.token.request_cancel();
+            scores
+        }
+    }
+    let project = tempfile::tempdir().unwrap();
+    let mut list = tiny_list(project.path(), 2);
+    let backend = NumberedBackend::new(Vec::new());
+    let prose = "how does the scored subject work";
+    let identity = memo_identity(
+        &list.key,
+        prose,
+        None,
+        &backend.fingerprint(),
+        2,
+        list.blocks[0].entries.iter().map(|entry| &entry.result),
+    );
+    let search = SearchConfig::default();
+    let token = crate::executor::JobCancellation::new();
+    {
+        let _token = crate::executor::install_job_cancellation(token.clone());
+        let selected = Ok(SelectedBackend {
+            backend: Arc::new(CancelAfterScoring {
+                backend: backend.clone(),
+                token,
+            }),
+            fail_closed: false,
+        });
+        let _ = rerank_block_zero(
+            &mut list,
+            &selected,
+            &RerankSettings::resolve(&search),
+            &head_request(&search, project.path(), Some(prose), None),
+        );
+    }
+    assert!(
+        memo().lookup(&identity).is_none(),
+        "cancellation during scoring must be checked again before memo publication"
+    );
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    rerank_block_zero(
+        &mut list,
+        &Ok(SelectedBackend {
+            backend: backend.clone(),
+            fail_closed: false,
+        }),
+        &RerankSettings::resolve(&search),
+        &head_request(&search, project.path(), Some(prose), None),
+    )
+    .unwrap();
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
 }
 
 fn head_request<'a>(

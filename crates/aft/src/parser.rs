@@ -775,17 +775,30 @@ pub fn detect_language(path: &Path) -> Option<LangId> {
 /// Dynamic extensions are opt-in per handling context. Detection never reads
 /// stored grammars and never starts a download.
 pub fn detect_language_any(path: &Path, dynamic_languages: bool) -> Option<LangId> {
-    detect_language(path).or_else(|| {
-        if !dynamic_languages {
-            return None;
-        }
-        let extension = path.extension()?.to_str()?;
-        crate::grammar::manifest()
-            .extensions
-            .iter()
-            .any(|ext| ext == extension)
-            .then_some(LangId::Luau)
-    })
+    detect_language(path).or_else(|| dynamic_language_for_extension(path, dynamic_languages))
+}
+
+/// Whether `path` is a Luau file, decided from its name alone. It gives the
+/// same answer as `detect_language_any(..) == Some(LangId::Luau)` but never
+/// opens the file: `detect_language` reads and parses every `.h` header to
+/// choose between C, C++ and Objective-C, and a header is never Luau. Callers
+/// that test every path of a checkout must use this one; with the header
+/// reads, a Linux kernel cold build spent over a minute on one thread here.
+pub(crate) fn is_luau_path(path: &Path, dynamic_languages: bool) -> bool {
+    language_for_extension(path).is_none()
+        && dynamic_language_for_extension(path, dynamic_languages) == Some(LangId::Luau)
+}
+
+fn dynamic_language_for_extension(path: &Path, dynamic_languages: bool) -> Option<LangId> {
+    if !dynamic_languages {
+        return None;
+    }
+    let extension = path.extension()?.to_str()?;
+    crate::grammar::manifest()
+        .extensions
+        .iter()
+        .any(|ext| ext == extension)
+        .then_some(LangId::Luau)
 }
 
 /// Detect against the caller's source snapshot rather than reopening the file.
@@ -1157,9 +1170,120 @@ pub(crate) mod work_counters {
 pub(crate) fn read_source(path: &Path) -> std::io::Result<String> {
     #[cfg(test)]
     work_counters::SOURCE_READS.with(|count| count.set(count.get() + 1));
-    let source = crate::bounded_io::read_to_string(path)?;
+    if !crate::bounded_io::skip_disclosure_active() {
+        return crate::bounded_io::read_to_string(path);
+    }
+    let mut reader = crate::bounded_io::reader(path, None)?;
+    crate::large_read::allow_whole(
+        crate::large_read::Site::ParseSource,
+        path,
+        reader.size_at_open(),
+    )?;
+    let bytes = reader.append(Vec::new(), reader.size_at_open() as usize)?;
+    let source = String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     crate::large_read::record_whole(crate::large_read::Site::ParseSource, source.len());
     Ok(source)
+}
+
+#[cfg(test)]
+#[test]
+fn stage2_search_scoped_parse_source_obeys_whole_read_ceiling() {
+    crate::bounded_io::with_skip_disclosure(|| {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("large.rs");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(crate::large_read::WHOLE_READ_CEILING + 1)
+            .unwrap();
+        assert!(crate::large_read::is_ceiling_error(
+            &read_source(&path).unwrap_err()
+        ));
+        file.set_len(crate::large_read::WHOLE_READ_CEILING - 1)
+            .unwrap();
+        assert_eq!(
+            read_source(&path).unwrap().len() as u64,
+            crate::large_read::WHOLE_READ_CEILING - 1
+        );
+        crate::protocol::Response::success("parse-ceiling", serde_json::json!({}))
+    });
+}
+
+#[cfg(test)]
+mod large_source_scope_tests {
+    use super::*;
+    use crate::language::LanguageProvider;
+
+    fn large_typescript(path: &Path) {
+        let mut source = "/*".to_string();
+        source.push_str(&"x".repeat(17 << 20));
+        source.push_str(
+            "*/\n\n\n\n\n\n\n\n\n\n\nexport function large_member(): number { return 7; }\n",
+        );
+        std::fs::write(path, source).unwrap();
+    }
+
+    #[test]
+    fn audit1432_round3_supported_large_source_reaches_real_outline_and_zoom() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("large.ts");
+        large_typescript(&path);
+        let ctx = crate::context::AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.path().to_path_buf()),
+                storage_dir: Some(root.path().join(".store")),
+                ..Default::default()
+            },
+        );
+        for command in ["outline", "zoom"] {
+            let req: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+                "id":"large-source", "command":command, "file":path, "symbol":"large_member", "context_lines":0
+            })).unwrap();
+            let response = if command == "outline" {
+                crate::commands::outline::handle_outline(&req, &ctx)
+            } else {
+                crate::commands::zoom::handle_zoom(&req, &ctx)
+            };
+            assert!(response.success, "{command}: {response:?}");
+            let rendered = crate::subc_format::format_response(command, &response, false);
+            assert!(rendered.contains("large_member"), "{command}: {response:?}");
+            assert!(!response
+                .data
+                .to_string()
+                .contains(crate::large_read::WHOLE_READ_SKIP_REASON));
+        }
+    }
+
+    #[test]
+    fn audit1432_round3_background_parser_does_not_inherit_another_threads_search_ceiling() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("large.ts");
+        large_typescript(&path);
+        crate::bounded_io::with_skip_disclosure(|| {
+            assert!(crate::bounded_io::skip_disclosure_active());
+            let budget = crate::bounded_io::capture();
+            let worker_path = path.clone();
+            std::thread::scope(|threads| {
+                let background = threads.spawn(|| {
+                    assert!(!crate::bounded_io::skip_disclosure_active());
+                    assert!(read_source(&path).unwrap().len() > 17 << 20);
+                    let symbols = TreeSitterProvider::new().list_symbols(&path).unwrap();
+                    assert!(symbols.iter().any(|symbol| symbol.name == "large_member"));
+                });
+                let search_worker = threads.spawn(move || {
+                    crate::bounded_io::with_budget(budget, || {
+                        assert!(crate::bounded_io::skip_disclosure_active());
+                        assert!(crate::large_read::is_ceiling_error(
+                            &read_source(&worker_path).unwrap_err()
+                        ));
+                    })
+                });
+                search_worker.join().unwrap();
+                background.join().unwrap();
+            });
+            crate::protocol::Response::success("background-parse", serde_json::json!({}))
+        });
+    }
 }
 
 /// Keep the completed read's allocation; an Arc<str> conversion copies its bytes.
@@ -1401,20 +1525,8 @@ pub(crate) fn retains_luau_parser_for_test() -> bool {
     REUSABLE_PARSERS.with(|parsers| parsers.borrow().contains_key(&LangId::Luau))
 }
 
-/// One parsing boundary for fresh and reused dynamic-language parsers.
-pub(crate) fn parse_with_parser(
-    parser: &mut tree_sitter::Parser,
-    path: &Path,
-    source: &str,
-    lang: LangId,
-    old_tree: Option<&Tree>,
-) -> Result<Tree, AftError> {
-    let no_tree = || AftError::ParseError {
-        message: format!("tree-sitter parse returned None for {}", path.display()),
-    };
-    if lang != LangId::Luau {
-        return parser.parse(source, old_tree).ok_or_else(no_tree);
-    }
+/// The process's Luau budget, also used to describe persisted timeout gaps.
+pub(crate) fn luau_parse_deadline() -> std::time::Duration {
     #[cfg(feature = "test-hooks")]
     let deadline = {
         static FROM_ENV: std::sync::LazyLock<Option<std::time::Duration>> =
@@ -1434,6 +1546,24 @@ pub(crate) fn parse_with_parser(
     };
     #[cfg(not(feature = "test-hooks"))]
     let deadline = LUAU_PARSE_DEADLINE;
+    deadline
+}
+
+/// One parsing boundary for fresh and reused dynamic-language parsers.
+pub(crate) fn parse_with_parser(
+    parser: &mut tree_sitter::Parser,
+    path: &Path,
+    source: &str,
+    lang: LangId,
+    old_tree: Option<&Tree>,
+) -> Result<Tree, AftError> {
+    let no_tree = || AftError::ParseError {
+        message: format!("tree-sitter parse returned None for {}", path.display()),
+    };
+    if lang != LangId::Luau {
+        return parser.parse(source, old_tree).ok_or_else(no_tree);
+    }
+    let deadline = luau_parse_deadline();
     let start = std::time::Instant::now();
     let mut expired = false;
     // This bounds host parsing, but cannot interrupt one lex or scanner call

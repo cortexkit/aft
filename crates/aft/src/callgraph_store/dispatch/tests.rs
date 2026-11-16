@@ -342,6 +342,143 @@ fn resolutions(parse: &ParseBlob) -> Vec<Resolution> {
         .collect()
 }
 
+#[test]
+fn rust_smart_pointer_fields_resolve_concrete_methods() {
+    for (imports, field_type) in [
+        ("use std::sync::Arc;", "Arc<Inner>"),
+        ("use std::{sync::Arc as Shared};", "Shared<Inner>"),
+        ("use std::rc::Rc;", "Rc<Inner>"),
+        ("use alloc::{sync::Arc};", "Arc<Inner>"),
+        ("use alloc::rc::Rc;", "Rc<Inner>"),
+        ("use alloc::boxed::Box as Owned;", "Owned<Inner>"),
+        (
+            "#![no_std]\nextern crate alloc; use alloc::boxed::Box;",
+            "Box<Inner>",
+        ),
+        ("extern crate alloc as heap;", "heap::boxed::Box<Inner>"),
+        ("", "Box<Inner>"),
+        ("", "std::sync::Arc<Inner>"),
+        ("", "::std::rc::Rc<Inner>"),
+        ("", "alloc::boxed::Box<Inner>"),
+        ("use std::sync::Arc;", "Arc<Box<Inner>>"),
+    ] {
+        let source = format!("{imports} struct Inner; impl Inner {{ fn hit(&self) {{}} }} struct Holder {{ value: {field_type} }} impl Holder {{ fn run(&self) {{ self.value.hit(); }} }}");
+        let record = crate::data_layer::content::extract(source.as_bytes(), "rust").unwrap();
+        let (surface, body) = record.encode();
+        let decoded = aft_store::content::ContentRecord::decode(&surface, &body).unwrap();
+        let CallgraphBlob::Parse(parsed) =
+            crate::data_layer::content::blob_from_record(&decoded).unwrap()
+        else {
+            unreachable!()
+        };
+        let result = resolutions(&parsed);
+        assert_eq!(result.len(), 1, "{source}: {:#?}", parsed.dispatch);
+        assert_eq!(
+            result[0]
+                .targets
+                .iter()
+                .map(|t| (t.symbol.as_str(), t.provenance))
+                .collect::<Vec<_>>(),
+            vec![("Inner::hit", "exact")],
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn rust_smart_pointer_identity_is_lexical_and_never_unwraps_locks() {
+    for source in [
+        "struct Arc<T>(T); struct Holder { value: Arc<Inner> }",
+        "struct Box<T>(T); struct Holder { value: Box<Inner> }",
+        "use other::Arc; struct Holder { value: Arc<Inner> }",
+        "use std::sync::Mutex; struct Holder { value: Mutex<Inner> }",
+        "struct Holder<Arc> { value: Arc<Inner> }",
+        "use std::sync::Arc; struct Holder<Inner> { value: Arc<Inner> }",
+        "mod std {} struct Holder { value: std::sync::Arc<Inner> }",
+        "extern crate other as std; struct Holder { value: std::sync::Arc<Inner> }",
+        "#![no_std]\nstruct Holder { value: Box<Inner> }",
+    ] {
+        let source = format!("{source} struct Inner; impl Inner {{ fn hit(&self) {{}} }} impl Holder {{ fn run(&self) {{ self.value.hit(); }} }}");
+        let parsed = parse(&source, "rust");
+        assert!(
+            parsed
+                .dispatch
+                .fields
+                .iter()
+                .all(|f| !f.ty.starts_with("@smart:")),
+            "{source}"
+        );
+        assert!(
+            resolutions(&parsed).iter().all(|r| r.targets.is_empty()),
+            "{source}"
+        );
+    }
+    let parsed = parse(
+        "use std::sync::Arc; mod local { struct Arc<T>(T); struct Holder { value: Arc<Inner> } }",
+        "rust",
+    );
+    assert_eq!(
+        parsed
+            .dispatch
+            .fields
+            .iter()
+            .find(|f| f.name == "value")
+            .unwrap()
+            .ty,
+        "Arc"
+    );
+}
+
+#[test]
+fn rust_smart_pointer_wrapper_methods_keep_precedence() {
+    for (imports, field_type) in [
+        ("use std::sync::Arc;", "Arc<Inner>"),
+        ("use std::sync::Arc as Shared;", "Shared<Inner>"),
+        ("use std::rc::Rc;", "Rc<Inner>"),
+    ] {
+        let parsed = parse(&format!("{imports} #[derive(Clone)] struct Inner; impl Inner {{ fn clone(&self) {{}} fn as_ref(&self) {{}} fn borrow(&self) {{}} fn deref(&self) {{}} fn into(&self) {{}} fn to_owned(&self) {{}} }} struct Holder {{ value: {field_type} }} impl Holder {{ fn run(&self) {{ self.value.clone(); self.value.as_ref(); self.value.borrow(); self.value.deref(); self.value.into(); self.value.to_owned(); }} }}"), "rust");
+        let result = resolutions(&parsed);
+        assert_eq!(result.len(), 6);
+        assert!(
+            result.iter().all(|r| r.targets.is_empty()),
+            "{field_type}: {result:#?}"
+        );
+    }
+    let parsed = parse("struct Inner; impl Inner { fn leak(&self) {} fn clone(&self) {} fn len(&self) {} } struct Holder { value: Box<Inner> } impl Holder { fn run(&self) { self.value.leak(); self.value.clone(); self.value.len(); } }", "rust");
+    let result = resolutions(&parsed);
+    assert_eq!(result.len(), 3);
+    for (result, method) in result
+        .iter()
+        .zip(["Inner::leak", "Inner::clone", "Inner::len"])
+    {
+        assert_eq!(
+            result
+                .targets
+                .iter()
+                .map(|t| t.symbol.as_str())
+                .collect::<Vec<_>>(),
+            vec![method]
+        );
+    }
+}
+
+#[test]
+fn rust_smart_pointer_trait_objects_and_user_wrapper_methods_are_unchanged() {
+    let parsed = parse("trait Task { fn hit(&self); } struct Inner; impl Task for Inner { fn hit(&self) {} } struct Holder { value: Box<dyn Task> } impl Holder { fn run(&self) { self.value.hit(); } }", "rust");
+    assert_eq!(parsed.dispatch.fields[0].ty, "Box");
+    assert!(resolutions(&parsed)[0].targets.is_empty());
+    let parsed = parse("struct Arc<T>(T); impl<T> Arc<T> { fn hit(&self) {} } struct Inner; impl Inner { fn hit(&self) {} } struct Holder { value: Arc<Inner> } impl Holder { fn run(&self) { self.value.hit(); } }", "rust");
+    let result = resolutions(&parsed);
+    assert_eq!(
+        result[0]
+            .targets
+            .iter()
+            .map(|t| t.symbol.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Arc<T>::hit"]
+    );
+}
+
 fn ts_object_target(parse: &ParseBlob, line: u32) -> BTreeSet<String> {
     let resolver = Resolver::new(BTreeMap::from([("fixture".into(), parse)]));
     let site = parse

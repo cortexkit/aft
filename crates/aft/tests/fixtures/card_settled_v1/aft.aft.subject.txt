@@ -1,0 +1,1 @@
+ck.box_example.event.cingulate.card_settled.v1.aft

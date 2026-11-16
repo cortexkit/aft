@@ -154,11 +154,14 @@ fn zoom_parse_source(
     if LEGACY_ZOOM_PARSE.with(|legacy| legacy.get()) {
         return FileParser::new().parse_cloned(path);
     }
-    let lang = crate::parser::detect_language_from_source(path, source).ok_or_else(|| {
-        crate::error::AftError::InvalidRequest {
+    let lang = crate::parser::detect_language_from_source(path, source)
+        .or_else(|| {
+            crate::parser::detect_language_any(path, cfg!(feature = "wasm-grammars"))
+                .filter(|language| *language == LangId::Luau)
+        })
+        .ok_or_else(|| crate::error::AftError::InvalidRequest {
             message: format!("unsupported file extension: {}", path.display()),
-        }
-    })?;
+        })?;
     // Zoom already read these bytes. Parse the displayed source, not a second
     // disk snapshot that can differ if an editor saves during the request.
     Ok((FileParser::parse_source(path, source, lang)?, lang))
@@ -462,6 +465,7 @@ fn handle_zoom_targets(
     // the rest of the batch still answers. The whole call is refused only
     // when no entry is usable, because then there is nothing to return.
     let mut entries = Vec::with_capacity(targets.len());
+    let mut gaps = Vec::new();
     let mut first_refusal: Option<String> = None;
     let mut any_usable = false;
     let mut memo = ZoomTargetMemo {
@@ -475,7 +479,7 @@ fn handle_zoom_targets(
                 match zoom_target_symbol_names(req, ctx, file, symbols, &mut memo) {
                     Ok(names) => {
                         for name in names {
-                            let response = zoom_one_target_response(
+                            let mut response = zoom_one_target_response(
                                 req,
                                 ctx,
                                 file,
@@ -485,6 +489,15 @@ fn handle_zoom_targets(
                                 &mut memo,
                             );
                             crate::run_tool_call::progress::report();
+                            if matches!(
+                                response.data["code"].as_str(),
+                                Some("grammar_unavailable" | "grammar_parse_timeout")
+                            ) {
+                                let mut gap = response.data.clone();
+                                gap["path"] = file.into();
+                                response.data["gaps"] = serde_json::json!([gap.clone()]);
+                                gaps.push(gap);
+                            }
                             // An access ask must reach the host unchanged so it
                             // can ask and retry; inside one batch entry nobody
                             // would see it.
@@ -501,7 +514,16 @@ fn handle_zoom_targets(
                             }));
                         }
                     }
-                    Err(response) => {
+                    Err(mut response) => {
+                        if matches!(
+                            response.data["code"].as_str(),
+                            Some("grammar_unavailable" | "grammar_parse_timeout")
+                        ) {
+                            let mut gap = response.data.clone();
+                            gap["path"] = file.into();
+                            response.data["gaps"] = serde_json::json!([gap.clone()]);
+                            gaps.push(gap);
+                        }
                         if crate::access_policy::is_access_request(&response)
                             || (targets.len() == 1 && response.data["code"] == "denied_floor")
                         {
@@ -542,12 +564,23 @@ fn handle_zoom_targets(
         }
     }
 
-    Response::success(
+    let mut response = Response::success(
         &req.id,
         serde_json::json!({
             "targets": entries,
         }),
-    )
+    );
+    if !gaps.is_empty() {
+        response.data["complete"] = false.into();
+        response.data["text"] = gaps
+            .iter()
+            .filter_map(|gap| gap["message"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into();
+        response.data["gaps"] = serde_json::json!(gaps);
+    }
+    response
 }
 
 /// Merge a top-level file lookup into the target batch without parsing it yet.
@@ -1513,9 +1546,12 @@ fn zoom_one_symbol_inner(
         );
     }
 
+    if let Err(error) = crate::data_layer::grammar::prepare(ctx, path) {
+        return crate::data_layer::grammar::error_response_for_path(&req.id, &error, path);
+    }
     let matches = match resolve_zoom_symbol(ctx.provider(), path, symbol_name, is_heading) {
         Ok(matches) => matches,
-        Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+        Err(e) => return crate::data_layer::grammar::error_response_for_path(&req.id, &e, path),
     };
 
     // LSP-enhanced disambiguation (S03)
@@ -1567,8 +1603,15 @@ fn zoom_one_symbol_inner(
     }
 
     if matches.is_empty() {
-        let msg = match crate::parser::list_symbols_shared(ctx.provider(), path, false) {
+        let msg = match crate::parser::list_symbols_shared(
+            ctx.provider(),
+            path,
+            cfg!(feature = "wasm-grammars"),
+        ) {
             Ok(all_symbols) => symbol_not_found_message(symbol_name, &all_symbols, is_heading),
+            Err(error) if crate::data_layer::grammar::is_grammar_error(&error) => {
+                return crate::data_layer::grammar::error_response_for_path(&req.id, &error, path)
+            }
             Err(_) => deterministic_zoom_refusal(
                 format!("symbol '{symbol_name}' not found"),
                 "List the file outline, then change `target` or `symbols`.",
@@ -1593,12 +1636,17 @@ fn zoom_one_symbol_inner(
         .map(|source| source.lines().collect::<Vec<_>>());
     let effective_lines = resolved_lines.as_deref().unwrap_or(lines);
 
-    let resolved_lang = detect_language(resolved_file_path);
+    let resolved_lang =
+        crate::parser::detect_language_any(resolved_file_path, cfg!(feature = "wasm-grammars"));
     let container_outline = if might_have_container_members(target) {
         match build_container_outline(ctx, resolved_file_path, target) {
             Ok(outline) => Some(outline),
             Err(e) => {
-                return Response::error(&req.id, e.code(), e.to_string());
+                return crate::data_layer::grammar::error_response_for_path(
+                    &req.id,
+                    &e,
+                    resolved_file_path,
+                );
             }
         }
     } else {
@@ -1689,16 +1737,30 @@ fn zoom_one_symbol_inner(
         if !enrichments.contains_key(resolved_file_path) {
             #[cfg(test)]
             ZOOM_ENRICHMENT_BUILDS.with(|count| count.set(count.get() + 1));
-            let symbols =
-                match crate::parser::list_symbols_shared(ctx.provider(), resolved_file_path, false)
-                {
-                    Ok(symbols) => symbols,
-                    Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
-                };
+            let symbols = match crate::parser::list_symbols_shared(
+                ctx.provider(),
+                resolved_file_path,
+                cfg!(feature = "wasm-grammars"),
+            ) {
+                Ok(symbols) => symbols,
+                Err(e) => {
+                    return crate::data_layer::grammar::error_response_for_path(
+                        &req.id,
+                        &e,
+                        resolved_file_path,
+                    )
+                }
+            };
             let resolved_source = resolved_source.as_deref().unwrap_or(source).to_string();
             let (tree, lang) = match zoom_parse_source(resolved_file_path, &resolved_source) {
                 Ok(parsed) => parsed,
-                Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+                Err(e) => {
+                    return crate::data_layer::grammar::error_response_for_path(
+                        &req.id,
+                        &e,
+                        resolved_file_path,
+                    )
+                }
             };
             let calls = extract_calls_with_ranges(&resolved_source, tree.root_node(), lang);
             let line_starts = zoom_line_starts(&resolved_source);
@@ -2031,6 +2093,24 @@ fn resolve_zoom_symbol(
     let (name, anchor_line) = split_zoom_line_anchor(query);
     let matches = if is_heading {
         resolve_heading_symbols(provider, path, name)?
+    } else if crate::parser::detect_language_any(path, cfg!(feature = "wasm-grammars"))
+        == Some(LangId::Luau)
+    {
+        crate::parser::list_symbols_shared(provider, path, true)?
+            .iter()
+            .filter(|symbol| {
+                symbol.name == name
+                    || symbol.parent.as_ref().is_some_and(|parent| {
+                        format!("{parent}.{}", symbol.name) == name
+                            || format!("{parent}:{}", symbol.name) == name
+                    })
+            })
+            .cloned()
+            .map(|symbol| SymbolMatch {
+                file: path.display().to_string(),
+                symbol,
+            })
+            .collect()
     } else {
         match provider.resolve_symbol(path, name) {
             Err(crate::error::AftError::SymbolNotFound { .. }) => Vec::new(),
@@ -2455,7 +2535,11 @@ fn render_json_zoom(
         None
     };
     let (calls_out, called_by) = if include_callgraph {
-        let all_symbols = match crate::parser::list_symbols_shared(ctx.provider(), path, false) {
+        let all_symbols = match crate::parser::list_symbols_shared(
+            ctx.provider(),
+            path,
+            cfg!(feature = "wasm-grammars"),
+        ) {
             Ok(s) => s,
             Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
         };
@@ -2585,15 +2669,16 @@ fn resolve_heading_symbols(
     path: &Path,
     query: &str,
 ) -> Result<Vec<SymbolMatch>, crate::error::AftError> {
-    let headings: Vec<SymbolMatch> = crate::parser::list_symbols_shared(provider, path, false)?
-        .iter()
-        .filter(|symbol| symbol.kind == SymbolKind::Heading)
-        .cloned()
-        .map(|symbol| SymbolMatch {
-            file: path.display().to_string(),
-            symbol,
-        })
-        .collect();
+    let headings: Vec<SymbolMatch> =
+        crate::parser::list_symbols_shared(provider, path, cfg!(feature = "wasm-grammars"))?
+            .iter()
+            .filter(|symbol| symbol.kind == SymbolKind::Heading)
+            .cloned()
+            .map(|symbol| SymbolMatch {
+                file: path.display().to_string(),
+                symbol,
+            })
+            .collect();
 
     let anchors = if query.starts_with('#') {
         provider.heading_anchors(path)?

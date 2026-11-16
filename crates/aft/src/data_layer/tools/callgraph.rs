@@ -45,6 +45,8 @@ pub(crate) enum Access {
 /// The data layer's call graph for `ctx`'s root, once no recorded edit
 /// waits for it, or [`Access::Building`] after [`READ_WAIT`].
 pub(crate) fn access(ctx: &AppContext) -> Access {
+    #[cfg(feature = "wasm-grammars")]
+    crate::grammar::configure(&ctx.config());
     let Some(checkout) = ctx
         .data_checkout()
         .filter(|checkout| checkout.checkout().planes().callgraph)
@@ -111,6 +113,14 @@ pub(crate) fn ops_graph(
         index_refusal_response, not_indexed_response, store_error_response,
     };
     use crate::context::CallgraphStoreAccess;
+    #[cfg(not(feature = "wasm-grammars"))]
+    for file in files {
+        if let Err(error) = super::super::grammar::prepare(ctx, file) {
+            return Err(super::super::grammar::error_response_for_path(
+                req_id, &error, file,
+            ));
+        }
+    }
     match access(ctx) {
         Access::Building => Err(index_refusal_response(
             req_id,
@@ -121,6 +131,9 @@ pub(crate) fn ops_graph(
         Access::Failed(error) => Err(store_error_response(req_id, operation, error)),
         Access::Ready(reader, view) => {
             for file in files {
+                if let Some(response) = grammar_gap(req_id, &view, file) {
+                    return Err(response);
+                }
                 if !covers(&view, file) {
                     // A file whose slice could not be read looks absent;
                     // say the read failed rather than that it is not
@@ -150,6 +163,19 @@ pub(crate) fn ops_graph(
             Err(index_refusal_response(req_id, operation, ctx, &access))
         }
     }
+}
+
+pub(crate) fn grammar_gap(
+    req_id: &str,
+    view: &CheckoutView,
+    file: &Path,
+) -> Option<crate::protocol::Response> {
+    let relative = relative(view.root(), file)?;
+    let reason = view
+        .current_state()
+        .skipped_parses()
+        .get(relative.as_bytes())?;
+    super::super::grammar::response(req_id, reason, &view.root().join(relative))
 }
 
 /// The error to send instead of an answer built while a read of the data

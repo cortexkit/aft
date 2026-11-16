@@ -2041,7 +2041,6 @@ impl SubcRelayTransport {
         let consumer = self.consumer().await?;
         let identity = subc_protocol::BindIdentity::new("aft-gh-relay", session.to_string());
         let mut options = subc_client_rs::CallOptions {
-            consumer_identity: crate::launch_nonce::consumer_identity(),
             ..subc_client_rs::CallOptions::default()
         };
         if let Some(deadline) = self.route_open_deadline {

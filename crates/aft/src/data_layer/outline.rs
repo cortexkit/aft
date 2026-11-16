@@ -22,11 +22,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
-use aft_store::content::{OutlineSymbol, RecordKey};
+use aft_store::content::OutlineSymbol;
 use aft_store::ids::ContentKey;
 
 use super::checkout::{CheckoutView, DataError};
-use super::content::EXTRACTOR_VERSION;
 use super::runtime::DataCheckout;
 use crate::context::AppContext;
 use crate::parser::{SharedSymbolCache, SymbolCache};
@@ -186,7 +185,7 @@ fn load(
     if !parsed_as(path, &record.language) {
         return Ok(Outcome::Left);
     }
-    let key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
+    let key = crate::data_layer::content::record_key(record.content, &record.language);
     // The checkout's stat evidence proves the file still holds the bytes
     // its record was read from: a shared table needs no read of the file.
     if record.kind.has_content()
@@ -320,6 +319,7 @@ fn parsed_as(path: &Path, language: &str) -> bool {
         return matches!(language, "c" | "cpp" | "objc");
     }
     crate::parser::language_for_extension(path)
+        .or_else(|| crate::parser::detect_language_any(path, cfg!(feature = "wasm-grammars")))
         .is_some_and(|lang| format!("{lang:?}").to_lowercase() == language)
 }
 

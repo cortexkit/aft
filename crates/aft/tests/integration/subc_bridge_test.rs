@@ -8381,11 +8381,25 @@ async fn drive_lossy_pressure_daemon(input: FakeDaemonInput) {
 }
 
 async fn read_raw_inventory_frame(stream: &mut tokio::net::TcpStream, label: &str) -> Frame {
-    tokio::time::timeout(Duration::from_secs(10), read_subc_frame(stream))
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
-        .expect("read inventory frame")
-        .unwrap_or_else(|| panic!("EOF waiting for {label}"))
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = crate::subc_fake::read_frame(stream)
+                .await
+                .expect("read inventory frame")
+                .unwrap_or_else(|| panic!("EOF waiting for {label}"));
+            if frame_operation(&frame).as_deref() != Some("catalog.watch") {
+                return frame;
+            }
+            assert_eq!(frame.header.ty, FrameType::Request);
+            assert_eq!(frame.header.channel, 0);
+            // These inventory fixtures model a polling-only daemon.
+            // Refuse every watch attempt, including retries after a status
+            // publication is acknowledged.
+            send_channel_zero_error(stream, frame.header.corr, "unknown_op").await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
 }
 
 async fn accept_status_consumer(
@@ -8408,6 +8422,10 @@ async fn accept_status_consumer(
         .await
         .expect("authenticate consumer");
         let first = read_raw_inventory_frame(&mut stream, "consumer request").await;
+        if crate::subc_fake::ckbus_route_refusal(&first).is_some() {
+            tokio::spawn(crate::subc_fake::serve_without_modules(stream, first));
+            continue;
+        }
         if frame_operation(&first).as_deref() == Some("route.open") {
             // The default-enabled GitHub shim also connects at startup. This
             // daemon has no vault; refuse its manifest route, not the fleet dial.
@@ -13331,6 +13349,7 @@ async fn drive_module_hello_health_manifest_daemon(input: FakeDaemonInput) {
             "page.collect",
             "page.read",
             "page.release",
+            "display.read",
             "diagnostics.findings",
             "permissions.list",
             "permissions.revoke",

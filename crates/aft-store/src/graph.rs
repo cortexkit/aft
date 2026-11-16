@@ -50,6 +50,9 @@ const TERM_POSTINGS: SectionKind = SectionKind::new(0x0304);
 /// separately. These sections are required, so raising this raises
 /// [`crate::segment::FORMAT_VERSION`] too.
 const VERSION: u16 = 4;
+/// The graph sections' version, for a build that names what its saved
+/// work depends on.
+pub const SECTIONS_VERSION: u16 = VERSION;
 const SLICE_DATA: SectionKind = SectionKind::new(0x0305);
 const SLICE_INDEX: SectionKind = SectionKind::new(0x0306);
 /// The version of the slice sections. They are optional, so raising it

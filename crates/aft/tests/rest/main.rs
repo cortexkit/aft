@@ -4,6 +4,9 @@ compile_error!("the rest test suite requires --features test-hooks");
 // Import `test_helpers` from `callgraph_store_test` rather than compiling a
 #[path = "../helpers/context_storage.rs"]
 mod context_storage;
+#[path = "../helpers/subc_fake.rs"]
+#[cfg(unix)]
+mod subc_fake;
 
 // Import `test_helpers` from `callgraph_store_test` rather than compiling a
 // second copy of the helper tests in this target.
@@ -60,6 +63,8 @@ mod status_counts_inspect_seams;
 mod synapse_live_test;
 #[cfg(unix)]
 use test_helpers as test_support;
+#[path = "../subc_release_compat.rs"]
+mod subc_release_compat;
 #[path = "../tool_provider_conformance.rs"]
 mod tool_provider_conformance;
 #[path = "../tool_provider_subc_e2e.rs"]

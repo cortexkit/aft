@@ -17,7 +17,10 @@ use super::incremental_tests::checkout;
 /// sites of every key with more than one go through a scratch file; and
 /// with a few keys per flush. Bound files are kept up to the default
 /// budget, and up to one byte, where every file but the last bound is let go
-/// and bound again when read again. Returns the file-reading resolution.
+/// and bound again when read again. The pass-4 record cache gets the bound
+/// files' budget, so with one byte no record is kept: each is read through,
+/// held only by the resolver reading it, and read from disk again when
+/// needed again. Returns the file-reading resolution.
 fn records_match_files(inputs: &CheckoutInputs) -> BTreeMap<String, FileResolution> {
     let reference = LiveCheckout::cold(inputs.clone())
         .unwrap()

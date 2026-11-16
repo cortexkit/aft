@@ -8,6 +8,7 @@ import {
   isTerminalStatus,
   maxWatchTimeoutMs,
   REGEX_WINDOW_SCAN_INCOMPLETE_TEXT,
+  resolveBashTaskId,
   resolveWatchTimeoutMs,
   TERMINAL_SCAN_INCOMPLETE_TEXT,
   taskKillDeadlineText,
@@ -135,10 +136,10 @@ export function bashWatchDescription(
 ): string {
   const noPolling = statusRegistered ? " Never loop bash_status to wait." : "";
   if (role === "worker") {
-    return `Watch a background bash task and wait until it exits or prints a pattern. ${WATCH_SYNC_DEFAULTS_DESCRIPTION}. A background task never wakes you, so wait on it before you report a result. ${WORKER_KEEP_WAITING}${noPolling}`;
+    return `Watch a background bash task and wait until it exits or prints a pattern; a remote job ID works too. ${WATCH_SYNC_DEFAULTS_DESCRIPTION}. A background task never wakes you, so wait on it before you report a result. ${WORKER_KEEP_WAITING}${noPolling}`;
   }
   const asyncSentences = asyncWatches ? PRIMARY_ASYNC_WATCH_SENTENCES : "";
-  return `Watch a background bash task. ${WATCH_SYNC_DEFAULTS_DESCRIPTION}. In a main session sync waits are for a short remaining wait on a task; for anything longer, first do the work that doesn't need the result, end the turn only when everything left needs it, and let the completion reminder wake you, or use \`bash({wait:true})\` when the result is needed before anything else.${asyncSentences}${noPolling}`;
+  return `Watch a background bash task; a remote job ID works too. ${WATCH_SYNC_DEFAULTS_DESCRIPTION}. In a main session sync waits are for a short remaining wait on a task; for anything longer, first do the work that doesn't need the result, end the turn only when everything left needs it, and let the completion reminder wake you, or use \`bash({wait:true})\` when the result is needed before anything else.${asyncSentences}${noPolling}`;
 }
 
 /** The `pattern` argument's sentence about the sync and async watch modes. */
@@ -152,7 +153,11 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
       bashCompanionRegistered(ctx.config, "bash_status"),
     ),
     args: {
-      taskId: z.string().describe("Background task ID returned by bash({ background: true })."),
+      taskId: z
+        .string()
+        .describe(
+          "Background task ID returned by bash({ background: true }), or its remote job ID.",
+        ),
       pattern: z
         .union([z.string(), z.object({ regex: z.string() })])
         .optional()
@@ -178,7 +183,9 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
         .describe("Async-only. Defaults true; false keeps the watch sticky until task exit."),
     },
     execute: async (args, context) => {
-      const taskId = args.taskId as string;
+      const taskId = await resolveBashTaskId(args.taskId as string, (reference) =>
+        callBashBridge(ctx, context, "bash_status", { task_id: reference }),
+      );
       // Coerce at the boundary: stringified background must enable async mode (coerceBoolean).
       const requestedAsync = coerceBoolean(args.background);
       const waitFor = parseWaitPattern(args.pattern);

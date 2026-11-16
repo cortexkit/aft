@@ -748,6 +748,54 @@ fn children_build_nothing_while_the_parent_root_is_unbound() {
     assert!(found[0].ends_with("one/src/added.rs"), "{found:?}");
 }
 
+#[test]
+fn audit1432_parent_search_collects_ceiling_skips_from_both_children() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("projects");
+    let storage = base.join("storage");
+    std::fs::create_dir_all(&storage).unwrap();
+    for name in ["alpha", "beta"] {
+        init_repo(&root.join(name), name);
+        let mut bytes = vec![b'x'; 17 << 20];
+        bytes.extend_from_slice(b"only_at_tail");
+        std::fs::write(root.join(name).join("large.rs"), bytes).unwrap();
+    }
+    let parent = {
+        let _git = crate::test_env::hermetic_git_env_guard();
+        configure(&root, &storage, false)
+    };
+    let session = parent_session(&parent);
+    assert_eq!(session.children().len(), 2);
+    let req = request(
+        json!({"id":"parent-skips", "command":"semantic_search", "query":"(?s)only_at_tail.*", "include_tests":true, "top_k":10}),
+    );
+    let response = settled(
+        || routed(&parent, &req),
+        |response| {
+            response.data["skipped_files"]
+                .as_array()
+                .is_some_and(|skips| skips.len() == 2)
+        },
+    );
+    assert!(response.success, "{response:?}");
+    let skipped = response.data["skipped_files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{response:?}"));
+    for name in ["alpha", "beta"] {
+        assert!(
+            skipped.iter().any(
+                |skip| skip["file"] == json!(root.join(name).join("large.rs"))
+                    && skip["reason"] == crate::large_read::WHOLE_READ_SKIP_REASON
+            ),
+            "{response:?}"
+        );
+    }
+    assert_eq!(skipped.len(), 2, "{response:?}");
+    assert_eq!(response.data["complete"], false);
+    assert_eq!(response.data["skipped_files_remaining"], 0);
+}
+
 /// With the data layer on, a parent folder's `aft_search` reads each
 /// child's meaning plane without filling it: `alpha`, whose vectors another
 /// checkout of its repository stored, answers from them; `beta`, whose store

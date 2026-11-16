@@ -38,7 +38,15 @@ struct FreeSpaceOverrides {
 }
 struct FreeSpaceOverride {
     canonical: Option<PathBuf>,
-    value: Option<(u64, u64)>,
+    value: Probe,
+}
+/// What an override reports: a fixed probe result, or (tests only) one
+/// computed at each probe, as free space that grows when files are deleted.
+#[derive(Clone)]
+enum Probe {
+    Fixed(Option<(u64, u64)>),
+    #[cfg(test)]
+    Computed(std::sync::Arc<dyn Fn() -> Option<(u64, u64)> + Send + Sync>),
 }
 static FREE_SPACE: Mutex<FreeSpaceOverrides> = Mutex::new(FreeSpaceOverrides {
     storage: std::collections::BTreeMap::new(),
@@ -73,7 +81,21 @@ pub fn set_free_space_for_test(storage: &Path, free: u64, capacity: u64) -> Free
     set_free_space_probe_for_test(storage, Some((free, capacity)))
 }
 
+/// [`set_free_space_for_test`], with `probe` computing the free space and
+/// capacity at each probe; `None` is a probe that fails.
+#[cfg(test)]
+pub(crate) fn set_free_space_fn_for_test(
+    storage: &Path,
+    probe: impl Fn() -> Option<(u64, u64)> + Send + Sync + 'static,
+) -> FreeSpaceTestGuard {
+    set_probe_for_test(storage, Probe::Computed(std::sync::Arc::new(probe)))
+}
+
 fn set_free_space_probe_for_test(storage: &Path, value: Option<(u64, u64)>) -> FreeSpaceTestGuard {
+    set_probe_for_test(storage, Probe::Fixed(value))
+}
+
+fn set_probe_for_test(storage: &Path, value: Probe) -> FreeSpaceTestGuard {
     let storage = storage.to_path_buf();
     let entry = FreeSpaceOverride {
         canonical: canonical_free_space_path(&storage),
@@ -148,14 +170,21 @@ pub(crate) fn free_space(path: &Path) -> Option<(u64, u64)> {
                 });
                 let depth = canonical_depth
                     .or_else(|| path.starts_with(root).then(|| root.components().count()))?;
-                Some((depth, entry.value))
+                Some((depth, entry.value.clone()))
             })
             .max_by_key(|(depth, _)| *depth)
             .map(|(_, value)| value)
-            .or_else(|| (overrides.unlimited > 0).then_some(Some((u64::MAX, u64::MAX / 2))))
+            .or_else(|| {
+                (overrides.unlimited > 0).then_some(Probe::Fixed(Some((u64::MAX, u64::MAX / 2))))
+            })
     };
-    if let Some(value) = value {
-        return value;
+    // A computed probe runs once the overrides are unlocked: it may look
+    // at the disk, and nothing it calls may wait on them.
+    match value {
+        Some(Probe::Fixed(value)) => return value,
+        #[cfg(test)]
+        Some(Probe::Computed(probe)) => return probe(),
+        None => {}
     }
     probe_free_space(path)
 }

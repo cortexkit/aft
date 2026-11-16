@@ -55,7 +55,7 @@ fn registered_cause_sets_have_pinned_kind_bounds_and_units() {
     let expected_case_count = SURFACE_SPECS
         .iter()
         .map(|surface| {
-            if surface.command == "search" {
+            if surface.command == "search" && surface.list_id == "payload.results" {
                 5
             } else {
                 (1usize << surface.reasons.len()) - 1
@@ -331,7 +331,51 @@ fn transport_parity_corpus_covers_every_registered_surface_and_is_byte_equal() {
             "{}: capped fixture ndjson output must contain trailer",
             fixture.name
         );
+        if fixture.list_id == "payload.skipped_files" {
+            for expected in [
+                "large-00.txt",
+                "large-19.txt",
+                "Skipped: reading this file would exceed the 16 MiB in-memory read ceiling.",
+            ] {
+                assert!(
+                    subc_text.contains(expected),
+                    "{} subc missing {expected:?}: {subc_text}",
+                    fixture.name
+                );
+                assert!(
+                    ndjson_text.contains(expected),
+                    "{} NDJSON missing {expected:?}: {ndjson_text}",
+                    fixture.name
+                );
+            }
+            assert_eq!(
+                subc_text.matches("shown 20 of 23 files").count(),
+                1,
+                "{subc_text}"
+            );
+            assert_eq!(
+                ndjson_text.matches("shown 20 of 23 files").count(),
+                1,
+                "{ndjson_text}"
+            );
+        }
     }
+}
+
+#[test]
+fn audit1432_skipped_file_transport_arms_have_independent_sources() {
+    let mut fixture = capped_parity_fixtures()
+        .into_iter()
+        .find(|fixture| fixture.list_id == "payload.skipped_files")
+        .unwrap();
+    fixture.reply["skipped_files"][0]["reason"] = serde_json::json!("structured_side_only_reason");
+    let (subc_text, ndjson_text) = render_transports(&fixture);
+    assert_ne!(
+        subc_text, ndjson_text,
+        "changing only structured disclosure must not rewrite the independent producer text"
+    );
+    assert!(subc_text.contains("structured_side_only_reason"));
+    assert!(!ndjson_text.contains("structured_side_only_reason"));
 }
 
 #[test]

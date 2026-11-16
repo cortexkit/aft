@@ -117,7 +117,7 @@ fn export(checkout: &Checkout, out: &Path, reference: Option<&Path>) -> GateResu
     let mut offset = 0;
     for (index, record) in published.state.paths().iter().enumerate() {
         let path = std::str::from_utf8(&record.path)?.to_string();
-        let key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION)
+        let key = crate::data_layer::content::record_key(record.content, &record.language)
             .digest()
             .to_string();
         let fragment = published.state.fragment(index);

@@ -2058,7 +2058,15 @@ async fn consent_folder_grant_resumes_all_three_parallel_covered_reads_once() {
         assert!(text(&value).contains(contents.trim()), "{value}");
     }
     assert_eq!(SUCCESSFUL_READS.load(Ordering::SeqCst), 4);
-    assert_eq!(f.fake.calls("consent.request").len(), 4, "no second card");
+    // Under load a held read can re-send its request while it waits. A re-send
+    // carries the same call_key, and Cingulate reuses that card, so count cards
+    // by call_key: four reads file four cards, and the grant adds none.
+    let requests = f.fake.calls("consent.request");
+    let cards: std::collections::BTreeSet<&str> = requests
+        .iter()
+        .map(|request| request["call_key"].as_str().unwrap())
+        .collect();
+    assert_eq!(cards.len(), 4, "no second card: {requests:?}");
     assert_eq!(f.fake.calls("consent.withdraw").len(), 3);
     assert_eq!(f.fake.state.lock().unwrap().withdrawn.len(), 3);
     assert!(f.asks().is_empty(), "all four approvals were consumed");

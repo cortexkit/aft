@@ -48,6 +48,24 @@ struct Scheduled {
     completion: bool,
     retrying: bool,
     expedite: bool,
+    follow: Arc<Follow>,
+}
+
+#[derive(Default)]
+struct Follow {
+    send_id: std::sync::Mutex<Option<String>>,
+    force: AtomicBool,
+    attached: AtomicBool,
+    receipts: std::sync::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>,
+}
+
+struct FollowReceipt(Vec<tokio::sync::oneshot::Sender<()>>);
+impl FollowReceipt {
+    fn applied(self) {
+        for done in self.0 {
+            let _ = done.send(());
+        }
+    }
 }
 
 #[derive(Default)]
@@ -60,7 +78,22 @@ struct Scheduler {
 
 impl Scheduler {
     fn offer(&self, id: String, completion: bool, work: Work, expedite: bool) -> bool {
+        self.offer_follow(id, completion, work, expedite, Arc::new(Follow::default()))
+    }
+
+    fn offer_follow(
+        &self,
+        id: String,
+        completion: bool,
+        work: Work,
+        expedite: bool,
+        follow: Arc<Follow>,
+    ) -> bool {
         let mut entries = self.entries.lock().unwrap();
+        follow.attached.store(
+            crate::late_result_bus::readers::sendstate_attached(),
+            Ordering::Relaxed,
+        );
         if let Some(entry) = entries.get_mut(&id) {
             if expedite {
                 if entry.work.is_some() {
@@ -83,10 +116,58 @@ impl Scheduler {
                 completion,
                 retrying: false,
                 expedite: false,
+                follow,
             },
         );
         self.wake.notify_all();
         true
+    }
+
+    fn bus_wake(&self, send_id: Option<&str>) -> Vec<tokio::sync::oneshot::Receiver<()>> {
+        let mut entries = self.entries.lock().unwrap();
+        let targeted = send_id.is_some_and(|id| {
+            entries
+                .values()
+                .any(|entry| entry.follow.send_id.lock().unwrap().as_deref() == Some(id))
+        });
+        let mut waits = Vec::new();
+        for entry in entries.values_mut() {
+            let followed = entry.follow.send_id.lock().unwrap();
+            if followed.is_none() || targeted && followed.as_deref() != send_id {
+                continue;
+            }
+            let (done, wait) = tokio::sync::oneshot::channel();
+            entry.follow.receipts.lock().unwrap().push(done);
+            entry.follow.force.store(true, Ordering::Relaxed);
+            if entry.work.is_some() {
+                entry.due = std::time::Instant::now();
+            } else {
+                entry.expedite = true;
+            }
+            waits.push(wait);
+        }
+        self.wake.notify_all();
+        waits
+    }
+
+    fn attachment_changed(&self, attached: bool) {
+        for entry in self.entries.lock().unwrap().values_mut() {
+            entry.follow.attached.store(attached, Ordering::Relaxed);
+            if entry.follow.send_id.lock().unwrap().is_none() {
+                continue;
+            }
+            if attached {
+                entry.due = std::time::Instant::now() + crate::late_result_bus::readers::BACKSTOP;
+            } else {
+                entry.follow.force.store(true, Ordering::Relaxed);
+                if entry.work.is_some() {
+                    entry.due = std::time::Instant::now();
+                } else {
+                    entry.expedite = true;
+                }
+            }
+        }
+        self.wake.notify_all();
     }
 
     fn take(
@@ -152,6 +233,23 @@ impl Scheduler {
             self.finish(&id, work, next, std::time::Instant::now());
         }
     }
+}
+
+pub(crate) async fn bus_wake(send_id: Option<&str>) -> Result<(), &'static str> {
+    let Some(Ok(scheduler)) = SCHEDULER.get() else {
+        return Ok(());
+    };
+    for wait in scheduler.bus_wake(send_id) {
+        wait.await.map_err(|_| "send_state_apply")?;
+    }
+    Ok(())
+}
+
+pub(crate) fn bus_attachment_changed(attached: bool) {
+    let Some(Ok(scheduler)) = SCHEDULER.get() else {
+        return;
+    };
+    scheduler.attachment_changed(attached);
 }
 
 fn scheduler() -> Option<&'static Arc<Scheduler>> {
@@ -951,6 +1049,7 @@ pub(crate) fn retry_held_notice_fallback(
             completion: false,
             retrying: false,
             expedite: false,
+            follow: Arc::new(Follow::default()),
         });
     scheduler.wake.notify_all();
 }
@@ -1279,7 +1378,7 @@ async fn open_notice_route(
     consumer: &SubcConsumer,
     address: &Address,
 ) -> Result<subc_client_rs::RouteHandle, Outcome> {
-    let Some(principal) = crate::launch_nonce::consumer_identity() else {
+    let Some(_) = crate::launch_nonce::consumer_identity() else {
         return Err(retry(
             FailureClass::ConsumerIdentity,
             "AFT launch has no consumer identity",
@@ -1289,7 +1388,6 @@ async fn open_notice_route(
     let options = CallOptions {
         timeout: Duration::from_secs(5),
         route_retry_deadline: Duration::from_secs(5),
-        consumer_identity: Some(principal),
         role_versions: Some(role_versions()),
         ..CallOptions::default()
     };
@@ -1442,10 +1540,18 @@ fn offer(
     let mut retry_logged = false;
     let mut settled = false;
     let mut delivery_update: Option<DeliveryUpdate> = None;
-    let queued = scheduler.offer(
+    let follow = Arc::new(Follow::default());
+    follow.attached.store(
+        crate::late_result_bus::readers::sendstate_attached(),
+        Ordering::Relaxed,
+    );
+    let work_follow = Arc::clone(&follow);
+    let queued = scheduler.offer_follow(
         id.clone(),
         completion,
         Box::new(move || {
+            let forced = work_follow.force.swap(false, Ordering::Relaxed);
+            let receipt = FollowReceipt(std::mem::take(&mut *work_follow.receipts.lock().unwrap()));
             let _identity = crate::bash_background::task_identity_scope(Some(owner.clone()));
             // Keep a failed durable transition in memory: never send the old
             // generation again just because writing its replacement failed.
@@ -1457,6 +1563,7 @@ fn offer(
                 return Next::Done;
             };
             if completion && metadata.completion_delivered {
+                receipt.applied();
                 return Next::Done;
             }
             let timestamp = now();
@@ -1464,10 +1571,11 @@ fn offer(
             let progress = metadata.runner_completion_delivery.clone();
             let generation = progress.as_ref().map_or(1, |progress| progress.generation);
             let checking = completion && matches!(progress.as_ref().map(|progress| &progress.phase), Some(RunnerCompletionPhase::Pending { .. }));
+            *work_follow.send_id.lock().unwrap() = if checking { metadata.runner_completion_notice.as_ref().map(|request| request.send_id.clone()) } else { None };
             if completion {
                 match progress.as_ref().map(|progress| &progress.phase) {
                     Some(RunnerCompletionPhase::Retired) => settled = true,
-                    Some(RunnerCompletionPhase::Ready { due_ms } | RunnerCompletionPhase::Pending { due_ms, .. }) if *due_ms > timestamp && age < MAX_AGE_MS => {
+                    Some(RunnerCompletionPhase::Ready { due_ms } | RunnerCompletionPhase::Pending { due_ms, .. }) if !(forced && checking) && *due_ms > timestamp && age < MAX_AGE_MS => {
                         return Next::Retry(Duration::from_millis((*due_ms - timestamp).min(MAX_AGE_MS - age)));
                     }
                     _ => {}
@@ -1653,6 +1761,8 @@ fn offer(
                         return Next::Retry(retry_delay(0));
                     }
                     if generation < MAX_GENERATIONS {
+                        *work_follow.send_id.lock().unwrap() = None;
+                        receipt.applied();
                         let delay = retry_delay(*attempt);
                         *attempt = attempt.saturating_add(1);
                         return Next::Retry(delay.min(Duration::from_millis(MAX_AGE_MS.saturating_sub(age))));
@@ -1671,9 +1781,10 @@ fn offer(
                     (checks, true, retry_delay(0))
                 } else {
                     let checks = if checking { checks.saturating_add(1) } else { checks };
-                    (checks, false, pending_delay(checks))
+                    (checks, false, if work_follow.attached.load(Ordering::Relaxed) { crate::late_result_bus::readers::BACKSTOP } else { pending_delay(checks) })
                 };
                 let delay = delay.min(Duration::from_millis(MAX_AGE_MS.saturating_sub(age)));
+                *work_follow.send_id.lock().unwrap() = current_request.as_ref().or(metadata.runner_completion_notice.as_ref()).map(|request| request.send_id.clone());
                 delivery_update = Some((current_request.or(metadata.runner_completion_notice).expect("pending send is frozen"), RunnerCompletionDelivery {
                     generation,
                     phase: RunnerCompletionPhase::Pending { checks, due_ms: timestamp.saturating_add(delay.as_millis() as u64), retry: retrying },
@@ -1681,6 +1792,7 @@ fn offer(
                 if flush_delivery_update(&registry, &owner.session, &task_id, &mut delivery_update).is_err() {
                     return Next::Retry(retry_delay(0));
                 }
+                if !failed { receipt.applied(); }
                 return Next::Retry(delay);
             }
             settled = completion && !matches!(outcome, Outcome::Retry(_));
@@ -1701,10 +1813,11 @@ fn offer(
                 Next::Retry(delay) if completion => {
                     Next::Retry(delay.min(Duration::from_millis(MAX_AGE_MS.saturating_sub(age))))
                 }
-                next => next,
+                next => { if settled { receipt.applied(); } next },
             }
         }),
         expedite,
+        follow,
     );
     if !queued {
         log::warn!("runner notice deferred: notice queue full");

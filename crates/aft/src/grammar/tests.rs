@@ -9,6 +9,70 @@ use crate::grammar::PRODUCTION_MANIFEST;
 
 const WASM: &[u8] = include_bytes!("../../tests/fixtures/grammars/56b2a562244e6f35f7b320bce59099126185389df1277a93e450ba4156c0e039.wasm");
 
+#[test]
+fn luau_s4_same_storage_root_preserves_retry_budget() {
+    let (directory, registry, clock, transport) = setup((0..5).map(|_| Hop::Error));
+    for failure in 1..=5 {
+        let _ = registry.request();
+        settled(&registry);
+        let (state, retry_at, generation) = {
+            let entry = registry.entry.lock();
+            assert_eq!(entry.failures, failure);
+            (entry.state, entry.retry_at, entry.root_generation)
+        };
+        registry.set_storage_root(directory.path().into());
+        {
+            let entry = registry.entry.lock();
+            assert_eq!(
+                (
+                    entry.failures,
+                    entry.state,
+                    entry.retry_at,
+                    entry.root_generation
+                ),
+                (failure, state, retry_at, generation)
+            );
+        }
+        let _ = registry.request();
+        assert_eq!(transport.calls.load(Ordering::SeqCst), failure as usize);
+        clock.advance(retry_at.saturating_sub(clock.now_ms()));
+    }
+    assert_eq!(
+        registry.request().unwrap_err().state,
+        GrammarState::AttemptsExhausted
+    );
+    let other = tempfile::tempdir().unwrap();
+    registry.set_storage_root(other.path().into());
+    assert_eq!(registry.entry.lock().failures, 0);
+    assert_eq!(
+        registry.status_snapshot().unwrap().state,
+        GrammarState::NotDownloaded
+    );
+}
+
+#[test]
+fn luau_s4_readiness_subscriptions_are_pruned_on_drop() {
+    let (directory, registry, _, _) = setup([]);
+    let first = registry.subscribe();
+    let second = registry.subscribe();
+    assert_eq!(registry.listeners.lock().len(), 2);
+    drop(first);
+    assert_eq!(registry.listeners.lock().len(), 1);
+    drop(second);
+    assert!(registry.listeners.lock().is_empty());
+    stored(directory.path());
+    registry.stored().unwrap();
+    let ready = registry.subscribe();
+    assert_eq!(ready.recv().unwrap(), registry.identity());
+    assert_eq!(registry.listeners.lock().len(), 1);
+    assert_eq!(
+        ready.recv_timeout(Duration::from_millis(1)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    );
+    drop(ready);
+    assert!(registry.listeners.lock().is_empty());
+}
+
 #[derive(Default)]
 struct FakeClock(AtomicU64);
 impl Clock for FakeClock {
@@ -215,6 +279,33 @@ fn grammar_detection_golden_builtins_and_opt_in() {
             detect_language_any(path, true),
             (extension == "luau").then_some(Luau)
         );
+    }
+    // The read-free Luau test agrees with full detection for every name above,
+    // including headers that would otherwise be read and parsed.
+    let mut names: Vec<String> = mappings
+        .iter()
+        .flat_map(|(extensions, _)| extensions.split_whitespace())
+        .map(|extension| format!("nonexistent.{extension}"))
+        .collect();
+    names.extend(
+        [
+            "f.luau",
+            "f.LUAU",
+            "f.unknown",
+            "Jenkinsfile",
+            "no_extension",
+        ]
+        .map(String::from),
+    );
+    for name in &names {
+        let path = std::path::Path::new(name);
+        for dynamic in [false, true] {
+            assert_eq!(
+                crate::parser::is_luau_path(path, dynamic),
+                detect_language_any(path, dynamic) == Some(Luau),
+                "{name} dynamic={dynamic}"
+            );
+        }
     }
 }
 

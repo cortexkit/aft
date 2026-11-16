@@ -4,6 +4,8 @@ compile_error!("the integration test suite requires --features test-hooks");
 #[path = "../helpers/context_storage.rs"]
 mod context_storage;
 mod context_storage_test;
+#[path = "../helpers/subc_fake.rs"]
+mod subc_fake;
 
 #[path = "../helpers/mod.rs"]
 mod test_helpers;
@@ -151,6 +153,7 @@ mod semantic_disk_test;
 mod shared_db_call_ledger_test;
 mod shared_db_contention_test;
 mod shared_index_scope_test;
+mod shell_env_provider_test;
 mod stage_card_floor_test;
 mod staging_cleanup_test;
 mod standalone_search_deferred_test;

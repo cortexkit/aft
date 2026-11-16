@@ -322,6 +322,24 @@ export function workerWatchStillRunning(options: {
  */
 export const WATCH_UNAVAILABLE_GIVE_UP_MS = 120_000;
 
+/** Resolve a remote job alias before plugin-owned watch bookkeeping starts. */
+export async function resolveBashTaskId(
+  reference: string,
+  status: (reference: string) => Promise<Record<string, unknown>>,
+): Promise<string> {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(reference)) {
+    return reference;
+  }
+  const data = await status(reference);
+  if (data.success === false) {
+    throw new Error(String(data.message ?? "bash_status failed"));
+  }
+  if (typeof data.task_id !== "string" || !/^bash-[0-9a-f]{16}$/.test(data.task_id)) {
+    throw new Error("bash_status did not return a background task ID");
+  }
+  return data.task_id;
+}
+
 /**
  * What a delegated worker is told whenever its watch returned while its task
  * is still running. A worker cannot be woken after its turn ends, so the only

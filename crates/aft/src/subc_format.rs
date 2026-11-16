@@ -1943,6 +1943,7 @@ fn format_grep(data: &Value) -> String {
         .and_then(|v| serde_json::from_value::<crate::list_envelope::ListEnvelope>(v.clone()).ok());
 
     let base = if let Some(text) = data.get("text").and_then(Value::as_str) {
+        let text = crate::bounded_io::strip_skipped_files_text(text, data);
         if envelope.is_some() {
             text.replace(" (capped)", "")
         } else {
@@ -1999,7 +2000,11 @@ fn format_grep(data: &Value) -> String {
         }
     };
 
-    let base = append_ast_skipped_files(base, data.get("skipped_files"));
+    let base = if data.get("skipped_files_list_envelope").is_some() {
+        crate::bounded_io::append_skipped_files_text(base, data)
+    } else {
+        append_ast_skipped_files(base, data.get("skipped_files"))
+    };
     if let Some(env) = envelope {
         if let Some(trailer) = render_envelope_trailer(&env) {
             if base.is_empty() {
@@ -2416,7 +2421,11 @@ fn format_search(data: &Value) -> String {
         .get("results_list_envelope")
         .and_then(|v| serde_json::from_value::<crate::list_envelope::ListEnvelope>(v.clone()).ok());
 
-    let note = if envelope.is_some() {
+    // The named skip disclosure already explains incomplete coverage and ends
+    // with its own list trailer; do not append the same partial-status notice.
+    let note = if data.get("skipped_files_list_envelope").is_some() {
+        semantic_honesty_note_with_partial(data, false)
+    } else if envelope.is_some() {
         search_status_only_note(data)
     } else {
         extra_honesty_note(data)
@@ -2427,9 +2436,15 @@ fn format_search(data: &Value) -> String {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
     {
+        let text = crate::bounded_io::strip_skipped_files_text(text, data);
         match note {
             Some(n) => format!("{text}\n{n}"),
             None => text.to_string(),
+        }
+    } else if data.get("skipped_files_list_envelope").is_some() {
+        match note {
+            Some(note) => format!("No results.\n{note}"),
+            None => "No results.".to_string(),
         }
     } else if envelope.is_some() {
         match note {
@@ -2440,6 +2455,7 @@ fn format_search(data: &Value) -> String {
         semantic_honesty_note(data).unwrap_or_else(|| "No results.".to_string())
     };
 
+    let base = crate::bounded_io::append_skipped_files_text(base, data);
     if let Some(env) = envelope {
         if let Some(trailer) = render_envelope_trailer(&env) {
             if base.is_empty() {
@@ -2475,6 +2491,10 @@ fn search_status_only_note(data: &Value) -> Option<String> {
 }
 
 fn semantic_honesty_note(data: &Value) -> Option<String> {
+    semantic_honesty_note_with_partial(data, true)
+}
+
+fn semantic_honesty_note_with_partial(data: &Value, include_partial: bool) -> Option<String> {
     let mut notes = Vec::new();
     if data.get("more_available").and_then(Value::as_bool) == Some(true) {
         notes.push("more results available");
@@ -2485,7 +2505,7 @@ fn semantic_honesty_note(data: &Value) -> Option<String> {
     if data.get("fully_degraded").and_then(Value::as_bool) == Some(true) {
         notes.push(FILESYSTEM_SCAN_STATUS);
     }
-    if data.get("complete").and_then(Value::as_bool) == Some(false) {
+    if include_partial && data.get("complete").and_then(Value::as_bool) == Some(false) {
         notes.push("partial/incomplete");
     }
     if notes.is_empty() {

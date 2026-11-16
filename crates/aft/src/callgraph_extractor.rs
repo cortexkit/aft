@@ -31,5 +31,6 @@ pub(crate) fn is_resolution_input(path: &[u8]) -> bool {
         || name == b"Cargo.toml"
         || name == b"go.mod"
         || name == b".gitignore"
+        || cfg!(feature = "wasm-grammars") && name == b".luaurc"
         || name.starts_with(b"tsconfig") && name.ends_with(b".json")
 }

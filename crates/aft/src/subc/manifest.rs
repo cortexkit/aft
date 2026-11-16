@@ -581,6 +581,11 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
             ProviderRole::ManagementSurface {
                 operations: vec![
                     ManagementOperation {
+                        name: cortexkit_role_tool_display::DISPLAY_READ.to_string(),
+                        kind: ManagementOperationKind::Query,
+                        description: Some("Read a retained display snapshot as the discovered display server.".into()),
+                    },
+                    ManagementOperation {
                         name: super::scope_background_tasks::OPERATION.to_string(),
                         kind: ManagementOperationKind::Query,
                         description: None,
@@ -1067,6 +1072,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 (
+                    cortexkit_role_tool_display::DISPLAY_READ,
+                    &ManagementOperationKind::Query
+                ),
+                (
                     super::super::scope_background_tasks::OPERATION,
                     &ManagementOperationKind::Query,
                 ),
@@ -1406,6 +1415,13 @@ mod tests {
             json!({"name": "commands.preview", "kind": "query"}),
             json!({"name": "commands.run", "kind": "mutate"}),
         ]);
+        operations.insert(
+            0,
+            json!({
+                "name": cortexkit_role_tool_display::DISPLAY_READ, "kind": "query",
+                "description": "Read a retained display snapshot as the discovered display server.",
+            }),
+        );
         // AFT registers not-ready and flips itself ready after warm-up (see
         // `subc::readiness`); this is the only field readiness adds.
         let top = expected.as_object_mut().expect("manifest object");

@@ -1,0 +1,74 @@
+{
+  "version": "e8bde9db13c4a1f7e98d427e4fd15a237dd137aaf8ccb104446059c83a8028a1",
+  "available": true,
+  "effect": "Search ready; code map building",
+  "facts": [
+    {
+      "label": "Text search",
+      "state": "ready"
+    },
+    {
+      "label": "Code map",
+      "state": "building"
+    },
+    {
+      "label": "Errors",
+      "value": 2.0,
+      "unit": "count",
+      "tone": "danger"
+    },
+    {
+      "label": "Warnings",
+      "value": 3.0,
+      "unit": "count"
+    },
+    {
+      "label": "Shells running",
+      "value": 1.0,
+      "unit": "count"
+    }
+  ],
+  "table": {
+    "columns": [
+      "State",
+      "Files"
+    ],
+    "rows": [
+      {
+        "label": "Text search",
+        "cells": [
+          {
+            "state": "ready"
+          },
+          {
+            "value": 10.0,
+            "unit": "count"
+          }
+        ]
+      },
+      {
+        "label": "Code map",
+        "cells": [
+          {
+            "state": "building"
+          },
+          {
+            "state": "building"
+          }
+        ]
+      },
+      {
+        "label": "Meaning search",
+        "cells": [
+          {
+            "state": "building",
+            "progress": 0.4
+          },
+          {
+            "state": "building"
+          }
+        ]
+      }
+    ]
+  }
+}

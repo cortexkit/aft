@@ -2316,7 +2316,7 @@ fn fallback_grep_with_limits_counted(
     let mut batch: Vec<PathBuf> = Vec::with_capacity(256);
     // Files for a path-ordered scan, searched one at a time after the walk.
     let mut ordered: Vec<PathBuf> = Vec::new();
-    let io_budget = crate::bounded_io::current();
+    let io_budget = crate::bounded_io::capture();
     let alloc_label = crate::alloc_trace::carry();
     let confinement = crate::context::confinement::capture();
 
@@ -2587,18 +2587,21 @@ fn fallback_search_file(
         return Vec::new();
     }
 
-    let opened =
-        match crate::search_index::open_grep_file(file, deadline, authorized_task_artifact, || {
-            fallback_line_matcher(pattern).is_some()
-        }) {
-            Ok(opened) => opened,
-            Err(error) => {
-                if error.kind() == std::io::ErrorKind::TimedOut {
-                    engine_capped.store(true, Ordering::Relaxed);
-                }
-                return Vec::new();
+    let opened = match crate::search_index::open_grep_file(
+        file,
+        deadline,
+        authorized_task_artifact,
+        crate::large_read::Site::GrepFallback,
+        || fallback_line_matcher(pattern).is_some(),
+    ) {
+        Ok(opened) => opened,
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                engine_capped.store(true, Ordering::Relaxed);
             }
-        };
+            return Vec::new();
+        }
+    };
     let bytes = match opened {
         crate::search_index::GrepFileRead::Whole(bytes) => bytes,
         crate::search_index::GrepFileRead::Large(large) => {
@@ -2851,6 +2854,8 @@ fn fallback_search_file_streamed(
     let mut same_line = 0usize;
     let mut reported_line_end = 0usize;
     let scan = crate::large_read::scan_lines(
+        crate::large_read::Site::GrepFallback,
+        file,
         &mut large.reader,
         size,
         std::mem::take(&mut large.head),
@@ -2925,6 +2930,7 @@ fn fallback_search_file_streamed(
             engine_capped.store(true, Ordering::Relaxed);
             return Vec::new();
         }
+        Err(error) if crate::large_read::is_ceiling_error(&error) => {}
         Err(error) => {
             if error.kind() == std::io::ErrorKind::TimedOut {
                 engine_capped.store(true, Ordering::Relaxed);
@@ -5009,5 +5015,39 @@ mod streamed_fallback_tests {
                 assert_eq!(streamed, whole, "{pattern:?}, cap {max_results}");
             }
         }
+    }
+    #[test]
+    fn audit1432_single_line_over_ceiling_keeps_allocation_below_the_file_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("single-line.txt");
+        let mut bytes = vec![b'x'; 17 << 20];
+        let end = bytes.len();
+        bytes[end - 3..].copy_from_slice(b"foo");
+        std::fs::write(&path, bytes).unwrap();
+        let pattern = foo_literal();
+        let _scope = crate::bounded_io::enter_disclosure_if_absent();
+        let ((rows, counts, _), volume, largest) =
+            crate::test_allocations::count_bytes_and_largest(|| scan(&path, &pattern, 10));
+        eprintln!("single-line scan: allocated_bytes={volume}, largest_allocation_bytes={largest}");
+        assert!(rows.is_empty());
+        assert_eq!(counts[0], 0);
+        assert!(
+            largest <= crate::large_read::WHOLE_READ_CEILING as usize + 1,
+            "largest allocation={largest}"
+        );
+        assert!(
+            volume
+                < crate::large_read::WHOLE_READ_CEILING as usize
+                    + 4 * crate::large_read::STEP_BYTES,
+            "allocation volume={volume}, largest={largest}"
+        );
+        let mut response =
+            crate::protocol::Response::success("allocation-skip", serde_json::json!({}));
+        crate::bounded_io::disclose_large_read_skips(&mut response);
+        assert_eq!(response.data["complete"], false);
+        assert_eq!(
+            response.data["skipped_files"][0]["file"],
+            serde_json::json!(path)
+        );
     }
 }

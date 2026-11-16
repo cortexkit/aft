@@ -44,6 +44,7 @@ mod lease;
 mod manifest;
 pub(crate) mod record;
 mod snapshot;
+pub mod workspace;
 mod writer;
 
 #[cfg(test)]
@@ -59,8 +60,8 @@ use std::sync::{Arc, Mutex};
 pub use manifest::{Manifest, SegmentEntry, StateRef};
 pub use snapshot::Snapshot;
 pub use writer::{
-    BuildScratch, PendingSegment, Publication, ReclaimOutcome, ReclaimReport, ScratchDir,
-    WriteSession,
+    BuildScratch, PendingSegment, Publication, ReclaimOutcome, ReclaimReport, Reclaimed,
+    ScratchClaim, ScratchDir, WriteSession, reclaim_dead_workspaces,
 };
 
 use crate::ids::{CheckoutId, FamilyId, Generation, SegmentId};
@@ -104,6 +105,10 @@ pub enum FamilyError {
     Poisoned,
     #[error("{0}")]
     Misuse(&'static str),
+    /// Another live build holds the checkout's `checkout.lock`: the work
+    /// can be tried again once it ends.
+    #[error("{0}")]
+    CheckoutBusy(&'static str),
 }
 
 impl FamilyError {

@@ -61,7 +61,7 @@ fn single(node: Node<'_>) -> Option<Node<'_>> {
         .flatten()
 }
 
-fn local_pair(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+pub(crate) fn local_pair(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
     let binding = single(child(node, "binding_list")?)?;
     Some((
         binding.child_by_field_name("name")?,
@@ -69,7 +69,7 @@ fn local_pair(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
     ))
 }
 
-fn assignment_pairs(node: Node<'_>) -> Vec<(Node<'_>, Option<Node<'_>>)> {
+pub(crate) fn assignment_pairs(node: Node<'_>) -> Vec<(Node<'_>, Option<Node<'_>>)> {
     let Some(left) = child(node, "variable_list") else {
         return Vec::new();
     };
@@ -78,6 +78,16 @@ fn assignment_pairs(node: Node<'_>) -> Vec<(Node<'_>, Option<Node<'_>>)> {
         .enumerate()
         .map(|(i, name)| (name, right.and_then(|r| r.named_child(i as u32))))
         .collect()
+}
+
+/// Value-flow follows only one plain binding, not parallel assignments.
+pub(crate) fn single_assignment_pair(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    let value = single(child(node, "expression_list")?)?;
+    let pairs = assignment_pairs(node);
+    match pairs.as_slice() {
+        [(name, Some(_))] if name.kind() == "identifier" => Some((*name, value)),
+        _ => None,
+    }
 }
 
 fn member<'source, 'tree>(

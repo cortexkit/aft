@@ -1673,6 +1673,8 @@ pub(crate) struct RouteCensusTask {
 
 pub(crate) struct BgTask {
     start_view: Mutex<Option<crate::gh_shim_speech::start_view::StartView>>,
+    #[cfg(unix)]
+    provider_preflight: Mutex<Option<Arc<crate::shell_env_provider::PreflightLayout>>>,
     changed_files: Option<Arc<crate::bash_changed_files::Capture>>,
     /// Absent after replay: secret values must never be persisted or recovered
     /// from payload files. Completion notices withhold output when this is absent.
@@ -2093,6 +2095,25 @@ fn completion_matches_session(completion: &BgCompletion, session_id: Option<&str
 }
 
 impl BgTaskRegistry {
+    #[cfg(unix)]
+    pub(crate) fn bind_provider_preflight(
+        &self,
+        task_id: &str,
+        layout: Option<Arc<crate::shell_env_provider::PreflightLayout>>,
+    ) {
+        let Some(task) = self.task(task_id) else {
+            return;
+        };
+        let Ok(state) = task.lock_state() else {
+            return;
+        };
+        if !state.metadata.status.is_terminal() {
+            *task
+                .provider_preflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = layout;
+        }
+    }
     pub(crate) fn bind_start_view(
         &self,
         task_id: &str,
@@ -3208,6 +3229,48 @@ impl BgTaskRegistry {
         rendered_execution_note(&state.metadata)
     }
 
+    /// Resolve a runner job alias only within the caller's own task records.
+    /// Leave misses unchanged so the tool's ordinary task-not-found path applies.
+    pub(crate) fn resolve_task_reference(
+        &self,
+        reference: &str,
+        session: &str,
+        storage_dir: &Path,
+    ) -> String {
+        let Ok(job_id) = crate::exec_remote::types::Uuid::parse_str(reference) else {
+            return reference.to_owned();
+        };
+        let matches = |metadata: &PersistedTask| {
+            metadata.session_id == session
+                && super::TaskIdentity::allows_current(metadata.launching_identity.as_ref())
+                && metadata.remote.as_ref().and_then(|remote| remote.job_id) == Some(job_id)
+        };
+        for task in self.task_arcs() {
+            if task.session_id == session {
+                if let Ok(state) = task.lock_state() {
+                    if matches(&state.metadata) {
+                        return task.task_id.clone();
+                    }
+                }
+            }
+        }
+        // Stored task files can be newer than the database or not loaded yet.
+        // Read only this session; resolving an alias must not start recovery.
+        let dir = session_tasks_dir(storage_dir, session);
+        if let Ok((task_ids, _)) = discover_task_ids(&dir) {
+            for task_id in task_ids {
+                if let Ok(metadata) =
+                    resolve_task_layout(&dir, &task_id).and_then(|task| read_task_at(&task))
+                {
+                    if metadata.task_id == task_id && matches(&metadata) {
+                        return task_id;
+                    }
+                }
+            }
+        }
+        reference.to_owned()
+    }
+
     /// `None` means this was not an explicit runon request. Local commands and
     /// commands routed remotely by legacy configuration retain immediate launches.
     pub(crate) fn runon_launch_pending(&self, task_id: &str, session: &str) -> Option<bool> {
@@ -3450,6 +3513,11 @@ impl BgTaskRegistry {
         emit_frame: bool,
         token_policy: CompletionTokenPolicy,
     ) -> Result<(), String> {
+        #[cfg(unix)]
+        task.provider_preflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Err(error) = self.cleanup_terminal_task_temp(task) {
             crate::slog_warn!("failed to clean task scratch for {}: {error}", task.task_id);
         }
@@ -6088,6 +6156,8 @@ impl BgTaskRegistry {
 
         let task = Arc::new(BgTask {
             start_view: Mutex::new(None),
+            #[cfg(unix)]
+            provider_preflight: Mutex::new(None),
             changed_files: crate::bash_changed_files::current(),
             completion_secrets: Mutex::new(Some(completion_secrets.values)),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
@@ -6542,6 +6612,8 @@ impl BgTaskRegistry {
         let terminal_reader_done = Arc::clone(&runtime.reader_done);
         let task = Arc::new(BgTask {
             start_view: Mutex::new(None),
+            #[cfg(unix)]
+            provider_preflight: Mutex::new(None),
             changed_files: crate::bash_changed_files::current(),
             completion_secrets: Mutex::new(Some(completion_secrets.values)),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
@@ -6916,6 +6988,8 @@ impl BgTaskRegistry {
 
         let task = Arc::new(BgTask {
             start_view: Mutex::new(None),
+            #[cfg(unix)]
+            provider_preflight: Mutex::new(None),
             changed_files: crate::bash_changed_files::current(),
             completion_secrets: Mutex::new(Some(completion_secrets.values)),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
@@ -14074,6 +14148,8 @@ impl BgTaskRegistry {
         wait_on_rehydrated_registration_gate_for_test(&task_id);
         let mut task = BgTask {
             start_view: Mutex::new(None),
+            #[cfg(unix)]
+            provider_preflight: Mutex::new(None),
             changed_files,
             completion_secrets: Mutex::new(
                 metadata

@@ -24,6 +24,7 @@ import {
 } from "@cortexkit/aft-bridge";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { Container, Text } from "@earendil-works/pi-tui";
+import { SHELL_REFUSAL_UNKNOWN } from "../../../aft-bridge/src/__tests__/fixtures/bash-permission-refusals.js";
 import {
   __resetBgNotificationStateForTests,
   appendToolResultBgCompletions,
@@ -1305,6 +1306,34 @@ describe("bash tool adapter", () => {
     }
   });
 
+  test("async bash_watch resolves a remote job ID before notification registration", async () => {
+    const job = "01234567-89ab-cdef-0123-456789abcdef";
+    const task = "bash-0123456789abcdef";
+    const calls: Array<{ command: string; params: Record<string, unknown> }> = [];
+    const bridge = {
+      send: async (command: string, params: Record<string, unknown>) => {
+        calls.push({ command, params });
+        return command === "bash_status"
+          ? { success: true, task_id: task, status: "running" }
+          : { success: true, watch_id: "watch-job" };
+      },
+    } as unknown as BinaryBridge;
+    const tools = new Map<string, MockToolDef>();
+    registerBashTool(makeMockApi(tools), makeMockContext(bridge));
+    const result = await tools
+      .get("bash_watch")!
+      .execute("call", { task_id: job, pattern: "READY", background: true }, undefined, undefined, {
+        cwd: projectRoot,
+        sessionManager: { getSessionId: () => "s-job-watch" },
+      });
+    expect(calls.filter(({ command }) => command === "bash_status")).toHaveLength(1);
+    expect(calls.find(({ command }) => command === "bash_status")?.params.task_id).toBe(job);
+    expect(calls.find(({ command }) => command === "bash_notify")?.params.task_id).toBe(task);
+    expect(result.content).toEqual([
+      { type: "text", text: expect.stringContaining(`on task ${task}`) },
+    ]);
+  });
+
   test("async bash_watch registration does not add synthetic outstanding task", async () => {
     __resetBgNotificationStateForTests();
     const tools = new Map<string, MockToolDef>();
@@ -1978,7 +2007,53 @@ describe("bash tool adapter", () => {
       .catch((error) => error);
     expect(error).toBeInstanceOf(BridgeError);
     expect(error.message).toBe(
-      `Permission denied for this shell command: mkdir -p x && rm -rf x @ ${projectRoot} (Permission denied: unsandboxed host execution was denied). The parts are checked together, so one denied part denies the whole command; run the allowed parts in a separate call.`,
+      `Permission denied for this shell command: one or more of these parts was denied: \`mkdir -p x && rm -rf x @ ${projectRoot}\` (Permission denied: unsandboxed host execution was denied). The parts are checked together, so one denied part denies the whole command; run the allowed parts in a separate call.`,
+    );
+    expect(error.code).toBe("permission_denied");
+    expect(calls).toHaveLength(1);
+    expect(approvals).toBe(1);
+  });
+
+  test("permission loop uses the shared unknown refusal without rule data", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const parts = ["mkdir -p x", "git ls-tree HEAD src"];
+    const { bridge, calls } = makeTrackableMockBridge({
+      success: false,
+      code: "permission_required",
+      asks: parts.map((command, index) => ({
+        kind: "escalation",
+        command,
+        grant_id: `esc_${index}`,
+      })),
+    });
+    registerBashTool(makeMockApi(tools), makeMockContext(bridge));
+    let approvals = 0;
+    const extCtx: MockExtensionContext = {
+      cwd: projectRoot,
+      hasUI: true,
+      ui: {
+        confirm: async () => {
+          approvals++;
+          return false;
+        },
+      },
+    };
+    const error = await tools
+      .get("bash")!
+      .execute(
+        "denied",
+        { command: parts.join(" && "), sandbox: "host" },
+        undefined,
+        undefined,
+        extCtx,
+      )
+      .catch((error) => error);
+    expect(error).toBeInstanceOf(BridgeError);
+    expect(error.message).toBe(
+      SHELL_REFUSAL_UNKNOWN.replace(
+        "Permission denied: shell",
+        "Permission denied: unsandboxed host execution was denied",
+      ),
     );
     expect(error.code).toBe("permission_denied");
     expect(calls).toHaveLength(1);

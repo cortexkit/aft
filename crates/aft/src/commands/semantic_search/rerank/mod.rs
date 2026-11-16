@@ -363,6 +363,9 @@ pub(crate) fn rerank_block_zero(
     settings: &RerankSettings,
     request: &RerankRequest<'_>,
 ) -> Result<HeadOutcome, String> {
+    if crate::executor::current_job_cancelled() {
+        return Ok(HeadOutcome::Skipped("request cancelled".into()));
+    }
     let Some(prose) = rerank_prose(request) else {
         return Ok(HeadOutcome::NotApplicable);
     };
@@ -409,17 +412,33 @@ pub(crate) fn rerank_block_zero(
             let candidate_wait = super::waits::time(super::waits::SearchWait::RerankCandidates);
             let texts = members
                 .iter()
-                .map(|entry| candidate_text(request.project_root, &entry.result, prose))
+                .map(|entry| candidate_text_checked(request.project_root, &entry.result, prose))
                 .collect::<Vec<_>>();
             drop(candidate_wait);
+            if crate::executor::current_job_cancelled()
+                || texts
+                    .iter()
+                    .any(|text| text.completion == CandidateCompletion::Cancelled)
+            {
+                return Ok(HeadOutcome::Skipped("request cancelled".into()));
+            }
+            if texts
+                .iter()
+                .any(|text| text.completion != CandidateCompletion::Complete)
+            {
+                return Ok(HeadOutcome::Skipped("candidate source incomplete".into()));
+            }
             let docs = texts
                 .iter()
-                .map(|text| RerankDoc { text })
+                .map(|text| RerankDoc { text: &text.text })
                 .collect::<Vec<_>>();
             let deadline = Instant::now() + settings.timeout;
             let scores = super::waits::timed(super::waits::SearchWait::RerankBackend, || {
                 selected.backend.score(prose, &docs, deadline)
             });
+            if crate::executor::current_job_cancelled() {
+                return Ok(HeadOutcome::Skipped("request cancelled".into()));
+            }
             let computed = match scores {
                 Ok(scores) => match validate_scores(&scores, depth) {
                     Ok(()) => CommittedOutcome::Reordered(permutation(&scores, &segments).into()),
@@ -437,7 +456,10 @@ pub(crate) fn rerank_block_zero(
                     CommittedOutcome::Skipped(error.skip_reason())
                 }
             };
-            memo().commit(identity, computed)
+            let Some(committed) = memo().commit(identity, computed) else {
+                return Ok(HeadOutcome::Skipped("request cancelled".into()));
+            };
+            committed
         }
     };
 
@@ -574,18 +596,59 @@ fn short_reason(reason: &str) -> String {
 /// are always kept whole. The result depends only on the project root, the
 /// entry, the prose and the file, never on which page is being served.
 pub(crate) fn candidate_text(project_root: &Path, result: &CandidateResult, prose: &str) -> String {
+    candidate_text_checked(project_root, result, prose).text
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CandidateCompletion {
+    Complete,
+    Cancelled,
+    Incomplete,
+}
+
+struct CandidateText {
+    // Diagnostics may retain a useful header after an incomplete read. Only
+    // completed source text may establish an outcome for later requests.
+    text: String,
+    completion: CandidateCompletion,
+}
+
+fn candidate_completion(read_completed: bool) -> CandidateCompletion {
+    if crate::executor::current_job_cancelled() {
+        CandidateCompletion::Cancelled
+    } else if read_completed {
+        CandidateCompletion::Complete
+    } else {
+        CandidateCompletion::Incomplete
+    }
+}
+
+fn candidate_text_checked(
+    project_root: &Path,
+    result: &CandidateResult,
+    prose: &str,
+) -> CandidateText {
     let _cost = super::telemetry::CostPhase::start("candidate_text");
     let files = super::request_files::current();
-    let file = super::request_files::read_through(files.as_deref(), &result.path, |path| {
+    if files
+        .as_ref()
+        .and_then(|files| files.kept(&result.path))
+        .is_none()
+        && std::fs::metadata(&result.path)
+            .is_ok_and(|metadata| crate::large_read::is_large(metadata.len()))
+    {
+        return streamed_candidate_text_checked(project_root, result, prose);
+    }
+    let read = super::request_files::read_through(files.as_deref(), &result.path, |path| {
         #[cfg(test)]
         crate::search_hot_path_measurements::record_file_read_path(path);
         crate::large_read::counted(
             crate::large_read::Site::CandidateText,
             super::request_files::read_whole_file(path),
         )
-    })
-    .ok()
-    .map(|fetched| fetched.file);
+    });
+    let mut completion = candidate_completion(read.is_ok());
+    let file = read.ok().map(|fetched| fetched.file);
     let bytes = file.as_ref().map_or(&[][..], |file| file.bytes());
     let (raw_line, selected) = if let Some(range) = result.symbol_range {
         let start = floor_raw_boundary(&bytes, range.start.min(bytes.len()));
@@ -618,11 +681,17 @@ pub(crate) fn candidate_text(project_root: &Path, result: &CandidateResult, pros
             };
             let matched = match (&files, &file) {
                 (Some(files), Some(_)) => {
-                    files.matching_line(&result.path, prose, None, || Ok(find()))
+                    files.matching_line_checked(&result.path, prose, None, || Ok(find()))
                 }
-                _ => find(),
-            }
-            .map(|(line, _)| line as usize);
+                _ => Ok(find()),
+            };
+            let matched = match matched {
+                Ok(found) => found.map(|(line, _)| line as usize),
+                Err(_) => {
+                    completion = candidate_completion(false);
+                    None
+                }
+            };
             let first = matched.map_or(0, |line| line.saturating_sub(FILE_CONTEXT_LINES_ABOVE));
             let name =
                 matched_identifier(prose, &source).unwrap_or_else(|| file_stem(&result.path));
@@ -650,7 +719,134 @@ pub(crate) fn candidate_text(project_root: &Path, result: &CandidateResult, pros
         let room = CANDIDATE_TEXT_BUDGET_BYTES - text.len();
         text.push_str(&line[..floor_char_boundary(line, line.len().min(room))]);
     }
-    text
+    CandidateText { text, completion }
+}
+
+#[cfg(test)]
+fn streamed_candidate_text(project_root: &Path, result: &CandidateResult, prose: &str) -> String {
+    streamed_candidate_text_checked(project_root, result, prose).text
+}
+
+fn streamed_candidate_text_checked(
+    project_root: &Path,
+    result: &CandidateResult,
+    prose: &str,
+) -> CandidateText {
+    let mut name = None;
+    let mut raw_line = 0usize;
+    let mut saw_code = false;
+    let identifiers = identifier_words(prose).collect::<Vec<_>>();
+    let mut found = vec![false; identifiers.len()];
+    let scan = crate::large_read::visit_lines(
+        &result.path,
+        crate::large_read::Site::CandidateText,
+        |index, offset, bytes| {
+            if let Some(range) = result.symbol_range {
+                if offset <= range.start {
+                    raw_line = index
+                        + usize::from(
+                            range.start >= offset + bytes.len() && bytes.ends_with(b"\n"),
+                        );
+                    let at = range.start - offset;
+                    // A leading invalid continuation run floors back onto the
+                    // preceding LF, which belongs to the preceding source line.
+                    if offset > 0
+                        && at < bytes.len()
+                        && bytes[0] & 0xc0 == 0x80
+                        && floor_raw_boundary(bytes, at) == 0
+                    {
+                        raw_line = index.saturating_sub(1);
+                    }
+                }
+                let selected = selected_line(bytes, offset, range);
+                if !selected.is_empty() && !saw_code {
+                    let source = String::from_utf8_lossy(selected).replace("\r\n", "\n");
+                    for line in source.lines() {
+                        if is_code_line(line.trim()) {
+                            saw_code = true;
+                            name = declared_name(&[line]);
+                            break;
+                        }
+                    }
+                }
+            } else {
+                let source = String::from_utf8_lossy(bytes);
+                for (needle, found) in identifiers.iter().zip(&mut found) {
+                    *found |= source.contains(needle);
+                }
+            }
+        },
+    );
+    let selection = if scan.is_ok() && result.symbol_range.is_none() {
+        super::matching_line_from_source_checked(&result.path, prose, None)
+    } else {
+        Ok(None)
+    };
+    // A successful no-match is complete; a failed selection must not be hidden
+    // by a later successful read of the body.
+    let selection_complete = selection.is_ok();
+    let matched = selection.ok().flatten().map(|(line, _)| line as usize);
+    let line = if result.symbol_range.is_some() {
+        raw_line
+    } else {
+        matched.unwrap_or(0)
+    };
+    if result.symbol_range.is_none() {
+        name = identifiers
+            .iter()
+            .zip(found)
+            .find(|(_, found)| *found)
+            .map(|(word, _)| bounded_name(word));
+    }
+    let name = name.unwrap_or_else(|| file_stem(&result.path));
+    let mut text = format!(
+        "{}:{}\n{name}",
+        display_path(project_root, &result.path),
+        line + 1
+    );
+    if scan.is_err() {
+        return CandidateText {
+            text,
+            completion: candidate_completion(false),
+        };
+    }
+    let first = matched.map_or(0, |line| line.saturating_sub(FILE_CONTEXT_LINES_ABOVE));
+    let scan = crate::large_read::visit_lines(
+        &result.path,
+        crate::large_read::Site::CandidateText,
+        |index, offset, bytes| {
+            let selected = match result.symbol_range {
+                Some(range) => selected_line(bytes, offset, range),
+                None if index >= first => bytes,
+                None => return,
+            };
+            let source = String::from_utf8_lossy(selected).replace("\r\n", "\n");
+            for line in source.lines() {
+                append_candidate_line(&mut text, line);
+            }
+        },
+    );
+    CandidateText {
+        text,
+        completion: candidate_completion(selection_complete && scan.is_ok()),
+    }
+}
+
+fn selected_line(bytes: &[u8], offset: usize, range: super::SymbolOffsetRange) -> &[u8] {
+    let start = floor_raw_boundary(bytes, range.start.saturating_sub(offset).min(bytes.len()));
+    let end =
+        floor_raw_boundary(bytes, range.end.saturating_sub(offset).min(bytes.len())).max(start);
+    &bytes[start..end]
+}
+
+fn append_candidate_line(text: &mut String, line: &str) {
+    let line = line.trim_end();
+    if line.trim().is_empty() || text.len() + 1 >= CANDIDATE_TEXT_BUDGET_BYTES {
+        return;
+    }
+    text.push('\n');
+    let room = CANDIDATE_TEXT_BUDGET_BYTES - text.len();
+    text.push_str(&line[..floor_char_boundary(line, line.len().min(room))]);
 }
 
 fn floor_raw_boundary(bytes: &[u8], mut at: usize) -> usize {
@@ -724,12 +920,10 @@ fn declared_name(lines: &[&str]) -> Option<String> {
         "declare",
         "readonly",
     ];
-    let code = lines.iter().map(|line| line.trim()).find(|line| {
-        !line.is_empty()
-            && !["#[", "#!", "@", "//", "/*", "*", "#", "--", "\"\"\""]
-                .iter()
-                .any(|prefix| line.starts_with(prefix))
-    })?;
+    let code = lines
+        .iter()
+        .map(|line| line.trim())
+        .find(|line| is_code_line(line))?;
     if let Some(captures) = DECLARATION.captures(code) {
         return Some(bounded_name(&captures[1]));
     }
@@ -743,6 +937,19 @@ fn declared_name(lines: &[&str]) -> Option<String> {
 /// The first code identifier of the prose (a word with an underscore, `::`,
 /// `$`, or an inner capital) that occurs in `source`.
 fn matched_identifier(prose: &str, source: &str) -> Option<String> {
+    identifier_words(prose)
+        .find(|word| source.contains(word))
+        .map(bounded_name)
+}
+
+fn is_code_line(line: &str) -> bool {
+    !line.is_empty()
+        && !["#[", "#!", "@", "//", "/*", "*", "#", "--", "\"\"\""]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+}
+
+fn identifier_words(prose: &str) -> impl Iterator<Item = &str> {
     prose
         .split(|character: char| {
             !(character.is_alphanumeric() || matches!(character, '_' | ':' | '$'))
@@ -754,8 +961,6 @@ fn matched_identifier(prose: &str, source: &str) -> Option<String> {
                 || word.contains('$')
                 || word.chars().skip(1).any(char::is_uppercase)
         })
-        .find(|word| source.contains(word))
-        .map(bounded_name)
 }
 
 fn floor_char_boundary(text: &str, mut index: usize) -> usize {
@@ -845,14 +1050,18 @@ impl Memo {
     /// Commit `outcome` unless another request committed first; either way,
     /// return the outcome now in force. A result that arrives after a skip was
     /// committed therefore never replaces it.
-    fn commit(&self, identity: [u8; 32], outcome: CommittedOutcome) -> CommittedOutcome {
+    /// Cancelled computations return None and never publish a reusable outcome.
+    fn commit(&self, identity: [u8; 32], outcome: CommittedOutcome) -> Option<CommittedOutcome> {
         let mut guard = self
             .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (entries, order) = &mut *guard;
+        if crate::executor::current_job_cancelled() {
+            return None;
+        }
         if let Some(existing) = entries.get(&identity) {
-            return existing.clone();
+            return Some(existing.clone());
         }
         while entries.len() >= MEMO_CAPACITY {
             let Some(oldest) = order.pop_front() else {
@@ -860,9 +1069,12 @@ impl Memo {
             };
             entries.remove(&oldest);
         }
+        if crate::executor::current_job_cancelled() {
+            return None;
+        }
         entries.insert(identity, outcome.clone());
         order.push_back(identity);
-        outcome
+        Some(outcome)
     }
 }
 

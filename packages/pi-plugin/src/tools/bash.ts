@@ -24,6 +24,7 @@ import {
   maybeAppendGrepSearchHint,
   REGEX_WINDOW_SCAN_INCOMPLETE_TEXT,
   refuseAftModuleOptionWithoutFallback,
+  resolveBashTaskId,
   resolveWatchTimeoutMs,
   runBashHostFallback,
   runningTaskStatusHint,
@@ -412,7 +413,8 @@ export function nativeSandboxEnabled(config: PluginContext["config"]): boolean {
 
 const BashTaskParams = Type.Object({
   task_id: Type.String({
-    description: "Background bash task id returned by bash({ background: true }).",
+    description:
+      "Background bash task id returned by bash({ background: true }), or its remote job ID.",
   }),
 });
 
@@ -434,7 +436,8 @@ const BashStatusParams = Type.Object({
     }),
   ),
   task_id: Type.String({
-    description: "Background bash task id returned by bash({ background: true }).",
+    description:
+      "Background bash task id returned by bash({ background: true }), or its remote job ID.",
   }),
   output_mode: Type.Optional(
     Type.Union([Type.Literal("screen"), Type.Literal("raw"), Type.Literal("both")], {
@@ -446,7 +449,8 @@ const BashStatusParams = Type.Object({
 
 const BashWatchParams = Type.Object({
   task_id: Type.String({
-    description: "Background bash task id returned by bash({ background: true }).",
+    description:
+      "Background bash task id returned by bash({ background: true }), or its remote job ID.",
   }),
   pattern: Type.Optional(Type.Union([Type.String(), Type.Object({ regex: Type.String() })])),
   background: Type.Optional(Type.Boolean()),
@@ -1146,7 +1150,7 @@ export function createBashStatusTool(ctx: PluginContext) {
     name: "bash_status",
     label: "bash_status",
     // Point at bash_watch for waiting only when the model can call it.
-    description: `Read-only snapshot of a background bash task. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion.${bashCompanionRegistered(ctx.config, "bash_watch") ? " To wait, use bash_watch." : ""}`,
+    description: `Read-only snapshot of a background bash task; a remote job ID works too. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion.${bashCompanionRegistered(ctx.config, "bash_watch") ? " To wait, use bash_watch." : ""}`,
     promptSnippet: "Inspect a background bash task by task_id",
     parameters: BashStatusParams,
     async execute(
@@ -1207,7 +1211,7 @@ export function createBashWatchTool(ctx: PluginContext) {
     name: "bash_watch",
     label: "bash_watch",
     // The polling warning names bash_status only when the model can call it.
-    description: `Watch a background bash task. ${WATCH_SYNC_DEFAULTS_DESCRIPTION}. In a main session sync waits are for a short remaining wait on a task; for anything longer, first do the work that doesn't need the result, end the turn only when everything left needs it, and let the completion reminder wake you, or use \`bash({wait:true})\` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn.${bashCompanionRegistered(ctx.config, "bash_status") ? " Never loop bash_status to wait." : ""}`,
+    description: `Watch a background bash task; a remote job ID works too. ${WATCH_SYNC_DEFAULTS_DESCRIPTION}. In a main session sync waits are for a short remaining wait on a task; for anything longer, first do the work that doesn't need the result, end the turn only when everything left needs it, and let the completion reminder wake you, or use \`bash({wait:true})\` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn.${bashCompanionRegistered(ctx.config, "bash_status") ? " Never loop bash_status to wait." : ""}`,
     promptSnippet: "Wait for or watch a background bash task",
     parameters: BashWatchParams,
     async execute(
@@ -1218,6 +1222,12 @@ export function createBashWatchTool(ctx: PluginContext) {
       extCtx: ExtensionContext,
     ) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
+      params = {
+        ...params,
+        task_id: await resolveBashTaskId(params.task_id, (reference) =>
+          callBashBridge(bridge, "bash_status", { task_id: reference }, extCtx),
+        ),
+      };
       const waitFor = parseWaitPattern(params.pattern);
       const bashCfg = resolveBashConfig(ctx.config);
       // A worker that may not background also may not park an async watch it
@@ -1433,7 +1443,7 @@ export function createBashKillTool(ctx: PluginContext) {
     name: "bash_kill",
     label: "bash_kill",
     description:
-      "Terminate a running background bash task spawned with bash({ background: true }).",
+      "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too.",
     promptSnippet: "Kill a background bash task by task_id",
     parameters: BashTaskParams,
     async execute(

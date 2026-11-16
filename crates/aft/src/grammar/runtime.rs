@@ -55,6 +55,8 @@ impl Clock for MonotonicClock {
 }
 
 struct Entry {
+    #[cfg(feature = "test-hooks")]
+    attempts_started: usize,
     root_generation: u64,
     loading: bool,
     language: Option<Language>,
@@ -69,6 +71,8 @@ struct Entry {
 impl Default for Entry {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "test-hooks")]
+            attempts_started: 0,
             root_generation: 0,
             loading: false,
             language: None,
@@ -97,9 +101,35 @@ pub struct GrammarRegistry {
     transport: OnceLock<Result<Arc<dyn download::Transport>, String>>,
     queries: Vec<String>,
     fault: RwLock<storage::StorageFault>,
-    listeners: Mutex<Vec<std::sync::mpsc::Sender<String>>>,
+    listeners: Mutex<std::collections::BTreeMap<u64, std::sync::mpsc::Sender<String>>>,
+    next_listener: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    forced_unavailable: Mutex<Option<GrammarUnavailable>>,
     #[cfg(any(test, feature = "test-hooks"))]
     load_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+/// A readiness receiver whose registration ends with the receiver's lifetime.
+pub struct ReadinessSubscription {
+    receiver: std::sync::mpsc::Receiver<String>,
+    registration: Option<(std::sync::Weak<GrammarRegistry>, u64)>,
+}
+
+impl std::ops::Deref for ReadinessSubscription {
+    type Target = std::sync::mpsc::Receiver<String>;
+    fn deref(&self) -> &Self::Target {
+        &self.receiver
+    }
+}
+
+impl Drop for ReadinessSubscription {
+    fn drop(&mut self) {
+        if let Some((registry, id)) = &self.registration {
+            if let Some(registry) = registry.upgrade() {
+                registry.listeners.lock().remove(id);
+            }
+        }
+    }
 }
 
 static REGISTRY: OnceLock<Arc<GrammarRegistry>> = OnceLock::new();
@@ -138,7 +168,10 @@ impl GrammarRegistry {
                 crate::luau::COMMENT_QUERY.into(),
             ],
             fault: RwLock::new(storage::StorageFault::None),
-            listeners: Mutex::new(Vec::new()),
+            listeners: Mutex::new(std::collections::BTreeMap::new()),
+            next_listener: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            forced_unavailable: Mutex::new(None),
             #[cfg(any(test, feature = "test-hooks"))]
             load_hook: Mutex::new(None),
         });
@@ -154,6 +187,28 @@ impl GrammarRegistry {
 
     pub fn compile_ms(&self) -> f64 {
         self.entry.lock().compile_ms
+    }
+
+    /// Observe availability without opening storage, compiling or requesting.
+    pub fn status_snapshot(&self) -> Option<GrammarUnavailable> {
+        #[cfg(test)]
+        if let Some(error) = self.forced_unavailable.lock().clone() {
+            return Some(error);
+        }
+        let entry = self.entry.lock();
+        entry.language.is_none().then(|| self.unavailable(&entry))
+    }
+
+    /// Whether a background driver can start an attempt on the current clock.
+    pub fn retry_due(&self) -> bool {
+        let entry = self.entry.lock();
+        entry.language.is_none()
+            && !entry.loading
+            && (entry.state == GrammarState::NotDownloaded
+                || matches!(
+                    entry.state,
+                    GrammarState::NetworkRetry | GrammarState::StorageRetry
+                ) && self.clock.now_ms() >= entry.retry_at)
     }
 
     fn set_storage_root(&self, root: std::path::PathBuf) {
@@ -209,6 +264,10 @@ impl GrammarRegistry {
     /// Waiters release that mutex and have a finite wait; command-level request
     /// calls report an in-progress load immediately instead of waiting for it.
     pub fn stored(&self) -> Result<Language, GrammarUnavailable> {
+        #[cfg(test)]
+        if let Some(error) = self.forced_unavailable.lock().clone() {
+            return Err(error);
+        }
         let mut entry = self.entry.lock();
         let wait_until = Instant::now() + std::time::Duration::from_secs(30);
         while entry.loading {
@@ -258,9 +317,13 @@ impl GrammarRegistry {
             .ok_or_else(|| self.unavailable(&entry))
     }
 
-    /// Called only by named-file command handlers. Stored bytes always win over
-    /// a download, including the very first qualifying call after a restart.
+    /// Called by dynamic command preparation and checkout maintenance. Stored
+    /// bytes win over a download, including the first request after a restart.
     pub fn request(self: &Arc<Self>) -> Result<Language, GrammarUnavailable> {
+        #[cfg(test)]
+        if let Some(error) = self.forced_unavailable.lock().clone() {
+            return Err(error);
+        }
         {
             let entry = self.entry.lock();
             if entry.loading {
@@ -282,6 +345,10 @@ impl GrammarRegistry {
             GrammarState::NetworkRetry | GrammarState::StorageRetry
         ) && self.clock.now_ms() >= entry.retry_at;
         if entry.state == GrammarState::NotDownloaded || retry {
+            #[cfg(feature = "test-hooks")]
+            {
+                entry.attempts_started += 1;
+            }
             entry.state = GrammarState::Downloading;
             let generation = entry.root_generation;
             let registry = Arc::clone(self);
@@ -413,21 +480,27 @@ impl GrammarRegistry {
                 entry.language = Some(language);
                 self.listeners
                     .lock()
-                    .retain(|listener| listener.send(self.identity().into()).is_ok());
+                    .retain(|_, listener| listener.send(self.identity().into()).is_ok());
             }
             Err(state) => entry.state = state,
         }
     }
 
     /// Subscribe before the grammar is loaded; a ready grammar immediately emits its hash.
-    pub fn subscribe(&self) -> std::sync::mpsc::Receiver<String> {
+    pub fn subscribe(self: &Arc<Self>) -> ReadinessSubscription {
         let (tx, rx) = std::sync::mpsc::channel();
         let entry = self.entry.lock();
         if entry.language.is_some() {
             let _ = tx.send(self.identity().into());
         }
-        self.listeners.lock().push(tx);
-        rx
+        let id = self
+            .next_listener
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.listeners.lock().insert(id, tx);
+        ReadinessSubscription {
+            receiver: rx,
+            registration: Some((Arc::downgrade(self), id)),
+        }
     }
 }
 

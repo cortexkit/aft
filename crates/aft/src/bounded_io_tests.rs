@@ -1,4 +1,72 @@
 use super::*;
+
+#[test]
+fn stage2_disclosure_scope_has_no_deadline_or_sticky_read_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let _scope = enter_disclosure_if_absent();
+    assert!(current().is_none());
+    assert!(request_deadline(None).is_none());
+    let id = capture().unwrap().id;
+    {
+        let _nested = enter_disclosure_if_absent();
+        assert_eq!(capture().unwrap().id, id);
+    }
+    let _error = failure(&root.path().join("absent"), "read_blocked", "test failure");
+    assert!(prior_failure().is_none());
+    let context = capture();
+    rayon::join(
+        || {
+            with_budget(context.clone(), || {
+                note_large_read_skip(&root.path().join("large.txt"))
+            })
+        },
+        || {},
+    );
+    let response = with_skip_disclosure(|| {
+        finish_response(Response::success(
+            "native",
+            serde_json::json!({"complete":true}),
+        ))
+    });
+    assert!(response.success);
+    assert_eq!(response.data["complete"], false);
+    assert_eq!(response.data["skipped_files"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn stage2_skip_disclosure_is_sorted_bounded_deduplicated_and_non_failing() {
+    let root = tempfile::tempdir().unwrap();
+    let readable = root.path().join("readable.txt");
+    std::fs::write(&readable, b"still readable").unwrap();
+    let response = with_budget(Some(Budget::after(Duration::from_secs(30))), || {
+        for at in (0..23).rev() {
+            let path = root.path().join(format!("large-{at:02}.txt"));
+            note_large_read_skip(&path);
+            note_large_read_skip(&path);
+        }
+        assert_eq!(read(&readable, None).unwrap(), b"still readable");
+        with_skip_disclosure(|| {
+            finish_response(Response::success(
+                "skips",
+                serde_json::json!({"complete":true,"text":"results"}),
+            ))
+        })
+    });
+    assert!(response.success);
+    assert_eq!(response.data["complete"], false);
+    let skips = response.data["skipped_files"].as_array().unwrap();
+    assert_eq!(skips.len(), 20);
+    assert!(skips[0]["file"].as_str().unwrap().ends_with("large-00.txt"));
+    assert!(skips[19]["file"]
+        .as_str()
+        .unwrap()
+        .ends_with("large-19.txt"));
+    assert_eq!(response.data["skipped_files_remaining"], 3);
+    assert!(response.data["text"]
+        .as_str()
+        .unwrap()
+        .contains("shown 20 of 23 files (cap) · narrow: path"));
+}
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 struct HelperGate {
@@ -1169,4 +1237,256 @@ fn probe_pool_workload() {
     let spawns = THREAD_SPAWNS.load(Ordering::Relaxed) - spawns;
     let probes: usize = totals.iter().map(|row| row[3]).sum();
     println!("PROBE_LOAD calls/directory/traversal/dispatch={totals:?} wall_s={wall:.6} cpu_s={cpu:.6} spawns={spawns} threads_per_s={:.3} cpu_us_per_probe={:.3}", spawns as f64 / wall, cpu * 1_000_000.0 / probes as f64);
+}
+#[test]
+fn audit1432_skip_disclosure_does_not_mutate_error_or_cancelled_replies() {
+    with_budget(Some(Budget::after(Duration::from_secs(30))), || {
+        note_large_read_skip(Path::new("large.log"));
+        for code in ["test_error", "request_cancelled"] {
+            let mut response = Response::error("omission-error", code, "original failure");
+            let original = serde_json::to_value(&response).unwrap();
+            disclose_large_read_skips(&mut response);
+            assert_eq!(serde_json::to_value(response).unwrap(), original, "{code}");
+        }
+    });
+}
+
+#[test]
+fn audit1432_zero_result_search_keeps_no_results_and_independent_honesty_notes() {
+    with_budget(Some(Budget::after(Duration::from_secs(30))), || {
+        note_large_read_skip(Path::new("large.log"));
+        let mut response = Response::success(
+            "empty-search",
+            serde_json::json!({
+                "text":"", "results":[], "more_available":true, "engine_capped":true,
+                "fully_degraded":true,
+                "results_list_envelope":{"shown":0,"total":{"kind":"exact","value":0},"unit":"results","causes":[],"narrow":["query"]}
+            }),
+        );
+        disclose_large_read_skips(&mut response);
+        let text = crate::subc_format::format_response("search", &response, false);
+        for expected in [
+            "No results.",
+            "more results available",
+            "enumeration capped",
+            "answered by a filesystem scan",
+            "large.log",
+            crate::large_read::WHOLE_READ_SKIP_REASON,
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}: {text}");
+        }
+    });
+}
+
+#[test]
+fn audit1432_round2_nonempty_search_keeps_independent_honesty_with_skips() {
+    with_budget(Some(Budget::after(Duration::from_secs(30))), || {
+        note_large_read_skip(Path::new("large.log"));
+        let mut response = Response::success(
+            "rows-search",
+            serde_json::json!({"text":"retained row", "more_available":true, "engine_capped":true, "fully_degraded":true}),
+        );
+        disclose_large_read_skips(&mut response);
+        let text = crate::subc_format::format_response("search", &response, false);
+        for expected in [
+            "retained row",
+            "more results available",
+            "enumeration capped",
+            "answered by a filesystem scan",
+            "large.log",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}: {text}");
+        }
+    });
+}
+
+fn round2_context(root: &Path) -> AppContext {
+    let mut config = crate::config::Config::default();
+    config.project_root = Some(root.to_path_buf());
+    config.restrict_to_project_root = false;
+    config.storage_dir = Some(root.join(".store"));
+    config.backup.enabled = Some(false);
+    AppContext::new(Box::new(crate::language::StubProvider), config)
+}
+
+fn round2_nonsearch_reply(
+    command_name: &str,
+    body: serde_json::Value,
+    floors: &[PathBuf],
+) -> Response {
+    let root = tempfile::tempdir().unwrap();
+    let ctx = round2_context(root.path());
+    let req: RawRequest =
+        serde_json::from_value(serde_json::json!({"id":"main-contract","command":command_name}))
+            .unwrap();
+    crate::context::confinement::with_floor_disclosure(|| {
+        command(&req, &ctx, |_, _| {
+            for path in floors {
+                crate::context::confinement::capture().record_matched_floor(path);
+            }
+            Response::success("main-contract", body)
+        })
+    })
+}
+
+#[test]
+fn audit1432_round2_outline_directory_reply_keeps_main_skip_contract_bytes() {
+    let skips = (0..23).rev().map(|at| serde_json::json!({"file":format!("unsupported-{at:02}.odd"),"reason":"unsupported_language"})).collect::<Vec<_>>();
+    let body = serde_json::json!({"text":"directory outline\nstructure footer", "structure_footer":"structure footer", "discovered":true,"complete":true,"skipped_files":skips});
+    let expected = Response::success("main-contract", body.clone());
+    let response = round2_nonsearch_reply("outline", body, &[]);
+    assert_eq!(
+        serde_json::to_vec(&response).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+    assert_eq!(
+        crate::subc_format::format_response("outline", &response, false),
+        crate::subc_format::format_response("outline", &expected, false)
+    );
+}
+
+#[test]
+fn audit1432_round2_glob_floor_only_reply_keeps_main_skip_contract_bytes() {
+    let floors = (0..23)
+        .map(|at| PathBuf::from(format!("denied-{at:02}.log")))
+        .collect::<Vec<_>>();
+    let mut expected_body = serde_json::json!({"text":"visible.rs", "files":["visible.rs"]});
+    let response = round2_nonsearch_reply("glob", expected_body.clone(), &floors);
+    expected_body["skipped_files"] = serde_json::json!(floors
+        .iter()
+        .map(|path| serde_json::json!({"file":path,"reason":"denied_floor"}))
+        .collect::<Vec<_>>());
+    expected_body["complete"] = serde_json::json!(false);
+    let expected = Response::success("main-contract", expected_body);
+    assert_eq!(
+        serde_json::to_vec(&response).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+    assert_eq!(
+        crate::subc_format::format_response("glob", &response, false),
+        crate::subc_format::format_response("glob", &expected, false)
+    );
+}
+
+#[test]
+fn audit1432_round2_nested_dead_code_reply_keeps_main_skip_contract_bytes() {
+    let skips = (0..23)
+        .rev()
+        .map(
+            |at| serde_json::json!({"file":format!("large-{at:02}.rs"),"reason":"graph_too_large"}),
+        )
+        .collect::<Vec<_>>();
+    let body = serde_json::json!({"summary":{"dead_code":{"complete":false,"skipped_files_count":23,"skipped_files":skips}}});
+    let expected = Response::success("main-contract", body.clone());
+    let response = round2_nonsearch_reply("inspect", body, &[]);
+    assert_eq!(
+        serde_json::to_vec(&response).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+}
+
+#[test]
+fn audit1432_grep_without_producer_text_still_renders_named_skips() {
+    with_budget(Some(Budget::after(Duration::from_secs(30))), || {
+        note_large_read_skip(Path::new("large.log"));
+        let mut response = Response::success("textless-grep", serde_json::json!({"matches":[]}));
+        disclose_large_read_skips(&mut response);
+        response.data.as_object_mut().unwrap().remove("text");
+        let text = crate::subc_format::format_response("grep", &response, false);
+        assert!(text.contains("large.log"), "{text}");
+        assert!(
+            text.contains(crate::large_read::WHOLE_READ_SKIP_REASON),
+            "{text}"
+        );
+    });
+}
+
+#[test]
+fn audit1432_walk_gap_precedes_the_entire_skipped_files_block() {
+    with_budget(Some(Budget::after(Duration::from_secs(30))), || {
+        let budget = current().unwrap();
+        budget.walk_partial.store(true, Ordering::Release);
+        budget
+            .walk_time_limit_reached
+            .store(true, Ordering::Release);
+        for at in 0..23 {
+            note_large_read_skip(Path::new(&format!("large-{at:02}.log")));
+        }
+        let response = with_skip_disclosure(|| {
+            finish_response(Response::success(
+                "walk-and-skips",
+                serde_json::json!({"text":"rows"}),
+            ))
+        });
+        let text = response.data["text"].as_str().unwrap();
+        assert!(
+            text.find(WALK_PARTIAL_GAP).unwrap()
+                < text
+                    .find(crate::large_read::WHOLE_READ_SKIP_REASON)
+                    .unwrap(),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("shown 20 of 23 files (cap) · narrow: path"),
+            "{text}"
+        );
+    });
+}
+
+#[test]
+fn audit1432_skip_collector_is_order_independent_and_deduplicates_paths_with_both_reasons() {
+    let collect = |command_name: &str, reverse: bool| {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = round2_context(root.path());
+        let req: RawRequest =
+            serde_json::from_value(serde_json::json!({"id":"mixed-order","command":command_name}))
+                .unwrap();
+        with_skip_disclosure(|| {
+            let work = || {
+                for at in 0..23 {
+                    let path = PathBuf::from(format!("file-{at:02}.log"));
+                    crate::context::confinement::capture().record_matched_floor(&path);
+                    note_large_read_skip(&path);
+                }
+                Response::success("mixed-order", serde_json::json!({"text":"rows"}))
+            };
+            if reverse {
+                command(&req, &ctx, |_, _| {
+                    crate::context::confinement::with_floor_disclosure(work)
+                })
+            } else {
+                crate::context::confinement::with_floor_disclosure(|| {
+                    command(&req, &ctx, |_, _| work())
+                })
+            }
+        })
+    };
+    let first = collect("grep", false);
+    for command in ["grep", "semantic_search"] {
+        for reverse in [false, true] {
+            assert_eq!(
+                serde_json::to_vec(&first).unwrap(),
+                serde_json::to_vec(&collect(command, reverse)).unwrap(),
+                "{command}, reverse={reverse}"
+            );
+        }
+    }
+    let files = first.data["skipped_files"].as_array().unwrap();
+    assert_eq!(files.len(), 20);
+    assert_eq!(first.data["skipped_files_remaining"], 3);
+    assert_eq!(first.data["skipped_files_list_envelope"]["shown"], 20);
+    assert_eq!(
+        first.data["skipped_files_list_envelope"]["total"]["value"],
+        23
+    );
+    assert_eq!(files[0]["file"], "file-00.log");
+    let reasons = files[0]["reasons"].as_array().unwrap();
+    assert!(reasons.contains(&serde_json::json!("denied_floor")));
+    assert!(reasons.contains(&serde_json::json!(
+        crate::large_read::WHOLE_READ_SKIP_REASON
+    )));
+    assert!(first.data["text"]
+        .as_str()
+        .unwrap()
+        .ends_with("shown 20 of 23 files (cap) · narrow: path"));
 }

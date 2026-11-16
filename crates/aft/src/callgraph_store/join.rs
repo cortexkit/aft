@@ -446,8 +446,13 @@ impl CallgraphBlob {
         Ok(Self::Parse(parse))
     }
 
-    /// Builds a manifest configuration input.  The caller must key it with
-    /// `language = "config"` and the same extractor version stored here.
+    /// Builds a manifest configuration input. The caller keys it with the
+    /// file's configuration language (plain `config`, or `config-<grammar>`
+    /// when the record also holds TODO markers read in that grammar; see
+    /// `data_layer::content::is_config_language`) and the same extractor
+    /// version stored here. The blob itself always names plain `config`:
+    /// it holds the file's bytes whole, which do not depend on the grammar,
+    /// and readers take the language from the path record, not from here.
     pub fn config(source: impl Into<Vec<u8>>, extractor_version: impl Into<String>) -> Self {
         Self::Config(ConfigBlob {
             extractor_version: extractor_version.into(),
@@ -1377,7 +1382,14 @@ pub(super) fn dispatch_type_names(parse: &ParseBlob) -> BTreeSet<String> {
         names.insert(method.owner.clone());
         names.extend(method.trait_name.iter().cloned());
     }
-    names.extend(parse.dispatch.fields.iter().map(|f| f.ty.clone()));
+    for field in &parse.dispatch.fields {
+        let mut name = field.ty.as_str();
+        while let Some((_, outer, inner)) = dispatch::smart_pointer::parts(name) {
+            names.insert(outer.to_string());
+            name = inner;
+        }
+        names.insert(name.to_string());
+    }
     names.extend(parse.dispatch.returns.iter().map(|r| r.ty.clone()));
     for site in &parse.dispatch.sites {
         if let Some(receiver) = &site.receiver {

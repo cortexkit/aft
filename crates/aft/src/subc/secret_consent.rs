@@ -88,6 +88,7 @@ struct Card {
     elicitation: Option<String>,
     answered: Option<ConsentOutcome>,
     warned_unreadable: bool,
+    bus_watch: Option<crate::late_result_bus::readers::CardWatch>,
 }
 
 fn consent_unavailable(detail: &str) -> ConsentOutcome {
@@ -250,6 +251,7 @@ impl SubcSecretConsent {
                         elicitation: None,
                         answered: None,
                         warned_unreadable: false,
+                        bus_watch: None,
                     }))
                 })
                 .clone()
@@ -261,6 +263,7 @@ impl SubcSecretConsent {
         if let Some(answer) = &card.answered {
             return answer.clone();
         }
+        let existing = card.elicitation.is_some();
         if card.elicitation.is_none() {
             if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
                 card.answered = Some(ConsentOutcome::Cancelled);
@@ -324,15 +327,32 @@ impl SubcSecretConsent {
                     .await;
             };
             card.elicitation = Some(id.to_owned());
+            card.bus_watch = Some(crate::late_result_bus::readers::watch_card(id));
             card.answered = None;
         }
-        let await_card = self
+        let await_card = async {
+            if existing {
+                if let Some(watch) = &card.bus_watch {
+                    watch.wait().await;
+                }
+            }
+            let hold = if card
+                .bus_watch
+                .as_ref()
+                .is_some_and(|watch| watch.attached())
+            {
+                Duration::ZERO
+            } else {
+                hold.min(SECRET_AWAIT_CAP)
+            };
+            self
             .call(
                 request,
                 "consent.await",
                 serde_json::json!({"elicitation_id": card.elicitation, "timeout_ms": hold.min(SECRET_AWAIT_CAP).as_millis() as u64}),
                 hold.min(SECRET_AWAIT_CAP) + SECRET_CONSENT_TIMEOUT,
-            );
+            ).await
+        };
         let cancelled = async {
             match cancel {
                 Some(cancel) => cancel.cancelled().await,
@@ -347,6 +367,7 @@ impl SubcSecretConsent {
                     crate::slog_warn!("secret consent withdrawal failed");
                 }
                 card.answered = Some(ConsentOutcome::Cancelled);
+                if let Some(watch) = card.bus_watch.take() { watch.receipt().applied(); }
                 return ConsentOutcome::Cancelled;
             },
             response = await_card => response,
@@ -407,6 +428,9 @@ impl SubcSecretConsent {
                 | ConsentOutcome::Cancelled
         ) {
             card.answered = Some(outcome.clone());
+            if let Some(watch) = card.bus_watch.take() {
+                watch.receipt().applied();
+            }
         }
         if cancel.is_some() && matches!(outcome, ConsentOutcome::Unavailable { .. }) {
             // An unsuccessful await still leaves a live phone card. Withdraw it
@@ -426,7 +450,13 @@ impl SubcSecretConsent {
             // A known id means the card was filed for the person. A failed
             // await is cancellation, never evidence of a decline or expiry.
             card.answered = Some(ConsentOutcome::Cancelled);
+            if let Some(watch) = card.bus_watch.take() {
+                watch.receipt().applied();
+            }
             return ConsentOutcome::Cancelled;
+        }
+        if outcome != ConsentOutcome::Pending {
+            card.bus_watch.take();
         }
         outcome
     }
@@ -581,6 +611,8 @@ pub(super) fn call_scopes(
         } else {
             Ineligibility::EphemeralOutsideCodemode
         }),
+        ScopeKind::Federated => Err(Ineligibility::NotACommandScope),
+        _ => Err(Ineligibility::NotACommandScope),
     }
 }
 

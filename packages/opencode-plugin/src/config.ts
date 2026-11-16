@@ -408,6 +408,42 @@ const BashFeaturesSchema = z.object({
 
 const BashConfigSchema = z.union([z.boolean(), BashFeaturesSchema]);
 
+const ShellEnvProviderSchema = z
+  .object({
+    kind: z.enum(["mise", "direnv", "custom"]),
+    command: z
+      .array(z.string().refine((arg) => !arg.includes("\0")))
+      .min(1)
+      .optional(),
+    timeout_ms: z.number().int().min(100).max(10000).default(2000),
+    watch: z.array(z.string()).default([]),
+  })
+  .strict()
+  .superRefine((provider, context) => {
+    if (provider.kind !== "custom" && provider.watch.length > 0)
+      context.addIssue({
+        code: "custom",
+        path: ["watch"],
+        message: "invalid_security_config:shell.env_provider.watch",
+      });
+    if (provider.kind === "custom" && provider.command === undefined)
+      context.addIssue({
+        code: "custom",
+        message: "shell.env_provider.command is required for custom",
+      });
+    if (provider.command?.[0] === "")
+      context.addIssue({
+        code: "custom",
+        message: "shell.env_provider.command must be a nonempty argv without NUL bytes",
+      });
+    if (process.platform === "win32" && provider.kind === "direnv")
+      context.addIssue({
+        code: "custom",
+        message: "shell.env_provider: direnv is not supported on Windows; use mise or custom",
+      });
+  });
+const ShellConfigSchema = z.object({ env_provider: ShellEnvProviderSchema.optional() }).strict();
+
 const SandboxConfigSchema = z.object({
   /** Project overrides may only harden a role's user-selected profile. */
   profile: z
@@ -697,6 +733,8 @@ const AftConfigFieldsSchema = z.object({
    * Replaces `experimental.bash.*`.
    */
   bash: BashConfigSchema.optional(),
+  /** User-only, opt-in per-project shell environment export. */
+  shell: ShellConfigSchema.optional(),
   /** Experimental opt-in features. Default: all false. */
   experimental: ExperimentalConfigSchema.optional(),
   /** User-defined and built-in LSP server configuration. */
@@ -968,6 +1006,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   if (config.validate_on_edit !== undefined) overrides.validate_on_edit = config.validate_on_edit;
   if (config.formatter !== undefined) overrides.formatter = config.formatter;
   if (config.checker !== undefined) overrides.checker = config.checker;
+  if (config.shell !== undefined) overrides.shell = config.shell;
 
   // Project containment — default false at the plugin layer (parity with
   // OpenCode's built-in tools). Users opt in with `restrict_to_project_root: true`.
@@ -1552,6 +1591,18 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
       result.error.issues,
     );
     if (rejected.length > 0) throw new ConfigRejectedError(rejected, configPath);
+    const shellIssues = result.error.issues.filter(
+      (issue) =>
+        issue.path[0] === "shell" ||
+        (issue.path[0] === "harnesses" &&
+          issue.path[1] === ACTIVE_HARNESS &&
+          issue.path[2] === "shell"),
+    );
+    if (tier === "user" && shellIssues.length > 0)
+      throw new ConfigRejectedError(
+        shellIssues.map((issue) => issue.message),
+        configPath,
+      );
     const errorMsg = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join(", ");
     warn(`Config validation error in ${configPath}: ${errorMsg}`);
     configValidationErrors.push({ path: configPath, message: errorMsg });
@@ -1971,6 +2022,7 @@ function getStrippedTopLevelKeys(override: AftConfig, base: AftConfig): string[]
   if (override.url_fetch_allow_private !== undefined) stripped.push("url_fetch_allow_private");
   if (override.auto_update !== undefined) stripped.push("auto_update");
   if (override.bridge !== undefined) stripped.push("bridge");
+  if (override.shell?.env_provider !== undefined) stripped.push("shell.env_provider");
   if (override.backup?.enabled !== undefined || override.backup?.max_depth !== undefined)
     stripped.push("backup");
   if (override.index?.roots !== undefined) stripped.push("index.roots");

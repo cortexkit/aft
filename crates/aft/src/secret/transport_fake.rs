@@ -148,6 +148,8 @@ impl State {
                 };
                 (parent.owner, "head", parent.scope_ref, parent.scope_epoch)
             }
+            ScopeKind::Federated => return not_found(),
+            _ => return not_found(),
         };
         let coverage = params.coverage;
         let record = self
@@ -385,7 +387,7 @@ impl FakeClaustrum {
                                 if subc_transport::authenticate_server(&mut stream, &key, &daemon_id, "0.39.0", Duration::from_secs(2)).await.is_err() { return; }
                                 state.lock().unwrap().connections += 1;
                                 let mut principal = String::new();
-                                while let Ok(Some(request)) = subc_transport::read_frame(&mut stream).await {
+                                while let Ok(Some(request)) = crate::subc_fake::read_frame(&mut stream).await {
                                     if request.header.ty == FrameType::Ping {
                                         let pong = Frame::build(FrameType::Pong, flags(), 0, 0, request.header.corr, Vec::new()).unwrap();
                                         if subc_transport::write_frame(&mut stream, &pong).await.is_err() { break; }

@@ -22,7 +22,8 @@ use tokio::net::{TcpListener, TcpStream};
 use super::subc_detach_test::{
     bind_route, control_flags, extract_task_id, frame_body, read_any_frame_timeout,
     read_tool_response, send_connection_goodbye, send_frame, send_tool_call, tool_result_is_error,
-    wait_for_status, write_connection_file, write_user_config, ModuleProcess,
+    wait_for_status, write_raw_connection_file as write_connection_file, write_user_config,
+    ModuleProcess,
 };
 
 const PIPE_NONCE: &str = "pipe-launch-nonce-0123456789abcdef";
@@ -166,7 +167,7 @@ fn subc_module_reads_the_pipe_nonce_and_no_child_inherits_it() {
 
         assert_eq!(
             manifest["provenance"]["wire_crate_version"],
-            json!("0.35.0")
+            json!("0.37.0")
         );
         // Binary builders may provide a revision explicitly. Ordinary Cargo
         // builds omit it; the nonce and child checks do not depend on provenance.

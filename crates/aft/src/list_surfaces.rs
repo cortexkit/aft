@@ -206,7 +206,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
                 kind: ReasonKind::Bounding,
                 // The regex route sets engine_capped in rank_collection when its
                 // file-count or time bound left candidate files unexamined.
-                predicate_name: "engine_capped, rank_collection",
+                predicate_name: "engine_capped, rank_collection, read_degraded_grep_file",
             },
             // from_matches is the regex route's per-result line allowance: a
             // file lists its first matching lines and reports the rest in
@@ -260,6 +260,24 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             kind: ReasonKind::Selecting,
             predicate_name: "MatchBudget",
         }],
+    },
+    SurfaceEntry {
+        requires: None,
+        command: "search",
+        mode: "",
+        list_id: "payload.skipped_files",
+        unit: Unit::Files,
+        narrow: &["path"],
+        reasons: &[ReasonEntry { reason: Reason::Cap, kind: ReasonKind::Selecting, predicate_name: "disclose_large_read_skips" }],
+    },
+    SurfaceEntry {
+        requires: None,
+        command: "grep",
+        mode: "",
+        list_id: "payload.skipped_files",
+        unit: Unit::Files,
+        narrow: &["path"],
+        reasons: &[ReasonEntry { reason: Reason::Cap, kind: ReasonKind::Selecting, predicate_name: "disclose_large_read_skips" }],
     },
     SurfaceEntry {
         requires: None,
@@ -376,6 +394,12 @@ pub struct ExclusionEntry {
 
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
+    ExclusionEntry {
+        file: "late_result_bus.rs",
+        enclosing_item: "scan,replay,read_batch,capacity,due,deliver",
+        location_or_primitive: "SCAN_BATCH (64), LATE_RESULTS_PAGE_MAX, UNACKED_RESULTS_MAX, SQL LIMIT",
+        reason: "internal bus wakes use index-seeked settlement batches and startup-only custodian feed pages; the retry set stops cursor advancement at the existing feed retention cap, leaving overflow durable in the ledger rather than shortening a command result list",
+    },
     #[cfg(feature = "callgraph-shape-census")]
     ExclusionEntry {
         file: "data_layer/shape_census.rs",
@@ -433,9 +457,15 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "subc/rich_ui/outbox.rs",
-        enclosing_item: "admit, retry, pop_due",
+        enclosing_item: "admit, retry, pop_due, ReadCache::insert, ReadCache::prune",
         location_or_primitive: "MAX_CALLS, MAX_BYTES, EXPIRY, attempts",
         reason: "Optional display delivery quotas bound pending snapshots and retries, never a tool's result list or execution.",
+    },
+    ExclusionEntry {
+        file: "subc/rich_ui/outbox/reads.rs",
+        enclosing_item: "ReadCache::insert, ReadCache::prune",
+        location_or_primitive: "MAX_CALLS, MAX_BYTES, MIN_READ_WINDOW, EXPIRY",
+        reason: "Process-local display pull copies have bounded count, bytes and retention; early pressure eviction is counted in bus health and missing records return the protocol's unknown refusal, not a truncated tool result.",
     },
     ExclusionEntry {
         file: "subc/rich_ui/display.rs",
@@ -808,6 +838,24 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "make_room_for, store_literal_presence, prune_lifecycle",
         location_or_primitive: "MAX_EXACT_MEMO_BYTES, MAX_LITERAL_PRESENCE_BYTES, MAX_RETIRED_POISONED_BYTES and obsolete-generation cache retirement",
         reason: "internal reconstructible cache ownership only; complete verified results still feed ranking and oversized entries are served without retention, while evicted literal-presence answers are recomputed; no agent-visible result is cut",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/data_file.rs",
+        enclosing_item: "is_data_file_after_metadata",
+        location_or_primitive: "io::Read::take(DATA_FILE_MIN_BYTES)",
+        reason: "classification needs only the size threshold or a long line in a smaller file; reaching the byte threshold classifies the file as data, without cutting a result list",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/memo.rs",
+        enclosing_item: "digest_open_file_at_size",
+        location_or_primitive: "io::Read::take(size)",
+        reason: "small and streamed digests both stop at the descriptor's size at open; growth changes the stat and is re-digested by the next lookup, not silently accepted as a complete current-file hash",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/request_files.rs",
+        enclosing_item: "read_whole_file_at",
+        location_or_primitive: "io::Read::take(stat.size)",
+        reason: "reads the descriptor's size at open; files above the whole-read ceiling are separately disclosed as skipped, not silently cut from a result list",
     },
     ExclusionEntry {
         file: "bash_background/remote.rs",
@@ -1366,6 +1414,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         location_or_primitive: "commands::zoom indexed offset work-count test",
         reason: "test fixture selecting sample offsets for a work-count assertion; not an agent-visible list",
     },
+    ExclusionEntry {
+        file: "commands/semantic_search/mod.rs",
+        enclosing_item: "audit1432_degraded_transient_rows_are_bounded_by_concurrency_not_all_files",
+        location_or_primitive: "degraded grep fixture expected first ten rows",
+        reason: "test-only reference selecting the expected input-order prefix before comparing independently sorted paths and line numbers; no tool response is produced",
+    },
     // Split-query search (aft_search with both query and pattern). The
     // results list is the search surface's, cut and enveloped by the engine;
     // these items only describe the pattern input.
@@ -1391,7 +1445,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     // results page is the search surface's, registered under its cap reason.
     ExclusionEntry {
         file: "commands/semantic_search/external_exact.rs",
-        enclosing_item: "sweep",
+        enclosing_item: "sweep_after_metadata",
         location_or_primitive: "commands::semantic_search::external_exact::sweep skipped_foreign_mounts",
         reason: "counts mount points of other filesystems that the walk does not enter; no list is cut here, and a walk the deadline stops is reported through the sweep's enumeration_stopped and the reply's coverage line",
     },
@@ -1448,6 +1502,18 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "disclose_index_gaps",
         location_or_primitive: "INDEX_GAP_PREVIEW",
         reason: "coverage-gap preview, not a findings page; skipped_folders counts every relevant unreadable folder and skipped_folders_omitted counts names beyond the preview",
+    },
+    ExclusionEntry {
+        file: "data_layer/surfaces.rs",
+        enclosing_item: "disclose_parse_gaps",
+        location_or_primitive: "INDEX_GAP_PREVIEW",
+        reason: "parse-coverage preview; skipped_parses and skipped_parses_omitted retain full counts; parse_gaps_list and its standard trailer disclose the preview cap",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/mod.rs",
+        enclosing_item: "CheckoutSemanticGaps::disclose",
+        location_or_primitive: ".take(crate::data_layer::surfaces::INDEX_GAP_PREVIEW)",
+        reason: "semantic Luau coverage previews; skipped_files_count/omitted and failed_files_count/omitted retain full counts; each list envelope and its standard trailer disclose the preview cap",
     },
 ];
 

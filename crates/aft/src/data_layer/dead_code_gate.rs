@@ -77,11 +77,8 @@ fn reset_peak() {
 /// Returns freed allocator pages to the system, so a phase's peak is not
 /// hidden by an earlier phase's freed memory.
 fn trim_allocator() {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    // SAFETY: malloc_trim only returns free pages to the system.
-    unsafe {
-        libc::malloc_trim(0);
-    }
+    #[cfg(target_os = "linux")]
+    let _ = crate::memory::purge_allocator();
 }
 
 /// Runs `phase`, reporting its time and peak memory as one JSON line.

@@ -37,7 +37,7 @@ async fn connection(mut stream: TcpStream, holder: Arc<Mutex<ReadHolder>>) {
     }
     let mut channels: HashMap<u16, ScopeStamp> = HashMap::new();
     let mut channel = 40;
-    while let Ok(Some(frame)) = read_frame(&mut stream).await {
+    while let Ok(Some(frame)) = crate::subc_fake::read_frame(&mut stream).await {
         let header = frame.header;
         let respond = |ty, body: Value| {
             Frame::build_with_version(

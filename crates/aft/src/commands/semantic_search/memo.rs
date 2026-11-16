@@ -89,18 +89,30 @@ fn read_digest(
     path: &Path,
     request_files: Option<&super::request_files::RequestFiles>,
 ) -> Result<String, PathBuf> {
+    read_digest_after_open(path, request_files, || {})
+}
+
+fn read_digest_after_open(
+    path: &Path,
+    request_files: Option<&super::request_files::RequestFiles>,
+    after_open: impl FnOnce(),
+) -> Result<String, PathBuf> {
     #[cfg(test)]
     crate::search_hot_path_measurements::record_memo_file_read(path);
+    if let Some(file) = request_files.and_then(|files| files.kept(path)) {
+        return Ok(compute_content_digest(file.bytes()));
+    }
     super::waits::timed(super::waits::SearchWait::FileRead, || {
-        super::request_files::read_through(request_files, path, |path| {
-            crate::large_read::counted(
-                crate::large_read::Site::MemoDigest,
-                fs::read(path).map(|bytes| (bytes, None)),
-            )
-        })
+        let mut file = fs::File::open(path)?;
+        let (digest, bytes, stat) = digest_open_file_after_stat(&mut file, after_open)?;
+        #[cfg(test)]
+        super::request_files::record_disk_read(path);
+        if let (Some(files), Some(bytes)) = (request_files, bytes) {
+            files.keep_read(path, bytes, Some(stat));
+        }
+        Ok(digest)
     })
-    .map(|fetched| compute_content_digest(fetched.file.bytes()))
-    .map_err(|_| path.to_path_buf())
+    .map_err(|_: std::io::Error| path.to_path_buf())
 }
 
 /// Whether some file holds a code literal's whole text, as one search settled
@@ -215,7 +227,120 @@ pub fn compute_content_digest(bytes: &[u8]) -> String {
 
 /// Compute content digest for a file on disk.
 pub fn compute_file_content_digest(path: &Path) -> Option<String> {
-    fs::read(path).ok().map(|b| compute_content_digest(&b))
+    let mut file = fs::File::open(path).ok()?;
+    digest_open_file(&mut file)
+        .ok()
+        .map(|(digest, _, _)| digest)
+}
+
+/// Hash the opened descriptor, keeping small inputs for the request cache but
+/// never retaining a large file just to prove its digest.
+fn digest_open_file(
+    file: &mut fs::File,
+) -> std::io::Result<(String, Option<Vec<u8>>, super::request_files::FileStat)> {
+    digest_open_file_after_stat(file, || {})
+}
+
+fn digest_open_file_after_stat(
+    file: &mut fs::File,
+    after_open: impl FnOnce(),
+) -> std::io::Result<(String, Option<Vec<u8>>, super::request_files::FileStat)> {
+    let stat = super::request_files::FileStat::of(&file.metadata()?);
+    after_open();
+    digest_open_file_at_size(file, stat.size).map(|(digest, bytes)| (digest, bytes, stat))
+}
+
+fn digest_open_file_at_size(
+    file: &mut fs::File,
+    size: u64,
+) -> std::io::Result<(String, Option<Vec<u8>>)> {
+    if !crate::large_read::is_large(size) {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(size as usize)
+            .map_err(std::io::Error::other)?;
+        // Small and streamed digests describe the same snapshot boundary:
+        // bytes appended after the opened stat belong to the next lookup.
+        (&mut *file).take(size).read_to_end(&mut bytes)?;
+        crate::large_read::record_whole(crate::large_read::Site::MemoDigest, bytes.len());
+        return Ok((compute_content_digest(&bytes), Some(bytes)));
+    }
+    finish_stream_digest(file, size, 0, blake3::Hasher::new())
+}
+
+fn finish_stream_digest(
+    file: &mut fs::File,
+    size: u64,
+    mut read: u64,
+    mut hasher: blake3::Hasher,
+) -> std::io::Result<(String, Option<Vec<u8>>)> {
+    let mut buffer = vec![0; crate::large_read::STEP_BYTES];
+    let token = crate::executor::current_job_cancellation();
+    while read < size {
+        if token
+            .as_ref()
+            .is_some_and(|token| token.cancel_requested_before_commit())
+        {
+            return Err(std::io::Error::other("request cancelled"));
+        }
+        let want = (size - read).min(buffer.len() as u64) as usize;
+        let count = file.read(&mut buffer[..want])?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        read += count as u64;
+    }
+    crate::large_read::record(crate::large_read::Site::MemoDigest, size, read);
+    Ok((hasher.finalize().to_hex().to_string(), None))
+}
+
+#[cfg(test)]
+#[test]
+fn stage2_streamed_digest_matches_whole_bytes_without_retaining_large_input() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("digest.bin");
+    for size in [0, 17, crate::large_read::LARGE_READ_BYTES as usize + 37] {
+        let bytes = (0..size).map(|at| (at % 251) as u8).collect::<Vec<_>>();
+        fs::write(&path, &bytes).unwrap();
+        let mut file = fs::File::open(&path).unwrap();
+        let (digest, kept, _) = digest_open_file(&mut file).unwrap();
+        assert_eq!(digest, compute_content_digest(&bytes));
+        assert_eq!(
+            kept.is_some(),
+            size as u64 <= crate::large_read::LARGE_READ_BYTES
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn audit1432_digest_growth_hashes_opened_size_and_next_lookup_refreshes() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("growing.bin");
+    let opened = vec![b'a'; 1 << 20];
+    let mut grown = opened.clone();
+    grown.resize(crate::large_read::LARGE_READ_BYTES as usize + 123, b'b');
+    fs::write(&path, &opened).unwrap();
+    let expected_opened = compute_content_digest(&opened);
+    let expected_grown = compute_content_digest(&grown);
+    let memo = ExactMemoStore::new();
+    memo.check_file_digest(&path, &expected_opened).unwrap();
+    let first = super::request_files::RequestFiles::default();
+    let digest =
+        read_digest_after_open(&path, Some(&first), || fs::write(&path, &grown).unwrap()).unwrap();
+    assert_eq!(
+        digest, expected_opened,
+        "growth must not change the opened-size digest policy"
+    );
+    assert_eq!(
+        first.kept(&path).unwrap().stat().unwrap().size,
+        opened.len() as u64
+    );
+    let next = super::request_files::RequestFiles::default();
+    assert_eq!(read_digest(&path, Some(&next)).unwrap(), expected_grown);
+    assert!(memo.check_file_digest(&path, &expected_opened).is_err());
+    memo.check_file_digest(&path, &expected_grown).unwrap();
 }
 
 /// Memo key K = (project_root, snapshot_generation, normalized_query, include_tests,
@@ -785,23 +910,16 @@ impl ExactMemoStore {
         let read_wait = super::waits::time(super::waits::SearchWait::FileRead);
         let mut file = fs::File::open(path).map_err(|_| path.to_path_buf())?;
         let opened = NativeStat::read_open_file(&file, path).ok();
-        let read_stat = file
-            .metadata()
-            .ok()
-            .map(|metadata| super::request_files::FileStat::of(&metadata));
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .map_err(|_| path.to_path_buf())?;
+        let (digest, bytes, read_stat) =
+            digest_open_file(&mut file).map_err(|_| path.to_path_buf())?;
         drop(read_wait);
-        crate::large_read::record_whole(crate::large_read::Site::MemoDigest, bytes.len());
         #[cfg(test)]
         super::request_files::record_disk_read(path);
-        let digest = compute_content_digest(&bytes);
         after_read();
         // Later phases of this request (snippets, matching lines) read the
         // same file; keep the bytes for them.
-        if let Some(files) = &request_files {
-            files.keep_read(path, bytes, read_stat);
+        if let (Some(files), Some(bytes)) = (&request_files, bytes) {
+            files.keep_read(path, bytes, Some(read_stat));
         }
         if digest != expected {
             return Err(path.to_path_buf());

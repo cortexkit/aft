@@ -67,6 +67,295 @@ fn request(id: &str, command: &str) -> RawRequest {
     spawn_test_request(id, command, true)
 }
 
+fn provider_context(
+    project: &Path,
+    storage: &Path,
+    kind: crate::config::ShellEnvProviderKind,
+    command: Vec<String>,
+) -> AppContext {
+    let mut config = context(project, storage).config().as_ref().clone();
+    config.git.co_author = "off".into();
+    config.shell.env_provider = Some(crate::config::ShellEnvProvider {
+        kind,
+        command: Some(command),
+        timeout_ms: 2000,
+        watch: vec![],
+    });
+    AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config)
+}
+
+fn fake_export(project: &Path, export: serde_json::Value) -> Vec<String> {
+    let path = project.join("provider.json");
+    std::fs::write(&path, serde_json::to_vec(&export).unwrap()).unwrap();
+    vec![
+        "sh".into(),
+        "-c".into(),
+        "cat \"$1\"".into(),
+        "provider".into(),
+        path.to_string_lossy().into_owned(),
+    ]
+}
+
+#[test]
+fn shell_env_provider_custom_end_to_end_and_failure_fallback() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = provider_context(
+        project.path(),
+        storage.path(),
+        crate::config::ShellEnvProviderKind::Custom,
+        fake_export(
+            project.path(),
+            json!({"GIT_AUTHOR_NAME":"Project Author", "GIT_COMMITTER_EMAIL":"project@example.org", "REMOVE": null, "LD_PRELOAD":"bad", "GIT_SSH_COMMAND":"bad", "SUBC_DAEMON_PID":"bad"}),
+        ),
+    );
+    let mut call = request("provider-custom", "printf '%s|%s|%s|%s|%s' \"$GIT_AUTHOR_NAME\" \"$GIT_COMMITTER_EMAIL\" \"${REMOVE-unset}\" \"${LD_PRELOAD-unset}\" \"${GIT_SSH_COMMAND-unset}\"");
+    call.params["params"]["env"] =
+        json!({"REMOVE":"base", "AFT_INTERNAL_SHELL_ENV_REMOVALS":"[\"GIT_AUTHOR_NAME\"]"});
+    assert_eq!(
+        run_output(&ctx, project.path(), &call),
+        "Project Author|project@example.org|unset|unset|unset"
+    );
+    std::fs::write(project.path().join("provider.json"), "bad JSON").unwrap();
+    let fallback = request("provider-fallback", "printf shell-still-runs");
+    let response = handle(&fallback, &ctx);
+    assert!(response.success, "{response:?}");
+    assert_eq!(response.data["_bash_env_provider_failure"], "Project environment not loaded (invalid provider output: not a JSON object); this command used AFT's default PATH.");
+    assert_eq!(
+        run_output(
+            &ctx,
+            project.path(),
+            &request("provider-fallback-output", "printf shell-still-runs")
+        ),
+        "shell-still-runs"
+    );
+}
+
+#[test]
+fn shell_env_provider_hanging_export_still_spawns_in_a_five_second_window() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let base = provider_context(
+        project.path(),
+        storage.path(),
+        crate::config::ShellEnvProviderKind::Custom,
+        vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+    );
+    let mut config = base.config().as_ref().clone();
+    config.foreground_wait_window_ms = 5000;
+    config.shell.env_provider.as_mut().unwrap().timeout_ms = 10000;
+    let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let receipt = std::sync::Arc::new(crate::bash_background::SpawnReceipt::new(
+        std::time::Instant::now() + std::time::Duration::from_millis(5000),
+    ));
+    let mut call = request("provider-short-window", "printf fallback-shell-ran");
+    call.params["params"]["background"] = json!(false);
+    let response =
+        crate::bash_background::with_spawn_receipt(receipt.clone(), || handle(&call, &ctx));
+    assert!(response.success, "{response:?}");
+    assert!(!receipt.refused());
+    let notice = response.data["_bash_env_provider_failure"]
+        .as_str()
+        .unwrap();
+    let reason = notice
+        .strip_prefix("Project environment not loaded (timed out after ")
+        .unwrap();
+    let seconds: f64 = reason.split(" s)").next().unwrap().parse().unwrap();
+    assert!(seconds > 0.0 && seconds <= 4.0, "{notice}");
+    let task_id = response.data["task_id"].as_str().unwrap();
+    let started = std::time::Instant::now();
+    loop {
+        let snapshot = ctx
+            .bash_background()
+            .status(
+                task_id,
+                "sandbox-spawn-test",
+                Some(project.path()),
+                Some(&crate::bash_background::task_storage_dir(&ctx)),
+                4096,
+            )
+            .unwrap();
+        if snapshot.info.status.is_terminal() {
+            assert_eq!(snapshot.output_preview, "fallback-shell-ran");
+            break;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn shell_env_provider_mise_end_to_end() {
+    use std::os::unix::fs::PermissionsExt;
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let nested = project.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let real = std::env::var("AFT_TEST_MISE").ok();
+    let command = if let Some(mise) = &real {
+        std::fs::write(
+            project.path().join("mise.toml"),
+            "[tools]\nnode = '20'\n[env]\nGIT_AUTHOR_NAME = 'Parent Author'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            nested.join("mise.toml"),
+            "[env]\nPROVIDER_NESTED = 'nested value'\n",
+        )
+        .unwrap();
+        for path in [project.path().join("mise.toml"), nested.join("mise.toml")] {
+            let output = std::process::Command::new(mise)
+                .args(["trust"])
+                .arg(path)
+                .env("MISE_PARANOID", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        vec![mise.clone(), "env".into(), "--json".into()]
+    } else {
+        let bin = project.path().join("node20/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let node = bin.join("node");
+        std::fs::write(&node, "#!/bin/sh\nprintf 'v20.0.0\\n'\n").unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fake_export(
+            project.path(),
+            json!({"PATH":format!("{}:{}", bin.display(), crate::effective_path::effective_path().to_string_lossy()), "GIT_AUTHOR_NAME":"Parent Author", "PROVIDER_NESTED":"nested value"}),
+        )
+    };
+    let ctx = provider_context(
+        project.path(),
+        storage.path(),
+        crate::config::ShellEnvProviderKind::Mise,
+        command,
+    );
+    let mut call = request(
+        "provider-mise",
+        "node --version; printf '%s|%s' \"$GIT_AUTHOR_NAME\" \"$PROVIDER_NESTED\"",
+    );
+    call.params["params"]["workdir"] = json!(nested);
+    call.params["params"]["env"] = json!({"MISE_PARANOID":"1"});
+    let output = run_output(&ctx, project.path(), &call);
+    assert!(output.starts_with("v20."), "{output}");
+    assert!(output.ends_with("Parent Author|nested value"), "{output}");
+    if real.is_some() {
+        let baseline = run_output(
+            &context(project.path(), storage.path()),
+            project.path(),
+            &request("provider-mise-baseline", "node --version"),
+        );
+        assert!(
+            baseline.starts_with("v22."),
+            "Linux gate must supply daemon Node 22: {baseline}"
+        );
+    }
+}
+
+#[test]
+fn shell_env_provider_direnv_end_to_end() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let real = std::env::var("AFT_TEST_DIRENV").ok();
+    let command = if let Some(direnv) = &real {
+        std::fs::write(
+            project.path().join(".envrc"),
+            "unset REMOVE\nexport GIT_AUTHOR_NAME='Direnv Author'\n",
+        )
+        .unwrap();
+        let output = std::process::Command::new(direnv)
+            .arg("allow")
+            .arg(project.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        vec![direnv.clone(), "export".into(), "json".into()]
+    } else {
+        fake_export(
+            project.path(),
+            json!({"REMOVE":null, "GIT_AUTHOR_NAME":"Direnv Author"}),
+        )
+    };
+    let ctx = provider_context(
+        project.path(),
+        storage.path(),
+        crate::config::ShellEnvProviderKind::Direnv,
+        command,
+    );
+    let mut call = request("provider-direnv", "printf '%s|%s|%s' \"${REMOVE-unset}\" \"$GIT_AUTHOR_NAME\" \"${AFT_INTERNAL_SHELL_ENV_REMOVALS-unset}\"");
+    call.params["params"]["env"] = json!({"REMOVE":"base"});
+    assert_eq!(
+        run_output(&ctx, project.path(), &call),
+        "unset|Direnv Author|unset"
+    );
+}
+
+#[test]
+fn shell_env_provider_untrusted_managers_fall_back_to_default_path() {
+    for (kind, binary_env, config_file, content, stderr, reason) in [
+        (
+            crate::config::ShellEnvProviderKind::Mise,
+            "AFT_TEST_MISE",
+            "mise.toml",
+            "[env]\nGIT_AUTHOR_NAME='Untrusted'\n",
+            "mise ERROR Config files are not trusted.",
+            "mise: config not trusted, run 'mise trust'",
+        ),
+        (
+            crate::config::ShellEnvProviderKind::Direnv,
+            "AFT_TEST_DIRENV",
+            ".envrc",
+            "export GIT_AUTHOR_NAME=Untrusted\n",
+            ".envrc is blocked. Run direnv allow",
+            "direnv: .envrc is blocked, run 'direnv allow'",
+        ),
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join(config_file), content).unwrap();
+        let command = if let Ok(binary) = std::env::var(binary_env) {
+            let args = if kind == crate::config::ShellEnvProviderKind::Mise {
+                ["env", "--json"]
+            } else {
+                ["export", "json"]
+            };
+            vec![binary, args[0].into(), args[1].into()]
+        } else {
+            vec![
+                "sh".into(),
+                "-c".into(),
+                format!("printf '%s\\n' '{}' >&2; exit 1", stderr),
+            ]
+        };
+        let ctx = provider_context(project.path(), storage.path(), kind, command);
+        let mut call = request("provider-untrusted", "printf '%s' \"$PATH\"");
+        call.params["params"]["env"] = json!({"MISE_PARANOID":"1"});
+        let response = handle(&call, &ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(
+            response.data["_bash_env_provider_failure"],
+            format!(
+                "Project environment not loaded ({reason}); this command used AFT's default PATH."
+            )
+        );
+        let actual = run_output(&ctx, project.path(), &call);
+        let default = run_output(
+            &context(project.path(), storage.path()),
+            project.path(),
+            &request("provider-default-path", "printf '%s' \"$PATH\""),
+        );
+        assert_eq!(actual, default);
+    }
+}
+
 #[test]
 fn an_untrusted_project_bash_env_is_ignored_until_the_project_is_trusted() {
     let project = tempfile::tempdir().unwrap();

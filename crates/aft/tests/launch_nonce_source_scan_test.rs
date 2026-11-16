@@ -10,6 +10,177 @@ const NONCE_NAMES: &[&str] = &[
     "SUBC_LAUNCH_NONCE_ENV_FD",
 ];
 
+fn test_only(node: Node<'_>, source: &str) -> bool {
+    let mut previous = node.prev_named_sibling();
+    while let Some(attribute) = previous {
+        if is_comment(attribute) {
+            previous = attribute.prev_named_sibling();
+            continue;
+        }
+        if attribute.kind() != "attribute_item" {
+            break;
+        }
+        let attr = compact(attribute, source);
+        if attr == "#[cfg(test)]" || attr.starts_with("#[cfg(all(test,") {
+            return true;
+        }
+        previous = attribute.prev_named_sibling();
+    }
+    false
+}
+
+fn consumer_identity_fields(node: Node<'_>, source: &str, lines: &mut Vec<usize>) {
+    if is_comment(node) || test_only(node, source) {
+        return;
+    }
+    // Fake-principal injection must stay test-only, including references that
+    // do not assign a consumer_identity field at the call site.
+    if node.kind() == "identifier" && text(node, source) == "with_test_vault_principal" {
+        lines.push(node.start_position().row + 1);
+    }
+    let field = match node.kind() {
+        "field_initializer" | "field_declaration" => node
+            .child_by_field_name("field")
+            .or_else(|| node.child_by_field_name("name")),
+        "shorthand_field_initializer" => Some(node),
+        "assignment_expression" => node.child_by_field_name("left").and_then(|left| {
+            (left.kind() == "field_expression")
+                .then(|| left.child_by_field_name("field"))
+                .flatten()
+        }),
+        _ => None,
+    };
+    if field.is_some_and(|field| text(field, source) == "consumer_identity") {
+        lines.push(node.start_position().row + 1);
+    }
+    // Macro bodies contain tokens rather than field-initializer nodes.
+    if node.kind() == "token_tree" {
+        let mut cursor = node.walk();
+        for token in node.children(&mut cursor) {
+            if text(token, source) == "consumer_identity"
+                && token
+                    .next_sibling()
+                    .is_some_and(|next| text(next, source) == ":")
+            {
+                lines.push(token.start_position().row + 1);
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        consumer_identity_fields(child, source, lines);
+    }
+}
+
+fn rust_tree(source: &str) -> tree_sitter::Tree {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .unwrap();
+    parser.parse(source, None).unwrap()
+}
+
+fn test_module_files(node: Node<'_>, source: &str, directory: &Path, files: &mut Vec<PathBuf>) {
+    if node.kind() == "mod_item" {
+        let name = text(node.child_by_field_name("name").unwrap(), source);
+        if test_only(node, source) && node.child_by_field_name("body").is_none() {
+            let mut attribute = node.prev_named_sibling();
+            while let Some(attr) = attribute {
+                if !matches!(
+                    attr.kind(),
+                    "attribute_item" | "line_comment" | "block_comment"
+                ) {
+                    break;
+                }
+                let value = compact(attr, source);
+                if let Some(path) = value
+                    .strip_prefix("#[path=\"")
+                    .and_then(|s| s.strip_suffix("\"]"))
+                {
+                    files.push(directory.join(path));
+                    return;
+                }
+                attribute = attr.prev_named_sibling();
+            }
+            files.push(directory.join(format!("{name}.rs")));
+            files.push(directory.join(name).join("mod.rs"));
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        test_module_files(child, source, directory, files);
+    }
+}
+
+#[test]
+fn consumer_identity_is_selected_by_connection_not_production_calls() {
+    let root = crate::test_helpers::manifest_dir().join("src");
+    let mut files = Vec::new();
+    collect(&root, &["rs"], &mut files);
+    let sources: Vec<_> = files
+        .iter()
+        .map(|path| {
+            let source = fs::read_to_string(path).unwrap();
+            let tree = rust_tree(&source);
+            (path, source, tree)
+        })
+        .collect();
+    // Out-of-line test modules lack their parent's cfg attribute in their own
+    // file. Discover them from declarations, not filename allowlists.
+    let mut test_files = Vec::new();
+    for (path, source, tree) in &sources {
+        test_module_files(
+            tree.root_node(),
+            source,
+            path.parent().unwrap(),
+            &mut test_files,
+        );
+    }
+    let mut failures = Vec::new();
+    for (path, source, tree) in &sources {
+        if test_files.contains(path) {
+            continue;
+        }
+        let mut lines = Vec::new();
+        consumer_identity_fields(tree.root_node(), source, &mut lines);
+        for line in lines {
+            failures.push(format!(
+                "{}:{line}: leave consumer identity to the connection",
+                path.display()
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn consumer_identity_guard_detects_fields_and_excludes_only_test_code() {
+    for source in [
+        "fn f() { CallOptions { consumer_identity: None, ..Default::default() }; }",
+        "fn f() { CallOptions { consumer_identity, ..Default::default() }; }",
+        "fn f() { options.consumer_identity = Some(principal); }",
+        "fn f() { wrapper!(CallOptions { consumer_identity: Some(principal) }); }",
+        "#[cfg(test)] mod tests {} fn f() { CallOptions { consumer_identity: None }; }",
+        "fn f() { with_test_vault_principal(options, principal); }",
+        "fn f() { let hook = with_test_vault_principal; }",
+    ] {
+        let mut lines = Vec::new();
+        consumer_identity_fields(rust_tree(source).root_node(), source, &mut lines);
+        assert_eq!(lines.len(), 1, "{source}");
+    }
+    let source = r#"
+        // consumer_identity: is forbidden in calls, not in comments or strings.
+        const MESSAGE: &str = "consumer_identity: example";
+        #[cfg(test)] fn with_test_principal() { options.consumer_identity = None; }
+        #[cfg(all(test, unix))] mod tests { fn f() { CallOptions { consumer_identity: None }; } }
+        #[cfg(test)] fn with_test_vault_principal() {}
+        fn f() { #[cfg(test)] let options = with_test_vault_principal(options, principal); }
+    "#;
+    let mut lines = Vec::new();
+    consumer_identity_fields(rust_tree(source).root_node(), source, &mut lines);
+    assert!(lines.is_empty(), "{lines:?}");
+}
+
 fn text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     &source[node.byte_range()]
 }

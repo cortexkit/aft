@@ -310,27 +310,37 @@ impl SqliteMemorySnapshot {
 /// the number wherever it is reported so nobody reads it as resident memory.
 pub const ALLOCATOR_SLACK_LABEL: &str = "address-space slack: allocator-mapped bytes minus in-use bytes; includes free pages already returned to the OS, so it is not resident memory";
 
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct JemallocMemorySnapshot {
+    pub accounting_source: &'static str,
+    pub allocated: u64,
+    pub active: u64,
+    pub resident: u64,
+    pub retained: u64,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AllocatorMemorySnapshot {
     pub status: &'static str,
     pub bytes_in_use: Option<u64>,
     pub size_allocated: Option<u64>,
     /// Address-space slack: `size_allocated - bytes_in_use`. This is NOT
-    /// resident memory. Both allocators hand free pages back to the OS without
-    /// shrinking `size_allocated` (glibc `malloc_trim` uses
-    /// `madvise(MADV_DONTNEED)` inside the heap mapping; macOS libmalloc
-    /// `madvise`s free pages inside its regions), and neither exposes whether a
-    /// free chunk is still resident. Slack can therefore exceed RSS.
+    /// resident memory. Allocators can return free pages without releasing the
+    /// address space. Slack can therefore exceed RSS.
     pub retained_slack_bytes: Option<u64>,
     /// Always `ALLOCATOR_SLACK_LABEL`; serialized so status readers see what
     /// `retained_slack_bytes` means.
     pub retained_slack_label: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub not_estimated: Option<&'static str>,
+    #[cfg(target_os = "linux")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jemalloc: Option<JemallocMemorySnapshot>,
 }
 
 impl AllocatorMemorySnapshot {
-    #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn measured(bytes_in_use: u64, size_allocated: u64) -> Self {
         Self {
             status: "measured",
@@ -339,12 +349,12 @@ impl AllocatorMemorySnapshot {
             retained_slack_bytes: Some(size_allocated.saturating_sub(bytes_in_use)),
             retained_slack_label: ALLOCATOR_SLACK_LABEL,
             not_estimated: None,
+            #[cfg(target_os = "linux")]
+            jemalloc: None,
         }
     }
 
-    // Not cfg-gated to the fallback platforms: linux-gnu also uses this at
-    // RUNTIME when the host glibc predates mallinfo2 (< 2.33), which only
-    // manifests on release binaries built against an old glibc floor.
+    // A supported allocator can also fail to provide a measurement at runtime.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     fn not_estimated(reason: &'static str) -> Self {
         Self {
@@ -354,6 +364,8 @@ impl AllocatorMemorySnapshot {
             retained_slack_bytes: None,
             retained_slack_label: ALLOCATOR_SLACK_LABEL,
             not_estimated: Some(reason),
+            #[cfg(target_os = "linux")]
+            jemalloc: None,
         }
     }
 
@@ -434,10 +446,8 @@ pub struct ProcessMemorySnapshot {
 }
 
 /// Source label for `AllocatorPressureRelief::allocator_accounting_bytes` on
-/// Linux: the drop in glibc `mallinfo2().arena + hblkhd`. `malloc_trim(0)`
-/// returns free pages inside the heap with `madvise(MADV_DONTNEED)` without
-/// shrinking `arena`, so this reads near zero even when RSS falls by GiB.
-pub const RELIEF_ACCOUNTING_SOURCE_GLIBC: &str = "glibc_mallinfo2_size_allocated_drop";
+/// Linux: the drop in jemalloc's `stats.resident`, not the kernel's RSS.
+pub const RELIEF_ACCOUNTING_SOURCE_JEMALLOC: &str = "jemalloc_stats_resident_drop";
 /// Source label for `AllocatorPressureRelief::allocator_accounting_bytes` on
 /// macOS: the byte count `malloc_zone_pressure_relief` returns, i.e. what
 /// libmalloc says it handed back. It is the allocator's own claim, not a
@@ -470,7 +480,7 @@ pub struct AllocatorPressureRelief {
     /// Bytes the allocator's own accounting says the pass returned. What it
     /// measures depends on the platform; see `allocator_accounting_source`.
     pub allocator_accounting_bytes: u64,
-    /// `RELIEF_ACCOUNTING_SOURCE_GLIBC` or `RELIEF_ACCOUNTING_SOURCE_MACOS`.
+    /// Names the allocator counter used, independently of the kernel readings.
     pub allocator_accounting_source: &'static str,
     /// Observed RSS drop across the pass (`rss_before - rss_after`, floored at
     /// zero). `None` when either reading is unavailable. Other threads can
@@ -525,23 +535,29 @@ impl AllocatorPressureRelief {
         }
     }
 
-    /// Linux form: the allocator figure is the drop in `size_allocated`
-    /// (glibc `arena + hblkhd`) between the two allocator snapshots.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    fn from_size_allocated_drop(
+    /// Linux form: the allocator figure is the drop in `stats.resident`.
+    #[cfg(target_os = "linux")]
+    fn from_jemalloc_resident_drop(
         resident_before: ResidentReading,
         resident_after: ResidentReading,
         allocator_before: AllocatorMemorySnapshot,
         allocator_after: AllocatorMemorySnapshot,
     ) -> Self {
         let accounting = allocator_before
-            .size_allocated
-            .zip(allocator_after.size_allocated)
+            .jemalloc
+            .as_ref()
+            .map(|stats| stats.resident)
+            .zip(
+                allocator_after
+                    .jemalloc
+                    .as_ref()
+                    .map(|stats| stats.resident),
+            )
             .map(|(before, after)| before.saturating_sub(after))
             .unwrap_or(0);
         Self::from_observations(
             accounting,
-            RELIEF_ACCOUNTING_SOURCE_GLIBC,
+            RELIEF_ACCOUNTING_SOURCE_JEMALLOC,
             resident_before,
             resident_after,
             allocator_before,
@@ -1038,61 +1054,58 @@ fn allocator_memory_snapshot_impl() -> AllocatorMemorySnapshot {
     )
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(target_os = "linux")]
 fn allocator_memory_snapshot_impl() -> AllocatorMemorySnapshot {
-    // mallinfo2 exists only in glibc >= 2.33. Release Linux binaries link
-    // against an older glibc floor (cross gnu images, kept old so dlopen and
-    // wide distro compatibility hold), so a link-time reference to the symbol
-    // fails the release build even though native CI (glibc 2.35) links fine.
-    // Resolve it at runtime instead and report honestly when it is absent.
-    use std::sync::OnceLock;
-    type Mallinfo2Fn = unsafe extern "C" fn() -> libc::mallinfo2;
-    static MALLINFO2: OnceLock<Option<Mallinfo2Fn>> = OnceLock::new();
-    let resolved = MALLINFO2.get_or_init(|| {
-        let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"mallinfo2".as_ptr()) };
-        if symbol.is_null() {
-            None
-        } else {
-            // SAFETY: glibc declares mallinfo2 as `struct mallinfo2 (*)(void)`;
-            // the signature matches Mallinfo2Fn exactly.
-            Some(unsafe { std::mem::transmute::<*mut libc::c_void, Mallinfo2Fn>(symbol) })
-        }
-    });
-    let Some(mallinfo2) = resolved else {
-        return AllocatorMemorySnapshot::not_estimated("mallinfo2_requires_glibc_2_33");
+    let read = || -> Result<_, tikv_jemalloc_ctl::Error> {
+        tikv_jemalloc_ctl::epoch::advance()?;
+        Ok((
+            tikv_jemalloc_ctl::stats::allocated::read()? as u64,
+            tikv_jemalloc_ctl::stats::active::read()? as u64,
+            tikv_jemalloc_ctl::stats::resident::read()? as u64,
+            tikv_jemalloc_ctl::stats::retained::read()? as u64,
+            tikv_jemalloc_ctl::stats::mapped::read()? as u64,
+        ))
     };
-    let statistics = unsafe { mallinfo2() };
-    let mapped_bytes = statistics.hblkhd as u64;
-    let bytes_in_use = (statistics.uordblks as u64).saturating_add(mapped_bytes);
-    let size_allocated = (statistics.arena as u64).saturating_add(mapped_bytes);
-    AllocatorMemorySnapshot::measured(bytes_in_use, size_allocated)
+    let Ok((allocated, active, resident, retained, mapped)) = read() else {
+        return AllocatorMemorySnapshot::unavailable("jemalloc_statistics_unavailable");
+    };
+    // Preserve the existing envelope: bytes_in_use is stats.allocated;
+    // size_allocated is mapped + retained virtual address space, not residency;
+    // retained_slack_bytes is that envelope minus allocated, not stats.retained.
+    let mut snapshot =
+        AllocatorMemorySnapshot::measured(allocated, mapped.saturating_add(retained));
+    snapshot.jemalloc = Some(JemallocMemorySnapshot {
+        accounting_source: "jemalloc",
+        allocated,
+        active,
+        resident,
+        retained,
+    });
+    snapshot
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-type MallocTrimFn = unsafe extern "C" fn(libc::size_t) -> libc::c_int;
-
-/// Resolve glibc's optional trimming primitive without creating a link-time
-/// dependency on a symbol that musl and alternate allocators do not provide.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn resolved_malloc_trim() -> Option<MallocTrimFn> {
-    use std::sync::OnceLock;
-    static MALLOC_TRIM: OnceLock<Option<MallocTrimFn>> = OnceLock::new();
-    MALLOC_TRIM
-        .get_or_init(|| {
-            let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"malloc_trim".as_ptr()) };
-            if symbol.is_null() {
-                None
-            } else {
-                // SAFETY: glibc declares malloc_trim as `int (size_t)`;
-                // the signature matches MallocTrimFn exactly.
-                Some(unsafe { std::mem::transmute::<*mut libc::c_void, MallocTrimFn>(symbol) })
-            }
-        })
-        .as_ref()
-        .copied()
+/// Return unused Linux allocator pages without measuring counters or RSS.
+/// Call-graph build phases use the same purge as the measured idle-relief path.
+#[cfg(target_os = "linux")]
+pub fn purge_allocator() -> std::io::Result<()> {
+    // MALLCTL_ARENAS_ALL is 4096 in jemalloc 5.3.0. This command takes no value.
+    let result = unsafe {
+        tikv_jemalloc_sys::mallctl(
+            c"arena.4096.purge".as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(result))
+    }
 }
 
-#[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn allocator_memory_snapshot_impl() -> AllocatorMemorySnapshot {
     AllocatorMemorySnapshot::not_estimated("platform_allocator_statistics_unavailable")
 }
@@ -1131,10 +1144,7 @@ fn allocator_observation(source: AllocatorSource) -> (AllocatorMemorySnapshot, O
             .unwrap_or_else(|| {
                 // A cold cache is not evidence that the allocator lacks counters.
                 // Keep the request path cheap while the first sample is pending.
-                let snapshot = if cfg!(any(
-                    target_os = "macos",
-                    all(target_os = "linux", target_env = "gnu")
-                )) {
+                let snapshot = if cfg!(any(target_os = "macos", target_os = "linux")) {
                     AllocatorMemorySnapshot::unavailable("allocator_observation_unavailable")
                 } else {
                     AllocatorMemorySnapshot::not_estimated("allocator_observation_unavailable")
@@ -1185,9 +1195,8 @@ pub const ALLOCATOR_SLACK_RELIEF_MIN_INTERVAL: std::time::Duration =
 
 /// Periodic allocator readers wait at least this many times the last walk's
 /// own duration before walking again, so walks take at most 0.5% of the time.
-/// A walk is cheap on macOS (tens of milliseconds on a multi-GiB heap), but
-/// glibc's `mallinfo2` visits every free chunk while holding that arena's
-/// lock, which on a fragmented heap takes seconds.
+/// Allocator walks can contend with allocations, so their measured cost bounds
+/// sampling frequency even when a fragmented heap makes a walk expensive.
 const ALLOCATOR_WALK_COST_FACTOR: u64 = 200;
 
 /// The longest an expensive walk can stretch a periodic reader's reuse window,
@@ -1238,6 +1247,9 @@ static LAST_OBSERVED_ALLOCATOR_BYTES_IN_USE: std::sync::atomic::AtomicU64 =
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 static LAST_OBSERVED_ALLOCATOR_SIZE_ALLOCATED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(UNKNOWN_ALLOCATOR_SLACK);
+#[cfg(target_os = "linux")]
+static LAST_OBSERVED_JEMALLOC: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(UNKNOWN_ALLOCATOR_SLACK) }; 3];
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 static LAST_ALLOCATOR_OBSERVATION_STATUS: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(ALLOCATOR_OBSERVATION_UNSAMPLED);
@@ -1342,11 +1354,11 @@ fn cached_allocator_slack() -> Option<u64> {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn cached_allocator_not_estimated_reason() -> &'static str {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[cfg(target_os = "linux")]
     {
-        "mallinfo2_requires_glibc_2_33"
+        "jemalloc_statistics_unavailable"
     }
-    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    #[cfg(not(target_os = "linux"))]
     {
         "platform_allocator_statistics_unavailable"
     }
@@ -1378,6 +1390,10 @@ pub fn cached_allocator_observation() -> Option<(AllocatorMemorySnapshot, u64)> 
                 LAST_OBSERVED_ALLOCATOR_SIZE_ALLOCATED.load(std::sync::atomic::Ordering::Acquire);
             let retained_slack =
                 LAST_OBSERVED_ALLOCATOR_SLACK_BYTES.load(std::sync::atomic::Ordering::Acquire);
+            #[cfg(target_os = "linux")]
+            let jemalloc_counters = LAST_OBSERVED_JEMALLOC
+                .each_ref()
+                .map(|value| value.load(std::sync::atomic::Ordering::Acquire));
             let sequence_after =
                 ALLOCATOR_OBSERVATION_SEQUENCE.load(std::sync::atomic::Ordering::Acquire);
             if sequence != sequence_after || sequence_after % 2 != 0 {
@@ -1396,6 +1412,15 @@ pub fn cached_allocator_observation() -> Option<(AllocatorMemorySnapshot, u64)> 
                         retained_slack_bytes: Some(retained_slack),
                         retained_slack_label: ALLOCATOR_SLACK_LABEL,
                         not_estimated: None,
+                        #[cfg(target_os = "linux")]
+                        jemalloc: (!jemalloc_counters.contains(&UNKNOWN_ALLOCATOR_SLACK))
+                            .then_some(JemallocMemorySnapshot {
+                                accounting_source: "jemalloc",
+                                allocated: bytes_in_use,
+                                active: jemalloc_counters[0],
+                                resident: jemalloc_counters[1],
+                                retained: jemalloc_counters[2],
+                            }),
                     }
                 }
                 ALLOCATOR_OBSERVATION_NOT_ESTIMATED => {
@@ -1443,6 +1468,17 @@ fn publish_allocator_slack(snapshot: &AllocatorMemorySnapshot, sampled_at_ms: u6
         std::sync::atomic::Ordering::Relaxed,
     );
     LAST_ALLOCATOR_OBSERVATION_AT_MS.store(sampled_at_ms, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(target_os = "linux")]
+    for (counter, value) in LAST_OBSERVED_JEMALLOC.iter().zip(
+        snapshot
+            .jemalloc
+            .as_ref()
+            .map_or([UNKNOWN_ALLOCATOR_SLACK; 3], |stats| {
+                [stats.active, stats.resident, stats.retained]
+            }),
+    ) {
+        counter.store(value, std::sync::atomic::Ordering::Relaxed);
+    }
     ALLOCATOR_OBSERVATION_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Release);
     LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS.store(sampled_at_ms, std::sync::atomic::Ordering::Release);
 }
@@ -1602,7 +1638,7 @@ pub fn allocator_relief_accounting_source() -> Option<&'static str> {
     }
     #[cfg(target_os = "linux")]
     {
-        Some(RELIEF_ACCOUNTING_SOURCE_GLIBC)
+        Some(RELIEF_ACCOUNTING_SOURCE_JEMALLOC)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -1707,8 +1743,7 @@ pub fn spawn_allocator_slack_relief_if_due(_now: std::time::Instant) -> bool {
 
 /// Ask the platform allocator to return unused pages after a process-wide idle
 /// gate. Callers own that gate because allocator pressure relief can add
-/// latency. Linux invokes glibc's optional `malloc_trim(0)` when the symbol is
-/// available; non-glibc allocators intentionally remain a no-op.
+/// latency. Linux purges all jemalloc arenas; macOS asks libmalloc for relief.
 #[cfg(target_os = "macos")]
 fn relieve_allocator_pressure_from_snapshot(
     allocator_before: AllocatorMemorySnapshot,
@@ -1740,15 +1775,10 @@ fn relieve_allocator_pressure_from_snapshot(
     allocator_before: AllocatorMemorySnapshot,
 ) -> AllocatorPressureRelief {
     let resident_before = ResidentReading::read();
-    #[cfg(target_env = "gnu")]
-    if let Some(malloc_trim) = resolved_malloc_trim() {
-        // SAFETY: resolved_malloc_trim verifies the symbol and its C ABI
-        // signature before returning the function pointer.
-        unsafe { malloc_trim(0) };
-    }
+    let _ = purge_allocator();
     let allocator_after = allocator_memory_snapshot();
     let resident_after = ResidentReading::read();
-    AllocatorPressureRelief::from_size_allocated_drop(
+    AllocatorPressureRelief::from_jemalloc_resident_drop(
         resident_before,
         resident_after,
         allocator_before,
@@ -2005,7 +2035,7 @@ mod tests {
             .is_some());
     }
 
-    #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn allocator_snapshot_reports_measured_slack() {
         let allocator = allocator_memory_snapshot();
@@ -2023,7 +2053,7 @@ mod tests {
             assert_eq!(allocator.retained_slack_bytes, None);
             assert_eq!(
                 allocator.not_estimated,
-                Some("mallinfo2_requires_glibc_2_33")
+                Some("jemalloc_statistics_unavailable")
             );
         }
     }
@@ -2036,15 +2066,24 @@ mod tests {
             retained_slack_bytes: Some(size_allocated.saturating_sub(bytes_in_use)),
             retained_slack_label: ALLOCATOR_SLACK_LABEL,
             not_estimated: None,
+            #[cfg(target_os = "linux")]
+            jemalloc: Some(JemallocMemorySnapshot {
+                accounting_source: "jemalloc",
+                allocated: bytes_in_use,
+                active: bytes_in_use,
+                resident: size_allocated,
+                retained: 0,
+            }),
         }
     }
 
+    #[cfg(target_os = "linux")]
     const GIB: u64 = 1024 * 1024 * 1024;
     const MIB: u64 = 1024 * 1024;
 
-    /// The production case from a Linux daemon: `malloc_trim(0)` returned
-    /// 1.53 GiB through madvise, so RSS fell while glibc's `arena + hblkhd`
-    /// did not move. The record must carry both figures, each labelled.
+    /// Kernel RSS can fall independently of the allocator's resident estimate.
+    /// The record must carry both figures, each labelled.
+    #[cfg(target_os = "linux")]
     #[test]
     fn relief_reports_rss_drop_when_allocator_accounting_is_unchanged() {
         let in_use = 2 * GIB;
@@ -2057,7 +2096,7 @@ mod tests {
             rss_bytes: Some(4910 * MIB),
             phys_footprint_bytes: None,
         };
-        let relief = AllocatorPressureRelief::from_size_allocated_drop(
+        let relief = AllocatorPressureRelief::from_jemalloc_resident_drop(
             before,
             after,
             measured_allocator(in_use, size_allocated),
@@ -2066,7 +2105,7 @@ mod tests {
         assert_eq!(relief.allocator_accounting_bytes, 0);
         assert_eq!(
             relief.allocator_accounting_source,
-            RELIEF_ACCOUNTING_SOURCE_GLIBC
+            RELIEF_ACCOUNTING_SOURCE_JEMALLOC
         );
         assert_eq!(relief.rss_drop_bytes, Some(1530 * MIB));
         assert_eq!(relief.rss_before_bytes, Some(6440 * MIB));
@@ -2080,10 +2119,11 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn relief_keeps_allocator_accounting_and_resident_drops_independent() {
-        // Arena shrank by 64 MiB (sbrk trim) while RSS fell by 300 MiB.
-        let relief = AllocatorPressureRelief::from_size_allocated_drop(
+        // jemalloc's resident estimate fell by 64 MiB while RSS fell by 300 MiB.
+        let relief = AllocatorPressureRelief::from_jemalloc_resident_drop(
             ResidentReading {
                 rss_bytes: Some(1000 * MIB),
                 phys_footprint_bytes: None,
@@ -2100,7 +2140,7 @@ mod tests {
 
         // RSS growth during the pass floors the drop at zero; a missing
         // reading yields no drop rather than a guessed one.
-        let grew = AllocatorPressureRelief::from_size_allocated_drop(
+        let grew = AllocatorPressureRelief::from_jemalloc_resident_drop(
             ResidentReading {
                 rss_bytes: Some(700 * MIB),
                 phys_footprint_bytes: Some(500 * MIB),
@@ -2160,16 +2200,16 @@ mod tests {
         drop(allocation);
 
         let relief = relieve_allocator_pressure();
-        std::hint::black_box(relief);
-
-        #[cfg(target_env = "gnu")]
-        assert!(
-            resolved_malloc_trim().is_some(),
-            "glibc malloc_trim must be available for the Linux relief path"
+        assert_eq!(
+            relief.allocator_accounting_source,
+            RELIEF_ACCOUNTING_SOURCE_JEMALLOC
         );
+        assert!(relief.allocator_before.jemalloc.is_some());
+        assert!(relief.allocator_after.jemalloc.is_some());
+        purge_allocator().expect("jemalloc all-arena purge must succeed");
     }
 
-    #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[test]
     fn allocator_snapshot_is_honest_when_platform_counters_are_unavailable() {
         let allocator = allocator_memory_snapshot();

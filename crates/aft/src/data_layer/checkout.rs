@@ -32,7 +32,9 @@ use aft_store::text::{
 };
 
 use super::callgraph::{CheckoutInputs, EncodedResolution, FileResolution};
-use super::content::{blob_from_record, extract, language_for, EXTRACTOR_VERSION};
+#[cfg(test)]
+use super::content::EXTRACTOR_VERSION;
+use super::content::{blob_from_record, language_for};
 use super::graph_store::{Held, SectionsWriter, StoredSlices};
 use super::incremental::{LiveCheckout, UpdateError, UpdateStats};
 use super::overlay::{CacheKey, OverlaySlices, PreparedSlice};
@@ -40,16 +42,22 @@ use super::query::{SliceReader, SliceSource};
 use super::refresh_budget::{RefreshBudget, RefreshLimit};
 use super::slice::FileSlice;
 use crate::callgraph_store::join::{CallgraphBlob, ParseBlob};
+use staged_records::StagedKind;
 
 mod engines;
 #[cfg(feature = "test-hooks")]
 pub mod exactness;
 mod fold;
+pub(crate) mod resume;
 pub(crate) mod staged_records;
 mod text_build;
 use text_build::TextBuild;
 #[cfg(test)]
+mod grammar_parity_tests;
+#[cfg(test)]
 pub(super) mod publication_tests;
+#[cfg(test)]
+mod resume_tests;
 #[cfg(test)]
 mod todo_tests;
 
@@ -209,6 +217,11 @@ impl DataError {
                     .downcast_ref::<aft_store::segment::SegmentError>()
                     .and_then(aft_store::family::NewerFormat::of_segment)
             });
+        if let Some(aft_store::family::FamilyError::CheckoutBusy(reason)) =
+            error_any.downcast_ref::<aft_store::family::FamilyError>()
+        {
+            return Self::Busy((*reason).to_string());
+        }
         match refusal {
             Some(refusal) => Self::NewerFormat(refusal),
             None => Self::Store(error.to_string()),
@@ -796,6 +809,8 @@ impl ChangeContent {
 enum Extracted {
     /// Nothing: not a parsed language, not text, or gone.
     Nothing,
+    /// Text is available, but the dynamic parse has a typed, rebuildable gap.
+    GrammarGap(String),
     /// A parsed file: its parse key and parse, and the content record
     /// they came from, encoded, which a publication of the change stores.
     /// Decoded, a large file's record takes about as much as its parse,
@@ -906,6 +921,12 @@ pub struct BuildReport {
     /// Content records the build's scan read from the store instead of
     /// parsing their files again.
     pub stored_records: usize,
+    /// Records an earlier attempt of the same build staged, used instead of
+    /// extracting the files again.
+    pub resumed_records: usize,
+    /// Whether passes 2-3 were taken from an earlier attempt of the same
+    /// build instead of resolved again.
+    pub resumed_passes: bool,
     /// Files the reclamation after publishing removed, or why it could not
     /// run (the publication stands either way).
     pub reclaimed_files: usize,
@@ -1286,6 +1307,81 @@ impl Checkout {
     ///
     /// When a path's folder cannot be walked. Nothing is recorded then.
     pub fn record_paths(&self, paths: &[Vec<u8>]) -> Result<(), DataError> {
+        self.record_paths_inner(paths, false)
+    }
+
+    /// Re-read only unavailable grammar members, even when stat and content
+    /// are unchanged. A ready event is not a filesystem edit.
+    pub(crate) fn retry_grammar_gaps(&self) -> Result<bool, DataError> {
+        let paths = {
+            let live = self.live.read().expect("no panics while holding it");
+            let state = live
+                .state
+                .as_deref()
+                .or_else(|| live.published.as_ref().map(|p| &p.state));
+            state
+                .map(|state| {
+                    state
+                        .skipped_parses()
+                        .iter()
+                        .filter(|(_, reason)| {
+                            serde_json::from_str::<serde_json::Value>(reason)
+                                .is_ok_and(|v| v["code"] == "grammar_unavailable")
+                        })
+                        .map(|(path, _)| path.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        if paths.is_empty() || crate::grammar::registry().stored().is_err() {
+            return Ok(false);
+        }
+        #[cfg(all(
+            test,
+            feature = "wasm-grammars",
+            feature = "test-hooks",
+            not(all(target_os = "windows", target_arch = "aarch64"))
+        ))]
+        {
+            super::test_gates::arrive(&self.root, super::test_gates::Point::GrammarRetryRead);
+            if super::test_gates::fail_grammar_retry(&self.root) {
+                return Err(DataError::Scan("injected grammar reread failure".into()));
+            }
+        }
+        self.record_paths_inner(&paths, true)?;
+        Ok(true)
+    }
+
+    #[cfg(feature = "wasm-grammars")]
+    pub(crate) fn has_grammar_gaps(&self) -> bool {
+        self.view().is_some_and(|view| {
+            view.current_state()
+                .skipped_parses()
+                .values()
+                .any(|reason| {
+                    serde_json::from_str::<serde_json::Value>(reason)
+                        .is_ok_and(|v| v["code"] == "grammar_unavailable")
+                })
+        })
+    }
+
+    pub(crate) fn has_unpublished_luau_changes(&self) -> bool {
+        cfg!(feature = "wasm-grammars")
+            && self
+                .live
+                .read()
+                .expect("no panics while holding it")
+                .changes
+                .keys()
+                .any(|path| {
+                    super::vectors::native_path(path).is_some_and(|path| {
+                        crate::parser::detect_language_any(&path, true)
+                            == Some(crate::parser::LangId::Luau)
+                    })
+                })
+    }
+
+    fn record_paths_inner(&self, paths: &[Vec<u8>], retry_grammar: bool) -> Result<(), DataError> {
         if paths.is_empty() {
             return Ok(());
         }
@@ -1330,7 +1426,7 @@ impl Checkout {
                 return Ok(());
             };
             let sink = ChangeSink::default();
-            let (state, changed) = if whole {
+            let (state, mut changed) = if whole {
                 let scanned = scan(&self.root, &self.layer.policy, Some(&base), &sink)
                     .map_err(|error| DataError::Scan(error.to_string()))?;
                 let changed = changed_members(&base, &scanned.state);
@@ -1340,7 +1436,27 @@ impl Checkout {
                     .map_err(|error| DataError::Scan(error.to_string()))?;
                 (scanned.state, scanned.changed)
             };
-            if self.apply_scan(&base, generation, state, &changed, sink.finish()) {
+            let mut read = sink.finish();
+            if retry_grammar {
+                for path in paths {
+                    let Some(record) = state.get(path) else {
+                        continue;
+                    };
+                    let Ok(relative) = std::str::from_utf8(path) else {
+                        continue;
+                    };
+                    let Ok(bytes) = crate::project_content::read(self.root.join(relative)) else {
+                        continue;
+                    };
+                    if ContentKey::of(&bytes) == record.content {
+                        read.insert(path.clone(), bytes);
+                        changed.push(path.clone());
+                    }
+                }
+                changed.sort_unstable();
+                changed.dedup();
+            }
+            if self.apply_scan(&base, generation, state, &changed, read) {
                 return Ok(());
             }
         }
@@ -1427,6 +1543,22 @@ impl Checkout {
                 .set_language(index, language)
                 .expect("a language a state stores");
         }
+        let gaps = base
+            .skipped_parses()
+            .iter()
+            .filter(|(path, _)| {
+                !changed.contains(path)
+                    && state.get(path).is_some_and(|now| {
+                        base.get(path).is_some_and(|before| {
+                            same_member(before, now) && before.language == now.language
+                        })
+                    })
+            })
+            .map(|(path, reason)| (path.clone(), reason.clone()))
+            .collect();
+        state = state
+            .with_skipped_parses(gaps)
+            .expect("unchanged gap members");
         if changed.is_empty() {
             let mut live = self.write_live();
             if live.generation != generation {
@@ -1578,6 +1710,13 @@ impl Checkout {
         // resolution rather than after them. So does the writer below the
         // free-disk floor.
         self.family.check_formats().map_err(DataError::store)?;
+        // Below the floor, dead build workspaces go first, so the disk they
+        // hold can let this build or a later one run: other checkouts'
+        // first, then, only if that was not enough, this checkout's own,
+        // which this build could otherwise resume from. This build has not
+        // claimed a workspace yet, so none of them is live here.
+        self.reclaim_disk_for(0, true);
+        self.reclaim_disk_for(0, false);
         self.check_disk_floor()?;
         if !self.planes.callgraph {
             // Without a call graph, a build is the text scan alone.
@@ -1601,6 +1740,9 @@ impl Checkout {
         // one's publication rather than building cold.
         if unpublished && self.planes.text && self.planes.callgraph {
             if let Some(report) = self.start_from_sibling(build_started)? {
+                // Published from a sibling, or by another process: there
+                // may be no cold build left to resume.
+                self.discard_build_workspace();
                 return Ok(report);
             }
         }
@@ -1638,20 +1780,59 @@ impl Checkout {
             .manifest()
             .checkout(self.checkout)
             .cloned();
-        let started = Instant::now();
         // The build's one workspace: the text index's posting runs, the
         // graph sections' spill and the resolutions spool each keep their
-        // own folder in it, and it is removed once the last of them is done.
+        // own folder in it. An earlier attempt's is adopted when this build
+        // is the same build, with the stages it completed (see `resume`).
         let paused = DiskPause::default();
-        let scratch = self.build_scratch_noting(Arc::clone(&paused))?;
+        let claimed = self.claim_build_workspace(Arc::clone(&paused))?;
+        let result = self.build_cold(measure, report, covered, started_from, &paused, &claimed);
+        if let Err(error) = &result {
+            claimed.ended(error);
+        }
+        result
+    }
+
+    /// The cold build [`Self::build_inner`] runs in the workspace it
+    /// claimed: scan, resolve, write and publish, reusing the stages an
+    /// earlier attempt completed there.
+    fn build_cold(
+        &self,
+        measure: bool,
+        mut report: BuildReport,
+        covered: u64,
+        started_from: Option<aft_store::family::StateRef>,
+        paused: &DiskPause,
+        claimed: &resume::Claimed,
+    ) -> Result<BuildReport, DataError> {
+        let started = Instant::now();
+        let scratch = Arc::clone(&claimed.scratch);
+        // The records an earlier attempt staged, found by key instead of
+        // extracted again.
+        let adopted = match &claimed.records {
+            Some(marker) => match staged_records::AdoptedRecords::load(scratch.path(), marker) {
+                Ok(adopted) => adopted,
+                Err(error) => {
+                    log::info!(
+                        "callgraph build resume: discarded stage {}: {error}",
+                        resume::RECORDS
+                    );
+                    let _ = resume::discard_stage(scratch.path(), marker);
+                    staged_records::AdoptedRecords::default()
+                }
+            },
+            None => staged_records::AdoptedRecords::default(),
+        };
         // Each extracted record goes to a staging segment in the workspace as
         // it is extracted, rather than staying in memory until the segment
         // is written (see `staged_records`).
         let stage = staged_records::RecordStage::new(
             scratch
-                .subdir("records")
+                .subdir_existing(staged_records::FOLDER)
                 .map_err(|error| DataError::Store(error.to_string()))?,
             self.family.id(),
+            claimed.identity.digest,
+            adopted,
         );
         let sink = BuildSink {
             skip_text: !self.planes.text,
@@ -1666,6 +1847,13 @@ impl Checkout {
         let mut collected = sink
             .finish()
             .map_err(|error| graph_spill_error(error, &paused))?;
+        #[cfg(all(
+            test,
+            feature = "wasm-grammars",
+            feature = "test-hooks",
+            not(all(target_os = "windows", target_arch = "aarch64"))
+        ))]
+        super::test_gates::arrive(self.root(), super::test_gates::Point::BuildPublication);
         // Contents too large to read are members whose text is not
         // indexed; record them so grep reports them rather than walking
         // them.
@@ -1686,6 +1874,7 @@ impl Checkout {
         report.text_units = collected.text.len();
         report.extract_failures = collected.failures;
         report.stored_records = collected.reused;
+        report.resumed_records = collected.resumed;
         report.scan_ms = elapsed_ms(started);
 
         #[cfg(feature = "test-hooks")]
@@ -1709,7 +1898,9 @@ impl Checkout {
         let state =
             CheckoutState::new(scanned.state.git.clone(), scanned.state.conversion, records)
                 .map_err(DataError::store)?
-                .with_root_of(&scanned.state);
+                .with_root_of(&scanned.state)
+                .with_skipped_parses(collected.gaps.clone())
+                .map_err(DataError::store)?;
         if measure {
             use aft_store::heap::HeapBytes as _;
             let mut seen = aft_store::heap::Seen::new();
@@ -1759,6 +1950,18 @@ impl Checkout {
         let taking = Instant::now();
         let (mut inputs, content) = collected.take_inputs(&state);
         report.parsed_files = inputs.parses.len();
+        // What resolution reads is now fixed: an earlier attempt's passes 2-3
+        // are reused only when they were resolved from exactly these inputs.
+        let snapshot = resume::snapshot_digest(&inputs);
+        let passes = claimed.passes.as_ref().filter(|marker| {
+            let matches = resume::passes_match(marker, snapshot);
+            if !matches {
+                let _ = resume::discard_stage(scratch.path(), marker);
+            }
+            matches
+        });
+        // Set only once the stage is adopted, which can still fail.
+        let resumed_passes = std::sync::atomic::AtomicBool::new(false);
         // A stage boundary: the scan's staging and text runs are written.
         scratch
             .check_space(0)
@@ -1815,6 +2018,7 @@ impl Checkout {
             .map(|record| record.stat.size)
             .sum::<u64>()
             .saturating_mul(8);
+        self.reclaim_disk_for(estimate, true);
         let reserve = Arc::new(std::sync::atomic::AtomicU64::new(estimate));
         let remaining = reserve.clone();
         let admission = Arc::clone(&scratch);
@@ -1845,6 +2049,7 @@ impl Checkout {
             })?;
         spill.estimate_space(inputs.parses.len(), estimate, reserve);
         sections.stream(spill);
+        resume::kill_point("stage.resolve");
         let _census = super::callgraph::resolve_checkout_into(
             &mut inputs,
             self.layer.threads,
@@ -1852,7 +2057,14 @@ impl Checkout {
             &scratch,
             super::callgraph::KeyOrderBudget::configured(),
             super::callgraph::bind_cache_bytes(),
+            super::callgraph::PassesCheckpoint {
+                identity: claimed.identity.digest,
+                snapshot,
+                adopted: passes,
+                resumed: Some(&resumed_passes),
+            },
             &mut |inputs, files| {
+                resume::kill_point("assembly.batch");
                 sections
                     .add_batch(inputs, files)
                     .map_err(crate::callgraph_store::join::ManifestJoinError::Parse)
@@ -1867,6 +2079,7 @@ impl Checkout {
             )
         })?;
         report.resolve_ms = elapsed_ms(started);
+        report.resumed_passes = resumed_passes.into_inner();
         checkpoint()?;
 
         #[cfg(feature = "test-hooks")]
@@ -1881,9 +2094,13 @@ impl Checkout {
             // down: it serves that publication and records what differs from
             // the files now on disk, as a bind does.
             drop(session);
-            // The graph spill's files close before its folder is deleted.
+            // The graph spill's and the staged records' files close before
+            // their folder is deleted: Windows may keep listing a deleted
+            // file another handle still has open, so the folder would stay.
             drop(sections);
-            remove_workspace(&scratch);
+            drop(inputs);
+            drop(collected);
+            claimed.finished();
             report.superseded = true;
             self.adopt_newest()?;
             return Ok(report);
@@ -1896,6 +2113,7 @@ impl Checkout {
             .map_err(|error| graph_spill_error(DataError::Store(error), &paused))?;
         #[cfg(feature = "test-hooks")]
         super::refresh_probe::stage("write");
+        resume::kill_point("stage.write");
         let mut pending = session.create_segment().map_err(DataError::store)?;
         collected.text.write(pending.writer())?;
         let fragments = sections
@@ -1913,6 +2131,7 @@ impl Checkout {
 
         #[cfg(feature = "test-hooks")]
         super::refresh_probe::stage("publish");
+        resume::kill_point("stage.publish");
         let started = Instant::now();
         let per_path = state
             .paths()
@@ -1924,8 +2143,9 @@ impl Checkout {
                     .map(|key| key.digest())
             })
             .collect();
+        let version = super::content::graph_version(&state);
         let state = state
-            .with_fragments_for(per_path, EXTRACTOR_VERSION)
+            .with_fragments_for(per_path, &version)
             .map_err(DataError::store)?;
         let written = session
             .write_checkout_state(self.checkout, &state)
@@ -1946,8 +2166,11 @@ impl Checkout {
             })
             .map_err(DataError::store)?;
         // The publication is in the manifest, so nothing in the workspace is
-        // needed any more; every builder closed its files when it finished.
-        remove_workspace(&scratch);
+        // needed any more. The staged records' files close first (see the
+        // stand-down above); every other builder closed its files when it
+        // finished.
+        drop(inputs);
+        claimed.finished();
         // Removes what no generation at or above the horizon names. A view
         // still reading an older generation holds a lease on it, so its
         // files stay until the view drops.
@@ -2020,7 +2243,7 @@ impl Checkout {
             }
             match snapshot.checkout_state(state_ref.checkout) {
                 Ok(Some(state))
-                    if state.has_fragments_for(EXTRACTOR_VERSION)
+                    if state.has_fragments_for(&super::content::graph_version(&state))
                         && !state.root().is_some_and(folder_is_gone) =>
                 {
                     siblings.push((*state_ref, state));
@@ -2071,11 +2294,25 @@ impl Checkout {
         let fragments = (0..records.len())
             .map(|index| sibling.fragment(index))
             .collect();
+        let gaps = sibling
+            .skipped_parses()
+            .iter()
+            .filter(|(path, _)| {
+                scanned.state.get(path).is_some_and(|record| {
+                    sibling
+                        .get(path)
+                        .is_some_and(|before| same_member(before, record))
+                })
+            })
+            .map(|(path, reason)| (path.clone(), reason.clone()))
+            .collect();
         let start =
             CheckoutState::new(scanned.state.git.clone(), scanned.state.conversion, records)
                 .map_err(DataError::store)?
                 .with_root_of(&scanned.state)
-                .with_fragments_for(fragments, EXTRACTOR_VERSION)
+                .with_skipped_parses(gaps)
+                .map_err(DataError::store)?
+                .with_fragments_for(fragments, &super::content::graph_version(&sibling))
                 .map_err(DataError::store)?;
         let scan_ms = elapsed_ms(started);
         checkpoint()?;
@@ -2236,12 +2473,30 @@ fn check_disk_floor_at(dir: &Path, additional: u64) -> Result<(), DataError> {
     )))
 }
 
+/// Whether the disk holding `dir` has less free space than the floor plus
+/// `additional`. An error when the free space cannot be measured: an
+/// unknown measurement is not low disk, and never justifies deleting
+/// anything to make room.
+fn still_short(dir: &Path, additional: u64) -> Result<bool, DataError> {
+    match check_disk_floor_at(dir, additional) {
+        Ok(()) => Ok(false),
+        Err(DataError::DiskFloor(_)) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
 /// Deletes a build's workspace once the build published or stood down. A
 /// workspace that cannot be deleted now (on Windows, a file another process
 /// still has open) is left to the next writer's sweep, which deletes it
 /// once this build has let go of the checkout's build lock.
 fn remove_workspace(scratch: &aft_store::family::BuildScratch<DataError>) {
     let _ = scratch.remove();
+}
+
+fn log_reclaimed(removed: usize) {
+    if removed > 0 {
+        log::info!("callgraph build: deleted {removed} dead build workspace(s) to make room");
+    }
 }
 
 /// The disk-floor refusal a build workspace's admission last made, if any.
@@ -2270,17 +2525,107 @@ impl Checkout {
         &self,
         paused: DiskPause,
     ) -> Result<Arc<aft_store::family::BuildScratch<DataError>>, DataError> {
-        let dir = self.family.dir().to_path_buf();
         self.writer()?
-            .create_scratch(self.checkout, move |bytes| {
-                let result = check_disk_floor_at(&dir, bytes);
-                if let Err(DataError::DiskFloor(message)) = &result {
-                    *paused.lock().expect("disk pause lock") = Some(message.clone());
-                }
-                result
-            })
+            .create_scratch(self.checkout, self.admission(paused))
             .map(Arc::new)
             .map_err(DataError::store)
+    }
+
+    /// A build workspace's disk admission: the free-disk floor. Before it
+    /// refuses, other checkouts' dead build workspaces are deleted to make
+    /// room (see [`aft_store::family::reclaim_dead_workspaces`]): free space
+    /// just above the floor, but short of what a stage asks to write, would
+    /// otherwise stop the build before the later reclamation for the graph
+    /// is reached. Each refusal is also kept in `paused`.
+    fn admission(
+        &self,
+        paused: DiskPause,
+    ) -> impl Fn(u64) -> Result<(), DataError> + Send + Sync + 'static {
+        let dir = self.family.dir().to_path_buf();
+        let checkout = self.checkout;
+        move |bytes| {
+            let mut result = check_disk_floor_at(&dir, bytes);
+            if matches!(result, Err(DataError::DiskFloor(_))) {
+                let reclaimed = aft_store::family::reclaim_dead_workspaces(
+                    &dir,
+                    Some(checkout),
+                    || still_short(&dir, bytes),
+                    || still_short(&dir, 0),
+                );
+                log_reclaimed(reclaimed.removed);
+                // Asked again whatever the count: a deletion that failed
+                // partway is not counted, yet may have freed enough.
+                result = match reclaimed.stopped {
+                    Some(error) => Err(error),
+                    None => check_disk_floor_at(&dir, bytes),
+                };
+            }
+            if let Err(DataError::DiskFloor(message)) = &result {
+                *paused.lock().expect("disk pause lock") = Some(message.clone());
+            }
+            result
+        }
+    }
+
+    /// The workspace of a cold build: the one an earlier attempt of the same
+    /// build left, adopted with the stages it completed, or a new one (see
+    /// [`resume::claim`]).
+    fn claim_build_workspace(&self, paused: DiskPause) -> Result<resume::Claimed, DataError> {
+        let identity = resume::BuildIdentity::of(
+            self.family.id(),
+            self.checkout,
+            &self.root,
+            self.planes,
+            &self.layer.policy,
+        );
+        let claim = self
+            .writer()?
+            .claim_scratch(self.checkout)
+            .map_err(DataError::store)?;
+        resume::claim(claim, identity, self.admission(paused))
+    }
+
+    /// Deletes what an earlier cold build of this checkout left to resume
+    /// from, once the checkout no longer needs a cold build: kept while it
+    /// still does, as when another process published only its text index
+    /// and died building the call graph. Best effort: a live build keeps
+    /// its own, and a later writer's sweep deletes the rest.
+    fn discard_build_workspace(&self) {
+        if self.needs_build() {
+            return;
+        }
+        let claim = match self.family.try_write() {
+            Ok(Some(mut session)) => session.claim_scratch(self.checkout),
+            _ => return,
+        };
+        if let Ok(claim) = claim {
+            resume::discard(claim);
+        }
+    }
+
+    /// Below the free-disk floor plus `reserve`, what the next stage of the
+    /// build may write, deletes dead build workspaces, oldest first, until
+    /// there is room; one a paused build left goes only below the floor
+    /// itself. `others_only` keeps this checkout's own, which a build of it
+    /// running here holds. Best effort, and safe against live builds: each
+    /// deletion takes the workspace's checkout lock first, and the build's
+    /// own admission still refuses what does not fit. Free space that
+    /// cannot be measured deletes nothing; the floor check that follows
+    /// reports it.
+    fn reclaim_disk_for(&self, reserve: u64, others_only: bool) {
+        let dir = self.family.dir().to_path_buf();
+        if !matches!(still_short(&dir, reserve), Ok(true)) {
+            return;
+        }
+        let Ok(Some(mut session)) = self.family.try_write() else {
+            return;
+        };
+        let reclaimed = session.reclaim_dead_workspaces(
+            others_only.then_some(self.checkout),
+            || still_short(&dir, reserve),
+            || still_short(&dir, 0),
+        );
+        log_reclaimed(reclaimed.removed);
     }
 
     #[cfg(test)]
@@ -2613,8 +2958,10 @@ impl Checkout {
                         None => {}
                     }
                     if !record.language.is_empty() {
-                        let key =
-                            RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
+                        let key = crate::data_layer::content::record_key(
+                            record.content,
+                            &record.language,
+                        );
                         let holder = if reuse {
                             *match record_holders.entry(key) {
                                 std::collections::hash_map::Entry::Occupied(entry) => {
@@ -3021,6 +3368,22 @@ impl Checkout {
                 .filter(|(_, change)| change.sequence <= covered)
                 .map(|(path, _)| path.clone())
                 .collect::<BTreeSet<_>>();
+            if let Some(state) = &live.state {
+                let mut gaps = state.skipped_parses().clone();
+                for path in &resolved {
+                    gaps.remove(path);
+                    if let Extracted::GrammarGap(reason) = live.changes[path].content.get() {
+                        gaps.insert(path.clone(), reason.clone());
+                    }
+                }
+                live.state = Some(Arc::new(
+                    state
+                        .as_ref()
+                        .clone()
+                        .with_skipped_parses(gaps)
+                        .expect("current change gaps"),
+                ));
+            }
             // The refresh extracted these changes, so each one whose
             // extraction failed now counts as unparsed. The set is copied
             // only when that changes it and a view still holds it.
@@ -3188,7 +3551,10 @@ impl Checkout {
                             .records
                             .insert(name.to_string(), Arc::clone(record));
                     }
-                    Extracted::Config(..) | Extracted::Markers(_) | Extracted::Nothing => {
+                    Extracted::Config(..)
+                    | Extracted::Markers(_)
+                    | Extracted::GrammarGap(_)
+                    | Extracted::Nothing => {
                         engine.refreshed.records.remove(name);
                     }
                 }
@@ -3313,14 +3679,14 @@ impl Checkout {
             let Some(record) = &change.record else {
                 continue;
             };
-            let key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
+            let key = crate::data_layer::content::record_key(record.content, &record.language);
             match change.content.get() {
                 Extracted::Parse(_, _, stored)
                 | Extracted::Config(_, stored)
                 | Extracted::Markers(stored) => {
                     records.add_encoded(key, Arc::clone(stored));
                 }
-                Extracted::Nothing => {}
+                Extracted::GrammarGap(_) | Extracted::Nothing => {}
             }
             if !seen.insert(record.content) {
                 continue;
@@ -3452,7 +3818,7 @@ impl Checkout {
         let state = inputs
             .state
             .clone()
-            .with_fragments_for(per_path, EXTRACTOR_VERSION)
+            .with_fragments_for(per_path, &super::content::graph_version(&inputs.state))
             .map_err(DataError::store)?;
         let written = session
             .write_checkout_state(self.checkout, &state)
@@ -3844,7 +4210,11 @@ impl Checkout {
         published: &Arc<Published>,
         timings: &mut Vec<(&'static str, f64)>,
     ) -> Result<GraphEngine, DataError> {
-        if !published.state.has_fragments_for(EXTRACTOR_VERSION) || !published.graph_built {
+        if !published
+            .state
+            .has_fragments_for(&super::content::graph_version(&published.state))
+            || !published.graph_built
+        {
             return Err(DataError::Damaged(
                 "the call graph was not built by this extractor".to_string(),
             ));
@@ -4089,13 +4459,16 @@ impl Published {
         // supply current records while this publication names old fragments.
         let mut files = Vec::new();
         let mut unparsed = BTreeSet::new();
-        let graph_built = state.has_fragments_for(EXTRACTOR_VERSION);
+        let graph_built = state.has_fragments_for(&super::content::graph_version(&state));
         for (index, record) in state.paths().iter().enumerate() {
             if !graph_built {
                 break;
             }
             let Some(fragment) = state.fragment(index) else {
-                if graph_built && is_unparsed(record) {
+                if graph_built
+                    && is_unparsed(record)
+                    && !state.skipped_parses().contains_key(&record.path)
+                {
                     unparsed.insert(record.path.clone());
                 }
                 continue;
@@ -4103,7 +4476,7 @@ impl Published {
             let Ok(path) = std::str::from_utf8(&record.path) else {
                 continue;
             };
-            let key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
+            let key = crate::data_layer::content::record_key(record.content, &record.language);
             files.push((
                 path.to_string(),
                 key.digest().to_string(),
@@ -4192,6 +4565,38 @@ impl CheckoutView {
     #[must_use]
     pub fn text_generation(&self) -> String {
         format!("{}:{}", self.published.identity, self.sequence)
+    }
+
+    /// Parsing can record a gap without changing text or publishing. Meaning
+    /// coverage caches must distinguish those views too.
+    pub(crate) fn parse_gaps_identity(&self) -> Digest128 {
+        let mut hash = blake3::Hasher::new_derive_key("AFT checkout parse coverage");
+        for (path, reason) in self.current_state().skipped_parses() {
+            hash.update(&(path.len() as u64).to_le_bytes());
+            hash.update(path);
+            hash.update(&(reason.len() as u64).to_le_bytes());
+            hash.update(reason.as_bytes());
+        }
+        Digest128::from_hash(&hash.finalize())
+    }
+
+    pub(crate) fn awaits_parse_publication(&self, path: &[u8]) -> bool {
+        if !self.published.graph_built || self.callgraph_pending.contains(path) {
+            return true;
+        }
+        match (
+            self.published.state.get(path),
+            self.current_state().get(path),
+        ) {
+            (Some(before), Some(now))
+                if same_member(before, now) && before.language == now.language =>
+            {
+                self.published.state.skipped_parses().contains_key(path)
+                    && !self.current_state().skipped_parses().contains_key(path)
+            }
+            (_, Some(_)) => true,
+            _ => false,
+        }
     }
 
     /// The paths changed since the publication, which queries answer from
@@ -4786,7 +5191,9 @@ fn next_inputs(
 ) -> CheckoutInputs {
     let mut parses = previous.parses.clone();
     let mut configs = previous.configs.clone();
+    let mut gaps = state.skipped_parses().clone();
     for path in changed {
+        gaps.remove(path);
         let Ok(name) = std::str::from_utf8(path) else {
             continue;
         };
@@ -4799,11 +5206,17 @@ fn next_inputs(
             Some(Extracted::Config(source, _)) => {
                 configs.insert(path.clone(), Arc::clone(source));
             }
+            Some(Extracted::GrammarGap(reason)) => {
+                gaps.insert(path.clone(), reason.clone());
+            }
             Some(Extracted::Markers(_) | Extracted::Nothing) | None => {}
         }
     }
     CheckoutInputs {
-        state: state.clone(),
+        state: state
+            .clone()
+            .with_skipped_parses(gaps)
+            .expect("typed gaps name current members"),
         parses,
         configs,
     }
@@ -4883,8 +5296,11 @@ fn changed_language(record: &PathRecord, bytes: &[u8]) -> String {
 /// in a build, a file the extractor fails on is not parsed.
 fn extract_recorded(source: &RecordedSource) -> Extracted {
     let language = &source.language;
-    let Ok(mut extracted) = extract(&source.bytes, language) else {
-        return Extracted::Nothing;
+    let mut extracted = match super::grammar::extract(&source.bytes, language) {
+        Ok(record) => record,
+        Err(error) => {
+            return super::grammar::reason(&error).map_or(Extracted::Nothing, Extracted::GrammarGap)
+        }
     };
     if let Ok(path) = std::str::from_utf8(&source.path) {
         // Without them a configuration file's TODOs are reported unread.
@@ -4898,7 +5314,7 @@ fn extract_recorded(source: &RecordedSource) -> Extracted {
         RecordBody::Markers => Extracted::Markers(Arc::new(EncodedRecord::of(&extracted))),
         RecordBody::Parsed { .. } => match blob_from_record(&extracted) {
             Ok(CallgraphBlob::Parse(parse)) => {
-                let key = RecordKey::new(source.content, language, EXTRACTOR_VERSION);
+                let key = crate::data_layer::content::record_key(source.content, language);
                 Extracted::Parse(
                     key.digest().to_string(),
                     Arc::new(parse),
@@ -5074,6 +5490,7 @@ struct BuildSink {
     seen_text: Mutex<HashSet<ContentKey>>,
     /// Each parsed path's language.
     languages: Mutex<HashMap<Vec<u8>, String>>,
+    gaps: Mutex<BTreeMap<Vec<u8>, String>>,
     /// Each extracted record, by the parse key the resolver uses, when the
     /// sink holds records in memory.
     records: Mutex<HashMap<String, (RecordKey, Arc<ContentRecord>)>>,
@@ -5089,6 +5506,8 @@ struct BuildSink {
     /// file again, and how many were.
     stored: StoredRecords,
     reused: std::sync::atomic::AtomicUsize,
+    /// Records found among those an earlier attempt of the build staged.
+    resumed: std::sync::atomic::AtomicUsize,
 }
 
 /// The content records the family stores, which a build reads instead of
@@ -5131,45 +5550,12 @@ struct StagedEntry {
     kind: StagedKind,
 }
 
-enum StagedKind {
-    /// A configuration file's record, with its bytes, which the resolver
-    /// reads from memory.
-    Config(Arc<[u8]>),
-    /// A parsed file's record, and whether its parse converts for the call
-    /// graph (one that does not is left out of the resolver's inputs), with
-    /// the parse's kinds the resolver lists files by
-    /// ([`super::callgraph::list_kinds`]).
-    Parsed {
-        converts: bool,
-        kinds: (bool, bool),
-    },
-    Markers,
-}
-
-impl StagedKind {
-    fn of(record: &ContentRecord) -> Self {
-        match &record.data {
-            RecordBody::Config { source } => Self::Config(Arc::from(source.as_slice())),
-            RecordBody::Parsed { .. } => match blob_from_record(record) {
-                Ok(CallgraphBlob::Parse(parse)) => Self::Parsed {
-                    converts: true,
-                    kinds: super::callgraph::list_kinds(&parse),
-                },
-                _ => Self::Parsed {
-                    converts: false,
-                    kinds: (false, false),
-                },
-            },
-            RecordBody::Markers => Self::Markers,
-        }
-    }
-}
-
 /// A build sink's results, after the scan.
 struct Collected {
     text: TextBuild,
     seen_text: HashSet<ContentKey>,
     languages: HashMap<Vec<u8>, String>,
+    gaps: BTreeMap<Vec<u8>, String>,
     records: HashMap<String, (RecordKey, Arc<ContentRecord>)>,
     /// The staged records, when the scan staged them, and each one's entry
     /// by parse key.
@@ -5180,6 +5566,8 @@ struct Collected {
     failures: usize,
     /// Records read from the store rather than parsed.
     reused: usize,
+    /// Records found among an earlier attempt's staged ones.
+    resumed: usize,
 }
 
 impl BuildSink {
@@ -5191,6 +5579,7 @@ impl BuildSink {
             text_error: Mutex::new(None),
             seen_text: Mutex::default(),
             languages: Mutex::default(),
+            gaps: Mutex::default(),
             records: Mutex::default(),
             stage: None,
             staged: Mutex::default(),
@@ -5198,6 +5587,7 @@ impl BuildSink {
             failures: std::sync::atomic::AtomicUsize::default(),
             stored: StoredRecords::default(),
             reused: std::sync::atomic::AtomicUsize::default(),
+            resumed: std::sync::atomic::AtomicUsize::default(),
         }
     }
 
@@ -5226,6 +5616,7 @@ impl BuildSink {
             None => None,
         };
         Ok(Collected {
+            gaps: self.gaps.into_inner().expect("no panics while holding it"),
             text: self.text.into_inner().expect("no panics while holding it"),
             seen_text: self
                 .seen_text
@@ -5242,6 +5633,7 @@ impl BuildSink {
             staged,
             failures: self.failures.into_inner(),
             reused: self.reused.into_inner(),
+            resumed: self.resumed.into_inner(),
         })
     }
 }
@@ -5304,7 +5696,7 @@ impl ContentSink for BuildSink {
             .lock()
             .expect("no panics while holding it")
             .insert(path.to_vec(), language.clone());
-        let record_key = RecordKey::new(key, &language, EXTRACTOR_VERSION);
+        let record_key = crate::data_layer::content::record_key(key, &language);
         let parse_key = record_key.digest().to_string();
         let held = if self.stage.is_some() {
             self.staged
@@ -5320,13 +5712,31 @@ impl ContentSink for BuildSink {
         if held {
             return;
         }
+        // A record an earlier attempt of this build staged is used where it
+        // lies, exactly as if this scan had staged it.
+        if let Some((stage, _)) = &self.stage {
+            if let Some((at, kind)) = stage.adopted(record_key) {
+                self.resumed
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.staged
+                    .lock()
+                    .expect("no panics while holding it")
+                    .entry(parse_key)
+                    .or_insert(StagedEntry {
+                        key: record_key,
+                        at,
+                        kind,
+                    });
+                return;
+            }
+        }
         let extracted = match self.stored.record(record_key) {
             Some(record) => {
                 self.reused
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(record)
             }
-            None => extract(bytes, &language).map(|mut record| {
+            None => super::grammar::extract(bytes, &language).map(|mut record| {
                 // Without them a configuration file's TODOs are reported
                 // unread; the resolver still reads its bytes.
                 let _ = super::content::add_config_markers(&mut record, path_text, bytes);
@@ -5344,7 +5754,8 @@ impl ContentSink for BuildSink {
                 {
                     return;
                 }
-                match stage.append(&record) {
+                let kind = StagedKind::of(&record);
+                match stage.append(record_key, &record, &kind) {
                     Ok(at) => {
                         self.staged
                             .lock()
@@ -5353,7 +5764,7 @@ impl ContentSink for BuildSink {
                             .or_insert_with(|| StagedEntry {
                                 key: record_key,
                                 at,
-                                kind: StagedKind::of(&record),
+                                kind,
                             });
                     }
                     Err(error) => {
@@ -5370,7 +5781,14 @@ impl ContentSink for BuildSink {
                     .expect("no panics while holding it")
                     .insert(parse_key, (record_key, Arc::new(record)));
             }
-            Err(_) => {
+            Err(error) => {
+                if let Some(reason) = super::grammar::reason(&error) {
+                    self.gaps
+                        .lock()
+                        .expect("no panics while holding it")
+                        .insert(path.to_vec(), reason);
+                    return;
+                }
                 self.failures
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -5397,7 +5815,8 @@ impl Collected {
             if record.language.is_empty() {
                 continue;
             }
-            let record_key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
+            let record_key =
+                crate::data_layer::content::record_key(record.content, &record.language);
             let parse_key = record_key.digest().to_string();
             let Some((_, stored)) = self.records.get(&parse_key) else {
                 continue;
@@ -5423,7 +5842,8 @@ impl Collected {
             let Ok(path) = std::str::from_utf8(&record.path) else {
                 continue;
             };
-            let record_key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
+            let record_key =
+                crate::data_layer::content::record_key(record.content, &record.language);
             let parse_key = record_key.digest().to_string();
             if converts.get(&parse_key) != Some(&true) {
                 continue;
@@ -5457,7 +5877,8 @@ impl Collected {
             if record.language.is_empty() {
                 continue;
             }
-            let record_key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
+            let record_key =
+                crate::data_layer::content::record_key(record.content, &record.language);
             let parse_key = record_key.digest().to_string();
             let Some(entry) = entries.get(&parse_key) else {
                 continue;
@@ -5651,6 +6072,7 @@ impl aft_store::heap::HeapBytes for Extracted {
     fn heap_bytes(&self, seen: &mut aft_store::heap::Seen) -> usize {
         match self {
             Self::Nothing => 0,
+            Self::GrammarGap(reason) => reason.heap_bytes(seen),
             Self::Parse(key, parse, record) => {
                 key.heap_bytes(seen) + parse.heap_bytes(seen) + record.heap_bytes(seen)
             }
@@ -5996,7 +6418,7 @@ impl CheckoutView {
         let Some(published) = self.unchanged_record(path) else {
             return Ok(None);
         };
-        let key = RecordKey::new(published.content, &published.language, EXTRACTOR_VERSION);
+        let key = crate::data_layer::content::record_key(published.content, &published.language);
         for segment in self.published.segments.iter().rev() {
             let Some(content) = ContentSegment::open(segment).map_err(DataError::store)? else {
                 continue;
@@ -6142,12 +6564,17 @@ impl Checkout {
                 .iter()
                 .map(|path| {
                     let record = view.current_state().get(path)?;
-                    if record.stat.size > max_len || record.language.is_empty() {
+                    if record.stat.size > max_len
+                        || record.language.is_empty()
+                        || view.current_state().skipped_parses().contains_key(path)
+                    {
                         return None;
                     }
-                    let published = view.published.state.get(path).is_some_and(|published| {
-                        published.content == record.content && published.language == record.language
-                    });
+                    let published = !view.published.state.skipped_parses().contains_key(path)
+                        && view.published.state.get(path).is_some_and(|published| {
+                            published.content == record.content
+                                && published.language == record.language
+                        });
                     if published {
                         if view.unparsed.contains(path) {
                             return None;
@@ -6158,10 +6585,9 @@ impl Checkout {
                             return None;
                         }
                     }
-                    Some(RecordKey::new(
+                    Some(crate::data_layer::content::record_key(
                         record.content,
                         &record.language,
-                        EXTRACTOR_VERSION,
                     ))
                 })
                 .collect::<Vec<_>>()
@@ -6257,14 +6683,22 @@ impl Checkout {
                 if record.language.is_empty() {
                     return Ok(PathTodos::Unrecorded);
                 }
-                let published = view.published.state.get(path).is_some_and(|published| {
-                    published.content == record.content && published.language == record.language
-                });
+                // A recorded parse gap has no TODO record. The grammar driver
+                // retries transient gaps; a TODO query must not wait for a
+                // publication that cannot contain this file's markers yet.
+                if view.current_state().skipped_parses().contains_key(path) {
+                    return Ok(PathTodos::Unextracted);
+                }
+                let published = !view.published.state.skipped_parses().contains_key(path)
+                    && view.published.state.get(path).is_some_and(|published| {
+                        published.content == record.content && published.language == record.language
+                    });
                 if published {
                     if view.unparsed.contains(path) {
                         return Ok(PathTodos::Unextracted);
                     }
-                    let key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
+                    let key =
+                        crate::data_layer::content::record_key(record.content, &record.language);
                     for content in &contents {
                         if let Some(ordinal) = content.find(key).map_err(DataError::store)? {
                             note_source_work(&self.root, |work| work.todo_decodes += 1);
@@ -6287,7 +6721,7 @@ impl Checkout {
                         note_source_work(&self.root, |work| work.todo_decodes += 1);
                         PathTodos::Recorded(stored.todos().map_err(DataError::store)?)
                     }
-                    Extracted::Nothing => PathTodos::Unextracted,
+                    Extracted::GrammarGap(_) | Extracted::Nothing => PathTodos::Unextracted,
                 })
             })
             .collect()
@@ -6425,7 +6859,7 @@ impl Checkout {
             .iter()
             .find(|path| path.path == file.as_bytes())
             .unwrap();
-        let key = RecordKey::new(path.content, &path.language, EXTRACTOR_VERSION);
+        let key = crate::data_layer::content::record_key(path.content, &path.language);
         let mut damaged = false;
         for segment in &published.segments {
             let Some(content) = ContentSegment::open(segment).unwrap() else {
@@ -7201,12 +7635,12 @@ pub fn other() { callee(); }
         assert!(callers.contains("caller"), "{callers}");
     }
 
-    /// Publishes the older string-table representation with keys from another
-    /// extractor, without running another binary or sharing process globals.
-    fn publish_legacy_graph(checkout: &Checkout, stamp: Option<&str>) {
+    /// Publishes the older string-table representation with keys from the
+    /// extractor `version`, without running another binary or sharing
+    /// process globals. `stamp` is the extractor the published state names.
+    pub(super) fn publish_legacy_graph(checkout: &Checkout, version: &str, stamp: Option<&str>) {
         use crate::callgraph_store::join::CallgraphBlob;
         use aft_store::content::ContentSectionsBuilder;
-        let version = "ruled-callgraph-v14-resolver-precision+record-12";
         let sink = BuildSink::new(checkout.text_build().unwrap());
         let scanned = scan(&checkout.root, &checkout.layer.policy, None, &sink).unwrap();
         let collected = sink.finish().unwrap();
@@ -7222,7 +7656,7 @@ pub fn other() { callee(); }
             };
             state.set_language(index, language.clone()).unwrap();
             let content = state.paths()[index].content;
-            let current = RecordKey::new(content, language, EXTRACTOR_VERSION);
+            let current = crate::data_layer::content::record_key(content, language);
             let mut record = (*collected.records[&current.digest().to_string()].1).clone();
             record.extractor_version = version.to_string();
             let key = RecordKey::new(content, language, version);
@@ -7331,7 +7765,11 @@ pub fn other() { callee(); }
         }
         let layer = Arc::new(DataLayer::new(8 << 20, 2));
         let old = Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path()).unwrap();
-        publish_legacy_graph(&old, stamp);
+        publish_legacy_graph(
+            &old,
+            "ruled-callgraph-v14-resolver-precision+record-12",
+            stamp,
+        );
         drop(old);
         let other =
             Checkout::bind(Arc::clone(&layer), store.path(), family(), sibling.path()).unwrap();
@@ -9247,21 +9685,32 @@ pub fn other() { callee(); }
         checkout.build().unwrap();
         assert_eq!(listing(&builds), ["checkout.lock"]);
 
-        // One byte above the floor: the build starts, and the text index's
-        // first run is refused once the workspace exists.
+        // A megabyte above the floor: the build starts and writes its
+        // workspace's identity, and the scan's first staging write, which
+        // asks for 64 MiB, is refused.
         let low = crate::disk_floor::set_free_space_for_test(
             store.path(),
-            crate::disk_floor::MIN_FREE_BYTES + 1,
+            crate::disk_floor::MIN_FREE_BYTES + (1 << 20),
             10 * 1024 * 1024 * 1024,
         );
         let error = checkout.build().unwrap_err();
         assert!(matches!(error, DataError::DiskFloor(_)), "{error}");
+        // The workspace stays, marked paused, beside the checkout's lock and
+        // its attempts record, which says the attempt ended without dying.
+        let listed = listing(&builds);
         assert_eq!(
-            listing(&builds).len(),
-            2,
-            "a paused build keeps its workspace: {:?}",
-            listing(&builds)
+            listed.len(),
+            3,
+            "a paused build keeps its workspace: {listed:?}"
         );
+        assert!(listed.contains(&"attempts".to_string()), "{listed:?}");
+        let workspace = listed
+            .iter()
+            .find(|name| *name != "attempts" && *name != "checkout.lock")
+            .unwrap();
+        assert!(aft_store::family::workspace::is_paused(
+            &builds.join(workspace)
+        ));
 
         drop(low);
         checkout.build().unwrap();

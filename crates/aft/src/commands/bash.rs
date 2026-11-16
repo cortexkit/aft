@@ -359,6 +359,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             format!("bash env contains blocked variable: {blocked}"),
         );
     }
+    crate::shell_env_provider::clear_request_control(&mut params.env);
 
     if let Some(refusal) = crate::sandbox_spawn::unsupported_platform_sandbox_refusal(ctx) {
         return Response::error(
@@ -421,6 +422,10 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     #[cfg(not(unix))]
     let host_escalation: Option<crate::sandbox_spawn::HostEscalationAttempt> = None;
     #[cfg(unix)]
+    let mut host_provider_failure: Option<String> = None;
+    #[cfg(not(unix))]
+    let host_provider_failure: Option<String> = None;
+    #[cfg(unix)]
     if host_requested && crate::sandbox_spawn::sandbox_required(ctx) {
         let configured_root = ctx
             .config()
@@ -448,13 +453,22 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             }
         };
         let shell_path = std::fs::canonicalize(&shell_path).unwrap_or_else(|_| shell_path.clone());
-        let environment =
+        let mut environment =
             crate::sandbox_spawn::approved_payload_environment(&params.env, &std::env::temp_dir());
         if let Some(grant_id) = params
             .permissions_granted
             .iter()
             .find(|grant| grant.starts_with("esc_"))
         {
+            if let Some(snapshot) = crate::sandbox_spawn::frozen_provider_approval(
+                ctx,
+                grant_id,
+                &principal,
+                &params.env,
+            ) {
+                environment = snapshot.environment;
+                host_provider_failure = snapshot.failure;
+            }
             host_escalation = Some(crate::sandbox_spawn::HostEscalationAttempt {
                 grant_id: grant_id.clone(),
                 command: execution_command.as_bytes().to_vec(),
@@ -465,6 +479,30 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             });
             spawn_workdir = Some(cwd);
         } else {
+            let mut snapshot = None;
+            if ctx.config().shell.env_provider.is_some() {
+                let mut overrides = params.env.clone();
+                let (failure, preflight_layout) =
+                    crate::shell_env_provider::host_preflight(ctx, &cwd, &mut overrides);
+                if let Err(error) = crate::agent_child_env::inject(
+                    ctx.config().as_ref(),
+                    &crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref()),
+                    &mut overrides,
+                    None,
+                ) {
+                    return Response::error(&req.id, "child_environment_unavailable", error);
+                }
+                environment = crate::sandbox_spawn::approved_payload_environment(
+                    &overrides,
+                    &std::env::temp_dir(),
+                );
+                snapshot = Some(crate::sandbox_spawn::ProviderApprovalSnapshot {
+                    input: params.env.clone(),
+                    environment: environment.clone(),
+                    failure,
+                    preflight_layout,
+                });
+            }
             let storage_dir = crate::bash_background::task_storage_dir(ctx);
             let grant_id = match crate::sandbox_spawn::mint_host_escalation_grant(
                 ctx,
@@ -482,6 +520,9 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                     return Response::error(&req.id, "sandbox_escalation_denied", error);
                 }
             };
+            if let Some(snapshot) = snapshot {
+                crate::sandbox_spawn::save_provider_approval(ctx, &grant_id, snapshot);
+            }
             return Response::error_with_data(
                 &req.id,
                 ERROR_PERMISSION_REQUIRED,
@@ -660,6 +701,9 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 "_bash_duplicate_warning".to_string(),
                 json!(format_duplicate_warning(&duplicate)),
             );
+        }
+        if let Some(failure) = host_provider_failure {
+            object.insert("_bash_env_provider_failure".into(), json!(failure));
         }
         if !disclosure.is_empty()
             && ctx

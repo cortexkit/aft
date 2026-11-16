@@ -21,7 +21,8 @@ use aft_store::scan::{scan, ContentKind, ContentSink};
 use serde_json::{json, Value};
 
 use super::callgraph::{resolve_checkout, CheckoutInputs};
-use super::content::{blob_from_record, extract, language_for, EXTRACTOR_VERSION};
+use super::content::{blob_from_record, language_for, record_key};
+use super::grammar::extract;
 use crate::callgraph_store::join::CallgraphBlob;
 
 #[derive(Default)]
@@ -42,7 +43,7 @@ impl ContentSink for Records {
         let Some(language) = language_for(path, bytes) else {
             return;
         };
-        let key = RecordKey::new(content, &language, EXTRACTOR_VERSION);
+        let key = record_key(content, &language);
         let known = self
             .by_key
             .lock()

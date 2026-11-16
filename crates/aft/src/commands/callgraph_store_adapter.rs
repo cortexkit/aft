@@ -1789,6 +1789,7 @@ struct TraceFile {
     content_hash: blake3::Hash,
     tree: tree_sitter::Tree,
     symbols: Vec<Symbol>,
+    lang: crate::parser::LangId,
 }
 
 #[cfg(test)]
@@ -1803,7 +1804,10 @@ impl TraceFileFacts {
             return Ok(cached.clone());
         }
         let source = std::fs::read_to_string(file)?;
-        let parsed = match detect_language_from_source(file, &source) {
+        let parsed = match detect_language_from_source(file, &source).or_else(|| {
+            crate::parser::detect_language_any(file, cfg!(feature = "wasm-grammars"))
+                .filter(|language| *language == crate::parser::LangId::Luau)
+        }) {
             Some(lang) => {
                 #[cfg(test)]
                 TRACE_FILE_PARSES.with(|count| count.set(count.get() + 1));
@@ -1814,6 +1818,7 @@ impl TraceFileFacts {
                     source,
                     tree,
                     symbols,
+                    lang,
                 }))
             }
             None => None,
@@ -1888,6 +1893,7 @@ fn trace_data_inner(
         files,
         body_node,
         source,
+        facts.lang,
         &current_calls,
         &mut tracked,
         symbol,
@@ -1909,6 +1915,7 @@ fn walk_for_data_flow(
     files: &TraceFileFacts,
     node: Node<'_>,
     source: &str,
+    lang: crate::parser::LangId,
     current_calls: &[TraceForwardCall],
     tracked: &mut TrackedBindings,
     symbol: &str,
@@ -1922,6 +1929,47 @@ fn walk_for_data_flow(
     visited: &mut HashSet<(String, String, String, bool)>,
 ) -> StoreAdapterResult<()> {
     let kind = node.kind();
+    let luau_assignment = lang == crate::parser::LangId::Luau
+        && matches!(kind, "local_variable_declaration" | "assignment_statement");
+    if luau_assignment && luau_assignment_pair(node).is_none() {
+        // Calls on the right use the pre-assignment bindings even when field,
+        // index or parallel targets cannot be attributed to a plain binding.
+        if let Some(values) = find_child_by_kind(node, "expression_list") {
+            walk_for_data_flow(
+                store,
+                symbol_cache,
+                files,
+                values,
+                source,
+                lang,
+                current_calls,
+                tracked,
+                symbol,
+                rel_file,
+                max_depth,
+                current_depth,
+                control_flow_uncertain,
+                origin_function_seen,
+                hops,
+                depth_limited,
+                visited,
+            )?;
+        }
+        // Parallel assignments are not attributed. Discard overwritten names
+        // rather than claiming that their old values survive the assignment.
+        if kind == "assignment_statement" {
+            for (name, _) in crate::luau::assignment_pairs(node) {
+                tracked.kill(&trace_node_text(name, source));
+            }
+        } else if let Some(bindings) = find_child_by_kind(node, "binding_list") {
+            for binding in bindings.named_children(&mut bindings.walk()) {
+                if let Some(name) = binding.child_by_field_name("name") {
+                    tracked.kill(&trace_node_text(name, source));
+                }
+            }
+        }
+        return Ok(());
+    }
     let is_var_decl = matches!(
         kind,
         "variable_declarator"
@@ -1932,8 +1980,8 @@ fn walk_for_data_flow(
             | "short_var_declaration"
     );
 
-    if is_var_decl {
-        if let Some(assignment) = extract_assignment_info(node, source, tracked) {
+    if is_var_decl || luau_assignment {
+        if let Some(assignment) = extract_assignment_info(node, source, tracked, luau_assignment) {
             let approximate = assignment.approximate || control_flow_uncertain;
             hops.push(callgraph::DataFlowHop {
                 file: rel_file.to_string(),
@@ -1947,7 +1995,11 @@ fn walk_for_data_flow(
             if assignment.stop_after_hop {
                 return Ok(());
             }
-        } else if let Some(overwritten_name) = plain_assignment_target(node, source) {
+        } else if let Some(overwritten_name) = if luau_assignment {
+            luau_assignment_pair(node).map(|(name, _)| trace_node_text(name, source))
+        } else {
+            plain_assignment_target(node, source)
+        } {
             if tracked.contains(&overwritten_name) {
                 if control_flow_uncertain {
                     // Because an assignment inside a conditional or loop may be skipped,
@@ -1960,7 +2012,11 @@ fn walk_for_data_flow(
         }
     }
 
-    if kind == "call_expression" || kind == "call" || kind == "macro_invocation" {
+    if kind == "call_expression"
+        || kind == "call"
+        || kind == "macro_invocation"
+        || (lang == crate::parser::LangId::Luau && kind == "function_call")
+    {
         check_call_for_data_flow(
             store,
             symbol_cache,
@@ -1979,7 +2035,9 @@ fn walk_for_data_flow(
         )?;
     }
 
-    let is_function = function_container(kind);
+    let is_function = function_container(kind)
+        || (lang == crate::parser::LangId::Luau
+            && matches!(kind, "local_function_declaration" | "function_definition"));
     let descendants_uncertain = control_flow_uncertain
         || conditional_flow_container(kind)
         || (is_function && origin_function_seen);
@@ -1993,6 +2051,7 @@ fn walk_for_data_flow(
                 files,
                 cursor.node(),
                 source,
+                lang,
                 current_calls,
                 tracked,
                 symbol,
@@ -2017,26 +2076,31 @@ fn extract_assignment_info(
     node: Node<'_>,
     source: &str,
     tracked: &TrackedBindings,
+    luau_assignment: bool,
 ) -> Option<AssignmentInfo> {
     let kind = node.kind();
     let line = node.start_position().row as u32 + 1;
 
-    let (name_node, value_node) = match kind {
-        "variable_declarator" => (
-            node.child_by_field_name("name")?,
-            node.child_by_field_name("value")?,
-        ),
-        "assignment_expression" | "augmented_assignment_expression" | "assignment" => (
-            node.child_by_field_name("left")?,
-            node.child_by_field_name("right")?,
-        ),
-        "let_declaration" | "short_var_declaration" => (
-            node.child_by_field_name("pattern")
-                .or_else(|| node.child_by_field_name("left"))?,
-            node.child_by_field_name("value")
-                .or_else(|| node.child_by_field_name("right"))?,
-        ),
-        _ => return None,
+    let (name_node, value_node) = if luau_assignment {
+        luau_assignment_pair(node)?
+    } else {
+        match kind {
+            "variable_declarator" => (
+                node.child_by_field_name("name")?,
+                node.child_by_field_name("value")?,
+            ),
+            "assignment_expression" | "augmented_assignment_expression" | "assignment" => (
+                node.child_by_field_name("left")?,
+                node.child_by_field_name("right")?,
+            ),
+            "let_declaration" | "short_var_declaration" => (
+                node.child_by_field_name("pattern")
+                    .or_else(|| node.child_by_field_name("left"))?,
+                node.child_by_field_name("value")
+                    .or_else(|| node.child_by_field_name("right"))?,
+            ),
+            _ => return None,
+        }
     };
 
     let binding = trace_node_text(name_node, source);
@@ -2067,6 +2131,14 @@ fn extract_assignment_info(
         approximate: source_approximate,
         stop_after_hop: false,
     })
+}
+
+fn luau_assignment_pair(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    match node.kind() {
+        "local_variable_declaration" => crate::luau::local_pair(node),
+        "assignment_statement" => crate::luau::single_assignment_pair(node),
+        _ => None,
+    }
 }
 
 fn merge_reference_approximation(left: Option<bool>, right: Option<bool>) -> Option<bool> {
@@ -2381,7 +2453,8 @@ fn resolve_symbol_query_with_cache(
     symbol: &str,
     symbol_cache: &SharedSymbolCache,
 ) -> StoreAdapterResult<String> {
-    let mut parser = FileParser::with_symbol_cache(symbol_cache.clone());
+    let mut parser = FileParser::with_symbol_cache(symbol_cache.clone())
+        .with_dynamic_languages(cfg!(feature = "wasm-grammars"));
     let symbols = parser.extract_symbols(file)?;
     let candidates = symbol_query_candidates_from_symbols(&symbols, symbol);
     match candidates.as_slice() {
@@ -2511,6 +2584,42 @@ pub fn serialized_response<T: Serialize>(req_id: &str, operation: &str, value: &
     }
 }
 
+pub(crate) fn serialized_response_with_view<T: Serialize>(
+    req_id: &str,
+    operation: &str,
+    value: &T,
+    view: Option<&crate::data_layer::checkout::CheckoutView>,
+    queried_paths: &[&Path],
+) -> Response {
+    response_with_view(
+        serialized_response(req_id, operation, value),
+        view,
+        queried_paths,
+    )
+}
+
+pub(crate) fn response_with_view(
+    mut response: Response,
+    view: Option<&crate::data_layer::checkout::CheckoutView>,
+    queried_paths: &[&Path],
+) -> Response {
+    // Luau requires cannot cross into built-in languages. A missing Luau
+    // caller can affect a Luau traversal, but not a built-in-only answer.
+    if queried_paths.iter().any(|path| {
+        crate::parser::detect_language_any(path, cfg!(feature = "wasm-grammars"))
+            == Some(crate::parser::LangId::Luau)
+    }) {
+        if let Some(view) = view {
+            crate::data_layer::surfaces::disclose_parse_gaps(
+                view,
+                &[view.root().to_path_buf()],
+                &mut response,
+            );
+        }
+    }
+    response
+}
+
 pub fn serialization_error_response(
     req_id: &str,
     operation: &str,
@@ -2561,6 +2670,9 @@ pub fn store_error_response(req_id: &str, operation: &str, error: CallGraphStore
         );
     }
     match error {
+        CallGraphStoreError::Aft(error) if crate::data_layer::grammar::is_grammar_error(&error) => {
+            crate::data_layer::grammar::error_response(req_id, &error)
+        }
         CallGraphStoreError::Aft(error) => Response::error(req_id, error.code(), error.to_string()),
         CallGraphStoreError::Unavailable(message)
             if crate::view_storage_reserve::is_message(&message) =>
@@ -3431,7 +3543,7 @@ fn content_matches_store(
 /// derived for each language it can be parsed as: any of them matching still
 /// proves the record was extracted from these bytes.
 fn data_layer_record_keys(file: &str, current: blake3::Hash) -> Vec<String> {
-    use crate::data_layer::content::{language_for, EXTRACTOR_VERSION};
+    use crate::data_layer::content::{language_for, record_key};
     let content =
         aft_store::ids::ContentKey::from_digest(aft_store::ids::Digest128::from_hash(&current));
     let languages = if Path::new(file)
@@ -3444,11 +3556,7 @@ fn data_layer_record_keys(file: &str, current: blake3::Hash) -> Vec<String> {
     };
     languages
         .iter()
-        .map(|language| {
-            aft_store::content::RecordKey::new(content, language, EXTRACTOR_VERSION)
-                .digest()
-                .to_string()
-        })
+        .map(|language| record_key(content, language).digest().to_string())
         .collect()
 }
 
@@ -3500,11 +3608,7 @@ fn display_file_for_error(store: &impl CallGraphRead, file: &Path) -> String {
 
 fn relative_file(store: &impl CallGraphRead, file: &Path) -> String {
     let absolute = absolute_file(store, file);
-    absolute
-        .strip_prefix(store.project_root())
-        .unwrap_or(&absolute)
-        .to_string_lossy()
-        .replace('\\', "/")
+    crate::callgraph_store::relative_path(store.project_root(), &absolute)
 }
 
 fn absolute_file(store: &impl CallGraphRead, file: &Path) -> PathBuf {
@@ -3524,6 +3628,28 @@ mod trace_to_tests {
         StoreImpactResult as RawImpactResult, StoredEdge,
     };
     use std::cell::RefCell;
+
+    #[cfg(windows)]
+    #[test]
+    fn luau_s4_relative_keys_match_plain_and_verbatim_windows_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let verbatim = std::fs::canonicalize(dir.path()).unwrap();
+        let plain = crate::windows_path::normalize_windows_path(&verbatim);
+        assert_ne!(plain, verbatim);
+        std::fs::write(plain.join("source.luau"), "local answer = 42\n").unwrap();
+
+        for root in [&plain, &verbatim] {
+            let mut store = CountingStore::new();
+            store.root = root.clone();
+            for file in [
+                PathBuf::from("source.luau"),
+                plain.join("source.luau"),
+                verbatim.join("source.luau"),
+            ] {
+                assert_eq!(relative_file(&store, &file), "source.luau");
+            }
+        }
+    }
 
     struct CountingStore {
         root: PathBuf,

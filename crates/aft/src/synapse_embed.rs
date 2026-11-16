@@ -537,12 +537,12 @@ pub(crate) mod pause_test_support {
                     let listener = tokio::net::TcpListener::from_std(listener).unwrap();
                     let (mut stream, _) = listener.accept().await.unwrap();
                     subc_transport::authenticate_server(&mut stream, &key, &daemon_id, FAKE_DAEMON_VERSION, Duration::from_secs(2)).await.unwrap();
-                    let catalog = subc_transport::read_frame(&mut stream).await.unwrap().unwrap();
+                    let catalog = crate::subc_fake::read_frame(&mut stream).await.unwrap().unwrap();
                     respond(&mut stream, &catalog, json!({"op":"catalog.list","generation":1,"modules":[{
                         "module_id":"synapse","module_version":"1","roles":[{"role":"management_surface",
                         "operations":[{"name":"models.list","kind":"query"},{"name":"embed.query","kind":"query"},{"name":"embed.batch","kind":"query"}],
                         "config_schema":{"type":"object"},"observability":[],"identity_scope":[]}],"control_ops":[]}],"subc_ops":["catalog.list","route.open"]})).await;
-                    let route = subc_transport::read_frame(&mut stream).await.unwrap().expect("project-free Synapse route.open");
+                    let route = crate::subc_fake::read_frame(&mut stream).await.unwrap().expect("project-free Synapse route.open");
                     let route_body: Value = serde_json::from_slice(&route.body).unwrap();
                     assert_eq!(route_body["op"], "route.open");
                     assert!(route_body["identity"].get("project_root").is_none());
@@ -1456,7 +1456,6 @@ impl SynapseState {
                     format!("aft-semantic-{}", std::process::id()),
                 ),
                 CallOptions {
-                    consumer_identity: crate::launch_nonce::consumer_identity(),
                     ..CallOptions::default()
                 },
             )

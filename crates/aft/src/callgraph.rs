@@ -2738,6 +2738,21 @@ pub(crate) fn rust_import_local_names(imp: &imports::ImportStatement) -> Vec<Str
         .collect()
 }
 
+/// The local name and full path of each explicit Rust use-tree leaf.
+pub(crate) fn rust_import_paths(raw: &str) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
+    if let Some(body) = rust_use_body(raw) {
+        expand_rust_use_tree(body.trim_start_matches("::"), &mut entries);
+    }
+    entries
+        .into_iter()
+        .filter_map(|entry| match entry.kind {
+            RustUseKind::Module => Some((entry.local_name, entry.module_path)),
+            RustUseKind::Item { .. } => None,
+        })
+        .collect()
+}
+
 fn rust_use_body(raw: &str) -> Option<&str> {
     let use_pos = raw.find("use ")?;
     let body = raw[use_pos + 4..].trim();
@@ -2746,39 +2761,53 @@ fn rust_use_body(raw: &str) -> Option<&str> {
 }
 
 fn expand_rust_use_tree(path: &str, entries: &mut Vec<RustUseEntry>) {
-    let path = path.trim();
-    if path.is_empty() {
-        return;
+    enum Work {
+        Expand(String),
+        ModuleSelf(String),
     }
-
-    if let Some((prefix, inner)) = split_rust_use_braces(path) {
-        let prefix = prefix.trim().trim_end_matches("::").trim();
-        for part in split_top_level_commas(inner) {
-            let part = part.trim();
-            if part.is_empty() {
-                continue;
-            }
-            if part == "self" {
-                if let Some(local_name) = rust_last_path_segment(prefix) {
+    // Use trees can nest beyond the file walker's stack. Keep both subtrees
+    // and `self` entries on the heap, in reverse order, so popping them emits
+    // exactly the depth-first order stored by the recursive expansion.
+    let mut pending = vec![Work::Expand(path.to_string())];
+    while let Some(work) = pending.pop() {
+        let path = match work {
+            Work::ModuleSelf(prefix) => {
+                if let Some(local_name) = rust_last_path_segment(&prefix) {
                     entries.push(RustUseEntry {
-                        module_path: prefix.to_string(),
+                        module_path: prefix,
                         local_name,
                         kind: RustUseKind::Module,
                     });
                 }
                 continue;
             }
-            let combined = if prefix.is_empty() {
-                part.to_string()
-            } else {
-                format!("{prefix}::{part}")
-            };
-            expand_rust_use_tree(&combined, entries);
+            Work::Expand(path) => path,
+        };
+        let path = path.trim();
+        if path.is_empty() {
+            continue;
         }
-        return;
+        if let Some((prefix, inner)) = split_rust_use_braces(path) {
+            let prefix = prefix.trim().trim_end_matches("::").trim();
+            for part in split_top_level_commas(inner).into_iter().rev() {
+                let part = part.trim();
+                if part.is_empty() {
+                    continue;
+                }
+                if part == "self" {
+                    pending.push(Work::ModuleSelf(prefix.to_string()));
+                } else {
+                    pending.push(Work::Expand(if prefix.is_empty() {
+                        part.to_string()
+                    } else {
+                        format!("{prefix}::{part}")
+                    }));
+                }
+            }
+        } else {
+            add_rust_use_leaf(path, entries);
+        }
     }
-
-    add_rust_use_leaf(path, entries);
 }
 
 fn split_rust_use_braces(path: &str) -> Option<(&str, &str)> {
@@ -4456,7 +4485,9 @@ fn walk_project_files_filtered_while_with_builder(
     configure_builder: impl FnOnce(&mut ignore::WalkBuilder),
 ) -> impl Iterator<Item = PathBuf> {
     walk_project_paths_filtered_while_with_builder(root, include, keep_walking, configure_builder)
-        .filter(|path| detect_language(path).is_some())
+        .filter(|path| {
+            crate::parser::detect_language_any(path, cfg!(feature = "wasm-grammars")).is_some()
+        })
 }
 
 fn walk_project_paths_filtered_while_with_builder(
@@ -4563,7 +4594,8 @@ pub fn walk_could_include(relative: &str) -> bool {
     if crate::os_metadata::is_os_metadata_file_name(std::ffi::OsStr::new(file_name)) {
         return false;
     }
-    detect_language(Path::new(file_name)).is_some()
+    crate::parser::detect_language_any(Path::new(file_name), cfg!(feature = "wasm-grammars"))
+        .is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -4577,6 +4609,44 @@ mod tests {
     use std::cell::Cell;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn rust_use_tree_expansion_preserves_depth_first_entry_order() {
+        let mut entries = Vec::new();
+        expand_rust_use_tree(
+            "root::{first, branch::{self, nested::{Leaf as Renamed, *, {}}, after}, self, *, {}, last as Tail}",
+            &mut entries,
+        );
+        let actual: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                let imported = match &entry.kind {
+                    RustUseKind::Item { imported_name } => Some(imported_name.as_str()),
+                    RustUseKind::Module => None,
+                };
+                (
+                    entry.module_path.as_str(),
+                    entry.local_name.as_str(),
+                    imported,
+                )
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                ("root", "first", Some("first")),
+                ("root::first", "first", None),
+                ("root::branch", "branch", None),
+                ("root::branch::nested", "Renamed", Some("Leaf")),
+                ("root::branch::nested::Leaf", "Renamed", None),
+                ("root::branch", "after", Some("after")),
+                ("root::branch::after", "after", None),
+                ("root", "root", None),
+                ("root", "Tail", Some("last")),
+                ("root::last", "Tail", None),
+            ]
+        );
+    }
 
     #[test]
     fn call_tree_work_gap_text_names_the_node_budget() {

@@ -763,6 +763,10 @@ pub(crate) fn apply_to_command(command: &mut Command, environment: &HashMap<Stri
         command.env_remove(key);
     }
     command.envs(environment);
+    command.env_remove(crate::shell_env_provider::REMOVALS_ENV);
+    for name in crate::shell_env_provider::removals(environment) {
+        command.env_remove(name);
+    }
     command.env_remove(crate::privacy_spawn::CONTROL_ENV);
 
     let mut credential_keys = std::env::vars_os()
@@ -2174,6 +2178,50 @@ mod tests {
         let once = environment.clone();
         inject(&config, storage.path(), &mut environment, None).unwrap();
         assert_eq!(environment, once);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_env_provider_path_keeps_governance_first_and_removes_dead_pins() {
+        let storage = tempfile::tempdir().unwrap();
+        let binary = storage.path().join("aft");
+        write_self_reporting_shim(&binary);
+        let tools = storage.path().join("project-node20/bin");
+        let dead = storage.path().join("run/aft-pinned-100-200/shims");
+        let path = std::env::join_paths([dead, tools.clone(), PathBuf::from("/usr/bin")]).unwrap();
+        let export = serde_json::json!({"PATH":path.to_string_lossy()}).to_string();
+        let provider = crate::config::ShellEnvProvider {
+            kind: crate::config::ShellEnvProviderKind::Custom,
+            command: Some(vec![
+                "sh".into(),
+                "-c".into(),
+                format!("printf '%s' '{}'", export),
+            ]),
+            timeout_ms: 2000,
+            watch: vec![],
+        };
+        let mut environment = HashMap::new();
+        assert!(crate::shell_env_provider::apply(
+            Some(&provider),
+            &mut crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+            storage.path(),
+            &mut environment,
+            false
+        )
+        .is_none());
+        let mut config = Config::default();
+        config.github.shim = true;
+        config.gh_shim.binary_path = Some(binary);
+        config.git.co_author = "off".into();
+        inject(&config, storage.path(), &mut environment, None).unwrap();
+        assert_eq!(
+            std::env::split_paths(&environment["PATH"]).collect::<Vec<_>>(),
+            [
+                storage.path().join("shims"),
+                tools,
+                PathBuf::from("/usr/bin")
+            ]
+        );
     }
 
     fn test_thread_file(root: &Path, contents: Option<&[u8]>) {

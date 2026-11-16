@@ -389,14 +389,10 @@ impl<'i> SectionsWriter<'i> {
         // Configuration files' records too, so a reader of the segment can
         // give the resolver the same configuration bytes the build read.
         for record in state.paths() {
-            if prebuilt || record.language != "config" {
+            if prebuilt || !super::content::is_config_language(&record.language) {
                 continue;
             }
-            let key = RecordKey::new(
-                record.content,
-                &record.language,
-                super::content::EXTRACTOR_VERSION,
-            );
+            let key = super::content::record_key(record.content, &record.language);
             if let Some((record_key, stored)) = records.get(&key.digest().to_string()) {
                 content.add(*record_key, stored);
             }
@@ -904,14 +900,10 @@ impl StoredSlices {
             .map_err(|error| error.to_string())?;
         let mut configs = HashMap::new();
         for record in state.paths() {
-            if record.language != "config" {
+            if !super::content::is_config_language(&record.language) {
                 continue;
             }
-            let key = RecordKey::new(
-                record.content,
-                &record.language,
-                super::content::EXTRACTOR_VERSION,
-            );
+            let key = super::content::record_key(record.content, &record.language);
             let Some((index, ordinal)) = find_newest(&contents, |content| content.find(key))?
             else {
                 continue;

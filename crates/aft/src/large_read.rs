@@ -24,19 +24,121 @@ use regex::bytes::Regex;
 /// counted in health as large reads.
 pub(crate) const LARGE_READ_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Twice the largest file production readers touched (8.1 MB), so whole reads
+/// cannot turn a growing log into a multi-gigabyte allocation.
+pub(crate) const WHOLE_READ_CEILING: u64 = 16 * 1024 * 1024;
+
+/// Kept in one place so the agent-visible explanation can be reviewed separately.
+pub(crate) const WHOLE_READ_SKIP_REASON: &str =
+    "Skipped: reading this file would exceed the 16 MiB in-memory read ceiling.";
+
+pub(crate) fn allow_whole(site: Site, path: &std::path::Path, size: u64) -> io::Result<()> {
+    if size <= WHOLE_READ_CEILING {
+        return Ok(());
+    }
+    skip(site, path);
+    Err(io::Error::other(WHOLE_READ_SKIP_REASON))
+}
+
+pub(crate) fn skip(site: Site, path: &std::path::Path) {
+    with_counter(site, |counter| {
+        counter.skipped.fetch_add(1, Ordering::Relaxed);
+    });
+    crate::bounded_io::note_large_read_skip(path);
+}
+
+/// Visit raw lines, including their LF, without retaining earlier lines. The
+/// caller keeps only its selected windows. An oversized line is skipped and
+/// its path is reported as incomplete, just like an oversized whole-file read.
+pub(crate) fn visit_lines(
+    path: &std::path::Path,
+    site: Site,
+    mut visit: impl FnMut(usize, usize, &[u8]),
+) -> io::Result<()> {
+    use std::io::{BufRead, Read};
+    let file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    let mut reader = io::BufReader::with_capacity(64 * 1024, file.take(size));
+    let token = crate::executor::current_job_cancellation();
+    let mut line = Vec::new();
+    let mut offset = 0usize;
+    let mut index = 0usize;
+    let mut read = 0u64;
+    let outcome = (|| loop {
+        if token
+            .as_ref()
+            .is_some_and(|token| token.cancel_requested_before_commit())
+        {
+            return Err(io::Error::other("request cancelled"));
+        }
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            if !line.is_empty() {
+                visit(index, offset, &line);
+            }
+            return Ok(());
+        }
+        let lf = memchr::memchr(b'\n', chunk);
+        let count = lf.map_or(chunk.len(), |at| at + 1);
+        if line.len().saturating_add(count) as u64 > WHOLE_READ_CEILING {
+            skip(site, path);
+            return Err(io::Error::other(WHOLE_READ_SKIP_REASON));
+        }
+        if line.capacity() - line.len() < count {
+            let needed = line.len() + count;
+            let target = if needed <= STEP_BYTES * 2 {
+                STEP_BYTES * 2
+            } else {
+                WHOLE_READ_CEILING as usize
+            };
+            line.try_reserve_exact(target - line.len())
+                .map_err(io::Error::other)?;
+        }
+        line.extend_from_slice(&chunk[..count]);
+        reader.consume(count);
+        read += count as u64;
+        #[cfg(test)]
+        STEP_TAP.with(|tap| {
+            if let Some(tap) = tap.borrow_mut().as_mut() {
+                tap(read);
+            }
+        });
+        #[cfg(test)]
+        if LINE_SCAN_FAILURE.with(|failure| {
+            if failure.get() == Some(site) {
+                failure.take();
+                true
+            } else {
+                false
+            }
+        }) {
+            return Err(io::Error::other("injected line scan failure"));
+        }
+        if lf.is_some() {
+            visit(index, offset, &line);
+            offset += line.len();
+            index += 1;
+            line.clear();
+        }
+    })();
+    record(site, size, read);
+    outcome
+}
+
 /// Bytes read per step from a large file.
 pub(crate) const STEP_BYTES: usize = 1024 * 1024;
 
 #[cfg(test)]
 thread_local! {
+    static LINE_SCAN_FAILURE: std::cell::Cell<Option<Site>> = const { std::cell::Cell::new(None) };
     /// Replaces [`STEP_BYTES`] on this thread, so tests can put step edges
     /// anywhere in small generated files.
     static STEP_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     /// Replaces [`LARGE_READ_BYTES`] on this thread, so small generated files
     /// take the streamed paths.
     static LARGE_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-    /// Runs after every step a [`Steps`] reads on this thread, with the bytes
-    /// read so far, so a test can cancel or outrun a deadline mid-file.
+    /// Runs after every step or raw-line consumption on this thread, with the
+    /// bytes read so far, so a test can cancel mid-file.
     static STEP_TAP: std::cell::RefCell<Option<Box<dyn FnMut(u64)>>> =
         const { std::cell::RefCell::new(None) };
     /// A [`Steps`] reservation that would grow its buffer past this many
@@ -44,7 +146,27 @@ thread_local! {
     static REFUSE_RESERVE_OVER: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
 }
 
-/// Run `work` with `tap` called after every step read on this thread.
+/// Fail one raw-line scan at `site` after it consumes its first chunk. The
+/// assertion prevents a regression test from passing without reaching the read.
+#[cfg(test)]
+pub(crate) fn with_line_scan_failure<T>(site: Site, work: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            LINE_SCAN_FAILURE.with(|failure| failure.set(None));
+        }
+    }
+    LINE_SCAN_FAILURE.with(|failure| failure.set(Some(site)));
+    let _reset = Reset;
+    let value = work();
+    assert!(
+        LINE_SCAN_FAILURE.with(|failure| failure.get().is_none()),
+        "injected line scan failure was never reached"
+    );
+    value
+}
+
+/// Run `work` with `tap` called after every step or raw-line chunk on this thread.
 #[cfg(test)]
 pub(crate) fn with_step_tap<T>(tap: impl FnMut(u64) + 'static, work: impl FnOnce() -> T) -> T {
     struct Reset;
@@ -149,12 +271,10 @@ impl<'a, S: StepSource + ?Sized> Steps<'a, S> {
 
     /// Append the next step to `buffer`; the returned count is 0 at the end.
     /// `buffer` has room for two steps, which holds a step and the partial
-    /// line carried before it. A line longer than that grows it once, to
-    /// everything the rest of the file could need: one copy of the carried
-    /// bytes instead of one per doubling. The carried bytes were read from
-    /// this file and are not yet dropped, so the buffer never holds more than
-    /// the file's size at open: no more than a whole read reserves. Only the
-    /// bytes the line fills are touched.
+    /// line carried before it. A longer line grows it once, up to the smaller
+    /// of the file's remaining size and the read ceiling plus one probe byte.
+    /// The scanner uses that byte to distinguish a line at the ceiling from
+    /// one exceeding it, without doubling a large carried buffer.
     ///
     /// The reservation is exact and fallible: an allocation the system
     /// refuses is the same `io::Error::other` a whole read's
@@ -170,11 +290,14 @@ impl<'a, S: StepSource + ?Sized> Steps<'a, S> {
         if buffer.capacity() - buffer.len() < want {
             let limit = buffer.len().saturating_add(remaining);
             let needed = buffer.len() + want;
+            if needed as u64 > WHOLE_READ_CEILING + 1 {
+                return Err(io::Error::other(WHOLE_READ_SKIP_REASON));
+            }
             let two_steps = self.step.saturating_mul(2);
             let target = if needed <= two_steps {
                 two_steps.min(limit)
             } else {
-                limit
+                limit.min(WHOLE_READ_CEILING as usize + 1)
             };
             #[cfg(test)]
             if REFUSE_RESERVE_OVER.with(std::cell::Cell::get) < target {
@@ -202,6 +325,10 @@ impl<'a, S: StepSource + ?Sized> Steps<'a, S> {
         }
         Ok(read)
     }
+}
+
+pub(crate) fn is_ceiling_error(error: &io::Error) -> bool {
+    error.to_string() == WHOLE_READ_SKIP_REASON
 }
 
 // ---------------------------------------------------------------------------
@@ -648,6 +775,8 @@ pub(crate) enum ScanEnd {
 /// every byte once, in order, before it is searched, and can end the scan
 /// with [`ScanEnd::Stopped`] or [`ScanEnd::Interrupted`].
 pub(crate) fn scan_lines(
+    site: Site,
+    path: &std::path::Path,
     source: &mut (impl StepSource + ?Sized),
     size_at_open: u64,
     head: Vec<u8>,
@@ -669,6 +798,12 @@ pub(crate) fn scan_lines(
     loop {
         if let Some(end) = step_hook(&buffer[fresh_from..]) {
             return Ok(end);
+        }
+        if buffer.len() as u64 > WHOLE_READ_CEILING
+            && memchr::memchr(b'\n', &buffer).is_none_or(|at| at as u64 > WHOLE_READ_CEILING)
+        {
+            skip(site, path);
+            return Err(io::Error::other(WHOLE_READ_SKIP_REASON));
         }
         if let Some(last_lf) = memchr::memrchr(b'\n', &buffer[fresh_from..]) {
             let end = fresh_from + last_lf + 1;
@@ -695,7 +830,14 @@ pub(crate) fn scan_lines(
             buffer.drain(..end);
         }
         fresh_from = buffer.len();
-        if steps.append(&mut buffer)? == 0 {
+        steps.step = step_bytes().min(WHOLE_READ_CEILING as usize + 1 - buffer.len());
+        let appended = steps.append(&mut buffer).map_err(|error| {
+            if error.to_string() == WHOLE_READ_SKIP_REASON {
+                skip(site, path);
+            }
+            error
+        })?;
+        if appended == 0 {
             break;
         }
     }
@@ -896,6 +1038,7 @@ struct Counter {
     largest: AtomicU64,
     whole_count: AtomicU64,
     whole_bytes: AtomicU64,
+    skipped: AtomicU64,
 }
 
 #[allow(clippy::declare_interior_mutable_const)]
@@ -905,6 +1048,7 @@ const ZERO: Counter = Counter {
     largest: AtomicU64::new(0),
     whole_count: AtomicU64::new(0),
     whole_bytes: AtomicU64::new(0),
+    skipped: AtomicU64::new(0),
 };
 
 static COUNTERS: [Counter; SITES.len()] = [ZERO; SITES.len()];
@@ -967,22 +1111,30 @@ struct HealthSite {
     largest: u64,
     whole_count: u64,
     whole_bytes: u64,
+    skipped: u64,
 }
 
 fn summarize_health_sites(mut sites: Vec<HealthSite>) -> serde_json::Value {
-    sites.retain(|site| site.count > 0);
+    sites.retain(|site| site.count > 0 || site.skipped > 0);
     let sites_active = sites.len();
+    let skipped_by_site = sites
+        .iter()
+        .filter(|site| site.skipped > 0)
+        .map(|site| (site.site.to_string(), serde_json::json!(site.skipped)))
+        .collect::<serde_json::Map<_, _>>();
     let mut count = 0_u64;
     let mut bytes = 0_u64;
     let mut largest = 0_u64;
     let mut whole_count = 0_u64;
     let mut whole_bytes = 0_u64;
+    let mut skipped = 0_u64;
     for site in &sites {
         count = count.saturating_add(site.count);
         bytes = bytes.saturating_add(site.bytes);
         largest = largest.max(site.largest);
         whole_count = whole_count.saturating_add(site.whole_count);
         whole_bytes = whole_bytes.saturating_add(site.whole_bytes);
+        skipped = skipped.saturating_add(site.skipped);
     }
     sites.sort_unstable_by(|left, right| {
         right
@@ -1002,6 +1154,7 @@ fn summarize_health_sites(mut sites: Vec<HealthSite>) -> serde_json::Value {
                 "largest": site.largest,
                 "whole_count": site.whole_count,
                 "whole_bytes": site.whole_bytes,
+                "skipped": site.skipped,
             })
         })
         .collect::<Vec<_>>();
@@ -1011,6 +1164,8 @@ fn summarize_health_sites(mut sites: Vec<HealthSite>) -> serde_json::Value {
         "largest": largest,
         "whole_count": whole_count,
         "whole_bytes": whole_bytes,
+        "skipped": skipped,
+        "skipped_by_site": skipped_by_site,
         "sites_active": sites_active,
         "top": top,
     })
@@ -1031,6 +1186,7 @@ pub(crate) fn health() -> serde_json::Value {
                     largest: counter.largest.load(Ordering::Relaxed),
                     whole_count: counter.whole_count.load(Ordering::Relaxed),
                     whole_bytes: counter.whole_bytes.load(Ordering::Relaxed),
+                    skipped: counter.skipped.load(Ordering::Relaxed),
                 })
             })
             .collect(),
@@ -1054,6 +1210,7 @@ pub(crate) fn widest_health_for_test() -> serde_json::Value {
                 largest: u64::MAX,
                 whole_count: u64::MAX,
                 whole_bytes: u64::MAX,
+                skipped: u64::MAX,
             })
             .collect(),
     )
@@ -1191,6 +1348,7 @@ mod tests {
                 largest: 0,
                 whole_count: 0,
                 whole_bytes: 0,
+                skipped: 0,
             })
             .collect();
         assert_eq!(
@@ -1201,6 +1359,8 @@ mod tests {
                 "largest": 0,
                 "whole_count": 0,
                 "whole_bytes": 0,
+                "skipped": 0,
+                "skipped_by_site": {},
                 "sites_active": 0,
                 "top": [],
             })
@@ -1218,6 +1378,7 @@ mod tests {
                 largest: index as u64 + 1,
                 whole_count: index as u64 % 2,
                 whole_bytes: (index as u64 % 2) * 10,
+                skipped: 0,
             })
             .collect();
         let health = summarize_health_sites(sites);
@@ -1230,10 +1391,10 @@ mod tests {
         assert_eq!(
             health["top"],
             serde_json::json!([
-                {"site": "exact_corpus", "count": 12, "bytes": 30, "largest": 12, "whole_count": 1, "whole_bytes": 10},
-                {"site": "grep_fallback", "count": 3, "bytes": 30, "largest": 3, "whole_count": 0, "whole_bytes": 0},
-                {"site": "lexical_exactness", "count": 9, "bytes": 30, "largest": 9, "whole_count": 0, "whole_bytes": 0},
-                {"site": "line_windows", "count": 15, "bytes": 30, "largest": 15, "whole_count": 0, "whole_bytes": 0},
+                {"site": "exact_corpus", "count": 12, "bytes": 30, "largest": 12, "whole_count": 1, "whole_bytes": 10, "skipped": 0},
+                {"site": "grep_fallback", "count": 3, "bytes": 30, "largest": 3, "whole_count": 0, "whole_bytes": 0, "skipped": 0},
+                {"site": "lexical_exactness", "count": 9, "bytes": 30, "largest": 9, "whole_count": 0, "whole_bytes": 0, "skipped": 0},
+                {"site": "line_windows", "count": 15, "bytes": 30, "largest": 15, "whole_count": 0, "whole_bytes": 0, "skipped": 0},
             ])
         );
     }
@@ -1301,6 +1462,7 @@ mod tests {
             serde_json::json!({
                 "site": "grep_collect", "count": 2, "bytes": size + 17,
                 "largest": size, "whole_count": 1, "whole_bytes": size,
+                "skipped": 0,
             })
         );
         assert_eq!(sites[1]["site"], "parse_source");

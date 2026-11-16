@@ -13,6 +13,16 @@ pub mod edit_gate;
 pub mod extract_gate;
 pub mod fragment;
 pub(crate) mod gate;
+pub(crate) mod grammar;
+#[cfg(all(
+    test,
+    not(all(
+        feature = "wasm-grammars",
+        target_os = "windows",
+        target_arch = "aarch64"
+    ))
+))]
+mod grammar_tests;
 pub(crate) mod graph_rows;
 pub(crate) mod graph_store;
 pub mod incremental;
@@ -44,6 +54,13 @@ pub mod standing;
 pub(crate) mod subjects;
 pub mod surfaces;
 pub mod symbol_prewarm_measure;
+#[cfg(all(
+    test,
+    feature = "wasm-grammars",
+    feature = "test-hooks",
+    not(all(target_os = "windows", target_arch = "aarch64"))
+))]
+mod test_gates;
 pub(crate) mod tools;
 pub mod trace_measure;
 pub mod vectors;

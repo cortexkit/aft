@@ -1715,7 +1715,7 @@ impl SearchIndexSnapshot {
         let stop_after = max_results.saturating_mul(2);
         let stop_scan = Arc::new(AtomicBool::new(false));
         let deadline = make_deadline();
-        let io_budget = crate::bounded_io::current();
+        let io_budget = crate::bounded_io::capture();
         let alloc_label = crate::alloc_trace::carry();
         let floor_disclosure = crate::context::confinement::capture();
         let verification_claims = AtomicUsize::new(0);
@@ -2040,7 +2040,7 @@ impl SearchIndexSnapshot {
         let job_cancellation = crate::executor::current_job_cancellation();
         let started = Instant::now();
         let stopped_early = AtomicBool::new(false);
-        let io_budget = crate::bounded_io::current();
+        let io_budget = crate::bounded_io::capture();
         let alloc_label = crate::alloc_trace::carry();
         let files_examined = AtomicUsize::new(0);
         let missing_on_disk = AtomicUsize::new(0);
@@ -2076,9 +2076,13 @@ impl SearchIndexSnapshot {
                     let fetched = crate::commands::semantic_search::request_files::read_through(
                         request_files,
                         &file.path,
-                        |path| match open_grep_file(path, deadline, false, || {
-                            matcher.line_matcher().is_some()
-                        })? {
+                        |path| match open_grep_file(
+                            path,
+                            deadline,
+                            false,
+                            crate::large_read::Site::GrepCollect,
+                            || matcher.line_matcher().is_some(),
+                        )? {
                             GrepFileRead::Whole(bytes) => Ok((bytes, None)),
                             GrepFileRead::Large(opened) => {
                                 large = Some(opened);
@@ -2098,10 +2102,8 @@ impl SearchIndexSnapshot {
                             keep_past_limit,
                             job_cancellation.as_ref(),
                         );
-                        // A file not read to its end gives no rows, as a
-                        // whole read that hit its deadline or failed. Such a
-                        // read still counted as examined here, and so does
-                        // this one.
+                        // I/O failures give no rows. A ceiling skip keeps the
+                        // earlier, complete lines and discloses the missing tail.
                         files_examined.fetch_add(1, Ordering::Relaxed);
                         match end {
                             Ok(crate::large_read::ScanEnd::Interrupted(_)) => {
@@ -2109,6 +2111,7 @@ impl SearchIndexSnapshot {
                                 return None;
                             }
                             Ok(_) => {}
+                            Err(error) if crate::large_read::is_ceiling_error(&error) => {}
                             Err(error) => {
                                 if error.kind() == std::io::ErrorKind::TimedOut {
                                     stopped_early.store(true, Ordering::Relaxed);
@@ -2537,9 +2540,13 @@ fn search_candidate_file(
         }
         Vec::new()
     };
-    let opened = match open_grep_file(&file.path, deadline.read_at, false, || {
-        matcher.line_matcher().is_some()
-    }) {
+    let opened = match open_grep_file(
+        &file.path,
+        deadline.read_at,
+        false,
+        crate::large_read::Site::GrepIndexed,
+        || matcher.line_matcher().is_some(),
+    ) {
         Ok(opened) => opened,
         Err(error) => return read_failed(error),
     };
@@ -2731,6 +2738,8 @@ fn search_candidate_file_streamed(
     let mut state = CandidateScan::new(file);
     let mut read = 0u64;
     let scan = crate::large_read::scan_lines(
+        crate::large_read::Site::GrepIndexed,
+        &file.path,
         &mut large.reader,
         size,
         std::mem::take(&mut large.head),
@@ -2787,6 +2796,12 @@ fn search_candidate_file_streamed(
         Ok(crate::large_read::ScanEnd::Interrupted(_)) => {
             engine_capped.store(true, Ordering::Relaxed);
             None
+        }
+        Err(error) if crate::large_read::is_ceiling_error(&error) => {
+            // Earlier complete lines participated, but the unread tail is not
+            // byte-verified and is disclosed separately as a coverage gap.
+            files_searched.fetch_add(1, Ordering::Relaxed);
+            return Ok(state.finish(files_with_matches));
         }
         Err(error) => Some(error),
     };
@@ -2891,6 +2906,8 @@ fn matching_lines_streamed(
     let mut state = LineCollect::default();
     let mut read = 0u64;
     let end = crate::large_read::scan_lines(
+        crate::large_read::Site::GrepCollect,
+        path,
         &mut large.reader,
         size,
         std::mem::take(&mut large.head),
@@ -3094,19 +3111,26 @@ pub(crate) fn read_request_corpus_file(
             let read = files.read(path, |path| {
                 #[cfg(test)]
                 crate::search_hot_path_measurements::record_file_read_path(path);
-                // Bound the read itself as well as admission: the file can
-                // grow after stat. Bytes cut at the bound are not kept.
-                let mut bytes = Vec::with_capacity(
-                    usize::try_from(metadata.len().min(max_file_size)).unwrap_or(0),
-                );
-                crate::project_content::open(path)?
-                    .take(max_file_size.saturating_add(1))
-                    .read_to_end(&mut bytes)?;
+                let file = crate::project_content::open(path)?;
+                let stat = FileStat::of(&file.metadata()?);
+                if stat.size > max_file_size {
+                    return Err(std::io::Error::other(CutAtSizeBound));
+                }
+                crate::large_read::allow_whole(
+                    crate::large_read::Site::ExactCorpus,
+                    path,
+                    stat.size,
+                )?;
+                let mut bytes = Vec::new();
+                bytes
+                    .try_reserve_exact(stat.size as usize)
+                    .map_err(std::io::Error::other)?;
+                file.take(stat.size).read_to_end(&mut bytes)?;
                 crate::large_read::record_whole(crate::large_read::Site::ExactCorpus, bytes.len());
                 if bytes.len() as u64 > max_file_size {
                     return Err(std::io::Error::other(CutAtSizeBound));
                 }
-                Ok((bytes, Some(FileStat::of(&metadata))))
+                Ok((bytes, Some(stat)))
             });
             match read {
                 Ok(fetched) => fetched,
@@ -3122,6 +3146,18 @@ pub(crate) fn read_request_corpus_file(
         }
     };
     let bytes = fetched.file.bytes();
+    if crate::large_read::allow_whole(
+        crate::large_read::Site::ExactCorpus,
+        path,
+        bytes.len() as u64,
+    )
+    .is_err()
+    {
+        if fetched.fresh {
+            files.release(path);
+        }
+        return RequestCorpusFile::Skipped;
+    }
     if bytes.len() as u64 > max_file_size || is_binary_bytes(bytes) {
         if fetched.fresh {
             files.release(path);
@@ -3169,18 +3205,35 @@ fn read_search_corpus_file_with_metadata(
     if metadata.size > max_file_size {
         return SearchCorpusEligibility::Unindexed(metadata);
     }
+    if crate::large_read::allow_whole(crate::large_read::Site::ExactCorpus, path, metadata.size)
+        .is_err()
+    {
+        return SearchCorpusEligibility::Unindexed(metadata);
+    }
 
     #[cfg(test)]
     crate::search_hot_path_measurements::record_file_read_path(path);
-    // Bound the read itself as well as admission: the file can grow after stat.
-    let mut bytes =
-        Vec::with_capacity(usize::try_from(metadata.size.min(max_file_size)).unwrap_or(0));
+    let mut bytes = Vec::new();
     #[cfg(test)]
     audit_record(|work| work.corpus_opens += 1);
     let read = crate::project_content::open(path).and_then(|file| {
-        file.take(max_file_size.saturating_add(1))
-            .read_to_end(&mut bytes)
+        let size = file.metadata()?.len();
+        if size > max_file_size {
+            return Err(std::io::Error::other(CutAtSizeBound));
+        }
+        crate::large_read::allow_whole(crate::large_read::Site::ExactCorpus, path, size)?;
+        bytes
+            .try_reserve_exact(size as usize)
+            .map_err(std::io::Error::other)?;
+        file.take(size).read_to_end(&mut bytes)
     });
+    if read.as_ref().is_err_and(|error| {
+        error
+            .get_ref()
+            .is_some_and(|inner| inner.is::<CutAtSizeBound>())
+    }) {
+        return SearchCorpusEligibility::Unindexed(metadata);
+    }
     if read.is_err() {
         return SearchCorpusEligibility::Skipped;
     }
@@ -3690,20 +3743,18 @@ where
     Ok(files)
 }
 
-pub(crate) fn read_searchable_text(path: &Path) -> Option<String> {
-    let bytes = crate::bounded_io::read(path, None).ok()?;
-    if is_binary_bytes(&bytes) {
-        return None;
-    }
-    String::from_utf8(bytes).ok()
-}
-
 /// Read an indexed file whole for grep verification, as the scans read a
 /// file they do not stream. Keep the original I/O error so callers
 /// distinguish a missing entry from blocked access or a scan timeout.
 #[cfg(test)]
 fn read_indexed_file_bytes(path: &Path, deadline: Option<Instant>) -> std::io::Result<Vec<u8>> {
-    match open_grep_file(path, deadline, false, || false)? {
+    match open_grep_file(
+        path,
+        deadline,
+        false,
+        crate::large_read::Site::GrepIndexed,
+        || false,
+    )? {
         GrepFileRead::Whole(bytes) => Ok(bytes),
         GrepFileRead::Large(_) => unreachable!("a large read was not asked for"),
     }
@@ -3733,11 +3784,32 @@ pub(crate) fn open_grep_file(
     path: &Path,
     deadline: Option<Instant>,
     authorized_task_artifact: bool,
+    site: crate::large_read::Site,
     stream: impl FnOnce() -> bool,
+) -> std::io::Result<GrepFileRead> {
+    open_grep_file_after_open(
+        path,
+        deadline,
+        authorized_task_artifact,
+        site,
+        stream,
+        || {},
+    )
+}
+
+fn open_grep_file_after_open(
+    path: &Path,
+    deadline: Option<Instant>,
+    authorized_task_artifact: bool,
+    site: crate::large_read::Site,
+    stream: impl FnOnce() -> bool,
+    after_open: impl FnOnce(),
 ) -> std::io::Result<GrepFileRead> {
     let mut reader =
         crate::project_content::reader_bounded(path, deadline, authorized_task_artifact)?;
-    let prefix = reader.chunk(Vec::new(), 1024)?;
+    after_open();
+    let sniff_bytes = reader.size_at_open().min(1024) as usize;
+    let prefix = reader.chunk(Vec::new(), sniff_bytes)?;
     if is_binary_bytes(&prefix) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -3753,12 +3825,95 @@ pub(crate) fn open_grep_file(
             head: prefix,
         }));
     }
-    reader.rest(prefix).map(GrepFileRead::Whole)
+    crate::large_read::allow_whole(site, path, reader.size_at_open())?;
+    // Bound the small branch too: a log can grow after its descriptor opens.
+    let remaining = reader.size_at_open().saturating_sub(prefix.len() as u64) as usize;
+    reader.append(prefix, remaining).map(GrepFileRead::Whole)
 }
 
 #[cfg(test)]
 mod grep_binary_prefix_tests {
     use super::*;
+
+    #[test]
+    fn audit1432_corpus_readers_enforce_ceiling_with_a_larger_configured_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("large.rs");
+        std::fs::write(&path, b"// ascii source\n".repeat((17 << 20) / 16)).unwrap();
+        for cached in [false, true] {
+            let _scope = crate::bounded_io::enter_disclosure_if_absent();
+            let files = crate::commands::semantic_search::request_files::RequestFiles::default();
+            let (eligible, _, largest) = crate::test_allocations::count_bytes_and_largest(|| {
+                if cached {
+                    matches!(
+                        read_request_corpus_file(Some(&files), &path, 64 << 20),
+                        RequestCorpusFile::Eligible { .. }
+                    )
+                } else {
+                    matches!(
+                        read_search_corpus_file(&path, 64 << 20),
+                        SearchCorpusEligibility::Eligible(_)
+                    )
+                }
+            });
+            assert!(
+                !eligible,
+                "a configured corpus limit must not bypass the whole-read ceiling"
+            );
+            assert!(
+                (largest as u64) < crate::large_read::WHOLE_READ_CEILING,
+                "largest allocation={largest}"
+            );
+            let mut response =
+                crate::protocol::Response::success("corpus-ceiling", serde_json::json!({}));
+            crate::bounded_io::disclose_large_read_skips(&mut response);
+            assert_eq!(response.data["complete"], false);
+            assert_eq!(
+                response.data["skipped_files"][0]["file"],
+                serde_json::json!(path)
+            );
+        }
+    }
+
+    #[test]
+    fn growing_small_grep_read_stops_at_open_size_without_large_allocation() {
+        use std::io::{Seek, Write};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("growing.log");
+        for size in [0, 8, 512, 1023, 2048] {
+            for nul_growth in [false, true] {
+                let opened = vec![b'x'; size];
+                std::fs::write(&path, &opened).unwrap();
+                let (read, allocated) = crate::test_allocations::count_bytes(|| {
+                    open_grep_file_after_open(
+                        &path,
+                        None,
+                        false,
+                        crate::large_read::Site::GrepIndexed,
+                        || true,
+                        || {
+                            let mut file =
+                                std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                            file.set_len(64 << 20).unwrap();
+                            if !nul_growth {
+                                file.seek(std::io::SeekFrom::Start(size as u64)).unwrap();
+                                file.write_all(&[b'y'; 2048]).unwrap();
+                            }
+                        },
+                    )
+                    .expect("growth beyond the opened size must not affect binary admission")
+                });
+                assert!(
+                    allocated < 8 << 20,
+                    "allocated {allocated} bytes for a {size}-byte opened file"
+                );
+                let GrepFileRead::Whole(bytes) = read else {
+                    panic!("small opened file must use the whole branch");
+                };
+                assert_eq!(bytes, opened, "size={size}, nul_growth={nul_growth}");
+            }
+        }
+    }
 
     #[test]
     fn grep_binary_prefix_rejects_archive_before_returning_its_body() {
@@ -7000,6 +7155,35 @@ mod streamed_scan_tests {
     }
 
     #[test]
+    fn audit1432_round2_indexed_ceiling_keeps_earlier_rows_with_consistent_file_counters() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("early-match.txt");
+        let mut bytes = b"foo\n".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', 17 << 20));
+        std::fs::write(&path, bytes).unwrap();
+        let _scope = crate::bounded_io::enter_disclosure_if_absent();
+        let (rows, counters, _) = candidate_scan(&path, &foo_literal(), 10);
+        assert_eq!(rows, vec![(1, 1, "foo".into(), "foo".into())]);
+        assert_eq!(
+            counters,
+            [1, 1, 1, 0, 0],
+            "partial files participate in searched/matched counts, never full-byte verification"
+        );
+        let mut response =
+            crate::protocol::Response::success("indexed-ceiling", serde_json::json!({}));
+        crate::bounded_io::disclose_large_read_skips(&mut response);
+        assert_eq!(response.data["complete"], false);
+        assert_eq!(
+            response.data["skipped_files"][0]["file"],
+            serde_json::json!(path)
+        );
+        assert_eq!(
+            response.data["skipped_files"][0]["reason"],
+            crate::large_read::WHOLE_READ_SKIP_REASON
+        );
+    }
+
+    #[test]
     fn streamed_candidate_scan_matches_whole_read() {
         let directory = tempfile::tempdir().unwrap();
         for (index, bytes) in files().into_iter().enumerate() {
@@ -7043,9 +7227,14 @@ mod streamed_scan_tests {
                     let line_matcher = matcher.line_matcher().unwrap();
                     for step in STEPS {
                         let streamed = crate::large_read::with_test_steps(step, 0, || {
-                            let GrepFileRead::Large(large) =
-                                open_grep_file(&path, None, false, || true).unwrap()
-                            else {
+                            let GrepFileRead::Large(large) = open_grep_file(
+                                &path,
+                                None,
+                                false,
+                                crate::large_read::Site::GrepCollect,
+                                || true,
+                            )
+                            .unwrap() else {
                                 panic!("a large read");
                             };
                             matching_lines_streamed(
@@ -7085,6 +7274,8 @@ mod streamed_scan_tests {
                         let mut source = crate::large_read::source(&bytes, short);
                         let mut state = LineCollect::default();
                         let end = crate::large_read::scan_lines(
+                            crate::large_read::Site::GrepCollect,
+                            path,
                             &mut source,
                             bytes.len() as u64,
                             Vec::new(),
@@ -7117,7 +7308,14 @@ mod streamed_scan_tests {
         let opened = |threshold| {
             crate::large_read::with_test_steps(4, threshold, || {
                 matches!(
-                    open_grep_file(&path, None, false, || true).unwrap(),
+                    open_grep_file(
+                        &path,
+                        None,
+                        false,
+                        crate::large_read::Site::GrepCollect,
+                        || true
+                    )
+                    .unwrap(),
                     GrepFileRead::Large(_)
                 )
             })
@@ -7126,7 +7324,14 @@ mod streamed_scan_tests {
         assert!(opened(2047));
         // A pattern that is not line-local keeps the whole read.
         assert!(!crate::large_read::with_test_steps(4, 0, || matches!(
-            open_grep_file(&path, None, false, || false).unwrap(),
+            open_grep_file(
+                &path,
+                None,
+                false,
+                crate::large_read::Site::GrepCollect,
+                || false
+            )
+            .unwrap(),
             GrepFileRead::Large(_)
         )));
     }
@@ -7286,9 +7491,14 @@ mod streamed_scan_tests {
             let whole = matching_lines_in_content(&path, &bytes, &matcher, 3, &keep_past_limit);
             let line_matcher = matcher.line_matcher().unwrap();
             let streamed = crate::large_read::with_test_steps(step, 0, || {
-                let GrepFileRead::Large(large) =
-                    open_grep_file(&path, None, false, || true).unwrap()
-                else {
+                let GrepFileRead::Large(large) = open_grep_file(
+                    &path,
+                    None,
+                    false,
+                    crate::large_read::Site::GrepCollect,
+                    || true,
+                )
+                .unwrap() else {
                     panic!("a large read");
                 };
                 matching_lines_streamed(&path, large, &line_matcher, 3, &keep_past_limit, None)

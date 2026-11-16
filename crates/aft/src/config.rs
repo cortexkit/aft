@@ -827,6 +827,75 @@ pub struct BashConfig {
     pub runon_env: Vec<String>,
 }
 
+/// User-only project environment selection, separate from shell tool switches.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ShellConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_provider: Option<ShellEnvProvider>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShellEnvProviderKind {
+    Mise,
+    Direnv,
+    Custom,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellEnvProvider {
+    pub kind: ShellEnvProviderKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+    #[serde(default = "default_env_provider_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub watch: Vec<String>,
+}
+
+fn default_env_provider_timeout_ms() -> u64 {
+    2000
+}
+
+impl ShellEnvProvider {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.kind != ShellEnvProviderKind::Custom && !self.watch.is_empty() {
+            return Err("invalid_security_config:shell.env_provider.watch".into());
+        }
+        if !(100..=10000).contains(&self.timeout_ms) {
+            return Err("shell.env_provider.timeout_ms must be between 100 and 10000".into());
+        }
+        if self.kind == ShellEnvProviderKind::Custom && self.command.is_none() {
+            return Err("shell.env_provider.command is required for custom".into());
+        }
+        if self.command.as_ref().is_some_and(|command| {
+            command.is_empty()
+                || command[0].is_empty()
+                || command.iter().any(|arg| arg.contains('\0'))
+        }) {
+            return Err(
+                "shell.env_provider.command must be a nonempty argv without NUL bytes".into(),
+            );
+        }
+        if cfg!(windows) && self.kind == ShellEnvProviderKind::Direnv {
+            return Err(
+                "shell.env_provider: direnv is not supported on Windows; use mise or custom".into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn argv(&self) -> Vec<String> {
+        self.command.clone().unwrap_or_else(|| match self.kind {
+            ShellEnvProviderKind::Mise => vec!["mise".into(), "env".into(), "--json".into()],
+            ShellEnvProviderKind::Direnv => vec!["direnv".into(), "export".into(), "json".into()],
+            ShellEnvProviderKind::Custom => unreachable!("custom command validated at config load"),
+        })
+    }
+}
+
 impl Default for BashConfig {
     fn default() -> Self {
         Self {
@@ -1010,6 +1079,7 @@ pub struct Config {
     pub foreground_wait_window_ms: u64,
     /// Plugin-owned bash settings accepted by configure but inert in the engine.
     pub bash: BashConfig,
+    pub shell: ShellConfig,
     /// Enable OpenCode-style bash permission prompts (default: false).
     pub bash_permissions: bool,
     /// Native sandbox policy for first-party bash and PTY processes.
@@ -1131,6 +1201,7 @@ impl Default for Config {
             bash_long_running_reminder_interval_ms: 600_000,
             foreground_wait_window_ms: default_foreground_wait_window_ms(),
             bash: BashConfig::default(),
+            shell: ShellConfig::default(),
             bash_permissions: false,
             sandbox: SandboxConfig::default(),
             remote_exec: RemoteExecConfig::default(),

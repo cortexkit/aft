@@ -38,9 +38,7 @@ use std::time::{Duration, Instant};
 use super::extensions::{RawQuery, Token};
 use super::SearchShape;
 use crate::list_envelope::{ListEnvelope, Reason, Total, Unit};
-use crate::search_index::{
-    decompose_regex, read_searchable_text, FileEntry, GrepMatch, SearchIndex,
-};
+use crate::search_index::{decompose_regex, FileEntry, GrepMatch, SearchIndex};
 
 /// Wall-clock budget shared by enumeration and reading, the same budget the
 /// other bounded fallback walks use.
@@ -50,7 +48,7 @@ pub(super) const SWEEP_BUDGET: Duration = crate::grep_executor::FALLBACK_WALK_BU
 /// captured logs and dumps routinely exceed that limit, and an exact pass that
 /// silently skipped them would not match what grep finds. The time budget, not
 /// this cap, bounds the total work.
-pub(super) const SWEEP_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+pub(super) const SWEEP_MAX_FILE_BYTES: u64 = crate::large_read::WHOLE_READ_CEILING;
 
 /// Lines longer than this never supply a spelling-variant hit. A line this
 /// long is embedded content (a captured request body, a minified bundle), and
@@ -314,6 +312,17 @@ pub(super) fn sweep(
     include_tests: bool,
     deadline: Instant,
 ) -> SweepOutcome {
+    sweep_after_metadata(root, terms, index, include_tests, deadline, |_| {})
+}
+
+fn sweep_after_metadata(
+    root: &Path,
+    terms: &IdentifierTerms,
+    index: Option<&SearchIndex>,
+    include_tests: bool,
+    deadline: Instant,
+    mut after_metadata: impl FnMut(&Path),
+) -> SweepOutcome {
     let mut outcome = SweepOutcome {
         used_index: index.is_some(),
         ..SweepOutcome::default()
@@ -381,13 +390,27 @@ pub(super) fn sweep(
             continue;
         };
         if metadata.len() > SWEEP_MAX_FILE_BYTES {
+            let _ = crate::large_read::allow_whole(
+                crate::large_read::Site::ExternalSweep,
+                path,
+                metadata.len(),
+            );
+            outcome.oversized_skipped += 1;
+            continue;
+        }
+        after_metadata(path);
+        let content = read_sweep_text(path);
+        if content
+            .as_ref()
+            .is_err_and(crate::large_read::is_ceiling_error)
+        {
             outcome.oversized_skipped += 1;
             continue;
         }
         outcome.files_read += 1;
         outcome.files_checked += 1;
         // Binary and non-UTF-8 files are checked but cannot hold a text hit.
-        if let Some(content) = read_searchable_text(path) {
+        if let Ok(Some(content)) = content {
             crate::large_read::record_whole(crate::large_read::Site::ExternalSweep, content.len());
             scan_content(path, &content, *class, terms, &mut hits);
         }
@@ -396,6 +419,17 @@ pub(super) fn sweep(
     rank_hits(&mut hits, root);
     outcome.hits = hits;
     outcome
+}
+
+fn read_sweep_text(path: &Path) -> std::io::Result<Option<String>> {
+    let mut reader = crate::bounded_io::reader(path, None)?;
+    let size = reader.size_at_open();
+    crate::large_read::allow_whole(crate::large_read::Site::ExternalSweep, path, size)?;
+    let bytes = reader.append(Vec::new(), size as usize)?;
+    if crate::search_index::is_binary_bytes(&bytes) {
+        return Ok(None);
+    }
+    Ok(String::from_utf8(bytes).ok())
 }
 
 /// Source before text before data, so a sweep that runs out of time has read
@@ -735,6 +769,54 @@ fn render_hits_counted(page: &[&SweepHit], display_root: &Path) -> (String, usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn audit1432_oversized_sweep(grows_after_stat: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("large.rs");
+        std::fs::write(&file, b"initial\n").unwrap();
+        if !grows_after_stat {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_len(17 << 20)
+                .unwrap();
+        }
+        let _scope = crate::bounded_io::enter_disclosure_if_absent();
+        let outcome =
+            sweep_after_metadata(root.path(), &terms(), None, true, far_deadline(), |path| {
+                if grows_after_stat {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(path)
+                        .unwrap()
+                        .set_len(17 << 20)
+                        .unwrap();
+                }
+            });
+        assert_eq!(outcome.files_discovered, 1);
+        assert_eq!(outcome.oversized_skipped, 1);
+        assert_eq!(outcome.files_read, 0);
+        assert_eq!(outcome.files_checked, 0);
+        let mut response =
+            crate::protocol::Response::success("external-size", serde_json::json!({}));
+        crate::bounded_io::disclose_large_read_skips(&mut response);
+        assert_eq!(response.data["skipped_files"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            response.data["skipped_files"][0]["file"],
+            serde_json::json!(file)
+        );
+    }
+
+    #[test]
+    fn audit1432_external_exact_stable_oversize_is_not_double_counted() {
+        audit1432_oversized_sweep(false);
+    }
+
+    #[test]
+    fn audit1432_external_exact_growth_is_skipped_not_counted_as_checked() {
+        audit1432_oversized_sweep(true);
+    }
 
     const IDENTIFIER: &str = "requireCredentialStamps";
 

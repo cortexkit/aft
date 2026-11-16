@@ -810,12 +810,12 @@ export function createBashStatusTool(ctx: PluginContext): ToolDefinition {
     ? " To wait, use bash_watch."
     : "";
   return {
-    description: `Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion.${waitSteer}`,
+    description: `Read-only snapshot of a background or PTY bash task's current state and output; a remote job ID works too. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion.${waitSteer}`,
     args: {
       taskId: z
         .string()
         .describe(
-          "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+          "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
         ),
       outputOffset: optionalInt(0, Number.MAX_SAFE_INTEGER).describe(
         "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
@@ -872,12 +872,12 @@ export function createBashStatusTool(ctx: PluginContext): ToolDefinition {
 export function createBashKillTool(ctx: PluginContext): ToolDefinition {
   return {
     description:
-      "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+      "Terminate a running background bash task spawned with bash({ background: true }); a remote job ID works too. Returns confirmation of kill or an error if the task already finished.",
     args: {
       taskId: z
         .string()
         .describe(
-          "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+          "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded, or its remote job ID.",
         ),
     },
     execute: async (args, context) => {

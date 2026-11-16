@@ -52,6 +52,26 @@ fn impact(
 }
 
 #[test]
+fn rust_smart_pointer_fields_reach_callers_and_impact_without_internal_hints() {
+    let (_temp, store) = fixture(&[
+        ("Cargo.toml", "[package]\nname = \"pointer-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        ("src/lib.rs", "mod inner;\nuse inner::Inner;\nuse std::{sync::Arc, rc::Rc};\nstruct Holder { shared: Arc<Inner>, local: Rc<Inner>, owned: Box<Inner> }\nimpl Holder {\n fn shared(&self) { self.shared.hit(); }\n fn local(&self) { self.local.hit(); }\n fn owned(&self) { self.owned.hit(); }\n}\n"),
+        ("src/inner.rs", "pub struct Inner;\nimpl Inner { pub fn hit(&self) {} }\n"),
+    ]);
+    let found = callers(&store, "src/inner.rs", "Inner::hit", false);
+    assert_eq!(found, "3 callers · 1 file group\nsrc/lib.rs\n  ↳ Holder::local:7\n  ↳ Holder::owned:8\n  ↳ Holder::shared:6");
+    let affected = impact(&store, "src/inner.rs", "Inner::hit", false);
+    assert!(affected.contains("3 affected call sites"), "{affected}");
+    for method in ["Holder::shared", "Holder::local", "Holder::owned"] {
+        assert!(affected.contains(method), "{affected}");
+    }
+    for output in [found, affected] {
+        assert!(!output.contains("@smart:"), "{output}");
+        assert!(!output.contains("@method:"), "{output}");
+    }
+}
+
+#[test]
 fn callgraph_empty_receiver_note_exact_counts_and_test_filtering() {
     let (_temp, store) = fixture(&[("lib.rs", "fn target() {}\n")]);
     let target = store

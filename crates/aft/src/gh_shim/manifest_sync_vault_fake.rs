@@ -109,7 +109,7 @@ async fn serve(
         return;
     }
     let samples = samples();
-    while let Ok(Some(request)) = subc_transport::read_frame(&mut stream).await {
+    while let Ok(Some(request)) = crate::subc_fake::read_frame(&mut stream).await {
         if request.header.ty == FrameType::Ping {
             let pong = Frame::build(
                 FrameType::Pong,
@@ -145,7 +145,14 @@ async fn serve(
         };
         let replies = {
             let mut state = state.lock().unwrap();
-            if value["op"] == "route.open" {
+            if value["op"] == "server.describe" {
+                // The SDK probes the server before opening routes; this fake
+                // advertises no extra operations or capabilities.
+                vec![response(
+                    FrameType::Response,
+                    json!({"op":"server.describe","protocol_ver":2,"subc_ops":[],"capabilities":[],"connected_clients":1}),
+                )]
+            } else if value["op"] == "route.open" {
                 assert_eq!(
                     value["target"],
                     json!({"kind":"management_surface","module_id":"claustrum"})

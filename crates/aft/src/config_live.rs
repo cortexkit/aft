@@ -988,6 +988,7 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     live!("bash.db_schema_hints", bash.db_schema_hints);
     live!("bash.changed_files", bash.changed_files);
     live!("bash.env", bash.env);
+    live!("shell.env_provider", shell.env_provider);
     // A project's `bash.env` values and the user's runon allowlist apply to
     // every later command, so an edit or a deletion must take effect without a
     // reconfigure instead of waiting for the next connection.
@@ -1095,6 +1096,7 @@ fn classification_is_exhaustive(config: &Config) {
         bash_long_running_reminder_interval_ms: _,
         foreground_wait_window_ms: _,
         bash,
+        shell,
         sandbox,
         semantic,
         search: _,
@@ -1137,6 +1139,7 @@ fn classification_is_exhaustive(config: &Config) {
         project_env: _,
         runon_env: _,
     } = bash;
+    let crate::config::ShellConfig { env_provider: _ } = shell;
     let crate::config::SandboxConfig {
         profile: _,
         write_allow: _,

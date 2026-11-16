@@ -51,8 +51,40 @@ use crate::parser::LangId;
 /// unresolved site replaced the call's resolved module binding; 12 added
 /// each file's TODO markers, and records holding only the markers of the
 /// files whose comments are counted but which the call graph does not parse
-/// (see [`MARKERS_PREFIX`]), so counting TODOs never parses a file.
-pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-13";
+/// (see [`MARKERS_PREFIX`]), so counting TODOs never parses a file; 14
+/// named, in a configuration file's language, the grammar its TODO comments
+/// are read in (see [`CONFIG`]), so two configuration files with the same
+/// bytes and different names have different records; it also retained the
+/// contained type of proven standard-library smart-pointer fields (for example,
+/// `Runner` in `Arc<Runner>`), so calls can resolve to that type's methods.
+pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-14";
+
+/// The language of a resolver configuration file the call graph reads raw,
+/// or the start of it. A configuration record also holds the TODO markers
+/// of the file's comments, read in the grammar the file's name calls for
+/// (TOML for `Cargo.toml`, YAML for `pnpm-workspace.yaml`), so its language
+/// names that grammar after a `-` (`config-toml`): a record's key is its
+/// content, language and extractor version, and two files with the same
+/// bytes whose comments are read in different grammars must not share one.
+pub const CONFIG: &str = "config";
+
+/// Whether `language` (as [`language_for`] chose it) is a configuration
+/// file's (see [`CONFIG`]).
+#[must_use]
+pub fn is_config_language(language: &str) -> bool {
+    language
+        .strip_prefix(CONFIG)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
+}
+
+/// The language of the configuration file at `path`: [`CONFIG`], followed
+/// by the grammar its TODO comments are read in, if they are.
+fn config_language(path: &Path) -> String {
+    match todos::path_todo_language(path) {
+        Some(language @ TodoLanguage::Tree(_)) => format!("{CONFIG}-{}", language.name()),
+        _ => CONFIG.to_string(),
+    }
+}
 
 /// The start of the language of a file whose record holds only its TODO
 /// markers: a Markdown file, a minified bundle, or a C header no grammar
@@ -60,12 +92,57 @@ pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+reco
 /// [`TodoLanguage::name`]), such as `markers-markdown`.
 pub const MARKERS_PREFIX: &str = "markers-";
 
+/// Record identity is language-local: changing Luau never invalidates a
+/// built-in language's records. Extraction always receives the bare name.
+pub fn keyed_language(language: &str) -> std::borrow::Cow<'_, str> {
+    if language == "luau" {
+        format!(
+            "luau@{}:{}",
+            crate::grammar::manifest().sha256,
+            crate::grammar::extractor_version()
+        )
+        .into()
+    } else {
+        language.into()
+    }
+}
+
+/// The single key builder for extracted content, including dynamic identity.
+pub fn record_key(
+    content: aft_store::ids::ContentKey,
+    language: &str,
+) -> aft_store::content::RecordKey {
+    aft_store::content::RecordKey::new(content, &keyed_language(language), EXTRACTOR_VERSION)
+}
+
+/// A publication containing Luau cannot pair an older grammar's fragments
+/// with newer records another checkout wrote to the shared store.
+pub(super) fn graph_version(
+    state: &aft_store::checkout::CheckoutState,
+) -> std::borrow::Cow<'static, str> {
+    if state.paths().iter().any(|record| {
+        std::str::from_utf8(&record.path).is_ok_and(|path| {
+            crate::parser::is_luau_path(Path::new(path), cfg!(feature = "wasm-grammars"))
+        })
+    }) {
+        format!("{EXTRACTOR_VERSION}+{}", keyed_language("luau")).into()
+    } else {
+        EXTRACTOR_VERSION.into()
+    }
+}
+
+fn source_language(path: &Path) -> Option<LangId> {
+    crate::callgraph_extractor::source_language(path).or_else(|| {
+        crate::parser::is_luau_path(path, cfg!(feature = "wasm-grammars")).then_some(LangId::Luau)
+    })
+}
+
 /// Whether `language` (as [`language_for`] chose it) is one the call graph
 /// parses: not a configuration file read raw, nor a file whose record holds
 /// only its TODO markers.
 #[must_use]
 pub fn is_parsed_language(language: &str) -> bool {
-    !language.is_empty() && language != "config" && !language.starts_with(MARKERS_PREFIX)
+    !language.is_empty() && !is_config_language(language) && !language.starts_with(MARKERS_PREFIX)
 }
 
 /// The scan policy every data-layer scan uses: a file a plane parses or
@@ -94,19 +171,25 @@ fn parsed_or_embedded_path(path: &[u8]) -> bool {
     };
     let path = Path::new(path);
     path.extension().is_some_and(|extension| extension == "h")
-        || crate::callgraph_extractor::source_language(path).is_some()
+        || source_language(path).is_some()
         || crate::semantic_index::is_semantic_indexed_extension(path)
 }
 
-/// The language the call graph parses the file at `path` as, `"config"`
-/// for resolver configuration it reads raw, a [`MARKERS_PREFIX`] language
+/// The language the call graph parses the file at `path` as, a [`CONFIG`]
+/// language for resolver configuration it reads raw, a [`MARKERS_PREFIX`] language
 /// for a file whose record holds only its TODO markers (a Markdown file, a
 /// minified bundle, a C header no grammar resolves), or `None` for a file
 /// with neither.
 #[must_use]
 pub fn language_for(path: &str, source: &[u8]) -> Option<String> {
+    #[cfg(test)]
+    if super::grammar::extraction_for_test(source)
+        == Some(super::grammar::TestExtraction::MarkersOnly)
+    {
+        return Some(format!("{MARKERS_PREFIX}{}", TodoLanguage::Lexical.name()));
+    }
     if crate::callgraph_extractor::is_resolution_input(path.as_bytes()) {
-        return Some("config".to_string());
+        return Some(config_language(Path::new(path)));
     }
     let path_text = path;
     let path = Path::new(path);
@@ -123,7 +206,7 @@ pub fn language_for(path: &str, source: &[u8]) -> Option<String> {
             None => return Some(format!("{MARKERS_PREFIX}{}", TodoLanguage::Lexical.name())),
         }
     } else {
-        match crate::callgraph_extractor::source_language(path) {
+        match source_language(path) {
             Some(language) => language,
             None => return markers_language(path),
         }
@@ -168,9 +251,9 @@ fn markers_record(source: &[u8], language: &str) -> Result<ContentRecord, Manife
 /// Adds to `record`, when it is the configuration record of the file at
 /// `path` (relative to the root) holding `source`, the TODO markers of the
 /// file's comments, read as the language its name calls for (TOML for
-/// `Cargo.toml`, YAML for `pnpm-workspace.yaml`). A configuration record's
-/// key does not name that language, so the markers say which they were
-/// read as.
+/// `Cargo.toml`, YAML for `pnpm-workspace.yaml`). The record's language,
+/// and so its key, names that grammar too (see [`CONFIG`]), and the
+/// markers say which they were read as.
 ///
 /// # Errors
 ///
@@ -197,8 +280,8 @@ pub fn add_config_markers(
 ///
 /// When the extractor fails on the source.
 /// A missing dynamic grammar is a typed `GrammarUnavailable` error, not a
-/// successful empty record. Discovery and persisted record identities remain
-/// unchanged until dynamic-language indexing is enabled.
+/// successful empty record. The scan owns download requests; extraction alone
+/// consults only the stored grammar.
 pub fn extract(source: &[u8], language: &str) -> Result<ContentRecord, ManifestJoinError> {
     extract_with_tree(source, language).map(|(record, _)| record)
 }
@@ -264,7 +347,7 @@ pub fn extract_with_tree(
     source: &[u8],
     language: &str,
 ) -> Result<(ContentRecord, Option<SyntaxTree>), ManifestJoinError> {
-    if language == "config" {
+    if is_config_language(language) {
         let blob = CallgraphBlob::config(source.to_vec(), EXTRACTOR_VERSION);
         return Ok((record_from_blob(&blob), None));
     }
@@ -297,7 +380,7 @@ pub fn reparse(
     source: &[u8],
     language: &str,
 ) -> Result<Option<SyntaxTree>, ManifestJoinError> {
-    if language == "config" || language.starts_with(MARKERS_PREFIX) {
+    if is_config_language(language) || language.starts_with(MARKERS_PREFIX) {
         return Ok(None);
     }
     let lang = join::language_id(language)
@@ -337,7 +420,7 @@ pub fn extract_parsed(
     language: &str,
     tree: &SyntaxTree,
 ) -> Result<ContentRecord, ManifestJoinError> {
-    if language == "config" {
+    if is_config_language(language) {
         return Ok(record_from_blob(&CallgraphBlob::config(
             source.to_vec(),
             EXTRACTOR_VERSION,
@@ -879,10 +962,9 @@ mod tests {
         let registry = crate::grammar::configure(&config);
         let source = b"local function f() return 1 end";
         let classified = super::language_for("f.luau", source);
-        assert_ne!(
-            classified.as_deref(),
-            Some("luau"),
-            "S2 must not enable dynamic discovery"
+        assert_eq!(
+            classified.as_deref() == Some("luau"),
+            cfg!(feature = "wasm-grammars")
         );
         let error = super::extract_with_tree(source, "luau")
             .err()
@@ -924,6 +1006,29 @@ mod tests {
 
     /// Every stored kind name is the parser's serialized name, and reads
     /// back as the same kind.
+    #[test]
+    fn configuration_files_of_different_comment_grammars_have_different_record_keys() {
+        let bytes = b"# TODO: fix this\n";
+        let toml = language_for("tools/Cargo.toml", bytes).unwrap();
+        let yaml = language_for("tools/pnpm-workspace.yaml", bytes).unwrap();
+        assert_eq!(toml, "config-toml");
+        assert_eq!(yaml, "config-yaml");
+        for language in [&toml, &yaml, &CONFIG.to_string()] {
+            assert!(is_config_language(language), "{language}");
+            assert!(!is_parsed_language(language), "{language}");
+            assert!(matches!(
+                extract(bytes, language).unwrap().data,
+                RecordBody::Config { .. }
+            ));
+        }
+        assert!(!is_config_language("configuration"));
+        let content = aft_store::ids::ContentKey::from_digest(aft_store::ids::Digest128::of(bytes));
+        assert_ne!(
+            aft_store::content::RecordKey::new(content, &toml, EXTRACTOR_VERSION),
+            aft_store::content::RecordKey::new(content, &yaml, EXTRACTOR_VERSION),
+        );
+    }
+
     #[test]
     fn outline_kinds_round_trip_under_their_serialized_names() {
         use crate::symbols::SymbolKind;
@@ -1140,7 +1245,7 @@ mod tests {
             let (surface, body) = record.encode();
             let decoded = ContentRecord::decode(&surface, &body).unwrap();
             assert_eq!(decoded, record, "{path}");
-            let mut original = if language == "config" {
+            let mut original = if is_config_language(&language) {
                 CallgraphBlob::config(source.as_bytes().to_vec(), EXTRACTOR_VERSION)
             } else {
                 CallgraphBlob::extract(source, &language, EXTRACTOR_VERSION).unwrap()

@@ -19,7 +19,11 @@ pub(super) fn consumer_capabilities(
 mod tests {
     use super::super::*;
 
-    fn bind(principal: &Option<Principal>, harness: &str, capabilities: &[String]) {
+    fn bind_answer(
+        principal: &Option<Principal>,
+        harness: &str,
+        capabilities: &[String],
+    ) -> (Frame, Option<ManagementIdentity>) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -28,9 +32,10 @@ mod tests {
             let app = App::default_shared();
             let executor = Arc::new(Executor::new());
             let (writer, mut replies) = mpsc::channel(8);
-            let (completion, _completed) = mpsc::channel(8);
+            let (completion, mut completed) = mpsc::channel(8);
             let (lossy_tx, _lossy_rx) = mpsc::channel(8);
             let (reliable_tx, _reliable_rx) = mpsc::unbounded_channel();
+            let a0 = A0Egress::new(writer.clone(), completion.clone());
             let senders = PushSenders {
                 lossy_tx,
                 reliable_tx,
@@ -74,7 +79,7 @@ mod tests {
             handle_control_request(
                 &writer,
                 &writer,
-                &A0Egress::new(writer.clone(), completion.clone()),
+                &a0,
                 &frame,
                 &app,
                 &executor,
@@ -109,18 +114,116 @@ mod tests {
             )
             .await
             .unwrap();
-            let reply = replies.try_recv().expect("management bind answer");
+            let mut reply = replies.try_recv().expect("management bind answer");
             assert_eq!(reply.header.corr, 91);
-            if matches!(principal, Some(Principal::Direct)) {
-                let decoded: ModuleControlResponse = serde_json::from_slice(&reply.body).unwrap();
+            let identity = if reply.header.ty == FrameType::Response {
+                assert!(reply.begin_ack_write());
+                reply.finish_ack_write(true);
+                let ControlCompletion::ManagementAckWritten {
+                    route, identity, ..
+                } = completed.recv().await.expect("written management ack")
+                else {
+                    panic!("management bind must publish a management ack");
+                };
+                assert_eq!(route, route_key(7, 1));
+                Some(identity)
+            } else {
+                None
+            };
+            (reply.frame.clone(), identity)
+        })
+    }
+
+    fn bind(principal: &Option<Principal>, harness: &str, capabilities: &[String]) {
+        let (reply, _) = bind_answer(principal, harness, capabilities);
+        if matches!(principal, Some(Principal::Direct)) {
+            let decoded: ModuleControlResponse = serde_json::from_slice(&reply.body).unwrap();
+            assert!(matches!(
+                decoded,
+                ModuleControlResponse::RouteBindAck { .. }
+            ));
+        } else {
+            assert_eq!(reply.header.ty, FrameType::Error);
+        }
+    }
+
+    #[test]
+    fn management_bind_requires_the_catalog_display_declaration() {
+        let entry = |id: &str, provides: Vec<&str>| -> subc_client_rs::CatalogEntry {
+            serde_json::from_value(json!({
+                "module_id": id, "roles": [], "control_ops": [],
+                "capabilities": {"provides": provides, "requires": [], "must_never_reach": []}
+            }))
+            .unwrap()
+        };
+        let other = Some(Principal::Reserved {
+            module_id: "other-module".into(),
+        });
+        let display = Some(Principal::Reserved {
+            module_id: "display-module".into(),
+        });
+        for modules in [
+            vec![entry("other-module", vec![])],
+            vec![
+                entry("other-module", vec![]),
+                entry("display-module", vec!["tool-display/v1"]),
+            ],
+        ] {
+            let reader = rich_ui::display::declared_display(&modules);
+            crate::late_result_bus::with_test_reader(reader.as_deref(), || {
+                let (reply, route) = bind_answer(&other, "other-module", &[]);
+                assert_eq!(reply.header.ty, FrameType::Error);
+                let error: ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+                assert_eq!(error.code, "route_refused");
+                assert_eq!(
+                    error.message,
+                    "AFT management routes require a first-party principal"
+                );
+                assert!(route.is_none());
+
+                let (reply, route) = bind_answer(&display, "display-module", &[]);
+                if reader.is_none() {
+                    assert_eq!(reply.header.ty, FrameType::Error);
+                    assert!(route.is_none());
+                    return;
+                }
+                assert_eq!(reply.header.ty, FrameType::Response);
                 assert!(matches!(
-                    decoded,
+                    serde_json::from_slice::<ModuleControlResponse>(&reply.body).unwrap(),
                     ModuleControlResponse::RouteBindAck { .. }
                 ));
-            } else {
-                assert_eq!(reply.header.ty, FrameType::Error);
-            }
-        });
+                let route = route.expect("declaring display module has an installed route");
+                assert!(route.admission == ManagementAdmission::DisplayOnly);
+                for role in manifest::build_manifest().provides {
+                    if let subc_protocol::manifest::ProviderRole::ManagementSurface {
+                        operations,
+                        ..
+                    } = role
+                    {
+                        for op in operations {
+                            for request in [json!({"name": op.name}), json!({"op": op.name})] {
+                                assert_eq!(
+                                    admit_management_flow_request(&route, Some(&request)).is_ok(),
+                                    op.name == cortexkit_role_tool_display::DISPLAY_READ,
+                                    "{}",
+                                    op.name
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        let flow = ManagementIdentity {
+            admission: ManagementAdmission::FlowOnly,
+            ..Default::default()
+        };
+        assert_eq!(
+            admit_management_flow_request(&flow, Some(&json!({"op": "display.read"})))
+                .unwrap_err()
+                .code,
+            "flow_scope_not_supported"
+        );
     }
 
     #[test]

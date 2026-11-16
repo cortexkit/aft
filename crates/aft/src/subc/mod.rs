@@ -268,7 +268,7 @@ pub(crate) mod result_body;
 mod retained_result;
 pub(crate) mod rich_ui;
 mod run_scope;
-mod runner_notices;
+pub(crate) mod runner_notices;
 
 #[cfg(feature = "test-scope-owner")]
 #[doc(hidden)]
@@ -1676,6 +1676,10 @@ enum ManagementAdmission {
     PermissionsOnly,
     /// Phone and simulator operator routes have read-only shell authority only.
     ShellsOnly,
+    /// The catalog's display module may request display reads;
+    /// each read still checks the caller against the catalog's single module
+    /// declaring the display capability.
+    DisplayOnly,
     /// Occipital relays person commands and reads provider metadata, but has no
     /// general management authority or project-tool access on this route.
     Occipital,
@@ -5469,6 +5473,11 @@ where
     // Stamped workers' permission asks go to Cingulate over this daemon.
     consent::install_subc_transport(connection_file_path);
     let _manifest_sync = crate::gh_shim::manifest_sync::start(connection_file_path.to_path_buf());
+    let bus_worker = crate::late_result_bus::start(
+        Arc::clone(&shared_app),
+        connection_file_path.to_path_buf(),
+        storage_dir.join("aft.db"),
+    );
     // Withdraw the macOS access cards earlier builds filed. It runs beside the
     // route loop, never before it: each withdrawal waits on Cingulate, and a
     // slow or absent Cingulate must not delay route binds.
@@ -6107,6 +6116,23 @@ where
                         let route = route_key(frame.header.channel, frame.header.epoch);
                         let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies };
                         if let Ok(body) = decoded.body() {
+                            if body.get("name").or_else(|| body.get("op")).and_then(Value::as_str)
+                                == Some(cortexkit_role_tool_display::DISPLAY_READ) {
+                                if let Some(identity) = management_routes.get(&route) {
+                                    if let Err(error) = admit_management_flow_request(identity, Some(body)) {
+                                        log_management_refusal(identity, &decoded.frame, &error);
+                                        if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await {
+                                            break Err(error);
+                                        }
+                                        continue;
+                                    }
+                                }
+                                let principal = management_routes.get(&route)
+                                    .filter(|identity| !matches!(identity.admission, ManagementAdmission::ProjectFree { .. }))
+                                    .and_then(|identity| identity.principal.clone());
+                                dispatch_display_read(&writer_tx, &dispatch_path_metrics, &decoded.frame, principal, body);
+                                continue;
+                            }
                             if user_commands::is_request(body) {
                                 let principal = management_routes.get(&route).and_then(|identity| identity.principal.as_ref());
                                 if let Err(error) = user_commands::dispatch(&writer_tx, &dispatch_path_metrics, &decoded.frame, principal, body, &routes, &executor).await {
@@ -7065,6 +7091,9 @@ where
         );
     }
     health_rollup_worker.shutdown();
+    if let Some(worker) = bus_worker {
+        worker.shutdown();
+    }
     // The flip retries until accepted; the connection ending is what stops it.
     scope_describe_task.abort();
     // Cancellation is not a join guarantee. If the monitor does not stop in
@@ -8646,6 +8675,10 @@ async fn handle_control_request(
                 matches!(target, RouteTarget::ToolProvider { .. }) && bind_project_root.is_none();
             schedule_scope_workdir_comparison(&identity, legacy_root.as_deref(), scope.as_ref());
             if matches!(target, RouteTarget::ManagementSurface { .. }) || project_free {
+                let display_reader = crate::late_result_bus::display_reader().ok().flatten();
+                let display_admitted =
+                    rich_ui::display::check_reader(principal.as_ref(), display_reader.as_deref())
+                        .is_ok();
                 if !project_free
                     && matches!(principal.as_ref(), Some(Principal::Reserved { module_id }) if module_id == "callosum")
                     && !shells::operator(
@@ -8685,6 +8718,7 @@ async fn handle_control_request(
                     && diagnostics_findings::admit_flow(scope.as_ref()).is_err()
                     && !permissions::is_cingulate(principal.as_ref())
                     && !user_commands::is_occipital(principal.as_ref())
+                    && !display_admitted
                     && !shells::operator(
                         principal.as_ref(),
                         Some(&identity.harness),
@@ -8735,6 +8769,8 @@ async fn handle_control_request(
                     // Cingulate is not a first-party AFT principal: it binds
                     // only to list and revoke the person's saved grants.
                     ManagementAdmission::PermissionsOnly
+                } else if !matches!(bind_trust, BindTrust::FirstParty) && display_admitted {
+                    ManagementAdmission::DisplayOnly
                 } else {
                     ManagementAdmission::FirstParty
                 };
@@ -9261,6 +9297,52 @@ async fn handle_control_request(
             .await
         }
     }
+}
+
+fn dispatch_display_read(
+    tx: &WriterSender,
+    metrics: &Arc<DispatchPathMetrics>,
+    frame: &Frame,
+    principal: Option<Principal>,
+    body: &Value,
+) {
+    let arguments = if body.get("op").is_some() {
+        let mut arguments = body.clone();
+        arguments
+            .as_object_mut()
+            .expect("named request")
+            .remove("op");
+        arguments
+    } else {
+        body.get("arguments").cloned().unwrap_or(Value::Null)
+    };
+    let (tx, metrics, frame) = (tx.clone(), metrics.clone(), frame.clone());
+    let guard = ResponseTaskGuard::new(&metrics);
+    tokio::spawn(async move {
+        let _guard = guard;
+        let result = match rich_ui::display::read(principal.as_ref(), arguments).await {
+            Ok(bytes) => match Frame::build_with_version(
+                frame.header.ver,
+                FrameType::Response,
+                frame.header.flags,
+                frame.header.channel,
+                frame.header.epoch,
+                frame.header.corr,
+                bytes,
+            )
+            .map_err(SubcError::FrameBuild)
+            {
+                Ok(response) => {
+                    send_reliable_writer_frame(&tx, &metrics, response, "display read").await
+                }
+                Err(error) => Err(error),
+            },
+            Err(error) => send_provider_error(&tx, &metrics, &frame, error).await,
+        };
+        if let Err(error) = result {
+            log::warn!("display read reply: {error}");
+        }
+    });
 }
 
 /// Metadata needs no project. Only rootless provider routes also retain the
@@ -10408,6 +10490,7 @@ fn log_management_refusal(identity: &ManagementIdentity, frame: &Frame, error: &
         ManagementAdmission::FlowOnly => "FlowOnly",
         ManagementAdmission::PermissionsOnly => "PermissionsOnly",
         ManagementAdmission::ShellsOnly => "ShellsOnly",
+        ManagementAdmission::DisplayOnly => "DisplayOnly",
         ManagementAdmission::Occipital => "Occipital",
         ManagementAdmission::ProjectFree { .. } => "ProjectFree",
     };
@@ -10423,6 +10506,21 @@ fn admit_management_flow_request(
     identity: &ManagementIdentity,
     body: Option<&Value>,
 ) -> Result<(), ErrorBody> {
+    if identity.admission == ManagementAdmission::DisplayOnly {
+        return if body.is_some_and(|body| {
+            body.get("name")
+                .or_else(|| body.get("op"))
+                .and_then(Value::as_str)
+                == Some(cortexkit_role_tool_display::DISPLAY_READ)
+        }) {
+            Ok(())
+        } else {
+            Err(ErrorBody::new(
+                "route_not_admitted",
+                "this route serves only display reads",
+            ))
+        };
+    }
     if identity.admission == ManagementAdmission::Occipital {
         return if body.is_some_and(|body| {
             user_commands::is_request(body)
@@ -15737,6 +15835,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn display_read_only_admission_preserves_other_management_and_occipital_limits() {
+        let display = ManagementIdentity {
+            principal: Some(Principal::Reserved {
+                module_id: "third-party-display".into(),
+            }),
+            admission: ManagementAdmission::DisplayOnly,
+            ..Default::default()
+        };
+        assert_eq!(
+            trust_for_principal(&display.principal),
+            BindTrust::Untrusted
+        );
+        let manifest = manifest::build_manifest();
+        for role in manifest.provides {
+            if let subc_protocol::manifest::ProviderRole::ManagementSurface { operations, .. } =
+                role
+            {
+                for op in operations {
+                    let request = json!({"name":op.name,"arguments":{}});
+                    let admitted = admit_management_flow_request(&display, Some(&request)).is_ok();
+                    assert_eq!(
+                        admitted,
+                        op.name == cortexkit_role_tool_display::DISPLAY_READ,
+                        "{}",
+                        op.name
+                    );
+                }
+            }
+        }
+        let occipital = ManagementIdentity {
+            admission: ManagementAdmission::Occipital,
+            ..Default::default()
+        };
+        for name in ["role.describe", "tool.views", "tool.catalog"] {
+            assert!(admit_management_flow_request(&occipital, Some(&json!({"name":name}))).is_ok());
+        }
+        for name in ["health.digest", "late_results", "memory.census"] {
+            assert!(
+                admit_management_flow_request(&occipital, Some(&json!({"name":name}))).is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn display_read_dispatch_uses_final_denied_for_non_display_routes() {
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (tx, mut rx) = mpsc::channel(4);
+        let body = json!({"name":cortexkit_role_tool_display::DISPLAY_READ,"arguments":{"record_id":"record:1"}});
+        let request = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            9,
+            1,
+            42,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap();
+        dispatch_display_read(&tx, &metrics, &request, None, &body);
+        let response = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.header.ty, FrameType::Error);
+        assert_eq!(response.header.corr, 42);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&response.body).unwrap()["code"],
+            cortexkit_role_tool_display::DISPLAY_READ_DENIED
+        );
+    }
+
+    #[test]
     fn subc_startup_takes_storage_lease_before_connecting() {
         let temp = tempfile::tempdir().unwrap();
         let storage = temp.path().join("storage");
@@ -18262,10 +18431,12 @@ mod tests {
             retained_slack_bytes: Some(4 * 1024 * 1024),
             retained_slack_label: crate::memory::ALLOCATOR_SLACK_LABEL,
             not_estimated: None,
+            #[cfg(target_os = "linux")]
+            jemalloc: None,
         };
         let relief = crate::memory::AllocatorPressureRelief {
             allocator_accounting_bytes: 3 * 1024 * 1024,
-            allocator_accounting_source: crate::memory::RELIEF_ACCOUNTING_SOURCE_GLIBC,
+            allocator_accounting_source: crate::memory::RELIEF_ACCOUNTING_SOURCE_JEMALLOC,
             rss_drop_bytes: Some(3 * 1024 * 1024),
             phys_footprint_drop_bytes: None,
             rss_before_bytes: Some(20 * 1024 * 1024),
@@ -18284,9 +18455,7 @@ mod tests {
         assert!(message.contains("phys footprint dropped not estimated"));
         assert!(message.contains("allocated 12.0 MB -> 9.0 MB"));
         assert!(message.contains("address-space slack 4.0 MB -> 1.0 MB"));
-        assert!(
-            message.contains("allocator accounting 3.0 MB (glibc_mallinfo2_size_allocated_drop)")
-        );
+        assert!(message.contains("allocator accounting 3.0 MB (jemalloc_stats_resident_drop)"));
         assert!(!message.contains("released"));
     }
 

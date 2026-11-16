@@ -31,6 +31,8 @@ const FAKE_DAEMON_VERSION: &str = "0.39.0";
 mod aft_binary;
 #[path = "helpers/executable_cache.rs"]
 mod executable_cache;
+#[path = "helpers/subc_fake.rs"]
+mod subc_fake;
 #[path = "../src/test_gate.rs"]
 mod test_gate;
 #[path = "helpers/worker_gh_read.rs"]

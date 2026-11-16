@@ -350,25 +350,23 @@ impl RequestFiles {
     }
 
     /// The matching line of `path` for `query` within `range`, computed once
-    /// per request: the ranking and the reranker's candidate text pick the
-    /// same line from the same bytes. A `compute` that could not read the
-    /// file answers `None` and leaves nothing behind, so a later phase tries
-    /// again.
-    pub(crate) fn matching_line(
+    /// per request. Successful no-match results are cached; failed computations
+    /// are returned without caching, so a later phase can retry the read.
+    pub(crate) fn matching_line_checked(
         &self,
         path: &Path,
         query: &str,
         range: Option<(usize, usize)>,
         compute: impl FnOnce() -> io::Result<Option<(u32, String)>>,
-    ) -> Option<(u32, String)> {
+    ) -> io::Result<Option<(u32, String)>> {
         let key = (path.to_path_buf(), query.to_string(), range);
         if let Some(found) = self.matching_lines.lock().get(&key) {
             self.matching_line_hits.fetch_add(1, Ordering::Relaxed);
-            return found.clone();
+            return Ok(found.clone());
         }
-        let found = compute().ok()?;
+        let found = compute()?;
         self.matching_lines.lock().insert(key, found.clone());
-        found
+        Ok(found)
     }
 
     pub(crate) fn report(&self) -> RequestFilesReport {
@@ -508,15 +506,76 @@ pub(crate) fn read_through(
 /// Read the whole file the way `std::fs::read` does, with the stat of the
 /// opened file.
 pub(crate) fn read_whole_file(path: &Path) -> io::Result<(Vec<u8>, Option<FileStat>)> {
+    read_whole_file_at(path, crate::large_read::Site::SourceFile)
+}
+
+pub(crate) fn read_whole_file_at(
+    path: &Path,
+    site: crate::large_read::Site,
+) -> io::Result<(Vec<u8>, Option<FileStat>)> {
     use std::io::Read as _;
     let mut file = std::fs::File::open(path)?;
-    let stat = file.metadata().ok().map(|metadata| FileStat::of(&metadata));
+    let stat = FileStat::of(&file.metadata()?);
+    crate::large_read::allow_whole(site, path, stat.size)?;
     let mut bytes = Vec::new();
-    if let Some(stat) = stat {
-        bytes.reserve(usize::try_from(stat.size).unwrap_or(0));
+    bytes
+        .try_reserve_exact(stat.size as usize)
+        .map_err(io::Error::other)?;
+    (&mut file).take(stat.size).read_to_end(&mut bytes)?;
+    crate::large_read::allow_whole(site, path, bytes.len() as u64)?;
+    Ok((bytes, Some(stat)))
+}
+
+#[cfg(test)]
+mod matching_line_completion_tests {
+    use super::*;
+
+    #[test]
+    fn audit1432_round4_failed_selection_is_uncached_and_complete_no_match_is_cached() {
+        let files = RequestFiles::default();
+        let path = Path::new("/request-files/selection.rs");
+        let computes = std::cell::Cell::new(0);
+        let error = files
+            .matching_line_checked(path, "subject", None, || {
+                computes.set(computes.get() + 1);
+                Err(io::Error::other("selection read failed"))
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "selection read failed");
+        let found = Some((12, "fn subject() {}".to_string()));
+        assert_eq!(
+            files
+                .matching_line_checked(path, "subject", None, || {
+                    computes.set(computes.get() + 1);
+                    Ok(found.clone())
+                })
+                .unwrap(),
+            found
+        );
+        assert_eq!(
+            files
+                .matching_line_checked(path, "subject", None, || panic!(
+                    "successful result was not cached"
+                ))
+                .unwrap(),
+            found
+        );
+        assert_eq!(computes.get(), 2);
+        assert!(files
+            .matching_line_checked(path, "missing", None, || {
+                computes.set(computes.get() + 1);
+                Ok(None)
+            })
+            .unwrap()
+            .is_none());
+        assert!(files
+            .matching_line_checked(path, "missing", None, || panic!(
+                "complete no-match was not cached"
+            ))
+            .unwrap()
+            .is_none());
+        assert_eq!(computes.get(), 3);
     }
-    file.read_to_end(&mut bytes)?;
-    Ok((bytes, stat))
 }
 
 /// Test probe: every read of file content a search does, by path, whether
@@ -814,4 +873,23 @@ mod search_read_tests {
             "some search must read a file twice without the set"
         );
     }
+}
+#[test]
+fn audit1432_exactly_reserved_whole_read_does_not_double_at_the_ceiling() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("at-ceiling.bin");
+    let size = crate::large_read::WHOLE_READ_CEILING as usize;
+    std::fs::write(&path, vec![b'x'; size]).unwrap();
+    let (read, volume, largest) = crate::test_allocations::count_bytes_and_largest(|| {
+        read_whole_file_at(&path, crate::large_read::Site::SourceFile)
+    });
+    eprintln!("whole read: allocated_bytes={volume}, largest_allocation_bytes={largest}");
+    let (bytes, stat) = read.unwrap();
+    assert_eq!(bytes.len(), size);
+    assert_eq!(stat.unwrap().size as usize, size);
+    assert_eq!(largest, size, "whole-file reservation unexpectedly grew");
+    assert!(
+        volume < size + crate::large_read::STEP_BYTES,
+        "allocation volume={volume}, largest={largest}"
+    );
 }

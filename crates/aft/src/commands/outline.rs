@@ -17,8 +17,8 @@ use crate::edit;
 use crate::error::AftError;
 use crate::inspect::job::is_test_file;
 use crate::parser::{
-    detect_language, node_range_with_decorators, node_text, FileParser, LangId, ParsedFile,
-    RustModule, TreeSitterProvider,
+    node_range_with_decorators, node_text, FileParser, LangId, ParsedFile, RustModule,
+    TreeSitterProvider,
 };
 use crate::protocol::{RawRequest, Response};
 use crate::symbols::{Range, Symbol};
@@ -29,6 +29,10 @@ const BINARY_SAMPLE_BYTES: usize = 4 * 1024;
 const OUTLINE_FILE_WALK_CAP: usize = 200;
 const OUTLINE_FILE_COLLECTION_CAP: usize = 10_000;
 const TYPE_MEMBER_PREVIEW_CAP: usize = 3;
+
+fn detect_language(path: &Path) -> Option<LangId> {
+    crate::parser::detect_language_any(path, cfg!(feature = "wasm-grammars"))
+}
 
 #[cfg(test)]
 thread_local! {
@@ -161,6 +165,9 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             "skipped_files": skipped_files,
             "content_files": rendered.content_files,
         });
+        if !rendered.gaps.is_empty() {
+            body["gaps"] = serde_json::json!(rendered.gaps);
+        }
         if rendered.deadline_reached {
             body["deadline_reached"] = serde_json::json!(true);
         }
@@ -204,6 +211,9 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             "skipped_files": skipped_files,
             "content_files": rendered.content_files,
         });
+        if !rendered.gaps.is_empty() {
+            body["gaps"] = serde_json::json!(rendered.gaps);
+        }
         if rendered.deadline_reached {
             body["deadline_reached"] = serde_json::json!(true);
         }
@@ -282,10 +292,17 @@ fn outline_single_target(req: &RawRequest, ctx: &AppContext, file: &str) -> Resp
 /// Outline one file already resolved to a readable local `path`; `file` is
 /// the caller's spelling (a URL for a downloaded document).
 fn outline_single_file(req: &RawRequest, ctx: &AppContext, path: PathBuf, file: &str) -> Response {
-    let symbols = match crate::parser::list_symbols_shared(ctx.provider(), &path, false) {
+    if let Err(error) = crate::data_layer::grammar::prepare(ctx, &path) {
+        return crate::data_layer::grammar::error_response_for_path(&req.id, &error, &path);
+    }
+    let symbols = match crate::parser::list_symbols_shared(
+        ctx.provider(),
+        &path,
+        cfg!(feature = "wasm-grammars"),
+    ) {
         Ok(s) => s,
         Err(e) => {
-            return Response::error(&req.id, e.code(), e.to_string());
+            return crate::data_layer::grammar::error_response_for_path(&req.id, &e, &path);
         }
     };
 
@@ -294,7 +311,8 @@ fn outline_single_file(req: &RawRequest, ctx: &AppContext, path: PathBuf, file: 
         .as_any()
         .downcast_ref::<TreeSitterProvider>()
         .map(|provider| FileParser::with_symbol_cache(provider.symbol_cache()))
-        .unwrap_or_else(FileParser::new);
+        .unwrap_or_else(FileParser::new)
+        .with_dynamic_languages(cfg!(feature = "wasm-grammars"));
     let structure = if detect_language(&path) == Some(LangId::Rust)
         && ctx.provider().as_any().is::<TreeSitterProvider>()
     {
@@ -315,7 +333,9 @@ fn outline_single_file(req: &RawRequest, ctx: &AppContext, path: PathBuf, file: 
     };
     let entries = match structure {
         Ok(entries) => entries,
-        Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
+        Err(error) => {
+            return crate::data_layer::grammar::error_response_for_path(&req.id, &error, &path)
+        }
     };
     let filename = if is_http_url(file) {
         file.to_string()
@@ -1700,7 +1720,8 @@ fn handle_outline_files_mode(
         &file_entries,
         max_output_bytes.saturating_sub(empty_targets.iter().map(String::len).sum::<usize>()),
     );
-    populate_rendered_file_symbols(&rows, &mut file_entries, ctx);
+    let grammar_gaps =
+        populate_rendered_file_symbols(&rows, &mut file_entries, ctx, &mut skipped_files);
     let table = format_files_table(&rows, &directory_nodes, &file_entries, max_output_bytes);
     let mut text = table.into_string();
     for explanation in empty_targets {
@@ -1760,7 +1781,12 @@ fn handle_outline_files_mode(
     let content_files = rows
         .iter()
         .filter_map(|row| match row {
-            OutlineTableRow::File(file_id) => Some(file_entries[*file_id].absolute_path.clone()),
+            OutlineTableRow::File(file_id) => {
+                let entry = &file_entries[*file_id];
+                (detect_language(&entry.absolute_path) != Some(LangId::Luau)
+                    || entry.symbols.is_some())
+                .then(|| entry.absolute_path.clone())
+            }
             OutlineTableRow::Rollup(_) => None,
         })
         // A read manifest is a set: sorted and without duplicates, whatever
@@ -1787,6 +1813,22 @@ fn handle_outline_files_mode(
     });
     if !skipped_files.is_empty() {
         response_data["skipped_files"] = serde_json::json!(skipped_files);
+    }
+    if !grammar_gaps.is_empty() {
+        let messages = grammar_gaps
+            .iter()
+            .filter_map(|gap| gap["message"].as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join("\n");
+        response_data["text"] = format!(
+            "{messages}\n\n{}",
+            response_data["text"].as_str().unwrap_or_default()
+        )
+        .into();
+        response_data["gaps"] = serde_json::json!(grammar_gaps);
+        response_data["complete"] = false.into();
     }
     if let Some(env) = envelope {
         response_data["files_list_envelope"] = serde_json::to_value(&env).unwrap();
@@ -2179,12 +2221,25 @@ fn populate_rendered_file_symbols(
     rows: &[OutlineTableRow],
     file_entries: &mut [OutlineFileEntry],
     ctx: &AppContext,
-) {
-    for file_id in rows.iter().filter_map(|row| match row {
-        OutlineTableRow::File(file_id) => Some(*file_id),
-        OutlineTableRow::Rollup(_) => None,
-    }) {
-        let entry = &mut file_entries[file_id];
+    skipped_files: &mut Vec<SkippedFile>,
+) -> Vec<serde_json::Value> {
+    let mut gaps = Vec::new();
+    let mut dynamic_parser = FileParser::with_symbol_cache(ctx.symbol_cache())
+        .with_source_capture()
+        .with_dynamic_languages(cfg!(feature = "wasm-grammars"));
+    let rendered = rows
+        .iter()
+        .filter_map(|row| match row {
+            OutlineTableRow::File(file_id) => Some(*file_id),
+            OutlineTableRow::Rollup(_) => None,
+        })
+        .collect::<HashSet<_>>();
+    // A directory rollup hides symbol rows, not the files' parse coverage.
+    for (file_id, entry) in file_entries.iter_mut().enumerate() {
+        let dynamic = detect_language(&entry.absolute_path) == Some(LangId::Luau);
+        if !rendered.contains(&file_id) && !dynamic {
+            continue;
+        }
         if entry.symbols.is_some() {
             continue;
         }
@@ -2193,6 +2248,58 @@ fn populate_rendered_file_symbols(
             continue;
         }
         let path = entry.absolute_path.clone();
+        if dynamic {
+            let metadata = match crate::bounded_io::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    skipped_files.push(SkippedFile::new(&entry.path, "file_not_found"));
+                    continue;
+                }
+            };
+            if metadata.len() > MAX_OUTLINE_FILE_BYTES {
+                skipped_files.push(SkippedFile::new(&entry.path, "too_large"));
+                continue;
+            }
+            if let Some(count) = cached_symbol_count(ctx, &path, &metadata) {
+                match dynamic_parser.cached_has_error(&path) {
+                    Some(true) => {
+                        skipped_files.push(SkippedFile::new(&entry.path, "parse_error"));
+                        continue;
+                    }
+                    Some(false) => {
+                        entry.symbols = Some(count);
+                        continue;
+                    }
+                    // Symbol tables loaded from index-store records have no
+                    // syntax verdict. Validate their source before using the count.
+                    None => (),
+                }
+            }
+            let symbols = crate::data_layer::grammar::prepare(ctx, &path).and_then(|_| {
+                let parsed = dynamic_parser.parse_snapshot(&path)?;
+                if parsed.tree.root_node().has_error() {
+                    skipped_files.push(SkippedFile::new(&entry.path, "parse_error"));
+                    return Ok(None);
+                }
+                dynamic_parser
+                    .extract_symbols_from_snapshot(&path, &parsed)
+                    .map(|symbols| Some(symbols.len()))
+            });
+            dynamic_parser.evict_parse_tree(&path);
+            match symbols {
+                Ok(Some(count)) => entry.symbols = Some(count),
+                Ok(None) => (),
+                Err(error) if crate::data_layer::grammar::is_grammar_error(&error) => {
+                    let mut gap = error.to_error_json();
+                    gap["path"] = serde_json::json!(path);
+                    gaps.push(gap);
+                }
+                Err(error) => {
+                    skipped_files.push(SkippedFile::new(&entry.path, outline_error_reason(&error)))
+                }
+            }
+            continue;
+        }
         if detect_language(&path).is_none() {
             entry.symbols = Some(0);
             continue;
@@ -2205,13 +2312,18 @@ fn populate_rendered_file_symbols(
             if metadata.len() > MAX_OUTLINE_FILE_BYTES {
                 0
             } else {
-                crate::parser::list_symbols_shared(ctx.provider(), &path, false)
-                    .map(|symbols| symbols.len())
-                    .unwrap_or(0)
+                crate::parser::list_symbols_shared(
+                    ctx.provider(),
+                    &path,
+                    cfg!(feature = "wasm-grammars"),
+                )
+                .map(|symbols| symbols.len())
+                .unwrap_or(0)
             }
         });
         entry.symbols = Some(symbols);
     }
+    gaps
 }
 
 fn relative_path_from_root(path: &Path, root: &Path) -> Option<String> {
@@ -2689,9 +2801,12 @@ fn outline_many_files(
         .as_any()
         .downcast_ref::<TreeSitterProvider>()
         .map(|provider| {
-            FileParser::with_symbol_cache(provider.symbol_cache()).with_source_capture()
+            FileParser::with_symbol_cache(provider.symbol_cache())
+                .with_source_capture()
+                .with_dynamic_languages(cfg!(feature = "wasm-grammars"))
         });
-    let mut fallback_parser = FileParser::new();
+    let mut fallback_parser =
+        FileParser::new().with_dynamic_languages(cfg!(feature = "wasm-grammars"));
 
     for (examined, (index, file, path, rel_path)) in ordered.into_iter().enumerate() {
         if path
@@ -2728,15 +2843,56 @@ fn outline_many_files(
             }
             continue;
         };
-        if crate::bounded_io::metadata(&path).is_err() {
-            skipped_files.push((index, SkippedFile::new(file, "file_not_found")));
+        let metadata = match crate::bounded_io::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                writer.content_incomplete |= detect_language(&path) == Some(LangId::Luau);
+                skipped_files.push((index, SkippedFile::new(file, "file_not_found")));
+                continue;
+            }
+        };
+        if metadata.len() > MAX_OUTLINE_FILE_BYTES {
+            writer.content_incomplete |= detect_language(&path) == Some(LangId::Luau);
+            skipped_files.push((index, SkippedFile::new(rel_path, "too_large")));
             continue;
         }
 
-        if let Some(reason) = outline_skip_reason(&path, batch_parser.as_mut()) {
-            if let Some(parser) = batch_parser.as_mut() {
-                parser.evict_parse_tree(&path);
+        if detect_language(&path) == Some(LangId::Luau) {
+            let parsed = crate::data_layer::grammar::prepare(ctx, &path).and_then(|_| {
+                batch_parser
+                    .as_mut()
+                    .unwrap_or(&mut fallback_parser)
+                    .parse(&path)
+                    .map(|_| ())
+            });
+            if let Err(error) = parsed {
+                if !crate::data_layer::grammar::is_grammar_error(&error) {
+                    writer.content_incomplete = true;
+                    skipped_files.push((
+                        index,
+                        SkippedFile::new(rel_path, outline_error_reason(&error)),
+                    ));
+                    continue;
+                }
+                writer.content_incomplete = true;
+                if !writer.push_text(format!("{rel_path}\n{}", error), Vec::new(), None) {
+                    break;
+                }
+                let mut gap = error.to_error_json();
+                gap["path"] = serde_json::json!(path);
+                writer.gaps.push(gap);
+                continue;
             }
+        }
+        if let Some(reason) = outline_skip_reason(
+            &path,
+            Some(batch_parser.as_mut().unwrap_or(&mut fallback_parser)),
+        ) {
+            writer.content_incomplete |= detect_language(&path) == Some(LangId::Luau);
+            batch_parser
+                .as_mut()
+                .unwrap_or(&mut fallback_parser)
+                .evict_parse_tree(&path);
             skipped_files.push((index, SkippedFile::new(rel_path, reason)));
             continue;
         }
@@ -2773,10 +2929,22 @@ fn outline_many_files(
                     break;
                 }
             }
-            Err(error) => skipped_files.push((
-                index,
-                SkippedFile::new(rel_path, outline_error_reason(&error)),
-            )),
+            Err(error) => {
+                writer.content_incomplete |= detect_language(&path) == Some(LangId::Luau);
+                if crate::data_layer::grammar::is_grammar_error(&error) {
+                    let mut gap = error.to_error_json();
+                    gap["path"] = serde_json::json!(path);
+                    writer.gaps.push(gap);
+                    if !writer.push_text(format!("{rel_path}\n{error}"), Vec::new(), None) {
+                        break;
+                    }
+                } else {
+                    skipped_files.push((
+                        index,
+                        SkippedFile::new(rel_path, outline_error_reason(&error)),
+                    ));
+                }
+            }
         }
     }
 
@@ -2865,7 +3033,8 @@ fn fallback_file_structure(
     req_id: &str,
     session_id: &str,
 ) -> Result<Vec<OutlineEntry>, AftError> {
-    let symbols = crate::parser::list_symbols_shared(ctx.provider(), path, false)?;
+    let symbols =
+        crate::parser::list_symbols_shared(ctx.provider(), path, cfg!(feature = "wasm-grammars"))?;
     let mut entries =
         outline_structure_entries(path, &symbols, parser, ctx, req_id, session_id, true, None)?;
     if detect_language(path) == Some(LangId::Rust) {
@@ -3716,6 +3885,7 @@ fn format_single_file_tree(filename: &str, entries: &[OutlineEntry]) -> String {
 /// The rendered structure map for a batch of files, built incrementally by
 /// [`MultiFileTreeWriter`] in path order.
 struct RenderedOutline {
+    gaps: Vec<serde_json::Value>,
     text: String,
     /// The output byte budget cut the map.
     truncated: bool,
@@ -3757,6 +3927,7 @@ fn outline_structure_footer(
 /// that the budget is spent. The files never offered count toward the total
 /// in the footer but are not shown.
 struct MultiFileTreeWriter {
+    gaps: Vec<serde_json::Value>,
     output: String,
     truncated: bool,
     /// The request's file list was cut before outlining.
@@ -3794,6 +3965,7 @@ impl MultiFileTreeWriter {
             + 2;
         Self {
             output: String::new(),
+            gaps: Vec::new(),
             truncated: false,
             files_capped: budget.files_capped,
             deadline_reached: false,
@@ -3962,6 +4134,7 @@ impl MultiFileTreeWriter {
             output.push_str(&footer);
         }
         RenderedOutline {
+            gaps: self.gaps,
             text: output,
             truncated: self.truncated,
             cut_short: self.files_capped || self.deadline_reached,
@@ -5112,7 +5285,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
             .map(OutlineTableRow::File)
             .collect::<Vec<_>>();
         let before = crate::parser::work_counters::OWNED_SYMBOL_COPIES.with(|count| count.get());
-        populate_rendered_file_symbols(&rows, &mut entries, &ctx);
+        let _ = populate_rendered_file_symbols(&rows, &mut entries, &ctx, &mut Vec::new());
         assert!(entries.iter().all(|entry| entry.symbols == Some(2)));
         assert_eq!(
             crate::parser::work_counters::OWNED_SYMBOL_COPIES.with(|count| count.get()) - before,

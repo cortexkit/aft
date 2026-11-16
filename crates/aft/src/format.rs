@@ -25,6 +25,9 @@ pub struct ExternalToolResult {
 
 pub(crate) struct SubprocessOutcome {
     pub(crate) stdout: String,
+    // Formatters keep lossy text; JSON providers use this bit to reject malformed
+    // UTF-8 instead of silently replacing bytes before parsing.
+    pub(crate) stdout_utf8_valid: bool,
     pub(crate) stderr: String,
     pub(crate) status: ExitStatus,
     pub(crate) truncated: bool,
@@ -247,21 +250,41 @@ const PROBE_CAPTURE_BYTES: usize = 4096;
 
 /// Bound the child and pipe lifetime together; callers must reject truncated output.
 pub(crate) fn capture_probe_command(
+    command: Command,
+    tool: &str,
+    deadline: Instant,
+    cancelled: impl Fn() -> bool,
+) -> Result<SubprocessOutcome, FormatError> {
+    capture_bounded_command(
+        command,
+        tool,
+        deadline,
+        cancelled,
+        PROBE_CAPTURE_BYTES,
+        true,
+    )
+}
+
+pub(crate) fn capture_bounded_command(
     mut command: Command,
     tool: &str,
     deadline: Instant,
     cancelled: impl Fn() -> bool,
+    capture_bytes: usize,
+    new_process_group: bool,
 ) -> Result<SubprocessOutcome, FormatError> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    isolate_in_process_group(&mut command);
+    if new_process_group {
+        isolate_in_process_group(&mut command);
+    }
     let child = command.spawn().map_err(|error| FormatError::Failed {
         tool: tool.to_string(),
         stderr: error.to_string(),
     })?;
-    wait_with_deadline_with_limit(child, tool, deadline, cancelled, PROBE_CAPTURE_BYTES)
+    wait_with_deadline_with_limit(child, tool, deadline, cancelled, capture_bytes)
 }
 
 /// Share output capture and process-tree cleanup with deadline-bound inspect checks.
@@ -294,7 +317,7 @@ fn wait_with_deadline_with_limit(
     let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
     let stdout_closed = closed_tx.clone();
     let stdout_thread = thread::spawn(move || {
-        let output = read_bounded_to_string(stdout_pipe, capture_bytes);
+        let output = read_bounded_bytes(stdout_pipe, capture_bytes);
         let _ = stdout_closed.send(());
         output
     });
@@ -314,7 +337,8 @@ fn wait_with_deadline_with_limit(
                 let (stdout, stdout_truncated) = stdout_thread.join().unwrap_or_default();
                 let (stderr, stderr_truncated) = stderr_thread.join().unwrap_or_default();
                 return Ok(SubprocessOutcome {
-                    stdout,
+                    stdout_utf8_valid: std::str::from_utf8(&stdout).is_ok(),
+                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
                     stderr,
                     status,
                     truncated: stdout_truncated || stderr_truncated,
@@ -383,7 +407,12 @@ thread_local! {
     static FULL_POLL_SLEEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn read_bounded_to_string<R: Read>(mut reader: R, limit: usize) -> (String, bool) {
+fn read_bounded_to_string<R: Read>(reader: R, limit: usize) -> (String, bool) {
+    let (bytes, truncated) = read_bounded_bytes(reader, limit);
+    (String::from_utf8_lossy(&bytes).into_owned(), truncated)
+}
+
+fn read_bounded_bytes<R: Read>(mut reader: R, limit: usize) -> (Vec<u8>, bool) {
     let mut bytes = Vec::with_capacity(limit.min(8192));
     let mut scratch = [0u8; 8192];
     let mut truncated = false;
@@ -407,7 +436,7 @@ fn read_bounded_to_string<R: Read>(mut reader: R, limit: usize) -> (String, bool
         }
     }
 
-    (String::from_utf8_lossy(&bytes).into_owned(), truncated)
+    (bytes, truncated)
 }
 
 /// TTL for tool availability and resolution cache entries.
@@ -4359,6 +4388,22 @@ mod tests {
         );
         assert!(result.is_ok(), "capture should not error on non-zero exit");
         assert_eq!(result.unwrap().exit_code, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_external_tool_capture_preserves_lossy_utf8() {
+        let outcome = run_external_tool_capture(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            "/bin/sh",
+            &["-c", r#"printf '{"VALUE":"\377"}'"#],
+            None,
+            2,
+        )
+        .unwrap();
+        assert_eq!(outcome.stdout, "{\"VALUE\":\"�\"}");
+        assert_eq!(outcome.exit_code, 0);
+        assert!(!outcome.truncated);
     }
 
     #[test]

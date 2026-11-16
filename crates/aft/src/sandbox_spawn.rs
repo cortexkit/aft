@@ -125,12 +125,91 @@ struct EscalationGrant {
     payload_reclaimed: bool,
     session_dir: PathBuf,
     task_id: String,
+    provider_snapshot: Option<ProviderApprovalSnapshot>,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderApprovalSnapshot {
+    pub(crate) input: HashMap<String, String>,
+    pub(crate) environment: ChildEnvironment,
+    pub(crate) failure: Option<String>,
+    pub(crate) preflight_layout: Option<Arc<crate::shell_env_provider::PreflightLayout>>,
+}
+
+#[cfg(unix)]
+pub(crate) fn save_provider_approval(
+    ctx: &AppContext,
+    id: &str,
+    snapshot: ProviderApprovalSnapshot,
+) {
+    let mut store = ctx.escalation_grants().lock();
+    if let Some(grant) = store.grants.get_mut(id) {
+        grant.provider_snapshot = Some(snapshot);
+    }
+    if !store.provider_timer_running {
+        store.provider_timer_running = true;
+        let owner = ctx.escalation_grant_owner();
+        std::thread::spawn(move || provider_grant_expiry_timer(owner));
+    }
+}
+
+#[cfg(unix)]
+// A cancelled approval prompt sends no denial event. Expire its frozen state
+// without requiring a later request; a weak owner never keeps a context alive.
+fn provider_grant_expiry_timer(owner: std::sync::Weak<parking_lot::Mutex<EscalationGrantStore>>) {
+    loop {
+        let next = {
+            let Some(owner) = owner.upgrade() else {
+                return;
+            };
+            let mut store = owner.lock();
+            let payloads = store.take_unclaimable_payloads(Instant::now());
+            let next = store
+                .grants
+                .values()
+                .filter(|grant| grant.provider_snapshot.is_some())
+                .map(|grant| grant.expires_at)
+                .min();
+            if next.is_none() {
+                store.provider_timer_running = false;
+            }
+            drop(store);
+            delete_unclaimable_payloads(payloads);
+            let _ = sweep_provider_temp_layouts();
+            next
+        };
+        let Some(next) = next else {
+            return;
+        };
+        std::thread::sleep(next.saturating_duration_since(Instant::now()));
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn frozen_provider_approval(
+    ctx: &AppContext,
+    id: &str,
+    principal: &AuthenticatedPrincipal,
+    input: &HashMap<String, String>,
+) -> Option<ProviderApprovalSnapshot> {
+    let store = ctx.escalation_grants().lock();
+    let grant = store.grants.get(id)?;
+    if grant.consumed || grant.expires_at <= Instant::now() || grant.principal != *principal {
+        return None;
+    }
+    grant
+        .provider_snapshot
+        .as_ref()
+        .filter(|snapshot| snapshot.input == *input)
+        .cloned()
 }
 
 #[cfg(unix)]
 #[derive(Debug, Default)]
 pub(crate) struct EscalationGrantStore {
     grants: HashMap<String, EscalationGrant>,
+    provider_timer_running: bool,
 }
 
 #[cfg(unix)]
@@ -152,6 +231,7 @@ impl EscalationGrantStore {
                 continue;
             }
             grant.payload_reclaimed = true;
+            grant.provider_snapshot = None;
             payloads.push((grant.session_dir.clone(), grant.task_id.clone()));
         }
         payloads
@@ -214,6 +294,7 @@ pub enum SandboxTaskKind {
 #[cfg(unix)]
 struct PreparedTaskInner {
     secret_runtime: Mutex<Option<crate::bash_background::secrets::SharedRuntime>>,
+    provider_preflight: Mutex<Option<Arc<crate::shell_env_provider::PreflightLayout>>>,
     paths: crate::bash_background::persistence::TaskPaths,
     dirs: crate::bash_background::persistence::TaskDirs,
     digest: blake3::Hash,
@@ -262,6 +343,15 @@ pub(crate) struct PayloadInvocation {
 
 #[cfg(unix)]
 impl PreparedTask {
+    pub(crate) fn take_provider_preflight(
+        &self,
+    ) -> Option<Arc<crate::shell_env_provider::PreflightLayout>> {
+        self.0
+            .provider_preflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
     pub(crate) fn set_secret_runtime(
         &self,
         runtime: crate::bash_background::secrets::SharedRuntime,
@@ -1007,6 +1097,7 @@ fn mint_host_escalation_grant_at(
         payload_reclaimed: false,
         session_dir: prepared.0.paths.session_dir.clone(),
         task_id: prepared.0.paths.task_id.clone(),
+        provider_snapshot: None,
     };
     store.grants.insert(grant_id.clone(), grant);
     drop(store);
@@ -1022,7 +1113,15 @@ fn check_escalation_grant(
     principal: &AuthenticatedPrincipal,
     attempt: &HostEscalationAttempt,
     now: Instant,
-) -> Result<(blake3::Hash, PathBuf, String), EscalationRefusal> {
+) -> Result<
+    (
+        blake3::Hash,
+        PathBuf,
+        String,
+        Option<Arc<crate::shell_env_provider::PreflightLayout>>,
+    ),
+    EscalationRefusal,
+> {
     let Some(grant) = store.grants.get_mut(&attempt.grant_id) else {
         return Err(EscalationRefusal::DigestMismatch);
     };
@@ -1039,6 +1138,10 @@ fn check_escalation_grant(
         None
     };
     grant.consumed = true;
+    let preflight = grant
+        .provider_snapshot
+        .take()
+        .and_then(|snapshot| snapshot.preflight_layout);
     if let Some(refusal) = refusal {
         grant.refused = true;
         return Err(refusal);
@@ -1047,6 +1150,7 @@ fn check_escalation_grant(
         grant.digest,
         grant.session_dir.clone(),
         grant.task_id.clone(),
+        preflight,
     ))
 }
 
@@ -1057,7 +1161,7 @@ fn consume_host_escalation_grant_at(
     attempt: &HostEscalationAttempt,
     now: Instant,
 ) -> Result<PreparedTask, EscalationRefusal> {
-    let (digest, session_dir, task_id) = {
+    let (digest, session_dir, task_id, preflight) = {
         let mut store = ctx.escalation_grants().lock();
         let checked = check_escalation_grant(&mut store, principal, attempt, now);
         let unclaimable = store.take_unclaimable_payloads(now);
@@ -1087,6 +1191,14 @@ fn consume_host_escalation_grant_at(
         Some(digest),
         true,
     )
+    .map(|prepared| {
+        *prepared
+            .0
+            .provider_preflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = preflight;
+        prepared
+    })
     .map_err(|_| EscalationRefusal::DigestMismatch)
 }
 
@@ -1255,6 +1367,7 @@ fn verify_payload(
         .map_err(|error| format!("failed to rewind environment payload: {error}"))?;
     Ok(PreparedTask(Arc::new(PreparedTaskInner {
         secret_runtime: Mutex::new(None),
+        provider_preflight: Mutex::new(None),
         paths: task.paths,
         dirs: task.dirs,
         digest,
@@ -5950,6 +6063,19 @@ pub fn managed_task_temp_root() -> &'static Path {
     task_temp::root()
 }
 
+#[cfg(unix)]
+pub(crate) fn create_provider_temp_layout() -> std::io::Result<PathBuf> {
+    task_temp::create_provider_layout()
+}
+#[cfg(unix)]
+pub(crate) fn remove_provider_temp_layout(path: &Path) -> std::io::Result<()> {
+    task_temp::remove_provider_layout(path)
+}
+#[cfg(unix)]
+pub(crate) fn sweep_provider_temp_layouts() -> std::io::Result<()> {
+    task_temp::sweep_provider_layouts()
+}
+
 #[cfg(target_os = "macos")]
 fn install_worker_mktemp(temp_dir: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
@@ -6472,6 +6598,79 @@ fn isolated_environment_for_plan(
     }
 }
 
+pub(crate) fn provider_base_environment(
+    plan: &SpawnPlan,
+    overrides: &HashMap<String, String>,
+) -> ChildEnvironment {
+    isolated_environment_for_plan(plan, overrides).unwrap_or_else(|| {
+        let mut environment: ChildEnvironment = std::env::vars_os().collect();
+        environment.insert(
+            "PATH".into(),
+            crate::effective_path::effective_path().into(),
+        );
+        environment.extend(overrides.iter().map(|(k, v)| (k.into(), v.into())));
+        environment.retain(|key, _| {
+            !key.to_str()
+                .is_some_and(crate::agent_child_env::is_subc_credential_env_key)
+        });
+        environment
+    })
+}
+
+/// A version manager may expose toolchain directories, not arbitrary home reads.
+/// Canonicalization prevents a home-relative symlink from granting an outside tree.
+pub(crate) fn allow_provider_path(plan: &mut SpawnPlan, path: Option<&str>) {
+    let SpawnPlan::Launcher { profile, .. } = plan else {
+        return;
+    };
+    if profile.mode != SandboxMode::Strict {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .and_then(|home| std::fs::canonicalize(home).ok())
+    else {
+        return;
+    };
+    let Some(path) = path else {
+        return;
+    };
+    for entry in std::env::split_paths(path) {
+        if !entry.is_absolute() || !entry.starts_with(&home) {
+            continue;
+        }
+        let Ok(entry) = entry.canonicalize() else {
+            continue;
+        };
+        if !entry.starts_with(&home) {
+            continue;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let intended = [IntendedReadGrant {
+                path: entry,
+                force_children: false,
+                mandatory: false,
+            }];
+            let denies: Vec<_> = profile
+                .read_deny
+                .iter()
+                .chain(&profile.data_policy.deny)
+                .cloned()
+                .collect();
+            if let Ok(grants) =
+                split_read_grants(&intended, &denies, &mut SecureReadDirectoryLister)
+            {
+                profile.read_allow.extend(grants);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        profile.read_allow.push(entry);
+    }
+    profile.read_allow.sort_unstable();
+    profile.read_allow.dedup();
+}
+
 /// Stores live output secrets and whether any non-ticket secret must remain
 /// withheld after restart. The ticket digest lets previews redact that exact value.
 pub(crate) struct CompletionSecrets {
@@ -6575,6 +6774,7 @@ fn sandboxed_child_environment(
         }
         environment.insert(OsString::from(key), OsString::from(value));
     }
+    crate::shell_env_provider::apply_removals_to_snapshot(&mut environment, request_environment);
     for key in ["TMPDIR", "TEMP", "TMP"] {
         environment.insert(OsString::from(key), temp_dir.as_os_str().to_os_string());
     }
@@ -6725,6 +6925,10 @@ pub(crate) fn pty_command_for_plan(
         command.env_remove(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV);
         for (key, value) in env {
             command.env(key, value);
+        }
+        command.env_remove(crate::shell_env_provider::REMOVALS_ENV);
+        for name in crate::shell_env_provider::removals(env) {
+            command.env_remove(name);
         }
     }
     // Scrub credentials after explicit overrides too; only the command's own
@@ -10735,6 +10939,85 @@ mod scope_grant_tests;
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn provider_layout_grant(ttl: Duration) -> (AppContext, String, PathBuf) {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let layout = crate::shell_env_provider::PreflightLayout::create().unwrap();
+        let path = layout.path().to_path_buf();
+        let id = "esc_provider_layout".to_owned();
+        ctx.escalation_grants().lock().grants.insert(
+            id.clone(),
+            EscalationGrant {
+                principal: AuthenticatedPrincipal::FirstParty,
+                root: PathBuf::from("/provider-root"),
+                digest: blake3::hash(b"unused payload"),
+                expires_at: Instant::now() + ttl,
+                consumed: false,
+                refused: false,
+                payload_reclaimed: false,
+                session_dir: path.join("nonexistent-session"),
+                task_id: "nonexistent-task".into(),
+                provider_snapshot: None,
+            },
+        );
+        save_provider_approval(
+            &ctx,
+            &id,
+            ProviderApprovalSnapshot {
+                input: HashMap::new(),
+                environment: ChildEnvironment::new(),
+                failure: None,
+                preflight_layout: Some(layout),
+            },
+        );
+        (ctx, id, path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_env_provider_unused_grant_expires_without_another_mint() {
+        let (ctx, id, path) = provider_layout_grant(Duration::from_millis(50));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !path.exists(),
+            "the expiry timer must release unused provider scratch"
+        );
+        assert!(ctx.escalation_grants().lock().grants[&id]
+            .provider_snapshot
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_env_provider_refused_grant_releases_preflight_layout() {
+        let (ctx, id, path) = provider_layout_grant(Duration::from_secs(120));
+        let attempt = HostEscalationAttempt {
+            grant_id: id,
+            command: vec![],
+            root: PathBuf::from("/wrong-root"),
+            cwd: PathBuf::from("/"),
+            shell_path: PathBuf::from("/bin/sh"),
+            environment: ChildEnvironment::new(),
+        };
+        let result = consume_host_escalation_grant_at(
+            &ctx,
+            &AuthenticatedPrincipal::FirstParty,
+            &attempt,
+            Instant::now(),
+        );
+        assert!(matches!(result, Err(EscalationRefusal::DigestMismatch)));
+        assert!(
+            !path.exists(),
+            "a refused consume must release its provider scratch"
+        );
+    }
 
     #[cfg(unix)]
     #[test]

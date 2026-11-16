@@ -28,6 +28,7 @@ import {
 } from "@cortexkit/aft-bridge";
 import { type ToolContext, tool } from "@opencode-ai/plugin";
 import { Effect } from "effect";
+import { SHELL_REFUSAL_UNKNOWN } from "../../../aft-bridge/src/__tests__/fixtures/bash-permission-refusals.js";
 import { withEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import {
   __resetBgNotificationStateForTests,
@@ -557,23 +558,21 @@ describe("OpenCode bash adapter", () => {
     expect(calls[1].params.permissions_granted).toEqual(["rm *", "/tmp/*"]);
   });
 
-  test("permission loop reports host refusal of all shell command parts without retrying", async () => {
+  test("permission loop reports an unattributed host refusal without retrying", async () => {
     const ask = mockAskDeny("Permission denied: shell");
     const { calls, tool: bash } = createHarness(() => ({
       success: false,
       code: "permission_required",
       asks: [
         { kind: "bash", patterns: ["mkdir -p x"] },
-        { kind: "bash", patterns: ["rm -rf x"] },
+        { kind: "bash", patterns: ["git ls-tree HEAD src"] },
       ],
     }));
     const error = await bash
-      .execute({ command: "mkdir -p x && rm -rf x" }, createMockSdkContext({ ask }))
+      .execute({ command: "mkdir -p x && git ls-tree HEAD src" }, createMockSdkContext({ ask }))
       .catch((error) => error);
     expect(error).toBeInstanceOf(BashPermissionLoopError);
-    expect(error.message).toBe(
-      "Permission denied for this shell command: mkdir -p x, rm -rf x (Permission denied: shell). The parts are checked together, so one denied part denies the whole command; run the allowed parts in a separate call.",
-    );
+    expect(error.message).toBe(SHELL_REFUSAL_UNKNOWN);
     expect(error.cause).toBeInstanceOf(Error);
     expect(error.cause.message).toBe("Permission denied: shell");
     expect(calls).toHaveLength(1);
@@ -1954,6 +1953,24 @@ describe("bash_status tool", () => {
     expect(calls.find((call) => call.cmd === "bash_kill")?.options?.transportTimeoutMs).toBe(
       30_000,
     );
+  });
+
+  test("async bash_watch resolves a remote job ID before notification registration", async () => {
+    const job = "01234567-89ab-cdef-0123-456789abcdef";
+    const task = "bash-0123456789abcdef";
+    const { watchTool, calls } = makeCtx((cmd) =>
+      cmd === "bash_status"
+        ? { success: true, task_id: task, status: "running" }
+        : { success: true, watch_id: "watch-job" },
+    );
+    const result = await watchTool.execute(
+      { taskId: job, pattern: "READY", background: true },
+      createMockSdkContext({ sessionID: "s-job-watch" }),
+    );
+    expect(calls.filter(({ cmd }) => cmd === "bash_status")).toHaveLength(1);
+    expect(calls.find(({ cmd }) => cmd === "bash_status")?.params.task_id).toBe(job);
+    expect(calls.find(({ cmd }) => cmd === "bash_notify")?.params.task_id).toBe(task);
+    expect(result).toContain(`on task ${task}`);
   });
 
   test("async bash_watch registration does not add synthetic outstanding task", async () => {

@@ -2510,6 +2510,7 @@ fn priority_health_field(field: &str, value: &Value) -> bool {
             | "sqlite"
             | "runner_notices"
             | "manifest_sync"
+            | "bus"
             | "indexing"
             | "gh_speech"
             | "embedding_backend"
@@ -3580,7 +3581,7 @@ fn memory_rollup_metrics(snapshot: Option<crate::memory::MemoryRollupSnapshot>) 
         })
         .collect::<serde_json::Map<String, Value>>()
         .into();
-    json!({
+    let result = json!({
         "status": snapshot.roots_status,
         "roots": per_root,
         "roots_total": snapshot.roots_total,
@@ -3601,7 +3602,16 @@ fn memory_rollup_metrics(snapshot: Option<crate::memory::MemoryRollupSnapshot>) 
         "phys_footprint_bytes": snapshot.process.phys_footprint_bytes,
         "total_attributed_bytes": snapshot.process.total_attributed_bytes,
         "sqlite_bytes": snapshot.process.sqlite.memory_used_bytes,
-    })
+    });
+    #[cfg(target_os = "linux")]
+    let result = {
+        let mut result = result;
+        if let Some(stats) = &snapshot.process.allocator.jemalloc {
+            result["jemalloc"] = json!(stats);
+        }
+        result
+    };
+    result
 }
 
 fn mutating_lanes_metrics(executor: &Executor) -> Value {
@@ -4811,6 +4821,7 @@ fn assemble_health_report(
         "manifest_sync".into(),
         crate::gh_shim::manifest_sync::health(),
     );
+    metrics.insert("bus".into(), crate::late_result_bus::health());
     metrics.insert("age_ms".to_string(), json!(snapshot_age_ms));
     metrics.insert("generated_at_ms".to_string(), json!(rollup.generated_at_ms));
     metrics.insert("stale".to_string(), json!(stale_reason.is_some()));
@@ -10123,6 +10134,16 @@ mod tests {
         assert_eq!(memory["allocator_slack_kind"], ALLOCATOR_SLACK_KIND);
         assert!(memory["last_relief_allocator_accounting_bytes"].is_u64());
         assert!(memory.get("last_relief_rss_drop_bytes").is_some());
+        #[cfg(target_os = "linux")]
+        {
+            let stats = &memory["jemalloc"];
+            assert_eq!(stats["accounting_source"], "jemalloc");
+            let allocated = stats["allocated"].as_u64().unwrap();
+            let active = stats["active"].as_u64().unwrap();
+            let resident = stats["resident"].as_u64().unwrap();
+            assert!(allocated > 0 && allocated <= active && active <= resident);
+            assert!(stats["retained"].is_u64());
+        }
         if memory
             .get("allocator_slack_measured")
             .and_then(Value::as_bool)
@@ -10633,9 +10654,11 @@ mod tests {
                 refreshing: false,
                 coverage: MeaningCoverage {
                     files: 123_456,
+                    files_skipped: 0,
                     files_embedded: 100_000,
                     files_too_large: 1_234,
                     files_failed: 1_234,
+                    files_luau_outline_failed: 0,
                     files_pending: 20_988,
                     files_past_cap: 99_999,
                     chunks: 9_999_999,
@@ -10901,6 +10924,8 @@ mod tests {
             .collect::<Vec<_>>();
         let mut metrics = json!({
             "actor_count": 71,
+            "bus": {"connected": false, "connects": u64::MAX, "published": u64::MAX,
+                "publish_failures": u64::MAX, "last_error": "bus_consumer_disconnected"},
             "root_count": 71,
             "root_details_omitted": 0,
             "embedding_backend": { "available": true, "last_error": null, "since_ms": null },
@@ -10914,6 +10939,19 @@ mod tests {
         .expect("metrics object")
         .clone();
 
+        #[cfg(target_os = "linux")]
+        metrics.insert(
+            "memory".into(),
+            json!({
+                "jemalloc": {
+                    "accounting_source": "jemalloc",
+                    "allocated": u64::MAX,
+                    "active": u64::MAX,
+                    "resident": u64::MAX,
+                    "retained": u64::MAX,
+                }
+            }),
+        );
         budget_health_metrics(&mut metrics);
         let encoded =
             serde_json::to_vec(&Value::Object(metrics.clone())).expect("encode budgeted metrics");
@@ -10928,6 +10966,12 @@ mod tests {
             encoded.len()
         );
         assert_eq!(metrics["actor_count"], 71);
+        assert_eq!(metrics["bus"]["published"], u64::MAX);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            metrics["memory"]["jemalloc"]["accounting_source"],
+            "jemalloc"
+        );
         // Large-read telemetry is a priority section: ordinary ready root rows
         // yield before it, even with every site at its widest.
         assert_eq!(
