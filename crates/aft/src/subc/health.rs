@@ -1899,10 +1899,19 @@ const HEALTH_METRICS_BUDGET_BYTES: usize = 12 * 1024;
 // A 6 KiB (one-half) project share keeps those facts, unlike a one-third share.
 // Repeated rebuilds used 11,129 bytes for 52 roots and 21,401 for 100 roots,
 // displacing even memory and runtime. Group them within this share; process
-// telemetry is budgeted independently first and never borrows project space.
+// telemetry is allocated first; this is a ceiling, not reserved project space.
 const HEALTH_PROJECT_BUDGET_BYTES: usize = HEALTH_METRICS_BUDGET_BYTES / 2;
 const HEALTH_ROOT_GROUP_EXAMPLES: usize = 3;
 const HEALTH_BUILD_STALL_MS: u64 = 10 * 60 * 1000;
+const HEALTH_PROJECT_FIELDS: [&str; 7] = [
+    "roots",
+    "root_groups",
+    "root_details_omitted",
+    "root_details_reduced",
+    "root_detail_gap",
+    "root_groups_omitted",
+    "root_group_roots_omitted",
+];
 // Bound the whole compact reply, not just metrics, to leave headroom even if
 // the daemon applies its 16 KiB cache ceiling to a larger envelope.
 const HEALTH_REPLY_HARD_LIMIT_BYTES: usize = 16 * 1024;
@@ -2293,25 +2302,37 @@ fn budget_health_metrics_with_limits(
     hard_limit: usize,
 ) {
     let mut projects = serde_json::Map::new();
-    for key in [
-        "roots",
-        "root_groups",
-        "root_details_omitted",
-        "root_details_reduced",
-        "root_detail_gap",
-        "root_groups_omitted",
-        "root_group_roots_omitted",
-    ] {
+    for key in HEALTH_PROJECT_FIELDS {
         if let Some(value) = metrics.remove(key) {
             projects.insert(key.into(), value);
         }
     }
-    // Apply the existing telemetry summaries with no per-project rows competing
-    // for their bytes. Large process sections must yield to other process data,
-    // not consume the other half of the report.
-    fit_health_metrics(metrics, budget.min(HEALTH_PROJECT_BUDGET_BYTES), hard_limit);
+    group_health_roots(&mut projects);
+    fit_health_metrics(
+        &mut projects,
+        HEALTH_PROJECT_BUDGET_BYTES,
+        HEALTH_PROJECT_BUDGET_BYTES,
+    );
+    let mut mandatory = projects.clone();
+    mandatory.remove("root_groups");
+    let has_mandatory = mandatory
+        .get_mut("roots")
+        .and_then(Value::as_array_mut)
+        .is_some_and(|roots| {
+            roots.retain(|root| !progressing_health_root(root, health_now_ms()));
+            !roots.is_empty()
+        });
+    let mandatory_bytes = if has_mandatory {
+        refresh_metrics_bytes(&mut mandatory)
+    } else {
+        0
+    };
+    // Process sections come first, with project detail limited to the remainder
+    // and at most 6 KiB. Failed/refused/degraded identities outrank only optional
+    // process detail: use each process section's own summaries before cutting
+    // those identities. Repeated ready/building roots never displace telemetry.
+    fit_health_metrics(metrics, budget.saturating_sub(mandatory_bytes), hard_limit);
     if !projects.is_empty() {
-        group_health_roots(&mut projects);
         let process_bytes = refresh_metrics_bytes(metrics);
         let project_budget =
             HEALTH_PROJECT_BUDGET_BYTES.min(budget.saturating_sub(process_bytes).saturating_sub(1));
@@ -2320,7 +2341,11 @@ fn budget_health_metrics_with_limits(
         fit_health_metrics(&mut projects, project_budget, project_budget);
         projects.remove("metrics_bytes");
         projects.remove("metrics_over_budget");
-        metrics.extend(projects);
+        for key in HEALTH_PROJECT_FIELDS {
+            if let Some(value) = projects.remove(key) {
+                metrics.insert(key.into(), value);
+            }
+        }
     }
     if refresh_metrics_bytes(metrics) > budget {
         metrics.insert("metrics_over_budget".into(), json!(true));
@@ -2355,6 +2380,14 @@ fn progressing_health_root(root: &Value, now_ms: u64) -> bool {
     settled_health_root(&ready)
 }
 
+fn health_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
 fn health_root_status(root: &Value) -> Value {
     let mut status = json!({"state": root["state"]});
     for component in ["search_index", "semantic_index", "callgraph_store", "tier2"] {
@@ -2367,11 +2400,7 @@ fn group_health_roots(metrics: &mut serde_json::Map<String, Value>) {
     let Some(roots) = metrics.get_mut("roots").and_then(Value::as_array_mut) else {
         return;
     };
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u128::from(u64::MAX)) as u64;
+    let now_ms = health_now_ms();
     let mut repeated = std::collections::BTreeMap::<String, Vec<Value>>::new();
     let mut individuals = Vec::new();
     for root in std::mem::take(roots) {
@@ -2408,12 +2437,16 @@ fn group_health_roots(metrics: &mut serde_json::Map<String, Value>) {
     // Failures, then stalled/unknown/gap states, then normal progress. Stable
     // ordering preserves the producer's memory/path order within each severity.
     individuals.sort_by_key(|root| {
-        if health_failure_evidence(root) {
+        if matches!(root["state"].as_str(), Some("degraded" | "failed"))
+            || root["standing_refusal"].is_string()
+        {
             0
-        } else if !progressing_health_root(root, now_ms) {
+        } else if health_failure_evidence(root) {
             1
-        } else {
+        } else if !progressing_health_root(root, now_ms) {
             2
+        } else {
+            3
         }
     });
     *roots = individuals;
@@ -2487,6 +2520,17 @@ fn fit_health_metrics(
     loop {
         if refresh_metrics_bytes(metrics) <= budget {
             return;
+        }
+        if metrics
+            .get_mut("roots")
+            .and_then(Value::as_array_mut)
+            .is_some_and(|roots| {
+                roots.iter_mut().fold(false, |changed, root| {
+                    abbreviate_health_root(root) || changed
+                })
+            })
+        {
+            continue;
         }
         if trim_health_root_groups(metrics) {
             continue;
@@ -2795,10 +2839,11 @@ fn enforce_health_hard_limit(metrics: &mut serde_json::Map<String, Value>, hard_
             "root_details_omitted".into(),
             json!(omitted.saturating_add(1)),
         );
-        metrics.insert(
-            "root_detail_gap".into(),
-            json!({"omitted": true, "count": previous_omitted.saturating_add(omitted_ids.len() as u64)}),
-        );
+        let gap = metrics
+            .entry("root_detail_gap")
+            .or_insert_with(|| json!({}));
+        gap["omitted"] = json!(true);
+        gap["count"] = json!(previous_omitted.saturating_add(omitted_ids.len() as u64));
     }
     if !omitted_ids.is_empty() {
         metrics["root_detail_gap"]["root_ids"] = json!(omitted_ids);
@@ -3280,6 +3325,10 @@ impl HealthRollupCache {
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
                 .to_string();
+            if plane == "callgraph_store" && status != "building" {
+                timings.remove(&(root.to_string(), plane));
+                continue;
+            }
             let key = (root.to_string(), plane);
             let reported_since_ms = component.get("since_ms").and_then(Value::as_u64);
             let reported_progress_ms = component.get("last_progress_at_ms").and_then(Value::as_u64);
@@ -6269,7 +6318,14 @@ mod tests {
         assert_eq!(metrics["root_details_omitted"], 18 - retained.len());
         assert_eq!(metrics["root_detail_gap"]["count"], 18 - retained.len());
         assert_eq!(metrics["root_detail_gap"]["omitted"], true);
-        assert!(serde_json::to_vec(&metrics).unwrap().len() <= HEALTH_PROJECT_BUDGET_BYTES + 100);
+        let projects = metrics
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| HEALTH_PROJECT_FIELDS.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<serde_json::Map<_, _>>();
+        assert!(serde_json::to_vec(&projects).unwrap().len() <= HEALTH_PROJECT_BUDGET_BYTES);
     }
 
     #[test]
@@ -6362,9 +6418,9 @@ mod tests {
         cached.insert("fresh_liveness".into(), json!("f".repeat(1000)));
         super::budget_health_metrics(&mut cached);
         assert_eq!(cached["roots"].as_array().unwrap().len(), 1);
-        // Ancillary liveness yields first so the current root keeps its full diagnostics.
-        assert!(cached["roots"][0].get("abbreviated").is_none());
-        assert_eq!(cached["fresh_liveness"]["omitted"], true);
+        // Ordinary root text cannot displace a process observation.
+        assert_eq!(cached["roots"][0]["abbreviated"], true);
+        assert_eq!(cached["fresh_liveness"], "f".repeat(1000));
         assert_eq!(cached["roots"][0]["project_root"], "ordinary");
         assert_eq!(
             cached["metrics_bytes"],
@@ -6374,7 +6430,7 @@ mod tests {
     }
 
     #[test]
-    fn health_budget_trims_every_sweep_before_root_detail() {
+    fn health_budget_keeps_small_sweeps_before_oversized_root_detail() {
         let roots = json!([{
             "project_root": "standing", "state": "ready", "standing": true,
             "standing_refusal": "resolved-path-drift refusal", "detail":"r".repeat(13000)
@@ -6389,8 +6445,11 @@ mod tests {
         .unwrap()
         .clone();
         super::budget_health_metrics(&mut metrics);
-        assert_eq!(metrics["v2_family_sweeps"], json!([]));
-        assert_eq!(metrics["v2_family_sweeps_omitted"], 5);
+        assert_eq!(
+            metrics["v2_family_sweeps"],
+            json!([{"family":"one"}, {"family":"two"}])
+        );
+        assert_eq!(metrics["v2_family_sweeps_omitted"], 3);
         assert_eq!(metrics["root_details_omitted"], 0);
         assert_eq!(metrics["roots"][0]["project_root"], "standing");
         assert_eq!(
@@ -11332,8 +11391,8 @@ mod tests {
         );
         assert_eq!(metrics["root_count"], 71);
         assert!(metrics["embedding_backend"].is_object());
-        // Ledger telemetry yields before root rows after its paths have been compacted.
-        assert_eq!(metrics["write_ledger_top_10m"]["omitted"], true);
+        // Grouping ordinary roots leaves room for the compacted ledger rows.
+        assert_eq!(metrics["write_ledger_top_10m"].as_array().unwrap().len(), 3);
         assert_eq!(
             metrics["metrics_bytes"].as_u64(),
             Some(encoded.len() as u64)

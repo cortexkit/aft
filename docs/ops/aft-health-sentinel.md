@@ -48,7 +48,8 @@ groups also report `root_groups_omitted` and `root_group_roots_omitted`.
 
 A grouped or omitted root is not evidence that a previous per-root problem
 recovered. The sentinel treats incomplete individual-root detail as an unavailable
-census, preserves prior per-root findings and watcher baselines, and leaves the
+census, preserves prior per-root findings and the previous watcher dropped-event
+counter values used to detect new overflows, and leaves the
 independent process/liveness detectors running. Group examples are not an inventory
 or a substitute for a root-local probe.
 
