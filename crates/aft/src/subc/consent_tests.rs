@@ -2140,7 +2140,7 @@ async fn folder_grant_settles_and_withdraws_covered_sibling(recover_unreceipted:
             kind: GrantKind::File,
             operation: AccessOperation::Read,
         };
-        let directory = scope_before_db(&grant).await;
+        let directory = scope_before_db(&grant, true).await;
         let identity = f.worker.clone();
         let arguments = json!({"path": a});
         let prepared = with_db_handle(&scope_probe_call(&f, &a), move |db, ctx| {
@@ -3471,7 +3471,7 @@ async fn consent_scope_card_matches_stored_directory() {
     assert_eq!(request["paths"], json!([f.head_root.join("shared.txt")]));
     assert_eq!(request["tool"], "read");
     assert_eq!(request["operation"], "read");
-    assert_eq!(request["reason"], "Allow scope: read-only access for all AFT read tools within the displayed directory tree. Protected paths remain denied.");
+    assert_eq!(request["reason"], format!("Allow scope: read-only access for all AFT read tools within the directory tree rooted at {}. Protected paths remain denied.", f.head_root.display()));
     assert_eq!(
         f.worker_grants(),
         vec![AccessGrant {
@@ -3479,6 +3479,270 @@ async fn consent_scope_card_matches_stored_directory() {
             kind: GrantKind::Subtree,
             operation: AccessOperation::Read,
         }]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn worker_read_repository_scope_covers_manifest_tests_and_open_asks() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let _probe = DirectoryScopeProbeBudgetOverride::generous();
+    let f = fixture(FakeCingulate::up());
+    std::fs::create_dir(f.head_root.join(".git")).unwrap();
+    std::fs::create_dir(f.head_root.join("src")).unwrap();
+    std::fs::create_dir(f.head_root.join("tests")).unwrap();
+    let source = f.head_root.join("src/lib.rs");
+    let manifest = f.head_root.join("Cargo.toml");
+    let test = f.head_root.join("tests/x.rs");
+    for (path, contents) in [
+        (&source, "source contents"),
+        (&manifest, "manifest contents"),
+        (&test, "test contents"),
+    ] {
+        std::fs::write(path, contents).unwrap();
+    }
+    set_hold_budget_for_test(Some(Duration::from_secs(5)));
+    let mut source_reply = f.send_read(&f.worker, &source, 901).await;
+    let mut manifest_reply = f.send_read(&f.worker, &manifest, 902).await;
+    let mut test_reply = f.send_read(&f.worker, &test, 903).await;
+    wait_for(|| {
+        f.asks()
+            .iter()
+            .filter(|ask| ask.elicitation_id.is_some())
+            .count()
+            == 3
+    })
+    .await;
+    let requests = f.fake.calls("consent.request");
+    let source_key = call_key_for_file(&requests, "lib.rs");
+    let source_card = requests
+        .iter()
+        .find(|request| request["call_key"] == source_key)
+        .unwrap();
+    assert_eq!(
+        source_card["pattern"],
+        format!("{}/**", f.head_root.display())
+    );
+    assert_eq!(source_card["paths"], json!([source]));
+    assert_eq!(source_card["reason"], format!("Allow scope: read-only access for all AFT read tools within the directory tree rooted at {}. Protected paths remain denied.", f.head_root.display()));
+    f.fake.answer(
+        &source_key,
+        json!({"state":"settled", "outcome":"allow_scope", "answered_by":"user"}),
+    );
+    for (replies, expected) in [
+        (&mut source_reply, "source contents"),
+        (&mut manifest_reply, "manifest contents"),
+        (&mut test_reply, "test contents"),
+    ] {
+        let reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+            .await
+            .expect("one repository approval resumes every covered read")
+            .unwrap();
+        let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert!(text(&reply).contains(expected), "{reply}");
+    }
+    assert_eq!(f.fake.calls("consent.withdraw").len(), 2);
+    assert!(f.asks().is_empty());
+    assert_eq!(
+        f.worker_grants(),
+        vec![AccessGrant {
+            path: f.head_root.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        }]
+    );
+    for (path, expected, corr) in [
+        (&manifest, "manifest contents", 904),
+        (&test, "test contents", 905),
+    ] {
+        let reply = f.read(&f.worker, path, corr).await;
+        assert!(text(&reply).contains(expected), "{reply}");
+    }
+    assert_eq!(f.fake.calls("consent.request").len(), 3);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn worker_read_repository_scope_leaves_write_asks_at_the_folder() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let _probe = DirectoryScopeProbeBudgetOverride::generous();
+    let f = fixture(FakeCingulate::up());
+    std::fs::create_dir(f.head_root.join(".git")).unwrap();
+    let parent = f.head_root.join("src");
+    std::fs::create_dir(&parent).unwrap();
+    let target = parent.join("lib.rs");
+    set_hold_budget_for_test(Some(Duration::from_millis(100)));
+    let reply = f
+        .tool(
+            "write",
+            json!({"filePath": target, "content":"new contents"}),
+            901,
+        )
+        .await;
+    assert_eq!(code(&reply), "access_pending", "{reply}");
+    let request = &f.fake.calls("consent.request")[0];
+    assert_eq!(request["pattern"], format!("{}/**", parent.display()));
+    assert_eq!(request["reason"], WRITE_TREE_SCOPE_REASON);
+    let (mut prep, _) = open_prepared(f.asks().pop().unwrap()).unwrap();
+    assert_eq!(advertised_scope(&prep).unwrap().path, parent);
+    prep.request["pattern"] = json!(format!("{}/**", f.head_root.display()));
+    assert_eq!(
+        advertised_scope(&prep),
+        None,
+        "write cards cannot widen to ancestors"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_read_repository_scope_home_repository_falls_back_to_folder() {
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
+    let _probe = DirectoryScopeProbeBudgetOverride::generous();
+    let dir = tempfile::tempdir().unwrap();
+    let outer = crate::access_policy::policy_path(dir.path());
+    let home = outer.join("home");
+    let parent = home.join("project/src");
+    std::fs::create_dir_all(&parent).unwrap();
+    std::fs::create_dir(outer.join(".git")).unwrap();
+    std::fs::write(home.join(".git"), "gitdir: elsewhere").unwrap();
+    let folder = directory_scope(&AccessGrant {
+        path: parent.join("lib.rs"),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    });
+    assert_eq!(folder.path, parent);
+    let repository = repository_scope_with(&parent, |root| {
+        probe_directory_scope_at_home(root, &home, |_, _| Some(false)) == Ok(true)
+    });
+    assert_eq!(
+        repository, None,
+        "home must not select an outer repository either"
+    );
+    assert_eq!(repository.unwrap_or_else(|| folder.path.clone()), parent);
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_read_repository_scope_without_repository_keeps_folder() {
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
+    let _probe = DirectoryScopeProbeBudgetOverride::generous();
+    let dir = tempfile::tempdir().unwrap();
+    let parent = crate::access_policy::policy_path(&dir.path().join("plain/src"));
+    std::fs::create_dir_all(&parent).unwrap();
+    assert_eq!(repository_scope_with(&parent, |_| true), None);
+    let grant = AccessGrant {
+        path: parent.join("lib.rs"),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    };
+    let scope = worker_read_scope(&grant);
+    assert_eq!(scope, directory_scope(&grant));
+    assert_eq!(scope.path, parent);
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_read_repository_scope_nested_submodule_uses_its_git_file() {
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
+    let _probe = DirectoryScopeProbeBudgetOverride::generous();
+    let dir = tempfile::tempdir().unwrap();
+    let repo = crate::access_policy::policy_path(&dir.path().join("repo"));
+    let submodule = repo.join("modules/inner");
+    std::fs::create_dir_all(submodule.join("src")).unwrap();
+    std::fs::create_dir(repo.join(".git")).unwrap();
+    std::fs::write(submodule.join(".git"), "gitdir: ../../.git/modules/inner").unwrap();
+    let scope = worker_read_scope(&AccessGrant {
+        path: submodule.join("src/lib.rs"),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    });
+    assert_eq!(scope.path, submodule);
+    assert_eq!(scope.kind, GrantKind::Subtree);
+    assert!(!scope.covers(AccessOperation::Read, &repo.join("Cargo.toml")));
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_read_repository_scope_still_denies_protected_and_configured_paths() {
+    use crate::access_policy::AccessDecision;
+
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
+    let _probe = DirectoryScopeProbeBudgetOverride::generous();
+    let dir = tempfile::tempdir().unwrap();
+    let repo = crate::access_policy::policy_path(&dir.path().join("repo"));
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::create_dir(repo.join(".git")).unwrap();
+    let scope = worker_read_scope(&AccessGrant {
+        path: repo.join("src/lib.rs"),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    });
+    assert_eq!(scope.path, repo);
+    let mut config = crate::config::Config::default();
+    config.sandbox.read_deny = vec![repo.join("private")];
+    let mut policy = AccessPolicy::from_config(&config, &dir.path().join("store"), vec![], &repo);
+    policy.install_scope_grants(vec![scope], true);
+    assert_eq!(
+        policy.decide(AccessOperation::Read, &repo.join("Cargo.toml"), false),
+        AccessDecision::Allow
+    );
+    for path in [repo.join(".ssh/id_ed25519"), repo.join("private/secret")] {
+        assert_eq!(
+            policy.decide(AccessOperation::Read, &path, false),
+            AccessDecision::Deny(crate::access_policy::AccessDenial::Floor)
+        );
+    }
+    assert_ne!(
+        policy.decide(AccessOperation::Write, &repo.join("Cargo.toml"), false),
+        AccessDecision::Allow
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn worker_read_repository_scope_does_not_widen_existing_folder_cards_or_grants() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let _probe = DirectoryScopeProbeBudgetOverride::generous();
+    let f = fixture(FakeCingulate::up());
+    let parent = f.head_root.join("src");
+    std::fs::create_dir(&parent).unwrap();
+    let source = parent.join("lib.rs");
+    std::fs::write(&source, "source contents").unwrap();
+    set_hold_budget_for_test(Some(Duration::from_millis(100)));
+    assert_eq!(
+        code(&f.read(&f.worker, &source, 901).await),
+        "access_pending"
+    );
+    let request = f.fake.calls("consent.request")[0].clone();
+    assert_eq!(request["pattern"], format!("{}/**", parent.display()));
+    // Discovering a repository later must not change an already displayed card.
+    std::fs::create_dir(f.head_root.join(".git")).unwrap();
+    f.fake.answer(
+        request["call_key"].as_str().unwrap(),
+        json!({"state":"settled", "outcome":"allow_scope", "answered_by":"user"}),
+    );
+    let reply = f.settled_read(&f.worker, &source, 902).await;
+    assert!(text(&reply).contains("source contents"), "{reply}");
+    assert_eq!(
+        f.worker_grants(),
+        vec![AccessGrant {
+            path: parent.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        }]
+    );
+    let manifest = f.head_root.join("Cargo.toml");
+    std::fs::write(&manifest, "manifest contents").unwrap();
+    set_hold_budget_for_test(Some(Duration::from_millis(100)));
+    assert_eq!(
+        code(&f.read(&f.worker, &manifest, 903).await),
+        "access_pending"
+    );
+    assert_eq!(f.worker_grants()[0].path, parent);
+    assert_eq!(
+        f.fake.calls("consent.request").len(),
+        3,
+        "old card is resent unchanged, then the manifest asks separately"
     );
 }
 
@@ -3919,7 +4183,7 @@ async fn consent_stalled_home_scope_probe_is_single_flight_and_file_only() {
         kind: GrantKind::File,
         operation: AccessOperation::Read,
     };
-    assert_eq!(scope_before_db(&next).await.kind, GrantKind::Subtree);
+    assert_eq!(scope_before_db(&next, true).await.kind, GrantKind::Subtree);
 }
 
 #[cfg(unix)]
@@ -4144,7 +4408,7 @@ fn consent_scope_nested_file_still_offers_directory() {
     assert_eq!(scope.path, parent);
     assert_eq!(scope.kind, GrantKind::Subtree);
     assert_eq!(scope.operation, AccessOperation::Read);
-    assert_eq!(scope_reason(&scope), "Allow scope: read-only access for all AFT read tools within the displayed directory tree. Protected paths remain denied.");
+    assert_eq!(scope_reason(&scope), format!("Allow scope: read-only access for all AFT read tools within the directory tree rooted at {}. Protected paths remain denied.", scope.path.display()));
 }
 
 #[cfg(unix)]
