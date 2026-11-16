@@ -17,7 +17,8 @@ macro_rules! counters {
         #[cfg(test)]
         #[test]
         fn display_counter_labels_and_max_values_are_bounded() {
-            let maximum = serde_json::json!({$($label: u64::MAX),+});
+            let mut maximum = serde_json::Map::new();
+            $(maximum.insert($label.into(), serde_json::Value::from(u64::MAX));)+
             assert!(serde_json::to_vec(&maximum).unwrap().len() < 4096);
         }
     };

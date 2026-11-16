@@ -77,8 +77,9 @@ async fn fake_display(
         let reply = match body["op"].as_str().or(body["name"].as_str()) {
             Some("catalog.list") => json!({
                 "op":"catalog.list", "generation":1,
-                "modules":[{"module_id":"occipital", "capabilities": {
-                    "provides":[cortexkit_role_tool_display::TOOL_DISPLAY_CAPABILITY]
+                "modules":[{"module_id":"occipital", "ready":true, "roles":[], "control_ops":[], "capabilities": {
+                    "provides":[cortexkit_role_tool_display::TOOL_DISPLAY_CAPABILITY],
+                    "requires":[], "must_never_reach":[]
                 }}], "subc_ops":["catalog.list","route.open"]
             }),
             Some("route.open") => {
