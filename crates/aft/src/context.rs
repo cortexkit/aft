@@ -4340,7 +4340,7 @@ pub struct AppContext {
     bash_background: BgTaskRegistry,
     output_files: Arc<crate::tool_output::OutputFiles>,
     #[cfg(unix)]
-    escalation_grants: parking_lot::Mutex<crate::sandbox_spawn::EscalationGrantStore>,
+    escalation_grants: Arc<parking_lot::Mutex<crate::sandbox_spawn::EscalationGrantStore>>,
     /// Thread-safe registry of TOML output filters. Lazy-built on first
     /// access; populated atomically via `RwLock`. Shared between command
     /// handlers (which use it through `filter_registry()` -> read guard) and
@@ -4637,6 +4637,8 @@ impl AppContext {
         provider: Box<dyn LanguageProvider>,
         config: Config,
     ) -> Self {
+        #[cfg(unix)]
+        crate::shell_env_provider::sweep_preflight_layouts_on_startup();
         #[cfg(test)]
         let config = app.isolate_test_config(config);
         let mut config = config;
@@ -4825,9 +4827,9 @@ impl AppContext {
             bash_background,
             output_files: crate::tool_output::OutputFiles::shared(),
             #[cfg(unix)]
-            escalation_grants: parking_lot::Mutex::new(
+            escalation_grants: Arc::new(parking_lot::Mutex::new(
                 crate::sandbox_spawn::EscalationGrantStore::default(),
-            ),
+            )),
             filter_registry: Arc::new(std::sync::RwLock::new(
                 crate::compress::toml_filter::FilterRegistry::default(),
             )),
@@ -6702,6 +6704,14 @@ impl AppContext {
         &self,
     ) -> &parking_lot::Mutex<crate::sandbox_spawn::EscalationGrantStore> {
         &self.escalation_grants
+    }
+
+    #[cfg(unix)]
+    /// The expiry timer must not keep a project's grant store alive after unbind.
+    pub(crate) fn escalation_grant_owner(
+        &self,
+    ) -> std::sync::Weak<parking_lot::Mutex<crate::sandbox_spawn::EscalationGrantStore>> {
+        Arc::downgrade(&self.escalation_grants)
     }
 
     pub fn drain_bg_completions(&self) -> Vec<BgCompletion> {

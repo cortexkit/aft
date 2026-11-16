@@ -171,6 +171,62 @@ fn shell_env_provider_host_approval_freezes_environment_and_refuses_changed_inpu
 }
 
 #[test]
+fn shell_env_provider_host_temp_layout_lives_only_until_the_approved_task_ends() {
+    for references_temp in [false, true] {
+        let (fixture, mut aft) = fixture();
+        let script = if references_temp {
+            "printf '%s' \"$TMPDIR\" > preflight-path; printf payload > \"$TMPDIR/probe\"; printf '{\"PROJECT_TEMP\":\"%s\"}' \"$TMPDIR\""
+        } else {
+            "printf '%s' \"$TMPDIR\" > preflight-path; printf '{\"GIT_AUTHOR_NAME\":\"Temp Author\"}'"
+        };
+        let configured = aft.send(&json!({"id":"provider-temp-config", "command":"configure", "harness":"opencode",
+            "project_root":fixture.path().join("project"), "storage_dir":fixture.path().join("storage"), "bash_permissions":false,
+            "config":user_config(json!({"git":{"co_author":"off"}, "bash":{"background":true}, "sandbox":{"profile":{"head":"strict", "worker":"strict"}}, "shell":{"env_provider":{"kind":"custom", "command":["/bin/sh", "-c", script]}}}))
+        }).to_string());
+        assert_eq!(configured["success"], true, "{configured}");
+        let command = if references_temp {
+            "test -f \"$PROJECT_TEMP/probe\" && printf provider-temp-ok"
+        } else {
+            "printf '%s' \"$GIT_AUTHOR_NAME\""
+        };
+        let mut params = json!({"command":command, "sandbox":"host", "foreground_orchestrate":true, "compressed":false});
+        let asked = call(&mut aft, "provider-temp-ask", params.clone());
+        assert_eq!(asked["code"], "permission_required", "{asked}");
+        let path = std::path::PathBuf::from(
+            std::fs::read_to_string(fixture.path().join("project/preflight-path")).unwrap(),
+        );
+        assert_eq!(
+            path.exists(),
+            references_temp,
+            "only an exported scratch path needs a retained layout"
+        );
+        params["permissions_granted"] = json!([asked["asks"][0]["grant_id"]]);
+        let result = call(&mut aft, "provider-temp-retry", params);
+        assert_eq!(result["status"], "completed", "{result}");
+        assert!(
+            result["output"]
+                .as_str()
+                .unwrap()
+                .contains(if references_temp {
+                    "provider-temp-ok"
+                } else {
+                    "Temp Author"
+                }),
+            "{result}"
+        );
+        assert!(
+            !path.exists(),
+            "terminalization must release provider scratch without task-output retention"
+        );
+        assert!(
+            !path.parent().unwrap().exists(),
+            "the preflight control layout must also be removed"
+        );
+        assert!(aft.shutdown().success());
+    }
+}
+
+#[test]
 fn shell_env_provider_failure_notice_precedes_existing_task_tail() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path();

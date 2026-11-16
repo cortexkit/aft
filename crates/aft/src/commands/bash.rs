@@ -482,7 +482,8 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             let mut snapshot = None;
             if ctx.config().shell.env_provider.is_some() {
                 let mut overrides = params.env.clone();
-                let failure = crate::shell_env_provider::host_preflight(ctx, &cwd, &mut overrides);
+                let (failure, preflight_layout) =
+                    crate::shell_env_provider::host_preflight(ctx, &cwd, &mut overrides);
                 if let Err(error) = crate::agent_child_env::inject(
                     ctx.config().as_ref(),
                     &crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref()),
@@ -499,6 +500,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                     input: params.env.clone(),
                     environment: environment.clone(),
                     failure,
+                    preflight_layout,
                 });
             }
             let storage_dir = crate::bash_background::task_storage_dir(ctx);

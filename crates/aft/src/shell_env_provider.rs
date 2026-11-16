@@ -329,10 +329,19 @@ fn run(
         crate::sandbox_spawn::apply_sandbox_environment(plan, &mut command, overrides);
         command
     };
+    // Startup admission wins over the configured provider timeout: reserve one
+    // second to create the fallback shell before a caller is told nothing ran.
+    let timeout_ms = effective_timeout_ms(
+        provider.timeout_ms,
+        crate::bash_background::provider_startup_remaining(),
+    );
+    if timeout_ms < 100 {
+        return Err(Failure::Timeout(timeout_ms));
+    }
     let result = crate::format::capture_bounded_command(
         command,
         &argv[0],
-        std::time::Instant::now() + std::time::Duration::from_millis(provider.timeout_ms),
+        std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms),
         || false,
         OUTPUT_LIMIT + 1,
         // Unix probes already start a new session. setpgid after setsid would
@@ -340,7 +349,7 @@ fn run(
         cfg!(not(unix)),
     )
     .map_err(|error| match error {
-        crate::format::FormatError::Timeout { .. } => Failure::Timeout(provider.timeout_ms),
+        crate::format::FormatError::Timeout { .. } => Failure::Timeout(timeout_ms),
         crate::format::FormatError::Failed { stderr, .. } => Failure::Spawn(stderr),
         other => Failure::Spawn(other.to_string()),
     })?;
@@ -370,20 +379,76 @@ fn run(
     parse_export(result.stdout.as_bytes())
 }
 
+fn effective_timeout_ms(configured: u64, remaining: Option<std::time::Duration>) -> u64 {
+    remaining.map_or(configured, |remaining| {
+        configured.min(
+            remaining
+                .saturating_sub(std::time::Duration::from_millis(1000))
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+        )
+    })
+}
+
+#[cfg(unix)]
+/// Owns scratch and control files referenced by a frozen host approval or its
+/// running task. Ownership stays in memory; restart cleanup checks the recorded
+/// daemon pid and OS start time before reclaiming orphaned files.
+#[derive(Debug)]
+pub(crate) struct PreflightLayout(PathBuf);
+
+#[cfg(unix)]
+impl PreflightLayout {
+    pub(crate) fn create() -> std::io::Result<std::sync::Arc<Self>> {
+        crate::sandbox_spawn::create_provider_temp_layout()
+            .map(|path| std::sync::Arc::new(Self(path)))
+    }
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PreflightLayout {
+    fn drop(&mut self) {
+        let _ = crate::sandbox_spawn::remove_provider_temp_layout(&self.0);
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn sweep_preflight_layouts_on_startup() {
+    static SWEPT: OnceLock<()> = OnceLock::new();
+    SWEPT.get_or_init(|| {
+        let _ = crate::sandbox_spawn::sweep_provider_temp_layouts();
+    });
+}
+
 #[cfg(unix)]
 pub(crate) fn host_preflight(
     ctx: &crate::context::AppContext,
     cwd: &Path,
     environment: &mut HashMap<String, String>,
-) -> Option<String> {
+) -> (Option<String>, Option<std::sync::Arc<PreflightLayout>>) {
     let config = ctx.config();
-    let provider = config.shell.env_provider.as_ref()?;
+    let Some(provider) = config.shell.env_provider.as_ref() else {
+        return (None, None);
+    };
+    if let Err(error) = crate::agent_child_env::maintain(
+        config.as_ref(),
+        &crate::bash_background::storage_dir(config.storage_dir.as_deref()),
+    ) {
+        return (Some(failure_line(&Failure::Spawn(error))), None);
+    }
+    let layout = match PreflightLayout::create() {
+        Ok(layout) => layout,
+        Err(error) => return (Some(failure_line(&Failure::Spawn(error.to_string()))), None),
+    };
     let task = match crate::bash_background::persistence::allocate_task_layout(
-        &ctx.storage_dir(),
+        layout.path(),
         "env-provider",
     ) {
         Ok(task) => task,
-        Err(error) => return Some(failure_line(&Failure::Spawn(error.to_string()))),
+        Err(error) => return (Some(failure_line(&Failure::Spawn(error.to_string()))), None),
     };
     let mut plan = crate::sandbox_spawn::resolve_sandbox_spawn(
         ctx,
@@ -398,9 +463,10 @@ pub(crate) fn host_preflight(
     } else {
         apply(Some(provider), &mut plan, cwd, environment, false)
     };
-    plan.cleanup_unspawned();
-    let _ = crate::bash_background::persistence::delete_resolved_task(&task);
-    result
+    let retain = plan.temp_dir().and_then(Path::to_str).is_some_and(|temp| {
+        result.is_none() && environment.values().any(|value| value.contains(temp))
+    });
+    (result, retain.then_some(layout))
 }
 
 /// Keep agent-visible reason wording together: callers append the same fallback
@@ -475,6 +541,51 @@ fn parse_export(output: &[u8]) -> Result<Export, Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_env_provider_startup_timeout_keeps_spawn_headroom() {
+        use std::time::Duration;
+        assert_eq!(
+            effective_timeout_ms(10000, Some(Duration::from_millis(5000))),
+            4000
+        );
+        assert_eq!(
+            effective_timeout_ms(2000, Some(Duration::from_millis(5000))),
+            2000
+        );
+        assert_eq!(
+            effective_timeout_ms(10000, Some(Duration::from_millis(1050))),
+            50
+        );
+        assert_eq!(
+            effective_timeout_ms(10000, Some(Duration::from_millis(900))),
+            0
+        );
+        assert_eq!(effective_timeout_ms(2000, None), 2000);
+    }
+
+    #[test]
+    fn shell_env_provider_does_not_start_with_less_than_minimum_startup_budget() {
+        let project = tempfile::tempdir().unwrap();
+        let provider = ShellEnvProvider {
+            kind: ShellEnvProviderKind::Custom,
+            command: Some(vec!["provider-must-not-start".into()]),
+            timeout_ms: 10000,
+            watch: vec![],
+        };
+        let receipt = std::sync::Arc::new(crate::bash_background::SpawnReceipt::new(
+            std::time::Instant::now() + std::time::Duration::from_millis(500),
+        ));
+        let result = crate::bash_background::with_spawn_receipt(receipt, || {
+            run(
+                &provider,
+                &SpawnPlan::Unsandboxed,
+                project.path(),
+                &HashMap::new(),
+            )
+        });
+        assert!(matches!(result, Err(Failure::Timeout(0))));
+    }
 
     fn fake(kind: ShellEnvProviderKind, output: &Path) -> ShellEnvProvider {
         #[cfg(unix)]

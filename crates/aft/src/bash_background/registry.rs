@@ -1673,6 +1673,8 @@ pub(crate) struct RouteCensusTask {
 
 pub(crate) struct BgTask {
     start_view: Mutex<Option<crate::gh_shim_speech::start_view::StartView>>,
+    #[cfg(unix)]
+    provider_preflight: Mutex<Option<Arc<crate::shell_env_provider::PreflightLayout>>>,
     changed_files: Option<Arc<crate::bash_changed_files::Capture>>,
     /// Absent after replay: secret values must never be persisted or recovered
     /// from payload files. Completion notices withhold output when this is absent.
@@ -2093,6 +2095,25 @@ fn completion_matches_session(completion: &BgCompletion, session_id: Option<&str
 }
 
 impl BgTaskRegistry {
+    #[cfg(unix)]
+    pub(crate) fn bind_provider_preflight(
+        &self,
+        task_id: &str,
+        layout: Option<Arc<crate::shell_env_provider::PreflightLayout>>,
+    ) {
+        let Some(task) = self.task(task_id) else {
+            return;
+        };
+        let Ok(state) = task.lock_state() else {
+            return;
+        };
+        if !state.metadata.status.is_terminal() {
+            *task
+                .provider_preflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = layout;
+        }
+    }
     pub(crate) fn bind_start_view(
         &self,
         task_id: &str,
@@ -3492,6 +3513,11 @@ impl BgTaskRegistry {
         emit_frame: bool,
         token_policy: CompletionTokenPolicy,
     ) -> Result<(), String> {
+        #[cfg(unix)]
+        task.provider_preflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Err(error) = self.cleanup_terminal_task_temp(task) {
             crate::slog_warn!("failed to clean task scratch for {}: {error}", task.task_id);
         }
@@ -6130,6 +6156,8 @@ impl BgTaskRegistry {
 
         let task = Arc::new(BgTask {
             start_view: Mutex::new(None),
+            #[cfg(unix)]
+            provider_preflight: Mutex::new(None),
             changed_files: crate::bash_changed_files::current(),
             completion_secrets: Mutex::new(Some(completion_secrets.values)),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
@@ -6584,6 +6612,8 @@ impl BgTaskRegistry {
         let terminal_reader_done = Arc::clone(&runtime.reader_done);
         let task = Arc::new(BgTask {
             start_view: Mutex::new(None),
+            #[cfg(unix)]
+            provider_preflight: Mutex::new(None),
             changed_files: crate::bash_changed_files::current(),
             completion_secrets: Mutex::new(Some(completion_secrets.values)),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
@@ -6958,6 +6988,8 @@ impl BgTaskRegistry {
 
         let task = Arc::new(BgTask {
             start_view: Mutex::new(None),
+            #[cfg(unix)]
+            provider_preflight: Mutex::new(None),
             changed_files: crate::bash_changed_files::current(),
             completion_secrets: Mutex::new(Some(completion_secrets.values)),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
@@ -14116,6 +14148,8 @@ impl BgTaskRegistry {
         wait_on_rehydrated_registration_gate_for_test(&task_id);
         let mut task = BgTask {
             start_view: Mutex::new(None),
+            #[cfg(unix)]
+            provider_preflight: Mutex::new(None),
             changed_files,
             completion_secrets: Mutex::new(
                 metadata

@@ -132,6 +132,59 @@ fn shell_env_provider_custom_end_to_end_and_failure_fallback() {
 }
 
 #[test]
+fn shell_env_provider_hanging_export_still_spawns_in_a_five_second_window() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let base = provider_context(
+        project.path(),
+        storage.path(),
+        crate::config::ShellEnvProviderKind::Custom,
+        vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+    );
+    let mut config = base.config().as_ref().clone();
+    config.foreground_wait_window_ms = 5000;
+    config.shell.env_provider.as_mut().unwrap().timeout_ms = 10000;
+    let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let receipt = std::sync::Arc::new(crate::bash_background::SpawnReceipt::new(
+        std::time::Instant::now() + std::time::Duration::from_millis(5000),
+    ));
+    let mut call = request("provider-short-window", "printf fallback-shell-ran");
+    call.params["params"]["background"] = json!(false);
+    let response =
+        crate::bash_background::with_spawn_receipt(receipt.clone(), || handle(&call, &ctx));
+    assert!(response.success, "{response:?}");
+    assert!(!receipt.refused());
+    let notice = response.data["_bash_env_provider_failure"]
+        .as_str()
+        .unwrap();
+    let reason = notice
+        .strip_prefix("Project environment not loaded (timed out after ")
+        .unwrap();
+    let seconds: f64 = reason.split(" s)").next().unwrap().parse().unwrap();
+    assert!(seconds > 0.0 && seconds <= 4.0, "{notice}");
+    let task_id = response.data["task_id"].as_str().unwrap();
+    let started = std::time::Instant::now();
+    loop {
+        let snapshot = ctx
+            .bash_background()
+            .status(
+                task_id,
+                "sandbox-spawn-test",
+                Some(project.path()),
+                Some(&crate::bash_background::task_storage_dir(&ctx)),
+                4096,
+            )
+            .unwrap();
+        if snapshot.info.status.is_terminal() {
+            assert_eq!(snapshot.output_preview, "fallback-shell-ran");
+            break;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
 fn shell_env_provider_mise_end_to_end() {
     use std::os::unix::fs::PermissionsExt;
     let project = tempfile::tempdir().unwrap();

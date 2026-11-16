@@ -20,6 +20,88 @@ pub(super) fn root() -> &'static Path {
     Path::new(ROOT)
 }
 
+fn provider_root() -> PathBuf {
+    root().join("env-provider")
+}
+
+/// Provider preflights have their own namespace so restart cleanup can inspect
+/// process identities without changing ordinary task scratch retention.
+pub(super) fn create_provider_layout() -> io::Result<PathBuf> {
+    Parent::open(root())?;
+    let parent = Parent::open(&provider_root())?;
+    let identity = crate::bash_background::process::ProcessIdentity::of(std::process::id())
+        .ok_or_else(|| io::Error::other("process start time unavailable"))?;
+    let path = parent.allocate(Path::new(""))?;
+    let owner = parent.path.join(format!(
+        "{}.owner",
+        path.file_name().unwrap().to_string_lossy()
+    ));
+    let result = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(owner)
+        .and_then(|mut file| file.write_all(&serde_json::to_vec(&identity)?));
+    if let Err(error) = result {
+        let _ = remove_provider_layout(&path);
+        return Err(error);
+    }
+    Ok(path)
+}
+
+pub(super) fn remove_provider_layout(path: &Path) -> io::Result<()> {
+    if path.parent() == Some(provider_root().as_path())
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(task_name)
+    {
+        Parent::open(&provider_root())?.remove(path.file_name().unwrap().to_str().unwrap())?;
+    }
+    Ok(())
+}
+
+pub(super) fn sweep_provider_layouts() -> io::Result<()> {
+    if !provider_root().exists() {
+        return Ok(());
+    }
+    sweep_provider_layouts_at(&Parent::open(&provider_root())?)
+}
+
+fn sweep_provider_layouts_at(parent: &Parent) -> io::Result<()> {
+    use crate::bash_background::process::ProcessIdentity;
+    parent.verify_identity()?;
+    for entry in fs::read_dir(&parent.path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str().filter(|name| task_name(name)) else {
+            continue;
+        };
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+            continue;
+        }
+        let owner = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(parent.path.join(format!("{name}.owner")));
+        let Some(owner) = owner
+            .ok()
+            .and_then(|file| serde_json::from_reader::<_, ProcessIdentity>(file.take(1024)).ok())
+        else {
+            continue;
+        };
+        let stale = match ProcessIdentity::of(owner.pid) {
+            Some(current) => current != owner,
+            None => !crate::fs_lock::process_alive(owner.pid),
+        };
+        if stale {
+            parent.remove(name)?;
+        }
+    }
+    Ok(())
+}
+
 struct Parent {
     file: File,
     path: PathBuf,
@@ -169,7 +251,14 @@ fn task_name(name: &str) -> bool {
 }
 
 pub(super) fn is_managed(path: &Path) -> bool {
-    path.parent() == Some(Path::new(ROOT))
+    let provider_parent = path.parent().is_some_and(|parent| {
+        parent.parent() == Some(provider_root().as_path())
+            && parent
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(task_name)
+    });
+    (path.parent() == Some(Path::new(ROOT)) || provider_parent)
         && path
             .file_name()
             .and_then(|name| name.to_str())
@@ -177,6 +266,16 @@ pub(super) fn is_managed(path: &Path) -> bool {
 }
 
 pub(super) fn create(task_io: &Path) -> io::Result<PathBuf> {
+    if let Ok(relative) = task_io.strip_prefix(provider_root()) {
+        if let Some(name) = relative
+            .components()
+            .next()
+            .and_then(|name| name.as_os_str().to_str())
+            .filter(|name| task_name(name))
+        {
+            return Parent::open(&provider_root().join(name))?.allocate(task_io);
+        }
+    }
     static CURSOR: OnceLock<Mutex<Option<ReadDir>>> = OnceLock::new();
     let parent = Parent::open(Path::new(ROOT))?;
     if let Ok(mut cursor) = CURSOR.get_or_init(|| Mutex::new(None)).lock() {
@@ -190,7 +289,7 @@ pub(super) fn remove(path: &Path) -> io::Result<()> {
     if !is_managed(path) {
         return Ok(());
     }
-    Parent::open(Path::new(ROOT))?.remove(path.file_name().unwrap().to_str().unwrap())
+    Parent::open(path.parent().unwrap())?.remove(path.file_name().unwrap().to_str().unwrap())
 }
 
 fn sweep_stale(
@@ -284,6 +383,54 @@ fn sweep_stale(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shell_env_provider_sweep_reclaims_dead_and_reused_owners_only() {
+        use crate::bash_background::process::ProcessIdentity;
+        let fixture = tempfile::tempdir().unwrap();
+        let parent = Parent::open(&fixture.path().join("env-provider")).unwrap();
+        let live = ProcessIdentity::of(std::process::id()).unwrap();
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let dead = ProcessIdentity {
+            pid: child.id(),
+            started_at_ms: 0,
+        };
+        child.wait().unwrap();
+        let reused = ProcessIdentity {
+            started_at_ms: live.started_at_ms + 1,
+            ..live
+        };
+        let mut paths = Vec::new();
+        for identity in [dead, reused, live] {
+            let path = parent.allocate(Path::new("")).unwrap();
+            fs::write(
+                parent.path.join(format!(
+                    "{}.owner",
+                    path.file_name().unwrap().to_string_lossy()
+                )),
+                serde_json::to_vec(&identity).unwrap(),
+            )
+            .unwrap();
+            paths.push(path);
+        }
+        let ordinary = Parent::open(fixture.path())
+            .unwrap()
+            .allocate(Path::new(""))
+            .unwrap();
+        sweep_provider_layouts_at(&parent).unwrap();
+        assert!(!paths[0].exists(), "dead owner must be reclaimed");
+        assert!(
+            !paths[1].exists(),
+            "pid reuse must not preserve old scratch"
+        );
+        assert!(paths[2].exists(), "another live owner must be left alone");
+        assert!(
+            ordinary.exists(),
+            "ordinary task scratch is outside the provider sweep"
+        );
+    }
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
 

@@ -444,6 +444,18 @@ pub(crate) fn changed_files_deadline_for_spawn(
     })
 }
 
+pub(crate) fn provider_startup_remaining() -> Option<std::time::Duration> {
+    CURRENT_SPAWN_RECEIPT.with(|slot| {
+        let receipt = slot.borrow();
+        let receipt = receipt.as_ref()?;
+        Some(
+            receipt
+                .deadline
+                .saturating_duration_since(receipt.reply_clock.now()),
+        )
+    })
+}
+
 pub(crate) fn enter_bash_startup_step(step: BashStartupStep) {
     CURRENT_SPAWN_RECEIPT.with(|slot| {
         if let Some(receipt) = slot.borrow().as_ref() {
@@ -1293,6 +1305,8 @@ pub(crate) fn spawn_with_secrets(
     crate::gh_shim_ticket::mark_spawn_background(require_background_flag || pty);
     let mut start_view = None;
     let mut provider_failure = None;
+    let local_provider =
+        config.shell.env_provider.is_some() && remote.is_none() && host_escalation.is_none();
     let prepare_environment = |plan: &mut crate::sandbox_spawn::SpawnPlan,
                                env: &mut HashMap<String, String>|
      -> Result<_, String> {
@@ -1337,6 +1351,24 @@ pub(crate) fn spawn_with_secrets(
         }
         Ok((view, failure))
     };
+    // With no provider, preserve the original preparation order: profile builders
+    // inspect generated hooks and shim files. Providers need those files ready
+    // too, but their environment export must precede AFT's own added values.
+    if !local_provider {
+        match prepare_environment(&mut crate::sandbox_spawn::SpawnPlan::Unsandboxed, &mut env) {
+            Ok((view, failure)) => {
+                start_view = view;
+                provider_failure = failure;
+            }
+            Err(error) => {
+                return Response::error(request_id, "child_environment_unavailable", error)
+            }
+        }
+    } else if let Err(error) =
+        crate::agent_child_env::maintain(config.as_ref(), &child_storage_root)
+    {
+        return Response::error(request_id, "child_environment_unavailable", error);
+    }
     enter_runon_phase("sandbox_preflight");
     let task_kind = if pty {
         SandboxTaskKind::BashPty
@@ -1396,14 +1428,16 @@ pub(crate) fn spawn_with_secrets(
         if plan.refusal_code().is_some() {
             (plan, Some(task))
         } else {
-            match prepare_environment(&mut plan, &mut env) {
-                Ok((view, failure)) => {
-                    start_view = view;
-                    provider_failure = failure;
-                }
-                Err(error) => {
-                    let _ = persistence::delete_resolved_task(&task);
-                    return Response::error(request_id, "child_environment_unavailable", error);
+            if local_provider {
+                match prepare_environment(&mut plan, &mut env) {
+                    Ok((view, failure)) => {
+                        start_view = view;
+                        provider_failure = failure;
+                    }
+                    Err(error) => {
+                        let _ = persistence::delete_resolved_task(&task);
+                        return Response::error(request_id, "child_environment_unavailable", error);
+                    }
                 }
             }
             let root = project_root.as_deref().unwrap_or(&workdir);
@@ -1456,7 +1490,7 @@ pub(crate) fn spawn_with_secrets(
             host_escalation.as_ref(),
             sandbox_requirement,
         );
-        if plan.refusal_code().is_none() {
+        if local_provider && plan.refusal_code().is_none() {
             match prepare_environment(&mut plan, &mut env) {
                 Ok((view, failure)) => {
                     start_view = view;
@@ -1482,7 +1516,7 @@ pub(crate) fn spawn_with_secrets(
         sandbox_requirement,
     );
     #[cfg(not(unix))]
-    if spawn_plan.refusal_code().is_none() {
+    if local_provider && spawn_plan.refusal_code().is_none() {
         match prepare_environment(&mut spawn_plan, &mut env) {
             Ok((view, failure)) => {
                 start_view = view;
@@ -1616,6 +1650,10 @@ pub(crate) fn spawn_with_secrets(
         )
     };
     #[cfg(unix)]
+    let provider_preflight = cleanup_plan
+        .prepared_task()
+        .and_then(|task| task.take_provider_preflight());
+    #[cfg(unix)]
     if spawn_result.is_ok() {
         if let Some(launch) = secret_launch.as_mut() {
             launch.spawned();
@@ -1629,6 +1667,9 @@ pub(crate) fn spawn_with_secrets(
 
     match spawn_result {
         Ok(task_id) => {
+            #[cfg(unix)]
+            ctx.bash_background()
+                .bind_provider_preflight(&task_id, provider_preflight);
             // A revoke scans the running commands right after it deletes the
             // grant. One whose sandbox was built before that delete but which
             // registered after the scan was missed, so check the grants again
