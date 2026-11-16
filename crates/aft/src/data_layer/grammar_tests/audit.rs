@@ -941,7 +941,17 @@ fn dead_code_gaps() {
             write(
                 &f.root,
                 "plain.ts",
-                "export function searchable() { return 1; }\n",
+                "export function live() { return 1; }\nexport function unused() { return 2; }\n",
+            );
+            write(
+                &f.root,
+                "main.ts",
+                "import { live } from './plain';\nlive();\n",
+            );
+            write(
+                &f.root,
+                "package.json",
+                r#"{"main":"main.ts","type":"module"}"#,
             );
         }
         let _build = crate::data_layer::runtime::hold_builds_for_test(&f.root);
@@ -951,7 +961,21 @@ fn dead_code_gaps() {
         assert!(response.success, "{:?}", response.data);
         let dead = &response.data["summary"]["dead_code"];
         assert_eq!(dead["complete"], false, "{:?}", response.data);
-        if !mixed {
+        if mixed {
+            assert_eq!(dead["code"], "callgraph_off", "{:?}", response.data);
+            assert!(dead.get("count").is_none(), "{:?}", response.data);
+            let exports = &response.data["summary"]["unused_exports"];
+            assert_eq!(exports["count"], 1, "{:?}", response.data);
+            assert!(
+                exports["top"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["file"] == "plain.ts" && item["symbol"] == "unused"),
+                "{:?}",
+                response.data
+            );
+        } else {
             assert_eq!(dead.get("count"), Some(&Value::Null), "{:?}", response.data);
         }
         assert!(dead["gaps"]
