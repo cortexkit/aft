@@ -13298,8 +13298,12 @@ impl BgTaskRegistry {
                 }
             });
             drop(proxies);
+            let removed_proxy = !stopped.is_empty();
             for runtime in stopped {
                 runtime.lock().unwrap_or_else(|p| p.into_inner()).stop();
+            }
+            if removed_proxy {
+                crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
             }
         }
         if let Err(error) = self.stop_scope_tasks(scope, false, None, None) {

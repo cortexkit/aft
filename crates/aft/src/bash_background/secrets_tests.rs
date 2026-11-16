@@ -175,22 +175,31 @@ async fn scope_watch_secret_proxy_arm_and_stop_notify_without_strict_execution()
     lifetime.scope_ref = "secret-bash-run".into();
     let authorization_scope = crate::secret::SecretScope::from_stamp(&authorization);
     let lifetime_scope = crate::secret::SecretScope::from_stamp(&lifetime);
-    let proxy = crate::secret_proxy::SecretProxy::start_for_test(
-        crate::secret_proxy::ProxyConfig {
-            vault: Vault::new(0),
-            authorization_scope: authorization_scope.clone(),
-            lifetime_scope: lifetime_scope.clone(),
-            scanned_labels: vec!["test".into()],
-            consent_context: None,
-            test_https_port: None,
-            approval_clock: None,
-            origin: "scope-watch-unit".into(),
-        },
-        rustls::ClientConfig::builder()
-            .with_root_certificates(rustls::RootCertStore::empty())
-            .with_no_client_auth(),
-    )
-    .unwrap();
+    let runtime = || {
+        let proxy = crate::secret_proxy::SecretProxy::start_for_test(
+            crate::secret_proxy::ProxyConfig {
+                vault: Vault::new(0),
+                authorization_scope: authorization_scope.clone(),
+                lifetime_scope: lifetime_scope.clone(),
+                scanned_labels: vec!["test".into()],
+                consent_context: None,
+                test_https_port: None,
+                approval_clock: None,
+                origin: "scope-watch-unit".into(),
+            },
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        )
+        .unwrap();
+        Arc::new(Mutex::new(Runtime {
+            proxy,
+            bundle: storage.path().join("unused-trust.pem"),
+            lifetime: lifetime_scope.clone(),
+            authorization: authorization_scope.clone(),
+            armed: false,
+        }))
+    };
     let layout = crate::bash_background::persistence::allocate_task_layout(
         storage.path(),
         "scope-watch-unit",
@@ -210,13 +219,7 @@ async fn scope_watch_secret_proxy_arm_and_stop_notify_without_strict_execution()
         &environment,
     )
     .unwrap();
-    prepared.set_secret_runtime(Arc::new(Mutex::new(Runtime {
-        proxy,
-        bundle: storage.path().join("unused-trust.pem"),
-        lifetime: lifetime_scope,
-        authorization: authorization_scope,
-        armed: false,
-    })));
+    prepared.set_secret_runtime(runtime());
     let plan = crate::sandbox_spawn::SpawnPlan::Unsandboxed.with_prepared_task(prepared);
     let registry = ctx.bash_background();
     assert!(registry.secret_authorization_scope_stamps().is_empty());
@@ -236,6 +239,15 @@ async fn scope_watch_secret_proxy_arm_and_stop_notify_without_strict_execution()
     let before_stop = revision(Source::Shell);
     registry.stop_secret_proxy("scope-watch-unit");
     assert!(revision(Source::Shell) > before_stop);
+    assert!(registry.secret_authorization_scope_stamps().is_empty());
+    assert!(registry.live_scope_stamps().is_empty());
+    plan.prepared_task().unwrap().set_secret_runtime(runtime());
+    registry
+        .arm_secret_proxy(&plan, "scope-watch-unit", child.0.id())
+        .unwrap();
+    let before_scope_end = revision(Source::Shell);
+    registry.kill_scope(&lifetime);
+    assert!(revision(Source::Shell) > before_scope_end);
     assert!(registry.secret_authorization_scope_stamps().is_empty());
     assert!(registry.live_scope_stamps().is_empty());
 }
