@@ -93,6 +93,7 @@ export {
 } from "./bash-pattern-ack.js";
 export {
   BASH_PERMISSION_DENIED,
+  BASH_PERMISSION_DENIED_KNOWN,
   BASH_PERMISSION_NOT_SETTLED,
   type BashPermissionAsk,
   BashPermissionLoopError,

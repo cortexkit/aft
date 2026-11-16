@@ -28,6 +28,7 @@ import {
 } from "@cortexkit/aft-bridge";
 import { type ToolContext, tool } from "@opencode-ai/plugin";
 import { Effect } from "effect";
+import { SHELL_REFUSAL_UNKNOWN } from "../../../aft-bridge/src/__tests__/fixtures/bash-permission-refusals.js";
 import { withEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import {
   __resetBgNotificationStateForTests,
@@ -557,23 +558,21 @@ describe("OpenCode bash adapter", () => {
     expect(calls[1].params.permissions_granted).toEqual(["rm *", "/tmp/*"]);
   });
 
-  test("permission loop reports host refusal of all shell command parts without retrying", async () => {
+  test("permission loop reports an unattributed host refusal without retrying", async () => {
     const ask = mockAskDeny("Permission denied: shell");
     const { calls, tool: bash } = createHarness(() => ({
       success: false,
       code: "permission_required",
       asks: [
         { kind: "bash", patterns: ["mkdir -p x"] },
-        { kind: "bash", patterns: ["rm -rf x"] },
+        { kind: "bash", patterns: ["git ls-tree HEAD src"] },
       ],
     }));
     const error = await bash
-      .execute({ command: "mkdir -p x && rm -rf x" }, createMockSdkContext({ ask }))
+      .execute({ command: "mkdir -p x && git ls-tree HEAD src" }, createMockSdkContext({ ask }))
       .catch((error) => error);
     expect(error).toBeInstanceOf(BashPermissionLoopError);
-    expect(error.message).toBe(
-      "Permission denied for this shell command: mkdir -p x, rm -rf x (Permission denied: shell). The parts are checked together, so one denied part denies the whole command; run the allowed parts in a separate call.",
-    );
+    expect(error.message).toBe(SHELL_REFUSAL_UNKNOWN);
     expect(error.cause).toBeInstanceOf(Error);
     expect(error.cause.message).toBe("Permission denied: shell");
     expect(calls).toHaveLength(1);

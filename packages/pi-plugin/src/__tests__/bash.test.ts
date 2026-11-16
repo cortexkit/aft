@@ -24,6 +24,7 @@ import {
 } from "@cortexkit/aft-bridge";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { Container, Text } from "@earendil-works/pi-tui";
+import { SHELL_REFUSAL_UNKNOWN } from "../../../aft-bridge/src/__tests__/fixtures/bash-permission-refusals.js";
 import {
   __resetBgNotificationStateForTests,
   appendToolResultBgCompletions,
@@ -2006,7 +2007,53 @@ describe("bash tool adapter", () => {
       .catch((error) => error);
     expect(error).toBeInstanceOf(BridgeError);
     expect(error.message).toBe(
-      `Permission denied for this shell command: mkdir -p x && rm -rf x @ ${projectRoot} (Permission denied: unsandboxed host execution was denied). The parts are checked together, so one denied part denies the whole command; run the allowed parts in a separate call.`,
+      `Permission denied for this shell command: one or more of these parts was denied: \`mkdir -p x && rm -rf x @ ${projectRoot}\` (Permission denied: unsandboxed host execution was denied). The parts are checked together, so one denied part denies the whole command; run the allowed parts in a separate call.`,
+    );
+    expect(error.code).toBe("permission_denied");
+    expect(calls).toHaveLength(1);
+    expect(approvals).toBe(1);
+  });
+
+  test("permission loop uses the shared unknown refusal without rule data", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const parts = ["mkdir -p x", "git ls-tree HEAD src"];
+    const { bridge, calls } = makeTrackableMockBridge({
+      success: false,
+      code: "permission_required",
+      asks: parts.map((command, index) => ({
+        kind: "escalation",
+        command,
+        grant_id: `esc_${index}`,
+      })),
+    });
+    registerBashTool(makeMockApi(tools), makeMockContext(bridge));
+    let approvals = 0;
+    const extCtx: MockExtensionContext = {
+      cwd: projectRoot,
+      hasUI: true,
+      ui: {
+        confirm: async () => {
+          approvals++;
+          return false;
+        },
+      },
+    };
+    const error = await tools
+      .get("bash")!
+      .execute(
+        "denied",
+        { command: parts.join(" && "), sandbox: "host" },
+        undefined,
+        undefined,
+        extCtx,
+      )
+      .catch((error) => error);
+    expect(error).toBeInstanceOf(BridgeError);
+    expect(error.message).toBe(
+      SHELL_REFUSAL_UNKNOWN.replace(
+        "Permission denied: shell",
+        "Permission denied: unsandboxed host execution was denied",
+      ),
     );
     expect(error.code).toBe("permission_denied");
     expect(calls).toHaveLength(1);

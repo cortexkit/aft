@@ -18,6 +18,12 @@ import { resolve } from "node:path";
 import { BashPermissionLoopError, type BridgePool } from "@cortexkit/aft-bridge";
 import { Error as ToolError } from "@opencode/plugin/promise/tool";
 import { Cause, Effect, Schema } from "effect";
+import {
+  SHELL_REFUSAL_ALL_DENIED,
+  SHELL_REFUSAL_KNOWN,
+  SHELL_REFUSAL_TWO_DENIED,
+  SHELL_REFUSAL_UNKNOWN,
+} from "../../../aft-bridge/src/__tests__/fixtures/bash-permission-refusals.js";
 
 import { executeV2Bash } from "../tools/bash/executor.js";
 import { createBashTool } from "../tools/bash.js";
@@ -25,13 +31,14 @@ import { hostPermissionRefusal, projectV2Tool } from "../tools/definitions/v2.js
 import type { PluginContext } from "../types.js";
 
 const PROJECT_CWD = resolve(import.meta.dir, "../../../..");
-const COMMAND = "touch denied";
-const REFUSAL_TAIL =
-  "The parts are checked together, so one denied part denies the whole command; run the allowed parts in a separate call.";
-/** AFT's refusal text for a deny rule, as the model sees it today. */
-const RULE_REFUSAL = `Permission denied for this shell command: touch denied (Permission denied: shell). ${REFUSAL_TAIL}`;
+const COMMAND = "git ls-tree HEAD src";
+const PARTS = ["mkdir -p x", COMMAND];
+const RULE_REFUSAL = SHELL_REFUSAL_KNOWN;
 /** AFT's refusal text when the person rejects the prompt with feedback. */
-const FEEDBACK_REFUSAL = `Permission denied for this shell command: touch denied (Use a narrower path). ${REFUSAL_TAIL}`;
+const FEEDBACK_REFUSAL = SHELL_REFUSAL_UNKNOWN.replace(
+  "Permission denied: shell",
+  "Use a narrower path",
+);
 
 // The host's permission errors, which the plugin API does not export. Same
 // fields and message as @opencode/core 2.1.0 `src/permission.ts`
@@ -78,11 +85,11 @@ class UnbuildableBlockedError extends Error {
   }
 }
 
-const RULES = [{ action: "shell", resource: "touch *", effect: "deny" }];
+const RULES = [{ action: "shell", resource: "git ls-tree *", effect: "deny" }];
 
 /** What the plugin's `permission.assert` fails with on a deny rule (host.ts:432-436). */
 function ruleDenial(
-  blocked: Error = new BlockedError({ rules: RULES, permission: "shell", resources: [COMMAND] }),
+  blocked: Error = new BlockedError({ rules: RULES, permission: "shell", resources: PARTS }),
 ) {
   return new ToolError({ message: blocked.message, error: blocked });
 }
@@ -125,14 +132,17 @@ function hostFiling(failure: unknown): { type: string; message: string } {
 }
 
 /** Run the shipped bash tool on OpenCode 2 against a host that refuses with `refusal`. */
-async function refusedShell(refusal: unknown): Promise<unknown> {
+async function refusedShell(refusal: unknown, parts = PARTS): Promise<unknown> {
+  let requests = 0;
+  let approvals = 0;
   const bridge = {
     send: async (command: string) => {
       if (command !== "bash") return { success: true };
+      requests++;
       return {
         success: false,
         code: "permission_required",
-        asks: [{ kind: "bash", patterns: [COMMAND], always: ["touch *"] }],
+        asks: parts.map((part) => ({ kind: "bash", patterns: [part], always: [part] })),
       };
     },
   };
@@ -151,14 +161,16 @@ async function refusedShell(refusal: unknown): Promise<unknown> {
     { directory: PROJECT_CWD },
     {
       executeBash: executeV2Bash,
-      requestPermission: async () => {
+      requestPermission: async (request) => {
+        approvals++;
+        expect(request).toMatchObject({ permission: "shell", patterns: parts });
         throw refusal;
       },
     },
   );
   const exit = await Effect.runPromiseExit(
     projected.execute(
-      { command: COMMAND },
+      { command: parts.join(" && ") },
       {
         sessionID: "shell-refusal",
         messageID: "message",
@@ -167,6 +179,8 @@ async function refusedShell(refusal: unknown): Promise<unknown> {
       },
     ),
   );
+  expect(requests).toBe(1);
+  expect(approvals).toBe(1);
   if (exit._tag !== "Failure") throw new Error("the refused shell call succeeded");
   return Cause.squash(exit.cause);
 }
@@ -178,9 +192,37 @@ describe("OpenCode 2 shell permission refusal", () => {
     expect(failure).toBeInstanceOf(ToolError);
     const blocked = (failure as ToolError).error;
     expect(blocked).toBeInstanceOf(BlockedError);
-    expect(blocked).toMatchObject({ rules: RULES, permission: "shell", resources: [COMMAND] });
+    expect(blocked).toMatchObject({ rules: RULES, permission: "shell", resources: PARTS });
     expect((failure as ToolError).message).toBe(RULE_REFUSAL);
     expect(hostFiling(failure)).toEqual({ type: "permission.rejected", message: RULE_REFUSAL });
+  });
+
+  test.each([
+    [
+      "two denied parts",
+      [...PARTS, "git show HEAD"],
+      [...RULES, { action: "shell", resource: "git show *", effect: "deny" }],
+      SHELL_REFUSAL_TWO_DENIED,
+    ],
+    [
+      "all parts denied",
+      PARTS,
+      [{ action: "shell", resource: "*", effect: "deny" }],
+      SHELL_REFUSAL_ALL_DENIED,
+    ],
+    [
+      "no matching deny rules",
+      PARTS,
+      [{ action: "shell", resource: "git diff *", effect: "deny" }],
+      SHELL_REFUSAL_UNKNOWN,
+    ],
+    ["no rules", PARTS, [], SHELL_REFUSAL_UNKNOWN],
+  ])("renders %s as the host's permission rejection", async (_label, parts, rules, expected) => {
+    const failure = await refusedShell(
+      ruleDenial(new BlockedError({ rules, permission: "shell", resources: parts })),
+      parts,
+    );
+    expect(hostFiling(failure)).toEqual({ type: "permission.rejected", message: expected });
   });
 
   test("a rejection with feedback is filed as a permission rejection with AFT's text", async () => {
@@ -200,22 +242,22 @@ describe("OpenCode 2 shell permission refusal", () => {
       () =>
         new ToolError({
           message: "Permission denied: shell",
-          error: { _tag: "Permission.BlockedError", permission: "shell", resources: [COMMAND] },
+          error: { _tag: "Permission.BlockedError", permission: "shell", resources: PARTS },
         }),
-      RULE_REFUSAL,
+      SHELL_REFUSAL_UNKNOWN,
     ],
     [
       "a blocked error whose message ignores its reason",
       () =>
         ruleDenial(
-          new ReasonlessBlockedError({ rules: RULES, permission: "shell", resources: [COMMAND] }),
+          new ReasonlessBlockedError({ rules: RULES, permission: "shell", resources: PARTS }),
         ),
       RULE_REFUSAL,
     ],
     [
       "a blocked error that cannot be rebuilt with AFT's fields",
       () => ruleDenial(new UnbuildableBlockedError()),
-      RULE_REFUSAL,
+      SHELL_REFUSAL_UNKNOWN,
     ],
     [
       "a Tool.Error without a permission error inside",
@@ -230,11 +272,11 @@ describe("OpenCode 2 shell permission refusal", () => {
         });
         return new ToolError({ message: "Permission denied: shell", error: notFound });
       },
-      RULE_REFUSAL,
+      SHELL_REFUSAL_UNKNOWN,
     ],
   ];
   for (const [label, refusal, text] of fallbacks) {
-    test(`keeps today's error and text for ${label}`, async () => {
+    test(`keeps the plain error with AFT's refusal text for ${label}`, async () => {
       const failure = await refusedShell(refusal());
 
       expect(failure).toBeInstanceOf(BashPermissionLoopError);
