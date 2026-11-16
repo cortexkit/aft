@@ -70,6 +70,7 @@ pub fn fetch(
     fetch_timed(manifest, transport, &|| start.elapsed())
 }
 
+test_support_visibility! {
 pub(super) fn fetch_timed(
     manifest: &GrammarManifest,
     transport: &dyn Transport,
@@ -138,4 +139,5 @@ pub(super) fn fetch_timed(
         };
     }
     Err(DownloadFailure::Network)
+}
 }
