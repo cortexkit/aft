@@ -268,7 +268,8 @@ async fn run_display_case(switch: Option<&str>) {
         "health report exceeded 12 KiB"
     );
     let response: ModuleControlResponse = serde_json::from_slice(&report.body).unwrap();
-    let metrics = response.health_report().unwrap().metrics.as_ref().unwrap();
+    let report = response.health_report().unwrap();
+    let metrics = report.metrics.as_ref().unwrap();
     let display = &metrics["display"];
     assert_eq!(display["enabled"], switch != Some("0"));
     if switch == Some("0") {
