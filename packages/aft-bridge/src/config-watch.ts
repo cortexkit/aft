@@ -143,6 +143,7 @@ export function aftLiveConfigKeys<C>(
     bashKey<C>("foreground_wait_window_ms", resolveBash),
     bashKey<C>("host_fallback", resolveBash),
     pathKey<C>("remote_exec.enabled"),
+    pathKey<C>("remote_exec.project_off"),
     bashKey<C>("subagent_background", resolveBash),
     bashKey<C>("watch_sync_max_ms", resolveBash),
     bashKey<C>("worker_wait_max_ms", resolveBash),

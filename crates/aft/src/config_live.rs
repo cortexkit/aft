@@ -1030,10 +1030,12 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     later!("github.write", github.write);
     later!("gh_shim.binary_path", gh_shim.binary_path);
     live!("git.co_author", git.co_author);
-    // Whether `runon` is offered is decided once per host process (the head
-    // plugins build bash's arguments at startup), so a change waits for a
-    // restart rather than refusing calls the surface still offers.
-    later!("remote_exec", remote_exec);
+    // The user switch and project refusal apply to the next call, even if
+    // the caller still holds a catalog that offered runon. A later catalog
+    // fetch reflects the new switch; the runner default waits for reconnect.
+    live!("remote_exec.enabled", remote_exec.enabled);
+    live!("remote_exec.project_off", remote_exec.project_off);
+    later!("remote_exec.default_demand", remote_exec.default_demand);
 
     // `aft_search_registered` is derived from `disabled_tools`, which is
     // deferred, so it is never copied.
@@ -1104,7 +1106,7 @@ fn classification_is_exhaustive(config: &Config) {
         github,
         gh_shim: _,
         git: _,
-        remote_exec: _,
+        remote_exec,
         experimental_lsp_ty: _,
         lsp_servers: _,
         disabled_lsp: _,
@@ -1138,6 +1140,11 @@ fn classification_is_exhaustive(config: &Config) {
         runon_env: _,
     } = bash;
     let crate::config::ShellConfig { env_provider: _ } = shell;
+    let crate::config::RemoteExecConfig {
+        enabled: _,
+        project_off: _,
+        default_demand: _,
+    } = remote_exec;
     let crate::config::SandboxConfig {
         profile: _,
         write_allow: _,

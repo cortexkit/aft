@@ -1373,6 +1373,46 @@ mod catalog_runon_log_tests {
     }
 
     #[test]
+    fn live_remote_switch_refuses_before_refetch_and_new_catalog_reflects_reenable() {
+        let case = Case::enabled();
+        let published = case.ctx.config();
+        let mut candidate = (*published).clone();
+        candidate.remote_exec.enabled = false;
+        let off = crate::config_live::apply_live_config(&published, &candidate, &published);
+        case.ctx.update_config(|config| *config = off.next);
+        // A stale catalog must not keep runon usable after the user turns it off.
+        assert_eq!(
+            crate::bash_background::remote_for_runon(
+                &case.ctx.config(),
+                "linux",
+                false,
+                false,
+                false
+            )
+            .unwrap_err(),
+            "runon is disabled by the user setting remote_exec.enabled"
+        );
+        let off_catalog = catalog(json!({"preset":"worker"}), &case.route, &case.ctx).unwrap();
+        assert!(
+            bash_catalog_entry(&off_catalog)["input_schema"]["properties"]
+                .get("runon")
+                .is_none()
+        );
+        let on = crate::config_live::apply_live_config(&case.ctx.config(), &published, &published);
+        case.ctx.update_config(|config| *config = on.next);
+        assert!(
+            bash_catalog_entry(&off_catalog)["input_schema"]["properties"]
+                .get("runon")
+                .is_none()
+        );
+        let refreshed = catalog(json!({"preset":"worker"}), &case.route, &case.ctx).unwrap();
+        assert_eq!(
+            bash_catalog_entry(&refreshed)["input_schema"]["properties"]["runon"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
     fn user_remote_exec_gate() {
         let case = Case::enabled();
         case.ctx
