@@ -195,12 +195,12 @@ const PLUGIN_VERSION: string = resolvePluginVersion(import.meta.url);
  * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
  * will not re-show it.
  */
-const ANNOUNCEMENT_VERSION = "0.65.0";
+const ANNOUNCEMENT_VERSION = "0.66.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "OpenCode 2: AFT's read-only tools also work inside Code Mode as `tools.aft.code.*`.",
-  "TypeScript monorepos run one language server per TypeScript version instead of one per package; `lsp.max_servers` caps the total.",
-  "Search and grep stay light on large growing files, and shell waits survive the computer going to sleep.",
-  "`views.enabled`, `views.callgraph_copies` and `worktree.ram_overlay` are now refused in user config; `npx @cortexkit/aft doctor --fix` removes them.",
+  "Large projects' first index build now fits in a few gigabytes of memory, and resumes after an interruption.",
+  "Luau support: outlines, navigation, call graphs and search for Luau and Roblox projects.",
+  "Opt-in per-project shell environments: set `shell.env_provider` to `mise`, `direnv` or your own command.",
+  "Existing call graphs rebuild once after this upgrade; on macOS, set `durability.macos_full_sync: true` to restore full drive flushes.",
 ];
 
 /**
