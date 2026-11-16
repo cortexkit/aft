@@ -360,6 +360,71 @@ async fn scope_watch_slow_verification_confirms_a_lost_push_and_counts_it() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn scope_watch_verification_shared_epochs_keep_one_ref_cooldown_across_rearm() {
+    let (control, pending, mut frames) = control(&["scope.describe", "scope.watch"]);
+    let scope = stamp(0);
+    let mut newer = scope.clone();
+    newer.scope_epoch = 2;
+    let source = vec![scope.clone(), newer];
+    let (_handle, _ended, worker) = start_with_scope_source(
+        control.clone(),
+        Arc::new(Executor::new()),
+        Duration::from_secs(60),
+        move || std::future::ready(source.clone()),
+    );
+    let watch = request(&mut frames, "scope.watch").await;
+    snapshot(&pending, &watch);
+    let query = request(&mut frames, "scope.describe").await;
+    response(
+        &pending,
+        &query,
+        answer(&scope, subc_protocol::scope::ScopeStatus::Live, 2),
+    );
+    let rearm = request(&mut frames, "scope.watch").await;
+    assert_eq!(snapshot(&pending, &rearm), 1);
+    let query = request(&mut frames, "scope.describe").await;
+    response(
+        &pending,
+        &query,
+        answer(&scope, subc_protocol::scope::ScopeStatus::Live, 2),
+    );
+    turns().await;
+    tokio::time::advance(scope_watch::VERIFY_INTERVAL / 2).await;
+    let query = request(&mut frames, "scope.describe").await;
+    response(
+        &pending,
+        &query,
+        answer(&scope, subc_protocol::scope::ScopeStatus::Live, 2),
+    );
+    turns().await;
+    tokio::time::advance(scope_watch::VERIFY_INTERVAL / 2).await;
+    turns().await;
+    assert!(
+        frames.try_recv().is_err(),
+        "the other retained epoch must share the first epoch's verification cooldown"
+    );
+    tokio::time::advance(scope_watch::VERIFY_INTERVAL / 2).await;
+    let query = request(&mut frames, "scope.describe").await;
+    response(
+        &pending,
+        &query,
+        answer(&scope, subc_protocol::scope::ScopeStatus::Live, 2),
+    );
+    turns().await;
+    assert_eq!(
+        control
+            .metrics
+            .scope_descriptions
+            .lock()
+            .unwrap()
+            .scope_watch_health()["verifications"],
+        2
+    );
+    worker.abort();
+    let _ = worker.await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn scope_watch_probe_panic_releases_the_ref_and_pending_keys() {
     let (control, pending, mut frames) = control(&["scope.describe", "scope.watch"]);
     control.panic_next_describe.store(true, Ordering::Relaxed);

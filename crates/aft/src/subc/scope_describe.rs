@@ -347,6 +347,8 @@ where
                     .any(|(key, _, _)| verification_keys.contains(key))
                 {
                     watches.health.verifications += 1;
+                    // One owner/ref probe also verifies its retained epochs.
+                    verifications.verified(group.iter().map(|(key, _, _)| key.clone()));
                 }
                 for (key, _, _) in &group {
                     verification_keys.remove(key);

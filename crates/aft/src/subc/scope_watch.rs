@@ -83,6 +83,12 @@ impl Verifications {
         self.slot = Some(now + VERIFY_INTERVAL / self.active.len() as u32);
         Some(key)
     }
+    pub(super) fn verified(&mut self, keys: impl Iterator<Item = Key>) {
+        let next = tokio::time::Instant::now() + VERIFY_INTERVAL;
+        for key in keys {
+            self.due.insert(key, next);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
