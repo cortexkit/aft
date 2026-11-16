@@ -8393,7 +8393,8 @@ async fn read_raw_inventory_frame(stream: &mut tokio::net::TcpStream, label: &st
             assert_eq!(frame.header.ty, FrameType::Request);
             assert_eq!(frame.header.channel, 0);
             // These inventory fixtures model a polling-only daemon.
-            // Refuse every watch attempt, including retries after an ack.
+            // Refuse every watch attempt, including retries after a status
+            // publication is acknowledged.
             send_channel_zero_error(stream, frame.header.corr, "unknown_op").await;
         }
     })
