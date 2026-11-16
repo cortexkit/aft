@@ -173,8 +173,8 @@ async fn scope_watch_secret_proxy_arm_and_stop_notify_without_strict_execution()
     let authorization = stamp("head");
     let mut lifetime = stamp("ephemeral");
     lifetime.scope_ref = "secret-bash-run".into();
-    let authorization_scope = crate::secret::SecretScope::from_stamp(&authorization).unwrap();
-    let lifetime_scope = crate::secret::SecretScope::from_stamp(&lifetime).unwrap();
+    let authorization_scope = crate::secret::SecretScope::from_stamp(&authorization);
+    let lifetime_scope = crate::secret::SecretScope::from_stamp(&lifetime);
     let proxy = crate::secret_proxy::SecretProxy::start_for_test(
         crate::secret_proxy::ProxyConfig {
             vault: Vault::new(0),
