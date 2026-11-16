@@ -5598,6 +5598,39 @@ mod tests {
         }
     }
 
+    fn health_section_sizes(label: &str, metrics: &serde_json::Map<String, Value>) {
+        let sizes = metrics
+            .iter()
+            .map(|(key, value)| (key.clone(), json!(serde_json::to_vec(value).unwrap().len())))
+            .collect::<serde_json::Map<_, _>>();
+        eprintln!("{label}: {}", json!(sizes));
+    }
+
+    #[test]
+    fn health_building_fleet_keeps_process_sections() {
+        for count in [52, 100] {
+            let mut metrics = recovered_overflow_health_fleet();
+            let roots = (0..count)
+                .map(|index| {
+                    json!({
+                        "project_root": format!("/Users/worker/Work/Projects/project-{index:03}"),
+                        "state": "warming",
+                        "search_index": {"status": "ready"},
+                        "semantic_index": {"status": "ready"},
+                        "tier2": {"status": "ready"},
+                        "callgraph_store": {"status": "building"}
+                    })
+                })
+                .collect::<Vec<_>>();
+            metrics.insert("roots".into(), json!(roots));
+            metrics.insert("root_count".into(), json!(count));
+            metrics.insert("root_details_omitted".into(), json!(0));
+            health_section_sizes(&format!("{count}-building before"), &metrics);
+            budget_health_metrics(&mut metrics);
+            health_section_sizes(&format!("{count}-building after"), &metrics);
+        }
+    }
+
     #[test]
     fn health_live_fleet_keeps_process_sections_and_all_five_abnormal_roots() {
         let (_, mut metrics) =
@@ -5686,7 +5719,15 @@ mod tests {
             metrics: Some(json!(metrics)),
         };
         let before = serde_json::to_vec(&report).unwrap().len();
+        health_section_sizes(
+            "95-root before",
+            report.metrics.as_ref().unwrap().as_object().unwrap(),
+        );
         budget_health_report(&mut report);
+        health_section_sizes(
+            "95-root after",
+            report.metrics.as_ref().unwrap().as_object().unwrap(),
+        );
         let after = serde_json::to_vec(&report).unwrap().len();
         let metrics = report.metrics.as_ref().unwrap();
         eprintln!("95-actor / 42-bound-root health: raw_reply={before}, budgeted_reply={after}, metrics_bytes={}, omitted={}",
