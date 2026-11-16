@@ -461,6 +461,29 @@ pub fn end_scope_grants(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<(
     Ok(())
 }
 
+/// Preserve per-row decoding errors so one corrupt row cannot hide other saved
+/// scopes from the lifecycle census.
+pub(crate) fn saved_scopes(conn: &Connection) -> rusqlite::Result<Vec<rusqlite::Result<ScopeKey>>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT owner,scope_ref,epoch FROM access_grants")?;
+    let rows = stmt
+        .query_map([], |row| {
+            let epoch: String = row.get(2)?;
+            Ok(ScopeKey {
+                owner: row.get(0)?,
+                scope_ref: row.get(1)?,
+                epoch: epoch.parse().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+            })
+        })?
+        .collect();
+    Ok(rows)
+}
+
 /// Keyset pagination bounds housekeeping work, not a tool's result list.
 pub(crate) fn saved_scope_batch(
     conn: &Connection,

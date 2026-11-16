@@ -550,6 +550,8 @@ pub(super) struct DaemonControl {
     pending: PendingControlReplies,
     next_corr: AtomicU64,
     describe_slots: tokio::sync::Semaphore,
+    #[cfg(test)]
+    pub(super) panic_next_describe: std::sync::atomic::AtomicBool,
 }
 
 impl DaemonControl {
@@ -614,6 +616,8 @@ impl DaemonControl {
             pending,
             next_corr: AtomicU64::new(first_corr),
             describe_slots: tokio::sync::Semaphore::new(4),
+            #[cfg(test)]
+            panic_next_describe: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -634,6 +638,10 @@ impl DaemonControl {
         &self,
         stamp: &subc_protocol::scope::ScopeStamp,
     ) -> Result<ModuleControlResponseToModule, ControlError> {
+        #[cfg(test)]
+        if self.panic_next_describe.swap(false, Ordering::Relaxed) {
+            panic!("injected scope describe task panic");
+        }
         const OP: &str = subc_protocol::scope::SCOPE_DESCRIBE_OP;
         if !self.advertises(OP) {
             return Err(ControlError::NotAdvertised(OP));

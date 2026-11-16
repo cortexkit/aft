@@ -632,8 +632,11 @@ fn validate_tool_result_source(
 }
 
 /// Scope identities retained by calls that have not settled, including held
-/// calls without a route or a running shell task.
-pub(crate) fn unsettled_scopes(conn: &Connection) -> rusqlite::Result<Vec<ScopeIdentity>> {
+/// calls without a route or a running shell task. Row errors are returned
+/// individually so housekeeping can skip malformed rows without losing peers.
+pub(crate) fn unsettled_scopes(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<rusqlite::Result<ScopeIdentity>>> {
     let mut statement = conn.prepare("SELECT DISTINCT owner,scope_ref,scope_epoch FROM call_ledger WHERE state IN ('Prepared','Authorized','DispatchStarted') AND owner IS NOT NULL AND scope_ref IS NOT NULL AND scope_epoch IS NOT NULL")?;
     let scopes = statement
         .query_map([], |row| {
@@ -644,7 +647,7 @@ pub(crate) fn unsettled_scopes(conn: &Connection) -> rusqlite::Result<Vec<ScopeI
             })
         })?
         .collect();
-    scopes
+    Ok(scopes)
 }
 
 /// Atomically settle Prepared and Authorized calls as scope-ended.

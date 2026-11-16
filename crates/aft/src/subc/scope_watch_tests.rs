@@ -5,6 +5,9 @@ use subc_client_rs::{
     ScopeWatchStatus,
 };
 
+#[path = "scope_watch_audit_tests.rs"]
+mod audit;
+
 fn stamp(index: usize) -> ScopeStamp {
     ScopeStamp::new(
         subc_protocol::Principal::Direct,

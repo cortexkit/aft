@@ -105,6 +105,22 @@ pub(super) struct EndedScope {
     pub(super) keys: Vec<crate::db::call_ledger::Key>,
 }
 
+fn trigger_describe(
+    key: scope_watch::Key,
+    stamp: ScopeStamp,
+    pending: &mut HashSet<scope_watch::Key>,
+    queued: &mut HashMap<scope_watch::Key, ScopeStamp>,
+    retrigger: &mut HashSet<scope_watch::Key>,
+) {
+    if pending.insert(key.clone()) {
+        queued.insert(key, stamp);
+    } else {
+        retrigger.insert(key);
+    }
+}
+type ScopeReference = (String, String);
+type ProbeGroup = Vec<(scope_watch::Key, ScopeStamp, bool)>;
+
 #[cfg(test)]
 #[allow(
     dead_code,
@@ -194,10 +210,7 @@ where
         }));
     }
     let worker = tokio::spawn(async move {
-        let (coverage, covered) = tokio::sync::watch::channel(scope_watch::Coverage {
-            keys: HashSet::new(),
-            all: control.advertises(subc_control::ops::SCOPE_WATCH),
-        });
+        let (coverage, covered) = tokio::sync::watch::channel(scope_watch::Coverage::default());
         let mut grant_sweep = Box::pin(access_grants::sweep::run(
             control.clone(),
             executor.clone(),
@@ -210,38 +223,81 @@ where
         let mut queued: HashMap<scope_watch::Key, ScopeStamp> = HashMap::new();
         let mut retry = HashMap::new();
         let mut pending = HashSet::new();
+        let mut retrigger = HashSet::new();
+        let mut verification_keys = HashSet::new();
         let mut confirmed = HashSet::new();
         let mut speech_pending = HashSet::new();
+        let mut cleanup_keys = HashSet::new();
         let mut next_poll: HashMap<_, tokio::time::Instant> = HashMap::new();
         // Only unix refreshes the set from secret proxy authorizations.
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut secret_authorizations: HashSet<(String, String, u64)> = HashSet::new();
         let mut inflight = tokio::task::JoinSet::new();
-        let mut inflight_refs: HashSet<(String, String)> = HashSet::new();
+        let mut inflight_jobs: HashMap<tokio::task::Id, (ScopeReference, ProbeGroup)> =
+            HashMap::new();
+        let mut inflight_refs: HashSet<ScopeReference> = HashSet::new();
         let mut fanout = tokio::task::JoinSet::new();
         let mut next_scan = tokio::time::Instant::now() + interval;
         let mut next_backstop = tokio::time::Instant::now() + scope_watch::BACKSTOP;
         let mut inventory = scope_watch::Inventory::default();
         let mut inventory_revision = scope_watch::revisions();
-        let mut dirty = true;
+        let mut refresh = scope_watch::Refresh::new();
+        let mut verifications = scope_watch::Verifications::default();
         let mut watches = scope_watch::Watches::new(control.metrics.clone());
         loop {
             let changed = scope_watch::notifier().notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            dirty |= scope_watch::revisions() != inventory_revision;
-            if dirty {
+            if scope_watch::revisions() != inventory_revision {
+                refresh.changed();
+            }
+            if refresh.due() {
                 inventory_revision = scope_watch::revisions();
                 let mut refreshed = scope_source().await;
                 refreshed.retain_unread(&inventory);
                 inventory = refreshed;
-                dirty = false;
+                refresh.at = None;
             }
             let mut held_scopes = inventory.scopes();
+            speech_pending
+                .retain(|key| held_scopes.contains_key(key) || cleanup_keys.contains(key));
+            confirmed.retain(|key| {
+                held_scopes.contains_key(key)
+                    || cleanup_keys.contains(key)
+                    || speech_pending.contains(key)
+            });
+            next_poll.retain(|key, _| held_scopes.contains_key(key) && !confirmed.contains(key));
+            retry.retain(|key, _| held_scopes.contains_key(key) && !confirmed.contains(key));
+            retrigger.retain(|key| held_scopes.contains_key(key) && !confirmed.contains(key));
+            verification_keys
+                .retain(|key| held_scopes.contains_key(key) && !confirmed.contains(key));
+            queued.retain(|key, _| held_scopes.contains_key(key) && !confirmed.contains(key));
+            let active_keys: HashSet<_> = inflight_jobs
+                .values()
+                .flat_map(|(_, group)| group.iter().map(|(key, _, _)| key.clone()))
+                .collect();
+            pending.retain(|key| queued.contains_key(key) || active_keys.contains(key));
             held_scopes.retain(|key, _| !confirmed.contains(key));
             watches.reconcile(&held_scopes, &control, interval);
             let protected = watches.coverage(held_scopes.len());
             let protected_keys = &protected.keys;
+            verifications.reconcile(protected_keys, &held_scopes);
+            if let Some(key) = verifications.take_due() {
+                if let Some(stamp) = held_scopes.get(&key) {
+                    verification_keys.insert(key.clone());
+                    trigger_describe(
+                        key,
+                        stamp.clone(),
+                        &mut pending,
+                        &mut queued,
+                        &mut retrigger,
+                    );
+                }
+            }
+            watches.health.skipped_grant_rows = inventory.skipped[0];
+            watches.health.skipped_held_rows = inventory.skipped[1];
+            watches.health.poll_keys = next_poll.len();
+            watches.health.confirmed_cleanup = confirmed.len();
             coverage.send_replace(protected.clone());
             control
                 .metrics
@@ -286,19 +342,29 @@ where
                         (key, stamp, full)
                     })
                     .collect();
+                if group
+                    .iter()
+                    .any(|(key, _, _)| verification_keys.contains(key))
+                {
+                    watches.health.verifications += 1;
+                }
+                for (key, _, _) in &group {
+                    verification_keys.remove(key);
+                }
                 let control = control.clone();
                 // Persisted grants and held rows have only owner/ref/epoch,
                 // not a full speech authority stamp. Their ordinary cleanup
                 // still requires the daemon's definitive describe answer.
                 let speech = speech.clone();
-                inflight.spawn(async move {
+                let task_group = group.clone();
+                let job = inflight.spawn(async move {
                     let sent = std::time::Instant::now();
                     let generation = speech
                         .as_ref()
                         .map(|service| service.generation())
                         .unwrap_or_default();
                     let reply = control.describe(&stamp).await;
-                    for (_, stamp, full) in &group {
+                    for (_, stamp, full) in &task_group {
                         control
                             .metrics
                             .scope_descriptions
@@ -317,8 +383,9 @@ where
                             );
                         }
                     }
-                    (reference, group, reply, generation)
+                    (reply, generation)
                 });
+                inflight_jobs.insert(job.id(), (reference, group));
             }
             let routed_now = routed
                 .lock()
@@ -345,31 +412,46 @@ where
             let wake_at = watches
                 .next_retry()
                 .map_or(wake_at, |retry| retry.min(wake_at));
+            let wake_at = verifications
+                .deadline()
+                .map_or(wake_at, |due| due.min(wake_at));
+            let wake_at = refresh.at.map_or(wake_at, |due| due.min(wake_at));
             tokio::select! {
-                () = &mut changed => { dirty = true; }
+                () = &mut changed => { refresh.changed(); }
                 Some(event) = watches.receiver.recv() => {
                     for key in watches.event(event, held_scopes.len()) {
                         if let Some(stamp) = held_scopes.get(&key) {
-                            if !confirmed.contains(&key) && pending.insert(key.clone()) { queued.insert(key, stamp.clone()); }
+                            if !confirmed.contains(&key) { trigger_describe(key, stamp.clone(), &mut pending, &mut queued, &mut retrigger); }
                         }
                     }
                 }
                 () = &mut grant_sweep => unreachable!("saved grant sweep runs until cancelled"),
                 Some(stamp)=observations.recv()=>{
                     if let Some(service)=&speech { if speech_pending.remove(&stamp_key(&stamp)) || confirmed.insert(stamp_key(&stamp)) {
+                        let key = stamp_key(&stamp);
+                        cleanup_keys.insert(key.clone());
                         accept_confirmed_end(&executor, run_scopes.as_deref(), &control.metrics, &stamp);
                         let service=service.clone();
                         let executor=executor.clone();
                         let metrics=control.metrics.clone();
                         let notices=ended.clone();
-                        fanout.spawn(async move { finish_fenced_notice(executor, stamp.clone(), || service.store.scope_ended(&stamp), metrics, notices).await });
+                        fanout.spawn(async move { (key, finish_fenced_notice(executor, stamp.clone(), || service.store.scope_ended(&stamp), metrics, notices).await) });
                     } }
                 }
-                Some(Ok(Some(notice)))=fanout.join_next(), if !fanout.is_empty()=>{ let _=ended.send(notice); }
+                Some(Ok((key, notice)))=fanout.join_next(), if !fanout.is_empty()=>{
+                    cleanup_keys.remove(&key);
+                    if let Some(notice) = notice { let _=ended.send(notice); }
+                    refresh.immediate();
+                }
                 Some(stamp) = closes.recv() => {
                     // An idle route needs no RPC; parked consent asks still
                     // need a scope-end determination even without a process.
-                    let scopes: Vec<_> = scope_source().await.scopes().into_values().collect();
+                    inventory_revision = scope_watch::revisions();
+                    let mut current = scope_source().await;
+                    current.retain_unread(&inventory);
+                    inventory = current;
+                    refresh.at = None;
+                    let scopes: Vec<_> = inventory.scopes().into_values().collect();
                     let key = stamp_key(&stamp);
                     // Let the test daemon observe the exact Goodbye snapshot,
                     // including a close that found no registered shell task.
@@ -378,14 +460,15 @@ where
                         let matches = scopes.iter().filter(|live| stamp_key(live) == key).count();
                         let _ = std::fs::write(path, matches.to_string());
                     }
-                    dirty = true;
-                    if !protected_keys.contains(&key) && !confirmed.contains(&key) && scopes.iter().any(|live| stamp_key(live) == key) && pending.insert(key.clone()) {
+                    if !protected_keys.contains(&key) && !confirmed.contains(&key) && scopes.iter().any(|live| stamp_key(live) == key) {
                         #[cfg(feature = "test-timing-hooks")]
                         crate::slog_info!("scope diagnostic phase=goodbye_describe_queued scope_epoch={}", stamp.scope_epoch);
-                        queued.insert(key, stamp);
+                        trigger_describe(key, stamp, &mut pending, &mut queued, &mut retrigger);
                     }
                 }
                 _ = tokio::time::sleep_until(wake_at) => {
+                    if refresh.due() { continue; }
+                    if verifications.deadline().is_some_and(|due| due <= tokio::time::Instant::now()) { continue; }
                     if tokio::time::Instant::now() >= next_backstop {
                         let now = scope_watch::revisions();
                         let mut refreshed = scope_source().await;
@@ -414,19 +497,25 @@ where
                     for stamp in scopes {
                         let key = stamp_key(&stamp);
                         if !protected_keys.contains(&key) && !confirmed.contains(&key) && (!routed.contains(&key) || secret_authorizations.contains(&key) || retry.contains_key(&key))
-                            && next_poll.get(&key).is_none_or(|due| tokio::time::Instant::now() >= *due)
-                            && pending.insert(key.clone()) {
-                            queued.insert(key, stamp);
+                            && next_poll.get(&key).is_none_or(|due| tokio::time::Instant::now() >= *due) {
+                            trigger_describe(key, stamp, &mut pending, &mut queued, &mut retrigger);
                         }
                     }
                 }
-                Some(result) = inflight.join_next(), if !inflight.is_empty() => {
-                    if let Ok((reference, group, reply,generation)) = result {
+                Some(result) = inflight.join_next_with_id(), if !inflight.is_empty() => {
+                    let (id, reply, generation) = match result {
+                        Ok((id, (reply, generation))) => (id, reply, generation),
+                        Err(error) => {
+                            log::warn!("scope.describe task failed; retaining scope state: {error}");
+                            (error.id(), Err(readiness::ControlError::Decode(error.to_string())), String::new())
+                        }
+                    };
+                    if let Some((reference, group)) = inflight_jobs.remove(&id) {
                         inflight_refs.remove(&reference);
                         watches.health.descriptions += 1;
                         for (key, stamp, full_stamp) in group {
                         if let Ok(ModuleControlResponseToModule::ScopeDescribe { status: subc_protocol::scope::ScopeStatus::Live, scope_epoch: Some(epoch), .. }) = &reply {
-                            if watches.rebind(&key, *epoch) { dirty = true; }
+                            watches.rebind(&key, *epoch);
                         }
                         // A Goodbye query can finish just before the connection's
                         // periodic tick. Wait a full interval after its answer
@@ -459,7 +548,9 @@ where
                                     let metrics=control.metrics.clone();
                                     let notices=ended.clone();
                                     let stamp=stamp.clone();
-                                    fanout.spawn(async move { finish_confirmed_end(executor, stamp, metrics, notices).await });
+                                    cleanup_keys.insert(key.clone());
+                                    let cleanup_key = key.clone();
+                                    fanout.spawn(async move { (cleanup_key, finish_confirmed_end(executor, stamp, metrics, notices).await) });
                                 }
                             }
                             retry.remove(&key);
@@ -480,9 +571,14 @@ where
                                 }
                         }
                         if retry.contains_key(&key) { watches.fallback(&key, interval); }
-                        // Non-definitive answers and errors retry only on the
-                        // regular poll, never in a reconnect-induced busy loop.
                         pending.remove(&key);
+                        // A terminal push is sent only once. If it raced this
+                        // probe, a Live or failed answer may predate the end.
+                        if retrigger.remove(&key) && !confirmed.contains(&key) {
+                            if let Some(current) = held_scopes.get(&key) {
+                                trigger_describe(key, current.clone(), &mut pending, &mut queued, &mut retrigger);
+                            }
+                        }
                         }
                     }
                 }
@@ -553,34 +649,52 @@ async fn work_scopes(
                 let conn = db
                     .lock()
                     .map_err(|_| "database lock poisoned".to_string())?;
-                let mut cursor = None;
-                loop {
-                    let keys =
-                        crate::db::access_grants::saved_scope_batch(&conn, cursor.as_ref(), 256)
-                            .map_err(|error| error.to_string())?;
-                    if keys.is_empty() {
-                        break;
+                match crate::db::access_grants::saved_scopes(&conn) {
+                    Ok(keys) => {
+                        for key in keys {
+                            match key
+                                .ok()
+                                .and_then(|key| access_grants::sweep::stamp(&key).ok())
+                            {
+                                Some(stamp) => scopes.add(scope_watch::Source::Grants, [stamp]),
+                                None => scopes.skipped[0] += 1,
+                            }
+                        }
                     }
-                    cursor = keys.last().cloned();
-                    for key in keys {
-                        scopes.add(
-                            scope_watch::Source::Grants,
-                            [access_grants::sweep::stamp(&key)
-                                .map_err(|error| error.to_string())?],
+                    Err(error) => {
+                        scopes.failed.insert(1);
+                        log::warn!(
+                            "scope.watch selector census read failed source=grants: {error}"
                         );
                     }
                 }
-                for key in crate::db::call_ledger::unsettled_scopes(&conn)
-                    .map_err(|error| error.to_string())?
-                {
+                let keys = match crate::db::call_ledger::unsettled_scopes(&conn) {
+                    Ok(keys) => keys,
+                    Err(error) => {
+                        scopes.failed.insert(2);
+                        log::warn!("scope.watch selector census read failed source=held: {error}");
+                        return Ok(());
+                    }
+                };
+                for key in keys {
+                    let Ok(key) = key else {
+                        scopes.skipped[1] += 1;
+                        continue;
+                    };
                     let owner = match key.owner.as_str() {
                         "direct" => subc_protocol::Principal::Direct,
                         "unverified" => subc_protocol::Principal::Unverified,
                         other => subc_protocol::Principal::Reserved {
-                            module_id: other
+                            module_id: match other
                                 .strip_prefix("reserved:")
-                                .ok_or_else(|| "invalid held scope owner".to_string())?
-                                .into(),
+                                .filter(|module| !module.is_empty())
+                            {
+                                Some(module) => module.into(),
+                                None => {
+                                    scopes.skipped[1] += 1;
+                                    continue;
+                                }
+                            },
                         },
                     };
                     scopes.add(
@@ -733,7 +847,16 @@ async fn finish_confirmed_end(
     if first.complete {
         return None;
     }
-    for delay in [1, 2, 4] {
+    // A confirmed end remains pending through temporary database failures.
+    // Cap retry delays at five seconds even when watch coverage is complete.
+    let mut attempt = 0u32;
+    loop {
+        let delay = match attempt {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            _ => 5,
+        };
         tokio::time::sleep(Duration::from_secs(delay)).await;
         let result = revoke(executor.clone(), &stamp).await;
         metrics
@@ -747,13 +870,8 @@ async fn finish_confirmed_end(
                 keys: result.keys,
             });
         }
+        attempt = attempt.saturating_add(1);
     }
-    log::warn!(
-        "scope-ended cleanup remains fenced after bounded retries scope_ref={:?} scope_epoch={}",
-        stamp.scope_ref,
-        stamp.scope_epoch
-    );
-    None
 }
 
 struct ScopeRevokeResult {

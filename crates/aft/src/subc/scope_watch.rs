@@ -7,6 +7,83 @@ pub(super) type Key = (String, String, u64);
 const SELECTORS_PER_WATCH: usize = 256;
 const WATCHES_PER_CONNECTION: usize = 16;
 pub(super) const BACKSTOP: Duration = Duration::from_secs(5 * 60);
+pub(super) const VERIFY_INTERVAL: Duration = Duration::from_secs(15 * 60);
+pub(super) const DEBOUNCE: Duration = Duration::from_millis(50);
+
+/// A fixed window coalesces mutation hints without postponing reads forever
+/// when calls keep arriving. Explicit end cleanup can request an immediate read.
+pub(super) struct Refresh {
+    pub(super) at: Option<tokio::time::Instant>,
+}
+impl Refresh {
+    pub(super) fn new() -> Self {
+        Self {
+            at: Some(tokio::time::Instant::now()),
+        }
+    }
+    pub(super) fn changed(&mut self) {
+        self.at
+            .get_or_insert(tokio::time::Instant::now() + DEBOUNCE);
+    }
+    pub(super) fn immediate(&mut self) {
+        self.at = Some(tokio::time::Instant::now());
+    }
+    pub(super) fn due(&self) -> bool {
+        self.at.is_some_and(|at| at <= tokio::time::Instant::now())
+    }
+}
+
+/// Spread verification across a quarter-hour instead of probing all healthy
+/// selectors on one timer tick. A delayed worker never catches up in a burst.
+#[derive(Default)]
+pub(super) struct Verifications {
+    due: std::collections::BTreeMap<Key, tokio::time::Instant>,
+    active: HashSet<Key>,
+    slot: Option<tokio::time::Instant>,
+}
+impl Verifications {
+    pub(super) fn reconcile(&mut self, keys: &HashSet<Key>, held: &HashMap<Key, ScopeStamp>) {
+        self.due.retain(|key, _| held.contains_key(key));
+        self.active = keys.clone();
+        if keys.is_empty() {
+            self.slot = None;
+            return;
+        }
+        let mut keys: Vec<_> = keys.iter().cloned().collect();
+        keys.sort();
+        let spacing = VERIFY_INTERVAL / keys.len() as u32;
+        let now = tokio::time::Instant::now();
+        for (index, key) in keys.into_iter().enumerate() {
+            self.due
+                .entry(key)
+                .or_insert(now + spacing * (index as u32 + 1));
+        }
+    }
+    pub(super) fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.due
+            .iter()
+            .filter(|(key, _)| self.active.contains(*key))
+            .map(|(_, due)| *due)
+            .min()
+            .map(|due| self.slot.map_or(due, |slot| due.max(slot)))
+    }
+    pub(super) fn take_due(&mut self) -> Option<Key> {
+        let now = tokio::time::Instant::now();
+        if self.deadline()? > now {
+            return None;
+        }
+        let key = self
+            .due
+            .iter()
+            .filter(|(key, _)| self.active.contains(*key))
+            .min_by_key(|(_, due)| *due)?
+            .0
+            .clone();
+        self.due.insert(key.clone(), now + VERIFY_INTERVAL);
+        self.slot = Some(now + VERIFY_INTERVAL / self.active.len() as u32);
+        Some(key)
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum Source {
@@ -59,6 +136,7 @@ pub(crate) fn revision(source: Source) -> u64 {
 pub(super) struct Inventory {
     pub(super) sources: [HashMap<Key, ScopeStamp>; 4],
     pub(super) failed: HashSet<usize>,
+    pub(super) skipped: [u64; 2],
 }
 impl Inventory {
     pub(super) fn add(&mut self, source: Source, stamps: impl IntoIterator<Item = ScopeStamp>) {
@@ -113,6 +191,7 @@ pub(super) struct Subscription {
     metrics: Arc<DispatchPathMetrics>,
     version: u8,
     cancelled: Option<oneshot::Sender<()>>,
+    initial: Vec<subc_client_rs::ScopeWatchState>,
 }
 impl Subscription {
     pub(super) fn new(
@@ -132,6 +211,7 @@ impl Subscription {
             metrics,
             version,
             cancelled: Some(cancelled),
+            initial: vec![],
         }
     }
     async fn frame(&mut self) -> Result<Frame, readiness::ControlError> {
@@ -177,6 +257,7 @@ impl Subscription {
                 "scope.watch snapshot does not cover its selectors".into(),
             ));
         }
+        self.initial = snapshot.scopes;
         Ok(())
     }
     async fn next(&mut self) -> Result<subc_client_rs::ScopeWatchPush, readiness::ControlError> {
@@ -247,6 +328,11 @@ pub(super) struct Health {
     pub(super) fallbacks: u64,
     pub(super) descriptions: u64,
     pub(super) drift_repairs: u64,
+    pub(super) verifications: u64,
+    pub(super) skipped_grant_rows: u64,
+    pub(super) skipped_held_rows: u64,
+    pub(super) poll_keys: usize,
+    pub(super) confirmed_cleanup: usize,
 }
 
 #[derive(Clone, Default)]
@@ -295,7 +381,7 @@ impl Watches {
         let keys: HashSet<_> = self
             .shards
             .iter()
-            .filter(|shard| shard.task.is_some())
+            .filter(|shard| shard.healthy && shard.task.is_some())
             .flat_map(|shard| shard.keys.clone())
             .collect();
         let all = keys.len() == total;
@@ -429,6 +515,22 @@ impl Watches {
                 let result: Result<(), readiness::ControlError> = async {
                     let mut subscription = control.scope_watch(selectors, cancelled).await?;
                     let _ = sender.send(Event::Opened(index, generation));
+                    for state in &subscription.initial {
+                        if state.status != subc_client_rs::ScopeWatchStatus::Live {
+                            let identity = (
+                                principal_id(&Some(state.scope_ref.owner.clone()))
+                                    .unwrap_or_default(),
+                                state.scope_ref.scope_ref.clone(),
+                                state.epoch,
+                            );
+                            if let Some(keys) = keys.get(&identity) {
+                                for key in keys {
+                                    let _ =
+                                        sender.send(Event::Observe(index, generation, key.clone()));
+                                }
+                            }
+                        }
+                    }
                     loop {
                         let event = subscription.next().await?;
                         if !matches!(
