@@ -65,6 +65,8 @@ dependencies = [
  "subc-protocol 0.37.0",
  "subc-transport 0.18.0",
  "tempfile",
+ "tikv-jemalloc-ctl",
+ "tikv-jemalloc-sys",
  "tokio",
  "tokio-rustls",
  "tokio-util",

@@ -308,7 +308,6 @@ impl<'a, S: StepSource + ?Sized> Steps<'a, S> {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Incremental UTF-8 validation
 

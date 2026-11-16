@@ -113,9 +113,6 @@ pub mod log_redact;
 pub mod logging;
 pub mod memory;
 
-#[cfg(test)]
-#[path = "../../aft/tests/helpers/subc_fake.rs"]
-mod subc_fake;
 pub mod native_stat;
 pub mod ndjson_text;
 pub mod ort_lifecycle;
@@ -153,6 +150,9 @@ pub mod shell_format;
 pub mod stage_timer;
 pub mod storage_path;
 pub mod subc_config;
+#[cfg(test)]
+#[path = "../../aft/tests/helpers/subc_fake.rs"]
+mod subc_fake;
 pub mod symbols;
 pub mod system_temp;
 pub mod task_temp_reads;
