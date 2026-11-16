@@ -9653,13 +9653,27 @@ async fn remote_job_id_own_status_watch_and_kill_use_persisted_task_ids() {
     let (original, task_id, _) =
         persist_accepted_with_snapshot(dir.path(), daemon.connection.clone(), "cargo test");
     drop(original);
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    remote_launch_log_captures()
+        .lock()
+        .unwrap()
+        .insert(dir.path().canonicalize().unwrap(), capture.clone());
     let ctx = remote_job_id_context(dir.path());
     for tool in ["bash_status", "bash_watch", "bash_kill"] {
         let response =
             remote_job_id_response(Arc::clone(&ctx), tool, &id().to_string(), "session").await;
+        eprintln!("{tool}: {response:?}");
         assert!(response.success, "{tool}: {response:?}");
         assert_eq!(response.data["task_id"], task_id, "{tool}: {response:?}");
     }
+    eprintln!("worker logs: {:?}", capture.lock().unwrap());
+    eprintln!("daemon log: {:?}", daemon.log.lock().unwrap());
+    eprintln!(
+        "connection={} canonical={} connections={}",
+        daemon.connection.display(),
+        daemon.connection.canonicalize().unwrap().display(),
+        daemon.connections.load(Ordering::SeqCst)
+    );
     // A kill reaches the build server either as an `exec.cancel` request or,
     // while a follower holds the job's stream, as a stream Cancel frame, and
     // the fake can log it after the kill reply returns.
