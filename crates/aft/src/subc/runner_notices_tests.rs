@@ -1,6 +1,136 @@
 use super::*;
 
 #[test]
+fn code_search_nudge_runner_send_is_once_and_leaves_result_bytes_unchanged() {
+    install(PathBuf::from("unused-test-notice-connection"));
+    let session = "code-search-nudge-runner";
+    let capture = test_endpoint::capture(session, false);
+    let notice = CodeSearchNotice {
+        address: Some(Address {
+            module: "broca".into(),
+            identity: BindIdentity::new("broca", session),
+            scope: None,
+            worker: true,
+        }),
+        call_key: "call-17".into(),
+    };
+    let context = crate::subc_format::BashCodeSearchHint {
+        command: "echo marker; rg foo".into(),
+        workdir: None,
+        search_tool: Some("search".into()),
+        grep_tool: Some("grep".into()),
+        shell_tool: "bash".into(),
+        runner_notice: Some(notice),
+    };
+    let root = tempfile::tempdir().unwrap();
+    let response = crate::protocol::Response::success(
+        "call-17",
+        json!({
+            "task_id": "bash-native", "status": "completed", "exit_code": 0, "output": "matches\n[task bash-native]"
+        }),
+    );
+    let ctx = AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(root.path().to_path_buf()),
+            ..Default::default()
+        },
+    );
+    let before = serde_json::to_vec(&response).unwrap();
+    let format_context = crate::subc_format::FormatContext::default();
+    let expected = super::super::bash::finalized_bash_result(
+        serde_json::from_slice(&before).unwrap(),
+        &ctx,
+        session,
+        &format_context,
+        false,
+        None,
+    );
+    let result = super::super::bash::finalized_bash_result(
+        response,
+        &ctx,
+        session,
+        &crate::subc_format::FormatContext {
+            bash_code_search_hint: Some(context),
+            ..format_context
+        },
+        false,
+        None,
+    );
+    assert_eq!(
+        serde_json::to_vec(&result.response).unwrap(),
+        serde_json::to_vec(&expected.response).unwrap()
+    );
+    assert_eq!(result.text, expected.text);
+    let got = capture.receiver.try_recv().unwrap();
+    assert!(
+        capture.receiver.try_recv().is_err(),
+        "exactly one send before returning the result"
+    );
+    assert_eq!(got.request["method"], "session.send");
+    let params = &got.request["params"];
+    assert_eq!(params["send_id"], "aft:nudge:code_search:call-17");
+    assert_eq!(params["delivery"], json!(["tool_result"]));
+    assert_eq!(params["dedupe_key"], "aft:nudge:code_search");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert!((now + 55_000..=now + 60_000).contains(&params["expires_at_ms"].as_u64().unwrap()));
+    assert!(serde_json::to_string(params).unwrap().contains("DO NOT search code by running grep/rg in bash — it is unindexed, unranked, and serial. Use the `search` tool instead (it auto-routes concepts, identifiers, regex, and literals)."));
+}
+
+#[test]
+fn code_search_nudge_runner_drops_refused_undelivered_and_missing_address() {
+    install(PathBuf::from("unused-test-notice-connection"));
+    let root = tempfile::tempdir().unwrap();
+    for (case, missing) in [
+        ("refused", false),
+        ("not-delivered", false),
+        ("no-address", true),
+    ] {
+        let session = format!("code-search-nudge-{case}");
+        let capture = test_endpoint::capture(&session, false);
+        if case == "refused" {
+            capture.refuse("delivery_unsupported", None);
+        }
+        if case == "not-delivered" {
+            capture.reply(undelivered("handover_failed"));
+        }
+        let context = crate::subc_format::BashCodeSearchHint {
+            command: "rg foo".into(),
+            workdir: None,
+            search_tool: Some("aft_search".into()),
+            grep_tool: Some("grep".into()),
+            shell_tool: "shell".into(),
+            runner_notice: Some(CodeSearchNotice {
+                address: (!missing).then(|| Address {
+                    module: "broca".into(),
+                    identity: BindIdentity::new("broca", &session),
+                    scope: None,
+                    worker: true,
+                }),
+                call_key: format!("call-{case}"),
+            }),
+        };
+        let mut response = crate::protocol::Response::success(
+            "call",
+            json!({"task_id": "native", "status": "completed", "exit_code": 0, "output": "hit"}),
+        );
+        let before = serde_json::to_vec(&response).unwrap();
+        context.deliver(&mut response, root.path());
+        assert_eq!(serde_json::to_vec(&response).unwrap(), before, "{case}");
+        if !missing {
+            capture.receiver.try_recv().unwrap();
+        }
+        assert!(
+            capture.receiver.try_recv().is_err(),
+            "{case} never retries or appends"
+        );
+    }
+}
+
+#[test]
 fn bus_runner_targeted_not_delivered_applies_before_ack_and_uses_new_id() {
     let _guard = DELIVERY_COUNTER_TEST.lock().unwrap();
     let task = Completion::new("bash-00000000000fb001", 0);

@@ -375,12 +375,107 @@ pub(super) fn warning(
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Address {
     module: String,
     identity: BindIdentity,
     scope: Option<ScopeSelector>,
     worker: bool,
+}
+
+/// A runner route remains a runner route even when its notice address is
+/// unavailable. Such nudges are dropped, never appended to command output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodeSearchNotice {
+    address: Option<Address>,
+    call_key: String,
+}
+
+pub(super) fn code_search_notice(
+    route: &RouteIdentity,
+    call_key: &str,
+) -> Option<CodeSearchNotice> {
+    let route = route
+        .run_owner
+        .as_ref()
+        .map_or(route, |owner| &owner.owner_route);
+    if !runner_route(route) {
+        return None;
+    }
+    let raw = match &route.spawn_principal {
+        AuthenticatedPrincipal::RouteBind { harness, .. } => harness.clone(),
+        _ => String::new(),
+    };
+    Some(CodeSearchNotice {
+        address: Address::new(&route.task_identity(), raw, route.scope.as_ref()),
+        call_key: call_key.to_owned(),
+    })
+}
+
+fn code_search_request(call_key: &str, text: &str, now_ms: u64) -> SendRequest {
+    let mut order = DeliveryOrder::new(vec![Mode::ToolResult]);
+    order.dedupe_key = Some("aft:nudge:code_search".into());
+    order.expires_at_ms = Some(now_ms.saturating_add(60_000));
+    SendRequest::new(text, format!("aft:nudge:code_search:{call_key}"))
+        .with_notice(true)
+        .with_delivery_order(&order)
+}
+
+impl CodeSearchNotice {
+    /// One best-effort send before returning the tool result. No retries or
+    /// append fallback: the runner owns when and how its notice is delivered.
+    pub(crate) fn send(&self, text: &str) {
+        // Rendering can run on either an actor thread or a Tokio worker. Keep
+        // the synchronous send's runtime off both callers' runtime stacks.
+        let outcome = std::thread::scope(|scope| scope.spawn(|| self.send_once(text)).join())
+            .unwrap_or_else(|_| retry(FailureClass::Runtime, "code-search notice sender panicked"));
+        match outcome {
+            Outcome::Accepted | Outcome::Pending => {}
+            Outcome::NotDelivered(reason) => log::info!(
+                "runner code-search nudge call_key={} not_delivered reason={reason}; dropped",
+                self.call_key
+            ),
+            Outcome::Final(failure) | Outcome::Retry(failure) => log::info!(
+                "runner code-search nudge call_key={} dropped class={:?} code={} detail={}",
+                self.call_key,
+                failure.class,
+                failure.code.as_deref().unwrap_or("none"),
+                failure.detail
+            ),
+        }
+    }
+
+    fn send_once(&self, text: &str) -> Outcome {
+        (|| {
+            let address = self
+                .address
+                .as_ref()
+                .ok_or_else(|| retry(FailureClass::Address, "call has no runner notice address"))?;
+            let path = CONNECTION
+                .get()
+                .map(|path| path.read().unwrap().clone())
+                .ok_or_else(|| {
+                    retry(
+                        FailureClass::Address,
+                        "runner notice connection unavailable",
+                    )
+                })?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| retry(FailureClass::Runtime, error))?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            Ok::<_, Outcome>(runtime.block_on(send(
+                &path,
+                address,
+                &code_search_request(&self.call_key, text, now),
+            )))
+        })()
+        .unwrap_or_else(|outcome| outcome)
+    }
 }
 
 fn concrete_route_harness(principal: Option<&str>, session: &str) -> Option<String> {

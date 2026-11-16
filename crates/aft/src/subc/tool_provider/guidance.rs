@@ -10,6 +10,7 @@ use super::CatalogPreset;
 
 const TOOL_KEYS: &[&str] = &[
     "search",
+    "grep",
     "outline",
     "zoom",
     "callgraph",

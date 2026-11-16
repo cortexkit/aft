@@ -1317,7 +1317,7 @@ pub(super) fn permission_grants_for_retry(
         .collect()
 }
 
-fn finalized_bash_result(
+pub(super) fn finalized_bash_result(
     mut response: Response,
     ctx: &AppContext,
     session_id: &str,
@@ -1325,6 +1325,10 @@ fn finalized_bash_result(
     allow_bg_completions: bool,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
 ) -> ToolCallResult {
+    if let Some(hint) = &format_context.bash_code_search_hint {
+        let root = ctx.config().project_root.clone().unwrap_or_default();
+        hint.deliver(&mut response, &root);
+    }
     // The bash formatter never renders `bg_completions`, so formatting before finalization
     // yields the same text and lets the finalizer append the status bar to it.
     let mut text =
@@ -1937,7 +1941,7 @@ pub(super) fn submit_deferred_bash(
     flags: Flags,
     ver: u8,
     arguments: Value,
-    format_context: crate::subc_format::FormatContext,
+    mut format_context: crate::subc_format::FormatContext,
     cancel: BashWaitCancel,
     bind_trust: BindTrust,
     spawn_principal: crate::sandbox_spawn::AuthenticatedPrincipal,
@@ -2191,6 +2195,44 @@ pub(super) fn submit_deferred_bash(
     let scope_stamp = cancel.scope.clone();
     let speech_seed = cancel.speech_seed.clone();
     let secret_identity = super::secret_consent::current_identity();
+    let disabled = secret_identity
+        .as_ref()
+        .map(|identity| identity.disabled_tools.as_slice())
+        .unwrap_or_default();
+    format_context.bash_code_search_hint = arguments
+        .get("command")
+        .and_then(Value::as_str)
+        .filter(|_| {
+            arguments.get("background").and_then(Value::as_bool) != Some(true)
+                && arguments.get("pty").and_then(Value::as_bool) != Some(true)
+        })
+        .map(|command| crate::subc_format::BashCodeSearchHint {
+            command: command.into(),
+            workdir: arguments
+                .get("workdir")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            search_tool: crate::tool_gate::catalog_keeps("search", disabled).then(|| {
+                if worker_preset {
+                    "search"
+                } else {
+                    "aft_search"
+                }
+                .into()
+            }),
+            grep_tool: crate::tool_gate::catalog_keeps("grep", disabled).then(|| "grep".into()),
+            shell_tool: format_context
+                .host_tool_names
+                .as_ref()
+                .map_or("bash", |names| names.shell())
+                .into(),
+            runner_notice: secret_identity.as_ref().and_then(|identity| {
+                super::runner_notices::code_search_notice(
+                    identity,
+                    call_key.as_deref().unwrap_or(&request_id),
+                )
+            }),
+        });
     let program_held = secret_identity.as_ref().is_some_and(running_hold_route);
     let task_identity = secret_identity
         .as_ref()

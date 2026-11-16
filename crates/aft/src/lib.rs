@@ -65,6 +65,7 @@ pub(crate) mod bash_changed_files;
 #[cfg(unix)]
 pub(crate) mod bash_db_hints;
 pub(crate) mod bash_env;
+pub(crate) mod bash_hints;
 pub mod bash_permissions;
 pub mod bash_rewrite;
 pub(crate) mod bounded_io;

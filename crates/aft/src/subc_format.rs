@@ -54,6 +54,19 @@ pub struct FormatContext {
     /// envelope; `None` when it sent none. Carried here because this context
     /// travels with a call through every deferred path, bash included.
     pub host_tool_names: Option<crate::host_tool_names::HostToolNames>,
+    /// Per-call native shell steering facts retained across deferred rendering.
+    pub bash_code_search_hint: Option<BashCodeSearchHint>,
+}
+
+/// Native shell guidance facts carried with a deferred call's render context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BashCodeSearchHint {
+    pub(crate) command: String,
+    pub(crate) workdir: Option<String>,
+    pub(crate) search_tool: Option<String>,
+    pub(crate) grep_tool: Option<String>,
+    pub(crate) shell_tool: String,
+    pub(crate) runner_notice: Option<crate::subc::runner_notices::CodeSearchNotice>,
 }
 
 impl Default for FormatContext {
@@ -78,6 +91,7 @@ impl Default for FormatContext {
             worker_session: false,
             bash_watch_available: None,
             host_tool_names: None,
+            bash_code_search_hint: None,
         }
     }
 }
@@ -106,6 +120,7 @@ impl FormatContext {
             worker_session: false,
             bash_watch_available: None,
             host_tool_names: None,
+            bash_code_search_hint: None,
         }
     }
 }
