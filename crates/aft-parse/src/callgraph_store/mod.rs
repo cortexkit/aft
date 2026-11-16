@@ -689,32 +689,65 @@ impl DbFileIndex {
 
 #[derive(Debug, Clone)]
 pub struct DbFileIndex {
+    #[cfg(any(test, feature = "test-support"))]
+    pub lang: Option<LangId>,
+    #[cfg(not(any(test, feature = "test-support")))]
     lang: Option<LangId>,
     #[cfg(any(test, feature = "test-support"))]
     pub exports: HashSet<String>,
     #[cfg(not(any(test, feature = "test-support")))]
     exports: HashSet<String>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub default_export: Option<String>,
+    #[cfg(not(any(test, feature = "test-support")))]
     default_export: Option<String>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub export_aliases: HashMap<String, String>,
+    #[cfg(not(any(test, feature = "test-support")))]
     export_aliases: HashMap<String, String>,
     #[cfg(any(test, feature = "test-support"))]
     pub node_by_scoped: HashMap<String, String>,
     #[cfg(not(any(test, feature = "test-support")))]
     node_by_scoped: HashMap<String, String>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub node_by_bare: HashMap<String, String>,
+    #[cfg(not(any(test, feature = "test-support")))]
     node_by_bare: HashMap<String, String>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub node_kind_by_id: HashMap<String, String>,
+    #[cfg(not(any(test, feature = "test-support")))]
     node_kind_by_id: HashMap<String, String>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub module_targets: HashMap<String, Option<String>>,
+    #[cfg(not(any(test, feature = "test-support")))]
     module_targets: HashMap<String, Option<String>>,
     #[cfg(any(test, feature = "test-support"))]
     pub declared_module_targets: HashMap<String, Option<String>>,
     #[cfg(not(any(test, feature = "test-support")))]
     declared_module_targets: HashMap<String, Option<String>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub macro_use_module_targets: BTreeSet<String>,
+    #[cfg(not(any(test, feature = "test-support")))]
     macro_use_module_targets: BTreeSet<String>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub reexports: Vec<ReexportIndex>,
+    #[cfg(not(any(test, feature = "test-support")))]
     reexports: Vec<ReexportIndex>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ReexportIndex {
+    #[cfg(any(test, feature = "test-support"))]
+    pub target_file: Option<String>,
+    #[cfg(not(any(test, feature = "test-support")))]
     target_file: Option<String>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub named: HashMap<String, String>,
+    #[cfg(not(any(test, feature = "test-support")))]
     named: HashMap<String, String>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub wildcard: bool,
+    #[cfg(not(any(test, feature = "test-support")))]
     wildcard: bool,
 }
 
@@ -739,7 +772,13 @@ aft_store::heap_bytes_of_fields!(ReexportIndex {
 
 #[derive(Clone)]
 pub struct ProjectIndex<'a> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub facts: Rc<dyn ProjectFacts + 'a>,
+    #[cfg(not(any(test, feature = "test-support")))]
     facts: Rc<dyn ProjectFacts + 'a>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub project_root: PathBuf,
+    #[cfg(not(any(test, feature = "test-support")))]
     project_root: PathBuf,
     #[cfg(any(test, feature = "test-support"))]
     /// Shared, so several resolver threads can each wrap the same bound
@@ -749,27 +788,67 @@ pub struct ProjectIndex<'a> {
     /// Shared, so several resolver threads can each wrap the same bound
     /// surfaces in their own index with their own memos.
     files: Arc<HashMap<String, DbFileIndex>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub caller_data: HashMap<String, &'a FileCallData>,
+    #[cfg(not(any(test, feature = "test-support")))]
     caller_data: HashMap<String, &'a FileCallData>,
+    #[cfg(any(test, feature = "test-support"))]
+    /// File indexes loaded on demand: the legacy store's rows, for an
+    /// incremental refresh, or the data layer's files bound on first use.
+    /// Files in `files` take precedence over it.
+    pub lazy: Option<Rc<dyn LoadedFileIndexes + 'a>>,
+    #[cfg(not(any(test, feature = "test-support")))]
     /// File indexes loaded on demand: the legacy store's rows, for an
     /// incremental refresh, or the data layer's files bound on first use.
     /// Files in `files` take precedence over it.
     lazy: Option<Rc<dyn LoadedFileIndexes + 'a>>,
+    #[cfg(any(test, feature = "test-support"))]
+    /// Root-scoped maps shared by successive refresh-worker batches. Cargo.toml
+    /// and go.mod watcher events replace them before another batch resolves refs.
+    /// Cold/direct refreshes use a private cache so each refresh builds and uses
+    /// its own workspace mapping.
+    pub workspace_crate_prefixes: WorkspaceCratePrefixCache,
+    #[cfg(not(any(test, feature = "test-support")))]
     /// Root-scoped maps shared by successive refresh-worker batches. Cargo.toml
     /// and go.mod watcher events replace them before another batch resolves refs.
     /// Cold/direct refreshes use a private cache so each refresh builds and uses
     /// its own workspace mapping.
     workspace_crate_prefixes: WorkspaceCratePrefixCache,
+    #[cfg(any(test, feature = "test-support"))]
+    pub rust_crate_roots: callgraph::RustCrateRootMemo,
+    #[cfg(not(any(test, feature = "test-support")))]
     rust_crate_roots: callgraph::RustCrateRootMemo,
+    #[cfg(any(test, feature = "test-support"))]
+    /// Crate-wide lookups derived from `files`, built on first use and never
+    /// rebuilt. Only an index with every file in memory (`lazy` is `None`)
+    /// uses it. Such an index's file set is fixed when it is constructed: a
+    /// changed file set means a new `ProjectIndex`, which starts empty.
+    pub crate_scans: std::cell::OnceCell<CrateScanMemo>,
+    #[cfg(not(any(test, feature = "test-support")))]
     /// Crate-wide lookups derived from `files`, built on first use and never
     /// rebuilt. Only an index with every file in memory (`lazy` is `None`)
     /// uses it. Such an index's file set is fixed when it is constructed: a
     /// changed file set means a new `ProjectIndex`, which starts empty.
     crate_scans: std::cell::OnceCell<CrateScanMemo>,
+    #[cfg(any(test, feature = "test-support"))]
+    /// The lazy index overlays fresh caller extracts on stored rows. Its parent
+    /// map and caller paths belong to that immutable snapshot, not the worker.
+    pub lazy_module_parents: std::cell::OnceCell<Arc<ModuleParents>>,
+    #[cfg(not(any(test, feature = "test-support")))]
     /// The lazy index overlays fresh caller extracts on stored rows. Its parent
     /// map and caller paths belong to that immutable snapshot, not the worker.
     lazy_module_parents: std::cell::OnceCell<Arc<ModuleParents>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub lazy_inline_candidates: std::cell::OnceCell<RustInlineCandidates>,
+    #[cfg(not(any(test, feature = "test-support")))]
     lazy_inline_candidates: std::cell::OnceCell<RustInlineCandidates>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub rust_caller_paths: RefCell<HashMap<String, Vec<String>>>,
+    #[cfg(not(any(test, feature = "test-support")))]
     rust_caller_paths: RefCell<HashMap<String, Vec<String>>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub go_packages: RefCell<GoPackageMemo>,
+    #[cfg(not(any(test, feature = "test-support")))]
     go_packages: RefCell<GoPackageMemo>,
     #[cfg(any(test, feature = "test-support"))]
     pub local_symbols: RefCell<CallerSymbolMemo>,
@@ -839,6 +918,7 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+test_support_visibility! {
 /// Answers to the two Rust lookups that otherwise scan every indexed file on
 /// each call (`module_parent`, `inline_scoped_target`), precomputed from an
 /// in-memory file set. Lookups return exactly what the scans return.
@@ -849,6 +929,7 @@ struct CrateScanMemo {
     /// For each declared module target, the smallest `(declaring file,
     /// module name)` pair, which is the scan's first match after sorting.
     module_parents: HashMap<String, (String, String)>,
+}
 }
 
 impl CrateScanMemo {
@@ -1336,11 +1417,13 @@ impl RustInlineFile {
     }
 }
 
+test_support_visibility! {
 #[derive(Clone, Debug, Default)]
 struct RustInlineCandidates {
     files: Vec<RustInlineFile>,
     by_path: HashMap<String, usize>,
     by_prefix: HashMap<String, HashMap<Vec<String>, Vec<usize>>>,
+}
 }
 
 impl RustInlineCandidates {
@@ -2623,6 +2706,7 @@ const GO_PACKAGE_MEMO_BYTES: usize = 8 * 1024 * 1024;
 // directory could trigger the same failed construction on every reference.
 const GO_PACKAGE_OVERSIZED_MEMO_BYTES: usize = 64 * 1024;
 
+test_support_visibility! {
 #[derive(Clone, Default)]
 struct GoPackageMemo {
     packages: HashMap<PathBuf, Rc<GoPackage>>,
@@ -2630,6 +2714,7 @@ struct GoPackageMemo {
     bytes: usize,
     oversized_dirs: HashSet<PathBuf>,
     oversized_bytes: usize,
+}
 }
 
 impl GoPackageMemo {

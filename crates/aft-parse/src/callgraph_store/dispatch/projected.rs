@@ -32,9 +32,18 @@ use super::{dependency, DispatchFacts, MethodHint, ParseBlob, Resolver, SiteHint
 /// The answer [`Resolver::project_type`] gave for one name asked of one file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectedType {
+    #[cfg(any(test, feature = "test-support"))]
+    /// The file declaring the type and the type's position among that
+    /// file's types, or `None` when the name names no project type.
+    pub found: Option<(String, u32)>,
+    #[cfg(not(any(test, feature = "test-support")))]
     /// The file declaring the type and the type's position among that
     /// file's types, or `None` when the name names no project type.
     found: Option<(String, u32)>,
+    #[cfg(any(test, feature = "test-support"))]
+    /// The keys the lookup recorded.
+    pub dependencies: Box<[String]>,
+    #[cfg(not(any(test, feature = "test-support")))]
     /// The keys the lookup recorded.
     dependencies: Box<[String]>,
 }
@@ -44,7 +53,13 @@ pub struct ProjectedType {
 /// recorded separately, as a [`ProjectedType`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectedMro {
+    #[cfg(any(test, feature = "test-support"))]
+    pub mro: Option<Vec<(String, String)>>,
+    #[cfg(not(any(test, feature = "test-support")))]
     mro: Option<Vec<(String, String)>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub dependencies: Box<[String]>,
+    #[cfg(not(any(test, feature = "test-support")))]
     dependencies: Box<[String]>,
 }
 
@@ -65,22 +80,54 @@ pub struct SiteRecord {
 /// Everything pass 4 reads about one file once receivers are projected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileRecord {
+    #[cfg(any(test, feature = "test-support"))]
+    /// The file's language, Go package, types and methods; everything else
+    /// is left empty.
+    pub facts: ParseBlob,
+    #[cfg(not(any(test, feature = "test-support")))]
     /// The file's language, Go package, types and methods; everything else
     /// is left empty.
     facts: ParseBlob,
+    #[cfg(any(test, feature = "test-support"))]
+    /// Every name pass 4 asks [`Resolver::project_type`] of this file, with
+    /// its answer.
+    pub projections: BTreeMap<String, ProjectedType>,
+    #[cfg(not(any(test, feature = "test-support")))]
     /// Every name pass 4 asks [`Resolver::project_type`] of this file, with
     /// its answer.
     projections: BTreeMap<String, ProjectedType>,
+    #[cfg(any(test, feature = "test-support"))]
+    /// For each owner of a Python `super()` site of this file, the owner
+    /// type's resolution order.
+    pub mro: BTreeMap<String, ProjectedMro>,
+    #[cfg(not(any(test, feature = "test-support")))]
     /// For each owner of a Python `super()` site of this file, the owner
     /// type's resolution order.
     mro: BTreeMap<String, ProjectedMro>,
+    #[cfg(any(test, feature = "test-support"))]
+    /// Set for a Rust file whose every resolvable name is in
+    /// `projections`, so any other name has the fixed miss answer.
+    pub complete_names: bool,
+    #[cfg(not(any(test, feature = "test-support")))]
     /// Set for a Rust file whose every resolvable name is in
     /// `projections`, so any other name has the fixed miss answer.
     complete_names: bool,
+    #[cfg(any(test, feature = "test-support"))]
+    /// How many of `projections` are there only because `complete_names`
+    /// is set, for measurement.
+    pub resolvable_name_projections: u32,
+    #[cfg(not(any(test, feature = "test-support")))]
     /// How many of `projections` are there only because `complete_names`
     /// is set, for measurement.
     resolvable_name_projections: u32,
+    #[cfg(any(test, feature = "test-support"))]
+    pub sites: Vec<SiteRecord>,
+    #[cfg(not(any(test, feature = "test-support")))]
     sites: Vec<SiteRecord>,
+    #[cfg(any(test, feature = "test-support"))]
+    /// Sorted ordinals of the sites whose `associated` is set.
+    pub associated: Vec<u32>,
+    #[cfg(not(any(test, feature = "test-support")))]
     /// Sorted ordinals of the sites whose `associated` is set.
     associated: Vec<u32>,
 }
