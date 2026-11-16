@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Exercise publication from the module's real route bind and tool-call entry.
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -135,9 +137,15 @@ async fn run_display_case(switch: Option<&str>) {
                     let modules = modules_tx.clone();
                     let writes = writes_tx.clone();
                     connections.spawn(async move {
-                        authenticate_server(&mut stream, &[0x42; subc_transport::KEY_LEN],
-                            &[0x24; subc_transport::DAEMON_ID_LEN], "subc-detach-test", Duration::from_secs(5)).await.unwrap();
-                        let first = read_any_frame_timeout(&mut stream, "first frame").await;
+                        if authenticate_server(&mut stream, &[0x42; subc_transport::KEY_LEN],
+                            &[0x24; subc_transport::DAEMON_ID_LEN], "subc-detach-test", Duration::from_secs(5)).await.is_err() {
+                            return;
+                        }
+                        // Startup probes can authenticate and close without a
+                        // frame. They are not module or display connections.
+                        let Ok(Ok(Some(first))) = tokio::time::timeout(
+                            Duration::from_secs(5), subc_transport::read_frame(&mut stream)
+                        ).await else { return; };
                         if first.header.ty == FrameType::Hello {
                             modules.send((stream, first)).unwrap();
                         } else if serde_json::from_slice::<Value>(&first.body).unwrap()["op"] == "catalog.list" {
@@ -245,8 +253,23 @@ async fn run_display_case(switch: Option<&str>) {
                     }
                 }
             })
-            .await
-            .expect("runner record never reached the display module");
+            .await;
+            let write = match write {
+                Ok(write) => write,
+                Err(_) => {
+                    let report = request(
+                        &mut stream,
+                        0,
+                        80 + index as u64,
+                        serde_json::to_value(ModuleControlRequest::HealthCheck {}).unwrap(),
+                    )
+                    .await;
+                    panic!(
+                        "runner record never reached the display module: {}",
+                        String::from_utf8_lossy(&report.body)
+                    );
+                }
+            };
             assert_eq!(
                 write.runner,
                 Principal::Reserved {
