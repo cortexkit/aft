@@ -71,12 +71,17 @@ jobs:
           python3 -c 'import os, pathlib, shutil; build = pathlib.Path(os.environ["CARGO_TARGET_DIR"]); shutil.copy2(build / "release" / ("aft" + os.environ["BENCH_EXE"]), build.parent / "bin" / ("aft-candidate" + os.environ["BENCH_EXE"])); shutil.rmtree(build)'
 
       - name: Cold builds at Linux matrix pins
+        env:
+          # A second Mac sample of the projects whose first run finished, in the
+          # opposite version order (the harness alternates order by position).
+          BENCH_PROJECTS: ${{ github.ref_name == 'bench/index-mac' && 'linux kubernetes' || '' }}
         run: |
           python3 scripts/telemetry/index-bench/run.py run \
             --work target/index-bench-work \
             --output target/index-bench-results \
             --baseline "target/index-bench-work/bin/aft-0.65.0${BENCH_EXE}" \
-            --candidate "target/index-bench-work/bin/aft-candidate${BENCH_EXE}"
+            --candidate "target/index-bench-work/bin/aft-candidate${BENCH_EXE}" \
+            ${BENCH_PROJECTS:+--projects $BENCH_PROJECTS}
 
       - name: Publish table in job summary
         if: always()
