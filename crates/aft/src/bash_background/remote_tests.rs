@@ -8634,7 +8634,7 @@ async fn old_shape_prefix_routing_survives_the_runon_kill_switch_and_runon_works
             assert!(!whole.success);
             assert_eq!(
                 whole.data["message"],
-                "runon is disabled by the user setting remote_exec.enabled"
+                "runon refused: runon is disabled by the user setting remote_exec.enabled"
             );
             assert_eq!(exec_runs(&daemon).len(), 1);
         }
