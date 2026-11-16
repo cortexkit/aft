@@ -50,6 +50,17 @@ jobs:
           bash scripts/check-cmake.sh
           mkdir -p target/index-bench-results
 
+      # Elasticsearch needs AFT's disk floor (about 43 GiB on rented-mac) plus
+      # its clone and store. Old test leftovers in the runner user's temp
+      # folder are the largest thing AFT can reclaim there; only entries
+      # untouched for six hours go, so a running job's files stay.
+      - name: Reclaim stale runner temp files (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          df -h "$TMPDIR" | tail -1
+          find "$TMPDIR" -mindepth 1 -maxdepth 1 -user "$(id -u)" -mmin +360 -exec rm -rf {} + 2>/dev/null || true
+          df -h "$TMPDIR" | tail -1
+
       - name: Download and checksum official 0.65.0
         run: python3 scripts/telemetry/index-bench/run.py download --work target/index-bench-work
 
@@ -72,9 +83,9 @@ jobs:
 
       - name: Cold builds at Linux matrix pins
         env:
-          # A second Mac sample of the projects whose first run finished, in the
-          # opposite version order (the harness alternates order by position).
-          BENCH_PROJECTS: ${{ github.ref_name == 'bench/index-mac' && 'linux kubernetes' || '' }}
+          # Elasticsearch alone on the Mac, after reclaiming stale temp files; the
+          # other projects already have two Mac samples.
+          BENCH_PROJECTS: ${{ github.ref_name == 'bench/index-mac' && 'elasticsearch' || '' }}
         run: |
           python3 scripts/telemetry/index-bench/run.py run \
             --work target/index-bench-work \
