@@ -97,6 +97,12 @@ pub(crate) fn visit_lines(
         line.extend_from_slice(&chunk[..count]);
         reader.consume(count);
         read += count as u64;
+        #[cfg(test)]
+        STEP_TAP.with(|tap| {
+            if let Some(tap) = tap.borrow_mut().as_mut() {
+                tap(read);
+            }
+        });
         if lf.is_some() {
             visit(index, offset, &line);
             offset += line.len();
@@ -119,8 +125,8 @@ thread_local! {
     /// Replaces [`LARGE_READ_BYTES`] on this thread, so small generated files
     /// take the streamed paths.
     static LARGE_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-    /// Runs after every step a [`Steps`] reads on this thread, with the bytes
-    /// read so far, so a test can cancel or outrun a deadline mid-file.
+    /// Runs after every step or raw-line consumption on this thread, with the
+    /// bytes read so far, so a test can cancel mid-file.
     static STEP_TAP: std::cell::RefCell<Option<Box<dyn FnMut(u64)>>> =
         const { std::cell::RefCell::new(None) };
     /// A [`Steps`] reservation that would grow its buffer past this many
@@ -128,7 +134,7 @@ thread_local! {
     static REFUSE_RESERVE_OVER: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
 }
 
-/// Run `work` with `tap` called after every step read on this thread.
+/// Run `work` with `tap` called after every step or raw-line chunk on this thread.
 #[cfg(test)]
 pub(crate) fn with_step_tap<T>(tap: impl FnMut(u64) + 'static, work: impl FnOnce() -> T) -> T {
     struct Reset;

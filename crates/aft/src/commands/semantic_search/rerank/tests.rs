@@ -699,6 +699,209 @@ fn tiny_list(project: &Path, count: usize) -> CanonicalList {
     }
 }
 
+#[test]
+fn audit1432_round3_cancelled_candidate_scan_never_commits_and_next_request_is_fresh() {
+    for cancel_pass in [1, 2] {
+        let project = tempfile::tempdir().unwrap();
+        let mut list = tiny_list(project.path(), 2);
+        let path = list.blocks[0].entries[0].result.path.clone();
+        let mut source = b"fn scan_subject() {}\n".to_vec();
+        source.extend(b"// padding\n".repeat((5 << 20) / 11));
+        std::fs::write(&path, &source).unwrap();
+        list.blocks[0].entries[0].result.symbol_range =
+            Some(super::super::comparator::SymbolOffsetRange::new(0, 20));
+        let before = names(&list);
+        let backend = NumberedBackend::new(Vec::new());
+        let prose = "how does the streamed subject work";
+        let identity = memo_identity(
+            &list.key,
+            prose,
+            None,
+            &backend.fingerprint(),
+            2,
+            list.blocks[0].entries.iter().map(|entry| &entry.result),
+        );
+        assert!(memo().lookup(&identity).is_none());
+        let token = crate::executor::JobCancellation::new();
+        let worker_token = token.clone();
+        let worker_backend = backend.clone();
+        let root = project.path().to_path_buf();
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let _token = crate::executor::install_job_cancellation(worker_token);
+            let mut pass = 1;
+            let mut previous = 0;
+            let mut paused = false;
+            let outcome = crate::large_read::with_step_tap(
+                move |read| {
+                    if read < previous {
+                        pass += 1;
+                    }
+                    previous = read;
+                    if !paused && pass == cancel_pass && read >= 1 << 20 {
+                        paused = true;
+                        reached_tx.send((pass, read)).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                    }
+                },
+                || {
+                    let search = SearchConfig::default();
+                    rerank_block_zero(
+                        &mut list,
+                        &Ok(SelectedBackend {
+                            backend: worker_backend,
+                            fail_closed: false,
+                        }),
+                        &RerankSettings::resolve(&search),
+                        &head_request(&search, &root, Some(prose), None),
+                    )
+                },
+            );
+            (list, outcome)
+        });
+        let (pass, read) = reached_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(pass, cancel_pass);
+        assert!(read < source.len() as u64);
+        token.request_cancel();
+        release_tx.send(()).unwrap();
+        let (mut list, _) = worker.join().unwrap();
+        assert!(
+            memo().lookup(&identity).is_none(),
+            "cancelled pass {cancel_pass} established a cross-request memo entry"
+        );
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(names(&list), before);
+        let search = SearchConfig::default();
+        let outcome = rerank_block_zero(
+            &mut list,
+            &Ok(SelectedBackend {
+                backend: backend.clone(),
+                fail_closed: false,
+            }),
+            &RerankSettings::resolve(&search),
+            &head_request(&search, project.path(), Some(prose), None),
+        )
+        .unwrap();
+        assert_eq!(outcome, HeadOutcome::Reordered);
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            1,
+            "the next request must score complete candidates, not replay a cancelled outcome"
+        );
+        assert!(memo().lookup(&identity).is_some());
+    }
+}
+
+#[test]
+fn audit1432_round3_ceiling_incomplete_candidate_never_commits() {
+    let project = tempfile::tempdir().unwrap();
+    let mut list = tiny_list(project.path(), 2);
+    let path = list.blocks[0].entries[0].result.path.clone();
+    let mut source = b"fn scan_subject() {}\n".to_vec();
+    source.extend(vec![b'x'; 17 << 20]);
+    std::fs::write(path, source).unwrap();
+    list.blocks[0].entries[0].result.symbol_range =
+        Some(super::super::comparator::SymbolOffsetRange::new(0, 20));
+    let backend = NumberedBackend::new(Vec::new());
+    let prose = "how does the streamed subject work";
+    let identity = memo_identity(
+        &list.key,
+        prose,
+        None,
+        &backend.fingerprint(),
+        2,
+        list.blocks[0].entries.iter().map(|entry| &entry.result),
+    );
+    let search = SearchConfig::default();
+    let _ = rerank_block_zero(
+        &mut list,
+        &Ok(SelectedBackend {
+            backend: backend.clone(),
+            fail_closed: false,
+        }),
+        &RerankSettings::resolve(&search),
+        &head_request(&search, project.path(), Some(prose), None),
+    );
+    assert!(
+        memo().lookup(&identity).is_none(),
+        "a ceiling-skipped candidate must not be treated as a complete memo input"
+    );
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn audit1432_round3_cancelled_backend_result_never_commits() {
+    struct CancelAfterScoring {
+        backend: Arc<NumberedBackend>,
+        token: crate::executor::JobCancellation,
+    }
+    impl RerankBackend for CancelAfterScoring {
+        fn fingerprint(&self) -> RerankFingerprint {
+            self.backend.fingerprint()
+        }
+        fn max_batch(&self) -> usize {
+            self.backend.max_batch()
+        }
+        fn score(
+            &self,
+            query: &str,
+            docs: &[RerankDoc<'_>],
+            deadline: Instant,
+        ) -> Result<Vec<f32>, RerankError> {
+            let scores = self.backend.score(query, docs, deadline);
+            self.token.request_cancel();
+            scores
+        }
+    }
+    let project = tempfile::tempdir().unwrap();
+    let mut list = tiny_list(project.path(), 2);
+    let backend = NumberedBackend::new(Vec::new());
+    let prose = "how does the scored subject work";
+    let identity = memo_identity(
+        &list.key,
+        prose,
+        None,
+        &backend.fingerprint(),
+        2,
+        list.blocks[0].entries.iter().map(|entry| &entry.result),
+    );
+    let search = SearchConfig::default();
+    let token = crate::executor::JobCancellation::new();
+    {
+        let _token = crate::executor::install_job_cancellation(token.clone());
+        let selected = Ok(SelectedBackend {
+            backend: Arc::new(CancelAfterScoring {
+                backend: backend.clone(),
+                token,
+            }),
+            fail_closed: false,
+        });
+        let _ = rerank_block_zero(
+            &mut list,
+            &selected,
+            &RerankSettings::resolve(&search),
+            &head_request(&search, project.path(), Some(prose), None),
+        );
+    }
+    assert!(
+        memo().lookup(&identity).is_none(),
+        "cancellation during scoring must be checked again before memo publication"
+    );
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    rerank_block_zero(
+        &mut list,
+        &Ok(SelectedBackend {
+            backend: backend.clone(),
+            fail_closed: false,
+        }),
+        &RerankSettings::resolve(&search),
+        &head_request(&search, project.path(), Some(prose), None),
+    )
+    .unwrap();
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+}
+
 fn head_request<'a>(
     search: &'a SearchConfig,
     project: &'a Path,

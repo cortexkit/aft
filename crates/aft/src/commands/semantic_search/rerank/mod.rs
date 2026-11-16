@@ -363,6 +363,9 @@ pub(crate) fn rerank_block_zero(
     settings: &RerankSettings,
     request: &RerankRequest<'_>,
 ) -> Result<HeadOutcome, String> {
+    if crate::executor::current_job_cancelled() {
+        return Ok(HeadOutcome::Skipped("request cancelled".into()));
+    }
     let Some(prose) = rerank_prose(request) else {
         return Ok(HeadOutcome::NotApplicable);
     };
@@ -409,17 +412,33 @@ pub(crate) fn rerank_block_zero(
             let candidate_wait = super::waits::time(super::waits::SearchWait::RerankCandidates);
             let texts = members
                 .iter()
-                .map(|entry| candidate_text(request.project_root, &entry.result, prose))
+                .map(|entry| candidate_text_checked(request.project_root, &entry.result, prose))
                 .collect::<Vec<_>>();
             drop(candidate_wait);
+            if crate::executor::current_job_cancelled()
+                || texts
+                    .iter()
+                    .any(|text| text.completion == CandidateCompletion::Cancelled)
+            {
+                return Ok(HeadOutcome::Skipped("request cancelled".into()));
+            }
+            if texts
+                .iter()
+                .any(|text| text.completion != CandidateCompletion::Complete)
+            {
+                return Ok(HeadOutcome::Skipped("candidate source incomplete".into()));
+            }
             let docs = texts
                 .iter()
-                .map(|text| RerankDoc { text })
+                .map(|text| RerankDoc { text: &text.text })
                 .collect::<Vec<_>>();
             let deadline = Instant::now() + settings.timeout;
             let scores = super::waits::timed(super::waits::SearchWait::RerankBackend, || {
                 selected.backend.score(prose, &docs, deadline)
             });
+            if crate::executor::current_job_cancelled() {
+                return Ok(HeadOutcome::Skipped("request cancelled".into()));
+            }
             let computed = match scores {
                 Ok(scores) => match validate_scores(&scores, depth) {
                     Ok(()) => CommittedOutcome::Reordered(permutation(&scores, &segments).into()),
@@ -437,7 +456,10 @@ pub(crate) fn rerank_block_zero(
                     CommittedOutcome::Skipped(error.skip_reason())
                 }
             };
-            memo().commit(identity, computed)
+            let Some(committed) = memo().commit(identity, computed) else {
+                return Ok(HeadOutcome::Skipped("request cancelled".into()));
+            };
+            committed
         }
     };
 
@@ -574,6 +596,38 @@ fn short_reason(reason: &str) -> String {
 /// are always kept whole. The result depends only on the project root, the
 /// entry, the prose and the file, never on which page is being served.
 pub(crate) fn candidate_text(project_root: &Path, result: &CandidateResult, prose: &str) -> String {
+    candidate_text_checked(project_root, result, prose).text
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CandidateCompletion {
+    Complete,
+    Cancelled,
+    Incomplete,
+}
+
+struct CandidateText {
+    // Diagnostics may retain a useful header after an incomplete read. Only
+    // completed source text may establish an outcome for later requests.
+    text: String,
+    completion: CandidateCompletion,
+}
+
+fn candidate_completion(read_completed: bool) -> CandidateCompletion {
+    if crate::executor::current_job_cancelled() {
+        CandidateCompletion::Cancelled
+    } else if read_completed {
+        CandidateCompletion::Complete
+    } else {
+        CandidateCompletion::Incomplete
+    }
+}
+
+fn candidate_text_checked(
+    project_root: &Path,
+    result: &CandidateResult,
+    prose: &str,
+) -> CandidateText {
     let _cost = super::telemetry::CostPhase::start("candidate_text");
     let files = super::request_files::current();
     if files
@@ -583,18 +637,18 @@ pub(crate) fn candidate_text(project_root: &Path, result: &CandidateResult, pros
         && std::fs::metadata(&result.path)
             .is_ok_and(|metadata| crate::large_read::is_large(metadata.len()))
     {
-        return streamed_candidate_text(project_root, result, prose);
+        return streamed_candidate_text_checked(project_root, result, prose);
     }
-    let file = super::request_files::read_through(files.as_deref(), &result.path, |path| {
+    let read = super::request_files::read_through(files.as_deref(), &result.path, |path| {
         #[cfg(test)]
         crate::search_hot_path_measurements::record_file_read_path(path);
         crate::large_read::counted(
             crate::large_read::Site::CandidateText,
             super::request_files::read_whole_file(path),
         )
-    })
-    .ok()
-    .map(|fetched| fetched.file);
+    });
+    let completion = candidate_completion(read.is_ok());
+    let file = read.ok().map(|fetched| fetched.file);
     let bytes = file.as_ref().map_or(&[][..], |file| file.bytes());
     let (raw_line, selected) = if let Some(range) = result.symbol_range {
         let start = floor_raw_boundary(&bytes, range.start.min(bytes.len()));
@@ -659,10 +713,19 @@ pub(crate) fn candidate_text(project_root: &Path, result: &CandidateResult, pros
         let room = CANDIDATE_TEXT_BUDGET_BYTES - text.len();
         text.push_str(&line[..floor_char_boundary(line, line.len().min(room))]);
     }
-    text
+    CandidateText { text, completion }
 }
 
+#[cfg(test)]
 fn streamed_candidate_text(project_root: &Path, result: &CandidateResult, prose: &str) -> String {
+    streamed_candidate_text_checked(project_root, result, prose).text
+}
+
+fn streamed_candidate_text_checked(
+    project_root: &Path,
+    result: &CandidateResult,
+    prose: &str,
+) -> CandidateText {
     let mut name = None;
     let mut raw_line = 0usize;
     let mut saw_code = false;
@@ -732,10 +795,13 @@ fn streamed_candidate_text(project_root: &Path, result: &CandidateResult, prose:
         line + 1
     );
     if scan.is_err() {
-        return text;
+        return CandidateText {
+            text,
+            completion: candidate_completion(false),
+        };
     }
     let first = matched.map_or(0, |line| line.saturating_sub(FILE_CONTEXT_LINES_ABOVE));
-    let _ = crate::large_read::visit_lines(
+    let scan = crate::large_read::visit_lines(
         &result.path,
         crate::large_read::Site::CandidateText,
         |index, offset, bytes| {
@@ -750,7 +816,10 @@ fn streamed_candidate_text(project_root: &Path, result: &CandidateResult, prose:
             }
         },
     );
-    text
+    CandidateText {
+        text,
+        completion: candidate_completion(scan.is_ok()),
+    }
 }
 
 fn selected_line(bytes: &[u8], offset: usize, range: super::SymbolOffsetRange) -> &[u8] {
@@ -971,14 +1040,18 @@ impl Memo {
     /// Commit `outcome` unless another request committed first; either way,
     /// return the outcome now in force. A result that arrives after a skip was
     /// committed therefore never replaces it.
-    fn commit(&self, identity: [u8; 32], outcome: CommittedOutcome) -> CommittedOutcome {
+    /// Cancelled computations return None and never publish a reusable outcome.
+    fn commit(&self, identity: [u8; 32], outcome: CommittedOutcome) -> Option<CommittedOutcome> {
         let mut guard = self
             .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (entries, order) = &mut *guard;
+        if crate::executor::current_job_cancelled() {
+            return None;
+        }
         if let Some(existing) = entries.get(&identity) {
-            return existing.clone();
+            return Some(existing.clone());
         }
         while entries.len() >= MEMO_CAPACITY {
             let Some(oldest) = order.pop_front() else {
@@ -986,9 +1059,12 @@ impl Memo {
             };
             entries.remove(&oldest);
         }
+        if crate::executor::current_job_cancelled() {
+            return None;
+        }
         entries.insert(identity, outcome.clone());
         order.push_back(identity);
-        outcome
+        Some(outcome)
     }
 }
 
