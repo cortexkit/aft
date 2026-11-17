@@ -279,7 +279,15 @@ async fn drive(
             .await;
             match retained {
                 Ok(Ok(retained)) => state.retry(&mut publisher, retained).await,
-                _ => {
+                // Name the step that failed (open, busy or read); a join
+                // error means the blocking task itself did not finish.
+                Ok(Err(code)) => {
+                    failure(code);
+                    tokio::time::sleep(delay).await;
+                    delay = backoff(delay);
+                    continue;
+                }
+                Err(_) => {
                     failure("bus_retry_ledger");
                     tokio::time::sleep(delay).await;
                     delay = backoff(delay);
@@ -306,8 +314,14 @@ async fn drive(
                         continue;
                     }
                 }
-                _ => {
-                    failure("bus_ledger_read");
+                Ok(Err(code)) => {
+                    failure(code);
+                    tokio::time::sleep(delay).await;
+                    delay = backoff(delay);
+                    continue;
+                }
+                Err(_) => {
+                    failure("bus_ledger_task");
                     tokio::time::sleep(delay).await;
                     delay = backoff(delay);
                     continue;
