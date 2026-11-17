@@ -978,8 +978,8 @@ struct ActionsLogRetry {
 }
 
 fn actions_log_retry_replies() -> [(&'static [u8], &'static str); 3] {
-    // TODO: replace the inline GitHub read reply bytes with Plexus's published test
-    // vectors from gh_shim_wire/read-bulk-replies-contract/ when available.
+    // Keep the legacy nested and missing-transmission replies exercised while
+    // deployed Plexus versions still use them. The bulk vectors cover current replies.
     [
         (br#"{"error":{"code":"read_dispatch_failed","outcome":{"transmission":"unknown","code":null,"message":"connection dropped"}}}"#, "read_dispatch_failed: connection dropped"),
         (br#"{"error":{"code":"read_dispatch_failed","transmission":"unknown","outcome":{"transmission":"unknown","code":null,"message":"connection dropped"}}}"#, "read_dispatch_failed: connection dropped"),

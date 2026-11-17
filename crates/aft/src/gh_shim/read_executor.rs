@@ -207,6 +207,8 @@ pub(super) fn decode_reply(request: &WireRequest, value: &Value) -> Result<ReadR
                 | "repository_not_visible"
                 | "endpoint_not_allowed"
                 | "agent_identity_required"
+                | "invalid_request"
+                | "grant_action_selector"
         );
         // A size refusal can follow a real GitHub response. Reads are safe to
         // narrow and retry even once the request has reached GitHub.
@@ -235,6 +237,7 @@ pub(super) fn decode_reply(request: &WireRequest, value: &Value) -> Result<ReadR
             }
             "response_too_large" => ReadError::ResponseTooLarge(format!("worker read response exceeds 1 MiB; narrow the request: {message}")),
             "agent_identity_required" => ReadError::Refused(format!("worker read requires a bot identity on the stamped route; restart the scoped session: {message}")),
+            "invalid_request" | "grant_action_selector" => ReadError::Refused(format!("{code}: {message}")),
             "vendor_error" => {
                 let status = error["status"].as_u64().filter(|status| (100..=599).contains(status) && !(200..=299).contains(status)).ok_or_else(|| malformed(code, "invalid HTTP status"))?;
                 ReadError::Vendor { status: status as u16, message: message.into() }
