@@ -298,15 +298,6 @@ fn complete_path_exemption_list_is_closed_and_goldens_are_exact() {
             "{}: complete-path transport parity mismatch between subc and ndjson",
             fixture.name
         );
-        if fixture.list_id == "payload.ignored_entries" {
-            assert!(
-                subc_text.contains("a/, b/, c/ and 3 more in this folder."),
-                "{subc_text}"
-            );
-            assert_eq!(subc_text.matches("Not searched (ignore rules):").count(), 1);
-            assert!(!subc_text.contains("shown "), "{subc_text}");
-            continue;
-        }
         assert_eq!(
             ndjson_text, fixture.golden,
             "{}: complete-path ndjson rendering drifted from its pinned golden",
@@ -330,6 +321,15 @@ fn transport_parity_corpus_covers_every_registered_surface_and_is_byte_equal() {
             "{}: transport parity mismatch between subc and ndjson",
             fixture.name
         );
+        if fixture.list_id == "payload.ignored_entries" {
+            assert!(
+                subc_text.contains("a/, b/, c/ and 3 more in this folder."),
+                "{subc_text}"
+            );
+            assert_eq!(subc_text.matches("Not searched (ignore rules):").count(), 1);
+            assert!(!subc_text.contains("shown "), "{subc_text}");
+            continue;
+        }
         assert!(
             subc_text.contains("shown "),
             "{}: capped fixture subc output must contain trailer",
