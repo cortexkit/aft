@@ -87,15 +87,13 @@ impl ReadError {
 }
 
 fn job_log_reason<'a>(code: &str, message: &'a str) -> &'a str {
-    if message != code {
-        return message;
-    }
+    // Keep command-line reasons stable even when backend diagnostics change.
     match code {
-        "job_not_finished" => "job has not finished",
-        "job_log_unavailable" => "log is unavailable (job skipped, never started, or log expired)",
-        "job_log_redirect_refused" => "log download redirect was refused",
-        "job_log_read_limit" => "log exceeds the read limit",
-        "job_log_download_failed" => "log download failed",
+        "job_not_finished" => "the job hasn't finished",
+        "job_log_unavailable" => "GitHub has no log for this job",
+        "job_log_redirect_refused" => "the download failed; retry later",
+        "job_log_read_limit" => "the log is over the read limit",
+        "job_log_download_failed" => "the download failed; retry later",
         _ => message,
     }
 }

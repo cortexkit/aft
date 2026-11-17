@@ -853,7 +853,7 @@ fn actions_log_unavailable_preserves_other_jobs_and_succeeds() {
         );
         assert_eq!(
             diagnostics,
-            "job 2: no log (log is unavailable (job skipped, never started, or log expired))\n"
+            "job 2: no log (GitHub has no log for this job)\n"
         );
         assert_eq!(calls, [1, 2, 3]);
     }
@@ -862,13 +862,16 @@ fn actions_log_unavailable_preserves_other_jobs_and_succeeds() {
 #[test]
 fn actions_log_incomplete_refusals_preserve_other_jobs_and_fail() {
     for (code, reason) in [
-        ("job_not_finished", "job has not finished"),
+        ("job_not_finished", "the job hasn't finished"),
         (
             "job_log_redirect_refused",
-            "log download redirect was refused",
+            "the download failed; retry later",
         ),
-        ("job_log_read_limit", "log exceeds the read limit"),
-        ("job_log_download_failed", "log download failed"),
+        ("job_log_read_limit", "the log is over the read limit"),
+        (
+            "job_log_download_failed",
+            "the download failed; retry later",
+        ),
     ] {
         let (result, output, diagnostics, calls) = actions_log_case(
             &["run", "view", "44003672471", "--log"],
@@ -958,7 +961,10 @@ fn actions_log_late_page_refusal_preserves_the_unterminated_log_line() {
     );
     assert_eq!(result.unwrap(), 1);
     assert_eq!(output, b"test\tUNKNOWN STEP\tpartial\n");
-    assert_eq!(diagnostics, b"test: no log (connection dropped)\n");
+    assert_eq!(
+        diagnostics,
+        b"test: no log (the download failed; retry later)\n"
+    );
     assert_eq!(ranges, [0, 7]);
 }
 

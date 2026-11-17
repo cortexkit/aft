@@ -335,20 +335,20 @@ fn actions_log_refusals_decode_as_readable_job_errors() {
         decode(&serde_json::from_slice(unavailable).unwrap())
             .unwrap_err()
             .message("bot"),
-        "log is unavailable (job skipped, never started, or log expired)"
+        "GitHub has no log for this job"
     );
     for (code, expected) in [
-        ("job_not_finished", "job has not finished"),
-        (
-            "job_log_unavailable",
-            "log is unavailable (job skipped, never started, or log expired)",
-        ),
+        ("job_not_finished", "the job hasn't finished"),
+        ("job_log_unavailable", "GitHub has no log for this job"),
         (
             "job_log_redirect_refused",
-            "log download redirect was refused",
+            "the download failed; retry later",
         ),
-        ("job_log_read_limit", "log exceeds the read limit"),
-        ("job_log_download_failed", "log download failed"),
+        ("job_log_read_limit", "the log is over the read limit"),
+        (
+            "job_log_download_failed",
+            "the download failed; retry later",
+        ),
     ] {
         let value = json!({"error":{"code":code,"message":code,"transmission":"sent"}});
         let error = decode(&value).unwrap_err();
@@ -357,16 +357,20 @@ fn actions_log_refusals_decode_as_readable_job_errors() {
         assert_eq!(error.message("bot"), expected);
         let mut readable = value.clone();
         readable["error"]["message"] = json!("Readable upstream reason");
-        assert_eq!(
-            decode(&readable).unwrap_err().message("bot"),
-            "Readable upstream reason"
-        );
-        for transmission in [json!("not_sent"), json!("unknown"), json!(null)] {
+        assert_eq!(decode(&readable).unwrap_err().message("bot"), expected);
+        for (transmission, reason) in [
+            (json!("not_sent"), "unexpected transmission"),
+            (json!("unknown"), "unexpected transmission"),
+            (json!(null), "transmission is missing"),
+        ] {
             let mut invalid = value.clone();
             invalid["error"]["transmission"] = transmission;
             let error = decode(&invalid).unwrap_err();
             assert_eq!(error.status(), REFUSAL_EXIT_STATUS);
-            assert!(error.message("bot").contains("malformed Plexus reply"));
+            assert_eq!(
+                error.message("bot"),
+                format!("malformed Plexus github_read reply (code {code}): {reason}")
+            );
         }
     }
 }
