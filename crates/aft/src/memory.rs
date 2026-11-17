@@ -1261,7 +1261,7 @@ static ALLOCATOR_OBSERVATION_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 static ALLOCATOR_OBSERVATION_PUBLISH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 static LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(UNSAMPLED_AT_MS);
 #[cfg(any(target_os = "macos", target_os = "linux"))]
