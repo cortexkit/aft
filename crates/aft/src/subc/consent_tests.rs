@@ -1,68 +1,8 @@
 use super::*;
 
-#[test]
-fn consent_scope_reason_bounds_paths_without_losing_repository_name() {
-    let separator = std::path::MAIN_SEPARATOR;
-    let deep = format!(
-        "{separator}first{separator}{}repository",
-        "middle/".repeat(30)
-    )
-    .replace('/', &separator.to_string());
-    let long_name = format!("repository-{}-ending", "界".repeat(100));
-    let cases = [
-        (
-            format!("{separator}first{separator}repository"),
-            "repository",
-        ),
-        (deep, "repository"),
-        (format!("{separator}{long_name}"), "repository-"),
-    ];
-    for (path, identity) in cases {
-        let reason = scope_reason(&AccessGrant {
-            path: PathBuf::from(&path),
-            kind: GrantKind::Subtree,
-            operation: AccessOperation::Read,
-        });
-        assert!(reason.chars().count() <= 160, "{path}: {reason}");
-        assert!(reason.starts_with("Allow scope: read-only access for all AFT read tools within the directory tree rooted at "));
-        assert!(reason.ends_with(". Protected paths remain denied."));
-        assert!(reason.contains(identity), "{reason}");
-        if path.contains(&long_name) {
-            assert!(reason.contains('…'), "{reason}");
-            assert!(reason.contains("-ending"), "{reason}");
-        } else if path.contains("middle") {
-            assert!(
-                reason.contains(&format!("{separator}first{separator}…")),
-                "{reason}"
-            );
-            assert!(
-                reason.contains(&format!("middle{separator}repository")),
-                "{reason}"
-            );
-        } else {
-            assert!(reason.contains(&path), "{reason}");
-        }
-    }
-}
-
-#[test]
-fn consent_scope_reason_shows_home_and_drops_first_component_before_repository() {
-    let separator = std::path::MAIN_SEPARATOR;
-    let home = PathBuf::from(format!("{separator}home{separator}worker"));
-    let path = home.join("middle").join("repository");
-    assert_eq!(
-        scope_reason_path(&path, &[home], 43),
-        format!("~{separator}middle{separator}repository")
-    );
-    let path = PathBuf::from(format!(
-        "{separator}{}{separator}repository",
-        "first".repeat(20)
-    ));
-    assert_eq!(
-        scope_reason_path(&path, &[], 43),
-        format!("…{separator}repository")
-    );
-}
+#[path = "consent_label_tests.rs"]
+mod labels;
+use labels::assert_read_tree_scope_label;
 
 #[cfg(unix)]
 mod program_approvals {
@@ -3530,6 +3470,7 @@ async fn consent_scope_read_preserves_floor_denial() {
     assert_eq!(f.fake.calls("consent.request").len(), count);
 }
 
+
 #[cfg(unix)]
 #[tokio::test]
 async fn consent_scope_card_matches_stored_directory() {
@@ -3544,7 +3485,7 @@ async fn consent_scope_card_matches_stored_directory() {
     assert_eq!(request["paths"], json!([f.head_root.join("shared.txt")]));
     assert_eq!(request["tool"], "read");
     assert_eq!(request["operation"], "read");
-    assert_eq!(request["reason"], format!("Allow scope: read-only access for all AFT read tools within the directory tree rooted at {}. Protected paths remain denied.", super::permissions::display_path(&f.head_root, &super::permissions::home_folders())));
+    assert_read_tree_scope_label(request["reason"].as_str().unwrap(), &f.head_root);
     assert_eq!(
         f.worker_grants(),
         vec![AccessGrant {
@@ -3597,7 +3538,7 @@ async fn worker_read_repository_scope_covers_manifest_tests_and_open_asks() {
         format!("{}/**", f.head_root.display())
     );
     assert_eq!(source_card["paths"], json!([source]));
-    assert_eq!(source_card["reason"], format!("Allow scope: read-only access for all AFT read tools within the directory tree rooted at {}. Protected paths remain denied.", super::permissions::display_path(&f.head_root, &super::permissions::home_folders())));
+    assert_read_tree_scope_label(source_card["reason"].as_str().unwrap(), &f.head_root);
     f.fake.answer(
         &source_key,
         json!({"state":"settled", "outcome":"allow_scope", "answered_by":"user"}),
@@ -4279,13 +4220,7 @@ async fn consent_scope_held_probe_at_settlement_keeps_advertised_tree_and_siblin
     );
     let request = &f.fake.calls("consent.request")[0];
     assert_eq!(request["pattern"], format!("{}/**", f.head_root.display()));
-    assert_eq!(
-        request["reason"],
-        READ_TREE_SCOPE_REASON.replace(
-            "{path}",
-            &super::permissions::display_path(&f.head_root, &super::permissions::home_folders())
-        )
-    );
+    assert_read_tree_scope_label(request["reason"].as_str().unwrap(), &f.head_root);
     assert_eq!(request["head_policy"], "allow");
     // A head may answer after the directory memo expires, while another
     // filesystem probe owns the only permit.
@@ -4494,7 +4429,7 @@ fn consent_scope_nested_file_still_offers_directory() {
     assert_eq!(scope.path, parent);
     assert_eq!(scope.kind, GrantKind::Subtree);
     assert_eq!(scope.operation, AccessOperation::Read);
-    assert_eq!(scope_reason(&scope), format!("Allow scope: read-only access for all AFT read tools within the directory tree rooted at {}. Protected paths remain denied.", super::permissions::display_path(&scope.path, &super::permissions::home_folders())));
+    assert_read_tree_scope_label(&scope_reason(&scope), &scope.path);
 }
 
 #[cfg(unix)]
@@ -4699,16 +4634,7 @@ fn consent_scope_four_concurrent_cards_share_directory_probe() {
             prep.request["pattern"],
             json!(format!("{}/**", f.head_root.display()))
         );
-        assert_eq!(
-            prep.request["reason"],
-            READ_TREE_SCOPE_REASON.replace(
-                "{path}",
-                &super::permissions::display_path(
-                    &f.head_root,
-                    &super::permissions::home_folders()
-                )
-            )
-        );
+        assert_read_tree_scope_label(prep.request["reason"].as_str().unwrap(), &f.head_root);
     }
     assert_eq!(
         probes.load(Ordering::SeqCst),
