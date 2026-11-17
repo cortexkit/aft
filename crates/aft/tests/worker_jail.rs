@@ -3790,7 +3790,7 @@ lookup="$AFT_GH_SHIM_STATE_DIR/read-session-lookup.json"
 rm -f "$lookup"
 unset AFT_GH_READ_SOCKET
 if gh api repos/cortexkit/aft >/dev/null 2>&1; then exit 91; fi
-python3 - "$lookup" 'worker read broker requires AFT_GH_READ_SOCKET' <<'PY'
+python3 - "$lookup" 'worker read broker requires AFT_GH_READ_SOCKET. Start a new bash command.' <<'PY'
 import json, sys
 with open(sys.argv[1]) as f: record = json.load(f)
 assert record['outcome'] == 'unavailable' and record['reason'] == sys.argv[2], record
@@ -3798,7 +3798,7 @@ PY
 rm "$lookup"
 export AFT_GH_READ_SOCKET="$TMPDIR/stale.sock"
 if gh api repos/cortexkit/aft >/dev/null 2>&1; then exit 92; fi
-python3 - "$lookup" 'worker read broker unavailable' <<'PY'
+python3 - "$lookup" 'gh reads are unavailable in this bash command. Start a new bash command.' <<'PY'
 import json, sys
 with open(sys.argv[1]) as f: record = json.load(f)
 assert record['outcome'] == 'unavailable' and record['reason'] == sys.argv[2], record
@@ -4276,7 +4276,7 @@ wait "$peer"
 python3 - "$AFT_GH_SHIM_STATE_DIR/read-session-lookup.json" <<'PY'
 import json, sys
 with open(sys.argv[1]) as f: record = json.load(f)
-assert record['outcome'] == 'unavailable' and record['reason'] == 'worker read broker reply malformed', record
+assert record['outcome'] == 'unavailable' and record['reason'] == 'gh read failed: worker read broker reply malformed. Start a new bash command.', record
 PY
 echo MALFORMED_BROKER_REPLY_REFUSED
 "#.replace("__AFT_SOCKET_GATE__", &test_gate::gate_socket("\"$TMPDIR/malformed.sock\"", "sleep .02"))).await;
@@ -4524,9 +4524,18 @@ async fn gh_shim_router_host_lookup_transport_failures_record_their_stage() {
     let capability = jail.worktree.join("host-test-capability");
     std::fs::write(&capability, "0123456789abcdef0123456789abcdef").unwrap();
     for (case, expected) in [
-        ("missing", "worker read broker requires AFT_GH_READ_SOCKET"),
-        ("stale", "worker read broker unavailable"),
-        ("malformed", "worker read broker reply malformed"),
+        (
+            "missing",
+            "worker read broker requires AFT_GH_READ_SOCKET. Start a new bash command.",
+        ),
+        (
+            "stale",
+            "gh reads are unavailable in this bash command. Start a new bash command.",
+        ),
+        (
+            "malformed",
+            "gh read failed: worker read broker reply malformed. Start a new bash command.",
+        ),
     ] {
         let _ = std::fs::remove_file(&lookup);
         let socket = jail.base.join(format!("{case}.sock"));
