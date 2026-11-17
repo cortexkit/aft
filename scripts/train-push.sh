@@ -1727,6 +1727,13 @@ fi
 # deleted. Publication inputs are checked in a disposable snapshot: no
 # generated document, alignment commit, or native release build is needed.
 preflights_ran=()
+if [ -f "$REPO/scripts/check-file-sizes.py" ]; then
+  python3 "$REPO/scripts/check-file-sizes.py" --self-test \
+    || refuse "file-size scanner self-tests failed"
+  python3 "$REPO/scripts/check-file-sizes.py" \
+    || refuse "file-size check failed — split growing files and lower stale pins"
+  preflights_ran+=(file-sizes)
+fi
 if [ -f "$REPO/scripts/release-gate-v049.mjs" ]; then
   node "$REPO/scripts/release-gate-v049.mjs" --check-inputs \
     || refuse "publication input check failed — fix the source, schema, policy, or reviewed vocabulary allowlist"

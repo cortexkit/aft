@@ -84,6 +84,10 @@ jobs:
         # .cortexkit/ is private working space; .gitignore names the few paths
         # there that may be tracked, and any other tracked file fails here.
         run: scripts/check-cortexkit-tracking.sh
+      - name: Hand-written source file sizes
+        run: |
+          python3 scripts/check-file-sizes.py --self-test
+          python3 scripts/check-file-sizes.py
       - name: Capture exact queue context for removal diagnostics
         if: ${{ always() && github.event_name == 'merge_group' }}
         run: |
