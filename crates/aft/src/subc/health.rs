@@ -11274,9 +11274,27 @@ mod tests {
         .metrics
         .expect("health metrics");
         if fixed_roots {
-            // Start with full root details, not a report that the first budget
-            // pass may already have reduced under platform-specific pressure.
-            report["roots"] = cache.snapshot().0.metrics["roots"].clone();
+            // Keep both names and reducible telemetry fixed: Windows has no
+            // FSEvents counters, and a prior budget pass may reduce real roots.
+            report["roots"] = json!([{
+                "project_root": "/health/root-000", "state": "ready", "actor_count": 1,
+                "search_index": {"status": "ready", "files": 123456},
+                "semantic_index": {"status": "ready"},
+                "callgraph_store": {"status": "ready", "symbols": 123456},
+                "tier2": {"status": "ready", "chunks": 9999999},
+                "watcher": {
+                    "exclusion_planning": {"status": "planned", "effective_prefixes": ["node_modules/.bun"], "matcher_generation": 2},
+                    "fsevents_stream_creations_total": 5,
+                    "invalidating_events_since_last_rescan": 547, "invalidating_events_total": 4275,
+                    "last_overflow_prefixes": [{"count": 512, "prefix": "node_modules/.bun"}],
+                    "last_rescan_at_ms": 1_794_682_252_879u64, "last_rescan_cost_ms": 2,
+                    "last_rescan_rss_delta_bytes": 1_884_160, "overflows_total": 1,
+                    "paths_after_gitignore_total": 1, "paths_dispatched_total": 1,
+                    "raw_events_since_last_rescan": 547, "raw_events_total": 4295,
+                    "rescans_user_dropped_total": 1
+                },
+                "bash": {"running": 0, "pending_completions": 0}
+            }]);
             report
                 .as_object_mut()
                 .unwrap()
