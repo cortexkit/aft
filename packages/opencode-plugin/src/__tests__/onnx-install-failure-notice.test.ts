@@ -20,7 +20,6 @@ function dependencies(
   return {
     ...defaultBridgeBootstrapDependencies,
     resolveBinary: async () => "/never-spawned/aft",
-    ensureStorageMigrated: async () => {},
     resolveStorageRoot: () => "/never-used/storage",
     buildConfigureParams: (_directory, state) => ({ ...state }),
     startLspAutoInstall: () => null,

@@ -1,5 +1,5 @@
 pub mod backups;
-pub mod clean_old_caches;
+pub mod clean_old;
 pub mod fix_config;
 pub mod grammar_smoke;
 pub mod help;

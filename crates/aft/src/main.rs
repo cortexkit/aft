@@ -323,23 +323,6 @@ fn main() {
     aft::pinned_executable::capture_at_startup();
     startup_phase("executable_source_captured");
 
-    if std::env::args().nth(1).as_deref() == Some("migrate-storage") {
-        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
-        match aft::migrate_storage::parse_cli_args(args) {
-            Ok(args) => {
-                let status = aft::migrate_storage::run_with_options(
-                    args,
-                    aft::migrate_storage::Options::default(),
-                );
-                std::process::exit(i32::from(status.code()));
-            }
-            Err(message) => {
-                eprintln!("{message}");
-                std::process::exit(2);
-            }
-        }
-    }
-
     // The index command is a serial CLI handoff: it performs one finite
     // snapshot and exits before logging, the App, runtime registry, or subc
     // scheduler can establish any standing actor or future maintenance work.
@@ -388,12 +371,6 @@ fn main() {
         let args = std::env::args_os().skip(2).collect::<Vec<_>>();
         std::process::exit(cli::fix_config::run(args));
     }
-    if std::env::args().nth(1).as_deref() == Some("clean-old-caches") {
-        std::process::exit(cli::clean_old_caches::run(
-            std::env::args_os().skip(2).collect(),
-        ));
-    }
-
     // `aft backups purge` removes undo backups early. It runs before logging
     // and the application start: it either hands the purge to the running
     // daemon or performs it once and exits.
@@ -408,9 +385,7 @@ fn main() {
         }
     }
 
-    // `aft cache prune-legacy` deletes the index folders AFT used before
-    // 0.64. Like `backups`, it runs before logging and the application start;
-    // it opens none of AFT's stores, so daemons can keep running meanwhile.
+    // Cache maintenance runs before logging and the application start.
     if std::env::args().nth(1).as_deref() == Some("cache") {
         let args = std::env::args_os().skip(2).collect::<Vec<_>>();
         std::process::exit(cli::prune_legacy::run(args));

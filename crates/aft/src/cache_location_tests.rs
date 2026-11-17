@@ -1,4 +1,4 @@
-use super::clean_old_caches_for_test as clean_old_caches;
+use super::clean_old_for_test as clean_old;
 use super::prepare_cache_root_for_test as prepare_cache_root;
 
 #[test]
@@ -13,7 +13,7 @@ fn legacy_cleanup_refuses_a_non_resolved_storage_root() {
         source: "test".into(),
         doc: serde_json::json!({"storage":{"cache_dir":parent}}).to_string(),
     }];
-    let report = super::clean_old_caches(&tiers, &storage, |_| true);
+    let report = super::clean_old(&tiers, &storage, |_| true);
     assert_eq!(
         report.reason,
         Some("old_cache_storage_root_mismatch"),
@@ -49,7 +49,7 @@ fn legacy_cleanup_requires_an_existing_aft_storage_proof() {
         source: "test".into(),
         doc: serde_json::json!({"storage":{"cache_dir":parent}}).to_string(),
     }];
-    let report = clean_old_caches(&tiers, &storage, |_| {
+    let report = clean_old(&tiers, &storage, |_| {
         panic!("ownership must be proved before confirmation")
     });
     assert_eq!(
@@ -74,7 +74,7 @@ fn legacy_cleanup_requires_the_active_namespace_on_its_own_device() {
     }];
     // No simulated volume here: this deliberately models an old enrollment on
     // the primary device, which is not sufficient to authorize legacy cleanup.
-    let report = super::clean_old_caches_resolved(&tiers, &storage, &storage, |_| {
+    let report = super::clean_old_resolved(&tiers, &storage, &storage, |_| {
         panic!("same-device namespace must be refused before confirmation")
     });
     assert_eq!(
@@ -329,7 +329,7 @@ fn cache_location_symlinked_storage_legacy_cleanup_works() {
     let tiers = [user_tier(
         &serde_json::json!({"storage":{"cache_dir":config.cache_dir}}).to_string(),
     )];
-    let report = clean_old_caches(&tiers, storage, |inventory| {
+    let report = clean_old(&tiers, storage, |inventory| {
         assert_eq!(inventory.len(), 1);
         assert_eq!(inventory[0].path, storage.join("index"));
         true
@@ -846,7 +846,7 @@ fn old_cache_cleanup_keeps_durable_names_when_a_candidate_is_their_bind_alias() 
         source: "user".into(),
         doc: serde_json::json!({"storage":{"cache_dir":parent}}).to_string(),
     }];
-    let report = clean_old_caches(&tiers, &storage, |_| true);
+    let report = clean_old(&tiers, &storage, |_| true);
     REPAIR_IDENTITIES.with(|ids| {
         ids.borrow_mut().remove(&candidate);
     });
@@ -1171,7 +1171,7 @@ fn cache_cleanup_upgrade_window_refuses_a_prelease_daemon() {
     LEGACY_DAEMON_PROCESSES.with(|text| *text.borrow_mut() = processes);
     let doctor = reclaim_configured_inactive_caches(&tiers, &storage);
     let mut confirmed = false;
-    let report = clean_old_caches(&tiers, &storage, |_| {
+    let report = clean_old(&tiers, &storage, |_| {
         confirmed = true;
         true
     });
@@ -1415,7 +1415,7 @@ fn cache_cleanup_refuses_a_daemon_using_the_same_storage_root() {
     // from startup, even while it is waiting for its first route.
     let daemon = acquire_daemon_storage_lease(&storage).unwrap();
     let mut confirmed = false;
-    let report = clean_old_caches(&tiers, &storage, |_| {
+    let report = clean_old(&tiers, &storage, |_| {
         confirmed = true;
         true
     });
@@ -1431,7 +1431,7 @@ fn cache_cleanup_refuses_a_daemon_using_the_same_storage_root() {
     assert!(!confirmed);
     assert!(old.is_file());
     drop(daemon);
-    let report = clean_old_caches(&tiers, &storage, |_| true);
+    let report = clean_old(&tiers, &storage, |_| true);
     assert!(report.error.is_none(), "{report:?}");
     assert!(!old.exists());
 }
@@ -1452,7 +1452,7 @@ fn cache_cleanup_allows_a_daemon_using_a_different_storage_root() {
         acquire_cache_cleanup_lease(&other).unwrap_err().kind(),
         io::ErrorKind::WouldBlock
     );
-    let report = clean_old_caches(&tiers, &storage, |inventory| {
+    let report = clean_old(&tiers, &storage, |inventory| {
         assert_eq!(inventory.len(), 1);
         assert_eq!(inventory[0].path, storage.join("index"));
         // Cleanup holds its exclusive lease through the confirmation prompt,
@@ -1997,7 +1997,7 @@ fn old_cache_cleanup_refuses_without_external_root_and_without_confirmation() {
     let temp = tempfile::tempdir().unwrap();
     let storage = temp.path().join("storage");
     let precious = canary(&storage, "index/old");
-    let report = clean_old_caches(&[], &storage, |_| panic!("must refuse before confirmation"));
+    let report = clean_old(&[], &storage, |_| panic!("must refuse before confirmation"));
     assert_eq!(report.reason, Some("old_cache_external_root_required"));
     assert!(precious.is_file());
     let parent = temp.path().join("volume");
@@ -2015,7 +2015,7 @@ fn old_cache_cleanup_refuses_without_external_root_and_without_confirmation() {
         source: "user file".into(),
         doc: serde_json::json!({"storage":{"cache_dir":parent}}).to_string(),
     }];
-    let report = clean_old_caches(&tiers, &storage, |inventory| {
+    let report = clean_old(&tiers, &storage, |inventory| {
         assert_eq!(inventory.len(), 1);
         assert_eq!(inventory[0].path, storage.join("index"));
         assert_eq!(inventory[0].bytes, 7);
@@ -2045,7 +2045,7 @@ fn old_cache_cleanup_resolves_system_symlink_ancestors_before_preflight() {
     let tiers = [user_tier(
         &serde_json::json!({"storage":{"cache_dir":parent}}).to_string(),
     )];
-    let report = clean_old_caches(&tiers, &storage, |inventory| {
+    let report = clean_old(&tiers, &storage, |inventory| {
         assert_eq!(inventory.len(), 1);
         assert_eq!(inventory[0].path, storage.join("index"));
         assert_eq!(inventory[0].bytes, 7);
@@ -2085,7 +2085,7 @@ fn old_cache_cleanup_refuses_nested_mounts_and_reports_partial_removal() {
             });
         }
         let report =
-            with_repair_failure_after_for_test(1, || clean_old_caches(&tiers, &storage, |_| true));
+            with_repair_failure_after_for_test(1, || clean_old(&tiers, &storage, |_| true));
         REPAIR_IDENTITIES.with(|ids| {
             ids.borrow_mut().remove(&nested);
         });

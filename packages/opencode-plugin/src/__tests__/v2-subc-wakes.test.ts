@@ -230,7 +230,6 @@ async function start(
     configLoadTexts: () => new Map(),
     deliverLoadNotices: () => {},
     migrateConfigLocations: () => [],
-    ensureStorageMigrated: async () => {},
     ensureOnnxRuntime: async () => null,
     startLspAutoInstall: () => null,
     pushLspPaths: async () => {},

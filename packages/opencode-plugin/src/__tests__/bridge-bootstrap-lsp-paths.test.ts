@@ -26,7 +26,6 @@ import { abortInFlightGithubInstalls } from "../lsp-github-install.js";
 const dependencies: BridgeBootstrapDependencies = {
   ...defaultBridgeBootstrapDependencies,
   resolveBinary: async () => "/never-spawned/aft",
-  ensureStorageMigrated: async () => {},
   resolveStorageRoot: () => "/never-used/storage",
   buildConfigureParams: (_directory, state) => ({ ...state }),
   ensureOnnxRuntime: async () => null,

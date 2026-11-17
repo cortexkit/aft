@@ -20,8 +20,7 @@ Subcommands:
   profile             Profile the running daemon's CPU, memory, or writes.
   backups purge       Preview or remove undo backups early.
   cache prune-legacy  Preview or remove index folders used before AFT 0.64.
-  migrate-storage     Migrate legacy storage into the CortexKit-rooted layout.
-  clean-old-caches    Remove old caches after moving them to a separate device.
+  cache clean-old     Remove old caches after moving them to a separate device.
 ";
 
 /// Only the first argument belongs to this guard; subcommands own their flags.
@@ -33,10 +32,38 @@ pub fn handle_first_arg(first_arg: Option<&str>) -> Option<i32> {
             Some(0)
         }
         "--version" | "-V" | "--formats" | "--subc" => None,
-        _ if arg.starts_with("--subc=") || !arg.starts_with('-') => None,
+        "setup" | "fix-config" | "index" | "grammar-smoke" | "backups" | "cache" | "profile"
+        | "warmup" => None,
+        _ if arg.starts_with("--subc=") => None,
+        _ if !arg.starts_with('-') => {
+            eprint!("aft: unknown command '{arg}'\n\n{USAGE}");
+            Some(2)
+        }
         _ => {
             eprint!("aft: unknown option '{arg}'\n\n{USAGE}");
             Some(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handle_first_arg;
+
+    #[test]
+    fn recognized_commands_pass_through_to_their_dispatchers() {
+        for command in [
+            "setup",
+            "fix-config",
+            "index",
+            "grammar-smoke",
+            "backups",
+            "cache",
+            "profile",
+            "warmup",
+        ] {
+            assert_eq!(handle_first_arg(Some(command)), None, "{command}");
+        }
+        assert_eq!(handle_first_arg(None), None);
     }
 }

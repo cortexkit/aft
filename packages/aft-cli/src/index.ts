@@ -30,12 +30,12 @@ function printHelp(): void {
   console.log(
     "    cache prune-legacy  Delete the index folders AFT used before 0.64 (dry run unless --yes)",
   );
+  console.log("    cache clean-old  Confirm removal of old storage-root caches after moving them");
   console.log("    doctor           Check and fix configuration issues");
   console.log("    doctor --profile [seconds]  Profile a running AFT daemon");
   console.log("    doctor lsp <file> Inspect LSP setup for one file");
   console.log(
     "    doctor --fix     Auto-fix common issues (e.g. ONNX Runtime mismatch, retired config keys)",
-    "    doctor --clean-old-caches  Confirm removal of old storage-root caches after moving them",
   );
   console.log("    doctor --reconfigure  Rerun the feature wizard");
   console.log(
@@ -91,10 +91,6 @@ async function main(): Promise<number> {
     return runCache(args);
   }
   if (command === "doctor") {
-    if (args.includes("--clean-old-caches")) {
-      const { runOldCacheCleanup } = await import("./commands/clean-old-caches.js");
-      return runOldCacheCleanup(args);
-    }
     if (args.includes("--profile")) {
       const { runDoctorProfile } = await import("./commands/doctor.js");
       return runDoctorProfile(args);

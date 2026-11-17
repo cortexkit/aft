@@ -6,21 +6,17 @@ import { CLI } from "../lib/cli.js";
 export function runOldCacheCleanup(argv: string[]): number {
   const binary = findAftBinary();
   if (!binary) {
-    console.error(missingAftBinaryMessage(`${CLI} doctor --clean-old-caches`));
+    console.error(missingAftBinaryMessage(`${CLI} cache clean-old`));
     return 1;
   }
-  if (argv.some((arg) => !["--clean-old-caches", "--yes", "--help", "-h"].includes(arg))) {
-    console.error("usage: aft doctor --clean-old-caches [--yes]");
+  if (argv.some((arg) => !["--yes", "--help", "-h"].includes(arg))) {
+    console.error("usage: aft cache clean-old [--yes]");
     return 2;
   }
-  const result = spawnSync(
-    binary,
-    ["clean-old-caches", ...argv.filter((arg) => arg !== "--clean-old-caches")],
-    {
-      stdio: "inherit",
-      env: process.env,
-    },
-  );
+  const result = spawnSync(binary, ["cache", "clean-old", ...argv], {
+    stdio: "inherit",
+    env: process.env,
+  });
   if (result.error) console.error(`Old cache cleanup failed to start: ${result.error.message}`);
   return result.status ?? 1;
 }

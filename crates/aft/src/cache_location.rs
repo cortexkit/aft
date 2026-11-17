@@ -2039,12 +2039,12 @@ fn remove_legacy_cache_roots(storage: &Path, active: &[PathBuf]) -> CleanupRepor
 
 /// Legacy cache deletion is a separate operation, never automatic repair.
 /// The callback sees the fully preflighted inventory while all locks are held.
-pub fn clean_old_caches(
+pub fn clean_old(
     tiers: &[crate::config_resolve::ConfigTier],
     storage: &Path,
     confirm: impl FnMut(&[CleanupCandidate]) -> bool,
 ) -> CleanupReport {
-    clean_old_caches_resolved(
+    clean_old_resolved(
         tiers,
         storage,
         &crate::bash_background::storage_dir(None),
@@ -2052,7 +2052,7 @@ pub fn clean_old_caches(
     )
 }
 
-fn clean_old_caches_resolved(
+fn clean_old_resolved(
     tiers: &[crate::config_resolve::ConfigTier],
     storage: &Path,
     resolved: &Path,
@@ -2126,7 +2126,7 @@ fn clean_old_caches_resolved(
 }
 
 #[cfg(test)]
-pub(crate) fn clean_old_caches_for_test(
+pub(crate) fn clean_old_for_test(
     tiers: &[crate::config_resolve::ConfigTier],
     storage: &Path,
     confirm: impl FnMut(&[CleanupCandidate]) -> bool,
@@ -2138,7 +2138,7 @@ pub(crate) fn clean_old_caches_for_test(
         .as_ref()
         .filter(|parent| parent.is_dir())
         .map(|parent| crate::walk_boundary::simulated_volumes::simulate(parent, u64::MAX - 17));
-    clean_old_caches_resolved(tiers, storage, storage, confirm)
+    clean_old_resolved(tiers, storage, storage, confirm)
 }
 
 /// Whether `storage` holds AFT's database (`aft.db`) or an owner marker that

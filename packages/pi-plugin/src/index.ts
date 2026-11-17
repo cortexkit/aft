@@ -36,7 +36,6 @@ import {
   createAftTransportPool,
   ensureBinary,
   ensureOnnxRuntime,
-  ensureStorageMigrated,
   findBinary,
   findBinarySync,
   formatDroppedKeyWarnings,
@@ -437,7 +436,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
   // Resolving an uncached binary can download it. A host may load this factory
   // only to validate the extension, without ever starting a session, so defer
-  // binary resolution and storage migration until actual transport demand.
+  // binary resolution until actual transport demand.
   const usesSubc = Boolean(config.subc?.connection_file?.trim());
   const storageDir = resolveCortexKitStorageRoot();
 
@@ -575,13 +574,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           (!explicitBinary ? findBinarySync(PLUGIN_VERSION) : null) ??
           (await findBinary(PLUGIN_VERSION));
       }
-      log("AFT binary resolved; checking storage migration");
-      await ensureStorageMigrated({
-        harness: "pi",
-        binaryPath: binaryPath ?? undefined,
-        expectedVersion: PLUGIN_VERSION,
-        logger: bridgeLogger,
-      });
       return createAftTransportPool({
         harness: "pi",
         binaryPath,

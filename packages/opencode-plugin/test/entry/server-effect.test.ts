@@ -35,7 +35,6 @@ function testDependencies(events: string[]) {
     configLoadTexts: () => new Map(),
     deliverLoadNotices: () => {},
     migrateConfigLocations: () => [],
-    ensureStorageMigrated: async () => {},
     ensureOnnxRuntime: async () => null,
     startLspAutoInstall: () => null,
     pushLspPaths: async () => {},

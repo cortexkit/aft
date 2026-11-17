@@ -2,7 +2,7 @@
 use std::ffi::OsString;
 use std::io::{self, BufRead, IsTerminal, Write};
 
-const HELP: &str = "usage: aft clean-old-caches [--yes]\n\nExplicit legacy exception: remove only views/, blobs/, callgraph/, semantic/, index/, symbols/ and inspect/ directly under the resolved, proven AFT storage root (aft.db or its owner marker). Harness folders and durable state are never selected. An active enrolled cache root on a separate device is required. Symlinks, foreign-device domains, nested mounts and hardlinks refuse cleanup. The prompt lists the exact folders and sizes and requires delete, or explicit --yes.";
+const HELP: &str = "usage: aft cache clean-old [--yes]\n\nExplicit legacy exception: remove only views/, blobs/, callgraph/, semantic/, index/, symbols/ and inspect/ directly under the resolved, proven AFT storage root (aft.db or its owner marker). Harness folders and durable state are never selected. An active enrolled cache root on a separate device is required. Symlinks, foreign-device domains, nested mounts and hardlinks refuse cleanup. The prompt lists the exact folders and sizes and requires delete, or explicit --yes.";
 
 pub fn run(args: Vec<OsString>) -> i32 {
     if args.len() == 1 && matches!(args[0].to_str(), Some("--help" | "-h")) {
@@ -42,7 +42,7 @@ fn run_with(
     input: &mut impl BufRead,
     output: &mut impl Write,
 ) -> i32 {
-    let report = aft::root_cache::clean_old_caches(tiers, storage, |candidates| {
+    let report = aft::root_cache::clean_old(tiers, storage, |candidates| {
         let mut total = 0u64;
         for candidate in candidates {
             total = total.saturating_add(candidate.bytes);
@@ -105,7 +105,7 @@ mod tests {
         let _process_snapshot = {
             use std::os::unix::fs::PermissionsExt;
             // Fake `ps` to report no running daemons for this real-volume deletion
-            // test; a separate test verifies the upgrade-window refusal. The scan
+            // test; separate tests verify refusal when old daemons are running. The scan
             // asks `ps` for executables (`pid=,comm=`) and for command lines
             // (`pid=,args=`), and refuses a listing that leaves out the scanning
             // process, so both answers list it: the script's parent.

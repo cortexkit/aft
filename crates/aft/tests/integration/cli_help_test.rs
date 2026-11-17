@@ -88,9 +88,8 @@ fn assert_usage(text: &str) {
         "warmup",
         "profile",
         "backups",
-        "cache",
-        "migrate-storage",
-        "clean-old-caches",
+        "cache prune-legacy",
+        "cache clean-old",
     ] {
         assert!(
             text.lines().any(|line| line.trim_start().starts_with(name)),
@@ -130,6 +129,38 @@ fn unknown_option_prints_error_and_usage_without_startup_files() {
     assert_eq!(usage.as_bytes(), help.output.stdout);
     assert_no_startup_files(&invocation);
     assert_no_startup_files(&help);
+}
+
+#[test]
+fn unknown_commands_print_error_and_usage_without_startup_files() {
+    let help = run(&["--help"]);
+    for command in ["migrate-storage", "clean-old-caches", "frobnicate"] {
+        let invocation = run(&[command]);
+        assert_eq!(invocation.output.status.code(), Some(2), "{command}");
+        assert!(invocation.output.stdout.is_empty());
+        let stderr = String::from_utf8(invocation.output.stderr.clone()).unwrap();
+        let prefix = format!("aft: unknown command '{command}'\n\n");
+        let usage = stderr
+            .strip_prefix(&prefix)
+            .unwrap_or_else(|| panic!("missing unknown-command diagnostic: {stderr}"));
+        assert_usage(usage);
+        assert_eq!(usage.as_bytes(), help.output.stdout);
+        assert_no_startup_files(&invocation);
+    }
+    assert_no_startup_files(&help);
+}
+
+#[test]
+fn cache_clean_old_dispatches_without_startup_files() {
+    let invocation = run(&["cache", "clean-old", "--help"]);
+    assert_eq!(invocation.output.status.code(), Some(0));
+    assert!(invocation.output.stderr.is_empty());
+    let stdout = String::from_utf8_lossy(&invocation.output.stdout);
+    assert!(
+        stdout.starts_with("usage: aft cache clean-old [--yes]"),
+        "{stdout}"
+    );
+    assert_no_startup_files(&invocation);
 }
 
 #[test]

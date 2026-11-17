@@ -190,9 +190,6 @@ describe.serial.skipIf(process.platform === "win32")(
         started.push("ensureBinary");
         throw new Error("network disabled");
       });
-      spyOn(bridge, "ensureStorageMigrated").mockImplementation(async () => {
-        started.push("migration");
-      });
       spyOn(bridge, "createAftTransportPool").mockImplementation(async () => {
         started.push("pool");
         throw new Error("transport must remain lazy");

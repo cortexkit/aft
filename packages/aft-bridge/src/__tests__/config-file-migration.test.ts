@@ -4,166 +4,11 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-  __migrationAsyncSpawnsForTests,
-  ensureStorageMigrated,
-  migrateAftConfigFile,
-  resolveCortexKitStorageRoot,
-  resolveLegacyStorageRoot,
-} from "../migration.js";
-import { type AftFixtureBehavior, writeAftFixture } from "./test-utils/aft-executable-fixture.js";
-import { acquireEnv } from "./test-utils/env-guard.js";
+import { migrateAftConfigFile } from "../config-file-migration.js";
 
 const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
-
-describe("storage migration bootstrap", () => {
-  let tempDir: string;
-  let releaseEnv: (() => void) | undefined;
-
-  beforeEach(async () => {
-    tempDir = mkdtempSync(join(tmpdir(), "aft-migration-test-"));
-    releaseEnv = await acquireEnv({
-      XDG_DATA_HOME: tempDir,
-      HOME: tempDir,
-      AFT_STORAGE_DIR: undefined,
-      // CI exports AFT_CACHE_DIR for the e2e suites; it outranks the XDG data
-      // root in the storage ladder these tests pin.
-      AFT_CACHE_DIR: undefined,
-    });
-  });
-
-  afterEach(() => {
-    releaseEnv?.();
-    releaseEnv = undefined;
-    rmSync(tempDir, { recursive: true, force: true });
-  });
-
-  function binary(behavior: AftFixtureBehavior): string {
-    const path = join(tempDir, `aft-${Math.random().toString(16).slice(2)}`);
-    return writeAftFixture(path, behavior);
-  }
-
-  test("ensureStorageMigrated_no_legacy_is_noop", async () => {
-    await expect(
-      ensureStorageMigrated({ harness: "opencode", binaryPath: "/missing/aft" }),
-    ).resolves.toBeUndefined();
-  }, 30_000);
-
-  test("ensureStorageMigrated_with_source_marker_backfills_target_marker", async () => {
-    const legacyRoot = resolveLegacyStorageRoot("opencode");
-    mkdirSync(legacyRoot, { recursive: true });
-    writeFileSync(join(legacyRoot, ".migrated_to_cortexkit"), "{}", "utf8");
-    const aft = binary({ exitCode: 0 });
-
-    await expect(
-      ensureStorageMigrated({ harness: "opencode", binaryPath: aft }),
-    ).resolves.toBeUndefined();
-  }, 30_000);
-
-  test("ensureStorageMigrated_spawns_and_succeeds", async () => {
-    const legacyRoot = resolveLegacyStorageRoot("opencode");
-    mkdirSync(legacyRoot, { recursive: true });
-    writeFileSync(join(legacyRoot, "warned_tools.json"), "{}", "utf8");
-    const aft = binary({ exitCode: 0 });
-
-    let deadline: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await expect(
-        Promise.race([
-          ensureStorageMigrated({ harness: "opencode", binaryPath: aft, timeoutMs: 59_000 }),
-          new Promise<never>((_, reject) => {
-            deadline = setTimeout(
-              () =>
-                reject(
-                  new Error(
-                    "ensureStorageMigrated_spawns_and_succeeds: native fixture did not close within 60 seconds",
-                  ),
-                ),
-              60_000,
-            );
-          }),
-        ]),
-      ).resolves.toBeUndefined();
-    } finally {
-      if (deadline) clearTimeout(deadline);
-    }
-  }, 65_000);
-
-  test("storage migration leaves the host event loop running", async () => {
-    mkdirSync(resolveLegacyStorageRoot("opencode"), { recursive: true });
-    const aft = binary({ sleepMs: 150, exitCode: 0 });
-    let turns = 0;
-    const before = __migrationAsyncSpawnsForTests();
-    const timer = setInterval(() => {
-      turns += 1;
-    }, 5);
-    try {
-      await ensureStorageMigrated({ harness: "opencode", binaryPath: aft });
-      expect(turns).toBeGreaterThan(0);
-      expect(__migrationAsyncSpawnsForTests() - before).toBe(1);
-    } finally {
-      clearInterval(timer);
-    }
-  }, 30_000);
-
-  test("ensureStorageMigrated_throws_on_nonzero_exit", async () => {
-    const legacyRoot = resolveLegacyStorageRoot("opencode");
-    mkdirSync(legacyRoot, { recursive: true });
-    writeFileSync(join(legacyRoot, "warned_tools.json"), "{}", "utf8");
-    const aft = binary({ stderr: "failed\n", exitCode: 5 });
-
-    await expect(ensureStorageMigrated({ harness: "opencode", binaryPath: aft })).rejects.toThrow(
-      /exit 5.*logs\/migration\/opencode-/,
-    );
-  }, 30_000);
-
-  test("ensureStorageMigrated_throws_on_timeout", async () => {
-    const legacyRoot = resolveLegacyStorageRoot("opencode");
-    mkdirSync(legacyRoot, { recursive: true });
-    writeFileSync(join(legacyRoot, "warned_tools.json"), "{}", "utf8");
-    const aft = binary({ sleepMs: 1_000 });
-
-    await expect(
-      ensureStorageMigrated({ harness: "opencode", binaryPath: aft, timeoutMs: 10 }),
-    ).rejects.toThrow(/ETIMEDOUT|timed out|spawn error/i);
-  }, 30_000);
-
-  test("resolveLegacyStorageRoot_returns_pi_fixed_path", () => {
-    expect(resolveLegacyStorageRoot("pi")).toBe(
-      join(process.env.HOME as string, ".pi", "agent", "aft"),
-    );
-  });
-
-  test("resolveLegacyStorageRoot_returns_opencode_xdg_path", () => {
-    expect(resolveLegacyStorageRoot("opencode")).toBe(
-      join(tempDir, "opencode", "storage", "plugin", "aft"),
-    );
-  });
-
-  test("resolveCortexKitStorageRoot_uses_new_xdg_path", () => {
-    expect(resolveCortexKitStorageRoot()).toBe(join(tempDir, "cortexkit", "aft"));
-  });
-
-  test("resolveCortexKitStorageRoot_prefers_absolute_environment_override", () => {
-    process.env.AFT_STORAGE_DIR = join(tempDir, "local-storage");
-    expect(resolveCortexKitStorageRoot()).toBe(join(tempDir, "local-storage"));
-  });
-
-  test("resolveCortexKitStorageRoot_resolves_relative_and_tilde_overrides", () => {
-    process.env.AFT_STORAGE_DIR = "./relative-storage/../local-storage";
-    expect(resolveCortexKitStorageRoot()).toBe(resolve("./local-storage"));
-
-    process.env.AFT_STORAGE_DIR = "~/tilde-storage";
-    expect(resolveCortexKitStorageRoot()).toBe(join(tempDir, "tilde-storage"));
-  });
-
-  test("resolveCortexKitStorageRoot_ignores_empty_override", () => {
-    process.env.AFT_STORAGE_DIR = "";
-    expect(resolveCortexKitStorageRoot()).toBe(join(tempDir, "cortexkit", "aft"));
-  });
-});
 
 describe("config file migration", () => {
   let root: string;
@@ -433,7 +278,7 @@ describe("config file migration", () => {
     writeFileSync(source, '{"semantic_search":true,"formatter":{"typescript":"biome"}}\n', "utf8");
 
     const script = `
-      import { migrateAftConfigFile } from "./src/migration.ts";
+      import { migrateAftConfigFile } from "./src/config-file-migration.ts";
       const result = migrateAftConfigFile({
         scope: "user",
         targetPath: process.env.TARGET,

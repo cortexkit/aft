@@ -215,6 +215,11 @@ export {
   formatSubcConnectionMissingMessage,
   resolveSubcConnectionFilePath,
 } from "./config-error.js";
+export type {
+  AftConfigFileMigrationOptions,
+  AftConfigFileMigrationResult,
+} from "./config-file-migration.js";
+export { migrateAftConfigFile } from "./config-file-migration.js";
 // --- shared harness config keys ---
 export {
   OPENCODE_ONLY_KEYS,
@@ -343,21 +348,6 @@ export {
   stripDetachKeywordsAndTidyGap,
   stripStandaloneDetachKeywords,
 } from "./message-detach.js";
-export type {
-  AftConfigFileMigrationOptions,
-  AftConfigFileMigrationResult,
-  MigrationHarness,
-  MigrationOptions,
-  MigrationStatus,
-} from "./migration.js";
-// --- storage migration ---
-export {
-  ensureStorageMigrated,
-  getMigrationStatus,
-  migrateAftConfigFile,
-  resolveCortexKitStorageRoot,
-  resolveLegacyStorageRoot,
-} from "./migration.js";
 export {
   clearMigrationNotices,
   deliverMigrationNoticeOnce,
@@ -398,7 +388,7 @@ export {
   findExecutablesOnPath,
   type PathLookupOptions,
 } from "./path-lookup.js";
-export type { LegacyAftConfigSource, ResolvedAftConfigPaths } from "./paths.js";
+export type { LegacyAftConfigSource, MigrationHarness, ResolvedAftConfigPaths } from "./paths.js";
 export {
   decodeFileUrl,
   legacyProjectConfigLocationNotice,
@@ -455,6 +445,7 @@ export {
   isTestEnvironment,
   resolveAftLogPath,
   resolveAftStorageRoot,
+  resolveCortexKitStorageRoot,
   resolveDataHome,
   resolvePluginLogPath,
   resolveStoragePath,

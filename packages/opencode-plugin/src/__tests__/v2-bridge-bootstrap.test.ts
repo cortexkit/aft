@@ -94,7 +94,6 @@ describe.serial("OpenCode 2 boot resolves ONNX Runtime through the shared bootst
       migrateConfigLocations: () => [],
       resolveVersion: () => "test",
       resolveBinary: async () => "/never-spawned-aft",
-      ensureStorageMigrated: async () => {},
       resolveStorageRoot: () => "/isolated/storage",
       buildConfigureParams: () => ({}),
       startLspAutoInstall: () => null,
@@ -138,7 +137,6 @@ describe.serial("OpenCode 2 boot resolves ONNX Runtime through the shared bootst
       migrateConfigLocations: () => [],
       resolveVersion: () => "0.0.0-test",
       resolveBinary: async () => join(tempDir as string, "never-spawned-aft"),
-      ensureStorageMigrated: async () => {},
       resolveStorageRoot: () => join(tempDir as string, "storage"),
       buildConfigureParams: (_directory: string, state: Overrides) => ({ ...state, config: [] }),
       ensureOnnxRuntime: async (storageDir: string) => {
@@ -242,7 +240,6 @@ describe.serial("OpenCode 1 and OpenCode 2 configure bridges identically", () =>
     // The shared bootstrap's production dependencies stay real; only the
     // effects that would download, spawn, or migrate are stubbed underneath.
     spyOn(bridge, "findBinarySync").mockImplementation(() => join(tempDir as string, "aft"));
-    spyOn(bridge, "ensureStorageMigrated").mockImplementation(async () => {});
     spyOn(bridge, "ensureOnnxRuntime").mockImplementation(async () => "/managed/onnxruntime");
 
     const v1Pools: RecordingPool[] = [];
@@ -334,7 +331,6 @@ describe.serial("OpenCode 2 live config reload", () => {
       migrateConfigLocations: () => [],
       resolveVersion: () => "0.0.0-test",
       resolveBinary: async () => join(tempDir as string, "never-spawned-aft"),
-      ensureStorageMigrated: async () => {},
       resolveStorageRoot: () => join(tempDir as string, "storage"),
       buildConfigureParams: (_directory: string, state: Overrides) => ({ ...state, config: [] }),
       ensureOnnxRuntime: async () => null,
@@ -410,7 +406,6 @@ test("V2 linked-worktree boot preserves Location storage and shell permission ov
     migrateConfigLocations: () => [],
     resolveVersion: () => "0.0.0-test",
     resolveBinary: async () => "never-spawned-aft",
-    ensureStorageMigrated: async () => {},
     resolveStorageRoot: () => storage,
     buildConfigureParams: (_root: string, state: Overrides) => ({
       ...state,
