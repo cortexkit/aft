@@ -393,7 +393,7 @@ pub(crate) struct AllocatorObservation {
 }
 
 impl AllocatorObservation {
-    fn from_source(source: AllocatorSource) -> Self {
+    pub(crate) fn from_source(source: AllocatorSource) -> Self {
         let (snapshot, age_ms) = allocator_observation(source);
         Self { snapshot, age_ms }
     }
@@ -1665,7 +1665,7 @@ pub fn allocator_slack_relief_due(
     }
 }
 
-/// Opportunistically return unused allocator pages without reading allocator
+/// On Linux, opportunistically return unused allocator pages without reading allocator
 /// statistics on the module loop. The loop only reads cached atomics. When the
 /// cached observation is stale, one sampler takes an initial snapshot; if it
 /// finds enough slack, the page-return operation reuses it and takes only one
@@ -1674,7 +1674,7 @@ pub fn allocator_slack_relief_due(
 /// `phys_footprint_bytes` cannot make this decision: it includes file mappings
 /// and other resident memory, so it cannot identify mapped-but-unused allocator
 /// arenas without allocator-zone statistics.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub fn spawn_allocator_slack_relief_if_due(now: std::time::Instant) -> bool {
     let now_ms = allocator_slack_elapsed_ms(now);
     if sample_is_stale(now_ms) {
@@ -1734,9 +1734,9 @@ pub fn spawn_allocator_slack_relief_if_due(now: std::time::Instant) -> bool {
     spawned
 }
 
-/// No allocator-statistics API is wired on this target; the loop-side decision
-/// is a no-op and the cache statics above stay at their unsampled sentinels.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// macOS statistics take every allocator-zone lock; sampling and relief there
+/// are explicit-only. Other non-Linux targets have no automatic sampler.
+#[cfg(not(target_os = "linux"))]
 pub fn spawn_allocator_slack_relief_if_due(_now: std::time::Instant) -> bool {
     false
 }
@@ -1927,7 +1927,7 @@ mod tests {
         assert_eq!(allocator_snapshot_calls_for_test(), calls_before);
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn loop_slack_decision_never_reads_allocator_statistics() {
         LAST_OBSERVED_ALLOCATOR_SLACK_BYTES.store(
@@ -1975,6 +1975,18 @@ mod tests {
             !threads.iter().any(|name| *name == loop_thread),
             "the loop-side decision must never read allocator statistics: {threads:?}"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_automatic_slack_sampling_and_relief_are_explicit_only() {
+        let before = allocator_snapshot_calls_for_test();
+        for seconds in [0, 30, 300, 3_600] {
+            assert!(!spawn_allocator_slack_relief_if_due(
+                std::time::Instant::now() + std::time::Duration::from_secs(seconds)
+            ));
+        }
+        assert_eq!(allocator_snapshot_calls_for_test(), before);
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

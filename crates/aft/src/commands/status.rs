@@ -662,6 +662,7 @@ impl AppContext {
                 .unwrap_or(serde_json::Value::Null);
             // The health worker publishes lifecycle details off the reply path.
             let lifecycle = self.app().lifecycle_census_snapshot();
+            payload["lifecycle_snapshot_age_ms"] = serde_json::json!(lifecycle.measured_age_ms);
             payload["lsp"] = serde_json::json!(lifecycle.lsp);
             payload["threads"] = serde_json::json!(lifecycle.threads);
             payload["sqlite"] = serde_json::json!(lifecycle.sqlite);
