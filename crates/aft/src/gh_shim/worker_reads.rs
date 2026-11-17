@@ -58,6 +58,7 @@ struct ByteRange {
 enum ReadError {
     Budget { retry_after_ms: u64 },
     Vendor { status: u16, message: String },
+    JobLog { code: String, message: String },
     ResponseTooLarge(String),
     Refused(String),
     Failed(String),
@@ -66,7 +67,7 @@ enum ReadError {
 impl ReadError {
     fn status(&self) -> i32 {
         match self {
-            Self::Failed(_) | Self::Vendor { .. } => 1,
+            Self::Failed(_) | Self::Vendor { .. } | Self::JobLog { .. } => 1,
             _ => REFUSAL_EXIT_STATUS,
         }
     }
@@ -78,9 +79,24 @@ impl ReadError {
                 retry_after_ms.div_ceil(60_000).max(1)
             ),
             Self::Vendor { status, message } => format!("HTTP {status}: {message}"),
+            Self::JobLog { code, message } => job_log_reason(code, message).into(),
             Self::ResponseTooLarge(text) | Self::Refused(text) | Self::Failed(text) => text.clone(),
         }
         .replace(['\n', '\r'], " ")
+    }
+}
+
+fn job_log_reason<'a>(code: &str, message: &'a str) -> &'a str {
+    if message != code {
+        return message;
+    }
+    match code {
+        "job_not_finished" => "job has not finished",
+        "job_log_unavailable" => "log is unavailable (job skipped, never started, or log expired)",
+        "job_log_redirect_refused" => "log download redirect was refused",
+        "job_log_read_limit" => "log exceeds the read limit",
+        "job_log_download_failed" => "log download failed",
+        _ => message,
     }
 }
 

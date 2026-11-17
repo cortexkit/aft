@@ -133,12 +133,29 @@ pub(super) fn decode_reply(request: &WireRequest, value: &Value) -> Result<ReadR
         let code = error["code"]
             .as_str()
             .ok_or_else(|| malformed("missing", "error.code must be a string"))?;
-        let transmission = error["transmission"]
-            .as_str()
-            .ok_or_else(|| malformed(code, "transmission is missing"))?;
+        let transmission = error
+            .get("transmission")
+            .or_else(|| {
+                error
+                    .get("outcome")
+                    .and_then(|outcome| outcome.get("transmission"))
+            })
+            .and_then(Value::as_str);
         let message = error["message"]
             .as_str()
+            .or_else(|| {
+                (code == "read_dispatch_failed")
+                    .then(|| error["outcome"]["message"].as_str())
+                    .flatten()
+            })
             .ok_or_else(|| malformed(code, "message must be a string"))?;
+        if code == "read_response_invalid" {
+            return Err(ReadError::Failed(format!(
+                "GitHub read response is invalid: {message}"
+            )));
+        }
+        let transmission =
+            transmission.ok_or_else(|| malformed(code, "transmission is missing"))?;
         let known_refusal = matches!(
             code,
             "read_budget_exhausted"
@@ -151,6 +168,16 @@ pub(super) fn decode_reply(request: &WireRequest, value: &Value) -> Result<ReadR
         if (known_refusal && transmission != "not_sent")
             || (code == "response_too_large" && !matches!(transmission, "sent" | "not_sent"))
             || (code == "vendor_error" && transmission != "sent")
+            || (matches!(
+                code,
+                "job_not_finished"
+                    | "job_log_unavailable"
+                    | "job_log_redirect_refused"
+                    | "job_log_read_limit"
+                    | "job_log_download_failed"
+            ) && transmission != "sent")
+            || (code == "read_dispatch_failed"
+                && !matches!(transmission, "sent" | "not_sent" | "unknown"))
         {
             return Err(malformed(code, "unexpected transmission"));
         }
@@ -167,6 +194,8 @@ pub(super) fn decode_reply(request: &WireRequest, value: &Value) -> Result<ReadR
                 let status = error["status"].as_u64().filter(|status| (100..=599).contains(status) && !(200..=299).contains(status)).ok_or_else(|| malformed(code, "invalid HTTP status"))?;
                 ReadError::Vendor { status: status as u16, message: message.into() }
             }
+            "job_not_finished" | "job_log_unavailable" | "job_log_redirect_refused" | "job_log_read_limit" | "job_log_download_failed" => ReadError::JobLog { code: code.into(), message: message.into() },
+            "read_dispatch_failed" => ReadError::Failed(format!("GitHub read dispatch failed (transmission {transmission}); retry the read: {message}")),
             _ => malformed(code, "unknown error code"),
         });
     }

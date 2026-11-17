@@ -328,6 +328,83 @@ fn read_draft_transmission_guard_rejects_refusal_and_vendor_mismatches() {
 }
 
 #[test]
+fn actions_log_refusals_decode_as_readable_job_errors() {
+    // Plexus can return lean errors without an MCP presentation wrapper.
+    let unavailable = br#"{"error":{"code":"job_log_unavailable","message":"job_log_unavailable","transmission":"sent"}}"#;
+    assert_eq!(
+        decode(&serde_json::from_slice(unavailable).unwrap())
+            .unwrap_err()
+            .message("bot"),
+        "log is unavailable (job skipped, never started, or log expired)"
+    );
+    for (code, expected) in [
+        ("job_not_finished", "job has not finished"),
+        (
+            "job_log_unavailable",
+            "log is unavailable (job skipped, never started, or log expired)",
+        ),
+        (
+            "job_log_redirect_refused",
+            "log download redirect was refused",
+        ),
+        ("job_log_read_limit", "log exceeds the read limit"),
+        ("job_log_download_failed", "log download failed"),
+    ] {
+        let value = json!({"error":{"code":code,"message":code,"transmission":"sent"}});
+        let error = decode(&value).unwrap_err();
+        assert!(matches!(error, ReadError::JobLog { .. }), "{error:?}");
+        assert_eq!(error.status(), 1);
+        assert_eq!(error.message("bot"), expected);
+        let mut readable = value.clone();
+        readable["error"]["message"] = json!("Readable upstream reason");
+        assert_eq!(
+            decode(&readable).unwrap_err().message("bot"),
+            "Readable upstream reason"
+        );
+        for transmission in [json!("not_sent"), json!("unknown"), json!(null)] {
+            let mut invalid = value.clone();
+            invalid["error"]["transmission"] = transmission;
+            let error = decode(&invalid).unwrap_err();
+            assert_eq!(error.status(), REFUSAL_EXIT_STATUS);
+            assert!(error.message("bot").contains("malformed Plexus reply"));
+        }
+    }
+}
+
+#[test]
+fn actions_log_dispatch_failure_accepts_nested_and_top_level_transmission() {
+    let legacy = br#"{"error":{"code":"read_dispatch_failed","outcome":{"transmission":"unknown","code":null,"message":"connection dropped"}}}"#;
+    let mut value: Value = serde_json::from_slice(legacy).unwrap();
+    for top_level in [false, true] {
+        if top_level {
+            value["error"]["transmission"] = json!("unknown");
+        }
+        let error = decode(&value).unwrap_err();
+        assert_eq!(error.status(), 1);
+        assert_eq!(error.message("bot"), "GitHub read dispatch failed (transmission unknown); retry the read: connection dropped");
+    }
+    value["error"]["transmission"] = json!("not_sent");
+    value["error"]["message"] = json!("top-level reason");
+    assert_eq!(
+        decode(&value).unwrap_err().message("bot"),
+        "GitHub read dispatch failed (transmission not_sent); retry the read: top-level reason"
+    );
+    value["error"]["transmission"] = json!("future");
+    assert_eq!(decode(&value).unwrap_err().status(), REFUSAL_EXIT_STATUS);
+}
+
+#[test]
+fn actions_log_invalid_response_needs_no_transmission() {
+    let value = br#"{"error":{"code":"read_response_invalid","message":"invalid response body"}}"#;
+    let error = decode(&serde_json::from_slice(value).unwrap()).unwrap_err();
+    assert_eq!(error.status(), 1);
+    assert_eq!(
+        error.message("bot"),
+        "GitHub read response is invalid: invalid response body"
+    );
+}
+
+#[test]
 fn read_draft_root_is_empty_and_lone_slash_never_reaches_transport() {
     let argv = [OsString::from("api"), OsString::from("/")];
     assert!(plan(&argv, "cortexkit/aft").is_err());

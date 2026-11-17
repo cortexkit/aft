@@ -775,6 +775,225 @@ fn v20_log_failed_skips_successful_jobs() {
     assert_eq!(log_ids, vec![120842790454]);
 }
 
+fn actions_log_case(
+    raw: &[&str],
+    ids: &[u64],
+    refusals: &[(u64, &str)],
+) -> (Result<i32, ReadError>, String, String, Vec<u64>) {
+    let jobs: Vec<Value> = ids
+        .iter()
+        .map(|id| {
+            json!({
+                "id":id,"name":format!("job {id}"),"conclusion":"failure"
+            })
+        })
+        .collect();
+    let mut output = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut calls = Vec::new();
+    let result = render::run_with_io(
+        &planned(raw),
+        &mut |request| match request {
+            ReadRequest::Get { path, .. } => Ok(reply(if path.contains("/actions/jobs/") {
+                jobs[0].clone()
+            } else {
+                json!({"jobs":jobs})
+            })),
+            ReadRequest::JobLog { job_id, .. } => {
+                calls.push(*job_id);
+                let value = if let Some((_, code)) = refusals.iter().find(|(id, _)| id == job_id) {
+                    json!({"error":{"code":code,"message":code,"transmission":"sent"}})
+                } else {
+                    json!({"result":{"body":"kept\n","offset":0,"length":5,"total_bytes":5}})
+                };
+                executor::decode_reply(
+                    &executor::wire_request("cortexkit/aft", request).unwrap(),
+                    &value,
+                )
+            }
+            _ => panic!("unexpected request {request:?}"),
+        },
+        &mut output,
+        &mut diagnostics,
+        &mut |_| panic!("log refusals must not retry or sleep"),
+    );
+    (
+        result,
+        String::from_utf8(output).unwrap(),
+        String::from_utf8(diagnostics).unwrap(),
+        calls,
+    )
+}
+
+#[test]
+fn actions_log_single_job_success_has_no_diagnostic() {
+    let (result, output, diagnostics, calls) = actions_log_case(
+        &["run", "view", "--job", "133780422078", "--log"],
+        &[133780422078],
+        &[],
+    );
+    assert_eq!(result.unwrap(), 0);
+    assert_eq!(output, "job 133780422078\tUNKNOWN STEP\tkept\n");
+    assert!(diagnostics.is_empty());
+    assert_eq!(calls, [133780422078]);
+}
+
+#[test]
+fn actions_log_unavailable_preserves_other_jobs_and_succeeds() {
+    for flag in ["--log", "--log-failed"] {
+        let (result, output, diagnostics, calls) = actions_log_case(
+            &["run", "view", "44003672471", flag],
+            &[1, 2, 3],
+            &[(2, "job_log_unavailable")],
+        );
+        assert_eq!(result.unwrap(), 0);
+        assert_eq!(
+            output,
+            "job 1\tUNKNOWN STEP\tkept\njob 3\tUNKNOWN STEP\tkept\n"
+        );
+        assert_eq!(
+            diagnostics,
+            "job 2: no log (log is unavailable (job skipped, never started, or log expired))\n"
+        );
+        assert_eq!(calls, [1, 2, 3]);
+    }
+}
+
+#[test]
+fn actions_log_incomplete_refusals_preserve_other_jobs_and_fail() {
+    for (code, reason) in [
+        ("job_not_finished", "job has not finished"),
+        (
+            "job_log_redirect_refused",
+            "log download redirect was refused",
+        ),
+        ("job_log_read_limit", "log exceeds the read limit"),
+        ("job_log_download_failed", "log download failed"),
+    ] {
+        let (result, output, diagnostics, calls) = actions_log_case(
+            &["run", "view", "44003672471", "--log"],
+            &[1, 2, 3],
+            &[(2, code)],
+        );
+        assert_eq!(result.unwrap(), 1, "{code}");
+        assert_eq!(
+            output,
+            "job 1\tUNKNOWN STEP\tkept\njob 3\tUNKNOWN STEP\tkept\n"
+        );
+        assert_eq!(diagnostics, format!("job 2: no log ({reason})\n"));
+        assert_eq!(calls, [1, 2, 3]);
+    }
+}
+
+#[test]
+fn actions_log_all_unavailable_and_single_job_refusals_fail() {
+    let (result, output, diagnostics, calls) = actions_log_case(
+        &["run", "view", "44003672471", "--log"],
+        &[1, 2],
+        &[(1, "job_log_unavailable"), (2, "job_log_unavailable")],
+    );
+    assert_eq!(result.unwrap(), 1);
+    assert!(output.is_empty());
+    assert_eq!(diagnostics.lines().count(), 2);
+    assert_eq!(calls, [1, 2]);
+    for code in [
+        "job_not_finished",
+        "job_log_unavailable",
+        "job_log_redirect_refused",
+        "job_log_read_limit",
+        "job_log_download_failed",
+    ] {
+        let (result, output, diagnostics, calls) = actions_log_case(
+            &["run", "view", "--job", "133780422078", "--log"],
+            &[133780422078],
+            &[(133780422078, code)],
+        );
+        assert_eq!(result.unwrap(), 1, "{code}");
+        assert!(output.is_empty());
+        assert!(diagnostics.starts_with("job 133780422078: no log ("));
+        assert_eq!(calls, [133780422078]);
+    }
+}
+
+#[test]
+fn actions_log_exit_status_still_reports_failed_jobs_with_unavailable_logs() {
+    let (result, output, diagnostics, calls) = actions_log_case(
+        &["run", "view", "44003672471", "--log", "--exit-status"],
+        &[1, 2],
+        &[(2, "job_log_unavailable")],
+    );
+    assert_eq!(result.unwrap(), 1);
+    assert_eq!(output, "job 1\tUNKNOWN STEP\tkept\n");
+    assert!(diagnostics.starts_with("job 2: no log ("));
+    assert_eq!(calls, [1, 2]);
+}
+
+#[test]
+fn actions_log_late_page_refusal_preserves_the_unterminated_log_line() {
+    let mut ranges = Vec::new();
+    let mut output = Vec::new();
+    let mut diagnostics = Vec::new();
+    let result = render::run_with_io(
+        &planned(&["run", "view", "8", "--log"]),
+        &mut |request| match request {
+            ReadRequest::Get { .. } => Ok(reply(json!({"jobs":[{"id":1,"name":"test"}]}))),
+            ReadRequest::JobLog {
+                range: Some(range), ..
+            } => {
+                ranges.push(range.offset);
+                if range.offset == 0 {
+                    Ok(log_reply(b"partial", 0, 100))
+                } else {
+                    Err(ReadError::JobLog {
+                        code: "job_log_download_failed".into(),
+                        message: "connection dropped".into(),
+                    })
+                }
+            }
+            _ => panic!("unexpected request {request:?}"),
+        },
+        &mut output,
+        &mut diagnostics,
+        &mut |_| panic!("log refusals must not retry or sleep"),
+    );
+    assert_eq!(result.unwrap(), 1);
+    assert_eq!(output, b"test\tUNKNOWN STEP\tpartial\n");
+    assert_eq!(diagnostics, b"test: no log (connection dropped)\n");
+    assert_eq!(ranges, [0, 7]);
+}
+
+#[test]
+fn actions_log_single_job_dispatch_failure_is_readable_and_not_retried() {
+    let mut calls = 0;
+    let mut output = Vec::new();
+    let mut diagnostics = Vec::new();
+    let error = render::run_with_io(
+        &planned(&["run", "view", "--job", "133780422078", "--log"]),
+        &mut |request| match request {
+            ReadRequest::Get { .. } => Ok(reply(json!({"id":133780422078_u64,"name":"test"}))),
+            ReadRequest::JobLog { .. } => {
+                calls += 1;
+                executor::decode_reply(
+                    &executor::wire_request("cortexkit/aft", request).unwrap(),
+                    &json!({"error":{"code":"read_dispatch_failed","outcome":{"transmission":"unknown","code":null,"message":"connection dropped"}}}),
+                )
+            }
+            _ => panic!("unexpected request"),
+        },
+        &mut output,
+        &mut diagnostics,
+        &mut |_| panic!("must not retry"),
+    ).unwrap_err();
+    assert_eq!(error.status(), 1);
+    assert_eq!(
+        error.message("bot"),
+        "GitHub read dispatch failed (transmission unknown); retry the read: connection dropped"
+    );
+    assert_eq!(calls, 1);
+    assert!(output.is_empty());
+    assert!(diagnostics.is_empty());
+}
+
 #[test]
 fn v20_log_protocol_rejects_missing_total_stalls_and_oversized_replies() {
     for response in [
