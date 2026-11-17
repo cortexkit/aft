@@ -10,8 +10,8 @@ Both files are JSONC (comments allowed). One location serves every harness:
 
 Agents may read and edit the entire CortexKit settings folder, `~/.config/cortexkit`
 or `$XDG_CONFIG_HOME/cortexkit`, including any key or token files still there.
-Secrets belong in the vault, not in the settings folder. Subconscious's settings
-gate turns edits into proposals for the user to approve. CortexKit's private data
+Secrets belong in the vault, not in the settings folder. When Subconscious's settings
+protection is on, edits become proposals for the user to approve. CortexKit's private data
 and state folders (`~/.local/share/cortexkit`, `~/.local/state/cortexkit`, and their
 `XDG_DATA_HOME` and `XDG_STATE_HOME` equivalents), AFT's storage directory, and the
 daemon connection file remain blocked.

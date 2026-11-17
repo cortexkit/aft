@@ -78,7 +78,7 @@ async fn prefrontal_rename_bus_preserves_custody_and_reader_subjects() {
                 .event_subject_with_reader(
                     "aft",
                     LATE_RESULT_READY_EVENT,
-                    LATE_RESULT_READY_VERSION,
+                    LATE_RESULT_READY_VERSION.try_into().unwrap(),
                     reader,
                 )
                 .unwrap(),
