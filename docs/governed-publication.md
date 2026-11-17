@@ -59,6 +59,42 @@ the current Cargo workspace version. `--build` remains an explicit release-only
 packaging option; neither `--stage` nor `--check-inputs` invokes it. Combining
 `--check-inputs` with `--build` is rejected.
 
+## Publication outcomes and crates.io retries
+
+On a release tag, crates.io publication, the GitHub release and npm publication
+all require the exact-commit CI gate, every release build and every shipped E2E
+job to succeed. npm also waits for the GitHub release. GitHub and npm do not wait
+for crates.io: a crates.io refusal or outage leaves the Actions run red, with
+`Publish to crates.io` failed, but does not stop the other publications.
+
+`scripts/release.sh` stops after tagging; it does not wait for publication.
+Use `scripts/wait-release.sh <tag>` to monitor the release run. The waiter does
+not cancel the other publications when crates.io fails. Once the run finishes,
+it reports when GitHub and npm succeeded but crates.io failed, and still exits
+1. Other blocking job failures retain fail-fast cancellation. Check the named
+jobs before treating a red run as a complete release failure.
+
+After the GitHub release exists, retry crates.io without rebuilding, rerunning
+E2E or republishing GitHub/npm:
+
+```sh
+gh workflow run crates-retry.yml --ref main -f tag=vX.Y.Z
+gh run list --workflow crates-retry.yml --limit 5
+gh run watch <retry-run-id> --exit-status
+```
+
+Alternatively, select **Retry crates.io publication** in GitHub Actions, choose
+the `main` branch and enter the existing release tag. The workflow must already
+be available on the default branch. It refuses absent or draft GitHub releases,
+checks out `refs/tags/<tag>` as the publication source, syncs the manifests to
+that tag's version, and runs only the crates.io publish job. Retry tooling comes
+from the selected workflow revision so tags older than the retry helper work.
+The shared publisher retains the leaf-crate ordering, sparse-index wait and
+`already exists` skips, so a partial publication can be retried safely. It does
+not create or move a tag, change the released source or repair the original
+run's red conclusion. If crates.io still refuses the unchanged package (for
+example, its size limit), a retry will remain red until that refusal is resolved.
+
 ## Field ownership and checks
 
 Logical `docs/...` record paths in policy and artifact rows are resolved to the

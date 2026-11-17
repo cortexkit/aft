@@ -5,12 +5,14 @@
 # Polls every 5 seconds, exits 0 on success, 1 on failure, 2 on timeout.
 #
 # Behavior:
-#   - Watches BOTH the workflow conclusion AND individual job state. When any
-#     non-skipped, non-allowlisted job reaches a failure-class conclusion
+#   - Watches BOTH the workflow conclusion AND individual job state. When a
+#     blocking job reaches a failure-class conclusion
 #     (failure, cancelled, timed_out, action_required) the script cancels
 #     the remaining run, waits for terminal state, and exits 1 with the
 #     failing job name. This saves the 15-20 minute tail when one job fails
 #     at minute 3 but the other parallel jobs would have kept running.
+#   - A crates.io failure never cancels GitHub or npm publication. Wait for
+#     their outcomes and still exit 1 if crates.io failed; the run stays red.
 #   - Allowlist of failure-tolerant jobs is fixed in JOB_FAILURE_ALLOWLIST
 #     below — only contains the Discord announcement step, which is
 #     intentionally continue-on-error and isn't allowed to roll back a real
@@ -156,7 +158,8 @@ is_allowlisted_job() {
   return 1
 }
 
-# Returns 0 (true) when a job is in a non-allowlisted terminal failure state.
+# Returns 0 when a failure requires cancelling the other publication jobs.
+# crates.io remains a terminal failure, but must not prevent GitHub/npm shipping.
 # Outputs "<name>\t<conclusion>" on stdout for the first matching job.
 find_failed_job() {
   local jobs_json="$1"
@@ -164,7 +167,7 @@ find_failed_job() {
   # but skip jobs that are intentionally continue-on-error AND in the allowlist.
   while IFS=$'\t' read -r name conclusion; do
     [[ -z "$name" ]] && continue
-    if ! is_allowlisted_job "$name"; then
+    if ! is_allowlisted_job "$name" && [[ "$name" != "Publish to crates.io" ]]; then
       echo -e "${name}\t${conclusion}"
       return 0
     fi
@@ -178,6 +181,17 @@ find_failed_job() {
     '
   )
   return 1
+}
+
+crates_only_failure() {
+  echo "$1" | jq -e '
+    any(.jobs[]; .name == "Publish to crates.io" and .status == "completed"
+      and (.conclusion as $c | ["failure", "cancelled", "timed_out", "action_required"] | index($c)))
+    and any(.jobs[]; .name == "Create GitHub Release" and .conclusion == "success")
+    and any(.jobs[]; .name == "Publish to npm" and .conclusion == "success")
+    and all(.jobs[]; .conclusion == "success" or .conclusion == "skipped"
+      or .name == "Publish to crates.io" or .name == "Announce on Discord")
+  ' >/dev/null
 }
 
 print_job_transitions() {
@@ -280,7 +294,14 @@ while true; do
       echo "   https://github.com/${REPO}/actions/runs/${RUN_ID}"
       exit 0
     else
-      echo "❌ Release workflow failed: conclusion=${CONCLUSION} (run ${RUN_ID})"
+      if crates_only_failure "$RUN_VIEW_JSON"; then
+        echo "❌ crates.io publication failed; GitHub release and npm published successfully (run ${RUN_ID})."
+        echo "   The release run remains red. Retry only crates.io for the same tag:"
+        echo "   gh workflow run crates-retry.yml --ref main -f tag=${TAG}"
+      else
+        echo "❌ Release workflow failed: conclusion=${CONCLUSION} (run ${RUN_ID})"
+        print_job_transitions "$RUN_VIEW_JSON"
+      fi
       echo "   https://github.com/${REPO}/actions/runs/${RUN_ID}"
       exit 1
     fi
