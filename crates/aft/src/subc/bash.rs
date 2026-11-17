@@ -2200,44 +2200,6 @@ pub(super) fn submit_deferred_bash(
     let scope_stamp = cancel.scope.clone();
     let speech_seed = cancel.speech_seed.clone();
     let secret_identity = super::secret_consent::current_identity();
-    let disabled = secret_identity
-        .as_ref()
-        .map(|identity| identity.disabled_tools.as_slice())
-        .unwrap_or_default();
-    let search_registered = server_completion
-        || executor
-            .actor_context(&root)
-            .is_some_and(|ctx| ctx.config().aft_search_registered);
-    format_context.bash_code_search_hint = arguments
-        .get("command")
-        .and_then(Value::as_str)
-        .filter(|_| {
-            arguments.get("background").and_then(Value::as_bool) != Some(true)
-                && arguments.get("pty").and_then(Value::as_bool) != Some(true)
-        })
-        .map(|command| crate::subc_format::BashCodeSearchHint {
-            command: command.into(),
-            workdir: arguments
-                .get("workdir")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            search_tool: (search_registered && crate::tool_gate::catalog_keeps("search", disabled))
-                .then(|| {
-                    if worker_preset {
-                        "search"
-                    } else {
-                        "aft_search"
-                    }
-                    .into()
-                }),
-            grep_tool: crate::tool_gate::catalog_keeps("grep", disabled).then(|| "grep".into()),
-            shell_tool: format_context
-                .host_tool_names
-                .as_ref()
-                .map_or("bash", |names| names.shell())
-                .into(),
-            runner_notice: format_context.runner_notice.clone(),
-        });
     let program_held = secret_identity.as_ref().is_some_and(running_hold_route);
     let task_identity = secret_identity
         .as_ref()
@@ -2262,7 +2224,6 @@ pub(super) fn submit_deferred_bash(
         .as_ref()
         .map(super::secret_consent::call_scopes);
     let run_scoped = run_scope.is_some();
-    let server_completion = server_completion || run_scoped;
     // Local startup must answer early enough for its reply to be queued and
     // relayed before the client's deadline. OpenCode and Pi extend their reply
     // deadlines for runon calls to allow input capture after task registration.
@@ -2307,6 +2268,44 @@ pub(super) fn submit_deferred_bash(
             return;
         }
     };
+    // Reuse the admitted context so a hint cannot wait on the scheduler lock
+    // and prevent a busy executor from returning its refusal promptly.
+    let disabled = secret_identity
+        .as_ref()
+        .map(|identity| identity.disabled_tools.as_slice())
+        .unwrap_or_default();
+    let search_registered = server_completion || spawn_ctx.config().aft_search_registered;
+    format_context.bash_code_search_hint = arguments
+        .get("command")
+        .and_then(Value::as_str)
+        .filter(|_| {
+            arguments.get("background").and_then(Value::as_bool) != Some(true)
+                && arguments.get("pty").and_then(Value::as_bool) != Some(true)
+        })
+        .map(|command| crate::subc_format::BashCodeSearchHint {
+            command: command.into(),
+            workdir: arguments
+                .get("workdir")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            search_tool: (search_registered && crate::tool_gate::catalog_keeps("search", disabled))
+                .then(|| {
+                    if worker_preset {
+                        "search"
+                    } else {
+                        "aft_search"
+                    }
+                    .into()
+                }),
+            grep_tool: crate::tool_gate::catalog_keeps("grep", disabled).then(|| "grep".into()),
+            shell_tool: format_context
+                .host_tool_names
+                .as_ref()
+                .map_or("bash", |names| names.shell())
+                .into(),
+            runner_notice: format_context.runner_notice.clone(),
+        });
+    let server_completion = server_completion || run_scoped;
     if matches!(ask_route, crate::access_policy::AskRoute::Plugin { .. }) {
         spawn_ctx.mark_standalone_plugin_host();
     }
