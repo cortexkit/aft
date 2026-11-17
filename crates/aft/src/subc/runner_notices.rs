@@ -430,12 +430,13 @@ pub(super) fn code_search_notice(
     })
 }
 
+/// Builds a nudge's ordered send. Callers send it only to a runner that
+/// confirmed `delivery_order`; a plain send would start a turn of its own.
 pub(super) fn nudge_request(
     call_key: &str,
     notice: &crate::subc::runner_notices::notice_templates::Notice,
     preset: &str,
     now_ms: u64,
-    modern: bool,
     cleared: bool,
     fallback: bool,
 ) -> SendRequest {
@@ -447,9 +448,6 @@ pub(super) fn nudge_request(
         "aft:nudge:{kind}:{call_key}{}",
         if fallback { ":fallback" } else { "" }
     );
-    if !modern {
-        return SendRequest::new(&notice.text, send_id).with_notice(true);
-    }
     let mut order = DeliveryOrder::new(vec![Mode::ToolResult]);
     order.dedupe_key = Some(format!("aft:nudge:{kind}"));
     order.expires_at_ms = Some(now_ms.saturating_add(60_000));
@@ -576,12 +574,24 @@ impl CodeSearchNotice {
                     remaining,
                     async {
                         let modern = runner_delivery_order(&path, address).await == Some(true);
+                        if !modern {
+                            // A send without a delivery order queues behind the
+                            // running turn and then starts a turn of its own at
+                            // idle. A nudge that costs the agent a whole turn
+                            // defeats its purpose, so unless the runner confirms
+                            // ordered delivery the nudge is dropped. That covers
+                            // an older runner and a capability probe that failed.
+                            return Outcome::Final(Failure::new(
+                                FailureClass::NoOrderedDelivery,
+                                "runner did not confirm delivery_order",
+                            ));
+                        }
                         let cleared = modern && runner_capability(&path, address, "delivery_order_modes:turn_system_cleared").await == Some(true);
-                        let request = nudge_request(&self.call_key, notice, &self.preset, now, modern, cleared, false);
+                        let request = nudge_request(&self.call_key, notice, &self.preset, now, cleared, false);
                         let outcome = send(&path, address, &request, modern).await;
                         let refused = matches!(&outcome, Outcome::Final(failure) | Outcome::Retry(failure) if failure.code.as_deref() == Some("invalid_params") && failure.field.as_deref() == Some("template"));
                         if request.runner_params.contains_key("template") && refused {
-                            send(&path, address, &nudge_request(&self.call_key, notice, &self.preset, now, true, false, true), true).await
+                            send(&path, address, &nudge_request(&self.call_key, notice, &self.preset, now, false, true), true).await
                         } else { outcome }
                     },
                 )
@@ -822,17 +832,30 @@ async fn runner_capability(path: &Path, address: &Address, capability: &str) -> 
     if let Some(supported) = test_endpoint::capability(address, capability) {
         return supported;
     }
-    let consumer = SubcConsumer::connect(path, ConsumerOptions::default())
-        .await
-        .ok()?;
+    // Every failed step is logged by name: an unknown answer turns notices
+    // off, so the log has to say why the runner could not be asked.
+    let failed = |step: &str| {
+        log::info!(
+            "runner capability probe module={} capability={capability} failed at {step}",
+            address.module
+        );
+        None
+    };
+    let Ok(consumer) = SubcConsumer::connect(path, ConsumerOptions::default()).await else {
+        return failed("connect");
+    };
     let result = async {
-        let before = runner_incarnation(&consumer, &address.module).await?;
-        let route = open_notice_route(&consumer, address).await.ok()?;
+        let Some(before) = runner_incarnation(&consumer, &address.module).await else {
+            return failed("incarnation");
+        };
+        let Ok(route) = open_notice_route(&consumer, address).await else {
+            return failed("route_open");
+        };
         let result = async {
             // A route is tied to one runner process. Check both sides of the
             // probe so a restart cannot label an old reply as a new capability.
             if runner_incarnation(&consumer, &address.module).await? != before {
-                return None;
+                return failed("runner_restarted");
             }
             let cache = RUNNER_CAPABILITIES.get_or_init(Default::default);
             if let Some(supported) =
@@ -843,7 +866,7 @@ async fn runner_capability(path: &Path, address: &Address, capability: &str) -> 
             {
                 return Some(supported);
             }
-            let bytes = consumer
+            let Ok(bytes) = consumer
                 .request(
                     &route,
                     br#"{"method":"role.describe","params":{}}"#.to_vec(),
@@ -853,11 +876,16 @@ async fn runner_capability(path: &Path, address: &Address, capability: &str) -> 
                     },
                 )
                 .await
-                .ok()?;
+            else {
+                return failed("describe");
+            };
             let supported = if capability == "delivery_order" {
-                described_delivery_order(&bytes)?
+                described_delivery_order(&bytes)
             } else {
-                described_capability(&bytes, capability)?
+                described_capability(&bytes, capability)
+            };
+            let Some(supported) = supported else {
+                return failed("decode");
             };
             if runner_incarnation(&consumer, &address.module).await? != before {
                 return None;
@@ -1188,6 +1216,9 @@ enum FailureClass {
     Address,
     Persistence,
     Expired,
+    /// The runner did not confirm ordered delivery, so a notice that must ride
+    /// a tool result is not sent at all.
+    NoOrderedDelivery,
     #[cfg(test)]
     TestEndpoint,
 }

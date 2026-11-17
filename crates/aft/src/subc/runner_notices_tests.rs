@@ -254,7 +254,7 @@ fn notice_templates_refusal_falls_back_once_at_user_authority() {
 }
 
 #[test]
-fn notice_templates_legacy_runner_keeps_plain_send() {
+fn notice_templates_unordered_runner_gets_no_nudge() {
     install(PathBuf::from("unused-test-notice-connection"));
     let capture = test_endpoint::capture("notice-legacy", false);
     capture.delivery_order(Some(false));
@@ -269,13 +269,11 @@ fn notice_templates_legacy_runner_keeps_plain_send() {
         ),
     );
     crate::subc::runner_notices::notice_templates::deliver(&mut response, None);
-    let sent = capture.receiver.try_recv().unwrap().request;
-    assert_eq!(sent["params"]["prompt"], "Prefer `read` tool over bash.");
-    for field in ["template", "delivery", "dedupe_key", "expires_at_ms"] {
-        assert!(sent["params"].get(field).is_none(), "{field}: {sent}");
-    }
-    assert_eq!(response.data["text"], "body");
+    // A plain send would wait for the turn to end and then start one of its
+    // own, so a runner without ordered delivery gets nothing, and the result
+    // is not appended to either.
     assert!(capture.receiver.try_recv().is_err());
+    assert_eq!(response.data["text"], "body");
 }
 
 #[test]
@@ -457,6 +455,7 @@ fn code_search_nudge_runner_deadline_preserves_result_bytes_and_drops_once() {
     install(PathBuf::from("unused-test-notice-connection"));
     let session = "code-search-nudge-deadline";
     let capture = test_endpoint::capture(session, false);
+    capture.delivery_order(Some(true));
     capture.delay_reply(Duration::from_secs(5));
     let root = tempfile::tempdir().unwrap();
     let ctx = AppContext::new(
@@ -535,16 +534,21 @@ fn code_search_nudge_runner_deadline_preserves_result_bytes_and_drops_once() {
 }
 
 #[test]
-fn code_search_nudge_runner_drops_refused_undelivered_and_missing_address() {
+fn code_search_nudge_runner_drops_refused_undelivered_unordered_and_missing_address() {
     install(PathBuf::from("unused-test-notice-connection"));
     let root = tempfile::tempdir().unwrap();
-    for (case, missing) in [
-        ("refused", false),
-        ("not-delivered", false),
-        ("no-address", true),
+    // `sends` is whether the runner sees a send at all. Without confirmed
+    // ordered delivery a nudge would start a turn of its own, so none is sent.
+    for (case, missing, ordered, sends) in [
+        ("refused", false, Some(true), true),
+        ("not-delivered", false, Some(true), true),
+        ("older-runner", false, Some(false), false),
+        ("probe-failed", false, None, false),
+        ("no-address", true, Some(true), false),
     ] {
         let session = format!("code-search-nudge-{case}");
         let capture = test_endpoint::capture(&session, false);
+        capture.delivery_order(ordered);
         if case == "refused" {
             capture.refuse("delivery_unsupported", None);
         }
@@ -576,12 +580,13 @@ fn code_search_nudge_runner_drops_refused_undelivered_and_missing_address() {
         let before = serde_json::to_vec(&response).unwrap();
         context.deliver(&mut response, root.path());
         assert_eq!(serde_json::to_vec(&response).unwrap(), before, "{case}");
-        if !missing {
-            capture.receiver.try_recv().unwrap();
+        if sends {
+            let got = capture.receiver.try_recv().unwrap();
+            assert!(got.request["params"]["delivery"].is_array(), "{case}");
         }
         assert!(
             capture.receiver.try_recv().is_err(),
-            "{case} never retries or appends"
+            "{case} never retries, sends unordered or appends"
         );
     }
 }
