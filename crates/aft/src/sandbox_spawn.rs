@@ -11106,6 +11106,27 @@ mod policy_tests {
                                             mode
                                         };
                                         assert_eq!(tool.mode, expected);
+                                        let home = absolute_env_path("HOME")
+                                            .unwrap()
+                                            .canonicalize()
+                                            .unwrap();
+                                        for profile in [tool, bash] {
+                                            let settings = home.join(".config/cortexkit/x.jsonc");
+                                            assert!(!profile
+                                                .read_deny
+                                                .iter()
+                                                .chain(&profile.write_deny)
+                                                .chain(&profile.data_policy.deny)
+                                                .any(|deny| settings.starts_with(deny)));
+                                            for relative in
+                                                [".local/share/cortexkit", ".local/state/cortexkit"]
+                                            {
+                                                assert!(profile
+                                                    .data_policy
+                                                    .deny
+                                                    .contains(&home.join(relative)));
+                                            }
+                                        }
                                         if expected == SandboxMode::Strict {
                                             assert!(tool.cache_roots.contains(&cache_marker));
                                             assert!(bash.cache_roots.contains(&cache_marker));

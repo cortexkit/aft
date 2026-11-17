@@ -1890,6 +1890,98 @@ async fn relaxed_macos_worker_jail_still_fences_operator_gh() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+async fn cortexkit_settings_file_tools_and_relaxed_shell_are_open_for_head_and_worker() {
+    assert!(
+        native_available(),
+        "settings regression requires a native launcher"
+    );
+    let mut jail =
+        Jail::start_with_layout_and_env(None, None, true, "relaxed", false, false, |base, _| {
+            let config = base.join("xdg/config/cortexkit/aft.jsonc");
+            let mut value: Value =
+                serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+            value["sandbox"]["profile"]["head"] = json!("relaxed");
+            std::fs::write(config, value.to_string()).unwrap();
+        })
+        .await;
+    jail.bind_grant_head().await;
+    let settings = [
+        jail.home.join(".config/cortexkit"),
+        jail.base.join("xdg/config/cortexkit"),
+    ];
+    for directory in &settings {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    jail.allow_paths(json!([
+        {"path": settings[0], "mode": "write"},
+        {"path": settings[1], "mode": "write"},
+    ]))
+    .await;
+    for (channel, session) in [(2, "head-session"), (1, "worker-session")] {
+        for directory in &settings {
+            let path = directory.join("x.jsonc");
+            std::fs::write(&path, "{\"value\":\"initial\"}\n").unwrap();
+            let read = jail
+                .tool_reply_on_channel(channel, "read", json!({"path": path}))
+                .await;
+            assert_eq!(read["isError"], false, "{session}: {read}");
+            assert!(read.to_string().contains("initial"), "{read}");
+            let edit = jail
+                .tool_reply_on_channel(
+                    channel,
+                    "edit",
+                    json!({
+                        "path": path, "edits": [{"oldString": "initial", "newString": "edited"}],
+                    }),
+                )
+                .await;
+            assert_eq!(edit["isError"], false, "{session}: {edit}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "{\"value\":\"edited\"}\n"
+            );
+            let shell = jail.tool_reply_on_channel(channel, "bash", json!({
+                "command": format!("printf '{{\"value\":\"shell\"}}\\n' > {} && printf SETTINGS_WRITTEN", quote(&path)),
+                "timeout": 300_000,
+            })).await;
+            jail.assert_bash_completed(session, &shell);
+            assert!(
+                shell.to_string().contains("profile=relaxed unenforced=["),
+                "{shell}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "{\"value\":\"shell\"}\n"
+            );
+        }
+        for relative in [
+            ".local/share/cortexkit/other-module/x.jsonc",
+            ".local/state/cortexkit/other-module/x.jsonc",
+        ] {
+            let path = jail.home.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "private").unwrap();
+            for (tool, args) in [
+                ("read", json!({"path": path})),
+                (
+                    "edit",
+                    json!({"path": path, "edits": [{"oldString": "private", "newString": "changed"}]}),
+                ),
+            ] {
+                let reply = jail.tool_reply_on_channel(channel, tool, args).await;
+                assert_eq!(reply["isError"], true, "{session}: {reply}");
+                assert!(
+                    reply.to_string().contains("other-module module's"),
+                    "{reply}"
+                );
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), "private");
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn relaxed_linux_names_unenforced_denies_and_keeps_broad_access() {
     if !native_available() {
         return;

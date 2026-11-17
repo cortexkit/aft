@@ -983,16 +983,10 @@ mod tests {
     fn native_credential_floor_normalizes_each_path_once_per_profile() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();
-        let deny: Vec<_> = [
-            ".ssh",
-            ".aws",
-            ".gnupg",
-            ".config/gcloud",
-            ".azure",
-        ]
-        .into_iter()
-        .map(|name| root.join(name))
-        .collect();
+        let deny: Vec<_> = [".ssh", ".aws", ".gnupg", ".config/gcloud", ".azure"]
+            .into_iter()
+            .map(|name| root.join(name))
+            .collect();
         CANONICALIZE_CALLS.with(|count| count.set(0));
         let profile = SandboxProfile::build(
             vec![root.clone()],
