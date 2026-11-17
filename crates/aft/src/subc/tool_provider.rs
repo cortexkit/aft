@@ -5247,7 +5247,6 @@ mod tests {
                     preset,
                     1700000000000,
                     true,
-                    true,
                     false,
                 );
                 sends.push(json!({"method":"session.send", "params":request}));
