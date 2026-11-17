@@ -281,6 +281,14 @@ impl Server {
                                 .lock()
                                 .push(json!({"target":parts.uri.to_string(),"headers":fields,
                                 "body":String::from_utf8_lossy(&data)}));
+                            if mode == "no-content" {
+                                let mut response = Response::new(full(Bytes::new()));
+                                *response.status_mut() = StatusCode::NO_CONTENT;
+                                response
+                                    .headers_mut()
+                                    .insert("x-echo", HeaderValue::from_bytes(K1).unwrap());
+                                return Ok::<_, std::convert::Infallible>(response);
+                            }
                             if mode == "redirect"
                                 && parts
                                     .headers
@@ -591,6 +599,24 @@ fn client_child() {
         for line in std::io::stdin().lock().lines() {
             let value: Value = serde_json::from_str(&line.unwrap()).unwrap();
             let result = tokio::time::timeout(Duration::from_secs(10), async {
+                if value["op"] == "curl_available" {
+                    let available = Command::new("curl").arg("--version").output().ok().is_some_and(|output| {
+                        output.status.success() && String::from_utf8_lossy(&output.stdout).lines().any(|line| line.starts_with("Features:") && line.split_whitespace().any(|feature| feature == "HTTP2"))
+                    });
+                    return Ok(json!({"available":available}));
+                }
+                if value["op"] == "curl" {
+                    let mut ca = tempfile::NamedTempFile::new().map_err(|_| ())?;
+                    ca.write_all(std::env::var("AFT_PROXY_CA").unwrap().as_bytes()).map_err(|_| ())?;
+                    let output = Command::new("curl")
+                        .args(["--silent", "--show-error", "--max-time", "8", "--noproxy", "", "--proxy"])
+                        .arg(std::env::var("AFT_PROXY").unwrap())
+                        .arg("--cacert").arg(ca.path())
+                        .args(["--request", "DELETE", "--header", &format!("Authorization: Bearer {MARKER}"), "--dump-header", "-", "--write-out", "\nAFT_CURL_RESULT %{http_version} %{http_code}"])
+                        .arg(format!("https://{}/approved", std::env::var("AFT_UPSTREAM").unwrap()))
+                        .output().map_err(|_| ())?;
+                    return Ok(json!({"ok":output.status.success(), "wire":String::from_utf8_lossy(&output.stdout), "stderr":String::from_utf8_lossy(&output.stderr)}));
+                }
                 if value["op"] == "raw" {
                     let socket: &mut tokio_rustls::client::TlsStream<TcpStream> = raw_sockets.last_mut().ok_or(())?;
                     socket.write_all(value["wire"].as_str().ok_or(())?.as_bytes()).await.map_err(|_| ())?;
@@ -645,10 +671,12 @@ fn client_child() {
                     }
                     let mut config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
                     let h2 = value["h2"] == true;
-                    config.alpn_protocols = vec![if h2 { b"h2".to_vec() } else { b"http/1.1".to_vec() }];
+                    config.alpn_protocols = if value["negotiate"] == true { vec![b"h2".to_vec(), b"http/1.1".to_vec()] } else { vec![if h2 { b"h2".to_vec() } else { b"http/1.1".to_vec() }] };
                     let host = authority.rsplit_once(':').unwrap().0.trim_start_matches('[').trim_end_matches(']').to_owned();
                     let tls = tokio_rustls::TlsConnector::from(Arc::new(config)).connect(rustls::pki_types::ServerName::try_from(host).unwrap(), socket).await.map_err(|_| ())?;
                     if value["raw"] == true { raw_sockets.push(tls); return Ok(json!({"ok":true})); }
+                    let alpn = tls.get_ref().1.alpn_protocol().map(|protocol| String::from_utf8_lossy(protocol).into_owned());
+                    let h2 = alpn.as_deref() == Some("h2");
                     if h2 {
                         let (sender, connection) = hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls)).await.map_err(|_| ())?;
                         tokio::spawn(async move { let _ = connection.await; }); senders.push(Sender::H2(sender));
@@ -656,7 +684,7 @@ fn client_child() {
                         let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls)).await.map_err(|_| ())?;
                         tokio::spawn(async move { let _ = connection.with_upgrades().await; }); senders.push(Sender::H1(sender));
                     }
-                    return Ok(json!({"ok":true}));
+                    return Ok(json!({"ok":true,"alpn":alpn}));
                 }
                 let index = value["connection"].as_u64().map(|v| v as usize).unwrap_or(senders.len().saturating_sub(1));
                 let sender = senders.get_mut(index).ok_or(())?;

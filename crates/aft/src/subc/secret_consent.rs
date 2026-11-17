@@ -25,6 +25,7 @@
 //! why [`CallScopes`] holds plain data rather than borrowing a route.
 
 use super::{carrier_read_only, flow_read, tool_provider, RouteIdentity};
+use crate::secret::consent::CancellationReason;
 use crate::secret::eligibility::{alfonso_of_kind, COMMAND_SCOPE_KINDS};
 #[cfg(test)]
 use crate::secret::{file_consent, withhold_consent};
@@ -97,6 +98,47 @@ fn consent_unavailable(detail: &str) -> ConsentOutcome {
     }
 }
 
+fn log_secret_card(request: &SecretConsentRequest, id: &str, reason: Option<CancellationReason>) {
+    use base64::Engine;
+    #[derive(serde::Deserialize)]
+    struct Target {
+        host: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Metadata {
+        #[serde(rename = "use")]
+        target: Option<Target>,
+        request_expires_at_ms: Option<u64>,
+    }
+    // Decode only public card metadata; neither the statement nor unknown
+    // fields belong in diagnostics, including when parsing fails.
+    let metadata = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&request.statement_b64url)
+        .ok()
+        .map(zeroize::Zeroizing::new)
+        .and_then(|bytes| serde_json::from_slice::<Metadata>(&bytes).ok());
+    let host = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.target.as_ref())
+        .map_or("unknown", |target| target.host.as_str());
+    let expires = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.request_expires_at_ms)
+        .or(request.expires_at_ms)
+        .map_or_else(|| "unknown".to_owned(), |expires| expires.to_string());
+    let event = if reason.is_some() {
+        "withdrawn"
+    } else {
+        "filed"
+    };
+    let reason = reason.map_or(String::new(), |reason| format!(" reason={}", reason.code()));
+    crate::slog_info!(
+        "secret consent card {event}: request_id={:?} card_id={id:?} label={:?} host={host:?} expires_at_ms={expires}{reason}",
+        request.request_id,
+        request.label,
+    );
+}
+
 /// Generic secret cards have `el_` ids and their own states; filesystem
 /// permission cards use a different response contract.
 fn decode_secret_elicitation(result: &serde_json::Value) -> Option<&str> {
@@ -150,6 +192,28 @@ fn decode_secret_record(record: &serde_json::Value, request_id: &str) -> Consent
 }
 
 impl SubcSecretConsent {
+    async fn withdraw_card(
+        &self,
+        request: &SecretConsentRequest,
+        id: &str,
+        reason: CancellationReason,
+    ) {
+        if self
+            .call(
+                request,
+                "consent.withdraw",
+                serde_json::json!({"elicitation_id": id}),
+                SECRET_CONSENT_TIMEOUT,
+            )
+            .await
+            .is_err()
+        {
+            crate::slog_warn!("secret consent withdrawal failed");
+        } else {
+            log_secret_card(request, id, Some(reason));
+        }
+    }
+
     async fn call(
         &self,
         request: &SecretConsentRequest,
@@ -211,19 +275,10 @@ impl SubcSecretConsent {
             return consent_unavailable("Cingulate could not file the secret-use card");
         };
         card.elicitation = Some(id.clone());
+        log_secret_card(request, &id, None);
         card.answered = Some(ConsentOutcome::Cancelled);
-        if self
-            .call(
-                request,
-                "consent.withdraw",
-                serde_json::json!({"elicitation_id": id}),
-                SECRET_CONSENT_TIMEOUT,
-            )
-            .await
-            .is_err()
-        {
-            crate::slog_warn!("secret consent withdrawal failed");
-        }
+        self.withdraw_card(request, &id, CancellationReason::Cancelled)
+            .await;
         ConsentOutcome::Cancelled
     }
 
@@ -327,6 +382,7 @@ impl SubcSecretConsent {
                     .await;
             };
             card.elicitation = Some(id.to_owned());
+            log_secret_card(request, id, None);
             card.bus_watch = Some(crate::late_result_bus::readers::watch_card(id));
             card.answered = None;
         }
@@ -362,10 +418,8 @@ impl SubcSecretConsent {
         let response = tokio::select! {
             biased;
             () = cancelled => {
-                let result = self.call(request, "consent.withdraw", serde_json::json!({"elicitation_id": card.elicitation}), SECRET_CONSENT_TIMEOUT).await;
-                if result.is_err() {
-                    crate::slog_warn!("secret consent withdrawal failed");
-                }
+                let reason = cancel.and_then(|cancel| cancel.reason()).unwrap_or(CancellationReason::Cancelled);
+                self.withdraw_card(request, card.elicitation.as_deref().unwrap(), reason).await;
                 card.answered = Some(ConsentOutcome::Cancelled);
                 if let Some(watch) = card.bus_watch.take() { watch.receipt().applied(); }
                 return ConsentOutcome::Cancelled;
@@ -435,18 +489,12 @@ impl SubcSecretConsent {
         if cancel.is_some() && matches!(outcome, ConsentOutcome::Unavailable { .. }) {
             // An unsuccessful await still leaves a live phone card. Withdraw it
             // before returning an error, using the same authorization scope as consent.request.
-            if self
-                .call(
-                    request,
-                    "consent.withdraw",
-                    serde_json::json!({"elicitation_id": card.elicitation}),
-                    SECRET_CONSENT_TIMEOUT,
-                )
-                .await
-                .is_err()
-            {
-                crate::slog_warn!("secret consent withdrawal failed");
-            }
+            self.withdraw_card(
+                request,
+                card.elicitation.as_deref().unwrap(),
+                CancellationReason::Cancelled,
+            )
+            .await;
             // A known id means the card was filed for the person. A failed
             // await is cancellation, never evidence of a decline or expiry.
             card.answered = Some(ConsentOutcome::Cancelled);
@@ -495,7 +543,7 @@ impl crate::secret::SecretConsentTransport for SubcSecretConsent {
             loop {
                 let now = crate::secret::vault::now_ms();
                 if now >= expires {
-                    cancel.cancel();
+                    cancel.cancel_with_reason(CancellationReason::Expired);
                 }
                 let outcome = self
                     .file_cancellable(

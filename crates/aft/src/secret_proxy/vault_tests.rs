@@ -567,6 +567,73 @@ async fn live_vault_decline_and_expiry_answer_403_without_sending_or_retrying() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_vault_negotiated_h2_client_waits_past_idle_then_injects_and_masks() {
+    for mode in ["echo-request", "no-content"] {
+        let daemon = FakeClaustrum::start();
+        daemon.state.lock().unwrap().record = Some(record("authorization_bearer"));
+        let phone = PhoneGuard::install();
+        let server = Server::new(mode).await;
+        let proxy = SecretProxy::start_with_tls(
+            live_config(&daemon, server.address.port(), Clock::new()),
+            server.client_tls.clone(),
+        )
+        .unwrap();
+        proxy
+            .state
+            .test_idle_timeout_ms
+            .store(100, Ordering::Release);
+        let mut client = Client::spawn(&proxy, &server);
+        proxy.arm_command(client.process.id()).unwrap();
+        let curl = client.command(json!({"op":"curl_available"}))["available"] == true;
+        if !curl {
+            let negotiated = client.command(json!({"op":"connect", "negotiate":true}));
+            assert_eq!(negotiated["alpn"], "h2", "{negotiated}");
+        }
+        let worker = std::thread::spawn(move || {
+            let reply = client.command(if curl { json!({"op":"curl"}) } else {
+                json!({"op":"request", "method":"DELETE", "headers":{"authorization":format!("Bearer {MARKER}")}})
+            });
+            (reply, client)
+        });
+        phone.phone.card(1).await;
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(
+            !worker.is_finished(),
+            "the h2 approval hold must outlive several socket idle intervals"
+        );
+        assert!(
+            server.seen.lock().is_empty(),
+            "approval must precede upstream dispatch"
+        );
+        phone.phone.decide(&daemon, 1, ConsentOutcome::Answered);
+        let (reply, _client) = worker.join().unwrap();
+        let expected_status = if mode == "no-content" { 204 } else { 200 };
+        if curl {
+            assert_eq!(reply["ok"], true, "{reply}");
+            assert!(
+                reply["wire"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("AFT_CURL_RESULT 2 {expected_status}")),
+                "{reply}"
+            );
+            assert!(reply["wire"].as_str().unwrap().contains(MARKER), "{reply}");
+        } else {
+            assert_eq!(reply["status"], expected_status, "{reply}");
+            assert_eq!(reply["headers"]["x-echo"], MARKER, "{reply}");
+        }
+        assert_eq!(
+            server.seen.lock().last().unwrap()["headers"]["authorization"],
+            "Bearer test-key-12345678"
+        );
+        assert!(
+            !reply.to_string().contains(std::str::from_utf8(K1).unwrap()),
+            "{reply}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_vault_injected_ten_minute_deadline_answers_403_locally() {
     let daemon = FakeClaustrum::start();
     daemon.state.lock().unwrap().record = Some(record("authorization_bearer"));
