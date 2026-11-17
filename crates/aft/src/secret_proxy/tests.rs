@@ -596,11 +596,15 @@ fn client_child() {
         }
         let mut senders: Vec<Sender> = Vec::new();
         let mut raw_sockets = Vec::new();
+        #[cfg(target_os = "macos")]
+        let curl = "/usr/bin/curl";
+        #[cfg(not(target_os = "macos"))]
+        let curl = "curl";
         for line in std::io::stdin().lock().lines() {
             let value: Value = serde_json::from_str(&line.unwrap()).unwrap();
             let result = tokio::time::timeout(Duration::from_secs(10), async {
                 if value["op"] == "curl_available" {
-                    let available = Command::new("curl").arg("--version").output().ok().is_some_and(|output| {
+                    let available = Command::new(curl).arg("--version").output().ok().is_some_and(|output| {
                         output.status.success() && String::from_utf8_lossy(&output.stdout).lines().any(|line| line.starts_with("Features:") && line.split_whitespace().any(|feature| feature == "HTTP2"))
                     });
                     return Ok(json!({"available":available}));
@@ -608,7 +612,7 @@ fn client_child() {
                 if value["op"] == "curl" {
                     let mut ca = tempfile::NamedTempFile::new().map_err(|_| ())?;
                     ca.write_all(std::env::var("AFT_PROXY_CA").unwrap().as_bytes()).map_err(|_| ())?;
-                    let output = Command::new("curl")
+                    let output = Command::new(curl)
                         .args(["--silent", "--show-error", "--max-time", "8", "--noproxy", "", "--proxy"])
                         .arg(std::env::var("AFT_PROXY").unwrap())
                         .arg("--cacert").arg(ca.path())

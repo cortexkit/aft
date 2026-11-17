@@ -366,7 +366,12 @@ async fn live_vault_release_injects_only_the_deposit_location_and_every_use_is_a
         server.seen.lock().is_empty(),
         "approval holds before any upstream request"
     );
-    assert_eq!(proxy.approval_status(), vec!["secret test: waiting for your approval for localhost (requests wait up to 10 minutes)"]);
+    assert_eq!(
+        proxy.approval_status(),
+        vec![
+            "secret test: waiting for your approval for localhost (requests wait up to 10 minutes)"
+        ]
+    );
     phone.phone.decide(&daemon, 1, ConsentOutcome::Answered);
     let (reply, mut client) = worker.join().unwrap();
     assert_eq!(reply["status"], 200);
@@ -567,14 +572,38 @@ async fn live_vault_decline_and_expiry_answer_403_without_sending_or_retrying() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn live_vault_negotiated_h2_client_waits_past_idle_then_injects_and_masks() {
-    for mode in ["echo-request", "no-content"] {
+async fn live_vault_negotiated_h2_client_holds_then_returns_clean_responses() {
+    for (mode, decision, refusal) in [
+        ("echo-request", Some(ConsentOutcome::Answered), ""),
+        ("no-content", Some(ConsentOutcome::Answered), ""),
+        (
+            "echo-request",
+            Some(ConsentOutcome::Declined),
+            "secret test: approval was declined for localhost; the request was not sent",
+        ),
+        (
+            "echo-request",
+            Some(ConsentOutcome::Expired),
+            "secret test: approval expired for localhost; the request was not sent",
+        ),
+        (
+            "echo-request",
+            Some(ConsentOutcome::Cancelled),
+            "secret test: the request for localhost was cancelled; the request was not sent",
+        ),
+        (
+            "echo-request",
+            None,
+            "secret test: approval expired for localhost; the request was not sent",
+        ),
+    ] {
         let daemon = FakeClaustrum::start();
         daemon.state.lock().unwrap().record = Some(record("authorization_bearer"));
         let phone = PhoneGuard::install();
         let server = Server::new(mode).await;
+        let clock = Clock::new();
         let proxy = SecretProxy::start_with_tls(
-            live_config(&daemon, server.address.port(), Clock::new()),
+            live_config(&daemon, server.address.port(), clock.clone()),
             server.client_tls.clone(),
         )
         .unwrap();
@@ -605,9 +634,19 @@ async fn live_vault_negotiated_h2_client_waits_past_idle_then_injects_and_masks(
             server.seen.lock().is_empty(),
             "approval must precede upstream dispatch"
         );
-        phone.phone.decide(&daemon, 1, ConsentOutcome::Answered);
+        if let Some(decision) = decision {
+            phone.phone.decide(&daemon, 1, decision);
+        } else {
+            clock.advance(600_000);
+        }
         let (reply, _client) = worker.join().unwrap();
-        let expected_status = if mode == "no-content" { 204 } else { 200 };
+        let expected_status = if !refusal.is_empty() {
+            403
+        } else if mode == "no-content" {
+            204
+        } else {
+            200
+        };
         if curl {
             assert_eq!(reply["ok"], true, "{reply}");
             assert!(
@@ -617,15 +656,32 @@ async fn live_vault_negotiated_h2_client_waits_past_idle_then_injects_and_masks(
                     .contains(&format!("AFT_CURL_RESULT 2 {expected_status}")),
                 "{reply}"
             );
-            assert!(reply["wire"].as_str().unwrap().contains(MARKER), "{reply}");
+            assert!(
+                reply["wire"]
+                    .as_str()
+                    .unwrap()
+                    .contains(if refusal.is_empty() { MARKER } else { refusal }),
+                "{reply}"
+            );
         } else {
             assert_eq!(reply["status"], expected_status, "{reply}");
-            assert_eq!(reply["headers"]["x-echo"], MARKER, "{reply}");
+            if refusal.is_empty() {
+                assert_eq!(reply["headers"]["x-echo"], MARKER, "{reply}");
+            } else {
+                assert_eq!(reply["body"], refusal, "{reply}");
+            }
         }
-        assert_eq!(
-            server.seen.lock().last().unwrap()["headers"]["authorization"],
-            "Bearer test-key-12345678"
-        );
+        if refusal.is_empty() {
+            assert_eq!(
+                server.seen.lock().last().unwrap()["headers"]["authorization"],
+                "Bearer test-key-12345678"
+            );
+        } else {
+            assert!(
+                server.seen.lock().is_empty(),
+                "a refusal must not send upstream"
+            );
+        }
         assert!(
             !reply.to_string().contains(std::str::from_utf8(K1).unwrap()),
             "{reply}"
@@ -909,7 +965,12 @@ async fn live_vault_new_card_after_longer_approval_does_not_claim_it_was_once() 
     // answer, standing in for a revoked grant before another request arrives.
     let second = request_in_thread(client, false);
     phone.phone.card(2).await;
-    assert_eq!(proxy.approval_status(), vec!["secret test: waiting for your approval for localhost (requests wait up to 10 minutes)"]);
+    assert_eq!(
+        proxy.approval_status(),
+        vec![
+            "secret test: waiting for your approval for localhost (requests wait up to 10 minutes)"
+        ]
+    );
     phone.phone.decide(&daemon, 2, ConsentOutcome::Declined);
     let (reply, _client) = second.join().unwrap();
     assert_eq!(reply["status"], 403);
