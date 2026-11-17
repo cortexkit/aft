@@ -117,6 +117,7 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
             }
         }
     }
+    render_data_ancestor_listings(&mut source, profile)?;
     for path in &profile.read_deny {
         source.push_str(&format!(
             "(deny file-read* ({} \"{}\"))\n",
@@ -237,6 +238,7 @@ fn render_relaxed_profile(profile: &SandboxProfile) -> Result<String, String> {
             }
         }
     }
+    render_data_ancestor_listings(&mut source, profile)?;
     render_worker_canary_metadata(&mut source, profile)?;
     render_worker_keychain_denies(&mut source, profile)?;
     Ok(source)
@@ -246,6 +248,38 @@ fn render_secret_memory_boundary(source: &mut String, profile: &SandboxProfile) 
     if profile.secret_proxy {
         source.push_str("(deny mach-priv-task-port)\n");
     }
+}
+
+fn render_data_ancestor_listings(
+    source: &mut String,
+    profile: &SandboxProfile,
+) -> Result<(), String> {
+    // Bun's script discovery opens ancestor directories even when the checkout
+    // is readable. Literal directory grants expose names, not sibling contents.
+    let ancestors = profile
+        .data_policy
+        .read_allow
+        .iter()
+        .flat_map(|allow| allow.ancestors().skip(1))
+        .filter(|ancestor| {
+            profile
+                .data_policy
+                .deny
+                .iter()
+                .any(|deny| ancestor.starts_with(deny))
+                && !profile
+                    .read_deny
+                    .iter()
+                    .any(|deny| ancestor.starts_with(deny))
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    for ancestor in ancestors {
+        source.push_str(&format!(
+            "(allow file-read-metadata file-read-data (literal \"{}\"))\n",
+            escape_path(ancestor)?
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1389,5 +1423,134 @@ mod broker_root_render_tests {
             !render_profile(&profile).unwrap().contains("gh-read[.]sock"),
             "head profiles must not receive the worker socket restriction"
         );
+    }
+}
+
+#[cfg(test)]
+mod data_ancestor_read_tests {
+    use super::*;
+
+    fn nested_profile(root: &Path) -> SandboxProfile {
+        let data = root.join("private-data");
+        let exception = data.join("alfonso/worktrees");
+        let credential_floor = data.join("credentials");
+        std::fs::create_dir_all(&exception).unwrap();
+        std::fs::create_dir_all(credential_floor.join("checkout")).unwrap();
+        std::fs::create_dir_all(data.join("alias")).unwrap();
+        let mut profile = SandboxProfile::build(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![credential_floor.clone()],
+            Vec::new(),
+            Vec::new(),
+            root.to_path_buf(),
+        )
+        .unwrap();
+        profile.data_policy.deny = vec![data.clone()];
+        profile.data_policy.read_allow = vec![exception, credential_floor.join("checkout")];
+        profile.data_policy.read_metadata_allow = vec![data.join("alias")];
+        profile
+    }
+
+    #[test]
+    fn nested_read_exceptions_list_only_literal_ancestors_without_overriding_floors() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut profile = nested_profile(&root);
+        let data = root.join("private-data");
+        let intermediate = data.join("alfonso");
+        for mode in [
+            aft::config::SandboxMode::Strict,
+            aft::config::SandboxMode::Relaxed,
+        ] {
+            profile.mode = mode;
+            let source = render_profile(&profile).unwrap();
+            let grants = source
+                .lines()
+                .filter(|line| line.starts_with("(allow file-read-metadata file-read-data "))
+                .collect::<Vec<_>>();
+            let expected = [&data, &intermediate].map(|path| {
+                format!(
+                    "(allow file-read-metadata file-read-data (literal \"{}\"))",
+                    escape_path(path).unwrap()
+                )
+            });
+            assert_eq!(grants, expected, "{mode:?}");
+            for ancestor in [&data, &intermediate] {
+                for operation in [
+                    "file-read*",
+                    "file-read-data",
+                    "file-read-metadata file-read-data",
+                ] {
+                    assert!(
+                        !source.contains(&format!(
+                            "(allow {operation} (subpath \"{}\"))",
+                            escape_path(ancestor).unwrap()
+                        )),
+                        "ancestor grant must not cover descendants: {mode:?}"
+                    );
+                }
+            }
+            assert!(source.contains(&format!(
+                "(allow file-read-metadata (literal \"{}\"))",
+                escape_path(&data.join("alias")).unwrap()
+            )));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_nested_read_exceptions_list_ancestors_but_deny_sibling_file_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut profile = nested_profile(&root);
+        let data = root.join("private-data");
+        let intermediate = data.join("alfonso");
+        let allowed = intermediate.join("worktrees/allowed.txt");
+        let sibling = data.join("sibling/secret.txt");
+        std::fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+        std::fs::write(&allowed, "exception readable").unwrap();
+        std::fs::write(&sibling, "sibling private").unwrap();
+        for mode in [
+            aft::config::SandboxMode::Strict,
+            aft::config::SandboxMode::Relaxed,
+        ] {
+            profile.mode = mode;
+            let rendered = root.join("profile.sb");
+            std::fs::write(&rendered, render_profile(&profile).unwrap()).unwrap();
+            let output = std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(["-f"])
+                .arg(&rendered)
+                .args([
+                    "/bin/sh",
+                    "-c",
+                    r#"set -eu
+/bin/ls "$1" >/dev/null
+/bin/ls "$2" >/dev/null
+if /bin/cat "$4" >/dev/null 2>&1; then
+    echo 'sibling file unexpectedly readable' >&2
+    exit 1
+fi
+[ "$(/bin/cat "$3")" = 'exception readable' ]
+echo 'ancestor listings and read boundaries passed'
+"#,
+                    "ancestor-read-probe",
+                ])
+                .args([&data, &intermediate, &allowed, &sibling])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode:?}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                "ancestor listings and read boundaries passed"
+            );
+        }
     }
 }
