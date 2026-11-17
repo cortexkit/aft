@@ -233,7 +233,7 @@ fn page_collect_refuses_callers_other_than_core() {
         None,
         Some(Principal::Direct),
         Some(Principal::Reserved {
-            module_id: "prefrontal".into(),
+            module_id: "prefrontal-other".into(),
         }),
         Some(Principal::Reserved {
             module_id: "aft".into(),

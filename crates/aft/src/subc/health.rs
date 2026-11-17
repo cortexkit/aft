@@ -12067,8 +12067,21 @@ mod tests {
         std::fs::remove_file(&link).expect("replace standing symlink");
         std::os::unix::fs::symlink(retargeted.path(), &link).expect("retarget standing symlink");
 
-        let unbudgeted = build_health_diagnostic_rollup(&HealthRollupCache::new(), &executor, &app)
-            .expect("standing diagnostic rollup");
+        let cache = HealthRollupCache::new();
+        let mut unbudgeted = None;
+        // The setup snapshot uses the same bounded actor-contention retry as
+        // the health report below; all drift assertions still use real data.
+        health_report_after_scheduler_contention("standing drift setup", || {
+            unbudgeted = build_health_diagnostic_rollup(&cache, &executor, &app);
+            HealthReport {
+                status: HealthStatus::Degraded,
+                detail: unbudgeted
+                    .is_none()
+                    .then(|| EXECUTOR_SCHEDULER_CONTENTION_DETAIL.into()),
+                metrics: None,
+            }
+        });
+        let unbudgeted = unbudgeted.expect("standing diagnostic rollup");
         let mut project = unbudgeted.metrics.as_object().unwrap().clone();
         project.retain(|key, _| HEALTH_PROJECT_FIELDS.contains(&key.as_str()));
         for root in project["roots"].as_array_mut().unwrap() {
