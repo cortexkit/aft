@@ -281,6 +281,18 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
     },
     SurfaceEntry {
         requires: None,
+        command: "grep",
+        mode: "",
+        list_id: "payload.ignored_entries",
+        unit: Unit::Paths,
+        narrow: &["path"],
+        reasons: &[
+            ReasonEntry { reason: Reason::Walk, kind: ReasonKind::Bounding, predicate_name: "MAX_IGNORE_PROBE_ENTRIES, ignored_entries_in_folder" },
+            ReasonEntry { reason: Reason::Cap, kind: ReasonKind::Selecting, predicate_name: "MAX_IGNORED_SCOPE_NAMES, ignored_entries_in_folder" },
+        ],
+    },
+    SurfaceEntry {
+        requires: None,
         command: "glob",
         mode: "",
         list_id: "payload.files",

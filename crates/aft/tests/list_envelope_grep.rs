@@ -106,6 +106,45 @@ fn wire_key_is_matches_list_envelope() {
 }
 
 #[test]
+fn grep_ignore_disclosure_has_an_independent_bounded_path_list() {
+    use aft::list_surfaces::grep::{
+        build_ignored_entries_envelope, IGNORED_LIST_ID, IGNORED_NARROW, IGNORED_UNIT,
+    };
+    let surface = find_surface("grep", "", IGNORED_LIST_ID).unwrap();
+    assert_eq!(surface.unit, Unit::Paths);
+    assert_eq!(surface.unit, IGNORED_UNIT);
+    assert_eq!(surface.narrow, IGNORED_NARROW);
+    assert_eq!(
+        derive_wire_key(IGNORED_LIST_ID, false),
+        "ignored_entries_list_envelope"
+    );
+    assert_eq!(surface.reasons[0].kind, ReasonKind::Bounding);
+    assert_eq!(surface.reasons[1].kind, ReasonKind::Selecting);
+
+    let mut payload = serde_json::json!({
+        "ignored_entries": ["a/", "b/", "c/"],
+        "ignored_entries_total": 6,
+        "ignored_entries_truncated": true,
+    });
+    let envelope = build_ignored_entries_envelope(&payload).unwrap();
+    assert_eq!(envelope.shown, 3);
+    assert_eq!(envelope.total, Total::Exact(6));
+    assert_eq!(envelope.causes, vec![Reason::Cap]);
+    assert!(build_grep_envelope(&payload).is_none());
+
+    payload["ignored_entries_total"] = Value::Null;
+    let envelope = build_ignored_entries_envelope(&payload).unwrap();
+    assert_eq!(envelope.total, Total::AtLeast(3));
+    assert_eq!(envelope.causes, vec![Reason::Walk, Reason::Cap]);
+
+    payload["ignored_entries"] = serde_json::json!(["a/"]);
+    let envelope = build_ignored_entries_envelope(&payload).unwrap();
+    assert_eq!(envelope.causes, vec![Reason::Walk]);
+    payload["ignored_entries_total"] = serde_json::json!(1);
+    assert!(build_ignored_entries_envelope(&payload).is_none());
+}
+
+#[test]
 fn cap_on_finished_walk_renders_at_least_floor() {
     let fixture = load_fixture("cap_100_of_1204.json");
     let envelope = build_grep_envelope(&fixture).expect("envelope present");

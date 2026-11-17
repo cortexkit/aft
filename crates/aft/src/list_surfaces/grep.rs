@@ -14,6 +14,37 @@ pub const LIST_ID: &str = "payload.matches";
 pub const UNIT: Unit = Unit::Rows;
 pub const NARROW: &[&str] = &["offset", "path", "include"];
 
+pub const IGNORED_LIST_ID: &str = "payload.ignored_entries";
+pub const IGNORED_UNIT: Unit = Unit::Paths;
+pub const IGNORED_NARROW: &[&str] = &["path"];
+
+/// Ignore boundaries have their own list: the preview cap never changes the
+/// match-row envelope, and an unfinished folder listing has no exact total.
+pub fn build_ignored_entries_envelope(data: &Value) -> Option<ListEnvelope> {
+    let shown = data.get("ignored_entries")?.as_array()?.len();
+    let total = data.get("ignored_entries_total").and_then(Value::as_u64);
+    let mut causes = Vec::new();
+    if total.is_none() {
+        causes.push(Reason::Walk);
+    }
+    if total.is_some_and(|total| total > shown as u64)
+        || total.is_none() && shown == crate::grep_executor::MAX_IGNORED_SCOPE_NAMES
+    {
+        causes.push(Reason::Cap);
+    }
+    if causes.is_empty() {
+        return None;
+    }
+    let total = total.map_or(Total::AtLeast(shown), |total| Total::Exact(total as usize));
+    Some(ListEnvelope::new(
+        shown,
+        total,
+        IGNORED_UNIT,
+        causes,
+        IGNORED_NARROW,
+    ))
+}
+
 /// Build the list truncation envelope for a grep response from its component parts.
 ///
 /// Returns `None` if no truncation cause fired (the response is complete).

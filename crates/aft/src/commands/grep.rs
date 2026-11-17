@@ -328,6 +328,11 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         None
     };
+    let ignored_scope = scope_has_files
+        .then(|| grep_executor::scope_ignored_entries(&scope))
+        .flatten()
+        .filter(|entries| !entries.names.is_empty());
+    let ignored_scope_note = ignored_scope.as_ref().and_then(ignored_scope_note);
     let scope_probe = scope_probe_started.elapsed();
     let format_started = std::time::Instant::now();
     let output = grep_page_output(
@@ -338,6 +343,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             file_roots: &file_roots,
             offset,
             explicit_page_rows,
+            ignored_scope_note: ignored_scope_note.as_deref(),
         },
     );
     let next_offset = output.next_offset;
@@ -387,6 +393,17 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         "truncated": result.truncated,
         "search_ms": (search_ms * 1000.0).round() / 1000.0,
     });
+    if let Some(entries) = ignored_scope {
+        body["ignored_entries"] = serde_json::json!(entries.names);
+        body["ignored_entries_total"] =
+            serde_json::json!((!entries.truncated).then_some(entries.total));
+        body["ignored_entries_truncated"] =
+            serde_json::json!(entries.truncated || entries.total > entries.names.len());
+        if let Some(envelope) = crate::list_surfaces::grep::build_ignored_entries_envelope(&body) {
+            body["ignored_entries_list_envelope"] =
+                serde_json::to_value(envelope).unwrap_or_default();
+        }
+    }
     if let Some(counts) = phases.walk_counts {
         body["entries_examined"] = serde_json::json!(counts.entries_visited);
         body["files_examined"] = serde_json::json!(counts.examined);
@@ -654,6 +671,26 @@ fn grep_tool_footer(result: &GrepResult) -> String {
     )
 }
 
+/// Only immediate children of the searched folder were compared with the
+/// walker's ignore decisions; deeper ignored folders are not enumerated.
+fn ignored_scope_note(entries: &grep_executor::IgnoredScopeEntries) -> Option<String> {
+    if entries.names.is_empty() {
+        return None;
+    }
+    let mut names = entries.names.join(", ");
+    if entries.truncated {
+        names.push_str(" and more");
+    } else if entries.total > entries.names.len() {
+        names.push_str(&format!(
+            " and {} more",
+            entries.total - entries.names.len()
+        ));
+    }
+    Some(format!(
+        "Not searched (ignore rules): {names} in this folder. Name a path inside one to search it."
+    ))
+}
+
 /// `Found 1 match in 1 file`, `Found 2 matches in 1 file`, `Found 3 matches
 /// across 2 files`: the grep tool's count sentence, in plain English.
 pub(crate) fn found_matches_phrase(matches: usize, files: usize) -> String {
@@ -814,6 +851,7 @@ pub(crate) struct GrepPageRequest<'a> {
     /// `max_results` when the caller set it: every page then holds that many
     /// rows, with no first-page summary sizing.
     pub explicit_page_rows: Option<usize>,
+    pub ignored_scope_note: Option<&'a str>,
 }
 
 /// One rendered grep page and the counts its JSON reply and list envelope
@@ -961,6 +999,7 @@ pub(crate) fn grep_page_output<'a>(
     let metadata_bytes = counted_text.as_ref().map_or(0, String::len)
         + only_counted_note.as_ref().map_or(0, String::len)
         + grep_tool_footer(result).len()
+        + request.ignored_scope_note.map_or(0, str::len)
         + if first {
             files_first_summary(&shown, &files, DEFAULT_MAX_RESULTS).len()
         } else {
@@ -1006,6 +1045,9 @@ pub(crate) fn grep_page_output<'a>(
         sections.push(block);
     }
     sections.push(grep_tool_footer(result));
+    if let Some(note) = request.ignored_scope_note {
+        sections.push(note.to_string());
+    }
     if let Some(next) = next_offset {
         sections.push(format!("(More lines; continue with offset={next}.)"));
     } else if offset > 0 && rendered == 0 {
@@ -1900,6 +1942,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn grep_ignore_disclosure_wording_is_centralized() {
+        let mut entries = grep_executor::IgnoredScopeEntries {
+            names: vec![".agents/".to_string(), "target/".to_string()],
+            total: 3,
+            truncated: false,
+        };
+        assert_eq!(ignored_scope_note(&entries).unwrap(),
+            "Not searched (ignore rules): .agents/, target/ and 1 more in this folder. Name a path inside one to search it.");
+        entries.truncated = true;
+        assert_eq!(ignored_scope_note(&entries).unwrap(),
+            "Not searched (ignore rules): .agents/, target/ and more in this folder. Name a path inside one to search it.");
+        entries.names.clear();
+        assert!(ignored_scope_note(&entries).is_none());
+    }
+
+    #[test]
     fn second_scope_probe_keeps_partial_grep_reply_after_expiry() {
         use std::time::{Duration, Instant};
         let dir = tempfile::tempdir().unwrap();
@@ -2045,6 +2103,7 @@ mod tests {
                 file_roots: &[],
                 offset: 0,
                 explicit_page_rows: Some(1000),
+                ignored_scope_note: None,
             },
         );
         assert!(output.rendered > 0 && output.rendered < 1000);

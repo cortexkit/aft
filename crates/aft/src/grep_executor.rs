@@ -276,6 +276,16 @@ pub(crate) struct ScopeFileCounts {
     pub entries_visited: usize,
 }
 
+pub(crate) const MAX_IGNORE_PROBE_ENTRIES: usize = 4096;
+pub(crate) const MAX_IGNORED_SCOPE_NAMES: usize = 3;
+
+#[derive(Debug, Default)]
+pub(crate) struct IgnoredScopeEntries {
+    pub names: Vec<String>,
+    pub total: usize,
+    pub truncated: bool,
+}
+
 impl ScopeFileCounts {
     pub(crate) fn add(&mut self, other: Self) {
         self.examined += other.examined;
@@ -1312,6 +1322,7 @@ pub(crate) fn fallback_project_walk_builder(
         false,
         false,
         Some(search_root),
+        None,
     )
 }
 
@@ -1336,6 +1347,7 @@ fn fallback_target_walk_builder(
         ignored_target,
         ignore_ancestors,
         filter_root,
+        None,
     ))
 }
 
@@ -1347,6 +1359,7 @@ fn target_walk_builder(
     ignored_target: bool,
     ignore_ancestors: bool,
     filter_root: Option<&Path>,
+    max_depth: Option<usize>,
 ) -> WalkBuilder {
     #[cfg(test)]
     TARGET_WALK_BUILDERS.with(|count| count.set(count.get() + 1));
@@ -1364,7 +1377,10 @@ fn target_walk_builder(
         .unwrap_or_default();
     // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
     // the daemon, so never open directories outside this walk root's filesystem.
-    builder.same_file_system(true).hidden(false);
+    builder
+        .same_file_system(true)
+        .hidden(false)
+        .max_depth(max_depth);
     // Skip nested linked worktrees of this repository: their files are indexed
     // under their own roots, and walking them here duplicates every file.
     // The named starting path itself is always admitted (depth 0), so an
@@ -1430,7 +1446,11 @@ fn target_walk_builder(
                     return false;
                 }
             }
+            // A directory at the depth limit is only named, never opened.
+            // Probing its contents would turn a shallow ignore comparison
+            // into extra reads below the searched folder.
             !is_dir
+                || max_depth.is_some_and(|depth| entry.depth() >= depth)
                 || crate::bounded_io::probe_walk_directory(&permission_root, entry.path()).is_ok()
         });
     if ignored_target {
@@ -1511,6 +1531,135 @@ impl TargetIgnoreRules {
 pub(crate) fn target_is_ignored(path: &Path) -> bool {
     crate::bounded_io::run(path, None, |path| Ok(target_is_ignored_unbounded(&path)))
         .unwrap_or(false)
+}
+
+/// Compare the walker's admitted names with one immediate directory listing.
+/// The iterator is lazy so callers can stop before reading an oversized folder.
+fn compared_directory_entries<'a>(
+    directory: &Path,
+    accepted: &'a HashSet<std::ffi::OsString>,
+) -> std::io::Result<impl Iterator<Item = std::io::Result<(std::fs::DirEntry, bool)>> + 'a> {
+    Ok(std::fs::read_dir(directory)?.map(move |entry| {
+        entry.map(|entry| {
+            let admitted = accepted.contains(&entry.file_name());
+            (entry, admitted)
+        })
+    }))
+}
+
+/// Only ignored project content belongs in the disclosure. Repository pointers,
+/// nested worktrees, OS metadata and AFT's storage are not searchable content;
+/// naming those implementation details would add a line to every Git checkout.
+fn is_disclosable_ignore_boundary(
+    entry: &std::fs::DirEntry,
+    kind: &std::fs::FileType,
+    worktrees: &crate::project_content::NestedWorktreeBoundary,
+) -> bool {
+    entry.file_name() != ".git"
+        && !crate::project_content::is_excluded_with_file_type(&entry.path(), Some(kind))
+        && !(kind.is_dir() && worktrees.is_nested_worktree_root(&entry.path()))
+        && crate::bash_background::registry::safe_task_entry(&entry.path())
+}
+
+/// Evidence is limited to the named folder's children, never ignored subtrees.
+/// An incomplete accepted-name set cannot prove that a missing name was ignored.
+pub(crate) fn scope_ignored_entries(scope: &GrepScope) -> Option<IgnoredScopeEntries> {
+    let [root] = scope.roots.as_slice() else {
+        return None;
+    };
+    if crate::context::confinement::active()
+        || root.ignored_target
+        || !crate::bounded_io::metadata(&root.search_root).is_ok_and(|meta| meta.is_dir())
+    {
+        return None;
+    }
+    let filter_root = root.filter_root.clone();
+    let deadline = crate::bounded_io::deadline_before_io_timeout(
+        &root.search_root,
+        fallback_walk_budget(),
+        FALLBACK_WALK_RETURN_MARGIN,
+    );
+    crate::bounded_io::run(&root.search_root, None, move |search_root| {
+        Ok(ignored_entries_in_folder(
+            &filter_root,
+            &search_root,
+            deadline,
+        ))
+    })
+    .ok()
+    .flatten()
+}
+
+fn ignored_entries_in_folder(
+    filter_root: &Path,
+    search_root: &Path,
+    deadline: Instant,
+) -> Option<IgnoredScopeEntries> {
+    let within_budget = || Instant::now() < deadline && !crate::executor::current_job_cancelled();
+    let skipped = Arc::new(AtomicUsize::new(0));
+    let builder = target_walk_builder(
+        search_root,
+        Arc::clone(&skipped),
+        false,
+        false,
+        Some(filter_root),
+        Some(1),
+    );
+    let mut accepted = HashSet::new();
+    for entry in builder.build() {
+        if !within_budget() {
+            return None;
+        }
+        let entry = entry.ok()?;
+        if entry.depth() == 0 {
+            continue;
+        }
+        if accepted.len() == MAX_IGNORE_PROBE_ENTRIES {
+            return None;
+        }
+        accepted.insert(entry.file_name().to_os_string());
+    }
+    if skipped.load(Ordering::Relaxed) > 0 {
+        return None;
+    }
+    let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(search_root);
+    let mut result = IgnoredScopeEntries::default();
+    for (visited, entry) in compared_directory_entries(search_root, &accepted)
+        .ok()?
+        .enumerate()
+    {
+        if !within_budget() {
+            return None;
+        }
+        if visited == MAX_IGNORE_PROBE_ENTRIES {
+            result.truncated = true;
+            break;
+        }
+        let (entry, admitted) = entry.ok()?;
+        if admitted {
+            continue;
+        }
+        let kind = entry.file_type().ok()?;
+        if !is_disclosable_ignore_boundary(&entry, &kind, &worktrees) {
+            continue;
+        }
+        result.total += 1;
+        let name = format!(
+            "{}{}",
+            entry.file_name().to_string_lossy(),
+            if kind.is_dir() { "/" } else { "" }
+        );
+        // Retain only the first display names in lexical order, not every
+        // ignored entry in a wide folder.
+        let position = result.names.binary_search(&name).unwrap_or_else(|pos| pos);
+        if position < MAX_IGNORED_SCOPE_NAMES {
+            result.names.insert(position, name);
+            if result.names.len() > MAX_IGNORED_SCOPE_NAMES {
+                result.names.pop();
+            }
+        }
+    }
+    Some(result)
 }
 
 fn target_is_ignored_unbounded(path: &Path) -> bool {
@@ -1631,17 +1780,17 @@ fn diagnose_scope_counts_unbounded(
         if directory != search_root {
             counts.entries_visited += 1;
         }
-        for entry in std::fs::read_dir(&directory).ok()? {
+        for entry in compared_directory_entries(&directory, &accepted).ok()? {
             if !within_budget(counts.entries_visited) {
                 return None;
             }
             counts.entries_visited += 1;
-            let entry = entry.ok()?;
+            let (entry, admitted) = entry.ok()?;
             let kind = entry.file_type().ok()?;
             if kind.is_file() {
                 counts.examined += 1;
             }
-            if !accepted.contains(&entry.file_name()) {
+            if !admitted {
                 counts.ignored += 1;
                 continue;
             }
@@ -3893,6 +4042,7 @@ mod tests {
                 file_roots: &[],
                 offset: 0,
                 explicit_page_rows: None,
+                ignored_scope_note: None,
             },
         )
         .text;
@@ -4006,6 +4156,40 @@ mod tests {
         };
         assert!(!scope.multi_root);
         assert_eq!(scope.per_root_max, 10);
+    }
+
+    #[test]
+    fn grep_ignore_disclosure_is_suppressed_while_confined() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), ".agents/\n").unwrap();
+        std::fs::create_dir(dir.path().join(".agents")).unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
+        let scope = GrepScope {
+            roots: vec![ResolvedRoot {
+                search_root: dir.path().to_path_buf(),
+                filter_root: dir.path().to_path_buf(),
+                use_index: false,
+                is_external: false,
+                ignored_target: false,
+                authorized_task_artifact: false,
+            }],
+            multi_root: false,
+            per_root_max: 10,
+        };
+        assert_eq!(scope_ignored_entries(&scope).unwrap().names, [".agents/"]);
+        crate::context::confinement::with_root(&ctx, "ignore-disclosure", || {
+            TARGET_WALK_BUILDERS.with(|count| count.set(0));
+            assert!(scope_ignored_entries(&scope).is_none());
+            TARGET_WALK_BUILDERS.with(|count| assert_eq!(count.get(), 0));
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
