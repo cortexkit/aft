@@ -37,6 +37,32 @@ thread_local! {
     /// wall-clock time cannot show on a loaded machine.
     static FALLBACK_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TARGET_WALK_BUILDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static IGNORE_PROBE_STATE: std::cell::Cell<Option<IgnoreProbeStateForTest>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum IgnoreProbeStateForTest {
+    Ready,
+    Pending,
+    Busy,
+}
+
+/// Pin completion on the calling thread without changing process-wide state
+/// or racing the optional worker. Evidence still comes from the real folder.
+#[cfg(test)]
+pub(crate) fn with_ignore_probe_state_for_test<R>(
+    state: IgnoreProbeStateForTest,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<IgnoreProbeStateForTest>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            IGNORE_PROBE_STATE.with(|current| current.set(self.0));
+        }
+    }
+    let _restore = Restore(IGNORE_PROBE_STATE.with(|current| current.replace(Some(state))));
+    run()
 }
 
 /// Records that a fallback filesystem walk started on this thread.
@@ -316,7 +342,7 @@ impl IgnoredScopeProbe {
         }
     }
 
-    #[cfg(feature = "test-hooks")]
+    #[cfg(any(test, feature = "test-hooks"))]
     fn pending(deadline: Instant) -> Self {
         let (sender, result) = std::sync::mpsc::sync_channel(1);
         Self {
@@ -422,6 +448,17 @@ pub(crate) fn start_scope_ignored_probe(scope: &GrepScope) -> Option<IgnoredScop
     );
     if Instant::now() >= deadline {
         return None;
+    }
+    #[cfg(test)]
+    if let Some(state) = IGNORE_PROBE_STATE.with(std::cell::Cell::get) {
+        return match state {
+            IgnoreProbeStateForTest::Ready => Some(IgnoredScopeProbe::ready(
+                scope_ignored_entries(scope),
+                deadline,
+            )),
+            IgnoreProbeStateForTest::Pending => Some(IgnoredScopeProbe::pending(deadline)),
+            IgnoreProbeStateForTest::Busy => None,
+        };
     }
     #[cfg(feature = "test-hooks")]
     match std::env::var("AFT_TEST_GREP_IGNORE_PROBE").as_deref() {

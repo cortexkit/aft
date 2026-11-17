@@ -79,6 +79,92 @@ fn call(ctx: &AppContext, route: &RouteIdentity, name: &str, args: Value) -> Res
     .unwrap_or_else(|response| response)
 }
 
+#[test]
+fn grep_ignore_disclosure_ready_pending_and_busy_preserve_subc_text() {
+    use crate::grep_executor::{with_ignore_probe_state_for_test, IgnoreProbeStateForTest};
+
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let root = project.path();
+    for directory in [".git/info", ".aft-env/storage", ".aft-user"] {
+        std::fs::create_dir_all(root.join(directory)).unwrap();
+    }
+    for (path, content) in [
+        (".aftignore", ".aft-env/\n.aft-user/\n"),
+        ("sample.ts", "export const marker = 'subc_parity_marker';\n"),
+        (".aft-env/storage/parity-probe.txt", "subc_parity_marker\n"),
+        (".aft-user/aft.jsonc", "{\"disabled_tools\":[]}"),
+    ] {
+        std::fs::write(root.join(path), content).unwrap();
+    }
+    let ctx = context(root, storage.path(), None);
+    ctx.set_harness(crate::harness::Harness::Opencode);
+    let route = identity(root, "parity-grep", 1, false);
+    assert!(!admit_confined(&ctx, &route, "grep").unwrap());
+    let args = json!({"pattern":"subc_parity_marker", "path":"."});
+    let format = crate::subc_format::FormatContext::from_tool_call("grep", &args, root);
+    let tool_ctx = ToolCallContext {
+        project_root: root.to_path_buf(),
+        session_id: Some("parity-grep".into()),
+        request_id: "parity-grep".into(),
+        diagnostics_on_edit: false,
+        preview: false,
+        edit_slot_survives: None,
+        report_registration_downgrade: false,
+        standard_edit_grammar: true,
+        head_catalog_key: None,
+        disabled_tools: Some(Arc::new(vec![])),
+        worker_session: false,
+        host_tool_names: None,
+    };
+    let run = |state| {
+        with_ignore_probe_state_for_test(state, || {
+            with_call_policy(
+                &ctx,
+                &route,
+                &tool_ctx.request_id,
+                "grep",
+                args.clone(),
+                |args| {
+                    assert!(!crate::context::confinement::active());
+                    let ToolCallOutcome::Unary(result) = run_tool_call(
+                        "grep",
+                        args,
+                        &format,
+                        &tool_ctx,
+                        &ctx,
+                        &|request, ctx| crate::commands::grep::handle_grep(&request, ctx),
+                        None,
+                        None,
+                    );
+                    assert!(result.response.success, "{:?}", result.response);
+                    assert_eq!(result.response.data["total_matches"], 1);
+                    assert!(result.text.contains("sample.ts"));
+                    assert!(!result.text.contains("parity-probe.txt"));
+                    result
+                },
+            )
+            .unwrap()
+        })
+    };
+
+    let busy = run(IgnoreProbeStateForTest::Busy);
+    assert!(!busy.text.contains("Not searched (ignore rules):"));
+    assert!(busy.response.data.get("ignored_entries").is_none());
+    let ready = run(IgnoreProbeStateForTest::Ready);
+    assert_eq!(
+        ready.response.data["ignored_entries"],
+        json!([".aft-env/", ".aft-user/"])
+    );
+    assert_eq!(ready.text, format!(
+        "{}\n\nNot searched (ignore rules): .aft-env/, .aft-user/ in this folder. Name a path inside one to search it.",
+        busy.text
+    ));
+    let pending = run(IgnoreProbeStateForTest::Pending);
+    assert_eq!(pending.text, busy.text);
+    assert!(pending.response.data.get("ignored_entries").is_none());
+}
+
 /// A confined glob without `path` walks from the canonicalized project root.
 /// On Windows that spelling keeps the `\\?\` prefix the read gate's root
 /// lacks; the tree's own ignore files must apply all the same, at the root
