@@ -40,8 +40,8 @@ impl BgTaskRegistry {
             }
             drop(state);
             drop(db);
-            // For an owner pause, not starting the command is the whole
-            // cancellation: the runner refused the job.
+            // When the owning session pauses, a refused remote job needs no
+            // further cancellation if its local fallback has not started.
             if self.finish_owner_pause_cancel(task, Ok(())) {
                 return Ok(());
             }
@@ -156,7 +156,7 @@ impl BgTaskRegistry {
                 },
             )
         };
-        let mut child = spawn_child(
+        let child_result = spawn_child(
             scope.as_ref(),
             state.io_handles.as_mut().ok_or("task handles absent")?,
         )
@@ -176,7 +176,18 @@ impl BgTaskRegistry {
                 }
             }
             Ok(child)
-        })?;
+        });
+        let mut child = match child_result {
+            Ok(child) => child,
+            Err(error) => {
+                // If spawning or scope placement fails before the command can
+                // run, do not report the proposed runtime as a task deadline.
+                state.metadata.task_scope_runtime_ms = None;
+                self.persist_task_locked(task, &state.metadata, &mut db)
+                    .map_err(|error| error.to_string())?;
+                return Err(error);
+            }
+        };
         if scope.is_none() {
             state.metadata.task_scope_runtime_ms = None;
         }

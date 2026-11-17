@@ -179,80 +179,119 @@ async fn task_scope_remote_fallback_deadline_survives_reload() {
 #[cfg(target_os = "linux")]
 #[test]
 fn task_scope_remote_failed_unscoped_retry_clears_saved_deadline() {
-    let root = tempfile::tempdir().unwrap();
-    let (registry, id, paths) = persist_accepted_with_snapshot_scope(
-        root.path(),
-        root.path().join("unused-connection"),
-        "true",
-        None,
-        true,
-        60,
-    );
-    let task = registry.task(&id).unwrap();
-    let digest = task
-        .state
-        .lock()
-        .unwrap()
-        .metadata
-        .remote
-        .as_ref()
-        .unwrap()
-        .fallback_digest
-        .clone()
-        .unwrap();
-    let layout = resolve_task_layout(&paths.session_dir, &id).unwrap();
-    let (plan, shell_path, env, linux_scope, memory_limit_mib, linux_scope_max_runtime_secs) =
-        crate::sandbox_spawn::restore_local_launch(&layout, &digest).unwrap();
-    let workdir = root.path().join("workdir");
-    fs::create_dir(&workdir).unwrap();
-    {
-        let mut state = task.state.lock().unwrap();
-        state.metadata.workdir = workdir;
-        write_task(&paths.json, &state.metadata).unwrap();
-    }
-    let launcher = root.path().join("systemd-run");
-    crate::executable_cache::write_executable(
-        &launcher,
-        br#"#!/bin/bash
+    for failure in ["unscoped retry", "initial spawn", "scope placement"] {
+        let root = tempfile::tempdir().unwrap();
+        let (registry, id, paths) = persist_accepted_with_snapshot_scope(
+            root.path(),
+            root.path().join("unused-connection"),
+            "true",
+            None,
+            true,
+            60,
+        );
+        let task = registry.task(&id).unwrap();
+        let digest = task
+            .state
+            .lock()
+            .unwrap()
+            .metadata
+            .remote
+            .as_ref()
+            .unwrap()
+            .fallback_digest
+            .clone()
+            .unwrap();
+        let layout = resolve_task_layout(&paths.session_dir, &id).unwrap();
+        let (plan, shell_path, env, linux_scope, memory_limit_mib, linux_scope_max_runtime_secs) =
+            crate::sandbox_spawn::restore_local_launch(&layout, &digest).unwrap();
+        let workdir = root.path().join("workdir");
+        if failure != "initial spawn" {
+            fs::create_dir(&workdir).unwrap();
+        }
+        {
+            let mut state = task.state.lock().unwrap();
+            state.metadata.workdir = workdir;
+            write_task(&paths.json, &state.metadata).unwrap();
+        }
+        let launcher = root.path().join("systemd-run");
+        let script = format!(
+            r#"#!/bin/bash
 if [[ $1 == --version ]]; then echo 'systemd 254'; exit 0; fi
 while [[ $1 == --* ]]; do shift; done
 if [[ $1 == /bin/true ]]; then exec "$@"; fi
-echo launch >> "${0%/*}/calls"
-rmdir "${0%/*}/workdir"
+echo launch >> "${{0%/*}}/calls"
+if [[ '{failure}' == 'scope placement' ]]; then exec sleep 60; fi
+rmdir "${{0%/*}}/workdir"
 exit 97
 "#,
-    )
-    .unwrap();
-    registry.inner.task_scopes.set_launcher_for_test(launcher);
-    registry.configure_task_scope_runtime(true, Duration::from_secs(60));
-    let result = registry.remote_fallback(
-        &task,
-        LocalFallback {
-            plan,
-            shell_path,
-            env,
-            capture_pipeline: false,
-            memory_limit_mib,
-            linux_scope,
-            linux_scope_max_runtime_secs,
-        },
-        "capacity",
-        None,
-    );
-    assert!(
-        result.is_err(),
-        "removed fallback workdir unexpectedly spawned"
-    );
-    assert_eq!(
-        fs::read_to_string(root.path().join("calls")).unwrap(),
-        "launch\n"
-    );
-    let saved = read_task(&paths.json).unwrap();
-    assert!(saved.local_fallback_started);
-    assert_eq!(
-        saved.task_scope_runtime_ms, None,
-        "failed unscoped retry retained a scope deadline"
-    );
+        );
+        crate::executable_cache::write_executable(&launcher, script.as_bytes()).unwrap();
+        registry.inner.task_scopes.set_launcher_for_test(launcher);
+        registry.configure_task_scope_runtime(true, Duration::from_secs(60));
+        let launch = || {
+            registry.remote_fallback(
+                &task,
+                LocalFallback {
+                    plan,
+                    shell_path,
+                    env,
+                    capture_pipeline: false,
+                    memory_limit_mib,
+                    linux_scope,
+                    linux_scope_max_runtime_secs,
+                },
+                "capacity",
+                None,
+            )
+        };
+        let result = if failure == "scope placement" {
+            let metadata_path = paths.json.clone();
+            let observed = Arc::new(AtomicBool::new(false));
+            let observed_in_probe = Arc::clone(&observed);
+            let result = super::super::super::super::task_scope::with_placement_reader_for_test(
+                move |_, _| {
+                    assert_eq!(
+                        read_task(&metadata_path).unwrap().task_scope_runtime_ms,
+                        Some(60_000),
+                        "scope runtime must be durable before placement"
+                    );
+                    observed_in_probe.store(true, Ordering::SeqCst);
+                    Err("forced scope placement error".into())
+                },
+                launch,
+            );
+            assert!(observed.load(Ordering::SeqCst));
+            assert!(result
+                .as_ref()
+                .unwrap_err()
+                .contains("forced scope placement error"));
+            result
+        } else {
+            launch()
+        };
+        assert!(
+            result.is_err(),
+            "{failure}: failed fallback unexpectedly spawned"
+        );
+        if failure == "unscoped retry" {
+            assert_eq!(
+                fs::read_to_string(root.path().join("calls")).unwrap(),
+                "launch\n"
+            );
+        } else if failure == "initial spawn" {
+            assert!(!root.path().join("calls").exists());
+        }
+        let saved = read_task(&paths.json).unwrap();
+        assert!(saved.local_fallback_started);
+        assert_eq!(
+            saved.task_scope_runtime_ms, None,
+            "{failure}: failed fallback retained a scope deadline"
+        );
+        assert_eq!(
+            task.state.lock().unwrap().metadata.task_scope_runtime_ms,
+            None
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
