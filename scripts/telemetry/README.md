@@ -20,8 +20,9 @@ Linux cost measurements remain available only through manual dispatch with
 storage under **`~/aft-nightly-cost/`**, outside the Actions checkout and outside
 the disposable macOS Caches folder. It creates `.metadata_never_index`, applies
 the runner user's `tmutil addexclusion`, and verifies the exclusion. A missing
-tool, disk or permission is an operator problem: the workflow never installs
-system software or uses sudo. The binary is rebuilt and any changed corpus
+tool, disk or permission is an operator problem: the workflow installs only the
+pinned Rust toolchain into the runner user's home (as the release jobs do) and
+never installs system software or uses sudo. The binary is rebuilt and any changed corpus
 pins fetched **before** asking MOTOR to isolate the machine. Measurement uses
 `--prepared-only`, which refuses to build, fetch or generate missing inputs.
 
