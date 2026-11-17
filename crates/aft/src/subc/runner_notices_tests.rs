@@ -35,10 +35,13 @@ fn notice_templates_rewritten_bash_sends_once_without_footers() {
                 ..Default::default()
             },
         );
-        std::fs::File::open(root.path())
-            .unwrap()
-            .set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
-            .unwrap();
+        filetime::set_file_mtime(
+            root.path(),
+            filetime::FileTime::from_system_time(
+                std::time::SystemTime::now() - Duration::from_secs(120),
+            ),
+        )
+        .unwrap();
         let response = crate::bash_rewrite::try_rewrite_for_request(
             command,
             "notice-call",
