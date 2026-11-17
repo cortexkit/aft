@@ -2205,7 +2205,7 @@ pub(crate) fn engine_pool() -> Result<Arc<rayon::ThreadPool>, ManifestJoinError>
     let mut slot = POOL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let threads = crate::memory_profile::current()
+    let threads = crate::memory::profile::current()
         .resolver_threads
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, usize::from));
     if let Some((size, pool)) = slot.as_ref() {

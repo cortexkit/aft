@@ -5167,7 +5167,7 @@ fn assemble_health_report(
     metrics.insert("sync_mode".to_string(), json!(aft_store::sync::mode()));
     metrics.insert(
         "memory_profile".to_string(),
-        json!(crate::memory_profile::current_effective()),
+        json!(crate::memory::profile::current_effective()),
     );
     metrics.insert(
         "runtime".to_string(),

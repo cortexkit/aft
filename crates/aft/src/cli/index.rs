@@ -180,7 +180,7 @@ fn run_snapshot(
         )));
     }
     reject_index_refusals(&dropped, &warnings)?;
-    aft::memory_profile::publish(config.memory);
+    aft::memory::profile::publish(config.memory);
 
     if config.index.roots.is_empty() {
         // This exact one-line response distinguishes a deliberate snapshot no-op

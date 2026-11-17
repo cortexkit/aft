@@ -1516,7 +1516,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "the PARTIAL status line shows every explicitly requested cause first, then previews unrequested causes up to MAX_INSPECT_HEADER_PARTS total parts and says `+N more`; every scanner reason stays in the body and the structured gaps, diagnostic overflow reasons are rendered in the body, and the cap never changes `complete`",
     },
     ExclusionEntry {
-        file: "commands/inspect.rs",
+        file: "commands/inspect/gap_render.rs",
         enclosing_item: "incomplete_analysis_reason_with_files",
         location_or_primitive: "commands::inspect::MAX_PARSE_FAILURE_FILES",
         reason: "an incomplete-analysis explanation previews five parse-failure paths with their parse reasons and says `+N more`; this is a coverage gap, not a findings page. The full failure count and structured parse_errors stay visible and scope can narrow the affected files; the preview never changes completeness",

@@ -6749,7 +6749,7 @@ mod tests {
         let base = Config::default();
 
         let mut live = base.clone();
-        live.memory = Some(crate::memory_profile::MemoryMode::Lean);
+        live.memory = Some(crate::memory::profile::MemoryMode::Lean);
         live.inspect.enabled = !live.inspect.enabled;
         live.semantic.query_timeout_ms += 1;
         live.semantic.query_instruction = "off".to_string();

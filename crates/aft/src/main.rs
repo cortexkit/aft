@@ -211,7 +211,7 @@ mod rayon_thread_tests {
 }
 
 fn main() {
-    aft::memory_profile::publish(None);
+    aft::memory::profile::publish(None);
     #[cfg(feature = "test-hooks")]
     aft::grammar::initialize_test_identity();
     // The subc daemon hands a supervised module its launch nonce through an

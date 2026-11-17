@@ -45,7 +45,7 @@ fn layer() -> Arc<DataLayer> {
 
 pub(crate) fn memory_profile_changed() {
     if let Some(layer) = LAYER.get() {
-        layer.apply_memory_profile(crate::memory_profile::current_effective().value.profile());
+        layer.apply_memory_profile(crate::memory::profile::current_effective().value.profile());
     }
 }
 
@@ -247,7 +247,7 @@ impl Pool {
     fn submit(self, job: PoolJob) {
         let mut state = self.state().lock();
         state.queue.push_back(job);
-        let profile = crate::memory_profile::current_effective().value.profile();
+        let profile = crate::memory::profile::current_effective().value.profile();
         let Some(job) = state.admit(self.cap()) else {
             return;
         };
@@ -257,13 +257,13 @@ impl Pool {
 
     /// A thread that runs `job`, then whatever queued behind it, until the
     /// queue is empty.
-    fn spawn(self, job: PoolJob, mut profile: crate::memory_profile::MemoryProfile) {
+    fn spawn(self, job: PoolJob, mut profile: crate::memory::profile::MemoryProfile) {
         let spawned = std::thread::Builder::new()
             .name(format!("aft-data-{self:?}").to_lowercase())
             .spawn(move || {
                 let mut next = Some(job);
                 while let Some(job) = next.take() {
-                    crate::memory_profile::admitted(profile, job);
+                    crate::memory::profile::admitted(profile, job);
                     if matches!(self, Pool::Build) {
                         // A build frees most of what it allocated when it
                         // ends. Hand those pages back now, as dead code does
@@ -274,7 +274,7 @@ impl Pool {
                     }
                     let mut state = self.state().lock();
                     state.running -= 1;
-                    profile = crate::memory_profile::current();
+                    profile = crate::memory::profile::current();
                     next = state.admit(self.cap());
                 }
             });
@@ -2394,7 +2394,7 @@ mod tests {
 
     #[test]
     fn memory_live_change_applies_to_next_cold_build_admission() {
-        use crate::memory_profile::{self, MemoryMode};
+        use crate::memory::profile::{self as memory_profile, MemoryMode};
         let ctx = crate::context::AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),

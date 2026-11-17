@@ -1,5 +1,12 @@
 use super::*;
 
+pub(super) fn configure_background_scope(registry: &BgTaskRegistry, app: &App, config: &Config) {
+    registry.configure_task_scope_runtime(
+        app.subc_connection_file().is_some(),
+        Duration::from_secs(config.bash.linux_scope_max_runtime_secs),
+    );
+}
+
 impl AppContext {
     pub fn app(&self) -> Arc<App> {
         Arc::clone(&self.app)

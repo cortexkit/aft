@@ -4668,10 +4668,7 @@ impl AppContext {
         // so the documented `lsp.diagnostic_cache_size` knob takes effect.
         lsp_manager.set_diagnostic_capacity(config.diagnostic_cache_size);
         let bash_background = BgTaskRegistry::new(Arc::clone(&progress_sender));
-        bash_background.configure_task_scope_runtime(
-            app.subc_connection_file().is_some(),
-            Duration::from_secs(config.bash.linux_scope_max_runtime_secs),
-        );
+        runtime_handles::configure_background_scope(&bash_background, &app, &config);
         let compression_aggregates = bash_background.compression_aggregate_cache();
         let checkpoint_store = CheckpointStore::new();
         let checkpoint_namespace_request = checkpoint_store.namespace_request();
@@ -7632,7 +7629,7 @@ impl AppContext {
             // reset it when another root starts with a default config. Before
             // the first configure publishes, syncs use the plain fsync default.
             aft_store::sync::set_macos_full_sync(next.durability.macos_full_sync);
-            crate::memory_profile::publish(next.memory);
+            crate::memory::profile::publish(next.memory);
             (next, changed)
         };
         if replace_pin {

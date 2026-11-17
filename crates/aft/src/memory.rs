@@ -1,3 +1,5 @@
+pub mod profile;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 

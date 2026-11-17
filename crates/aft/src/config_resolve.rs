@@ -107,7 +107,7 @@ pub struct ResolveResult {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RawAftConfig {
-    pub memory: Option<crate::memory_profile::MemoryMode>,
+    pub memory: Option<crate::memory::profile::MemoryMode>,
     pub durability: Option<RawDurability>,
     pub storage: Option<RawStorage>,
     #[serde(rename = "$schema")]
@@ -3726,7 +3726,7 @@ mod tests {
 
     #[test]
     fn memory_config_only_user_base_selects_machine_limits() {
-        use crate::memory_profile::MemoryMode;
+        use crate::memory::profile::MemoryMode;
         for (name, expected) in [
             ("lean", MemoryMode::Lean),
             ("balanced", MemoryMode::Balanced),
@@ -5149,7 +5149,7 @@ mod tests {
         assert!(!result.config.indexes.callgraph);
         assert_eq!(
             result.config.memory,
-            Some(crate::memory_profile::MemoryMode::Balanced)
+            Some(crate::memory::profile::MemoryMode::Balanced)
         );
         assert!(result.config.url_fetch_allow_private);
         assert_eq!(
