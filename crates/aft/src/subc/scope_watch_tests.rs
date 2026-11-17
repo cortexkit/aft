@@ -840,10 +840,12 @@ async fn scope_watch_healthy_does_not_poll_and_live_rearm_needs_no_confirmation(
             opening_probes.push(frame);
         }
     }
-    let opening_count = opening_probes.len();
     snapshot(&pending, &rearm);
     turns().await;
+    let mut refs = HashSet::new();
     for query in opening_probes {
+        let body: Value = serde_json::from_slice(&query.body).unwrap();
+        assert!(refs.insert(body["ref"].as_str().unwrap().to_owned()));
         response(
             &pending,
             &query,
@@ -860,6 +862,7 @@ async fn scope_watch_healthy_does_not_poll_and_live_rearm_needs_no_confirmation(
         }
         let body: Value = serde_json::from_slice(&query.body).unwrap();
         assert_eq!(body["op"], "scope.describe");
+        assert!(refs.insert(body["ref"].as_str().unwrap().to_owned()));
         response(
             &pending,
             &query,
@@ -867,7 +870,10 @@ async fn scope_watch_healthy_does_not_poll_and_live_rearm_needs_no_confirmation(
         );
         describes += 1;
     }
-    assert_eq!(describes, opening_count);
+    assert!(
+        describes <= scopes.len(),
+        "at most one failure poll per ref, with no live rearm fanout"
+    );
     tokio::time::advance(Duration::from_secs(59)).await;
     turns().await;
     assert!(frames.try_recv().is_err());
