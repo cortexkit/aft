@@ -200,7 +200,10 @@ impl RequestSecrets {
             owner: self,
             sequence,
         };
-        let mut lines = vec![format!("secret {label}: waiting for approval on the phone for {} (requests wait up to 10 minutes)", target.host)];
+        let mut lines = vec![format!(
+            "secret {label}: waiting for your approval for {} (requests wait up to 10 minutes)",
+            target.host
+        )];
         if self
             .once
             .lock()

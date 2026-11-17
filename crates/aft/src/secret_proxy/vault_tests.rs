@@ -366,7 +366,7 @@ async fn live_vault_release_injects_only_the_deposit_location_and_every_use_is_a
         server.seen.lock().is_empty(),
         "approval holds before any upstream request"
     );
-    assert_eq!(proxy.approval_status(), vec!["secret test: waiting for approval on the phone for localhost (requests wait up to 10 minutes)"]);
+    assert_eq!(proxy.approval_status(), vec!["secret test: waiting for your approval for localhost (requests wait up to 10 minutes)"]);
     phone.phone.decide(&daemon, 1, ConsentOutcome::Answered);
     let (reply, mut client) = worker.join().unwrap();
     assert_eq!(reply["status"], 200);
@@ -909,7 +909,7 @@ async fn live_vault_new_card_after_longer_approval_does_not_claim_it_was_once() 
     // answer, standing in for a revoked grant before another request arrives.
     let second = request_in_thread(client, false);
     phone.phone.card(2).await;
-    assert_eq!(proxy.approval_status(), vec!["secret test: waiting for approval on the phone for localhost (requests wait up to 10 minutes)"]);
+    assert_eq!(proxy.approval_status(), vec!["secret test: waiting for your approval for localhost (requests wait up to 10 minutes)"]);
     phone.phone.decide(&daemon, 2, ConsentOutcome::Declined);
     let (reply, _client) = second.join().unwrap();
     assert_eq!(reply["status"], 403);
