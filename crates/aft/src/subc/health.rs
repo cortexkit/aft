@@ -2362,6 +2362,7 @@ fn budget_health_metrics_with_limits(
             .get("roots")
             .and_then(Value::as_array)
             .is_some_and(|roots| roots.len() == 1);
+    let mut mandatory_reduced = 0;
     if let Some(roots) = mandatory.get_mut("roots").and_then(Value::as_array_mut) {
         roots.retain(|root| last_identity || !progressing_health_root(root, health_now_ms()));
         if !last_identity
@@ -2370,9 +2371,19 @@ fn budget_health_metrics_with_limits(
                 .any(|root| !progressing_health_root(root, health_now_ms()))
         {
             for root in roots.iter_mut() {
-                reduce_health_root_details(root);
+                mandatory_reduced += usize::from(reduce_health_root_details(root));
             }
         }
+    }
+    if mandatory_reduced > 0 {
+        let previous = mandatory
+            .get("root_details_reduced")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        mandatory.insert(
+            "root_details_reduced".into(),
+            json!(previous.saturating_add(mandatory_reduced as u64)),
+        );
     }
     // Empty root lists still carry omission counts and group status. Reserve
     // that bookkeeping before fitting process sections, not after merging it.
@@ -2396,6 +2407,33 @@ fn budget_health_metrics_with_limits(
         let process_bytes = refresh_metrics_bytes(metrics);
         let project_budget =
             HEALTH_PROJECT_BUDGET_BYTES.min(budget.saturating_sub(process_bytes).saturating_sub(1));
+        // Preserve identities that fit within the 6 KiB project ceiling. When
+        // process sections leave less space, shed previews and optional root
+        // fields first so process pressure alone cannot shorten those paths.
+        while refresh_metrics_bytes(&mut projects) > project_budget
+            && trim_health_root_groups(&mut projects)
+        {}
+        if refresh_metrics_bytes(&mut projects) > project_budget {
+            let reduced = projects
+                .get_mut("roots")
+                .and_then(Value::as_array_mut)
+                .map_or(0, |roots| {
+                    roots
+                        .iter_mut()
+                        .map(|root| usize::from(reduce_health_root_details(root)))
+                        .sum::<usize>()
+                });
+            if reduced > 0 {
+                let previous = projects
+                    .get("root_details_reduced")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                projects.insert(
+                    "root_details_reduced".into(),
+                    json!(previous.saturating_add(reduced as u64)),
+                );
+            }
+        }
         // The temporary map includes its own size field and braces, a small
         // conservative allowance for merging it back into the process map.
         fit_health_metrics(&mut projects, project_budget, project_budget);
@@ -5975,6 +6013,42 @@ mod tests {
             budget_health_metrics(&mut metrics);
             assert_eq!(metrics, once);
         }
+    }
+
+    #[test]
+    fn health_standing_identity_within_project_share_survives_process_pressure() {
+        let path = format!("/work/{}/repository", "long-directory/".repeat(24));
+        let refusal = format!("resolved-path-drift refusal: resolved_target {path}/old");
+        let row = json!({
+            "project_root": path,
+            "root_id": path,
+            "state": "degraded",
+            "standing": true,
+            "standing_entry": path,
+            "standing_refusal": refusal,
+            "views": {"pinned": true, "optional_preview": "detail".repeat(350)}
+        });
+        assert!(serde_json::to_vec(&row).unwrap().len() < HEALTH_PROJECT_BUDGET_BYTES);
+        let mut metrics = recovered_overflow_health_fleet();
+        metrics.insert("roots".into(), json!([row]));
+        for (key, count) in [
+            ("root_count", 1),
+            ("actor_count", 1),
+            ("healthy_roots", 0),
+            ("warming_roots", 0),
+            ("root_details_omitted", 0),
+        ] {
+            metrics.insert(key.into(), json!(count));
+        }
+        assert!(encoded_health_metrics_len(&metrics) > HEALTH_METRICS_BUDGET_BYTES);
+        budget_health_metrics(&mut metrics);
+        assert!(metrics["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
+        let row = &metrics["roots"][0];
+        for key in ["project_root", "root_id", "standing_entry"] {
+            assert_eq!(row[key], path, "{key}");
+        }
+        assert_eq!(row["standing_refusal"], refusal);
+        assert_ne!(row["abbreviated"], true);
     }
 
     #[test]
