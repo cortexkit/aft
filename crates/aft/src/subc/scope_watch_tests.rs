@@ -7,6 +7,9 @@ use subc_client_rs::{
 
 #[path = "scope_watch_audit_tests.rs"]
 mod audit;
+#[cfg(unix)]
+#[path = "scope_continuity_tests.rs"]
+mod continuity;
 
 fn stamp(index: usize) -> ScopeStamp {
     ScopeStamp::new(

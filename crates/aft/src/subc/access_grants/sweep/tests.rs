@@ -52,6 +52,46 @@ fn listed(db: &Db) -> Value {
 }
 
 #[tokio::test]
+async fn prefrontal_scope_sweep_retains_continuations_and_holds_but_revokes_absence() {
+    for (status, configured, synced, absent) in [
+        (ScopeStatus::Live, true, true, false),
+        (ScopeStatus::NotLive, true, false, false),
+        (ScopeStatus::NotLive, false, false, true),
+        (ScopeStatus::Live, false, true, true),
+        (ScopeStatus::Ended, true, true, true),
+    ] {
+        let (dir, db) = fixture();
+        let key = save(&db, dir.path(), "rename-agent", 1);
+        let calls = Mutex::new(Vec::new());
+        let stats = tick(db.clone(), &mut None, |stamp| {
+            calls.lock().unwrap().push(stamp.owner.clone());
+            let mut answer = reply(ScopeStatus::Ended, true);
+            if stamp.owner
+                == (subc_protocol::Principal::Reserved {
+                    module_id: "prefrontal".into(),
+                })
+            {
+                answer = ModuleControlResponseToModule::ScopeDescribe {
+                    status,
+                    scope_epoch: Some(1),
+                    daemon_incarnation: "test".into(),
+                    owner_synced: synced,
+                    owner_configured: configured,
+                    scope: None,
+                };
+            }
+            std::future::ready(Ok(answer))
+        })
+        .await;
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        assert_eq!(stats.deleted_grants, u64::from(absent));
+        let conn = db.lock().unwrap();
+        assert_eq!(store::list(&conn, &key).unwrap().is_empty(), absent);
+        assert_eq!(store::scope_ended(&conn, &key).unwrap(), absent);
+    }
+}
+
+#[tokio::test]
 async fn saved_grant_sweep_rechecks_coverage_before_each_describe() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let (dir, db) = fixture();

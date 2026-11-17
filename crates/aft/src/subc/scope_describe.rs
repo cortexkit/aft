@@ -100,6 +100,7 @@ pub(super) struct ScopeDescribes {
     iterations: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     completed: Arc<StdMutex<CompletedEnds>>,
+    bound: mpsc::UnboundedSender<ScopeStamp>,
 }
 
 pub(super) fn start_for_speech(
@@ -120,18 +121,32 @@ pub(super) fn start_for_speech(
         move || work_scopes(executor.clone(), watched_runs.clone()),
         Some(speech),
         Some(run_scopes),
+        crate::prefrontal::catalog_updates(),
     )
 }
 impl ScopeDescribes {
     pub(super) fn routes(&self, routes: &HashMap<RouteChannel, RouteIdentity>) {
-        *self
-            .routed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = routes
+        let current: HashSet<_> = routes
             .values()
             .filter_map(|identity| identity.scope.as_ref())
             .map(stamp_key)
             .collect();
+        let mut routed = self
+            .routed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for stamp in routes
+            .values()
+            .filter_map(|identity| identity.scope.as_ref())
+        {
+            if stamp.owner_authorized
+                && crate::prefrontal::is_principal(&stamp.owner)
+                && !routed.contains(&stamp_key(stamp))
+            {
+                let _ = self.bound.send(stamp.clone());
+            }
+        }
+        *routed = current;
     }
     pub(super) fn goodbye(&self, stamp: ScopeStamp) {
         let _ = self.goodbye.send(stamp);
@@ -181,6 +196,7 @@ pub(super) fn start(
         move || work_scopes(executor.clone(), watched_runs.clone()),
         None,
         Some(run_scopes),
+        tokio::sync::watch::channel(Vec::new()).1,
     )
 }
 
@@ -213,6 +229,7 @@ where
         },
         None,
         None,
+        tokio::sync::watch::channel(Vec::new()).1,
     )
 }
 
@@ -223,6 +240,7 @@ fn start_with_scope_source_impl<F, Fut>(
     scope_source: F,
     speech: Option<Arc<crate::gh_shim_speech::service::Service>>,
     run_scopes: Option<Arc<super::run_scope::RunScopes>>,
+    mut catalog: tokio::sync::watch::Receiver<Vec<String>>,
 ) -> (
     ScopeDescribes,
     mpsc::UnboundedReceiver<EndedScope>,
@@ -234,6 +252,7 @@ where
 {
     let (goodbye, mut closes) = mpsc::unbounded_channel();
     let (observed, mut observations) = mpsc::unbounded_channel();
+    let (bound, mut bindings) = mpsc::unbounded_channel();
     let (ended, receiver) = mpsc::unbounded_channel();
     let routed = Arc::new(StdMutex::new(HashSet::new()));
     let completed = Arc::new(StdMutex::new(CompletedEnds::default()));
@@ -247,6 +266,7 @@ where
         iterations: iterations.clone(),
         #[cfg(test)]
         completed: completed.clone(),
+        bound,
     };
     if let Some(service) = &speech {
         let sender = handle.observed.clone();
@@ -289,6 +309,8 @@ where
         let mut refresh = scope_watch::Refresh::new();
         let mut verifications = scope_watch::Verifications::default();
         let mut watches = scope_watch::Watches::new(control.metrics.clone());
+        let mut catalog_open = true;
+        let mut catalog_seen = HashSet::new();
         loop {
             #[cfg(test)]
             iterations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -306,6 +328,26 @@ where
                 refresh.at = None;
             }
             let mut held_scopes = inventory.scopes();
+            for module_id in catalog.borrow_and_update().clone() {
+                if !catalog_seen.insert(module_id.clone()) {
+                    continue;
+                }
+                let owner = Principal::Reserved { module_id };
+                for stamp in held_scopes.values() {
+                    if let Some(other) =
+                        crate::prefrontal::counterpart(stamp).filter(|other| other.owner == owner)
+                    {
+                        crate::prefrontal::log_continuation(stamp, &other, "catalog_reconcile");
+                        trigger_describe(
+                            stamp_key(stamp),
+                            stamp.clone(),
+                            &mut pending,
+                            &mut queued,
+                            &mut retrigger,
+                        );
+                    }
+                }
+            }
             speech_pending
                 .retain(|key| held_scopes.contains_key(key) || cleanup_keys.contains(key));
             confirmed.retain(|key| {
@@ -432,7 +474,18 @@ where
                             );
                         }
                     }
-                    (reply, generation)
+                    let counterpart_reply = if reply.as_ref().is_ok_and(|reply| {
+                        describe_answer_ends_scope(reply)
+                            || crate::prefrontal::retired(&stamp, reply)
+                    }) {
+                        match crate::prefrontal::counterpart(&stamp) {
+                            Some(other) => Some(control.describe(&other).await),
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                    (reply, generation, counterpart_reply)
                 });
                 inflight_jobs.insert(job.id(), (reference, group));
             }
@@ -467,6 +520,22 @@ where
             let wake_at = refresh.at.map_or(wake_at, |due| due.min(wake_at));
             tokio::select! {
                 () = &mut changed => { refresh.changed(); }
+                result = catalog.changed(), if catalog_open => {
+                    catalog_open = result.is_ok();
+                }
+                Some(stamp) = bindings.recv() => {
+                    if let Some(other) = crate::prefrontal::counterpart(&stamp) {
+                        match rehome_shell_scopes(executor.clone(), other.clone(), stamp.clone()).await {
+                            Ok(count) => crate::prefrontal::log_continuation(&other, &stamp, if count == 0 { "bind_no_tracked_tasks" } else { "bind_continuation" }),
+                            Err(error) => {
+                                crate::prefrontal::log_continuation(&other, &stamp, "bind_hold_persistence_failed");
+                                log::warn!("prefrontal scope tracking rehome failed: {error}");
+                                trigger_describe(stamp_key(&other), other, &mut pending, &mut queued, &mut retrigger);
+                            }
+                        }
+                        refresh.immediate();
+                    }
+                }
                 Some(event) = watches.receiver.recv() => {
                     for key in watches.event(event, held_scopes.len()) {
                         if let Some(stamp) = held_scopes.get(&key) {
@@ -477,6 +546,10 @@ where
                 () = &mut grant_sweep => unreachable!("saved grant sweep runs until cancelled"),
                 Some(stamp)=observations.recv()=>{
                     if completed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&stamp_key(&stamp)) { continue; }
+                    if crate::prefrontal::is_principal(&stamp.owner) && !confirmed.contains(&stamp_key(&stamp)) {
+                        trigger_describe(stamp_key(&stamp), stamp, &mut pending, &mut queued, &mut retrigger);
+                        continue;
+                    }
                     if let Some(service)=&speech { if speech_pending.remove(&stamp_key(&stamp)) || confirmed.insert(stamp_key(&stamp)) {
                         let key = stamp_key(&stamp);
                         cleanup_keys.insert(key.clone());
@@ -560,11 +633,11 @@ where
                     }
                 }
                 Some(result) = inflight.join_next_with_id(), if !inflight.is_empty() => {
-                    let (id, reply, generation) = match result {
-                        Ok((id, (reply, generation))) => (id, reply, generation),
+                    let (id, reply, generation, counterpart_reply) = match result {
+                        Ok((id, (reply, generation, counterpart_reply))) => (id, reply, generation, counterpart_reply),
                         Err(error) => {
                             log::warn!("scope.describe task failed; retaining scope state: {error}");
-                            (error.id(), Err(readiness::ControlError::Decode(error.to_string())), String::new())
+                            (error.id(), Err(readiness::ControlError::Decode(error.to_string())), String::new(), None)
                         }
                     };
                     if let Some((reference, group)) = inflight_jobs.remove(&id) {
@@ -578,6 +651,42 @@ where
                         // periodic tick. Wait a full interval after its answer
                         // before rechecking shell tasks with that owner/ref/epoch.
                         next_poll.insert(key.clone(), tokio::time::Instant::now() + interval);
+                        let ends = reply.as_ref().is_ok_and(|reply| describe_answer_ends_scope(reply) || crate::prefrontal::retired(&stamp, reply));
+                        if ends {
+                            if let Some(other) = crate::prefrontal::counterpart(&stamp) {
+                                let decision = crate::prefrontal::continuation(&other, counterpart_reply.as_ref().and_then(|reply| reply.as_ref().ok()));
+                                match decision {
+                                    crate::prefrontal::Continuation::Live(live) => {
+                                        match rehome_shell_scopes(executor.clone(), stamp.clone(), live.clone()).await {
+                                            Ok(_) => {
+                                                crate::prefrontal::log_continuation(&stamp, &live, "continuation");
+                                                retry.remove(&key);
+                                                retrigger.remove(&key);
+                                            }
+                                            Err(error) => {
+                                                crate::prefrontal::log_continuation(&stamp, &live, "hold_persistence_failed");
+                                                log::warn!("prefrontal scope tracking rehome failed: {error}");
+                                                retry.insert(key.clone(), stamp.clone());
+                                                watches.fallback(&key, interval);
+                                            }
+                                        }
+                                        pending.remove(&key);
+                                        refresh.immediate();
+                                        continue;
+                                    }
+                                    crate::prefrontal::Continuation::Hold => {
+                                        crate::prefrontal::log_continuation(&stamp, &other, "hold");
+                                        retry.insert(key.clone(), stamp.clone());
+                                        watches.fallback(&key, interval);
+                                        pending.remove(&key);
+                                        continue;
+                                    }
+                                    crate::prefrontal::Continuation::Absent => crate::prefrontal::log_continuation(&stamp, &other, "absent_end"),
+                                }
+                            }
+                        } else if let Some(other) = crate::prefrontal::counterpart(&stamp) {
+                            crate::prefrontal::log_continuation(&stamp, &other, crate::prefrontal::retained_outcome(reply.as_ref().ok()));
+                        }
                         #[cfg(unix)]
                         if reply.as_ref().is_ok_and(|answer| secret_authorization_rebound(&stamp, answer)) {
                             let executor = executor.clone();
@@ -593,7 +702,7 @@ where
                                 _ => None,
                             })
                         });
-                        if reply.as_ref().is_ok_and(describe_answer_ends_scope) {
+                        if ends {
                             #[cfg(feature = "test-timing-hooks")]
                             crate::slog_info!("scope diagnostic phase=describe_ended scope_epoch={}", stamp.scope_epoch);
                             if confirmed.insert(key.clone()) {
@@ -853,6 +962,25 @@ pub(crate) async fn confirm_secret_rebind_for_test(
         "a rebind is not an ordinary scope end"
     );
     worker.abort();
+}
+
+async fn rehome_shell_scopes(
+    executor: Arc<Executor>,
+    from: ScopeStamp,
+    to: ScopeStamp,
+) -> Result<usize, String> {
+    tokio::task::spawn_blocking(move || {
+        let mut changed = 0;
+        for ctx in executor.actor_contexts() {
+            changed += ctx
+                .bash_background()
+                .rehome_scope(&from, &to)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(changed)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn fence_confirmed_end(executor: &Executor, stamp: &ScopeStamp) {

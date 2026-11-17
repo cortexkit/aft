@@ -87,6 +87,9 @@ pub(super) async fn watch_reader(
                         if !connected.load(Ordering::Relaxed) {
                             break;
                         }
+                        crate::prefrontal::observe_catalog(
+                            catalog.modules.iter().map(|entry| entry.module_id.as_str()),
+                        );
                         READER.lock().update(epoch, &catalog.modules);
                         delay = Duration::from_secs(1);
                         let changed = loop {

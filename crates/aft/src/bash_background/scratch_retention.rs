@@ -156,7 +156,7 @@ impl BgTaskRegistry {
             let same_scope = task
                 .lock_state()
                 .ok()
-                .and_then(|state| state.metadata.scope.clone())
+                .and_then(|state| state.metadata.lifecycle_scope().cloned())
                 .is_some_and(|stamp| {
                     stamp.owner == scope.owner
                         && stamp.scope_ref == scope.scope_ref

@@ -8216,7 +8216,7 @@ impl BgTaskRegistry {
             task_id,
             Some(project_root),
             harness,
-            |metadata| match metadata.scope.as_ref() {
+            |metadata| match metadata.lifecycle_scope() {
                 None => true,
                 // A newer epoch rebinds the same scope after a restart; it does
                 // not give another scope or an older binding control of the job.
@@ -9335,8 +9335,7 @@ impl BgTaskRegistry {
             let metadata = &state.metadata;
             known.insert(metadata.task_id.clone());
             if metadata
-                .scope
-                .as_ref()
+                .lifecycle_scope()
                 .is_some_and(|stamp| scope.matches(stamp))
                 && !metadata.is_terminal()
             {
@@ -13109,8 +13108,7 @@ impl BgTaskRegistry {
                 // the entry and releases it, or this check sees the scope end.
                 let scope_ended = state
                     .metadata
-                    .scope
-                    .as_ref()
+                    .lifecycle_scope()
                     .is_some_and(|scope| self.scope_revoked(scope));
                 if !scope_ended {
                     return Ok(true);
@@ -13218,6 +13216,51 @@ impl BgTaskRegistry {
             .min_by_key(|task| task.age)
     }
 
+    /// Persist a confirmed rename only in process-lifetime tracking. The spawn
+    /// scope and terminal execution facts remain unchanged for audit and speech.
+    pub(crate) fn rehome_scope(
+        &self,
+        from: &subc_protocol::scope::ScopeStamp,
+        to: &subc_protocol::scope::ScopeStamp,
+    ) -> std::io::Result<usize> {
+        if crate::prefrontal::counterpart_owner(&from.owner).as_ref() != Some(&to.owner)
+            || from.scope_ref != to.scope_ref
+        {
+            return Err(std::io::Error::other("not a prefrontal scope continuation"));
+        }
+        let mut changed = 0;
+        for task in self.task_arcs() {
+            if task.is_terminal() && !self.has_live_task_processes(&task.task_id, &task.session_id)
+            {
+                continue;
+            }
+            let mut db = DeferredDbWrites::new(self, &task);
+            let mut state = task
+                .lock_state()
+                .map_err(|_| std::io::Error::other("background task lock poisoned"))?;
+            let matches = |metadata: &PersistedTask| {
+                metadata.lifecycle_scope().is_some_and(|scope| {
+                    scope.owner == from.owner
+                        && scope.scope_ref == from.scope_ref
+                        && scope.scope_epoch == from.scope_epoch
+                })
+            };
+            if !matches(&state.metadata) {
+                continue;
+            }
+            state.metadata = self.update_task_metadata_locked(&task, &mut db, |metadata| {
+                if matches(metadata) {
+                    metadata.lifecycle_scope = Some(to.clone());
+                }
+            })?;
+            changed += 1;
+        }
+        if changed > 0 {
+            crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
+        }
+        Ok(changed)
+    }
+
     /// Find held task scopes, including published tasks whose process is still
     /// starting. Run away from daemon frame dispatch: acquiring registry locks
     /// and checking whether descendant processes remain alive can block.
@@ -13240,7 +13283,12 @@ impl BgTaskRegistry {
         let mut scopes: Vec<_> = candidates
             .into_iter()
             .filter_map(|task| {
-                let scope = task.lock_state().ok()?.metadata.scope.clone()?;
+                let scope = task
+                    .lock_state()
+                    .ok()?
+                    .metadata
+                    .lifecycle_scope()
+                    .cloned()?;
                 (!task.is_terminal()
                     || self.has_live_task_processes(&task.task_id, &task.session_id))
                 .then_some(scope)
@@ -13494,7 +13542,7 @@ impl BgTaskRegistry {
             let in_scope = task
                 .lock_state()
                 .ok()
-                .and_then(|state| state.metadata.scope.clone())
+                .and_then(|state| state.metadata.lifecycle_scope().cloned())
                 .is_some_and(|stamp| {
                     stamp.owner == scope.owner
                         && stamp.scope_ref == scope.scope_ref
@@ -13942,7 +13990,7 @@ impl BgTaskRegistry {
                     if remote.is_some_and(|remote| remote != state.metadata.remote.is_some()) {
                         return None;
                     }
-                    state.metadata.scope.clone()
+                    state.metadata.lifecycle_scope().cloned()
                 })
                 .filter(|stamp| {
                     stamp.owner == scope.owner
@@ -17581,7 +17629,7 @@ fn saved_scope_task_records(
             else {
                 continue;
             };
-            let same_scope = metadata.scope.as_ref().is_some_and(|stamp| {
+            let same_scope = metadata.lifecycle_scope().is_some_and(|stamp| {
                 stamp.owner == scope.owner
                     && stamp.scope_ref == scope.scope_ref
                     && stamp.scope_epoch == scope.scope_epoch

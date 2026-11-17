@@ -370,9 +370,9 @@ const SCOPED_TASKS_SQL: &str = "SELECT task_id, metadata FROM bash_tasks
     WHERE status IN ('starting', 'running', 'killing')
       AND completed_at IS NULL
       AND CASE WHEN json_valid(metadata) THEN
-          json_extract(metadata, '$.scope.owner') = json(?1)
-          AND json_extract(metadata, '$.scope.ref') = ?2
-          AND json_extract(metadata, '$.scope.scope_epoch') = json_extract(?3, '$')
+          json_extract(coalesce(json_extract(metadata, '$.lifecycle_scope'), json_extract(metadata, '$.scope')), '$.owner') = json(?1)
+          AND json_extract(coalesce(json_extract(metadata, '$.lifecycle_scope'), json_extract(metadata, '$.scope')), '$.ref') = ?2
+          AND json_extract(coalesce(json_extract(metadata, '$.lifecycle_scope'), json_extract(metadata, '$.scope')), '$.scope_epoch') = json_extract(?3, '$')
           ELSE 0 END
     LIMIT ?4";
 
@@ -430,8 +430,7 @@ fn scan_saved(
                 serde_json::from_str(&json)
                     .map_err(|error| format!("store_read_failed: {error}"))?;
             if metadata
-                .scope
-                .as_ref()
+                .lifecycle_scope()
                 .is_some_and(|stamp| scope.matches(stamp))
                 && !metadata.is_terminal()
             {
@@ -531,8 +530,7 @@ fn scan_sessions(
                 .and_then(|task| read_task_at(&task))
                 .map_err(|error| format!("store_read_failed: {error}"))?;
             if metadata
-                .scope
-                .as_ref()
+                .lifecycle_scope()
                 .is_some_and(|stamp| scope.matches(stamp))
                 && !metadata.is_terminal()
             {
@@ -1362,6 +1360,113 @@ mod tests {
         assert_eq!(reply.data["complete"], false);
         assert_eq!(reply.data["reason"], "task_busy");
         drop(locked);
+        registry.kill(&id, "session").unwrap();
+        registry.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prefrontal_scope_background_tasks_lists_rehomed_lifecycle_not_spawn_owner() {
+        use crate::bash_background::{
+            persistence, registry::with_scope_spawn, BashShell, BgTaskRegistry, HardKill, TaskSlot,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::default();
+        let mut old = selector();
+        old.owner = Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        };
+        let stamp = subc_protocol::scope::ScopeStamp::new(
+            old.owner.clone(),
+            old.scope_ref.clone(),
+            old.epoch,
+            subc_protocol::scope::ScopeKind::Worker,
+        );
+        let live = crate::prefrontal::counterpart(&stamp).unwrap();
+        let new = Selector {
+            owner: live.owner.clone(),
+            scope_ref: live.scope_ref.clone(),
+            epoch: live.scope_epoch,
+        };
+        let id = with_scope_spawn(Some(stamp.clone()), || {
+            registry.spawn_with_shell_in_slot(
+                crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+                "sleep 30",
+                BashShell::Bash,
+                crate::bash_background::registry::resolve_posix_shell(),
+                "session".into(),
+                dir.path().into(),
+                HashMap::new(),
+                HardKill::After(Duration::from_secs(30)),
+                None,
+                dir.path().into(),
+                TaskSlot::Background { max: 10 },
+                true,
+                false,
+                Some(dir.path().into()),
+            )
+        })
+        .unwrap();
+        let observe = |selected: &Selector| {
+            answer(
+                json!({"scope":selected}),
+                Some(&selected.owner),
+                &[registry.clone()],
+                dir.path(),
+                &[],
+            )
+        };
+        assert_eq!(observe(&old).data["running"][0]["task_id"], id);
+        assert_eq!(registry.rehome_scope(&stamp, &live).unwrap(), 1);
+        assert_eq!(observe(&new).data["running"][0]["task_id"], id);
+        assert_eq!(observe(&old).data["running"], json!([]));
+        let paths = persistence::task_paths(dir.path(), "session", &id).unwrap();
+        let metadata = persistence::read_task(&paths.json).unwrap();
+        assert_eq!(metadata.scope.as_ref(), Some(&stamp));
+        let sessions = [paths.session_dir.clone()];
+        for selected in [&old, &new] {
+            let mut remaining = WALK_LIMIT;
+            let disk = scan_sessions(
+                &sessions,
+                selected,
+                &HashSet::new(),
+                &mut remaining,
+                Instant::now() + Duration::from_secs(1),
+            );
+            assert_eq!(
+                disk,
+                if selected.owner == new.owner {
+                    Err("registry_not_loaded".into())
+                } else {
+                    Ok(())
+                }
+            );
+        }
+        let db = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        crate::db::bash_tasks::upsert_bash_task(
+            &db,
+            &metadata.to_bash_task_row("test", &paths).unwrap(),
+        )
+        .unwrap();
+        for selected in [&old, &new] {
+            let mut remaining = WALK_LIMIT;
+            let saved = scan_saved(
+                dir.path(),
+                selected,
+                &HashSet::new(),
+                &mut remaining,
+                Instant::now() + Duration::from_secs(1),
+                &[],
+            );
+            assert_eq!(
+                saved,
+                if selected.owner == new.owner {
+                    Err("registry_not_loaded".into())
+                } else {
+                    Ok(())
+                }
+            );
+        }
         registry.kill(&id, "session").unwrap();
         registry.shutdown();
     }

@@ -108,11 +108,42 @@ where
         }
         if !replies.contains_key(&reference) {
             stats.described += 1;
-            let reply = tokio::time::timeout(scope_describe::describe_timeout(), describe(request))
-                .await
-                .unwrap_or(Err(readiness::ControlError::Timeout));
+            let reply = tokio::time::timeout(
+                scope_describe::describe_timeout(),
+                describe(request.clone()),
+            )
+            .await
+            .unwrap_or(Err(readiness::ControlError::Timeout));
+            let mut ends = reply.as_ref().is_ok_and(|reply| {
+                scope_describe::describe_answer_ends_scope(reply)
+                    || crate::prefrontal::retired(&request, reply)
+            });
+            if ends {
+                if let Some(other) = crate::prefrontal::counterpart(&request) {
+                    let answer = tokio::time::timeout(
+                        scope_describe::describe_timeout(),
+                        describe(other.clone()),
+                    )
+                    .await
+                    .unwrap_or(Err(readiness::ControlError::Timeout));
+                    let (absent, outcome) =
+                        match crate::prefrontal::continuation(&other, answer.as_ref().ok()) {
+                            crate::prefrontal::Continuation::Live(_) => (false, "continuation"),
+                            crate::prefrontal::Continuation::Hold => (false, "hold"),
+                            crate::prefrontal::Continuation::Absent => (true, "absent_end"),
+                        };
+                    crate::prefrontal::log_continuation(&request, &other, outcome);
+                    ends = absent;
+                }
+            } else if let Some(other) = crate::prefrontal::counterpart(&request) {
+                crate::prefrontal::log_continuation(
+                    &request,
+                    &other,
+                    crate::prefrontal::retained_outcome(reply.as_ref().ok()),
+                );
+            }
             match &reply {
-                Ok(reply) if scope_describe::describe_answer_ends_scope(reply) => stats.ended += 1,
+                Ok(_) if ends => stats.ended += 1,
                 Ok(ModuleControlResponseToModule::ScopeDescribe {
                     status: subc_protocol::scope::ScopeStatus::Live,
                     ..
@@ -121,12 +152,9 @@ where
                 Err(readiness::ControlError::Timeout) => stats.timeouts += 1,
                 Err(_) => stats.errors += 1,
             }
-            replies.insert(reference.clone(), reply);
+            replies.insert(reference.clone(), ends);
         }
-        if replies[&reference]
-            .as_ref()
-            .is_ok_and(scope_describe::describe_answer_ends_scope)
-        {
+        if replies[&reference] {
             let db = db.clone();
             match tokio::task::spawn_blocking(move || {
                 let conn = db

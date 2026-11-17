@@ -720,7 +720,13 @@ async fn run_connected_status_dial<C: StatusConsumer>(
             STATUS_CADENCE
         };
         if tokio::time::Instant::now() >= next_discovery_at {
-            match consumer.catalog_list().await {
+            let catalog = consumer.catalog_list().await;
+            if let Ok(catalog) = &catalog {
+                crate::prefrontal::observe_catalog(
+                    catalog.modules.iter().map(|entry| entry.module_id.as_str()),
+                );
+            }
+            match catalog {
                 Ok(catalog) if status_holder(&catalog.modules).is_some() => {
                     let holder = status_holder(&catalog.modules).expect("advertised status holder");
                     catalog_generation = Some(catalog.generation);
