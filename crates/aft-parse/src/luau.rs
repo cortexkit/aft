@@ -61,7 +61,7 @@ fn single(node: Node<'_>) -> Option<Node<'_>> {
         .flatten()
 }
 
-pub(crate) fn local_pair(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+pub fn local_pair(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
     let binding = single(child(node, "binding_list")?)?;
     Some((
         binding.child_by_field_name("name")?,
@@ -69,7 +69,7 @@ pub(crate) fn local_pair(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
     ))
 }
 
-pub(crate) fn assignment_pairs(node: Node<'_>) -> Vec<(Node<'_>, Option<Node<'_>>)> {
+pub fn assignment_pairs(node: Node<'_>) -> Vec<(Node<'_>, Option<Node<'_>>)> {
     let Some(left) = child(node, "variable_list") else {
         return Vec::new();
     };

@@ -92,7 +92,7 @@ fn enable_meaning(ctx: &AppContext, root: &Path) -> impl Drop {
 fn wait_meaning(ctx: &AppContext) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if crate::data_layer::tools::search::DataSemantic::current(ctx)
+        if crate::data_layer::meaning_query::DataSemantic::current(ctx)
             .and_then(|data| data.serving().cloned())
             .is_some_and(|meaning| meaning.coverage().pending.is_empty())
         {
@@ -120,7 +120,7 @@ fn luau_s4_round4_non_luau_failures_preserve_main_search_contract() {
         .unwrap()
         .wait_for_memory_profile_idle_for_test();
     wait_meaning(&ctx);
-    let plane = crate::data_layer::tools::search::DataSemantic::current(&ctx).unwrap();
+    let plane = crate::data_layer::meaning_query::DataSemantic::current(&ctx).unwrap();
     let coverage = plane.serving().unwrap().coverage();
     assert_eq!(coverage.files, 2, "{coverage:?}");
     assert_eq!(coverage.files_embedded, 1, "{coverage:?}");

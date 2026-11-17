@@ -71,6 +71,7 @@ pub enum ToolOutcome {
     Completed {
         status: ExitStatus,
         stdout: String,
+        stdout_utf8_valid: bool,
         stderr: String,
         truncated: bool,
     },
@@ -90,6 +91,7 @@ impl ToolOutcome {
             Ok(output) => Self::Completed {
                 status: output.status,
                 stdout: output.stdout,
+                stdout_utf8_valid: output.stdout_utf8_valid,
                 stderr: output.stderr,
                 truncated: output.truncated,
             },
@@ -105,11 +107,13 @@ impl ToolOutcome {
             Self::Completed {
                 status,
                 stdout,
+                stdout_utf8_valid,
                 stderr,
                 truncated,
             } => Ok(SubprocessOutcome {
                 status,
                 stdout,
+                stdout_utf8_valid,
                 stderr,
                 truncated,
             }),
@@ -125,6 +129,32 @@ impl ToolOutcome {
                 timeout_secs,
             }),
         }
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod utf8_capture_tests {
+    use super::*;
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt;
+
+    #[test]
+    fn tool_outcome_roundtrip_keeps_raw_stdout_utf8_fact() {
+        let captured = SubprocessOutcome {
+            stdout: "\u{fffd}".into(),
+            stdout_utf8_valid: false,
+            stderr: String::new(),
+            status: ExitStatus::from_raw(0),
+            truncated: false,
+        };
+        let restored = ToolOutcome::from_result(Ok(captured))
+            .into_result("utf8-capture")
+            .unwrap();
+        assert!(!restored.stdout_utf8_valid);
+        assert_eq!(restored.stdout, "\u{fffd}");
+        assert!(restored.status.success());
     }
 }
 

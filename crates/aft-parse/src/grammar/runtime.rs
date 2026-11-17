@@ -128,6 +128,9 @@ pub struct GrammarRegistry {
     transport: OnceLock<Result<Arc<dyn download::Transport>, String>>,
     queries: Vec<String>,
     fault: RwLock<storage::StorageFault>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub listeners: Mutex<std::collections::BTreeMap<u64, std::sync::mpsc::Sender<String>>>,
+    #[cfg(not(any(test, feature = "test-support")))]
     listeners: Mutex<std::collections::BTreeMap<u64, std::sync::mpsc::Sender<String>>>,
     next_listener: std::sync::atomic::AtomicU64,
     #[cfg(any(test, feature = "test-support"))]

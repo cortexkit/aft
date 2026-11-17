@@ -107,8 +107,8 @@ pub(crate) fn ops_graph(
     };
     #[cfg(not(feature = "wasm-grammars"))]
     for file in files {
-        if let Err(error) = super::super::grammar::prepare(ctx, file) {
-            return Err(super::super::grammar::error_response_for_path(
+        if let Err(error) = crate::data_layer::grammar::prepare(ctx, file) {
+            return Err(crate::data_layer::grammar::error_response_for_path(
                 req_id, &error, file,
             ));
         }
@@ -167,7 +167,7 @@ pub(crate) fn grammar_gap(
         .current_state()
         .skipped_parses()
         .get(relative.as_bytes())?;
-    super::super::grammar::response(req_id, reason, &view.root().join(relative))
+    crate::data_layer::grammar::response(req_id, reason, &view.root().join(relative))
 }
 
 /// The error to send instead of an answer built while a read of the data

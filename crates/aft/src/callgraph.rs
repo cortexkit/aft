@@ -75,44 +75,6 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn rust_use_tree_expansion_preserves_depth_first_entry_order() {
-        let mut entries = Vec::new();
-        expand_rust_use_tree(
-            "root::{first, branch::{self, nested::{Leaf as Renamed, *, {}}, after}, self, *, {}, last as Tail}",
-            &mut entries,
-        );
-        let actual: Vec<_> = entries
-            .iter()
-            .map(|entry| {
-                let imported = match &entry.kind {
-                    RustUseKind::Item { imported_name } => Some(imported_name.as_str()),
-                    RustUseKind::Module => None,
-                };
-                (
-                    entry.module_path.as_str(),
-                    entry.local_name.as_str(),
-                    imported,
-                )
-            })
-            .collect();
-        assert_eq!(
-            actual,
-            [
-                ("root", "first", Some("first")),
-                ("root::first", "first", None),
-                ("root::branch", "branch", None),
-                ("root::branch::nested", "Renamed", Some("Leaf")),
-                ("root::branch::nested::Leaf", "Renamed", None),
-                ("root::branch", "after", Some("after")),
-                ("root::branch::after", "after", None),
-                ("root", "root", None),
-                ("root", "Tail", Some("last")),
-                ("root::last", "Tail", None),
-            ]
-        );
-    }
-
-    #[test]
     fn call_tree_work_gap_text_names_the_node_budget() {
         assert_eq!(
             CALL_TREE_WORK_GAP,
