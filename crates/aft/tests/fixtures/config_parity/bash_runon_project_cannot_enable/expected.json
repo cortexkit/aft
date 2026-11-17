@@ -1,8 +1,5 @@
 {
   "aft_search_registered": true,
-  "bash": {
-    "runon_enabled": false
-  },
   "disabled_tools": [
     "aft_delete",
     "aft_move"
@@ -14,6 +11,9 @@
     "callgraph": true,
     "semantic": true,
     "trigram": true
+  },
+  "remote_exec": {
+    "enabled": false
   },
   "restrict_to_project_root": false
 }

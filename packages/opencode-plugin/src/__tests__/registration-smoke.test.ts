@@ -32,8 +32,7 @@ function profile(runon: boolean, reduced: boolean): AftConfig {
       ? ["aft_search", "aft_zoom", "aft_outline", "bash_watch", "bash_status", "bash_write"]
       : [],
     subc: { connection_file: "/configured/daemon.json" },
-    remote_exec: { enabled: true },
-    bash: { runon_enabled: runon },
+    remote_exec: { enabled: runon },
   } as AftConfig;
 }
 
@@ -119,7 +118,7 @@ test("real OpenCode registration preserves narrowed wording and reprojects the l
     definitions,
   );
   for (const enabled of [true, false]) {
-    ctx.config = { ...ctx.config, bash: { runon_enabled: enabled } };
+    ctx.config = { ...ctx.config, remote_exec: { enabled } };
     const projected = new Map<string, V2ProviderTool>();
     transform!({
       add: (definition) => projected.set(definition.name, definition),

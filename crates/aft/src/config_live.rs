@@ -981,7 +981,6 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     live!("bash.disclaim_privacy", bash.disclaim_privacy);
     live!("bash.foreground_wait_window_ms", foreground_wait_window_ms);
     live!("bash.host_fallback", bash.host_fallback);
-    live!("bash.runon_enabled", bash.runon_enabled);
     live!("bash.watch_sync_max_ms", bash.watch_sync_max_ms);
     live!("bash.worker_wait_max_ms", bash.worker_wait_max_ms);
     later!("bash.detach_on_user_message", bash.detach_on_user_message);
@@ -1031,10 +1030,12 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     later!("github.write", github.write);
     later!("gh_shim.binary_path", gh_shim.binary_path);
     live!("git.co_author", git.co_author);
-    // Whether `runon` is offered is decided once per host process (the head
-    // plugins build bash's arguments at startup), so a change waits for a
-    // restart rather than refusing calls the surface still offers.
-    later!("remote_exec", remote_exec);
+    // The user switch and project refusal apply to the next call, even if
+    // the caller still holds a catalog that offered runon. A later catalog
+    // fetch reflects the new switch; the runner default waits for reconnect.
+    live!("remote_exec.enabled", remote_exec.enabled);
+    live!("remote_exec.project_off", remote_exec.project_off);
+    later!("remote_exec.default_demand", remote_exec.default_demand);
 
     // `aft_search_registered` is derived from `disabled_tools`, which is
     // deferred, so it is never copied.
@@ -1105,7 +1106,7 @@ fn classification_is_exhaustive(config: &Config) {
         github,
         gh_shim: _,
         git: _,
-        remote_exec: _,
+        remote_exec,
         experimental_lsp_ty: _,
         lsp_servers: _,
         disabled_lsp: _,
@@ -1126,7 +1127,6 @@ fn classification_is_exhaustive(config: &Config) {
         changed_files: _,
         enabled: _,
         host_fallback: _,
-        runon_enabled: _,
         detach_on_user_message: _,
         db_schema_hints: _,
         watch_sync_max_ms: _,
@@ -1140,6 +1140,11 @@ fn classification_is_exhaustive(config: &Config) {
         runon_env: _,
     } = bash;
     let crate::config::ShellConfig { env_provider: _ } = shell;
+    let crate::config::RemoteExecConfig {
+        enabled: _,
+        project_off: _,
+        default_demand: _,
+    } = remote_exec;
     let crate::config::SandboxConfig {
         profile: _,
         write_allow: _,

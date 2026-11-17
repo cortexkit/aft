@@ -7056,8 +7056,8 @@ fn restarted_context_with_runon(dir: &Path, enabled: bool) -> crate::context::Ap
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             project_root: Some(dir.into()),
-            bash: crate::config::BashConfig {
-                runon_enabled: enabled,
+            remote_exec: crate::config::RemoteExecConfig {
+                enabled,
                 ..Default::default()
             },
             sandbox: crate::config::SandboxConfig {
@@ -8001,8 +8001,8 @@ async fn runon_queue_wait_limit_follows_only_explicit_timeouts() {
                 crate::config::Config {
                     project_root: Some(dir.path().into()),
                     experimental_bash_background: true,
-                    bash: crate::config::BashConfig {
-                        runon_enabled: true,
+                    remote_exec: crate::config::RemoteExecConfig {
+                        enabled: true,
                         ..Default::default()
                     },
                     ..Default::default()
@@ -8632,10 +8632,10 @@ async fn old_shape_prefix_routing_survives_the_runon_kill_switch_and_runon_works
             assert_eq!(exec_runs(&daemon).len(), 2);
         } else {
             assert!(!whole.success);
-            assert!(whole.data["message"]
-                .as_str()
-                .unwrap()
-                .contains("bash.runon_enabled"));
+            assert_eq!(
+                whole.data["message"],
+                "runon refused: runon is disabled by the user setting remote_exec.enabled"
+            );
             assert_eq!(exec_runs(&daemon).len(), 1);
         }
     }
@@ -8711,7 +8711,6 @@ async fn runon_is_refused_by_name_whenever_it_cannot_run_remotely() {
     };
     project_off.sandbox.profile.head = crate::config::SandboxMode::Off;
     project_off.remote_exec.project_off = true;
-    project_off.bash.runon_enabled = true;
     let project_off_ctx = crate::context::AppContext::new(
         Box::new(crate::parser::TreeSitterProvider::new()),
         project_off,

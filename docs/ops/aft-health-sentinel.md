@@ -35,6 +35,24 @@ turn unknown roots into an empty memory census or use stale footprint values in
 place of the live process sample. Instrument findings follow the normal
 three-consecutive-tick warning policy.
 
+The 12 KiB health metrics budget allocates process telemetry first. Individual
+project rows and grouped summaries together receive at most 6 KiB and only the
+space left after process telemetry. `root_count`, not `roots.length`, is the fleet
+size. `roots` retains exceptional identities, ordered by severity; repeated normal
+states (including a progressing call-graph rebuild) appear in `root_groups` with
+the state/component-status tuple, `count`, up to three `examples`, and an exact
+`examples_omitted` count. Failed or stalled rebuilds remain individual diagnostics.
+`root_details_omitted` counts all roots not individually listed;
+`root_detail_gap.summarized` identifies how many were grouped. Budget cuts to
+groups also report `root_groups_omitted` and `root_group_roots_omitted`.
+
+A grouped or omitted root is not evidence that a previous per-root problem
+recovered. The sentinel treats incomplete individual-root detail as an unavailable
+census, preserves prior per-root findings and the previous watcher dropped-event
+counter values used to detect new overflows, and leaves the
+independent process/liveness detectors running. Group examples are not an inventory
+or a substitute for a root-local probe.
+
 ## Rules
 
 | Rule | Severity and trigger | Clears when |

@@ -28,6 +28,8 @@ pub(crate) fn worker_kill_deadline_within_handoff_margin(remaining: Option<Durat
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct BashOrchestrateParams {
+    command: String,
+    workdir: Option<String>,
     foreground_orchestrate: bool,
     block_to_completion: bool,
     wait: bool,
@@ -442,6 +444,7 @@ fn observe_raw_bash_response(
     ctx: &AppContext,
     response: &mut Response,
 ) {
+    crate::subc::runner_notices::notice_templates::deliver(response, None);
     let Some(data) = response.data.as_object_mut() else {
         return;
     };
@@ -457,8 +460,12 @@ fn observe_raw_bash_response(
     let Some(mut text) = data.get(field).and_then(Value::as_str).map(str::to_string) else {
         return;
     };
-    repeat.observe(ctx, &mut text);
-    data.insert(field.to_string(), Value::String(text));
+    repeat.observe(ctx, response, &mut text);
+    response
+        .data
+        .as_object_mut()
+        .unwrap()
+        .insert(field.to_string(), Value::String(text));
 }
 
 pub fn build_bash_outcome(
@@ -601,6 +608,9 @@ pub fn build_bash_outcome_with_wake(
     let task_id_for_poll = task_id.clone();
     let request_id_for_poll = request_id.clone();
     let session_id_for_poll = session_id.clone();
+    let command_for_hint = params.command.clone();
+    let workdir_for_hint = params.workdir.clone();
+    let shell_tool_for_hint = req.host_tool_names().shell().to_string();
     let mut progress = ctx.request_handles_progress(&req.id).then(|| {
         crate::bash_background::progress::BashProgressPump::new(
             ctx,
@@ -703,6 +713,19 @@ pub fn build_bash_outcome_with_wake(
             ))
         };
         let response = response.map(|mut response| {
+            if crate::bash_rewrite::bash_hints::is_terminal_native_reply(&response) {
+                if let Some(hint) = crate::bash_rewrite::bash_hints::code_search_nudge(
+                    response.data["output"].as_str().unwrap_or_default(),
+                    &command_for_hint,
+                    project_root.as_deref(),
+                    workdir_for_hint.as_deref(),
+                    ctx.config().aft_search_registered.then_some("aft_search"),
+                    Some("grep"),
+                    &shell_tool_for_hint,
+                ) {
+                    crate::bash_rewrite::bash_hints::append_nudge(&mut response, &hint);
+                }
+            }
             append_bash_reply_notices(
                 &mut response,
                 duplicate_warning.as_deref(),
@@ -1089,6 +1112,7 @@ pub(crate) fn with_capture_warning(response: &Response) -> Response {
         id: response.id.clone(),
         success: response.success,
         data: response.data.clone(),
+        notices: response.notices.clone(),
     };
     if !reply_announces_live_task(&response) {
         return response;
@@ -1155,6 +1179,7 @@ pub(crate) fn runon_uncaptured_reply(
         id: response.id.clone(),
         success: response.success,
         data: response.data.clone(),
+        notices: response.notices.clone(),
     };
     if let Some(note) = registry
         .runon_launch_state(task_id, session)
@@ -1375,7 +1400,7 @@ fn append_bash_reply_notices(
 /// Split a bash reply into its body and the closing lines AFT adds after the
 /// command output: an optional `[task <id>]` line followed by the optional
 /// list-envelope `trailer`. The tail is returned with its own line breaks.
-fn split_reply_tail<'a>(output: &'a str, trailer: Option<&str>) -> (&'a str, &'a str) {
+pub(crate) fn split_reply_tail<'a>(output: &'a str, trailer: Option<&str>) -> (&'a str, &'a str) {
     let mut tail_start = output.len();
     if let Some(trailer) = trailer.filter(|trailer| !trailer.is_empty()) {
         if output.ends_with(trailer) {

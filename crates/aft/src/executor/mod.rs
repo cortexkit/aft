@@ -1359,6 +1359,7 @@ impl Executor {
             crate::cache_location::markers::register_live_scope(&ctx.storage_dir(), &memory_root);
             app.register_memory_context(memory_root, &ctx);
             app.actor_root_registered();
+            crate::subc::scope_watch::context_changed();
         }
         self.wake_scheduler();
         inserted
@@ -1385,6 +1386,7 @@ impl Executor {
             );
             app.unregister_memory_context(root_id.as_path(), &actor.ctx);
             app.actor_root_unregistered();
+            crate::subc::scope_watch::context_changed();
         }
         drop(removed);
         self.wake_scheduler();
@@ -1450,6 +1452,7 @@ impl Executor {
         );
         app.unregister_memory_context(root_id.as_path(), &actor.ctx);
         app.actor_root_unregistered();
+        crate::subc::scope_watch::context_changed();
         std::thread::spawn(move || {
             actor.ctx.teardown_deleted_root();
             drop(actor);

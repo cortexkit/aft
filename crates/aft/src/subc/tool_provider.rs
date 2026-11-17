@@ -753,6 +753,10 @@ pub(super) fn validate_catalog_request_with_default(
     let mut request: CatalogRequest = serde_json::from_value(body)
         .map_err(|e| errors::invalid_request("arguments", e.to_string()))?;
     request.facts = facts;
+    cortexkit_role_tool_provider::catalog::check_notice_templates_request(
+        &request,
+        &[cortexkit_role_tool_provider::SESSION_NOTICES_V1.to_owned()],
+    )?;
     // The tool-provider contract reads a system-text item's preset as
     // optional, where a missing preset asks for the provider's default text.
     // AFT does not offer default text (its manifest does not declare
@@ -1468,6 +1472,14 @@ fn render_catalog(
     let composition = request.composition.as_ref().map(|composition| {
         composition_digest(&Value::Object(composition.clone())).expect("composition is JSON")
     });
+    if request.notice_templates == Some(true) {
+        answer.notice_templates = Some(
+            crate::subc::runner_notices::notice_templates::templates(preset.name())
+                .iter()
+                .map(|template| serde_json::to_value(template).expect("notice template is JSON"))
+                .collect(),
+        );
+    }
     answer.composition_digest = composition.clone();
     if let Some(item) = request.system_text {
         // The request was validated before policy persistence; rendering must
@@ -5190,6 +5202,140 @@ mod tests {
 
     const REGENERATE_CATALOG: &str = "cargo test -p agent-file-tools --lib regenerate_tool_provider_catalog --locked -- --ignored";
 
+    fn notice_template_vectors() -> BTreeMap<String, String> {
+        use crate::subc::runner_notices::notice_templates::{self as notices, Notice, Target};
+        use sha2::{Digest, Sha256};
+        let mut files = BTreeMap::new();
+        files.insert("README.md".into(), "# AFT notice templates v1\n\nOpt-in `tool.catalog` replies and example `session.send` requests for each preset.\nThe examples use a fixed clock (1700000000000 ms), call key and cleared delivery\nmode; real sends use the current clock and the runner's declared modes.\nTemplate digests use llm-runner's RFC 8785 SHA-256 helper.\n\nRegenerate with `cargo test -p agent-file-tools --lib regenerate_notice_template_vectors -- --ignored`.\nThe `notice_template_vectors_match_samples` test regenerates in memory and compares every byte.\n".into());
+        for preset in ["head", "worker", "reader"] {
+            let reply = catalog(
+                json!({"preset": preset, "notice_templates": true}),
+                &[],
+                false,
+            )
+            .unwrap();
+            files.insert(
+                format!("{preset}.catalog.json"),
+                format!("{}\n", serde_json::to_string_pretty(&reply).unwrap()),
+            );
+            let mut sends = vec![];
+            for template in notices::templates(preset) {
+                let slots = match template.id.as_str() {
+                    notices::CODE_SEARCH => notices::code_search_slots(
+                        Some(if preset == "worker" {
+                            "search"
+                        } else {
+                            "aft_search"
+                        }),
+                        "bash",
+                    ),
+                    notices::PREFER_TOOL => json!({"tool":"read", "shell":"bash"}),
+                    _ => {
+                        json!({"count":3, "span":42, "instruction": crate::response_finalize::repeat_instruction(preset == "worker", preset == "worker", false)})
+                    }
+                };
+                let id = match template.id.as_str() {
+                    notices::CODE_SEARCH => notices::CODE_SEARCH,
+                    notices::PREFER_TOOL => notices::PREFER_TOOL,
+                    notices::IDENTICAL => notices::IDENTICAL,
+                    _ => notices::DRIFTING,
+                };
+                let notice = Notice::template(id, slots, String::new(), Target::Text);
+                let request = super::super::runner_notices::nudge_request(
+                    "example-call",
+                    &notice,
+                    preset,
+                    1700000000000,
+                    true,
+                    true,
+                    false,
+                );
+                sends.push(json!({"method":"session.send", "params":request}));
+            }
+            files.insert(
+                format!("{preset}.sends.json"),
+                format!("{}\n", serde_json::to_string_pretty(&sends).unwrap()),
+            );
+        }
+        let sums = files
+            .iter()
+            .map(|(path, text)| format!("{:x}  {path}\n", Sha256::digest(text.as_bytes())))
+            .collect::<String>();
+        files.insert("SHA256SUMS".into(), sums);
+        files
+    }
+
+    #[test]
+    fn notice_template_vectors_match_samples() {
+        let root = std::path::Path::new(crate::test_support::manifest_dir())
+            .join("../../test-vectors/aft-notice-templates-v1");
+        for (path, expected) in notice_template_vectors() {
+            assert_eq!(
+                std::fs::read_to_string(root.join(&path)).unwrap(),
+                expected,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "explicit sample regeneration, not a verification gate"]
+    fn regenerate_notice_template_vectors() {
+        let root = std::path::Path::new(crate::test_support::manifest_dir())
+            .join("../../test-vectors/aft-notice-templates-v1");
+        std::fs::create_dir_all(&root).unwrap();
+        for (path, text) in notice_template_vectors() {
+            std::fs::write(root.join(path), text).unwrap();
+        }
+    }
+
+    #[test]
+    fn notice_templates_are_opt_in_preset_scoped_and_runner_validated() {
+        use cortexkit_role_llm_runner::delivery_order::{check_plan, Template};
+        for preset in ["head", "worker", "reader"] {
+            let unasked = catalog(json!({"preset":preset}), &[], false).unwrap();
+            let disabled = catalog(
+                json!({"preset":preset, "notice_templates":false}),
+                &[],
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::to_vec(&unasked).unwrap(),
+                serde_json::to_vec(&disabled).unwrap()
+            );
+            assert!(unasked.get("notice_templates").is_none());
+            let answer = catalog(
+                json!({"preset":preset, "notice_templates":true}),
+                &[],
+                false,
+            )
+            .unwrap();
+            let decoded: CatalogAnswer = serde_json::from_value(answer.clone()).unwrap();
+            let templates = decoded.notice_templates.unwrap();
+            assert_eq!(templates.len(), if preset == "reader" { 2 } else { 4 });
+            assert_ne!(answer["catalog_digest"], unasked["catalog_digest"]);
+            let plan = json!({"senders":[{"module":"aft", "templates":templates}]});
+            check_plan(plan.as_object().unwrap(), &["delivery_order"]).unwrap();
+            for template in templates {
+                let template: Template = serde_json::from_value(template).unwrap();
+                if preset == "reader" {
+                    let text = serde_json::to_string(&template).unwrap();
+                    for forbidden in ["bash_watch", "bash_status", "bash_kill"] {
+                        assert!(!text.contains(forbidden));
+                    }
+                }
+            }
+            let digest = catalog(
+                json!({"preset":preset, "notice_templates":true, "digest_only":true}),
+                &[],
+                false,
+            )
+            .unwrap();
+            assert_eq!(digest["catalog_digest"], answer["catalog_digest"]);
+        }
+    }
+
     /// The catalog goldens: the `head` file AFT pinned before presets existed,
     /// and one file holding the fixtures whose request names a preset: each
     /// non-head preset, and `head` with and without a model. Both are
@@ -5231,6 +5377,32 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    #[ignore = "explicit fixture regeneration, not a verification gate"]
+    fn regenerate_tool_provider_system_text() {
+        let mut fixtures = serde_json::Map::new();
+        for (disabled, worker, name) in [
+            (vec![], false, "all_tools_worker_false"),
+            (vec![], true, "all_tools_worker_true"),
+            (vec!["bash".into()], false, "bash_disabled_worker_false"),
+        ] {
+            let reply = catalog(
+                json!({"system_text": {"preset": "broca", "params": {"worker": worker}}}),
+                &disabled,
+                true,
+            )
+            .unwrap();
+            fixtures.insert(name.into(), reply["system_text"]["text"].clone());
+        }
+        let path = Path::new(crate::test_support::manifest_dir())
+            .join("tests/fixtures/tool_provider_system_text.json");
+        std::fs::write(
+            path,
+            format!("{}\n", serde_json::to_string_pretty(&fixtures).unwrap()),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -5312,8 +5484,9 @@ mod tests {
         );
         assert!(
             serde_json::to_vec(&actual).unwrap() == serde_json::to_vec(&fixture["reply"]).unwrap(),
-            "full catalog bytes differ for {}; regenerate with: {}",
+            "full catalog bytes differ for {}: {}; regenerate with: {}",
             fixture["name"],
+            catalog_golden_difference(&fixture["reply"], &actual, "reply"),
             REGENERATE_CATALOG
         );
         assert_eq!(actual["generation"], actual["catalog_digest"]);
@@ -5327,6 +5500,42 @@ mod tests {
             catalog(fixture["request"].clone(), &disabled, available).unwrap(),
             actual
         );
+    }
+
+    fn catalog_golden_difference(expected: &Value, actual: &Value, path: &str) -> String {
+        match (expected, actual) {
+            (Value::Object(left), Value::Object(right)) => {
+                for key in left.keys().chain(right.keys()) {
+                    if key == "generation" || key == "digest" || key.ends_with("_digest") {
+                        continue;
+                    }
+                    if left.get(key) != right.get(key) {
+                        if let (Some(left), Some(right)) = (left.get(key), right.get(key)) {
+                            return catalog_golden_difference(
+                                left,
+                                right,
+                                &format!("{path}.{key}"),
+                            );
+                        }
+                        return format!("{path}.{key}: member presence differs");
+                    }
+                }
+                format!("{path}: only digest members or serialized order differ")
+            }
+            (Value::Array(left), Value::Array(right)) => {
+                for (index, (left, right)) in left.iter().zip(right).enumerate() {
+                    if left != right {
+                        return catalog_golden_difference(left, right, &format!("{path}[{index}]"));
+                    }
+                }
+                format!(
+                    "{path}: expected {} items, actual {}",
+                    left.len(),
+                    right.len()
+                )
+            }
+            _ => format!("{path}: expected {expected}, actual {actual}"),
+        }
     }
 
     #[test]
@@ -6006,8 +6215,9 @@ mod tests {
                 assert_eq!(unresolved_references(&reply), Vec::<String>::new());
                 let text = reply["system_text"]["text"].as_str().unwrap();
                 for line in [
-                    "start with aft_search;",
-                    "Then aft_outline for structure, aft_zoom for named symbols, read for line ranges.",
+                    "`aft_search` is the primary code-search tool:",
+                    "Then `aft_outline` for structure → `aft_zoom` for symbol(s).",
+                    "STOP — use aft_search (concepts, identifiers, regex, literals), read, aft_outline, or aft_zoom instead.",
                     "**Relationships**: aft_callgraph for callers",
                     "**After edits**: run aft_inspect for diagnostics;",
                     "Pass wait: true when you need a long command's result before anything else.",

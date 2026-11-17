@@ -25,13 +25,28 @@ pub fn add_grep_footer(
     aft_search_registered: bool,
     shell_tool: &str,
 ) -> String {
-    let hint = if aft_search_registered {
-        "Use the `aft_search` tool instead (it auto-routes concepts, identifiers, regex, and literals)."
+    let hint = grep_search_hint(
+        aft_search_registered.then_some("aft_search"),
+        "grep",
+        shell_tool,
+    );
+    format!("{response_output}\n\n{hint}")
+}
+
+/// Render the same search guidance for rewritten and native searches using the
+/// tool names available to the caller.
+pub(crate) fn grep_search_hint(
+    search_tool: Option<&str>,
+    grep_tool: &str,
+    shell_tool: &str,
+) -> String {
+    let hint = if let Some(search_tool) = search_tool {
+        format!("Use the `{search_tool}` tool instead (it auto-routes concepts, identifiers, regex, and literals).")
     } else {
-        "Use the `grep` tool instead (indexed and ranked)."
+        format!("Use the `{grep_tool}` tool instead (indexed and ranked).")
     };
     format!(
-        "{response_output}\n\nDO NOT search code by running grep/rg in {shell_tool} \u{2014} it is unindexed, unranked, and serial. {hint}"
+        "DO NOT search code by running grep/rg in {shell_tool} \u{2014} it is unindexed, unranked, and serial. {hint}"
     )
 }
 

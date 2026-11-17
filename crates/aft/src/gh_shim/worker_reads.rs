@@ -129,6 +129,16 @@ fn tuple(args: &[OsString]) -> Option<String> {
     })
 }
 
+fn authorized_tuple(tuple: &str) -> &str {
+    // Watch polls the same run endpoint as view, so it uses the existing
+    // `run view` authorization.
+    if tuple == "run watch" {
+        "run view"
+    } else {
+        tuple
+    }
+}
+
 pub(super) fn candidate(args: &[OsString], manifest: &Manifest, platform: &str) -> bool {
     if manifest.manifest_version < 20
         || shim_disabled_by_operator()
@@ -142,10 +152,11 @@ pub(super) fn candidate(args: &[OsString], manifest: &Manifest, platform: &str) 
     let Some(tuple) = tuple(args) else {
         return false;
     };
+    let tuple = authorized_tuple(&tuple);
     if tuple == "api" && !api_read_candidate(args) {
         return false;
     }
-    TUPLES.contains(&tuple.as_str())
+    TUPLES.contains(&tuple)
         && manifest
             .worker_reads
             .iter()
@@ -232,6 +243,22 @@ pub(super) fn last_lookup(paths: &StatePaths) -> Option<LookupRecord> {
     serde_json::from_slice(&fs::read(paths.root.join("read-session-lookup.json")).ok()?).ok()
 }
 
+pub(super) fn refuse_unavailable_command(args: &[OsString]) -> Option<i32> {
+    if tuple(args).as_deref() != Some("run download") {
+        return None;
+    }
+    let relay = RelayContext::from_process();
+    let signals = native_guard::ShellSignals::from_process();
+    if relay.worker_broker.is_none() && !signals.sandboxed && !signals.worker_marked {
+        return None;
+    }
+    // Artifact archives cannot fit the worker broker's 1 MiB typed replies.
+    Some(refuse(
+        RefusalCode::WorkerNativeGh,
+        &crate::gh_shim_worker_broker::failure_text("run_download"),
+    ))
+}
+
 pub(super) fn dispatch(
     args: &[OsString],
     manifest: &Manifest,
@@ -247,12 +274,27 @@ pub(super) fn dispatch(
     let relay = RelayContext::from_process();
     match identity(args, manifest, paths, &relay) {
         Ok(Some(false) | None) => return None,
-        Err(_) => return None,
+        Err(text) => {
+            let signals = native_guard::ShellSignals::from_process();
+            if relay.worker_broker.is_some() || signals.sandboxed || signals.worker_marked {
+                // A failed identity lookup does not change a read into native gh.
+                return Some(refuse(
+                    RefusalCode::GovernanceUnavailable,
+                    &format!("gh read failed: {text}"),
+                ));
+            }
+            return None;
+        }
         Ok(Some(true)) => {}
     }
     let repository = match relay_client::worker_repository(&relay) {
         Ok(repository) => repository,
-        Err(text) => return Some(refuse(RefusalCode::UnboundTarget, &text)),
+        Err(text) => {
+            return Some(refuse(
+                RefusalCode::GovernanceUnavailable,
+                &format!("gh read failed: {text}"),
+            ))
+        }
     };
     let binding = match ticket_bound_repository(args, manifest, &repository) {
         Ok(binding) => binding,
@@ -340,7 +382,7 @@ impl Plan {
 fn parse_plan(args: &[OsString], repository: &str) -> Result<Plan, String> {
     let tuple = tuple(args).ok_or("missing read command")?;
     let (_, _, command_index) = command_head(args).ok_or("missing command")?;
-    if !TUPLES.contains(&tuple.as_str()) {
+    if !TUPLES.contains(&authorized_tuple(&tuple)) {
         return Err("this verb is not a governed worker read".into());
     }
     let mut result = Plan {
@@ -430,6 +472,16 @@ fn plan(args: &[OsString], repository: &str) -> Result<Plan, String> {
             return Err("--limit must be positive".into());
         }
     }
+    if let Some(interval) = result.value("interval") {
+        if interval
+            .parse::<u64>()
+            .ok()
+            .filter(|seconds| *seconds > 0)
+            .is_none()
+        {
+            return Err(crate::gh_shim_worker_broker::failure_text("watch_interval"));
+        }
+    }
     if result.tuple == "api" {
         result.api = Some(api_plan(&result)?);
     } else if result.tuple.starts_with("search ") {
@@ -439,6 +491,15 @@ fn plan(args: &[OsString], repository: &str) -> Result<Plan, String> {
             return Err("name at most one read target".into());
         }
         match result.tuple.as_str() {
+            "run watch" => {
+                positive_id(
+                    result
+                        .positional
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or("<missing>"),
+                )?;
+            }
             "run view" if !result.flag("job") => {
                 positive_id(
                     result
@@ -547,7 +608,7 @@ fn flag_spec(tuple: &str, flag: &str) -> Option<(&'static str, bool)> {
         "--json"
             if !matches!(
                 tuple,
-                "api" | "pr diff" | "pr files" | "issue comments" | "workflow view"
+                "api" | "pr diff" | "pr files" | "issue comments" | "workflow view" | "run watch"
             ) =>
         {
             Some(("json", true))
@@ -555,7 +616,7 @@ fn flag_spec(tuple: &str, flag: &str) -> Option<(&'static str, bool)> {
         "--jq" | "-q"
             if !matches!(
                 tuple,
-                "pr diff" | "pr files" | "issue comments" | "workflow view"
+                "pr diff" | "pr files" | "issue comments" | "workflow view" | "run watch"
             ) =>
         {
             Some(("jq", true))
@@ -582,6 +643,8 @@ fn flag_spec(tuple: &str, flag: &str) -> Option<(&'static str, bool)> {
         ("run view", "--log") => Some(("log", false)),
         ("run view", "--log-failed") => Some(("log-failed", false)),
         ("run view", "--exit-status") => Some(("exit-status", false)),
+        ("run watch", "--exit-status") => Some(("exit-status", false)),
+        ("run watch", "--interval" | "-i") => Some(("interval", true)),
         ("run view", "--verbose" | "-v") => Some(("verbose", false)),
         ("run list", "--branch" | "-b") => Some(("branch", true)),
         ("run list", "--commit" | "-c") => Some(("commit", true)),

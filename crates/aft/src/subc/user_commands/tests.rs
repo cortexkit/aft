@@ -51,6 +51,16 @@ fn route(root: &ProjectRootId, principal: &str) -> RouteIdentity {
     session_route(root, principal, "opencode", "chat", "head")
 }
 
+#[test]
+fn prefrontal_rename_runner_matching_keeps_other_principals_scoped() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = ProjectRootId::from_path(dir.path()).unwrap();
+    for principal in ["reserved:prefrontal", "reserved:prefrontal-core"] {
+        assert!(runner_matches(&route(&root, principal), "broca"));
+    }
+    assert!(!runner_matches(&route(&root, "reserved:other"), "broca"));
+}
+
 fn session_route(
     root: &ProjectRootId,
     principal: &str,

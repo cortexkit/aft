@@ -557,6 +557,31 @@ fn delegating_stamp() -> ScopeStamp {
 }
 
 #[test]
+fn prefrontal_rename_relay_and_secret_scope_admission() {
+    use subc_protocol::{scope::ScopeKind, Principal};
+    for module in ["prefrontal", "prefrontal-core", "other"] {
+        let mut stamp = delegating_stamp();
+        stamp.owner = Principal::Reserved {
+            module_id: module.into(),
+        };
+        let admitted = module != "other";
+        assert_eq!(head_scope(&stamp), admitted);
+        assert_eq!(
+            crate::secret::eligibility::alfonso_of_kind(&stamp, &[ScopeKind::Head]),
+            admitted
+        );
+        stamp.kind = ScopeKind::Worker;
+        assert_eq!(worker_scope(&stamp), admitted);
+        stamp.owner_authorized = false;
+        assert!(!worker_scope(&stamp));
+        assert!(!crate::secret::eligibility::alfonso_of_kind(
+            &stamp,
+            &[ScopeKind::Worker]
+        ));
+    }
+}
+
+#[test]
 fn authority_never_widens_across_reconnect() {
     let original = delegating_stamp();
     let mut replacement = original.clone();

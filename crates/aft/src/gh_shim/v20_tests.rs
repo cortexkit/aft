@@ -2302,3 +2302,321 @@ fn v20_broker_t7_worker_discovery_never_loads_general_connection() {
         "a worker must never discover the general daemon credential"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn v20_worker_lookup_failures_keep_cause_and_plain_reads_recover() {
+    use crate::gh_shim::tests::ScopedTestEnvVar;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+
+    let _state = crate::test_env::gh_shim_state_guard();
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("broker.sock");
+    let capability = root.path().join("capability");
+    fs::write(&capability, "0123456789abcdef0123456789abcdef").unwrap();
+    let _socket = ScopedTestEnvVar::set(crate::gh_shim_worker_broker::SOCKET_ENV, socket.to_str());
+    let _capability = ScopedTestEnvVar::set(
+        crate::gh_shim_worker_broker::CAPABILITY_FILE_ENV,
+        capability.to_str(),
+    );
+    let _repo = ScopedTestEnvVar::set("GH_REPO", None);
+    let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", None);
+    let paths = StatePaths::from_process();
+    crate::gh_shim::tests::write_signed_manifest(&paths, manifest(), unix_seconds());
+
+    let context =
+        json!({"status":"ok","data":{"worker":true,"head":false,"repository":"cortexkit/aft"}});
+    let busy = "gh read refused: too many gh commands are running at once in this shell. Retry in 1 second, or run fewer in parallel.";
+    let rate = "gh read refused: more than 30 gh reads in one second. Retry in 1 second.";
+    let refused = |code: &str, message: &str| json!({"status":"error","data":{"refusal_code":code,"stage":"worker_broker","message":message}});
+    let get = |body: Value| json!({"status":"ok","data":{"result":{"status":200,"body":body,"next_page":null}}});
+    let replies = vec![
+        ("gh_shim.session_context", refused("broker_busy", busy)),
+        ("gh_shim.session_context", context.clone()),
+        (
+            "gh_shim.session_context",
+            refused("request_rate_exceeded", rate),
+        ),
+        ("gh_shim.session_context", context.clone()),
+        ("gh_shim.session_context", context.clone()),
+        ("gh_shim.read_request", get(json!({"id":42793233115u64}))),
+        ("gh_shim.read_request", get(json!({"jobs":[]}))),
+        ("gh_shim.session_context", refused("broker_busy", busy)),
+        ("gh_shim.session_context", context.clone()),
+        ("gh_shim.session_context", context.clone()),
+        (
+            "gh_shim.read_request",
+            get(json!({"number":7,"title":"Title","user":{"login":"author"},"state":"open"})),
+        ),
+        ("gh_shim.session_context", context.clone()),
+        ("gh_shim.session_context", context),
+        (
+            "gh_shim.read_request",
+            get(json!({"status":"completed","conclusion":"failure"})),
+        ),
+        (
+            "gh_shim.read_request",
+            get(json!({"jobs":[{"name":"test","conclusion":"failure"}]})),
+        ),
+    ];
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let broker = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        for (operation, reply) in replies {
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "missing {operation}");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut size = [0; 4];
+            stream.read_exact(&mut size).unwrap();
+            let mut bytes = vec![0; u32::from_be_bytes(size) as usize];
+            stream.read_exact(&mut bytes).unwrap();
+            let request: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(request["operation"]["op"], operation);
+            let bytes = serde_json::to_vec(&reply).unwrap();
+            stream
+                .write_all(&(bytes.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(&bytes).unwrap();
+        }
+    });
+    let run = |raw: &[&str]| {
+        run_with(
+            &args(raw),
+            |_| panic!("worker read reached native gh"),
+            identity_for_command,
+        )
+    };
+    let run_args = ["run", "view", "42793233115", "--json", "jobs"];
+    let issue_args = [
+        "issue",
+        "view",
+        "7",
+        "--repo",
+        "cortexkit/aft",
+        "--json",
+        "title,author,state",
+    ];
+    for (raw, expected) in [(&run_args[..], busy), (&run_args[..], rate)] {
+        let (_capture, lines) = capture_refusals_for_test();
+        assert_eq!(run(raw), REFUSAL_EXIT_STATUS);
+        assert_eq!(
+            *lines.lock().unwrap(),
+            vec![refusal_line(
+                RefusalCode::GovernanceUnavailable,
+                &format!("gh read failed: {expected}")
+            )]
+        );
+    }
+    assert_eq!(
+        run(&run_args),
+        0,
+        "a plain run read must recover without --repo"
+    );
+    let (_capture, lines) = capture_refusals_for_test();
+    assert_eq!(run(&issue_args), REFUSAL_EXIT_STATUS);
+    assert_eq!(
+        *lines.lock().unwrap(),
+        vec![refusal_line(
+            RefusalCode::GovernanceUnavailable,
+            &format!("gh read failed: {busy}")
+        )]
+    );
+    assert_eq!(
+        run(&issue_args),
+        0,
+        "an explicit repository read must also recover"
+    );
+    lines.lock().unwrap().clear();
+    assert_eq!(
+        run(&[
+            "run",
+            "watch",
+            "43863185628",
+            "-R",
+            "cortexkit/aft",
+            "--exit-status"
+        ]),
+        1
+    );
+    assert!(
+        lines.lock().unwrap().is_empty(),
+        "watch must use the worker read path, not a native-gh refusal"
+    );
+    broker.join().unwrap();
+}
+
+#[test]
+fn v20_watch_polls_status_then_reports_conclusion_and_failed_jobs() {
+    let plan = planned(&[
+        "run",
+        "watch",
+        "43863185628",
+        "--exit-status",
+        "--interval",
+        "3",
+    ]);
+    let mut replies = vec![
+        json!({"status":"queued","conclusion":null}),
+        json!({"status":"in_progress","conclusion":null}),
+        json!({"status":"completed","conclusion":"failure"}),
+        json!({"jobs":[{"name":"build","conclusion":"success"},{"name":"unit tests","conclusion":"failure"}]}),
+    ].into_iter();
+    let mut requests = Vec::new();
+    let mut sleeps = Vec::new();
+    let mut output = Vec::new();
+    let status = render::run_with_sleep(
+        &plan,
+        &mut |request| {
+            requests.push(request.clone());
+            Ok(reply(
+                replies
+                    .next()
+                    .expect("one request per poll plus final jobs"),
+            ))
+        },
+        &mut output,
+        &mut |duration| sleeps.push(duration),
+    )
+    .unwrap();
+    assert_eq!(status, 1);
+    assert_eq!(String::from_utf8(output).unwrap(), "43863185628\tqueued\n43863185628\tin_progress\n43863185628\tcompleted\n43863185628\tfailure\nunit tests\tfailure\n");
+    assert_eq!(sleeps, vec![Duration::from_secs(10); 2]);
+    assert_eq!(
+        requests[..3],
+        vec![
+            ReadRequest::Get {
+                path: "/repos/cortexkit/aft/actions/runs/43863185628".into(),
+                accept: None
+            };
+            3
+        ]
+    );
+    assert_eq!(
+        requests[3],
+        ReadRequest::Get {
+            path: "/repos/cortexkit/aft/actions/runs/43863185628/jobs".into(),
+            accept: None
+        }
+    );
+    assert!(replies.next().is_none());
+}
+
+#[test]
+fn v20_watch_interval_exit_codes_and_signed_read_authorization() {
+    let manifest = manifest();
+    assert!(candidate(&args(&["run", "watch", "7"]), &manifest, "linux"));
+    let mut no_view = manifest;
+    no_view.worker_reads.retain(|row| row.tuple() != "run view");
+    assert!(!candidate(&args(&["run", "watch", "7"]), &no_view, "linux"));
+    for value in ["0", "-1", "NaN"] {
+        assert_eq!(
+            plan(
+                &args(&["run", "watch", "7", "--interval", value]),
+                "cortexkit/aft"
+            )
+            .unwrap_err(),
+            "--interval must be a positive number of seconds"
+        );
+    }
+    for (flags, interval) in [
+        (vec![], 10),
+        (vec!["--interval", "1"], 10),
+        (vec!["-i", "25"], 25),
+    ] {
+        let mut raw = vec!["run", "watch", "7", "--exit-status"];
+        raw.extend(flags);
+        for conclusion in [
+            "success",
+            "neutral",
+            "skipped",
+            "failure",
+            "cancelled",
+            "timed_out",
+            "action_required",
+        ] {
+            let mut calls = 0;
+            let mut sleeps = Vec::new();
+            let result = render::run_with_sleep(
+                &planned(&raw),
+                &mut |_| {
+                    calls += 1;
+                    Ok(reply(match calls {
+                        1 | 2 => json!({"status":"in_progress","conclusion":null}),
+                        3 => json!({"status":"completed","conclusion":conclusion}),
+                        4 => json!({"jobs":[]}),
+                        _ => panic!("unexpected poll"),
+                    }))
+                },
+                &mut Vec::new(),
+                &mut |duration| sleeps.push(duration),
+            )
+            .unwrap();
+            assert_eq!(sleeps, vec![Duration::from_secs(interval); 2]);
+            assert_eq!(
+                result,
+                i32::from(!matches!(conclusion, "success" | "neutral" | "skipped")),
+                "{conclusion}"
+            );
+            assert_eq!(calls, 4);
+        }
+    }
+    let mut responses = [
+        json!({"status":"completed","conclusion":"failure"}),
+        json!({"jobs":[]}),
+    ]
+    .into_iter();
+    assert_eq!(
+        render::run_with_sleep(
+            &planned(&["run", "watch", "7"]),
+            &mut |_| Ok(reply(responses.next().unwrap())),
+            &mut Vec::new(),
+            &mut |_| panic!("completed run must not sleep")
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn v20_worker_download_refusal_names_the_supported_alternative() {
+    use crate::gh_shim::tests::ScopedTestEnvVar;
+    let _state = crate::test_env::gh_shim_state_guard();
+    let _worker = ScopedTestEnvVar::set(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV, Some("1"));
+    let paths = StatePaths::from_process();
+    for contents in [None, Some("invalid manifest")] {
+        if let Some(contents) = contents {
+            fs::write(&paths.manifest, contents).unwrap();
+        }
+        let (_capture, lines) = capture_refusals_for_test();
+        assert_eq!(
+            run_with(
+                &args(&[
+                    "run",
+                    "download",
+                    "43863185628",
+                    "-R",
+                    "cortexkit/common-auth",
+                    "-D",
+                    "artifacts"
+                ]),
+                |_| panic!("worker download reached native gh"),
+                |_, _, _, _| panic!("unsupported downloads must not query the broker"),
+            ),
+            REFUSAL_EXIT_STATUS
+        );
+        assert_eq!(*lines.lock().unwrap(), vec![refusal_line(RefusalCode::WorkerNativeGh,
+            "gh run download isn't available in worker shells; ask your head agent to download the artifacts")]);
+    }
+}

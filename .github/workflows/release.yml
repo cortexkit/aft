@@ -295,13 +295,15 @@ jobs:
       - name: Strip binary
         run: strip target/release/aft
 
-      # Ad-hoc sign, hard-verify, and execute once. --verify --strict fails on
-      # an unsigned or corrupt-signature binary; the --version run proves the
-      # exact bytes being published start on macOS.
+      # Keep the daemon's hardened runtime and ONNX exception, but use the npm
+      # identifier aft and an ad-hoc identity. Read back the signed policy, not
+      # just signature validity, before bundling the bytes that E2E will smoke.
       - name: Sign, verify, and smoke-test binary
+        shell: bash
         run: |
-          codesign -f -s - target/release/aft
-          codesign --verify --strict target/release/aft
+          source scripts/lib/ck-aft-signature.sh
+          ck_aft_sign_npm target/release/aft
+          ck_aft_check_npm_signature target/release/aft release
           target/release/aft --version
 
       # Package the split debug info (dSYM) as a sibling release asset, so a
@@ -381,14 +383,15 @@ jobs:
       - name: Strip binary
         run: strip target/x86_64-apple-darwin/release/aft
 
-      # Sign after the LAST binary mutation and hard-verify: v0.51.1 published
-      # this asset with no signature at all (#238 class - cross-compiled x64
-      # gets no linker signature and nothing signed it). --verify --strict
-      # fails the job on unsigned or corrupt-signature binaries.
+      # Sign after the LAST binary mutation and enforce the same policy as ARM64.
+      # x64 is cross-built on ARM64; executable ONNX/Pulley smokes run against
+      # the native shipped ARM64 binary in e2e-darwin-arm64.
       - name: Sign and verify binary
+        shell: bash
         run: |
-          codesign -f -s - target/x86_64-apple-darwin/release/aft
-          codesign --verify --strict target/x86_64-apple-darwin/release/aft
+          source scripts/lib/ck-aft-signature.sh
+          ck_aft_sign_npm target/x86_64-apple-darwin/release/aft
+          ck_aft_check_npm_signature target/x86_64-apple-darwin/release/aft release
 
       # Package the split debug info (dSYM) as a sibling release asset. The
       # shipped binary is stripped (no symtab), so `sample`/`atos` on a deployed
@@ -828,8 +831,8 @@ jobs:
     # bundle at about 160 KB/s (14 minutes), while the suite itself takes a
     # few minutes here.
     runs-on: macos-26
-    # v0.62.0/v0.63.3/v0.63.4: 2.4/3.0/3.4 min; 10 min covers cold setup.
-    timeout-minutes: 10
+    # Existing E2E takes about 3 min; allow the isolated ONNX/model downloads too.
+    timeout-minutes: 15
     env:
       CARGO_INCREMENTAL: "0"
     steps:
@@ -850,14 +853,48 @@ jobs:
       - name: Verify shipped binary provenance
         run: python3 scripts/native-release-artifact.py unpack-binary --archive "$RUNNER_TEMP/shipped-darwin-arm64/release.tar"
       - name: Verify signature and warm tested binary
+        shell: bash
         run: |
-          codesign --verify --strict target/release/aft
+          source scripts/lib/ck-aft-signature.sh
+          ck_aft_check_npm_signature target/release/aft release-e2e
           target/release/aft --version
       - name: Install dependencies and build local plugin
         run: |
           bun install --frozen-lockfile
           bun run --cwd packages/aft-bridge build
           bun run --cwd packages/opencode-plugin build
+      - name: Verify hardened ONNX and Pulley loads
+        shell: bash
+        timeout-minutes: 6
+        run: |
+          source scripts/lib/ck-aft-signature.sh
+          source scripts/lib/ck-aft-grammar-smoke.sh
+          smoke="$RUNNER_TEMP/npm-hardened-smoke"
+          mkdir -p "$smoke/home" "$smoke/storage" "$smoke/project" "$smoke/tmp"
+          export TMPDIR="$smoke/tmp"
+          # Use the user's installer and require its downloaded copy, not a
+          # system library that could hide a library-validation regression.
+          export CK_SMOKE_DOWNLOADS="$smoke/downloads"
+          ort_dir="$(node --input-type=module - <<'JS'
+          import { ensureOnnxRuntime } from './packages/aft-bridge/dist/index.js';
+          const root = process.env.CK_SMOKE_DOWNLOADS;
+          const dir = await ensureOnnxRuntime(root);
+          if (!dir || !dir.startsWith(`${root}/onnxruntime/`)) {
+            throw new Error(`Smoke requires a downloaded ONNX Runtime, got ${dir}`);
+          }
+          console.log(dir);
+          JS
+          )"
+          export CK_SMOKE_ORT_DYLIB="$ort_dir/libonnxruntime.dylib"
+          export CK_SMOKE_MODEL_CACHE="$smoke/storage/semantic/models"
+          printf 'export function greetUser() { return "hello"; }\n' > "$smoke/project/app.ts"
+          # Prime only the isolated model cache; the shared card smoke then
+          # performs its own real semantic-index build with the signed binary.
+          env -i PATH=/usr/bin:/bin HOME="$smoke/home" AFT_STORAGE_DIR="$smoke/storage" \
+            ORT_DYLIB_PATH="$CK_SMOKE_ORT_DYLIB" target/release/aft warmup \
+            --root "$smoke/project" --only semantic --timeout 180000
+          ck_aft_smoke_onnx "$PWD/target/release/aft" release-e2e
+          ck_aft_smoke_grammar "$PWD/target/release/aft" release-e2e
       - name: Run shipped E2E suite
         run: bash tests/macos-e2e/run.sh
         env:

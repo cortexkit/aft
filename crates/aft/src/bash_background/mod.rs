@@ -766,8 +766,8 @@ pub(crate) fn remote_for_runon(
     powershell: bool,
     host_sandbox: bool,
 ) -> Result<RemoteLaunch, String> {
-    if !config.bash.runon_enabled {
-        return Err("runon is disabled by the user safety setting bash.runon_enabled".into());
+    if !config.remote_exec.enabled && !config.remote_exec.project_off {
+        return Err("runon is disabled by the user setting remote_exec.enabled".into());
     }
     if cfg!(not(unix)) {
         return Err(

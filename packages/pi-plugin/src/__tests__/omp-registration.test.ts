@@ -230,7 +230,7 @@ describe("Full surface registration funnel", () => {
     });
     registerPiToolSurface(api, ctx, resolvePiToolSurface(config), "omp");
     const first = tools.get("bash");
-    // What index.ts does when a reload flips bash.runon_enabled.
+    // What index.ts does when a reload flips remote_exec.enabled.
     reregisterBashTool(api, ctx, false);
     const replaced = tools.get("bash") as unknown as {
       loadMode?: string;

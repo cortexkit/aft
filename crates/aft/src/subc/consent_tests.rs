@@ -1,5 +1,9 @@
 use super::*;
 
+#[path = "consent_label_tests.rs"]
+mod labels;
+use labels::assert_read_tree_scope_label;
+
 #[cfg(unix)]
 mod program_approvals {
     use super::*;
@@ -912,8 +916,17 @@ fn fixture_with_executor(
     dir: tempfile::TempDir,
     executor: Arc<Executor>,
 ) -> Fixture {
+    fixture_with_worker_directory(fake, dir, executor, "worker")
+}
+
+fn fixture_with_worker_directory(
+    fake: Arc<FakeCingulate>,
+    dir: tempfile::TempDir,
+    executor: Arc<Executor>,
+    worker_directory: &str,
+) -> Fixture {
     let head_root = crate::access_policy::policy_path(&dir.path().join("head"));
-    let worker_root = crate::access_policy::policy_path(&dir.path().join("worker"));
+    let worker_root = crate::access_policy::policy_path(&dir.path().join(worker_directory));
     std::fs::create_dir_all(&head_root).unwrap();
     std::fs::create_dir_all(&worker_root).unwrap();
     std::fs::write(head_root.join("shared.txt"), "head-owned contents\n").unwrap();
@@ -1645,10 +1658,16 @@ async fn consent_parked_ask_only_scope_goodbye_ended_withdraws_and_refuses_retry
         .unwrap()
     };
     let (ready, mut ready_rx) = mpsc::unbounded_channel();
+    let before_park =
+        super::super::scope_watch::revision(super::super::scope_watch::Source::Parked);
     let held = f.read(&f.worker, &target, 7).await;
     assert_eq!(code(&held), "access_pending", "{held}");
     assert_eq!(f.asks().len(), 1);
     assert_eq!(scopes.parked_scopes().len(), 1);
+    assert!(
+        super::super::scope_watch::revision(super::super::scope_watch::Source::Parked)
+            > before_park
+    );
     assert!(f.ctx.bash_background().live_scope_stamps().is_empty());
 
     let (describes, mut ended, worker) =
@@ -1668,6 +1687,8 @@ async fn consent_parked_ask_only_scope_goodbye_ended_withdraws_and_refuses_retry
         query.header.corr,
         subc_protocol::scope::ScopeStatus::Ended
     )));
+    let before_withdraw =
+        super::super::scope_watch::revision(super::super::scope_watch::Source::Parked);
     let confirmed = tokio::time::timeout(Duration::from_secs(2), ended.recv())
         .await
         .unwrap()
@@ -1676,6 +1697,10 @@ async fn consent_parked_ask_only_scope_goodbye_ended_withdraws_and_refuses_retry
     wait_for(|| !f.fake.calls("consent.withdraw").is_empty() && f.asks().is_empty()).await;
     assert!(f.worker.run_scope.get().unwrap().revoked());
     assert!(scopes.parked_scopes().is_empty());
+    assert!(
+        super::super::scope_watch::revision(super::super::scope_watch::Source::Parked)
+            > before_withdraw
+    );
 
     // A retry crosses the same run admission seam as a real incoming frame.
     // It must be refused before it can reach the tool or claim an approval.
@@ -2128,7 +2153,7 @@ async fn folder_grant_settles_and_withdraws_covered_sibling(recover_unreceipted:
             kind: GrantKind::File,
             operation: AccessOperation::Read,
         };
-        let directory = scope_before_db(&grant).await;
+        let directory = scope_before_db(&grant, true).await;
         let identity = f.worker.clone();
         let arguments = json!({"path": a});
         let prepared = with_db_handle(&scope_probe_call(&f, &a), move |db, ctx| {
@@ -3459,7 +3484,7 @@ async fn consent_scope_card_matches_stored_directory() {
     assert_eq!(request["paths"], json!([f.head_root.join("shared.txt")]));
     assert_eq!(request["tool"], "read");
     assert_eq!(request["operation"], "read");
-    assert_eq!(request["reason"], "Allow scope: read-only access for all AFT read tools within the displayed directory tree. Protected paths remain denied.");
+    assert_read_tree_scope_label(request["reason"].as_str().unwrap(), &f.head_root);
     assert_eq!(
         f.worker_grants(),
         vec![AccessGrant {
@@ -3467,6 +3492,277 @@ async fn consent_scope_card_matches_stored_directory() {
             kind: GrantKind::Subtree,
             operation: AccessOperation::Read,
         }]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn worker_read_repository_scope_covers_manifest_tests_and_open_asks() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let _probe = DirectoryScopeProbeBudgetOverride::generous();
+    let f = fixture(FakeCingulate::up());
+    std::fs::create_dir(f.head_root.join(".git")).unwrap();
+    std::fs::create_dir(f.head_root.join("src")).unwrap();
+    std::fs::create_dir(f.head_root.join("tests")).unwrap();
+    let source = f.head_root.join("src/lib.rs");
+    let manifest = f.head_root.join("Cargo.toml");
+    let test = f.head_root.join("tests/x.rs");
+    for (path, contents) in [
+        (&source, "source contents"),
+        (&manifest, "manifest contents"),
+        (&test, "test contents"),
+    ] {
+        std::fs::write(path, contents).unwrap();
+    }
+    set_hold_budget_for_test(Some(Duration::from_secs(5)));
+    let mut source_reply = f.send_read(&f.worker, &source, 901).await;
+    let mut manifest_reply = f.send_read(&f.worker, &manifest, 902).await;
+    let mut test_reply = f.send_read(&f.worker, &test, 903).await;
+    wait_for(|| {
+        f.asks()
+            .iter()
+            .filter(|ask| ask.elicitation_id.is_some())
+            .count()
+            == 3
+    })
+    .await;
+    let requests = f.fake.calls("consent.request");
+    let source_key = call_key_for_file(&requests, "lib.rs");
+    let source_card = requests
+        .iter()
+        .find(|request| request["call_key"] == source_key)
+        .unwrap();
+    assert_eq!(
+        source_card["pattern"],
+        format!("{}/**", f.head_root.display())
+    );
+    assert_eq!(source_card["paths"], json!([source]));
+    assert_read_tree_scope_label(source_card["reason"].as_str().unwrap(), &f.head_root);
+    f.fake.answer(
+        &source_key,
+        json!({"state":"settled", "outcome":"allow_scope", "answered_by":"user"}),
+    );
+    for (replies, expected) in [
+        (&mut source_reply, "source contents"),
+        (&mut manifest_reply, "manifest contents"),
+        (&mut test_reply, "test contents"),
+    ] {
+        let reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+            .await
+            .expect("one repository approval resumes every covered read")
+            .unwrap();
+        let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert!(text(&reply).contains(expected), "{reply}");
+    }
+    assert_eq!(f.fake.calls("consent.withdraw").len(), 2);
+    assert!(f.asks().is_empty());
+    assert_eq!(
+        f.worker_grants(),
+        vec![AccessGrant {
+            path: f.head_root.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        }]
+    );
+    let requests = f.fake.calls("consent.request");
+    let distinct_card_keys: std::collections::HashSet<_> = requests
+        .iter()
+        .map(|request| request["call_key"].as_str().unwrap())
+        .collect();
+    assert_eq!(distinct_card_keys.len(), 3);
+    let request_count = requests.len();
+    for (path, expected, corr) in [
+        (&manifest, "manifest contents", 904),
+        (&test, "test contents", 905),
+    ] {
+        let reply = f.read(&f.worker, path, corr).await;
+        assert!(text(&reply).contains(expected), "{reply}");
+    }
+    assert_eq!(f.fake.calls("consent.request").len(), request_count);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn worker_read_repository_scope_leaves_write_asks_at_the_folder() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let _probe = DirectoryScopeProbeBudgetOverride::generous();
+    let f = fixture(FakeCingulate::up());
+    std::fs::create_dir(f.head_root.join(".git")).unwrap();
+    let parent = f.head_root.join("src");
+    std::fs::create_dir(&parent).unwrap();
+    let target = parent.join("lib.rs");
+    set_hold_budget_for_test(Some(Duration::from_millis(100)));
+    let reply = f
+        .tool(
+            "write",
+            json!({"path": target, "content":"new contents"}),
+            901,
+        )
+        .await;
+    assert_eq!(code(&reply), "access_pending", "{reply}");
+    let request = &f.fake.calls("consent.request")[0];
+    assert_eq!(request["pattern"], format!("{}/**", parent.display()));
+    assert_eq!(request["reason"], WRITE_TREE_SCOPE_REASON);
+    let (mut prep, _) = open_prepared(f.asks().pop().unwrap()).unwrap();
+    assert_eq!(advertised_scope(&prep).unwrap().path, parent);
+    prep.request["pattern"] = json!(format!("{}/**", f.head_root.display()));
+    assert_eq!(
+        advertised_scope(&prep),
+        None,
+        "write cards cannot widen to ancestors"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_read_repository_scope_home_repository_falls_back_to_folder() {
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
+    let _probe = DirectoryScopeProbeBudgetOverride::generous();
+    let dir = tempfile::tempdir().unwrap();
+    let outer = crate::access_policy::policy_path(dir.path());
+    let home = outer.join("home");
+    let parent = home.join("project/src");
+    std::fs::create_dir_all(&parent).unwrap();
+    std::fs::create_dir(outer.join(".git")).unwrap();
+    std::fs::write(home.join(".git"), "gitdir: elsewhere").unwrap();
+    let folder = directory_scope(&AccessGrant {
+        path: parent.join("lib.rs"),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    });
+    assert_eq!(folder.path, parent);
+    let repository = repository_scope_with(&parent, |root| {
+        probe_directory_scope_at_home(root, &home, |_, _| Some(false)) == Ok(true)
+    });
+    assert_eq!(
+        repository, None,
+        "home must not select an outer repository either"
+    );
+    assert_eq!(repository.unwrap_or_else(|| folder.path.clone()), parent);
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_read_repository_scope_without_repository_keeps_folder() {
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
+    let _probe = DirectoryScopeProbeBudgetOverride::generous();
+    let dir = tempfile::tempdir().unwrap();
+    let parent = crate::access_policy::policy_path(&dir.path().join("plain/src"));
+    std::fs::create_dir_all(&parent).unwrap();
+    assert_eq!(repository_scope_with(&parent, |_| true), None);
+    let grant = AccessGrant {
+        path: parent.join("lib.rs"),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    };
+    let scope = worker_read_scope(&grant);
+    assert_eq!(scope, directory_scope(&grant));
+    assert_eq!(scope.path, parent);
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_read_repository_scope_nested_submodule_uses_its_git_file() {
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
+    let _probe = DirectoryScopeProbeBudgetOverride::generous();
+    let dir = tempfile::tempdir().unwrap();
+    let repo = crate::access_policy::policy_path(&dir.path().join("repo"));
+    let submodule = repo.join("modules/inner");
+    std::fs::create_dir_all(submodule.join("src")).unwrap();
+    std::fs::create_dir(repo.join(".git")).unwrap();
+    std::fs::write(submodule.join(".git"), "gitdir: ../../.git/modules/inner").unwrap();
+    let scope = worker_read_scope(&AccessGrant {
+        path: submodule.join("src/lib.rs"),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    });
+    assert_eq!(scope.path, submodule);
+    assert_eq!(scope.kind, GrantKind::Subtree);
+    assert!(!scope.covers(AccessOperation::Read, &repo.join("Cargo.toml")));
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_read_repository_scope_still_denies_protected_and_configured_paths() {
+    use crate::access_policy::AccessDecision;
+
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
+    let _probe = DirectoryScopeProbeBudgetOverride::generous();
+    let dir = tempfile::tempdir().unwrap();
+    let repo = crate::access_policy::policy_path(&dir.path().join("repo"));
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::create_dir(repo.join(".git")).unwrap();
+    let scope = worker_read_scope(&AccessGrant {
+        path: repo.join("src/lib.rs"),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    });
+    assert_eq!(scope.path, repo);
+    let mut config = crate::config::Config::default();
+    config.sandbox.read_deny = vec![repo.join("private")];
+    let mut policy = AccessPolicy::from_config(&config, &dir.path().join("store"), vec![], &repo);
+    policy.install_scope_grants(vec![scope], true);
+    assert_eq!(
+        policy.decide(AccessOperation::Read, &repo.join("Cargo.toml"), false),
+        AccessDecision::Allow
+    );
+    for path in [repo.join(".ssh/id_ed25519"), repo.join("private/secret")] {
+        assert_eq!(
+            policy.decide(AccessOperation::Read, &path, false),
+            AccessDecision::Deny(crate::access_policy::AccessDenial::Floor)
+        );
+    }
+    assert_ne!(
+        policy.decide(AccessOperation::Write, &repo.join("Cargo.toml"), false),
+        AccessDecision::Allow
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn worker_read_repository_scope_does_not_widen_existing_folder_cards_or_grants() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let _probe = DirectoryScopeProbeBudgetOverride::generous();
+    let f = fixture(FakeCingulate::up());
+    let parent = f.head_root.join("src");
+    std::fs::create_dir(&parent).unwrap();
+    let source = parent.join("lib.rs");
+    std::fs::write(&source, "source contents").unwrap();
+    set_hold_budget_for_test(Some(Duration::from_millis(100)));
+    assert_eq!(
+        code(&f.read(&f.worker, &source, 901).await),
+        "access_pending"
+    );
+    let request = f.fake.calls("consent.request")[0].clone();
+    assert_eq!(request["pattern"], format!("{}/**", parent.display()));
+    // Discovering a repository later must not change an already displayed card.
+    std::fs::create_dir(f.head_root.join(".git")).unwrap();
+    f.fake.answer(
+        request["call_key"].as_str().unwrap(),
+        json!({"state":"settled", "outcome":"allow_scope", "answered_by":"user"}),
+    );
+    let reply = f.settled_read(&f.worker, &source, 902).await;
+    assert!(text(&reply).contains("source contents"), "{reply}");
+    assert_eq!(
+        f.worker_grants(),
+        vec![AccessGrant {
+            path: parent.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        }]
+    );
+    let manifest = f.head_root.join("Cargo.toml");
+    std::fs::write(&manifest, "manifest contents").unwrap();
+    set_hold_budget_for_test(Some(Duration::from_millis(100)));
+    assert_eq!(
+        code(&f.read(&f.worker, &manifest, 903).await),
+        "access_pending"
+    );
+    assert_eq!(f.worker_grants()[0].path, parent);
+    assert_eq!(
+        f.fake.calls("consent.request").len(),
+        3,
+        "old card is resent unchanged, then the manifest asks separately"
     );
 }
 
@@ -3907,7 +4203,7 @@ async fn consent_stalled_home_scope_probe_is_single_flight_and_file_only() {
         kind: GrantKind::File,
         operation: AccessOperation::Read,
     };
-    assert_eq!(scope_before_db(&next).await.kind, GrantKind::Subtree);
+    assert_eq!(scope_before_db(&next, true).await.kind, GrantKind::Subtree);
 }
 
 #[cfg(unix)]
@@ -3923,7 +4219,7 @@ async fn consent_scope_held_probe_at_settlement_keeps_advertised_tree_and_siblin
     );
     let request = &f.fake.calls("consent.request")[0];
     assert_eq!(request["pattern"], format!("{}/**", f.head_root.display()));
-    assert_eq!(request["reason"], READ_TREE_SCOPE_REASON);
+    assert_read_tree_scope_label(request["reason"].as_str().unwrap(), &f.head_root);
     assert_eq!(request["head_policy"], "allow");
     // A head may answer after the directory memo expires, while another
     // filesystem probe owns the only permit.
@@ -4132,7 +4428,7 @@ fn consent_scope_nested_file_still_offers_directory() {
     assert_eq!(scope.path, parent);
     assert_eq!(scope.kind, GrantKind::Subtree);
     assert_eq!(scope.operation, AccessOperation::Read);
-    assert_eq!(scope_reason(&scope), "Allow scope: read-only access for all AFT read tools within the displayed directory tree. Protected paths remain denied.");
+    assert_read_tree_scope_label(&scope_reason(&scope), &scope.path);
 }
 
 #[cfg(unix)]
@@ -4337,7 +4633,7 @@ fn consent_scope_four_concurrent_cards_share_directory_probe() {
             prep.request["pattern"],
             json!(format!("{}/**", f.head_root.display()))
         );
-        assert_eq!(prep.request["reason"], READ_TREE_SCOPE_REASON);
+        assert_read_tree_scope_label(prep.request["reason"].as_str().unwrap(), &f.head_root);
     }
     assert_eq!(
         probes.load(Ordering::SeqCst),
@@ -7934,6 +8230,104 @@ async fn consent_worker_glob_suggests_existing_checkout_path_without_asking() {
         )
     );
     assert!(f.fake.calls("consent.request").is_empty());
+}
+
+#[path = "consent_suffix_tests.rs"]
+mod suffix;
+use suffix::{build_suffix_inventory, suffix_fixture, worker_suffix_file};
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_worker_read_family_suggests_unique_indexed_suffix_without_asking() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = suffix_fixture();
+    set_hold_budget_for_test(Some(Duration::from_millis(300)));
+    let counterpart = worker_suffix_file(&f, "crates/broca-session-loop/src/run.rs");
+    build_suffix_inventory(&f);
+    let requested = f.dir.path().join("broca-session-loop/src/run.rs");
+    for (index, (name, arguments)) in [
+        ("outline", json!({"target": requested})),
+        (
+            "zoom",
+            json!({"batch": [{"target": requested, "symbols": "suffix_marker"}]}),
+        ),
+        (
+            "grep",
+            json!({"path": requested, "pattern": "suffix_marker"}),
+        ),
+        ("glob", json!({"path": requested, "pattern": "*.rs"})),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let reply = f.tool(name, arguments, 7 + index as u64).await;
+        let (reply_code, message) = if name == "zoom" {
+            let response = &reply["structuredContent"]["targets"][0]["response"];
+            (
+                response["code"].as_str().unwrap(),
+                response["message"].as_str().unwrap().to_owned(),
+            )
+        } else {
+            (code(&reply), text(&reply))
+        };
+        assert_eq!(reply_code, "path_not_found_did_you_mean", "{name}: {reply}");
+        assert_eq!(
+            message,
+            format!(
+                "path not found: {}; did you mean {}?",
+                requested.display(),
+                counterpart.display()
+            ),
+            "{name}: {reply}"
+        );
+    }
+    assert!(f.fake.calls("consent.request").is_empty());
+    assert!(f.asks().is_empty());
+}
+
+#[tokio::test]
+async fn consent_worker_ambiguous_longest_indexed_suffix_still_asks() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = suffix_fixture();
+    set_hold_budget_for_test(Some(Duration::from_millis(300)));
+    worker_suffix_file(&f, "crates/broca-session-loop/src/run.rs");
+    worker_suffix_file(&f, "other/broca-session-loop/src/run.rs");
+    build_suffix_inventory(&f);
+    let requested = f.dir.path().join("broca-session-loop/src/run.rs");
+
+    let reply = f.read(&f.worker, &requested, 7).await;
+
+    assert_worker_outside_read_denied(&f, &reply);
+    assert!(!text(&reply).contains("did you mean"));
+}
+
+#[tokio::test]
+async fn consent_worker_one_component_indexed_suffix_still_asks() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = suffix_fixture();
+    set_hold_budget_for_test(Some(Duration::from_millis(300)));
+    worker_suffix_file(&f, "crates/broca-session-loop/src/run.rs");
+    build_suffix_inventory(&f);
+    let requested = f.dir.path().join("not-src/run.rs");
+
+    let reply = f.read(&f.worker, &requested, 7).await;
+
+    assert_worker_outside_read_denied(&f, &reply);
+    assert!(!text(&reply).contains("did you mean"));
+}
+
+#[tokio::test]
+async fn consent_worker_unready_indexed_suffix_still_asks() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = suffix_fixture();
+    set_hold_budget_for_test(Some(Duration::from_millis(300)));
+    worker_suffix_file(&f, "crates/broca-session-loop/src/run.rs");
+    let requested = f.dir.path().join("broca-session-loop/src/run.rs");
+
+    let reply = f.read(&f.worker, &requested, 7).await;
+
+    assert_worker_outside_read_denied(&f, &reply);
+    assert!(!text(&reply).contains("did you mean"));
 }
 
 #[tokio::test]

@@ -1007,14 +1007,37 @@ export function translateConfigDocument(
     retiredKeys: [],
     retiredEnabledFalse: false,
   };
+  translateRunonEnabled(map, tier, "", out);
   translateBlock(map, tier === "user", "base", out);
   if (isRecord(map.harnesses)) {
     for (const [name, block] of Object.entries(map.harnesses)) {
-      if (isRecord(block)) translateBlock(block, false, `harnesses.${name}`, out);
+      if (isRecord(block)) {
+        translateRunonEnabled(block, tier, `harnesses.${name}.`, out);
+        translateBlock(block, false, `harnesses.${name}`, out);
+      }
     }
   }
   out.retiredKeys = sortedUnique(out.retiredKeys);
   return out;
+}
+
+/** Drop the user-only retired bash gate, preserving explicit user-block opt-outs. */
+function translateRunonEnabled(
+  map: JsonRecord,
+  tier: "user" | "project",
+  prefix: string,
+  out: DocumentTranslation,
+): void {
+  if (!isRecord(map.bash) || !Object.hasOwn(map.bash, "runon_enabled")) return;
+  const retired = map.bash.runon_enabled;
+  // Keep an empty bash object so its normal defaults still override retired
+  // experimental bash flags, as they did before removing the old gate.
+  delete map.bash.runon_enabled;
+  recordRetired(out, prefix, "bash.runon_enabled");
+  if (tier === "user" && retired === false) {
+    if (map.remote_exec === undefined) map.remote_exec = {};
+    if (isRecord(map.remote_exec)) map.remote_exec.enabled = false;
+  }
 }
 
 /** Distinct unknown names in a resolved disabled list, sorted. */
@@ -1066,6 +1089,7 @@ function projectBlock(block: JsonRecord): JsonRecord {
     ...REMOVED_NO_EFFECT_PATHS,
     ...DATA_LAYER_RETIRED_PATHS,
     ...REMOVED_DATA_LAYER_PATHS,
+    "bash.runon_enabled",
   ]) {
     const dot = path.indexOf(".");
     if (dot < 0) {

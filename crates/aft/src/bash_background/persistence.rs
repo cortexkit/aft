@@ -26,6 +26,10 @@ use crate::db::bash_tasks::BashTaskRow;
 use super::process::{LiveDescendant, LiveDescendantsUnavailable, ProcessIdentity};
 use super::BgTaskStatus;
 
+#[path = "task_metadata_update.rs"]
+mod task_metadata_update;
+pub use task_metadata_update::update_task_at;
+
 #[cfg(test)]
 type SessionCreateGate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 
@@ -1918,6 +1922,10 @@ pub struct PersistedTask {
     /// must not relabel a running command as belonging to the new route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<subc_protocol::scope::ScopeStamp>,
+    /// Confirmed module-rename continuation used only for process lifetime.
+    /// Spawn identity remains in `scope` for history and speech authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lifecycle_scope: Option<subc_protocol::scope::ScopeStamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) remote: Option<super::registry::remote::RemoteTask>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2092,6 +2100,7 @@ impl PersistedTask {
             schema_pin: super::current_schema_pin(),
             display: crate::subc::rich_ui::display::current_task(),
             scope: super::registry::scope_for_spawn(),
+            lifecycle_scope: None,
             remote: None,
             execution_note: None,
             memory_policy: None,
@@ -2275,6 +2284,7 @@ impl From<BashTaskRow> for PersistedTask {
             schema_pin: None,
             display: None,
             scope: None,
+            lifecycle_scope: None,
             remote: None,
             execution_note: None,
             memory_policy: None,
@@ -3365,46 +3375,6 @@ fn task_storage_full_for_test() -> io::Error {
     // portable error kind and a stable message so the test exercises disk-full
     // handling on every host without depending on localized system text.
     io::Error::new(io::ErrorKind::StorageFull, "No space left on device")
-}
-
-pub fn update_task_at<F>(task: &ResolvedTask, update: F) -> io::Result<PersistedTask>
-where
-    F: FnOnce(&mut PersistedTask),
-{
-    let mut metadata = read_task_at(task)?;
-    let original_terminal = metadata.is_terminal();
-    let original = metadata.clone();
-    update(&mut metadata);
-    metadata.schema_version = SCHEMA_VERSION;
-    if original_terminal {
-        // Terminal execution facts are immutable; delivery bookkeeping can
-        // still advance as a consumer receives or acknowledges the result.
-        let completion_delivered = metadata.completion_delivered;
-        let runner_completion_offers = metadata
-            .runner_completion_offers
-            .max(original.runner_completion_offers);
-        let runner_completion_delivery = metadata.runner_completion_delivery.clone();
-        let runner_completion_notice = original
-            .runner_completion_notice
-            .clone()
-            .or(metadata.runner_completion_notice);
-        let runner_notice_policy = original
-            .runner_notice_policy
-            .or(metadata.runner_notice_policy);
-        let runner_reminder_elapsed_ms = original
-            .runner_reminder_elapsed_ms
-            .max(metadata.runner_reminder_elapsed_ms);
-        metadata = original;
-        metadata.completion_delivered = completion_delivered;
-        metadata.runner_completion_offers = runner_completion_offers;
-        metadata.runner_completion_notice = runner_completion_notice;
-        metadata.runner_completion_delivery = runner_completion_delivery;
-        metadata.runner_notice_policy = runner_notice_policy;
-        metadata.runner_reminder_elapsed_ms = runner_reminder_elapsed_ms;
-        metadata.schema_version = SCHEMA_VERSION;
-    }
-    write_task_at(task, &metadata)?;
-    Ok(metadata)
 }
 
 pub fn delete_task_bundle(paths: &TaskPaths) -> io::Result<()> {
@@ -6997,6 +6967,49 @@ mod tests {
         assert_eq!(old.status, task.status);
         assert!(serde_json::to_value(old).unwrap().get("scope").is_none());
         assert_eq!(read_task_at(&resolved).unwrap().scope, task.scope);
+    }
+
+    #[test]
+    fn prefrontal_scope_lifecycle_metadata_is_readable_by_legacy_v7_reader() {
+        let directory = tempfile::tempdir().unwrap();
+        let (resolved, mut task) = counted_task(directory.path());
+        let old = subc_protocol::scope::ScopeStamp::new(
+            subc_protocol::Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            },
+            "agent",
+            7,
+            subc_protocol::scope::ScopeKind::Head,
+        );
+        task.scope = Some(old.clone());
+        task.lifecycle_scope = crate::access_policy::prefrontal::counterpart(&old);
+        write_task_at(&resolved, &task).unwrap();
+        let bytes = std::fs::read(&resolved.paths.json).unwrap();
+        let legacy = read_scope_blind_v7(&bytes).unwrap();
+        assert_eq!(legacy.schema_version, 7);
+        assert_eq!(legacy.task_id, task.task_id);
+        assert_eq!(legacy.command, task.command);
+        assert!(serde_json::to_value(legacy)
+            .unwrap()
+            .get("lifecycle_scope")
+            .is_none());
+        let current = read_task_at(&resolved).unwrap();
+        assert_eq!(current.scope, Some(old));
+        assert_eq!(current.lifecycle_scope, task.lifecycle_scope);
+        task.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        task.lifecycle_scope = None;
+        write_task_at(&resolved, &task).unwrap();
+        let live =
+            crate::access_policy::prefrontal::counterpart(task.scope.as_ref().unwrap()).unwrap();
+        let updated = update_task_at(&resolved, |metadata| {
+            metadata.lifecycle_scope = Some(live.clone());
+            metadata.command = "must not rewrite terminal history".into();
+        })
+        .unwrap();
+        assert_eq!(updated.command, task.command);
+        assert_eq!(updated.scope, task.scope);
+        assert_eq!(updated.lifecycle_scope(), Some(&live));
+        assert_eq!(updated.finished_at, task.finished_at);
     }
 
     #[test]

@@ -523,6 +523,9 @@ fn retries_stop_on_real_divergence_and_success_but_not_ack_loss() {
 
 #[test]
 fn blocked_display_and_full_wake_queue_never_delay_a_reply() {
+    let before = counters::snapshot()["enqueue_outbox_lock_failed"]
+        .as_u64()
+        .unwrap_or(0);
     let (wake, mut receiver) = tokio::sync::mpsc::channel(1);
     let writer = Writer {
         outbox: Mutex::new(Outbox::new()),
@@ -549,6 +552,12 @@ fn blocked_display_and_full_wake_queue_never_delay_a_reply() {
         DisplayKind::Record,
         json!({"durationMs":1,"outcome":"success"})
     ));
+    assert!(
+        counters::snapshot()["enqueue_outbox_lock_failed"]
+            .as_u64()
+            .unwrap()
+            > before
+    );
     drop(held);
     assert!(enqueue_snapshot(
         &writer,

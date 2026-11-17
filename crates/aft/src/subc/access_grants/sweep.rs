@@ -39,7 +39,7 @@ impl Stats {
     }
 }
 
-fn stamp(key: &store::ScopeKey) -> Result<ScopeStamp, serde_json::Error> {
+pub(in crate::subc) fn stamp(key: &store::ScopeKey) -> Result<ScopeStamp, serde_json::Error> {
     serde_json::from_value(serde_json::json!({
         "owner": serde_json::from_str::<serde_json::Value>(&key.owner)?,
         "ref": key.scope_ref, "scope_epoch": key.epoch,
@@ -47,9 +47,28 @@ fn stamp(key: &store::ScopeKey) -> Result<ScopeStamp, serde_json::Error> {
     }))
 }
 
+#[cfg(test)]
 async fn tick<F, Fut>(db: Db, cursor: &mut Option<store::ScopeKey>, describe: F) -> Stats
 where
     F: Fn(ScopeStamp) -> Fut,
+    Fut: std::future::Future<
+        Output = Result<ModuleControlResponseToModule, readiness::ControlError>,
+    >,
+{
+    tick_unwatched(db, cursor, describe, |_| false, |_| false).await
+}
+
+async fn tick_unwatched<F, Fut, C, D>(
+    db: Db,
+    cursor: &mut Option<store::ScopeKey>,
+    describe: F,
+    covered: C,
+    counterpart_configured: D,
+) -> Stats
+where
+    F: Fn(ScopeStamp) -> Fut,
+    C: Fn(&ScopeStamp) -> bool,
+    D: Fn(&ScopeStamp) -> bool,
     Fut: std::future::Future<
         Output = Result<ModuleControlResponseToModule, readiness::ControlError>,
     >,
@@ -86,13 +105,63 @@ where
             }
         };
         let reference = (key.owner.clone(), key.scope_ref.clone());
+        if covered(&request) {
+            continue;
+        }
         if !replies.contains_key(&reference) {
             stats.described += 1;
-            let reply = tokio::time::timeout(scope_describe::describe_timeout(), describe(request))
-                .await
-                .unwrap_or(Err(readiness::ControlError::Timeout));
+            let reply = tokio::time::timeout(
+                scope_describe::describe_timeout(),
+                describe(request.clone()),
+            )
+            .await
+            .unwrap_or(Err(readiness::ControlError::Timeout));
+            let mut ends = reply.as_ref().is_ok_and(|reply| {
+                scope_describe::describe_answer_ends_scope(reply)
+                    || crate::access_policy::prefrontal::retired(&request, reply)
+            });
+            if ends {
+                if let Some(other) = crate::access_policy::prefrontal::counterpart(&request) {
+                    if !counterpart_configured(&request) {
+                        crate::access_policy::prefrontal::log_continuation(
+                            &request,
+                            &other,
+                            "absent_from_catalog",
+                        );
+                    } else {
+                        let answer = tokio::time::timeout(
+                            scope_describe::describe_timeout(),
+                            describe(other.clone()),
+                        )
+                        .await
+                        .unwrap_or(Err(readiness::ControlError::Timeout));
+                        let (absent, outcome) = match crate::access_policy::prefrontal::continuation(
+                            &other,
+                            answer.as_ref().ok(),
+                        ) {
+                            crate::access_policy::prefrontal::Continuation::Live(_) => {
+                                (false, "continuation")
+                            }
+                            crate::access_policy::prefrontal::Continuation::Hold => (false, "hold"),
+                            crate::access_policy::prefrontal::Continuation::Absent => {
+                                (true, "absent_end")
+                            }
+                        };
+                        crate::access_policy::prefrontal::log_continuation(
+                            &request, &other, outcome,
+                        );
+                        ends = absent;
+                    }
+                }
+            } else if let Some(other) = crate::access_policy::prefrontal::counterpart(&request) {
+                crate::access_policy::prefrontal::log_continuation(
+                    &request,
+                    &other,
+                    crate::access_policy::prefrontal::retained_outcome(reply.as_ref().ok()),
+                );
+            }
             match &reply {
-                Ok(reply) if scope_describe::describe_answer_ends_scope(reply) => stats.ended += 1,
+                Ok(_) if ends => stats.ended += 1,
                 Ok(ModuleControlResponseToModule::ScopeDescribe {
                     status: subc_protocol::scope::ScopeStatus::Live,
                     ..
@@ -101,12 +170,9 @@ where
                 Err(readiness::ControlError::Timeout) => stats.timeouts += 1,
                 Err(_) => stats.errors += 1,
             }
-            replies.insert(reference.clone(), reply);
+            replies.insert(reference.clone(), ends);
         }
-        if replies[&reference]
-            .as_ref()
-            .is_ok_and(scope_describe::describe_answer_ends_scope)
-        {
+        if replies[&reference] {
             let db = db.clone();
             match tokio::task::spawn_blocking(move || {
                 let conn = db
@@ -125,10 +191,20 @@ where
 }
 
 /// Owned by the connection's scope worker: cancellation stops the sweep too.
-pub(in crate::subc) async fn run(control: Arc<readiness::DaemonControl>, executor: Arc<Executor>) {
+pub(in crate::subc) async fn run(
+    control: Arc<readiness::DaemonControl>,
+    executor: Arc<Executor>,
+    mut covered: tokio::sync::watch::Receiver<super::super::scope_watch::Coverage>,
+    catalog: tokio::sync::watch::Receiver<Vec<String>>,
+) {
     let mut cursors = HashMap::new();
     let mut database = 0usize;
     loop {
+        while covered.borrow_and_update().all {
+            if covered.changed().await.is_err() {
+                return;
+            }
+        }
         let executor = executor.clone();
         let dbs = tokio::task::spawn_blocking(move || {
             let mut dbs = BTreeMap::new();
@@ -150,12 +226,24 @@ pub(in crate::subc) async fn run(control: Arc<readiness::DaemonControl>, executo
             Ok(dbs) if !dbs.is_empty() => {
                 let (path, db) = &dbs[database % dbs.len()];
                 database = database.wrapping_add(1);
-                let stats = tick(
+                let stats = tick_unwatched(
                     db.clone(),
                     cursors.entry(path.clone()).or_default(),
                     |stamp| {
                         let control = control.clone();
                         async move { control.describe(&stamp).await }
+                    },
+                    |stamp| {
+                        // A snapshot may arrive while the database batch is
+                        // being read. Check coverage at the actual RPC boundary.
+                        let latest = covered.borrow();
+                        latest.all || latest.keys.contains(&scope_describe::stamp_key(stamp))
+                    },
+                    |stamp| {
+                        crate::access_policy::prefrontal::counterpart_in_catalog(
+                            stamp,
+                            catalog.borrow().as_slice(),
+                        )
                     },
                 )
                 .await;

@@ -27,6 +27,7 @@ import {
 } from "../config-watch.js";
 
 type TestConfig = {
+  remote_exec?: { enabled?: boolean; project_off?: boolean; default_demand?: string };
   durability?: { macos_full_sync?: boolean };
   lsp?: { idle_minutes?: number | "never"; max_servers?: number };
   restrict_to_project_root?: boolean;
@@ -66,6 +67,23 @@ function tempDir(): string {
 }
 
 describe("applyLiveConfigKeys", () => {
+  test("remote switch and project refusal apply live while demand waits for reconnect", () => {
+    const current: TestConfig = { remote_exec: { enabled: true, default_demand: "linux" } };
+    const next: TestConfig = {
+      remote_exec: { enabled: false, project_off: true, default_demand: "windows" },
+    };
+    const off = applyLiveConfigKeys(current, next, KEYS);
+    expect(off.applied).toEqual(["remote_exec.enabled", "remote_exec.project_off"]);
+    expect(off.deferred).toEqual(["remote_exec.default_demand"]);
+    expect(off.config.remote_exec).toEqual({
+      enabled: false,
+      project_off: true,
+      default_demand: "linux",
+    });
+    const on = applyLiveConfigKeys(off.config, current, KEYS);
+    expect(on.config.remote_exec).toEqual(current.remote_exec);
+    expect(on.deferred).toEqual([]);
+  });
   test("macos_full_sync applies live and returns to the default when removed", () => {
     const current: TestConfig = {};
     const next: TestConfig = { durability: { macos_full_sync: true } };

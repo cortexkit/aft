@@ -3253,8 +3253,12 @@ fn normalize_path(path: &Path) -> PathBuf {
     crate::path_identity::lexical_normalize(path)
 }
 
+mod checkout_suggestion;
+use checkout_suggestion::checkout_counterpart;
+
 #[cfg(test)]
 mod lexical_comparison_tests {
+
     /// Unmatched leading `..` components must survive comparison normalization:
     /// dropping them makes a path that escapes upward look like a nearby child.
     #[test]
@@ -3285,32 +3289,6 @@ fn relative_components_under_root(path: &Path) -> Option<PathBuf> {
         relative.push(component.as_os_str());
     }
     Some(relative)
-}
-
-fn checkout_counterpart(original: &Path, checkout: &Path) -> Option<PathBuf> {
-    let relative = relative_components_under_root(original)?;
-    if relative.as_os_str().is_empty() {
-        return None;
-    }
-
-    // Normalize before probing so a spelling such as /../secret never stats
-    // the unnormalized path supplied by the caller.
-    let normalized_original = normalize_path(original);
-    match std::fs::symlink_metadata(&normalized_original) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        _ => return None,
-    }
-
-    let checkout = std::fs::canonicalize(checkout).ok()?;
-    let candidate = normalize_path(&checkout.join(relative));
-    if !candidate.starts_with(&checkout) {
-        return None;
-    }
-
-    let canonical_candidate = std::fs::canonicalize(&candidate).ok()?;
-    canonical_candidate
-        .starts_with(&checkout)
-        .then_some(canonical_candidate)
 }
 
 fn resolve_with_existing_ancestors(path: &Path) -> PathBuf {
@@ -3824,6 +3802,7 @@ impl App {
         let conn = Arc::new(Mutex::new(crate::db::open_with_mode(path, mode)?));
         crate::db::deferred_checkpoint::register_shared(&conn);
         *slot = Some((key, Arc::clone(&conn)));
+        crate::subc::scope_watch::context_changed();
         drop(slot);
         if created {
             // The startup catalog cannot declare a database that does not
@@ -3870,10 +3849,12 @@ impl App {
     pub fn set_db(&self, conn: Arc<Mutex<TrackedConnection>>) {
         crate::db::deferred_checkpoint::register_shared(&conn);
         *self.db.lock() = Some((PathBuf::new(), conn));
+        crate::subc::scope_watch::context_changed();
     }
 
     pub fn clear_db(&self) {
         *self.db.lock() = None;
+        crate::subc::scope_watch::context_changed();
     }
 
     /// Clear the shared handle only when it still refers to `path`. A failed
@@ -3886,6 +3867,7 @@ impl App {
             existing_path.as_os_str().is_empty() || existing_path == &key
         }) {
             *slot = None;
+            crate::subc::scope_watch::context_changed();
         }
     }
 
@@ -4131,6 +4113,8 @@ pub struct AppContext {
     /// Standing roots retain artifacts across idle session reaping, but they
     /// remain subject to every verification and publication fence.
     standing_artifact_exempt: AtomicBool,
+    /// Reconciled from the daemon's installed routes, never from root paths.
+    worker_only_routes: AtomicBool,
     cold_build_limiter: RwLock<Arc<crate::cold_build_limiter::ColdBuildLimiter>>,
     /// This root's checkout in the data layer that replaces the views and
     /// legacy stores; only with `AFT_DATA_LAYER=1` (see
@@ -4721,6 +4705,7 @@ impl AppContext {
             degraded_reasons: parking_lot::Mutex::new(Vec::new()),
             heavy_root_work_allowed: Arc::clone(&heavy_root_work_allowed),
             standing_artifact_exempt: AtomicBool::new(false),
+            worker_only_routes: AtomicBool::new(false),
             cold_build_limiter: RwLock::new(crate::cold_build_limiter::global_limiter()),
             data_checkout: parking_lot::Mutex::new(None),
             data_checkout_pinned: AtomicBool::new(false),
@@ -8018,6 +8003,7 @@ impl AppContext {
                 planes,
             ) {
                 Ok(checkout) => {
+                    checkout.set_background_refresh(self.background_callgraph_refresh_allowed());
                     *self.data_bind_failure.lock() = None;
                     // Status pushes follow the data layer's builds and
                     // refreshes. Only a context its transport owns can push.
@@ -8749,6 +8735,24 @@ impl AppContext {
     pub(crate) fn set_standing_artifact_exempt(&self, exempt: bool) {
         self.standing_artifact_exempt
             .store(exempt, Ordering::Release);
+        self.sync_background_callgraph_refresh();
+    }
+
+    pub(crate) fn set_worker_only_routes(&self, worker_only: bool) {
+        self.worker_only_routes
+            .store(worker_only, Ordering::Release);
+        self.sync_background_callgraph_refresh();
+    }
+
+    pub(crate) fn background_callgraph_refresh_allowed(&self) -> bool {
+        !self.worker_only_routes.load(Ordering::Acquire)
+            || self.standing_artifact_exempt.load(Ordering::Acquire)
+    }
+
+    fn sync_background_callgraph_refresh(&self) {
+        if let Some(checkout) = self.data_checkout.lock().as_ref() {
+            checkout.set_background_refresh(self.background_callgraph_refresh_allowed());
+        }
     }
 
     pub(crate) fn cold_build_limiter(&self) -> Arc<crate::cold_build_limiter::ColdBuildLimiter> {
@@ -11779,19 +11783,26 @@ impl AppContext {
         ))
     }
 
-    fn checkout_path_suggestion(&self, original: &Path) -> Option<PathBuf> {
+    fn checkout_path_suggestion(
+        &self,
+        original: &Path,
+        operation: crate::access_policy::AccessOperation,
+    ) -> Option<PathBuf> {
         if !original.has_root() || !self.current_call_is_worker() {
             return None;
         }
         let checkout = self.checkout_root_for_message()?;
+        let indexed = (operation == crate::access_policy::AccessOperation::Read)
+            .then(|| self.data_checkout.lock().clone())
+            .flatten();
         if crate::bounded_io::current().is_some() {
             crate::bounded_io::run(original, None, move |path| {
-                Ok(checkout_counterpart(&path, &checkout))
+                Ok(checkout_counterpart(&path, &checkout, indexed.as_deref()))
             })
             .ok()
             .flatten()
         } else {
-            checkout_counterpart(original, &checkout)
+            checkout_counterpart(original, &checkout, indexed.as_deref())
         }
     }
 
@@ -11933,9 +11944,9 @@ impl AppContext {
                 return Ok(());
             }
         }
-        // A worker naming the head's path for a file its own checkout has is
-        // pointed at its checkout instead of being asked about the head's.
-        if let Some(suggestion) = self.checkout_path_suggestion(original) {
+        // Missing outside paths with an unambiguous checkout counterpart need
+        // correction, not permission to read the missing location.
+        if let Some(suggestion) = self.checkout_path_suggestion(original, operation) {
             return Err(crate::protocol::Response::error(
                 req_id,
                 "path_not_found_did_you_mean",

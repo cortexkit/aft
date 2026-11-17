@@ -395,6 +395,18 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "context/checkout_suggestion.rs",
+        enclosing_item: "unique_indexed_checkout_suffix",
+        location_or_primitive: "MAX_PATHS, MAX_COMPONENTS",
+        reason: "Missing-path correction refuses recovery when the complete indexed inventory or requested path exceeds its work budget; it never returns a suggestion based on a truncated candidate list.",
+    },
+    ExclusionEntry {
+        file: "subc/scope_describe.rs",
+        enclosing_item: "CompletedEnds::insert",
+        location_or_primitive: "COMPLETED_END_CAP, pop_front",
+        reason: "Internal completed-end notification deduplication evicts oldest stamps at capacity or after ten minutes; a later duplicate can repeat an idempotent cleanup notice but cannot truncate a tool result or kill an ended task again.",
+    },
+    ExclusionEntry {
         file: "late_result_bus.rs",
         enclosing_item: "scan,replay,read_batch,capacity,due,deliver",
         location_or_primitive: "SCAN_BATCH (64), LATE_RESULTS_PAGE_MAX, UNACKED_RESULTS_MAX, SQL LIMIT",
@@ -490,6 +502,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "saved_scope_batch",
         location_or_primitive: "SQL LIMIT, PER_TICK (4)",
         reason: "Keyset pagination bounds background lifecycle probes, not permissions.list; every live grant remains listed and later maintenance ticks continue after the saved cursor.",
+    },
+    ExclusionEntry {
+        file: "subc/scope_watch.rs",
+        enclosing_item: "reconcile",
+        location_or_primitive: "SELECTORS_PER_WATCH (256), WATCHES_PER_CONNECTION (16)",
+        reason: "Daemon subscription limits partition internal lifecycle selectors; excess scopes retain polling coverage and are counted in health, never dropped from a tool result or from lifecycle monitoring.",
     },
     ExclusionEntry {
         file: "subc/held_task_recovery.rs",
@@ -762,10 +780,16 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "a process-group check keeps at most 16 members and reports the exact omitted count in live_descendants_omitted; each member's name is shortened with an ellipsis and its arguments are never kept; the record keeps at most 1,024 member identities for recognising the group later and flags when more were found; this is task status detail, not a paginated result list",
     },
     ExclusionEntry {
+        file: "subc/consent.rs",
+        enclosing_item: "scope_reason_path",
+        location_or_primitive: "160-character reason limit, middle path-component elision, repository basename chars().take()",
+        reason: "consent-card display text, not a tool result list; the approved sentence stays intact while its path shows home as ~, keeps the repository basename before ancestor components, and visibly middle-elides a basename only when it alone cannot fit; the request path, scope pattern and stored grant retain the full path",
+    },
+    ExclusionEntry {
         file: "subc/health.rs",
-        enclosing_item: "budget_health_metrics_with_limits, reduce_health_root_details, gap_largest_ancillary_health_field, compact_health_lsp_preview, enforce_health_hard_limit, abbreviate_health_root, abbreviated_health_path, abbreviated_health_refusal, build_health_diagnostic_rollup_from_actors",
-        location_or_primitive: "healthy root detail cap and removal, default root counter removal, abnormal root reduction with largest-only overflow prefix, LSP preview clear, cache/root path and free-text caps, storage_retention map removal, v2_family_sweeps and data_store_failed pop, named telemetry gaps under HEALTH_METRICS_BUDGET_BYTES, root and optional gap-id pop under HEALTH_REPLY_HARD_LIMIT_BYTES",
-        reason: "management health detail, not an agent result list; small process diagnostics precede healthy root detail, whose total remains in healthy_roots; abnormal roots bypass the normal detail cap, but before priority process telemetry yields they reduce to identities, states, statuses and failure facts, counted by root_details_reduced; current watcher loss keeps its overflow total and largest prefix; LSP fleet totals survive preview removal; long identities use full digests and bounded free text names the bytes cut; only the whole-reply hard ceiling permits abnormal root removal, with exact root_detail_gap and root_details_omitted counts and ids when they fit; other oversized telemetry becomes a named gap with its original byte size",
+        enclosing_item: "budget_health_metrics_with_limits, fit_health_metrics, group_health_roots, trim_health_root_groups, reduce_health_root_details, gap_largest_ancillary_health_field, compact_health_lsp_preview, enforce_health_hard_limit, abbreviate_health_root, abbreviated_health_path, abbreviated_health_refusal, build_health_diagnostic_rollup_from_actors",
+        location_or_primitive: "HEALTH_PROJECT_BUDGET_BYTES, HEALTH_ROOT_GROUP_EXAMPLES truncate, example pop and preview removal, healthy root detail cap and removal, default root counter removal, abnormal root reduction with largest-only overflow prefix, LSP preview clear, cache/root path and free-text caps, storage_retention map removal, v2_family_sweeps and data_store_failed pop, named telemetry gaps under HEALTH_METRICS_BUDGET_BYTES, root and optional gap-id pop under project and reply ceilings",
+        reason: "management health detail, not an agent result list; process telemetry is budgeted independently first, project detail receives at most half the metrics budget and only the remainder; repeated normal statuses always keep count and status, with exact examples_omitted, root_details_omitted and root_detail_gap.summarized counts; failed or stalled roots stay individual, most severe first; project cuts report root_detail_gap; abnormal reductions preserve failure facts and count root_details_reduced; current watcher loss keeps its overflow total and largest prefix; LSP fleet totals survive preview removal; identities that fit the project ceiling are not shortened by process pressure; long identities use full digests and bounded free text names the bytes cut; other oversized telemetry becomes a named gap with its original byte size",
     },
     ExclusionEntry {
         file: "subc/health.rs",

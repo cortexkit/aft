@@ -3472,12 +3472,15 @@ impl BgTaskRegistry {
                         .as_str()
                         .unwrap_or("unknown")
                         .to_owned();
-                    let result = self.restored_remote_fallback(
-                        &task,
-                        &remote,
-                        &reason,
-                        refusal_detail.as_deref(),
-                    );
+                    let result = self
+                        .fallback_off_executor(
+                            &task,
+                            None,
+                            &remote,
+                            &reason,
+                            refusal_detail.as_deref(),
+                        )
+                        .await;
                     // An owner pause recorded before this worker started already
                     // ended the task, and the fallback above declined to launch.
                     // The runner refused the job, so withholding the local run
@@ -3621,7 +3624,8 @@ impl BgTaskRegistry {
                         return if remote.explicit_runon {
                             self.refuse_remote_before_dispatch(&task, &error)
                         } else {
-                            self.remote_fallback(&task, fallback, &error, None)
+                            self.fallback_off_executor(&task, Some(fallback), &remote, &error, None)
+                                .await
                         };
                     }
                     if let Some(point) = remote.point().filter(|_| remote.connection_file.is_some())
@@ -3687,12 +3691,15 @@ impl BgTaskRegistry {
                 Some(stream) => stream,
                 None if fresh => {
                     sink.settle_never_accepted().map_err(|e| e.to_string())?;
-                    return self.restored_remote_fallback(
-                        &task,
-                        &remote,
-                        "submission_never_accepted",
-                        None,
-                    );
+                    return self
+                        .fallback_off_executor(
+                            &task,
+                            None,
+                            &remote,
+                            "submission_never_accepted",
+                            None,
+                        )
+                        .await;
                 }
                 None => {
                     return Err(
@@ -3721,7 +3728,14 @@ impl BgTaskRegistry {
                     return if remote.explicit_runon {
                         self.refuse_remote_before_dispatch(&task, &error.to_string())
                     } else {
-                        self.remote_fallback(&task, local, &error.to_string(), None)
+                        self.fallback_off_executor(
+                            &task,
+                            Some(local),
+                            &remote,
+                            &error.to_string(),
+                            None,
+                        )
+                        .await
                     }
                 }
             };
@@ -3775,12 +3789,14 @@ impl BgTaskRegistry {
                     return if remote.explicit_runon {
                         self.refuse_remote_before_dispatch(&task, &error.to_string())
                     } else {
-                        self.remote_fallback(
+                        self.fallback_off_executor(
                             &task,
-                            fallback.take().unwrap(),
+                            Some(fallback.take().unwrap()),
+                            &remote,
                             &error.to_string(),
                             None,
                         )
+                        .await
                     }
                 }
                 Err(error) => self
@@ -4011,14 +4027,23 @@ impl BgTaskRegistry {
                     let result = if let Some(fallback) = fallback.take() {
                         // A live refusal uses the launch plan captured before
                         // dispatch. The private disk snapshot is for restarts.
-                        self.remote_fallback(&task, fallback, &reason, refusal_detail.as_deref())
-                    } else {
-                        self.restored_remote_fallback(
+                        self.fallback_off_executor(
                             &task,
+                            Some(fallback),
                             &remote,
                             &reason,
                             refusal_detail.as_deref(),
                         )
+                        .await
+                    } else {
+                        self.fallback_off_executor(
+                            &task,
+                            None,
+                            &remote,
+                            &reason,
+                            refusal_detail.as_deref(),
+                        )
+                        .await
                     };
                     // If the owner's pause landed after this refusal arrived
                     // but before the lines above reported it, the pause had
@@ -4514,6 +4539,29 @@ impl BgTaskRegistry {
         }
     }
 
+    async fn fallback_off_executor(
+        &self,
+        task: &Arc<BgTask>,
+        local: Option<LocalFallback>,
+        remote: &RemoteTask,
+        reason: &str,
+        refusal_detail: Option<&str>,
+    ) -> Result<(), String> {
+        let registry = self.clone();
+        let task = task.clone();
+        let remote = remote.clone();
+        let reason = reason.to_owned();
+        let detail = refusal_detail.map(str::to_owned);
+        // A failed local launch can wait out process-group termination. Keep
+        // that cleanup off the async runtime thread handling the remote task.
+        tokio::task::spawn_blocking(move || match local {
+            Some(local) => registry.remote_fallback(&task, local, &reason, detail.as_deref()),
+            None => registry.restored_remote_fallback(&task, &remote, &reason, detail.as_deref()),
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
     fn remote_fallback(
         &self,
         task: &Arc<BgTask>,
@@ -4632,7 +4680,10 @@ impl BgTaskRegistry {
         )?;
         if let Some(mut monitor) = memory_monitor.take() {
             if let Err(error) = monitor.attach(child.id()) {
-                super::super::process::terminate_pgid(child.id() as i32, None);
+                drop(state);
+                super::super::process::terminate_pgid_with(child.id() as i32, || {
+                    matches!(child.try_wait(), Ok(Some(_)))
+                });
                 let _ = child.wait();
                 return Err(error);
             }
@@ -4853,6 +4904,7 @@ impl BgTaskRegistry {
         }
         let _ = self.post_terminal_transition(task, true);
         self.inner.terminal_transition.notify_waiters();
+        crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
         let _ = self.inner.wake_tx.try_send(());
     }
 
@@ -5001,6 +5053,7 @@ impl BgTaskRegistry {
         );
         let _ = self.post_terminal_transition(task, true);
         self.inner.terminal_transition.notify_waiters();
+        crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
         let _ = self.inner.wake_tx.try_send(());
     }
 

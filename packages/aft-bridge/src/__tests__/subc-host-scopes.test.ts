@@ -25,6 +25,7 @@ const scope: RouteScope = {
 };
 
 class HostClient implements SubcClientLike {
+  catalogModuleIds = ["prefrontal-core"];
   readonly opens: Array<{ target: RouteTarget; identity: BindIdentity; opts?: RouteOpenOptions }> =
     [];
   readonly reads: unknown[] = [];
@@ -58,6 +59,10 @@ class HostClient implements SubcClientLike {
     return [...this.subscriptions.keys()];
   }
 
+  async catalogList() {
+    return { modules: this.catalogModuleIds.map((module_id) => ({ module_id })) };
+  }
+
   bumpScopeEpoch(epoch: number, refusedBinds: number, code = "scope_not_live") {
     this.answer = { owner: scope.owner, ref: scope.ref, scope_epoch: epoch };
     this.pendingScopeBinds = refusedBinds;
@@ -67,8 +72,8 @@ class HostClient implements SubcClientLike {
   async routeOpen(target: RouteTarget, identity: BindIdentity, opts?: RouteOpenOptions) {
     this.opens.push({ target, identity, opts });
     const channel = this.opens.length;
-    if (target.module_id === "prefrontal-core" && this.scopeOpenError) throw this.scopeOpenError;
-    if (target.module_id === "prefrontal-core") await this.scopeOpenGate;
+    if (target.kind === "management_surface" && this.scopeOpenError) throw this.scopeOpenError;
+    if (target.kind === "management_surface") await this.scopeOpenGate;
     if (target.module_id === "aft") {
       await this.toolOpenGate;
       if (opts?.scope) await this.scopedOpenGate;
@@ -91,7 +96,7 @@ class HostClient implements SubcClientLike {
 
   async request(route: RouteHandle, body: unknown) {
     if (this.endedChannels.has(route.channel)) throw new SubcError("route gone", "unknown_channel");
-    if (this.modules.get(route.channel) === "prefrontal-core") {
+    if (["prefrontal", "prefrontal-core"].includes(this.modules.get(route.channel) ?? "")) {
       this.reads.push(body);
       // Decode like core's management surface: a body without a string `method`
       // or with params other than {harness, session} is refused, as core does.
@@ -297,6 +302,42 @@ function setup(
 async function settle() {
   for (let turn = 0; turn < 64; turn++) await Promise.resolve();
 }
+
+test("prefrontal rename chooses both catalog states and retains the daemon owner", async () => {
+  for (const [catalog, module] of [
+    [["prefrontal-core"], "prefrontal-core"],
+    [["prefrontal"], "prefrontal"],
+    [["prefrontal-core", "prefrontal"], "prefrontal"],
+    [["other"], "prefrontal-core"],
+  ] as const) {
+    const { client, pool } = setup();
+    client.catalogModuleIds = [...catalog];
+    const expected = { ...scope, owner: { kind: "reserved", module_id: module } };
+    client.answer = { owner: expected.owner, ref: scope.ref, scope_epoch: scope.scopeEpoch };
+    await pool.getBridge(TEST_PROJECT_ROOT).toolCall("head", "read", {});
+    expect(client.opens[0].target).toEqual({ kind: "management_surface", module_id: module });
+    expect(client.opens.find((open) => open.target.module_id === "aft")?.opts?.scope).toEqual(
+      expected,
+    );
+    await pool.shutdown();
+  }
+});
+
+test("prefrontal rename refreshes a removed scope carrier without restarting AFT", async () => {
+  const { client, pool, push } = setup();
+  await pool.getBridge(TEST_PROJECT_ROOT).toolCall("head", "read", {});
+  client.catalogModuleIds = ["prefrontal"];
+  const renamed = { ...scope, owner: { kind: "reserved", module_id: "prefrontal" } };
+  client.answer = { owner: renamed.owner, ref: scope.ref, scope_epoch: scope.scopeEpoch };
+  push({ op: "route.closed", body: { module_id: "aft", reason: "scope_carrier_removed" } });
+  await pool.getBridge(TEST_OTHER_ROOT).toolCall("head", "read", {});
+  expect(
+    client.opens
+      .filter((open) => open.target.kind === "management_surface")
+      .map((open) => open.target.module_id),
+  ).toEqual(["prefrontal-core", "prefrontal"]);
+  expect(client.opens.at(-1)?.opts?.scope).toEqual(renamed);
+});
 
 test("module restart reopens every head route with its cached scope through reload refusals", async () => {
   for (const code of ["module_reloading", "module_warming", "target_unavailable"]) {

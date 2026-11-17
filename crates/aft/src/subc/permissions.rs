@@ -292,14 +292,14 @@ pub(super) fn stop_folder_tasks(
     let count = held.len();
     if count > 0 {
         let kill_all = |held: Vec<(crate::bash_background::registry::BgTaskRegistry, _)>| {
-            for (registry, task) in held {
+            crate::bash_background::registry::stop_tasks_in_parallel(held, |(registry, task)| {
                 if let Err(error) = registry.kill_for_folder_revocation(&task) {
                     log::warn!(
                         "folder revoke: could not stop task {}: {error}",
                         task.task_id
                     );
                 }
-            }
+            });
         };
         let inline = held.clone();
         let spawned = std::thread::Builder::new()

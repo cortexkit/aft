@@ -986,6 +986,35 @@ const CASES: ParityCase[] = [
   },
   { name: "bash_subagent", user: { bash: { subagent_background: true } } },
   {
+    name: "remote_runon_retired_false",
+    user: { remote_exec: { enabled: true }, bash: { runon_enabled: false } },
+  },
+  {
+    name: "remote_runon_retired_true",
+    user: { remote_exec: { enabled: true }, bash: { runon_enabled: true } },
+  },
+  {
+    name: "remote_runon_retired_absent",
+    user: { remote_exec: { enabled: true } },
+  },
+  {
+    name: "remote_runon_retired_empty_bash",
+    user: {
+      remote_exec: { enabled: true },
+      bash: { runon_enabled: false },
+      experimental: { bash: { compress: false, background: false } },
+    },
+  },
+  {
+    name: "remote_runon_retired_harness",
+    harness: "pi",
+    user: {
+      remote_exec: { enabled: true },
+      harnesses: { pi: { bash: { runon_enabled: false } } },
+    },
+    project: { bash: { runon_enabled: false } },
+  },
+  {
     name: "bash_runon_project_cannot_enable",
     user: { bash: { runon_enabled: false } },
     project: { bash: { runon_enabled: true } },

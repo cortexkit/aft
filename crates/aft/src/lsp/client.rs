@@ -3032,11 +3032,12 @@ fn stderr_tail_to_string(tail: &VecDeque<String>) -> String {
 /// Necessary because some LSP servers ship as npm-installed Node shims that
 /// spawn the real binary as a child. Killing only the wrapper PID leaves the
 /// real server orphaned to PID 1 and accumulates over time.
-fn kill_lsp_child_group(child: &mut std::process::Child) {
+pub(crate) fn kill_lsp_child_group(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         let pgid = child.id() as i32;
-        crate::bash_background::process::terminate_pgid(pgid, Some(child));
+        // LSP cleanup holds the manager lock, so retain the short leader-only wait.
+        crate::bash_background::process::terminate_pgid_leader_grace(pgid, child);
         let _ = child.wait();
     }
     #[cfg(not(unix))]

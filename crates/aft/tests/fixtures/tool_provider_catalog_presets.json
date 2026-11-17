@@ -10,8 +10,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "91d45467367c9f0a0564f8f6a2cca3618fab70db23b11bf6d52d9701abe8aa44",
-      "catalog_digest": "91d45467367c9f0a0564f8f6a2cca3618fab70db23b11bf6d52d9701abe8aa44",
+      "generation": "87b3d585c5e7fa30fd31ab09e22d4fb7c4778090f1336b6a7bb24d4fafc08ba4",
+      "catalog_digest": "87b3d585c5e7fa30fd31ab09e22d4fb7c4778090f1336b6a7bb24d4fafc08ba4",
       "tools": [
         {
           "name": "status",
@@ -1233,9 +1233,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent Foundational Toolkit\n\n**Finding code**: start with search; it takes concepts, identifiers, regex and literals. Then outline for structure, zoom for named symbols, read for line ranges. Don't find or read code with grep, find, sed or cat in bash.\n**Relationships**: callgraph for callers, impact, and execution or data-flow traces.\n**Web pages**: outline with a URL as target, then zoom on a heading.\n**Parallel calls**: send independent read-only calls in one response.\n**After edits**: run inspect for diagnostics; the project's typecheck and tests are the final check.\n**Status bar**: `[AFT E.. W.. | T..]` appears when a count changes. E above 0 usually means your last edit broke something; `?` means unknown, not zero.\n**Commands**: don't pipe test or build output into tail, grep or head; AFT already shortens it. Pass wait: true to wait for a long command; after the worker wait limit (bash.worker_wait_max_ms, 30 minutes by default) it reports the command is still running. A background command never wakes you: wait on it with bash_watch before you report, and never loop bash_status.\nAs a worker, keep changes within your assigned scope, verify them, and report the result to your parent.\n",
-        "item_digest": "3f1161de5205022b6420f991cf375c667fb2b203858c2e3151ffaf72acd691f1",
-        "preflight_digest": "3f1161de5205022b6420f991cf375c667fb2b203858c2e3151ffaf72acd691f1",
+        "text": "# Agent Foundational Toolkit\n\n**Code exploration**: `search` is the primary code-search tool: one call auto-routes concepts, identifiers, regex, error strings, and literals. Then `outline` for structure → `zoom` for symbol(s). DO NOT run `grep`/`rg`/`find`/`sed`/`cat` through `bash` to locate or read code — the bash path is unindexed, unranked, serial, and routinely surfaces the wrong hit. Keep `bash` for shell facts (git state, file metadata, processes). If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use search (concepts, identifiers, regex, literals), read, outline, or zoom instead. Reflex translations:\n- `grep -rn \"handleAuth\" src/` in bash → `search({ query: \"handleAuth\" })`\n- `find . -name \"*.ts\" | xargs grep watcher` in bash → `search({ query: \"watcher invalidation\" })` (concepts work too)\n- `sed -n '100,160p' app.ts` / `cat app.ts` in bash → `read({ path: \"app.ts\", startLine: 100, endLine: 160 })`\n**Relationships**: callgraph for callers, impact, and execution or data-flow traces.\n**Web pages**: outline with a URL as target, then zoom on a heading.\n**Parallel calls**: send independent read-only calls in one response.\n**After edits**: run inspect for diagnostics; the project's typecheck and tests are the final check.\n**Status bar**: `[AFT E.. W.. | T..]` appears when a count changes. E above 0 usually means your last edit broke something; `?` means unknown, not zero.\n**Commands**: don't pipe test or build output into tail, grep or head; AFT already shortens it. Pass wait: true to wait for a long command; after the worker wait limit (bash.worker_wait_max_ms, 30 minutes by default) it reports the command is still running. A background command never wakes you: wait on it with bash_watch before you report, and never loop bash_status.\nAs a worker, keep changes within your assigned scope, verify them, and report the result to your parent.\n",
+        "item_digest": "586309e3165dac5a0d795c6f3b94df90bae1274c06970ddc0a206a1f072102f3",
+        "preflight_digest": "586309e3165dac5a0d795c6f3b94df90bae1274c06970ddc0a206a1f072102f3",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -1279,8 +1279,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "a151655d2bce9fd77c2aa9fd61fe48282dcf07e66ce8937a5d7dd4131ea637a9",
-      "catalog_digest": "a151655d2bce9fd77c2aa9fd61fe48282dcf07e66ce8937a5d7dd4131ea637a9",
+      "generation": "e50c068a871ff3fac578280b624bffe06f86f2c430a3d2e5735cc98c749206d7",
+      "catalog_digest": "e50c068a871ff3fac578280b624bffe06f86f2c430a3d2e5735cc98c749206d7",
       "tools": [
         {
           "name": "status",
@@ -2576,9 +2576,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent Foundational Toolkit\n\n**Finding code**: start with search; it takes concepts, identifiers, regex and literals. Then outline for structure, zoom for named symbols, read for line ranges. Don't find or read code with grep, find, sed or cat in bash.\n**Relationships**: callgraph for callers, impact, and execution or data-flow traces.\n**Web pages**: outline with a URL as target, then zoom on a heading.\n**Parallel calls**: send independent read-only calls in one response.\n**After edits**: run inspect for diagnostics; the project's typecheck and tests are the final check.\n**Status bar**: `[AFT E.. W.. | T..]` appears when a count changes. E above 0 usually means your last edit broke something; `?` means unknown, not zero.\n**Commands**: don't pipe test or build output into tail, grep or head; AFT already shortens it. Pass wait: true to wait for a long command; after the worker wait limit (bash.worker_wait_max_ms, 30 minutes by default) it reports the command is still running. A background command never wakes you: wait on it with bash_watch before you report, and never loop bash_status.\nAs a worker, keep changes within your assigned scope, verify them, and report the result to your parent.\n",
-        "item_digest": "3f1161de5205022b6420f991cf375c667fb2b203858c2e3151ffaf72acd691f1",
-        "preflight_digest": "3f1161de5205022b6420f991cf375c667fb2b203858c2e3151ffaf72acd691f1",
+        "text": "# Agent Foundational Toolkit\n\n**Code exploration**: `search` is the primary code-search tool: one call auto-routes concepts, identifiers, regex, error strings, and literals. Then `outline` for structure → `zoom` for symbol(s). DO NOT run `grep`/`rg`/`find`/`sed`/`cat` through `bash` to locate or read code — the bash path is unindexed, unranked, serial, and routinely surfaces the wrong hit. Keep `bash` for shell facts (git state, file metadata, processes). If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use search (concepts, identifiers, regex, literals), read, outline, or zoom instead. Reflex translations:\n- `grep -rn \"handleAuth\" src/` in bash → `search({ query: \"handleAuth\" })`\n- `find . -name \"*.ts\" | xargs grep watcher` in bash → `search({ query: \"watcher invalidation\" })` (concepts work too)\n- `sed -n '100,160p' app.ts` / `cat app.ts` in bash → `read({ path: \"app.ts\", startLine: 100, endLine: 160 })`\n**Relationships**: callgraph for callers, impact, and execution or data-flow traces.\n**Web pages**: outline with a URL as target, then zoom on a heading.\n**Parallel calls**: send independent read-only calls in one response.\n**After edits**: run inspect for diagnostics; the project's typecheck and tests are the final check.\n**Status bar**: `[AFT E.. W.. | T..]` appears when a count changes. E above 0 usually means your last edit broke something; `?` means unknown, not zero.\n**Commands**: don't pipe test or build output into tail, grep or head; AFT already shortens it. Pass wait: true to wait for a long command; after the worker wait limit (bash.worker_wait_max_ms, 30 minutes by default) it reports the command is still running. A background command never wakes you: wait on it with bash_watch before you report, and never loop bash_status.\nAs a worker, keep changes within your assigned scope, verify them, and report the result to your parent.\n",
+        "item_digest": "586309e3165dac5a0d795c6f3b94df90bae1274c06970ddc0a206a1f072102f3",
+        "preflight_digest": "586309e3165dac5a0d795c6f3b94df90bae1274c06970ddc0a206a1f072102f3",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -2623,8 +2623,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "fddab0017e7e0a0e6ba940cc8a32903218d23d8fad4ff881f582f53291452823",
-      "catalog_digest": "fddab0017e7e0a0e6ba940cc8a32903218d23d8fad4ff881f582f53291452823",
+      "generation": "34f9c1db13de0fa4d9aefbf1b6be686edf2bfb433b1805b9b85552e685076332",
+      "catalog_digest": "34f9c1db13de0fa4d9aefbf1b6be686edf2bfb433b1805b9b85552e685076332",
       "tools": [
         {
           "name": "read",
@@ -3046,9 +3046,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent Foundational Toolkit\n\nThis session is read-only: it can read and search code, but it has no tool that runs commands or changes, moves or deletes files.\n**Finding code**: start with search; it takes concepts, identifiers, regex and literals. Then outline for structure, zoom for named symbols, read for line ranges.\n**Relationships**: callgraph for callers, impact, and execution or data-flow traces.\n**Web pages**: outline with a URL as target, then zoom on a heading.\n**Parallel calls**: send independent read-only calls in one response.\nUse inspect for diagnostics.\n",
-        "item_digest": "05c295c4fe07777ef6ede51adb61256e7194a28783f54cde5a339ebaead4c10d",
-        "preflight_digest": "05c295c4fe07777ef6ede51adb61256e7194a28783f54cde5a339ebaead4c10d",
+        "text": "# Agent Foundational Toolkit\n\nThis session is read-only: it can read and search code, but it has no tool that runs commands or changes, moves or deletes files.\n**Code exploration**: `search` is the primary code-search tool: one call auto-routes concepts, identifiers, regex, error strings, and literals. Then `outline` for structure → `zoom` for symbol(s).\n**Relationships**: callgraph for callers, impact, and execution or data-flow traces.\n**Web pages**: outline with a URL as target, then zoom on a heading.\n**Parallel calls**: send independent read-only calls in one response.\nUse inspect for diagnostics.\n",
+        "item_digest": "92a529166ee8ee4021f51b006093eb92a789a0b7722097dfa9af15b75f9c73ec",
+        "preflight_digest": "92a529166ee8ee4021f51b006093eb92a789a0b7722097dfa9af15b75f9c73ec",
         "tool_names": [
           "callgraph",
           "glob",
@@ -3076,8 +3076,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "fddab0017e7e0a0e6ba940cc8a32903218d23d8fad4ff881f582f53291452823",
-      "catalog_digest": "fddab0017e7e0a0e6ba940cc8a32903218d23d8fad4ff881f582f53291452823",
+      "generation": "34f9c1db13de0fa4d9aefbf1b6be686edf2bfb433b1805b9b85552e685076332",
+      "catalog_digest": "34f9c1db13de0fa4d9aefbf1b6be686edf2bfb433b1805b9b85552e685076332",
       "tools": [
         {
           "name": "read",
@@ -3499,9 +3499,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent Foundational Toolkit\n\nThis session is read-only: it can read and search code, but it has no tool that runs commands or changes, moves or deletes files.\n**Finding code**: start with search; it takes concepts, identifiers, regex and literals. Then outline for structure, zoom for named symbols, read for line ranges.\n**Relationships**: callgraph for callers, impact, and execution or data-flow traces.\n**Web pages**: outline with a URL as target, then zoom on a heading.\n**Parallel calls**: send independent read-only calls in one response.\nUse inspect for diagnostics.\n",
-        "item_digest": "05c295c4fe07777ef6ede51adb61256e7194a28783f54cde5a339ebaead4c10d",
-        "preflight_digest": "05c295c4fe07777ef6ede51adb61256e7194a28783f54cde5a339ebaead4c10d",
+        "text": "# Agent Foundational Toolkit\n\nThis session is read-only: it can read and search code, but it has no tool that runs commands or changes, moves or deletes files.\n**Code exploration**: `search` is the primary code-search tool: one call auto-routes concepts, identifiers, regex, error strings, and literals. Then `outline` for structure → `zoom` for symbol(s).\n**Relationships**: callgraph for callers, impact, and execution or data-flow traces.\n**Web pages**: outline with a URL as target, then zoom on a heading.\n**Parallel calls**: send independent read-only calls in one response.\nUse inspect for diagnostics.\n",
+        "item_digest": "92a529166ee8ee4021f51b006093eb92a789a0b7722097dfa9af15b75f9c73ec",
+        "preflight_digest": "92a529166ee8ee4021f51b006093eb92a789a0b7722097dfa9af15b75f9c73ec",
         "tool_names": [
           "callgraph",
           "glob",
@@ -3530,8 +3530,8 @@
     "powershell_available": false,
     "remote_runs": true,
     "reply": {
-      "generation": "6aaf0b4f01b3bd3c9761b11737b4827f7c1a0e644c6667bd17223d3523e50040",
-      "catalog_digest": "6aaf0b4f01b3bd3c9761b11737b4827f7c1a0e644c6667bd17223d3523e50040",
+      "generation": "2aa3c95ee1d36d80bf1c8a3d85343465c06e39664e6a980e95258ec30bd164e3",
+      "catalog_digest": "2aa3c95ee1d36d80bf1c8a3d85343465c06e39664e6a980e95258ec30bd164e3",
       "tools": [
         {
           "name": "status",
@@ -4765,9 +4765,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent Foundational Toolkit\n\n**Finding code**: start with search; it takes concepts, identifiers, regex and literals. Then outline for structure, zoom for named symbols, read for line ranges. Don't find or read code with grep, find, sed or cat in bash.\n**Relationships**: callgraph for callers, impact, and execution or data-flow traces.\n**Web pages**: outline with a URL as target, then zoom on a heading.\n**Parallel calls**: send independent read-only calls in one response.\n**After edits**: run inspect for diagnostics; the project's typecheck and tests are the final check.\n**Status bar**: `[AFT E.. W.. | T..]` appears when a count changes. E above 0 usually means your last edit broke something; `?` means unknown, not zero.\n**Commands**: don't pipe test or build output into tail, grep or head; AFT already shortens it. Pass wait: true to wait for a long command; after the worker wait limit (bash.worker_wait_max_ms, 30 minutes by default) it reports the command is still running. A background command never wakes you: wait on it with bash_watch before you report, and never loop bash_status.\nAs a worker, keep changes within your assigned scope, verify them, and report the result to your parent.\n",
-        "item_digest": "3f1161de5205022b6420f991cf375c667fb2b203858c2e3151ffaf72acd691f1",
-        "preflight_digest": "3f1161de5205022b6420f991cf375c667fb2b203858c2e3151ffaf72acd691f1",
+        "text": "# Agent Foundational Toolkit\n\n**Code exploration**: `search` is the primary code-search tool: one call auto-routes concepts, identifiers, regex, error strings, and literals. Then `outline` for structure → `zoom` for symbol(s). DO NOT run `grep`/`rg`/`find`/`sed`/`cat` through `bash` to locate or read code — the bash path is unindexed, unranked, serial, and routinely surfaces the wrong hit. Keep `bash` for shell facts (git state, file metadata, processes). If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use search (concepts, identifiers, regex, literals), read, outline, or zoom instead. Reflex translations:\n- `grep -rn \"handleAuth\" src/` in bash → `search({ query: \"handleAuth\" })`\n- `find . -name \"*.ts\" | xargs grep watcher` in bash → `search({ query: \"watcher invalidation\" })` (concepts work too)\n- `sed -n '100,160p' app.ts` / `cat app.ts` in bash → `read({ path: \"app.ts\", startLine: 100, endLine: 160 })`\n**Relationships**: callgraph for callers, impact, and execution or data-flow traces.\n**Web pages**: outline with a URL as target, then zoom on a heading.\n**Parallel calls**: send independent read-only calls in one response.\n**After edits**: run inspect for diagnostics; the project's typecheck and tests are the final check.\n**Status bar**: `[AFT E.. W.. | T..]` appears when a count changes. E above 0 usually means your last edit broke something; `?` means unknown, not zero.\n**Commands**: don't pipe test or build output into tail, grep or head; AFT already shortens it. Pass wait: true to wait for a long command; after the worker wait limit (bash.worker_wait_max_ms, 30 minutes by default) it reports the command is still running. A background command never wakes you: wait on it with bash_watch before you report, and never loop bash_status.\nAs a worker, keep changes within your assigned scope, verify them, and report the result to your parent.\n",
+        "item_digest": "586309e3165dac5a0d795c6f3b94df90bae1274c06970ddc0a206a1f072102f3",
+        "preflight_digest": "586309e3165dac5a0d795c6f3b94df90bae1274c06970ddc0a206a1f072102f3",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -4812,8 +4812,8 @@
     "powershell_available": true,
     "remote_runs": true,
     "reply": {
-      "generation": "990c1a56df78f97d6579f7d7b71791025f01181998fb50b01963ed252ad9b5a3",
-      "catalog_digest": "990c1a56df78f97d6579f7d7b71791025f01181998fb50b01963ed252ad9b5a3",
+      "generation": "dfe09c908969770cda7b9a063adbad1d0907e3f91b11c6fa49c73020086ecf75",
+      "catalog_digest": "dfe09c908969770cda7b9a063adbad1d0907e3f91b11c6fa49c73020086ecf75",
       "tools": [
         {
           "name": "status",
@@ -6121,9 +6121,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent Foundational Toolkit\n\n**Finding code**: start with search; it takes concepts, identifiers, regex and literals. Then outline for structure, zoom for named symbols, read for line ranges. Don't find or read code with grep, find, sed or cat in bash.\n**Relationships**: callgraph for callers, impact, and execution or data-flow traces.\n**Web pages**: outline with a URL as target, then zoom on a heading.\n**Parallel calls**: send independent read-only calls in one response.\n**After edits**: run inspect for diagnostics; the project's typecheck and tests are the final check.\n**Status bar**: `[AFT E.. W.. | T..]` appears when a count changes. E above 0 usually means your last edit broke something; `?` means unknown, not zero.\n**Commands**: don't pipe test or build output into tail, grep or head; AFT already shortens it. Pass wait: true to wait for a long command; after the worker wait limit (bash.worker_wait_max_ms, 30 minutes by default) it reports the command is still running. A background command never wakes you: wait on it with bash_watch before you report, and never loop bash_status.\nAs a worker, keep changes within your assigned scope, verify them, and report the result to your parent.\n",
-        "item_digest": "3f1161de5205022b6420f991cf375c667fb2b203858c2e3151ffaf72acd691f1",
-        "preflight_digest": "3f1161de5205022b6420f991cf375c667fb2b203858c2e3151ffaf72acd691f1",
+        "text": "# Agent Foundational Toolkit\n\n**Code exploration**: `search` is the primary code-search tool: one call auto-routes concepts, identifiers, regex, error strings, and literals. Then `outline` for structure → `zoom` for symbol(s). DO NOT run `grep`/`rg`/`find`/`sed`/`cat` through `bash` to locate or read code — the bash path is unindexed, unranked, serial, and routinely surfaces the wrong hit. Keep `bash` for shell facts (git state, file metadata, processes). If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use search (concepts, identifiers, regex, literals), read, outline, or zoom instead. Reflex translations:\n- `grep -rn \"handleAuth\" src/` in bash → `search({ query: \"handleAuth\" })`\n- `find . -name \"*.ts\" | xargs grep watcher` in bash → `search({ query: \"watcher invalidation\" })` (concepts work too)\n- `sed -n '100,160p' app.ts` / `cat app.ts` in bash → `read({ path: \"app.ts\", startLine: 100, endLine: 160 })`\n**Relationships**: callgraph for callers, impact, and execution or data-flow traces.\n**Web pages**: outline with a URL as target, then zoom on a heading.\n**Parallel calls**: send independent read-only calls in one response.\n**After edits**: run inspect for diagnostics; the project's typecheck and tests are the final check.\n**Status bar**: `[AFT E.. W.. | T..]` appears when a count changes. E above 0 usually means your last edit broke something; `?` means unknown, not zero.\n**Commands**: don't pipe test or build output into tail, grep or head; AFT already shortens it. Pass wait: true to wait for a long command; after the worker wait limit (bash.worker_wait_max_ms, 30 minutes by default) it reports the command is still running. A background command never wakes you: wait on it with bash_watch before you report, and never loop bash_status.\nAs a worker, keep changes within your assigned scope, verify them, and report the result to your parent.\n",
+        "item_digest": "586309e3165dac5a0d795c6f3b94df90bae1274c06970ddc0a206a1f072102f3",
+        "preflight_digest": "586309e3165dac5a0d795c6f3b94df90bae1274c06970ddc0a206a1f072102f3",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -6168,8 +6168,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "73d0a290aa26ca651afb96a34482c720b1bc087492555b6e04ef17af4905d930",
-      "catalog_digest": "73d0a290aa26ca651afb96a34482c720b1bc087492555b6e04ef17af4905d930",
+      "generation": "31f607caad910ad5e638f61e67ea4eb105b81c6e875cecf05890215dbe9e124d",
+      "catalog_digest": "31f607caad910ad5e638f61e67ea4eb105b81c6e875cecf05890215dbe9e124d",
       "tools": [
         {
           "name": "status",
@@ -7326,9 +7326,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent Foundational Toolkit\n\n**Finding code**: start with search; it takes concepts, identifiers, regex and literals. Then outline for structure, zoom for named symbols, read for line ranges. Don't find or read code with grep, find, sed or cat in bash.\n**Relationships**: callgraph for callers, impact, and execution or data-flow traces.\n**Web pages**: outline with a URL as target, then zoom on a heading.\n**Parallel calls**: send independent read-only calls in one response.\n**After edits**: run inspect for diagnostics; the project's typecheck and tests are the final check.\n**Status bar**: `[AFT E.. W.. | T..]` appears when a count changes. E above 0 usually means your last edit broke something; `?` means unknown, not zero.\n**Commands**: don't pipe test or build output into tail, grep or head; AFT already shortens it. Pass wait: true when you need a long command's result before anything else. Otherwise a long command moves to the background and a notice brings its result.\n",
-        "item_digest": "33a6b892bb91b52f8b97d0728085e86f129e77e8de183569f5747e432cbed2cc",
-        "preflight_digest": "33a6b892bb91b52f8b97d0728085e86f129e77e8de183569f5747e432cbed2cc",
+        "text": "# Agent Foundational Toolkit\n\n**Code exploration**: `search` is the primary code-search tool: one call auto-routes concepts, identifiers, regex, error strings, and literals. Then `outline` for structure → `zoom` for symbol(s). DO NOT run `grep`/`rg`/`find`/`sed`/`cat` through `bash` to locate or read code — the bash path is unindexed, unranked, serial, and routinely surfaces the wrong hit. Keep `bash` for shell facts (git state, file metadata, processes). If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use search (concepts, identifiers, regex, literals), read, outline, or zoom instead. Reflex translations:\n- `grep -rn \"handleAuth\" src/` in bash → `search({ query: \"handleAuth\" })`\n- `find . -name \"*.ts\" | xargs grep watcher` in bash → `search({ query: \"watcher invalidation\" })` (concepts work too)\n- `sed -n '100,160p' app.ts` / `cat app.ts` in bash → `read({ path: \"app.ts\", startLine: 100, endLine: 160 })`\n**Relationships**: callgraph for callers, impact, and execution or data-flow traces.\n**Web pages**: outline with a URL as target, then zoom on a heading.\n**Parallel calls**: send independent read-only calls in one response.\n**After edits**: run inspect for diagnostics; the project's typecheck and tests are the final check.\n**Status bar**: `[AFT E.. W.. | T..]` appears when a count changes. E above 0 usually means your last edit broke something; `?` means unknown, not zero.\n**Commands**: don't pipe test or build output into tail, grep or head; AFT already shortens it. Pass wait: true when you need a long command's result before anything else. Otherwise a long command moves to the background and a notice brings its result.\n",
+        "item_digest": "dbb7648f1557891c954ebe1b9181a56fbdccb18ed76d7e608029d077ddb1a4fe",
+        "preflight_digest": "dbb7648f1557891c954ebe1b9181a56fbdccb18ed76d7e608029d077ddb1a4fe",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -7371,8 +7371,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "3e24367d31fe785131d3f41d55ec219cff34378fa83fef7559bdd70f2fd52f77",
-      "catalog_digest": "3e24367d31fe785131d3f41d55ec219cff34378fa83fef7559bdd70f2fd52f77",
+      "generation": "d6c53aa22c6cf2fbf86a4f28aa122c892a3bfba589217da339273478227776fc",
+      "catalog_digest": "d6c53aa22c6cf2fbf86a4f28aa122c892a3bfba589217da339273478227776fc",
       "tools": [
         {
           "name": "status",
@@ -8603,9 +8603,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent Foundational Toolkit\n\n**Finding code**: start with search; it takes concepts, identifiers, regex and literals. Then outline for structure, zoom for named symbols, read for line ranges. Don't find or read code with grep, find, sed or cat in bash.\n**Relationships**: callgraph for callers, impact, and execution or data-flow traces.\n**Web pages**: outline with a URL as target, then zoom on a heading.\n**Parallel calls**: send independent read-only calls in one response.\n**After edits**: run inspect for diagnostics; the project's typecheck and tests are the final check.\n**Status bar**: `[AFT E.. W.. | T..]` appears when a count changes. E above 0 usually means your last edit broke something; `?` means unknown, not zero.\n**Commands**: don't pipe test or build output into tail, grep or head; AFT already shortens it. Pass wait: true when you need a long command's result before anything else. Otherwise a long command moves to the background and a notice brings its result.\n",
-        "item_digest": "33a6b892bb91b52f8b97d0728085e86f129e77e8de183569f5747e432cbed2cc",
-        "preflight_digest": "33a6b892bb91b52f8b97d0728085e86f129e77e8de183569f5747e432cbed2cc",
+        "text": "# Agent Foundational Toolkit\n\n**Code exploration**: `search` is the primary code-search tool: one call auto-routes concepts, identifiers, regex, error strings, and literals. Then `outline` for structure → `zoom` for symbol(s). DO NOT run `grep`/`rg`/`find`/`sed`/`cat` through `bash` to locate or read code — the bash path is unindexed, unranked, serial, and routinely surfaces the wrong hit. Keep `bash` for shell facts (git state, file metadata, processes). If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use search (concepts, identifiers, regex, literals), read, outline, or zoom instead. Reflex translations:\n- `grep -rn \"handleAuth\" src/` in bash → `search({ query: \"handleAuth\" })`\n- `find . -name \"*.ts\" | xargs grep watcher` in bash → `search({ query: \"watcher invalidation\" })` (concepts work too)\n- `sed -n '100,160p' app.ts` / `cat app.ts` in bash → `read({ path: \"app.ts\", startLine: 100, endLine: 160 })`\n**Relationships**: callgraph for callers, impact, and execution or data-flow traces.\n**Web pages**: outline with a URL as target, then zoom on a heading.\n**Parallel calls**: send independent read-only calls in one response.\n**After edits**: run inspect for diagnostics; the project's typecheck and tests are the final check.\n**Status bar**: `[AFT E.. W.. | T..]` appears when a count changes. E above 0 usually means your last edit broke something; `?` means unknown, not zero.\n**Commands**: don't pipe test or build output into tail, grep or head; AFT already shortens it. Pass wait: true when you need a long command's result before anything else. Otherwise a long command moves to the background and a notice brings its result.\n",
+        "item_digest": "dbb7648f1557891c954ebe1b9181a56fbdccb18ed76d7e608029d077ddb1a4fe",
+        "preflight_digest": "dbb7648f1557891c954ebe1b9181a56fbdccb18ed76d7e608029d077ddb1a4fe",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -8655,8 +8655,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "09a33cb022dd42772af20a2f71d1d73c66f1b272727b438df331254cb50115d1",
-      "catalog_digest": "09a33cb022dd42772af20a2f71d1d73c66f1b272727b438df331254cb50115d1",
+      "generation": "413ad3baf6484ec32ae63df39479397a4321159132b351699d91217795752401",
+      "catalog_digest": "413ad3baf6484ec32ae63df39479397a4321159132b351699d91217795752401",
       "tools": [
         {
           "name": "bash",
@@ -9733,9 +9733,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent Foundational Toolkit\n\n**Finding code**: start with aft_search; it takes concepts, identifiers, regex and literals. Then aft_outline for structure, aft_zoom for named symbols, read for line ranges. Don't find or read code with grep, find, sed or cat in bash.\n**Relationships**: aft_callgraph for callers, impact, and execution or data-flow traces.\n**Web pages**: aft_outline with a URL as target, then aft_zoom on a heading.\n**Parallel calls**: send independent read-only calls in one response.\n**After edits**: run aft_inspect for diagnostics; the project's typecheck and tests are the final check.\n**Status bar**: `[AFT E.. W.. | T..]` appears when a count changes. E above 0 usually means your last edit broke something; `?` means unknown, not zero.\n**Commands**: don't pipe test or build output into tail, grep or head; AFT already shortens it. Pass wait: true when you need a long command's result before anything else. Otherwise a long command moves to the background and a notice brings its result. Block on it with bash_watch only when nothing else is left, and never loop bash_status.\n",
-        "item_digest": "060f54fc57908493073f80687e2c3133dc86d010dfc9a652df32199b2f0e3969",
-        "preflight_digest": "060f54fc57908493073f80687e2c3133dc86d010dfc9a652df32199b2f0e3969",
+        "text": "# Agent Foundational Toolkit\n\n**Code exploration**: `aft_search` is the primary code-search tool: one call auto-routes concepts, identifiers, regex, error strings, and literals. Then `aft_outline` for structure → `aft_zoom` for symbol(s). DO NOT run `grep`/`rg`/`find`/`sed`/`cat` through `bash` to locate or read code — the bash path is unindexed, unranked, serial, and routinely surfaces the wrong hit. Keep `bash` for shell facts (git state, file metadata, processes). If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use aft_search (concepts, identifiers, regex, literals), read, aft_outline, or aft_zoom instead. Reflex translations:\n- `grep -rn \"handleAuth\" src/` in bash → `aft_search({ query: \"handleAuth\" })`\n- `find . -name \"*.ts\" | xargs grep watcher` in bash → `aft_search({ query: \"watcher invalidation\" })` (concepts work too)\n- `sed -n '100,160p' app.ts` / `cat app.ts` in bash → `read({ path: \"app.ts\", startLine: 100, endLine: 160 })`\n**Relationships**: aft_callgraph for callers, impact, and execution or data-flow traces.\n**Web pages**: aft_outline with a URL as target, then aft_zoom on a heading.\n**Parallel calls**: send independent read-only calls in one response.\n**After edits**: run aft_inspect for diagnostics; the project's typecheck and tests are the final check.\n**Status bar**: `[AFT E.. W.. | T..]` appears when a count changes. E above 0 usually means your last edit broke something; `?` means unknown, not zero.\n**Commands**: don't pipe test or build output into tail, grep or head; AFT already shortens it. Pass wait: true when you need a long command's result before anything else. Otherwise a long command moves to the background and a notice brings its result. Block on it with bash_watch only when nothing else is left, and never loop bash_status.\n",
+        "item_digest": "2113e12d31ee78eb515b59efdd631ebe5aae9ad334a9f813da90fe6eff60fbd8",
+        "preflight_digest": "2113e12d31ee78eb515b59efdd631ebe5aae9ad334a9f813da90fe6eff60fbd8",
         "tool_names": [
           "aft_callgraph",
           "aft_conflicts",
@@ -9782,8 +9782,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "fe29190a1fbd6bc7554d9aa14fbf5850d7e852752a855128e7b9d8259a4149a3",
-      "catalog_digest": "fe29190a1fbd6bc7554d9aa14fbf5850d7e852752a855128e7b9d8259a4149a3",
+      "generation": "cafb946fb29c080c242f3c9313805664d8de5ba6cf92f1516fc3637cc5fdd231",
+      "catalog_digest": "cafb946fb29c080c242f3c9313805664d8de5ba6cf92f1516fc3637cc5fdd231",
       "tools": [
         {
           "name": "bash",
@@ -10948,9 +10948,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent Foundational Toolkit\n\n**Finding code**: start with aft_search; it takes concepts, identifiers, regex and literals. Then aft_outline for structure, aft_zoom for named symbols, read for line ranges. Don't find or read code with grep, find, sed or cat in bash.\n**Relationships**: aft_callgraph for callers, impact, and execution or data-flow traces.\n**Web pages**: aft_outline with a URL as target, then aft_zoom on a heading.\n**Parallel calls**: send independent read-only calls in one response.\n**After edits**: run aft_inspect for diagnostics; the project's typecheck and tests are the final check.\n**Status bar**: `[AFT E.. W.. | T..]` appears when a count changes. E above 0 usually means your last edit broke something; `?` means unknown, not zero.\n**Commands**: don't pipe test or build output into tail, grep or head; AFT already shortens it. Pass wait: true when you need a long command's result before anything else. Otherwise a long command moves to the background and a notice brings its result. Block on it with bash_watch only when nothing else is left, and never loop bash_status.\n",
-        "item_digest": "060f54fc57908493073f80687e2c3133dc86d010dfc9a652df32199b2f0e3969",
-        "preflight_digest": "060f54fc57908493073f80687e2c3133dc86d010dfc9a652df32199b2f0e3969",
+        "text": "# Agent Foundational Toolkit\n\n**Code exploration**: `aft_search` is the primary code-search tool: one call auto-routes concepts, identifiers, regex, error strings, and literals. Then `aft_outline` for structure → `aft_zoom` for symbol(s). DO NOT run `grep`/`rg`/`find`/`sed`/`cat` through `bash` to locate or read code — the bash path is unindexed, unranked, serial, and routinely surfaces the wrong hit. Keep `bash` for shell facts (git state, file metadata, processes). If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use aft_search (concepts, identifiers, regex, literals), read, aft_outline, or aft_zoom instead. Reflex translations:\n- `grep -rn \"handleAuth\" src/` in bash → `aft_search({ query: \"handleAuth\" })`\n- `find . -name \"*.ts\" | xargs grep watcher` in bash → `aft_search({ query: \"watcher invalidation\" })` (concepts work too)\n- `sed -n '100,160p' app.ts` / `cat app.ts` in bash → `read({ path: \"app.ts\", startLine: 100, endLine: 160 })`\n**Relationships**: aft_callgraph for callers, impact, and execution or data-flow traces.\n**Web pages**: aft_outline with a URL as target, then aft_zoom on a heading.\n**Parallel calls**: send independent read-only calls in one response.\n**After edits**: run aft_inspect for diagnostics; the project's typecheck and tests are the final check.\n**Status bar**: `[AFT E.. W.. | T..]` appears when a count changes. E above 0 usually means your last edit broke something; `?` means unknown, not zero.\n**Commands**: don't pipe test or build output into tail, grep or head; AFT already shortens it. Pass wait: true when you need a long command's result before anything else. Otherwise a long command moves to the background and a notice brings its result. Block on it with bash_watch only when nothing else is left, and never loop bash_status.\n",
+        "item_digest": "2113e12d31ee78eb515b59efdd631ebe5aae9ad334a9f813da90fe6eff60fbd8",
+        "preflight_digest": "2113e12d31ee78eb515b59efdd631ebe5aae9ad334a9f813da90fe6eff60fbd8",
         "tool_names": [
           "aft_callgraph",
           "aft_conflicts",
@@ -11001,8 +11001,8 @@
       "hashline": true
     },
     "reply": {
-      "generation": "f35fd9c145b413ab88777e7f3c1607e0c408b1ffc9b1b87714cb049a46586fd4",
-      "catalog_digest": "f35fd9c145b413ab88777e7f3c1607e0c408b1ffc9b1b87714cb049a46586fd4",
+      "generation": "9fcd4b3cc0353aae51825982bc424a785059cc1af219c410114d7a2e809f1417",
+      "catalog_digest": "9fcd4b3cc0353aae51825982bc424a785059cc1af219c410114d7a2e809f1417",
       "tools": [
         {
           "name": "bash",
@@ -12113,9 +12113,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent Foundational Toolkit\n\n**Finding code**: start with aft_search; it takes concepts, identifiers, regex and literals. Then aft_outline for structure, aft_zoom for named symbols, read for line ranges. Don't find or read code with grep, find, sed or cat in bash.\n**Relationships**: aft_callgraph for callers, impact, and execution or data-flow traces.\n**Web pages**: aft_outline with a URL as target, then aft_zoom on a heading.\n**Parallel calls**: send independent read-only calls in one response.\n**After edits**: run aft_inspect for diagnostics; the project's typecheck and tests are the final check.\n**Status bar**: `[AFT E.. W.. | T..]` appears when a count changes. E above 0 usually means your last edit broke something; `?` means unknown, not zero.\n**Commands**: don't pipe test or build output into tail, grep or head; AFT already shortens it. Pass wait: true when you need a long command's result before anything else. Otherwise a long command moves to the background and a notice brings its result. Block on it with bash_watch only when nothing else is left, and never loop bash_status.\n**Hashline edit tags**: Only `read` (and accepted AFT `cat`/`head`/`tail` rewrites) mint hashline tags. `aft_zoom`, `aft_outline`, `grep`, `aft_search`, and conflict snippets do not. After navigation, call `read` on every file and range the patch addresses.\n",
-        "item_digest": "e3ad401b9ca5bb20cf3942ca1d6561178b284fcd2cd132a1815ac4b49ba65d67",
-        "preflight_digest": "e3ad401b9ca5bb20cf3942ca1d6561178b284fcd2cd132a1815ac4b49ba65d67",
+        "text": "# Agent Foundational Toolkit\n\n**Code exploration**: `aft_search` is the primary code-search tool: one call auto-routes concepts, identifiers, regex, error strings, and literals. Then `aft_outline` for structure → `aft_zoom` for symbol(s). DO NOT run `grep`/`rg`/`find`/`sed`/`cat` through `bash` to locate or read code — the bash path is unindexed, unranked, serial, and routinely surfaces the wrong hit. Keep `bash` for shell facts (git state, file metadata, processes). If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use aft_search (concepts, identifiers, regex, literals), read, aft_outline, or aft_zoom instead. Reflex translations:\n- `grep -rn \"handleAuth\" src/` in bash → `aft_search({ query: \"handleAuth\" })`\n- `find . -name \"*.ts\" | xargs grep watcher` in bash → `aft_search({ query: \"watcher invalidation\" })` (concepts work too)\n- `sed -n '100,160p' app.ts` / `cat app.ts` in bash → `read({ path: \"app.ts\", startLine: 100, endLine: 160 })`\n**Relationships**: aft_callgraph for callers, impact, and execution or data-flow traces.\n**Web pages**: aft_outline with a URL as target, then aft_zoom on a heading.\n**Parallel calls**: send independent read-only calls in one response.\n**After edits**: run aft_inspect for diagnostics; the project's typecheck and tests are the final check.\n**Status bar**: `[AFT E.. W.. | T..]` appears when a count changes. E above 0 usually means your last edit broke something; `?` means unknown, not zero.\n**Commands**: don't pipe test or build output into tail, grep or head; AFT already shortens it. Pass wait: true when you need a long command's result before anything else. Otherwise a long command moves to the background and a notice brings its result. Block on it with bash_watch only when nothing else is left, and never loop bash_status.\n**Hashline edit tags**: Only `read` (and accepted AFT `cat`/`head`/`tail` rewrites) mint hashline tags. `aft_zoom`, `aft_outline`, `grep`, `aft_search`, and conflict snippets do not. After navigation, call `read` on every file and range the patch addresses.\n",
+        "item_digest": "ba6c43e4da9ec81f063580b3e07df37d665c7ab935db8cce0218bf6c0cf52754",
+        "preflight_digest": "ba6c43e4da9ec81f063580b3e07df37d665c7ab935db8cce0218bf6c0cf52754",
         "tool_names": [
           "aft_callgraph",
           "aft_conflicts",

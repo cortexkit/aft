@@ -743,6 +743,8 @@ pub(crate) fn finish_tool_call_response(
     finalizer: Option<&FinalizeFn<'_>>,
     mut phase_trace: Option<&mut PhaseTrace>,
 ) -> ToolCallResult {
+    response.notices.route = format_context.runner_notice.clone();
+    crate::subc::runner_notices::notice_templates::deliver(&mut response, None);
     if surface_downgraded {
         attach_hashline_downgrade(&mut response);
     }
@@ -822,27 +824,40 @@ impl RepeatObservation {
         })
     }
 
-    /// Records the call and appends the breaker's reminder to `text` when the
-    /// call is a repeat worth steering.
+    /// Records the call and delivers a reminder when the call is a repeat
+    /// worth steering. Only standalone callers append it to the result text.
     ///
     /// `text` must be the rendered tool text before the status bar, alerts, and
     /// trailers are attached. Those decorations carry moving counts, so hashing
     /// afterward would make identical results appear different forever and
     /// silently prevent the breaker from firing.
-    pub(crate) fn observe(self, app_ctx: &AppContext, text: &mut String) {
+    pub(crate) fn observe(self, app_ctx: &AppContext, response: &mut Response, text: &mut String) {
         let output_hash = crate::response_finalize::repeat_breaker::output_hash(text);
         if let Some(intervention) =
             app_ctx
                 .repeat_breaker()
                 .observe(&self.session_id, &self.call, output_hash)
         {
+            let mut standalone = String::new();
             crate::response_finalize::append_repeat_breaker_reminder(
-                text,
+                &mut standalone,
                 &self.session_id,
                 &intervention,
                 self.worker_session,
                 self.bash_watch_available,
             );
+            let instruction = crate::response_finalize::repeat_instruction(
+                self.worker_session,
+                self.bash_watch_available,
+                crate::response_finalize::repeat_breaker::escalation_starts_at(intervention.count),
+            );
+            response.notices.items.push(crate::subc::runner_notices::notice_templates::Notice::template(
+                if intervention.outputs_identical { crate::subc::runner_notices::notice_templates::IDENTICAL } else { crate::subc::runner_notices::notice_templates::DRIFTING },
+                serde_json::json!({"count": intervention.count, "span": intervention.span.as_secs(), "instruction": instruction}),
+                standalone,
+                crate::subc::runner_notices::notice_templates::Target::Text,
+            ));
+            crate::subc::runner_notices::notice_templates::deliver(response, Some(text));
         }
     }
 }
@@ -1007,7 +1022,7 @@ pub fn run_tool_call(
     };
 
     if let Some(repeat) = repeat {
-        repeat.observe(app_ctx, &mut result.text);
+        repeat.observe(app_ctx, &mut result.response, &mut result.text);
     }
     // Finalize after hashing: the status bar the finalizer may append carries moving counts.
     if finalize_after_breaker {

@@ -57,11 +57,50 @@ pub(super) fn stamp_key(stamp: &ScopeStamp) -> (String, String, u64) {
     )
 }
 
+// The scope.watch contract bounds daemon tombstones by count, not time.
+// Keep local notification deduplication for ten minutes and at most 4,096 ends.
+const COMPLETED_END_TTL: Duration = Duration::from_secs(10 * 60);
+const COMPLETED_END_CAP: usize = 4_096;
+
+#[derive(Default)]
+struct CompletedEnds(std::collections::VecDeque<(scope_watch::Key, tokio::time::Instant)>);
+
+impl CompletedEnds {
+    fn contains(&mut self, key: &scope_watch::Key) -> bool {
+        let now = tokio::time::Instant::now();
+        while self
+            .0
+            .front()
+            .is_some_and(|(_, at)| now.duration_since(*at) >= COMPLETED_END_TTL)
+        {
+            self.0.pop_front();
+        }
+        self.0.iter().any(|(completed, _)| completed == key)
+    }
+
+    fn insert(&mut self, key: scope_watch::Key) {
+        if self.contains(&key) {
+            return;
+        }
+        if self.0.len() == COMPLETED_END_CAP {
+            self.0.pop_front();
+        }
+        // After eviction a duplicate may send a redundant notice, but lifecycle
+        // cleanup remains idempotent and cannot kill the ended task a second time.
+        self.0.push_back((key, tokio::time::Instant::now()));
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct ScopeDescribes {
     goodbye: mpsc::UnboundedSender<ScopeStamp>,
     routed: Arc<StdMutex<HashSet<(String, String, u64)>>>,
     observed: mpsc::UnboundedSender<ScopeStamp>,
+    #[cfg(test)]
+    iterations: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    completed: Arc<StdMutex<CompletedEnds>>,
+    bound: mpsc::UnboundedSender<ScopeStamp>,
 }
 
 pub(super) fn start_for_speech(
@@ -82,18 +121,32 @@ pub(super) fn start_for_speech(
         move || work_scopes(executor.clone(), watched_runs.clone()),
         Some(speech),
         Some(run_scopes),
+        crate::access_policy::prefrontal::catalog_updates(),
     )
 }
 impl ScopeDescribes {
     pub(super) fn routes(&self, routes: &HashMap<RouteChannel, RouteIdentity>) {
-        *self
-            .routed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = routes
+        let current: HashSet<_> = routes
             .values()
             .filter_map(|identity| identity.scope.as_ref())
             .map(stamp_key)
             .collect();
+        let mut routed = self
+            .routed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for stamp in routes
+            .values()
+            .filter_map(|identity| identity.scope.as_ref())
+        {
+            if stamp.owner_authorized
+                && crate::access_policy::prefrontal::is_principal(&stamp.owner)
+                && !routed.contains(&stamp_key(stamp))
+            {
+                let _ = self.bound.send(stamp.clone());
+            }
+        }
+        *routed = current;
     }
     pub(super) fn goodbye(&self, stamp: ScopeStamp) {
         let _ = self.goodbye.send(stamp);
@@ -104,6 +157,22 @@ pub(super) struct EndedScope {
     pub(super) stamp: ScopeStamp,
     pub(super) keys: Vec<crate::db::call_ledger::Key>,
 }
+
+fn trigger_describe(
+    key: scope_watch::Key,
+    stamp: ScopeStamp,
+    pending: &mut HashSet<scope_watch::Key>,
+    queued: &mut HashMap<scope_watch::Key, ScopeStamp>,
+    retrigger: &mut HashSet<scope_watch::Key>,
+) {
+    if pending.insert(key.clone()) {
+        queued.insert(key, stamp);
+    } else {
+        retrigger.insert(key);
+    }
+}
+type ScopeReference = (String, String);
+type ProbeGroup = Vec<(scope_watch::Key, ScopeStamp, bool)>;
 
 #[cfg(test)]
 #[allow(
@@ -127,6 +196,7 @@ pub(super) fn start(
         move || work_scopes(executor.clone(), watched_runs.clone()),
         None,
         Some(run_scopes),
+        tokio::sync::watch::channel(Vec::new()).1,
     )
 }
 
@@ -145,7 +215,22 @@ where
     F: Fn() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Vec<ScopeStamp>> + Send,
 {
-    start_with_scope_source_impl(control, executor, interval, scope_source, None, None)
+    start_with_scope_source_impl(
+        control,
+        executor,
+        interval,
+        move || {
+            let source = scope_source();
+            async move {
+                let mut inventory = scope_watch::Inventory::default();
+                inventory.add(scope_watch::Source::Shell, source.await);
+                inventory
+            }
+        },
+        None,
+        None,
+        tokio::sync::watch::channel(Vec::new()).1,
+    )
 }
 
 fn start_with_scope_source_impl<F, Fut>(
@@ -155,6 +240,7 @@ fn start_with_scope_source_impl<F, Fut>(
     scope_source: F,
     speech: Option<Arc<crate::gh_shim_speech::service::Service>>,
     run_scopes: Option<Arc<super::run_scope::RunScopes>>,
+    mut catalog: tokio::sync::watch::Receiver<Vec<String>>,
 ) -> (
     ScopeDescribes,
     mpsc::UnboundedReceiver<EndedScope>,
@@ -162,16 +248,25 @@ fn start_with_scope_source_impl<F, Fut>(
 )
 where
     F: Fn() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = Vec<ScopeStamp>> + Send,
+    Fut: std::future::Future<Output = scope_watch::Inventory> + Send,
 {
     let (goodbye, mut closes) = mpsc::unbounded_channel();
     let (observed, mut observations) = mpsc::unbounded_channel();
+    let (bound, mut bindings) = mpsc::unbounded_channel();
     let (ended, receiver) = mpsc::unbounded_channel();
     let routed = Arc::new(StdMutex::new(HashSet::new()));
+    let completed = Arc::new(StdMutex::new(CompletedEnds::default()));
+    #[cfg(test)]
+    let iterations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let handle = ScopeDescribes {
         goodbye,
         routed: routed.clone(),
         observed,
+        #[cfg(test)]
+        iterations: iterations.clone(),
+        #[cfg(test)]
+        completed: completed.clone(),
+        bound,
     };
     if let Some(service) = &speech {
         let sender = handle.observed.clone();
@@ -180,59 +275,232 @@ where
         }));
     }
     let worker = tokio::spawn(async move {
-        let mut grant_sweep =
-            Box::pin(access_grants::sweep::run(control.clone(), executor.clone()));
+        let (coverage, covered) = tokio::sync::watch::channel(scope_watch::Coverage::default());
+        let mut grant_sweep = Box::pin(access_grants::sweep::run(
+            control.clone(),
+            executor.clone(),
+            covered,
+            catalog.clone(),
+        ));
         if !control.advertises(subc_protocol::scope::SCOPE_DESCRIBE_OP) {
             grant_sweep.await;
             return;
         }
-        let mut queued = HashMap::new();
+        let mut queued: HashMap<scope_watch::Key, ScopeStamp> = HashMap::new();
         let mut retry = HashMap::new();
         let mut pending = HashSet::new();
+        let mut retrigger = HashSet::new();
+        let mut verification_keys = HashSet::new();
         let mut confirmed = HashSet::new();
+        let mut speech_pending = HashSet::new();
+        let mut cleanup_keys = HashSet::new();
         let mut next_poll: HashMap<_, tokio::time::Instant> = HashMap::new();
         // Only unix refreshes the set from secret proxy authorizations.
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut secret_authorizations: HashSet<(String, String, u64)> = HashSet::new();
         let mut inflight = tokio::task::JoinSet::new();
+        let mut inflight_jobs: HashMap<tokio::task::Id, (ScopeReference, ProbeGroup)> =
+            HashMap::new();
+        let mut inflight_refs: HashSet<ScopeReference> = HashSet::new();
         let mut fanout = tokio::task::JoinSet::new();
         let mut next_scan = tokio::time::Instant::now() + interval;
+        let mut next_backstop = tokio::time::Instant::now() + scope_watch::BACKSTOP;
+        let mut inventory = scope_watch::Inventory::default();
+        let mut inventory_revision = scope_watch::revisions();
+        let mut refresh = scope_watch::Refresh::new();
+        let mut verifications = scope_watch::Verifications::default();
+        let mut watches = scope_watch::Watches::new(control.metrics.clone());
+        let mut catalog_open = true;
+        let mut catalog_seen = HashSet::new();
         loop {
+            #[cfg(test)]
+            iterations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let changed = scope_watch::notifier().notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if scope_watch::revisions() != inventory_revision {
+                refresh.changed();
+            }
+            if refresh.due() {
+                inventory_revision = scope_watch::revisions();
+                let mut refreshed = scope_source().await;
+                refreshed.retain_unread(&inventory);
+                inventory = refreshed;
+                refresh.at = None;
+            }
+            let mut held_scopes = inventory.scopes();
+            for module_id in catalog.borrow_and_update().clone() {
+                if !catalog_seen.insert(module_id.clone()) {
+                    continue;
+                }
+                let owner = Principal::Reserved { module_id };
+                for stamp in held_scopes.values() {
+                    if let Some(other) = crate::access_policy::prefrontal::counterpart(stamp)
+                        .filter(|other| other.owner == owner)
+                    {
+                        crate::access_policy::prefrontal::log_continuation(
+                            stamp,
+                            &other,
+                            "catalog_reconcile",
+                        );
+                        trigger_describe(
+                            stamp_key(stamp),
+                            stamp.clone(),
+                            &mut pending,
+                            &mut queued,
+                            &mut retrigger,
+                        );
+                    }
+                }
+            }
+            speech_pending
+                .retain(|key| held_scopes.contains_key(key) || cleanup_keys.contains(key));
+            confirmed.retain(|key| {
+                held_scopes.contains_key(key)
+                    || cleanup_keys.contains(key)
+                    || speech_pending.contains(key)
+            });
+            next_poll.retain(|key, _| held_scopes.contains_key(key) && !confirmed.contains(key));
+            retry.retain(|key, _| held_scopes.contains_key(key) && !confirmed.contains(key));
+            retrigger.retain(|key| held_scopes.contains_key(key) && !confirmed.contains(key));
+            verification_keys
+                .retain(|key| held_scopes.contains_key(key) && !confirmed.contains(key));
+            queued.retain(|key, _| held_scopes.contains_key(key) && !confirmed.contains(key));
+            let active_keys: HashSet<_> = inflight_jobs
+                .values()
+                .flat_map(|(_, group)| group.iter().map(|(key, _, _)| key.clone()))
+                .collect();
+            pending.retain(|key| queued.contains_key(key) || active_keys.contains(key));
+            held_scopes.retain(|key, _| !confirmed.contains(key));
+            watches.reconcile(&held_scopes, &control, interval);
+            let protected = watches.coverage(held_scopes.len());
+            let protected_keys = &protected.keys;
+            verifications.reconcile(protected_keys, &held_scopes);
+            if let Some(key) = verifications.take_due() {
+                if let Some(stamp) = held_scopes.get(&key) {
+                    verification_keys.insert(key.clone());
+                    trigger_describe(
+                        key,
+                        stamp.clone(),
+                        &mut pending,
+                        &mut queued,
+                        &mut retrigger,
+                    );
+                }
+            }
+            watches.health.skipped_grant_rows = inventory.skipped[0];
+            watches.health.skipped_held_rows = inventory.skipped[1];
+            watches.health.poll_keys = next_poll.len();
+            watches.health.confirmed_cleanup = confirmed.len();
+            coverage.send_replace(protected.clone());
+            control
+                .metrics
+                .scope_descriptions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .watch_health(&watches.health);
+            #[cfg(feature = "test-timing-hooks")]
+            if let Some(path) = std::env::var_os("AFT_TEST_SCOPE_WATCH_HEALTH_FILE") {
+                let _ = std::fs::write(path, serde_json::to_vec(&watches.health).unwrap());
+            }
             while inflight.len() < 4 && !queued.is_empty() {
-                let key = queued.keys().next().cloned().unwrap();
+                let Some(key) = queued
+                    .keys()
+                    .find(|key| !inflight_refs.contains(&(key.0.clone(), key.1.clone())))
+                    .cloned()
+                else {
+                    break;
+                };
                 let stamp: ScopeStamp = queued.remove(&key).unwrap();
                 if confirmed.contains(&key) {
                     pending.remove(&key);
                     continue;
                 }
+                // scope.describe selects owner/ref, not an epoch. One answer
+                // confirms every retained epoch that existed when it was sent.
+                let reference = (key.0.clone(), key.1.clone());
+                inflight_refs.insert(reference.clone());
+                let mut group: HashMap<_, _> = held_scopes
+                    .iter()
+                    .filter(|(key, _)| (key.0.clone(), key.1.clone()) == reference)
+                    .map(|(key, stamp)| (key.clone(), stamp.clone()))
+                    .collect();
+                group.entry(key).or_insert(stamp.clone());
+                let group: Vec<_> = group
+                    .into_iter()
+                    .map(|(key, stamp)| {
+                        queued.remove(&key);
+                        pending.insert(key.clone());
+                        let full = inventory.sources[0].contains_key(&key)
+                            || inventory.sources[3].contains_key(&key);
+                        (key, stamp, full)
+                    })
+                    .collect();
+                if group
+                    .iter()
+                    .any(|(key, _, _)| verification_keys.contains(key))
+                {
+                    watches.health.verifications += 1;
+                    // One owner/ref probe also verifies its retained epochs.
+                    verifications.verified(group.iter().map(|(key, _, _)| key.clone()));
+                }
+                for (key, _, _) in &group {
+                    verification_keys.remove(key);
+                }
                 let control = control.clone();
+                let scope_catalog = catalog.clone();
+                // Persisted grants and held rows have only owner/ref/epoch,
+                // not a full speech authority stamp. Their ordinary cleanup
+                // still requires the daemon's definitive describe answer.
                 let speech = speech.clone();
-                inflight.spawn(async move {
+                let task_group = group.clone();
+                let job = inflight.spawn(async move {
                     let sent = std::time::Instant::now();
                     let generation = speech
                         .as_ref()
                         .map(|service| service.generation())
                         .unwrap_or_default();
                     let reply = control.describe(&stamp).await;
-                    control
-                        .metrics
-                        .scope_descriptions
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .record(&stamp, reply.as_ref().ok(), Instant::now());
-                    if let Some(service) = &speech {
-                        service.remember_probe(
-                            &stamp,
-                            &generation,
-                            sent,
-                            reply
-                                .as_ref()
-                                .map(Clone::clone)
-                                .map_err(ToString::to_string),
-                        );
+                    for (_, stamp, full) in &task_group {
+                        control
+                            .metrics
+                            .scope_descriptions
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .record(&stamp, reply.as_ref().ok(), Instant::now());
+                        if let Some(service) = speech.as_ref().filter(|_| *full) {
+                            service.remember_probe(
+                                &stamp,
+                                &generation,
+                                sent,
+                                reply
+                                    .as_ref()
+                                    .map(Clone::clone)
+                                    .map_err(ToString::to_string),
+                            );
+                        }
                     }
-                    (key, stamp, reply, generation)
+                    // Configuration can change while the original probe is in
+                    // flight, so consult the latest catalog after its answer.
+                    let probe_counterpart = reply.as_ref().is_ok_and(|reply| {
+                        describe_answer_ends_scope(reply)
+                            || crate::access_policy::prefrontal::retired(&stamp, reply)
+                    })
+                        && crate::access_policy::prefrontal::counterpart_in_catalog(
+                            &stamp,
+                            scope_catalog.borrow().as_slice(),
+                        );
+                    let counterpart_reply = if probe_counterpart {
+                        match crate::access_policy::prefrontal::counterpart(&stamp) {
+                            Some(other) => Some(control.describe(&other).await),
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                    (reply, generation, counterpart_reply)
                 });
+                inflight_jobs.insert(job.id(), (reference, group));
             }
             let routed_now = routed
                 .lock()
@@ -243,6 +511,7 @@ where
                 .filter(|(key, _)| {
                     !confirmed.contains(*key)
                         && !pending.contains(*key)
+                        && !protected_keys.contains(*key)
                         && (!routed_now.contains(*key)
                             || secret_authorizations.contains(*key)
                             || retry.contains_key(*key))
@@ -250,23 +519,80 @@ where
                 .map(|(_, due)| *due)
                 .min()
                 .map_or(next_scan, |due| due.min(next_scan));
+            let wake_at = if protected.all {
+                next_backstop
+            } else {
+                wake_at.min(next_backstop)
+            };
+            let wake_at = watches
+                .next_retry()
+                .map_or(wake_at, |retry| retry.min(wake_at));
+            let wake_at = verifications
+                .deadline()
+                .map_or(wake_at, |due| due.min(wake_at));
+            let wake_at = refresh.at.map_or(wake_at, |due| due.min(wake_at));
             tokio::select! {
+                () = &mut changed => { refresh.changed(); }
+                result = catalog.changed(), if catalog_open => {
+                    catalog_open = result.is_ok();
+                }
+                Some(stamp) = bindings.recv() => {
+                    if let Some(other) = crate::access_policy::prefrontal::counterpart(&stamp) {
+                        match rehome_shell_scopes(executor.clone(), other.clone(), stamp.clone()).await {
+                            Ok(count) => crate::access_policy::prefrontal::log_continuation(&other, &stamp, if count == 0 { "bind_no_tracked_tasks" } else { "bind_continuation" }),
+                            Err(error) => {
+                                crate::access_policy::prefrontal::log_continuation(&other, &stamp, "bind_hold_persistence_failed");
+                                log::warn!("prefrontal scope tracking rehome failed: {error}");
+                                trigger_describe(stamp_key(&other), other, &mut pending, &mut queued, &mut retrigger);
+                            }
+                        }
+                        refresh.immediate();
+                    }
+                }
+                Some(event) = watches.receiver.recv() => {
+                    for key in watches.event(event, held_scopes.len()) {
+                        if let Some(stamp) = held_scopes.get(&key) {
+                            if !confirmed.contains(&key) { trigger_describe(key, stamp.clone(), &mut pending, &mut queued, &mut retrigger); }
+                        }
+                    }
+                }
                 () = &mut grant_sweep => unreachable!("saved grant sweep runs until cancelled"),
                 Some(stamp)=observations.recv()=>{
-                    if let Some(service)=&speech { if confirmed.insert(stamp_key(&stamp)) {
+                    if completed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&stamp_key(&stamp)) { continue; }
+                    let other_configured = crate::access_policy::prefrontal::counterpart_in_catalog(&stamp, catalog.borrow().as_slice());
+                    if other_configured && !confirmed.contains(&stamp_key(&stamp)) {
+                        trigger_describe(stamp_key(&stamp), stamp, &mut pending, &mut queued, &mut retrigger);
+                        continue;
+                    }
+                    if let Some(service)=&speech { if speech_pending.remove(&stamp_key(&stamp)) || confirmed.insert(stamp_key(&stamp)) {
+                        let key = stamp_key(&stamp);
+                        cleanup_keys.insert(key.clone());
                         accept_confirmed_end(&executor, run_scopes.as_deref(), &control.metrics, &stamp);
                         let service=service.clone();
                         let executor=executor.clone();
                         let metrics=control.metrics.clone();
                         let notices=ended.clone();
-                        fanout.spawn(async move { finish_fenced_notice(executor, stamp.clone(), || service.store.scope_ended(&stamp), metrics, notices).await });
+                        fanout.spawn(async move { (key, finish_fenced_notice(executor, stamp.clone(), || service.store.scope_ended(&stamp), metrics, notices).await) });
                     } }
                 }
-                Some(Ok(Some(notice)))=fanout.join_next(), if !fanout.is_empty()=>{ let _=ended.send(notice); }
+                Some(Ok((key, notice)))=fanout.join_next(), if !fanout.is_empty()=>{
+                    // Only finished cleanup is deduplicated. Scopes waiting for
+                    // prefrontal's other owner to sync, or continuing under it,
+                    // have no completed end to record.
+                    completed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key.clone());
+                    cleanup_keys.remove(&key);
+                    if let Some(notice) = notice { let _=ended.send(notice); }
+                    refresh.immediate();
+                }
                 Some(stamp) = closes.recv() => {
                     // An idle route needs no RPC; parked consent asks still
                     // need a scope-end determination even without a process.
-                    let scopes = scope_source().await;
+                    inventory_revision = scope_watch::revisions();
+                    let mut current = scope_source().await;
+                    current.retain_unread(&inventory);
+                    inventory = current;
+                    refresh.at = None;
+                    let scopes: Vec<_> = inventory.scopes().into_values().collect();
                     let key = stamp_key(&stamp);
                     // Let the test daemon observe the exact Goodbye snapshot,
                     // including a close that found no registered shell task.
@@ -275,38 +601,114 @@ where
                         let matches = scopes.iter().filter(|live| stamp_key(live) == key).count();
                         let _ = std::fs::write(path, matches.to_string());
                     }
-                    if !confirmed.contains(&key) && scopes.iter().any(|live| stamp_key(live) == key) && pending.insert(key.clone()) {
+                    if !protected_keys.contains(&key) && !confirmed.contains(&key) && scopes.iter().any(|live| stamp_key(live) == key) {
                         #[cfg(feature = "test-timing-hooks")]
                         crate::slog_info!("scope diagnostic phase=goodbye_describe_queued scope_epoch={}", stamp.scope_epoch);
-                        queued.insert(key, stamp);
+                        trigger_describe(key, stamp, &mut pending, &mut queued, &mut retrigger);
                     }
                 }
                 _ = tokio::time::sleep_until(wake_at) => {
-                    let scopes = scope_source().await;
-                    #[cfg(unix)]
-                    {
-                        let executor = executor.clone();
-                        secret_authorizations = tokio::task::spawn_blocking(move || executor.actor_contexts().into_iter().flat_map(|ctx| ctx.bash_background().secret_authorization_scope_stamps()).map(|stamp| stamp_key(&stamp)).collect()).await.unwrap_or_default();
+                    if refresh.due() { continue; }
+                    if verifications.deadline().is_some_and(|due| due <= tokio::time::Instant::now()) { continue; }
+                    if tokio::time::Instant::now() >= next_backstop {
+                        let now = scope_watch::revisions();
+                        let mut refreshed = scope_source().await;
+                        refreshed.retain_unread(&inventory);
+                        watches.health.drift_repairs += refreshed.warn_drift(&inventory, inventory_revision, now);
+                        inventory = refreshed;
+                        inventory_revision = now;
+                        next_backstop = tokio::time::Instant::now() + scope_watch::BACKSTOP;
+                        continue;
                     }
-                    next_scan = tokio::time::Instant::now() + interval;
+                    let scan_due = tokio::time::Instant::now() >= next_scan;
+                    if scan_due {
+                        inventory_revision = scope_watch::revisions();
+                        let mut refreshed = scope_source().await;
+                        refreshed.retain_unread(&inventory);
+                        inventory = refreshed;
+                        #[cfg(unix)]
+                        {
+                            let executor = executor.clone();
+                            secret_authorizations = tokio::task::spawn_blocking(move || executor.actor_contexts().into_iter().flat_map(|ctx| ctx.bash_background().secret_authorization_scope_stamps()).map(|stamp| stamp_key(&stamp)).collect()).await.unwrap_or_default();
+                        }
+                        next_scan = tokio::time::Instant::now() + interval;
+                    }
+                    let scopes: Vec<_> = inventory.scopes().into_values().collect();
                     retry.retain(|key, _| scopes.iter().any(|stamp| &stamp_key(stamp) == key));
                     next_poll.retain(|key, _| scopes.iter().any(|stamp| &stamp_key(stamp) == key));
                     let routed = routed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
                     for stamp in scopes {
                         let key = stamp_key(&stamp);
-                        if !confirmed.contains(&key) && (!routed.contains(&key) || secret_authorizations.contains(&key) || retry.contains_key(&key))
-                            && next_poll.get(&key).is_none_or(|due| tokio::time::Instant::now() >= *due)
-                            && pending.insert(key.clone()) {
-                            queued.insert(key, stamp);
+                        if !protected_keys.contains(&key) && !confirmed.contains(&key) && !pending.contains(&key) && (!routed.contains(&key) || secret_authorizations.contains(&key) || retry.contains_key(&key))
+                            && next_poll.get(&key).map_or(scan_due, |due| tokio::time::Instant::now() >= *due) {
+                            // A per-scope deadline can precede the next inventory
+                            // scan. Consume it when queuing the probe so no past
+                            // deadline remains an immediately-ready timer.
+                            next_poll.remove(&key);
+                            trigger_describe(key, stamp, &mut pending, &mut queued, &mut retrigger);
                         }
                     }
                 }
-                Some(result) = inflight.join_next(), if !inflight.is_empty() => {
-                    if let Ok((key, stamp, reply,generation)) = result {
+                Some(result) = inflight.join_next_with_id(), if !inflight.is_empty() => {
+                    let (id, reply, generation, counterpart_reply) = match result {
+                        Ok((id, (reply, generation, counterpart_reply))) => (id, reply, generation, counterpart_reply),
+                        Err(error) => {
+                            log::warn!("scope.describe task failed; retaining scope state: {error}");
+                            (error.id(), Err(readiness::ControlError::Decode(error.to_string())), String::new(), None)
+                        }
+                    };
+                    if let Some((reference, group)) = inflight_jobs.remove(&id) {
+                        inflight_refs.remove(&reference);
+                        watches.health.descriptions += 1;
+                        for (key, stamp, full_stamp) in group {
+                        if let Ok(ModuleControlResponseToModule::ScopeDescribe { status: subc_protocol::scope::ScopeStatus::Live, scope_epoch: Some(epoch), .. }) = &reply {
+                            watches.rebind(&key, *epoch);
+                        }
                         // A Goodbye query can finish just before the connection's
                         // periodic tick. Wait a full interval after its answer
                         // before rechecking shell tasks with that owner/ref/epoch.
                         next_poll.insert(key.clone(), tokio::time::Instant::now() + interval);
+                        let ends = reply.as_ref().is_ok_and(|reply| describe_answer_ends_scope(reply) || crate::access_policy::prefrontal::retired(&stamp, reply));
+                        if ends {
+                            if let Some(other) = crate::access_policy::prefrontal::counterpart(&stamp) {
+                                let decision = match counterpart_reply.as_ref() {
+                                    Some(reply) => crate::access_policy::prefrontal::continuation(&other, reply.as_ref().ok()),
+                                    // No RPC was needed because the counterpart
+                                    // module was absent; an RPC error is Some(Err).
+                                    None => crate::access_policy::prefrontal::Continuation::Absent,
+                                };
+                                match decision {
+                                    crate::access_policy::prefrontal::Continuation::Live(live) => {
+                                        match rehome_shell_scopes(executor.clone(), stamp.clone(), live.clone()).await {
+                                            Ok(_) => {
+                                                crate::access_policy::prefrontal::log_continuation(&stamp, &live, "continuation");
+                                                retry.remove(&key);
+                                                retrigger.remove(&key);
+                                            }
+                                            Err(error) => {
+                                                crate::access_policy::prefrontal::log_continuation(&stamp, &live, "hold_persistence_failed");
+                                                log::warn!("prefrontal scope tracking rehome failed: {error}");
+                                                retry.insert(key.clone(), stamp.clone());
+                                                watches.fallback(&key, interval);
+                                            }
+                                        }
+                                        pending.remove(&key);
+                                        refresh.immediate();
+                                        continue;
+                                    }
+                                    crate::access_policy::prefrontal::Continuation::Hold => {
+                                        crate::access_policy::prefrontal::log_continuation(&stamp, &other, "hold");
+                                        retry.insert(key.clone(), stamp.clone());
+                                        watches.fallback(&key, interval);
+                                        pending.remove(&key);
+                                        continue;
+                                    }
+                                    crate::access_policy::prefrontal::Continuation::Absent => crate::access_policy::prefrontal::log_continuation(&stamp, &other, if counterpart_reply.is_none() { "absent_from_catalog" } else { "absent_end" }),
+                                }
+                            }
+                        } else if let Some(other) = crate::access_policy::prefrontal::counterpart(&stamp) {
+                            crate::access_policy::prefrontal::log_continuation(&stamp, &other, crate::access_policy::prefrontal::retained_outcome(reply.as_ref().ok()));
+                        }
                         #[cfg(unix)]
                         if reply.as_ref().is_ok_and(|answer| secret_authorization_rebound(&stamp, answer)) {
                             let executor = executor.clone();
@@ -315,46 +717,57 @@ where
                                 for ctx in executor.actor_contexts() { ctx.bash_background().revoke_secret_authorization(&described); }
                             }).await;
                         }
-                        if let Some(service)=&speech{
-                            if let Ok(reply)=&reply{
-                                let role=if stamp.attributes.run_id.is_some(){crate::gh_shim_speech::ScopeRole::Run}else{crate::gh_shim_speech::ScopeRole::Authority};
-                                match crate::gh_shim_speech::scope::validate_scope_identity(&stamp,role,reply,&service.generation(),&generation,crate::db::call_ledger::now_ms() as u64){
-                                     Ok(crate::gh_shim_speech::scope::Answer::Ended(proof))=>{
-                                        // Ordinary program authority must close before a speech
-                                        // store write can block, fail, or wait for its own retry.
-                                        if !confirmed.contains(&key) {
-                                            accept_confirmed_end(&executor, run_scopes.as_deref(), &control.metrics, &stamp);
-                                        }
-                                        if let Err(error)=service.record_end(&stamp,proof){
-                                            log::warn!("speech scope-end persistence failed scope_ref={:?} scope_epoch={} code={:?} reason={}", stamp.scope_ref, stamp.scope_epoch, error.code, error.reason);
-                                            control.metrics.scope_descriptions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).cleanup_result(&stamp, false);
-                                            kill_only(executor.clone(),&stamp).await;
-                                        }
-                                        retry.remove(&key);
-                                    },
-                                    Ok(crate::gh_shim_speech::scope::Answer::Live(_))=>{retry.remove(&key);},
-                                    Err(_)=>{retry.insert(key.clone(),stamp);},
-                                }
-                            }else{retry.insert(key.clone(),stamp);}
-                        }else if reply.as_ref().is_ok_and(describe_answer_ends_scope) {
+                        let strict_end = speech.as_ref().filter(|_| full_stamp).and_then(|service| {
+                            let role=if stamp.attributes.run_id.is_some(){crate::gh_shim_speech::ScopeRole::Run}else{crate::gh_shim_speech::ScopeRole::Authority};
+                            reply.as_ref().ok().and_then(|reply| match crate::gh_shim_speech::scope::validate_scope_identity(&stamp,role,reply,&service.generation(),&generation,crate::db::call_ledger::now_ms() as u64) {
+                                Ok(crate::gh_shim_speech::scope::Answer::Ended(proof)) => Some((service.clone(), proof)),
+                                _ => None,
+                            })
+                        });
+                        if ends {
                             #[cfg(feature = "test-timing-hooks")]
                             crate::slog_info!("scope diagnostic phase=describe_ended scope_epoch={}", stamp.scope_epoch);
                             if confirmed.insert(key.clone()) {
                                 accept_confirmed_end(&executor, run_scopes.as_deref(), &control.metrics, &stamp);
-                                let executor=executor.clone();
-                                let metrics=control.metrics.clone();
-                                let notices=ended.clone();
-                                fanout.spawn(async move { finish_confirmed_end(executor, stamp, metrics, notices).await });
+                                if strict_end.is_some() {
+                                    speech_pending.insert(key.clone());
+                                } else {
+                                    let executor=executor.clone();
+                                    let metrics=control.metrics.clone();
+                                    let notices=ended.clone();
+                                    let stamp=stamp.clone();
+                                    cleanup_keys.insert(key.clone());
+                                    let cleanup_key = key.clone();
+                                    fanout.spawn(async move { (cleanup_key, finish_confirmed_end(executor, stamp, metrics, notices).await) });
+                                }
                             }
                             retry.remove(&key);
                         } else if !matches!(reply, Ok(ModuleControlResponseToModule::ScopeDescribe { status: subc_protocol::scope::ScopeStatus::Live, .. })) {
-                            retry.insert(key.clone(), stamp);
+                            retry.insert(key.clone(), stamp.clone());
                         } else {
                             retry.remove(&key);
                         }
-                        // Non-definitive answers and errors retry only on the
-                        // regular poll, never in a reconnect-induced busy loop.
+                        // Exact speech proofs retain persistence-before-ledger
+                        // cleanup ordering. If a ref moved to a newer live
+                        // epoch, its old stamp cannot mint that proof; a later
+                        // definitive ref end still closes its ordinary state.
+                        if let Some((service, proof)) = strict_end {
+                                if let Err(error)=service.record_end(&stamp,proof){
+                                    log::warn!("speech scope-end persistence failed scope_ref={:?} scope_epoch={} code={:?} reason={}", stamp.scope_ref, stamp.scope_epoch, error.code, error.reason);
+                                    control.metrics.scope_descriptions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).cleanup_result(&stamp, false);
+                                    kill_only(executor.clone(),&stamp).await;
+                                }
+                        }
+                        if retry.contains_key(&key) { watches.fallback(&key, interval); }
                         pending.remove(&key);
+                        // A terminal push is sent only once. If it raced this
+                        // probe, a Live or failed answer may predate the end.
+                        if retrigger.remove(&key) && !confirmed.contains(&key) {
+                            if let Some(current) = held_scopes.get(&key) {
+                                trigger_describe(key, current.clone(), &mut pending, &mut queued, &mut retrigger);
+                            }
+                        }
+                        }
                     }
                 }
                 else => break,
@@ -395,18 +808,100 @@ async fn finish_fenced_notice(
 #[cfg(all(test, unix))]
 #[path = "scope_describe_speech_tests.rs"]
 mod speech_fanout_tests;
+#[cfg(test)]
+#[path = "scope_watch_tests.rs"]
+mod watch_tests;
 
 async fn work_scopes(
     executor: Arc<Executor>,
     run_scopes: Arc<super::run_scope::RunScopes>,
-) -> Vec<ScopeStamp> {
+) -> scope_watch::Inventory {
     tokio::task::spawn_blocking(move || {
-        let mut scopes: Vec<_> = executor
-            .actor_contexts()
-            .into_iter()
-            .flat_map(|ctx| ctx.bash_background().live_scope_stamps())
-            .collect();
-        scopes.extend(run_scopes.parked_scopes());
+        let mut scopes = scope_watch::Inventory::default();
+        scopes.add(
+            scope_watch::Source::Shell,
+            executor
+                .actor_contexts()
+                .into_iter()
+                .flat_map(|ctx| ctx.bash_background().live_scope_stamps())
+                .collect::<Vec<_>>(),
+        );
+        scopes.add(scope_watch::Source::Parked, run_scopes.parked_scopes());
+        let mut seen = HashSet::new();
+        for ctx in executor.actor_contexts() {
+            let Some(db) = ctx.db() else { continue };
+            if !seen.insert(Arc::as_ptr(&db)) {
+                continue;
+            }
+            let result = (|| -> Result<(), String> {
+                let conn = db
+                    .lock()
+                    .map_err(|_| "database lock poisoned".to_string())?;
+                match crate::db::access_grants::saved_scopes(&conn) {
+                    Ok(keys) => {
+                        for key in keys {
+                            match key
+                                .ok()
+                                .and_then(|key| access_grants::sweep::stamp(&key).ok())
+                            {
+                                Some(stamp) => scopes.add(scope_watch::Source::Grants, [stamp]),
+                                None => scopes.skipped[0] += 1,
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        scopes.failed.insert(1);
+                        log::warn!(
+                            "scope.watch selector census read failed source=grants: {error}"
+                        );
+                    }
+                }
+                let keys = match crate::db::call_ledger::unsettled_scopes(&conn) {
+                    Ok(keys) => keys,
+                    Err(error) => {
+                        scopes.failed.insert(2);
+                        log::warn!("scope.watch selector census read failed source=held: {error}");
+                        return Ok(());
+                    }
+                };
+                for key in keys {
+                    let Ok(key) = key else {
+                        scopes.skipped[1] += 1;
+                        continue;
+                    };
+                    let owner = match key.owner.as_str() {
+                        "direct" => subc_protocol::Principal::Direct,
+                        "unverified" => subc_protocol::Principal::Unverified,
+                        other => subc_protocol::Principal::Reserved {
+                            module_id: match other
+                                .strip_prefix("reserved:")
+                                .filter(|module| !module.is_empty())
+                            {
+                                Some(module) => module.into(),
+                                None => {
+                                    scopes.skipped[1] += 1;
+                                    continue;
+                                }
+                            },
+                        },
+                    };
+                    scopes.add(
+                        scope_watch::Source::Held,
+                        [ScopeStamp::new(
+                            owner,
+                            key.scope_ref,
+                            key.scope_epoch,
+                            subc_protocol::scope::ScopeKind::Worker,
+                        )],
+                    );
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                scopes.failed.extend([1, 2]);
+                log::warn!("scope.watch selector census read failed source=grants,held: {error}");
+            }
+        }
         scopes
     })
     .await
@@ -491,6 +986,25 @@ pub(crate) async fn confirm_secret_rebind_for_test(
     worker.abort();
 }
 
+async fn rehome_shell_scopes(
+    executor: Arc<Executor>,
+    from: ScopeStamp,
+    to: ScopeStamp,
+) -> Result<usize, String> {
+    tokio::task::spawn_blocking(move || {
+        let mut changed = 0;
+        for ctx in executor.actor_contexts() {
+            changed += ctx
+                .bash_background()
+                .rehome_scope(&from, &to)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(changed)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 fn fence_confirmed_end(executor: &Executor, stamp: &ScopeStamp) {
     for ctx in executor.actor_contexts() {
         ctx.bash_background().fence_scope_end(stamp);
@@ -540,7 +1054,16 @@ async fn finish_confirmed_end(
     if first.complete {
         return None;
     }
-    for delay in [1, 2, 4] {
+    // A confirmed end remains pending through temporary database failures.
+    // Cap retry delays at five seconds even when watch coverage is complete.
+    let mut attempt = 0u32;
+    loop {
+        let delay = match attempt {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            _ => 5,
+        };
         tokio::time::sleep(Duration::from_secs(delay)).await;
         let result = revoke(executor.clone(), &stamp).await;
         metrics
@@ -554,13 +1077,8 @@ async fn finish_confirmed_end(
                 keys: result.keys,
             });
         }
+        attempt = attempt.saturating_add(1);
     }
-    log::warn!(
-        "scope-ended cleanup remains fenced after bounded retries scope_ref={:?} scope_epoch={}",
-        stamp.scope_ref,
-        stamp.scope_epoch
-    );
-    None
 }
 
 struct ScopeRevokeResult {
@@ -573,6 +1091,8 @@ async fn revoke(executor: Arc<Executor>, stamp: &ScopeStamp) -> ScopeRevokeResul
     fence_confirmed_end(&executor, stamp);
     let mut keys = Vec::new();
     let mut complete = true;
+    #[cfg(unix)]
+    let mut pending_kills = Vec::new();
     for (root, _) in entries {
         #[cfg(feature = "test-timing-hooks")]
         let submitted_at = std::time::Instant::now();
@@ -609,7 +1129,7 @@ async fn revoke(executor: Arc<Executor>, stamp: &ScopeStamp) -> ScopeRevokeResul
                             // a policy, so older head policies cannot be reused after end.
                             if let Err(error) = crate::db::access_grants::end_scope_grants(
                                 &conn,
-                                &crate::db::access_grants::ScopeKey::from_stamp(&stamp),
+                                &crate::db::access_grants::ScopeKey::for_grants(&stamp),
                             ) {
                                 log::warn!("scope-ended grant revocation failed scope_ref={:?} scope_epoch={}: {error}", stamp.scope_ref, stamp.scope_epoch);
                                 failures.push(format!("grant revocation: {error}"));
@@ -681,6 +1201,19 @@ async fn revoke(executor: Arc<Executor>, stamp: &ScopeStamp) -> ScopeRevokeResul
                 Response::success("scope-ended-kill", json!({}))
             }),
         );
+        #[cfg(unix)]
+        pending_kills.push(kill);
+        #[cfg(not(unix))]
+        {
+            complete &= await_executor_response(kill, "scope-ended-kill".into())
+                .await
+                .success;
+        }
+    }
+    // Submit every root's kill before waiting: different actor lanes can
+    // give their command groups the grace period concurrently.
+    #[cfg(unix)]
+    for kill in pending_kills {
         complete &= await_executor_response(kill, "scope-ended-kill".into())
             .await
             .success;
@@ -1029,6 +1562,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn live_epoch_move_repolls_only_after_scope_poll_interval() {
         let interval = Duration::from_millis(500);
+        let started_at = tokio::time::Instant::now();
         let stamp = ScopeStamp::new(
             subc_protocol::Principal::Direct,
             "scope",
@@ -1079,7 +1613,12 @@ mod tests {
             tokio::task::yield_now().await;
         }
         let answered_at = tokio::time::Instant::now();
-        tokio::time::advance(interval - Duration::from_millis(1)).await;
+        assert_eq!(answered_at, started_at + Duration::from_millis(400));
+        tokio::time::advance(Duration::from_millis(100)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_millis(399)).await;
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
@@ -1096,19 +1635,62 @@ mod tests {
         tokio::time::advance(Duration::from_millis(1)).await;
         let repeated = frames.recv().await.unwrap();
         assert_eq!(tokio::time::Instant::now(), answered_at + interval);
+        assert_eq!(
+            tokio::time::Instant::now(),
+            started_at + Duration::from_millis(900)
+        );
         assert_eq!(repeated.header.ty, FrameType::Request);
         let body: serde_json::Value = serde_json::from_slice(&repeated.body).unwrap();
         assert_eq!(body["op"], "scope.describe");
         assert_eq!(body["ref"], stamp.scope_ref);
         assert_ne!(repeated.header.corr, first.header.corr);
         assert!(ended.try_recv().is_err());
+        let before = scopes.iterations.load(std::sync::atomic::Ordering::Relaxed);
+        tokio::time::advance(Duration::from_millis(99)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        let after = scopes.iterations.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after - before <= 16,
+            "scope loop spun before the next scan: {} iterations",
+            after - before
+        );
+        assert!(
+            frames.try_recv().is_err(),
+            "one due deadline queues one poll"
+        );
+        assert!(
+            ended.try_recv().is_err(),
+            "polling cannot establish scope end"
+        );
+        assert!(scopes.completed.lock().unwrap().0.is_empty());
         worker.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_scope_ends_expire_and_evict_oldest_at_capacity() {
+        let key = |i| ("direct".to_owned(), format!("scope-{i}"), 1);
+        let mut completed = CompletedEnds::default();
+        for i in 0..COMPLETED_END_CAP {
+            completed.insert(key(i));
+        }
+        assert!(completed.contains(&key(0)));
+        completed.insert(key(COMPLETED_END_CAP));
+        assert_eq!(completed.0.len(), COMPLETED_END_CAP);
+        assert!(!completed.contains(&key(0)));
+        assert!(completed.contains(&key(1)));
+        tokio::time::advance(COMPLETED_END_TTL).await;
+        assert!(!completed.contains(&key(1)));
+        assert!(completed.0.is_empty());
     }
 }
 
 async fn kill_only(executor: Arc<Executor>, stamp: &ScopeStamp) {
     // This fallback may wait behind actor work, but authority fencing must not.
     fence_confirmed_end(&executor, stamp);
+    #[cfg(unix)]
+    let mut pending_kills = Vec::new();
     for (root, _) in executor.actor_entries() {
         let stamp = stamp.clone();
         let job = executor.submit_async(
@@ -1120,6 +1702,13 @@ async fn kill_only(executor: Arc<Executor>, stamp: &ScopeStamp) {
                 Response::success("speech-end-safety-kill", json!({}))
             }),
         );
+        #[cfg(unix)]
+        pending_kills.push(job);
+        #[cfg(not(unix))]
+        let _ = await_executor_response(job, "speech-end-safety-kill".into()).await;
+    }
+    #[cfg(unix)]
+    for job in pending_kills {
         let _ = await_executor_response(job, "speech-end-safety-kill".into()).await;
     }
 }

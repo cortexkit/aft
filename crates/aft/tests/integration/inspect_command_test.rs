@@ -313,6 +313,7 @@ fn inspect_as_opencode(
             id: "inspect".into(),
             success: value["success"] == true,
             data: value,
+            notices: Default::default(),
         }
     })
     .data

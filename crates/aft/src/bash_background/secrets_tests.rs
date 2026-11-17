@@ -140,6 +140,118 @@ fn stamp(kind: &str) -> subc_protocol::scope::ScopeStamp {
     serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"secret-bash","kind":kind,"scope_epoch":1,"owner_authorized":true})).unwrap()
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn scope_watch_secret_proxy_arm_and_stop_notify_without_strict_execution() {
+    use crate::subc::scope_watch::{revision, Source};
+    use std::ffi::OsString;
+    use std::os::unix::process::CommandExt;
+    struct Session(std::process::Child);
+    impl Drop for Session {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path());
+    // No secret is released and no sandbox is resolved. A harmless session
+    // leader supplies only the process identity that proxy arming requires.
+    let mut child = std::process::Command::new("/bin/sleep");
+    child.arg("30");
+    unsafe {
+        child.pre_exec(|| {
+            if libc::setsid() < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let child = Session(child.spawn().unwrap());
+    let authorization = stamp("head");
+    let mut lifetime = stamp("ephemeral");
+    lifetime.scope_ref = "secret-bash-run".into();
+    let authorization_scope = crate::secret::SecretScope::from_stamp(&authorization);
+    let lifetime_scope = crate::secret::SecretScope::from_stamp(&lifetime);
+    let runtime = || {
+        let proxy = crate::secret_proxy::SecretProxy::start_for_test(
+            crate::secret_proxy::ProxyConfig {
+                vault: Vault::new(0),
+                authorization_scope: authorization_scope.clone(),
+                lifetime_scope: lifetime_scope.clone(),
+                scanned_labels: vec!["test".into()],
+                consent_context: None,
+                test_https_port: None,
+                approval_clock: None,
+                origin: "scope-watch-unit".into(),
+            },
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        )
+        .unwrap();
+        Arc::new(Mutex::new(Runtime {
+            proxy,
+            bundle: storage.path().join("unused-trust.pem"),
+            lifetime: lifetime_scope.clone(),
+            authorization: authorization_scope.clone(),
+            armed: false,
+        }))
+    };
+    let layout = crate::bash_background::persistence::allocate_task_layout(
+        storage.path(),
+        "scope-watch-unit",
+    )
+    .unwrap();
+    let environment = crate::sandbox_spawn::ChildEnvironment::from([(
+        OsString::from("SAFE"),
+        OsString::from("yes"),
+    )]);
+    let prepared = crate::sandbox_spawn::prepare_task_payload(
+        &layout,
+        b"true",
+        root.path(),
+        root.path(),
+        &crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+        Path::new("/bin/sh"),
+        &environment,
+    )
+    .unwrap();
+    prepared.set_secret_runtime(runtime());
+    let plan = crate::sandbox_spawn::SpawnPlan::Unsandboxed.with_prepared_task(prepared);
+    let registry = ctx.bash_background();
+    assert!(registry.secret_authorization_scope_stamps().is_empty());
+    let before_arm = revision(Source::Shell);
+    registry
+        .arm_secret_proxy(&plan, "scope-watch-unit", child.0.id())
+        .unwrap();
+    assert!(revision(Source::Shell) > before_arm);
+    assert_eq!(
+        registry.secret_authorization_scope_stamps(),
+        vec![authorization.clone()]
+    );
+    assert!(registry
+        .live_scope_stamps()
+        .iter()
+        .any(|scope| scope == &authorization));
+    let before_stop = revision(Source::Shell);
+    registry.stop_secret_proxy("scope-watch-unit");
+    assert!(revision(Source::Shell) > before_stop);
+    assert!(registry.secret_authorization_scope_stamps().is_empty());
+    assert!(registry.live_scope_stamps().is_empty());
+    plan.prepared_task().unwrap().set_secret_runtime(runtime());
+    registry
+        .arm_secret_proxy(&plan, "scope-watch-unit", child.0.id())
+        .unwrap();
+    let before_scope_end = revision(Source::Shell);
+    registry.kill_scope(&lifetime);
+    assert!(revision(Source::Shell) > before_scope_end);
+    assert!(registry.secret_authorization_scope_stamps().is_empty());
+    assert!(registry.live_scope_stamps().is_empty());
+}
+
 fn code(response: &Response) -> Option<&str> {
     response.data.get("code").and_then(|code| code.as_str())
 }

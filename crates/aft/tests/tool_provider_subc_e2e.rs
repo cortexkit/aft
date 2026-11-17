@@ -194,6 +194,238 @@ fn fixture_logs(directory: &Path) -> String {
     logs
 }
 
+#[cfg(all(
+    target_os = "linux",
+    feature = "test-scope-owner",
+    feature = "test-timing-hooks"
+))]
+#[tokio::test]
+#[ignore = "requires CK_SUBC_BIN pointing to a daemon that serves scope.watch"]
+async fn scope_watch_real_daemon_confirms_end_after_route_close_without_polling() {
+    scope_watch_daemon_case("CK_SUBC_BIN", true).await;
+}
+
+#[cfg(all(
+    target_os = "linux",
+    feature = "test-scope-owner",
+    feature = "test-timing-hooks"
+))]
+#[tokio::test]
+#[ignore = "requires the pinned v0.21.3 archive via AFT_TEST_SUBC_CORE_BINARY"]
+async fn scope_watch_pinned_daemon_keeps_polling_and_confirms_end() {
+    scope_watch_daemon_case("AFT_TEST_SUBC_CORE_BINARY", false).await;
+}
+
+#[cfg(all(
+    target_os = "linux",
+    feature = "test-scope-owner",
+    feature = "test-timing-hooks"
+))]
+async fn scope_watch_daemon_case(binary_env: &str, expect_watch: bool) {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    use subc_client_rs::CloseRouteOptions;
+    struct ChildDaemon(std::process::Child);
+    impl Drop for ChildDaemon {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+            }
+            let _ = self.0.wait();
+        }
+    }
+    fn record(directory: &Path) -> Option<Value> {
+        for entry in std::fs::read_dir(directory).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(record) = record(&path) {
+                    return Some(record);
+                }
+            } else if path.file_name().and_then(|name| name.to_str()) == Some("metadata.json") {
+                if let Ok(bytes) = std::fs::read(path) {
+                    if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                        if value["session_id"] == "scope-watch-daemon" {
+                            return Some(value);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+    async fn health_at(path: &Path, expected: impl Fn(&Value) -> bool) -> Value {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Ok(health) = serde_json::from_slice::<Value>(&bytes) {
+                    if expected(&health) {
+                        return health;
+                    }
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "scope lifecycle health did not reach the expected state: {:?}",
+                std::fs::read_to_string(path)
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+    let binary = PathBuf::from(
+        std::env::var_os(binary_env).unwrap_or_else(|| panic!("provide {binary_env}")),
+    );
+    let binary = crate::test_helpers::executable_cache::cached_executable_named(
+        &std::fs::read(binary).unwrap(),
+        "ckdev-subc",
+    )
+    .unwrap();
+    let (_temp, home, project) = hermetic_home();
+    let health_file = home.join("watch-health.json");
+    let config_path = home.join("config/cortexkit/subc.jsonc");
+    let mut config: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["port"] = json!(0);
+    config["modules"]["aft"]["env"]["AFT_TEST_SCOPE_POLL_MS"] = json!("100");
+    config["modules"]["aft"]["env"]["AFT_TEST_SCOPE_WATCH_HEALTH_FILE"] = json!(health_file);
+    config["modules"]["aft-test-scope-owner"]["env"]["AFT_TEST_SCOPE_WATCH_END"] = json!("1");
+    std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let mut daemon = ChildDaemon(
+        Command::new(binary)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("HOME", home.join("home"))
+            .env("XDG_RUNTIME_DIR", home.join("runtime"))
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("XDG_DATA_HOME", home.join("data"))
+            .env("XDG_STATE_HOME", home.join("state"))
+            .env("XDG_CACHE_HOME", home.join("cache"))
+            .env("TMPDIR", home.join("tmp"))
+            .env("SUBC_PORT", "0")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(
+                std::fs::File::create(home.join("daemon.stderr")).unwrap(),
+            ))
+            .spawn()
+            .expect("start isolated fixture daemon"),
+    );
+    let connection = home.join("runtime/subc-connection.json");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !connection.exists() {
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "daemon exited: {}",
+            fixture_logs(&home)
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "daemon startup deadline: {}",
+            fixture_logs(&home)
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let consumer = SubcConsumer::connect(&connection, ConsumerOptions::default())
+        .await
+        .unwrap();
+    if !expect_watch {
+        assert_eq!(
+            consumer
+                .server_describe()
+                .await
+                .unwrap()
+                .build_git_sha
+                .as_deref(),
+            Some("b86f6d159cd7286e5edd3baa9b9671cdd9d73f7a")
+        );
+    }
+    let route = open(
+        &consumer,
+        &project,
+        "scope-watch-daemon",
+        Some(&[("tool-provider", "v1")]),
+    )
+    .await
+    .unwrap();
+    // PTY launches hand back a task id even to a direct consumer, leaving a
+    // running task to monitor after the consumer closes its route.
+    let reply = request(&consumer, &route, json!({"name":"bash", "arguments":{"command":"sleep 120", "background":true, "pty":true, "timeout":150000}})).await
+        .unwrap_or_else(|error| panic!("background bash request: {error}; fixture logs:\n{}", fixture_logs(&home)));
+    let reply: Value = serde_json::from_slice(&reply).unwrap();
+    assert_ne!(reply["isError"], true, "bash launch refused: {reply}");
+    let initial = health_at(&health_file, |health| {
+        if expect_watch {
+            health["descriptions"] == 1 && health["watched"] == 1 && health["polled"] == 0
+        } else {
+            health["opens"] == 0
+                && health["polled"] == 1
+                && health["fallbacks"].as_u64().unwrap_or(0) >= 1
+        }
+    })
+    .await;
+    let initial_descriptions = initial["descriptions"].as_u64().unwrap();
+    if !expect_watch {
+        assert!(initial["fallbacks"].as_u64().unwrap() >= 1);
+    }
+    consumer
+        .close_handle(&route, CloseRouteOptions::default())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(5500)).await;
+    let before_end = health_at(&health_file, |health| {
+        if expect_watch {
+            health["descriptions"] == 1 && health["watched"] == 1
+        } else {
+            health["opens"] == 0
+                && health["polled"] == 1
+                && health["descriptions"].as_u64().unwrap_or(0) > initial_descriptions
+        }
+    })
+    .await;
+    let before_end_descriptions = before_end["descriptions"].as_u64().unwrap();
+    if expect_watch {
+        assert_eq!(
+            before_end_descriptions, 1,
+            "route close and 55 fallback intervals must not poll a healthy watch"
+        );
+    }
+    assert_eq!(
+        record(&home).expect("background task metadata")["status"],
+        "running"
+    );
+    std::fs::write(home.join("scope-owner.end"), b"end").unwrap();
+    let final_health = health_at(&health_file, |health| {
+        health["watched"] == 0
+            && health["polled"] == 0
+            && if expect_watch {
+                health["descriptions"] == 2
+            } else {
+                health["descriptions"].as_u64().unwrap_or(0) > before_end_descriptions
+            }
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let task = record(&home).expect("background task metadata");
+        if task["status"] == "killed" {
+            assert_eq!(task["status_reason"], "scope_revoked");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "confirmed scope did not kill its task: {task}; {}",
+            fixture_logs(&home)
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    if expect_watch {
+        assert_eq!(final_health["descriptions"], 2);
+        println!("real daemon scope.watch: 1 initial describe; 0 describes across route close and 55 fallback intervals; 1 confirming describe for the end; killed (scope revoked)");
+    } else {
+        println!("pinned daemon scope.watch fallback: initial describes={initial_descriptions}; describes after route close and 55 intervals={before_end_descriptions}; after confirmed end={}; watches opened=0; killed (scope revoked)", final_health["descriptions"]);
+    }
+    consumer.close().await;
+}
+
 async fn wait_for_scope_owner(project: &Path) {
     let ready = project.parent().unwrap().join("scope-owner.ready");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -682,9 +914,30 @@ async fn tool_provider_subc_e2e_scope_without_workdir_uses_filled_legacy_root() 
 }
 
 #[cfg(all(target_os = "linux", feature = "test-scope-owner"))]
+fn notice_fixture_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+#[cfg(all(target_os = "linux", feature = "test-scope-owner"))]
+fn assert_ordered_completion_expiry(params: &Value, fixture_started_at: u64) {
+    let expires_at = params["expires_at_ms"]
+        .as_u64()
+        .expect("ordered completion expiry");
+    assert!(
+        (fixture_started_at + 86_400_000..=notice_fixture_now_ms() + 86_400_000)
+            .contains(&expires_at),
+        "a newly completed fixture task expires 24 hours after it finished: {params}"
+    );
+}
+
+#[cfg(all(target_os = "linux", feature = "test-scope-owner"))]
 #[tokio::test]
 #[ignore = "opt-in real-daemon runner transport; Linux only, needs test-scope-owner"]
 async fn runner_notice_real_daemon_scoped_carrier_authority() {
+    let fixture_started_at = notice_fixture_now_ms();
     let (_temp, home, _project) = hermetic_home();
     let config_path = home.join("config/cortexkit/subc.jsonc");
     let mut config: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
@@ -743,7 +996,7 @@ async fn runner_notice_real_daemon_scoped_carrier_authority() {
     assert_eq!(body["params"]["send_id"], "aft:bash:notice-allowed");
     assert_eq!(body["params"]["notice"], true);
     assert_eq!(body["params"]["dedupe_key"], "aft:bash-task:notice-allowed");
-    assert!(body["params"].get("expires_at_ms").is_none());
+    assert_ordered_completion_expiry(&body["params"], fixture_started_at);
     let log = std::fs::read_to_string(home.join("runner-transport.log")).unwrap();
     let refusals: Vec<_> = log
         .lines()
@@ -768,6 +1021,7 @@ async fn runner_notice_real_daemon_scoped_carrier_authority() {
 #[tokio::test]
 #[ignore = "opt-in real-daemon runner transport; Linux only, needs test-scope-owner"]
 async fn runner_notice_real_daemon_recovers_concrete_harnesses_without_model() {
+    let fixture_started_at = notice_fixture_now_ms();
     let (_temp, home, _project) = hermetic_home();
     let config_path = home.join("config/cortexkit/subc.jsonc");
     let mut config: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
@@ -836,13 +1090,15 @@ async fn runner_notice_real_daemon_recovers_concrete_harnesses_without_model() {
                 "send_id",
                 "notice",
                 "delivery",
-                "dedupe_key"
+                "dedupe_key",
+                "expires_at_ms"
             ])
         );
         assert_eq!(
             record["request"]["params"]["dedupe_key"],
             format!("aft:bash-task:{task}")
         );
+        assert_ordered_completion_expiry(&record["request"]["params"], fixture_started_at);
         let delivered = format!("INFO runner notice aft:bash:{task} delivered to {module} harness={harness} session={task}");
         assert_eq!(
             log.lines().filter(|line| *line == delivered).count(),

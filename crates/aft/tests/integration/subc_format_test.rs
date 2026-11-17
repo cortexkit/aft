@@ -157,6 +157,7 @@ fn response_from_flattened(value: Value) -> Response {
         id,
         success,
         data: Value::Object(data),
+        notices: Default::default(),
     }
 }
 
@@ -266,6 +267,7 @@ fn inspect_phase_failed_text_preserves_failure_details_and_retry_guidance() {
             "failure_detail": "metrics did not complete",
             "text": "request failed"
         }),
+        notices: Default::default(),
     };
 
     let text = format_response_with_context("inspect", &response, &FormatContext::default());
@@ -290,6 +292,7 @@ fn inspect_interrupted_text_names_the_terminal_and_safe_retry() {
             "completed_phases": [{"id": "lsp_quiescence"}],
             "text": "request failed"
         }),
+        notices: Default::default(),
     };
 
     let text = format_response_with_context("inspect", &response, &FormatContext::default());
@@ -312,6 +315,7 @@ fn inspect_deadline_details_use_plain_language_not_phase_ids() {
             "failure_detail": "request deadline elapsed during lsp_quiescence",
             "completed_phases": [{"id": "lsp_start"}]
         }),
+        notices: Default::default(),
     };
     let text = format_response_with_context("inspect", &response, &FormatContext::default());
     assert_eq!(text, "PHASE-FAILED — inspect could not complete: request deadline elapsed during waiting for language servers (waiting for language servers timeout). Retry aft_inspect, or narrow the scope.");

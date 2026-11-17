@@ -4373,6 +4373,7 @@ async fn conformance_inventory(subject: Subject) {
         "tool_result_v1_valid",
         "tool_result_legacy_route_unchanged",
         "catalog_schemas_portable",
+        "catalog_notice_templates",
     ] {
         assert_eq!(report.outcome(case), Some(&CaseOutcome::Passed));
         eprintln!(

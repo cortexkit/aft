@@ -419,7 +419,7 @@ fn catalog_inner(
     // A head previews the requested plan without a saved worker policy. Actual
     // workers render their frozen plan, including on a paramless refetch.
     // Head-preset catalogs use the user setting; workers cannot borrow it.
-    let runon_enabled = ctx.config().bash.runon_enabled;
+    let remote_enabled = ctx.config().remote_exec.enabled;
     let project_off = ctx.config().remote_exec.project_off;
     let preview = routing_policy
         .as_ref()
@@ -428,7 +428,7 @@ fn catalog_inner(
         ctx,
         identity,
         catalog_preset.name(),
-        runon_enabled,
+        remote_enabled,
         project_off,
         preview,
     );
@@ -491,13 +491,13 @@ fn catalog_inner(
     };
     crate::log_ctx::with_session(Some(identity.session.clone()), || {
         crate::slog_info!(
-            "catalog runon: session={:?} preset={} remote_exec_param={} key={} bind={} runon_enabled={} project_off={} bash_in_catalog={} offered={} first_failed={}",
+            "catalog runon: session={:?} preset={} remote_exec_param={} key={} bind={} remote_exec={} project_off={} bash_in_catalog={} offered={} first_failed={}",
             identity.session,
             catalog_preset.name(),
             remote_exec_param,
             policy_key(identity, Some(&preset)).err().unwrap_or("complete"),
             if matches!(identity.trust, BindTrust::FirstParty) { "first_party" } else { "other" },
-            runon_enabled,
+            remote_enabled,
             project_off,
             bash_in_catalog,
             served_runon.is_ok(),
@@ -560,18 +560,18 @@ fn catalog_runon_policy(
     ctx: &AppContext,
     identity: &RouteIdentity,
     preset: &str,
-    runon_enabled: bool,
+    remote_enabled: bool,
     project_off: bool,
     preview: Option<&crate::exec_remote::FrozenParams>,
 ) -> Result<(), &'static str> {
     if !cfg!(unix) {
         return Err("platform");
     }
-    if !runon_enabled {
-        return Err("runon_enabled");
-    }
     if project_off {
         return Err("project_off");
+    }
+    if !remote_enabled {
+        return Err("remote_exec");
     }
     if !matches!(identity.trust, BindTrust::FirstParty) {
         return Err("bind");

@@ -1,0 +1,11 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "note": "Post-0.66 batch 16 is non-ranking. Bash hints and runner notice templates live under their existing owning modules, so the diff against main changes no RANKING_FENCE_PREFIXES path. Tool-call parity response initializers remain covered by the existing harness fixtures; no ranking or count difference is authorized."
+}

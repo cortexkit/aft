@@ -286,6 +286,7 @@ pub async fn runner_notice_transport_for_test(
 }
 pub(crate) mod scope_background_tasks;
 mod scope_describe;
+pub(crate) mod scope_watch;
 mod shells;
 #[cfg(test)]
 mod stack_budget_tests;
@@ -1354,8 +1355,7 @@ pub(super) fn trust_for_principal(principal: &Option<Principal>) -> BindTrust {
             if module_id == "llm-runner"
                 || module_id == "aft"
                 || module_id == "broca"
-                || module_id == "prefrontal"
-                || module_id == "prefrontal-core" =>
+                || crate::access_policy::prefrontal::is_module(module_id) =>
         {
             BindTrust::FirstParty
         }
@@ -4019,6 +4019,7 @@ fn sync_bg_live_delivery_sessions(
             );
         }
         if let Some(ctx) = executor.actor_context(&root) {
+            sync_callgraph_refresh_policy(&ctx, routes, &root);
             if let Some(metrics) = metrics {
                 metrics.mark_frame_loop_wait_for_root(
                     "bash.live_delivery_sessions",
@@ -4030,6 +4031,27 @@ fn sync_bg_live_delivery_sessions(
                 .replace_live_delivery_sessions(sessions.clone());
         }
     }
+}
+
+/// Recompute from installed routes so adding or removing a non-worker route
+/// changes the checkout's maintenance policy without rebinding the checkout.
+fn sync_callgraph_refresh_policy(
+    ctx: &AppContext,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    root: &ProjectRootId,
+) {
+    let mut bound = routes
+        .values()
+        .filter(|identity| &identity.root == root)
+        .peekable();
+    let worker_only = bound.peek().is_some()
+        && bound.all(|identity| {
+            identity
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.kind == subc_protocol::scope::ScopeKind::Worker)
+        });
+    ctx.set_worker_only_routes(worker_only);
 }
 
 fn insert_bg_subscription_index(
@@ -6059,7 +6081,7 @@ where
                             break Err(error);
                         }
                     }
-                    FrameType::Response | FrameType::Error if frame.header.channel == 0 => {
+                    FrameType::Response | FrameType::Error | FrameType::StreamData | FrameType::StreamEnd if frame.header.channel == 0 => {
                         // Replies to AFT's own channel-0 requests (readiness).
                         let corr = frame.header.corr;
                         let ty = frame.header.ty;
@@ -11981,6 +12003,9 @@ async fn handle_tool_call_with_capabilities(
     );
 
     let request_id = format!("subc-{}-{}", frame.header.channel, frame.header.corr);
+    format_context.runner_notice =
+        runner_notices::code_search_notice(&identity, call_key.as_deref().unwrap_or(&request_id))
+            .map(|notice| notice.with_preset(role));
     // Pin the response ID only for the fixture's exact probe inputs. Other
     // calls and frame correlation keep their ordinary identities; all native
     // handlers, formatters and wire rendering still run unchanged.
@@ -19350,6 +19375,55 @@ mod tests {
     /// principal entirely for non-fed harnesses would satisfy both. Pin the
     /// delegation itself: on a normal harness the verdict must still come from
     /// the principal, in both directions.
+    #[test]
+    fn worker_only_route_refresh_policy_tracks_installed_scopes_and_standing_roots() {
+        let (_dir, root) = test_root("worker-refresh-policy");
+        let ctx = test_ctx();
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let mut routes = HashMap::new();
+        let mut root_channels = HashMap::new();
+        let scoped = |kind: &str| {
+            let mut route = test_support::route_identity(&root, "refresh-policy");
+            Arc::get_mut(&mut route.0).unwrap().scope = Some(
+                serde_json::from_value(json!({
+                    "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+                    "ref": kind, "scope_epoch": 1, "kind": kind, "owner_authorized": true
+                }))
+                .unwrap(),
+            );
+            route
+        };
+        let worker = route_key(51, 1);
+        let head = route_key(52, 1);
+        insert_route_channel(&mut routes, &mut root_channels, worker, scoped("worker"));
+        sync_bg_live_delivery_sessions(&executor, &routes, Some(&root), None);
+        assert!(!ctx.background_callgraph_refresh_allowed());
+        insert_route_channel(&mut routes, &mut root_channels, head, scoped("head"));
+        sync_bg_live_delivery_sessions(&executor, &routes, Some(&root), None);
+        assert!(ctx.background_callgraph_refresh_allowed());
+        remove_route_channel(&mut routes, &mut root_channels, head);
+        sync_bg_live_delivery_sessions(&executor, &routes, Some(&root), None);
+        assert!(!ctx.background_callgraph_refresh_allowed());
+
+        ctx.set_standing_artifact_exempt(true);
+        assert!(ctx.background_callgraph_refresh_allowed());
+        ctx.set_standing_artifact_exempt(false);
+        assert!(!ctx.background_callgraph_refresh_allowed());
+        insert_route_channel(
+            &mut routes,
+            &mut root_channels,
+            head,
+            test_support::route_identity(&root, "unscoped"),
+        );
+        sync_bg_live_delivery_sessions(&executor, &routes, Some(&root), None);
+        assert!(ctx.background_callgraph_refresh_allowed());
+        remove_route_channel(&mut routes, &mut root_channels, worker);
+        remove_route_channel(&mut routes, &mut root_channels, head);
+        sync_bg_live_delivery_sessions(&executor, &routes, Some(&root), None);
+        assert!(ctx.background_callgraph_refresh_allowed());
+    }
+
     /// Installed routes drive semantic admission: an OpenCode route opens its
     /// root until the session's last route on it is removed, and a runner
     /// (sidekick) route never opens one.

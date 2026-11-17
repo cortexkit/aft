@@ -156,6 +156,7 @@ pub struct ScopeKey {
 }
 
 impl ScopeKey {
+    /// Exact wire identity for callers that also use this shape for history.
     pub fn from_stamp(stamp: &subc_protocol::scope::ScopeStamp) -> Self {
         Self {
             owner: serde_json::to_string(&stamp.owner).expect("scope owner serializes"),
@@ -164,9 +165,20 @@ impl ScopeKey {
         }
     }
 
+    /// Storage identity shared by grants, their scope registrations and roles.
+    pub fn for_grants(stamp: &subc_protocol::scope::ScopeStamp) -> Self {
+        Self {
+            owner: crate::access_policy::prefrontal::grant_owner_key(&stamp.owner),
+            scope_ref: stamp.scope_ref.clone(),
+            epoch: stamp.scope_epoch,
+        }
+    }
+
     pub fn from_policy(key: &PolicyKey) -> Self {
         Self {
-            owner: key.owner.clone(),
+            owner: serde_json::from_str(&key.owner)
+                .map(|owner| crate::access_policy::prefrontal::grant_owner_key(&owner))
+                .unwrap_or_else(|_| key.owner.clone()),
             scope_ref: key.scope_ref.clone(),
             epoch: key.epoch,
         }
@@ -397,11 +409,12 @@ pub fn insert_with_source(
          grant_id=coalesce(access_grants.grant_id,excluded.grant_id),
          mode=CASE WHEN excluded.mode='write' THEN 'write' ELSE access_grants.mode END",
         params![key.owner,key.scope_ref,key.epoch.to_string(),canonical.to_string_lossy(),match grant.kind {GrantKind::File=>"file",GrantKind::Subtree=>"subtree"},match grant.operation {AccessOperation::Read=>"read",AccessOperation::Write=>"write"},super::access_grant_rows::new_grant_id(),super::access_grant_rows::now_ms(),card_ref,source.map(|source| source.as_str())])?;
+    crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Grants);
     Ok(())
 }
 
 pub fn revoke(conn: &Connection, key: &ScopeKey, path: &Path) -> rusqlite::Result<usize> {
-    conn.execute(
+    let deleted = conn.execute(
         "DELETE FROM access_grants WHERE owner=?1 AND scope_ref=?2 AND epoch=?3 AND path=?4",
         params![
             key.owner,
@@ -409,7 +422,9 @@ pub fn revoke(conn: &Connection, key: &ScopeKey, path: &Path) -> rusqlite::Resul
             key.epoch.to_string(),
             path.to_string_lossy()
         ],
-    )
+    )?;
+    crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Grants);
+    Ok(deleted)
 }
 
 /// Whether `key` still holds a saved grant for exactly `path`, of any kind or
@@ -453,7 +468,32 @@ pub fn end_scope_grants(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<(
     }
     crate::db::remote_exec::forget_scope(&tx, &key.owner, &key.scope_ref, key.epoch)?;
     crate::db::catalog_edit_modes::forget_scope(&tx, &key.owner, &key.scope_ref, key.epoch)?;
-    tx.commit()
+    tx.commit()?;
+    crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Grants);
+    Ok(())
+}
+
+/// Preserve per-row decoding errors so one corrupt row cannot hide other saved
+/// scopes from the lifecycle census.
+pub(crate) fn saved_scopes(conn: &Connection) -> rusqlite::Result<Vec<rusqlite::Result<ScopeKey>>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT owner,scope_ref,epoch FROM access_grants")?;
+    let rows = stmt
+        .query_map([], |row| {
+            let epoch: String = row.get(2)?;
+            Ok(ScopeKey {
+                owner: row.get(0)?,
+                scope_ref: row.get(1)?,
+                epoch: epoch.parse().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+            })
+        })?
+        .collect();
+    Ok(rows)
 }
 
 /// Keyset pagination bounds housekeeping work, not a tool's result list.
@@ -507,6 +547,7 @@ pub(crate) fn end_saved_scope(conn: &Connection, key: &ScopeKey) -> rusqlite::Re
         params![key.owner, key.scope_ref, key.epoch.to_string()],
     )?;
     tx.commit()?;
+    crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Grants);
     Ok(deleted)
 }
 
@@ -544,7 +585,9 @@ pub fn materialize(
     tx.execute("INSERT OR IGNORE INTO access_launch_params(project_root,harness,session,principal,owner,scope_ref,epoch,preset,params) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
         params![key.project_root,key.harness,key.session,key.principal,key.owner,key.scope_ref,key.epoch.to_string(),key.preset,raw.to_string()])?;
     materialize_on(&tx, &scope, grants)?;
-    tx.commit()
+    tx.commit()?;
+    crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Grants);
+    Ok(())
 }
 
 fn materialize_on(
@@ -666,6 +709,128 @@ pub fn restore_launch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefrontal_rename_grants_share_one_key_and_revoke_in_both_directions() {
+        use crate::db::access_grant_rows::{self, GrantSource};
+        use subc_protocol::{scope::ScopeStamp, Principal};
+
+        let stamp = |module: &str| -> ScopeStamp {
+            serde_json::from_value(serde_json::json!({
+                "owner":{"kind":"reserved","module_id":module},
+                "ref":"rename-head","scope_epoch":7,"kind":"head","owner_authorized":true
+            }))
+            .unwrap()
+        };
+        let snapshot = |conn: &Connection| -> Vec<String> {
+            [
+                "SELECT json_group_array(json_array(owner,scope_ref,epoch,path,kind,mode,grant_id,granted_at_ms,card_ref,source)) FROM access_grants",
+                "SELECT json_group_array(json_array(owner,scope_ref,epoch,parent_owner,parent,parent_epoch,config,ended)) FROM access_scopes",
+                "SELECT json_group_array(json_array(owner,scope_ref,epoch,agent_id,kind)) FROM access_scope_agents",
+                "SELECT json_group_array(json_array(owner,scope_ref,epoch,mode)) FROM access_modes",
+            ].into_iter().map(|sql| conn.query_row(sql, [], |row| row.get(0)).unwrap()).collect()
+        };
+        for (saved, caller) in [
+            ("prefrontal-core", "prefrontal"),
+            ("prefrontal", "prefrontal-core"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+            let saved = ScopeKey::for_grants(&stamp(saved));
+            let caller = ScopeKey::for_grants(&stamp(caller));
+            assert_eq!(saved, caller);
+            let policy = PolicyKey {
+                project_root: dir.path().display().to_string(),
+                harness: "test".into(),
+                session: "head".into(),
+                principal: "reserved:broca".into(),
+                owner: serde_json::to_string(&stamp("prefrontal").owner).unwrap(),
+                scope_ref: caller.scope_ref.clone(),
+                epoch: caller.epoch,
+                preset: "worker".into(),
+            };
+            assert_eq!(ScopeKey::from_policy(&policy), saved);
+            assert!(
+                policy.owner.contains("\"prefrontal\""),
+                "policy history keeps its wire owner"
+            );
+            assert_eq!(
+                saved.owner,
+                r#"{"kind":"reserved","module_id":"prefrontal-core"}"#
+            );
+            register_scope(&conn, &saved, None, &Config::default()).unwrap();
+            register_agent(&conn, &saved, "rename-agent", true).unwrap();
+            set_mode(&conn, &saved, crate::access_policy::ApprovalMode::Ask).unwrap();
+            let grant = AccessGrant {
+                path: crate::access_policy::policy_path(dir.path()).join("approved"),
+                kind: GrantKind::Subtree,
+                operation: AccessOperation::Read,
+            };
+            insert_with_source(
+                &conn,
+                &saved,
+                &grant,
+                Some("card-rename"),
+                Some(GrantSource::Person),
+            )
+            .unwrap();
+            let before = snapshot(&conn);
+            assert_eq!(list(&conn, &caller).unwrap(), [grant.clone()]);
+            assert!(holds(&conn, &caller, &grant.path).unwrap());
+            assert!(person_grant_covers(&conn, &caller, &grant).unwrap());
+            assert!(is_head(&conn, &caller).unwrap());
+            assert!(authorized(&conn, &caller, &saved).unwrap());
+            assert_eq!(
+                mode(&conn, &caller).unwrap(),
+                crate::access_policy::ApprovalMode::Ask
+            );
+            assert_eq!(
+                head_policy_scope(&conn, &caller).unwrap(),
+                Some(saved.clone())
+            );
+            let rows = access_grant_rows::live_rows(&conn).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                access_grant_rows::holder_for_scope(&conn, &caller).unwrap(),
+                Some(rows[0].holder.clone())
+            );
+            insert_with_source(
+                &conn,
+                &caller,
+                &grant,
+                Some("card-rename"),
+                Some(GrantSource::Person),
+            )
+            .unwrap();
+            assert_eq!(
+                snapshot(&conn),
+                before,
+                "lookups and duplicate grants must not rewrite stored bytes"
+            );
+
+            let other = ScopeKey::for_grants(&stamp("other"));
+            assert!(list(&conn, &other).unwrap().is_empty());
+            assert!(!holds(&conn, &other, &grant.path).unwrap());
+            assert!(!authorized(&conn, &other, &saved).unwrap());
+            assert_eq!(revoke(&conn, &other, &grant.path).unwrap(), 0);
+            assert_eq!(revoke(&conn, &caller, &grant.path).unwrap(), 1);
+            assert!(!holds(&conn, &saved, &grant.path).unwrap());
+            assert!(list(&conn, &saved).unwrap().is_empty());
+            insert(&conn, &saved, &grant).unwrap();
+            let id = access_grant_rows::live_rows(&conn).unwrap()[0]
+                .grant_id
+                .clone();
+            assert!(access_grant_rows::revoke_live(&conn, &id)
+                .unwrap()
+                .is_some());
+            assert!(list(&conn, &caller).unwrap().is_empty());
+            assert_eq!(crate::db::current_schema_version(&conn).unwrap(), 29);
+            assert_eq!(
+                crate::access_policy::prefrontal::grant_owner_key(&Principal::Direct),
+                r#"{"kind":"direct"}"#
+            );
+        }
+    }
 
     #[test]
     fn grants_head_policy_orders_unsigned_epochs_without_signed_casts() {

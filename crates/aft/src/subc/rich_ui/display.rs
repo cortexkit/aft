@@ -16,6 +16,10 @@ use cortexkit_role_tool_display::{
 use serde_json::{json, Value};
 use subc_protocol::Principal;
 
+pub(super) mod counters;
+mod diagnostics;
+use counters::{count, Counter::*};
+
 struct Writer {
     outbox: Mutex<Outbox>,
     wake: tokio::sync::mpsc::Sender<()>,
@@ -84,6 +88,31 @@ pub(crate) fn enabled() -> bool {
     SENDER.get().is_some()
 }
 
+// Module-mode publication is on by default, with an explicit opt-out.
+fn display_switch() -> Result<(), &'static str> {
+    match std::env::var("AFT_TOOL_DISPLAY").as_deref() {
+        Ok("0") => Err("opt_out"),
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn health() -> Value {
+    let enabled = SENDER.get().is_some();
+    let reason = if enabled {
+        None
+    } else if let Err(reason) = display_switch() {
+        Some(reason)
+    } else if std::env::var("SUBC_MODULE_ID").as_deref() != Ok("aft") {
+        Some("not_module")
+    } else if crate::launch_nonce::consumer_identity().is_none() {
+        Some("consumer_identity_missing")
+    } else {
+        Some("not_started")
+    };
+    json!({"enabled": enabled, "reason": reason, "last_error": diagnostics::health(), "zero_counters_omitted": true,
+        "counters": counters::snapshot()})
+}
+
 pub(in crate::subc) fn register(
     ledger_key: &crate::db::call_ledger::Key,
     route: &crate::subc::RouteIdentity,
@@ -93,14 +122,21 @@ pub(in crate::subc) fn register(
     // origin-only, keyless forward is display-free until it has durable
     // display-attempt retention independent of execution replay.
     if call.call_key.is_none() {
+        count(RegisterNoCallKey);
         return;
     }
-    if !enabled()
-        || !matches!(
-            call.name.as_str(),
-            "bash" | "edit" | "write" | "apply_patch"
-        )
-    {
+    if !enabled() {
+        count(RegisterDisabled);
+        if display_switch().is_err() {
+            count(RegisterOptOut);
+        }
+        return;
+    }
+    if !matches!(
+        call.name.as_str(),
+        "bash" | "edit" | "write" | "apply_patch"
+    ) {
+        count(RegisterUnsupportedTool);
         return;
     }
     let crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind {
@@ -108,16 +144,19 @@ pub(in crate::subc) fn register(
         ..
     } = &route.spawn_principal
     else {
+        count(RegisterUnattested);
         return;
     };
     // Plugin routes are direct/unverified. The harness name is not evidence:
     // an attested runner can legitimately use the same harness as a plugin.
     let Some(module_id) = principal.strip_prefix("reserved:") else {
+        count(RegisterNotReserved);
         return;
     };
     // Basal's inner program calls are not runner tool calls. Only an explicit
     // origin can associate one with a runner's transcript call.
     if (module_id == "basal" || route.run_owner.is_some()) && call.origin.is_none() {
+        count(RegisterInnerCall);
         return;
     }
     let (runner, call_key, pin) = if let Some(origin) = &call.origin {
@@ -136,14 +175,19 @@ pub(in crate::subc) fn register(
         )
     };
     let (Some(call_key), Some(schema_pin)) = (call_key, pin) else {
+        count(RegisterMissingIdentity);
         return;
     };
-    if subc_protocol::tool_call::validate_call_key(&call_key).is_err()
-        || subc_protocol::tool_call::validate_schema_pin(&schema_pin).is_err()
-    {
+    if subc_protocol::tool_call::validate_call_key(&call_key).is_err() {
+        count(RegisterInvalidCallKey);
+        return;
+    }
+    if subc_protocol::tool_call::validate_schema_pin(&schema_pin).is_err() {
+        count(RegisterInvalidPin);
         return;
     }
     if crate::subc::tool_views::view(&schema_pin).is_none() {
+        count(RegisterUnknownView);
         return;
     }
     let identity = Identity {
@@ -154,9 +198,15 @@ pub(in crate::subc) fn register(
     if let Ok(mut calls) = CALLS.lock() {
         calls.retain(|_, capture| capture.try_lock().map_or(true, |capture| !capture.finished));
         if calls.len() >= 64 {
+            count(RegisterCallCap);
+            return;
+        }
+        if calls.contains_key(&key(ledger_key)) {
+            count(RegisterExisting);
             return;
         }
         calls.entry(key(ledger_key)).or_insert_with(|| {
+            count(Registered);
             Arc::new(Mutex::new(Capture {
                 identity,
                 capture_key: key(ledger_key),
@@ -178,6 +228,8 @@ pub(in crate::subc) fn register(
                 completion_claimed: false,
             }))
         });
+    } else {
+        count(RegisterLock);
     }
 }
 
@@ -398,10 +450,12 @@ fn file_bodies(capture: &Capture, success: bool) -> (Value, Option<Value>) {
 
 fn emit(capture: &Capture, kind: DisplayKind, body: Value) {
     let Some(view) = crate::subc::tool_views::view(&capture.identity.schema_pin) else {
+        count(EmitUnknownView);
         return;
     };
     let schema = view.record_schema;
     let Some(map) = body.as_object() else {
+        count(EmitNotObject);
         return;
     };
     let valid = match kind {
@@ -410,6 +464,11 @@ fn emit(capture: &Capture, kind: DisplayKind, body: Value) {
         _ => cortexkit_role_tool_display::schema::validate_detail(map),
     };
     if valid.is_err() {
+        count(match kind {
+            DisplayKind::Record => EmitInvalidRecord,
+            DisplayKind::Completion => EmitInvalidCompletion,
+            _ => EmitInvalidDetail,
+        });
         return;
     }
     #[cfg(test)]
@@ -425,17 +484,18 @@ fn emit(capture: &Capture, kind: DisplayKind, body: Value) {
             false
         }
     }) {
+        count(Emitted);
         return;
     }
     let Some(writer) = SENDER.get() else {
+        count(EmitNoSender);
         return;
     };
-    if !enqueue_snapshot(writer, capture.identity.clone(), kind, body) {
-        DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if enqueue_snapshot(writer, capture.identity.clone(), kind, body) {
+        count(Emitted);
     }
 }
 
-static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn enqueue_snapshot(
     writer: &Writer,
     identity: Identity,
@@ -443,10 +503,12 @@ fn enqueue_snapshot(
     mut body: Value,
 ) -> bool {
     let Ok(limits) = writer.limits.try_lock() else {
+        count(EnqueueLimitsLock);
         return false;
     };
     if kind == DisplayKind::Detail {
         let Some(cut) = records::cut_detail(body, limits.max_detail_bytes as usize) else {
+            count(EnqueueDetailTooLarge);
             return false;
         };
         body = cut;
@@ -457,9 +519,14 @@ fn enqueue_snapshot(
         if admitted {
             crate::late_result_bus::display_committed();
         }
-        let _ = writer.wake.try_send(());
+        match writer.wake.try_send(()) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => count(WakeCoalesced),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => count(WakeClosed),
+        }
         admitted
     } else {
+        count(EnqueueOutboxLock);
         false
     }
 }
@@ -643,12 +710,16 @@ pub(crate) fn reply(
 }
 
 pub(crate) fn start(connection_file: PathBuf) {
-    if std::env::var("AFT_TOOL_DISPLAY").as_deref() != Ok("1") {
+    if display_switch().is_err() {
+        count(StartDisabled);
         return;
     }
-    if std::env::var("SUBC_MODULE_ID").as_deref() != Ok("aft")
-        || crate::launch_nonce::consumer_identity().is_none()
-    {
+    if std::env::var("SUBC_MODULE_ID").as_deref() != Ok("aft") {
+        count(StartNotModule);
+        return;
+    }
+    if crate::launch_nonce::consumer_identity().is_none() {
+        count(StartNoIdentity);
         return;
     }
     let (wake, receiver) = tokio::sync::mpsc::channel(1);
@@ -660,9 +731,11 @@ pub(crate) fn start(connection_file: PathBuf) {
         })
         .is_err()
     {
+        count(StartExisting);
         return;
     }
     tokio::spawn(send_loop(connection_file, receiver));
+    count(Started);
 }
 
 async fn send_loop(connection_file: PathBuf, mut receiver: tokio::sync::mpsc::Receiver<()>) {
@@ -672,14 +745,21 @@ async fn send_loop(connection_file: PathBuf, mut receiver: tokio::sync::mpsc::Re
     let mut consumer = None;
     loop {
         tokio::select! {
-            _ = receiver.recv() => {},
+            wake = receiver.recv() => {
+                if wake.is_none() {
+                    count(WriterStopped);
+                    return;
+                }
+            },
             _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {},
         }
-        let entry = writer
-            .outbox
-            .lock()
-            .ok()
-            .and_then(|mut outbox| outbox.pop_due(Instant::now()));
+        let entry = match writer.outbox.lock() {
+            Ok(mut outbox) => outbox.pop_due(Instant::now()),
+            Err(_) => {
+                count(WriterOutboxLock);
+                continue;
+            }
+        };
         let Some(entry) = entry else {
             continue;
         };
@@ -688,19 +768,42 @@ async fn send_loop(connection_file: PathBuf, mut receiver: tokio::sync::mpsc::Re
                 call_timeout: std::time::Duration::from_secs(5),
                 ..Default::default()
             };
-            consumer = SubcConsumer::connect(&connection_file, options).await.ok();
+            match SubcConsumer::connect(&connection_file, options).await {
+                Ok(client) => consumer = Some(client),
+                Err(_) => count(WriterConnect),
+            }
         }
         let mut retry = true;
         if let Some(client) = consumer.as_ref() {
             // Resolution includes warming modules and refuses ambiguity. Resolve
             // again for every attempt, even when a prior route was usable.
-            if let Some(module_id) = client
-                .catalog_list()
-                .await
-                .ok()
-                .and_then(|catalog| declared_display(&catalog.modules))
-            {
-                if let Ok(route) = client
+            let module_id = match client.catalog_list().await {
+                Ok(catalog) => {
+                    let display = declared_display(&catalog.modules);
+                    if display.is_none() {
+                        let present = catalog.modules.iter().any(|module| {
+                            module.capabilities.as_ref().is_some_and(|caps| {
+                                caps.provides.iter().any(|capability| {
+                                    capability
+                                        == cortexkit_role_tool_display::TOOL_DISPLAY_CAPABILITY
+                                })
+                            })
+                        });
+                        count(if present {
+                            WriterAmbiguousDisplay
+                        } else {
+                            WriterNoDisplay
+                        });
+                    }
+                    display
+                }
+                Err(_) => {
+                    count(WriterCatalog);
+                    None
+                }
+            };
+            if let Some(module_id) = module_id {
+                match client
                     .open_route(
                         subc_protocol::RouteTarget::ToolProvider { module_id },
                         BindIdentity::new("aft", "tool-display"),
@@ -708,71 +811,117 @@ async fn send_loop(connection_file: PathBuf, mut receiver: tokio::sync::mpsc::Re
                     )
                     .await
                 {
-                    let description = client
-                        .request(
-                            &route,
-                            br#"{"name":"role.describe","arguments":{}}"#.to_vec(),
-                            CallOptions::default(),
-                        )
-                        .await;
-                    let limits = description
-                        .ok()
-                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                        .and_then(|value| value.get("tool_display").cloned())
-                        .and_then(|value| {
-                            serde_json::from_value::<cortexkit_role_tool_display::DisplayLimits>(
-                                value,
+                    Ok(route) => {
+                        let description = client
+                            .request(
+                                &route,
+                                br#"{"name":"role.describe","arguments":{}}"#.to_vec(),
+                                CallOptions::default(),
                             )
-                            .ok()
-                        })
-                        .filter(|limits| limits.validate().is_ok());
-                    if let Some(limits) = limits {
-                        if let Ok(mut cached) = writer.limits.lock() {
-                            *cached = limits.clone();
-                        }
-                        // An admitted body cannot be rebuilt for a smaller store.
-                        // Lose that optional kind rather than change its first bytes.
-                        if entry.body.len() as u64 <= limits.max_bytes(&entry.kind).unwrap_or(0) {
-                            match client
-                                .request(&route, entry.frame.clone(), CallOptions::default())
-                                .await
-                            {
-                                Ok(bytes) => {
-                                    retry = retry_reply(&bytes);
-                                }
-                                Err(subc_client_rs::CallError::Module(error)) => {
-                                    retry = error.code == "module_warming";
-                                }
-                                Err(_) => {}
+                            .await;
+                        let limits = match description {
+                            Ok(bytes) => display_limits(&bytes),
+                            Err(_) => {
+                                count(WriterDescribe);
+                                None
                             }
-                        } else {
-                            retry = false;
+                        };
+                        if let Some(limits) = limits {
+                            if let Ok(mut cached) = writer.limits.lock() {
+                                *cached = limits.clone();
+                            } else {
+                                count(WriterLimitsLock);
+                            }
+                            // An admitted body cannot be rebuilt for a smaller store.
+                            // Lose that optional kind rather than change its first bytes.
+                            if entry.body.len() as u64 <= limits.max_bytes(&entry.kind).unwrap_or(0)
+                            {
+                                match client
+                                    .request(&route, entry.frame.clone(), CallOptions::default())
+                                    .await
+                                {
+                                    Ok(bytes) => {
+                                        retry = retry_reply(&bytes);
+                                    }
+                                    Err(subc_client_rs::CallError::Module(error)) => {
+                                        retry = error.code == "module_warming";
+                                        count(if retry {
+                                            WriterModuleWarming
+                                        } else {
+                                            WriterModuleRefused
+                                        });
+                                    }
+                                    Err(_) => count(WriterRequest),
+                                }
+                            } else {
+                                count(WriterTooLarge);
+                                retry = false;
+                            }
+                        }
+                        if client
+                            .close_handle(&route, CloseRouteOptions::default())
+                            .await
+                            .is_err()
+                        {
+                            count(WriterCloseRoute);
                         }
                     }
-                    let _ = client
-                        .close_handle(&route, CloseRouteOptions::default())
-                        .await;
+                    Err(error) => {
+                        count(WriterOpenRoute);
+                        diagnostics::route_open(&error);
+                    }
                 }
             }
         }
         if retry {
             if let Ok(mut outbox) = writer.outbox.lock() {
                 outbox.retry(entry, Instant::now());
+            } else {
+                count(WriterOutboxLock);
             }
         } else if let Ok(mut outbox) = writer.outbox.lock() {
             outbox.reads.push_finished(&entry.record_id, Instant::now());
+        } else {
+            count(WriterOutboxLock);
+        }
+    }
+}
+
+fn display_limits(bytes: &[u8]) -> Option<cortexkit_role_tool_display::DisplayLimits> {
+    let value: Value = match serde_json::from_slice(bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            count(WriterDescriptionJson);
+            return None;
+        }
+    };
+    let Some(value) = value.get("tool_display") else {
+        count(WriterDescriptionMissing);
+        return None;
+    };
+    match serde_json::from_value::<cortexkit_role_tool_display::DisplayLimits>(value.clone()) {
+        Ok(limits) if limits.validate().is_ok() => Some(limits),
+        _ => {
+            count(WriterDescriptionLimits);
+            None
         }
     }
 }
 
 fn retry_reply(bytes: &[u8]) -> bool {
     let Ok(reply) = serde_json::from_slice::<Value>(bytes) else {
+        count(WriterReplyJson);
         return true;
     };
-    if matches!(reply["result"].as_str(), Some("stored" | "already_stored")) {
+    if let Some(result @ ("stored" | "already_stored")) = reply["result"].as_str() {
+        count(if result == "stored" {
+            Stored
+        } else {
+            AlreadyStored
+        });
         return false;
     }
-    !matches!(
+    let refused = matches!(
         reply["code"].as_str(),
         Some(
             "display_write_conflict"
@@ -780,7 +929,13 @@ fn retry_reply(bytes: &[u8]) -> bool {
                 | "display_writer_unverified"
                 | "display_too_large"
         )
-    )
+    );
+    count(if refused {
+        WriterReplyRefused
+    } else {
+        WriterReplyUnknown
+    });
+    !refused
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

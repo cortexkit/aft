@@ -40,6 +40,7 @@ fn budget_rollups_present_renders_expected_trailer() {
         id: "test-budget".into(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext {
         outline_mode: aft::subc_format::OutlineMode::Files,
@@ -81,6 +82,7 @@ fn nested_budget_rollup_counts_once_through_frontier_without_double_counting() {
         id: "test-nested".into(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext {
         outline_mode: aft::subc_format::OutlineMode::Files,
@@ -117,6 +119,7 @@ fn data_heavy_only_renders_no_trailer_closed_exemption_b_byte_equal() {
         id: "test-data-heavy".into(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext {
         outline_mode: aft::subc_format::OutlineMode::Files,
@@ -153,6 +156,7 @@ fn collection_truncated_alone_renders_walk_trailer_with_at_least() {
         id: "test-collection-truncated-alone".into(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext {
         outline_mode: aft::subc_format::OutlineMode::Files,
@@ -193,6 +197,7 @@ fn collection_truncated_plus_budget_rollups_renders_walk_trailer_with_mixed_caus
         id: "test-collection-truncated-with-budget".into(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext {
         outline_mode: aft::subc_format::OutlineMode::Files,
@@ -319,6 +324,7 @@ fn r1_boundary_fixture_transport_parity_and_trailer() {
         id: "test-r1".into(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext {
         outline_mode: aft::subc_format::OutlineMode::Files,

@@ -5,6 +5,7 @@
 //! for differential tests. Once a request is accepted, its handler response is
 //! returned directly; native bash is never run as a recovery path.
 
+pub(crate) mod bash_hints;
 pub mod catalog;
 pub mod differential;
 pub mod dispatch;
@@ -93,14 +94,16 @@ pub fn try_rewrite(
     ctx: &AppContext,
     principal: &AuthenticatedPrincipal,
 ) -> Option<Response> {
-    try_rewrite_for_request(
+    let mut response = try_rewrite_for_request(
         command,
         "bash_rewrite",
         session_id,
         &crate::host_tool_names::HostToolNames::default(),
         ctx,
         principal,
-    )
+    )?;
+    crate::subc::runner_notices::notice_templates::deliver(&mut response, None);
+    Some(response)
 }
 
 /// Make the rewrite decision for one public bash request. A native route is

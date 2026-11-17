@@ -908,6 +908,7 @@ fn response(data: &Value) -> Response {
             .to_string(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     }
 }
 

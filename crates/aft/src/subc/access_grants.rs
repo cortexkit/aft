@@ -69,7 +69,7 @@ pub(super) fn scope_key(identity: &RouteIdentity) -> ScopeKey {
         .as_ref()
         .filter(|stamp| stamp.owner_authorized)
     {
-        return ScopeKey::from_stamp(stamp);
+        return ScopeKey::for_grants(stamp);
     }
     ScopeKey {
         owner: "session".into(),
@@ -105,7 +105,7 @@ pub(super) fn policy_scope_key(identity: &RouteIdentity) -> ScopeKey {
         if stamp.kind == subc_protocol::scope::ScopeKind::Ephemeral {
             if let Some(parent) = stamp.parent.as_ref() {
                 return ScopeKey {
-                    owner: serde_json::to_string(&parent.owner).expect("scope owner serializes"),
+                    owner: crate::access_policy::prefrontal::grant_owner_key(&parent.owner),
                     scope_ref: parent.scope_ref.clone(),
                     epoch: parent.scope_epoch,
                 };
@@ -255,6 +255,7 @@ fn register_on(
 ) -> Result<(), subc_protocol::ErrorBody> {
     register_scope_rows(conn, identity, ctx)?;
     scope_registered().notify_waiters();
+    super::scope_watch::changed(super::scope_watch::Source::Grants);
     Ok(())
 }
 
@@ -280,7 +281,7 @@ fn register_scope_rows(
         .as_ref()
         .and_then(|s| s.parent.as_ref())
         .map(|parent| ScopeKey {
-            owner: serde_json::to_string(&parent.owner).expect("scope owner serializes"),
+            owner: crate::access_policy::prefrontal::grant_owner_key(&parent.owner),
             scope_ref: parent.scope_ref.clone(),
             epoch: parent.scope_epoch,
         });
@@ -340,7 +341,7 @@ pub(super) fn operation(
         .and_then(|v| v.get("owner"))
         .map(|v| {
             serde_json::from_value::<Principal>(v.clone())
-                .map(|owner| serde_json::to_string(&owner).expect("scope owner serializes"))
+                .map(|owner| crate::access_policy::prefrontal::grant_owner_key(&owner))
         })
         .transpose()
         .map_err(|_| refusal("grants_scope_refused", "invalid scope owner"))?
@@ -398,7 +399,7 @@ pub(super) fn operation(
 
 fn alfonso(stamp: &subc_protocol::scope::ScopeStamp) -> bool {
     stamp.owner_authorized
-        && matches!(&stamp.owner, Principal::Reserved { module_id } if module_id == "prefrontal-core")
+        && crate::access_policy::prefrontal::is_principal(&stamp.owner)
         && matches!(
             stamp.kind,
             subc_protocol::scope::ScopeKind::Head
@@ -409,12 +410,12 @@ fn alfonso(stamp: &subc_protocol::scope::ScopeStamp) -> bool {
 
 pub(super) fn head_scope(identity: &RouteIdentity) -> Option<ScopeKey> {
     let stamp = identity.scope.as_ref().filter(|s| alfonso(s))?;
-    let own = ScopeKey::from_stamp(stamp);
+    let own = ScopeKey::for_grants(stamp);
     match stamp.kind {
         subc_protocol::scope::ScopeKind::Head => Some(own),
         _ => match stamp.parent.as_ref() {
             Some(parent) => Some(ScopeKey {
-                owner: serde_json::to_string(&parent.owner).expect("scope owner serializes"),
+                owner: crate::access_policy::prefrontal::grant_owner_key(&parent.owner),
                 scope_ref: parent.scope_ref.clone(),
                 epoch: parent.scope_epoch,
             }),
@@ -523,7 +524,7 @@ pub(super) fn consent_head(
         return Ok(None);
     };
     let parent = ScopeKey {
-        owner: serde_json::to_string(&parent.owner).expect("scope owner serializes"),
+        owner: crate::access_policy::prefrontal::grant_owner_key(&parent.owner),
         scope_ref: parent.scope_ref.clone(),
         epoch: parent.scope_epoch,
     };

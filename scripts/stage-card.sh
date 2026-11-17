@@ -53,6 +53,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 # shellcheck source=lib/ck-aft-signature.sh
 source "$REPO_ROOT/scripts/lib/ck-aft-signature.sh"
+# shellcheck source=lib/ck-aft-grammar-smoke.sh
+source "$REPO_ROOT/scripts/lib/ck-aft-grammar-smoke.sh"
 # shellcheck source=lib/storage-floor-check.sh
 source "$REPO_ROOT/scripts/lib/storage-floor-check.sh"
 # shellcheck source=lib/card-source-gate.sh
@@ -165,95 +167,10 @@ if [ "$(uname -s)" = "Darwin" ]; then
     exit 2
   fi
 
-  # Use the production stored-load path, offline and without test seams. A
-  # throwaway whole storage root works even without a second cache volume.
-  echo "==> smoke: pinned grammar compile under the signed card (offline)"
-  mkdir -p "$REPO_ROOT/target/scratch"
-  GRAMMAR_SMOKE="$(mktemp -d "$REPO_ROOT/target/scratch/grammar-smoke.XXXXXX")"
-  GRAMMAR_HASH="$(python3 -c 'import json; print(json.load(open("crates/aft/src/grammar/manifest.json"))["sha256"])')"
-  mkdir -p "$GRAMMAR_SMOKE/storage/grammars" "$GRAMMAR_SMOKE/home" "$GRAMMAR_SMOKE/config" "$GRAMMAR_SMOKE/cache" "$GRAMMAR_SMOKE/state" "$GRAMMAR_SMOKE/data" "$GRAMMAR_SMOKE/tmp"
-  cp "crates/aft/tests/fixtures/grammars/$GRAMMAR_HASH.wasm" "$GRAMMAR_SMOKE/storage/grammars/$GRAMMAR_HASH.wasm"
-  if ! sandbox-exec -p '(version 1) (allow default) (deny network*)' env \
-      -u AFT_STORAGE_DIR -u AFT_CACHE_DIR -u AFT_TEST_GRAMMAR_MANIFEST \
-      -u AFT_TEST_GRAMMAR_STORAGE -u AFT_TEST_GRAMMAR_QUERIES -u AFT_TEST_GRAMMAR_FAULT \
-      -u AFT_TEST_GRAMMAR_TRANSPORT_FILE -u AFT_TEST_GRAMMAR_CLOCK_FILE \
-      -u AFT_TEST_GRAMMAR_EXTRACTOR_VERSION \
-      HOME="$GRAMMAR_SMOKE/home" XDG_CONFIG_HOME="$GRAMMAR_SMOKE/config" \
-      XDG_CACHE_HOME="$GRAMMAR_SMOKE/cache" XDG_STATE_HOME="$GRAMMAR_SMOKE/state" \
-      XDG_DATA_HOME="$GRAMMAR_SMOKE/data" TMPDIR="$GRAMMAR_SMOKE/tmp" \
-      "$TMP" grammar-smoke --storage-dir "$GRAMMAR_SMOKE/storage" > "$GRAMMAR_SMOKE/result.json"; then
-    rm -rf "$GRAMMAR_SMOKE"
+  if ! ck_aft_smoke_grammar "$TMP" stage-card; then
     rm -f "$TMP"
-    echo "stage-card: signed grammar load failed; refusing to stage" >&2
     exit 2
   fi
-  if ! python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert not v["test_seams"]; assert v["engine_target"] == "pulley"; assert v["hash"] == sys.argv[2]; assert v["tree"].startswith("(chunk ")' "$GRAMMAR_SMOKE/result.json" "$GRAMMAR_HASH"; then
-    rm -rf "$GRAMMAR_SMOKE"
-    rm -f "$TMP"
-    echo "stage-card: grammar smoke did not verify the production grammar" >&2
-    exit 2
-  fi
-  echo "==> smoke: Luau outline under the signed card (offline)"
-  mkdir -p "$GRAMMAR_SMOKE/project"
-  cp "crates/aft/tests/fixtures/grammars/smoke.luau" "$GRAMMAR_SMOKE/project/smoke.luau"
-  if ! env -u AFT_STORAGE_DIR -u AFT_CACHE_DIR -u AFT_TEST_GRAMMAR_MANIFEST \
-      -u AFT_TEST_GRAMMAR_STORAGE -u AFT_TEST_GRAMMAR_QUERIES -u AFT_TEST_GRAMMAR_FAULT \
-      -u AFT_TEST_GRAMMAR_TRANSPORT_FILE -u AFT_TEST_GRAMMAR_CLOCK_FILE \
-      -u AFT_TEST_GRAMMAR_EXTRACTOR_VERSION -u AFT_TEST_GRAMMAR_PARSE_DEADLINE_MS \
-      HOME="$GRAMMAR_SMOKE/home" XDG_CONFIG_HOME="$GRAMMAR_SMOKE/config" \
-      XDG_CACHE_HOME="$GRAMMAR_SMOKE/cache" XDG_STATE_HOME="$GRAMMAR_SMOKE/state" \
-      XDG_DATA_HOME="$GRAMMAR_SMOKE/data" TMPDIR="$GRAMMAR_SMOKE/tmp" \
-      python3 - "$TMP" "$GRAMMAR_SMOKE" <<'PY'
-import json, pathlib, signal, subprocess, sys, time
-binary, root = sys.argv[1], pathlib.Path(sys.argv[2]).resolve()
-def timed_out(*_):
-    raise TimeoutError("signed outline smoke timed out")
-signal.signal(signal.SIGALRM, timed_out)
-signal.alarm(45)
-with open(root / "outline-stderr.log", "w") as stderr:
-    process = subprocess.Popen(["sandbox-exec", "-p", "(version 1) (allow default) (deny network*)", binary],
-                               cwd=root / "project", stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr, text=True)
-    try:
-        def request(value, retry_unavailable=False):
-            while True:
-                process.stdin.write(json.dumps(value) + "\n")
-                process.stdin.flush()
-                reply = None
-                for line in process.stdout:
-                    candidate = json.loads(line)
-                    if candidate.get("id") == value["id"]:
-                        reply = candidate
-                        break
-                if reply is None:
-                    raise RuntimeError("signed card exited before replying")
-                # The first Luau request starts loading the stored grammar in the
-                # background and answers grammar_unavailable ("retry in a few
-                # seconds") until it is ready; the 45 s alarm bounds the wait.
-                if retry_unavailable and reply.get("code") == "grammar_unavailable":
-                    time.sleep(0.5)
-                    continue
-                assert reply.get("success"), reply
-                return reply
-        request({"id": "signed-configure", "command": "configure", "harness": "runner",
-                 "project_root": str(root / "project"), "storage_dir": str(root / "storage"),
-                 "config": [{"tier": "user", "source": str(root / "config" / "aft.jsonc"),
-                             "doc": json.dumps({"storage": {"cache_dir": None}, "indexes": {"semantic": False}})}]})
-        reply = request({"id": "signed-outline", "command": "outline", "file": str(root / "project" / "smoke.luau")},
-                        retry_unavailable=True)
-        assert "signed_outline_fixture" in reply.get("text", ""), reply
-        (root / "outline-result.json").write_text(json.dumps(reply))
-    finally:
-        process.kill()
-        process.wait()
-signal.alarm(0)
-PY
-  then
-    rm -rf "$GRAMMAR_SMOKE"
-    rm -f "$TMP"
-    echo "stage-card: signed Luau outline failed; refusing to stage" >&2
-    exit 2
-  fi
-  rm -rf "$GRAMMAR_SMOKE"
 
   IMAGE_UUID="$(dwarfdump --uuid "$TMP" | awk 'NR == 1 { gsub(/-/, "", $2); print toupper($2) }')"
   DSYM_UUID="$(dwarfdump --uuid "$DSYM" | awk 'NR == 1 { gsub(/-/, "", $2); print toupper($2) }')"

@@ -445,6 +445,15 @@ pub(super) fn run(
     execute: &mut impl FnMut(&ReadRequest) -> Result<ReadReply, ReadError>,
     output: &mut impl Write,
 ) -> Result<i32, ReadError> {
+    run_with_sleep(plan, execute, output, &mut std::thread::sleep)
+}
+
+pub(super) fn run_with_sleep(
+    plan: &Plan,
+    execute: &mut impl FnMut(&ReadRequest) -> Result<ReadReply, ReadError>,
+    output: &mut impl Write,
+    sleep: &mut impl FnMut(Duration),
+) -> Result<i32, ReadError> {
     // Remember the stdout error before renderers turn it into display text.
     // A closed downstream reader is normal pipeline termination, unlike a
     // failed jq child or a real output error such as a full disk.
@@ -472,11 +481,68 @@ pub(super) fn run(
         writer: output,
         broken_pipe: false,
     };
-    let result = render(plan, execute, &mut output);
+    let result = if plan.tuple == "run watch" {
+        run_watch(plan, execute, &mut output, sleep)
+    } else {
+        render(plan, execute, &mut output)
+    };
     if output.broken_pipe {
         Ok(0)
     } else {
         result
+    }
+}
+
+fn run_watch(
+    plan: &Plan,
+    execute: &mut impl FnMut(&ReadRequest) -> Result<ReadReply, ReadError>,
+    output: &mut impl Write,
+    sleep: &mut impl FnMut(Duration),
+) -> Result<i32, ReadError> {
+    let id = &plan.positional[0];
+    // gh's 3-second default exhausts the shell's 600-read budget in 30 minutes.
+    // A 10-second floor keeps long watches useful without bypassing accounting.
+    let interval = Duration::from_secs(
+        plan.value("interval")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(10)
+            .max(10),
+    );
+    let mut previous = None;
+    loop {
+        let row = get(plan.path(&format!("actions/runs/{id}")), execute)?;
+        let status = row["status"].as_str().unwrap_or_default();
+        if previous.as_deref() != Some(status) {
+            writeln!(output, "{id}\t{status}").map_err(|error| failed(error.to_string()))?;
+            output.flush().map_err(|error| failed(error.to_string()))?;
+            previous = Some(status.to_string());
+        }
+        if status == "completed" {
+            writeln!(
+                output,
+                "{id}\t{}",
+                row["conclusion"].as_str().unwrap_or_default()
+            )
+            .map_err(|error| failed(error.to_string()))?;
+            let jobs = get(plan.path(&format!("actions/runs/{id}/jobs")), execute)?;
+            if let Some(jobs) = jobs["jobs"].as_array() {
+                for job in jobs {
+                    if job["conclusion"].as_str().is_some_and(|conclusion| {
+                        !matches!(conclusion, "success" | "neutral" | "skipped")
+                    }) {
+                        writeln!(
+                            output,
+                            "{}\t{}",
+                            job["name"].as_str().unwrap_or_default(),
+                            job["conclusion"].as_str().unwrap_or_default()
+                        )
+                        .map_err(|error| failed(error.to_string()))?;
+                    }
+                }
+            }
+            return Ok(exit_status(plan, &row));
+        }
+        sleep(interval);
     }
 }
 

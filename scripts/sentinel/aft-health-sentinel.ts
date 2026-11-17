@@ -181,6 +181,11 @@ function censusUnavailableReason(sample: SentinelSample): string | undefined {
   const census = metrics(sample);
   if (census.stale === true) return `health census is stale: ${census.stale_reason ?? "unknown"}; age_ms=${census.age_ms ?? "unknown"}`;
   if (!Array.isArray(census.roots)) return "health census roots are unknown";
+  const omitted = Number(census.root_details_omitted ?? 0);
+  const summarized = Number(census.root_detail_gap?.summarized ?? 0);
+  if (omitted > 0 || census.root_groups?.length > 0 || Number(census.root_count ?? census.roots.length) > census.roots.length) {
+    return `health root census is incomplete: ${summarized} summarized; ${omitted} individual details omitted`;
+  }
   return undefined;
 }
 function roots(sample: SentinelSample): RootHealth[] { return censusUnavailableReason(sample) ? [] : metrics(sample).roots; }

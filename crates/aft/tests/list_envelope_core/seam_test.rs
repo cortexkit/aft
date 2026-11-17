@@ -21,6 +21,7 @@ fn seam_grep_suppresses_legacy_clause_and_renders_trailer_when_envelope_present(
         id: "1".into(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
 
@@ -41,6 +42,7 @@ fn seam_grep_suppresses_legacy_clause_and_renders_trailer_when_envelope_present(
         id: "2".into(),
         success: true,
         data,
+        notices: Default::default(),
     };
     let formatted_present = format_response_with_context("grep", &resp_present, &ctx);
     assert!(!formatted_present.contains("(capped)"));
@@ -60,6 +62,7 @@ fn seam_glob_suppresses_legacy_clause_and_renders_trailer_when_envelope_present(
         id: "1".into(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
 
@@ -80,6 +83,7 @@ fn seam_glob_suppresses_legacy_clause_and_renders_trailer_when_envelope_present(
         id: "2".into(),
         success: true,
         data,
+        notices: Default::default(),
     };
     let formatted_present = format_response_with_context("glob", &resp_present, &ctx);
     assert!(!formatted_present.contains("Results are truncated"));
@@ -100,6 +104,7 @@ fn seam_search_suppresses_legacy_clauses_and_renders_trailer_when_envelope_prese
         id: "1".into(),
         success: true,
         data: data.clone(),
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
 
@@ -121,6 +126,7 @@ fn seam_search_suppresses_legacy_clauses_and_renders_trailer_when_envelope_prese
         id: "2".into(),
         success: true,
         data,
+        notices: Default::default(),
     };
     let formatted_present = format_response_with_context("search", &resp_present, &ctx);
     assert!(!formatted_present.contains("more results available"));
@@ -150,6 +156,7 @@ fn seam_bash_passes_through_unchanged_so_no_trailer_renders_twice() {
         id: "bash-1".into(),
         success: true,
         data,
+        notices: Default::default(),
     };
     let ctx = FormatContext::default();
     let formatted = format_response_with_context("bash", &resp, &ctx);

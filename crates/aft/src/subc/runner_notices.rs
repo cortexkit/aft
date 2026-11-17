@@ -1,10 +1,12 @@
 //! The runner records each notice's send_id durably, so retries cannot deliver
 //! the same notice twice. Runner sessions do not acknowledge AFT push frames.
 
+pub(crate) mod notice_templates;
+
 use super::*;
 use crate::bash_background::persistence::{RunnerCompletionDelivery, RunnerCompletionPhase};
 use cortexkit_role_llm_runner::{
-    delivery_order::{DeliveryOrder, Mode},
+    delivery_order::{render, template_digest, DeliveryOrder, Mode, TemplateUse},
     send::{states, SendReply, SendRequest},
     send_status::SendStatusRequest,
 };
@@ -15,6 +17,9 @@ const MAX_ATTEMPTS: usize = 10;
 const MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_GENERATIONS: u8 = 5;
 const RUNNER_CARRIERS: &[&str] = &["reserved:thalamus-harness", "reserved:broca"];
+// The send must be accepted before the result returns to ride that result,
+// rather than the next. Two seconds caps how long a slow runner delays a tool call.
+const CODE_SEARCH_NOTICE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) fn known_runner(module_id: &str) -> bool {
     RUNNER_CARRIERS
@@ -361,7 +366,7 @@ pub(super) fn warning(
                     &request.send_id,
                     attempt,
                     false,
-                    runtime.block_on(send(&path, &address, &request)),
+                    runtime.block_on(send(&path, &address, &request, false)),
                     &mut retry_logged,
                 );
                 attempt += 1;
@@ -375,12 +380,222 @@ pub(super) fn warning(
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Address {
     module: String,
     identity: BindIdentity,
     scope: Option<ScopeSelector>,
     worker: bool,
+}
+
+/// A runner route remains a runner route even when its notice address is
+/// unavailable. Such nudges are dropped, never appended to command output.
+#[derive(Debug, Clone)]
+pub struct CodeSearchNotice {
+    address: Option<Address>,
+    call_key: String,
+    preset: String,
+    remaining: Arc<std::sync::Mutex<Duration>>,
+}
+
+impl PartialEq for CodeSearchNotice {
+    fn eq(&self, other: &Self) -> bool {
+        self.address == other.address
+            && self.call_key == other.call_key
+            && self.preset == other.preset
+    }
+}
+impl Eq for CodeSearchNotice {}
+
+pub(super) fn code_search_notice(
+    route: &RouteIdentity,
+    call_key: &str,
+) -> Option<CodeSearchNotice> {
+    let route = route
+        .run_owner
+        .as_ref()
+        .map_or(route, |owner| &owner.owner_route);
+    if !runner_route(route) {
+        return None;
+    }
+    let raw = match &route.spawn_principal {
+        AuthenticatedPrincipal::RouteBind { harness, .. } => harness.clone(),
+        _ => String::new(),
+    };
+    Some(CodeSearchNotice {
+        address: Address::new(&route.task_identity(), raw, route.scope.as_ref()),
+        call_key: call_key.to_owned(),
+        preset: "head".into(),
+        remaining: Arc::new(std::sync::Mutex::new(CODE_SEARCH_NOTICE_TIMEOUT)),
+    })
+}
+
+pub(super) fn nudge_request(
+    call_key: &str,
+    notice: &crate::subc::runner_notices::notice_templates::Notice,
+    preset: &str,
+    now_ms: u64,
+    modern: bool,
+    cleared: bool,
+    fallback: bool,
+) -> SendRequest {
+    let kind = notice
+        .template
+        .as_ref()
+        .map_or("aft.diagnostics", |(id, _)| *id);
+    let send_id = format!(
+        "aft:nudge:{kind}:{call_key}{}",
+        if fallback { ":fallback" } else { "" }
+    );
+    if !modern {
+        return SendRequest::new(&notice.text, send_id).with_notice(true);
+    }
+    let mut order = DeliveryOrder::new(vec![Mode::ToolResult]);
+    order.dedupe_key = Some(format!("aft:nudge:{kind}"));
+    order.expires_at_ms = Some(now_ms.saturating_add(60_000));
+    let templates = crate::subc::runner_notices::notice_templates::templates(preset);
+    let mut text = notice.text.clone();
+    if let Some((id, slots)) = &notice.template {
+        if let Some(template) = templates.iter().find(|template| template.id == *id) {
+            let mut slots = slots.as_object().unwrap().clone();
+            if *id == crate::subc::runner_notices::notice_templates::CODE_SEARCH
+                && preset == "worker"
+                && slots["redirect"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("`aft_search`"))
+            {
+                slots["redirect"] =
+                    crate::subc::runner_notices::notice_templates::code_search_slots(
+                        Some("search"),
+                        "bash",
+                    )["redirect"]
+                        .clone();
+            }
+            let use_ = TemplateUse::new(*id, template_digest(template), slots);
+            if let Ok(rendered) = render(&templates, &use_, |_| None) {
+                text = rendered;
+                if !fallback {
+                    order.modes.insert(
+                        0,
+                        if cleared {
+                            Mode::TurnSystemCleared
+                        } else {
+                            Mode::TurnSystem
+                        },
+                    );
+                    order.template = Some(use_);
+                    return SendRequest::template(send_id, &order).with_notice(true);
+                }
+            }
+        }
+    }
+    SendRequest::new(text, send_id)
+        .with_notice(true)
+        .with_delivery_order(&order)
+}
+
+impl CodeSearchNotice {
+    pub(super) fn with_preset(mut self, role: super::tool_provider::CallerRole) -> Self {
+        self.preset = match role {
+            super::tool_provider::CallerRole::Head => "head",
+            super::tool_provider::CallerRole::Worker => "worker",
+            super::tool_provider::CallerRole::Reader => "reader",
+        }
+        .into();
+        self
+    }
+
+    /// Send before returning the tool result. If the runner refuses the
+    /// template (for example, the session plan omitted it), retry once as
+    /// free text at tool-result authority, within the same deadline; never append.
+    pub(crate) fn send(&self, notice: &crate::subc::runner_notices::notice_templates::Notice) {
+        // Cloned render contexts belong to the same call. All its nudges,
+        // capability probes and the one allowed fallback share this budget.
+        let mut remaining = self.remaining.lock().unwrap();
+        let budget = *remaining;
+        let started = std::time::Instant::now();
+        // Rendering can run on either an actor thread or a Tokio worker. Keep
+        // the synchronous send's runtime off both callers' runtime stacks.
+        let outcome =
+            std::thread::scope(|scope| scope.spawn(|| self.send_once(notice, budget)).join())
+                .unwrap_or_else(|_| {
+                    retry(FailureClass::Runtime, "code-search notice sender panicked")
+                });
+        *remaining = remaining.saturating_sub(started.elapsed());
+        match outcome {
+            Outcome::Accepted | Outcome::Pending => {}
+            Outcome::NotDelivered(reason) => log::info!(
+                "runner code-search nudge call_key={} not_delivered reason={reason}; dropped",
+                self.call_key
+            ),
+            Outcome::Final(failure) | Outcome::Retry(failure) => crate::slog_info!(
+                "runner code-search nudge call_key={} dropped class={:?} code={} detail={}",
+                self.call_key,
+                failure.class,
+                failure.code.as_deref().unwrap_or("none"),
+                failure.detail
+            ),
+        }
+    }
+
+    fn send_once(
+        &self,
+        notice: &crate::subc::runner_notices::notice_templates::Notice,
+        remaining: Duration,
+    ) -> Outcome {
+        if remaining.is_zero() {
+            return Outcome::Final(Failure::new(
+                FailureClass::Timeout,
+                "tool notice send budget exhausted",
+            ));
+        }
+        (|| {
+            let address = self
+                .address
+                .as_ref()
+                .ok_or_else(|| retry(FailureClass::Address, "call has no runner notice address"))?;
+            let path = CONNECTION
+                .get()
+                .map(|path| path.read().unwrap().clone())
+                .ok_or_else(|| {
+                    retry(
+                        FailureClass::Address,
+                        "runner notice connection unavailable",
+                    )
+                })?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| retry(FailureClass::Runtime, error))?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            Ok::<_, Outcome>(runtime.block_on(async {
+                tokio::time::timeout(
+                    remaining,
+                    async {
+                        let modern = runner_delivery_order(&path, address).await == Some(true);
+                        let cleared = modern && runner_capability(&path, address, "delivery_order_modes:turn_system_cleared").await == Some(true);
+                        let request = nudge_request(&self.call_key, notice, &self.preset, now, modern, cleared, false);
+                        let outcome = send(&path, address, &request, modern).await;
+                        let refused = matches!(&outcome, Outcome::Final(failure) | Outcome::Retry(failure) if failure.code.as_deref() == Some("invalid_params") && failure.field.as_deref() == Some("template"));
+                        if request.runner_params.contains_key("template") && refused {
+                            send(&path, address, &nudge_request(&self.call_key, notice, &self.preset, now, true, false, true), true).await
+                        } else { outcome }
+                    },
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Outcome::Final(Failure::new(
+                        FailureClass::Timeout,
+                        "code-search notice send exceeded 2s total deadline",
+                    ))
+                })
+            }))
+        })()
+        .unwrap_or_else(|outcome| outcome)
+    }
 }
 
 fn concrete_route_harness(principal: Option<&str>, session: &str) -> Option<String> {
@@ -490,6 +705,7 @@ fn task_request(
     request: SendRequest,
     task_id: &str,
     started_at: u64,
+    finished_at: Option<u64>,
     reminder_elapsed_ms: Option<u64>,
     policy: crate::bash_background::persistence::RunnerNoticePolicy,
 ) -> SendRequest {
@@ -498,12 +714,25 @@ fn task_request(
     }
     let mut order = request.delivery_order().unwrap().unwrap();
     order.dedupe_key = Some(format!("aft:bash-task:{task_id}"));
-    order.expires_at_ms = reminder_elapsed_ms.map(|elapsed| {
-        started_at
+    order.expires_at_ms = Some(match reminder_elapsed_ms {
+        Some(elapsed) => started_at
             .saturating_add(elapsed)
-            .saturating_add(policy.reminder_interval_ms)
+            .saturating_add(policy.reminder_interval_ms),
+        None => finished_at.unwrap_or(started_at).saturating_add(MAX_AGE_MS),
     });
     request.with_delivery_order(&order)
+}
+
+fn tracks_delivery_receipt(request: &SendRequest, delivery_order: bool) -> bool {
+    // The base delivery modes predate receipt semantics. A compatibility fallback
+    // removes both optional members and must keep the legacy acceptance behavior,
+    // even though the frozen runner policy still declares delivery_order.
+    delivery_order
+        && request
+            .delivery_order()
+            .ok()
+            .flatten()
+            .is_some_and(|order| order.dedupe_key.is_some() || order.expires_at_ms.is_some())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -569,6 +798,14 @@ fn described_delivery_order(bytes: &[u8]) -> Option<bool> {
 
 fn described_capability(bytes: &[u8], name: &str) -> Option<bool> {
     let description = cortexkit_role_llm_runner::wire::read_reply::<Value>(bytes).ok()?;
+    if let Some(mode) = name.strip_prefix("delivery_order_modes:") {
+        return Some(
+            description
+                .get("delivery_order_modes")
+                .and_then(Value::as_array)
+                .is_some_and(|modes| modes.iter().any(|item| item == mode)),
+        );
+    }
     let capabilities = description.get("capabilities")?.as_array()?;
     if !capabilities.iter().all(Value::is_string) {
         return None;
@@ -667,15 +904,17 @@ pub(super) mod test_endpoint {
         sender: std::sync::mpsc::Sender<Received>,
         stored: std::sync::Mutex<HashMap<String, Vec<u8>>>,
         delivery_order: std::sync::Mutex<Option<bool>>,
+        cleared: AtomicBool,
         send_status: AtomicBool,
-        replies: std::sync::Mutex<std::collections::VecDeque<SendReply>>,
-        states: std::sync::Mutex<HashMap<String, SendReply>>,
+        replies: std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>,
+        states: std::sync::Mutex<HashMap<String, Vec<u8>>>,
         lose_response: AtomicBool,
         effects: Arc<AtomicU64>,
         retries: std::sync::Mutex<u64>,
         refusals: std::sync::Mutex<std::collections::VecDeque<Value>>,
         active: AtomicU64,
         max_active: AtomicU64,
+        reply_delay_ms: AtomicU64,
         gate:
             std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     }
@@ -704,6 +943,9 @@ pub(super) mod test_endpoint {
         pub(super) fn delivery_order(&self, supported: Option<bool>) {
             *self.endpoint.delivery_order.lock().unwrap() = supported;
         }
+        pub(super) fn cleared(&self, supported: bool) {
+            self.endpoint.cleared.store(supported, Ordering::Relaxed);
+        }
         pub(super) fn retry(&self, count: u64) {
             *self.endpoint.retries.lock().unwrap() = count;
         }
@@ -713,6 +955,16 @@ pub(super) mod test_endpoint {
                 .store(supported, Ordering::Relaxed);
         }
         pub(super) fn reply(&self, reply: SendReply) {
+            self.endpoint
+                .replies
+                .lock()
+                .unwrap()
+                .push_back(cortexkit_role_llm_runner::wire::reply_body(&reply).unwrap());
+        }
+        pub(super) fn reply_fixture(&self, body: &[u8]) {
+            let mut reply = b"{\"result\":".to_vec();
+            reply.extend_from_slice(body);
+            reply.push(b'}');
             self.endpoint.replies.lock().unwrap().push_back(reply);
         }
         pub(super) fn refuse(&self, code: &str, field: Option<&str>) {
@@ -737,6 +989,11 @@ pub(super) mod test_endpoint {
         pub(super) fn max_active(&self) -> u64 {
             self.endpoint.max_active.load(Ordering::Relaxed)
         }
+        pub(super) fn delay_reply(&self, delay: Duration) {
+            self.endpoint
+                .reply_delay_ms
+                .store(delay.as_millis() as u64, Ordering::Relaxed);
+        }
     }
     impl Drop for Capture {
         fn drop(&mut self) {
@@ -751,6 +1008,7 @@ pub(super) mod test_endpoint {
             sender,
             stored: Default::default(),
             delivery_order: Default::default(),
+            cleared: AtomicBool::new(false),
             send_status: AtomicBool::new(false),
             replies: Default::default(),
             states: Default::default(),
@@ -760,6 +1018,7 @@ pub(super) mod test_endpoint {
             refusals: Default::default(),
             active: AtomicU64::new(0),
             max_active: AtomicU64::new(0),
+            reply_delay_ms: AtomicU64::new(0),
             gate: Default::default(),
         });
         assert!(endpoints()
@@ -780,14 +1039,16 @@ pub(super) mod test_endpoint {
             .unwrap()
             .get(&format!("aft:bash:{}", address.identity.session))
             .cloned()?;
-        let supported = if capability == "send_status" {
+        let supported = if capability == "delivery_order_modes:turn_system_cleared" {
+            Some(endpoint.cleared.load(Ordering::Relaxed))
+        } else if capability == "send_status" {
             Some(endpoint.send_status.load(Ordering::Relaxed))
         } else {
             *endpoint.delivery_order.lock().unwrap()
         };
         Some(supported)
     }
-    pub(super) fn call(address: &Address, bytes: &[u8]) -> Option<Result<Vec<u8>, Outcome>> {
+    pub(super) async fn call(address: &Address, bytes: &[u8]) -> Option<Result<Vec<u8>, Outcome>> {
         let body: Value = serde_json::from_slice(bytes).unwrap();
         let key = body["params"]["send_id"]
             .as_str()
@@ -817,6 +1078,10 @@ pub(super) mod test_endpoint {
             request: body.clone(),
             bytes: bytes.to_vec(),
         });
+        let delay_ms = endpoint.reply_delay_ms.load(Ordering::Relaxed);
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
         if body["method"] != "session.send"
             && body["method"] != cortexkit_role_llm_runner::ops::SESSION_SEND_STATUS
         {
@@ -877,11 +1142,17 @@ pub(super) mod test_endpoint {
             .unwrap()
             .pop_front()
             .or_else(|| states.get(&key).cloned())
-            .unwrap_or_else(|| SendReply::new("active"));
+            .unwrap_or_else(|| {
+                cortexkit_role_llm_runner::wire::reply_body(
+                    &SendReply::new("active")
+                        .with_delivered(cortexkit_role_llm_runner::send::Delivered::new("step")),
+                )
+                .unwrap()
+            });
         states.insert(key, response.clone());
         if new
             && !matches!(
-                decode_send_reply(&cortexkit_role_llm_runner::wire::reply_body(&response).unwrap()),
+                decode_send_reply(&response, false),
                 Outcome::NotDelivered(_)
             )
         {
@@ -890,9 +1161,8 @@ pub(super) mod test_endpoint {
         if endpoint.lose_response.swap(false, Ordering::Relaxed) {
             return Some(Err(retry(FailureClass::TestEndpoint, "response lost")));
         }
-        let reply = cortexkit_role_llm_runner::wire::reply_body(&response).unwrap();
-        cortexkit_role_llm_runner::wire::read_reply::<SendReply>(&reply).unwrap();
-        Some(Ok(reply))
+        cortexkit_role_llm_runner::wire::read_reply::<SendReply>(&response).unwrap();
+        Some(Ok(response))
     }
 }
 
@@ -913,6 +1183,7 @@ enum FailureClass {
     Request,
     ReplyDecode,
     PeerRefusal,
+    Timeout,
     Runtime,
     Address,
     Persistence,
@@ -1064,9 +1335,14 @@ mod recovery_fixture;
 #[cfg(feature = "test-scope-owner")]
 pub use recovery_fixture::RunnerNoticeRecoveryForTest;
 
-async fn send(path: &Path, address: &Address, request: &SendRequest) -> Outcome {
+async fn send(
+    path: &Path,
+    address: &Address,
+    request: &SendRequest,
+    delivery_order: bool,
+) -> Outcome {
     let outcome = match call(path, address, envelope(request)).await {
-        Ok(bytes) => decode_send_reply(&bytes),
+        Ok(bytes) => decode_send_reply(&bytes, tracks_delivery_receipt(request, delivery_order)),
         Err(outcome) => outcome,
     };
     if matches!(outcome, Outcome::Accepted) {
@@ -1081,7 +1357,12 @@ async fn send(path: &Path, address: &Address, request: &SendRequest) -> Outcome 
     outcome
 }
 
-async fn check_send(path: &Path, address: &Address, request: &SendRequest) -> Outcome {
+async fn check_send(
+    path: &Path,
+    address: &Address,
+    request: &SendRequest,
+    delivery_order: bool,
+) -> Outcome {
     // The send_status group promises a read-only lookup. Older runners instead
     // answer an identical session.send from the durable idempotency record.
     let bytes = if runner_capability(path, address, "send_status").await == Some(true) {
@@ -1090,7 +1371,7 @@ async fn check_send(path: &Path, address: &Address, request: &SendRequest) -> Ou
         envelope(request)
     };
     match call(path, address, bytes).await {
-        Ok(bytes) => decode_reply(&bytes, true),
+        Ok(bytes) => decode_send_reply(&bytes, tracks_delivery_receipt(request, delivery_order)),
         Err(outcome) => outcome,
     }
 }
@@ -1124,11 +1405,7 @@ fn flush_delivery_update(
     Ok(())
 }
 
-fn decode_send_reply(bytes: &[u8]) -> Outcome {
-    decode_reply(bytes, false)
-}
-
-fn decode_reply(bytes: &[u8], following: bool) -> Outcome {
+fn decode_send_reply(bytes: &[u8], receipt_semantics: bool) -> Outcome {
     match cortexkit_role_llm_runner::wire::read_reply::<SendReply>(bytes) {
         Ok(reply) => {
             // llm-runner 0.8.53 CONTRACT §9: not_delivered is final for this
@@ -1137,8 +1414,10 @@ fn decode_reply(bytes: &[u8], following: bool) -> Outcome {
                 return Outcome::NotDelivered(reply.reason.unwrap_or_else(|| "unknown".into()));
             }
             // CONTRACT §9 and §9.7 list finished, superseded, expired
-            // and template_part_gone as final. Active/paused (or future states)
-            // without a receipt do not end follow-up of a previously pending send.
+            // and template_part_gone as final. A run's active/paused state (or
+            // a future state) does not prove ordered notice delivery: without a
+            // receipt, both first and later replies need follow-up. Legacy sends
+            // never get receipts, so only explicit pending keeps them followed.
             let terminal = matches!(
                 reply.state.as_str(),
                 states::FINISHED
@@ -1146,7 +1425,10 @@ fn decode_reply(bytes: &[u8], following: bool) -> Outcome {
                     | states::EXPIRED
                     | states::TEMPLATE_PART_GONE
             );
-            if reply.delivered.is_none() && !terminal && (following || reply.state == "pending") {
+            if reply.delivered.is_none()
+                && !terminal
+                && (receipt_semantics || reply.state == "pending")
+            {
                 Outcome::Pending
             } else {
                 Outcome::Accepted
@@ -1252,17 +1534,13 @@ pub(super) async fn transport_for_test(path: &Path, session: &str, scope: ScopeS
         true,
         true,
     );
-    let request = task_request(
-        request,
-        session,
-        0,
-        None,
-        crate::bash_background::persistence::RunnerNoticePolicy {
-            dedupe: runner_delivery_order(path, &address).await == Some(true),
-            reminder_interval_ms: 600_000,
-        },
-    );
-    let outcome = send(path, &address, &request).await;
+    let policy = crate::bash_background::persistence::RunnerNoticePolicy {
+        dedupe: runner_delivery_order(path, &address).await == Some(true),
+        reminder_interval_ms: 600_000,
+    };
+    let now = crate::bash_background::persistence::unix_millis();
+    let request = task_request(request, session, now, Some(now), None, policy);
+    let outcome = send(path, &address, &request, policy.dedupe).await;
     let mut result = match &outcome {
         Outcome::Accepted => json!({"outcome":"accepted"}),
         Outcome::Pending => json!({"outcome":"pending"}),
@@ -1334,7 +1612,7 @@ fn log_route_refusal(address: &Address, failure: &Failure) {
 
 async fn call(path: &Path, address: &Address, body: Vec<u8>) -> Result<Vec<u8>, Outcome> {
     #[cfg(test)]
-    if let Some(result) = test_endpoint::call(address, &body) {
+    if let Some(result) = test_endpoint::call(address, &body).await {
         return result;
     }
     let Some(_) = crate::launch_nonce::consumer_identity() else {
@@ -1632,6 +1910,7 @@ fn offer(
                         Err(error) => return retry(FailureClass::Runtime, error),
                     };
                     let mut request = request(id.clone(), text.clone(), completion, address.worker);
+                    let mut delivery_order = false;
                     if completion || reminder_elapsed_ms.is_some() {
                         let policy = if let Some(policy) = metadata.runner_notice_policy.filter(|_| {
                             reminder_elapsed_ms <= metadata.runner_reminder_elapsed_ms
@@ -1645,7 +1924,8 @@ fn offer(
                                 Err(error) => return retry(FailureClass::Persistence, error),
                             }
                         };
-                        request = task_request(request, &task_id, metadata.started_at, reminder_elapsed_ms, policy);
+                        delivery_order = policy.dedupe;
+                        request = task_request(request, &task_id, metadata.started_at, metadata.finished_at, reminder_elapsed_ms, policy);
                     }
                     let request = if let Some(request) = metadata
                         .runner_completion_notice
@@ -1672,7 +1952,7 @@ fn offer(
                     };
                     current_request = Some(request.clone());
                     if checking {
-                        return runtime.block_on(check_send(&path, &address, &request));
+                        return runtime.block_on(check_send(&path, &address, &request, delivery_order));
                     }
                     if completion {
                         let Some(offers) = registry.reserve_runner_completion_offer(&task_id)
@@ -1694,11 +1974,11 @@ fn offer(
                         if completion {
                             registry
                                 .send_runner_completion(&task_id, || {
-                                    runtime.block_on(send(&path, &address, request))
+                                    runtime.block_on(send(&path, &address, request, delivery_order))
                                 })
                                 .unwrap_or(Outcome::Accepted)
                         } else {
-                            runtime.block_on(send(&path, &address, request))
+                            runtime.block_on(send(&path, &address, request, delivery_order))
                         }
                     };
                     let mut outcome = send_request(&request);
@@ -1747,7 +2027,11 @@ fn offer(
                 NOT_DELIVERED.fetch_add(1, Ordering::Relaxed);
                 if completion {
                     let mut request = current_request.expect("send reply has a frozen request");
-                    let (next_generation, phase) = if generation < MAX_GENERATIONS {
+                    // llm-runner 0.8.58 defines host_refused as permanent: resending cannot help.
+                    let (next_generation, phase) = if reason == "host_refused" {
+                        crate::slog_info!("runner notice task={task_id} session={} not_delivered reason={reason}; retired", owner.session);
+                        (generation, RunnerCompletionPhase::Retired)
+                    } else if generation < MAX_GENERATIONS {
                         let next_generation = generation + 1;
                         request.send_id = format!("{id}:{next_generation}");
                         crate::slog_info!("runner notice task={task_id} session={} not_delivered reason={reason}; retrying generation={next_generation}", owner.session);
@@ -1760,7 +2044,7 @@ fn offer(
                     if flush_delivery_update(&registry, &owner.session, &task_id, &mut delivery_update).is_err() {
                         return Next::Retry(retry_delay(0));
                     }
-                    if generation < MAX_GENERATIONS {
+                    if next_generation != generation {
                         *work_follow.send_id.lock().unwrap() = None;
                         receipt.applied();
                         let delay = retry_delay(*attempt);

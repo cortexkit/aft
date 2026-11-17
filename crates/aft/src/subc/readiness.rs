@@ -34,8 +34,8 @@ use subc_protocol::session::{
     LiveRoot, ModuleControlRequestFromModule, ModuleControlResponseToModule,
     MODULE_TO_SUBC_OP_CATALOG_UPDATE,
 };
-use subc_protocol::{ErrorBody, Frame, FrameType};
-use tokio::sync::oneshot;
+use subc_protocol::{ErrorBody, Flags, Frame, FrameType};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 use super::health::DispatchPathMetrics;
@@ -469,6 +469,7 @@ async fn flip_ready_until_accepted(control: &dyn ReadinessControl) -> u32 {
 #[derive(Clone, Default)]
 pub(super) struct PendingControlReplies {
     inner: Arc<StdMutex<HashMap<u64, oneshot::Sender<Frame>>>>,
+    streams: Arc<StdMutex<HashMap<u64, mpsc::Sender<Frame>>>>,
 }
 
 impl PendingControlReplies {
@@ -485,11 +486,31 @@ impl PendingControlReplies {
     /// Number of requests still waiting for the daemon's reply.
     pub(super) fn len(&self) -> usize {
         self.lock().len()
+            + self
+                .streams
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
     }
 
     /// Deliver a channel-0 reply. Returns false when no request is waiting
     /// for its correlation id (a late reply after a timeout, for example).
     pub(super) fn resolve(&self, frame: Frame) -> bool {
+        let mut streams = self
+            .streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(sender) = streams.get(&frame.header.corr) {
+            let corr = frame.header.corr;
+            let terminal = matches!(frame.header.ty, FrameType::Error | FrameType::StreamEnd)
+                || frame.header.flags.is_last();
+            let sent = sender.try_send(frame).is_ok();
+            if terminal || !sent {
+                streams.remove(&corr);
+            }
+            return true;
+        }
+        drop(streams);
         let waiter = self.lock().remove(&frame.header.corr);
         match waiter {
             Some(tx) => tx.send(frame).is_ok(),
@@ -529,9 +550,54 @@ pub(super) struct DaemonControl {
     pending: PendingControlReplies,
     next_corr: AtomicU64,
     describe_slots: tokio::sync::Semaphore,
+    #[cfg(test)]
+    pub(super) panic_next_describe: std::sync::atomic::AtomicBool,
 }
 
 impl DaemonControl {
+    pub(super) async fn scope_watch(
+        &self,
+        selectors: Vec<subc_client_rs::ScopeWatchSelector>,
+        cancelled: oneshot::Sender<()>,
+    ) -> Result<super::scope_watch::Subscription, ControlError> {
+        if !self.advertises(subc_control::ops::SCOPE_WATCH) {
+            return Err(ControlError::NotAdvertised(subc_control::ops::SCOPE_WATCH));
+        }
+        let corr = self.next_corr.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = mpsc::channel(257);
+        self.pending
+            .streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(corr, sender);
+        let mut subscription = super::scope_watch::Subscription::new(
+            receiver,
+            self.pending.streams.clone(),
+            corr,
+            self.writer.clone(),
+            self.metrics.clone(),
+            self.negotiated_ver,
+            cancelled,
+        );
+        let body = serde_json::to_vec(&subc_control::ScopeWatchRequest::new(selectors.clone()))
+            .map_err(|error| ControlError::Decode(error.to_string()))?;
+        let frame = Frame::build_with_version(
+            self.negotiated_ver,
+            FrameType::Request,
+            Flags(control_flags().0 | subc_protocol::FLAG_SUBSCRIPTION),
+            0,
+            0,
+            corr,
+            body,
+        )
+        .map_err(|error| ControlError::Decode(error.to_string()))?;
+        send_reliable_writer_frame(&self.writer, &self.metrics, frame, "scope.watch open")
+            .await
+            .map_err(|_| ControlError::ConnectionClosed)?;
+        subscription.open(&selectors).await?;
+        Ok(subscription)
+    }
+
     pub(super) fn new(
         writer: WriterSender,
         metrics: Arc<DispatchPathMetrics>,
@@ -550,6 +616,8 @@ impl DaemonControl {
             pending,
             next_corr: AtomicU64::new(first_corr),
             describe_slots: tokio::sync::Semaphore::new(4),
+            #[cfg(test)]
+            panic_next_describe: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -570,6 +638,10 @@ impl DaemonControl {
         &self,
         stamp: &subc_protocol::scope::ScopeStamp,
     ) -> Result<ModuleControlResponseToModule, ControlError> {
+        #[cfg(test)]
+        if self.panic_next_describe.swap(false, Ordering::Relaxed) {
+            panic!("injected scope describe task panic");
+        }
         const OP: &str = subc_protocol::scope::SCOPE_DESCRIBE_OP;
         if !self.advertises(OP) {
             return Err(ControlError::NotAdvertised(OP));

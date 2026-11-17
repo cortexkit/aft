@@ -18,9 +18,7 @@ fn route_checks(identity: &RouteIdentity) -> Result<&ScopeStamp, Refusal> {
         .scope
         .as_ref()
         .ok_or(Refusal::RouteNotAdmitted("owner"))?;
-    if !stamp.owner_authorized
-        || !matches!(&stamp.owner, Principal::Reserved { module_id } if module_id == "prefrontal-core")
-    {
+    if !stamp.owner_authorized || !crate::access_policy::prefrontal::is_principal(&stamp.owner) {
         return Err(Refusal::RouteNotAdmitted("owner"));
     }
     if stamp.kind != ScopeKind::Ephemeral {

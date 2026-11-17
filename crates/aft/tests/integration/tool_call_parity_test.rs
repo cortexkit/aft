@@ -329,6 +329,7 @@ fn watcher_parity_response(text: &str, pending: bool) -> Value {
         id: "watcher-parity-fixture".to_string(),
         success: true,
         data: json!({"text": text}),
+        notices: Default::default(),
     };
     // Use the production gap attachment and wire serialization, not a second
     // hand-written definition of where a pending watcher gap should appear.
@@ -498,6 +499,7 @@ fn parity_waits_for_real_maintenance_drain_between_calls() {
                                 id: "forced-watcher-drain".into(),
                                 success: true,
                                 data: json!({}),
+                                notices: Default::default(),
                             }
                         }),
                     );
@@ -1464,6 +1466,7 @@ fn response_from_wire(value: &Value) -> Response {
         id,
         success,
         data: Value::Object(data),
+        notices: Default::default(),
     }
 }
 

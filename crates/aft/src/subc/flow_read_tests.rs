@@ -45,6 +45,16 @@ fn stamp() -> Value {
         "expires_at_ms":crate::db::call_ledger::now_ms() + 60000,
         "parent":{"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"head","scope_epoch":7}})
 }
+
+#[test]
+fn prefrontal_rename_flow_read_admits_both_owners() {
+    let dir = tempfile::tempdir().unwrap();
+    for module in crate::access_policy::prefrontal::MODULE_IDS {
+        let mut scope = stamp();
+        scope["owner"]["module_id"] = json!(module);
+        assert!(route_checks(&identity(dir.path(), scope, "reserved:basal")).is_ok());
+    }
+}
 fn check(mut change: impl FnMut(&mut Value), principal: &str, expected: &'static str) {
     let dir = tempfile::tempdir().unwrap();
     let mut scope = stamp();

@@ -772,7 +772,7 @@ fn identity(root: &Path, session: &str, epoch: u64, scoped: bool) -> RouteIdenti
 }
 
 fn context(root: &Path, storage: &Path, connection: Option<PathBuf>) -> AppContext {
-    context_with_user_remote(root, storage, connection, false)
+    context_with_user_remote(root, storage, connection, true)
 }
 
 fn context_with_user_remote(
@@ -781,23 +781,12 @@ fn context_with_user_remote(
     connection: Option<PathBuf>,
     enabled: bool,
 ) -> AppContext {
-    context_with_switch(root, storage, connection, enabled, true)
-}
-
-fn context_with_switch(
-    root: &Path,
-    storage: &Path,
-    connection: Option<PathBuf>,
-    enabled: bool,
-    runon_enabled: bool,
-) -> AppContext {
     let mut config = crate::config::Config::default();
     config.project_root = Some(root.into());
     config.storage_dir = Some(storage.into());
     config.experimental_bash_background = true;
     config.sandbox.profile.head = crate::config::SandboxMode::Off;
     config.remote_exec.enabled = enabled;
-    config.bash.runon_enabled = runon_enabled;
     config.semantic.subc_connection_file = connection;
     let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
     ctx.set_db(Arc::new(StdMutex::new(
@@ -883,7 +872,7 @@ mod catalog_preset_tests {
     }
 
     #[test]
-    fn presetless_worker_runon_uses_only_its_frozen_policy() {
+    fn presetless_worker_runon_requires_user_switch_and_its_frozen_policy() {
         for head_enabled in [false, true] {
             for worker_enabled in [None, Some(false), Some(true)] {
                 for (kind, attributes, codemode) in [
@@ -908,7 +897,7 @@ mod catalog_preset_tests {
                         .is_some();
                     assert_eq!(
                         runon,
-                        cfg!(unix) && worker_enabled == Some(true),
+                        cfg!(unix) && head_enabled && worker_enabled == Some(true),
                         "head={head_enabled}, worker={worker_enabled:?}, kind={kind}"
                     );
                     assert_eq!(
@@ -1215,7 +1204,7 @@ mod catalog_runon_log_tests {
             // Preserve the pre-diagnostic predicate as an independent snapshot
             // oracle: logging must not change tools, descriptions or digests.
             let offered = cfg!(unix)
-                && self.ctx.config().bash.runon_enabled
+                && self.ctx.config().remote_exec.enabled
                 && !self.ctx.config().remote_exec.project_off
                 && matches!(self.route.trust, BindTrust::FirstParty)
                 && lookup(&self.ctx, &source(&self.route, Some(preset))).is_some_and(|launch| {
@@ -1282,7 +1271,7 @@ mod catalog_runon_log_tests {
                 format!("remote_exec_param={remote_exec_param}"),
                 format!("key={key_status}"),
                 format!("offered={offered}"),
-                format!("runon_enabled={}", self.ctx.config().bash.runon_enabled),
+                format!("remote_exec={}", self.ctx.config().remote_exec.enabled),
                 format!("project_off={}", self.ctx.config().remote_exec.project_off),
                 format!(
                     "bind={}",
@@ -1384,11 +1373,51 @@ mod catalog_runon_log_tests {
     }
 
     #[test]
-    fn runon_enabled_gate() {
+    fn live_remote_switch_refuses_before_refetch_and_new_catalog_reflects_reenable() {
+        let case = Case::enabled();
+        let published = case.ctx.config();
+        let mut candidate = (*published).clone();
+        candidate.remote_exec.enabled = false;
+        let off = crate::config_live::apply_live_config(&published, &candidate, &published);
+        case.ctx.update_config(|config| *config = off.next);
+        // A stale catalog must not keep runon usable after the user turns it off.
+        assert_eq!(
+            crate::bash_background::remote_for_runon(
+                &case.ctx.config(),
+                "linux",
+                false,
+                false,
+                false
+            )
+            .unwrap_err(),
+            "runon is disabled by the user setting remote_exec.enabled"
+        );
+        let off_catalog = catalog(json!({"preset":"worker"}), &case.route, &case.ctx).unwrap();
+        assert!(
+            bash_catalog_entry(&off_catalog)["input_schema"]["properties"]
+                .get("runon")
+                .is_none()
+        );
+        let on = crate::config_live::apply_live_config(&case.ctx.config(), &published, &published);
+        case.ctx.update_config(|config| *config = on.next);
+        assert!(
+            bash_catalog_entry(&off_catalog)["input_schema"]["properties"]
+                .get("runon")
+                .is_none()
+        );
+        let refreshed = catalog(json!({"preset":"worker"}), &case.route, &case.ctx).unwrap();
+        assert_eq!(
+            bash_catalog_entry(&refreshed)["input_schema"]["properties"]["runon"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn user_remote_exec_gate() {
         let case = Case::enabled();
         case.ctx
-            .update_config(|config| config.bash.runon_enabled = false);
-        case.check("runon_enabled", "enabled", "complete", false);
+            .update_config(|config| config.remote_exec.enabled = false);
+        case.check("remote_exec", "enabled", "complete", false);
     }
 
     #[test]
@@ -1462,6 +1491,8 @@ mod catalog_runon_log_tests {
     #[test]
     fn disabled_head_user_policy_gate() {
         let mut case = Case::enabled();
+        case.ctx
+            .update_config(|config| config.remote_exec.enabled = false);
         case.request = json!({"preset":"head"});
         case.check("remote_exec", "absent", "missing:preset", false);
     }
@@ -1640,7 +1671,7 @@ fn sessions_without_remote_execution_omit_runon_and_guidance() {
         catalog(
             json!({"preset":"head"}),
             &identity(root.path(), "head", 7, false),
-            &ctx,
+            &context_with_user_remote(root.path(), storage.path(), None, false),
         )
         .unwrap(),
     ] {
@@ -1661,7 +1692,7 @@ fn sessions_without_remote_execution_omit_runon_and_guidance() {
 fn safety_switch_hides_runon_without_disabling_the_persisted_old_prefix_plan() {
     let root = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
-    let ctx = context_with_switch(root.path(), storage.path(), None, true, false);
+    let ctx = context_with_user_remote(root.path(), storage.path(), None, false);
     let worker = identity(root.path(), "old-worker", 7, true);
     let mut old = plan("broca-worker");
     old["tool_items"][0]["params"]["remote_exec"] =
@@ -2070,7 +2101,7 @@ fn exec_remote_catalog_paramless_and_unscoped_parity() {
     let storage = tempfile::tempdir().unwrap();
     let sibling = root.path().join("sibling");
     std::fs::create_dir_all(sibling.join(".git")).unwrap();
-    let ctx = context(root.path(), storage.path(), None);
+    let ctx = context_with_user_remote(root.path(), storage.path(), None, false);
     let bind = identity(root.path(), "one", 7, false);
     for preset in ["head", "worker", "reader"] {
         let body = json!({"preset":preset});
@@ -3696,7 +3727,7 @@ fn head_sessions_take_remote_runs_from_the_user_config_only() {
         harness: "opencode".into(),
         session: "head".into(),
     };
-    let ctx = context(root.path(), storage.path(), None);
+    let ctx = context_with_user_remote(root.path(), storage.path(), None, false);
     assert!(lookup(&ctx, &head).is_none());
     let mut config = crate::config::Config::default();
     config.project_root = Some(root.path().into());

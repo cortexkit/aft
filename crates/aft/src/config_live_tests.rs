@@ -11,6 +11,33 @@ use crate::parser::TreeSitterProvider;
 use crate::protocol::RawRequest;
 
 #[test]
+fn remote_switch_and_project_refusal_apply_live_but_demand_waits_for_reconnect() {
+    let mut published = Config::default();
+    published.remote_exec.enabled = true;
+    published.remote_exec.default_demand = Some("linux".into());
+    let mut candidate = published.clone();
+    candidate.remote_exec.enabled = false;
+    candidate.remote_exec.project_off = true;
+    candidate.remote_exec.default_demand = Some("windows".into());
+    let off = apply_live_config(&published, &candidate, &published);
+    assert!(!off.next.remote_exec.enabled);
+    assert!(off.next.remote_exec.project_off);
+    assert_eq!(
+        off.next.remote_exec.default_demand.as_deref(),
+        Some("linux")
+    );
+    assert_eq!(
+        off.applied,
+        ["remote_exec.enabled", "remote_exec.project_off"]
+    );
+    assert_eq!(off.deferred, ["remote_exec.default_demand"]);
+    let on = apply_live_config(&off.next, &published, &published);
+    assert!(on.next.remote_exec.enabled);
+    assert!(!on.next.remote_exec.project_off);
+    assert!(on.deferred.is_empty());
+}
+
+#[test]
 fn shell_env_provider_changes_apply_to_the_next_call() {
     let published = Config::default();
     let mut candidate = published.clone();

@@ -64,6 +64,20 @@ async fn run() {
         assert_ne!(result.outcome, ScopeRecordOutcome::Refused, "{reply:?}");
     }
     std::fs::write(fixture.join("scope-owner.ready"), b"ready").expect("publish scope readiness");
+    if std::env::var_os("AFT_TEST_SCOPE_WATCH_END").is_some() {
+        let handle = handle.clone();
+        let fixture = fixture.to_path_buf();
+        tokio::spawn(async move {
+            while !fixture.join("scope-owner.end").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            handle
+                .scope_sync(2, vec![])
+                .await
+                .expect("end fixture scopes");
+            std::fs::write(fixture.join("scope-owner.ended"), b"ended").unwrap();
+        });
+    }
     serving
         .await
         .expect("serve task")

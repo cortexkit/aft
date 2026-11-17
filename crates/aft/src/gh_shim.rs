@@ -35,12 +35,15 @@ use subc_protocol::{BindIdentity, RouteTarget};
 pub(crate) mod manifest_sync;
 mod manifest_wire;
 mod native_guard;
+mod prefrontal_route;
 pub(crate) mod read_contract;
 mod rename_guard;
 mod ticket_repository;
 mod v22_rows;
 mod v23_queue;
 mod worker_reads;
+
+use prefrontal_route::select_route_holder;
 
 use v22_rows::{
     canonicalize_pr_edit_from, canonicalize_review_thread, canonicalize_v22_api_from,
@@ -80,7 +83,8 @@ const RECENTLY_REACHABLE_WINDOW: Duration = Duration::from_secs(300);
 /// in the future and therefore invalid.
 const ISSUED_AT_FUTURE_SKEW: Duration = Duration::from_secs(300);
 const ROUTING_OPERATION: &str = "gh.route";
-const ROUTING_HOLDER_MODULE_ID: &str = "prefrontal-core";
+#[cfg(test)]
+const ROUTING_HOLDER_MODULE_ID: &str = crate::access_policy::prefrontal::LEGACY_MODULE_ID;
 const MANIFEST_ARTIFACT_ID: &str = "gh-routing-manifest";
 const V1_GOVERNED_TUPLES: &[&str] = &["issue comment", "pr comment", "pr review", "issue reaction"];
 const V1_ADMIN_TUPLES: &[&str] = &["issue close", "pr close", "pr merge", "release create"];
@@ -796,6 +800,9 @@ fn run_with(
 
     let now = unix_seconds();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if let Some(status) = worker_reads::refuse_unavailable_command(args) {
+        return status;
+    }
 
     // Agents run `gh auth status` to learn whether they can write. Upstream
     // `gh` would describe the operator's login, which is not the identity a
@@ -3403,26 +3410,6 @@ fn route_holder(entries: &[subc_client_rs::CatalogEntry]) -> RouteHolder {
             })
             .then(|| entry.module_id.clone())
     }))
-}
-
-fn select_route_holder(advertisers: impl IntoIterator<Item = String>) -> RouteHolder {
-    let mut holder = None;
-    let mut unexpected_advertisers = BTreeSet::new();
-    for advertiser in advertisers {
-        // Governed routes carry identity-bearing writes, so only prefrontal-core may
-        // hold `gh.route`; another module advertising it must not capture the route.
-        // The holder module identifies the routing server, not the bound agent. Using
-        // its module ID would merge all agents into one audit and rate-accounting session.
-        if advertiser == ROUTING_HOLDER_MODULE_ID {
-            holder.get_or_insert(advertiser);
-        } else {
-            unexpected_advertisers.insert(advertiser);
-        }
-    }
-    RouteHolder {
-        module_id: holder,
-        unexpected_advertisers: unexpected_advertisers.into_iter().collect(),
-    }
 }
 
 fn project_root_for(cwd: &Path) -> PathBuf {
@@ -9191,6 +9178,17 @@ mod tests {
         let holder = select_route_holder(["other-module".to_string()]);
         assert_eq!(holder.module_id, None);
         assert_eq!(holder.unexpected_advertisers, vec!["other-module"]);
+    }
+
+    #[test]
+    fn prefrontal_rename_gh_route_catalog_accepts_only_aliases() {
+        for module in crate::access_policy::prefrontal::MODULE_IDS {
+            let holder = select_route_holder([module.to_string(), "other".into()]);
+            assert_eq!(holder.module_id.as_deref(), Some(module));
+            assert_eq!(holder.unexpected_advertisers, ["other"]);
+        }
+        let holder = select_route_holder(["prefrontal-core".into(), "prefrontal".into()]);
+        assert_eq!(holder.module_id.as_deref(), Some("prefrontal"));
     }
 
     #[test]
@@ -17007,7 +17005,7 @@ fn run_captured_protected(
     cwd: &Path,
     now: u64,
 ) -> i32 {
-    use crate::gh_shim_speech::{Code, Refusal};
+    use crate::gh_shim_speech::Code;
     // Background writes retain a signed policy snapshot from command launch,
     // but still require the current manifest. Report its absence before dispatch.
     if matches!(
@@ -17044,10 +17042,36 @@ fn run_captured_protected(
         |_| {
             refuse(
                 RefusalCode::SeamRefusal,
-                &Refusal::new(Code::PolicyDenied, "not_r3").agent_text(),
+                &captured_rung_refusal(&rung).agent_text(),
             )
         },
     )
+}
+
+fn captured_rung_refusal(rung: &RungRecord) -> crate::gh_shim_speech::Refusal {
+    use crate::gh_shim_speech::{Code, Refusal};
+    // Discovery records survive module restarts. A missing daemon or relay is
+    // retryable; missing policy configuration or ambient credentials are not.
+    let temporary = match rung.rung {
+        Rung::R1 => [R1Reason::Unreachable, R1Reason::DiscoveryBudgetExhausted]
+            .into_iter()
+            .any(|reason| {
+                rung.inputs.get("connection_file").map(String::as_str) == Some(reason.diagnostic())
+            }),
+        Rung::R2 => [
+            R2Reason::DaemonUnreachable,
+            R2Reason::CatalogGhRouteAbsent,
+            R2Reason::GhRouteHolderUnbound,
+        ]
+        .into_iter()
+        .any(|reason| rung.inputs.get(reason.diagnostic()).map(String::as_str) == Some("failed")),
+        Rung::R3 => false,
+    };
+    if temporary {
+        Refusal::new(Code::AuthorityUnavailable, "relay_unavailable")
+    } else {
+        Refusal::new(Code::PolicyDenied, "not_r3")
+    }
 }
 
 fn captured_plan(
@@ -17078,7 +17102,7 @@ fn captured_plan(
         .ok_or_else(|| Refusal::new(Code::PolicyDenied, "repository_denied"))?;
     let determination = determine_rung(paths, target, cwd, now);
     if determination.record.rung != Rung::R3 {
-        return Err(Refusal::new(Code::PolicyDenied, "not_r3"));
+        return Err(captured_rung_refusal(&determination.record));
     }
     Ok((manifest, classification, binding, determination.record))
 }

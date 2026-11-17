@@ -525,6 +525,138 @@ fn exact_policy_refusal(reason: &str) -> String {
 }
 
 #[test]
+fn captured_rung_refusals_distinguish_discovery_failures_from_policy() {
+    use crate::gh_shim_speech::Code;
+    let r1_cases = [
+        (R1Reason::DisabledByConfig, false),
+        (R1Reason::AbsentOrUnparseable, false),
+        (R1Reason::Unreachable, true),
+        (R1Reason::DiscoveryBudgetExhausted, true),
+    ];
+    let r2_cases = [
+        (R2Reason::ManifestUnavailable, false),
+        (R2Reason::AgentBindingUnavailable, false),
+        (R2Reason::AgentCredentialsPresent, false),
+        (R2Reason::DaemonUnreachable, true),
+        (R2Reason::CatalogGhRouteAbsent, true),
+        (R2Reason::GhRouteHolderUnbound, true),
+    ];
+    assert_eq!(r1_cases.len(), R1Reason::ALL.len());
+    assert_eq!(r2_cases.len(), R2Reason::ALL.len());
+    let provenance = RungRecordProvenance {
+        image_path: "aft".to_string(),
+        version: "test".to_string(),
+        repo_key: "cortexkit/aft".to_string(),
+    };
+    let cases = r1_cases
+        .into_iter()
+        .map(|(reason, temporary)| (RungDetermination::r1(1, reason), temporary))
+        .chain(r2_cases.into_iter().map(|(reason, temporary)| {
+            (
+                RungDetermination::r2(1, reason, Some(1), &provenance),
+                temporary,
+            )
+        }));
+    for (determination, temporary) in cases {
+        let refusal = captured_rung_refusal(&determination.record);
+        let expected = if temporary {
+            (Code::AuthorityUnavailable, "relay_unavailable")
+        } else {
+            (Code::PolicyDenied, "not_r3")
+        };
+        assert_eq!(
+            (refusal.code, refusal.reason.as_str()),
+            expected,
+            "{:?}",
+            determination.record.inputs
+        );
+    }
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn protected_restart_and_disabled_writes_refuse_without_native_delegation() {
+    let _lock = crate::test_env::process_env_lock();
+    for disabled in [false, true] {
+        let manifest = super::tests::fixture_manifest();
+        let fixture = RunWithFixture::new(&manifest);
+        let _provisioned = Env::set(
+            crate::gh_shim_speech::start_view::PROVISIONED_ENV,
+            Some(OsStr::new("1")),
+        );
+        let repo = manifest.bindings.keys().next().unwrap();
+        let args: Vec<OsString> = ["issue", "comment", "7", "--repo", repo, "--body", "body"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        let target = TargetRepository::from_invocation(&args);
+        let cwd = std::env::current_dir().unwrap();
+        let now = unix_seconds();
+        let connection_file = fixture._dir.path().join("connection.json");
+        std::fs::write(&connection_file, "present").unwrap();
+        let config = crate::subc_config::user_config_path_from(
+            Some(fixture._dir.path().join("config").as_os_str()),
+            Some(fixture._dir.path().join("home").as_os_str()),
+        )
+        .unwrap();
+        std::fs::write(
+            config,
+            serde_json::to_vec(&json!({
+                "github": { "shim": !disabled },
+                "subc": { "connection_file": connection_file },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // Discovery caches the missing relay while AFT restarts. Reusing that
+        // record must refuse with retry advice, not claim the policy changed.
+        let cached = RungDetermination::r2(
+            now,
+            R2Reason::CatalogGhRouteAbsent,
+            None,
+            &RungRecordProvenance::for_target(&target, &cwd),
+        );
+        write_rung_record_silently(&fixture.paths, &cached.record);
+        let determination = determine_rung(&fixture.paths, &target, &cwd, now);
+        if disabled {
+            assert_eq!(determination.record.rung, Rung::R1);
+            assert!(determination.operator_disabled);
+        } else {
+            assert_eq!(determination.record.rung, Rung::R2);
+            assert_eq!(determination.record.inputs, cached.record.inputs);
+        }
+        let expected = if disabled {
+            exact_policy_refusal("not_r3")
+        } else {
+            "gh-shim: gh_shim_seam_refusal: task_gh_authority_unavailable: bot writes from background commands are briefly unavailable (relay_unavailable); retry in a few seconds.".to_string()
+        };
+        let plan = captured_plan(&args, &fixture.paths, &target, &cwd, now);
+        let refusal = plan.err().expect("non-R3 write must not reach dispatch");
+        assert_eq!(
+            format!("gh-shim: gh_shim_seam_refusal: {}", refusal.agent_text()),
+            expected
+        );
+        let (_capture, lines) = capture_refusals_for_test();
+        let delegated = std::cell::Cell::new(false);
+        let exit = run_with(
+            &args,
+            |_| {
+                delegated.set(true);
+                0
+            },
+            |_, _, _, _| panic!("protected refusal must not reach the native probe"),
+        );
+        assert_eq!(exit, REFUSAL_EXIT_STATUS);
+        assert!(!delegated.get(), "disabled={disabled}");
+        assert_eq!(
+            *lines.lock().unwrap(),
+            vec![expected],
+            "disabled={disabled}"
+        );
+    }
+}
+
+#[test]
 fn provisioned_head_run_rerun_names_the_audited_operator_bypass() {
     let _lock = crate::test_env::process_env_lock();
     let manifest: Manifest = serde_json::from_str(include_str!(

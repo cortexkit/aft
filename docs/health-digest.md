@@ -63,6 +63,15 @@ on this route is refused with `unknown_management_op`.
 
 ## Storage retention in the subc health report
 
+The subc report is separate from the root-local digest above. Its fleet size is
+`metrics.root_count`, not the length of `metrics.roots`: individual exceptional
+rows share a maximum 6 KiB with `metrics.root_groups`, after process telemetry has
+been budgeted first. Each group has the identical state/component-status tuple,
+an exact `count`, up to three example paths, and `examples_omitted`.
+`root_details_omitted` counts roots without individual rows, including the
+`root_detail_gap.summarized` grouped roots. Missing rows or example paths must not
+be interpreted as healthy, absent, or recovered roots.
+
 Storage cleanup is reported by the subc health-check report's `metrics`, not
 by the `health.digest` fields. `metrics.storage_retention` holds the
 latest report per storage root. Each report separates `errors` (real I/O,

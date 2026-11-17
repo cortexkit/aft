@@ -38,7 +38,8 @@ const DISCOVERY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const DISCOVERY_MAX_BACKOFF: Duration = Duration::from_secs(60);
 const STATUS_PUBLISH_TTL_MS: u64 = 7_500;
 const STATUS_MODULE: &str = "aft";
-const STATUS_HOLDER_MODULE: &str = "prefrontal-core";
+#[cfg(test)]
+const STATUS_HOLDER_MODULE: &str = crate::access_policy::prefrontal::LEGACY_MODULE_ID;
 const STATUS_LINE_OPERATION: &str = "status.line";
 
 #[cfg(test)]
@@ -691,6 +692,7 @@ async fn run_connected_status_dial<C: StatusConsumer>(
         std::collections::VecDeque::new();
 
     let mut route: Option<C::Route> = None;
+    let mut route_module = None;
     let mut route_events = None;
     let mut catalog_watch = None;
     let mut catalog_generation = None;
@@ -718,9 +720,23 @@ async fn run_connected_status_dial<C: StatusConsumer>(
             STATUS_CADENCE
         };
         if tokio::time::Instant::now() >= next_discovery_at {
-            match consumer.catalog_list().await {
-                Ok(catalog) if catalog_advertises_status_line(&catalog.modules) => {
+            let catalog = consumer.catalog_list().await;
+            if let Ok(catalog) = &catalog {
+                crate::access_policy::prefrontal::observe_catalog(
+                    catalog.modules.iter().map(|entry| entry.module_id.as_str()),
+                );
+            }
+            match catalog {
+                Ok(catalog) if status_holder(&catalog.modules).is_some() => {
+                    let holder = status_holder(&catalog.modules).expect("advertised status holder");
                     catalog_generation = Some(catalog.generation);
+                    if route_module != Some(holder) {
+                        if let Some(opened_route) = route.take() {
+                            let _ = consumer.close_handle(&opened_route).await;
+                            client.set_route_live(false);
+                        }
+                        route_events = None;
+                    }
                     if route.is_none()
                         && reopen_forbidden.is_none()
                         && !refused_identities.contains(&route_identity)
@@ -734,7 +750,7 @@ async fn run_connected_status_dial<C: StatusConsumer>(
                         match consumer
                             .open_route(
                                 RouteTarget::ManagementSurface {
-                                    module_id: STATUS_HOLDER_MODULE.to_string(),
+                                    module_id: holder.to_string(),
                                 },
                                 identity,
                             )
@@ -746,6 +762,7 @@ async fn run_connected_status_dial<C: StatusConsumer>(
                                     last_route_channel =
                                         Some(consumer.route_channel(&opened_route));
                                     route = Some(opened_route);
+                                    route_module = Some(holder);
                                     discovery_backoff = DISCOVERY_INITIAL_BACKOFF;
                                 }
                                 Err(error) => {
@@ -757,13 +774,13 @@ async fn run_connected_status_dial<C: StatusConsumer>(
                             },
                             Err(RouteOpenFailure::Refused { code, message }) => {
                                 log::warn!(
-                                    "fleet status dial: {STATUS_HOLDER_MODULE} refused the status route for session {} (harness {}, project {}): {code}: {message}; not reopening it for this session",
+                                    "fleet status dial: {holder} refused the status route for session {} (harness {}, project {}): {code}: {message}; not reopening it for this session",
                                     route_identity.session,
                                     route_identity.harness,
                                     route_identity.project_root,
                                 );
                                 client.record_stopped_route(StoppedRoute {
-                                    target: STATUS_HOLDER_MODULE.to_string(),
+                                    target: holder.to_string(),
                                     session: route_identity.session.clone(),
                                     harness: route_identity.harness.clone(),
                                     project_root: route_identity.project_root.clone(),
@@ -783,7 +800,7 @@ async fn run_connected_status_dial<C: StatusConsumer>(
                                 // after it log at debug.
                                 if discovery_backoff == DISCOVERY_INITIAL_BACKOFF {
                                     log::info!(
-                                        "fleet status dial: {STATUS_HOLDER_MODULE} route unavailable for session {}: {error}; retrying with backoff",
+                                        "fleet status dial: {holder} route unavailable for session {}: {error}; retrying with backoff",
                                         route_identity.session,
                                     );
                                 } else {
@@ -1000,16 +1017,22 @@ fn consumer_identity_is_available() -> bool {
     crate::launch_nonce::consumer_identity().is_some()
 }
 
-fn catalog_advertises_status_line(entries: &[subc_client_rs::CatalogEntry]) -> bool {
-    entries.iter().any(|entry| {
-        entry.module_id == STATUS_HOLDER_MODULE && entry.roles.iter().any(|role| {
+fn status_holder(entries: &[subc_client_rs::CatalogEntry]) -> Option<&'static str> {
+    let holder = crate::access_policy::prefrontal::catalog_module(
+        entries.iter().map(|entry| entry.module_id.as_str()),
+    );
+    entries
+        .iter()
+        .any(|entry| {
+            entry.module_id == holder && entry.roles.iter().any(|role| {
             matches!(
                 role,
                 ProviderRole::ManagementSurface { operations, .. }
                     if operations.iter().any(|operation| operation.name == STATUS_LINE_OPERATION)
             )
         })
-    })
+        })
+        .then_some(holder)
 }
 
 /// Room for the daemon's control pushes between two turns of the dial loop.
@@ -1065,7 +1088,12 @@ fn record_forbidden_reopen(
     last_route_channel: Option<u16>,
     reopen_forbidden: &mut Option<String>,
 ) -> bool {
-    if push.body.get("module_id").and_then(Value::as_str) != Some(STATUS_HOLDER_MODULE) {
+    if !push
+        .body
+        .get("module_id")
+        .and_then(Value::as_str)
+        .is_some_and(crate::access_policy::prefrontal::is_module)
+    {
         return false;
     }
     if !push_names_dial_route(push, last_route_channel) {
@@ -1165,6 +1193,8 @@ mod tests {
     #[derive(Default)]
     struct FakeCatalogWatch {
         available: std::sync::atomic::AtomicBool,
+        renamed: std::sync::atomic::AtomicBool,
+        targets: parking_lot::Mutex<Vec<String>>,
         generation: AtomicU64,
         sender: parking_lot::Mutex<Option<mpsc::Sender<u64>>>,
     }
@@ -1208,7 +1238,11 @@ mod tests {
                 generation: self.watch.generation.load(Ordering::Relaxed).max(1),
                 modules: if self.advertises_status_line {
                     vec![status_catalog_entry(
-                        STATUS_HOLDER_MODULE,
+                        if self.watch.renamed.load(Ordering::Relaxed) {
+                            "prefrontal"
+                        } else {
+                            STATUS_HOLDER_MODULE
+                        },
                         STATUS_LINE_OPERATION,
                     )]
                 } else {
@@ -1231,10 +1265,13 @@ mod tests {
 
         async fn open_route(
             &self,
-            _target: RouteTarget,
+            target: RouteTarget,
             _identity: BindIdentity,
         ) -> Result<usize, RouteOpenFailure> {
             let mut attempts = self.attempts.lock();
+            if let RouteTarget::ManagementSurface { module_id } = target {
+                self.watch.targets.lock().push(module_id);
+            }
             attempts.push(tokio::time::Instant::now());
             if self.succeeds_on == Some(attempts.len()) {
                 Ok(attempts.len())
@@ -1308,6 +1345,76 @@ mod tests {
     async fn settle_dial() {
         for _ in 0..8 {
             tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prefrontal_rename_status_redials_on_catalog_change_without_restart() {
+        let (task, _, watch, _) = watch_dial(1).await;
+        assert_eq!(*watch.targets.lock(), ["prefrontal-core"]);
+        watch.renamed.store(true, Ordering::Relaxed);
+        watch.generation.store(2, Ordering::Relaxed);
+        watch.sender.lock().as_ref().unwrap().try_send(2).unwrap();
+        settle_dial().await;
+        assert_eq!(*watch.targets.lock(), ["prefrontal-core", "prefrontal"]);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initial_status_discovery_retains_the_queued_publish_cadence() {
+        let (client, mut wire_rx) = FleetStatusClient::dial_channel(1);
+        client.publish(
+            Path::new("/queued-project"),
+            "opencode",
+            "session",
+            "status",
+        );
+        let request = wire_rx.try_recv().unwrap();
+        let identity = FleetRouteIdentity::from(&request);
+        let queued = client.inner.state.lock().last_publish_at.clone();
+        assert_eq!(queued.len(), 1);
+        let watch = Arc::new(FakeCatalogWatch::default());
+        watch.available.store(true, Ordering::Relaxed);
+        let consumer = RejectingConsumer {
+            attempts: Arc::default(),
+            succeeds_on: Some(1),
+            failure: transient_failure(),
+            advertises_status_line: true,
+            catalog_calls: Arc::default(),
+            publish_calls: Arc::default(),
+            connection_callback: Arc::default(),
+            push_sender: Arc::default(),
+            control_sender: Arc::default(),
+            watch,
+        };
+        let task = tokio::spawn(run_connected_status_dial(
+            consumer,
+            client.clone(),
+            wire_rx,
+            identity,
+            None,
+        ));
+        settle_dial().await;
+        assert!(client.inner.route_live.load(Ordering::Acquire));
+        assert_eq!(client.inner.state.lock().last_publish_at, queued);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[test]
+    fn prefrontal_rename_status_discovery_and_close_push_accept_both() {
+        for module in crate::access_policy::prefrontal::MODULE_IDS {
+            assert_eq!(
+                status_holder(&[status_catalog_entry(module, STATUS_LINE_OPERATION)]),
+                Some(module)
+            );
+            let push = ControlPush {
+                op: "route.closed".into(),
+                body: json!({"op":"route.closed", "module_id":module, "reason":"scope_ended"}),
+            };
+            let mut forbidden = None;
+            assert!(record_forbidden_reopen(&push, None, &mut forbidden));
         }
     }
 
@@ -2075,18 +2182,18 @@ mod tests {
 
     #[test]
     fn catalog_gate_requires_matching_module_management_role_and_exact_operation() {
-        assert!(catalog_advertises_status_line(&[status_catalog_entry(
+        assert!(status_holder(&[status_catalog_entry(
             STATUS_HOLDER_MODULE,
             STATUS_LINE_OPERATION,
-        )]));
-        assert!(!catalog_advertises_status_line(&[status_catalog_entry(
-            "other-module",
-            STATUS_LINE_OPERATION,
-        )]));
-        assert!(!catalog_advertises_status_line(&[status_catalog_entry(
-            STATUS_HOLDER_MODULE,
-            "status.lines",
-        )]));
+        )])
+        .is_some());
+        assert!(
+            status_holder(&[status_catalog_entry("other-module", STATUS_LINE_OPERATION,)])
+                .is_none()
+        );
+        assert!(
+            status_holder(&[status_catalog_entry(STATUS_HOLDER_MODULE, "status.lines",)]).is_none()
+        );
     }
 
     #[test]

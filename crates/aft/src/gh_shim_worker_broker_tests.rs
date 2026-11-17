@@ -265,14 +265,54 @@ async fn gh_shim_broker_t4_frame_and_rate_and_upstream_budgets_are_bounded() {
         requests: 29,
         upstream: 599,
     };
-    assert!(limits.take(true));
-    assert!(!limits.take(true));
+    assert_eq!(limits.take(true), Ok(()));
+    assert_eq!(limits.take(true), Err("command_budget_exceeded"));
     limits.window = Instant::now() - Duration::from_secs(2);
-    assert!(limits.take(false));
-    assert!(
-        !limits.take(true),
-        "upstream budget does not refill with request rate"
-    );
+    assert_eq!(limits.take(false), Ok(()));
+    assert_eq!(limits.take(true), Err("command_budget_exceeded"));
+}
+
+#[test]
+fn gh_shim_broker_refusal_texts_are_pinned() {
+    for (code, text) in [
+        ("broker_busy", "gh read refused: too many gh commands are running at once in this shell. Retry in 1 second, or run fewer in parallel."),
+        ("request_rate_exceeded", "gh read refused: more than 30 gh reads in one second. Retry in 1 second."),
+        ("command_budget_exceeded", "gh read refused: this bash command has used its 600 gh reads. Start a new bash command."),
+        ("broker_timeout", "gh read timed out. Retry, or run fewer gh commands in parallel."),
+        ("broker_unavailable", "gh reads are unavailable in this bash command. Start a new bash command."),
+        ("watch_interval", "--interval must be a positive number of seconds"),
+        ("run_download", "gh run download isn't available in worker shells; ask your head agent to download the artifacts"),
+        ("command_ended", "gh read failed: command_ended. Start a new bash command."),
+    ] {
+        assert_eq!(failure_text(code), text);
+        assert_eq!(refusal(code).data["message"], text);
+    }
+}
+
+#[tokio::test]
+async fn gh_shim_broker_rate_limit_recovers_without_reissuing_capability() {
+    let grant = Grant::new();
+    let transport = Transport::default();
+    let limits = budget();
+    limits.lock().unwrap().requests = REQUESTS_PER_SECOND;
+    let bytes = grant.envelope(Operation::SessionContext);
+    let request = || {
+        dispatch(
+            &bytes,
+            &grant.socket,
+            &transport,
+            |cap| crate::gh_shim_ticket::redeem_worker_read(cap, &grant.socket),
+            |_| true,
+            |_| std::future::ready(Ok(Some(stamp()))),
+            &limits,
+        )
+    };
+    let reply = request().await;
+    assert_eq!(reply.data["refusal_code"], "request_rate_exceeded");
+    assert_eq!(reply.data["message"], failure_text("request_rate_exceeded"));
+    limits.lock().unwrap().window = Instant::now() - Duration::from_secs(2);
+    let reply = request().await;
+    assert!(reply.ok, "the same capability must recover: {reply:?}");
 }
 
 #[tokio::test]
@@ -426,10 +466,12 @@ async fn gh_shim_broker_t4_real_listener_bounds_connections_and_read_deadlines()
     .await
     .expect("real accepted connections must reserve bounded global slots");
     let mut excess = tokio::net::UnixStream::connect(&socket).await.unwrap();
-    let closed = tokio::time::timeout(Duration::from_millis(500), excess.read_u8())
+    let reply = tokio::time::timeout(Duration::from_millis(500), read_reply(&mut excess))
         .await
-        .expect("excess connection must close without waiting for frame deadline");
-    assert!(closed.is_err());
+        .expect("excess connection must receive a refusal without waiting for a frame")
+        .unwrap();
+    assert_eq!(reply["data"]["refusal_code"], "broker_busy");
+    assert_eq!(reply["data"]["message"], failure_text("broker_busy"));
     for mut client in clients {
         assert!(
             tokio::time::timeout(FRAME_DEADLINE + Duration::from_secs(1), client.read_u8())
@@ -444,6 +486,135 @@ async fn gh_shim_broker_t4_real_listener_bounds_connections_and_read_deadlines()
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn gh_shim_broker_four_admitted_connections_queue_instead_of_eof() {
+    let _state = installed_worker_manifest();
+    let root = tempfile::tempdir().unwrap();
+    for arguments in [
+        vec!["init", "-q"],
+        vec!["config", "remote.origin.url", "cortexkit/aft"],
+    ] {
+        let mut command = std::process::Command::new("git");
+        command.arg("-C").arg(root.path()).args(arguments);
+        assert!(crate::test_env::apply_hermetic_git_env(&mut command)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let socket = root.path().join("broker.sock");
+    let tasks = crate::bash_background::BgTaskRegistry::default();
+    let release = root.path().join("release-command");
+    let task_id = tasks
+        .spawn_with_shell_in_slot(
+            crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+            &crate::test_gate::gate(&format!("'{}'", release.display()), "sleep 0.01"),
+            crate::bash_background::BashShell::Bash,
+            PathBuf::from("/bin/bash"),
+            "concurrent-worker-reads".into(),
+            root.path().to_path_buf(),
+            Default::default(),
+            crate::bash_background::HardKill::After(Duration::from_secs(10)),
+            None,
+            root.path().to_path_buf(),
+            crate::bash_background::TaskSlot::Foreground,
+            false,
+            false,
+            Some(root.path().to_path_buf()),
+        )
+        .unwrap();
+    assert!(!tasks.is_task_terminal(&task_id));
+    let ticket = PendingTicket::issue("concurrent-worker-reads", root.path().to_str().unwrap());
+    ticket.reserve_task(&task_id);
+    let (capability, _) = ticket
+        .worker_read_capability(
+            socket.clone(),
+            Instant::now() + Duration::from_secs(60),
+            &stamp(),
+        )
+        .unwrap();
+    let (service, mut receiver) = optional_service(root.path());
+    let scopes = tokio::spawn(async move {
+        while let Some(query) = receiver.recv().await {
+            let _ = query.reply.send(Some(stamp()));
+        }
+    });
+    let upstream = Arc::new(Semaphore::new(2));
+    let occupied = upstream.clone().acquire_many_owned(2).await.unwrap();
+    let budget = Arc::new(budget());
+    let mut clients = Vec::new();
+    let mut connections = tokio::task::JoinSet::new();
+    for _ in 0..CONNECTIONS {
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        write_frame(
+            &mut client,
+            &serde_json::to_vec(&Envelope {
+                capability: capability.clone(),
+                operation: Operation::SessionContext,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        clients.push(client);
+        let (socket, service, tasks, upstream, budget) = (
+            socket.clone(),
+            service.clone(),
+            tasks.clone(),
+            upstream.clone(),
+            budget.clone(),
+        );
+        connections.spawn(async move {
+            connection(server, &socket, &service, &tasks, &upstream, &budget).await;
+        });
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), read_reply(&mut clients[0]))
+            .await
+            .is_err(),
+        "an admitted request must wait for an upstream slot, not close with EOF"
+    );
+    drop(occupied);
+    for client in &mut clients {
+        let reply = tokio::time::timeout(Duration::from_secs(1), read_reply(client))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply["status"], "ok", "{reply}");
+        assert_eq!(reply["data"]["repository"], "cortexkit/aft");
+    }
+    while let Some(result) = connections.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(
+        upstream.available_permits(),
+        2,
+        "burst must release all slots"
+    );
+    let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+    write_frame(
+        &mut client,
+        &serde_json::to_vec(&Envelope {
+            capability,
+            operation: Operation::SessionContext,
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    connection(server, &socket, &service, &tasks, &upstream, &budget).await;
+    assert_eq!(read_reply(&mut client).await.unwrap()["status"], "ok");
+    scopes.abort();
+    assert!(scopes.await.unwrap_err().is_cancelled());
+    std::fs::write(release, b"run").unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !tasks.is_task_terminal(&task_id) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the fixture's real command must end");
 }
 
 #[tokio::test]
@@ -930,11 +1101,10 @@ async fn gh_shim_broker_audit_excludes_capability_file_and_query_secrets() {
     );
 }
 
-#[tokio::test]
-async fn gh_shim_broker_raw_request_uses_real_signed_manifest_binding() {
+fn installed_worker_manifest() -> crate::test_env::GhShimStateGuard {
     use base64::Engine;
     use ring::signature::Ed25519KeyPair;
-    let _state = crate::test_env::gh_shim_state_guard();
+    let state = crate::test_env::gh_shim_state_guard();
     let root = PathBuf::from(std::env::var_os(STATE_ENV).unwrap());
     let mut manifest: Value =
         serde_json::from_str(include_str!("../tests/fixtures/gh_shim/v20-manifest.json")).unwrap();
@@ -951,6 +1121,12 @@ async fn gh_shim_broker_raw_request_uses_real_signed_manifest_binding() {
     let bytes = serde_json::to_vec(&manifest).unwrap();
     let key = Ed25519KeyPair::from_seed_unchecked(&SEED).unwrap();
     std::fs::write(root.join("gh-routing-manifest.json"),serde_json::to_vec(&json!({"artifact_id":"gh-routing-manifest","envelope_version":2,"key_id":"gh-routing-dev-test-key-v1","fetched_at_unix_secs":now,"signature":base64::engine::general_purpose::STANDARD.encode(key.sign(&bytes).as_ref()),"manifest_bytes":String::from_utf8(bytes).unwrap()})).unwrap()).unwrap();
+    state
+}
+
+#[tokio::test]
+async fn gh_shim_broker_raw_request_uses_real_signed_manifest_binding() {
+    let _state = installed_worker_manifest();
     struct SignedTransport(AtomicUsize);
     impl RelayTransport for SignedTransport {
         fn opens_scoped_routes(&self) -> bool {

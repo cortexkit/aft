@@ -52,6 +52,105 @@ fn listed(db: &Db) -> Value {
 }
 
 #[tokio::test]
+async fn prefrontal_scope_sweep_pre_window_end_sends_only_original_describe() {
+    let (dir, db) = fixture();
+    let key = save(&db, dir.path(), "pre-window", 1);
+    let calls = Mutex::new(Vec::new());
+    let stats = tick(db.clone(), &mut None, |stamp| {
+        calls.lock().unwrap().push(stamp.owner);
+        std::future::ready(Ok(reply(ScopeStatus::Ended, true)))
+    })
+    .await;
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [subc_protocol::Principal::Reserved {
+            module_id: "prefrontal-core".into()
+        }]
+    );
+    assert_eq!(stats.deleted_grants, 1);
+    assert!(store::scope_ended(&db.lock().unwrap(), &key).unwrap());
+}
+
+#[tokio::test]
+async fn prefrontal_scope_sweep_retains_continuations_and_holds_but_revokes_absence() {
+    for (status, configured, synced, absent) in [
+        (ScopeStatus::Live, true, true, false),
+        (ScopeStatus::NotLive, true, false, false),
+        (ScopeStatus::NotLive, false, false, true),
+        (ScopeStatus::Live, false, true, true),
+        (ScopeStatus::Ended, true, true, true),
+    ] {
+        let (dir, db) = fixture();
+        let key = save(&db, dir.path(), "rename-agent", 1);
+        let calls = Mutex::new(Vec::new());
+        let configured_modules = vec!["prefrontal".into()];
+        let stats = tick_unwatched(
+            db.clone(),
+            &mut None,
+            |stamp| {
+                calls.lock().unwrap().push(stamp.owner.clone());
+                let mut answer = reply(ScopeStatus::Ended, true);
+                if stamp.owner
+                    == (subc_protocol::Principal::Reserved {
+                        module_id: "prefrontal".into(),
+                    })
+                {
+                    answer = ModuleControlResponseToModule::ScopeDescribe {
+                        status,
+                        scope_epoch: Some(1),
+                        daemon_incarnation: "test".into(),
+                        owner_synced: synced,
+                        owner_configured: configured,
+                        scope: None,
+                    };
+                }
+                std::future::ready(Ok(answer))
+            },
+            |_| false,
+            |stamp| {
+                crate::access_policy::prefrontal::counterpart_in_catalog(stamp, &configured_modules)
+            },
+        )
+        .await;
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        assert_eq!(
+            calls.lock().unwrap()[1],
+            subc_protocol::Principal::Reserved {
+                module_id: "prefrontal".into()
+            }
+        );
+        assert_eq!(stats.deleted_grants, u64::from(absent));
+        let conn = db.lock().unwrap();
+        assert_eq!(store::list(&conn, &key).unwrap().is_empty(), absent);
+        assert_eq!(store::scope_ended(&conn, &key).unwrap(), absent);
+    }
+}
+
+#[tokio::test]
+async fn saved_grant_sweep_rechecks_coverage_before_each_describe() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let (dir, db) = fixture();
+    save(&db, dir.path(), "first", 1);
+    save(&db, dir.path(), "second", 1);
+    let protected = AtomicBool::new(false);
+    let calls = AtomicUsize::new(0);
+    let stats = tick_unwatched(
+        db,
+        &mut None,
+        |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            protected.store(true, Ordering::Relaxed);
+            std::future::ready(Ok(reply(ScopeStatus::Live, true)))
+        },
+        |_| protected.load(Ordering::Relaxed),
+        |_| false,
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.described, 1);
+}
+
+#[tokio::test]
 async fn saved_grant_sweep_only_deletes_definite_ends() {
     let (dir, db) = fixture();
     for (name, expected_end) in [

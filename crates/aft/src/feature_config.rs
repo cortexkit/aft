@@ -1098,10 +1098,12 @@ pub enum DocumentTier {
 /// exactly as if the file had spelled them out.
 pub fn translate_document(map: &mut Map<String, Value>, tier: DocumentTier) -> DocumentTranslation {
     let mut out = DocumentTranslation::default();
+    translate_runon_enabled(map, tier, "", &mut out);
     translate_block(map, tier == DocumentTier::User, "base", &mut out);
     if let Some(Value::Object(harnesses)) = map.get_mut("harnesses") {
         for (name, block) in harnesses.iter_mut() {
             if let Value::Object(block) = block {
+                translate_runon_enabled(block, tier, &format!("harnesses.{name}."), &mut out);
                 translate_block(block, false, &format!("harnesses.{name}"), &mut out);
             }
         }
@@ -1109,6 +1111,34 @@ pub fn translate_document(map: &mut Map<String, Value>, tier: DocumentTier) -> D
     out.retired_keys.sort();
     out.retired_keys.dedup();
     out
+}
+
+/// The retired bash gate was user-only. Projects drop it without changing
+/// their current remote-run setting; an explicit false in a user block keeps
+/// that block's remote runs off. Absence already uses the current setting.
+fn translate_runon_enabled(
+    map: &mut Map<String, Value>,
+    tier: DocumentTier,
+    prefix: &str,
+    out: &mut DocumentTranslation,
+) {
+    // Keep an empty bash object: its normal defaults still take precedence
+    // over retired experimental bash flags, unlike an absent bash setting.
+    if let Some(value) = map
+        .get_mut("bash")
+        .and_then(Value::as_object_mut)
+        .and_then(|bash| bash.remove("runon_enabled"))
+    {
+        record_retired(out, prefix, "bash.runon_enabled");
+        if tier == DocumentTier::User && value == Value::Bool(false) {
+            let remote = map
+                .entry("remote_exec".to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Value::Object(remote) = remote {
+                remote.insert("enabled".to_string(), Value::Bool(false));
+            }
+        }
+    }
 }
 
 /// Whether a translation carries the retired `enabled: false` note.
@@ -1352,6 +1382,7 @@ fn project_block(block: &Map<String, Value>) -> Value {
         .chain(REMOVED_NO_EFFECT_PATHS)
         .map(|(path, _)| path)
         .chain(DATA_LAYER_RETIRED_PATHS)
+        .chain(["bash.runon_enabled"])
         .chain(REMOVED_DATA_LAYER_PATHS)
     {
         let value = match path.split_once('.') {

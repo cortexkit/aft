@@ -49,6 +49,53 @@ fn fixture() -> (tempfile::TempDir, Arc<Service>, Arc<AtomicUsize>) {
     (dir, service, calls)
 }
 
+#[tokio::test]
+async fn scope_watch_service_notice_deduplicates_per_callback_and_replays_on_handoff() {
+    let (_dir, service, _calls) = fixture();
+    let scope = head();
+    let proof = || {
+        let reply = ModuleControlResponseToModule::ScopeDescribe {
+            status: ScopeStatus::Ended,
+            scope_epoch: Some(scope.scope_epoch),
+            daemon_incarnation: "daemon".into(),
+            owner_synced: true,
+            owner_configured: true,
+            scope: None,
+        };
+        match crate::gh_shim_speech::scope::validate_scope_identity(
+            &scope,
+            ScopeRole::Authority,
+            &reply,
+            &service.generation(),
+            &service.generation(),
+            0,
+        )
+        .unwrap()
+        {
+            crate::gh_shim_speech::scope::Answer::Ended(proof) => proof,
+            _ => panic!("expected exact epoch proof"),
+        }
+    };
+    let first = Arc::new(AtomicUsize::new(0));
+    let calls = first.clone();
+    service.set_end_notice(Arc::new(move |_| {
+        calls.fetch_add(1, Ordering::SeqCst);
+    }));
+    service.record_end(&scope, proof()).unwrap();
+    service.record_end(&scope, proof()).unwrap();
+    assert_eq!(first.load(Ordering::SeqCst), 1);
+    assert!(service.store.scope_ended(&scope).unwrap());
+    let replacement = Arc::new(AtomicUsize::new(0));
+    let calls = replacement.clone();
+    service.set_end_notice(Arc::new(move |_| {
+        calls.fetch_add(1, Ordering::SeqCst);
+    }));
+    service.record_end(&scope, proof()).unwrap();
+    service.record_end(&scope, proof()).unwrap();
+    assert_eq!(replacement.load(Ordering::SeqCst), 1);
+    assert_eq!(first.load(Ordering::SeqCst), 1);
+}
+
 #[test]
 fn binding_reply_diagnostics_distinguish_missing_generation_missing_rows_and_invalid_rows() {
     use serde_json::json;

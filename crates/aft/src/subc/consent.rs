@@ -1374,6 +1374,7 @@ impl SettlementGroup {
                     id: call.request_id.clone(),
                     success: reply.success,
                     data: reply.data,
+                    notices: Default::default(),
                 },
                 reply.text,
             )),
@@ -1864,7 +1865,7 @@ fn prepare_locked(
         tool,
         operation_name(grant.operation),
         &path,
-        scope_reason(&scope_grant),
+        &scope_reason(&scope_grant),
         &key.args_hash,
         &pattern(&scope_grant),
         head.map(head_policy_name),
@@ -1955,18 +1956,70 @@ fn prepare_shell(
     }))
 }
 
-const READ_TREE_SCOPE_REASON: &str = "Allow scope: read-only access for all AFT read tools within the displayed directory tree. Protected paths remain denied.";
+const READ_TREE_SCOPE_REASON: &str = "Allow scope: read-only access for all AFT read tools within the directory tree rooted at {path}. Protected paths remain denied.";
 const READ_FILE_SCOPE_REASON: &str = "Allow scope: read-only access for all AFT read tools to the displayed file only. Protected paths remain denied.";
 const WRITE_TREE_SCOPE_REASON: &str = "Allow scope: read/write access for all AFT file tools within the displayed directory tree. Protected paths remain denied.";
 const WRITE_FILE_SCOPE_REASON: &str = "Allow scope: read/write access for all AFT file tools to the displayed file only. Protected paths remain denied.";
 
-fn scope_reason(grant: &AccessGrant) -> &'static str {
+fn scope_reason(grant: &AccessGrant) -> String {
     match (grant.operation, grant.kind) {
-        (AccessOperation::Read, GrantKind::Subtree) => READ_TREE_SCOPE_REASON,
-        (AccessOperation::Read, GrantKind::File) => READ_FILE_SCOPE_REASON,
-        (AccessOperation::Write, GrantKind::Subtree) => WRITE_TREE_SCOPE_REASON,
-        (AccessOperation::Write, GrantKind::File) => WRITE_FILE_SCOPE_REASON,
+        (AccessOperation::Read, GrantKind::Subtree) => {
+            let budget = 160 - READ_TREE_SCOPE_REASON.replace("{path}", "").chars().count();
+            let path = scope_reason_path(&grant.path, &super::permissions::home_folders(), budget);
+            READ_TREE_SCOPE_REASON.replace("{path}", &path)
+        }
+        (AccessOperation::Read, GrantKind::File) => READ_FILE_SCOPE_REASON.into(),
+        (AccessOperation::Write, GrantKind::Subtree) => WRITE_TREE_SCOPE_REASON.into(),
+        (AccessOperation::Write, GrantKind::File) => WRITE_FILE_SCOPE_REASON.into(),
     }
+}
+
+fn scope_reason_path(path: &Path, homes: &[PathBuf], budget: usize) -> String {
+    let displayed = super::permissions::display_path(path, homes);
+    if displayed.chars().count() <= budget {
+        return displayed;
+    }
+    let separator = std::path::MAIN_SEPARATOR;
+    let parts = displayed
+        .split(separator)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let repository = parts.last().copied().unwrap_or(&displayed);
+    if repository.chars().count() > budget {
+        // The card's fixed sentence leaves limited space even for one folder.
+        let leading = (budget - 1).div_ceil(2);
+        let trailing = budget - leading - 1;
+        let end = repository.chars().count() - trailing;
+        return format!(
+            "{}…{}",
+            repository.chars().take(leading).collect::<String>(),
+            repository.chars().skip(end).collect::<String>()
+        );
+    }
+    let first = if displayed.starts_with(separator) {
+        format!("{separator}{}", parts[0])
+    } else {
+        parts[0].to_owned()
+    };
+    let keep_first = parts.len() > 1
+        && format!("{first}{separator}…{separator}{repository}")
+            .chars()
+            .count()
+            <= budget;
+    let mut result = repository.to_owned();
+    for start in (1..parts.len()).rev() {
+        let suffix = parts[start..].join(&separator.to_string());
+        let candidate = if keep_first {
+            format!("{first}{separator}…{separator}{suffix}")
+        } else {
+            format!("…{separator}{suffix}")
+        };
+        if candidate.chars().count() > budget {
+            break;
+        }
+        result = candidate;
+    }
+    result
 }
 
 /// Offer a file ask's immediate directory, for reads and writes alike, only
@@ -1976,6 +2029,52 @@ fn scope_reason(grant: &AccessGrant) -> &'static str {
 /// trees remain eligible. Unknown home/volume identity stays file-only.
 pub(crate) fn directory_scope(grant: &AccessGrant) -> AccessGrant {
     directory_scope_with(grant, directory_is_root_alias)
+}
+
+/// New worker read cards may offer the nearest repository, but never bypass
+/// the directory eligibility checks or reinterpret a previously offered scope.
+fn worker_read_scope(grant: &AccessGrant) -> AccessGrant {
+    let folder = directory_scope(grant);
+    if grant.operation != AccessOperation::Read || grant.kind != GrantKind::File {
+        return folder;
+    }
+    let Some(parent) = grant.path.parent() else {
+        return folder;
+    };
+    let deadline = Instant::now() + directory_scope_probe_budget();
+    let Some(permit) = DIRECTORY_SCOPE_PROBE_LIMITER.acquire_until(deadline) else {
+        return folder;
+    };
+    let repository = crate::bounded_io::run(parent, Some(deadline), move |directory| {
+        let _permit = permit;
+        Ok(repository_scope_with(&directory, |ancestor| {
+            probe_directory_scope_with(ancestor, directory_is_root_alias) == Ok(true)
+        }))
+    });
+    match repository {
+        Ok(Some(path)) => AccessGrant {
+            path,
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        },
+        _ => folder,
+    }
+}
+
+fn repository_scope_with(directory: &Path, eligible: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    for ancestor in directory.ancestors() {
+        match std::fs::symlink_metadata(ancestor.join(".git")) {
+            Ok(entry) if entry.is_dir() || entry.is_file() => {
+                // Stop at the nearest repository even if it is ineligible:
+                // a home repository must not select an outer repository.
+                return eligible(ancestor).then(|| ancestor.to_path_buf());
+            }
+            Ok(_) => return None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 const DIRECTORY_SCOPE_PROBE_BUDGET: Duration = Duration::from_millis(250);
@@ -2171,13 +2270,19 @@ fn log_directory_scope_fallback(parent: &Path, reason: &str) {
     }
 }
 
-async fn scope_before_db(grant: &AccessGrant) -> AccessGrant {
+async fn scope_before_db(grant: &AccessGrant, worker: bool) -> AccessGrant {
     let probing = grant.clone();
     // A bounded helper still waits for its deadline. Keep that wait off the
     // async executor and outside the database mutex used for head-policy checks.
-    tokio::task::spawn_blocking(move || directory_scope(&probing))
-        .await
-        .unwrap_or_else(|_| grant.clone())
+    tokio::task::spawn_blocking(move || {
+        if worker {
+            worker_read_scope(&probing)
+        } else {
+            directory_scope(&probing)
+        }
+    })
+    .await
+    .unwrap_or_else(|_| grant.clone())
 }
 
 fn probe_directory_scope_with(
@@ -2194,6 +2299,14 @@ fn probe_directory_scope_with(
             crate::access_policy::policy_path(&path)
         })
         .ok_or("home identity unknown")?;
+    probe_directory_scope_at_home(parent, &home, root_alias_check)
+}
+
+fn probe_directory_scope_at_home(
+    parent: &Path,
+    home: &Path,
+    root_alias_check: impl Fn(&Path, &Path) -> Option<bool>,
+) -> DirectoryScopeAnswer {
     // statfs and stat fail on a directory that is gone, such as task scratch
     // that cleanup removed after its command exited. Name that cause instead
     // of reporting it as an unknown volume.
@@ -2204,10 +2317,10 @@ fn probe_directory_scope_with(
     let (volume, _) = crate::volume::volume_anchor(parent).ok_or("volume identity unknown")?;
     let volume = crate::access_policy::policy_path(&volume);
     let root = parent.ancestors().last().unwrap_or(parent);
-    if !directory_scope_is_narrow(parent, &home, &volume) {
+    if !directory_scope_is_narrow(parent, home, &volume) {
         return Ok(false);
     }
-    if directory_is_protected_alias(parent, &home, &volume)
+    if directory_is_protected_alias(parent, home, &volume)
         .ok_or("protected alias identity unknown")?
     {
         return Ok(false);
@@ -2351,14 +2464,24 @@ fn advertised_scope(prep: &Prepared) -> Option<AccessGrant> {
         return None;
     }
     let parent = grant.path.parent()?;
-    // The filesystem root is never offered as a file's directory scope.
-    parent.parent()?;
-    let directory = AccessGrant {
-        path: parent.to_path_buf(),
-        kind: GrantKind::Subtree,
-        operation: grant.operation,
-    };
-    (advertised == pattern(&directory)).then_some(directory)
+    // Read cards can name a repository ancestor. Match the persisted pattern
+    // without probing again: existing folder cards must keep their old scope.
+    // Writes still accept only the immediate directory, and never a root.
+    for ancestor in parent.ancestors() {
+        ancestor.parent()?;
+        let directory = AccessGrant {
+            path: ancestor.to_path_buf(),
+            kind: GrantKind::Subtree,
+            operation: grant.operation,
+        };
+        if advertised == pattern(&directory) {
+            return Some(directory);
+        }
+        if grant.operation != AccessOperation::Read {
+            break;
+        }
+    }
+    None
 }
 
 /// The display pattern Cingulate shows for the capability an answer grants:
@@ -2753,7 +2876,16 @@ async fn hold(
     let arguments = call.arguments.clone();
     let asked = grant.clone();
     let directory_scope = match grant.file() {
-        Some(grant) => Some(scope_before_db(grant).await),
+        Some(grant) => Some(
+            scope_before_db(
+                grant,
+                identity
+                    .scope
+                    .as_ref()
+                    .is_some_and(|stamp| stamp.kind == subc_protocol::scope::ScopeKind::Worker),
+            )
+            .await,
+        ),
         None => None,
     };
     let prepared = with_db_handle(call, move |db, ctx| match &asked {

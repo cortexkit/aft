@@ -2,9 +2,17 @@ name: Nightly OSS cost gate
 
 on:
   schedule:
-    - cron: "17 2 * * *"
+    - cron: "5 3 * * *"
   workflow_dispatch:
     inputs:
+      runner:
+        description: "Mac mini nightly hardware, or manual-only GitHub-hosted Linux"
+        required: false
+        default: mac-mini
+        type: choice
+        options:
+          - mac-mini
+          - linux
       repo:
         description: "Run one fixed repository (all runs the complete matrix)"
         required: false
@@ -72,7 +80,85 @@ jobs:
           repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admission
 
   cost-gate:
+    name: OSS index cost gate (Mac mini)
+    if: ${{ github.event_name == 'schedule' || inputs.runner != 'linux' }}
+    runs-on: [self-hosted, mac-mini]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+
+      # The Mac mini keeps no Rust on its PATH (the release jobs install theirs
+      # the same way). Pin the version so every night measures a binary built
+      # by the same compiler; bump it together with a re-recorded baseline.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.100.0"
+
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
+
+      - name: Check runner tools
+        run: |
+          set -euo pipefail
+          for tool in cargo rustc cmake python3 git tmutil sysctl sw_vers pmset; do
+            command -v "$tool"
+          done
+          cargo --version
+          rustc --version
+          cmake --version
+          python3 --version
+
+      - name: Set persistent nightly storage outside the checkout
+        run: |
+          echo "AFT_COST_GATE_RESULTS_DIR=$HOME/aft-nightly-cost/results/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+
+      # The runner accepts one GitHub job at a time: a release build delays this
+      # job, never overlaps it. MOTOR's separate grant drains its job VMs too.
+      - name: Prepare, await MOTOR grant, and measure isolated Mac matrix
+        env:
+          REPO_INPUT: ${{ inputs.repo }}
+          WRITE_BASELINE: ${{ inputs.write_baseline }}
+        run: |
+          set -euo pipefail
+          args=(--repo "${REPO_INPUT:-all}")
+          if [[ "${WRITE_BASELINE:-false}" == "true" ]]; then
+            args+=(--write-baseline)
+          fi
+          python3 scripts/telemetry/mac-cost-gate.py "${args[@]}"
+
+      - name: Release nightly hold even after cancellation
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import os
+          import runpy
+          protocol = runpy.run_path('scripts/telemetry/mac-cost-gate.py')
+          hold = protocol['HOLD_DIR'] / 'hold.json'
+          record = protocol['read_hold_record'](hold)
+          if record and record['owner'] == protocol['hold_owner'](os.environ.get('GITHUB_RUN_ID')):
+              hold.unlink()
+          PY
+
+      - name: Upload Mac cost evidence (including unjudged nights)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oss-cost-gate-mac-mini-${{ github.run_id }}
+          path: |
+            ${{ env.AFT_COST_GATE_RESULTS_DIR }}/**/*.csv
+            ${{ env.AFT_COST_GATE_RESULTS_DIR }}/**/*.md
+            ${{ env.AFT_COST_GATE_RESULTS_DIR }}/**/*.log
+            ${{ env.AFT_COST_GATE_RESULTS_DIR }}/machine.json
+            ${{ env.AFT_COST_GATE_RESULTS_DIR }}/machine-after.json
+            ${{ env.AFT_COST_GATE_RESULTS_DIR }}/night-status.json
+            ${{ env.AFT_COST_GATE_RESULTS_DIR }}/cost-baselines.candidate.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  cost-gate-linux:
     name: OSS index cost gate
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'linux' }}
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:

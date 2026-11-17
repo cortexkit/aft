@@ -6,11 +6,12 @@ use std::time::{Duration, SystemTime};
 const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 const GREP_FOOTER_FRESHNESS_WINDOW: Duration = Duration::from_secs(60);
 
-use crate::bash_rewrite::footer::{add_footer, add_grep_footer};
+use crate::bash_rewrite::footer::grep_search_hint;
 use crate::bash_rewrite::parser::{parse, ParsedCommand};
 use crate::bash_rewrite::{RewriteRequest, RewriteRule};
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
+use crate::subc::runner_notices::notice_templates::{self, Notice, Target};
 
 pub struct GrepRule;
 pub struct RgRule;
@@ -684,32 +685,52 @@ fn tool_request(tool: &str, request: &RewriteRequest, ctx: &AppContext) -> RawRe
 /// response. A handler error is not a permission to execute native bash: the
 /// request has already entered the internal handler.
 fn call_and_footer(
-    response: Response,
+    mut response: Response,
     replacement_tool: &str,
     request: &RewriteRequest,
 ) -> Response {
     let output = response_output(&response.data);
-    let footered = add_footer(&output, replacement_tool, request.host_tool_names.shell());
-    apply_footer(response, footered)
+    let shell = request.host_tool_names.shell();
+    response.notices.items.push(Notice::template(
+        notice_templates::PREFER_TOOL,
+        json!({"tool": replacement_tool, "shell": shell}),
+        format!("Prefer `{replacement_tool}` tool over {shell}."),
+        Target::RewriteFooter,
+    ));
+    apply_footer(response, output)
 }
 
 fn grep_footer_response(
-    response: Response,
+    mut response: Response,
     request: &RewriteRequest,
     ctx: &AppContext,
     path: Option<&str>,
 ) -> Response {
     let output = response_output(&response.data);
-    let footered = if should_suppress_grep_footer(path, &grep_project_root(ctx)) {
-        output
-    } else {
-        add_grep_footer(
-            &output,
-            ctx.config().aft_search_registered,
-            request.host_tool_names.shell(),
-        )
-    };
-    apply_footer(response, footered)
+    if !should_suppress_grep_footer(path, &grep_project_root(ctx)) {
+        let search = ctx.config().aft_search_registered.then_some("aft_search");
+        let shell = request.host_tool_names.shell();
+        response.notices.items.push(Notice::template(
+            notice_templates::CODE_SEARCH,
+            notice_templates::code_search_slots(search, shell),
+            grep_search_hint(search, "grep", shell),
+            Target::RewriteFooter,
+        ));
+    }
+    apply_footer(response, output)
+}
+
+pub(crate) fn append_decided_footer(response: &mut Response, footer: &str) {
+    let output = format!("{}\n\n{footer}", response_output(&response.data));
+    if let Some(object) = response.data.as_object_mut() {
+        object.insert("output".into(), json!(output));
+        for key in ["text", "content", "message"] {
+            if object.get(key).is_some_and(Value::is_string) {
+                object.insert(key.into(), json!(output));
+                break;
+            }
+        }
+    }
 }
 
 fn grep_project_root(ctx: &AppContext) -> std::path::PathBuf {

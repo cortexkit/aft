@@ -146,6 +146,7 @@ fn test_4000_input_lines_count_only_sixty_output_lines() {
             .to_string(),
         success: val.get("success").and_then(Value::as_bool).unwrap_or(true),
         data: val.clone(),
+        notices: Default::default(),
     };
 
     assert!(resp.success);
@@ -256,6 +257,7 @@ fn test_subc_and_ndjson_transport_parity_on_fixture() {
             .to_string(),
         success: val.get("success").and_then(Value::as_bool).unwrap_or(true),
         data: val.clone(),
+        notices: Default::default(),
     };
 
     let ctx = FormatContext::default();
@@ -306,6 +308,7 @@ fn test_uncompressed_bash_output_stays_byte_identical_to_prespec_golden() {
             .to_string(),
         success: val.get("success").and_then(Value::as_bool).unwrap_or(true),
         data: val.clone(),
+        notices: Default::default(),
     };
 
     assert!(resp.success);
@@ -890,6 +893,7 @@ fn real_foreground_transports_attach_compressor_counts() {
         id: capped["id"].as_str().expect("response id").to_string(),
         success: true,
         data: capped.clone(),
+        notices: Default::default(),
     };
     let output = capped["output"].as_str().expect("foreground output");
     let subc_text = format_response_with_context("bash", &response, &FormatContext::default());
@@ -930,6 +934,7 @@ fn real_foreground_transports_attach_compressor_counts() {
         id: short["id"].as_str().expect("short response id").to_string(),
         success: true,
         data: short.clone(),
+        notices: Default::default(),
     };
     let short_subc =
         format_response_with_context("bash", &short_response, &FormatContext::default());

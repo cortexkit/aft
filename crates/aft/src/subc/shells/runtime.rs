@@ -699,7 +699,7 @@ fn holder(
 ) -> Holder {
     let resolved = metadata.scope.as_ref().and_then(|scope| {
         conn.and_then(|conn| {
-            crate::db::access_grant_rows::holder_for_scope(conn, &ScopeKey::from_stamp(scope))
+            crate::db::access_grant_rows::holder_for_scope(conn, &ScopeKey::for_grants(scope))
                 .ok()
                 .flatten()
         })
@@ -1133,7 +1133,7 @@ fn collect_at_store_revision(
     if dirty && db_available {
         let scopes = observations
             .iter()
-            .filter_map(|snapshot| snapshot.metadata.scope.as_ref().map(ScopeKey::from_stamp))
+            .filter_map(|snapshot| snapshot.metadata.scope.as_ref().map(ScopeKey::for_grants))
             .collect();
         (facts, db_available) = read_db_facts(db, &scopes, &bound_roots, facts);
         if db_available {
@@ -1156,7 +1156,7 @@ fn collect_at_store_revision(
                     .metadata
                     .scope
                     .as_ref()
-                    .and_then(|scope| facts.holders.get(&ScopeKey::from_stamp(scope)))
+                    .and_then(|scope| facts.holders.get(&ScopeKey::for_grants(scope)))
                     .cloned(),
                 &snapshot.metadata,
             );

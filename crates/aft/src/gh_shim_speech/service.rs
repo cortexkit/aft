@@ -338,6 +338,13 @@ impl Service {
             .on_end
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(notice);
+        // Delivery deduplication belongs to the recipient, not the durable
+        // authority proof. A replacement worker must be able to replay an end
+        // that was persisted before its predecessor lost the connection.
+        self.notified
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
     }
     pub(crate) fn generation(&self) -> String {
         self.runtime

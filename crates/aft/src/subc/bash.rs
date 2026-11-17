@@ -1317,7 +1317,7 @@ pub(super) fn permission_grants_for_retry(
         .collect()
 }
 
-fn finalized_bash_result(
+pub(super) fn finalized_bash_result(
     mut response: Response,
     ctx: &AppContext,
     session_id: &str,
@@ -1325,6 +1325,12 @@ fn finalized_bash_result(
     allow_bg_completions: bool,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
 ) -> ToolCallResult {
+    response.notices.route = format_context.runner_notice.clone();
+    crate::subc::runner_notices::notice_templates::deliver(&mut response, None);
+    if let Some(hint) = &format_context.bash_code_search_hint {
+        let root = ctx.config().project_root.clone().unwrap_or_default();
+        hint.deliver(&mut response, &root);
+    }
     // The bash formatter never renders `bg_completions`, so formatting before finalization
     // yields the same text and lets the finalizer append the status bar to it.
     let mut text =
@@ -1332,7 +1338,7 @@ fn finalized_bash_result(
     // Observe before finalizing: the status bar the finalizer appends carries
     // moving counts that would make identical results hash differently.
     if let Some(repeat) = repeat {
-        repeat.observe(ctx, &mut text);
+        repeat.observe(ctx, &mut response, &mut text);
     }
     crate::response_finalize::finalize_redisplayed_bash_response(
         &mut response,
@@ -1346,9 +1352,11 @@ fn finalized_bash_result(
 }
 
 fn bash_result_from_response(
-    response: Response,
+    mut response: Response,
     format_context: &crate::subc_format::FormatContext,
 ) -> ToolCallResult {
+    response.notices.route = format_context.runner_notice.clone();
+    crate::subc::runner_notices::notice_templates::deliver(&mut response, None);
     let mut text =
         crate::subc_format::format_response_with_context("bash", &response, format_context);
     if response.data["output"]
@@ -1378,7 +1386,7 @@ fn observe_completed_bash_result(
         .unwrap_or_default()
         .to_owned();
     if let Some(repeat) = repeat {
-        repeat.observe(ctx, &mut text);
+        repeat.observe(ctx, &mut result.response, &mut text);
     }
     text.push_str(&suffix);
     result.text = text;
@@ -1439,6 +1447,7 @@ fn copy_response(response: &Response) -> Response {
         id: response.id.clone(),
         success: response.success,
         data: response.data.clone(),
+        notices: response.notices.clone(),
     }
 }
 
@@ -1937,7 +1946,7 @@ pub(super) fn submit_deferred_bash(
     flags: Flags,
     ver: u8,
     arguments: Value,
-    format_context: crate::subc_format::FormatContext,
+    mut format_context: crate::subc_format::FormatContext,
     cancel: BashWaitCancel,
     bind_trust: BindTrust,
     spawn_principal: crate::sandbox_spawn::AuthenticatedPrincipal,
@@ -2215,7 +2224,6 @@ pub(super) fn submit_deferred_bash(
         .as_ref()
         .map(super::secret_consent::call_scopes);
     let run_scoped = run_scope.is_some();
-    let server_completion = server_completion || run_scoped;
     // Local startup must answer early enough for its reply to be queued and
     // relayed before the client's deadline. OpenCode and Pi extend their reply
     // deadlines for runon calls to allow input capture after task registration.
@@ -2260,6 +2268,44 @@ pub(super) fn submit_deferred_bash(
             return;
         }
     };
+    // Reuse the admitted context so a hint cannot wait on the scheduler lock
+    // and prevent a busy executor from returning its refusal promptly.
+    let disabled = secret_identity
+        .as_ref()
+        .map(|identity| identity.disabled_tools.as_slice())
+        .unwrap_or_default();
+    let search_registered = server_completion || spawn_ctx.config().aft_search_registered;
+    format_context.bash_code_search_hint = arguments
+        .get("command")
+        .and_then(Value::as_str)
+        .filter(|_| {
+            arguments.get("background").and_then(Value::as_bool) != Some(true)
+                && arguments.get("pty").and_then(Value::as_bool) != Some(true)
+        })
+        .map(|command| crate::subc_format::BashCodeSearchHint {
+            command: command.into(),
+            workdir: arguments
+                .get("workdir")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            search_tool: (search_registered && crate::tool_gate::catalog_keeps("search", disabled))
+                .then(|| {
+                    if worker_preset {
+                        "search"
+                    } else {
+                        "aft_search"
+                    }
+                    .into()
+                }),
+            grep_tool: crate::tool_gate::catalog_keeps("grep", disabled).then(|| "grep".into()),
+            shell_tool: format_context
+                .host_tool_names
+                .as_ref()
+                .map_or("bash", |names| names.shell())
+                .into(),
+            runner_notice: format_context.runner_notice.clone(),
+        });
+    let server_completion = server_completion || run_scoped;
     if matches!(ask_route, crate::access_policy::AskRoute::Plugin { .. }) {
         spawn_ctx.mark_standalone_plugin_host();
     }
@@ -3375,7 +3421,7 @@ pub(super) fn submit_deferred_bash(
                             // Recording repeated calls only updates in-memory state.
                             let mut result = bash_result_from_response(response, &deadline_target.format_context);
                             if let Some(repeat) = repeat_for_deadline {
-                                repeat.observe(&spawn_ctx, &mut result.text);
+                                repeat.observe(&spawn_ctx, &mut result.response, &mut result.text);
                             }
                             detach_held_bash_in_background(deadline_target, false);
                             send_bash_deferred_completion(&completion_tx, &task_metrics, route, corr, flags, ver, root_for_task, request_id, Some(result), false).await;
@@ -6471,7 +6517,7 @@ mod grant_path_tests {
         let ctx = super::super::test_support::test_ctx();
         ctx.update_config(|config| {
             config.project_root = Some(dir.path().into());
-            config.bash.runon_enabled = true;
+            config.remote_exec.enabled = true;
             config.sandbox.profile.head = crate::config::SandboxMode::Off;
         });
         let executor = Arc::new(Executor::new());
@@ -6969,7 +7015,7 @@ mod grant_path_tests {
         let ctx = super::super::test_support::test_ctx();
         ctx.update_config(|config| {
             config.project_root = Some(dir.path().into());
-            config.bash.runon_enabled = true;
+            config.remote_exec.enabled = true;
             config.sandbox.profile.head = crate::config::SandboxMode::Off;
             config.foreground_wait_window_ms = 15_000;
             config.experimental_bash_background = true;

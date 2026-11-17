@@ -268,24 +268,25 @@ markup5ever_rcdom = "0.38"
 # the protocol's control bodies must agree on the wire-v2 epoch envelope. Tokio
 # runs only at the --subc transport edge; AFT's command core stays synchronous.
 cortexkit-persona = "=0.3.0"
-cortexkit-role-tool-provider = "=0.15.8"
+cortexkit-role-tool-provider = "=0.15.9"
 cortexkit-role-llm-runner = "=0.8.53"
-cortexkit-role-tool-display = "=0.1.8"
+cortexkit-role-tool-display = "=0.1.9"
 cortexkit-role-agent-data = "=0.2.4"
 cortexkit-role-user-commands = "=0.1.4"
-cortexkit-project-identity = "=0.1.4"
+cortexkit-project-identity = "=0.1.5"
 cortexkit-agent-identity = "=0.1.1"
-cortexkit-bus-client = "=0.1.1"
+cortexkit-bus-client = "=0.1.2"
 cortexkit-bus-naming = "=0.4.2"
 async-nats = { version = "0.50", default-features = false, features = ["jetstream", "ring"] }
 jsonschema = { version = "0.33", default-features = false }
-subc-protocol = "=0.37.0"
+subc-protocol = "=0.37.2"
+subc-control = "=0.41.0"
 subc-transport = "=0.18.0"
-subc-client-rs = "=0.40.3"
+subc-client-rs = "=0.41.0"
 # The one reader of the daemon's launch nonce (pipe first, environment copy
 # second). subc-client-rs reads through the same cached accessor, so this pin
 # must match the version subc-client-rs depends on.
-subc-os = { version = "=0.1.38", features = ["tokio"] }
+subc-os = { version = "=0.1.40", features = ["tokio"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 vt100 = "0.16"
 jsonc-parser = { version = "0.33", features = ["cst"] }
@@ -321,8 +322,8 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 cortexkit-test-support = "=0.1.14"
 graphql-parser = "0.4.1"
-cortexkit-role-tool-provider-conformance = "=0.15.9"
-cortexkit-role-tool-provider = { version = "=0.15.8", features = ["test-vectors"] }
+cortexkit-role-tool-provider-conformance = "=0.15.10"
+cortexkit-role-tool-provider = { version = "=0.15.9", features = ["test-vectors"] }
 cortexkit-role-agent-data = { version = "=0.2.4", features = ["test-vectors"] }
 cortexkit-role-harness = "=0.1.0"
 async-trait = "0.1"
@@ -331,4 +332,4 @@ tempfile = "3"
 filetime = "0.2"
 
 [target.'cfg(unix)'.dev-dependencies]
-subc-daemon = "=0.39.0"
+subc-daemon = "=0.49.0"
