@@ -3255,6 +3255,42 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod lexical_comparison_tests {
+    #[cfg(windows)]
+    #[test]
+    fn checkout_suffix_matches_verbatim_checkout_to_ordinary_index_root() {
+        use crate::data_layer::runtime::{DataCheckout, Fresh};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("checkout");
+        let file = root.join("crates/project/src/lib.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "pub fn marker() {}\n").unwrap();
+        let verbatim = std::fs::canonicalize(&root).unwrap();
+        let ordinary = crate::windows_path::normalize_windows_path(&verbatim);
+        assert_ne!(ordinary, verbatim, "exercise both Windows path spellings");
+        let indexed = DataCheckout::open_planes(
+            &ordinary,
+            &dir.path().join("index"),
+            None,
+            crate::data_layer::checkout::Planes::ALL,
+        )
+        .unwrap();
+        assert!(matches!(
+            indexed.fresh_view(std::time::Duration::from_secs(120)),
+            Fresh::Ready(_)
+        ));
+        assert_eq!(indexed.root(), ordinary);
+        let missing = dir.path().join("project/src/lib.rs");
+        assert_eq!(
+            super::checkout_counterpart(&missing, &verbatim, Some(&indexed)),
+            Some(std::fs::canonicalize(&file).unwrap())
+        );
+        assert_eq!(
+            indexed.root(),
+            ordinary,
+            "comparison must not re-key the store"
+        );
+    }
+
     /// Unmatched leading `..` components must survive comparison normalization:
     /// dropping them makes a path that escapes upward look like a nearby child.
     #[test]
@@ -3327,7 +3363,9 @@ fn checkout_counterpart(
         return None;
     }
     let indexed = indexed?;
-    if normalize_path(indexed.root()) != normalize_path(&checkout) {
+    if crate::inspect::job::normalize_path(indexed.root())
+        != crate::inspect::job::normalize_path(&checkout)
+    {
         return None;
     }
     let view = indexed.view()?;
