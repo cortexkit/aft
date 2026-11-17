@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Run from the release source checkout, which may predate this helper on retries.
-set -euo pipefail
+# Match the release job's default bash -e shell: the already-exists fallback
+# tests dry-run output even when cargo exits nonzero, using grep's exit status.
+set -eu
 
 TAG="${1:?Usage: publish-crates.sh <vX.Y.Z>}"
 if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[[:alnum:].-]+)?(\+[[:alnum:].-]+)?$ ]]; then
