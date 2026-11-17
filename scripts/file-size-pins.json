@@ -8,11 +8,11 @@
     "reason": "Split remote execution tests by scenario pending; AFT crate split lane."
   },
   "crates/aft/tests/integration/subc_bridge_test.rs": {
-    "lines": 16422,
+    "lines": 16415,
     "reason": "Split bridge integration tests by tool family pending; AFT crate split lane."
   },
   "crates/aft/src/subc/mod.rs": {
-    "lines": 13488,
+    "lines": 13408,
     "reason": "Split daemon orchestration by area pending; AFT crate split lane."
   },
   "crates/aft/src/context.rs": {
@@ -88,7 +88,7 @@
     "reason": "Split executor tests by command family pending; AFT crate split lane."
   },
   "crates/aft/src/subc/health.rs": {
-    "lines": 5588,
+    "lines": 5587,
     "reason": "Split daemon health monitoring responsibilities pending; AFT crate split lane."
   },
   "crates/aft/src/search_index.rs": {

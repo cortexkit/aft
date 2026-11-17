@@ -23,6 +23,8 @@ mod allocator;
 use allocator::CachedAllocatorObservation;
 #[path = "health/demand.rs"]
 mod demand;
+#[path = "health/legacy_root.rs"]
+mod legacy_root;
 
 const EXECUTOR_SCHEDULER_CONTENTION_DETAIL: &str =
     "executor scheduler state could not be snapshotted without contention";
@@ -1049,14 +1051,7 @@ impl DispatchPathMetrics {
                 identity, scope, ..
             } = request
             {
-                operation.root = scope
-                    .as_ref()
-                    .and_then(|stamp| stamp.workdir.clone())
-                    .or_else(|| {
-                        super::legacy_route_project_root(frame)
-                            .map(|root| root.to_string_lossy().into_owned())
-                    })
-                    .unwrap_or_default();
+                operation.root = legacy_root::project_root(scope.as_ref(), frame);
                 operation.session.clone_from(&identity.session);
             }
         }
