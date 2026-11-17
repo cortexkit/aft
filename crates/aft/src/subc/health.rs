@@ -11212,9 +11212,10 @@ mod tests {
         meaning_fill_health_metrics(large_reads, false)
     }
 
-    // The real storage directories still exercise failed index-store binds.
-    // Only the cached telemetry fixture gets fixed names, before rendering,
-    // so OS temp prefixes cannot decide which rows or root details fit.
+    // The fixture's real temp storage directories still make each project's
+    // index-store bind fail, which these tests rely on. Only the cached
+    // telemetry gets fixed project names, before rendering, so the length of
+    // the OS temp path cannot decide which rows or root details fit the budget.
     fn fixed_health_fixture_root_names(cache: &HealthRollupCache, paths: &[String]) -> Vec<String> {
         fn rename(value: &mut Value, from: &str, to: &str) {
             match value {
@@ -11274,8 +11275,9 @@ mod tests {
         .metrics
         .expect("health metrics");
         if fixed_roots {
-            // Keep both names and reducible telemetry fixed: Windows has no
-            // FSEvents counters, and a prior budget pass may reduce real roots.
+            // Keep the root names and their metrics fixed: Windows has no
+            // FSEvents counters, and an earlier budget pass may already have
+            // shortened the real roots.
             report["roots"] = json!([{
                 "project_root": "/health/root-000", "state": "ready", "actor_count": 1,
                 "search_index": {"status": "ready", "files": 123456},

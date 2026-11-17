@@ -60,7 +60,8 @@ fn unique_indexed_checkout_suffix(
     paths: &[aft_store::checkout::PathRecord],
 ) -> Option<PathBuf> {
     // Refuse recovery outside these work budgets rather than claim uniqueness
-    // from an incomplete inventory. Ordinary permission handling remains safe.
+    // from an incomplete inventory. Without a suggestion the path takes the
+    // normal out-of-scope route and asks for permission as before.
     const MAX_PATHS: usize = 100_000;
     const MAX_COMPONENTS: usize = 64;
     if paths.len() > MAX_PATHS {
