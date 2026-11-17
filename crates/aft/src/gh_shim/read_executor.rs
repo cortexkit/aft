@@ -1,22 +1,46 @@
 //! Encode and decode the draft github_read contract pinned by Plexus's build.
 
 use super::*;
+use std::time::Instant;
+
+const RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(200)];
 
 pub(super) fn execute_read(
     context: &ExecutionContext<'_>,
     request: &ReadRequest,
 ) -> Result<ReadReply, ReadError> {
-    execute_read_with(context, request, &mut |request| {
-        relay_client::read_request(context.relay, request)
-    })
+    execute_read_with_clock(
+        context,
+        request,
+        &mut |request, budget| relay_client::read_request(context.relay, request, budget),
+        &mut Instant::now,
+        &mut std::thread::sleep,
+    )
 }
 
 /// Only the ticket and a validated read request cross the daemon boundary.
 /// Plexus chooses the bot from the stamped route, never from the request body.
+#[cfg(test)]
 pub(super) fn execute_read_with(
     context: &ExecutionContext<'_>,
     request: &ReadRequest,
     send: &mut impl FnMut(&Value) -> Result<Value, String>,
+) -> Result<ReadReply, ReadError> {
+    execute_read_with_clock(
+        context,
+        request,
+        &mut |request, _| send(request),
+        &mut Instant::now,
+        &mut std::thread::sleep,
+    )
+}
+
+pub(super) fn execute_read_with_clock(
+    context: &ExecutionContext<'_>,
+    request: &ReadRequest,
+    send: &mut impl FnMut(&Value, Duration) -> Result<Value, String>,
+    now: &mut impl FnMut() -> Instant,
+    sleep: &mut impl FnMut(Duration),
 ) -> Result<ReadReply, ReadError> {
     if context.manifest.manifest_version < 20 {
         return Err(ReadError::Refused(
@@ -26,9 +50,29 @@ pub(super) fn execute_read_with(
     let wire = wire_request(&context.binding.repo, request).map_err(ReadError::Refused)?;
     let value =
         serde_json::to_value(&wire).map_err(|error| ReadError::Refused(error.to_string()))?;
-    let reply = send(&value)
-        .map_err(|error| ReadError::Refused(format!("governed read transport failed: {error}")))?;
-    decode_reply(&wire, &reply)
+    let deadline = now() + relay_client::read_request_budget(context.relay);
+    let mut retries = 0;
+    loop {
+        // Every attempt uses the normal relay/broker admission path, so retries
+        // consume the same command read budget instead of bypassing its limits.
+        let reply = send(&value, deadline.saturating_duration_since(now())).map_err(|error| {
+            ReadError::Refused(format!("governed read transport failed: {error}"))
+        })?;
+        match decode_reply(&wire, &reply) {
+            Err(error @ ReadError::Retryable { .. }) if retries < RETRY_DELAYS.len() => {
+                let delay = RETRY_DELAYS[retries];
+                if now() + delay >= deadline {
+                    return Err(error);
+                }
+                sleep(delay);
+                if now() >= deadline {
+                    return Err(error);
+                }
+                retries += 1;
+            }
+            result => return result,
+        }
+    }
 }
 
 pub(super) fn wire_request(repository: &str, request: &ReadRequest) -> Result<WireRequest, String> {
@@ -150,9 +194,10 @@ pub(super) fn decode_reply(request: &WireRequest, value: &Value) -> Result<ReadR
             })
             .ok_or_else(|| malformed(code, "message must be a string"))?;
         if code == "read_response_invalid" {
-            return Err(ReadError::Failed(format!(
-                "GitHub read response is invalid: {message}"
-            )));
+            return Err(ReadError::Retryable {
+                code: code.into(),
+                message: message.into(),
+            });
         }
         let transmission =
             transmission.ok_or_else(|| malformed(code, "transmission is missing"))?;
@@ -195,7 +240,7 @@ pub(super) fn decode_reply(request: &WireRequest, value: &Value) -> Result<ReadR
                 ReadError::Vendor { status: status as u16, message: message.into() }
             }
             "job_not_finished" | "job_log_unavailable" | "job_log_redirect_refused" | "job_log_read_limit" | "job_log_download_failed" => ReadError::JobLog { code: code.into(), message: message.into() },
-            "read_dispatch_failed" => ReadError::Failed(format!("GitHub read dispatch failed (transmission {transmission}); retry the read: {message}")),
+            "read_dispatch_failed" => ReadError::Retryable { code: code.into(), message: message.into() },
             _ => malformed(code, "unknown error code"),
         });
     }

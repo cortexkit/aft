@@ -968,36 +968,197 @@ fn actions_log_late_page_refusal_preserves_the_unterminated_log_line() {
     assert_eq!(ranges, [0, 7]);
 }
 
-#[test]
-fn actions_log_single_job_dispatch_failure_is_readable_and_not_retried() {
-    let mut calls = 0;
-    let mut output = Vec::new();
-    let mut diagnostics = Vec::new();
-    let error = render::run_with_io(
+struct ActionsLogRetry {
+    result: Result<i32, ReadError>,
+    output: Vec<u8>,
+    diagnostics: Vec<u8>,
+    attempts: Vec<(Value, Duration)>,
+    sleeps: Vec<Duration>,
+    elapsed: Duration,
+}
+
+fn actions_log_retry_replies() -> [(&'static [u8], &'static str); 3] {
+    // TODO: replace the inline GitHub read reply bytes with Plexus's published test
+    // vectors from gh_shim_wire/read-bulk-replies-contract/ when available.
+    [
+        (br#"{"error":{"code":"read_dispatch_failed","outcome":{"transmission":"unknown","code":null,"message":"connection dropped"}}}"#, "read_dispatch_failed: connection dropped"),
+        (br#"{"error":{"code":"read_dispatch_failed","transmission":"unknown","outcome":{"transmission":"unknown","code":null,"message":"connection dropped"}}}"#, "read_dispatch_failed: connection dropped"),
+        (br#"{"error":{"code":"read_response_invalid","message":"invalid response body"}}"#, "read_response_invalid: invalid response body"),
+    ]
+}
+
+fn actions_log_retry_case(
+    refusals: &[&[u8]],
+    budget: Duration,
+    attempt_duration: Duration,
+) -> ActionsLogRetry {
+    let binding = AgentBinding {
+        repo: "cortexkit/aft".into(),
+        agent_id: "bot".into(),
+    };
+    let manifest = manifest();
+    let relay = RelayContext {
+        worker_broker: None,
+        connection_file: None,
+        ticket: None,
+        transient_delays: [Duration::ZERO; 2],
+        relay_budget: budget,
+    };
+    let context = ExecutionContext {
+        binding: &binding,
+        manifest: &manifest,
+        relay: &relay,
+    };
+    let started = std::time::Instant::now();
+    let clock = std::cell::Cell::new(started);
+    let mut trace = ActionsLogRetry {
+        result: Ok(0),
+        output: Vec::new(),
+        diagnostics: Vec::new(),
+        attempts: Vec::new(),
+        sleeps: Vec::new(),
+        elapsed: Duration::ZERO,
+    };
+    trace.result = render::run_with_io(
         &planned(&["run", "view", "--job", "133780422078", "--log"]),
         &mut |request| match request {
             ReadRequest::Get { .. } => Ok(reply(json!({"id":133780422078_u64,"name":"test"}))),
-            ReadRequest::JobLog { .. } => {
-                calls += 1;
-                executor::decode_reply(
-                    &executor::wire_request("cortexkit/aft", request).unwrap(),
-                    &json!({"error":{"code":"read_dispatch_failed","outcome":{"transmission":"unknown","code":null,"message":"connection dropped"}}}),
-                )
-            }
+            ReadRequest::JobLog { .. } => executor::execute_read_with_clock(
+                &context,
+                request,
+                &mut |wire, remaining| {
+                    trace.attempts.push((wire.clone(), remaining));
+                    clock.set(clock.get() + attempt_duration);
+                    Ok(
+                        if let Some(refusal) = refusals.get(trace.attempts.len() - 1) {
+                            serde_json::from_slice(refusal).unwrap()
+                        } else {
+                            json!({"result":{"body":"kept\n","offset":0,"length":5,"total_bytes":5}})
+                        },
+                    )
+                },
+                &mut || clock.get(),
+                &mut |delay| {
+                    trace.sleeps.push(delay);
+                    clock.set(clock.get() + delay);
+                },
+            ),
             _ => panic!("unexpected request"),
         },
-        &mut output,
-        &mut diagnostics,
-        &mut |_| panic!("must not retry"),
-    ).unwrap_err();
-    assert_eq!(error.status(), 1);
-    assert_eq!(
-        error.message("bot"),
-        "GitHub read dispatch failed (transmission unknown); retry the read: connection dropped"
+        &mut trace.output,
+        &mut trace.diagnostics,
+        &mut |_| panic!("the renderer must not retry reads itself"),
     );
-    assert_eq!(calls, 1);
-    assert!(output.is_empty());
-    assert!(diagnostics.is_empty());
+    trace.elapsed = clock.get().duration_since(started);
+    trace
+}
+
+#[test]
+fn actions_log_transient_read_failure_retries_and_succeeds() {
+    for (bytes, _) in actions_log_retry_replies() {
+        let trace = actions_log_retry_case(&[bytes], Duration::from_secs(1), Duration::ZERO);
+        assert_eq!(trace.result.unwrap(), 0);
+        assert_eq!(trace.output, b"test\tUNKNOWN STEP\tkept\n");
+        assert!(trace.diagnostics.is_empty());
+        assert_eq!(trace.sleeps, [Duration::from_millis(100)]);
+        assert_eq!(trace.attempts.len(), 2);
+        for (wire, _) in &trace.attempts {
+            assert_eq!(
+                *wire,
+                json!({"action":"github.actions.job_log","repository":"cortexkit/aft","args":{"job_id":133780422078_u64,"offset":0,"length":1047552}})
+            );
+        }
+        assert_eq!(trace.attempts[0].1, Duration::from_millis(1000));
+        assert_eq!(trace.attempts[1].1, Duration::from_millis(900));
+    }
+}
+
+#[test]
+fn actions_log_transient_read_failure_stops_after_two_retries() {
+    for (bytes, expected) in actions_log_retry_replies() {
+        let trace = actions_log_retry_case(&[bytes; 3], Duration::from_secs(1), Duration::ZERO);
+        let error = trace.result.unwrap_err();
+        assert_eq!(error.status(), 1);
+        assert_eq!(error.message("bot"), expected);
+        assert!(trace.output.is_empty());
+        assert!(trace.diagnostics.is_empty());
+        assert_eq!(trace.attempts.len(), 3);
+        assert_eq!(
+            trace.sleeps,
+            [Duration::from_millis(100), Duration::from_millis(200)]
+        );
+        assert_eq!(trace.attempts[2].1, Duration::from_millis(700));
+    }
+}
+
+#[test]
+fn actions_log_read_retries_do_not_reset_the_deadline() {
+    for (bytes, expected) in actions_log_retry_replies() {
+        let trace = actions_log_retry_case(
+            &[bytes; 3],
+            Duration::from_millis(300),
+            Duration::from_millis(50),
+        );
+        assert_eq!(trace.result.unwrap_err().message("bot"), expected);
+        assert_eq!(trace.attempts.len(), 2);
+        assert_eq!(trace.sleeps, [Duration::from_millis(100)]);
+        assert_eq!(trace.attempts[0].1, Duration::from_millis(300));
+        assert_eq!(trace.attempts[1].1, Duration::from_millis(150));
+        assert_eq!(trace.elapsed, Duration::from_millis(200));
+    }
+}
+
+#[test]
+fn actions_log_retries_stop_when_the_shared_read_budget_refuses() {
+    let budget = br#"{"error":{"code":"read_budget_exhausted","message":"budget exhausted","transmission":"not_sent","retry_after_ms":60000}}"#;
+    for (bytes, _) in actions_log_retry_replies() {
+        let trace =
+            actions_log_retry_case(&[bytes, budget], Duration::from_secs(1), Duration::ZERO);
+        let error = trace.result.unwrap_err();
+        assert_eq!(error.status(), REFUSAL_EXIT_STATUS);
+        assert_eq!(
+            error.message("bot"),
+            "read budget for bot used up; retry in 1 min"
+        );
+        assert_eq!(trace.attempts.len(), 2);
+        assert_eq!(trace.sleeps, [Duration::from_millis(100)]);
+    }
+}
+
+#[test]
+fn actions_log_retry_budget_preserves_the_existing_read_time_caps() {
+    let mut relay = RelayContext {
+        worker_broker: None,
+        connection_file: None,
+        ticket: None,
+        transient_delays: [Duration::ZERO; 2],
+        relay_budget: Duration::from_secs(210),
+    };
+    assert_eq!(
+        relay_client::read_request_budget(&relay),
+        Duration::from_secs(30)
+    );
+    relay.relay_budget = Duration::from_millis(250);
+    assert_eq!(
+        relay_client::read_request_budget(&relay),
+        Duration::from_millis(250)
+    );
+    #[cfg(unix)]
+    {
+        relay.worker_broker = Some(Err(crate::gh_shim_worker_broker::ClientError::MissingPath(
+            "unused",
+        )));
+        relay.relay_budget = Duration::from_secs(210);
+        assert_eq!(
+            relay_client::read_request_budget(&relay),
+            Duration::from_secs(20)
+        );
+        relay.relay_budget = Duration::from_millis(250);
+        assert_eq!(
+            relay_client::read_request_budget(&relay),
+            Duration::from_millis(250)
+        );
+    }
 }
 
 #[test]

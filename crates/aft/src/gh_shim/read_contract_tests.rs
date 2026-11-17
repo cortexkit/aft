@@ -385,13 +385,16 @@ fn actions_log_dispatch_failure_accepts_nested_and_top_level_transmission() {
         }
         let error = decode(&value).unwrap_err();
         assert_eq!(error.status(), 1);
-        assert_eq!(error.message("bot"), "GitHub read dispatch failed (transmission unknown); retry the read: connection dropped");
+        assert_eq!(
+            error.message("bot"),
+            "read_dispatch_failed: connection dropped"
+        );
     }
     value["error"]["transmission"] = json!("not_sent");
     value["error"]["message"] = json!("top-level reason");
     assert_eq!(
         decode(&value).unwrap_err().message("bot"),
-        "GitHub read dispatch failed (transmission not_sent); retry the read: top-level reason"
+        "read_dispatch_failed: top-level reason"
     );
     value["error"]["transmission"] = json!("future");
     assert_eq!(decode(&value).unwrap_err().status(), REFUSAL_EXIT_STATUS);
@@ -404,7 +407,7 @@ fn actions_log_invalid_response_needs_no_transmission() {
     assert_eq!(error.status(), 1);
     assert_eq!(
         error.message("bot"),
-        "GitHub read response is invalid: invalid response body"
+        "read_response_invalid: invalid response body"
     );
 }
 
