@@ -97,9 +97,9 @@ impl BgTaskRegistry {
         #[cfg(test)]
         tests::after_local_fallback_marker(&task.task_id);
         let hard_kill = if metadata.default_hard_kill {
-            super::super::super::super::HardKill::Default
+            super::super::super::HardKill::Default
         } else {
-            super::super::super::super::HardKill::After(Duration::from_millis(
+            super::super::super::HardKill::After(Duration::from_millis(
                 metadata.timeout_ms.unwrap_or(0),
             ))
         };
@@ -135,12 +135,12 @@ impl BgTaskRegistry {
             Self::prepare_memory_limit(local.memory_limit_mib, &task.task_id)?
         };
         let gated = scope.is_some() || memory_monitor.is_some();
-        let spawn_child = |scope: Option<&super::super::super::super::task_scope::ScopeLaunch>,
+        let spawn_child = |scope: Option<&super::super::super::task_scope::ScopeLaunch>,
                            io_handles: &mut TaskIoHandles| {
             spawn_detached_child(
                 &local.plan,
                 &metadata.command,
-                super::super::super::super::BashShell::Bash,
+                super::super::super::BashShell::Bash,
                 &local.shell_path,
                 &task.paths,
                 &metadata.workdir,
@@ -208,7 +208,7 @@ impl BgTaskRegistry {
         if let Some(mut monitor) = memory_monitor.take() {
             if let Err(error) = monitor.attach(child.id()) {
                 drop(state);
-                super::super::super::super::process::terminate_pgid_with(child.id() as i32, || {
+                super::super::super::process::terminate_pgid_with(child.id() as i32, || {
                     matches!(child.try_wait(), Ok(Some(_)))
                 });
                 if let Err(kill_error) =

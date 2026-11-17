@@ -118,10 +118,8 @@ pub(super) fn persist_accepted_with_snapshot_scope(
 #[tokio::test]
 #[ignore = "requires a systemd user manager"]
 async fn task_scope_remote_fallback_deadline_survives_reload() {
-    super::super::super::super::super::super::task_scope::probe_user_manager(Duration::from_secs(
-        1,
-    ))
-    .expect("requires a systemd user manager");
+    super::super::super::super::task_scope::probe_user_manager(Duration::from_secs(1))
+        .expect("requires a systemd user manager");
     let dir = tempfile::tempdir().unwrap();
     let (original, task_id, paths) = persist_accepted_with_snapshot_scope(
         dir.path(),
