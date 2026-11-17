@@ -172,7 +172,6 @@ pub mod pinned_executable;
 mod platform_tls;
 #[cfg(unix)]
 pub(crate) mod posix_spawn;
-pub(crate) mod prefrontal;
 mod privacy_spawn;
 #[doc(hidden)]
 pub mod private_storage;

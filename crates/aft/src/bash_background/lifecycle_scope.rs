@@ -10,7 +10,8 @@ impl BgTaskRegistry {
         from: &subc_protocol::scope::ScopeStamp,
         to: &subc_protocol::scope::ScopeStamp,
     ) -> std::io::Result<usize> {
-        if crate::prefrontal::counterpart_owner(&from.owner).as_ref() != Some(&to.owner)
+        if crate::access_policy::prefrontal::counterpart_owner(&from.owner).as_ref()
+            != Some(&to.owner)
             || from.scope_ref != to.scope_ref
         {
             return Err(std::io::Error::other("not a prefrontal scope continuation"));

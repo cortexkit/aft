@@ -121,7 +121,7 @@ pub(super) fn start_for_speech(
         move || work_scopes(executor.clone(), watched_runs.clone()),
         Some(speech),
         Some(run_scopes),
-        crate::prefrontal::catalog_updates(),
+        crate::access_policy::prefrontal::catalog_updates(),
     )
 }
 impl ScopeDescribes {
@@ -140,7 +140,7 @@ impl ScopeDescribes {
             .filter_map(|identity| identity.scope.as_ref())
         {
             if stamp.owner_authorized
-                && crate::prefrontal::is_principal(&stamp.owner)
+                && crate::access_policy::prefrontal::is_principal(&stamp.owner)
                 && !routed.contains(&stamp_key(stamp))
             {
                 let _ = self.bound.send(stamp.clone());
@@ -334,10 +334,14 @@ where
                 }
                 let owner = Principal::Reserved { module_id };
                 for stamp in held_scopes.values() {
-                    if let Some(other) =
-                        crate::prefrontal::counterpart(stamp).filter(|other| other.owner == owner)
+                    if let Some(other) = crate::access_policy::prefrontal::counterpart(stamp)
+                        .filter(|other| other.owner == owner)
                     {
-                        crate::prefrontal::log_continuation(stamp, &other, "catalog_reconcile");
+                        crate::access_policy::prefrontal::log_continuation(
+                            stamp,
+                            &other,
+                            "catalog_reconcile",
+                        );
                         trigger_describe(
                             stamp_key(stamp),
                             stamp.clone(),
@@ -476,9 +480,9 @@ where
                     }
                     let counterpart_reply = if reply.as_ref().is_ok_and(|reply| {
                         describe_answer_ends_scope(reply)
-                            || crate::prefrontal::retired(&stamp, reply)
+                            || crate::access_policy::prefrontal::retired(&stamp, reply)
                     }) {
-                        match crate::prefrontal::counterpart(&stamp) {
+                        match crate::access_policy::prefrontal::counterpart(&stamp) {
                             Some(other) => Some(control.describe(&other).await),
                             None => None,
                         }
@@ -524,11 +528,11 @@ where
                     catalog_open = result.is_ok();
                 }
                 Some(stamp) = bindings.recv() => {
-                    if let Some(other) = crate::prefrontal::counterpart(&stamp) {
+                    if let Some(other) = crate::access_policy::prefrontal::counterpart(&stamp) {
                         match rehome_shell_scopes(executor.clone(), other.clone(), stamp.clone()).await {
-                            Ok(count) => crate::prefrontal::log_continuation(&other, &stamp, if count == 0 { "bind_no_tracked_tasks" } else { "bind_continuation" }),
+                            Ok(count) => crate::access_policy::prefrontal::log_continuation(&other, &stamp, if count == 0 { "bind_no_tracked_tasks" } else { "bind_continuation" }),
                             Err(error) => {
-                                crate::prefrontal::log_continuation(&other, &stamp, "bind_hold_persistence_failed");
+                                crate::access_policy::prefrontal::log_continuation(&other, &stamp, "bind_hold_persistence_failed");
                                 log::warn!("prefrontal scope tracking rehome failed: {error}");
                                 trigger_describe(stamp_key(&other), other, &mut pending, &mut queued, &mut retrigger);
                             }
@@ -546,7 +550,7 @@ where
                 () = &mut grant_sweep => unreachable!("saved grant sweep runs until cancelled"),
                 Some(stamp)=observations.recv()=>{
                     if completed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&stamp_key(&stamp)) { continue; }
-                    if crate::prefrontal::is_principal(&stamp.owner) && !confirmed.contains(&stamp_key(&stamp)) {
+                    if crate::access_policy::prefrontal::is_principal(&stamp.owner) && !confirmed.contains(&stamp_key(&stamp)) {
                         trigger_describe(stamp_key(&stamp), stamp, &mut pending, &mut queued, &mut retrigger);
                         continue;
                     }
@@ -654,20 +658,20 @@ where
                         // periodic tick. Wait a full interval after its answer
                         // before rechecking shell tasks with that owner/ref/epoch.
                         next_poll.insert(key.clone(), tokio::time::Instant::now() + interval);
-                        let ends = reply.as_ref().is_ok_and(|reply| describe_answer_ends_scope(reply) || crate::prefrontal::retired(&stamp, reply));
+                        let ends = reply.as_ref().is_ok_and(|reply| describe_answer_ends_scope(reply) || crate::access_policy::prefrontal::retired(&stamp, reply));
                         if ends {
-                            if let Some(other) = crate::prefrontal::counterpart(&stamp) {
-                                let decision = crate::prefrontal::continuation(&other, counterpart_reply.as_ref().and_then(|reply| reply.as_ref().ok()));
+                            if let Some(other) = crate::access_policy::prefrontal::counterpart(&stamp) {
+                                let decision = crate::access_policy::prefrontal::continuation(&other, counterpart_reply.as_ref().and_then(|reply| reply.as_ref().ok()));
                                 match decision {
-                                    crate::prefrontal::Continuation::Live(live) => {
+                                    crate::access_policy::prefrontal::Continuation::Live(live) => {
                                         match rehome_shell_scopes(executor.clone(), stamp.clone(), live.clone()).await {
                                             Ok(_) => {
-                                                crate::prefrontal::log_continuation(&stamp, &live, "continuation");
+                                                crate::access_policy::prefrontal::log_continuation(&stamp, &live, "continuation");
                                                 retry.remove(&key);
                                                 retrigger.remove(&key);
                                             }
                                             Err(error) => {
-                                                crate::prefrontal::log_continuation(&stamp, &live, "hold_persistence_failed");
+                                                crate::access_policy::prefrontal::log_continuation(&stamp, &live, "hold_persistence_failed");
                                                 log::warn!("prefrontal scope tracking rehome failed: {error}");
                                                 retry.insert(key.clone(), stamp.clone());
                                                 watches.fallback(&key, interval);
@@ -677,18 +681,18 @@ where
                                         refresh.immediate();
                                         continue;
                                     }
-                                    crate::prefrontal::Continuation::Hold => {
-                                        crate::prefrontal::log_continuation(&stamp, &other, "hold");
+                                    crate::access_policy::prefrontal::Continuation::Hold => {
+                                        crate::access_policy::prefrontal::log_continuation(&stamp, &other, "hold");
                                         retry.insert(key.clone(), stamp.clone());
                                         watches.fallback(&key, interval);
                                         pending.remove(&key);
                                         continue;
                                     }
-                                    crate::prefrontal::Continuation::Absent => crate::prefrontal::log_continuation(&stamp, &other, "absent_end"),
+                                    crate::access_policy::prefrontal::Continuation::Absent => crate::access_policy::prefrontal::log_continuation(&stamp, &other, "absent_end"),
                                 }
                             }
-                        } else if let Some(other) = crate::prefrontal::counterpart(&stamp) {
-                            crate::prefrontal::log_continuation(&stamp, &other, crate::prefrontal::retained_outcome(reply.as_ref().ok()));
+                        } else if let Some(other) = crate::access_policy::prefrontal::counterpart(&stamp) {
+                            crate::access_policy::prefrontal::log_continuation(&stamp, &other, crate::access_policy::prefrontal::retained_outcome(reply.as_ref().ok()));
                         }
                         #[cfg(unix)]
                         if reply.as_ref().is_ok_and(|answer| secret_authorization_rebound(&stamp, answer)) {

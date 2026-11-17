@@ -6982,7 +6982,7 @@ mod tests {
             subc_protocol::scope::ScopeKind::Head,
         );
         task.scope = Some(old.clone());
-        task.lifecycle_scope = crate::prefrontal::counterpart(&old);
+        task.lifecycle_scope = crate::access_policy::prefrontal::counterpart(&old);
         write_task_at(&resolved, &task).unwrap();
         let bytes = std::fs::read(&resolved.paths.json).unwrap();
         let legacy = read_scope_blind_v7(&bytes).unwrap();
@@ -6999,7 +6999,8 @@ mod tests {
         task.mark_terminal(BgTaskStatus::Completed, Some(0), None);
         task.lifecycle_scope = None;
         write_task_at(&resolved, &task).unwrap();
-        let live = crate::prefrontal::counterpart(task.scope.as_ref().unwrap()).unwrap();
+        let live =
+            crate::access_policy::prefrontal::counterpart(task.scope.as_ref().unwrap()).unwrap();
         let updated = update_task_at(&resolved, |metadata| {
             metadata.lifecycle_scope = Some(live.clone());
             metadata.command = "must not rewrite terminal history".into();

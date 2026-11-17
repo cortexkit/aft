@@ -210,6 +210,7 @@ pub(crate) const PERMISSION_ASK_UNAVAILABLE: &str = "permission_ask_unavailable"
 
 #[path = "access_policy_plugin.rs"]
 pub(crate) mod plugin;
+pub(crate) mod prefrontal;
 
 #[path = "access_policy_temp.rs"]
 pub(crate) mod temp;

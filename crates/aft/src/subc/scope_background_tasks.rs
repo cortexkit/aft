@@ -1382,7 +1382,7 @@ mod tests {
             old.epoch,
             subc_protocol::scope::ScopeKind::Worker,
         );
-        let live = crate::prefrontal::counterpart(&stamp).unwrap();
+        let live = crate::access_policy::prefrontal::counterpart(&stamp).unwrap();
         let new = Selector {
             owner: live.owner.clone(),
             scope_ref: live.scope_ref.clone(),

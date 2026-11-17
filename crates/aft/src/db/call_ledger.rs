@@ -427,7 +427,7 @@ pub(crate) fn begin_approved(conn: &Connection, key: &Key) -> rusqlite::Result<b
             },
         };
         let origin = super::access_grants::ScopeKey {
-            owner: crate::prefrontal::grant_owner_key(&owner),
+            owner: crate::access_policy::prefrontal::grant_owner_key(&owner),
             scope_ref: scope.scope_ref.clone(),
             epoch: scope.scope_epoch,
         };

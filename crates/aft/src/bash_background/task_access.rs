@@ -532,7 +532,7 @@ impl BgTaskRegistry {
         };
         // A revived worker has a new session and epoch, but its parent
         // scope's owner and reference still identify the owning head.
-        if caller.owner != crate::prefrontal::grant_owner_key(&parent.owner)
+        if caller.owner != crate::access_policy::prefrontal::grant_owner_key(&parent.owner)
             || caller.scope_ref != parent.scope_ref
         {
             return false;

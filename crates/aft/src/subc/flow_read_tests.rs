@@ -49,7 +49,7 @@ fn stamp() -> Value {
 #[test]
 fn prefrontal_rename_flow_read_admits_both_owners() {
     let dir = tempfile::tempdir().unwrap();
-    for module in crate::prefrontal::MODULE_IDS {
+    for module in crate::access_policy::prefrontal::MODULE_IDS {
         let mut scope = stamp();
         scope["owner"]["module_id"] = json!(module);
         assert!(route_checks(&identity(dir.path(), scope, "reserved:basal")).is_ok());

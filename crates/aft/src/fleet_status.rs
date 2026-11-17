@@ -39,7 +39,7 @@ const DISCOVERY_MAX_BACKOFF: Duration = Duration::from_secs(60);
 const STATUS_PUBLISH_TTL_MS: u64 = 7_500;
 const STATUS_MODULE: &str = "aft";
 #[cfg(test)]
-const STATUS_HOLDER_MODULE: &str = crate::prefrontal::LEGACY_MODULE_ID;
+const STATUS_HOLDER_MODULE: &str = crate::access_policy::prefrontal::LEGACY_MODULE_ID;
 const STATUS_LINE_OPERATION: &str = "status.line";
 
 #[cfg(test)]
@@ -722,7 +722,7 @@ async fn run_connected_status_dial<C: StatusConsumer>(
         if tokio::time::Instant::now() >= next_discovery_at {
             let catalog = consumer.catalog_list().await;
             if let Ok(catalog) = &catalog {
-                crate::prefrontal::observe_catalog(
+                crate::access_policy::prefrontal::observe_catalog(
                     catalog.modules.iter().map(|entry| entry.module_id.as_str()),
                 );
             }
@@ -1018,8 +1018,9 @@ fn consumer_identity_is_available() -> bool {
 }
 
 fn status_holder(entries: &[subc_client_rs::CatalogEntry]) -> Option<&'static str> {
-    let holder =
-        crate::prefrontal::catalog_module(entries.iter().map(|entry| entry.module_id.as_str()));
+    let holder = crate::access_policy::prefrontal::catalog_module(
+        entries.iter().map(|entry| entry.module_id.as_str()),
+    );
     entries
         .iter()
         .any(|entry| {
@@ -1091,7 +1092,7 @@ fn record_forbidden_reopen(
         .body
         .get("module_id")
         .and_then(Value::as_str)
-        .is_some_and(crate::prefrontal::is_module)
+        .is_some_and(crate::access_policy::prefrontal::is_module)
     {
         return false;
     }
@@ -1362,7 +1363,7 @@ mod tests {
 
     #[test]
     fn prefrontal_rename_status_discovery_and_close_push_accept_both() {
-        for module in crate::prefrontal::MODULE_IDS {
+        for module in crate::access_policy::prefrontal::MODULE_IDS {
             assert_eq!(
                 status_holder(&[status_catalog_entry(module, STATUS_LINE_OPERATION)]),
                 Some(module)

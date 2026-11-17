@@ -168,7 +168,7 @@ impl ScopeKey {
     /// Storage identity shared by grants, their scope registrations and roles.
     pub fn for_grants(stamp: &subc_protocol::scope::ScopeStamp) -> Self {
         Self {
-            owner: crate::prefrontal::grant_owner_key(&stamp.owner),
+            owner: crate::access_policy::prefrontal::grant_owner_key(&stamp.owner),
             scope_ref: stamp.scope_ref.clone(),
             epoch: stamp.scope_epoch,
         }
@@ -177,7 +177,7 @@ impl ScopeKey {
     pub fn from_policy(key: &PolicyKey) -> Self {
         Self {
             owner: serde_json::from_str(&key.owner)
-                .map(|owner| crate::prefrontal::grant_owner_key(&owner))
+                .map(|owner| crate::access_policy::prefrontal::grant_owner_key(&owner))
                 .unwrap_or_else(|_| key.owner.clone()),
             scope_ref: key.scope_ref.clone(),
             epoch: key.epoch,
@@ -826,7 +826,7 @@ mod tests {
             assert!(list(&conn, &caller).unwrap().is_empty());
             assert_eq!(crate::db::current_schema_version(&conn).unwrap(), 29);
             assert_eq!(
-                crate::prefrontal::grant_owner_key(&Principal::Direct),
+                crate::access_policy::prefrontal::grant_owner_key(&Principal::Direct),
                 r#"{"kind":"direct"}"#
             );
         }

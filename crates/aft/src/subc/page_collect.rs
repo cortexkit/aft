@@ -27,7 +27,7 @@ pub(super) fn is_page_operation(operation: &str) -> bool {
 }
 
 fn caller_is_core(principal: Option<&Principal>) -> bool {
-    principal.is_some_and(crate::prefrontal::is_principal)
+    principal.is_some_and(crate::access_policy::prefrontal::is_principal)
 }
 
 fn response_id(operation: &str) -> String {

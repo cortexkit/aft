@@ -10,7 +10,7 @@ pub(super) fn select_route_holder(advertisers: impl IntoIterator<Item = String>)
         // hold `gh.route`; another module advertising it must not capture the route.
         // The holder module identifies the routing server, not the bound agent. Using
         // its module ID would merge all agents into one audit and rate-accounting session.
-        if crate::prefrontal::is_module(&advertiser) {
+        if crate::access_policy::prefrontal::is_module(&advertiser) {
             holders.push(advertiser);
         } else {
             unexpected_advertisers.insert(advertiser);
@@ -18,7 +18,8 @@ pub(super) fn select_route_holder(advertisers: impl IntoIterator<Item = String>)
     }
     RouteHolder {
         module_id: (!holders.is_empty()).then(|| {
-            crate::prefrontal::catalog_module(holders.iter().map(String::as_str)).to_string()
+            crate::access_policy::prefrontal::catalog_module(holders.iter().map(String::as_str))
+                .to_string()
         }),
         unexpected_advertisers: unexpected_advertisers.into_iter().collect(),
     }

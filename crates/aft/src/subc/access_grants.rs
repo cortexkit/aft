@@ -105,7 +105,7 @@ pub(super) fn policy_scope_key(identity: &RouteIdentity) -> ScopeKey {
         if stamp.kind == subc_protocol::scope::ScopeKind::Ephemeral {
             if let Some(parent) = stamp.parent.as_ref() {
                 return ScopeKey {
-                    owner: crate::prefrontal::grant_owner_key(&parent.owner),
+                    owner: crate::access_policy::prefrontal::grant_owner_key(&parent.owner),
                     scope_ref: parent.scope_ref.clone(),
                     epoch: parent.scope_epoch,
                 };
@@ -281,7 +281,7 @@ fn register_scope_rows(
         .as_ref()
         .and_then(|s| s.parent.as_ref())
         .map(|parent| ScopeKey {
-            owner: crate::prefrontal::grant_owner_key(&parent.owner),
+            owner: crate::access_policy::prefrontal::grant_owner_key(&parent.owner),
             scope_ref: parent.scope_ref.clone(),
             epoch: parent.scope_epoch,
         });
@@ -341,7 +341,7 @@ pub(super) fn operation(
         .and_then(|v| v.get("owner"))
         .map(|v| {
             serde_json::from_value::<Principal>(v.clone())
-                .map(|owner| crate::prefrontal::grant_owner_key(&owner))
+                .map(|owner| crate::access_policy::prefrontal::grant_owner_key(&owner))
         })
         .transpose()
         .map_err(|_| refusal("grants_scope_refused", "invalid scope owner"))?
@@ -399,7 +399,7 @@ pub(super) fn operation(
 
 fn alfonso(stamp: &subc_protocol::scope::ScopeStamp) -> bool {
     stamp.owner_authorized
-        && crate::prefrontal::is_principal(&stamp.owner)
+        && crate::access_policy::prefrontal::is_principal(&stamp.owner)
         && matches!(
             stamp.kind,
             subc_protocol::scope::ScopeKind::Head
@@ -415,7 +415,7 @@ pub(super) fn head_scope(identity: &RouteIdentity) -> Option<ScopeKey> {
         subc_protocol::scope::ScopeKind::Head => Some(own),
         _ => match stamp.parent.as_ref() {
             Some(parent) => Some(ScopeKey {
-                owner: crate::prefrontal::grant_owner_key(&parent.owner),
+                owner: crate::access_policy::prefrontal::grant_owner_key(&parent.owner),
                 scope_ref: parent.scope_ref.clone(),
                 epoch: parent.scope_epoch,
             }),
@@ -524,7 +524,7 @@ pub(super) fn consent_head(
         return Ok(None);
     };
     let parent = ScopeKey {
-        owner: crate::prefrontal::grant_owner_key(&parent.owner),
+        owner: crate::access_policy::prefrontal::grant_owner_key(&parent.owner),
         scope_ref: parent.scope_ref.clone(),
         epoch: parent.scope_epoch,
     };

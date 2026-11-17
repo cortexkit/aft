@@ -673,7 +673,7 @@ fn bot_authority(
 pub(crate) fn worker_scope(stamp: &ScopeStamp) -> bool {
     use subc_protocol::scope::ScopeKind;
     stamp.owner_authorized
-        && crate::prefrontal::is_principal(&stamp.owner)
+        && crate::access_policy::prefrontal::is_principal(&stamp.owner)
         && (stamp.kind == ScopeKind::Worker
             || (stamp.kind == ScopeKind::Ephemeral && stamp.parent.is_some()))
 }
@@ -681,7 +681,7 @@ pub(crate) fn worker_scope(stamp: &ScopeStamp) -> bool {
 fn head_scope(stamp: &ScopeStamp) -> bool {
     use subc_protocol::scope::ScopeKind;
     stamp.owner_authorized
-        && crate::prefrontal::is_principal(&stamp.owner)
+        && crate::access_policy::prefrontal::is_principal(&stamp.owner)
         && stamp.parent.is_none()
         && matches!(stamp.kind, ScopeKind::Head | ScopeKind::Ephemeral)
 }

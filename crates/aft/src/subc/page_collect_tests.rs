@@ -17,7 +17,7 @@ fn core() -> Option<Principal> {
 
 #[test]
 fn prefrontal_rename_page_admission_is_reserved_and_fail_closed() {
-    for module in crate::prefrontal::MODULE_IDS {
+    for module in crate::access_policy::prefrontal::MODULE_IDS {
         assert!(caller_is_core(Some(&Principal::Reserved {
             module_id: module.into()
         })));

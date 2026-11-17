@@ -84,7 +84,7 @@ const RECENTLY_REACHABLE_WINDOW: Duration = Duration::from_secs(300);
 const ISSUED_AT_FUTURE_SKEW: Duration = Duration::from_secs(300);
 const ROUTING_OPERATION: &str = "gh.route";
 #[cfg(test)]
-const ROUTING_HOLDER_MODULE_ID: &str = crate::prefrontal::LEGACY_MODULE_ID;
+const ROUTING_HOLDER_MODULE_ID: &str = crate::access_policy::prefrontal::LEGACY_MODULE_ID;
 const MANIFEST_ARTIFACT_ID: &str = "gh-routing-manifest";
 const V1_GOVERNED_TUPLES: &[&str] = &["issue comment", "pr comment", "pr review", "issue reaction"];
 const V1_ADMIN_TUPLES: &[&str] = &["issue close", "pr close", "pr merge", "release create"];
@@ -9182,7 +9182,7 @@ mod tests {
 
     #[test]
     fn prefrontal_rename_gh_route_catalog_accepts_only_aliases() {
-        for module in crate::prefrontal::MODULE_IDS {
+        for module in crate::access_policy::prefrontal::MODULE_IDS {
             let holder = select_route_holder([module.to_string(), "other".into()]);
             assert_eq!(holder.module_id.as_deref(), Some(module));
             assert_eq!(holder.unexpected_advertisers, ["other"]);
