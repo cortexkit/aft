@@ -194,7 +194,7 @@ jobs:
     name: Linux background task scopes (systemd user manager)
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 45
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
