@@ -57,11 +57,49 @@ pub(super) fn stamp_key(stamp: &ScopeStamp) -> (String, String, u64) {
     )
 }
 
+// The scope.watch contract bounds daemon tombstones by count, not time.
+// Keep local notification deduplication for ten minutes and at most 4,096 ends.
+const COMPLETED_END_TTL: Duration = Duration::from_secs(10 * 60);
+const COMPLETED_END_CAP: usize = 4_096;
+
+#[derive(Default)]
+struct CompletedEnds(std::collections::VecDeque<(scope_watch::Key, tokio::time::Instant)>);
+
+impl CompletedEnds {
+    fn contains(&mut self, key: &scope_watch::Key) -> bool {
+        let now = tokio::time::Instant::now();
+        while self
+            .0
+            .front()
+            .is_some_and(|(_, at)| now.duration_since(*at) >= COMPLETED_END_TTL)
+        {
+            self.0.pop_front();
+        }
+        self.0.iter().any(|(completed, _)| completed == key)
+    }
+
+    fn insert(&mut self, key: scope_watch::Key) {
+        if self.contains(&key) {
+            return;
+        }
+        if self.0.len() == COMPLETED_END_CAP {
+            self.0.pop_front();
+        }
+        // After eviction a duplicate may send a redundant notice, but lifecycle
+        // cleanup remains idempotent and cannot kill the ended task a second time.
+        self.0.push_back((key, tokio::time::Instant::now()));
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct ScopeDescribes {
     goodbye: mpsc::UnboundedSender<ScopeStamp>,
     routed: Arc<StdMutex<HashSet<(String, String, u64)>>>,
     observed: mpsc::UnboundedSender<ScopeStamp>,
+    #[cfg(test)]
+    iterations: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    completed: Arc<StdMutex<CompletedEnds>>,
 }
 
 pub(super) fn start_for_speech(
@@ -198,10 +236,17 @@ where
     let (observed, mut observations) = mpsc::unbounded_channel();
     let (ended, receiver) = mpsc::unbounded_channel();
     let routed = Arc::new(StdMutex::new(HashSet::new()));
+    let completed = Arc::new(StdMutex::new(CompletedEnds::default()));
+    #[cfg(test)]
+    let iterations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let handle = ScopeDescribes {
         goodbye,
         routed: routed.clone(),
         observed,
+        #[cfg(test)]
+        iterations: iterations.clone(),
+        #[cfg(test)]
+        completed: completed.clone(),
     };
     if let Some(service) = &speech {
         let sender = handle.observed.clone();
@@ -245,6 +290,8 @@ where
         let mut verifications = scope_watch::Verifications::default();
         let mut watches = scope_watch::Watches::new(control.metrics.clone());
         loop {
+            #[cfg(test)]
+            iterations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let changed = scope_watch::notifier().notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
@@ -429,6 +476,7 @@ where
                 }
                 () = &mut grant_sweep => unreachable!("saved grant sweep runs until cancelled"),
                 Some(stamp)=observations.recv()=>{
+                    if completed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&stamp_key(&stamp)) { continue; }
                     if let Some(service)=&speech { if speech_pending.remove(&stamp_key(&stamp)) || confirmed.insert(stamp_key(&stamp)) {
                         let key = stamp_key(&stamp);
                         cleanup_keys.insert(key.clone());
@@ -441,6 +489,7 @@ where
                     } }
                 }
                 Some(Ok((key, notice)))=fanout.join_next(), if !fanout.is_empty()=>{
+                    completed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key.clone());
                     cleanup_keys.remove(&key);
                     if let Some(notice) = notice { let _=ended.send(notice); }
                     refresh.immediate();
@@ -481,25 +530,31 @@ where
                         next_backstop = tokio::time::Instant::now() + scope_watch::BACKSTOP;
                         continue;
                     }
-                    if tokio::time::Instant::now() < next_scan { continue; }
-                    inventory_revision = scope_watch::revisions();
-                    let mut refreshed = scope_source().await;
-                    refreshed.retain_unread(&inventory);
-                    inventory = refreshed;
-                    let scopes: Vec<_> = inventory.scopes().into_values().collect();
-                    #[cfg(unix)]
-                    {
-                        let executor = executor.clone();
-                        secret_authorizations = tokio::task::spawn_blocking(move || executor.actor_contexts().into_iter().flat_map(|ctx| ctx.bash_background().secret_authorization_scope_stamps()).map(|stamp| stamp_key(&stamp)).collect()).await.unwrap_or_default();
+                    let scan_due = tokio::time::Instant::now() >= next_scan;
+                    if scan_due {
+                        inventory_revision = scope_watch::revisions();
+                        let mut refreshed = scope_source().await;
+                        refreshed.retain_unread(&inventory);
+                        inventory = refreshed;
+                        #[cfg(unix)]
+                        {
+                            let executor = executor.clone();
+                            secret_authorizations = tokio::task::spawn_blocking(move || executor.actor_contexts().into_iter().flat_map(|ctx| ctx.bash_background().secret_authorization_scope_stamps()).map(|stamp| stamp_key(&stamp)).collect()).await.unwrap_or_default();
+                        }
+                        next_scan = tokio::time::Instant::now() + interval;
                     }
-                    next_scan = tokio::time::Instant::now() + interval;
+                    let scopes: Vec<_> = inventory.scopes().into_values().collect();
                     retry.retain(|key, _| scopes.iter().any(|stamp| &stamp_key(stamp) == key));
                     next_poll.retain(|key, _| scopes.iter().any(|stamp| &stamp_key(stamp) == key));
                     let routed = routed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
                     for stamp in scopes {
                         let key = stamp_key(&stamp);
-                        if !protected_keys.contains(&key) && !confirmed.contains(&key) && (!routed.contains(&key) || secret_authorizations.contains(&key) || retry.contains_key(&key))
-                            && next_poll.get(&key).is_none_or(|due| tokio::time::Instant::now() >= *due) {
+                        if !protected_keys.contains(&key) && !confirmed.contains(&key) && !pending.contains(&key) && (!routed.contains(&key) || secret_authorizations.contains(&key) || retry.contains_key(&key))
+                            && next_poll.get(&key).map_or(scan_due, |due| tokio::time::Instant::now() >= *due) {
+                            // A per-scope deadline can precede the next inventory
+                            // scan. Consume it when queuing the probe so no past
+                            // deadline remains an immediately-ready timer.
+                            next_poll.remove(&key);
                             trigger_describe(key, stamp, &mut pending, &mut queued, &mut retrigger);
                         }
                     }
@@ -1357,6 +1412,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn live_epoch_move_repolls_only_after_scope_poll_interval() {
         let interval = Duration::from_millis(500);
+        let started_at = tokio::time::Instant::now();
         let stamp = ScopeStamp::new(
             subc_protocol::Principal::Direct,
             "scope",
@@ -1407,7 +1463,12 @@ mod tests {
             tokio::task::yield_now().await;
         }
         let answered_at = tokio::time::Instant::now();
-        tokio::time::advance(interval - Duration::from_millis(1)).await;
+        assert_eq!(answered_at, started_at + Duration::from_millis(400));
+        tokio::time::advance(Duration::from_millis(100)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_millis(399)).await;
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
@@ -1424,13 +1485,54 @@ mod tests {
         tokio::time::advance(Duration::from_millis(1)).await;
         let repeated = frames.recv().await.unwrap();
         assert_eq!(tokio::time::Instant::now(), answered_at + interval);
+        assert_eq!(
+            tokio::time::Instant::now(),
+            started_at + Duration::from_millis(900)
+        );
         assert_eq!(repeated.header.ty, FrameType::Request);
         let body: serde_json::Value = serde_json::from_slice(&repeated.body).unwrap();
         assert_eq!(body["op"], "scope.describe");
         assert_eq!(body["ref"], stamp.scope_ref);
         assert_ne!(repeated.header.corr, first.header.corr);
         assert!(ended.try_recv().is_err());
+        let before = scopes.iterations.load(std::sync::atomic::Ordering::Relaxed);
+        tokio::time::advance(Duration::from_millis(99)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        let after = scopes.iterations.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after - before <= 16,
+            "scope loop spun before the next scan: {} iterations",
+            after - before
+        );
+        assert!(
+            frames.try_recv().is_err(),
+            "one due deadline queues one poll"
+        );
+        assert!(
+            ended.try_recv().is_err(),
+            "polling cannot establish scope end"
+        );
+        assert!(scopes.completed.lock().unwrap().0.is_empty());
         worker.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_scope_ends_expire_and_evict_oldest_at_capacity() {
+        let key = |i| ("direct".to_owned(), format!("scope-{i}"), 1);
+        let mut completed = CompletedEnds::default();
+        for i in 0..COMPLETED_END_CAP {
+            completed.insert(key(i));
+        }
+        assert!(completed.contains(&key(0)));
+        completed.insert(key(COMPLETED_END_CAP));
+        assert_eq!(completed.0.len(), COMPLETED_END_CAP);
+        assert!(!completed.contains(&key(0)));
+        assert!(completed.contains(&key(1)));
+        tokio::time::advance(COMPLETED_END_TTL).await;
+        assert!(!completed.contains(&key(1)));
+        assert!(completed.0.is_empty());
     }
 }
 

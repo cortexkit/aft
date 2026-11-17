@@ -395,6 +395,18 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "context/checkout_suggestion.rs",
+        enclosing_item: "unique_indexed_checkout_suffix",
+        location_or_primitive: "MAX_PATHS, MAX_COMPONENTS",
+        reason: "Missing-path correction refuses recovery when the complete indexed inventory or requested path exceeds its work budget; it never returns a suggestion based on a truncated candidate list.",
+    },
+    ExclusionEntry {
+        file: "subc/scope_describe.rs",
+        enclosing_item: "CompletedEnds::insert",
+        location_or_primitive: "COMPLETED_END_CAP, pop_front",
+        reason: "Internal completed-end notification deduplication evicts oldest stamps at capacity or after ten minutes; a later duplicate can repeat an idempotent cleanup notice but cannot truncate a tool result or kill an ended task again.",
+    },
+    ExclusionEntry {
         file: "late_result_bus.rs",
         enclosing_item: "scan,replay,read_batch,capacity,due,deliver",
         location_or_primitive: "SCAN_BATCH (64), LATE_RESULTS_PAGE_MAX, UNACKED_RESULTS_MAX, SQL LIMIT",

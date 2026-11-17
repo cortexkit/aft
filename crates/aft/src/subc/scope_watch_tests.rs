@@ -402,6 +402,17 @@ async fn scope_watch_shell_terminal_notification_removes_selector_without_end_pr
 #[cfg(unix)]
 #[tokio::test]
 async fn scope_watch_connection_handoff_replays_durable_end_and_cleanup_is_idempotent() {
+    scope_watch_handoff_case(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn scope_watch_completed_end_eviction_repeats_one_notice_without_another_kill() {
+    scope_watch_handoff_case(true).await;
+}
+
+#[cfg(unix)]
+async fn scope_watch_handoff_case(evict_completed: bool) {
     use crate::db::{access_grants as grants, call_ledger as ledger};
     let (dir, root) = test_support::test_root("scope-watch-handoff");
     let ctx = test_support::test_ctx();
@@ -580,7 +591,7 @@ async fn scope_watch_connection_handoff_replays_durable_end_and_cleanup_is_idemp
     assert!(grants::list(&conn, &grant_key).unwrap().is_empty());
     drop(conn);
     second_handle.observed.send(scope.clone()).unwrap();
-    second_handle.observed.send(scope).unwrap();
+    second_handle.observed.send(scope.clone()).unwrap();
     turns().await;
     assert!(
         second_ended.try_recv().is_err(),
@@ -590,6 +601,42 @@ async fn scope_watch_connection_handoff_replays_durable_end_and_cleanup_is_idemp
         status().status,
         crate::bash_background::BgTaskStatus::Killed
     );
+    if evict_completed {
+        let duration = status().duration_ms;
+        {
+            let mut completed = second_handle.completed.lock().unwrap();
+            assert!(completed.contains(&stamp_key(&scope)));
+            for (_, at) in &mut completed.0 {
+                *at -= COMPLETED_END_TTL;
+            }
+        }
+        second_handle.observed.send(scope.clone()).unwrap();
+        let redundant = tokio::time::timeout(Duration::from_secs(5), second_ended.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stamp_key(&redundant.stamp), stamp_key(&scope));
+        assert!(redundant.keys.is_empty());
+        turns().await;
+        second_handle.observed.send(scope).unwrap();
+        turns().await;
+        assert!(
+            second_ended.try_recv().is_err(),
+            "one redundant notice after expiry"
+        );
+        assert_eq!(
+            status().duration_ms,
+            duration,
+            "the task was not killed again"
+        );
+        assert_eq!(
+            ledger::get(&db.lock().unwrap(), &ledger_key)
+                .unwrap()
+                .unwrap()
+                .seq,
+            sequence
+        );
+    }
     second_worker.abort();
     let _ = second_worker.await;
 }
