@@ -1392,7 +1392,15 @@ pub fn validate_trailer(fixture: &FixtureRecord) -> Vec<String> {
             fixture.name, expected, actual
         ));
     }
-    if !fixture.rendered.contains(&expected) {
+    if fixture.surface.list_id == "payload.ignored_entries" {
+        let sentence = "Not searched (ignore rules): a/, b/, c/ and 3 more in this folder. Name a path inside one to search it.";
+        if !fixture.rendered.contains(sentence) || fixture.rendered.contains(&expected) {
+            errors.push(format!(
+                "{}: ignored-boundary preview must use its remainder sentence, not a second trailer",
+                fixture.name
+            ));
+        }
+    } else if !fixture.rendered.contains(&expected) {
         errors.push(format!(
             "{}: surface text omitted canonical trailer {:?}",
             fixture.name, expected
