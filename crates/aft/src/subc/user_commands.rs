@@ -15,6 +15,37 @@ pub(super) fn is_occipital(principal: Option<&Principal>) -> bool {
     matches!(principal, Some(Principal::Reserved { module_id }) if module_id == "occipital")
 }
 
+/// Admits the operations Occipital's one AFT management route carries:
+/// user-commands/v1, provider metadata, and display reads. Occipital is
+/// classified before the display-reader check, so its display reads arrive
+/// here. Admitting `display.read` is not the authorization:
+/// `rich_ui::display::read` still refuses a caller that is not the catalog's
+/// display reader.
+pub(super) fn admit_occipital_route(body: Option<&Value>) -> Result<(), ErrorBody> {
+    let admitted = body.is_some_and(|body| {
+        is_request(body)
+            || matches!(
+                body.get("op")
+                    .or_else(|| body.get("name"))
+                    .and_then(Value::as_str),
+                Some(
+                    "role.describe"
+                        | "tool.views"
+                        | "tool.catalog"
+                        | cortexkit_role_tool_display::DISPLAY_READ
+                )
+            )
+    });
+    if admitted {
+        Ok(())
+    } else {
+        Err(ErrorBody::new(
+            "route_not_admitted",
+            "Occipital's AFT management route serves only user-commands/v1, display reads and provider metadata",
+        ))
+    }
+}
+
 fn admit(principal: Option<&Principal>) -> Result<(), ErrorBody> {
     // Protocol 0.35 carries the attested principal, not the daemon's additional
     // first-party attestation. Require that extra fact once the daemon sends it.
