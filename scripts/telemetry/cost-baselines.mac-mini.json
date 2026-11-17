@@ -1,0 +1,394 @@
+{
+  "schema": 1,
+  "generated_at": "2026-11-17T03:53:01Z",
+  "binary": {
+    "sha256": "25a49d67d0dcbd9ef37f3d066c5d9c46f4f9c6939b41bea875a92c993f996585",
+    "source_commit": "0602e43190d4dccef4a5c470a3137a8818b7a6e7",
+    "date": "2026-11-16"
+  },
+  "measured_on": {
+    "platform": "darwin-arm64",
+    "provenance": "workflow run 44013144440 (Nightly OSS cost gate), 2026-11-16, self-hosted mac-mini runner mac-mini, head 0602e43190d4dccef4a5c470a3137a8818b7a6e7; minimum observed value per metric over the run's two passes; memory=direct-child wait4 ru_maxrss (bytes); agreement checked against workflow run 44008608911 (same binary, all five repositories within existing tolerances/floors)",
+    "machine": {
+      "recorded_at": "2026-11-17T03:52:42.179734+00:00",
+      "model": "Mac18,5",
+      "cpu": "Apple M6",
+      "cpus": "12",
+      "memory_bytes": "17179869184",
+      "macos": "ProductName:\t\tmacOS\nProductVersion:\t\t27.2\nBuildVersion:\t\t26B123",
+      "power_source": "Now drawing from 'AC Power'",
+      "power_settings": "AC Power:\n Sleep On Power Button 1\n autorestartatconnect 0\n lowpowermode         0\n standby              0\n ttyskeepawake        1\n powernap             0\n womp                 1\n displaysleep         10\n networkoversleep     0\n sleep                0\n tcpkeepalive         1\n autorestart          1\n disksleep            0\n SleepServices        0",
+      "hold": {
+        "owner": "aft-nightly-44013144440",
+        "expires_at": "2026-11-17T05:00:00Z"
+      },
+      "exclusion": "[Excluded]  /Users/ghrunner/aft-nightly-cost"
+    }
+  },
+  "repos": {
+    "redox": {
+      "kind": "git",
+      "url": "https://github.com/redox-os/redox.git",
+      "sha": "af82439e08ebadd3f3540bc44b7b3f5bf68fb5d9",
+      "metrics": {
+        "callgraph_first_query_latency_ms": {
+          "value": 0.771,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "callgraph_refresh_ms": {
+          "value": 171.664,
+          "tolerance_pct": 20.0,
+          "absolute_floor": 500.0
+        },
+        "callgraph_store_build_ready_ms": {
+          "value": 1023.846,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "cpu_seconds": {
+          "value": 3.885,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "index_store_build_ready_ms": {
+          "value": 495.151,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "peak_rss_mb": {
+          "value": 165.9,
+          "tolerance_pct": 20.0,
+          "absolute_floor": 128.0
+        },
+        "search_first_query_latency_ms": {
+          "value": 1.03,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "waiting_on.artifact_load": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.build": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.limiter": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.resolver": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.total": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        }
+      },
+      "index_events": {},
+      "sample": {
+        "runs": 2,
+        "selection": "minimum observed value per metric"
+      },
+      "measurement_profile": "index-store-no-inspect-post-edit-refresh-v5"
+    },
+    "typescript-eslint": {
+      "kind": "git",
+      "url": "https://github.com/typescript-eslint/typescript-eslint.git",
+      "sha": "4586535ab24d7d5e9b3ba87e4adb8636f9314aca",
+      "metrics": {
+        "callgraph_first_query_latency_ms": {
+          "value": 0.604,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "callgraph_refresh_ms": {
+          "value": 56.75,
+          "tolerance_pct": 20.0,
+          "absolute_floor": 500.0
+        },
+        "callgraph_store_build_ready_ms": {
+          "value": 2277.126,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "cpu_seconds": {
+          "value": 15.505,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "index_store_build_ready_ms": {
+          "value": 666.219,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "peak_rss_mb": {
+          "value": 479.3,
+          "tolerance_pct": 20.0,
+          "absolute_floor": 128.0
+        },
+        "search_first_query_latency_ms": {
+          "value": 0.929,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "waiting_on.artifact_load": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.build": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.limiter": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.resolver": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.total": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        }
+      },
+      "index_events": {},
+      "sample": {
+        "runs": 2,
+        "selection": "minimum observed value per metric"
+      },
+      "measurement_profile": "index-store-no-inspect-post-edit-refresh-v5"
+    },
+    "jupyterlab": {
+      "kind": "git",
+      "url": "https://github.com/jupyterlab/jupyterlab.git",
+      "sha": "7848d05af740c18b5950a8d1b90e2ed580af8260",
+      "metrics": {
+        "callgraph_first_query_latency_ms": {
+          "value": 0.662,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "callgraph_refresh_ms": {
+          "value": 22.91,
+          "tolerance_pct": 20.0,
+          "absolute_floor": 500.0
+        },
+        "callgraph_store_build_ready_ms": {
+          "value": 1975.637,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "cpu_seconds": {
+          "value": 12.711,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "index_store_build_ready_ms": {
+          "value": 645.666,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "peak_rss_mb": {
+          "value": 326.4,
+          "tolerance_pct": 20.0,
+          "absolute_floor": 128.0
+        },
+        "search_first_query_latency_ms": {
+          "value": 1.39,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "waiting_on.artifact_load": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.build": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.limiter": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.resolver": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.total": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        }
+      },
+      "index_events": {},
+      "sample": {
+        "runs": 2,
+        "selection": "minimum observed value per metric"
+      },
+      "measurement_profile": "index-store-no-inspect-post-edit-refresh-v5"
+    },
+    "hugo": {
+      "kind": "git",
+      "url": "https://github.com/gohugoio/hugo.git",
+      "sha": "423e9cead1ce279dc1db3a4be4fff36cb49479ad",
+      "metrics": {
+        "callgraph_first_query_latency_ms": {
+          "value": 0.638,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "callgraph_refresh_ms": {
+          "value": 171.419,
+          "tolerance_pct": 20.0,
+          "absolute_floor": 500.0
+        },
+        "callgraph_store_build_ready_ms": {
+          "value": 1410.544,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "cpu_seconds": {
+          "value": 8.001,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "index_store_build_ready_ms": {
+          "value": 441.488,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "peak_rss_mb": {
+          "value": 319.4,
+          "tolerance_pct": 20.0,
+          "absolute_floor": 128.0
+        },
+        "search_first_query_latency_ms": {
+          "value": 0.818,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "waiting_on.artifact_load": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.build": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.limiter": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.resolver": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.total": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        }
+      },
+      "index_events": {},
+      "sample": {
+        "runs": 2,
+        "selection": "minimum observed value per metric"
+      },
+      "measurement_profile": "index-store-no-inspect-post-edit-refresh-v5"
+    },
+    "synthetic-24k": {
+      "kind": "synthetic",
+      "version": "synthetic-v2",
+      "metrics": {
+        "callgraph_first_query_latency_ms": {
+          "value": 1.233,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "callgraph_refresh_ms": {
+          "value": 67.266,
+          "tolerance_pct": 20.0,
+          "absolute_floor": 500.0
+        },
+        "callgraph_store_build_ready_ms": {
+          "value": 925.632,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "cpu_seconds": {
+          "value": 3.336,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "index_store_build_ready_ms": {
+          "value": 657.509,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "peak_rss_mb": {
+          "value": 85.0,
+          "tolerance_pct": 20.0,
+          "absolute_floor": 128.0
+        },
+        "search_first_query_latency_ms": {
+          "value": 2.233,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "waiting_on.artifact_load": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.build": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.limiter": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.resolver": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.total": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        }
+      },
+      "index_events": {},
+      "sample": {
+        "runs": 2,
+        "selection": "minimum observed value per metric"
+      },
+      "measurement_profile": "index-store-no-inspect-post-edit-refresh-v5"
+    }
+  }
+}
