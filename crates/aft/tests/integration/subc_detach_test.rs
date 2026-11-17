@@ -1571,7 +1571,7 @@ pub(super) async fn send_tool_call(
     name: &str,
     arguments: Value,
 ) {
-    let body = json!({ "name": name, "preset":"head", "arguments": arguments });
+    let body = json!({ "name": name, "arguments": arguments });
     send_frame(
         stream,
         Frame::build(

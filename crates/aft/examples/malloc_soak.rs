@@ -212,13 +212,13 @@ fn main() {
                 tokio::time::sleep(Duration::from_secs(if n == 0 { owner_warmup } else { 5 })).await;
                 request(&mut stream, 100, &mut corr, json!({"op":"memory.census"}), &out).await;
             } else {
-                request(&mut stream, n as u16 + 1, &mut corr, json!({"preset":"head","name":"inspect","arguments":{"sections":"all"}}), &out).await;
+                request(&mut stream, n as u16 + 1, &mut corr, json!({"name":"inspect","arguments":{"sections":"all"}}), &out).await;
             }
         }
         if scaling {
             for edited in [0, 1, 3, 5, 10] {
                 for n in 1..=edited {
-                    request(&mut stream, n as u16 + 1, &mut corr, json!({"preset":"head","name":"write","arguments":{"filePath":"malloc_soak_probe.rs","content":format!("pub fn scaling_{edited}() -> usize {{ {edited} }}\n")}}), &out).await;
+                    request(&mut stream, n as u16 + 1, &mut corr, json!({"name":"write","arguments":{"filePath":"malloc_soak_probe.rs","content":format!("pub fn scaling_{edited}() -> usize {{ {edited} }}\n")}}), &out).await;
                 }
                 tokio::time::sleep(Duration::from_secs(90)).await;
                 request(&mut stream, 100, &mut corr, json!({"op":"memory.census"}), &out).await;
@@ -227,7 +227,7 @@ fn main() {
             // Same roots, ten further edits each: separate per-edit growth from root cardinality.
             for revision in 0..10 {
                 for n in 1..=10 {
-                    request(&mut stream, n as u16 + 1, &mut corr, json!({"preset":"head","name":"write","arguments":{"filePath":"malloc_soak_probe.rs","content":format!("pub fn repeated_{revision}() -> usize {{ {revision} }}\n")}}), &out).await;
+                    request(&mut stream, n as u16 + 1, &mut corr, json!({"name":"write","arguments":{"filePath":"malloc_soak_probe.rs","content":format!("pub fn repeated_{revision}() -> usize {{ {revision} }}\n")}}), &out).await;
                 }
                 tokio::time::sleep(Duration::from_secs(10)).await;
             }
@@ -260,12 +260,12 @@ fn main() {
         let mut round = 0;
         while start.elapsed() < Duration::from_secs(active_secs) {
             for n in 0..roots.len() {
-                request(&mut stream, n as u16 + 1, &mut corr, json!({"preset":"head","name":"write","arguments":{"filePath":"malloc_soak_probe.rs","content":format!("/// Allocation experiment revision {round}.\npub fn malloc_soak_probe_{round}() -> usize {{ {round} }}\n")}}), &out).await;
-                request(&mut stream, n as u16 + 1, &mut corr, json!({"preset":"head","name":"search","arguments":{"query":"how are idle root artifacts released"}}), &out).await;
-                request(&mut stream, n as u16 + 1, &mut corr, json!({"preset":"head","name":"inspect","arguments":{"sections":["dead_code","cycles","duplicates"]}}), &out).await;
+                request(&mut stream, n as u16 + 1, &mut corr, json!({"name":"write","arguments":{"filePath":"malloc_soak_probe.rs","content":format!("/// Allocation experiment revision {round}.\npub fn malloc_soak_probe_{round}() -> usize {{ {round} }}\n")}}), &out).await;
+                request(&mut stream, n as u16 + 1, &mut corr, json!({"name":"search","arguments":{"query":"how are idle root artifacts released"}}), &out).await;
+                request(&mut stream, n as u16 + 1, &mut corr, json!({"name":"inspect","arguments":{"sections":["dead_code","cycles","duplicates"]}}), &out).await;
             }
             for channel in 10..13 {
-                request(&mut stream, channel, &mut corr, json!({"preset":"head","name":"search","arguments":{"query":"where is semantic refresh handled"}}), &out).await;
+                request(&mut stream, channel, &mut corr, json!({"name":"search","arguments":{"query":"where is semantic refresh handled"}}), &out).await;
             }
             request(&mut stream, 100, &mut corr, json!({"op":"memory.census"}), &out).await;
             round += 1;

@@ -2475,7 +2475,7 @@ fn send_tool_epoch(
             channel,
             epoch,
             corr,
-            serde_json::to_vec(&json!({ "name": name, "preset":"head", "arguments": arguments }))
+            serde_json::to_vec(&json!({ "name": name, "arguments": arguments }))
                 .expect("tool body"),
         )
         .expect("tool frame"),

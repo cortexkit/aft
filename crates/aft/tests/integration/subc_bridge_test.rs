@@ -5417,9 +5417,10 @@ async fn drive_bash_wait_rejection_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
-/// Worker calls select the worker preset and retain the legacy worker marker.
-/// A worker is never woken by a completion reminder, so its background hand-off
-/// text must not promise one; the head preset keeps the primary wording.
+/// The plugins mark a delegated worker's call with `worker_session: true` in
+/// the call body, beside `name` and `arguments`. A worker is never woken by a
+/// completion reminder, so its background hand-off text must not promise one;
+/// a call without the flag keeps the primary wording.
 async fn drive_bash_worker_role_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
         mut stream, root1, ..
@@ -5428,7 +5429,6 @@ async fn drive_bash_worker_role_daemon(input: FakeDaemonInput) {
     for (corr, worker) in [(130_u64, true), (131_u64, false)] {
         let mut body = json!({
             "name": "bash",
-            "preset": if worker { "worker" } else { "head" },
             "arguments": {
                 "command": "sleep 5",
                 "background": true,
@@ -5503,7 +5503,7 @@ async fn drive_bash_worker_wait_limit_daemon(input: FakeDaemonInput) {
             "compressed": false,
         });
         arguments[mode] = json!(true);
-        let body = json!({ "name": "bash", "preset":"worker", "arguments": arguments, "worker_session": true });
+        let body = json!({ "name": "bash", "arguments": arguments, "worker_session": true });
         let started = Instant::now();
         send_frame(
             &mut stream,
@@ -5932,7 +5932,7 @@ async fn send_tool_call_with_tokens(
     call_key: Option<&str>,
     schema_pin: Option<&str>,
 ) {
-    let mut body = json!({ "name": name, "preset":"head", "arguments": arguments });
+    let mut body = json!({ "name": name, "arguments": arguments });
     if let Some(call_key) = call_key {
         body["call_key"] = json!(call_key);
     }
@@ -6184,7 +6184,6 @@ async fn drive_bash_promote_failure_daemon(input: FakeDaemonInput) {
     let done = root1.join("promote-failure-done");
     let body = json!({
         "name": "bash",
-        "preset": "worker",
         "worker_session": true,
         "arguments": {
             "command": hold_bash_until_done_command(&marker, &release, &done),
@@ -13895,7 +13894,6 @@ async fn call_with_host_tool_names(
 ) -> Frame {
     let mut body = json!({
         "name": name,
-        "preset": "head",
         "arguments": arguments,
         "edit_slot_survives": true,
     });
@@ -14654,7 +14652,6 @@ async fn send_registered_tool_call(
 ) {
     let body = json!({
         "name": name,
-        "preset": "head",
         "arguments": arguments,
         "edit_slot_survives": edit_slot_survives,
     });
@@ -14681,7 +14678,7 @@ async fn send_tool_call_epoch(
     name: &str,
     arguments: Value,
 ) {
-    let body = json!({ "name": name, "preset":"head", "arguments": arguments });
+    let body = json!({ "name": name, "arguments": arguments });
     send_frame(
         stream,
         Frame::build(
@@ -16235,7 +16232,6 @@ async fn drive_preview_write_daemon(input: FakeDaemonInput) {
     // Preview: must succeed, must NOT create the file.
     let body = json!({
         "name": "write",
-        "preset": "head",
         "arguments": { "filePath": target.to_string_lossy(), "content": "hello preview\n" },
         "preview": true,
     });

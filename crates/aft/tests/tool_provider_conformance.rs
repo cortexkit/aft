@@ -3316,7 +3316,7 @@ async fn bind_route_stamped_with_mode(
     Ok(Route {
         wire,
         channel,
-        scoped_preset: Some("head"),
+        scoped_preset: stamp.scope.as_ref().map(|_| "head"),
         legacy_diagnostics: None,
     })
 }
