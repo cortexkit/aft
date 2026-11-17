@@ -429,6 +429,8 @@ def main() -> int:
                 continue
             if count is None:
                 generated += 1
+                if args.report:
+                    print(f"Skipped generated header: {path}")
                 continue
             counts[path] = count
             violation, message = size_message(path, count[0], pins)
