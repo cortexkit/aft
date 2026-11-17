@@ -259,7 +259,7 @@ impl Subscription {
                 "scope.watch missing snapshot".into(),
             ));
         }
-        // Every selector is described after opening, including terminal and
+        // Non-live entries need describe confirmation, including terminal and
         // unknown initial states. A snapshot is not itself an end proof.
         let snapshot = serde_json::from_slice::<subc_client_rs::ScopeWatchResponse>(&frame.body)
             .map_err(|error| readiness::ControlError::Decode(error.to_string()))?;
