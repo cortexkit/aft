@@ -6288,7 +6288,7 @@ mod tests {
     #[test]
     fn health_live_shaped_lsp_fleet_keeps_process_totals_and_semantic_failure_detail() {
         let (_, mut metrics) =
-            largest_meaning_fill_health_metrics(seventeen_active_large_read_sites());
+            meaning_fill_health_metrics(seventeen_active_large_read_sites(), true);
         let mut failed = metrics["roots"][0].clone();
         failed["project_root"] = json!("/projects/failed-root");
         failed["state"] = json!("degraded");
@@ -10929,7 +10929,15 @@ mod tests {
             }
             paths.sort();
             let cache = HealthRollupCache::new();
-            let report = refresh_until_root_count(&cache, &executor, &app, root_count as u64);
+            refresh_until_root_count(&cache, &executor, &app, root_count as u64);
+            paths = fixed_health_fixture_root_names(&cache, &paths);
+            let report = build_health_report(
+                &cache,
+                &executor,
+                &HashMap::new(),
+                &DispatchPathMetrics::new(),
+                &app,
+            );
             let report_bytes = serde_json::to_vec(&report)
                 .expect("serialize health report")
                 .len();
@@ -11201,6 +11209,41 @@ mod tests {
     fn largest_meaning_fill_health_metrics(
         large_reads: Value,
     ) -> (u64, serde_json::Map<String, Value>) {
+        meaning_fill_health_metrics(large_reads, false)
+    }
+
+    // The real storage directories still exercise failed index-store binds.
+    // Only the cached telemetry fixture gets fixed names, before rendering,
+    // so OS temp prefixes cannot decide which rows or root details fit.
+    fn fixed_health_fixture_root_names(cache: &HealthRollupCache, paths: &[String]) -> Vec<String> {
+        fn rename(value: &mut Value, from: &str, to: &str) {
+            match value {
+                Value::String(text) => *text = text.replace(from, to),
+                Value::Array(rows) => rows.iter_mut().for_each(|row| rename(row, from, to)),
+                Value::Object(fields) => fields
+                    .values_mut()
+                    .for_each(|value| rename(value, from, to)),
+                _ => {}
+            }
+        }
+        let mut snapshot = cache.snapshot.write().unwrap();
+        let snapshot = Arc::make_mut(&mut snapshot);
+        let mut fixed = Vec::new();
+        for (index, path) in paths.iter().enumerate() {
+            let name = format!("/health/root-{index:03}");
+            rename(&mut snapshot.metrics, path, &name);
+            if let Some(detail) = &mut snapshot.detail {
+                *detail = detail.replace(path, &name);
+            }
+            fixed.push(name);
+        }
+        fixed
+    }
+
+    fn meaning_fill_health_metrics(
+        large_reads: Value,
+        fixed_roots: bool,
+    ) -> (u64, serde_json::Map<String, Value>) {
         use crate::data_layer::surfaces::{MeaningCoverage, MeaningPlane, MeaningReport};
         let executor = Executor::new();
         let (_dir, root) = test_root("meaning-fill-health-budget");
@@ -11210,6 +11253,9 @@ mod tests {
         let dispatch = DispatchPathMetrics::new();
         let cache = HealthRollupCache::new();
         refresh_until_root_count(&cache, &executor, &app, 1);
+        if fixed_roots {
+            fixed_health_fixture_root_names(&cache, &[root.to_string()]);
+        }
         let roots = fixture_roots(&executor);
         let indexing_roots = roots.iter().map(|root| root.as_path()).collect::<Vec<_>>();
         let mut report = super::assemble_health_report(
@@ -11227,6 +11273,15 @@ mod tests {
         )
         .metrics
         .expect("health metrics");
+        if fixed_roots {
+            // Start with full root details, not a report that the first budget
+            // pass may already have reduced under platform-specific pressure.
+            report["roots"] = cache.snapshot().0.metrics["roots"].clone();
+            report
+                .as_object_mut()
+                .unwrap()
+                .remove("root_details_reduced");
+        }
         let metrics = report.as_object_mut().unwrap();
         retain_fixture_process_rows(metrics, &roots);
         metrics.insert("large_reads".into(), large_reads);
