@@ -722,6 +722,32 @@ The AFT sidebar and the OpenCode 2 prompt footer read their display settings fro
 
 `git.co_author` controls commit attribution for AFT-spawned agent children. `"off"` is the default, `"auto"` derives the repository's bound agent from the gh-shim manifest and cached GitHub numeric ID, and an explicit `"Name <email>"` value is used verbatim. When enabled, AFT selects a complete dispatcher set through child-only `GIT_CONFIG_*` variables; it does not edit global or repository Git configuration. The dispatchers are identical for every project and storage root, so AFT writes them once per user to a directory named by a hash of their content, `<aft-cache>/git-hooks/<content-hash>`, where `<aft-cache>` is `AFT_CACHE_DIR` when set, otherwise `%LOCALAPPDATA%\aft` on Windows and `$XDG_CACHE_HOME/aft` or `~/.cache/aft` elsewhere (`<storage_root>/git-hooks/<content-hash>` when no home directory is known). The set is created atomically and never rewritten while intact, so each hook version is a single new executable per user. Each dispatcher preserves arguments, stdin, and exit status while chaining to the first executable repository hook from local `core.hooksPath`, the repository's Git directory, or `.githooks`. The `prepare-commit-msg` dispatcher adds attribution first so the repository hook can validate or amend it. AFT quarantines unknown or modified entries in its managed directory and regenerates the expected dispatchers before child launch. Project config may override this attribution key because attribution is not a trust boundary.
 
+## Project environment in agent shells (`shell.env_provider`)
+
+By default, agent shells get the environment AFT itself started with, so a project's pinned tool versions (from mise, direnv or similar) don't apply. `shell.env_provider` asks a provider for each project's environment before a shell command starts:
+
+```jsonc
+// ~/.config/cortexkit/aft.jsonc
+{ "shell": { "env_provider": { "kind": "mise" } } }
+```
+
+- `kind`: `mise` (runs `mise env --json`), `direnv` (runs `direnv export json`; not supported on Windows) or `custom`.
+- `command`: the provider's argument list. Optional for `mise` and `direnv`, required for `custom`.
+- `timeout_ms`: 100 to 10000, default 2000. The provider also has to fit in the time a bash call allows for starting its command: when less than `timeout_ms` of that is left, the provider gets what is left minus one second.
+- `watch` (`custom` only): file names whose change makes AFT ask the provider again. A custom provider with no watch files runs before every command.
+
+The provider runs in the command's working directory, inside the same sandbox as the command. It must print one JSON object of string values, in UTF-8 and at most 256 KiB. A value of `null` removes that variable. `PATH` may be replaced. Names AFT never accepts from user configuration are silently dropped: loader variables (`LD_*`, `DYLD_*`), shell start-up variables (`BASH_ENV`, `ENV`, `IFS`, `SHELLOPTS`, `BASHOPTS`, `BASH_FUNC_*`), `GIT_CONFIG*`, and CortexKit and AFT control variables.
+
+AFT caches each answer per working directory and starting environment. It asks again when a watched file changes, checking every parent folder of the working directory. For `mise` these are `mise.toml`, `.mise.toml`, `mise.local.toml`, `.mise.local.toml`, `.tool-versions`, `.config/mise.toml`, `.config/mise/config.toml`, `.mise/config.toml` and `mise/config.toml`; for `direnv`, `.envrc` and `.env`.
+
+If the provider fails, times out or prints something AFT can't use, the command still runs, with AFT's default environment, and its output starts with one line naming the reason:
+
+```text
+Project environment not loaded (<reason>); this command used AFT's default PATH.
+```
+
+The setting is honored only in user config; a project config can't select a provider, because the provider runs a command. Changes apply to the next command without a restart. Commands run on a build server (`runon`) don't use it. Omit the setting to keep today's environment exactly.
+
 ## Remote runs
 
 `remote_exec.enabled` is the single user switch for whole-line `runon` and defaults to false. The retired `bash.runon_enabled` key is translated with a notice: an explicit false keeps remote runs off by setting `remote_exec.enabled: false`, and true leaves that setting unchanged; then the old key is removed. An absent old key already uses the current one-switch configuration. AFT rewrites the user file with its existing comment-preserving migration and backup, including each first-level harness block independently. Project files are not rewritten; their retired key is dropped with a notice.
