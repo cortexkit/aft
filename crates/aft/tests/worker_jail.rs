@@ -1891,10 +1891,9 @@ async fn relaxed_macos_worker_jail_still_fences_operator_gh() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn cortexkit_settings_file_tools_and_relaxed_shell_are_open_for_head_and_worker() {
-    assert!(
-        native_available(),
-        "settings regression requires a native launcher"
-    );
+    // native_available also requires the OS account's home to hold a marker
+    // protecting its GitHub credentials. Relaxed Linux leaves those reads unenforced.
+    run(Command::new(aft_binary::aft_binary()).args(["sandbox-launch", "--support"]));
     let mut jail =
         Jail::start_with_layout_and_env(None, None, true, "relaxed", false, false, |base, _| {
             let config = base.join("xdg/config/cortexkit/aft.jsonc");
