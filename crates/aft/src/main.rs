@@ -243,13 +243,6 @@ fn main() {
         aft::launch_nonce::capture_at_startup();
         startup_phase("nonce_capture_done");
     }
-    // Every mode, not only the supervised one, holds its startup executable
-    // open now (macOS): a build's resume checkpoints are tied to the image
-    // this process runs, which must be read before an upgrade can
-    // place another binary at the same path.
-    aft::pinned_executable::capture_at_startup();
-    startup_phase("executable_source_captured");
-
     // Only the binary embeds the per-commit revision. Declare it before CLI
     // dispatch or the subc HELLO can request the library's build provenance.
     assert!(
@@ -303,6 +296,12 @@ fn main() {
         }
     }
 
+    // Help and option errors must exit before storage, PATH, logging, or even
+    // capturing the executable used by serving and maintenance commands.
+    if let Some(code) = cli::help::handle_first_arg(std::env::args().nth(1).as_deref()) {
+        std::process::exit(code);
+    }
+
     // `--formats` reports the highest on-disk format version of every store
     // this build reads. Placement compares it with the storage root's reader
     // floor, so it must stay side-effect free: no storage, no logging, no
@@ -317,6 +316,12 @@ fn main() {
         println!("aft {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+
+    // Serving and maintenance modes hold their startup executable open now
+    // (macOS): a build's resume checkpoints are tied to the running image,
+    // which must be read before an upgrade replaces it at the same path.
+    aft::pinned_executable::capture_at_startup();
+    startup_phase("executable_source_captured");
 
     if std::env::args().nth(1).as_deref() == Some("migrate-storage") {
         let args = std::env::args_os().skip(2).collect::<Vec<_>>();

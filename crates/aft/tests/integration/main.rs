@@ -41,6 +41,7 @@ mod cache_root_doctor_test;
 mod callgraph_restart_reuse_test;
 mod callgraph_test;
 mod checkpoint_metadata_test;
+mod cli_help_test;
 mod commands_test;
 mod compress_cli_commands_test;
 mod compress_filters_test;

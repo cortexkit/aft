@@ -2,6 +2,7 @@ pub mod backups;
 pub mod clean_old_caches;
 pub mod fix_config;
 pub mod grammar_smoke;
+pub mod help;
 pub mod index;
 pub mod probe_login_shell_path;
 // Compiled everywhere: the memory census view has no OS dependency, and the
