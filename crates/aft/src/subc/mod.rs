@@ -10544,22 +10544,7 @@ fn admit_management_flow_request(
         };
     }
     if identity.admission == ManagementAdmission::Occipital {
-        return if body.is_some_and(|body| {
-            user_commands::is_request(body)
-                || matches!(
-                    body.get("op")
-                        .or_else(|| body.get("name"))
-                        .and_then(Value::as_str),
-                    Some("role.describe" | "tool.views" | "tool.catalog")
-                )
-        }) {
-            Ok(())
-        } else {
-            Err(ErrorBody::new(
-                "route_not_admitted",
-                "Occipital's AFT management route serves only user-commands/v1 and provider metadata",
-            ))
-        };
+        return user_commands::admit_occipital_route(body);
     }
     if identity.admission == ManagementAdmission::ShellsOnly {
         return if body.is_some_and(shells::is_request) {
@@ -15893,9 +15878,23 @@ mod tests {
             admission: ManagementAdmission::Occipital,
             ..Default::default()
         };
-        for name in ["role.describe", "tool.views", "tool.catalog"] {
-            assert!(admit_management_flow_request(&occipital, Some(&json!({"name":name}))).is_ok());
+        for name in [
+            "role.describe",
+            "tool.views",
+            "tool.catalog",
+            cortexkit_role_tool_display::DISPLAY_READ,
+        ] {
+            assert!(
+                admit_management_flow_request(&occipital, Some(&json!({"name":name}))).is_ok(),
+                "{name}"
+            );
         }
+        // Occipital's live display reads name the operation with `op`.
+        assert!(admit_management_flow_request(
+            &occipital,
+            Some(&json!({"op":cortexkit_role_tool_display::DISPLAY_READ,"record_id":"r"}))
+        )
+        .is_ok());
         for name in ["health.digest", "late_results", "memory.census"] {
             assert!(
                 admit_management_flow_request(&occipital, Some(&json!({"name":name}))).is_err()
