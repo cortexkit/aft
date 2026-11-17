@@ -1356,7 +1356,7 @@ fn bash_result_from_response(
     format_context: &crate::subc_format::FormatContext,
 ) -> ToolCallResult {
     response.notices.route = format_context.runner_notice.clone();
-    crate::notice_templates::deliver(&mut response, None);
+    crate::subc::runner_notices::notice_templates::deliver(&mut response, None);
     let mut text =
         crate::subc_format::format_response_with_context("bash", &response, format_context);
     if response.data["output"]

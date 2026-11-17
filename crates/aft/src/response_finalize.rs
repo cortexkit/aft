@@ -357,7 +357,7 @@ fn attach_alert_block(
         .notices
         .items
         .push(crate::subc::runner_notices::notice_templates::Notice::diagnostic(alert.text));
-    crate::notice_templates::deliver(response, None);
+    crate::subc::runner_notices::notice_templates::deliver(response, None);
 }
 
 pub enum DispatchOutcome {
