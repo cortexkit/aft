@@ -44,7 +44,7 @@
     "reason": "Split GitHub shim policy and commands pending; AFT crate split lane."
   },
   "crates/aft/src/subc/consent_tests.rs": {
-    "lines": 8712,
+    "lines": 8659,
     "reason": "Split consent tests by policy scenario pending; AFT crate split lane."
   },
   "crates/aft/tests/integration/inspect_command_test.rs": {
