@@ -75,7 +75,12 @@ async fn prefrontal_rename_bus_preserves_custody_and_reader_subjects() {
             .unwrap();
         assert_eq!(
             names
-                .event_subject_with_reader("aft", EVENT, 1, reader)
+                .event_subject_with_reader(
+                    "aft",
+                    LATE_RESULT_READY_EVENT,
+                    LATE_RESULT_READY_VERSION,
+                    reader,
+                )
                 .unwrap(),
             format!("ck.box_test.event.aft.late_result_ready.v1.{module}")
         );

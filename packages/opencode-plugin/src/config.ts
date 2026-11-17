@@ -3,8 +3,8 @@ import { homedir } from "node:os";
 import { isAbsolute, parse as parsePath, resolve as resolvePath } from "node:path";
 import {
   type AftConfigFileMigrationResult,
-  ConfigRejectedError,
   CALLGRAPH_CHUNK_KEY,
+  ConfigRejectedError,
   type ConfigTier,
   DATA_LAYER_RETIRED_PATHS,
   DEFAULT_DISABLED_TOOLS,
