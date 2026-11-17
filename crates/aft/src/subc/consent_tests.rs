@@ -3544,7 +3544,7 @@ async fn consent_scope_card_matches_stored_directory() {
     assert_eq!(request["paths"], json!([f.head_root.join("shared.txt")]));
     assert_eq!(request["tool"], "read");
     assert_eq!(request["operation"], "read");
-    assert_eq!(request["reason"], format!("Allow scope: read-only access for all AFT read tools within the directory tree rooted at {}. Protected paths remain denied.", f.head_root.display()));
+    assert_eq!(request["reason"], format!("Allow scope: read-only access for all AFT read tools within the directory tree rooted at {}. Protected paths remain denied.", super::permissions::display_path(&f.head_root, &super::permissions::home_folders())));
     assert_eq!(
         f.worker_grants(),
         vec![AccessGrant {
@@ -3597,7 +3597,7 @@ async fn worker_read_repository_scope_covers_manifest_tests_and_open_asks() {
         format!("{}/**", f.head_root.display())
     );
     assert_eq!(source_card["paths"], json!([source]));
-    assert_eq!(source_card["reason"], format!("Allow scope: read-only access for all AFT read tools within the directory tree rooted at {}. Protected paths remain denied.", f.head_root.display()));
+    assert_eq!(source_card["reason"], format!("Allow scope: read-only access for all AFT read tools within the directory tree rooted at {}. Protected paths remain denied.", super::permissions::display_path(&f.head_root, &super::permissions::home_folders())));
     f.fake.answer(
         &source_key,
         json!({"state":"settled", "outcome":"allow_scope", "answered_by":"user"}),
@@ -4281,7 +4281,10 @@ async fn consent_scope_held_probe_at_settlement_keeps_advertised_tree_and_siblin
     assert_eq!(request["pattern"], format!("{}/**", f.head_root.display()));
     assert_eq!(
         request["reason"],
-        READ_TREE_SCOPE_REASON.replace("{path}", &f.head_root.to_string_lossy())
+        READ_TREE_SCOPE_REASON.replace(
+            "{path}",
+            &super::permissions::display_path(&f.head_root, &super::permissions::home_folders())
+        )
     );
     assert_eq!(request["head_policy"], "allow");
     // A head may answer after the directory memo expires, while another
@@ -4491,7 +4494,7 @@ fn consent_scope_nested_file_still_offers_directory() {
     assert_eq!(scope.path, parent);
     assert_eq!(scope.kind, GrantKind::Subtree);
     assert_eq!(scope.operation, AccessOperation::Read);
-    assert_eq!(scope_reason(&scope), format!("Allow scope: read-only access for all AFT read tools within the directory tree rooted at {}. Protected paths remain denied.", scope.path.display()));
+    assert_eq!(scope_reason(&scope), format!("Allow scope: read-only access for all AFT read tools within the directory tree rooted at {}. Protected paths remain denied.", super::permissions::display_path(&scope.path, &super::permissions::home_folders())));
 }
 
 #[cfg(unix)]
@@ -4698,7 +4701,13 @@ fn consent_scope_four_concurrent_cards_share_directory_probe() {
         );
         assert_eq!(
             prep.request["reason"],
-            READ_TREE_SCOPE_REASON.replace("{path}", &f.head_root.to_string_lossy())
+            READ_TREE_SCOPE_REASON.replace(
+                "{path}",
+                &super::permissions::display_path(
+                    &f.head_root,
+                    &super::permissions::home_folders()
+                )
+            )
         );
     }
     assert_eq!(

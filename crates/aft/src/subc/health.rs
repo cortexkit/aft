@@ -2540,8 +2540,9 @@ fn trim_health_root_groups(metrics: &mut serde_json::Map<String, Value>) -> bool
         return false;
     };
     for group in groups.iter_mut().rev() {
-        if group["examples"]
-            .as_array_mut()
+        if group
+            .get_mut("examples")
+            .and_then(Value::as_array_mut)
             .is_some_and(|examples| examples.pop().is_some())
         {
             group["examples_omitted"] = json!(group["examples_omitted"]
