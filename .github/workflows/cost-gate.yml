@@ -87,7 +87,18 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Check existing runner tools (never install)
+      # The Mac mini keeps no Rust on its PATH (the release jobs install theirs
+      # the same way). Pin the version so every night measures a binary built
+      # by the same compiler; bump it together with a re-recorded baseline.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.100.0"
+
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
+
+      - name: Check runner tools
         run: |
           set -euo pipefail
           for tool in cargo rustc cmake python3 git tmutil sysctl sw_vers pmset; do
