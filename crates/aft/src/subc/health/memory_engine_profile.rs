@@ -1,10 +1,7 @@
 //! Manual reproduction of health's memory census with retained, edited AFT engines.
 
 use super::*;
-use crate::data_layer::runtime::{
-    memory_figure_walks_for_test, memory_profile_layer_for_test,
-    with_memory_figure_baseline_for_test,
-};
+use crate::data_layer::runtime::{memory_figure_walks_for_test, memory_profile_layer_for_test};
 use crate::test_allocations::profile::{cpu_ns, STEPS};
 
 fn copy_sources(source: &Path, root: &Path) {
@@ -52,26 +49,27 @@ fn bound_context(root: &Path, storage: &Path) -> Arc<AppContext> {
 #[test]
 #[ignore = "manual optimized multi-checkout health memory CPU measurement"]
 fn retained_aft_engines() {
-    const ROOTS: usize = 40;
-    const EDITING: usize = 3;
+    const ROOTS: usize = 100;
+    const ENGINES: usize = 15;
+    const EDITING: usize = ENGINES;
     assert!(!cfg!(debug_assertions), "use --profile ci-storm");
     let source = crate::test_support::manifest_dir().join("../..");
     let scratch = source.join("target/scratch");
     std::fs::create_dir_all(&scratch).unwrap();
     let dir = tempfile::tempdir_in(scratch).unwrap();
     let executor = Executor::with_config(crate::executor::ExecutorConfig {
-        actor_cap: 64,
+        actor_cap: 128,
         ..Default::default()
     });
-    // The production keeper deliberately evicts engines over 1 GiB. Keep all
-    // forty real engines for this isolated profile rather than measuring empty slots.
+    // Keep the working engines for this isolated profile rather than measuring
+    // slots evicted by the production keeper's process-wide budget.
     memory_profile_layer_for_test().set_engine_budget(16 << 30);
     memory_profile_layer_for_test().set_engine_idle(Duration::from_secs(3600));
     let app = crate::context::App::default_shared();
     let cache = HealthRollupCache::new();
     let mut contexts = Vec::new();
     let mut checkouts = Vec::new();
-    for index in 0..ROOTS {
+    for index in 0..ENGINES {
         let root = dir.path().join(format!("checkout-{index}"));
         copy_sources(&source, &root);
         eprintln!("memory fixture: binding checkout {index}");
@@ -129,17 +127,25 @@ fn retained_aft_engines() {
         contexts.push(ctx);
         checkouts.push(checkout);
     }
+    for index in ENGINES..ROOTS {
+        let root = dir.path().join(format!("idle-{index}"));
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(executor.register_actor(
+            ProjectRootId::from_path(&root).unwrap(),
+            crate::subc::test_support::test_ctx(),
+        ));
+    }
     for checkout in &checkouts {
         assert!(
             checkout.checkout().engine_memory_parts().is_some(),
             "every engine must still be retained"
         );
     }
+    profile_allocator_contention();
     let start = Instant::now();
-    for (mode_index, (mode, baseline)) in
-        [("before", true), ("after", false)].into_iter().enumerate()
-    {
-        with_memory_figure_baseline_for_test(baseline, || {
+    for (mode_index, (mode, baseline)) in [("current", false)].into_iter().enumerate() {
+        let _ = baseline;
+        {
             for (phase_index, (phase, editing)) in
                 [("rest", false), ("edits", true)].into_iter().enumerate()
             {
@@ -209,16 +215,56 @@ fn retained_aft_engines() {
             );
                 }
                 println!("MEMORY_ROLLUP mode={mode} phase={phase} roots={ROOTS} editing_roots={} simulated_seconds=60 asks=20 walks_per_minute={walks} cpu_ms_per_minute={:.3} core_percent={:.3}", if editing {EDITING} else {0}, total_cpu as f64 / 1e6, total_cpu as f64 / 6e8);
-                for (part, (cpu, _, _)) in steps
-                    .into_iter()
-                    .filter(|(part, _)| part.starts_with("engine /"))
-                {
+                for (part, (cpu, _, _)) in steps {
                     println!(
                         "MEMORY_PART mode={mode} phase={phase} part={part:?} cpu_ms={:.3}",
                         cpu as f64 / 1e6
                     );
                 }
             }
-        });
+        }
     }
+}
+
+fn profile_allocator_contention() {
+    use std::sync::atomic::AtomicBool;
+    let stop = Arc::new(AtomicBool::new(false));
+    let workers = (0..4)
+        .map(|_| {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut observations = Vec::new();
+                while !stop.load(Ordering::Relaxed) {
+                    let started = Instant::now();
+                    std::hint::black_box(vec![1u8; 4096]);
+                    observations.push((started, started.elapsed()));
+                    // Probe allocation latency without creating synthetic CPU load.
+                    std::thread::sleep(Duration::from_micros(250));
+                }
+                observations
+            })
+        })
+        .collect::<Vec<_>>();
+    std::thread::sleep(Duration::from_millis(100));
+    let started = Instant::now();
+    let cpu = cpu_ns();
+    let observation = crate::memory::AllocatorObservation::measure();
+    let cpu = cpu_ns() - cpu;
+    let finished = Instant::now();
+    std::thread::sleep(Duration::from_millis(100));
+    stop.store(true, Ordering::Relaxed);
+    let mut overlap_max = Duration::ZERO;
+    let mut outside_max = Duration::ZERO;
+    let mut overlap = 0;
+    for worker in workers {
+        for (at, elapsed) in worker.join().unwrap() {
+            if at <= finished && at + elapsed >= started {
+                overlap += 1;
+                overlap_max = overlap_max.max(elapsed);
+            } else {
+                outside_max = outside_max.max(elapsed);
+            }
+        }
+    }
+    println!("ALLOCATOR_PROFILE rss_bytes={:?} allocator={:?} wall_ms={:.3} cpu_ms={:.3} overlapping_probes={overlap} overlapping_max_ms={:.3} outside_max_ms={:.3}", crate::memory::rss_bytes(), observation.snapshot, finished.duration_since(started).as_secs_f64() * 1000.0, cpu as f64 / 1e6, overlap_max.as_secs_f64() * 1000.0, outside_max.as_secs_f64() * 1000.0);
 }

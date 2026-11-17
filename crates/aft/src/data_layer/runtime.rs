@@ -2362,7 +2362,7 @@ pub(crate) fn with_memory_figure_baseline_for_test<T>(
     measure()
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn memory_profile_layer_for_test() -> Arc<DataLayer> {
     layer()
 }
