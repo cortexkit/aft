@@ -936,6 +936,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "remote document previews use an explicit truncated-at-N-of-M-bytes footer with URL and symbol narrowing advice; this is a byte cut, not a paginated list of records",
     },
     ExclusionEntry {
+        file: "edit.rs",
+        enclosing_item: "render_diff, separator, write_str, finish",
+        location_or_primitive: "shared optional diff response byte budget",
+        reason: "optional diff text is omitted as a whole with an explicit notice when its byte allowance is exceeded; every file outcome and line count remains, so this does not cut a result list",
+    },
+    ExclusionEntry {
         file: "commands/file_read_exact.rs",
         enclosing_item: "bounded_bytes",
         location_or_primitive: "exact binary read byte ceiling",

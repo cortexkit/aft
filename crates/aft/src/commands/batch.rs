@@ -940,10 +940,10 @@ mod a03_tests {
             let elapsed = start.elapsed();
             assert!(response.success, "{:?}", response);
             let expected = format!("{}{}", "é\n".repeat(count), "z".repeat(1024 * 1024));
-            assert_eq!(
-                response.data["metadata"]["diff"],
-                edit::build_unified_diff(path.to_str().unwrap(), &source, &expected)
-            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+            // The unchanged one-megabyte context line exceeds the preview budget.
+            assert_eq!(response.data["diff_preview_omitted"], true);
+            assert!(response.data["metadata"].get("diff").is_none());
             let allocations = BATCH_OUTPUT_ALLOCATIONS.with(|counter| counter.get());
             eprintln!(
                 "A03 batch matches={count}: output allocations={allocations} elapsed={elapsed:?}"
@@ -1105,7 +1105,7 @@ mod a03_tests {
                         assert_eq!(response.data["created"], !existed);
                         assert_eq!(
                             response.data["metadata"]["diff"],
-                            edit::build_unified_diff(
+                            edit::build_unbounded_unified_diff(
                                 path.to_str().unwrap(),
                                 if existed { "const value = 1;\n" } else { "" },
                                 "const value = 2;\n"

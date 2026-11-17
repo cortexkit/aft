@@ -856,6 +856,7 @@ fn handle_glob_edit_match_inner(
 
     if edit::wants_preview(&req.params) {
         let mut preview_diff = String::new();
+        let mut budget = edit::DiffBudget::new(2);
         let mut additions = 0usize;
         let mut deletions = 0usize;
         let files = pending
@@ -866,12 +867,15 @@ fn handle_glob_edit_match_inner(
                     &edit.file_str,
                     &edit.original_source,
                     &edit.new_source,
+                    &mut budget,
                 );
                 additions += diff.get("additions").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 deletions += diff.get("deletions").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                preview_diff.push_str(&patch);
-                if !preview_diff.ends_with('\n') {
-                    preview_diff.push('\n');
+                if let Some(patch) = patch {
+                    preview_diff.push_str(&patch);
+                    if !preview_diff.ends_with('\n') {
+                        budget.separator(&mut preview_diff, "\n");
+                    }
                 }
                 serde_json::json!({
                     "file": edit.file_str,
@@ -881,22 +885,21 @@ fn handle_glob_edit_match_inner(
             })
             .collect::<Vec<_>>();
 
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "ok": true,
-                "preview": true,
-                "files": files,
-                "total_replacements": total_replacements,
-                "total_files": total_files,
-                "diff": {
-                    "additions": additions,
-                    "deletions": deletions,
-                },
-                "preview_diff": preview_diff,
-                "metadata": { "diff": preview_diff },
-            }),
-        );
+        let mut result = serde_json::json!({
+            "ok": true,
+            "preview": true,
+            "files": files,
+            "total_replacements": total_replacements,
+            "total_files": total_files,
+            "diff": {
+                "additions": additions,
+                "deletions": deletions,
+            },
+            "preview_diff": preview_diff,
+            "metadata": { "diff": preview_diff },
+        });
+        budget.finish(&mut result);
+        return Response::success(&req.id, result);
     }
 
     if pending
@@ -1169,15 +1172,16 @@ fn handle_glob_edit_match_inner(
         "format_skipped_count": format_skipped_count,
         "format_skip_reasons": format_skip_reasons,
     });
-    let diff = pending
-        .iter()
-        .map(|edit| {
-            let after =
-                std::fs::read_to_string(&edit.path).unwrap_or_else(|_| edit.new_source.clone());
-            edit::build_unified_diff(&edit.file_str, &edit.original_source, &after)
-        })
-        .collect::<String>();
+    let mut budget = edit::DiffBudget::new(1);
+    let mut diff = String::new();
+    for edit in &pending {
+        let after = std::fs::read_to_string(&edit.path).unwrap_or_else(|_| edit.new_source.clone());
+        if let Some(patch) = budget.render(&edit.file_str, &edit.original_source, &after) {
+            diff.push_str(&patch);
+        }
+    }
     result["metadata"] = serde_json::json!({ "diff": diff });
+    budget.finish(&mut result);
     edit::attach_backup_skipped_reason(&mut result, ctx, req.session(), op_id, None);
     Response::success(&req.id, result)
 }

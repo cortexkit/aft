@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
 
-use crate::edit::build_unified_diff;
+use crate::edit::DiffBudget;
 use crate::hashline::apply::{FileClassification, MutationState};
 use crate::hashline::syntax::{HashlineRejection, HashlineRejectionCode, RejectionStage};
 use crate::hashline::transaction::{FileOutcome, FileRole, TransactionEnvelope};
@@ -82,7 +82,8 @@ const HASHLINE_STRUCTURED_KEYS: &[&str] = &[
 /// Render a Phase-2 (or preview) envelope for one transport.
 pub fn render_mutation_response(input: MutationRenderInput<'_>) -> Value {
     let envelope = input.envelope;
-    let (diff, files_meta) = build_display_metadata(input.display_files, input.project_root);
+    let (diff, files_meta, budget) =
+        build_display_metadata(input.display_files, input.project_root);
     let file_path = first_display_path(input.display_files, envelope);
     let output = render_agent_output(envelope);
     let title = render_title(envelope);
@@ -103,6 +104,7 @@ pub fn render_mutation_response(input: MutationRenderInput<'_>) -> Value {
             "files": files_meta,
         },
     });
+    budget.finish(&mut payload);
 
     if let Some(path) = file_path {
         payload["filePath"] = json!(path);
@@ -313,8 +315,9 @@ fn first_display_path(
 fn build_display_metadata(
     display_files: &[DisplayFileBytes],
     project_root: Option<&Path>,
-) -> (String, Vec<Value>) {
+) -> (String, Vec<Value>, DiffBudget) {
     let mut files = Vec::with_capacity(display_files.len());
+    let mut budget = DiffBudget::new(2);
     for file in display_files {
         let before = String::from_utf8_lossy(&file.before);
         let after = if file.remove_file {
@@ -336,7 +339,7 @@ fn build_display_metadata(
         } else {
             "update"
         };
-        let patch = build_unified_diff(&file.requested_path, &before, &after);
+        let patch = budget.render(&file.requested_path, &before, &after);
         let (additions, deletions) = line_diff_counts(&before, &after);
         let mut entry = json!({
             "filePath": absolutize(project_root, &file.requested_path),
@@ -353,13 +356,60 @@ fn build_display_metadata(
         }
         files.push(entry);
     }
-    let diff = files
+    let mut diff = String::new();
+    for patch in files
         .iter()
         .filter_map(|file| file.get("patch").and_then(Value::as_str))
         .filter(|patch| !patch.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    (diff, files)
+    {
+        if !diff.is_empty() {
+            budget.separator(&mut diff, "\n");
+        }
+        diff.push_str(patch);
+    }
+    (diff, files, budget)
+}
+
+#[cfg(test)]
+mod diff_budget_tests {
+    use super::*;
+
+    #[test]
+    fn diff_budget_hashline_keeps_all_outcomes_when_a_deletion_is_omitted() {
+        let display = [
+            DisplayFileBytes {
+                requested_path: "large.txt".into(),
+                before: "x\n".repeat(100_000).into_bytes(),
+                remove_file: true,
+                ..Default::default()
+            },
+            DisplayFileBytes {
+                requested_path: "small.txt".into(),
+                before: b"old\n".to_vec(),
+                after: Some(b"new\n".to_vec()),
+                ..Default::default()
+            },
+        ];
+        let (diff, files, budget) = build_display_metadata(&display, None);
+        let mut result = json!({"hashline": true, "complete": true,
+            "output": "Deleted large.txt\nUpdated small.txt",
+            "metadata": {"diff": diff, "files": files}});
+        budget.finish(&mut result);
+        assert_eq!(result["metadata"]["files"].as_array().unwrap().len(), 2);
+        assert_eq!(result["metadata"]["files"][0]["type"], "delete");
+        assert_eq!(result["metadata"]["files"][0]["deletions"], 100_000);
+        assert_eq!(result["metadata"]["files"][1]["type"], "update");
+        assert_eq!(result["metadata"]["files"][1]["additions"], 1);
+        assert!(result["metadata"].get("diff").is_none());
+        assert!(result["metadata"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|file| file.get("patch").is_none()));
+        let response = crate::protocol::Response::success("hashline-budget", result);
+        assert_eq!(crate::subc_format::format_response("edit", &response, false),
+            "Deleted large.txt\nUpdated small.txt\nDiff preview omitted: exceeds the response budget.");
+    }
 }
 
 fn line_diff_counts(before: &str, after: &str) -> (usize, usize) {

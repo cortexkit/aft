@@ -2684,6 +2684,140 @@ pub(super) mod tests {
         );
     }
 
+    fn patch_diff_budget_fixture(large: bool) -> ToolCallResult {
+        let dir = tempfile::tempdir().unwrap();
+        let deleted = dir.path().join("deleted.txt");
+        let source = dir.path().join("source.txt");
+        let moved = dir.path().join("moved.txt");
+        let edited = dir.path().join("edited.txt");
+        let original = if large {
+            // A 33,608,233-byte, 380,960-line deletion must not hide later outcomes.
+            let mut text = format!("{}\n", "x".repeat(33_608_233 - 380_959 * 88 - 1));
+            text.push_str(&format!("{}\n", "x".repeat(87)).repeat(380_959));
+            assert_eq!(text.len(), 33_608_233);
+            text
+        } else {
+            "deleted\n".to_owned()
+        };
+        std::fs::write(&deleted, &original).unwrap();
+        std::fs::write(&source, "old move\n").unwrap();
+        std::fs::write(&edited, "old edit\n").unwrap();
+        let patch = format!(
+            "*** Begin Patch\n*** Delete File: {}\n*** Update File: {}\n*** Move to: {}\n@@\n-old move\n+new move\n*** Update File: {}\n@@\n-old edit\n+new edit\n*** End Patch",
+            deleted.display(), source.display(), moved.display(), edited.display()
+        );
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(dir.path().to_owned()),
+                storage_dir: Some(dir.path().join("state")),
+                format_on_edit: false,
+                diagnostics_on_edit: false,
+                disabled_tools: vec![],
+                ..Default::default()
+            },
+        );
+        let req = serde_json::from_value(json!({
+            "id": "patch-diff-budget",
+            "command": "tool_call",
+            "name": "apply_patch",
+            "arguments": { "patchText": patch },
+        }))
+        .unwrap();
+        let mut response =
+            crate::commands::tool_call::handle_with_dispatch(&req, &ctx, &|req, ctx| {
+                assert_eq!(req.command, "apply_patch");
+                crate::commands::apply_patch::handle_apply_patch(&req, ctx)
+            });
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["complete"], true);
+        assert!(!deleted.exists());
+        assert!(!source.exists());
+        assert_eq!(std::fs::read_to_string(moved).unwrap(), "new move\n");
+        assert_eq!(std::fs::read_to_string(edited).unwrap(), "new edit\n");
+        let files = response.data["metadata"]["files"].as_array().unwrap();
+        assert_eq!(files.len(), 3);
+        for (file, kind, additions, deletions) in [
+            (&files[0], "delete", 0, if large { 380_960 } else { 1 }),
+            (&files[1], "move", 1, 1),
+            (&files[2], "update", 1, 1),
+        ] {
+            assert_eq!(file["type"], kind);
+            assert_eq!(file["additions"], additions);
+            assert_eq!(file["deletions"], deletions);
+        }
+        let text = response.data["text"].as_str().unwrap().to_owned();
+        assert!(text.contains("Deleted "));
+        assert!(text.contains("Updated and moved "));
+        assert!(text.contains("Updated "));
+        let standalone = serde_json::to_vec(&response).unwrap();
+        assert!(standalone.len() < crate::edit::DIFF_RESPONSE_BUDGET);
+        if large {
+            assert_eq!(
+                text.lines()
+                    .filter(|line| *line == crate::edit::DIFF_OMITTED_NOTICE)
+                    .count(),
+                1
+            );
+            assert!(response.data["metadata"].get("diff").is_none());
+            assert!(files.iter().all(|file| file.get("patch").is_none()));
+        } else {
+            assert!(response.data.get("diff_preview_omitted").is_none());
+            let golden = [
+                (deleted, "@@ -1 +0,0 @@\n-deleted\n"),
+                (dir.path().join("moved.txt"), "@@ -1 +1 @@\n-old move\n+new move\n"),
+                (dir.path().join("edited.txt"), "@@ -1 +1 @@\n-old edit\n+new edit\n"),
+            ].map(|(path, hunk)| {
+                let path = path.to_string_lossy().replace('\\', "/");
+                format!("Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n{hunk}")
+            });
+            for (file, expected) in files.iter().zip(&golden) {
+                assert_eq!(file["patch"], *expected);
+            }
+            assert_eq!(response.data["metadata"]["diff"], golden.join("\n"));
+        }
+        response.data.as_object_mut().unwrap().remove("text");
+        ToolCallResult { text, response }
+    }
+
+    #[test]
+    fn diff_budget_large_patch_preserves_standalone_and_subc_outcomes() {
+        let result = patch_diff_budget_fixture(true);
+        let frame = build_tool_response_frame(
+            PROTOCOL_VERSION,
+            route_key(1, 1),
+            1291,
+            control_flags(),
+            &result,
+            BindTrust::FirstParty,
+        )
+        .unwrap();
+        assert!(frame.body.len() < crate::edit::DIFF_RESPONSE_BUDGET);
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(body["isError"], false);
+        assert_eq!(body["structuredContent"]["success"], true);
+        assert_eq!(body["structuredContent"]["complete"], true);
+        assert_eq!(
+            body["structuredContent"]["metadata"]["files"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(body["content"][0]["text"], result.text);
+        assert_eq!(
+            body["structuredContent"]["metadata"],
+            result.response.data["metadata"]
+        );
+        assert!(body["structuredContent"].get("code").is_none());
+    }
+
+    #[test]
+    fn diff_budget_small_patch_is_byte_identical_through_both_paths() {
+        let result = patch_diff_budget_fixture(false);
+        assert_tool_response_frame_matches_legacy(&result, BindTrust::FirstParty);
+    }
+
     #[test]
     fn normal_response_is_byte_identical_with_the_size_guard_enabled() {
         let result = production_shape_result("read", 1_024);

@@ -1417,13 +1417,9 @@ pub(crate) fn read_edit_text(path: &Path) -> std::io::Result<String> {
     std::fs::read_to_string(path)
 }
 
-/// Build the unified-diff string used by internal permission previews.
-///
-/// The OpenCode approval prompt expects a plain unified-diff string in
-/// `metadata.diff`. Host wrappers may alternatively consume the `diff.before` /
-/// `diff.after` response fields and render their own patch, but returning the
-/// ready-to-display string keeps the bridge contract self-contained.
-pub fn build_unified_diff(file: &str, before: &str, after: &str) -> String {
+/// Render a reference patch for size-limited GitHub comment bodies and tests.
+/// File responses must use [`DiffBudget`] instead of this unbounded renderer.
+pub(crate) fn build_unbounded_unified_diff(file: &str, before: &str, after: &str) -> String {
     let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Diff);
     if before == after {
         return format!(
@@ -1456,7 +1452,9 @@ pub fn no_change_response(id: &str) -> crate::protocol::Response {
 /// Supply the unified patch consumed by host diff views, independently of diff counts.
 pub fn attach_mutation_diff(result: &mut serde_json::Value, file: &str, before: &str, after: &str) {
     crate::subc::rich_ui::display::file(file, None, Some(before), Some(after), "modified");
-    result["metadata"] = serde_json::json!({ "diff": build_unified_diff(file, before, after) });
+    let mut budget = DiffBudget::new(1);
+    result["metadata"] = serde_json::json!({ "diff": budget.render(file, before, after) });
+    budget.finish(result);
 }
 
 /// Attach the standard preview diff fields to a command response payload.
@@ -1467,11 +1465,243 @@ pub fn attach_preview_diff(
     before: &str,
     after: &str,
 ) {
-    let (patch, info) = response_diff(params, file, before, after);
+    let mut budget = DiffBudget::new(2);
+    let (patch, info) = response_diff(params, file, before, after, &mut budget);
     result["metadata"] = serde_json::json!({ "diff": patch });
     result["preview"] = serde_json::json!(true);
     result["diff"] = info;
     result["preview_diff"] = serde_json::json!(patch);
+    budget.finish(result);
+}
+
+/// Total rendered diff bytes across all copies in a response. Even sixfold JSON
+/// escaping leaves ample room below the smallest transport's 3 MiB body limit.
+pub(crate) const DIFF_RESPONSE_BUDGET: usize = 128 * 1024;
+pub(crate) const DIFF_OMITTED_NOTICE: &str = "Diff preview omitted: exceeds the response budget.";
+
+/// One allowance shared by every file in a reply, including duplicate host fields.
+pub(crate) struct DiffBudget {
+    remaining: usize,
+    copies: usize,
+    omitted: bool,
+}
+
+impl DiffBudget {
+    pub(crate) fn new(copies: usize) -> Self {
+        assert!(copies > 0);
+        Self {
+            remaining: DIFF_RESPONSE_BUDGET,
+            copies,
+            omitted: false,
+        }
+    }
+
+    pub(crate) fn render(&mut self, file: &str, before: &str, after: &str) -> Option<String> {
+        if self.omitted {
+            return None;
+        }
+        self.render_diff(file, before == after, &construct_diff(before, after))
+    }
+
+    fn render_diff(
+        &mut self,
+        file: &str,
+        unchanged: bool,
+        diff: &similar::TextDiff<'_, '_, '_, str>,
+    ) -> Option<String> {
+        use std::fmt::Write;
+        if self.omitted {
+            return None;
+        }
+        let mut sink = BoundedDiffText {
+            text: String::new(),
+            limit: self.remaining / self.copies,
+        };
+        // Display streams hunks and lines into the sink. Its first rejected
+        // chunk stops the iterator, without allocating the rest of a deletion.
+        let rendered = write!(
+            sink,
+            "Index: {file}\n===================================================================\n"
+        )
+        .and_then(|()| {
+            if unchanged {
+                write!(sink, "--- {file}\n+++ {file}\n")
+            } else {
+                write!(sink, "{}", diff.unified_diff().header(file, file))
+            }
+        });
+        if rendered.is_err() {
+            self.omitted = true;
+            return None;
+        }
+        self.remaining -= sink.text.len() * self.copies;
+        Some(sink.text)
+    }
+
+    /// Charge aggregate separators as well as the individual rendered patches.
+    pub(crate) fn separator(&mut self, text: &mut String, separator: &str) {
+        let bytes = separator.len().saturating_mul(self.copies);
+        if self.omitted || bytes > self.remaining {
+            self.omitted = true;
+        } else {
+            self.remaining -= bytes;
+            text.push_str(separator);
+        }
+    }
+
+    /// A partial preview could hide the destructive file. Omit all diff text
+    /// together, retaining every outcome and count and one explicit notice.
+    pub(crate) fn finish(&self, result: &mut serde_json::Value) {
+        if !self.omitted {
+            return;
+        }
+        result["diff_preview_omitted"] = serde_json::json!(true);
+        if let Some(object) = result.as_object_mut() {
+            object.remove("preview_diff");
+        }
+        // Before/after sidecars are another rendering of the omitted preview.
+        fn counts_only(diff: &mut serde_json::Value) {
+            if let Some(diff) = diff.as_object_mut() {
+                let before = diff.remove("before");
+                let after = diff.remove("after");
+                if before.is_some() || after.is_some() {
+                    diff.insert("truncated".to_owned(), serde_json::json!(true));
+                }
+            }
+        }
+        if let Some(diff) = result.get_mut("diff") {
+            counts_only(diff);
+        }
+        if let Some(files) = result.get_mut("files").and_then(|v| v.as_array_mut()) {
+            for file in files {
+                if let Some(diff) = file.get_mut("diff") {
+                    counts_only(diff);
+                }
+            }
+        }
+        if let Some(metadata) = result.get_mut("metadata").and_then(|v| v.as_object_mut()) {
+            metadata.remove("diff");
+            if let Some(files) = metadata.get_mut("files").and_then(|v| v.as_array_mut()) {
+                for file in files {
+                    if let Some(file) = file.as_object_mut() {
+                        file.remove("patch");
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct BoundedDiffText {
+    text: String,
+    limit: usize,
+}
+
+impl std::fmt::Write for BoundedDiffText {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        if text.len() > self.limit.saturating_sub(self.text.len()) {
+            return Err(std::fmt::Error);
+        }
+        self.text.push_str(text);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod diff_budget_tests {
+    use super::*;
+    use serde_json::json;
+    use std::fmt::Write;
+
+    #[test]
+    fn diff_budget_writer_stops_the_stream_before_allocating_large_chunks() {
+        let mut sink = BoundedDiffText {
+            text: String::new(),
+            limit: 16,
+        };
+        let mut visited = 0;
+        let rendered = (0..1_000_000).try_for_each(|_| {
+            visited += 1;
+            sink.write_str("12345678")
+        });
+        assert!(rendered.is_err());
+        assert_eq!(visited, 3);
+        assert_eq!(sink.text, "1234567812345678");
+        let capacity = sink.text.capacity();
+        assert!(sink.write_str(&"x".repeat(1_000_000)).is_err());
+        assert_eq!(sink.text.capacity(), capacity);
+    }
+
+    #[test]
+    fn diff_budget_counts_all_files_and_duplicate_fields() {
+        let mut budget = DiffBudget::new(2);
+        let text = "x\n".repeat(15_000);
+        let first = budget.render("first.txt", &text, "").unwrap();
+        assert!(first.len() * 2 < DIFF_RESPONSE_BUDGET);
+        assert!(budget.render("second.txt", &text, "").is_none());
+        let mut result = json!({"metadata": {"diff": first, "files": [
+            {"type": "delete", "patch": first, "deletions": 15_000},
+            {"type": "delete", "patch": null, "deletions": 15_000}
+        ]}});
+        budget.finish(&mut result);
+        assert!(result["metadata"].get("diff").is_none());
+        assert!(result["metadata"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f.get("patch").is_none()));
+        assert_eq!(result["metadata"]["files"][1]["deletions"], 15_000);
+    }
+
+    #[test]
+    fn diff_budget_bounds_mutations_and_edit_write_previews_with_counts() {
+        let before = "x\n".repeat(100_000);
+        for mode in 0..3 {
+            let mut result = json!({"ok": true});
+            match mode {
+                0 => attach_mutation_diff(&mut result, "large.txt", &before, ""),
+                1 => attach_edit_diff(
+                    &mut result,
+                    &json!({"include_diff_content": true}),
+                    "large.txt",
+                    &before,
+                    "",
+                ),
+                _ => attach_preview_diff(
+                    &mut result,
+                    &json!({"include_diff_content": true}),
+                    "large.txt",
+                    &before,
+                    "",
+                ),
+            }
+            assert_eq!(result["diff_preview_omitted"], true);
+            assert!(result["metadata"].get("diff").is_none());
+            assert!(result.get("preview_diff").is_none());
+            if mode != 0 {
+                assert_eq!(result["diff"]["additions"], 0);
+                assert_eq!(result["diff"]["deletions"], 100_000);
+                assert!(result["diff"].get("before").is_none());
+            }
+            let response = crate::protocol::Response::success("budget", result);
+            let rendered = crate::subc_format::format_response("edit", &response, false);
+            assert_eq!(rendered.lines().last(), Some(DIFF_OMITTED_NOTICE));
+            assert!(serde_json::to_vec(&response).unwrap().len() < DIFF_RESPONSE_BUDGET);
+        }
+    }
+
+    #[test]
+    fn diff_budget_boundary_and_small_utf8_patches_preserve_exact_bytes() {
+        let mut budget = DiffBudget::new(1);
+        let patch = budget.render("small.txt", "old\r\n", "é\n").unwrap();
+        assert_eq!(patch, "Index: small.txt\n===================================================================\n--- small.txt\n+++ small.txt\n@@ -1 +1 @@\n-old\r\n+é\n");
+        let mut budget = DiffBudget::new(2);
+        budget.remaining = patch.len() * 2;
+        assert_eq!(budget.render("small.txt", "old\r\n", "é\n").unwrap(), patch);
+        assert_eq!(budget.remaining, 0);
+        budget.separator(&mut String::new(), "\n");
+        assert!(budget.omitted);
+    }
 }
 
 /// Longest a line diff may search for a minimal edit script. Past it,
@@ -1534,15 +1764,12 @@ pub(crate) fn response_diff(
     file: &str,
     before: &str,
     after: &str,
-) -> (String, serde_json::Value) {
+    budget: &mut DiffBudget,
+) -> (Option<String>, serde_json::Value) {
     let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Diff);
     let diff = construct_diff(before, after);
     let (additions, deletions) = counts_from_diff(&diff);
-    let patch = if before == after {
-        build_unified_diff(file, before, after)
-    } else {
-        format!("Index: {file}\n===================================================================\n{}", diff.unified_diff().header(file, file))
-    };
+    let patch = budget.render_diff(file, before == after, &diff);
     let info = diff_info_from_counts(
         before,
         after,
@@ -1564,9 +1791,11 @@ pub(crate) fn attach_edit_diff(
 ) {
     crate::subc::rich_ui::display::file(file, None, Some(before), Some(after), "modified");
     if wants_diff(params) {
-        let (patch, info) = response_diff(params, file, before, after);
+        let mut budget = DiffBudget::new(1);
+        let (patch, info) = response_diff(params, file, before, after, &mut budget);
         result["metadata"] = serde_json::json!({ "diff": patch });
         result["diff"] = info;
+        budget.finish(result);
     } else {
         attach_mutation_diff(result, file, before, after);
     }
@@ -3108,7 +3337,11 @@ mod tests {
             assert_eq!(response.data["diff"]["after"], final_text);
             assert_eq!(
                 response.data["metadata"]["diff"],
-                build_unified_diff(path.to_str().unwrap(), "const value = 1;\n", final_text)
+                build_unbounded_unified_diff(
+                    path.to_str().unwrap(),
+                    "const value = 1;\n",
+                    final_text
+                )
             );
             let reads = A03_HANDLER_READS.with(|count| count.get())
                 + crate::backup::capture_read_count(&path);

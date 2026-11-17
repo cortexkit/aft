@@ -538,6 +538,7 @@ fn build_preview_response(
 ) -> Response {
     let mut virtual_files: HashMap<PathBuf, Option<String>> = HashMap::new();
     let mut patches = Vec::new();
+    let mut budget = edit::DiffBudget::new(1);
     let filepath = affected_rel
         .first()
         .cloned()
@@ -561,11 +562,7 @@ fn build_preview_response(
                     );
                 }
                 let after = ensure_trailing_newline(contents);
-                patches.push(edit::build_unified_diff(
-                    &display_slash(&resolved_hunk.source.abs),
-                    "",
-                    &after,
-                ));
+                patches.push(budget.render(&display_slash(&resolved_hunk.source.abs), "", &after));
                 virtual_files.insert(resolved_hunk.source.abs.clone(), Some(after));
             }
             Hunk::Delete { path } => {
@@ -578,11 +575,7 @@ fn build_preview_response(
                     Ok(content) => content,
                     Err(error) => return Response::error(&req.id, "invalid_request", error),
                 };
-                patches.push(edit::build_unified_diff(
-                    &display_slash(&resolved_hunk.source.abs),
-                    &before,
-                    "",
-                ));
+                patches.push(budget.render(&display_slash(&resolved_hunk.source.abs), &before, ""));
                 virtual_files.insert(resolved_hunk.source.abs.clone(), None);
             }
             Hunk::Update {
@@ -617,11 +610,7 @@ fn build_preview_response(
                     .move_dest
                     .as_ref()
                     .unwrap_or(&resolved_hunk.source);
-                patches.push(edit::build_unified_diff(
-                    &display_slash(&target.abs),
-                    &before,
-                    &after,
-                ));
+                patches.push(budget.render(&display_slash(&target.abs), &before, &after));
                 if resolved_hunk.move_dest.is_some() {
                     virtual_files.insert(resolved_hunk.source.abs.clone(), None);
                 }
@@ -630,16 +619,24 @@ fn build_preview_response(
         }
     }
 
-    Response::success(
-        &req.id,
-        json!({
-            "preview": true,
-            "preview_diff": patches.join("\n"),
-            "affected_paths": affected_abs,
-            "affected_rel_paths": affected_rel,
-            "filepath": filepath,
-        }),
-    )
+    let mut preview_diff = String::new();
+    for (index, patch) in patches.into_iter().enumerate() {
+        if index > 0 {
+            budget.separator(&mut preview_diff, "\n");
+        }
+        if let Some(patch) = patch {
+            preview_diff.push_str(&patch);
+        }
+    }
+    let mut result = json!({
+        "preview": true,
+        "preview_diff": preview_diff,
+        "affected_paths": affected_abs,
+        "affected_rel_paths": affected_rel,
+        "filepath": filepath,
+    });
+    budget.finish(&mut result);
+    Response::success(&req.id, result)
 }
 
 fn ensure_trailing_newline(content: &str) -> String {
@@ -1073,8 +1070,9 @@ fn metadata_files(
     applied: &[AppliedHunkResult],
     root: Option<&Path>,
     created_checks: &HashMap<PathBuf, edit::CreatedFileSyntax>,
-) -> (String, Vec<Value>) {
+) -> (String, Vec<Value>, edit::DiffBudget) {
     let mut entries: Vec<(String, DiffEntry)> = Vec::new();
+    let mut budget = edit::DiffBudget::new(2);
 
     for applied_hunk in applied {
         let key = report_key(applied_hunk);
@@ -1126,6 +1124,7 @@ fn metadata_files(
                 &display_slash(&entry.display_path),
                 &entry.before,
                 &entry.after,
+                &mut budget,
             );
             let mut additions = counts["additions"].as_u64().unwrap() as usize;
             let mut deletions = counts["deletions"].as_u64().unwrap() as usize;
@@ -1168,14 +1167,19 @@ fn metadata_files(
         })
         .collect::<Vec<_>>();
 
-    let diff = files
+    let mut diff = String::new();
+    for patch in files
         .iter()
         .filter_map(|file| file.get("patch").and_then(Value::as_str))
         .filter(|patch| !patch.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
+    {
+        if !diff.is_empty() {
+            budget.separator(&mut diff, "\n");
+        }
+        diff.push_str(patch);
+    }
 
-    (diff, files)
+    (diff, files, budget)
 }
 
 fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) -> Response {
@@ -1337,7 +1341,7 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
         );
     }
     let root = project_root_for_relative_paths(ctx);
-    let (diff, mut files) = metadata_files(&applied, root.as_deref(), &created_checks);
+    let (diff, mut files, budget) = metadata_files(&applied, root.as_deref(), &created_checks);
     // A partial patch keeps successful writes, but is not a completed project
     // mutation. Do not run checkers when any hunk failed or rolled back.
     if failures.is_empty() {
@@ -1400,6 +1404,7 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
         "failures": failures,
         "metadata": { "diff": diff, "files": files },
     });
+    budget.finish(&mut result);
     if !write_warnings.is_empty() {
         result["warnings"] = json!(write_warnings);
     }
@@ -1601,6 +1606,38 @@ pub fn handle_apply_patch(req: &RawRequest, ctx: &AppContext) -> Response {
         affected_abs.iter().map(|path| std::path::Path::new(path)),
     );
     apply_patch(req, ctx, &resolved)
+}
+
+#[cfg(test)]
+mod diff_budget_tests {
+    use super::*;
+
+    #[test]
+    fn diff_budget_apply_patch_preview_omits_large_deletion_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("large.txt");
+        std::fs::write(&file, "x\n".repeat(100_000)).unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(dir.path().to_owned()),
+                storage_dir: Some(dir.path().join("state")),
+                ..Default::default()
+            },
+        );
+        let req = serde_json::from_value(json!({
+            "id": "preview-budget", "command": "apply_patch", "preview": true,
+            "patch_text": format!("*** Begin Patch\n*** Delete File: {}\n*** End Patch", file.display())
+        })).unwrap();
+        let response = handle_apply_patch(&req, &ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["preview"], true);
+        assert_eq!(response.data["diff_preview_omitted"], true);
+        assert!(response.data.get("preview_diff").is_none());
+        assert_eq!(response.data["affected_paths"].as_array().unwrap().len(), 1);
+        assert_eq!(std::fs::metadata(file).unwrap().len(), 200_000);
+        assert!(serde_json::to_vec(&response).unwrap().len() < edit::DIFF_RESPONSE_BUDGET);
+    }
 }
 
 #[cfg(test)]
