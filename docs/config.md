@@ -228,21 +228,24 @@ contain function names and line tables, not full local-variable/type information
 
 ### Memory profile (user config only)
 
-Set `"memory": "lean"`, `"balanced"`, or `"fast"` at the top level of your user
+Set `"memory": "lean"` or `"balanced"` at the top level of your user
 configuration. Project values and values inside `harnesses.*` are ignored with
 the user-only-key notice, even when malformed.
 
 | Value | Trade-off |
 |---|---|
-| `lean` | Uses less memory and builds more slowly: fewer resolver threads, fewer simultaneous builds and meaning-search fills, and smaller caches. On Linux, freed allocator pages are returned immediately. |
+| `lean` | Uses less memory and can build more slowly: a smaller shared block cache, four call-graph resolver threads on Linux and macOS, and immediate return of freed memory on Linux. Windows keeps all CPUs because limiting resolver threads did not lower the measured peak and made builds slower. |
 | `balanced` | Keeps the previous resource limits. |
-| `fast` | Keeps larger call-graph and read caches in memory to avoid rebuilds and reloads. |
 
 When omitted, AFT chooses from total physical RAM: below 8 GiB selects `lean`,
-8 GiB up to (but not including) 32 GiB selects `balanced`, and 32 GiB or more
-selects `fast`. If RAM cannot be read, it uses `balanced`. Health output includes
+otherwise it selects `balanced`. If RAM cannot be read, it uses `balanced`. Health output includes
 `memory_profile: { value, source, total_ram_bytes }`; `source` is `config` or `auto`
 and unavailable RAM is reported as `null`.
+
+The shared block cache holds 128 MiB in `lean` and 256 MiB in `balanced`.
+Both modes keep the same limits for simultaneous builds of uncached indexes,
+call graphs held in memory, jobs that prepare meaning-search data, and build
+caches.
 
 Changes apply to subsequent builds, cache sizing, and admissions without a
 restart. Work already admitted keeps its profile. Meaning search is not disabled

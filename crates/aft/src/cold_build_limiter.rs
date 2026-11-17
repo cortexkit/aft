@@ -6,9 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub(crate) mod progress;
 
 #[cfg(not(test))]
-const DEFAULT_COLD_BUILD_LIMIT: usize = crate::memory_profile::MemoryMode::Balanced
-    .profile()
-    .cold_builds;
+const DEFAULT_COLD_BUILD_LIMIT: usize = 2;
 #[cfg(test)]
 const DEFAULT_COLD_BUILD_LIMIT: usize = 1024;
 
@@ -17,11 +15,8 @@ const DEFAULT_COLD_BUILD_LIMIT: usize = 1024;
 // cover that exercise while bounding memory use in a long-lived daemon.
 const ADMISSION_EVENT_RETENTION: usize = 64;
 
-static GLOBAL_COLD_BUILD_LIMITER: LazyLock<Arc<ColdBuildLimiter>> = LazyLock::new(|| {
-    let mut limiter = ColdBuildLimiter::new(DEFAULT_COLD_BUILD_LIMIT);
-    limiter.memory_profile = cfg!(not(test));
-    Arc::new(limiter)
-});
+static GLOBAL_COLD_BUILD_LIMITER: LazyLock<Arc<ColdBuildLimiter>> =
+    LazyLock::new(|| Arc::new(ColdBuildLimiter::new(DEFAULT_COLD_BUILD_LIMIT)));
 
 pub(crate) fn global_limiter() -> Arc<ColdBuildLimiter> {
     Arc::clone(&GLOBAL_COLD_BUILD_LIMITER)
@@ -343,7 +338,6 @@ pub(crate) fn test_limiter(limit: usize) -> Arc<ColdBuildLimiter> {
 pub(crate) struct ColdBuildLimiter {
     available: AtomicUsize,
     limit: usize,
-    memory_profile: bool,
     /// Waiter counts are atomics so a Standing contender can yield without a
     /// second hot-path lock. Rotation still uses `admission_state` below.
     waiting_by_class: [AtomicUsize; ADMISSION_CLASS_COUNT],
@@ -469,7 +463,6 @@ impl ColdBuildLimiter {
         Self {
             available: AtomicUsize::new(limit),
             limit,
-            memory_profile: false,
             waiting_by_class: std::array::from_fn(|_| AtomicUsize::new(0)),
             admission_state: Mutex::new(AdmissionState {
                 next_turn: 1,
@@ -488,27 +481,13 @@ impl ColdBuildLimiter {
     }
 
     pub(crate) fn limit(&self) -> usize {
-        if self.memory_profile {
-            crate::memory_profile::current_effective()
-                .value
-                .profile()
-                .cold_builds
-                .min(self.limit)
-        } else {
-            self.limit
-        }
-    }
-
-    fn available_slots(&self) -> usize {
-        self.available
-            .load(Ordering::Acquire)
-            .saturating_sub(self.limit - self.limit())
+        self.limit
     }
 
     fn try_take_slot(&self) -> bool {
         loop {
             let available = self.available.load(Ordering::Acquire);
-            if available <= self.limit - self.limit() {
+            if available == 0 {
                 return false;
             }
             if self
@@ -612,7 +591,7 @@ impl ColdBuildLimiter {
             }
         }
 
-        let available = self.available_slots();
+        let available = self.available.load(Ordering::Acquire);
         if let Some(ticket) = ticket {
             let class = request.class.label();
             let older_same_class = state
@@ -740,7 +719,7 @@ impl ColdBuildLimiter {
             age_ms: now_ms.saturating_sub(entry.started_at_ms),
         };
         ColdBuildLimiterCensus {
-            cap: self.limit(),
+            cap: self.limit,
             holders: state.holders.values().map(render).collect(),
             queued: state.queued.values().map(render).collect(),
         }
@@ -904,36 +883,6 @@ impl Drop for ColdBuildPermitLease {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn memory_cold_build_limit_changes_without_revoking_old_permits() {
-        use crate::memory_profile::{self, MemoryMode};
-        let original = memory_profile::current_effective();
-        struct Restore(Option<MemoryMode>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                memory_profile::publish(self.0);
-            }
-        }
-        let _restore = Restore((original.source == "config").then_some(original.value));
-        let mut limiter = super::ColdBuildLimiter::new(2);
-        limiter.memory_profile = true;
-        let limiter = std::sync::Arc::new(limiter);
-        memory_profile::publish(Some(MemoryMode::Balanced));
-        let first = limiter.try_acquire().unwrap();
-        let second = limiter.try_acquire().unwrap();
-        memory_profile::publish(Some(MemoryMode::Lean));
-        assert_eq!(limiter.census().cap, 1);
-        assert_eq!(limiter.census().holders.len(), 2);
-        assert!(limiter.try_acquire().is_none());
-        drop(first);
-        assert!(limiter.try_acquire().is_none());
-        drop(second);
-        let lean = limiter.try_acquire().unwrap();
-        assert!(limiter.try_acquire().is_none());
-        memory_profile::publish(Some(MemoryMode::Fast));
-        assert!(limiter.try_acquire().is_some());
-        drop(lean);
-    }
     use super::*;
 
     // These tests mutate the process-global limiter; run them one at a time.

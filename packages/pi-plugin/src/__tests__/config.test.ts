@@ -111,7 +111,7 @@ describe("loadAftConfig", () => {
   test("memory uses only the user base and drops malformed project and harness values", () => {
     const fixture = createConfigFixture();
     const env = { HOME: join(fixture.root, "home"), XDG_CONFIG_HOME: fixture.xdgConfigHome };
-    for (const memory of ["lean", "balanced", "fast"]) {
+    for (const memory of ["lean", "balanced"]) {
       writeFileSync(
         fixture.userConfigPath,
         JSON.stringify({
@@ -135,6 +135,7 @@ describe("loadAftConfig", () => {
       JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout).memory,
     ).toBeUndefined();
     expect(AftConfigSchema.safeParse({ memory: "unknown" }).success).toBe(false);
+    expect(AftConfigSchema.safeParse({ memory: "fast" }).success).toBe(false);
   });
 
   test("removed callgraph chunk size is dropped before schema validation", () => {

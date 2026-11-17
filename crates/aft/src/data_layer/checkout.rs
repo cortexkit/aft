@@ -299,13 +299,11 @@ impl DataLayer {
         let profile = crate::memory_profile::current();
         let mut layer = Self::new(profile.block_cache_bytes, threads);
         layer.memory_profile = true;
-        layer.engines.set_budget(profile.engine_budget_bytes as u64);
         layer
     }
 
     pub(crate) fn apply_memory_profile(&self, profile: crate::memory_profile::MemoryProfile) {
         self.cache.set_budget(profile.block_cache_bytes);
-        self.engines.set_budget(profile.engine_budget_bytes as u64);
     }
 
     fn resolver_threads(&self) -> usize {

@@ -709,7 +709,7 @@ const AftConfigFieldsSchema = z.object({
   /** User-base-only macOS file flush policy. Full drive-cache flushes default off. */
   durability: z.object({ macos_full_sync: z.boolean().optional() }).strict().optional(),
   /** Machine-local limits; only the user config base may select a profile. */
-  memory: z.enum(["lean", "balanced", "fast"]).optional(),
+  memory: z.enum(["lean", "balanced"]).optional(),
   /** Codebase health inspection config. `inspect.enabled=false` makes aft_inspect report inspect_disabled. */
   inspect: InspectConfigSchema.optional(),
   /**

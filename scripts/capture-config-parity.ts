@@ -183,7 +183,8 @@ const USER_CACHE_DIR = `${ABSOLUTE_ROOT}/aft-cache`;
 
 const CASES: ParityCase[] = [
   ...(["opencode", "pi"] as const).flatMap((harness) => [
-    ...(["lean", "balanced", "fast"] as const).map((memory) => ({ name: `memory_user_${memory}_${harness}`, harness, user: { memory } })),
+    ...(["lean", "balanced"] as const).map((memory) => ({ name: `memory_user_${memory}_${harness}`, harness, user: { memory } })),
+    { name: `memory_invalid_fast_${harness}`, harness, user: { memory: "fast" } },
     { name: `memory_project_dropped_${harness}`, harness, project: { memory: "lean" } },
     { name: `memory_harness_dropped_${harness}`, harness, user: { memory: "balanced", harnesses: { [harness]: { memory: "fast" } } }, project: { memory: "lean", harnesses: { [harness]: { memory: "lean" } } } },
     { name: `memory_malformed_ignored_${harness}`, harness, user: { harnesses: { [harness]: { memory: {}, sandbox: { profile: { worker: "strict" } } } } }, project: { memory: 5 } },

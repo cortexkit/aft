@@ -153,10 +153,9 @@
       "type": "string",
       "enum": [
         "lean",
-        "balanced",
-        "fast"
+        "balanced"
       ],
-      "description": "Machine-local resource profile, user config base only. lean uses less memory and builds more slowly; balanced keeps the previous limits; fast keeps more data in memory to avoid reloads. When unset, total physical RAM selects lean below 8 GiB, balanced below 32 GiB, otherwise fast; unreadable RAM selects balanced. Changes apply to subsequent builds, cache sizing and admissions without a restart. Meaning search keeps its own setting."
+      "description": "Machine-local resource profile, user config base only. lean uses less memory and can build more slowly: it uses a smaller shared block cache, four call-graph resolver threads on Linux and macOS, and immediate freed-memory return on Linux. Windows keeps all CPUs. balanced keeps the previous limits. When unset, total physical RAM selects lean below 8 GiB, otherwise balanced; unreadable RAM selects balanced. Changes apply to subsequent builds and shared block cache sizing without a restart. Other limits and meaning-search settings stay unchanged."
     },
     "inspect": {
       "type": "object",
@@ -1070,10 +1069,9 @@
             "type": "string",
             "enum": [
               "lean",
-              "balanced",
-              "fast"
+              "balanced"
             ],
-            "description": "Machine-local resource profile, user config base only. lean uses less memory and builds more slowly; balanced keeps the previous limits; fast keeps more data in memory to avoid reloads. When unset, total physical RAM selects lean below 8 GiB, balanced below 32 GiB, otherwise fast; unreadable RAM selects balanced. Changes apply to subsequent builds, cache sizing and admissions without a restart. Meaning search keeps its own setting."
+            "description": "Machine-local resource profile, user config base only. lean uses less memory and can build more slowly: it uses a smaller shared block cache, four call-graph resolver threads on Linux and macOS, and immediate freed-memory return on Linux. Windows keeps all CPUs. balanced keeps the previous limits. When unset, total physical RAM selects lean below 8 GiB, otherwise balanced; unreadable RAM selects balanced. Changes apply to subsequent builds and shared block cache sizing without a restart. Other limits and meaning-search settings stay unchanged."
           },
           "inspect": {
             "type": "object",

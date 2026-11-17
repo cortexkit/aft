@@ -490,7 +490,7 @@ export interface AftConfig {
   /** User-base-only macOS file flush policy. Full drive-cache flushes default off. */
   durability?: { macos_full_sync?: boolean };
   /** Machine-local limits; only the user config base may select a profile. */
-  memory?: "lean" | "balanced" | "fast";
+  memory?: "lean" | "balanced";
   /** Codebase health inspection config. `inspect.enabled=false` makes aft_inspect report inspect_disabled. */
   inspect?: InspectConfig;
   /**
@@ -1128,7 +1128,7 @@ const AftConfigFieldsSchema = z.object({
   index: IndexConfigSchema.optional(),
   storage: z.object({ cache_dir: z.string().nullable().optional() }).optional(),
   durability: z.object({ macos_full_sync: z.boolean().optional() }).strict().optional(),
-  memory: z.enum(["lean", "balanced", "fast"]).optional(),
+  memory: z.enum(["lean", "balanced"]).optional(),
   inspect: InspectConfigSchema.optional(),
   idle: IdleConfigSchema.optional(),
   backup: BackupConfigSchema.optional(),

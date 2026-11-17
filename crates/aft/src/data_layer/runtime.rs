@@ -225,15 +225,9 @@ enum Pool {
 }
 
 impl Pool {
-    #[cfg(test)]
     fn cap(self) -> usize {
-        self.cap_for(crate::memory_profile::current())
-    }
-
-    fn cap_for(self, profile: crate::memory_profile::MemoryProfile) -> usize {
         match self {
-            Pool::Build => profile.cold_builds,
-            Pool::Fill => profile.meaning_fills,
+            Pool::Build | Pool::Fill => 2,
             Pool::Refresh => 4,
         }
     }
@@ -254,7 +248,7 @@ impl Pool {
         let mut state = self.state().lock();
         state.queue.push_back(job);
         let profile = crate::memory_profile::current_effective().value.profile();
-        let Some(job) = state.admit(self.cap_for(profile)) else {
+        let Some(job) = state.admit(self.cap()) else {
             return;
         };
         drop(state);
@@ -281,7 +275,7 @@ impl Pool {
                     let mut state = self.state().lock();
                     state.running -= 1;
                     profile = crate::memory_profile::current();
-                    next = state.admit(self.cap_for(profile));
+                    next = state.admit(self.cap());
                 }
             });
         if let Err(error) = spawned {
@@ -2418,6 +2412,8 @@ mod tests {
             ..Default::default()
         };
         ctx.set_config(published.clone());
+        assert_eq!(Pool::Build.cap(), 2);
+        assert_eq!(Pool::Fill.cap(), 2);
         let old_profile = memory_profile::current();
         let mut state = PoolState::new();
         state.queue.push_back(Box::new(|| {}));
@@ -2431,19 +2427,24 @@ mod tests {
         assert_eq!(live.applied, vec!["memory"]);
         assert!(live.deferred.is_empty());
         ctx.set_config(live.next);
-        assert_eq!(Pool::Build.cap(), 1);
-        assert!(state.admit(Pool::Build.cap()).is_none());
+        assert_eq!(Pool::Build.cap(), 2);
+        assert_eq!(Pool::Fill.cap(), 2);
         memory_profile::admitted(old_profile, || {
             assert_eq!(memory_profile::current().resolver_threads, None);
-            assert_eq!(memory_profile::current().cold_builds, 2);
+            assert_eq!(
+                memory_profile::current().block_cache_bytes,
+                256 * 1024 * 1024
+            );
         });
-        state.running -= 1;
         let job = state
             .admit(Pool::Build.cap())
-            .expect("next build admitted after the old build ends");
+            .expect("lean keeps the second cold-build slot available");
         let next = memory_profile::current();
-        assert_eq!(next.resolver_threads, Some(4));
-        assert_eq!(next.meaning_fills, 1);
+        assert_eq!(
+            next.resolver_threads,
+            if cfg!(windows) { None } else { Some(4) }
+        );
+        assert_eq!(next.block_cache_bytes, 128 * 1024 * 1024);
         memory_profile::admitted(next, job);
         ctx.set_config(published);
         assert_eq!(Pool::Build.cap(), 2);

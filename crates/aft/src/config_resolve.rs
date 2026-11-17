@@ -3730,7 +3730,6 @@ mod tests {
         for (name, expected) in [
             ("lean", MemoryMode::Lean),
             ("balanced", MemoryMode::Balanced),
-            ("fast", MemoryMode::Fast),
         ] {
             for harness in [Harness::Pi, Harness::Opencode] {
                 let result = resolve_config_for_harness(

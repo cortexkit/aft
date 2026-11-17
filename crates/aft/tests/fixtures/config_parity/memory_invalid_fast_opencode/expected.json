@@ -12,6 +12,5 @@
     "semantic": true,
     "trigram": true
   },
-  "memory": "fast",
   "restrict_to_project_root": false
 }
