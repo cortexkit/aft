@@ -832,7 +832,10 @@ impl Jail {
     }
 
     async fn bind_grant_head(&mut self) {
-        let root = self.base.clone();
+        self.bind_grant_head_at(self.base.clone()).await;
+    }
+
+    async fn bind_grant_head_at(&mut self, root: PathBuf) {
         self.bind({
             let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
                 route_channel: 2,
@@ -1903,7 +1906,7 @@ async fn cortexkit_settings_file_tools_and_relaxed_shell_are_open_for_head_and_w
             std::fs::write(config, value.to_string()).unwrap();
         })
         .await;
-    jail.bind_grant_head().await;
+    jail.bind_grant_head_at(jail.worktree.clone()).await;
     let settings = [
         jail.home.join(".config/cortexkit"),
         jail.base.join("xdg/config/cortexkit"),
