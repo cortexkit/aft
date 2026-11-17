@@ -102,6 +102,50 @@ afterEach(() => {
 });
 
 describe("loadAftConfig", () => {
+  test("memory uses only the user base and drops malformed project and harness values", () => {
+    const fixture = createConfigFixture();
+    const env = { HOME: join(fixture.root, "home"), XDG_CONFIG_HOME: fixture.xdgConfigHome };
+    for (const memory of ["lean", "balanced", "fast"]) {
+      writeFileSync(
+        fixture.userConfigPath,
+        JSON.stringify({
+          memory,
+          harnesses: { opencode: { memory: {}, sandbox: { profile: { worker: "strict" } } } },
+        }),
+      );
+      writeFileSync(
+        fixture.projectConfigPath,
+        JSON.stringify({ memory: 5, harnesses: { opencode: { memory: null } } }),
+      );
+      const loaded = runConfigLoader(fixture.projectDirectory, env);
+      const config = JSON.parse(loaded.stdout);
+      expect(config.memory).toBe(memory);
+      expect(config.sandbox.profile.worker).toBe("strict");
+      expect(loaded.stderr).toContain("Ignoring memory from project config");
+      expect(loaded.stderr).toContain("Ignoring memory from harnesses.opencode");
+    }
+    rmSync(fixture.userConfigPath);
+    expect(
+      JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout).memory,
+    ).toBeUndefined();
+    expect(AftConfigSchema.safeParse({ memory: "unknown" }).success).toBe(false);
+  });
+
+  test("removed callgraph chunk size is dropped before schema validation", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({
+        callgraph_chunk_size: {},
+        harnesses: { opencode: { callgraph_chunk_size: 1 } },
+      }),
+    );
+    const loaded = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+    expect(JSON.parse(loaded.stdout).callgraph_chunk_size).toBeUndefined();
+  });
   test("shell env provider is user-only and defaults to a bounded timeout", () => {
     const fixture = createConfigFixture();
     writeFileSync(

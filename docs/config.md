@@ -226,6 +226,33 @@ contain function names and line tables, not full local-variable/type information
 
 ## Config Options
 
+### Memory profile (user config only)
+
+Set `"memory": "lean"`, `"balanced"`, or `"fast"` at the top level of your user
+configuration. Project values and values inside `harnesses.*` are ignored with
+the user-only-key notice, even when malformed.
+
+| Value | Trade-off |
+|---|---|
+| `lean` | Uses less memory and builds more slowly: fewer resolver threads, fewer simultaneous builds and meaning-search fills, and smaller caches. On Linux, freed allocator pages are returned immediately. |
+| `balanced` | Keeps the previous resource limits. |
+| `fast` | Keeps larger call-graph and read caches in memory to avoid rebuilds and reloads. |
+
+When omitted, AFT chooses from total physical RAM: below 8 GiB selects `lean`,
+8 GiB up to (but not including) 32 GiB selects `balanced`, and 32 GiB or more
+selects `fast`. If RAM cannot be read, it uses `balanced`. Health output includes
+`memory_profile: { value, source, total_ram_bytes }`; `source` is `config` or `auto`
+and unavailable RAM is reported as `null`.
+
+Changes apply to subsequent builds, cache sizing, and admissions without a
+restart. Work already admitted keeps its profile. Meaning search is not disabled
+by `lean`; its own settings still control whether it runs. The allocator change
+applies only to Linux builds using jemalloc, not macOS or Windows.
+
+The unused `callgraph_chunk_size` key is removed. From 0.67, user configuration
+that still sets it is refused with `removed_config_key`; projects drop it with a
+notice. Run `npx @cortexkit/aft doctor --fix` to remove it.
+
 ```jsonc
 {
    // Edit/read surface: "default" (default) or "hashline". User and project
@@ -235,6 +262,9 @@ contain function names and line tables, not full local-variable/type information
    // Optional existing rebuildable-cache parent, user base only. Omit to keep
    // the default storage-root layout. See "Rebuildable cache root" above.
    // "storage": { "cache_dir": "/existing/cache-parent" },
+
+   // Optional machine-local profile; user base only. Omit for automatic choice.
+   // "memory": "balanced",
 
   // Auto-format files after edits. Default: false. When enabled, formatting is
   // queued and runs after ~90s without further edits to the file.

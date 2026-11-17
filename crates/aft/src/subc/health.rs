@@ -5166,6 +5166,10 @@ fn assemble_health_report(
     );
     metrics.insert("sync_mode".to_string(), json!(aft_store::sync::mode()));
     metrics.insert(
+        "memory_profile".to_string(),
+        json!(crate::memory_profile::current_effective()),
+    );
+    metrics.insert(
         "runtime".to_string(),
         json!({
             "live_watchers": shared_app.watcher_count(),
@@ -10512,6 +10516,35 @@ mod tests {
         assert_eq!(metrics["sync_mode"], aft_store::sync::mode());
         #[cfg(not(target_os = "macos"))]
         assert_eq!(fallbacks, 0);
+    }
+
+    #[test]
+    fn health_report_exposes_memory_profile_choice_and_ram() {
+        let report = build_health_report(
+            &HealthRollupCache::new(),
+            &Executor::new(),
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &App::default_shared(),
+        );
+        let metrics = report.metrics.expect("health metrics");
+        let profile = &metrics["memory_profile"];
+        assert!(matches!(
+            profile["value"].as_str(),
+            Some("lean" | "balanced" | "fast")
+        ));
+        assert!(matches!(
+            profile["source"].as_str(),
+            Some("auto" | "config")
+        ));
+        assert!(profile.get("total_ram_bytes").is_some());
+        assert!(
+            profile["total_ram_bytes"].is_null()
+                || profile["total_ram_bytes"]
+                    .as_u64()
+                    .is_some_and(|bytes| bytes > 0)
+        );
+        assert_eq!(profile.as_object().unwrap().len(), 3);
     }
 
     #[test]

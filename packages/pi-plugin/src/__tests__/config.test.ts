@@ -108,6 +108,47 @@ afterEach(() => {
 });
 
 describe("loadAftConfig", () => {
+  test("memory uses only the user base and drops malformed project and harness values", () => {
+    const fixture = createConfigFixture();
+    const env = { HOME: join(fixture.root, "home"), XDG_CONFIG_HOME: fixture.xdgConfigHome };
+    for (const memory of ["lean", "balanced", "fast"]) {
+      writeFileSync(
+        fixture.userConfigPath,
+        JSON.stringify({
+          memory,
+          harnesses: { pi: { memory: {}, sandbox: { profile: { worker: "strict" } } } },
+        }),
+      );
+      writeFileSync(
+        fixture.projectConfigPath,
+        JSON.stringify({ memory: 5, harnesses: { pi: { memory: null } } }),
+      );
+      const loaded = runConfigLoader(fixture.projectDirectory, env);
+      const config = JSON.parse(loaded.stdout);
+      expect(config.memory).toBe(memory);
+      expect(config.sandbox.profile.worker).toBe("strict");
+      expect(loaded.stderr).toContain("Ignoring memory from project config");
+      expect(loaded.stderr).toContain("Ignoring memory from harnesses.pi");
+    }
+    rmSync(fixture.userConfigPath);
+    expect(
+      JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout).memory,
+    ).toBeUndefined();
+    expect(AftConfigSchema.safeParse({ memory: "unknown" }).success).toBe(false);
+  });
+
+  test("removed callgraph chunk size is dropped before schema validation", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ callgraph_chunk_size: {}, harnesses: { pi: { callgraph_chunk_size: 1 } } }),
+    );
+    const loaded = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+    expect(JSON.parse(loaded.stdout).callgraph_chunk_size).toBeUndefined();
+  });
   test("shell env provider is user-only and defaults to a bounded timeout", () => {
     const fixture = createConfigFixture();
     writeFileSync(
@@ -962,7 +1003,7 @@ describe("loadAftConfig", () => {
     expect(config.disabled_tools).toEqual(["aft_callgraph"]);
   });
 
-  test("project config can override callgraph store chunking knobs", () => {
+  test("project config can disable callgraph indexing while retired chunking is dropped", () => {
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
@@ -980,7 +1021,7 @@ describe("loadAftConfig", () => {
 
     const config = JSON.parse(result.stdout);
     expect(config.indexes.callgraph).toBe(false);
-    expect(config.callgraph_chunk_size).toBe(3);
+    expect(config.callgraph_chunk_size).toBeUndefined();
     expect(result.stderr).not.toContain("Ignoring callgraph_store");
     expect(result.stderr).not.toContain("Ignoring callgraph_chunk_size");
   });
@@ -1878,17 +1919,15 @@ describe("resolveProjectOverridesForConfigure", () => {
     });
   });
 
-  test("forwards index switches and callgraph chunking to Rust configure", () => {
+  test("forwards index switches to Rust configure", () => {
     expect(
       resolveProjectOverridesForConfigure({
         disabled_tools: [],
         indexes: { callgraph: false },
-        callgraph_chunk_size: 3,
       }),
     ).toMatchObject({
       disabled_tools: [],
       indexes: { callgraph: false, semantic: true, trigram: true },
-      callgraph_chunk_size: 3,
     });
   });
 });

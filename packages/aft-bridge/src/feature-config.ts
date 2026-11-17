@@ -115,6 +115,11 @@ export const RETIRED_IDLE_CHECKOUT_HOURS = [
  */
 export const DATA_LAYER_KEYS_REFUSED_FROM: readonly [number, number] = [0, 65];
 
+export const CALLGRAPH_CHUNK_KEY = "callgraph_chunk_size";
+export const CALLGRAPH_CHUNK_REFUSED_FROM: readonly [number, number] = [0, 67];
+export const CALLGRAPH_CHUNK_NOTE =
+  "callgraph_chunk_size never had an effect, so the setting can be removed. From 0.67.0 AFT refuses a user config file that still sets it; run npx @cortexkit/aft doctor --fix.";
+
 /** The remaining version-gated rename; removed no-effect keys refuse only user config. */
 export const DATA_LAYER_RETIRED_PATHS = ["views.idle_checkout_hours"] as const;
 
@@ -225,6 +230,12 @@ function removedBlockKeyErrors(
   if (refuseRetired) paths.push(...refusedRetiredNames(value));
   if (refuseRetired && releaseAtLeast(release, DATA_LAYER_KEYS_REFUSED_FROM))
     paths.push(...DATA_LAYER_RETIRED_PATHS.filter((path) => hasPath(value, path)));
+  if (
+    refuseRetired &&
+    releaseAtLeast(release, CALLGRAPH_CHUNK_REFUSED_FROM) &&
+    Object.hasOwn(value, CALLGRAPH_CHUNK_KEY)
+  )
+    paths.push(CALLGRAPH_CHUNK_KEY);
   return paths.map((path) => `removed_config_key:${path}; run npx @cortexkit/aft doctor --fix`);
 }
 
@@ -566,6 +577,10 @@ export function retiredIdleCheckoutHours(value: unknown): number {
  * Removed no-effect keys are dropped before strict schema validation.
  */
 function translateDataLayerPaths(map: JsonRecord, prefix: string, out: DocumentTranslation): void {
+  if (Object.hasOwn(map, CALLGRAPH_CHUNK_KEY)) {
+    delete map[CALLGRAPH_CHUNK_KEY];
+    recordRetired(out, prefix, CALLGRAPH_CHUNK_KEY);
+  }
   const [retired, replacement] = RETIRED_IDLE_CHECKOUT_HOURS;
   const hours = takeNested(map, "views", "idle_checkout_hours");
   if (hours.found) {
@@ -595,6 +610,7 @@ export function dropRemovedDataLayerKeys(map: JsonRecord): void {
     for (const block of Object.values(map.harnesses)) if (isRecord(block)) blocks.push(block);
   }
   for (const block of blocks) {
+    delete block[CALLGRAPH_CHUNK_KEY];
     for (const path of REMOVED_DATA_LAYER_PATHS) {
       const [container, leaf] = path.split(".");
       if (container && leaf) takeNested(block, container, leaf);
@@ -913,6 +929,7 @@ export const NO_EFFECT_RETIRED_NOTES: ReadonlyArray<readonly [string, string]> =
 
 /** The no-effect sentence for a retired key, which may carry a `harnesses.<id>.` prefix. */
 function noEffectNote(key: string): string | undefined {
+  if (namesPath(key, CALLGRAPH_CHUNK_KEY)) return CALLGRAPH_CHUNK_NOTE;
   return [...NO_EFFECT_RETIRED_NOTES, ...REMOVED_DATA_LAYER_NOTES].find(([path]) =>
     namesPath(key, path),
   )?.[1];
@@ -977,6 +994,7 @@ export function legacyConfigNoticeMessage(
       parts.push(retiredIdleCheckoutHoursNote());
     }
   }
+  if (noEffect.has(CALLGRAPH_CHUNK_NOTE)) parts.push(CALLGRAPH_CHUNK_NOTE);
   for (const [, note] of [...NO_EFFECT_RETIRED_NOTES, ...REMOVED_DATA_LAYER_NOTES]) {
     if (noEffect.has(note)) parts.push(note);
   }
@@ -1090,6 +1108,7 @@ function projectBlock(block: JsonRecord): JsonRecord {
     ...DATA_LAYER_RETIRED_PATHS,
     ...REMOVED_DATA_LAYER_PATHS,
     "bash.runon_enabled",
+    CALLGRAPH_CHUNK_KEY,
   ]) {
     const dot = path.indexOf(".");
     if (dot < 0) {

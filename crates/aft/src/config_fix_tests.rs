@@ -1082,6 +1082,17 @@ fn doctor_fix_moves_idle_checkout_hours_and_deletes_removed_data_layer_keys() {
     );
 }
 
+#[test]
+fn doctor_fix_deletes_callgraph_chunk_size_from_base_and_harnesses() {
+    for tier in [FixTier::User, FixTier::Project] {
+        let migration = migrate_config_text(r#"{"callgraph_chunk_size":100,"harnesses":{"pi":{"callgraph_chunk_size":1,"memory":"lean"}}}"#, tier).unwrap();
+        assert!(migration.changed);
+        let value: Value = serde_json::from_str(&migration.text).unwrap();
+        assert_eq!(value, json!({"harnesses":{"pi":{"memory":"lean"}}}));
+        assert!(!migrate_config_text(&migration.text, tier).unwrap().changed);
+    }
+}
+
 /// The automatic rewrite of the user file moves `views.idle_checkout_hours`
 /// but keeps the removed keys for the loader to refuse. Its notice names only
 /// the key it moved; removing refused keys requires an explicit doctor fix.

@@ -7632,6 +7632,7 @@ impl AppContext {
             // reset it when another root starts with a default config. Before
             // the first configure publishes, syncs use the plain fsync default.
             aft_store::sync::set_macos_full_sync(next.durability.macos_full_sync);
+            crate::memory_profile::publish(next.memory);
             (next, changed)
         };
         if replace_pin {
@@ -13926,7 +13927,6 @@ mod callgraph_store_for_ops_tests {
             Config {
                 project_root: Some(project.path().to_path_buf()),
                 storage_dir: Some(storage.path().to_path_buf()),
-                callgraph_chunk_size: 1,
                 ..Config::default()
             },
         ));

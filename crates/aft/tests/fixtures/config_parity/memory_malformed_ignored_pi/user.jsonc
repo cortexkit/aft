@@ -1,0 +1,12 @@
+{
+  "harnesses": {
+    "pi": {
+      "memory": {},
+      "sandbox": {
+        "profile": {
+          "worker": "strict"
+        }
+      }
+    }
+  }
+}

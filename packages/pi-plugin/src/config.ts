@@ -4,6 +4,7 @@ import { isAbsolute } from "node:path";
 import {
   type AftConfigFileMigrationResult,
   ConfigRejectedError,
+  CALLGRAPH_CHUNK_KEY,
   type ConfigTier,
   DATA_LAYER_RETIRED_PATHS,
   DEFAULT_DISABLED_TOOLS,
@@ -488,8 +489,8 @@ export interface AftConfig {
   storage?: { cache_dir?: string | null };
   /** User-base-only macOS file flush policy. Full drive-cache flushes default off. */
   durability?: { macos_full_sync?: boolean };
-  /** Number of files to parse in a single batch during callgraph store cold build. Lower values reduce peak memory during cold build. Default: 100. */
-  callgraph_chunk_size?: number;
+  /** Machine-local limits; only the user config base may select a profile. */
+  memory?: "lean" | "balanced" | "fast";
   /** Codebase health inspection config. `inspect.enabled=false` makes aft_inspect report inspect_disabled. */
   inspect?: InspectConfig;
   /**
@@ -1127,7 +1128,7 @@ const AftConfigFieldsSchema = z.object({
   index: IndexConfigSchema.optional(),
   storage: z.object({ cache_dir: z.string().nullable().optional() }).optional(),
   durability: z.object({ macos_full_sync: z.boolean().optional() }).strict().optional(),
-  callgraph_chunk_size: z.number().optional(),
+  memory: z.enum(["lean", "balanced", "fast"]).optional(),
   inspect: InspectConfigSchema.optional(),
   idle: IdleConfigSchema.optional(),
   backup: BackupConfigSchema.optional(),
@@ -1181,6 +1182,8 @@ function applyActiveHarnessOverride(config: AftConfig, trusted: boolean): AftCon
   const merged = { ...base, ...override } as AftConfigFields;
   if (base.storage) merged.storage = base.storage;
   else delete merged.storage;
+  if (base.memory !== undefined) merged.memory = base.memory;
+  else delete merged.memory;
   if (override.durability?.macos_full_sync !== undefined) {
     warn(
       `Ignoring durability.macos_full_sync from harnesses.${ACTIVE_HARNESS} (the process-wide policy only honors the user config base)`,
@@ -1303,8 +1306,6 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
 
   overrides.indexes = resolvedIndexes(config);
   if (config.index !== undefined) overrides.index = config.index;
-  if (config.callgraph_chunk_size !== undefined)
-    overrides.callgraph_chunk_size = config.callgraph_chunk_size;
 
   Object.assign(overrides, resolveExperimentalConfigForConfigure(config));
   if (
@@ -1592,8 +1593,8 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   if (tier === "user") {
     removed.push(
       ...removedConfigKeyErrors(cleanConfig).filter((error) =>
-        [...REMOVED_DATA_LAYER_PATHS, ...DATA_LAYER_RETIRED_PATHS].some((path) =>
-          error.endsWith(`${path}; run npx @cortexkit/aft doctor --fix`),
+        [...REMOVED_DATA_LAYER_PATHS, ...DATA_LAYER_RETIRED_PATHS, CALLGRAPH_CHUNK_KEY].some(
+          (path) => error.endsWith(`${path}; run npx @cortexkit/aft doctor --fix`),
         ),
       ),
     );
@@ -1640,6 +1641,24 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   }
 
   warnIgnoredHarnessSpecificConfigKeys(cleanConfig, configPath);
+  // Drop machine limits before validation so malformed ignored values cannot
+  // discard otherwise-valid security settings in the same block.
+  if (tier === "project" && Object.hasOwn(cleanConfig, "memory")) {
+    delete cleanConfig.memory;
+    warn(
+      `Ignoring memory from project config ${configPath} (security: these settings only honor user-level config — a project should not weaken security boundaries for the user)`,
+    );
+  }
+  if (isConfigRecord(cleanConfig.harnesses)) {
+    for (const [name, block] of Object.entries(cleanConfig.harnesses)) {
+      if (isConfigRecord(block) && Object.hasOwn(block, "memory")) {
+        delete block.memory;
+        warn(
+          `Ignoring memory from harnesses.${name} (the process-wide policy only honors the user config base)`,
+        );
+      }
+    }
+  }
   warnIgnoredNestedHarnesses(cleanConfig, configPath);
   const result = AftConfigSchema.safeParse(cleanConfig);
   let parsed: AftConfig;
@@ -2007,7 +2026,6 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   "validate_on_edit",
   "configure_warnings_delivery",
   // "indexes" handled separately — a project can only switch an index off.
-  "callgraph_chunk_size",
   "inspect",
   "idle",
   // Git attribution only changes commit metadata; it grants no capabilities and
@@ -2074,6 +2092,7 @@ function getStrippedTopLevelKeys(override: AftConfig, base: AftConfig): string[]
     stripped.push("backup");
   if (override.index?.roots !== undefined) stripped.push("index.roots");
   if (override.storage?.cache_dir !== undefined) stripped.push("storage.cache_dir");
+  if (override.memory !== undefined) stripped.push("memory");
   if (override.durability?.macos_full_sync !== undefined)
     stripped.push("durability.macos_full_sync");
   const order = { off: 0, relaxed: 1, strict: 2 };

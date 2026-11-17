@@ -268,6 +268,7 @@ fn checkpoint() -> Result<(), DataError> {
 pub struct DataLayer {
     cache: Arc<BlockCache>,
     threads: usize,
+    memory_profile: bool,
     policy: ScanPolicy,
     /// Every checkout's call-graph engine, kept between refreshes until it
     /// falls idle or the engines together hold too much.
@@ -287,9 +288,33 @@ impl DataLayer {
         Self {
             cache: Arc::new(BlockCache::new(cache_bytes)),
             threads: threads.max(1),
+            memory_profile: false,
             policy: super::content::scan_policy(),
             engines: Arc::new(engines::EngineKeeper::new()),
             bound: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn with_memory_profile(threads: usize) -> Self {
+        let profile = crate::memory_profile::current();
+        let mut layer = Self::new(profile.block_cache_bytes, threads);
+        layer.memory_profile = true;
+        layer.engines.set_budget(profile.engine_budget_bytes as u64);
+        layer
+    }
+
+    pub(crate) fn apply_memory_profile(&self, profile: crate::memory_profile::MemoryProfile) {
+        self.cache.set_budget(profile.block_cache_bytes);
+        self.engines.set_budget(profile.engine_budget_bytes as u64);
+    }
+
+    fn resolver_threads(&self) -> usize {
+        if self.memory_profile {
+            crate::memory_profile::current()
+                .resolver_threads
+                .unwrap_or(self.threads)
+        } else {
+            self.threads
         }
     }
 
@@ -2059,7 +2084,7 @@ impl Checkout {
         resume::kill_point("stage.resolve");
         let _census = super::callgraph::resolve_checkout_into(
             &mut inputs,
-            self.layer.threads,
+            self.layer.resolver_threads(),
             measure.then_some(&mut report.memory),
             &scratch,
             super::callgraph::KeyOrderBudget::configured(),

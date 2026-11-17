@@ -29,7 +29,7 @@ use super::GraphEngine;
 /// again.
 pub(super) const ENGINE_IDLE: Duration = Duration::from_secs(10 * 60);
 
-/// How many bytes the engines of one data layer may hold together before
+/// The balanced profile's default bytes the engines may hold together before
 /// the least recently used idle ones go. Measured as the budget counts
 /// them: on AFT's own checkout (7,456 files) an engine holds about 105 MB
 /// after its first refresh, nearly all of it the files it bound; kept
@@ -38,7 +38,9 @@ pub(super) const ENGINE_IDLE: Duration = Duration::from_secs(10 * 60);
 /// 90th percentile and 344 MiB at most. A gibibyte keeps the engines of
 /// three worktrees refreshing at once, and of a few more agents'
 /// worktrees, without letting any go.
-pub(super) const ENGINE_BUDGET: u64 = 1 << 30;
+pub(super) const ENGINE_BUDGET: u64 = crate::memory_profile::MemoryMode::Balanced
+    .profile()
+    .engine_budget_bytes as u64;
 
 /// How old an engine's measured bytes may be before a refresh measures it
 /// again. Walking a large engine takes tens of milliseconds, a few percent

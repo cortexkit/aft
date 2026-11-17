@@ -91,6 +91,7 @@ function goldenParamsFromMerged(
   if (merged.storage?.cache_dir !== undefined) {
     params.cache_dir = merged.storage.cache_dir;
   }
+  if (merged.memory !== undefined) params.memory = merged.memory;
   // The OpenCode prompt server is read by the plugin itself and is not a
   // configure param either; it is carried here so the Rust resolver's user-only
   // handling of it is compared against the TypeScript loader's.
@@ -181,6 +182,14 @@ const ABSOLUTE_ROOT = "{ABSOLUTE_ROOT}";
 const USER_CACHE_DIR = `${ABSOLUTE_ROOT}/aft-cache`;
 
 const CASES: ParityCase[] = [
+  ...(["opencode", "pi"] as const).flatMap((harness) => [
+    ...(["lean", "balanced", "fast"] as const).map((memory) => ({ name: `memory_user_${memory}_${harness}`, harness, user: { memory } })),
+    { name: `memory_project_dropped_${harness}`, harness, project: { memory: "lean" } },
+    { name: `memory_harness_dropped_${harness}`, harness, user: { memory: "balanced", harnesses: { [harness]: { memory: "fast" } } }, project: { memory: "lean", harnesses: { [harness]: { memory: "lean" } } } },
+    { name: `memory_malformed_ignored_${harness}`, harness, user: { harnesses: { [harness]: { memory: {}, sandbox: { profile: { worker: "strict" } } } } }, project: { memory: 5 } },
+    { name: `callgraph_chunk_removed_user_${harness}`, harness, user: { callgraph_chunk_size: 100 } },
+    { name: `callgraph_chunk_removed_project_${harness}`, harness, project: { callgraph_chunk_size: 100 } },
+  ]),
   ...(["opencode", "pi"] as const).flatMap((harness) => [
     { name: `shell_env_provider_user_${harness}`, harness, user: { shell: { env_provider: { kind: "mise" } } }, project: { shell: { env_provider: { kind: "custom", command: ["hostile"] } } } },
     { name: `shell_env_provider_project_${harness}`, harness, project: { shell: { env_provider: { kind: "custom", command: ["hostile"] } } } },

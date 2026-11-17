@@ -67,6 +67,18 @@ test("retired runon gate translates user blocks and drops project gates with a n
   );
 });
 
+test("callgraph chunk size refuses only user config from 0.67", () => {
+  const doc = { callgraph_chunk_size: 100, harnesses: { pi: { callgraph_chunk_size: 1 } } };
+  expect(removedConfigKeyErrors(doc, [0, 66])).toEqual([]);
+  expect(removedConfigKeyErrors(doc, [0, 67])).toEqual([
+    "removed_config_key:callgraph_chunk_size; run npx @cortexkit/aft doctor --fix",
+    "removed_config_key:harnesses.pi.callgraph_chunk_size; run npx @cortexkit/aft doctor --fix",
+  ]);
+  expect(removedConfigKeyErrors(doc, [0, 67], false)).toEqual([]);
+  translateConfigDocument(doc, "project");
+  expect(doc).toEqual({ harnesses: { pi: {} } });
+});
+
 const fixtures = JSON.parse(
   readFileSync(
     new URL(

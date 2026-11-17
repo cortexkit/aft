@@ -214,14 +214,14 @@ fn prepared_bind_watches_keep_the_captured_source() {
         None,
     );
     let legacy = fixture.root.join(".pi/aft.jsonc");
-    write(&legacy, r#"{"callgraph_chunk_size":7}"#);
+    write(&legacy, r#"{"idle": {"checkout_hours": 7}}"#);
     let prepared = crate::subc_config::PreparedBindConfig::read(
         Some(&fixture.user_path),
         &fixture.root,
         &crate::harness::Harness::Pi,
     )
     .unwrap();
-    write(&fixture.project_path, r#"{"callgraph_chunk_size":9}"#);
+    write(&fixture.project_path, r#"{"idle": {"checkout_hours": 9}}"#);
     std::fs::remove_file(&legacy).unwrap();
     enable_config_watches_for_test();
     let request: RawRequest = serde_json::from_value(json!({"id":"prepared-watch","command":"configure","project_root":fixture.root,"harness":"pi","cortexkit_user_config_path":fixture.user_path})).unwrap();

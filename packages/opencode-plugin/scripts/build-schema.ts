@@ -227,11 +227,11 @@ function buildSchema(): Record<string, unknown> {
           "Background indexes. Each defaults on and builds independently of which tools are registered. Project config can only turn an index off.",
       },
 
-      callgraph_chunk_size: {
-        type: "number",
-        default: 100,
+      memory: {
+        type: "string",
+        enum: ["lean", "balanced", "fast"],
         description:
-          "Number of files to parse in a single batch during callgraph store cold build. Lower values reduce peak memory during cold build; set to 0 to parse all files at once.",
+          "Machine-local resource profile, user config base only. lean uses less memory and builds more slowly; balanced keeps the previous limits; fast keeps more data in memory to avoid reloads. When unset, total physical RAM selects lean below 8 GiB, balanced below 32 GiB, otherwise fast; unreadable RAM selects balanced. Changes apply to subsequent builds, cache sizing and admissions without a restart. Meaning search keeps its own setting.",
       },
 
       inspect: {
@@ -931,7 +931,7 @@ function buildSchema(): Record<string, unknown> {
   configProperties.harnesses = {
     type: "object",
     description:
-      "Per-harness overrides. The active harness applies its override after the base config within each tier: user base, user override, project base, project override. storage.cache_dir is storage-wide and durability.macos_full_sync is process-wide; neither can be overridden here. Nested harnesses are ignored; unknown harness names are reserved for forward compatibility.",
+      "Per-harness overrides. The active harness applies its override after the base config within each tier: user base, user override, project base, project override. storage.cache_dir, durability.macos_full_sync and memory apply to the whole process; none can be overridden here. Nested harnesses are ignored; unknown harness names are reserved for forward compatibility.",
     additionalProperties: {
       type: "object",
       properties: { ...configProperties },

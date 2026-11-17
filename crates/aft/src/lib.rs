@@ -154,6 +154,7 @@ pub mod lsp;
 pub mod lsp_hints;
 mod luau;
 pub mod memory;
+pub mod memory_profile;
 pub mod migrate_storage;
 pub(crate) mod native_stat;
 pub mod ndjson_text;

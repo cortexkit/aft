@@ -107,6 +107,7 @@ pub struct ResolveResult {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RawAftConfig {
+    pub memory: Option<crate::memory_profile::MemoryMode>,
     pub durability: Option<RawDurability>,
     pub storage: Option<RawStorage>,
     #[serde(rename = "$schema")]
@@ -128,8 +129,6 @@ pub struct RawAftConfig {
     pub restrict_to_project_root: Option<bool>,
     pub indexes: Option<RawIndexes>,
     pub index: Option<RawIndex>,
-    #[serde(deserialize_with = "deserialize_opt_usize")]
-    pub callgraph_chunk_size: Option<usize>,
     pub inspect: Option<RawInspect>,
     pub idle: Option<RawIdle>,
     pub backup: Option<RawBackup>,
@@ -713,7 +712,7 @@ pub fn resolve_config_for_harness(
 
     let mut parsed = Vec::with_capacity(tiers.len());
     for tier in tiers {
-        let outcome = match parse_tier(tier, harness, &mut warnings) {
+        let outcome = match parse_tier(tier, harness, &mut warnings, &mut dropped) {
             Ok(outcome) => outcome,
             Err(errors) => {
                 // A rejected candidate still records where caches belong, or
@@ -1094,6 +1093,7 @@ fn parse_tier(
     tier: &ConfigTier,
     harness: Option<&Harness>,
     warnings: &mut Vec<ConfigWarning>,
+    dropped: &mut Vec<DroppedKey>,
 ) -> Result<(RawAftConfig, feature_config::DocumentTranslation), Vec<String>> {
     let stripped = strip_jsonc(&tier.doc);
     let value = serde_json::from_str::<Value>(&stripped)
@@ -1111,6 +1111,18 @@ fn parse_tier(
         feature_config::DocumentTier::Project
     };
     let translation = feature_config::translate_document(&mut map, document_tier);
+    // Machine limits cannot be selected by repositories or harness blocks.
+    // Drop even malformed values before validating neighbouring security keys.
+    if tier.tier != "user" && map.remove("memory").is_some() {
+        push_drop(dropped, "memory", &tier.tier, USER_ONLY_REASON);
+    }
+    if let Some(blocks) = map.get_mut("harnesses").and_then(Value::as_object_mut) {
+        for block in blocks.values_mut().filter_map(Value::as_object_mut) {
+            if block.remove("memory").is_some() {
+                push_drop(dropped, "memory", &tier.tier, USER_ONLY_REASON);
+            }
+        }
+    }
     normalize_config_for_harness(&mut map, harness);
 
     let security_errors = malformed_security_config_errors(&map, harness);
@@ -1701,8 +1713,8 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.index.is_some() {
         base.index = override_config.index;
     }
-    if override_config.callgraph_chunk_size.is_some() {
-        base.callgraph_chunk_size = override_config.callgraph_chunk_size;
+    if override_config.memory.is_some() {
+        base.memory = override_config.memory;
     }
     if override_config.inspect.is_some() {
         base.inspect = override_config.inspect;
@@ -1812,9 +1824,6 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     }
     // A project may switch an index off but never back on.
     base.indexes = merge_indexes(base.indexes, project.indexes, true);
-    if project.callgraph_chunk_size.is_some() {
-        base.callgraph_chunk_size = project.callgraph_chunk_size;
-    }
 
     merge_formatter_map(&mut base.formatter, project.formatter);
     merge_checker_map(&mut base.checker, project.checker);
@@ -2831,9 +2840,7 @@ fn apply_resolved_config(
     if let Some(value) = raw.restrict_to_project_root {
         config.restrict_to_project_root = value;
     }
-    if let Some(value) = raw.callgraph_chunk_size {
-        config.callgraph_chunk_size = value;
-    }
+    config.memory = raw.memory;
     if let Some(value) = raw.url_fetch_allow_private {
         config.url_fetch_allow_private = value;
     }
@@ -3595,16 +3602,6 @@ where
         .transpose()
 }
 
-fn deserialize_opt_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Option::<u64>::deserialize(deserializer)?;
-    value
-        .map(|value| usize::try_from(value).map_err(|_| de::Error::custom("value is too large")))
-        .transpose()
-}
-
 fn deserialize_opt_positive_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
 where
     D: Deserializer<'de>,
@@ -3725,6 +3722,47 @@ mod tests {
             r#"{"storage":{"cache_dir":"/cache/aft"}}"#,
         );
         assert!(raw.is_ok(), "storage.cache_dir must be recognized: {raw:?}");
+    }
+
+    #[test]
+    fn memory_config_only_user_base_selects_machine_limits() {
+        use crate::memory_profile::MemoryMode;
+        for (name, expected) in [
+            ("lean", MemoryMode::Lean),
+            ("balanced", MemoryMode::Balanced),
+            ("fast", MemoryMode::Fast),
+        ] {
+            for harness in [Harness::Pi, Harness::Opencode] {
+                let result = resolve_config_for_harness(
+                    &[
+                        tier(
+                            "user",
+                            &format!(
+                                r#"{{"memory":"{name}","harnesses":{{"pi":{{"memory":{{}},"sandbox":{{"profile":{{"worker":"strict"}}}}}},"opencode":{{"memory":null,"sandbox":{{"profile":{{"worker":"strict"}}}}}}}}}}"#
+                            ),
+                        ),
+                        tier(
+                            "project",
+                            r#"{"memory":5,"harnesses":{"pi":{"memory":"fast"},"opencode":{"memory":"lean"}}}"#,
+                        ),
+                    ],
+                    Some(&harness),
+                );
+                assert!(result.errors.is_empty(), "{:?}", result.errors);
+                assert_eq!(result.config.memory, Some(expected));
+                assert!(result
+                    .dropped
+                    .iter()
+                    .any(|drop| drop.key == "memory" && drop.tier == "user"));
+                assert!(result
+                    .dropped
+                    .iter()
+                    .any(|drop| drop.key == "memory" && drop.tier == "project"));
+            }
+        }
+        let project = resolve_config(&[tier("project", r#"{"memory":"lean"}"#)]);
+        assert!(project.errors.is_empty());
+        assert_eq!(project.config.memory, None);
     }
 
     #[test]
@@ -3932,7 +3970,9 @@ mod tests {
                     .warnings
                     .iter()
                     .any(|warning| warning.code == "invalid_harness_override"));
-                let (raw, _) = parse_tier(&input, Some(&Harness::Pi), &mut Vec::new()).unwrap();
+                let (raw, _) =
+                    parse_tier(&input, Some(&Harness::Pi), &mut Vec::new(), &mut Vec::new())
+                        .unwrap();
                 assert!(raw.harnesses.unwrap()["pi"].get("auto_update").is_none());
             }
         }
@@ -3963,7 +4003,9 @@ mod tests {
                     crate::config::SandboxMode::Strict
                 );
                 assert!(strict_tier_error(&input, Some(&Harness::Pi)).is_none());
-                let (raw, _) = parse_tier(&input, Some(&Harness::Pi), &mut Vec::new()).unwrap();
+                let (raw, _) =
+                    parse_tier(&input, Some(&Harness::Pi), &mut Vec::new(), &mut Vec::new())
+                        .unwrap();
                 assert_eq!(raw.auto_update, None);
             }
         }
@@ -3972,7 +4014,13 @@ mod tests {
     #[test]
     fn opencode_owned_auto_update_remains_security_validated() {
         let valid = tier("user", r#"{"auto_update":false}"#);
-        let (raw, _) = parse_tier(&valid, Some(&Harness::Opencode), &mut Vec::new()).unwrap();
+        let (raw, _) = parse_tier(
+            &valid,
+            Some(&Harness::Opencode),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(raw.auto_update, Some(false));
         for tier_name in ["user", "project"] {
             let root = tier(
@@ -5055,7 +5103,7 @@ mod tests {
               "checker": { "rust": "cargo", "typescript": "tsc" },
               "restrict_to_project_root": true,
               "indexes": { "trigram": true, "semantic": true, "callgraph": false },
-              "callgraph_chunk_size": 17,
+              "memory": "balanced",
               "url_fetch_allow_private": true,
               "semantic": {
                 "backend": "openai_compatible",
@@ -5100,7 +5148,10 @@ mod tests {
         assert!(result.config.indexes.trigram);
         assert!(result.config.indexes.semantic);
         assert!(!result.config.indexes.callgraph);
-        assert_eq!(result.config.callgraph_chunk_size, 17);
+        assert_eq!(
+            result.config.memory,
+            Some(crate::memory_profile::MemoryMode::Balanced)
+        );
         assert!(result.config.url_fetch_allow_private);
         assert_eq!(
             result.config.semantic.backend,
@@ -6337,6 +6388,7 @@ mod tests {
                 r#"{ "bash": { "foreground_wait_window_ms": 1, "subagent_background": true } }"#,
             ),
             None,
+            &mut Vec::new(),
             &mut Vec::new(),
         ) else {
             panic!("test tier should parse");

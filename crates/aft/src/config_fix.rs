@@ -300,6 +300,10 @@ fn migrate_block(
         .chain([feature_config::RETIRED_IDLE_CHECKOUT_HOURS])
         .chain([("bash.runon_enabled", "remote_exec.enabled")])
         .chain(removed_paths.iter().map(|path| (*path, "")))
+        .chain(
+            (removed_keys == RemovedKeys::Delete)
+                .then_some((feature_config::CALLGRAPH_CHUNK_KEY, "")),
+        )
     {
         let segments: Vec<&str> = path.split('.').collect();
         let present = match segments.as_slice() {

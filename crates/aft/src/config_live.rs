@@ -944,7 +944,7 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     later!("indexes.semantic", indexes.semantic);
     later!("indexes.callgraph", indexes.callgraph);
     later!("index.roots", index.roots);
-    live!("callgraph_chunk_size", callgraph_chunk_size);
+    live!("memory", memory);
     // Inspect.
     live!("inspect.enabled", inspect.enabled);
     live!("inspect.categories", inspect.categories);
@@ -1093,7 +1093,7 @@ fn classification_is_exhaustive(config: &Config) {
         restrict_to_project_root: _,
         indexes,
         index: _,
-        callgraph_chunk_size: _,
+        memory: _,
         experimental_bash_rewrite: _,
         experimental_bash_compress: _,
         experimental_bash_background: _,
