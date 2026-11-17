@@ -1421,7 +1421,9 @@ mod tests {
         assert_eq!(observe(&new).data["running"][0]["task_id"], id);
         assert_eq!(observe(&old).data["running"], json!([]));
         let paths = persistence::task_paths(dir.path(), "session", &id).unwrap();
-        let metadata = persistence::read_task(&paths.json).unwrap();
+        let layout = persistence::resolve_task_layout(&paths.session_dir, &id).unwrap();
+        let paths = &layout.paths;
+        let metadata = persistence::read_task_at(&layout).unwrap();
         assert_eq!(metadata.scope.as_ref(), Some(&stamp));
         let sessions = [paths.session_dir.clone()];
         for selected in [&old, &new] {
@@ -1445,7 +1447,7 @@ mod tests {
         let db = crate::db::open(&dir.path().join("aft.db")).unwrap();
         crate::db::bash_tasks::upsert_bash_task(
             &db,
-            &metadata.to_bash_task_row("test", &paths).unwrap(),
+            &metadata.to_bash_task_row("test", paths).unwrap(),
         )
         .unwrap();
         for selected in [&old, &new] {

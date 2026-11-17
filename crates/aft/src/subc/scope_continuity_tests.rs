@@ -113,7 +113,8 @@ impl Fixture {
     fn metadata(&self) -> persistence::PersistedTask {
         let paths =
             persistence::task_paths(&self.ctx.storage_dir(), "watch-session", &self.task).unwrap();
-        persistence::read_task(&paths.json).unwrap()
+        let layout = persistence::resolve_task_layout(&paths.session_dir, &self.task).unwrap();
+        persistence::read_task_at(&layout).unwrap()
     }
 
     async fn opened(&mut self, scope: &ScopeStamp) -> WriterFrame {
