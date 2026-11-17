@@ -35,7 +35,7 @@ fn windows_launchers_use_injected_production_retry_policies() {
     // in their production bodies; comments and test adapters cannot satisfy this fence.
     for (source, function, callee) in [
         (
-            include_str!("registry.rs"),
+            include_str!("scope_spawn.rs"),
             "spawn_detached_child",
             "crate::windows_shell::spawn_piped_candidates",
         ),

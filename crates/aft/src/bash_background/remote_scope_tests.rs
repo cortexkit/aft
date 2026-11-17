@@ -250,7 +250,7 @@ exit 97
                 move |_, _| {
                     assert_eq!(
                         read_task(&metadata_path).unwrap().task_scope_runtime_ms,
-                        Some(60_000),
+                        Some(90_000),
                         "scope runtime must be durable before placement"
                     );
                     observed_in_probe.store(true, Ordering::SeqCst);
@@ -403,7 +403,7 @@ async fn task_scope_standalone_fallback_never_starts_systemd_run() {
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
     ))
     .unwrap();
-    let out = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", "bash_background::registry::remote::tests::task_scope_standalone_fallback_never_starts_systemd_run", "--nocapture"]).env(ROOT, root.path()).env("PATH", path).output().unwrap();
+    let out = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", "bash_background::registry::remote::tests::scope_tests::task_scope_standalone_fallback_never_starts_systemd_run", "--nocapture"]).env(ROOT, root.path()).env("PATH", path).output().unwrap();
     assert!(
         out.status.success(),
         "{}{}",
