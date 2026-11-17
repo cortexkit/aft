@@ -3470,7 +3470,6 @@ async fn consent_scope_read_preserves_floor_denial() {
     assert_eq!(f.fake.calls("consent.request").len(), count);
 }
 
-
 #[cfg(unix)]
 #[tokio::test]
 async fn consent_scope_card_matches_stored_directory() {
