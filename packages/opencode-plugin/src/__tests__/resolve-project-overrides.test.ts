@@ -77,7 +77,6 @@ describe("resolveProjectOverridesForConfigure", () => {
       checker: { typescript: "biome" },
       restrict_to_project_root: true,
       indexes: { trigram: true, semantic: true, callgraph: false },
-      callgraph_chunk_size: 3,
       github: { shim: true, read: true, write: true },
       experimental_bash_rewrite: true,
       experimental_bash_compress: true,
@@ -85,6 +84,7 @@ describe("resolveProjectOverridesForConfigure", () => {
       experimental_lsp_ty: true,
       semantic: { backend: "fastembed", timeout_ms: 25000 },
     });
+    expect(overrides).not.toHaveProperty("callgraph_chunk_size");
   });
 
   test("forwards the project-settable host fallback gate as inert bash config", () => {

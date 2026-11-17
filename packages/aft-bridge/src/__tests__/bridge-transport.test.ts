@@ -865,7 +865,9 @@ process.stdin.on("data", (chunk) => {
           () => "resolved",
           (err) => String(err instanceof Error ? err.message : err),
         );
-      expect(first).toContain("bridge kept warm");
+      expect(first).toContain(
+        "The change may still complete; check its result before repeating it.",
+      );
 
       const secondResult = bridge
         .toolCall("timeout-session", "aft_inspect", {}, { timeoutMs: 20 })
