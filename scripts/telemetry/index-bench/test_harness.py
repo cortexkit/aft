@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -62,6 +63,24 @@ class HarnessTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(dir=scratch)
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+
+    def test_memory_profile_uses_throwaway_user_file_and_original_guard(self):
+        for mode in ("lean", "balanced", "fast"):
+            folder, logs = self.root / mode, self.root / (mode + "-logs")
+            with patch.object(bench, "Client") as client_type, patch.object(bench.MATRIX, "wait_ready") as ready:
+                client = client_type.return_value
+                client.request.return_value = {"success": True}
+                client.close.return_value = {"guard_triggered": [], "counter_errors": []}
+                ready.return_value = {"success": True}
+                result = bench.measure(Path("aft"), self.root, folder, logs, 26, 2700, mode)
+                self.assertEqual(result["outcome"], "ready")
+                self.assertEqual(client_type.call_args.args[4], 26)
+                tier = client.request.call_args.kwargs["config"][0]
+                self.assertEqual(tier["tier"], "user")
+                self.assertTrue(Path(tier["source"]).is_relative_to(folder))
+                self.assertEqual(json.loads(Path(tier["source"]).read_text())["memory"], mode)
+                self.assertEqual(json.loads(tier["doc"])["memory"], mode)
+                self.assertEqual(result["timeout_seconds"], 2700)
 
     def test_default_project_and_skip_policy(self):
         for system, expected in (("macos", ["vscode", "kubernetes", "elasticsearch", "linux"]),

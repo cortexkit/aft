@@ -169,7 +169,7 @@ def store_bytes(path):
     return sum(file.stat().st_size for file in path.rglob("*") if file.is_file())
 
 
-def measure(binary, root, folder, logs, guard_gib, timeout_s):
+def measure(binary, root, folder, logs, guard_gib, timeout_s, memory=None):
     folder.mkdir(parents=True)
     logs.mkdir(parents=True)
     env = MATRIX.isolated_environment(folder)
@@ -177,11 +177,22 @@ def measure(binary, root, folder, logs, guard_gib, timeout_s):
     for key, relative in {"USERPROFILE": "home", "APPDATA": "appdata", "LOCALAPPDATA": "localappdata"}.items():
         env[key] = str(folder / relative)
         Path(env[key]).mkdir(exist_ok=True)
+    user_config = Path(env["XDG_CONFIG_HOME"]) / "cortexkit/aft.jsonc"
+    if memory:
+        save(user_config, {"memory": memory, "indexes": {"trigram": True, "callgraph": True,
+             "semantic": False}, "inspect": {"enabled": False}})
+        shutil.copy2(user_config, logs / "user-aft.jsonc")
     started = time.monotonic()
     client = Client(binary, root, env, logs, guard_gib, started + timeout_s)
     outcome, error = "ready", ""
     try:
-        MATRIX.configure(client, root, env, "callgraph", min(60, timeout_s))
+        if memory:
+            MATRIX.checked(client.request("configure", timeout_s=min(60, timeout_s),
+                project_root=str(root), harness="runner", storage_dir=env["AFT_STORAGE_DIR"],
+                config=[{"tier": "user", "source": str(user_config), "doc": user_config.read_text()}],
+                _bypass_size_limits=True), "configure")
+        else:
+            MATRIX.configure(client, root, env, "callgraph", min(60, timeout_s))
         status = MATRIX.wait_ready(client, "callgraph", started + timeout_s, logs)
         save(logs / "ready-status.json", status)
     except KeyboardInterrupt:
@@ -196,7 +207,7 @@ def measure(binary, root, folder, logs, guard_gib, timeout_s):
         outcome = "killed_by_guard"
     elif measurement["counter_errors"]:
         outcome = "measurement_error"
-    result = {**measurement, "outcome": outcome, "error": error, "wall_seconds": wall,
+    result = {**measurement, "outcome": outcome, "error": error, "wall_seconds": wall, "memory": memory,
               "store_bytes": store_bytes(folder / "storage"), "guard_gib": guard_gib, "timeout_seconds": timeout_s}
     save(logs / "measurement.json", result)
     if outcome == "interrupted":
@@ -285,23 +296,31 @@ def write_tables(output, rows):
 
 def run(args):
     system = host_platform()
+    if not args.memory_profiles and args.baseline is None:
+        raise ValueError("--baseline is required without --memory-profiles")
     work, output = args.work.resolve(), args.output.resolve()
     work.mkdir(parents=True, exist_ok=True)
     (work / ".index-bench-work").touch()
     output.mkdir(parents=True, exist_ok=True)
     if (output / "results.csv").exists():
         raise ValueError("use a fresh results directory for each comparison")
-    binaries = {"0.65.0": args.baseline.resolve(), "0.66-candidate": args.candidate.resolve()}
+    binaries = ({mode: args.candidate.resolve() for mode in ("lean", "balanced", "fast")}
+                if args.memory_profiles else
+                {"0.65.0": args.baseline.resolve(), "0.66-candidate": args.candidate.resolve()})
     identities = {name: binary_identity(binary) for name, binary in binaries.items()}
-    if not re.search(r"\b0\.65\.0\b", identities["0.65.0"]["reported_version"]):
+    if not args.memory_profiles and not re.search(r"\b0\.65\.0\b", identities["0.65.0"]["reported_version"]):
         raise ValueError("baseline does not report version 0.65.0")
     release = work / "bin/release.json"
-    if not release.exists() or MATRIX.sha256(binaries["0.65.0"]) != json.loads(release.read_text())["sha256"]:
+    if not args.memory_profiles and (not release.exists() or MATRIX.sha256(binaries["0.65.0"]) != json.loads(release.read_text())["sha256"]):
         raise ValueError("baseline must match the checksum-verified download in --work/bin")
-    shutil.copy2(release, output / "release.json")
-    shutil.copy2(work / "bin/checksums.sha256", output / "release-checksums.sha256")
+    if not args.memory_profiles:
+        shutil.copy2(release, output / "release.json")
+        shutil.copy2(work / "bin/checksums.sha256", output / "release-checksums.sha256")
     entries = {entry["repository"]: entry for entry in json.loads((MATRIX_DIR / "manifest.json").read_text())["repositories"]}
-    selected = plan(system, args.projects)
+    selected = ([("vscode", ["lean", "balanced", "fast"])] if args.memory_profiles
+                else plan(system, args.projects))
+    if args.memory_profiles and args.projects != ["vscode"]:
+        raise ValueError("memory-profile measurement requires --projects vscode")
     guard_gib = {"windows": 26, "macos": 13, "linux": 13}[system]
     save(output / "identity.json", {"binaries": identities, "source_commit": subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=HERE, text=True).strip(), "host": platform.uname()._asdict(),
@@ -338,7 +357,8 @@ def run(args):
                     folder = work / "run"
                     try:
                         row.update(measure(binaries[version], root, folder, logs / version, guard_gib,
-                                           5400 if project == "chromium" else 2700))
+                                           5400 if project == "chromium" else 2700,
+                                           version if args.memory_profiles else None))
                     except Exception as error:
                         row.update(outcome="failed", error=str(error))
                     finally:
@@ -364,9 +384,10 @@ def main():
         child.add_argument("--work", type=Path, required=True)
         if command == "run":
             child.add_argument("--output", type=Path, required=True)
-            child.add_argument("--baseline", type=Path, required=True)
+            child.add_argument("--baseline", type=Path)
             child.add_argument("--candidate", type=Path, required=True)
             child.add_argument("--projects", nargs="+", choices=PROJECTS)
+            child.add_argument("--memory-profiles", action="store_true")
     args = parser.parse_args()
     if args.command == "download":
         download(args.work.resolve())
