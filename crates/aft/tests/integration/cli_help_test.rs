@@ -73,7 +73,10 @@ fn assert_no_startup_files(invocation: &Invocation) {
 }
 
 fn assert_usage(text: &str) {
-    assert_eq!(text.lines().next(), Some("AFT — Agent Foundational Toolkit"));
+    assert_eq!(
+        text.lines().next(),
+        Some("AFT — Agent Foundational Toolkit")
+    );
     assert!(text.contains("Usage: aft"), "{text}");
     assert!(text.contains("harness plugin"), "{text}");
     assert!(text.contains("CortexKit daemon"), "{text}");
