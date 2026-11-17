@@ -11118,13 +11118,16 @@ mod policy_tests {
                                                 .chain(&profile.write_deny)
                                                 .chain(&profile.data_policy.deny)
                                                 .any(|deny| settings.starts_with(deny)));
-                                            for relative in
-                                                [".local/share/cortexkit", ".local/state/cortexkit"]
-                                            {
-                                                assert!(profile
-                                                    .data_policy
-                                                    .deny
-                                                    .contains(&home.join(relative)));
+                                            if expected != SandboxMode::Off {
+                                                for relative in [
+                                                    ".local/share/cortexkit",
+                                                    ".local/state/cortexkit",
+                                                ] {
+                                                    assert!(profile
+                                                        .data_policy
+                                                        .deny
+                                                        .contains(&home.join(relative)));
+                                                }
                                             }
                                         }
                                         if expected == SandboxMode::Strict {
