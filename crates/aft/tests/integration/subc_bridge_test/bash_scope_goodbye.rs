@@ -25,7 +25,7 @@ pub(super) async fn drive_bash_elicitation_goodbye_daemon(input: FakeDaemonInput
     })
     .unwrap();
     aft::subc::stamp_bind_workdir_for_test(&mut bind, json!(root1));
-    send_control_request(&mut stream, 101, serde_json::from_value(bind).unwrap()).await;
+    send_control_request(&mut stream, 101, bind).await;
     expect_route_bind_ack(&mut stream, 101).await;
     let root_id = ProjectRootId::from_path(&root1).unwrap();
     let ctx = executor.actor_context(&root_id).expect("bound actor");
