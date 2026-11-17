@@ -3645,19 +3645,21 @@ async fn worker_gh_read_t8_first_bound_read_uses_broker_with_credentials_denied(
     std::fs::write(&gh_store, "fixture-gh-credential").unwrap();
     let cargo_store = jail.home.join(".cargo/credentials.toml");
     std::fs::write(&cargo_store, "fixture-cargo-credential").unwrap();
-    // Landlock denies opening credentials, not stat(2). Seatbelt also denies
-    // their metadata, so require that stronger property only on macOS.
+    // CortexKit settings are intentionally readable. Probe metadata on gh's
+    // credential store instead: Linux Landlock denies opens, while macOS Seatbelt
+    // also denies stat(2).
     let metadata_check = if cfg!(target_os = "macos") {
         format!(
             "if /usr/bin/stat {} >/dev/null 2>&1; then echo 'CONFIG METADATA OPEN'; exit 94; fi",
-            quote(&jail.base.join("xdg/config/cortexkit/aft.jsonc"))
+            quote(&gh_store)
         )
     } else {
         String::new()
     };
     let command = format!(
         r#"set -eu
-for denied in {} {} {} {} {}; do
+cat {} >/dev/null
+for denied in {} {} {} {}; do
   if cat "$denied" >/dev/null 2>&1; then echo "CREDENTIAL FLOOR OPEN: $denied"; exit 93; fi
 done
 {}
