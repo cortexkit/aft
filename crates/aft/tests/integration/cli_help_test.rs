@@ -147,9 +147,7 @@ fn existing_metadata_flags_and_subc_launch_are_preserved() {
     let formats = run(&["--formats"]);
     assert_eq!(formats.output.status.code(), Some(0));
     let actual: serde_json::Value = serde_json::from_slice(&formats.output.stdout).unwrap();
-    let expected: serde_json::Value =
-        serde_json::from_str(&aft::persisted_format::formats_json()).unwrap();
-    assert_eq!(actual, expected);
+    assert_eq!(actual, aft::persisted_format::formats_json());
     assert!(actual.as_object().is_some_and(|object| !object.is_empty()));
     assert!(formats.output.stderr.is_empty());
     assert_no_startup_files(&formats);
