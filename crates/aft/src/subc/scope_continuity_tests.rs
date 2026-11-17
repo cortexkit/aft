@@ -126,6 +126,14 @@ impl Fixture {
         watch
     }
 
+    async fn list_both_owners(&mut self, current: &ScopeStamp) {
+        self.catalog
+            .send_replace(vec!["prefrontal-core".into(), "prefrontal".into()]);
+        self.reply(current, described(ScopeStatus::Live, true, true))
+            .await;
+        turns().await;
+    }
+
     async fn reply(&mut self, expected: &ScopeStamp, reply: ModuleControlResponseToModule) {
         let query = request(&mut self.frames, "scope.describe").await;
         let body: Value = serde_json::from_slice(&query.body).unwrap();
@@ -171,6 +179,7 @@ async fn prefrontal_scope_watch_continues_old_end_then_kills_new_end_despite_old
     let new = named("prefrontal");
     let mut f = Fixture::new(&old).await;
     let watch = f.opened(&old).await;
+    f.list_both_owners(&old).await;
     push(&f.pending, &watch, &old, ScopeWatchEvent::Ended);
     f.reply(&old, described(ScopeStatus::Ended, true, true))
         .await;
@@ -194,6 +203,7 @@ async fn prefrontal_scope_watch_holds_unsynced_counterpart_then_continues() {
     let new = named("prefrontal");
     let mut f = Fixture::new(&old).await;
     let watch = f.opened(&old).await;
+    f.list_both_owners(&old).await;
     push(&f.pending, &watch, &old, ScopeWatchEvent::Ended);
     f.reply(&old, described(ScopeStatus::Ended, true, true))
         .await;
@@ -236,6 +246,7 @@ async fn prefrontal_scope_held_duplicate_end_still_checks_continuity_before_dedu
     let new = named("prefrontal");
     let mut f = Fixture::new(&old).await;
     f.opened(&old).await;
+    f.list_both_owners(&old).await;
     f.handle.observed.send(old.clone()).unwrap();
     f.reply(&old, described(ScopeStatus::Ended, true, true))
         .await;
@@ -285,17 +296,26 @@ async fn prefrontal_scope_held_duplicate_end_still_checks_continuity_before_dedu
 }
 
 #[tokio::test]
-async fn prefrontal_scope_watch_end_before_window_still_kills() {
+async fn prefrontal_scope_watch_end_before_window_sends_no_counterpart_describe() {
     let old = named("prefrontal-core");
-    let new = named("prefrontal");
     let mut f = Fixture::new(&old).await;
     let watch = f.opened(&old).await;
+    f.catalog.send_replace(vec!["prefrontal-core".into()]);
     push(&f.pending, &watch, &old, ScopeWatchEvent::Ended);
     f.reply(&old, described(ScopeStatus::Ended, true, true))
         .await;
-    f.reply(&new, described(ScopeStatus::NotLive, false, false))
-        .await;
     f.killed().await;
+    turns().await;
+    while let Ok(frame) = f.frames.try_recv() {
+        if frame.header.ty == FrameType::Cancel {
+            continue;
+        }
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_ne!(
+            body["op"], "scope.describe",
+            "pre-window end sent another describe: {body}"
+        );
+    }
 }
 
 #[tokio::test]

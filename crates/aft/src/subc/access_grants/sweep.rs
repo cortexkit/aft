@@ -55,18 +55,20 @@ where
         Output = Result<ModuleControlResponseToModule, readiness::ControlError>,
     >,
 {
-    tick_unwatched(db, cursor, describe, |_| false).await
+    tick_unwatched(db, cursor, describe, |_| false, |_| false).await
 }
 
-async fn tick_unwatched<F, Fut, C>(
+async fn tick_unwatched<F, Fut, C, D>(
     db: Db,
     cursor: &mut Option<store::ScopeKey>,
     describe: F,
     covered: C,
+    counterpart_configured: D,
 ) -> Stats
 where
     F: Fn(ScopeStamp) -> Fut,
     C: Fn(&ScopeStamp) -> bool,
+    D: Fn(&ScopeStamp) -> bool,
     Fut: std::future::Future<
         Output = Result<ModuleControlResponseToModule, readiness::ControlError>,
     >,
@@ -120,26 +122,36 @@ where
             });
             if ends {
                 if let Some(other) = crate::access_policy::prefrontal::counterpart(&request) {
-                    let answer = tokio::time::timeout(
-                        scope_describe::describe_timeout(),
-                        describe(other.clone()),
-                    )
-                    .await
-                    .unwrap_or(Err(readiness::ControlError::Timeout));
-                    let (absent, outcome) = match crate::access_policy::prefrontal::continuation(
-                        &other,
-                        answer.as_ref().ok(),
-                    ) {
-                        crate::access_policy::prefrontal::Continuation::Live(_) => {
-                            (false, "continuation")
-                        }
-                        crate::access_policy::prefrontal::Continuation::Hold => (false, "hold"),
-                        crate::access_policy::prefrontal::Continuation::Absent => {
-                            (true, "absent_end")
-                        }
-                    };
-                    crate::access_policy::prefrontal::log_continuation(&request, &other, outcome);
-                    ends = absent;
+                    if !counterpart_configured(&request) {
+                        crate::access_policy::prefrontal::log_continuation(
+                            &request,
+                            &other,
+                            "absent_from_catalog",
+                        );
+                    } else {
+                        let answer = tokio::time::timeout(
+                            scope_describe::describe_timeout(),
+                            describe(other.clone()),
+                        )
+                        .await
+                        .unwrap_or(Err(readiness::ControlError::Timeout));
+                        let (absent, outcome) = match crate::access_policy::prefrontal::continuation(
+                            &other,
+                            answer.as_ref().ok(),
+                        ) {
+                            crate::access_policy::prefrontal::Continuation::Live(_) => {
+                                (false, "continuation")
+                            }
+                            crate::access_policy::prefrontal::Continuation::Hold => (false, "hold"),
+                            crate::access_policy::prefrontal::Continuation::Absent => {
+                                (true, "absent_end")
+                            }
+                        };
+                        crate::access_policy::prefrontal::log_continuation(
+                            &request, &other, outcome,
+                        );
+                        ends = absent;
+                    }
                 }
             } else if let Some(other) = crate::access_policy::prefrontal::counterpart(&request) {
                 crate::access_policy::prefrontal::log_continuation(
@@ -183,6 +195,7 @@ pub(in crate::subc) async fn run(
     control: Arc<readiness::DaemonControl>,
     executor: Arc<Executor>,
     mut covered: tokio::sync::watch::Receiver<super::super::scope_watch::Coverage>,
+    catalog: tokio::sync::watch::Receiver<Vec<String>>,
 ) {
     let mut cursors = HashMap::new();
     let mut database = 0usize;
@@ -225,6 +238,12 @@ pub(in crate::subc) async fn run(
                         // being read. Check coverage at the actual RPC boundary.
                         let latest = covered.borrow();
                         latest.all || latest.keys.contains(&scope_describe::stamp_key(stamp))
+                    },
+                    |stamp| {
+                        crate::access_policy::prefrontal::counterpart_in_catalog(
+                            stamp,
+                            catalog.borrow().as_slice(),
+                        )
                     },
                 )
                 .await;

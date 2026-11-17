@@ -39,6 +39,15 @@ pub(crate) fn counterpart(stamp: &ScopeStamp) -> Option<ScopeStamp> {
     Some(other)
 }
 
+/// A missing counterpart module cannot own a continuation. Preserve the
+/// original single-owner wire exchange until the catalog lists the other name.
+pub(crate) fn counterpart_in_catalog(stamp: &ScopeStamp, configured: &[String]) -> bool {
+    let Some(Principal::Reserved { module_id }) = counterpart_owner(&stamp.owner) else {
+        return false;
+    };
+    configured.contains(&module_id)
+}
+
 pub(crate) enum Continuation {
     Live(ScopeStamp),
     Hold,
@@ -212,6 +221,24 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn prefrontal_scope_counterpart_probe_requires_its_catalog_entry() {
+        let old = ScopeStamp::new(
+            Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            },
+            "agent",
+            7,
+            subc_protocol::scope::ScopeKind::Head,
+        );
+        let new = counterpart(&old).unwrap();
+        assert!(!counterpart_in_catalog(&old, &[]));
+        assert!(!counterpart_in_catalog(&old, &["prefrontal-core".into()]));
+        assert!(counterpart_in_catalog(&old, &["prefrontal".into()]));
+        assert!(counterpart_in_catalog(&new, &["prefrontal-core".into()]));
+        assert!(!counterpart_in_catalog(&new, &["prefrontal".into()]));
     }
 
     #[test]

@@ -280,6 +280,7 @@ where
             control.clone(),
             executor.clone(),
             covered,
+            catalog.clone(),
         ));
         if !control.advertises(subc_protocol::scope::SCOPE_DESCRIBE_OP) {
             grant_sweep.await;
@@ -447,6 +448,7 @@ where
                     verification_keys.remove(key);
                 }
                 let control = control.clone();
+                let scope_catalog = catalog.clone();
                 // Persisted grants and held rows have only owner/ref/epoch,
                 // not a full speech authority stamp. Their ordinary cleanup
                 // still requires the daemon's definitive describe answer.
@@ -478,10 +480,17 @@ where
                             );
                         }
                     }
-                    let counterpart_reply = if reply.as_ref().is_ok_and(|reply| {
+                    // Configuration can change while the original probe is in
+                    // flight, so consult the latest catalog after its answer.
+                    let probe_counterpart = reply.as_ref().is_ok_and(|reply| {
                         describe_answer_ends_scope(reply)
                             || crate::access_policy::prefrontal::retired(&stamp, reply)
-                    }) {
+                    })
+                        && crate::access_policy::prefrontal::counterpart_in_catalog(
+                            &stamp,
+                            scope_catalog.borrow().as_slice(),
+                        );
+                    let counterpart_reply = if probe_counterpart {
                         match crate::access_policy::prefrontal::counterpart(&stamp) {
                             Some(other) => Some(control.describe(&other).await),
                             None => None,
@@ -550,7 +559,8 @@ where
                 () = &mut grant_sweep => unreachable!("saved grant sweep runs until cancelled"),
                 Some(stamp)=observations.recv()=>{
                     if completed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&stamp_key(&stamp)) { continue; }
-                    if crate::access_policy::prefrontal::is_principal(&stamp.owner) && !confirmed.contains(&stamp_key(&stamp)) {
+                    let other_configured = crate::access_policy::prefrontal::counterpart_in_catalog(&stamp, catalog.borrow().as_slice());
+                    if other_configured && !confirmed.contains(&stamp_key(&stamp)) {
                         trigger_describe(stamp_key(&stamp), stamp, &mut pending, &mut queued, &mut retrigger);
                         continue;
                     }
@@ -661,7 +671,12 @@ where
                         let ends = reply.as_ref().is_ok_and(|reply| describe_answer_ends_scope(reply) || crate::access_policy::prefrontal::retired(&stamp, reply));
                         if ends {
                             if let Some(other) = crate::access_policy::prefrontal::counterpart(&stamp) {
-                                let decision = crate::access_policy::prefrontal::continuation(&other, counterpart_reply.as_ref().and_then(|reply| reply.as_ref().ok()));
+                                let decision = match counterpart_reply.as_ref() {
+                                    Some(reply) => crate::access_policy::prefrontal::continuation(&other, reply.as_ref().ok()),
+                                    // No RPC was needed because the counterpart
+                                    // module was absent; an RPC error is Some(Err).
+                                    None => crate::access_policy::prefrontal::Continuation::Absent,
+                                };
                                 match decision {
                                     crate::access_policy::prefrontal::Continuation::Live(live) => {
                                         match rehome_shell_scopes(executor.clone(), stamp.clone(), live.clone()).await {
@@ -688,7 +703,7 @@ where
                                         pending.remove(&key);
                                         continue;
                                     }
-                                    crate::access_policy::prefrontal::Continuation::Absent => crate::access_policy::prefrontal::log_continuation(&stamp, &other, "absent_end"),
+                                    crate::access_policy::prefrontal::Continuation::Absent => crate::access_policy::prefrontal::log_continuation(&stamp, &other, if counterpart_reply.is_none() { "absent_from_catalog" } else { "absent_end" }),
                                 }
                             }
                         } else if let Some(other) = crate::access_policy::prefrontal::counterpart(&stamp) {
@@ -1509,35 +1524,6 @@ mod tests {
                 0,
                 request.header.corr,
                 serde_json::to_vec(&answer).unwrap(),
-            )
-            .unwrap()
-        ));
-        let counterpart = tokio::time::timeout(Duration::from_secs(5), frames.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let body: Value = serde_json::from_slice(&counterpart.body).unwrap();
-        assert_eq!(
-            body["owner"],
-            json!({"kind":"reserved","module_id":"prefrontal"})
-        );
-        assert_eq!(body["ref"], "head");
-        let absent = ModuleControlResponseToModule::ScopeDescribe {
-            status: subc_protocol::scope::ScopeStatus::NotLive,
-            scope_epoch: None,
-            daemon_incarnation: "test-daemon".into(),
-            owner_synced: false,
-            owner_configured: false,
-            scope: None,
-        };
-        assert!(pending.resolve(
-            Frame::build(
-                FrameType::Response,
-                control_flags(),
-                0,
-                0,
-                counterpart.header.corr,
-                serde_json::to_vec(&absent).unwrap(),
             )
             .unwrap()
         ));
