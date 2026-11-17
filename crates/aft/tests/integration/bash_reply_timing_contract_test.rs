@@ -1461,7 +1461,7 @@ async fn bind_route_on_channel(stream: &mut TcpStream, root: &Path, v1: bool, ch
                 .then(|| std::collections::BTreeMap::from([("tool-provider".into(), "v1".into())])),
         })
         .unwrap();
-        aft::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(root.to_path_buf()));
+        bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
 
         bind
     };

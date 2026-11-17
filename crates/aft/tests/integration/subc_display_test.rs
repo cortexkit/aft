@@ -304,7 +304,7 @@ async fn run_display_case(switch: Option<&str>) {
             call_mode: None,
         })
         .unwrap();
-        aft::subc::stamp_bind_workdir_for_test(&mut bind, json!(project.path()));
+        bind["identity"]["project_root"] = json!(project.path());
         request(&mut stream, 0, 10 + index as u64, bind).await;
         wait_for_ready_root(&mut stream, project.path()).await;
         let call_key = format!("display-lineage:{index}");

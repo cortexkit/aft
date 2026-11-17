@@ -824,7 +824,7 @@ impl Jail {
                 call_mode: None,
             })
             .unwrap();
-            aft::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(&self.worktree));
+            bind["identity"]["project_root"] = serde_json::json!(&self.worktree);
 
             bind
         };
@@ -864,7 +864,7 @@ impl Jail {
                 call_mode: None,
             })
             .unwrap();
-            aft::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(&root));
+            bind["identity"]["project_root"] = serde_json::json!(&root);
 
             bind
         })
@@ -3810,7 +3810,7 @@ async fn worker_gh_read_t8_live_scope_rebind_refuses_before_upstream() {
             call_mode: None,
         })
         .unwrap();
-        aft::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(&jail.worktree));
+        bind["identity"]["project_root"] = serde_json::json!(&jail.worktree);
 
         bind
     })
@@ -3985,7 +3985,7 @@ async fn cross_command_broker_isolation(profile: &str) {
             call_mode: None,
         })
         .unwrap();
-        aft::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(&other_root));
+        bind["identity"]["project_root"] = serde_json::json!(&other_root);
 
         bind
     })
@@ -4513,7 +4513,7 @@ async fn worker_gh_read_t10_promotion_keeps_the_original_command_grant() {
             call_mode: None,
         })
         .unwrap();
-        aft::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(&jail.worktree));
+        bind["identity"]["project_root"] = serde_json::json!(&jail.worktree);
 
         bind
     })

@@ -59,7 +59,7 @@ fn bind(root: &Path, tool: bool, epoch: u32, corr: u64) -> Frame {
             call_mode: None,
         })
         .unwrap();
-        crate::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(root));
+        bind["identity"]["project_root"] = serde_json::json!(root);
 
         bind
     };

@@ -405,10 +405,7 @@ impl Daemon {
                 call_mode: None,
             })
             .unwrap();
-            aft::subc::stamp_bind_workdir_for_test(
-                &mut bind,
-                serde_json::json!(&self.root.join("project")),
-            );
+            bind["identity"]["project_root"] = serde_json::json!(&self.root.join("project"));
 
             bind
         };

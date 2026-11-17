@@ -842,15 +842,30 @@ async fn legacy_root_case(no_project: bool, scoped_without_workdir: bool) {
         )
         .await;
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
-        assert_eq!(reply.header.ty, FrameType::Error, "{body}");
-        assert_eq!(body["code"], "project_required");
-        assert_eq!(
-            body["message"].as_str().unwrap().as_bytes(),
-            b"This connection has no project folder, so AFT cannot run project tools on it."
-        );
-        assert_eq!(body["detail"]["cause"], "project_folder_missing");
-        assert_eq!(body["detail"]["source"], "none");
-        assert!(body["detail"]["folder"].is_null());
+        if no_project {
+            assert_eq!(reply.header.ty, FrameType::Error, "{body}");
+            assert_eq!(body["code"], "project_required");
+            assert_eq!(
+                body["message"].as_str().unwrap().as_bytes(),
+                b"This connection has no project folder, so AFT cannot run project tools on it."
+            );
+            assert_eq!(body["detail"]["cause"], "filesystem_root");
+            assert_eq!(body["detail"]["source"], "legacy_bind");
+            assert_eq!(body["detail"]["folder"], "/");
+        } else {
+            assert_eq!(reply.header.ty, FrameType::Response, "{body}");
+            assert_ne!(body["isError"], true, "{body}");
+            assert!(
+                String::from_utf8_lossy(&reply.body).contains("seed line one"),
+                "{body}"
+            );
+            if name == "grep" {
+                assert!(
+                    String::from_utf8_lossy(&reply.body).contains("seed.txt"),
+                    "{body}"
+                );
+            }
+        }
     }
     let catalog = legacy_rpc(&mut stream, channel, epoch, 4, json!({"op":"tool.catalog"})).await;
     assert_eq!(catalog.header.ty, FrameType::Response);
@@ -882,7 +897,7 @@ async fn legacy_root_case(no_project: bool, scoped_without_workdir: bool) {
 
 #[tokio::test]
 #[ignore = "opt-in daemon 0.39 integration; run with --features test-scope-owner"]
-async fn tool_provider_subc_e2e_unscoped_legacy_root_refuses_files() {
+async fn tool_provider_subc_e2e_unscoped_legacy_root_serves_files() {
     legacy_root_case(false, false).await;
 }
 
@@ -894,7 +909,7 @@ async fn tool_provider_subc_e2e_unscoped_slash_refuses_files_but_serves_catalog(
 
 #[tokio::test]
 #[ignore = "opt-in daemon 0.39 integration; run with --features test-scope-owner"]
-async fn tool_provider_subc_e2e_scope_without_workdir_refuses_files() {
+async fn tool_provider_subc_e2e_scope_without_workdir_uses_filled_legacy_root() {
     legacy_root_case(false, true).await;
 }
 

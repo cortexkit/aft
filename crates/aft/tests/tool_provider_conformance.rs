@@ -3280,7 +3280,7 @@ async fn bind_route_stamped_with_mode(
             call_mode: mode,
         })
         .unwrap();
-        aft::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(project));
+        bind["identity"]["project_root"] = serde_json::json!(project);
 
         bind
     };

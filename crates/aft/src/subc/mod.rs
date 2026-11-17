@@ -287,26 +287,6 @@ pub async fn runner_notice_transport_for_test(
 pub(crate) mod scope_background_tasks;
 mod scope_describe;
 pub(crate) mod scope_watch;
-
-/// Give fake provider binds project attribution while preserving any scope's
-/// owner, kind and authority. Management fixtures remain project-free.
-#[cfg(any(test, feature = "test-hooks"))]
-pub fn stamp_bind_workdir_for_test(bind: &mut Value, workdir: Value) {
-    if bind["target"]["kind"] != "tool_provider" {
-        return;
-    }
-    if bind["scope"].is_null() {
-        let session = bind["identity"]["session"].as_str().expect("bind session");
-        bind["scope"] = json!(subc_protocol::scope::ScopeStamp::new(
-            Principal::Direct,
-            session,
-            1,
-            subc_protocol::scope::ScopeKind::Head,
-        ));
-    }
-    bind["scope"]["workdir"] = workdir;
-}
-
 mod shells;
 #[cfg(test)]
 mod stack_budget_tests;
@@ -15899,10 +15879,7 @@ mod tests {
                     call_mode: None,
                 })
                 .unwrap();
-                crate::subc::stamp_bind_workdir_for_test(
-                    &mut bind,
-                    serde_json::json!(healthy_root.as_path()),
-                );
+                bind["identity"]["project_root"] = serde_json::json!(healthy_root.as_path());
 
                 bind
             };
@@ -16075,10 +16052,7 @@ mod tests {
                     call_mode: None,
                 })
                 .unwrap();
-                crate::subc::stamp_bind_workdir_for_test(
-                    &mut bind,
-                    serde_json::json!(root.as_path()),
-                );
+                bind["identity"]["project_root"] = serde_json::json!(root.as_path());
 
                 bind
             };
@@ -16153,10 +16127,7 @@ mod tests {
                         call_mode: None,
                     })
                     .unwrap();
-                    crate::subc::stamp_bind_workdir_for_test(
-                        &mut bind,
-                        serde_json::json!(root.as_path()),
-                    );
+                    bind["identity"]["project_root"] = serde_json::json!(root.as_path());
 
                     bind
                 };

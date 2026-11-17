@@ -2314,7 +2314,7 @@ fn send_bind_epoch(
             call_mode: None,
         })
         .unwrap();
-        aft::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(root.to_path_buf()));
+        bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
 
         bind
     };
@@ -2345,7 +2345,7 @@ async fn write_measure_bind(
             call_mode: None,
         })
         .unwrap();
-        aft::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(root.to_path_buf()));
+        bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
 
         bind
     };

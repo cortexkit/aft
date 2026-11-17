@@ -5,6 +5,7 @@ use std::{
     collections::HashMap,
     fs,
     io::{self, BufRead, Write},
+    path::PathBuf,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -70,13 +71,8 @@ async fn pipeline(stream: TcpStream) {
                     call_mode: None,
                 })
                 .unwrap();
-                bind["scope"] = serde_json::json!(subc_protocol::scope::ScopeStamp::new(
-                    Principal::Direct,
-                    format!("views-perf-{channel}"),
-                    1,
-                    subc_protocol::scope::ScopeKind::Head,
-                )
-                .with_workdir(Some(command["root"].as_str().unwrap().to_owned())));
+                bind["identity"]["project_root"] =
+                    serde_json::json!(PathBuf::from(command["root"].as_str().unwrap()));
 
                 bind
             })
@@ -298,13 +294,8 @@ async fn main() {
                     call_mode: None,
                 })
                 .unwrap();
-                bind["scope"] = serde_json::json!(subc_protocol::scope::ScopeStamp::new(
-                    Principal::Direct,
-                    format!("views-perf-{channel}"),
-                    1,
-                    subc_protocol::scope::ScopeKind::Head,
-                )
-                .with_workdir(Some(command["root"].as_str().unwrap().to_owned())));
+                bind["identity"]["project_root"] =
+                    serde_json::json!(PathBuf::from(command["root"].as_str().unwrap()));
 
                 bind
             })

@@ -140,10 +140,7 @@ impl WireRestore {
                     call_mode: None,
                 })
                 .unwrap();
-                crate::subc::stamp_bind_workdir_for_test(
-                    &mut bind,
-                    serde_json::json!(&fixture.revived.project_root),
-                );
+                bind["identity"]["project_root"] = serde_json::json!(&fixture.revived.project_root);
 
                 bind
             };

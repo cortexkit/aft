@@ -3301,7 +3301,7 @@ async fn drive_undecodable_control_request_daemon(input: FakeDaemonInput) {
             call_mode: None,
         })
         .unwrap();
-        aft::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(root1.clone()));
+        bind["identity"]["project_root"] = serde_json::json!(root1.clone());
 
         bind
     })
@@ -4074,7 +4074,7 @@ async fn drive_s1_rejection_daemon(
             call_mode: None,
         })
         .unwrap();
-        aft::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(root.clone()));
+        bind["identity"]["project_root"] = serde_json::json!(root.clone());
 
         bind
     };
@@ -4334,7 +4334,7 @@ async fn drive_readiness_daemon(
             call_mode: None,
         })
         .unwrap();
-        aft::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(root.clone()));
+        bind["identity"]["project_root"] = serde_json::json!(root.clone());
 
         bind
     };
@@ -11591,7 +11591,7 @@ async fn send_route_bind_with_elicitation_capability(
             call_mode: None,
         })
         .unwrap();
-        aft::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(root.to_path_buf()));
+        bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
 
         bind
     };
@@ -12681,7 +12681,7 @@ async fn drive_malformed_fed_harness_bind_production_daemon(
             call_mode: None,
         })
         .unwrap();
-        aft::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(root));
+        bind["identity"]["project_root"] = serde_json::json!(root);
 
         bind
     };
@@ -14404,10 +14404,7 @@ async fn send_management_route_bind_with_harness(
             call_mode: None,
         })
         .unwrap();
-        aft::subc::stamp_bind_workdir_for_test(
-            &mut bind,
-            serde_json::json!(identity_root.to_path_buf()),
-        );
+        bind["identity"]["project_root"] = serde_json::json!(identity_root.to_path_buf());
 
         bind
     })
@@ -14613,7 +14610,7 @@ async fn send_route_bind_with_harness_session_principal_and_doc_epoch(
             call_mode: None,
         })
         .unwrap();
-        aft::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(root.to_path_buf()));
+        bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
 
         bind
     };

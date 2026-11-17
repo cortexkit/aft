@@ -146,9 +146,9 @@ impl Daemon {
             role_versions: None,
             call_mode: None,
         };
-        // The provider gets its project only from the admitted scope workdir.
+        // Keep the legacy root-bearing route while using the project-free SDK.
         let mut bind = serde_json::to_value(bind).unwrap();
-        aft::subc::stamp_bind_workdir_for_test(&mut bind, json!(root));
+        bind["identity"]["project_root"] = json!(root);
         write_frame(
             &mut stream,
             &Frame::build(
