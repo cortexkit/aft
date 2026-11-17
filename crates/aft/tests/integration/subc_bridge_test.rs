@@ -39,6 +39,9 @@ use tokio::sync::mpsc;
 
 use super::helpers::ReleaseOnDrop;
 
+mod bash_scope_goodbye;
+use bash_scope_goodbye::drive_bash_elicitation_goodbye_daemon;
+
 mod management_surface;
 use management_surface::drive_management_surface_daemon;
 
@@ -2937,9 +2940,9 @@ fn subc_bridge_untrusted_bash_elicitation_ttl_denies_and_settles() {
 }
 
 #[test]
-fn subc_bridge_untrusted_bash_elicitation_goodbye_sweeps_pending() {
+fn subc_bridge_scoped_goodbye_holds_bash_until_confirmed_scope_end() {
     run_subc_bridge_test(
-        "subc_bridge_untrusted_bash_elicitation_goodbye_sweeps_pending",
+        "subc_bridge_scoped_goodbye_holds_bash_until_confirmed_scope_end",
         Duration::from_secs(45),
         drive_bash_elicitation_goodbye_daemon,
         |_, _, _| {},
@@ -12051,35 +12054,6 @@ async fn drive_bash_elicitation_ttl_daemon(input: FakeDaemonInput) {
     )
     .await;
     assert!(!touched.exists(), "late allow after TTL must be ignored");
-
-    send_connection_goodbye(&mut stream).await;
-}
-
-async fn drive_bash_elicitation_goodbye_daemon(input: FakeDaemonInput) {
-    let FakeDaemonSession {
-        mut stream, root1, ..
-    } = open_fake_daemon_session(input).await;
-    bind_untrusted_elicitation_route(&mut stream, 1, 101, &root1).await;
-
-    let touched = root1.join("elicitation-goodbye.txt");
-    send_tool_call(
-        &mut stream,
-        1,
-        401,
-        "bash",
-        json!({ "command": touch_command(&touched), "compressed": false }),
-    )
-    .await;
-    let (_ask_corr, _) = expect_bash_elicitation_request(&mut stream, 1, "touch").await;
-    send_route_goodbye(&mut stream, 1, 402).await;
-    // The correlated denial is emitted by GOODBYE settlement. Its arrival
-    // before the 30-second outer hang catch proves the 60-second TTL was not
-    // used as the completion path without imposing a scheduler latency target.
-    let frame = read_frame_timeout(&mut stream, "goodbye swept bash response").await;
-    assert_eq!(frame.header.channel, 1);
-    assert_eq!(frame.header.corr, 401);
-    assert_untrusted_tool_error(&frame, "cannot run shell commands", "goodbye deny");
-    assert!(!touched.exists(), "GOODBYE-denied bash must not spawn");
 
     send_connection_goodbye(&mut stream).await;
 }
