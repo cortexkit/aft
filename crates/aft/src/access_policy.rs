@@ -1558,7 +1558,7 @@ mod tests {
         let policy = AccessPolicy::from_config(
             &Config::default(),
             &home.join(".local/share/cortexkit/aft"),
-            vec![home.clone()],
+            vec![home.join(".config/cortexkit")],
             &home,
         );
         for operation in [AccessOperation::Read, AccessOperation::Write] {
