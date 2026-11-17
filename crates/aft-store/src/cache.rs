@@ -493,8 +493,12 @@ mod tests {
         let cache = BlockCache::new(4 * MIN_SHARD_BLOCKS * BLOCK_LEN);
         assert_eq!(cache.shards.len(), 4);
         assert_eq!(
-            cache.shards.iter().map(|shard| shard.budget).sum::<usize>(),
-            cache.budget
+            cache
+                .shards
+                .iter()
+                .map(|shard| shard.budget.load(Ordering::Acquire))
+                .sum::<usize>(),
+            cache.budget.load(Ordering::Acquire)
         );
         let (closed, open) = (FileToken::next(), FileToken::next());
         let loads = 6 * MIN_SHARD_BLOCKS as u64;

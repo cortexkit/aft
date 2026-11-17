@@ -164,10 +164,16 @@ fn apply_allocator_decay(mode: MemoryMode) {
                 let default = tikv_jemalloc_ctl::raw::read::<isize>(default_key)?;
                 let value = mode.profile().decay_ms.unwrap_or(default);
                 tikv_jemalloc_ctl::raw::write(global_key, value)?;
-                // MALLCTL_ARENAS_ALL (4096 in jemalloc 5.3) updates every
-                // initialized arena; arenas.* above covers future arenas.
-                let key = format!("arena.4096.{arena_key}\0");
-                tikv_jemalloc_ctl::raw::write(key.as_bytes(), value)?;
+                // Unlike purge, per-arena decay controls do not accept the
+                // all-arenas index. Update initialized arenas individually;
+                // arenas.* above supplies the default for future arenas.
+                let arenas = tikv_jemalloc_ctl::raw::read::<u32>(b"arenas.narenas\0")?;
+                for arena in 0..arenas {
+                    let key = format!("arena.{arena}.{arena_key}\0");
+                    if tikv_jemalloc_ctl::raw::read::<isize>(key.as_bytes()).is_ok() {
+                        tikv_jemalloc_ctl::raw::write(key.as_bytes(), value)?;
+                    }
+                }
             }
         }
         Ok(())

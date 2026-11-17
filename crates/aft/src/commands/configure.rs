@@ -7676,7 +7676,7 @@ mod tests {
             &user,
             r#"{"indexes":{"trigram":true,"semantic":false,"callgraph":false},"url_fetch_allow_private":true}"#,
         );
-        write_config(&legacy, r#"{"callgraph_chunk_size":7}"#);
+        write_config(&legacy, r#"{"idle":{"checkout_hours":7}}"#);
         let snapshot = crate::subc_config::PreparedBindConfig::read(
             Some(&user),
             &root,
@@ -7699,7 +7699,7 @@ mod tests {
                 write_config(&user, r#"{"url_fetch_allow_private":false}"#);
                 write_config(
                     &root.join(".cortexkit/aft.jsonc"),
-                    r#"{"callgraph_chunk_size":9}"#,
+                    r#"{"idle":{"checkout_hours":9}}"#,
                 );
                 fs::remove_file(&legacy).unwrap();
                 lock.execute_batch("ROLLBACK").unwrap();
