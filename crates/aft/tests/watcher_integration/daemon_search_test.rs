@@ -191,7 +191,8 @@ impl Daemon {
                 1,
                 1,
                 self.corr,
-                serde_json::to_vec(&json!({"name":name,"arguments":arguments})).unwrap(),
+                serde_json::to_vec(&json!({"name":name,"preset":"head","arguments":arguments}))
+                    .unwrap(),
             )
             .unwrap(),
         )

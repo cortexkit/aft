@@ -1486,7 +1486,7 @@ async fn bind_route_on_channel(stream: &mut TcpStream, root: &Path, v1: bool, ch
 }
 
 async fn send_tool_call(stream: &mut TcpStream, corr: u64, name: &str, arguments: Value) {
-    let body = json!({ "name": name, "arguments": arguments });
+    let body = json!({ "name": name, "preset":"head", "arguments": arguments });
     send_frame(
         stream,
         Frame::build(

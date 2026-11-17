@@ -8303,8 +8303,8 @@ fn resolve_route_project_root(
         Some(root) if root.as_os_str() == "/" => Ok(None),
         Some(root) if root.is_absolute() => {
             let normalized = normalized_scope_workdir(root).unwrap_or_else(|| root.to_path_buf());
-            // The daemon uses / when an opener has no project. Aliases of that
-            // sentinel must not accidentally configure or index the filesystem.
+            // The filesystem root is not a project. Its aliases must not
+            // accidentally configure or index the whole filesystem.
             if normalized.as_os_str() == "/" {
                 Ok(None)
             } else {

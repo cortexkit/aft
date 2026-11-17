@@ -348,7 +348,7 @@ async fn tool_result_ast_search_t6_complete_and_budget_cut_on_negotiated_route()
     drop(configured);
     let mut replies = Vec::new();
     for (corr, file) in [(10, "small.js"), (11, "large.js")] {
-        let call = json!({"name":"ast_search", "arguments":{
+        let call = json!({"name":"ast_search", "preset":"head", "arguments":{
             "pattern":"console.log($X)", "lang":"javascript", "paths":[file]
         }});
         write_frame(
@@ -553,7 +553,8 @@ async fn tool_result_oversized_first_search_result_is_visible_saved_and_counted_
         serde_json::from_slice::<ModuleControlResponse>(&ack.body).unwrap(),
         ModuleControlResponse::RouteBindAck {}
     ));
-    let call = json!({"name":"search", "arguments":{"query":"oversized first result"}});
+    let call =
+        json!({"name":"search", "preset":"head", "arguments":{"query":"oversized first result"}});
     write_frame(
         &mut daemon,
         &Frame::build(
@@ -610,7 +611,8 @@ async fn tool_result_oversized_first_search_result_is_visible_saved_and_counted_
         "saved first result is incomplete"
     );
     assert_eq!(cut, format!("[output cut at 50 KB of {:.1} KB; full result saved to {path}; read it with read and a line range]", full.len() as f64 / 1024.0));
-    let read = json!({"name":"read","arguments":{"path":path,"startLine":1,"endLine":1}});
+    let read =
+        json!({"name":"read","preset":"head","arguments":{"path":path,"startLine":1,"endLine":1}});
     write_frame(
         &mut daemon,
         &Frame::build(
@@ -913,7 +915,7 @@ async fn tool_result_capability_is_selected_per_bind_not_per_call() {
         ));
         // Both calls on a route must agree, even when a call claims the opposite capability.
         for spoof in [false, true] {
-            let call = json!({"name":"read", "arguments":{"path":"missing.txt"}, "consumer_capabilities": if spoof { vec![result_body::RESULT_FORMAT] } else { vec![] }});
+            let call = json!({"name":"read", "preset":"head", "arguments":{"path":"missing.txt"}, "consumer_capabilities": if spoof { vec![result_body::RESULT_FORMAT] } else { vec![] }});
             write_frame(
                 &mut daemon,
                 &Frame::build(
@@ -1091,7 +1093,10 @@ async fn tool_result_non_negotiating_routes_keep_legacy_success_and_error_bytes(
                     channel,
                     1,
                     corr,
-                    serde_json::to_vec(&json!({"name":"read", "arguments":{"path":path}})).unwrap(),
+                    serde_json::to_vec(
+                        &json!({"name":"read", "preset":"head", "arguments":{"path":path}}),
+                    )
+                    .unwrap(),
                 )
                 .unwrap(),
             )

@@ -81,7 +81,9 @@ async fn pipeline(stream: TcpStream) {
                 bind
             })
             .unwrap(),
-            "tool" => json!({"name":command["name"], "arguments":command["arguments"]}),
+            "tool" => {
+                json!({"preset":"head","name":command["name"], "arguments":command["arguments"]})
+            }
             "health" => serde_json::to_value(ModuleControlRequest::HealthCheck {}).unwrap(),
             other => panic!("unsupported pipelined operation {other}"),
         };
@@ -248,7 +250,7 @@ async fn main() {
             for request in command["requests"].as_array().expect("batch requests") {
                 corr = request["corr"].as_u64().unwrap_or(corr + 1);
                 let channel = request["channel"].as_u64().unwrap_or(1) as u16;
-                let body = json!({"name":request["name"], "arguments":request["arguments"]});
+                let body = json!({"preset":"head","name":request["name"], "arguments":request["arguments"]});
                 pending.insert(corr, (request["id"].clone(), Instant::now()));
                 write_frame(
                     &mut stream,
@@ -310,7 +312,9 @@ async fn main() {
             })
             .unwrap(),
             "health" => serde_json::to_value(ModuleControlRequest::HealthCheck {}).unwrap(),
-            "tool" => json!({"name":command["name"],"arguments":command["arguments"]}),
+            "tool" => {
+                json!({"preset":"head","name":command["name"],"arguments":command["arguments"]})
+            }
             "unbind" => {
                 write_frame(
                     &mut stream,
