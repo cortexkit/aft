@@ -1508,6 +1508,35 @@ mod tests {
             )
             .unwrap()
         ));
+        let counterpart = tokio::time::timeout(Duration::from_secs(5), frames.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let body: Value = serde_json::from_slice(&counterpart.body).unwrap();
+        assert_eq!(
+            body["owner"],
+            json!({"kind":"reserved","module_id":"prefrontal"})
+        );
+        assert_eq!(body["ref"], "head");
+        let absent = ModuleControlResponseToModule::ScopeDescribe {
+            status: subc_protocol::scope::ScopeStatus::NotLive,
+            scope_epoch: None,
+            daemon_incarnation: "test-daemon".into(),
+            owner_synced: false,
+            owner_configured: false,
+            scope: None,
+        };
+        assert!(pending.resolve(
+            Frame::build(
+                FrameType::Response,
+                control_flags(),
+                0,
+                0,
+                counterpart.header.corr,
+                serde_json::to_vec(&absent).unwrap(),
+            )
+            .unwrap()
+        ));
         tokio::time::timeout(Duration::from_secs(5), ended.recv())
             .await
             .unwrap()
