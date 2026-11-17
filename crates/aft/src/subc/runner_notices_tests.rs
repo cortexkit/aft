@@ -3003,6 +3003,117 @@ fn runner_notices_wire_params_have_no_model_or_plan() {
 }
 
 #[test]
+fn runner_notices_capability_probe_avoids_readers_plan_and_caches_before_route_open() {
+    let session = "head-with-readers-capability-probe";
+    let capture = test_endpoint::capture(session, false);
+    capture.probe_incarnation("daemon-1", 1);
+    capture.delivery_order(Some(true));
+    capture.send_status(true);
+    capture.cleared(true);
+    let address = notice_route(session).address.unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("connection.json");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        // The fake head plan permits AFT to send, but its readers exclude AFT.
+        let consumer = CapabilityConsumer::connect(&path, &address).await.unwrap();
+        let incarnation = consumer.incarnation(&address.module).await.unwrap();
+        assert_eq!(
+            consumer.describe(&address, &incarnation).await,
+            Err(("describe", Some("read_access_refused".into())))
+        );
+        consumer.close().await;
+        assert_eq!(capture.receiver.try_recv().unwrap().session, session);
+        for capability in [
+            "delivery_order",
+            "send_status",
+            "delivery_order_modes:turn_system_cleared",
+        ] {
+            assert_eq!(
+                runner_capability(&path, &address, capability).await,
+                Some(true)
+            );
+            let described = capture.receiver.try_recv().unwrap();
+            assert_eq!(described.session, "aft:runner-capability-probe");
+            assert_eq!(described.harness, "broca");
+            assert_eq!(described.scope, None);
+            assert_eq!(
+                described.request,
+                json!({"method":"role.describe", "params":{}})
+            );
+            let routes = capture.probe_routes();
+            assert_eq!(
+                runner_capability(&path, &address, capability).await,
+                Some(true)
+            );
+            assert_eq!(
+                capture.probe_routes(),
+                routes,
+                "cache hit must not open a route"
+            );
+            assert!(capture.receiver.try_recv().is_err());
+        }
+        assert_eq!(capture.probe_routes(), 4);
+        let notice = request(
+            format!("aft:bash:{session}"),
+            "completion".into(),
+            true,
+            false,
+        );
+        assert!(matches!(
+            send(&path, &address, &notice, true).await,
+            Outcome::Accepted
+        ));
+        let sent = capture.receiver.try_recv().unwrap();
+        assert_eq!(sent.session, session);
+        assert_eq!(sent.request["method"], "session.send");
+        assert!(matches!(
+            check_send(&path, &address, &notice, true).await,
+            Outcome::Accepted
+        ));
+        let checked = capture.receiver.try_recv().unwrap();
+        assert_eq!(checked.session, session);
+        assert_eq!(checked.request["method"], "session.send_status");
+        assert_eq!(capture.probe_routes(), 4);
+        capture.delivery_order(Some(false));
+        assert_eq!(runner_delivery_order(&path, &address).await, Some(true));
+        assert_eq!(capture.probe_routes(), 4);
+        capture.probe_incarnation("daemon-1", 2);
+        assert_eq!(runner_delivery_order(&path, &address).await, Some(false));
+        assert_eq!(capture.probe_routes(), 5);
+        capture.delivery_order(Some(true));
+        capture.probe_incarnation("daemon-2", 2);
+        assert_eq!(runner_delivery_order(&path, &address).await, Some(true));
+        assert_eq!(capture.probe_routes(), 6);
+    });
+}
+
+#[test]
+fn runner_notices_capability_probe_failure_is_unknown_and_not_cached() {
+    let session = "head-with-unavailable-capability-probe";
+    let capture = test_endpoint::capture(session, false);
+    capture.probe_incarnation("daemon-1", 1);
+    let address = notice_route(session).address.unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("connection.json");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        assert_eq!(runner_delivery_order(&path, &address).await, None);
+        assert_eq!(capture.probe_routes(), 1);
+        capture.delivery_order(Some(true));
+        assert_eq!(runner_delivery_order(&path, &address).await, Some(true));
+        assert_eq!(capture.probe_routes(), 2);
+        assert_eq!(capture.effects.load(Ordering::Relaxed), 0);
+    });
+}
+
+#[test]
 fn runner_notices_delivery_order_capability_cache_is_incarnation_scoped() {
     let mut cache = RunnerCapabilities::default();
     let first = RunnerIncarnation {
