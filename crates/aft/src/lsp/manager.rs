@@ -2526,7 +2526,13 @@ impl LspManager {
         key: &ServerKey,
         failure: StartFailure,
     ) -> ServerAttemptResult {
-        log_spawn_failure(def, key, &failure.error, self.retry_clock.now());
+        log_spawn_failure(
+            def,
+            key,
+            &failure.error,
+            failure.durability,
+            self.retry_clock.now(),
+        );
         let sdk_unavailable = matches!(failure.error, LspError::TypeScriptSdkUnavailable(_));
         let result = classify_spawn_error(&def.binary, &failure.error);
         // Remember executable failures so subsequent file events skip this
@@ -10633,7 +10639,13 @@ fn process_start_durability(error: &LspError) -> FailureDurability {
     }
 }
 
-fn log_spawn_failure(def: &ServerDef, key: &ServerKey, error: &LspError, now: Instant) {
+fn log_spawn_failure(
+    def: &ServerDef,
+    key: &ServerKey,
+    error: &LspError,
+    durability: FailureDurability,
+    now: Instant,
+) {
     let capacity = match error {
         LspError::Io(io) => io
             .get_ref()
@@ -10659,9 +10671,26 @@ fn log_spawn_failure(def: &ServerDef, key: &ServerKey, error: &LspError, now: In
             capacity.cap,
             capacity.current
         );
+    } else if durability == FailureDurability::Environment
+        || (durability == FailureDurability::Permanent
+            && typescript_sdk_error(&error.to_string(), ""))
+    {
+        slog_warn!(
+            "language server not started (project environment): {}: {}",
+            def.name,
+            error
+        );
     } else {
         slog_error!("failed to spawn {}: {}", def.name, error);
     }
+}
+
+fn typescript_sdk_error(reason: &str, stderr_tail: &str) -> bool {
+    use super::environmental::{TS_LS5_NO_INSTALLATION, TS_LS6_NO_TSSERVER};
+
+    [reason, stderr_tail]
+        .iter()
+        .any(|text| text.contains(TS_LS5_NO_INSTALLATION) || text.contains(TS_LS6_NO_TSSERVER))
 }
 
 /// Classify a server that died or failed during or after `initialize` from
@@ -10671,14 +10700,9 @@ fn log_spawn_failure(def: &ServerDef, key: &ServerKey, error: &LspError, now: In
 /// Anything else is transient: wrongly calling a failure permanent leaves
 /// the server off for the whole session while a needless retry costs seconds.
 fn exit_durability(reason: &str, stderr_tail: &str) -> FailureDurability {
-    use super::environmental::{TS_LS5_NO_INSTALLATION, TS_LS6_NO_TSSERVER};
-
-    let names_typescript_sdk_error = [reason, stderr_tail]
-        .iter()
-        .any(|text| text.contains(TS_LS5_NO_INSTALLATION) || text.contains(TS_LS6_NO_TSSERVER));
     if stderr_tail.starts_with("mise ERROR ") || rustup_component_unavailable(stderr_tail) {
         FailureDurability::Environment
-    } else if names_typescript_sdk_error {
+    } else if typescript_sdk_error(reason, stderr_tail) {
         FailureDurability::Permanent
     } else {
         FailureDurability::Transient
@@ -11528,6 +11552,43 @@ mod transient_retry_tests {
         assert_eq!(format_retry_delay(Duration::from_secs(45)), "45s");
         assert_eq!(format_retry_delay(Duration::from_secs(120)), "2m");
         assert_eq!(format_retry_delay(Duration::from_secs(270)), "4m 30s");
+    }
+
+    #[test]
+    fn spawn_failure_logs_project_environment_gaps_at_warn() {
+        let key = key();
+        let def = crate::lsp::registry::builtin_servers()
+            .into_iter()
+            .find(|def| def.kind == key.kind)
+            .unwrap();
+        let mut manager = LspManager::new();
+        let cases = [
+            ("mise ERROR error parsing config file: mise.toml", "WARN"),
+            (
+                "error: Unknown binary 'rust-analyzer' in official toolchain 'stable-x86_64'",
+                "WARN",
+            ),
+            ("Could not find a valid TypeScript installation", "WARN"),
+            ("provides no tsserver.js", "WARN"),
+            ("fatal: unrelated crash", "ERROR"),
+        ];
+        for (stderr, level) in cases {
+            let reason = format!("server crashed during initialize (exit 1: {stderr})");
+            let durability = exit_durability(&reason, stderr);
+            let error = LspError::ServerNotReady(reason);
+            let shown = error.to_string();
+            let (_, lines) = crate::logging::capture_log_lines(|| {
+                manager.record_file_start_failure(&def, &key, StartFailure { error, durability });
+            });
+            let startup_lines: Vec<_> = lines.iter().filter(|line| line.contains(&shown)).collect();
+            assert_eq!(startup_lines.len(), 1, "{stderr}: {lines:?}");
+            let line = startup_lines[0];
+            assert!(line.starts_with(&format!("{level} ")), "{lines:?}");
+            assert!(line.contains(&def.name), "{lines:?}");
+            if level == "WARN" {
+                assert!(line.contains("project environment"), "{lines:?}");
+            }
+        }
     }
 
     #[test]
