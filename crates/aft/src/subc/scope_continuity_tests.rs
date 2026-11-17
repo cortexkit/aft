@@ -231,6 +231,60 @@ async fn prefrontal_scope_watch_holds_unsynced_counterpart_then_continues() {
 }
 
 #[tokio::test]
+async fn prefrontal_scope_held_duplicate_end_still_checks_continuity_before_dedupe() {
+    let old = named("prefrontal-core");
+    let new = named("prefrontal");
+    let mut f = Fixture::new(&old).await;
+    f.opened(&old).await;
+    f.handle.observed.send(old.clone()).unwrap();
+    f.reply(&old, described(ScopeStatus::Ended, true, true))
+        .await;
+    f.reply(&new, described(ScopeStatus::NotLive, true, false))
+        .await;
+    turns().await;
+    assert_eq!(f.status(), BgTaskStatus::Running);
+    assert!(!f
+        .handle
+        .completed
+        .lock()
+        .unwrap()
+        .contains(&stamp_key(&old)));
+    f.handle.observed.send(old.clone()).unwrap();
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(2), f.frames.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if frame.header.ty == FrameType::Cancel {
+            continue;
+        }
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        if body["op"] == "scope.watch" {
+            snapshot(&f.pending, &frame);
+            continue;
+        }
+        assert_eq!(body["op"], "scope.describe");
+        assert_eq!(body["owner"], serde_json::to_value(&old.owner).unwrap());
+        response(
+            &f.pending,
+            &frame,
+            described(ScopeStatus::Ended, true, true),
+        );
+        break;
+    }
+    f.reply(&new, described(ScopeStatus::Live, true, true))
+        .await;
+    f.rehomed(&new).await;
+    assert!(!f
+        .handle
+        .completed
+        .lock()
+        .unwrap()
+        .contains(&stamp_key(&old)));
+    assert!(f.ended.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn prefrontal_scope_watch_end_before_window_still_kills() {
     let old = named("prefrontal-core");
     let new = named("prefrontal");

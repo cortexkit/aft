@@ -35,12 +35,15 @@ use subc_protocol::{BindIdentity, RouteTarget};
 pub(crate) mod manifest_sync;
 mod manifest_wire;
 mod native_guard;
+mod prefrontal_route;
 pub(crate) mod read_contract;
 mod rename_guard;
 mod ticket_repository;
 mod v22_rows;
 mod v23_queue;
 mod worker_reads;
+
+use prefrontal_route::select_route_holder;
 
 use v22_rows::{
     canonicalize_pr_edit_from, canonicalize_review_thread, canonicalize_v22_api_from,
@@ -3407,28 +3410,6 @@ fn route_holder(entries: &[subc_client_rs::CatalogEntry]) -> RouteHolder {
             })
             .then(|| entry.module_id.clone())
     }))
-}
-
-fn select_route_holder(advertisers: impl IntoIterator<Item = String>) -> RouteHolder {
-    let mut holders = Vec::new();
-    let mut unexpected_advertisers = BTreeSet::new();
-    for advertiser in advertisers {
-        // Governed routes carry identity-bearing writes, so only prefrontal may
-        // hold `gh.route`; another module advertising it must not capture the route.
-        // The holder module identifies the routing server, not the bound agent. Using
-        // its module ID would merge all agents into one audit and rate-accounting session.
-        if crate::prefrontal::is_module(&advertiser) {
-            holders.push(advertiser);
-        } else {
-            unexpected_advertisers.insert(advertiser);
-        }
-    }
-    RouteHolder {
-        module_id: (!holders.is_empty()).then(|| {
-            crate::prefrontal::catalog_module(holders.iter().map(String::as_str)).to_string()
-        }),
-        unexpected_advertisers: unexpected_advertisers.into_iter().collect(),
-    }
 }
 
 fn project_root_for(cwd: &Path) -> PathBuf {

@@ -562,6 +562,9 @@ where
                     } }
                 }
                 Some(Ok((key, notice)))=fanout.join_next(), if !fanout.is_empty()=>{
+                    // Only finished cleanup is deduplicated. Scopes waiting for
+                    // prefrontal's other owner to sync, or continuing under it,
+                    // have no completed end to record.
                     completed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key.clone());
                     cleanup_keys.remove(&key);
                     if let Some(notice) = notice { let _=ended.send(notice); }
