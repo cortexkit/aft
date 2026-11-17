@@ -745,17 +745,15 @@ pub fn detect_language_any(path: &Path, dynamic_languages: bool) -> Option<LangI
     detect_language(path).or_else(|| dynamic_language_for_extension(path, dynamic_languages))
 }
 
-test_support_visibility! {
 /// Whether `path` is a Luau file, decided from its name alone. It gives the
 /// same answer as `detect_language_any(..) == Some(LangId::Luau)` but never
 /// opens the file: `detect_language` reads and parses every `.h` header to
 /// choose between C, C++ and Objective-C, and a header is never Luau. Callers
 /// that test every path of a checkout must use this one; with the header
 /// reads, a Linux kernel cold build spent over a minute on one thread here.
-pub(crate) fn is_luau_path(path: &Path, dynamic_languages: bool) -> bool {
+pub fn is_luau_path(path: &Path, dynamic_languages: bool) -> bool {
     language_for_extension(path).is_none()
         && dynamic_language_for_extension(path, dynamic_languages) == Some(LangId::Luau)
-}
 }
 
 fn dynamic_language_for_extension(path: &Path, dynamic_languages: bool) -> Option<LangId> {
