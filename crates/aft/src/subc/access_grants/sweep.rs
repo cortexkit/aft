@@ -58,7 +58,7 @@ where
     tick_unwatched(db, cursor, describe, |_| false, |_| false).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(in crate::subc) async fn tick_covered<F, Fut>(
     db: Db,
     covered: &super::super::scope_watch::Coverage,

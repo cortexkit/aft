@@ -190,7 +190,7 @@ async fn saved_grant_sweep_live_table_shape_describe_counts() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let (dir, db) = fixture();
     let mut covered = Coverage::default();
-    for (index, count) in [2, 2, 2, 2, 2].into_iter().enumerate() {
+    for (index, count) in [3, 4, 1, 1, 1].into_iter().enumerate() {
         for grant in 0..count {
             let key = save(
                 &db,
@@ -204,10 +204,15 @@ async fn saved_grant_sweep_live_table_shape_describe_counts() {
         }
     }
     assert_eq!(listed(&db)["grants"].as_array().unwrap().len(), 10);
-    for (coverage, expected) in [(covered, 0), (Coverage::default(), 5)] {
+    for (coverage, expected) in [
+        (covered, vec![0, 0, 0]),
+        (Coverage::default(), vec![4, 1, 0]),
+    ] {
         let calls = AtomicUsize::new(0);
         let mut cursor = None;
+        let mut per_tick = Vec::new();
         loop {
+            let before = calls.load(Ordering::Relaxed);
             tick_unwatched(
                 db.clone(),
                 &mut cursor,
@@ -219,11 +224,12 @@ async fn saved_grant_sweep_live_table_shape_describe_counts() {
                 |_| false,
             )
             .await;
+            per_tick.push(calls.load(Ordering::Relaxed) - before);
             if cursor.is_none() {
                 break;
             }
         }
-        assert_eq!(calls.load(Ordering::Relaxed), expected);
+        assert_eq!(per_tick, expected);
     }
 }
 
