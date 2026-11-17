@@ -8234,7 +8234,6 @@ async fn consent_worker_glob_suggests_existing_checkout_path_without_asking() {
 
 #[path = "consent_suffix_tests.rs"]
 mod suffix;
-#[cfg(unix)]
 use suffix::{build_suffix_inventory, suffix_fixture, worker_suffix_file};
 
 #[cfg(unix)]
