@@ -16,6 +16,7 @@ import {
   isBridgeTransportTimeout,
 } from "../bridge.js";
 import {
+  AftModuleUnavailableError,
   AftToolError,
   adaptToolError,
   BASH_FRAME_READ_TIMEOUT_DISPOSITION,
@@ -42,6 +43,31 @@ import {
   SubcRouteClosedMidCallError,
   SubcTransportShuttingDownError,
 } from "../subc-transport.js";
+
+test("released Location and other unavailable errors retain exact distinct guidance", () => {
+  const released = new BridgeTransportUnavailableError(
+    "AFT bridge Location lease has already been released",
+  );
+  const unavailable = new BridgeTransportUnavailableError("Bridge is shutting down");
+  for (const [cause, expected] of [
+    [
+      released,
+      "AFT's plugin reloaded while this call was waiting, so the call was not sent. Nothing was started; it is safe to retry now.",
+    ],
+    [
+      unavailable,
+      "The AFT module connection is down or unavailable; this AFT-backed option has no host fallback. Nothing was started, so it is safe to retry after the connection is restored.",
+    ],
+  ] as const) {
+    const adapted = adaptToolError("edit", cause);
+    expect(adapted).toBeInstanceOf(AftModuleUnavailableError);
+    const typed = adapted as AftModuleUnavailableError;
+    expect(typed.message).toBe(expected);
+    expect(typed.code).toBe("aft_module_unavailable");
+    expect(typed.kind).toBe("not_sent");
+    expect(typed.cause).toBe(cause);
+  }
+});
 
 test("toolErrorFromResponse preserves unsafe_temp_path and its exact refusal message", () => {
   const response = {
