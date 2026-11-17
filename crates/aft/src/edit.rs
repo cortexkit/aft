@@ -1503,11 +1503,11 @@ impl DiffBudget {
         self.render_diff(file, before == after, &construct_diff(before, after))
     }
 
-    fn render_diff(
+    fn render_diff<'a>(
         &mut self,
         file: &str,
         unchanged: bool,
-        diff: &similar::TextDiff<'_, '_, '_, str>,
+        diff: &'a similar::TextDiff<'a, 'a, 'a, str>,
     ) -> Option<String> {
         use std::fmt::Write;
         if self.omitted {

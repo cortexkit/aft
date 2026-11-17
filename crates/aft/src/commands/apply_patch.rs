@@ -1485,7 +1485,7 @@ mod tests {
                 after: String::new(),
                 delete_lines: Some(1),
             }];
-            let (_, files) = metadata_files(&applied, Some(&root), &HashMap::new());
+            let (_, files, _) = metadata_files(&applied, Some(&root), &HashMap::new());
             assert_eq!(files.len(), 1);
             assert_eq!(files[0]["filePath"], path_string(&file_path));
             assert_eq!(files[0]["relativePath"], rel, "metadata for {rel}");
@@ -1517,7 +1517,7 @@ mod tests {
             })
             .collect();
         edit::A03_DIFF_CONSTRUCTIONS.with(|count| count.set(0));
-        let (diff, files) = metadata_files(&applied, None, &HashMap::new());
+        let (diff, files, _) = metadata_files(&applied, None, &HashMap::new());
         assert_eq!(
             files,
             vec![
