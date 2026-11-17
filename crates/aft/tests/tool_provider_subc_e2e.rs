@@ -914,9 +914,30 @@ async fn tool_provider_subc_e2e_scope_without_workdir_uses_filled_legacy_root() 
 }
 
 #[cfg(all(target_os = "linux", feature = "test-scope-owner"))]
+fn notice_fixture_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+#[cfg(all(target_os = "linux", feature = "test-scope-owner"))]
+fn assert_ordered_completion_expiry(params: &Value, fixture_started_at: u64) {
+    let expires_at = params["expires_at_ms"]
+        .as_u64()
+        .expect("ordered completion expiry");
+    assert!(
+        (fixture_started_at + 86_400_000..=notice_fixture_now_ms() + 86_400_000)
+            .contains(&expires_at),
+        "a newly completed fixture task expires 24 hours after it finished: {params}"
+    );
+}
+
+#[cfg(all(target_os = "linux", feature = "test-scope-owner"))]
 #[tokio::test]
 #[ignore = "opt-in real-daemon runner transport; Linux only, needs test-scope-owner"]
 async fn runner_notice_real_daemon_scoped_carrier_authority() {
+    let fixture_started_at = notice_fixture_now_ms();
     let (_temp, home, _project) = hermetic_home();
     let config_path = home.join("config/cortexkit/subc.jsonc");
     let mut config: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
@@ -975,7 +996,7 @@ async fn runner_notice_real_daemon_scoped_carrier_authority() {
     assert_eq!(body["params"]["send_id"], "aft:bash:notice-allowed");
     assert_eq!(body["params"]["notice"], true);
     assert_eq!(body["params"]["dedupe_key"], "aft:bash-task:notice-allowed");
-    assert!(body["params"].get("expires_at_ms").is_none());
+    assert_ordered_completion_expiry(&body["params"], fixture_started_at);
     let log = std::fs::read_to_string(home.join("runner-transport.log")).unwrap();
     let refusals: Vec<_> = log
         .lines()
@@ -1000,6 +1021,7 @@ async fn runner_notice_real_daemon_scoped_carrier_authority() {
 #[tokio::test]
 #[ignore = "opt-in real-daemon runner transport; Linux only, needs test-scope-owner"]
 async fn runner_notice_real_daemon_recovers_concrete_harnesses_without_model() {
+    let fixture_started_at = notice_fixture_now_ms();
     let (_temp, home, _project) = hermetic_home();
     let config_path = home.join("config/cortexkit/subc.jsonc");
     let mut config: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
@@ -1068,13 +1090,15 @@ async fn runner_notice_real_daemon_recovers_concrete_harnesses_without_model() {
                 "send_id",
                 "notice",
                 "delivery",
-                "dedupe_key"
+                "dedupe_key",
+                "expires_at_ms"
             ])
         );
         assert_eq!(
             record["request"]["params"]["dedupe_key"],
             format!("aft:bash-task:{task}")
         );
+        assert_ordered_completion_expiry(&record["request"]["params"], fixture_started_at);
         let delivered = format!("INFO runner notice aft:bash:{task} delivered to {module} harness={harness} session={task}");
         assert_eq!(
             log.lines().filter(|line| *line == delivered).count(),
