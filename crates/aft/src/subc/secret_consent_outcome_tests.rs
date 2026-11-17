@@ -43,12 +43,14 @@ async fn exact_line(scope_ref: &str, outcome: ConsentOutcome, expected: &str) {
         coordinator.status().is_empty(),
         "terminal outcomes clear the approval status"
     );
-    assert_eq!(
-        coordinator
-            .activity()
-            .load(std::sync::atomic::Ordering::Acquire),
-        0
-    );
+    {
+        let (waiting, completed_at) = coordinator.activity().snapshot();
+        assert!(!waiting);
+        assert!(
+            completed_at.is_some(),
+            "approval completion must refresh socket activity"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

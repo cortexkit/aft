@@ -282,6 +282,7 @@ async fn prepare_and_send(
                             let connection = connect_upstream(authority, state, ws)
                                 .await
                                 .map_err(|_| crate::secret::requests::UseError::Unavailable)?;
+                            state.approvals.activity().record_activity();
                             reconnected.lock().await.push(connection);
                             Ok(())
                         },

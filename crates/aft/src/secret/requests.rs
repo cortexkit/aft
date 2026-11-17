@@ -7,7 +7,7 @@ use super::{
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -63,6 +63,44 @@ pub(crate) fn consent_failure_message(label: &str, host: &str, reason: UseError)
     }
 }
 
+/// Shared progress for sockets whose idle budget excludes approval waits.
+#[derive(Default)]
+pub(crate) struct RequestActivity {
+    waiting: AtomicUsize,
+    last_activity: Mutex<Option<tokio::time::Instant>>,
+}
+impl RequestActivity {
+    pub(crate) fn begin_wait(&self) {
+        self.waiting.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn finish_wait(&self) {
+        // Publish progress before the count can reach zero, so a socket never
+        // resumes against the deadline from before the approval completed.
+        self.record_activity();
+        self.waiting.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn record_activity(&self) {
+        let mut last = self
+            .last_activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *last = Some(tokio::time::Instant::now());
+    }
+
+    pub(crate) fn snapshot(&self) -> (bool, Option<tokio::time::Instant>) {
+        // Read the count first: observing the last waiter leave also observes
+        // its previously published completion timestamp.
+        let waiting = self.waiting.load(Ordering::Acquire) != 0;
+        let last = *self
+            .last_activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (waiting, last)
+    }
+}
+
 pub(crate) struct RequestSecrets {
     vault: Arc<dyn SecretVault>,
     scope: SecretScope,
@@ -70,7 +108,7 @@ pub(crate) struct RequestSecrets {
     status: Mutex<BTreeMap<u64, Vec<String>>>,
     sequence: AtomicU64,
     clock: Arc<dyn ApprovalClock>,
-    active: Arc<std::sync::atomic::AtomicUsize>,
+    activity: Arc<RequestActivity>,
     once: Mutex<BTreeMap<String, bool>>,
     request_cancelled: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
@@ -85,7 +123,7 @@ impl Drop for Waiting<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.sequence);
-        self.owner.active.fetch_sub(1, Ordering::AcqRel);
+        self.owner.activity.finish_wait();
     }
 }
 impl RequestSecrets {
@@ -101,7 +139,7 @@ impl RequestSecrets {
             status: Mutex::default(),
             sequence: AtomicU64::new(1),
             clock: Arc::new(WallClock),
-            active: Arc::default(),
+            activity: Arc::default(),
             once: Mutex::default(),
             request_cancelled: None,
         }
@@ -133,8 +171,8 @@ impl RequestSecrets {
             .cloned()
             .collect()
     }
-    pub(crate) fn activity(&self) -> Arc<std::sync::atomic::AtomicUsize> {
-        self.active.clone()
+    pub(crate) fn activity(&self) -> Arc<RequestActivity> {
+        self.activity.clone()
     }
     #[cfg(test)]
     pub(crate) fn with_clock(mut self, clock: Option<Arc<dyn ApprovalClock>>) -> Self {
@@ -193,7 +231,7 @@ impl RequestSecrets {
             return Err(UseError::Unavailable);
         };
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
-        self.active.fetch_add(1, Ordering::AcqRel);
+        self.activity.begin_wait();
         // Drop also runs when a client cancels, the command stops, or another
         // label refuses; none of those paths may leave a waiting status behind.
         let _waiting = Waiting {
