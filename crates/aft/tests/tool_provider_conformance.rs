@@ -1532,21 +1532,9 @@ async fn s1_keyed_replay_headers_bytes_expiry_and_keyless_legacy_exclusion() {
         call_key: "replay".into(),
     };
     let row = ledger::get(&conn, &key).unwrap().unwrap();
-    assert_eq!(
-        row.scope,
-        Some(ledger::ScopeIdentity {
-            owner: "direct".into(),
-            scope_ref: "conformance-session".into(),
-            scope_epoch: 1,
-        })
-    );
+    assert!(row.scope.is_none());
+    assert!(row.late_entry.is_none());
     assert_eq!(row.frame.unwrap().body, first.body);
-    // Projectful routes now carry a scope. Seed an old unscoped stored row
-    // offline so the legacy expiry-by-deletion property remains covered.
-    conn.execute_batch("UPDATE call_ledger SET owner=NULL,scope_ref=NULL,scope_epoch=NULL,custodian=NULL,late_entry=NULL").unwrap();
-    let legacy_row = ledger::get(&conn, &key).unwrap().unwrap();
-    assert!(legacy_row.scope.is_none());
-    assert!(legacy_row.late_entry.is_none());
     conn.execute(
         "UPDATE call_ledger SET settled_at=?1",
         [ledger::now_ms() - ledger::RETENTION_MS],
@@ -1753,17 +1741,10 @@ async fn s1_keyed_write_during_migration_fails_closed_then_retries_exactly_once(
     let root = dir.path().join("module");
     let gate = DatabaseOpenGate::hold(&root);
     let process = Subject::head().spawn(&root).await.unwrap();
-    // The migration gate deliberately prevents policy/persistence readiness.
-    // Bind without the usual ready probe so the keyed write can test that gate.
-    let route = bind_route_declaring(
-        &process,
-        &root.join("project"),
-        "runner",
-        "conformance-session",
-        Some(BTreeMap::from([("tool-provider".into(), "v1".into())])),
-    )
-    .await
-    .unwrap();
+    let route = Subject::head()
+        .route(&process, &Subject::head().plain_stamp())
+        .await
+        .unwrap();
     gate.entered().await;
     let marker = root.join("project/keyed-write.txt");
     let body = json!({"name":"write","arguments":{"filePath":"keyed-write.txt","content":"first execution"},"call_key":"migration-write"});
@@ -4187,7 +4168,7 @@ async fn real_legacy_probe_wire_bytes_match_pre_flip_baselines() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn scope_oracle_uses_canonical_workdir_for_symlink_root() {
+async fn legacy_oracle_preserves_supplied_symlink_root() {
     let fixture = tempfile::tempdir().unwrap();
     let physical = fixture.path().join("physical-root");
     let supplied = fixture.path().join("supplied-root");
@@ -4214,13 +4195,11 @@ async fn assert_legacy_probe_wire_bytes_at(subject: Subject, root: &Path) {
     );
     let preset = subject.preset.unwrap_or("head");
     let process = subject.spawn(root).await.unwrap();
-    // Supplied-root spelling belonged to the retired unscoped bind root. A
-    // scope workdir uses the physical project spelling the daemon stamps.
-    let project = std::fs::canonicalize(subject.project.lock().unwrap().clone().unwrap()).unwrap();
+    let project = subject.project.lock().unwrap().clone().unwrap();
     assert_eq!(
         project,
-        std::fs::canonicalize(process.root.join("project")).unwrap(),
-        "the oracle must use the canonical scoped project"
+        process.root.join("project"),
+        "the oracle must use the exact project spelling sent on the route"
     );
     let route = subject
         .route(&process, &subject.plain_stamp())
