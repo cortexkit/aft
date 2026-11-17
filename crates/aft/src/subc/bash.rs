@@ -1326,7 +1326,7 @@ pub(super) fn finalized_bash_result(
     repeat: Option<crate::run_tool_call::RepeatObservation>,
 ) -> ToolCallResult {
     response.notices.route = format_context.runner_notice.clone();
-    crate::notice_templates::deliver(&mut response, None);
+    crate::subc::runner_notices::notice_templates::deliver(&mut response, None);
     if let Some(hint) = &format_context.bash_code_search_hint {
         let root = ctx.config().project_root.clone().unwrap_or_default();
         hint.deliver(&mut response, &root);

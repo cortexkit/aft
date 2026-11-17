@@ -80,7 +80,10 @@ fn notice_templates_rewritten_bash_sends_once_without_footers() {
                 json!({"tool":"read", "shell":"bash"})
             );
         }
-        crate::notice_templates::deliver(&mut result.response, Some(&mut result.text));
+        crate::subc::runner_notices::notice_templates::deliver(
+            &mut result.response,
+            Some(&mut result.text),
+        );
         assert!(capture.receiver.try_recv().is_err());
     }
 }
@@ -203,7 +206,7 @@ fn notice_templates_repeat_observations_send_typed_counts_without_appending() {
 #[test]
 fn notice_templates_refusal_falls_back_once_at_user_authority() {
     install(PathBuf::from("unused-test-notice-connection"));
-    use crate::notice_templates::{self as notices, Notice, Target};
+    use crate::subc::runner_notices::notice_templates::{self as notices, Notice, Target};
     for id in [
         notices::CODE_SEARCH,
         notices::PREFER_TOOL,
@@ -257,16 +260,15 @@ fn notice_templates_legacy_runner_keeps_plain_send() {
     capture.delivery_order(Some(false));
     let mut response = Response::success("notice-call", json!({"text":"body"}));
     response.notices.route = Some(notice_route("notice-legacy"));
-    response
-        .notices
-        .items
-        .push(crate::notice_templates::Notice::template(
-            crate::notice_templates::PREFER_TOOL,
+    response.notices.items.push(
+        crate::subc::runner_notices::notice_templates::Notice::template(
+            crate::subc::runner_notices::notice_templates::PREFER_TOOL,
             json!({"tool":"read", "shell":"bash"}),
             "Prefer `read` tool over bash.".into(),
-            crate::notice_templates::Target::Text,
-        ));
-    crate::notice_templates::deliver(&mut response, None);
+            crate::subc::runner_notices::notice_templates::Target::Text,
+        ),
+    );
+    crate::subc::runner_notices::notice_templates::deliver(&mut response, None);
     let sent = capture.receiver.try_recv().unwrap().request;
     assert_eq!(sent["params"]["prompt"], "Prefer `read` tool over bash.");
     for field in ["template", "delivery", "dedupe_key", "expires_at_ms"] {
@@ -284,19 +286,17 @@ fn notice_templates_fallback_and_later_notices_share_two_second_budget() {
     capture.refuse("invalid_params", Some("template"));
     capture.delay_reply(Duration::from_millis(1200));
     let route = notice_route("notice-shared-budget");
-    let notice = crate::notice_templates::Notice::template(
-        crate::notice_templates::PREFER_TOOL,
+    let notice = crate::subc::runner_notices::notice_templates::Notice::template(
+        crate::subc::runner_notices::notice_templates::PREFER_TOOL,
         json!({"tool":"read", "shell":"bash"}),
         "Prefer `read` tool over bash.".into(),
-        crate::notice_templates::Target::Text,
+        crate::subc::runner_notices::notice_templates::Target::Text,
     );
     let start = std::time::Instant::now();
     route.send(&notice);
-    route
-        .clone()
-        .send(&crate::notice_templates::Notice::diagnostic(
-            "diagnostic".into(),
-        ));
+    route.clone().send(
+        &crate::subc::runner_notices::notice_templates::Notice::diagnostic("diagnostic".into()),
+    );
     assert!((Duration::from_millis(1800)..Duration::from_secs(3)).contains(&start.elapsed()));
     assert_eq!(
         capture.receiver.try_recv().unwrap().request["params"]["template"]["id"],

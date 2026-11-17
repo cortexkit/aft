@@ -744,7 +744,7 @@ pub(crate) fn finish_tool_call_response(
     mut phase_trace: Option<&mut PhaseTrace>,
 ) -> ToolCallResult {
     response.notices.route = format_context.runner_notice.clone();
-    crate::notice_templates::deliver(&mut response, None);
+    crate::subc::runner_notices::notice_templates::deliver(&mut response, None);
     if surface_downgraded {
         attach_hashline_downgrade(&mut response);
     }
@@ -851,13 +851,13 @@ impl RepeatObservation {
                 self.bash_watch_available,
                 crate::response_finalize::repeat_breaker::escalation_starts_at(intervention.count),
             );
-            response.notices.items.push(crate::notice_templates::Notice::template(
-                if intervention.outputs_identical { crate::notice_templates::IDENTICAL } else { crate::notice_templates::DRIFTING },
+            response.notices.items.push(crate::subc::runner_notices::notice_templates::Notice::template(
+                if intervention.outputs_identical { crate::subc::runner_notices::notice_templates::IDENTICAL } else { crate::subc::runner_notices::notice_templates::DRIFTING },
                 serde_json::json!({"count": intervention.count, "span": intervention.span.as_secs(), "instruction": instruction}),
                 standalone,
-                crate::notice_templates::Target::Text,
+                crate::subc::runner_notices::notice_templates::Target::Text,
             ));
-            crate::notice_templates::deliver(response, Some(text));
+            crate::subc::runner_notices::notice_templates::deliver(response, Some(text));
         }
     }
 }

@@ -49,7 +49,7 @@ pub fn append_repeat_breaker_reminder(
         )
     };
     let reminder = format!("<system-reminder>\n{observation} {instruction}\n</system-reminder>");
-    crate::notice_templates::append_text(text, &reminder);
+    crate::subc::runner_notices::notice_templates::append_text(text, &reminder);
     log::info!(
         "repeat_breaker fired session={} tool={} count={} span_ms={}",
         session_id,
@@ -110,7 +110,7 @@ pub fn finalize_response_with_bg_completions(
     attach_command: &str,
     allow_bg_completions: bool,
 ) {
-    crate::notice_templates::deliver(response, None);
+    crate::subc::runner_notices::notice_templates::deliver(response, None);
     let (publish, counts) = finalize_prefix(
         response,
         ctx,
@@ -356,7 +356,7 @@ fn attach_alert_block(
     response
         .notices
         .items
-        .push(crate::notice_templates::Notice::diagnostic(alert.text));
+        .push(crate::subc::runner_notices::notice_templates::Notice::diagnostic(alert.text));
     crate::notice_templates::deliver(response, None);
 }
 

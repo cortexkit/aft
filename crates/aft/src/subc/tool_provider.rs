@@ -1474,7 +1474,7 @@ fn render_catalog(
     });
     if request.notice_templates == Some(true) {
         answer.notice_templates = Some(
-            crate::notice_templates::templates(preset.name())
+            crate::subc::runner_notices::notice_templates::templates(preset.name())
                 .iter()
                 .map(|template| serde_json::to_value(template).expect("notice template is JSON"))
                 .collect(),
@@ -5203,7 +5203,7 @@ mod tests {
     const REGENERATE_CATALOG: &str = "cargo test -p agent-file-tools --lib regenerate_tool_provider_catalog --locked -- --ignored";
 
     fn notice_template_vectors() -> BTreeMap<String, String> {
-        use crate::notice_templates::{self as notices, Notice, Target};
+        use crate::subc::runner_notices::notice_templates::{self as notices, Notice, Target};
         use sha2::{Digest, Sha256};
         let mut files = BTreeMap::new();
         files.insert("README.md".into(), "# AFT notice templates v1\n\nOpt-in `tool.catalog` replies and example `session.send` requests for each preset.\nThe examples use a fixed clock (1700000000000 ms), call key and cleared delivery\nmode; real sends use the current clock and the runner's declared modes.\nTemplate digests use llm-runner's RFC 8785 SHA-256 helper.\n\nRegenerate with `cargo test -p agent-file-tools --lib regenerate_notice_template_vectors -- --ignored`.\nThe `notice_template_vectors_match_samples` test regenerates in memory and compares every byte.\n".into());

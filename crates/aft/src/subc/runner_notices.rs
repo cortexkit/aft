@@ -1,6 +1,8 @@
 //! The runner records each notice's send_id durably, so retries cannot deliver
 //! the same notice twice. Runner sessions do not acknowledge AFT push frames.
 
+pub(crate) mod notice_templates;
+
 use super::*;
 use crate::bash_background::persistence::{RunnerCompletionDelivery, RunnerCompletionPhase};
 use cortexkit_role_llm_runner::{
@@ -430,7 +432,7 @@ pub(super) fn code_search_notice(
 
 pub(super) fn nudge_request(
     call_key: &str,
-    notice: &crate::notice_templates::Notice,
+    notice: &crate::subc::runner_notices::notice_templates::Notice,
     preset: &str,
     now_ms: u64,
     modern: bool,
@@ -451,19 +453,22 @@ pub(super) fn nudge_request(
     let mut order = DeliveryOrder::new(vec![Mode::ToolResult]);
     order.dedupe_key = Some(format!("aft:nudge:{kind}"));
     order.expires_at_ms = Some(now_ms.saturating_add(60_000));
-    let templates = crate::notice_templates::templates(preset);
+    let templates = crate::subc::runner_notices::notice_templates::templates(preset);
     let mut text = notice.text.clone();
     if let Some((id, slots)) = &notice.template {
         if let Some(template) = templates.iter().find(|template| template.id == *id) {
             let mut slots = slots.as_object().unwrap().clone();
-            if *id == crate::notice_templates::CODE_SEARCH
+            if *id == crate::subc::runner_notices::notice_templates::CODE_SEARCH
                 && preset == "worker"
                 && slots["redirect"]
                     .as_str()
                     .is_some_and(|s| s.contains("`aft_search`"))
             {
                 slots["redirect"] =
-                    crate::notice_templates::code_search_slots(Some("search"), "bash")["redirect"]
+                    crate::subc::runner_notices::notice_templates::code_search_slots(
+                        Some("search"),
+                        "bash",
+                    )["redirect"]
                         .clone();
             }
             let use_ = TemplateUse::new(*id, template_digest(template), slots);
@@ -503,7 +508,7 @@ impl CodeSearchNotice {
     /// Send before returning the tool result. If the runner refuses the
     /// template (for example, the session plan omitted it), retry once as
     /// free text at tool-result authority, within the same deadline; never append.
-    pub(crate) fn send(&self, notice: &crate::notice_templates::Notice) {
+    pub(crate) fn send(&self, notice: &crate::subc::runner_notices::notice_templates::Notice) {
         // Cloned render contexts belong to the same call. All its nudges,
         // capability probes and the one allowed fallback share this budget.
         let mut remaining = self.remaining.lock().unwrap();
@@ -533,7 +538,11 @@ impl CodeSearchNotice {
         }
     }
 
-    fn send_once(&self, notice: &crate::notice_templates::Notice, remaining: Duration) -> Outcome {
+    fn send_once(
+        &self,
+        notice: &crate::subc::runner_notices::notice_templates::Notice,
+        remaining: Duration,
+    ) -> Outcome {
         if remaining.is_zero() {
             return Outcome::Final(Failure::new(
                 FailureClass::Timeout,

@@ -444,7 +444,7 @@ fn observe_raw_bash_response(
     ctx: &AppContext,
     response: &mut Response,
 ) {
-    crate::notice_templates::deliver(response, None);
+    crate::subc::runner_notices::notice_templates::deliver(response, None);
     let Some(data) = response.data.as_object_mut() else {
         return;
     };
@@ -713,8 +713,8 @@ pub fn build_bash_outcome_with_wake(
             ))
         };
         let response = response.map(|mut response| {
-            if crate::bash_hints::is_terminal_native_reply(&response) {
-                if let Some(hint) = crate::bash_hints::code_search_nudge(
+            if crate::bash_rewrite::bash_hints::is_terminal_native_reply(&response) {
+                if let Some(hint) = crate::bash_rewrite::bash_hints::code_search_nudge(
                     response.data["output"].as_str().unwrap_or_default(),
                     &command_for_hint,
                     project_root.as_deref(),
@@ -723,7 +723,7 @@ pub fn build_bash_outcome_with_wake(
                     Some("grep"),
                     &shell_tool_for_hint,
                 ) {
-                    crate::bash_hints::append_nudge(&mut response, &hint);
+                    crate::bash_rewrite::bash_hints::append_nudge(&mut response, &hint);
                 }
             }
             append_bash_reply_notices(

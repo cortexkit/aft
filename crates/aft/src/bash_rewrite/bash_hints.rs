@@ -26,19 +26,18 @@ impl CallContext {
             return;
         };
         response.notices.route = self.runner_notice.clone();
-        response
-            .notices
-            .items
-            .push(crate::notice_templates::Notice::template(
-                crate::notice_templates::CODE_SEARCH,
-                crate::notice_templates::code_search_slots(
+        response.notices.items.push(
+            crate::subc::runner_notices::notice_templates::Notice::template(
+                crate::subc::runner_notices::notice_templates::CODE_SEARCH,
+                crate::subc::runner_notices::notice_templates::code_search_slots(
                     self.search_tool.as_deref(),
                     &self.shell_tool,
                 ),
                 hint,
-                crate::notice_templates::Target::BashOutput,
-            ));
-        crate::notice_templates::deliver(response, None);
+                crate::subc::runner_notices::notice_templates::Target::BashOutput,
+            ),
+        );
+        crate::subc::runner_notices::notice_templates::deliver(response, None);
     }
 }
 

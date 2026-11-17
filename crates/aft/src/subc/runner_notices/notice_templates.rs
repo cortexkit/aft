@@ -60,7 +60,9 @@ pub(crate) fn deliver(response: &mut crate::protocol::Response, mut text: Option
             Target::RewriteFooter => {
                 crate::bash_rewrite::rules::append_decided_footer(response, &notice.text)
             }
-            Target::BashOutput => crate::bash_hints::append_nudge(response, &notice.text),
+            Target::BashOutput => {
+                crate::bash_rewrite::bash_hints::append_nudge(response, &notice.text)
+            }
             Target::Text => {
                 if let Some(text) = text.as_deref_mut() {
                     append_text(text, &notice.text);

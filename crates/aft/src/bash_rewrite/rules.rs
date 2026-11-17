@@ -10,8 +10,8 @@ use crate::bash_rewrite::footer::grep_search_hint;
 use crate::bash_rewrite::parser::{parse, ParsedCommand};
 use crate::bash_rewrite::{RewriteRequest, RewriteRule};
 use crate::context::AppContext;
-use crate::notice_templates::{self, Notice, Target};
 use crate::protocol::{RawRequest, Response};
+use crate::subc::runner_notices::notice_templates::{self, Notice, Target};
 
 pub struct GrepRule;
 pub struct RgRule;
