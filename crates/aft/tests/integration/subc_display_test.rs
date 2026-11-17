@@ -309,7 +309,7 @@ async fn run_display_case(switch: Option<&str>) {
         wait_for_ready_root(&mut stream, project.path()).await;
         let call_key = format!("display-lineage:{index}");
         let response = request(&mut stream, channel, 20 + index as u64, json!({
-            "op":"tool.call", "name":"bash", "preset":"head", "arguments":{"command":"printf display-ok","compressed":false},
+            "op":"tool.call", "name":"bash", "arguments":{"command":"printf display-ok","compressed":false},
             "call_key":call_key, "schema_pin":BASH_PIN,
         })).await;
         let body: Value = serde_json::from_slice(&response.body).unwrap();

@@ -62,10 +62,7 @@ impl Daemon {
                 1,
                 self.epoch,
                 self.corr,
-                serde_json::to_vec(
-                    &json!({ "name": "bash", "preset":"head", "arguments": arguments }),
-                )
-                .unwrap(),
+                serde_json::to_vec(&json!({ "name": "bash", "arguments": arguments })).unwrap(),
             )
             .unwrap(),
         )
