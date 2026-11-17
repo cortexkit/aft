@@ -531,7 +531,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "commands/parent_query/engine.rs",
-        enclosing_item: "search",
+        enclosing_item: "search_with_disclosure",
         location_or_primitive: ".take()",
         reason: "Option::take transfers the embedding model between the parent and child search contexts; it does not cut a list.",
     },
@@ -968,13 +968,13 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "classification needs only the size threshold or a long line in a smaller file; reaching the byte threshold classifies the file as data, without cutting a result list",
     },
     ExclusionEntry {
-        file: "commands/semantic_search/memo.rs",
+        file: "search_state/memo.rs",
         enclosing_item: "digest_open_file_at_size",
         location_or_primitive: "io::Read::take(size)",
         reason: "small and streamed digests both stop at the descriptor's size at open; growth changes the stat and is re-digested by the next lookup, not silently accepted as a complete current-file hash",
     },
     ExclusionEntry {
-        file: "commands/semantic_search/request_files.rs",
+        file: "search_state/request_files.rs",
         enclosing_item: "read_whole_file_at",
         location_or_primitive: "io::Read::take(stat.size)",
         reason: "reads the descriptor's size at open; files above the whole-read ceiling are separately disclosed as skipped, not silently cut from a result list",
