@@ -757,7 +757,7 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
         }))
         .consumes(vec![
             ConsumerRole::ServiceClient {
-                of: vec!["prefrontal-core".to_string()],
+                of: crate::prefrontal::MODULE_IDS.into_iter().map(str::to_string).collect(),
             },
             ConsumerRole::ServiceClient {
                 of: vec!["synapse".to_string()],
@@ -1348,7 +1348,7 @@ mod tests {
         top.insert(
             "consumes".to_string(),
             json!([
-                {"role": "service_client", "of": ["prefrontal-core"]},
+                {"role": "service_client", "of": ["prefrontal", "prefrontal-core"]},
                 {"role": "service_client", "of": ["synapse"]}
             ]),
         );

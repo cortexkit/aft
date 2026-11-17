@@ -1355,8 +1355,7 @@ pub(super) fn trust_for_principal(principal: &Option<Principal>) -> BindTrust {
             if module_id == "llm-runner"
                 || module_id == "aft"
                 || module_id == "broca"
-                || module_id == "prefrontal"
-                || module_id == "prefrontal-core" =>
+                || crate::prefrontal::is_module(module_id) =>
         {
             BindTrust::FirstParty
         }

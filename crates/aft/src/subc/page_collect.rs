@@ -16,9 +16,6 @@ use crate::commands::file_read_exact::{self, OpenedFile, ReadExactRefusal};
 use crate::page_collect::snapshot::{BeginError, SnapshotOwner, SnapshotStore};
 use crate::page_collect::{self as page, Limits, PageSource, ReadFailure};
 
-/// The module whose management principal may call these operations.
-const CORE_MODULE_ID: &str = "prefrontal-core";
-
 pub(super) const SESSION_NOT_BOUND: &str = "session_not_bound";
 pub(super) const SESSION_ROUTE_AMBIGUOUS: &str = "session_route_ambiguous";
 
@@ -30,7 +27,7 @@ pub(super) fn is_page_operation(operation: &str) -> bool {
 }
 
 fn caller_is_core(principal: Option<&Principal>) -> bool {
-    matches!(principal, Some(Principal::Reserved { module_id }) if module_id == CORE_MODULE_ID)
+    principal.is_some_and(crate::prefrontal::is_principal)
 }
 
 fn response_id(operation: &str) -> String {

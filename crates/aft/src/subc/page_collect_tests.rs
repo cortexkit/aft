@@ -15,6 +15,20 @@ fn core() -> Option<Principal> {
     })
 }
 
+#[test]
+fn prefrontal_rename_page_admission_is_reserved_and_fail_closed() {
+    for module in crate::prefrontal::MODULE_IDS {
+        assert!(caller_is_core(Some(&Principal::Reserved {
+            module_id: module.into()
+        })));
+    }
+    assert!(!caller_is_core(None));
+    assert!(!caller_is_core(Some(&Principal::Direct)));
+    assert!(!caller_is_core(Some(&Principal::Reserved {
+        module_id: "other".into()
+    })));
+}
+
 fn identity(root: &ProjectRootId, trust: BindTrust) -> RouteIdentity {
     // A harness without a plugin prompt: a question the policy would ask
     // is refused outright, and no temp-directory exemption applies.

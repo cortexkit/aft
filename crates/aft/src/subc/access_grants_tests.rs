@@ -48,6 +48,61 @@ fn context(root: &Path, storage: &Path) -> AppContext {
     )));
     ctx
 }
+
+#[test]
+fn prefrontal_rename_access_scope_admission_preserves_authorization_and_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    for module in ["prefrontal", "prefrontal-core", "other"] {
+        let mut route = identity(dir.path(), "head", "head", None);
+        let stamp = Arc::get_mut(&mut route.0).unwrap().scope.as_mut().unwrap();
+        stamp.owner = Principal::Reserved {
+            module_id: module.into(),
+        };
+        assert_eq!(alfonso(stamp), module != "other");
+        stamp.owner_authorized = false;
+        assert!(!alfonso(stamp));
+    }
+}
+
+#[test]
+fn prefrontal_rename_parent_grant_keys_are_canonical_but_history_identity_is_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut route = identity(dir.path(), "run", "ephemeral", Some("head"));
+    let stamp = Arc::get_mut(&mut route.0).unwrap().scope.as_mut().unwrap();
+    stamp.owner = Principal::Reserved {
+        module_id: "prefrontal".into(),
+    };
+    stamp.parent.as_mut().unwrap().owner = stamp.owner.clone();
+    let wire = serde_json::to_string(stamp).unwrap();
+    assert_eq!(
+        super::super::tool_provider::ledger_scope(stamp).owner,
+        "reserved:prefrontal"
+    );
+    assert_eq!(
+        ScopeKey::from_stamp(stamp).owner,
+        r#"{"kind":"reserved","module_id":"prefrontal"}"#
+    );
+    assert_eq!(
+        head_scope(&route).unwrap().owner,
+        r#"{"kind":"reserved","module_id":"prefrontal-core"}"#
+    );
+    assert_eq!(
+        policy_scope_key(&route).owner,
+        head_scope(&route).unwrap().owner
+    );
+    let ctx = context(dir.path(), &dir.path().join("store"));
+    register(&route, &ctx).unwrap();
+    let db = ctx.db().unwrap();
+    let conn = db.lock().unwrap();
+    assert_eq!(
+        store::parent(&conn, &scope_key(&route)).unwrap(),
+        head_scope(&route)
+    );
+    assert_eq!(
+        serde_json::to_string(route.scope.as_ref().unwrap()).unwrap(),
+        wire
+    );
+}
 fn default_fixture() -> (tempfile::TempDir, AppContext, RouteIdentity, RouteIdentity) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("head");

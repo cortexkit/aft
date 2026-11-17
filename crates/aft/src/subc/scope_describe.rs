@@ -979,7 +979,7 @@ async fn revoke(executor: Arc<Executor>, stamp: &ScopeStamp) -> ScopeRevokeResul
                             // a policy, so older head policies cannot be reused after end.
                             if let Err(error) = crate::db::access_grants::end_scope_grants(
                                 &conn,
-                                &crate::db::access_grants::ScopeKey::from_stamp(&stamp),
+                                &crate::db::access_grants::ScopeKey::for_grants(&stamp),
                             ) {
                                 log::warn!("scope-ended grant revocation failed scope_ref={:?} scope_epoch={}: {error}", stamp.scope_ref, stamp.scope_epoch);
                                 failures.push(format!("grant revocation: {error}"));

@@ -672,9 +672,8 @@ fn bot_authority(
 /// policy, while an unparented run belongs to the head.
 pub(crate) fn worker_scope(stamp: &ScopeStamp) -> bool {
     use subc_protocol::scope::ScopeKind;
-    use subc_protocol::Principal;
     stamp.owner_authorized
-        && matches!(&stamp.owner, Principal::Reserved { module_id } if module_id == "prefrontal-core")
+        && crate::prefrontal::is_principal(&stamp.owner)
         && (stamp.kind == ScopeKind::Worker
             || (stamp.kind == ScopeKind::Ephemeral && stamp.parent.is_some()))
 }
@@ -682,7 +681,7 @@ pub(crate) fn worker_scope(stamp: &ScopeStamp) -> bool {
 fn head_scope(stamp: &ScopeStamp) -> bool {
     use subc_protocol::scope::ScopeKind;
     stamp.owner_authorized
-        && matches!(&stamp.owner, subc_protocol::Principal::Reserved {module_id} if module_id == "prefrontal-core")
+        && crate::prefrontal::is_principal(&stamp.owner)
         && stamp.parent.is_none()
         && matches!(stamp.kind, ScopeKind::Head | ScopeKind::Ephemeral)
 }

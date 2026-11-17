@@ -112,7 +112,7 @@ fn runner_matches(identity: &RouteIdentity, runner: &str) -> bool {
         .principal
         .as_deref()
         .and_then(|id| id.strip_prefix("reserved:"))
-        .is_some_and(|module| module == runner || module == "prefrontal-core")
+        .is_some_and(|module| module == runner || crate::prefrontal::is_module(module))
 }
 
 fn route_harness(identity: &RouteIdentity) -> Option<&str> {

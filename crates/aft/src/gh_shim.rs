@@ -80,7 +80,8 @@ const RECENTLY_REACHABLE_WINDOW: Duration = Duration::from_secs(300);
 /// in the future and therefore invalid.
 const ISSUED_AT_FUTURE_SKEW: Duration = Duration::from_secs(300);
 const ROUTING_OPERATION: &str = "gh.route";
-const ROUTING_HOLDER_MODULE_ID: &str = "prefrontal-core";
+#[cfg(test)]
+const ROUTING_HOLDER_MODULE_ID: &str = crate::prefrontal::LEGACY_MODULE_ID;
 const MANIFEST_ARTIFACT_ID: &str = "gh-routing-manifest";
 const V1_GOVERNED_TUPLES: &[&str] = &["issue comment", "pr comment", "pr review", "issue reaction"];
 const V1_ADMIN_TUPLES: &[&str] = &["issue close", "pr close", "pr merge", "release create"];
@@ -3409,21 +3410,23 @@ fn route_holder(entries: &[subc_client_rs::CatalogEntry]) -> RouteHolder {
 }
 
 fn select_route_holder(advertisers: impl IntoIterator<Item = String>) -> RouteHolder {
-    let mut holder = None;
+    let mut holders = Vec::new();
     let mut unexpected_advertisers = BTreeSet::new();
     for advertiser in advertisers {
-        // Governed routes carry identity-bearing writes, so only prefrontal-core may
+        // Governed routes carry identity-bearing writes, so only prefrontal may
         // hold `gh.route`; another module advertising it must not capture the route.
         // The holder module identifies the routing server, not the bound agent. Using
         // its module ID would merge all agents into one audit and rate-accounting session.
-        if advertiser == ROUTING_HOLDER_MODULE_ID {
-            holder.get_or_insert(advertiser);
+        if crate::prefrontal::is_module(&advertiser) {
+            holders.push(advertiser);
         } else {
             unexpected_advertisers.insert(advertiser);
         }
     }
     RouteHolder {
-        module_id: holder,
+        module_id: (!holders.is_empty()).then(|| {
+            crate::prefrontal::catalog_module(holders.iter().map(String::as_str)).to_string()
+        }),
         unexpected_advertisers: unexpected_advertisers.into_iter().collect(),
     }
 }
@@ -9194,6 +9197,17 @@ mod tests {
         let holder = select_route_holder(["other-module".to_string()]);
         assert_eq!(holder.module_id, None);
         assert_eq!(holder.unexpected_advertisers, vec!["other-module"]);
+    }
+
+    #[test]
+    fn prefrontal_rename_gh_route_catalog_accepts_only_aliases() {
+        for module in crate::prefrontal::MODULE_IDS {
+            let holder = select_route_holder([module.to_string(), "other".into()]);
+            assert_eq!(holder.module_id.as_deref(), Some(module));
+            assert_eq!(holder.unexpected_advertisers, ["other"]);
+        }
+        let holder = select_route_holder(["prefrontal-core".into(), "prefrontal".into()]);
+        assert_eq!(holder.module_id.as_deref(), Some("prefrontal"));
     }
 
     #[test]

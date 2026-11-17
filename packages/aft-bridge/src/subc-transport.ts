@@ -431,6 +431,20 @@ export interface SubcClientLike {
 
 /** The subc module id AFT registers under (matches the daemon manifest). */
 const AFT_MODULE_ID = "aft";
+const PREFRONTAL_MODULE_IDS = ["prefrontal", "prefrontal-core"] as const;
+
+function isPrefrontalModule(module: unknown): module is string {
+  return typeof module === "string" && PREFRONTAL_MODULE_IDS.some((id) => id === module);
+}
+
+function prefrontalModule(catalog: unknown): string {
+  const modules = isRecord(catalog) && Array.isArray(catalog.modules) ? catalog.modules : [];
+  return (
+    PREFRONTAL_MODULE_IDS.find((id) =>
+      modules.some((entry) => isRecord(entry) && entry.module_id === id),
+    ) ?? PREFRONTAL_MODULE_IDS[1]
+  );
+}
 const HOST_SCOPE_LOOKUP_TIMEOUT_MS = 2_000;
 const HOST_SCOPE_RETRY_FLOOR_MS = 5_000;
 const HOST_SCOPE_RETRY_CAP_MS = 300_000;
@@ -3246,8 +3260,10 @@ export class SubcTransportPool implements AftTransportPool {
     const read = async (): Promise<HostScopeResult> => {
       let route: RouteHandle | undefined;
       try {
+        const catalog = await client.catalogList?.().catch(() => undefined);
+        if (expired) return timeout();
         route = await client.routeOpen(
-          { kind: "management_surface", module_id: "prefrontal-core" },
+          { kind: "management_surface", module_id: prefrontalModule(catalog) },
           identity,
           { consumerIdentity: this.consumerIdentity },
         );
@@ -3268,7 +3284,7 @@ export class SubcTransportPool implements AftTransportPool {
           !isRecord(reply) ||
           !isRecord(reply.owner) ||
           reply.owner.kind !== "reserved" ||
-          reply.owner.module_id !== "prefrontal-core" ||
+          !isPrefrontalModule(reply.owner.module_id) ||
           typeof reply.ref !== "string" ||
           reply.ref.length === 0 ||
           !Number.isSafeInteger(reply.scope_epoch) ||
@@ -3278,7 +3294,7 @@ export class SubcTransportPool implements AftTransportPool {
         return {
           result: "scope",
           scope: {
-            owner: { kind: "reserved", module_id: "prefrontal-core" },
+            owner: { kind: "reserved", module_id: reply.owner.module_id as string },
             ref: reply.ref,
             scopeEpoch: reply.scope_epoch as number,
           },

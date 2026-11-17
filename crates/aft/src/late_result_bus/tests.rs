@@ -56,6 +56,53 @@ fn database() -> (tempfile::TempDir, crate::db::lifecycle::TrackedConnection) {
     (dir, db)
 }
 
+#[tokio::test]
+async fn prefrontal_rename_bus_preserves_custody_and_reader_subjects() {
+    let (_dir, conn) = database();
+    let names = AccountNames::derive("box_test").unwrap();
+    for module in ["prefrontal-core", "prefrontal"] {
+        let key = key(module);
+        let principal = format!("reserved:{module}");
+        admit(&conn, &key, &principal);
+        ledger::settle(&conn, &key, &frame(), "ok", None, ledger::now_ms()).unwrap();
+        let before = ledger::get(&conn, &key).unwrap().unwrap();
+        let mut publisher = RecordingPublisher::default();
+        drain(&conn, &mut DeliveryState::default(), &mut publisher).await;
+        let (reader, _, _) = publisher
+            .attempts
+            .iter()
+            .find(|(reader, _, _)| reader == module)
+            .unwrap();
+        assert_eq!(
+            names
+                .event_subject_with_reader("aft", EVENT, 1, reader)
+                .unwrap(),
+            format!("ck.box_test.event.aft.late_result_ready.v1.{module}")
+        );
+        let after = ledger::get(&conn, &key).unwrap().unwrap();
+        assert_eq!(after.scope, before.scope);
+        assert_eq!(after.custodian, before.custodian);
+        assert_eq!(after.custodian.as_deref(), Some(principal.as_str()));
+    }
+}
+
+#[test]
+fn prefrontal_rename_aft_subscriptions_do_not_filter_on_head_identity() {
+    let filters: Vec<_> = cortexkit_bus_naming::EVENT_CONSUMERS
+        .iter()
+        .filter(|row| row.module_id == "aft")
+        .flat_map(|row| row.filter_subjects.iter().copied())
+        .collect();
+    assert_eq!(
+        filters,
+        [
+            "event.thalamus-harness.send_state.v1",
+            "event.broca.send_state.v1.aft",
+            "event.cingulate.card_settled.v1.aft",
+        ]
+    );
+}
+
 async fn drain(
     conn: &Connection,
     state: &mut DeliveryState,
