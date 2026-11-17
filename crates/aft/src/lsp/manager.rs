@@ -10672,6 +10672,8 @@ fn log_spawn_failure(
             capacity.current
         );
     } else if durability == FailureDurability::Environment
+        || matches!(error, LspError::TypeScriptSdkUnavailable(_))
+        || matches!(error, LspError::ServerNotReady(reason) if reason.starts_with(NOT_IN_TYPESCRIPT_PROJECT))
         || (durability == FailureDurability::Permanent
             && typescript_sdk_error(&error.to_string(), ""))
     {
@@ -11588,6 +11590,41 @@ mod transient_retry_tests {
             if level == "WARN" {
                 assert!(line.contains("project environment"), "{lines:?}");
             }
+        }
+    }
+
+    #[test]
+    fn typescript_preflight_refusals_log_at_warn() {
+        let key = key();
+        let def = crate::lsp::registry::builtin_servers()
+            .into_iter()
+            .find(|def| def.kind == key.kind)
+            .unwrap();
+        let cases = [
+            LspError::TypeScriptSdkUnavailable("TypeScript SDK unavailable: the language server could not find a valid TypeScript installation; run bun install or enable LSP auto-install (AFT never installs into the worktree).".into()),
+            LspError::ServerNotReady("not in any TypeScript project: no installed typescript and no package.json declaring a typescript dependency covers these files".into()),
+        ];
+        let mut manager = LspManager::new();
+        for error in cases {
+            let shown = error.to_string();
+            let (_, lines) = crate::logging::capture_log_lines(|| {
+                manager.record_file_start_failure(
+                    &def,
+                    &key,
+                    StartFailure {
+                        error,
+                        durability: FailureDurability::Transient,
+                    },
+                );
+            });
+            let startup_lines: Vec<_> = lines.iter().filter(|line| line.contains(&shown)).collect();
+            assert_eq!(startup_lines.len(), 1, "{lines:?}");
+            assert!(startup_lines[0].starts_with("WARN "), "{lines:?}");
+            assert!(
+                startup_lines[0].contains("project environment"),
+                "{lines:?}"
+            );
+            assert!(startup_lines[0].contains(&def.name), "{lines:?}");
         }
     }
 
