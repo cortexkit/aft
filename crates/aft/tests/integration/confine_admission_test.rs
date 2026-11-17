@@ -33,7 +33,7 @@ async fn bind_scoped_worker(stream: &mut tokio::net::TcpStream, root: &std::path
             call_mode: None,
         })
         .unwrap();
-        bind["identity"]["project_root"] = serde_json::json!(root);
+        aft::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(root));
 
         bind
     })

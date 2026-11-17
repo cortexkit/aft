@@ -997,6 +997,7 @@ mod tests {
                 "worker-runs/v1".to_string(),
                 "scope-on-behalf-of/v1".to_string(),
                 "scope-workdir/v1".to_string(),
+                "bind-no-project/v1".to_string(),
                 "page-collect/v1".to_string(),
                 "permissions/v1".to_string(),
                 "shells/v1".to_string(),
@@ -1020,6 +1021,7 @@ mod tests {
                 "worker-runs/v1",
                 "scope-on-behalf-of/v1",
                 "scope-workdir/v1",
+                "bind-no-project/v1",
                 "page-collect/v1",
                 "permissions/v1",
                 "shells/v1",
@@ -1360,7 +1362,7 @@ mod tests {
         assert_eq!(
             top.insert(
                 "capabilities".to_string(),
-                json!({"provides": ["call-keepalive/v1", "tool-provider/v1", "call-modes/v1", "tool-views/v1", "session-notices/v1", "scope-background-tasks/v1", "call-yield/v1", "flow-scopes/v1", "worker-runs/v1", "scope-on-behalf-of/v1", "scope-workdir/v1", "page-collect/v1", "permissions/v1", "shells/v1", "user-commands/v1", "system-text-facts/v1"], "requires": [], "must_never_reach": []}),
+                json!({"provides": ["call-keepalive/v1", "tool-provider/v1", "call-modes/v1", "tool-views/v1", "session-notices/v1", "scope-background-tasks/v1", "call-yield/v1", "flow-scopes/v1", "worker-runs/v1", "scope-on-behalf-of/v1", "scope-workdir/v1", "bind-no-project/v1", "page-collect/v1", "permissions/v1", "shells/v1", "user-commands/v1", "system-text-facts/v1"], "requires": [], "must_never_reach": []}),
             ),
             None
         );

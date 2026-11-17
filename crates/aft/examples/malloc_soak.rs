@@ -104,7 +104,15 @@ async fn bind(
                 call_mode: None,
             })
             .unwrap();
-            bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
+            if bind["target"]["kind"] == "tool_provider" {
+                bind["scope"] = serde_json::json!(subc_protocol::scope::ScopeStamp::new(
+                    Principal::Direct,
+                    format!("malloc-soak-{channel}"),
+                    1,
+                    subc_protocol::scope::ScopeKind::Head,
+                )
+                .with_workdir(Some(root.display().to_string())));
+            }
 
             bind
         })

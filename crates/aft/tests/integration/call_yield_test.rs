@@ -114,7 +114,7 @@ async fn bind_scoped(
         call_mode: Some(subc_protocol::call_mode::CallMode::Classic),
     })
     .unwrap();
-    bind["identity"]["project_root"] = json!(root);
+    aft::subc::stamp_bind_workdir_for_test(&mut bind, json!(root));
     send_frame(
         stream,
         Frame::build(

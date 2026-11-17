@@ -1538,7 +1538,7 @@ async fn bind_route_as_at_epoch(
             call_mode: None,
         })
         .unwrap();
-        bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
+        aft::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(root.to_path_buf()));
 
         bind
     };
@@ -1934,7 +1934,7 @@ fn subc_034_project_empty_scope_workdir_is_refused() {
 }
 
 #[test]
-fn subc_034_project_missing_scope_workdir_uses_daemon_filled_root() {
+fn subc_034_project_missing_scope_workdir_refuses_files_despite_legacy_root() {
     scope_project_case_034(
         |project, _| {
             let mut bind = scope_project_bind_034(project);
@@ -1943,7 +1943,7 @@ fn subc_034_project_missing_scope_workdir_uses_daemon_filled_root() {
             bind
         },
         None,
-        false,
+        true,
     );
 }
 
@@ -1961,7 +1961,7 @@ fn subc_034_project_unscoped_project_free_route_refuses_files_but_serves_catalog
 }
 
 #[test]
-fn subc_034_project_unscoped_legacy_root_keeps_serving_files() {
+fn subc_034_project_unscoped_legacy_root_refuses_files_but_serves_catalog() {
     scope_project_case_034(
         |project, _| {
             let mut bind = scope_project_bind_034(project);
@@ -1970,7 +1970,7 @@ fn subc_034_project_unscoped_legacy_root_keeps_serving_files() {
             bind
         },
         None,
-        false,
+        true,
     );
 }
 

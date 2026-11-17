@@ -134,7 +134,7 @@ async fn real_bind_dispatch_scope_survives_config_edits_before_executor_admissio
             call_mode: None,
         })
         .unwrap();
-        bind["identity"]["project_root"] = serde_json::json!(root.as_path());
+        crate::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(root.as_path()));
 
         bind
     };

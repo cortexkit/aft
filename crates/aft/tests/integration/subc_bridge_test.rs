@@ -3298,7 +3298,7 @@ async fn drive_undecodable_control_request_daemon(input: FakeDaemonInput) {
             call_mode: None,
         })
         .unwrap();
-        bind["identity"]["project_root"] = serde_json::json!(root1.clone());
+        aft::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(root1.clone()));
 
         bind
     })
@@ -4071,7 +4071,7 @@ async fn drive_s1_rejection_daemon(
             call_mode: None,
         })
         .unwrap();
-        bind["identity"]["project_root"] = serde_json::json!(root.clone());
+        aft::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(root.clone()));
 
         bind
     };
@@ -4331,7 +4331,7 @@ async fn drive_readiness_daemon(
             call_mode: None,
         })
         .unwrap();
-        bind["identity"]["project_root"] = serde_json::json!(root.clone());
+        aft::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(root.clone()));
 
         bind
     };
@@ -11588,7 +11588,7 @@ async fn send_route_bind_with_elicitation_capability(
             call_mode: None,
         })
         .unwrap();
-        bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
+        aft::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(root.to_path_buf()));
 
         bind
     };
@@ -12678,7 +12678,7 @@ async fn drive_malformed_fed_harness_bind_production_daemon(
             call_mode: None,
         })
         .unwrap();
-        bind["identity"]["project_root"] = serde_json::json!(root);
+        aft::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(root));
 
         bind
     };
@@ -13535,14 +13535,17 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
     assert_eq!(ownership["summary"]["bound_routes"], 1);
     assert_eq!(
         ownership["summary"]["unscoped"],
-        json!({"routes": 1, "roots": 1})
+        json!({"routes": 0, "roots": 0})
     );
     let route = &ownership["roots"][0]["routes"][0];
     assert_eq!(route["channel"], 1);
     assert_eq!(route["harness"], "opencode");
     assert_eq!(route["session_id"], "session-1");
     assert_eq!(route["principal"], "direct");
-    assert_eq!(route["scope"], "none");
+    assert_eq!(
+        route["scope"],
+        json!({"owner":"direct","ref":"session-1","epoch":1})
+    );
     assert!(route["last_tool_call_age_ms"].is_null());
     send_control_request(&mut stream, 330, ModuleControlRequest::HealthCheck {}).await;
     let health = expect_health_check_report(&mut stream, 330).await;
@@ -13673,7 +13676,7 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
             call_mode: None,
         })
         .unwrap();
-        bind["identity"]["project_root"] = serde_json::json!(root1.clone());
+        aft::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(root1.clone()));
 
         bind
     })
@@ -13686,11 +13689,11 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
     assert_eq!(ownership["summary"]["bound_roots"], 1);
     assert_eq!(
         ownership["summary"]["scoped"],
-        json!({"routes":1,"roots":1})
+        json!({"routes":2,"roots":1})
     );
     assert_eq!(
         ownership["summary"]["unscoped"],
-        json!({"routes":1,"roots":1})
+        json!({"routes":0,"roots":0})
     );
     assert_eq!(
         ownership["roots"][0]["routes"][1]["scope"],
@@ -13709,7 +13712,7 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
     );
     assert_eq!(
         detached["data"]["route_ownership"]["summary"]["scoped"]["routes"],
-        0
+        1
     );
     send_route_goodbye(&mut stream, 1, 344).await;
     send_management_request(&mut stream, 2, 345, json!({"op":"memory.census"})).await;
@@ -13722,6 +13725,69 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
         unbound["data"]["route_ownership"]["summary"]["bound_routes"],
         0
     );
+
+    // Worker completion names its scope in params, not in the management bind.
+    send_management_request(&mut stream, 12, 350, json!({
+        "op":"scope.background_tasks",
+        "params":{"scope":{"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"finished-worker-no-project","epoch":1}}
+    })).await;
+    let tasks = read_management_response(&mut stream, 12, 350, "scope.background_tasks").await;
+    assert_eq!(tasks["status"], "ok", "{tasks}");
+    assert_eq!(tasks["data"]["running"], json!([]), "{tasks}");
+
+    let ticket = aft::gh_shim_ticket::ScopedTicket::issue(
+        "worker-no-project",
+        "no-project-read",
+        root1.to_str().unwrap(),
+    );
+    send_control_request(&mut stream, 450, json!({
+        "op":"route.bind", "route_channel":45, "epoch":1,
+        "target":{"kind":"tool_provider","module_id":"aft"},
+        "identity":{"harness":"runner","session":"worker-no-project"},
+        "principal":{"kind":"direct"},
+        "scope":{"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"no-project-worker","scope_epoch":1,"kind":"worker","owner_authorized":true,"workdir":root1}
+    })).await;
+    expect_route_bind_ack(&mut stream, 450).await;
+    for (channel, session) in [(46, "gh-read-session"), (47, "gh-shim:agent-no-project")] {
+        send_control_request(
+            &mut stream,
+            451,
+            json!({
+                "op":"route.bind", "route_channel":channel, "epoch":1,
+                "target":{"kind":"management_surface","module_id":"aft"},
+                "identity":{"harness":"aft-gh-shim","session":session},
+                "principal":{"kind":"reserved","module_id":"aft"}
+            }),
+        )
+        .await;
+        expect_route_bind_ack(&mut stream, 451).await;
+        send_management_request(
+            &mut stream,
+            channel,
+            452,
+            json!({
+                "op":"gh_shim.session_context", "params":{"ticket":ticket.value().unwrap()}
+            }),
+        )
+        .await;
+        let context =
+            read_management_response(&mut stream, channel, 452, "gh_shim.session_context").await;
+        assert_eq!(context["status"], "ok", "{context}");
+        assert_eq!(context["data"]["worker"], true, "{context}");
+        // A read for a repository the ticket cannot access is refused; it does
+        // not use the bind's root or the daemon's working directory as a fallback.
+        send_management_request(&mut stream, channel, 453, json!({
+            "op":"gh_shim.read_request", "params":{"ticket":ticket.value().unwrap(),
+            "request":{"action":"github.repo.get","repository":"cortexkit/aft","args":{"path":"pulls/7/files","accept":"application/vnd.github+json"}}}
+        })).await;
+        let read =
+            read_management_response(&mut stream, channel, 453, "gh_shim.read_request").await;
+        assert_eq!(read["status"], "error", "{read}");
+        assert_eq!(
+            read["data"]["refusal_code"], "repository_not_visible",
+            "{read}"
+        );
+    }
 
     send_connection_goodbye(&mut stream).await;
 }
@@ -14685,7 +14751,10 @@ async fn send_management_route_bind_with_harness(
             call_mode: None,
         })
         .unwrap();
-        bind["identity"]["project_root"] = serde_json::json!(identity_root.to_path_buf());
+        aft::subc::stamp_bind_workdir_for_test(
+            &mut bind,
+            serde_json::json!(identity_root.to_path_buf()),
+        );
 
         bind
     })
@@ -14891,7 +14960,7 @@ async fn send_route_bind_with_harness_session_principal_and_doc_epoch(
             call_mode: None,
         })
         .unwrap();
-        bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
+        aft::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(root.to_path_buf()));
 
         bind
     };

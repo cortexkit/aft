@@ -12607,7 +12607,7 @@ mod compatibility_root_tests {
     use super::*;
 
     #[test]
-    fn frame_loop_control_uses_filled_root_when_scope_workdir_is_absent() {
+    fn frame_loop_control_ignores_legacy_root_when_scope_workdir_is_absent() {
         let stamp = subc_protocol::scope::ScopeStamp::new(
             subc_protocol::Principal::Direct,
             "frame-root",
@@ -12615,8 +12615,8 @@ mod compatibility_root_tests {
             subc_protocol::scope::ScopeKind::Head,
         );
         for (scope, expected) in [
-            (None, "/legacy-root"),
-            (Some(stamp.clone()), "/legacy-root"),
+            (None, ""),
+            (Some(stamp.clone()), ""),
             (
                 Some(stamp.with_workdir(Some("/stamped-root".into()))),
                 "/stamped-root",

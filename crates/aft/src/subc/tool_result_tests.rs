@@ -315,7 +315,7 @@ async fn tool_result_ast_search_t6_complete_and_budget_cut_on_negotiated_route()
             call_mode: None,
         })
         .unwrap();
-        bind["identity"]["project_root"] = serde_json::json!(&root);
+        crate::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(&root));
 
         bind
     };
@@ -533,7 +533,7 @@ async fn tool_result_oversized_first_search_result_is_visible_saved_and_counted_
         call_mode: None,
     })
     .unwrap();
-    bind["identity"]["project_root"] = json!(&root);
+    crate::subc::stamp_bind_workdir_for_test(&mut bind, json!(&root));
     write_frame(
         &mut daemon,
         &Frame::build(
@@ -882,7 +882,7 @@ async fn tool_result_capability_is_selected_per_bind_not_per_call() {
                 call_mode: None,
             })
             .unwrap();
-            bind["identity"]["project_root"] = serde_json::json!(&root);
+            crate::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(&root));
 
             bind
         };
@@ -1053,7 +1053,7 @@ async fn tool_result_non_negotiating_routes_keep_legacy_success_and_error_bytes(
                 call_mode: None,
             })
             .unwrap();
-            bind["identity"]["project_root"] = serde_json::json!(&root);
+            crate::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(&root));
 
             bind
         };

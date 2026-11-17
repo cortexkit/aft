@@ -7021,7 +7021,7 @@ mod tests {
                     call_mode: None,
                 })
                 .unwrap();
-            bind["identity"]["project_root"] = serde_json::json!("/tmp/project");
+            crate::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!("/tmp/project"));
 
             bind
         };
@@ -7030,7 +7030,7 @@ mod tests {
         let subc_protocol::session::ModuleControlRequest::RouteBind { scope, .. } = decoded else {
             panic!("expected a route bind");
         };
-        assert_eq!(scope, Some(stamp));
+        assert_eq!(scope, Some(stamp.with_workdir(Some("/tmp/project".into()))));
     }
 
     #[test]

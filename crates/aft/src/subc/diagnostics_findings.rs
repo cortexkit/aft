@@ -1182,7 +1182,7 @@ mod tests {
                 call_mode: Some(subc_protocol::call_mode::CallMode::Flow),
             })
             .unwrap();
-            bind["identity"]["project_root"] = serde_json::json!(&root);
+            crate::subc::stamp_bind_workdir_for_test(&mut bind, serde_json::json!(&root));
 
             bind
         };
