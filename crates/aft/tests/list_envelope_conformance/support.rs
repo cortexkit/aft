@@ -2674,7 +2674,11 @@ fn surface_matches_file(command: &str, file: &str) -> bool {
         }
         "read" => file == "commands/read.rs" || file == "subc_format.rs",
         "outline" => file == "commands/outline.rs" || file == "subc_format.rs",
-        "inspect" => file == "commands/inspect.rs" || file == "subc_format.rs",
+        "inspect" => {
+            file == "commands/inspect.rs"
+                || file.starts_with("commands/inspect/")
+                || file == "subc_format.rs"
+        }
         "bash" => {
             file == "bash_changed_files.rs"
                 || file.starts_with("compress/")

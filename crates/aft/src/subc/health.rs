@@ -10709,7 +10709,16 @@ mod tests {
         let app = crate::context::App::default_shared();
         let registry = app.lsp_child_registry();
         registry.track(std::process::id());
-        let report = test_health_report(&executor, &HashMap::new(), &dispatch_path_metrics, &app);
+        let cache = HealthRollupCache::new();
+        cache.request_census();
+        cache.refresh(&executor, &app);
+        let report = build_health_report(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &dispatch_path_metrics,
+            &app,
+        );
         let metrics = report.metrics.expect("health metrics present");
         let memory = metrics.get("memory").expect("memory rollup present");
         // No actors registered: ready rollup with zero roots and process totals.
