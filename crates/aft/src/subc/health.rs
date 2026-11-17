@@ -1046,10 +1046,6 @@ impl DispatchPathMetrics {
                 operation.root = scope
                     .as_ref()
                     .and_then(|stamp| stamp.workdir.clone())
-                    .or_else(|| {
-                        super::legacy_route_project_root(frame)
-                            .map(|root| root.to_string_lossy().into_owned())
-                    })
                     .unwrap_or_default();
                 operation.session.clone_from(&identity.session);
             }

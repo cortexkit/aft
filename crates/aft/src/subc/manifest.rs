@@ -517,6 +517,7 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                 subc_protocol::scope::WORKER_RUNS_CAPABILITY.to_string(),
                 subc_protocol::scope::SCOPE_ON_BEHALF_OF_CAPABILITY.to_string(),
                 subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_string(),
+                subc_protocol::scope::BIND_NO_PROJECT_CAPABILITY.to_string(),
                 crate::page_collect::CAPABILITY.to_string(),
                 super::permissions::CAPABILITY.to_string(),
                 super::shells::CAPABILITY.to_string(),
