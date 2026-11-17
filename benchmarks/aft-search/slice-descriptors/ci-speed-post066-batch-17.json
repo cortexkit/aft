@@ -1,11 +1,9 @@
 {
-  "slice_class": "non_ranking",
+  "slice_class": "engine_unwired",
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
-    "harness-goldens",
-    "profile-grammar",
-    "paging"
+    "crates/aft/src/lib.rs"
   ],
-  "note": "Post-0.66 batch 17 is non-ranking. Memory profile controls live under the existing memory module, leaving the crate root unchanged. The integrated diff against batch 16 changes no RANKING_FENCE_PREFIXES path. Tool-call parity response initializers remain covered by the existing harness fixtures; no ranking or count difference is authorized."
+  "note": "Batch 17's only ranking-fence change removes the module declaration for the deleted migrate-storage CLI code. No search path calls that code, and no tool-call parity fixture is changed. Every search row must remain byte-equal; no ranking, count or presentation difference is authorized."
 }
