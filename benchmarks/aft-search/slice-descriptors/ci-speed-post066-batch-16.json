@@ -3,7 +3,8 @@
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
-    "crates/aft/src/lib.rs"
+    "crates/aft/src/lib.rs",
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
   ],
   "slices": [
     "bash-steering-and-grep-nudge",
