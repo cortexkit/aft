@@ -1,5 +1,5 @@
 pub const USAGE: &str = "\
-AFT — Agent Foundational Toolkit: code navigation and editing tools for AI agents.
+AFT — Agent Foundational Toolkit
 
 Usage: aft [<subcommand> [<args>...]]
        aft --subc <connection-file>
