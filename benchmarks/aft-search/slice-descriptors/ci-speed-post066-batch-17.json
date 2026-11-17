@@ -3,7 +3,8 @@
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
-    "crates/aft/src/lib.rs"
+    "crates/aft/src/lib.rs",
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
   ],
   "note": "Batch 17's only ranking-fence change removes the module declaration for the deleted migrate-storage CLI code. No search path calls that code, and no tool-call parity fixture is changed. Every search row must remain byte-equal; no ranking, count or presentation difference is authorized."
 }
