@@ -733,9 +733,9 @@ async fn run_connected_status_dial<C: StatusConsumer>(
                     if route_module != Some(holder) {
                         if let Some(opened_route) = route.take() {
                             let _ = consumer.close_handle(&opened_route).await;
+                            client.set_route_live(false);
                         }
                         route_events = None;
-                        client.set_route_live(false);
                     }
                     if route.is_none()
                         && reopen_forbidden.is_none()
@@ -1357,6 +1357,47 @@ mod tests {
         watch.sender.lock().as_ref().unwrap().try_send(2).unwrap();
         settle_dial().await;
         assert_eq!(*watch.targets.lock(), ["prefrontal-core", "prefrontal"]);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initial_status_discovery_retains_the_queued_publish_cadence() {
+        let (client, mut wire_rx) = FleetStatusClient::dial_channel(1);
+        client.publish(
+            Path::new("/queued-project"),
+            "opencode",
+            "session",
+            "status",
+        );
+        let request = wire_rx.try_recv().unwrap();
+        let identity = FleetRouteIdentity::from(&request);
+        let queued = client.inner.state.lock().last_publish_at.clone();
+        assert_eq!(queued.len(), 1);
+        let watch = Arc::new(FakeCatalogWatch::default());
+        watch.available.store(true, Ordering::Relaxed);
+        let consumer = RejectingConsumer {
+            attempts: Arc::default(),
+            succeeds_on: Some(1),
+            failure: transient_failure(),
+            advertises_status_line: true,
+            catalog_calls: Arc::default(),
+            publish_calls: Arc::default(),
+            connection_callback: Arc::default(),
+            push_sender: Arc::default(),
+            control_sender: Arc::default(),
+            watch,
+        };
+        let task = tokio::spawn(run_connected_status_dial(
+            consumer,
+            client.clone(),
+            wire_rx,
+            identity,
+            None,
+        ));
+        settle_dial().await;
+        assert!(client.inner.route_live.load(Ordering::Acquire));
+        assert_eq!(client.inner.state.lock().last_publish_at, queued);
         task.abort();
         let _ = task.await;
     }
