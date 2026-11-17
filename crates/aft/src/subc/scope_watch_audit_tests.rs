@@ -720,7 +720,7 @@ async fn scope_watch_confirmed_grant_cleanup_keeps_retrying_under_full_coverage(
     let runs = Arc::new(run_scope::RunScopes::new(control.clone()));
     let (_handle, mut ended, worker) = start(control.clone(), executor, runs);
     let watch = opening_watch(&pending, &mut frames).await;
-    snapshot(&pending, &watch);
+    snapshot_status(&pending, &watch, ScopeWatchStatus::Ended);
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             tokio::select! {

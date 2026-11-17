@@ -182,6 +182,19 @@ async fn scope_watch_end_kills_only_after_confirmation_and_live_rebind_kills_not
     }
     let mut current = scope.clone();
     current.scope_epoch = 2;
+    let coverage = scope_watch::Coverage {
+        keys: HashSet::from([stamp_key(&current)]),
+        all: false,
+    };
+    let swept = access_grants::sweep::tick_covered(db.clone(), &coverage, |_| async {
+        panic!("the newer watched epoch covers the saved old-epoch grant")
+    })
+    .await;
+    assert_eq!(swept.described, 0);
+    assert_eq!(
+        grants::list(&db.lock().unwrap(), &scope_key).unwrap().len(),
+        1
+    );
     push(&pending, &rebound, &current, ScopeWatchEvent::Ended);
     let query = request(&mut frames, "scope.describe").await;
     assert_eq!(status().status, BgTaskStatus::Running);
@@ -1121,7 +1134,7 @@ async fn scope_watch_partitions_more_than_256_and_keeps_overflow_polled() {
     }
     for _ in 0..16 {
         let event = watches.receiver.recv().await.unwrap();
-        assert_eq!(watches.event(event, scopes.len()).len(), 256);
+        assert!(watches.event(event, scopes.len()).is_empty());
     }
     assert_eq!(selected.len(), 4096);
     assert_eq!(watches.health.watched, 4096);
