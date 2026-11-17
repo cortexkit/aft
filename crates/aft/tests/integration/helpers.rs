@@ -74,7 +74,7 @@ pub fn inspect_reasking_tier1_deadline(
 }
 
 /// For fixtures starting a language server, re-ask inspect once on an explicit
-/// request-budget exhaustion reason.
+/// request-budget exhaustion reason or Rust's cold, unauthoritative producer gap.
 /// Keep all other partial answers visible to the caller's assertions, and require
 /// the retry to be complete without extending the product's deadline.
 #[allow(dead_code)] // Shared with watcher_integration, which has no inspect tests.
@@ -93,7 +93,13 @@ pub fn inspect_retrying_cold_deadline(
                         && gap["reason"] == "analysis did not finish within its wait budget";
                     let stat_deadline = gap["kind"] == "stat_verification_incomplete"
                         && gap["reason"] == "file freshness verification exceeded the request budget; retry aft_inspect";
-                    rust_reverification || analysis_deadline || stat_deadline
+                    // Indexing has no separate machine-readable cold-start
+                    // signal. Use a failed Rust producer with zero authoritative
+                    // files; a second partial still fails below.
+                    let rust_indexing = gap["kind"] == "failed_producer"
+                        && gap["producer"] == "rust"
+                        && response["summary"]["diagnostics"]["coverage"]["authoritative"] == 0;
+                    rust_reverification || analysis_deadline || stat_deadline || rust_indexing
                 })
             }));
     if deadline {
@@ -112,6 +118,49 @@ pub fn inspect_retrying_cold_deadline(
 mod cold_inspect_retry_tests {
     use super::inspect_retrying_cold_deadline;
     use serde_json::json;
+
+    #[test]
+    fn cold_inspect_retries_rust_zero_authority_once_and_rejects_a_second_partial() {
+        let partial = json!({
+            "complete": false,
+            "summary": {"diagnostics": {"coverage": {"authoritative": 0}}},
+            "gaps": [{"kind": "failed_producer", "producer": "rust"}]
+        });
+        let mut calls = 0;
+        let response = inspect_retrying_cold_deadline(|| {
+            calls += 1;
+            if calls == 1 {
+                partial.clone()
+            } else {
+                json!({"complete": true})
+            }
+        });
+        assert_eq!(calls, 2);
+        assert_eq!(response["complete"], true);
+        calls = 0;
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            inspect_retrying_cold_deadline(|| {
+                calls += 1;
+                partial.clone()
+            })
+        }));
+        assert!(failed.is_err());
+        assert_eq!(calls, 2);
+        for (producer, authoritative) in [("typescript", 0), ("rust", 1)] {
+            let mut other = partial.clone();
+            other["gaps"][0]["producer"] = json!(producer);
+            other["summary"]["diagnostics"]["coverage"]["authoritative"] = json!(authoritative);
+            let mut calls = 0;
+            assert_eq!(
+                inspect_retrying_cold_deadline(|| {
+                    calls += 1;
+                    other.clone()
+                }),
+                other
+            );
+            assert_eq!(calls, 1);
+        }
+    }
 
     #[test]
     fn cold_inspect_retries_the_exact_reverification_deadline_once() {
