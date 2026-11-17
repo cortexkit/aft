@@ -196,8 +196,7 @@ async fn status_kv_oversize_skips_whole_value_once_per_change_and_never_refreshe
 
 #[test]
 fn status_kv_recorded_vectors_match_real_encoder() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../test-vectors/aft-status-kv-v1");
+    let root = crate::test_support::manifest_dir().join("../../test-vectors/aft-status-kv-v1");
     let vectors = [
         ("ascii", "session-1", "[AFT E0 W1 | T2]", 1),
         ("punctuation", "runner:one/two", "[AFT E2 W0 | T3]", 42),
