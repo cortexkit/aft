@@ -1470,25 +1470,6 @@ pub(crate) fn run<T: Send + 'static>(
     )
 }
 
-/// A separate helper pool whose stalled jobs cannot consume file-read workers.
-#[derive(Clone)]
-pub(crate) struct IsolatedPool(Arc<Limiter>);
-
-impl IsolatedPool {
-    pub(crate) fn new(thread_cap: usize) -> Self {
-        Self(Limiter::with_limits(thread_cap, thread_cap))
-    }
-
-    pub(crate) fn run<T: Send + 'static>(
-        &self,
-        path: &Path,
-        at: Option<Instant>,
-        work: impl FnOnce(PathBuf) -> io::Result<T> + Send + 'static,
-    ) -> io::Result<T> {
-        run_with_limiter(path, at, Arc::clone(&self.0), work)
-    }
-}
-
 /// Reserves time for a bounded walk to return partial results before the bounded I/O helper's
 /// deadline; a helper still stuck in one OS call remains a `read_blocked`.
 pub(crate) fn deadline_before_io_timeout(
