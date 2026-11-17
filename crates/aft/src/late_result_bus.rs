@@ -14,7 +14,10 @@ use std::{
 };
 
 use cortexkit_bus_client::{BusClient, BusClientOptions};
-use cortexkit_bus_naming::{validate_token, TokenKind};
+use cortexkit_role_tool_provider::{
+    late_result_ready_msg_id, late_result_ready_reader, LateResultReady, LATE_RESULT_READY_EVENT,
+    LATE_RESULT_READY_VERSION,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use subc_client_rs::{ConnectionState, ConsumerOptions, SubcConsumer};
@@ -33,7 +36,6 @@ const SCAN_BATCH: usize = 64;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const OVERLAP_MS: i64 = 10_000;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
-const EVENT: &str = "late_result_ready";
 const LIVE_SCAN_SQL: &str = "SELECT rowid,settled_at,seq,CASE WHEN acked=0 AND late_entry IS NOT NULL AND seq>COALESCE((SELECT through_seq FROM call_ledger_ack WHERE custodian=call_ledger.custodian),0) THEN custodian END,carrier,call_key,event_id,outcome FROM call_ledger WHERE state='Settled' AND (settled_at,rowid)>(?1,?2) ORDER BY settled_at,rowid LIMIT ?3";
 static SETTLED: LazyLock<Notify> = LazyLock::new(Notify::new);
 static DISPLAY: LazyLock<Notify> = LazyLock::new(Notify::new);
@@ -354,18 +356,12 @@ struct Notice {
     settled_at: i64,
     reader: String,
     event_id: String,
-    body: Body,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct Body {
-    call_key: String,
-    outcome: String,
+    body: LateResultReady,
 }
 
 impl Notice {
     fn msg_id(&self) -> String {
-        format!("{}:{}", self.event_id, self.reader)
+        late_result_ready_msg_id(&self.event_id, &self.reader)
     }
 }
 
@@ -397,15 +393,9 @@ struct Batch {
 
 fn notice(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<Notice>> {
     let custodian: Option<String> = row.get(3)?;
-    let Some(reader) = custodian
-        .as_deref()
-        .and_then(|id| id.strip_prefix("reserved:"))
-    else {
+    let Some(reader) = custodian.as_deref().and_then(late_result_ready_reader) else {
         return Ok(None);
     };
-    if validate_token(TokenKind::ModuleId, reader).is_err() {
-        return Ok(None);
-    }
     Ok(Some(Notice {
         key: Key {
             carrier: row.get(4)?,
@@ -414,12 +404,11 @@ fn notice(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<Notice>> {
         settled_at: row.get(1)?,
         reader: reader.into(),
         event_id: row.get(6)?,
-        body: Body {
-            call_key: row.get(5)?,
-            outcome: row
-                .get::<_, Option<String>>(7)?
+        body: LateResultReady::new(
+            row.get::<_, String>(5)?,
+            row.get::<_, Option<String>>(7)?
                 .unwrap_or_else(|| "unknown".into()),
-        },
+        ),
     }))
 }
 
@@ -558,7 +547,13 @@ impl Publisher for RealPublisher<'_> {
         // publish_event uses AccountNames::event_subject_with_reader and sets
         // Nats-Msg-Id, and succeeds only after the JetStream acknowledgement.
         self.0
-            .publish_event(EVENT, 1, Some(reader), msg_id, body)
+            .publish_event(
+                LATE_RESULT_READY_EVENT,
+                LATE_RESULT_READY_VERSION as u32,
+                Some(reader),
+                msg_id,
+                body,
+            )
             .await
             .map(|_| ())
             .map_err(|error| error_code(&error))
