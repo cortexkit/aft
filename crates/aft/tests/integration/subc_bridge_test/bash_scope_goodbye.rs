@@ -2,12 +2,14 @@ use super::*;
 use aft::db::call_ledger::{self as ledger, State};
 
 pub(super) async fn drive_bash_elicitation_goodbye_daemon(input: FakeDaemonInput) {
+    let (session, _) =
+        open_fake_daemon_session_with_ops(input, &[subc_protocol::scope::SCOPE_DESCRIBE_OP]).await;
     let FakeDaemonSession {
         mut stream,
         root1,
         executor,
         ..
-    } = open_fake_daemon_session(input).await;
+    } = session;
     write_bind_project_config(&root1, &minimal_bind_doc());
     let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
         route_channel: 1,
