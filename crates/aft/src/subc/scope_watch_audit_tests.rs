@@ -13,6 +13,7 @@ async fn scope_watch_audit_push_during_inflight_describe_still_gets_confirmed() 
     );
     let watch = request(&mut frames, "scope.watch").await;
     snapshot(&pending, &watch);
+    push(&pending, &watch, &scope, ScopeWatchEvent::Ended);
     let query = request(&mut frames, "scope.describe").await;
     push(&pending, &watch, &scope, ScopeWatchEvent::Ended);
     turns().await;
@@ -50,6 +51,7 @@ async fn scope_watch_pending_trigger_rechecks_unsynced_error_and_timeout_answers
         );
         let watch = request(&mut frames, "scope.watch").await;
         snapshot(&pending, &watch);
+        push(&pending, &watch, &scope, ScopeWatchEvent::Ended);
         let query = request(&mut frames, "scope.describe").await;
         push(&pending, &watch, &scope, ScopeWatchEvent::Ended);
         turns().await;
@@ -111,7 +113,7 @@ async fn scope_watch_trigger_on_a_queued_key_is_not_consumed_by_its_first_probe(
         move || std::future::ready(source.clone()),
     );
     let watch = request(&mut frames, "scope.watch").await;
-    snapshot(&pending, &watch);
+    snapshot_status(&pending, &watch, ScopeWatchStatus::Ended);
     let mut active = Vec::new();
     let mut references = HashSet::new();
     for _ in 0..4 {
@@ -170,6 +172,7 @@ async fn scope_watch_snapshot_rearm_during_inflight_probe_retains_every_nonlive_
         );
         let watch = request(&mut frames, "scope.watch").await;
         snapshot(&pending, &watch);
+        push(&pending, &watch, &scope, ScopeWatchEvent::Ended);
         let stale = request(&mut frames, "scope.describe").await;
         scopes.lock().unwrap().push(stamp(1));
         scope_watch::changed(scope_watch::Source::Shell);
@@ -234,6 +237,7 @@ async fn scope_watch_pending_push_with_already_ended_answer_kills_once() {
         });
     let watch = request(&mut frames, "scope.watch").await;
     snapshot(&pending, &watch);
+    push(&pending, &watch, &scope, ScopeWatchEvent::Ended);
     let query = request(&mut frames, "scope.describe").await;
     push(&pending, &watch, &scope, ScopeWatchEvent::Ended);
     turns().await;
@@ -327,12 +331,6 @@ async fn scope_watch_slow_verification_confirms_a_lost_push_and_counts_it() {
     );
     let watch = request(&mut frames, "scope.watch").await;
     snapshot(&pending, &watch);
-    let query = request(&mut frames, "scope.describe").await;
-    response(
-        &pending,
-        &query,
-        answer(&scope, subc_protocol::scope::ScopeStatus::Live, 1),
-    );
     turns().await;
     tokio::time::advance(scope_watch::VERIFY_INTERVAL - Duration::from_secs(1)).await;
     turns().await;
@@ -374,6 +372,7 @@ async fn scope_watch_verification_shared_epochs_keep_one_ref_cooldown_across_rea
     );
     let watch = request(&mut frames, "scope.watch").await;
     snapshot(&pending, &watch);
+    push(&pending, &watch, &scope, ScopeWatchEvent::Superseded);
     let query = request(&mut frames, "scope.describe").await;
     response(
         &pending,
@@ -382,12 +381,6 @@ async fn scope_watch_verification_shared_epochs_keep_one_ref_cooldown_across_rea
     );
     let rearm = request(&mut frames, "scope.watch").await;
     assert_eq!(snapshot(&pending, &rearm), 1);
-    let query = request(&mut frames, "scope.describe").await;
-    response(
-        &pending,
-        &query,
-        answer(&scope, subc_protocol::scope::ScopeStatus::Live, 2),
-    );
     turns().await;
     tokio::time::advance(scope_watch::VERIFY_INTERVAL / 2).await;
     let query = request(&mut frames, "scope.describe").await;
@@ -465,7 +458,7 @@ async fn scope_watch_probe_panic_releases_the_ref_and_pending_keys() {
         move || std::future::ready(source.clone()),
     );
     let watch = request(&mut frames, "scope.watch").await;
-    snapshot(&pending, &watch);
+    snapshot_status(&pending, &watch, ScopeWatchStatus::Ended);
     turns().await;
     assert!(ended.try_recv().is_err());
     assert_eq!(
@@ -521,6 +514,7 @@ async fn scope_watch_completed_and_removed_keys_leave_no_poll_or_confirmed_bookk
     );
     let watch = request(&mut frames, "scope.watch").await;
     snapshot(&pending, &watch);
+    push(&pending, &watch, &scope, ScopeWatchEvent::Ended);
     let query = request(&mut frames, "scope.describe").await;
     response(
         &pending,

@@ -151,6 +151,83 @@ async fn saved_grant_sweep_rechecks_coverage_before_each_describe() {
 }
 
 #[tokio::test]
+async fn saved_grant_sweep_older_epoch_is_covered_and_watch_loss_restores_polling() {
+    use super::super::super::scope_watch::Coverage;
+    let (dir, db) = fixture();
+    let key = save(&db, dir.path(), "retained", 1);
+    let mut newer = stamp(&key).unwrap();
+    newer.scope_epoch = 9;
+    let covered = Coverage {
+        keys: [scope_describe::stamp_key(&newer)].into_iter().collect(),
+        all: false,
+    };
+    let stats = tick_unwatched(
+        db.clone(),
+        &mut None,
+        |_| async { panic!("a watched ref must not be described for an older grant epoch") },
+        |stamp| covered.covers_reference(stamp),
+        |_| false,
+    )
+    .await;
+    assert_eq!(stats.described, 0);
+    assert_eq!(store::list(&db.lock().unwrap(), &key).unwrap().len(), 1);
+    let stats = tick_unwatched(
+        db.clone(),
+        &mut None,
+        |_| std::future::ready(Ok(reply(ScopeStatus::Ended, true))),
+        |stamp| Coverage::default().covers_reference(stamp),
+        |_| false,
+    )
+    .await;
+    assert_eq!(stats.described, 1);
+    assert_eq!(stats.deleted_grants, 1);
+    assert!(store::scope_ended(&db.lock().unwrap(), &key).unwrap());
+}
+
+#[tokio::test]
+async fn saved_grant_sweep_live_table_shape_describe_counts() {
+    use super::super::super::scope_watch::Coverage;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (dir, db) = fixture();
+    let mut covered = Coverage::default();
+    for (index, count) in [2, 2, 2, 2, 2].into_iter().enumerate() {
+        for grant in 0..count {
+            let key = save(
+                &db,
+                &dir.path().join(format!("{index}-{grant}")),
+                &format!("scope-{index}"),
+                1,
+            );
+            covered
+                .keys
+                .insert(scope_describe::stamp_key(&stamp(&key).unwrap()));
+        }
+    }
+    assert_eq!(listed(&db)["grants"].as_array().unwrap().len(), 10);
+    for (coverage, expected) in [(covered, 0), (Coverage::default(), 5)] {
+        let calls = AtomicUsize::new(0);
+        let mut cursor = None;
+        loop {
+            tick_unwatched(
+                db.clone(),
+                &mut cursor,
+                |_| {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    std::future::ready(Ok(reply(ScopeStatus::Live, true)))
+                },
+                |stamp| coverage.covers_reference(stamp),
+                |_| false,
+            )
+            .await;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), expected);
+    }
+}
+
+#[tokio::test]
 async fn saved_grant_sweep_only_deletes_definite_ends() {
     let (dir, db) = fixture();
     for (name, expected_end) in [

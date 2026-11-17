@@ -10,6 +10,8 @@ mod audit;
 #[cfg(unix)]
 #[path = "scope_continuity_tests.rs"]
 mod continuity;
+#[path = "scope_watch_reopen_tests.rs"]
+mod reopen;
 
 fn stamp(index: usize) -> ScopeStamp {
     ScopeStamp::new(
@@ -100,13 +102,8 @@ async fn scope_watch_end_kills_only_after_confirmation_and_live_rebind_kills_not
         1,
         "shell publication must wake selector reconciliation"
     );
-    let query = request(&mut frames, "scope.describe").await;
-    response(
-        &pending,
-        &query,
-        answer(&scope, subc_protocol::scope::ScopeStatus::Live, 1),
-    );
     turns().await;
+    assert!(frames.try_recv().is_err(), "a live snapshot needs no probe");
     let status = || {
         ctx.bash_background()
             .status(
@@ -145,12 +142,6 @@ async fn scope_watch_end_kills_only_after_confirmation_and_live_rebind_kills_not
     let body: Value = serde_json::from_slice(&rebound.body).unwrap();
     assert_eq!(body["scopes"][0]["epoch"], 2);
     snapshot(&pending, &rebound);
-    let query = request(&mut frames, "scope.describe").await;
-    response(
-        &pending,
-        &query,
-        answer(&scope, subc_protocol::scope::ScopeStatus::Live, 2),
-    );
     turns().await;
     assert_eq!(
         status().status,
@@ -260,12 +251,6 @@ async fn scope_watch_grant_and_held_mutations_update_selectors_without_census_ti
     }
     let watch = request(&mut frames, "scope.watch").await;
     assert_eq!(snapshot(&pending, &watch), 1);
-    let query = request(&mut frames, "scope.describe").await;
-    response(
-        &pending,
-        &query,
-        answer(&scope, subc_protocol::scope::ScopeStatus::Live, 1),
-    );
     turns().await;
     grants::revoke(&db.lock().unwrap(), &key, &grant.path).unwrap();
     let cancel = cancellation(&pending, &mut frames, watch.header.corr).await;
@@ -292,12 +277,6 @@ async fn scope_watch_grant_and_held_mutations_update_selectors_without_census_ti
     .unwrap();
     let watch = request(&mut frames, "scope.watch").await;
     assert_eq!(snapshot(&pending, &watch), 1);
-    let query = request(&mut frames, "scope.describe").await;
-    response(
-        &pending,
-        &query,
-        answer(&scope, subc_protocol::scope::ScopeStatus::Live, 1),
-    );
     turns().await;
     ledger::settle(
         &db.lock().unwrap(),
@@ -362,12 +341,6 @@ async fn scope_watch_shell_terminal_notification_removes_selector_without_end_pr
     );
     let watch = request(&mut frames, "scope.watch").await;
     snapshot(&pending, &watch);
-    let query = request(&mut frames, "scope.describe").await;
-    response(
-        &pending,
-        &query,
-        answer(&scope, subc_protocol::scope::ScopeStatus::Live, 1),
-    );
     turns().await;
     std::fs::write(root.as_path().join("finish"), b"finish").unwrap();
     let cancel = tokio::time::timeout(Duration::from_secs(5), frames.recv())
@@ -493,12 +466,6 @@ async fn scope_watch_handoff_case(evict_completed: bool) {
         start_for_speech(first_control, executor.clone(), first_runs, service.clone());
     let watch = opening_watch(&first_pending, &mut first_frames).await;
     snapshot(&first_pending, &watch);
-    let query = request(&mut first_frames, "scope.describe").await;
-    response(
-        &first_pending,
-        &query,
-        answer(&scope, subc_protocol::scope::ScopeStatus::Live, 1),
-    );
     turns().await;
     push(&first_pending, &watch, &scope, ScopeWatchEvent::Ended);
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -807,7 +774,7 @@ fn control(
 }
 
 #[tokio::test(start_paused = true)]
-async fn scope_watch_healthy_does_not_poll_and_rearm_describes_each_scope_once() {
+async fn scope_watch_healthy_does_not_poll_and_live_rearm_needs_no_confirmation() {
     let (control, pending, mut frames) = control(&["scope.describe", "scope.watch"]);
     let scopes = vec![stamp(0), stamp(1), stamp(2)];
     let source = scopes.clone();
@@ -820,24 +787,12 @@ async fn scope_watch_healthy_does_not_poll_and_rearm_describes_each_scope_once()
     let watch = request(&mut frames, "scope.watch").await;
     assert_eq!(snapshot(&pending, &watch), 3);
     let mut describes = 0;
-    let mut refs = HashSet::new();
-    for _ in 0..3 {
-        let query = request(&mut frames, "scope.describe").await;
-        let body: Value = serde_json::from_slice(&query.body).unwrap();
-        assert!(refs.insert(body["ref"].as_str().unwrap().to_owned()));
-        response(
-            &pending,
-            &query,
-            answer(&scopes[0], subc_protocol::scope::ScopeStatus::Live, 1),
-        );
-        describes += 1;
-    }
     turns().await;
     tokio::time::advance(Duration::from_secs(240)).await;
     turns().await;
     assert!(frames.try_recv().is_err(), "healthy watch emitted a poll");
     assert!(ended.try_recv().is_err());
-    assert_eq!(describes, 3, "one initial describe per selected scope");
+    assert_eq!(describes, 0, "live snapshots need no describe");
     assert!(pending.resolve(
         Frame::build(
             FrameType::StreamEnd,
@@ -883,21 +838,8 @@ async fn scope_watch_healthy_does_not_poll_and_rearm_describes_each_scope_once()
         );
         describes += 1;
     }
-    refs.clear();
-    for _ in 0..3 {
-        let query = request(&mut frames, "scope.describe").await;
-        let body: Value = serde_json::from_slice(&query.body).unwrap();
-        refs.insert(body["ref"].as_str().unwrap().to_owned());
-        response(
-            &pending,
-            &query,
-            answer(&scopes[0], subc_protocol::scope::ScopeStatus::Live, 1),
-        );
-        describes += 1;
-    }
-    // A polling describe started while the watch was opening may send its
-    // frame after the first post-snapshot confirmation batch. Drain ready
-    // requests using the paused clock, not the mock receiver's arrival order.
+    // A real stream failure may start fallback probes before the replacement
+    // snapshot. The live snapshot itself must not retrigger those probes.
     while let Ok(Some(query)) = tokio::time::timeout(Duration::from_millis(1), frames.recv()).await
     {
         if query.header.ty == FrameType::Cancel {
@@ -905,7 +847,6 @@ async fn scope_watch_healthy_does_not_poll_and_rearm_describes_each_scope_once()
         }
         let body: Value = serde_json::from_slice(&query.body).unwrap();
         assert_eq!(body["op"], "scope.describe");
-        refs.insert(body["ref"].as_str().unwrap().to_owned());
         response(
             &pending,
             &query,
@@ -913,12 +854,7 @@ async fn scope_watch_healthy_does_not_poll_and_rearm_describes_each_scope_once()
         );
         describes += 1;
     }
-    assert_eq!(refs.len(), 3);
-    assert!(describes >= 6 + opening_count);
-    assert!(
-        describes <= 9,
-        "each ref needs at most one opening fallback and one fresh re-arm confirmation"
-    );
+    assert_eq!(describes, opening_count);
     tokio::time::advance(Duration::from_secs(59)).await;
     turns().await;
     assert!(frames.try_recv().is_err());
@@ -1005,12 +941,6 @@ async fn scope_watch_indeterminate_confirmation_holds_state_and_falls_back() {
         );
         let watch = request(&mut frames, "scope.watch").await;
         snapshot(&pending, &watch);
-        let query = request(&mut frames, "scope.describe").await;
-        response(
-            &pending,
-            &query,
-            answer(&scope, subc_protocol::scope::ScopeStatus::Live, 1),
-        );
         turns().await;
         push(&pending, &watch, &scope, ScopeWatchEvent::Ended);
         let query = request(&mut frames, "scope.describe").await;
@@ -1080,6 +1010,7 @@ async fn scope_watch_retained_epochs_share_one_describe_for_a_real_end() {
     );
     let watch = request(&mut frames, "scope.watch").await;
     assert_eq!(snapshot(&pending, &watch), 2);
+    push(&pending, &watch, &first, ScopeWatchEvent::Superseded);
     let query = request(&mut frames, "scope.describe").await;
     response(
         &pending,
@@ -1091,12 +1022,6 @@ async fn scope_watch_retained_epochs_share_one_describe_for_a_real_end() {
         snapshot(&pending, &rebound),
         1,
         "retained epochs share the current epoch selector after a rebind"
-    );
-    let query = request(&mut frames, "scope.describe").await;
-    response(
-        &pending,
-        &query,
-        answer(&first, subc_protocol::scope::ScopeStatus::Live, 2),
     );
     turns().await;
     assert!(frames.try_recv().is_err());
@@ -1127,8 +1052,8 @@ async fn scope_watch_retained_epochs_share_one_describe_for_a_real_end() {
             .lock()
             .unwrap()
             .scope_watch_health()["descriptions"],
-        3,
-        "one initial ref probe, one re-arm probe, one confirming end probe"
+        2,
+        "one superseded ref probe and one confirming end probe; no live re-arm probe"
     );
     worker.abort();
     let _ = worker.await;
@@ -1147,12 +1072,6 @@ async fn scope_watch_five_minute_backstop_repairs_unnotified_membership() {
     );
     let watch = request(&mut frames, "scope.watch").await;
     snapshot(&pending, &watch);
-    let query = request(&mut frames, "scope.describe").await;
-    response(
-        &pending,
-        &query,
-        answer(&stamp(0), subc_protocol::scope::ScopeStatus::Live, 1),
-    );
     turns().await;
     scopes.lock().unwrap().push(stamp(1));
     tokio::time::advance(scope_watch::BACKSTOP).await;
@@ -1162,15 +1081,11 @@ async fn scope_watch_five_minute_backstop_repairs_unnotified_membership() {
         2,
         "the census repairs drift by re-arming, not by polling the daemon"
     );
-    for _ in 0..2 {
-        let query = request(&mut frames, "scope.describe").await;
-        response(
-            &pending,
-            &query,
-            answer(&stamp(0), subc_protocol::scope::ScopeStatus::Live, 1),
-        );
-    }
     turns().await;
+    assert!(
+        frames.try_recv().is_err(),
+        "live census repair needs no describe"
+    );
     assert_eq!(
         control
             .metrics

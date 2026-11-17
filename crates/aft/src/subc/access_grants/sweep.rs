@@ -237,7 +237,7 @@ pub(in crate::subc) async fn run(
                         // A snapshot may arrive while the database batch is
                         // being read. Check coverage at the actual RPC boundary.
                         let latest = covered.borrow();
-                        latest.all || latest.keys.contains(&scope_describe::stamp_key(stamp))
+                        latest.covers_reference(stamp)
                     },
                     |stamp| {
                         crate::access_policy::prefrontal::counterpart_in_catalog(

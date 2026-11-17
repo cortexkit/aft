@@ -324,9 +324,35 @@ struct Shard {
     keys: Vec<Key>,
     generation: u64,
     healthy: bool,
+    handoff_until: Option<tokio::time::Instant>,
     retry_at: tokio::time::Instant,
     task: Option<JoinHandle<()>>,
     cancelled: Option<oneshot::Receiver<()>>,
+}
+impl Shard {
+    fn reopen(&mut self, retiring: &mut Vec<oneshot::Receiver<()>>) {
+        // A replacement snapshot catches ends during an intentional handoff.
+        // Repeated membership changes must not extend the fallback deadline.
+        if self.healthy {
+            self.handoff_until
+                .get_or_insert(tokio::time::Instant::now() + scope_describe::describe_timeout());
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        if let Some(cancelled) = self.cancelled.take() {
+            retiring.push(cancelled);
+        }
+        self.healthy = false;
+        self.retry_at = tokio::time::Instant::now();
+    }
+    fn protects(&self) -> bool {
+        self.task.is_some()
+            && (self.healthy
+                || self
+                    .handoff_until
+                    .is_some_and(|due| due > tokio::time::Instant::now()))
+    }
 }
 impl Drop for Shard {
     fn drop(&mut self) {
@@ -354,8 +380,19 @@ pub(super) struct Health {
 
 #[derive(Clone, Default)]
 pub(super) struct Coverage {
+    // Poll protection includes a bounded replacement handoff, not just health.
     pub(super) keys: HashSet<Key>,
     pub(super) all: bool,
+}
+impl Coverage {
+    pub(super) fn covers_reference(&self, stamp: &ScopeStamp) -> bool {
+        let key = scope_describe::stamp_key(stamp);
+        self.all
+            || self
+                .keys
+                .iter()
+                .any(|watched| watched.0 == key.0 && watched.1 == key.1)
+    }
 }
 
 pub(super) struct Watches {
@@ -386,7 +423,6 @@ impl Watches {
             retiring: vec![],
         }
     }
-    #[cfg(test)]
     pub(super) fn healthy_keys(&self) -> HashSet<Key> {
         self.shards
             .iter()
@@ -398,7 +434,7 @@ impl Watches {
         let keys: HashSet<_> = self
             .shards
             .iter()
-            .filter(|shard| shard.healthy && shard.task.is_some())
+            .filter(|shard| shard.protects())
             .flat_map(|shard| shard.keys.clone())
             .collect();
         let all = keys.len() == total;
@@ -414,6 +450,7 @@ impl Watches {
                     self.retiring.push(cancelled);
                 }
                 shard.healthy = false;
+                shard.handoff_until = None;
                 shard.retry_at = tokio::time::Instant::now() + interval;
             }
         }
@@ -438,14 +475,7 @@ impl Watches {
                 unassigned.remove(key);
             }
             if old != shard.keys {
-                if let Some(task) = shard.task.take() {
-                    task.abort();
-                }
-                if let Some(cancelled) = shard.cancelled.take() {
-                    self.retiring.push(cancelled);
-                }
-                shard.healthy = false;
-                shard.retry_at = tokio::time::Instant::now();
+                shard.reopen(&mut self.retiring);
             }
         }
         for index in 0..WATCHES_PER_CONNECTION {
@@ -457,6 +487,7 @@ impl Watches {
                     keys: vec![],
                     generation: 0,
                     healthy: false,
+                    handoff_until: None,
                     retry_at: tokio::time::Instant::now(),
                     task: None,
                     cancelled: None,
@@ -471,14 +502,7 @@ impl Watches {
                 shard.keys.push(key);
             }
             if old_len != shard.keys.len() {
-                if let Some(task) = shard.task.take() {
-                    task.abort();
-                }
-                if let Some(cancelled) = shard.cancelled.take() {
-                    self.retiring.push(cancelled);
-                }
-                shard.healthy = false;
-                shard.retry_at = tokio::time::Instant::now();
+                shard.reopen(&mut self.retiring);
             }
             if shard.keys.is_empty()
                 || shard.task.is_some()
@@ -487,6 +511,7 @@ impl Watches {
                 continue;
             }
             if !control.advertises(subc_control::ops::SCOPE_WATCH) {
+                shard.handoff_until = None;
                 if !self.warned_fallback {
                     log::warn!("scope.watch unavailable; falling back to scope polling");
                     self.warned_fallback = true;
@@ -593,14 +618,7 @@ impl Watches {
         self.epochs.insert(key.clone(), epoch);
         for shard in &mut self.shards {
             if shard.keys.contains(key) {
-                if let Some(task) = shard.task.take() {
-                    task.abort();
-                }
-                if let Some(cancelled) = shard.cancelled.take() {
-                    self.retiring.push(cancelled);
-                }
-                shard.healthy = false;
-                shard.retry_at = tokio::time::Instant::now();
+                shard.reopen(&mut self.retiring);
             }
         }
         true
@@ -619,14 +637,19 @@ impl Watches {
         let keys = match event {
             Event::Opened(..) => {
                 shard.healthy = true;
+                shard.handoff_until = None;
                 self.health.opens += 1;
                 self.warned_fallback = false;
                 log::info!("scope.watch opened scope_epochs={}", shard.keys.len());
-                shard.keys.clone()
+                // The snapshot already reports live selectors. Non-live
+                // snapshot entries emit Observe separately and still require
+                // describe confirmation before any end cleanup.
+                vec![]
             }
             Event::Observe(_, _, key) => vec![key],
             Event::Failed(_, _, error) => {
                 shard.healthy = false;
+                shard.handoff_until = None;
                 shard.task.take();
                 if let Some(cancelled) = shard.cancelled.take() {
                     self.retiring.push(cancelled);
@@ -655,8 +678,16 @@ impl Watches {
     pub(super) fn next_retry(&self) -> Option<tokio::time::Instant> {
         self.shards
             .iter()
-            .filter(|shard| !shard.keys.is_empty() && shard.task.is_none())
-            .map(|shard| shard.retry_at)
+            .filter(|shard| !shard.keys.is_empty())
+            .filter_map(|shard| {
+                if shard.task.is_none() {
+                    Some(shard.retry_at)
+                } else {
+                    shard
+                        .handoff_until
+                        .filter(|due| *due > tokio::time::Instant::now())
+                }
+            })
             .min()
     }
 }
