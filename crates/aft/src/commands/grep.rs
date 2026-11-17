@@ -258,6 +258,10 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         .map(|root| root.search_root.clone())
         .collect();
     let total_started = std::time::Instant::now();
+    let ignored_probe = file_roots
+        .is_empty()
+        .then(|| grep_executor::start_scope_ignored_probe(&scope))
+        .flatten();
     let search_start = std::time::Instant::now();
     let params = GrepParams {
         include,
@@ -299,6 +303,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
     let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
+    let ignored_scope = ignored_probe.and_then(grep_executor::IgnoredScopeProbe::finish);
     #[cfg(test)]
     AFTER_SEARCH.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
@@ -328,10 +333,8 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         None
     };
-    let ignored_scope = scope_has_files
-        .then(|| grep_executor::scope_ignored_entries(&scope))
-        .flatten()
-        .filter(|entries| !entries.names.is_empty());
+    let ignored_scope =
+        ignored_scope.filter(|entries| scope_has_files && !entries.names.is_empty());
     let ignored_scope_note = ignored_scope.as_ref().and_then(ignored_scope_note);
     let scope_probe = scope_probe_started.elapsed();
     let format_started = std::time::Instant::now();

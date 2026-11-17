@@ -286,6 +286,178 @@ pub(crate) struct IgnoredScopeEntries {
     pub truncated: bool,
 }
 
+const IGNORE_PROBE_JOIN_BUDGET: Duration = Duration::from_millis(1);
+
+#[derive(Debug)]
+pub(crate) struct IgnoredScopeProbe {
+    result: std::sync::mpsc::Receiver<Option<IgnoredScopeEntries>>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    deadline: Instant,
+    #[cfg(any(test, feature = "test-hooks"))]
+    _pending: Option<std::sync::mpsc::SyncSender<Option<IgnoredScopeEntries>>>,
+}
+
+impl IgnoredScopeProbe {
+    pub(crate) fn finish(self) -> Option<IgnoredScopeEntries> {
+        let wait =
+            IGNORE_PROBE_JOIN_BUDGET.min(self.deadline.saturating_duration_since(Instant::now()));
+        self.result.recv_timeout(wait).ok().flatten()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn ready(result: Option<IgnoredScopeEntries>, deadline: Instant) -> Self {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let _ = sender.send(result);
+        Self {
+            result: receiver,
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            deadline,
+            _pending: None,
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn pending(deadline: Instant) -> Self {
+        let (sender, result) = std::sync::mpsc::sync_channel(1);
+        Self {
+            result,
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            deadline,
+            _pending: Some(sender),
+        }
+    }
+}
+
+impl Drop for IgnoredScopeProbe {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+type IgnoreProbeJob = Box<dyn FnOnce() + Send>;
+
+struct IgnoreProbeWorker {
+    sender: std::sync::mpsc::SyncSender<IgnoreProbeJob>,
+    busy: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct IgnoreProbeBusy(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for IgnoreProbeBusy {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl IgnoreProbeWorker {
+    fn new() -> Option<Self> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<IgnoreProbeJob>(1);
+        std::thread::Builder::new()
+            .name("aft-grep-ignore-probe".into())
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                }
+            })
+            .ok()?;
+        Some(Self {
+            sender,
+            busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+
+    fn start(
+        &self,
+        deadline: Instant,
+        work: impl FnOnce(Arc<std::sync::atomic::AtomicBool>) -> Option<IgnoredScopeEntries>
+            + Send
+            + 'static,
+    ) -> Option<IgnoredScopeProbe> {
+        if self
+            .busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return None;
+        }
+        let busy = IgnoreProbeBusy(Arc::clone(&self.busy));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = Arc::clone(&cancelled);
+        let (sender, result) = std::sync::mpsc::sync_channel(1);
+        self.sender
+            .try_send(Box::new(move || {
+                let _busy = busy;
+                if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+                    return;
+                }
+                let answer = work(Arc::clone(&stop));
+                if !stop.load(Ordering::Acquire) {
+                    let _ = sender.send(answer);
+                }
+            }))
+            .ok()?;
+        Some(IgnoredScopeProbe {
+            result,
+            cancelled,
+            deadline,
+            #[cfg(any(test, feature = "test-hooks"))]
+            _pending: None,
+        })
+    }
+}
+
+/// Ignore coverage is optional: it never queues behind another probe or uses
+/// search's Rayon workers. A late answer is discarded after a one-ms join.
+pub(crate) fn start_scope_ignored_probe(scope: &GrepScope) -> Option<IgnoredScopeProbe> {
+    let [root] = scope.roots.as_slice() else {
+        return None;
+    };
+    if crate::context::confinement::active() || root.ignored_target {
+        return None;
+    }
+    let deadline = crate::bounded_io::deadline_before_io_timeout(
+        &root.search_root,
+        fallback_walk_budget(),
+        FALLBACK_WALK_RETURN_MARGIN,
+    );
+    if Instant::now() >= deadline {
+        return None;
+    }
+    #[cfg(feature = "test-hooks")]
+    match std::env::var("AFT_TEST_GREP_IGNORE_PROBE").as_deref() {
+        Ok("ready") => {
+            return Some(IgnoredScopeProbe::ready(
+                scope_ignored_entries(scope),
+                deadline,
+            ));
+        }
+        Ok("pending") => return Some(IgnoredScopeProbe::pending(deadline)),
+        Ok("busy") => return None,
+        _ => {}
+    }
+    static WORKER: std::sync::OnceLock<Option<IgnoreProbeWorker>> = std::sync::OnceLock::new();
+    let worker = WORKER.get_or_init(IgnoreProbeWorker::new).as_ref()?;
+    let scope = scope.clone();
+    let fence = crate::context::confinement::capture().without_floor_disclosure();
+    let alloc_label = crate::alloc_trace::carry();
+    let cancellation = crate::executor::current_job_cancellation();
+    // Do not retain the request's mutable failure/skip collectors in work that
+    // may outlive its reply. The independent budget still ends with the request.
+    let budget = crate::bounded_io::with_budget(None, || {
+        crate::bounded_io::Budget::after(deadline.saturating_duration_since(Instant::now()))
+            .capped(deadline)
+    });
+    worker.start(deadline, move |cancelled| {
+        let _alloc_label = alloc_label.enter();
+        let _cancellation = cancellation.map(crate::executor::install_job_cancellation);
+        crate::context::confinement::inherit(fence, || {
+            crate::bounded_io::with_budget(Some(budget), || {
+                scope_ignored_entries_cancellable(&scope, cancelled)
+            })
+        })
+    })
+}
+
 impl ScopeFileCounts {
     pub(crate) fn add(&mut self, other: Self) {
         self.examined += other.examined;
@@ -1563,11 +1735,22 @@ fn is_disclosable_ignore_boundary(
 
 /// Evidence is limited to the named folder's children, never ignored subtrees.
 /// An incomplete accepted-name set cannot prove that a missing name was ignored.
+#[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn scope_ignored_entries(scope: &GrepScope) -> Option<IgnoredScopeEntries> {
+    scope_ignored_entries_cancellable(scope, Arc::new(std::sync::atomic::AtomicBool::new(false)))
+}
+
+fn scope_ignored_entries_cancellable(
+    scope: &GrepScope,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+) -> Option<IgnoredScopeEntries> {
     let [root] = scope.roots.as_slice() else {
         return None;
     };
-    if crate::context::confinement::active() || root.ignored_target {
+    if cancelled.load(Ordering::Acquire)
+        || crate::context::confinement::active()
+        || root.ignored_target
+    {
         return None;
     }
     let filter_root = root.filter_root.clone();
@@ -1589,11 +1772,14 @@ pub(crate) fn scope_ignored_entries(scope: &GrepScope) -> Option<IgnoredScopeEnt
         if !crate::bounded_io::metadata(&root.search_root).is_ok_and(|meta| meta.is_dir()) {
             return None;
         }
+        let cancellation = crate::executor::current_job_cancellation();
         crate::bounded_io::run(&root.search_root, None, move |search_root| {
+            let _cancellation = cancellation.map(crate::executor::install_job_cancellation);
             Ok(ignored_entries_in_folder(
                 &filter_root,
                 &search_root,
                 deadline,
+                &cancelled,
             ))
         })
         .ok()
@@ -1605,8 +1791,16 @@ fn ignored_entries_in_folder(
     filter_root: &Path,
     search_root: &Path,
     deadline: Instant,
+    cancelled: &std::sync::atomic::AtomicBool,
 ) -> Option<IgnoredScopeEntries> {
-    let within_budget = || Instant::now() < deadline && !crate::executor::current_job_cancelled();
+    let within_budget = || {
+        !cancelled.load(Ordering::Acquire)
+            && Instant::now() < deadline
+            && !crate::executor::current_job_cancelled()
+    };
+    if !within_budget() {
+        return None;
+    }
     let skipped = Arc::new(AtomicUsize::new(0));
     let builder = target_walk_builder(
         search_root,
@@ -4201,6 +4395,89 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    fn ignore_probe_answer() -> IgnoredScopeEntries {
+        IgnoredScopeEntries {
+            names: vec![".agents/".to_string()],
+            total: 1,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn grep_ignore_disclosure_ready_probe_keeps_its_result() {
+        let probe = IgnoredScopeProbe::ready(
+            Some(ignore_probe_answer()),
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert_eq!(probe.finish().unwrap().names, [".agents/"]);
+    }
+
+    #[test]
+    fn grep_ignore_disclosure_late_probe_is_cancelled_without_waiting_for_work() {
+        let worker = IgnoreProbeWorker::new().unwrap();
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (finished, observed) = std::sync::mpsc::channel();
+        let probe = worker
+            .start(Instant::now() + Duration::from_secs(1), move |cancelled| {
+                entered.send(()).unwrap();
+                let _ = blocked.recv();
+                finished.send(cancelled.load(Ordering::Acquire)).unwrap();
+                Some(ignore_probe_answer())
+            })
+            .unwrap();
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        let before = Instant::now();
+        assert!(probe.finish().is_none());
+        assert!(before.elapsed() < Duration::from_millis(100));
+        release.send(()).unwrap();
+        assert!(observed.recv_timeout(Duration::from_secs(1)).unwrap());
+    }
+
+    #[test]
+    fn grep_ignore_disclosure_busy_worker_does_not_enqueue_or_wait() {
+        let worker = IgnoreProbeWorker::new().unwrap();
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (finished, observed) = std::sync::mpsc::channel();
+        let probe = worker
+            .start(Instant::now() + Duration::from_secs(1), move |_| {
+                entered.send(()).unwrap();
+                let _ = blocked.recv();
+                finished.send(()).unwrap();
+                None
+            })
+            .unwrap();
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        let before = Instant::now();
+        assert!(worker
+            .start(Instant::now() + Duration::from_secs(1), |_| {
+                panic!("busy worker must not run another probe")
+            })
+            .is_none());
+        assert!(before.elapsed() < Duration::from_millis(100));
+        drop(probe);
+        release.send(()).unwrap();
+        observed.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn grep_ignore_disclosure_cancelled_queued_probe_does_no_work() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let worker = IgnoreProbeWorker {
+            sender,
+            busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let probe = worker
+            .start(Instant::now() + Duration::from_secs(1), |_| {
+                panic!("cancelled queued probe must not start filesystem work")
+            })
+            .unwrap();
+        drop(probe);
+        receiver.recv().unwrap()();
+        assert!(!worker.busy.load(Ordering::Acquire));
     }
 
     #[test]

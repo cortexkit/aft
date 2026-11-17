@@ -67,6 +67,13 @@ impl std::fmt::Debug for Fence {
 }
 
 impl Fence {
+    /// Optional background work may outlive its reply. Keep its read authority,
+    /// but do not let it append omissions to a response that is already sent.
+    pub(crate) fn without_floor_disclosure(mut self) -> Self {
+        self.floor_omissions = None;
+        self
+    }
+
     pub(crate) fn for_floor_filter_root(mut self, root: &Path) -> Self {
         self.floor_filter_root = Some(root.to_path_buf());
         self
@@ -133,6 +140,38 @@ impl Fence {
         }
         gate.denied.lock().insert(path.to_path_buf());
         false
+    }
+}
+
+#[cfg(test)]
+mod ignore_probe_tests {
+    use super::*;
+
+    #[test]
+    fn grep_ignore_disclosure_detached_fence_keeps_authority_not_output_collector() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
+        let gate = Arc::new(ReadGate::new(&ctx, "probe-fence").unwrap());
+        let omissions = Arc::new(parking_lot::Mutex::new(FloorOmissions::default()));
+        let original = Fence {
+            requests: vec!["probe-fence".to_string()],
+            gate: Some(Arc::clone(&gate)),
+            floor_omissions: Some(Arc::clone(&omissions)),
+            floor_filter_root: None,
+        };
+        let detached = original.clone().without_floor_disclosure();
+        assert_eq!(detached.requests, original.requests);
+        assert!(Arc::ptr_eq(detached.gate.as_ref().unwrap(), &gate));
+        detached.record_matched_floor(&dir.path().join("not-reported"));
+        assert!(omissions.lock().paths.is_empty());
+        original.record_matched_floor(&dir.path().join("still-reported"));
+        assert_eq!(omissions.lock().paths.len(), 1);
     }
 }
 

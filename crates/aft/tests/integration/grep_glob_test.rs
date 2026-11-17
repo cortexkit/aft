@@ -39,7 +39,16 @@ mod grep_ignore_disclosure {
     const NEEDLE: &str = "ignore_disclosure_needle";
 
     fn start(root: &Path, indexed: bool) -> AftProcess {
-        let mut aft = AftProcess::spawn();
+        start_with_probe(root, indexed, "ready")
+    }
+
+    fn start_with_probe(root: &Path, indexed: bool, mode: &str) -> AftProcess {
+        // Pin only probe completion timing; evidence collection and normal
+        // command rendering still run against the fixture's real ignore rules.
+        let mut aft = AftProcess::spawn_with_env(&[(
+            "AFT_TEST_GREP_IGNORE_PROBE",
+            std::ffi::OsStr::new(mode),
+        )]);
         if indexed {
             configure_with_index(&mut aft, root);
             wait_for_index_ready(
@@ -89,6 +98,32 @@ mod grep_ignore_disclosure {
                 );
                 assert!(response.get("ignored_entries").is_none(), "{response}");
             }
+            assert!(aft.shutdown().success());
+        }
+    }
+
+    #[test]
+    fn late_and_busy_probes_omit_the_line_without_holding_the_reply() {
+        for mode in ["pending", "busy"] {
+            let project = setup_project(&[
+                (".git/info/exclude", ""),
+                (".gitignore", ".agents/\n"),
+                ("top.txt", NEEDLE),
+                (".agents/note.md", NEEDLE),
+            ]);
+            let mut aft = start_with_probe(project.path(), true, mode);
+            let started = Instant::now();
+            let response = grep(&mut aft, None);
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "{mode}: {response}"
+            );
+            assert_eq!(response["total_matches"], 1, "{response}");
+            assert!(
+                !response["text"].as_str().unwrap().contains("Not searched"),
+                "{response}"
+            );
+            assert!(response.get("ignored_entries").is_none(), "{response}");
             assert!(aft.shutdown().success());
         }
     }
