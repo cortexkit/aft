@@ -2129,13 +2129,12 @@ fn build_relaxed_profile(
     let mut stores = policy.private_stores.clone();
     stores.deny.push(session_store.to_path_buf());
     stores.session_task_read_dir = Some(session_store.to_path_buf());
-    stores.deny.push(home.join(".config/cortexkit"));
     stores.deny.extend([
         home.join(".local/share/cortexkit"),
         home.join(".local/state/cortexkit"),
         ctx.storage_dir(),
     ]);
-    for key in ["XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME"] {
+    for key in ["XDG_DATA_HOME", "XDG_STATE_HOME"] {
         if let Some(base) = absolute_env_path(key) {
             stores
                 .deny
@@ -2564,7 +2563,6 @@ fn credential_floor_paths(
                 ".pypirc",
                 ".git-credentials",
                 ".config/git/credentials",
-                ".config/cortexkit",
             ]
             .map(|path| home.join(path)),
         );
@@ -2708,7 +2706,7 @@ fn credential_paths_with_resolver(
         denies.extend(paths(key, ""));
     }
     denies.extend(paths("DOCKER_CONFIG", "config.json"));
-    for suffix in ["gh", "gcloud", "git/credentials", "cortexkit"] {
+    for suffix in ["gh", "gcloud", "git/credentials"] {
         denies.extend(paths("XDG_CONFIG_HOME", suffix));
     }
     if let Some(value) = getenv("KUBECONFIG") {
@@ -13254,6 +13252,7 @@ mod read_allow_tests {
                 &[
                     (".ssh", true),
                     (".config", true),
+                    (".local", true),
                     ("work", true),
                     ("notes", false),
                 ],
@@ -13262,11 +13261,15 @@ mod read_allow_tests {
                 "/home/alice/.config",
                 &[("gcloud", true), ("cortexkit", true), ("editor", true)],
             )
+            .directory("/home/alice/.local", &[("share", true), ("state", true)])
+            .directory("/home/alice/.local/share", &[("cortexkit", true)])
+            .directory("/home/alice/.local/state", &[("cortexkit", true)])
             .directory("/home/alice/work", &[("private", true), ("src", true)]);
         let denies = [
             "/home/alice/.ssh",
             "/home/alice/.config/gcloud",
-            "/home/alice/.config/cortexkit",
+            "/home/alice/.local/share/cortexkit",
+            "/home/alice/.local/state/cortexkit",
             "/home/alice/work/private",
         ]
         .map(PathBuf::from);
@@ -13277,6 +13280,7 @@ mod read_allow_tests {
         assert_eq!(
             emitted,
             [
+                "/home/alice/.config/cortexkit",
                 "/home/alice/.config/editor",
                 "/home/alice/notes",
                 "/home/alice/work/src",
@@ -13675,7 +13679,6 @@ mod credential_floor_tests {
                 ".pypirc",
                 ".kube/config",
                 "Library/Keychains",
-                ".config/cortexkit",
             ] {
                 assert!(
                     denies.contains(&home.join(relative)),
@@ -13684,6 +13687,7 @@ mod credential_floor_tests {
                 );
             }
             assert!(cargo.contains(&home.join(".cargo")));
+            assert!(!denies.contains(&home.join(".config/cortexkit")));
         }
         for path in [
             gh,
@@ -13723,7 +13727,7 @@ mod worker_broker_floor_tests {
     use super::*;
 
     #[test]
-    fn worker_gh_read_floor_xdg_config_is_denied_when_set() {
+    fn worker_gh_read_floor_allows_cortexkit_settings_when_xdg_set() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let xdg = dir.path().join("xdg-config");
@@ -13733,18 +13737,17 @@ mod worker_broker_floor_tests {
             (key == "XDG_CONFIG_HOME").then(|| xdg.as_os_str().to_owned())
         })
         .unwrap();
-        assert!(denies.contains(&home.join(".config/cortexkit")));
-        assert!(
-            denies.contains(&xdg.join("cortexkit")),
-            "the configured user config must remain credential-floored"
-        );
+        assert!(!denies.contains(&home.join(".config/cortexkit")));
+        assert!(!denies.contains(&xdg.join("cortexkit")));
+        assert!(denies.contains(&xdg.join("gh")));
     }
 
     #[test]
-    fn worker_gh_read_floor_home_config_is_denied_when_xdg_unset() {
+    fn worker_gh_read_floor_allows_cortexkit_settings_when_xdg_unset() {
         let dir = tempfile::tempdir().unwrap();
         let (denies, _) = credential_floor_paths(dir.path(), None, &[], |_| None).unwrap();
-        assert!(denies.contains(&dir.path().join(".config/cortexkit")));
+        assert!(!denies.contains(&dir.path().join(".config/cortexkit")));
+        assert!(denies.contains(&dir.path().join(".config/gh")));
     }
 
     #[test]

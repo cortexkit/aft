@@ -557,7 +557,6 @@ pub enum HeadPolicy {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum FloorRule {
     CredentialPath,
-    CortexkitConfig,
     CortexkitModuleData,
     CortexkitModuleState,
     AftStorage,
@@ -573,7 +572,6 @@ impl FloorRule {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::CredentialPath => "credential_path",
-            Self::CortexkitConfig => "cortexkit_config",
             Self::CortexkitModuleData => "cortexkit_module_data",
             Self::CortexkitModuleState => "cortexkit_module_state",
             Self::AftStorage => "aft_storage",
@@ -589,7 +587,6 @@ impl FloorRule {
     pub(crate) fn description(self) -> &'static str {
         match self {
             Self::CredentialPath => "credential path",
-            Self::CortexkitConfig => "CortexKit configuration store",
             Self::CortexkitModuleData => {
                 "module data store under ~/.local/share/cortexkit/<module>"
             }
@@ -663,7 +660,6 @@ impl AccessPolicy {
             (".gnupg", FloorRule::CredentialPath),
             (".config/gcloud", FloorRule::CredentialPath),
             (".azure", FloorRule::CredentialPath),
-            (".config/cortexkit", FloorRule::CortexkitConfig),
         ]
         .into_iter()
         .map(|(path, rule)| {
@@ -1554,6 +1550,31 @@ fn resolve_policy_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cortexkit_settings_are_not_a_floor_but_data_and_state_are() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let home = policy_path(dir.path());
+        let policy = AccessPolicy::from_config(
+            &Config::default(),
+            &home.join(".local/share/cortexkit/aft"),
+            vec![home.clone()],
+            &home,
+        );
+        for operation in [AccessOperation::Read, AccessOperation::Write] {
+            assert_eq!(
+                policy.decide(operation, &home.join(".config/cortexkit/x.jsonc"), false),
+                AccessDecision::Allow
+            );
+            for relative in [".local/share/cortexkit", ".local/state/cortexkit"] {
+                assert_eq!(
+                    policy.decide(operation, &home.join(relative).join("x.jsonc"), false),
+                    AccessDecision::Deny(AccessDenial::Floor)
+                );
+            }
+        }
+    }
+
     #[test]
     fn protected_folder_refusal_words_match_approved_table() {
         use super::*;

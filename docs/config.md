@@ -8,6 +8,14 @@ Both files are JSONC (comments allowed). One location serves every harness:
 | User | `~/.config/cortexkit/aft.jsonc` |
 | Project | `<project>/.cortexkit/aft.jsonc` |
 
+Agents may read and edit the entire CortexKit settings folder, `~/.config/cortexkit`
+or `$XDG_CONFIG_HOME/cortexkit`, including any key or token files still there.
+Secrets belong in the vault, not in the settings folder. Subconscious's settings
+gate turns edits into proposals for the user to approve. CortexKit's private data
+and state folders (`~/.local/share/cortexkit`, `~/.local/state/cortexkit`, and their
+`XDG_DATA_HOME` and `XDG_STATE_HOME` equivalents), AFT's storage directory, and the
+daemon connection file remain blocked.
+
 For the removal order and harness-specific registration steps, see [Uninstall](../README.md#uninstall).
 
 OMP uses this same CortexKit user file; register its Pi-compatible plugin with `npx @cortexkit/aft@latest setup --harness omp`.
@@ -846,14 +854,14 @@ Strict native profiles and relaxed macOS profiles enforce credential-file denies
 Read and write protection covers:
 
 - `~/.ssh`, `~/.gnupg`, `~/Library/Keychains`, `~/.aws`, `~/.config/gcloud`, `~/.azure`, `~/.config/gh`, `~/.netrc`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.docker/config.json`, `~/.npmrc`, `~/.pypirc`, `~/.kube/config` and `~/.cargo/credentials*` (including future filename suffixes).
-- CortexKit config, data and state: `~/.config/cortexkit`, `~/.local/share/cortexkit`, `~/.local/state/cortexkit`, their absolute XDG equivalents, AFT's resolved storage and the session store. This includes other agents' private stores. Daemon connection files selected through trusted configuration, `SUBC_CONNECTION_FILE`, `XDG_RUNTIME_DIR/subc-connection.json` and the production runtime path are protected even outside those trees. User `sandbox.read_deny` paths are protected as well.
+- CortexKit data and state: `~/.local/share/cortexkit`, `~/.local/state/cortexkit`, their absolute XDG equivalents, AFT's resolved storage and the session store. This includes other agents' private stores. Daemon connection files selected through trusted configuration, `SUBC_CONNECTION_FILE`, `XDG_RUNTIME_DIR/subc-connection.json` and the production runtime path are protected even outside those trees. User `sandbox.read_deny` paths are protected as well. The settings folder (`~/.config/cortexkit` or `$XDG_CONFIG_HOME/cortexkit`) is open to agents for reading and editing; secrets belong in the vault, not there.
 
 Private-store read exceptions are the checkout pool (so sibling checkout reads work), the current checkout and task I/O/temp, placed CortexKit binaries (`~/.local/share/cortexkit/bin` and the XDG equivalent), and the exact shim executable, `<storage>/shims`, content-keyed Git hook directory, and Git-resolved metadata/hook paths. AFT storage defaults to `<XDG_DATA_HOME>/cortexkit/aft` or `~/.local/share/cortexkit/aft`; [storage overrides](#storage-root-environment-override) can relocate it. The session store is the task directory under `<storage>/bash-tasks/<session-hash>`. These exceptions do not expose other agents' stores. Sandboxed shells can also read the file-tool-readable saved command files in their own harness/session (including local captures of remote commands), never saved launch environments or other private storage; macOS matches only those filenames, while Linux strict snapshots existing files from the 500 most recently modified task entries at launch and leaves older or later-created files unreadable until a subsequent eligible snapshot, without adding write access beyond the current task's existing I/O grant.
 
 Additional write denies cover:
 
 - `~/Work` and the Alfonso worktree pool, except the current checkout and the narrow shared Git object/ref/log/packed-ref grants needed for commits and branch deletion. Registered main and sibling worktrees outside those trees are also protected. This is a known-checkout boundary: a previously unknown, unrelated checkout outside these locations is not discovered by a filesystem-wide scan.
-- CortexKit config/data/state and AFT storage, except the current checkout and the current task's AFT-owned I/O/temp/scratch. Managed shim and hook executables remain immutable.
+- CortexKit data/state and AFT storage, except the current checkout and the current task's AFT-owned I/O/temp/scratch. Managed shim and hook executables remain immutable.
 - `~/.zshrc`, `~/.zprofile`, `~/.bashrc`, `~/.profile`, `~/.gitconfig`, `~/.config/git` and `~/Library/LaunchAgents`.
 - The repository's Git `config`, linked `config.worktree`, default and effective hooks directories, core's hook stubs, and the resolved `mason.originalHooksPath` target. Git binding files and executable project policy (`.cortexkit/aft.jsonc`, `.cortexkit/aft/filters`) remain protected too.
 
