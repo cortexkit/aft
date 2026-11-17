@@ -324,12 +324,15 @@ test("prefrontal rename chooses both catalog states and retains the daemon owner
 });
 
 test("prefrontal rename re-resolves a refused cached scope without restarting AFT", async () => {
+  const clock = retryClock();
   const { client, pool } = setup();
   await pool.getBridge(TEST_PROJECT_ROOT).toolCall("head", "read", {});
   client.catalogModuleIds = ["prefrontal"];
   const renamed = { ...scope, owner: { kind: "reserved", module_id: "prefrontal" } };
   client.answer = { owner: renamed.owner, ref: scope.ref, scope_epoch: scope.scopeEpoch };
   client.toolOpenErrors.push(new SubcError("old owner retired", "scope_not_live"));
+  await pool.getBridge(TEST_OTHER_ROOT).toolCall("head", "read", {});
+  await clock.tick(5_000);
   await pool.getBridge(TEST_OTHER_ROOT).toolCall("head", "read", {});
   expect(
     client.opens
