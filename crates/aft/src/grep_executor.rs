@@ -1567,10 +1567,7 @@ pub(crate) fn scope_ignored_entries(scope: &GrepScope) -> Option<IgnoredScopeEnt
     let [root] = scope.roots.as_slice() else {
         return None;
     };
-    if crate::context::confinement::active()
-        || root.ignored_target
-        || !crate::bounded_io::metadata(&root.search_root).is_ok_and(|meta| meta.is_dir())
-    {
+    if crate::context::confinement::active() || root.ignored_target {
         return None;
     }
     let filter_root = root.filter_root.clone();
@@ -1579,15 +1576,29 @@ pub(crate) fn scope_ignored_entries(scope: &GrepScope) -> Option<IgnoredScopeEnt
         fallback_walk_budget(),
         FALLBACK_WALK_RETURN_MARGIN,
     );
-    crate::bounded_io::run(&root.search_root, None, move |search_root| {
-        Ok(ignored_entries_in_folder(
-            &filter_root,
-            &search_root,
-            deadline,
-        ))
+    if Instant::now() >= deadline {
+        return None;
+    }
+    // This optional qualification must not turn already-found matches into an
+    // I/O error. Honor the remaining request time, but keep probe failures out
+    // of the search's recorded I/O failures and skipped-file reports.
+    let budget =
+        crate::bounded_io::Budget::after(deadline.saturating_duration_since(Instant::now()))
+            .capped(deadline);
+    crate::bounded_io::with_budget(Some(budget), || {
+        if !crate::bounded_io::metadata(&root.search_root).is_ok_and(|meta| meta.is_dir()) {
+            return None;
+        }
+        crate::bounded_io::run(&root.search_root, None, move |search_root| {
+            Ok(ignored_entries_in_folder(
+                &filter_root,
+                &search_root,
+                deadline,
+            ))
+        })
+        .ok()
+        .flatten()
     })
-    .ok()
-    .flatten()
 }
 
 fn ignored_entries_in_folder(
