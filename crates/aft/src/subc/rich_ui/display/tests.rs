@@ -1160,7 +1160,7 @@ async fn display_read_memory_hit_never_opens_the_store() {
 }
 
 #[tokio::test]
-async fn display_read_protected_capacity_defers_wake_but_never_blocks_push() {
+async fn display_read_protected_capacity_retries_past_eight_deferrals_then_announces() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("aft.db");
     let now = crate::db::display_records::now_ms();
@@ -1196,22 +1196,31 @@ async fn display_read_protected_capacity_defers_wake_but_never_blocks_push() {
         let bytes = outbox.reads.read(&id, at).unwrap();
         (id, bytes)
     };
-    let published = std::sync::atomic::AtomicBool::new(false);
-    let result = announce_retained(&writer, id.clone(), bytes, async {
-        published.store(true, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    })
-    .await;
-    assert_eq!(result, Err("display_store_deferred"));
-    assert!(
-        !published.load(std::sync::atomic::Ordering::Relaxed),
-        "a wake must not publish without durable capacity"
-    );
-    assert!(
-        writer.outbox.lock().unwrap().pop_due(at).is_some(),
-        "push ownership is independent of a deferred wake"
-    );
-    let conn = rusqlite::Connection::open(path).unwrap();
+    let published = std::sync::atomic::AtomicUsize::new(0);
+    let mut retry_at = at;
+    for _ in 0..12 {
+        assert_eq!(
+            writer.outbox.lock().unwrap().reads.due(retry_at),
+            Some(id.clone())
+        );
+        let result = announce_retained(&writer, id.clone(), bytes.clone(), async {
+            published.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        })
+        .await;
+        assert_eq!(result, Err("display_store_deferred"));
+        // Use the same wake-only completion path as the bus publisher; it
+        // reschedules the read copy without spending a push delivery attempt.
+        writer
+            .outbox
+            .lock()
+            .unwrap()
+            .reads
+            .published(&id, result.is_ok(), retry_at);
+        retry_at += Duration::from_secs(60);
+    }
+    assert_eq!(published.load(std::sync::atomic::Ordering::Relaxed), 0);
+    let conn = rusqlite::Connection::open(&path).unwrap();
     assert_eq!(
         conn.query_row("SELECT count(*) FROM display_records", [], |row| row
             .get::<_, usize>(0))
@@ -1221,6 +1230,42 @@ async fn display_read_protected_capacity_defers_wake_but_never_blocks_push() {
     assert!(crate::db::display_records::read(&conn, &id, now)
         .unwrap()
         .is_none());
+    // Let exactly one protected row expire; every other row is still protected.
+    crate::db::display_records::acknowledged(
+        &conn,
+        "protected:0",
+        crate::db::display_records::now_ms() - 600_001,
+    )
+    .unwrap();
+    drop(conn);
+    assert_eq!(
+        writer.outbox.lock().unwrap().reads.due(retry_at),
+        Some(id.clone())
+    );
+    let result = announce_retained(&writer, id.clone(), bytes.clone(), async {
+        published.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    })
+    .await;
+    assert_eq!(result, Ok(()));
+    writer
+        .outbox
+        .lock()
+        .unwrap()
+        .reads
+        .published(&id, result.is_ok(), retry_at);
+    assert_eq!(published.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert!(writer.outbox.lock().unwrap().reads.due(retry_at).is_none());
+    let push = writer.outbox.lock().unwrap().pop_due(retry_at).unwrap();
+    assert_eq!(
+        push.attempts, 0,
+        "wake deferrals never consume push attempts"
+    );
+    let conn = rusqlite::Connection::open(path).unwrap();
+    assert_eq!(
+        crate::db::display_records::read(&conn, &id, crate::db::display_records::now_ms()).unwrap(),
+        Some(bytes)
+    );
 }
 
 #[tokio::test]

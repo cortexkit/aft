@@ -23,7 +23,7 @@ impl Store {
         let database = self.database.clone();
         tokio::task::spawn_blocking(move || {
             let db = app.open_db(&database).map_err(|_| "display_store_open")?;
-            let conn = db.try_lock().map_err(|_| "display_store_busy")?;
+            let conn = db.lock().map_err(|_| "display_store_poisoned")?;
             action(&conn).map_err(|_| "display_store_query")
         })
         .await

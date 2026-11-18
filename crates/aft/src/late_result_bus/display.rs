@@ -159,6 +159,8 @@ pub(super) async fn publish_one(client: &BusClient) {
 }
 
 fn completed(id: &str, result: Result<(), &'static str>) {
+    // Wake backoff is separate from Outbox::retry's push attempt budget.
+    // A full store may defer a wake indefinitely without exhausting its pushes.
     crate::subc::rich_ui::display::with_outbox(|outbox| {
         outbox
             .reads

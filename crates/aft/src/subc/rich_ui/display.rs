@@ -1247,7 +1247,7 @@ async fn read_for_reader(
     let request = read_request(arguments)?;
     let memory = writer
         .outbox
-        .try_lock()
+        .lock()
         .map_err(|_| cortexkit_role_tool_display::not_ready())?
         .reads
         .read(&request.record_id, now);
