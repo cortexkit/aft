@@ -262,7 +262,7 @@ async fn scope_watch_grant_and_held_mutations_update_selectors_without_census_ti
         grants::register_scope(&conn, &key, None, &crate::config::Config::default()).unwrap();
         grants::insert(&conn, &key, &grant).unwrap();
     }
-    let watch = request(&mut frames, "scope.watch").await;
+    let watch = membership_watch(&pending, &mut frames, &scope).await;
     assert_eq!(snapshot(&pending, &watch), 1);
     turns().await;
     grants::revoke(&db.lock().unwrap(), &key, &grant.path).unwrap();
@@ -288,7 +288,7 @@ async fn scope_watch_grant_and_held_mutations_update_selectors_without_census_ti
         ledger::State::Prepared,
     )
     .unwrap();
-    let watch = request(&mut frames, "scope.watch").await;
+    let watch = membership_watch(&pending, &mut frames, &scope).await;
     assert_eq!(snapshot(&pending, &watch), 1);
     turns().await;
     ledger::settle(
@@ -317,7 +317,7 @@ async fn scope_watch_grant_and_held_mutations_update_selectors_without_census_ti
         preset: "head".into(),
     };
     grants::materialize(&db.lock().unwrap(), &policy, &json!({}), &[(grant, None)]).unwrap();
-    let watch = request(&mut frames, "scope.watch").await;
+    let watch = membership_watch(&pending, &mut frames, &scope).await;
     assert_eq!(
         snapshot(&pending, &watch),
         1,
@@ -740,6 +740,45 @@ async fn opening_watch(
             ),
             op => panic!("unexpected opening op {op}"),
         }
+    }
+}
+async fn membership_watch(
+    pending: &readiness::PendingControlReplies,
+    frames: &mut mpsc::Receiver<WriterFrame>,
+    scope: &ScopeStamp,
+) -> WriterFrame {
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("membership watch frame deadline")
+            .unwrap();
+        if frame.header.ty == FrameType::Cancel {
+            continue;
+        }
+        assert_eq!(frame.header.ty, FrameType::Request);
+        assert_eq!(frame.header.channel, 0);
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        if body["op"] == "scope.watch" {
+            return frame;
+        }
+        // Until the snapshot provides coverage, grant polling may describe the
+        // scope first. Accept only this fixture's exact fallback request.
+        assert_eq!(
+            body,
+            json!({
+                "op": "scope.describe", "owner": scope.owner, "ref": scope.scope_ref,
+            })
+        );
+        eprintln!("membership fixture answered uncovered-scope fallback");
+        response(
+            pending,
+            &frame,
+            answer(
+                scope,
+                subc_protocol::scope::ScopeStatus::Live,
+                scope.scope_epoch,
+            ),
+        );
     }
 }
 async fn cancellation(
