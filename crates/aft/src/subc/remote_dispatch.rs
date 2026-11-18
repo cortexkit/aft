@@ -16,7 +16,8 @@ pub(super) fn read_operation(wire_name: &str) -> Option<&'static str> {
         "aft_zoom" => Some("zoom"),
         "aft_callgraph" => Some("callgraph"),
         "ast_grep_search" => Some("ast_search"),
-        "aft_conflicts" => Some("conflicts"),
+        // `conflicts` scans the entire Git working tree before checking file
+        // paths, which could read outside the registered folder.
         _ => None,
     }
 }
@@ -26,6 +27,7 @@ pub(super) fn requested_mode(wire_name: &str) -> Option<Mode> {
         return Some(Mode::Read);
     }
     match crate::tool_gate::canonical_tool_name(wire_name)? {
+        "aft_conflicts" => Some(Mode::Read),
         "write" | "edit" | "apply_patch" | "aft_delete" | "aft_move" | "aft_import"
         | "ast_grep_replace" | "bash" => Some(Mode::ReadWrite),
         _ => None,
@@ -79,7 +81,9 @@ impl Read {
             )
             .map_err(|failed| failed.response)?;
             if read.arguments.get("ref").is_some() {
-                crate::revision_read::check_enabled(&prepared.request, ctx)?;
+                // Git revision reads can open an ancestor or linked worktree's
+                // object store outside the registered folder.
+                return Err(crate::revision_read::disabled(&prepared.request));
             }
             Ok(())
         })

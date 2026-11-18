@@ -44,10 +44,10 @@ fn tool_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
         return crate::commands::configure::handle_configure(&request, ctx);
     }
     READS.lock().unwrap().push(request.command.clone());
-    if request.command == "read" {
-        crate::commands::read::handle_read(&request, ctx)
-    } else {
-        Response::success(&request.id, json!({}))
+    match request.command.as_str() {
+        "read" => crate::commands::read::handle_read(&request, ctx),
+        "git_conflicts" => crate::commands::conflicts::handle_git_conflicts(ctx, &request),
+        _ => Response::success(&request.id, json!({})),
     }
 }
 
@@ -393,7 +393,6 @@ async fn remote_wire_admission_audit_read_and_pairing_custody() {
                 json!({"pattern":"f()","lang":"rust"}),
                 "ast_search",
             ),
-            ("conflicts", json!({}), "git_conflicts"),
         ] {
             let encoded = pin(name, CatalogPreset::Head, false, false, None);
             let (wire, digest, semantics) = {
@@ -431,7 +430,45 @@ async fn remote_wire_admission_audit_read_and_pairing_custody() {
                 corr += 1;
             }
         }
+        let conflicts_pin =
+            SchemaPin::parse(&pin("conflicts", CatalogPreset::Head, false, false, None)).unwrap();
+        for name in ["conflicts", "aft_conflicts"] {
+            refusal(
+                rpc(
+                    &mut daemon,
+                    2,
+                    corr,
+                    request(
+                        name,
+                        "head",
+                        json!({}),
+                        &format!("conflicts-{corr}"),
+                        SchemaPin::new(name, &conflicts_pin.schema_digest, conflicts_pin.semantics)
+                            .encode()
+                            .unwrap(),
+                    ),
+                )
+                .await,
+                "remote_tool_not_available",
+            );
+            corr += 1;
+        }
+        assert_eq!(*READS.lock().unwrap(), expected);
         assert_eq!(card_count.load(Ordering::Relaxed), 1);
+        executor
+            .actor_context(&root)
+            .unwrap()
+            .update_config(|config| {
+                config.revision_reads = true;
+            });
+        let mut enabled_ref = read("head", "a.txt", "ref-on");
+        enabled_ref["arguments"]["ref"] = json!("HEAD");
+        refusal(
+            rpc(&mut daemon, 2, corr, enabled_ref).await,
+            "revision_reads_disabled",
+        );
+        assert_eq!(*READS.lock().unwrap(), expected);
+        let corr = corr + 1;
         executor
             .actor_context(&root)
             .unwrap()

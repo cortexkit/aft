@@ -7071,6 +7071,7 @@ where
         sender.stop().await;
     }
     drop(control);
+    drop(remote_calls);
     a0.stop();
     drop(a0);
     drop(writer_tx);
