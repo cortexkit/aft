@@ -10,6 +10,7 @@ pub mod catalog;
 pub mod differential;
 pub mod dispatch;
 pub mod footer;
+pub(crate) mod notices;
 pub mod observation;
 pub use crate::bash_parse as parser;
 pub mod rules;
@@ -102,7 +103,7 @@ pub fn try_rewrite(
         ctx,
         principal,
     )?;
-    crate::subc::runner_notices::notice_templates::deliver(&mut response, None);
+    notices::deliver(&mut response, None);
     Some(response)
 }
 

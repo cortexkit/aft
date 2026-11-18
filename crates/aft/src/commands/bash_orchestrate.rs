@@ -432,7 +432,7 @@ fn observe_raw_bash_response(
     ctx: &AppContext,
     response: &mut Response,
 ) {
-    crate::subc::runner_notices::notice_templates::deliver(response, None);
+    crate::bash_rewrite::notices::deliver(response, None);
     let Some(data) = response.data.as_object_mut() else {
         return;
     };

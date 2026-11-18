@@ -7,11 +7,11 @@ const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 const GREP_FOOTER_FRESHNESS_WINDOW: Duration = Duration::from_secs(60);
 
 use crate::bash_rewrite::footer::grep_search_hint;
+use crate::bash_rewrite::notices::{self as notice_templates, Notice, Target};
 use crate::bash_rewrite::parser::{parse, ParsedCommand};
 use crate::bash_rewrite::{RewriteRequest, RewriteRule};
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
-use crate::subc::runner_notices::notice_templates::{self, Notice, Target};
 
 pub struct GrepRule;
 pub struct RgRule;
