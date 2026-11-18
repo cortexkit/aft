@@ -60,7 +60,7 @@
     "reason": "Split backup storage and recovery pending; AFT crate split lane."
   },
   "crates/aft/src/data_layer/checkout.rs": {
-    "lines": 6927,
+    "lines": 6538,
     "reason": "Split checkout lifecycle and storage pending; AFT crate split lane."
   },
   "crates/aft/src/bash_background/persistence.rs": {
@@ -88,7 +88,7 @@
     "reason": "Split executor tests by command family pending; AFT crate split lane."
   },
   "crates/aft/src/subc/health.rs": {
-    "lines": 5587,
+    "lines": 5568,
     "reason": "Split daemon health monitoring responsibilities pending; AFT crate split lane."
   },
   "crates/aft/src/search_index.rs": {

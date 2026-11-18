@@ -54,6 +54,8 @@ use super::checkout::resume;
 use super::checkout::staged_records::{StagedAt, StagedRecords};
 use super::graph_rows::references_by_key;
 use super::graph_store::StoredSlices;
+use super::incremental::UpdateError;
+use super::refresh_memory::{RefreshChecks, RefreshMemory, RefreshStop};
 
 /// What resolving a checkout reads.
 #[derive(Clone, Debug)]
@@ -646,6 +648,15 @@ impl EncodedResolution {
     /// `record_key`.
     #[must_use]
     pub(crate) fn encode(record_key: &str, resolution: &FileResolution) -> Self {
+        Self::encode_checked(record_key, resolution, None)
+            .expect("an unguarded resolution cannot stop")
+    }
+
+    fn encode_checked(
+        record_key: &str,
+        resolution: &FileResolution,
+        guard: Option<&RefreshMemory>,
+    ) -> Result<Self, RefreshStop> {
         debug_assert!(
             resolution
                 .rows
@@ -653,10 +664,10 @@ impl EncodedResolution {
                 .all(|row| row.caller_blob_key == record_key),
             "a resolution's rows carry its parse key"
         );
-        Self {
+        Ok(Self {
             record_key: record_key.into(),
-            bytes: super::fragment::encode(resolution).into_boxed_slice(),
-        }
+            bytes: super::fragment::encode_checked(resolution, guard)?.into_boxed_slice(),
+        })
     }
 
     /// The resolution of the file at `path` this encodes.
@@ -773,24 +784,39 @@ impl Resolutions {
     /// each file's parse key from `record_key`, so that
     /// [`Self::release_decoded`] can let it go. Runs on the current rayon
     /// pool.
-    pub(crate) fn encode_changed(&mut self, record_key: impl Fn(&str) -> Option<String> + Sync) {
+    pub(super) fn encode_changed(
+        &mut self,
+        record_key: impl Fn(&str) -> Option<String> + Sync,
+        guard: Option<&RefreshMemory>,
+    ) -> Result<(), RefreshStop> {
         let changed = std::mem::take(&mut self.changed);
         let map = &self.map;
         let carry = crate::alloc_trace::carry();
         let encoded = changed
             .par_iter()
-            .filter_map(|path| {
+            .map(|path| {
+                guard.file()?;
                 let _label = carry.enter();
-                let resolution = map.get(path)?.value.get()?.as_deref()?;
-                let key = record_key(path)?;
-                Some((path, EncodedResolution::encode(&key, resolution)))
+                let Some(resolution) = map.get(path).and_then(|slot| slot.value.get()?.as_deref())
+                else {
+                    return Ok(None);
+                };
+                let Some(key) = record_key(path) else {
+                    return Ok(None);
+                };
+                Ok(Some((
+                    path,
+                    EncodedResolution::encode_checked(&key, resolution, guard)?,
+                )))
             })
-            .collect::<Vec<_>>();
-        for (path, encoded) in encoded {
+            .collect::<Result<Vec<_>, RefreshStop>>()?;
+        for (path, encoded) in encoded.into_iter().flatten() {
+            guard.file()?;
             if let Some(slot) = self.map.get_mut(path) {
                 slot.source = ResolutionSource::Encoded(Arc::new(encoded));
             }
         }
+        Ok(())
     }
 
     /// How many entries that can be decoded again, from the publication or
@@ -1332,13 +1358,14 @@ impl BindCache {
     /// # Errors
     ///
     /// When binding fails on a file.
-    pub(crate) fn bind_module_declaring(
+    pub(super) fn bind_module_declaring_checked(
         &self,
         inputs: &CheckoutInputs,
-    ) -> Result<(), ManifestJoinError> {
-        let lists = self.lists_in_parallel(inputs);
+        guard: Option<&RefreshMemory>,
+    ) -> Result<(), UpdateError> {
+        let lists = self.lists_in_parallel(inputs, guard)?;
         let paths = lists.module_declaring.iter().collect::<Vec<_>>();
-        self.bind_missing(inputs, &paths)
+        self.bind_missing_checked(inputs, &paths, guard)
     }
 
     /// [`Self::lists`], built in parallel when no resolution has built them.
@@ -1349,14 +1376,18 @@ impl BindCache {
     /// parse decoded, and keeping every one held over 600 MB on AFT's own
     /// checkout. The lock is not held while they are read: a pool thread
     /// waiting on it could be the one a read needs.
-    fn lists_in_parallel(&self, inputs: &CheckoutInputs) -> Arc<FileLists> {
+    fn lists_in_parallel(
+        &self,
+        inputs: &CheckoutInputs,
+        guard: Option<&RefreshMemory>,
+    ) -> Result<Arc<FileLists>, RefreshStop> {
         if let Some(lists) = self
             .lists
             .lock()
             .expect("no panics while holding it")
             .as_ref()
         {
-            return Arc::clone(lists);
+            return Ok(Arc::clone(lists));
         }
         let paths = inputs.parses.keys().collect::<Vec<_>>();
         let known = {
@@ -1376,17 +1407,19 @@ impl BindCache {
             .par_iter()
             .zip(known)
             .map(|(path, known)| {
+                guard.file()?;
                 let _label = carry.enter();
-                known.unwrap_or_else(|| {
+                Ok(known.unwrap_or_else(|| {
                     inputs
                         .parses
                         .read(path)
                         .map_or((false, false), |(_, parse)| FileLists::kinds(&parse))
-                })
+                }))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, RefreshStop>>()?;
         let mut lists = FileLists::default();
         for (path, (rust, declaring)) in paths.into_iter().zip(kinds) {
+            guard.file()?;
             if rust {
                 lists.rust.push(path.clone());
             }
@@ -1395,7 +1428,7 @@ impl BindCache {
             }
         }
         let mut slot = self.lists.lock().expect("no panics while holding it");
-        Arc::clone(slot.get_or_insert_with(|| Arc::new(lists)))
+        Ok(Arc::clone(slot.get_or_insert_with(|| Arc::new(lists))))
     }
 
     /// The files resolution bound on first use since the last call.
@@ -1414,12 +1447,23 @@ impl BindCache {
         inputs: &CheckoutInputs,
         paths: &[&String],
     ) -> Result<(), ManifestJoinError> {
+        self.bind_missing_checked(inputs, paths, None)
+            .map_err(UpdateError::unguarded)
+    }
+
+    fn bind_missing_checked(
+        &self,
+        inputs: &CheckoutInputs,
+        paths: &[&String],
+        guard: Option<&RefreshMemory>,
+    ) -> Result<(), UpdateError> {
         let missing = paths
             .iter()
             .filter(|path| self.get(path).is_none())
             .copied()
             .collect::<Vec<_>>();
-        for (path, bound) in bind_all(inputs, &missing)? {
+        for (path, bound) in bind_all_checked(inputs, &missing, guard)? {
+            guard.file()?;
             self.set_new(&path, bound);
         }
         Ok(())
@@ -2207,22 +2251,33 @@ pub(crate) fn thread_facts(inputs: &CheckoutInputs) -> ViewBindingFacts<'_> {
 /// # Errors
 ///
 /// When binding fails on a file.
+#[cfg(test)]
 pub(crate) fn bind_all(
     inputs: &CheckoutInputs,
     paths: &[&String],
 ) -> Result<HashMap<String, BoundFile>, ManifestJoinError> {
+    bind_all_checked(inputs, paths, None).map_err(UpdateError::unguarded)
+}
+
+pub(super) fn bind_all_checked(
+    inputs: &CheckoutInputs,
+    paths: &[&String],
+    guard: Option<&RefreshMemory>,
+) -> Result<HashMap<String, BoundFile>, UpdateError> {
     let carry = crate::alloc_trace::carry();
     paths
         .par_iter()
         .map_init(
             || thread_facts(inputs),
             |facts, path| {
+                guard.file()?;
                 let _label = carry.enter();
                 let (_, parse) = inputs
                     .parses
                     .read(path)
                     .unwrap_or_else(|| panic!("{path} is not a parsed file"));
-                bind_file(path, &parse, facts, None).map(|(surface, binding)| {
+                let (surface, binding) = bind_file(path, &parse, facts, None)?;
+                Ok({
                     (
                         (*path).clone(),
                         BoundFile {
@@ -2248,8 +2303,17 @@ pub(crate) fn resolve_files(
     bound: &BindCache,
     paths: &[&String],
 ) -> Result<BTreeMap<String, FileResolution>, ManifestJoinError> {
+    resolve_files_checked(inputs, bound, paths, None).map_err(UpdateError::unguarded)
+}
+
+pub(super) fn resolve_files_checked(
+    inputs: &CheckoutInputs,
+    bound: &BindCache,
+    paths: &[&String],
+    guard: Option<&RefreshMemory>,
+) -> Result<BTreeMap<String, FileResolution>, UpdateError> {
     Ok(
-        resolve_files_with(inputs, bound, paths, &|_, resolution| resolution)?
+        resolve_files_with_checked(inputs, bound, paths, &|_, resolution| resolution, guard)?
             .into_iter()
             .collect(),
     )
@@ -2268,6 +2332,16 @@ pub(crate) fn resolve_files_with<T: Send>(
     paths: &[&String],
     keep: &(dyn Fn(&str, FileResolution) -> T + Sync),
 ) -> Result<Vec<(String, T)>, ManifestJoinError> {
+    resolve_files_with_checked(inputs, bound, paths, keep, None).map_err(UpdateError::unguarded)
+}
+
+fn resolve_files_with_checked<T: Send>(
+    inputs: &CheckoutInputs,
+    bound: &BindCache,
+    paths: &[&String],
+    keep: &(dyn Fn(&str, FileResolution) -> T + Sync),
+    guard: Option<&RefreshMemory>,
+) -> Result<Vec<(String, T)>, UpdateError> {
     let carry = crate::alloc_trace::carry();
     paths
         .par_iter()
@@ -2279,12 +2353,16 @@ pub(crate) fn resolve_files_with<T: Send>(
                 (facts, index, files)
             },
             |(facts, index, files), path| {
+                guard.file()?;
                 let _label = carry.enter();
                 let (key, parse) = &inputs.parses[path.as_str()];
                 let Some(own) = files.bound(path) else {
-                    return Err(files.take_error().unwrap_or_else(|| {
-                        ManifestJoinError::Parse(format!("{path} is not a parsed file"))
-                    }));
+                    return Err(files
+                        .take_error()
+                        .unwrap_or_else(|| {
+                            ManifestJoinError::Parse(format!("{path} is not a parsed file"))
+                        })
+                        .into());
                 };
                 let mut binding = own.binding.clone();
                 let mut rows = BTreeSet::new();
@@ -2306,7 +2384,7 @@ pub(crate) fn resolve_files_with<T: Send>(
                 let dispatch = dispatch_targets(path, parse, index, facts)?;
                 files.release_held();
                 if let Some(error) = files.take_error() {
-                    return Err(error);
+                    return Err(error.into());
                 }
                 let resolution = FileResolution {
                     rows: rows.into_iter().collect(),
@@ -2466,13 +2544,15 @@ impl MethodCallInputs {
     /// Declaration changes already identify method readers before resolving
     /// any importer. Compare raw facts on both sides: import/type targets are
     /// filled by resolution and are admitted separately when they are known.
-    pub(crate) fn changed_parse_method_keys(
+    pub(super) fn changed_parse_method_keys(
         old: &CheckoutInputs,
         next: &CheckoutInputs,
         changed: &BTreeSet<String>,
-    ) -> BTreeSet<String> {
+        guard: Option<&RefreshMemory>,
+    ) -> Result<BTreeSet<String>, RefreshStop> {
         let mut keys = BTreeSet::new();
         for path in changed {
+            guard.file()?;
             let before = old
                 .parses
                 .read(path)
@@ -2483,7 +2563,7 @@ impl MethodCallInputs {
                 .map(|(_, parse)| FileFacts::new(&parse));
             FileFacts::changed_keys_by_method(path, before.as_ref(), after.as_ref(), &mut keys);
         }
-        keys
+        Ok(keys)
     }
 
     /// The files whose inputs the resolver computed itself since the last
@@ -2648,16 +2728,27 @@ impl MethodCallInputs {
         resolved: &(dyn ResolutionLookup + Sync),
         paths: &[&String],
     ) -> Result<Vec<(String, Vec<SiteResolution>, BTreeSet<String>)>, ManifestJoinError> {
+        self.resolve_sites_checked(inputs, resolved, paths, None)
+            .map_err(UpdateError::unguarded)
+    }
+
+    pub(super) fn resolve_sites_checked(
+        &mut self,
+        inputs: &CheckoutInputs,
+        resolved: &(dyn ResolutionLookup + Sync),
+        paths: &[&String],
+        guard: Option<&RefreshMemory>,
+    ) -> Result<Vec<(String, Vec<SiteResolution>, BTreeSet<String>)>, UpdateError> {
         // Most updates reach no method-call site; the source below lists
         // every parsed file, so skip it then.
         if paths.is_empty() {
             return Ok(Vec::new());
         }
-        let source = SiteSource::new(inputs, resolved, self);
+        let source = SiteSource::new(inputs, resolved, self, guard)?;
         let results = if paths.len() <= SMALL_SITE_RUN {
-            source.load_declarers(paths);
+            source.load_declarers(paths, guard)?;
             let resolver = Resolver::over(&source);
-            resolve_chunk(inputs, &source, &resolver, paths)
+            resolve_chunk(inputs, &source, &resolver, paths, guard)
         } else {
             let chunk = paths
                 .len()
@@ -2671,7 +2762,7 @@ impl MethodCallInputs {
                     // The resolver and its memo are single-threaded caches
                     // over the shared source: one per chunk of files.
                     let resolver = Resolver::over(&source);
-                    resolve_chunk(inputs, &source, &resolver, chunk)
+                    resolve_chunk(inputs, &source, &resolver, chunk, guard)
                 })
                 .collect::<Result<Vec<_>, _>>()
                 .map(|chunks| chunks.into_iter().flatten().collect())
@@ -2682,10 +2773,13 @@ impl MethodCallInputs {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
         {
-            return Err(ManifestJoinError::Parse(error));
+            return Err(ManifestJoinError::Parse(error).into());
         }
-        let loaded = source.into_loaded();
-        self.files.extend(loaded);
+        let loaded = source.into_loaded(guard)?;
+        for (path, file) in loaded {
+            guard.file()?;
+            self.files.insert(path, file);
+        }
         Ok(results)
     }
 }
@@ -2709,20 +2803,22 @@ impl<'s> SiteSource<'s> {
         inputs: &'s CheckoutInputs,
         resolved: &'s (dyn ResolutionLookup + Sync),
         calls: &'s MethodCallInputs,
-    ) -> Self {
-        let loaded = inputs
-            .parses
-            .keys()
-            .filter(|path| !calls.files.contains_key(path.as_str()))
-            .map(|path| (path.as_str(), std::sync::OnceLock::new()))
-            .collect();
-        Self {
+        guard: Option<&RefreshMemory>,
+    ) -> Result<Self, RefreshStop> {
+        let mut loaded = HashMap::new();
+        for path in inputs.parses.keys() {
+            guard.file()?;
+            if !calls.files.contains_key(path.as_str()) {
+                loaded.insert(path.as_str(), std::sync::OnceLock::new());
+            }
+        }
+        Ok(Self {
             inputs,
             resolved,
             calls,
             loaded,
             error: Mutex::new(None),
-        }
+        })
     }
 
     /// The source over `calls` when it keeps every parsed file's inputs, as
@@ -2786,27 +2882,40 @@ impl<'s> SiteSource<'s> {
     /// common method name waits on decoding each of its declarers in turn.
     /// Computing them here first leaves the resolver finding them computed;
     /// what it reads, and what it records reading, is unchanged.
-    fn load_declarers(&self, paths: &[&String]) {
-        let members = paths
-            .iter()
-            .filter_map(|path| self.inputs.parses.get(path))
-            .flat_map(|(_, parse)| parse.bound_dispatch_sites())
-            .filter_map(|site| site.member)
-            .collect::<BTreeSet<_>>();
-        let declarers = members
-            .iter()
-            .flat_map(|member| self.files_with_method(member))
-            .filter(|file| !self.calls.files.contains_key(file.as_str()))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
+    fn load_declarers(
+        &self,
+        paths: &[&String],
+        guard: Option<&RefreshMemory>,
+    ) -> Result<(), RefreshStop> {
+        let mut members = BTreeSet::new();
+        for path in paths {
+            guard.file()?;
+            if let Some((_, parse)) = self.inputs.parses.get(path) {
+                for site in parse.bound_dispatch_sites() {
+                    guard.site()?;
+                    members.extend(site.member);
+                }
+            }
+        }
+        let mut declarers = BTreeSet::new();
+        for member in members {
+            for file in self.files_with_method(&member) {
+                guard.file()?;
+                if !self.calls.files.contains_key(file.as_str()) {
+                    declarers.insert(file);
+                }
+            }
+        }
+        let declarers = declarers.into_iter().collect::<Vec<_>>();
         let carry = crate::alloc_trace::carry();
-        declarers.par_iter().for_each(|file| {
+        declarers.par_iter().try_for_each(|file| {
+            guard.file()?;
             let _label = carry.enter();
             if let Some(slot) = self.loaded.get(file.as_str()) {
                 slot.get_or_init(|| self.compute(file));
             }
-        });
+            Ok(())
+        })
     }
 
     /// The stored files filed under `term` that are not filed in memory.
@@ -2824,11 +2933,18 @@ impl<'s> SiteSource<'s> {
             .unwrap_or_default()
     }
 
-    fn into_loaded(self) -> Vec<(String, Arc<SiteFile>)> {
-        self.loaded
-            .into_iter()
-            .filter_map(|(path, slot)| Some((path.to_string(), slot.into_inner()??)))
-            .collect()
+    fn into_loaded(
+        self,
+        guard: Option<&RefreshMemory>,
+    ) -> Result<Vec<(String, Arc<SiteFile>)>, RefreshStop> {
+        let mut loaded = Vec::new();
+        for (path, slot) in self.loaded {
+            guard.file()?;
+            if let Some(Some(file)) = slot.into_inner() {
+                loaded.push((path.to_string(), file));
+            }
+        }
+        Ok(loaded)
     }
 }
 
@@ -2887,7 +3003,8 @@ fn resolve_chunk(
     source: &SiteSource<'_>,
     resolver: &Resolver<'_>,
     paths: &[&String],
-) -> Result<Vec<(String, Vec<SiteResolution>, BTreeSet<String>)>, ManifestJoinError> {
+    guard: Option<&RefreshMemory>,
+) -> Result<Vec<(String, Vec<SiteResolution>, BTreeSet<String>)>, UpdateError> {
     let memoized = MemoizedResolver::new(resolver);
     resolver.take_dependencies();
     #[cfg(feature = "callgraph-shape-census")]
@@ -2895,6 +3012,7 @@ fn resolve_chunk(
     let result = paths
         .iter()
         .map(|path| {
+            guard.file()?;
             let (_, parse) = inputs
                 .parses
                 .get(path)
@@ -2907,6 +3025,7 @@ fn resolve_chunk(
                 .ordinary;
             let mut sites = Vec::new();
             for site in parse.bound_dispatch_sites() {
+                guard.site()?;
                 let resolution = memoized.resolve(path, &site);
                 // This runs for memo hits too, and before Rust's ordinary-edge
                 // preservation can omit a supplemental method-call row.

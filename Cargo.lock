@@ -125,6 +125,7 @@ dependencies = [
  "landlock",
  "libc",
  "libproc",
+ "mach2",
  "log",
  "lsp-types",
  "markup5ever_rcdom",

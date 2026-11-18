@@ -1045,6 +1045,19 @@ impl FileSlice {
         parse: &ParseBlob,
         resolution: &FileResolution,
     ) -> Self {
+        Self::build_checked(path, record_key, parse, resolution, None)
+            .expect("an unguarded slice cannot stop")
+    }
+
+    pub(super) fn build_checked(
+        path: &str,
+        record_key: &str,
+        parse: &ParseBlob,
+        resolution: &FileResolution,
+        guard: Option<&super::refresh_memory::RefreshMemory>,
+    ) -> Result<Self, super::refresh_memory::RefreshStop> {
+        use super::refresh_memory::RefreshChecks;
+
         let mut ordinary = HashMap::<&str, NodeId>::new();
         let surviving = surviving_nodes(path, parse, &mut ordinary);
         let mut scoped = HashMap::<&str, NodeId>::new();
@@ -1133,6 +1146,7 @@ impl FileSlice {
         // Method-call sites replace their reference's ordinary edge and
         // target with the dispatch pass's.
         for kept in &resolution.sites {
+            guard.site()?;
             let site = &kept.site;
             let resolution = &kept.resolution;
             let ref_id = format!("view:{path}:{}", site.ordinal);
@@ -1171,7 +1185,7 @@ impl FileSlice {
                 );
             }
         }
-        Self::pack(
+        Ok(Self::pack(
             path,
             record_key,
             &parse.language,
@@ -1181,7 +1195,7 @@ impl FileSlice {
             scoped,
             &refs,
             &edges,
-        )
+        ))
     }
 
     /// Packs assembled rows into columns over one sorted string table.
