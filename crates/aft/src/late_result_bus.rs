@@ -104,7 +104,11 @@ pub(crate) fn display_read_evicted_early(reason: &'static str) {
     let mut health = HEALTH.lock();
     health.display_read_evicted_early = health.display_read_evicted_early.saturating_add(1);
     if health.warned.insert(reason) {
-        log::warn!("display pull retention shortened by pressure: {reason}");
+        // Only the in-memory copy goes; display.read still serves the
+        // record from its database copy until that copy's own retention ends.
+        log::warn!(
+            "display pull cache dropped an announced record early ({reason}); reads use its database copy"
+        );
     }
 }
 
