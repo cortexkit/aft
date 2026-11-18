@@ -110,9 +110,9 @@ fn response_text(resp: &Value) -> &str {
 }
 
 #[test]
-fn conflicts_found_when_project_root_is_sibling_subdir() {
+fn unmerged_conflicts_are_limited_to_the_project_subdir() {
     let dir = tempfile::tempdir().unwrap();
-    create_merge_conflict(dir.path(), "packages/a/x.txt");
+    create_merge_conflicts(dir.path(), &["packages/a/x.txt", "packages/b/y.txt"]);
 
     let project_root = dir.path().join("packages/b");
     let (aft, resp) = configure_and_conflicts(&project_root);
@@ -122,9 +122,100 @@ fn conflicts_found_when_project_root_is_sibling_subdir() {
     assert_eq!(resp["conflict_count"], 1, "conflicts response: {resp:?}");
     assert_eq!(resp["unmerged_count"], 1, "conflicts response: {resp:?}");
     assert!(resp.get("complete").is_none() || resp["complete"] == true);
-    assert!(response_text(&resp).contains("packages/a/x.txt"));
+    assert!(!response_text(&resp).contains("packages/a/x.txt"));
+    assert!(response_text(&resp).contains("packages/b/y.txt"));
     assert!(response_text(&resp).contains("<<<<<<< HEAD"));
     assert!(aft.shutdown().success());
+}
+
+const MARKERS: &str = "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\n";
+const INSIDE: &str = "packages/scope[1]/inside.txt";
+const OUTSIDE: &str = "packages/scope1/outside.txt";
+
+fn stage_files_with_conflict_markers(repo: &Path) {
+    init_repo(repo);
+    write_file(repo, INSIDE, MARKERS);
+    write_file(repo, OUTSIDE, MARKERS);
+    git(repo, &["add", "."]);
+}
+
+#[cfg(unix)]
+#[test]
+fn marker_sweep_does_not_open_unreadable_file_outside_project_subdir() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    stage_files_with_conflict_markers(dir.path());
+    let protected_path = dir.path().join(OUTSIDE);
+    fs::set_permissions(&protected_path, fs::Permissions::from_mode(0)).unwrap();
+    assert_eq!(
+        fs::File::open(&protected_path).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+
+    let (aft, resp) = configure_and_conflicts(&dir.path().join("packages/scope[1]"));
+
+    assert_eq!(resp["success"], true, "conflicts response: {resp:?}");
+    assert_eq!(resp["file_count"], 1, "conflicts response: {resp:?}");
+    assert_eq!(resp["conflict_count"], 1, "conflicts response: {resp:?}");
+    assert!(response_text(&resp).contains(INSIDE));
+    assert!(!response_text(&resp).contains(OUTSIDE));
+    assert!(
+        resp.get("sweep_error").is_none(),
+        "Git tried opening the protected file: {resp:?}"
+    );
+    assert!(
+        resp.get("complete").is_none(),
+        "conflicts response: {resp:?}"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn repository_root_conflicts_reply_matches_existing_bytes() {
+    use aft::config::Config;
+    use aft::context::{default_language_provider_factory, AppContext};
+    use aft::protocol::{RawRequest, Response};
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().canonicalize().unwrap();
+    stage_files_with_conflict_markers(&repo);
+    let root = repo_toplevel(&repo);
+    let ctx = AppContext::new(
+        default_language_provider_factory(),
+        crate::context_storage::isolate(Config {
+            project_root: Some(repo),
+            ..Config::default()
+        }),
+    );
+    let req = RawRequest {
+        id: "conflicts".to_string(),
+        command: "git_conflicts".to_string(),
+        lsp_hints: None,
+        session_id: None,
+        params: json!({}),
+    };
+    let reply = aft::commands::conflicts::handle_git_conflicts(&ctx, &req);
+    let expected = Response::success(
+        "conflicts",
+        json!({
+            "text": format!(concat!(
+                "2 files, 2 conflicts\nChecked repo root: {}\n\n",
+                "── packages/scope1/outside.txt [1 conflict] ──\n",
+                "   1: <<<<<<< HEAD\n   2: ours\n   3: =======\n   4: theirs\n   5: >>>>>>> branch\n\n",
+                "── packages/scope[1]/inside.txt [1 conflict] ──\n",
+                "   1: <<<<<<< HEAD\n   2: ours\n   3: =======\n   4: theirs\n   5: >>>>>>> branch"
+            ), root),
+            "file_count": 2,
+            "conflict_count": 2,
+            "unmerged_count": 0,
+            "checked_root": root,
+        }),
+    );
+    assert_eq!(
+        serde_json::to_string(&reply).unwrap(),
+        serde_json::to_string(&expected).unwrap()
+    );
 }
 
 #[test]
@@ -342,7 +433,7 @@ fn conflicts_in_newline_filename_are_reported() {
 #[test]
 fn optional_path_can_inspect_external_repo_and_reports_checked_root() {
     let conflicted_dir = tempfile::tempdir().unwrap();
-    create_merge_conflict(conflicted_dir.path(), "packages/a/x.txt");
+    stage_files_with_conflict_markers(conflicted_dir.path());
     let r1_root = repo_toplevel(conflicted_dir.path());
 
     let clean_dir = tempfile::tempdir().unwrap();
@@ -373,7 +464,7 @@ fn optional_path_can_inspect_external_repo_and_reports_checked_root() {
     assert_eq!(clean_resp["checked_root"], r2_root);
     assert!(response_text(&clean_resp).contains("Checked repo root:"));
 
-    let external_subdir = conflicted_dir.path().join("packages/a");
+    let external_subdir = conflicted_dir.path().join("packages/scope[1]");
     let conflict_resp = aft.send(
         &json!({
             "id": "conflicts-external",
@@ -391,8 +482,26 @@ fn optional_path_can_inspect_external_repo_and_reports_checked_root() {
         "external response: {conflict_resp:?}"
     );
     assert_eq!(conflict_resp["checked_root"], r1_root);
-    assert!(response_text(&conflict_resp).contains("packages/a/x.txt"));
+    assert!(response_text(&conflict_resp).contains(INSIDE));
+    assert!(!response_text(&conflict_resp).contains(OUTSIDE));
     assert!(response_text(&conflict_resp).contains("Checked repo root:"));
+
+    let external_root_resp = aft.send(
+        &json!({
+            "id": "conflicts-external-root",
+            "command": "git_conflicts",
+            "params": { "path": conflicted_dir.path() }
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        external_root_resp["success"], true,
+        "{external_root_resp:?}"
+    );
+    assert_eq!(
+        external_root_resp["file_count"], 2,
+        "{external_root_resp:?}"
+    );
 
     assert!(aft.shutdown().success());
 }
