@@ -25,6 +25,7 @@ pub mod compression_events;
 #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
 pub(crate) mod contention_probe;
 pub(crate) mod deferred_checkpoint;
+pub(crate) mod display_records;
 pub(crate) mod gh_speech;
 pub mod github_read_cache;
 pub mod remote_exec;
@@ -687,6 +688,7 @@ pub(crate) fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConne
         apply_pragmas_with_timeout(&conn, TOOL_RETRY_BUSY_WAIT)?;
         run_migrations(&mut conn)?;
         ensure_additive_indexes(&conn)?;
+        display_records::install(&conn)?;
         clear_stored_compression_commands(&mut conn)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         return Ok(conn);
@@ -719,6 +721,7 @@ pub(crate) fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConne
             )?;
             run_migrations(&mut conn)?;
             ensure_additive_indexes(&conn)?;
+            display_records::install(&conn)?;
             clear_stored_compression_commands(&mut conn)?;
             Ok::<(), OpenError>(())
         })();
@@ -1232,6 +1235,7 @@ mod tests {
         "rich_ui_templates",
         "rich_ui_cursor_key",
         "rich_ui_session_presets",
+        "display_records",
     ];
 
     const EXPECTED_INDEXES: &[&str] = &[

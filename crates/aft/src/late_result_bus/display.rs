@@ -123,35 +123,38 @@ fn body(id: &str) -> Result<Vec<u8>, &'static str> {
 }
 
 pub(super) async fn publish_one(client: &BusClient) {
-    let Some(id) = crate::subc::rich_ui::display::with_outbox(|outbox| {
-        outbox.reads.due(std::time::Instant::now())
+    let Some((id, pull_bytes)) = crate::subc::rich_ui::display::with_outbox(|outbox| {
+        let now = std::time::Instant::now();
+        let id = outbox.reads.due(now)?;
+        let bytes = outbox.reads.read(&id, now)?;
+        Some((id, bytes))
     })
     .flatten() else {
         return;
     };
-    let result = match body(&id) {
-        Ok(bytes) => tokio::time::timeout(
-            super::IO_TIMEOUT,
-            client.publish_event(
-                DISPLAY_RECORD_READY_EVENT,
-                DISPLAY_RECORD_READY_VERSION as u32,
-                None,
-                &id,
-                bytes,
-            ),
-        )
-        .await
-        .map_err(|_| "display_bus_timeout")
-        .and_then(|result| {
-            result
-                .map(|_| ())
-                .map_err(|error| super::error_code(&error))
-        }),
-        Err(code) => {
-            completed(&id, Err(code));
-            return;
+    let result = crate::subc::rich_ui::display::announce(id.clone(), pull_bytes, async {
+        match body(&id) {
+            Ok(bytes) => tokio::time::timeout(
+                super::IO_TIMEOUT,
+                client.publish_event(
+                    DISPLAY_RECORD_READY_EVENT,
+                    DISPLAY_RECORD_READY_VERSION as u32,
+                    None,
+                    &id,
+                    bytes,
+                ),
+            )
+            .await
+            .map_err(|_| "display_bus_timeout")
+            .and_then(|result| {
+                result
+                    .map(|_| ())
+                    .map_err(|error| super::error_code(&error))
+            }),
+            Err(code) => Err(code),
         }
-    };
+    })
+    .await;
     completed(&id, result);
 }
 

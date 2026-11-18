@@ -29,13 +29,25 @@ fn display_read_authorizes_only_the_single_attested_display_module() {
     }
 }
 
-#[test]
-fn display_read_unknown_and_invalid_ids_have_contract_refusals() {
-    let outbox = Outbox::new();
+#[tokio::test]
+async fn display_read_unknown_and_invalid_ids_have_contract_refusals() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = test_writer(dir.path().join("aft.db"));
+    let reader = Principal::Reserved {
+        module_id: "reader".into(),
+    };
     assert_eq!(
-        read_retained(&outbox, json!({"record_id":"missing"}), Instant::now())
-            .unwrap_err()
-            .code,
+        read_for_reader(
+            &writer,
+            Some(&reader),
+            Some("reader"),
+            json!({"record_id":"missing"}),
+            Instant::now(),
+            0
+        )
+        .await
+        .unwrap_err()
+        .code,
         cortexkit_role_tool_display::DISPLAY_RECORD_UNKNOWN
     );
     for arguments in [
@@ -43,7 +55,16 @@ fn display_read_unknown_and_invalid_ids_have_contract_refusals() {
         json!({"record_id":"bad id"}),
         json!({"record_id":"ok","extra":1}),
     ] {
-        let error = read_retained(&outbox, arguments, Instant::now()).unwrap_err();
+        let error = read_for_reader(
+            &writer,
+            Some(&reader),
+            Some("reader"),
+            arguments,
+            Instant::now(),
+            0,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.code, cortexkit_role_tool_display::INVALID_PARAMS);
         assert_eq!(error.detail.unwrap()["field"], "record_id");
     }
@@ -531,6 +552,7 @@ fn blocked_display_and_full_wake_queue_never_delay_a_reply() {
         outbox: Mutex::new(Outbox::new()),
         wake,
         limits: Mutex::new(outbox::ceilings()),
+        store: store::Store::new(crate::context::App::default_shared(), PathBuf::new()),
     };
     let identity = Identity {
         runner: Principal::Reserved {
@@ -955,4 +977,269 @@ fn a_running_hold_preserves_observed_remote_execution() {
     assert_eq!(writes[0].body["execution"], "remote");
     assert_eq!(writes[0].body["target"], "linux");
     assert!(writes[0].body.get("endReason").is_none());
+}
+
+fn test_writer(database: PathBuf) -> Writer {
+    let (wake, _receiver) = tokio::sync::mpsc::channel(1);
+    Writer {
+        outbox: Mutex::new(Outbox::new()),
+        wake,
+        limits: Mutex::new(outbox::ceilings()),
+        store: store::Store::new(crate::context::App::default_shared(), database),
+    }
+}
+
+#[tokio::test]
+async fn display_read_restart_reopens_identical_frozen_bytes_and_preserves_reader_denial() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.db");
+    let writer = test_writer(path.clone());
+    let now = Instant::now();
+    let (id, expected) = {
+        let mut outbox = writer.outbox.lock().unwrap();
+        assert!(outbox.admit(
+            Identity {
+                runner: Principal::Reserved {
+                    module_id: "runner".into()
+                },
+                call_key: "restart:call".into(),
+                schema_pin: "pin:1".into(),
+            },
+            DisplayKind::Detail,
+            json!({"nested":{"text":"original output: é \\n", "number":1.5},"rows":[1,2,3]}),
+            &outbox::ceilings(),
+            now,
+        ));
+        let id = outbox.reads.due(now).unwrap();
+        let bytes = outbox.reads.read(&id, now).unwrap();
+        (id, bytes)
+    };
+    announce_retained(&writer, id.clone(), expected.clone(), async {
+        // The bus may expose the wake immediately: its first observer must
+        // already be able to fetch the committed, byte-identical pull reply.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let (bytes, ack): (Vec<u8>, Option<i64>) = conn
+            .query_row(
+                "SELECT pull_bytes,wake_acked_at_ms FROM display_records WHERE record_id=?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(bytes, expected);
+        assert_eq!(ack, None);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    writer
+        .outbox
+        .lock()
+        .unwrap()
+        .reads
+        .published(&id, true, now);
+    drop(writer);
+    let reopened = crate::db::open(&path).unwrap();
+    let ack: i64 = reopened
+        .query_row(
+            "SELECT wake_acked_at_ms FROM display_records WHERE record_id=?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(reopened);
+    // A fresh service has no process-local copies or replay queue.
+    let restarted = test_writer(path);
+    assert!(restarted
+        .outbox
+        .lock()
+        .unwrap()
+        .reads
+        .read(&id, now)
+        .is_none());
+    let reader = Principal::Reserved {
+        module_id: "reader".into(),
+    };
+    let args = json!({"record_id":id});
+    assert_eq!(
+        read_for_reader(
+            &restarted,
+            Some(&reader),
+            Some("reader"),
+            args.clone(),
+            now,
+            ack + 600_000
+        )
+        .await
+        .unwrap(),
+        expected
+    );
+    assert_eq!(
+        read_for_reader(
+            &restarted,
+            Some(&reader),
+            Some("reader"),
+            args.clone(),
+            now,
+            ack + 600_001
+        )
+        .await
+        .unwrap_err()
+        .code,
+        cortexkit_role_tool_display::DISPLAY_RECORD_UNKNOWN
+    );
+    let other = Principal::Reserved {
+        module_id: "other".into(),
+    };
+    for principal in [&other, &Principal::Direct, &Principal::Unverified] {
+        assert_eq!(
+            read_for_reader(
+                &restarted,
+                Some(principal),
+                Some("reader"),
+                args.clone(),
+                now,
+                ack + 1
+            )
+            .await
+            .unwrap_err()
+            .code,
+            cortexkit_role_tool_display::DISPLAY_READ_DENIED
+        );
+    }
+    assert_eq!(
+        read_for_reader(&restarted, Some(&reader), None, args, now, ack + 1)
+            .await
+            .unwrap_err()
+            .code,
+        cortexkit_role_tool_display::DISPLAY_READ_DENIED
+    );
+}
+
+#[tokio::test]
+async fn display_read_memory_hit_never_opens_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    // A directory cannot be opened as a SQLite database. A memory hit must
+    // still succeed, without depending on the durable fallback's availability.
+    let writer = test_writer(dir.path().to_path_buf());
+    let now = Instant::now();
+    let (id, bytes) = {
+        let mut outbox = writer.outbox.lock().unwrap();
+        assert!(outbox.admit(
+            Identity {
+                runner: Principal::Reserved {
+                    module_id: "runner".into()
+                },
+                call_key: "memory:call".into(),
+                schema_pin: "pin:1".into()
+            },
+            DisplayKind::Record,
+            json!({"durationMs":1,"outcome":"success"}),
+            &outbox::ceilings(),
+            now
+        ));
+        let id = outbox.reads.due(now).unwrap();
+        let bytes = outbox.reads.read(&id, now).unwrap();
+        (id, bytes)
+    };
+    let reader = Principal::Reserved {
+        module_id: "reader".into(),
+    };
+    assert_eq!(
+        read_for_reader(
+            &writer,
+            Some(&reader),
+            Some("reader"),
+            json!({"record_id":id}),
+            now,
+            0
+        )
+        .await
+        .unwrap(),
+        bytes
+    );
+}
+
+#[tokio::test]
+async fn display_read_protected_capacity_defers_wake_but_never_blocks_push() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.db");
+    let now = crate::db::display_records::now_ms();
+    let conn = crate::db::open(&path).unwrap();
+    for index in 0..crate::db::display_records::MAX_RECORDS {
+        assert!(crate::db::display_records::persist(
+            &conn,
+            &format!("protected:{index}"),
+            b"first",
+            now
+        )
+        .unwrap());
+    }
+    drop(conn);
+    let writer = test_writer(path.clone());
+    let at = Instant::now();
+    let (id, bytes) = {
+        let mut outbox = writer.outbox.lock().unwrap();
+        assert!(outbox.admit(
+            Identity {
+                runner: Principal::Reserved {
+                    module_id: "runner".into()
+                },
+                call_key: "deferred:call".into(),
+                schema_pin: "pin:1".into()
+            },
+            DisplayKind::Record,
+            json!({"durationMs":1,"outcome":"success"}),
+            &outbox::ceilings(),
+            at
+        ));
+        let id = outbox.reads.due(at).unwrap();
+        let bytes = outbox.reads.read(&id, at).unwrap();
+        (id, bytes)
+    };
+    let published = std::sync::atomic::AtomicBool::new(false);
+    let result = announce_retained(&writer, id.clone(), bytes, async {
+        published.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    })
+    .await;
+    assert_eq!(result, Err("display_store_deferred"));
+    assert!(
+        !published.load(std::sync::atomic::Ordering::Relaxed),
+        "a wake must not publish without durable capacity"
+    );
+    assert!(
+        writer.outbox.lock().unwrap().pop_due(at).is_some(),
+        "push ownership is independent of a deferred wake"
+    );
+    let conn = rusqlite::Connection::open(path).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM display_records", [], |row| row
+            .get::<_, usize>(0))
+            .unwrap(),
+        crate::db::display_records::MAX_RECORDS
+    );
+    assert!(crate::db::display_records::read(&conn, &id, now)
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn display_read_uncertain_publish_keeps_an_unacked_durable_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.db");
+    let writer = test_writer(path.clone());
+    assert_eq!(
+        announce_retained(&writer, "uncertain".into(), b"frozen".to_vec(), async {
+            Err("display_bus_timeout")
+        })
+        .await,
+        Err("display_bus_timeout")
+    );
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let (attempt, ack): (i64, Option<i64>) = conn.query_row("SELECT announced_at_ms,wake_acked_at_ms FROM display_records WHERE record_id='uncertain'", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert_eq!(ack, None);
+    assert_eq!(
+        crate::db::display_records::read(&conn, "uncertain", attempt + 600_001).unwrap(),
+        Some(b"frozen".to_vec())
+    );
 }
