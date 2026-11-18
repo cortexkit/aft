@@ -1033,25 +1033,32 @@ impl ParseBlob {
     /// Bind Python dispatch hints to the same keys as their call references.
     /// Nested bodies retain each enclosing caller, so their hints must use
     /// caller-specific keys rather than the shared syntax ordinal.
-    pub(crate) fn bound_dispatch_sites(&self) -> Vec<dispatch::SiteHint> {
-        let mut sites = self.dispatch.sites.clone();
-        if self.language == "python" {
-            let keys = self
-                .refs
+    pub(crate) fn iter_bound_dispatch_sites(
+        &self,
+    ) -> impl Iterator<Item = dispatch::SiteHint> + '_ {
+        let keys = (self.language == "python").then(|| {
+            self.refs
                 .iter()
                 .zip(self.reference_keys())
                 .filter(|(reference, _)| reference.kind == BlobRefKind::Call)
                 .map(|(reference, key)| {
                     ((reference.ordinal, reference.caller_symbol.as_deref()), key)
                 })
-                .collect::<HashMap<_, _>>();
-            for site in &mut sites {
-                if let Some(key) = keys.get(&(site.ordinal, site.caller.as_deref())) {
-                    site.ordinal = *key;
-                }
+                .collect::<HashMap<_, _>>()
+        });
+        self.dispatch.sites.iter().cloned().map(move |mut site| {
+            if let Some(key) = keys
+                .as_ref()
+                .and_then(|keys| keys.get(&(site.ordinal, site.caller.as_deref())))
+            {
+                site.ordinal = *key;
             }
-        }
-        sites
+            site
+        })
+    }
+
+    pub(crate) fn bound_dispatch_sites(&self) -> Vec<dispatch::SiteHint> {
+        self.iter_bound_dispatch_sites().collect()
     }
 
     /// AST ordinals stay intact in the blob. When several facts occupy one

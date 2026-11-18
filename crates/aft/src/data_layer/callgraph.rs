@@ -2891,7 +2891,7 @@ impl<'s> SiteSource<'s> {
         for path in paths {
             guard.file()?;
             if let Some((_, parse)) = self.inputs.parses.get(path) {
-                for site in parse.bound_dispatch_sites() {
+                for site in parse.iter_bound_dispatch_sites() {
                     guard.site()?;
                     members.extend(site.member);
                 }
@@ -3024,7 +3024,7 @@ fn resolve_chunk(
                 })?
                 .ordinary;
             let mut sites = Vec::new();
-            for site in parse.bound_dispatch_sites() {
+            for site in parse.iter_bound_dispatch_sites() {
                 guard.site()?;
                 let resolution = memoized.resolve(path, &site);
                 // This runs for memo hits too, and before Rust's ordinary-edge

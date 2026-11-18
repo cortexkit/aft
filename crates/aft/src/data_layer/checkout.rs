@@ -658,7 +658,6 @@ impl DeadCodeMemo {
         Self {
             snapshot: Mutex::default(),
             memory_epoch,
-            refresh_counts: refresh::RefreshCounters::default(),
         }
     }
 
@@ -992,6 +991,7 @@ impl Checkout {
             engine,
             recording: Mutex::new(()),
             memory_epoch,
+            refresh_counts: refresh::RefreshCounters::default(),
             readiness: (Mutex::new(0), std::sync::Condvar::new()),
             todo_counts: Mutex::new(TodoCountMemo::default()),
         };

@@ -28,7 +28,7 @@ fn refresh_memory_guard_checks_inside_one_large_site_batch() {
     let mut live = LiveCheckout::cold(checkout(&[(path, &initial)], &[])).unwrap();
     let next = checkout(&[(path, &edited)], &[]);
     let (_, parse) = next.parses.get(path).unwrap();
-    let sites = parse.bound_dispatch_sites().count();
+    let sites = parse.iter_bound_dispatch_sites().count();
     assert!(sites > 1024, "the fixture must populate one large batch");
     // Cross after the small-batch declarer scan, during actual resolution.
     let crossing = sites + 257;
