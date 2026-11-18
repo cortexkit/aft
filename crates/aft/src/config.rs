@@ -33,6 +33,7 @@ pub const MAX_BASH_WATCH_SYNC_MAX_MS: u64 = 1_800_000;
 /// decides whether to wait again or kill the command, so a stuck command can
 /// never hold a worker for longer than this.
 pub const DEFAULT_BASH_WORKER_WAIT_MAX_MS: u64 = 1_800_000;
+pub(crate) const DEFAULT_LINUX_SCOPE_MAX_RUNTIME_SECS: u64 = 86_400;
 /// Smallest accepted `bash.worker_wait_max_ms`. A shorter limit would make a
 /// worker re-wait (and re-read its whole context) every few seconds; a value
 /// below it is a config error rather than a silent clamp.
@@ -798,6 +799,8 @@ pub struct BashConfig {
     pub worker_wait_max_ms: u64,
     /// Put Linux tool shells in transient user scopes when systemd is available.
     pub linux_scope: bool,
+    /// User-only ceiling for daemon scopes, in seconds. Default: 86_400.
+    pub linux_scope_max_runtime_secs: u64,
     /// Aggregate local-command memory ceiling in MiB; absent means unlimited.
     pub memory_limit_mib: Option<u64>,
     /// On macOS, agent commands become responsible for their own privacy permissions.
@@ -904,7 +907,8 @@ impl Default for BashConfig {
             db_schema_hints: true,
             watch_sync_max_ms: default_bash_watch_sync_max_ms(),
             worker_wait_max_ms: default_bash_worker_wait_max_ms(),
-            linux_scope: false,
+            linux_scope: true,
+            linux_scope_max_runtime_secs: DEFAULT_LINUX_SCOPE_MAX_RUNTIME_SECS,
             memory_limit_mib: None,
             disclaim_privacy: false,
             powershell_tool: false,
@@ -975,6 +979,8 @@ pub struct DurabilityConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Machine-local resource profile; only the user config base may select it.
+    pub memory: Option<crate::memory::profile::MemoryMode>,
     /// User-selected file flush policy; only macOS has a full drive-flush option.
     pub durability: DurabilityConfig,
     /// Existing cache parent; AFT owns only its `aft` namespace. None preserves the storage-root layout.
@@ -1048,10 +1054,6 @@ pub struct Config {
     /// says nothing about index state or backend presence. Used only to pick
     /// the grep-rewrite footer. Not a capability gate.
     pub aft_search_registered: bool,
-    /// Number of files to parse in a single batch during callgraph store cold build (default: 100).
-    /// Lower values reduce peak memory during cold build.
-    /// Set to 0 to disable chunking and parse all files at once.
-    pub callgraph_chunk_size: usize,
     /// Enable experimental bash command rewriting (default: false).
     pub experimental_bash_rewrite: bool,
     /// Enable experimental bash command compression (default: false).
@@ -1158,6 +1160,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            memory: None,
             durability: DurabilityConfig::default(),
             cache_dir: None,
             cache_dir_configured: None,
@@ -1189,7 +1192,6 @@ impl Default for Config {
             indexes: IndexesConfig::default(),
             index: IndexConfig::default(),
             aft_search_registered: true,
-            callgraph_chunk_size: 100,
             experimental_bash_rewrite: false,
             experimental_bash_compress: false,
             experimental_bash_background: false,

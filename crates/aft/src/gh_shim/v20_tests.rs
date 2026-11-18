@@ -775,6 +775,392 @@ fn v20_log_failed_skips_successful_jobs() {
     assert_eq!(log_ids, vec![120842790454]);
 }
 
+fn actions_log_case(
+    raw: &[&str],
+    ids: &[u64],
+    refusals: &[(u64, &str)],
+) -> (Result<i32, ReadError>, String, String, Vec<u64>) {
+    let jobs: Vec<Value> = ids
+        .iter()
+        .map(|id| {
+            json!({
+                "id":id,"name":format!("job {id}"),"conclusion":"failure"
+            })
+        })
+        .collect();
+    let mut output = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut calls = Vec::new();
+    let result = render::run_with_io(
+        &planned(raw),
+        &mut |request| match request {
+            ReadRequest::Get { path, .. } => Ok(reply(if path.contains("/actions/jobs/") {
+                jobs[0].clone()
+            } else {
+                json!({"jobs":jobs})
+            })),
+            ReadRequest::JobLog { job_id, .. } => {
+                calls.push(*job_id);
+                let value = if let Some((_, code)) = refusals.iter().find(|(id, _)| id == job_id) {
+                    json!({"error":{"code":code,"message":code,"transmission":"sent"}})
+                } else {
+                    json!({"result":{"body":"kept\n","offset":0,"length":5,"total_bytes":5}})
+                };
+                executor::decode_reply(
+                    &executor::wire_request("cortexkit/aft", request).unwrap(),
+                    &value,
+                )
+            }
+            _ => panic!("unexpected request {request:?}"),
+        },
+        &mut output,
+        &mut diagnostics,
+        &mut |_| panic!("log refusals must not retry or sleep"),
+    );
+    (
+        result,
+        String::from_utf8(output).unwrap(),
+        String::from_utf8(diagnostics).unwrap(),
+        calls,
+    )
+}
+
+#[test]
+fn actions_log_single_job_success_has_no_diagnostic() {
+    let (result, output, diagnostics, calls) = actions_log_case(
+        &["run", "view", "--job", "133780422078", "--log"],
+        &[133780422078],
+        &[],
+    );
+    assert_eq!(result.unwrap(), 0);
+    assert_eq!(output, "job 133780422078\tUNKNOWN STEP\tkept\n");
+    assert!(diagnostics.is_empty());
+    assert_eq!(calls, [133780422078]);
+}
+
+#[test]
+fn actions_log_unavailable_preserves_other_jobs_and_succeeds() {
+    for flag in ["--log", "--log-failed"] {
+        let (result, output, diagnostics, calls) = actions_log_case(
+            &["run", "view", "44003672471", flag],
+            &[1, 2, 3],
+            &[(2, "job_log_unavailable")],
+        );
+        assert_eq!(result.unwrap(), 0);
+        assert_eq!(
+            output,
+            "job 1\tUNKNOWN STEP\tkept\njob 3\tUNKNOWN STEP\tkept\n"
+        );
+        assert_eq!(
+            diagnostics,
+            "job 2: no log (GitHub has no log for this job)\n"
+        );
+        assert_eq!(calls, [1, 2, 3]);
+    }
+}
+
+#[test]
+fn actions_log_incomplete_refusals_preserve_other_jobs_and_fail() {
+    for (code, reason) in [
+        ("job_not_finished", "the job hasn't finished"),
+        (
+            "job_log_redirect_refused",
+            "the download failed; retry later",
+        ),
+        ("job_log_read_limit", "the log is over the read limit"),
+        (
+            "job_log_download_failed",
+            "the download failed; retry later",
+        ),
+    ] {
+        let (result, output, diagnostics, calls) = actions_log_case(
+            &["run", "view", "44003672471", "--log"],
+            &[1, 2, 3],
+            &[(2, code)],
+        );
+        assert_eq!(result.unwrap(), 1, "{code}");
+        assert_eq!(
+            output,
+            "job 1\tUNKNOWN STEP\tkept\njob 3\tUNKNOWN STEP\tkept\n"
+        );
+        assert_eq!(diagnostics, format!("job 2: no log ({reason})\n"));
+        assert_eq!(calls, [1, 2, 3]);
+    }
+}
+
+#[test]
+fn actions_log_all_unavailable_and_single_job_refusals_fail() {
+    let (result, output, diagnostics, calls) = actions_log_case(
+        &["run", "view", "44003672471", "--log"],
+        &[1, 2],
+        &[(1, "job_log_unavailable"), (2, "job_log_unavailable")],
+    );
+    assert_eq!(result.unwrap(), 1);
+    assert!(output.is_empty());
+    assert_eq!(diagnostics.lines().count(), 2);
+    assert_eq!(calls, [1, 2]);
+    for code in [
+        "job_not_finished",
+        "job_log_unavailable",
+        "job_log_redirect_refused",
+        "job_log_read_limit",
+        "job_log_download_failed",
+    ] {
+        let (result, output, diagnostics, calls) = actions_log_case(
+            &["run", "view", "--job", "133780422078", "--log"],
+            &[133780422078],
+            &[(133780422078, code)],
+        );
+        assert_eq!(result.unwrap(), 1, "{code}");
+        assert!(output.is_empty());
+        assert!(diagnostics.starts_with("job 133780422078: no log ("));
+        assert_eq!(calls, [133780422078]);
+    }
+}
+
+#[test]
+fn actions_log_exit_status_still_reports_failed_jobs_with_unavailable_logs() {
+    let (result, output, diagnostics, calls) = actions_log_case(
+        &["run", "view", "44003672471", "--log", "--exit-status"],
+        &[1, 2],
+        &[(2, "job_log_unavailable")],
+    );
+    assert_eq!(result.unwrap(), 1);
+    assert_eq!(output, "job 1\tUNKNOWN STEP\tkept\n");
+    assert!(diagnostics.starts_with("job 2: no log ("));
+    assert_eq!(calls, [1, 2]);
+}
+
+#[test]
+fn actions_log_late_page_refusal_preserves_the_unterminated_log_line() {
+    let mut ranges = Vec::new();
+    let mut output = Vec::new();
+    let mut diagnostics = Vec::new();
+    let result = render::run_with_io(
+        &planned(&["run", "view", "8", "--log"]),
+        &mut |request| match request {
+            ReadRequest::Get { .. } => Ok(reply(json!({"jobs":[{"id":1,"name":"test"}]}))),
+            ReadRequest::JobLog {
+                range: Some(range), ..
+            } => {
+                ranges.push(range.offset);
+                if range.offset == 0 {
+                    Ok(log_reply(b"partial", 0, 100))
+                } else {
+                    Err(ReadError::JobLog {
+                        code: "job_log_download_failed".into(),
+                        message: "connection dropped".into(),
+                    })
+                }
+            }
+            _ => panic!("unexpected request {request:?}"),
+        },
+        &mut output,
+        &mut diagnostics,
+        &mut |_| panic!("log refusals must not retry or sleep"),
+    );
+    assert_eq!(result.unwrap(), 1);
+    assert_eq!(output, b"test\tUNKNOWN STEP\tpartial\n");
+    assert_eq!(
+        diagnostics,
+        b"test: no log (the download failed; retry later)\n"
+    );
+    assert_eq!(ranges, [0, 7]);
+}
+
+struct ActionsLogRetry {
+    result: Result<i32, ReadError>,
+    output: Vec<u8>,
+    diagnostics: Vec<u8>,
+    attempts: Vec<(Value, Duration)>,
+    sleeps: Vec<Duration>,
+    elapsed: Duration,
+}
+
+fn actions_log_retry_replies() -> [(&'static [u8], &'static str); 3] {
+    // Keep the legacy nested and missing-transmission replies exercised while
+    // deployed Plexus versions still use them. The bulk vectors cover current replies.
+    [
+        (br#"{"error":{"code":"read_dispatch_failed","outcome":{"transmission":"unknown","code":null,"message":"connection dropped"}}}"#, "read_dispatch_failed: connection dropped"),
+        (br#"{"error":{"code":"read_dispatch_failed","transmission":"unknown","outcome":{"transmission":"unknown","code":null,"message":"connection dropped"}}}"#, "read_dispatch_failed: connection dropped"),
+        (br#"{"error":{"code":"read_response_invalid","message":"invalid response body"}}"#, "read_response_invalid: invalid response body"),
+    ]
+}
+
+fn actions_log_retry_case(
+    refusals: &[&[u8]],
+    budget: Duration,
+    attempt_duration: Duration,
+) -> ActionsLogRetry {
+    let binding = AgentBinding {
+        repo: "cortexkit/aft".into(),
+        agent_id: "bot".into(),
+    };
+    let manifest = manifest();
+    let relay = RelayContext {
+        worker_broker: None,
+        connection_file: None,
+        ticket: None,
+        transient_delays: [Duration::ZERO; 2],
+        relay_budget: budget,
+    };
+    let context = ExecutionContext {
+        binding: &binding,
+        manifest: &manifest,
+        relay: &relay,
+    };
+    let started = std::time::Instant::now();
+    let clock = std::cell::Cell::new(started);
+    let mut trace = ActionsLogRetry {
+        result: Ok(0),
+        output: Vec::new(),
+        diagnostics: Vec::new(),
+        attempts: Vec::new(),
+        sleeps: Vec::new(),
+        elapsed: Duration::ZERO,
+    };
+    trace.result = render::run_with_io(
+        &planned(&["run", "view", "--job", "133780422078", "--log"]),
+        &mut |request| match request {
+            ReadRequest::Get { .. } => Ok(reply(json!({"id":133780422078_u64,"name":"test"}))),
+            ReadRequest::JobLog { .. } => executor::execute_read_with_clock(
+                &context,
+                request,
+                &mut |wire, remaining| {
+                    trace.attempts.push((wire.clone(), remaining));
+                    clock.set(clock.get() + attempt_duration);
+                    Ok(
+                        if let Some(refusal) = refusals.get(trace.attempts.len() - 1) {
+                            serde_json::from_slice(refusal).unwrap()
+                        } else {
+                            json!({"result":{"body":"kept\n","offset":0,"length":5,"total_bytes":5}})
+                        },
+                    )
+                },
+                &mut || clock.get(),
+                &mut |delay| {
+                    trace.sleeps.push(delay);
+                    clock.set(clock.get() + delay);
+                },
+            ),
+            _ => panic!("unexpected request"),
+        },
+        &mut trace.output,
+        &mut trace.diagnostics,
+        &mut |_| panic!("the renderer must not retry reads itself"),
+    );
+    trace.elapsed = clock.get().duration_since(started);
+    trace
+}
+
+#[test]
+fn actions_log_transient_read_failure_retries_and_succeeds() {
+    for (bytes, _) in actions_log_retry_replies() {
+        let trace = actions_log_retry_case(&[bytes], Duration::from_secs(1), Duration::ZERO);
+        assert_eq!(trace.result.unwrap(), 0);
+        assert_eq!(trace.output, b"test\tUNKNOWN STEP\tkept\n");
+        assert!(trace.diagnostics.is_empty());
+        assert_eq!(trace.sleeps, [Duration::from_millis(100)]);
+        assert_eq!(trace.attempts.len(), 2);
+        for (wire, _) in &trace.attempts {
+            assert_eq!(
+                *wire,
+                json!({"action":"github.actions.job_log","repository":"cortexkit/aft","args":{"job_id":133780422078_u64,"offset":0,"length":1047552}})
+            );
+        }
+        assert_eq!(trace.attempts[0].1, Duration::from_millis(1000));
+        assert_eq!(trace.attempts[1].1, Duration::from_millis(900));
+    }
+}
+
+#[test]
+fn actions_log_transient_read_failure_stops_after_two_retries() {
+    for (bytes, expected) in actions_log_retry_replies() {
+        let trace = actions_log_retry_case(&[bytes; 3], Duration::from_secs(1), Duration::ZERO);
+        let error = trace.result.unwrap_err();
+        assert_eq!(error.status(), 1);
+        assert_eq!(error.message("bot"), expected);
+        assert!(trace.output.is_empty());
+        assert!(trace.diagnostics.is_empty());
+        assert_eq!(trace.attempts.len(), 3);
+        assert_eq!(
+            trace.sleeps,
+            [Duration::from_millis(100), Duration::from_millis(200)]
+        );
+        assert_eq!(trace.attempts[2].1, Duration::from_millis(700));
+    }
+}
+
+#[test]
+fn actions_log_read_retries_do_not_reset_the_deadline() {
+    for (bytes, expected) in actions_log_retry_replies() {
+        let trace = actions_log_retry_case(
+            &[bytes; 3],
+            Duration::from_millis(300),
+            Duration::from_millis(50),
+        );
+        assert_eq!(trace.result.unwrap_err().message("bot"), expected);
+        assert_eq!(trace.attempts.len(), 2);
+        assert_eq!(trace.sleeps, [Duration::from_millis(100)]);
+        assert_eq!(trace.attempts[0].1, Duration::from_millis(300));
+        assert_eq!(trace.attempts[1].1, Duration::from_millis(150));
+        assert_eq!(trace.elapsed, Duration::from_millis(200));
+    }
+}
+
+#[test]
+fn actions_log_retries_stop_when_the_shared_read_budget_refuses() {
+    let budget = br#"{"error":{"code":"read_budget_exhausted","message":"budget exhausted","transmission":"not_sent","retry_after_ms":60000}}"#;
+    for (bytes, _) in actions_log_retry_replies() {
+        let trace =
+            actions_log_retry_case(&[bytes, budget], Duration::from_secs(1), Duration::ZERO);
+        let error = trace.result.unwrap_err();
+        assert_eq!(error.status(), REFUSAL_EXIT_STATUS);
+        assert_eq!(
+            error.message("bot"),
+            "read budget for bot used up; retry in 1 min"
+        );
+        assert_eq!(trace.attempts.len(), 2);
+        assert_eq!(trace.sleeps, [Duration::from_millis(100)]);
+    }
+}
+
+#[test]
+fn actions_log_retry_budget_preserves_the_existing_read_time_caps() {
+    let mut relay = RelayContext {
+        worker_broker: None,
+        connection_file: None,
+        ticket: None,
+        transient_delays: [Duration::ZERO; 2],
+        relay_budget: Duration::from_secs(210),
+    };
+    assert_eq!(
+        relay_client::read_request_budget(&relay),
+        Duration::from_secs(30)
+    );
+    relay.relay_budget = Duration::from_millis(250);
+    assert_eq!(
+        relay_client::read_request_budget(&relay),
+        Duration::from_millis(250)
+    );
+    #[cfg(unix)]
+    {
+        relay.worker_broker = Some(Err(crate::gh_shim_worker_broker::ClientError::MissingPath(
+            "unused",
+        )));
+        relay.relay_budget = Duration::from_secs(210);
+        assert_eq!(
+            relay_client::read_request_budget(&relay),
+            Duration::from_secs(20)
+        );
+        relay.relay_budget = Duration::from_millis(250);
+        assert_eq!(
+            relay_client::read_request_budget(&relay),
+            Duration::from_millis(250)
+        );
+    }
+}
+
 #[test]
 fn v20_log_protocol_rejects_missing_total_stalls_and_oversized_replies() {
     for response in [

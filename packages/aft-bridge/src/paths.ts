@@ -1,8 +1,9 @@
 import { existsSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import type { MigrationHarness } from "./migration.js";
 import { openPrivateStorageDir, PRIVATE_FILE_MODE } from "./private-storage.js";
+
+export type MigrationHarness = "opencode" | "pi";
 
 export interface ResolvedAftConfigPaths {
   userConfigPath: string;

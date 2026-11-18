@@ -1698,10 +1698,25 @@ fn session_context(relay: &RelayContext) -> Result<Option<SessionContext>, Strin
     })
 }
 
+pub(super) fn read_request_budget(relay: &RelayContext) -> Duration {
+    let budget = relay.relay_budget.min(READ_RELAY_BUDGET);
+    #[cfg(unix)]
+    let budget = if relay.worker_broker.is_some() {
+        budget.min(crate::gh_shim_worker_broker::CALL_DEADLINE)
+    } else {
+        budget
+    };
+    budget
+}
+
 /// Send one github_read request through AFT's ticket-authenticated management
 /// relay. Tool refusals remain Response bodies; Error frames are transport errors.
-pub(super) fn read_request(relay: &RelayContext, request: &Value) -> Result<Value, String> {
-    let budget = relay.relay_budget.min(READ_RELAY_BUDGET);
+pub(super) fn read_request(
+    relay: &RelayContext,
+    request: &Value,
+    budget: Duration,
+) -> Result<Value, String> {
+    let budget = budget.min(read_request_budget(relay));
     if let Some(client) = &relay.worker_broker {
         let client = client.as_ref().map_err(ToString::to_string)?;
         let request =

@@ -73,7 +73,8 @@ pub(crate) fn handle_comment_write(
             serde_json::json!({
                 "resource": resource.base_spelling(),
                 "preview_diff": body,
-                "metadata": { "diff": crate::edit::build_unified_diff(resource_spelling, "", body) },
+                // GitHub caps a comment body at 65,536 characters, so its diff cannot grow large.
+                "metadata": { "diff": crate::edit::build_unbounded_unified_diff(resource_spelling, "", body) },
                 "text": body,
             }),
         );
@@ -128,7 +129,8 @@ pub(crate) fn handle_comment_write(
             "comment_url": comment_url,
             "ordinal": ordinal,
             "text": text,
-            "metadata": { "diff": crate::edit::build_unified_diff(resource_spelling, "", body) },
+            // GitHub caps a comment body at 65,536 characters, so its diff cannot grow large.
+            "metadata": { "diff": crate::edit::build_unbounded_unified_diff(resource_spelling, "", body) },
         }),
     )
 }
@@ -239,7 +241,8 @@ pub(crate) fn handle_comment_edit(
                 "ordinal": ordinal,
                 "replacements": replacements,
                 "preview_diff": edited_body,
-                "metadata": { "diff": crate::edit::build_unified_diff(resource_spelling, &comment.body, &edited_body) },
+                // GitHub caps a comment body at 65,536 characters, so its diff cannot grow large.
+                "metadata": { "diff": crate::edit::build_unbounded_unified_diff(resource_spelling, &comment.body, &edited_body) },
                 "text": edited_body,
             }),
         );
@@ -272,7 +275,8 @@ pub(crate) fn handle_comment_edit(
             "ordinal": ordinal,
             "replacements": replacements,
             "text": format!("{comment_url}\nComment ordinal: {ordinal}\n{SAFETY_NOTICE}"),
-            "metadata": { "diff": crate::edit::build_unified_diff(resource_spelling, &comment.body, &edited_body) },
+            // GitHub caps a comment body at 65,536 characters, so its diff cannot grow large.
+            "metadata": { "diff": crate::edit::build_unbounded_unified_diff(resource_spelling, &comment.body, &edited_body) },
         }),
     )
 }

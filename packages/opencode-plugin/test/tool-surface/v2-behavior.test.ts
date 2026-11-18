@@ -49,7 +49,6 @@ describe("OpenCode V2 shared behavioral cases", () => {
         deliverLoadNotices: () => {},
         // Bootstrap side effects are inert: this test is about tool execution.
         migrateConfigLocations: () => [],
-        ensureStorageMigrated: async () => {},
         ensureOnnxRuntime: async () => null,
         startLspAutoInstall: () => null,
         pushLspPaths: async () => {},

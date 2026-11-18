@@ -48,6 +48,7 @@ mod engines;
 #[cfg(feature = "test-hooks")]
 pub mod exactness;
 mod fold;
+mod memory_profile;
 pub(crate) mod resume;
 pub(crate) mod staged_records;
 mod text_build;
@@ -268,6 +269,7 @@ fn checkpoint() -> Result<(), DataError> {
 pub struct DataLayer {
     cache: Arc<BlockCache>,
     threads: usize,
+    memory_profile: bool,
     policy: ScanPolicy,
     /// Every checkout's call-graph engine, kept between refreshes until it
     /// falls idle or the engines together hold too much.
@@ -280,19 +282,6 @@ pub struct DataLayer {
 }
 
 impl DataLayer {
-    /// A data layer whose segment reads share a cache of `cache_bytes`, and
-    /// whose builds use `threads` threads.
-    #[must_use]
-    pub fn new(cache_bytes: usize, threads: usize) -> Self {
-        Self {
-            cache: Arc::new(BlockCache::new(cache_bytes)),
-            threads: threads.max(1),
-            policy: super::content::scan_policy(),
-            engines: Arc::new(engines::EngineKeeper::new()),
-            bound: Mutex::new(Vec::new()),
-        }
-    }
-
     /// Sets how long a checkout's call-graph engine stays after the
     /// checkout's last edit or applied refresh. For tests and measurement.
     #[doc(hidden)]
@@ -2059,7 +2048,7 @@ impl Checkout {
         resume::kill_point("stage.resolve");
         let _census = super::callgraph::resolve_checkout_into(
             &mut inputs,
-            self.layer.threads,
+            self.layer.resolver_threads(),
             measure.then_some(&mut report.memory),
             &scratch,
             super::callgraph::KeyOrderBudget::configured(),

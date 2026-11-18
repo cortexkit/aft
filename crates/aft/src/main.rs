@@ -211,6 +211,7 @@ mod rayon_thread_tests {
 }
 
 fn main() {
+    aft::memory::profile::publish(None);
     #[cfg(feature = "test-hooks")]
     aft::grammar::initialize_test_identity();
     // The subc daemon hands a supervised module its launch nonce through an
@@ -242,13 +243,6 @@ fn main() {
         aft::launch_nonce::capture_at_startup();
         startup_phase("nonce_capture_done");
     }
-    // Every mode, not only the supervised one, holds its startup executable
-    // open now (macOS): a build's resume checkpoints are tied to the image
-    // this process runs, which must be read before an upgrade can
-    // place another binary at the same path.
-    aft::pinned_executable::capture_at_startup();
-    startup_phase("executable_source_captured");
-
     // Only the binary embeds the per-commit revision. Declare it before CLI
     // dispatch or the subc HELLO can request the library's build provenance.
     assert!(
@@ -302,6 +296,12 @@ fn main() {
         }
     }
 
+    // Help and option errors must exit before storage, PATH, logging, or even
+    // capturing the executable used by serving and maintenance commands.
+    if let Some(code) = cli::help::handle_first_arg(std::env::args().nth(1).as_deref()) {
+        std::process::exit(code);
+    }
+
     // `--formats` reports the highest on-disk format version of every store
     // this build reads. Placement compares it with the storage root's reader
     // floor, so it must stay side-effect free: no storage, no logging, no
@@ -317,22 +317,11 @@ fn main() {
         return;
     }
 
-    if std::env::args().nth(1).as_deref() == Some("migrate-storage") {
-        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
-        match aft::migrate_storage::parse_cli_args(args) {
-            Ok(args) => {
-                let status = aft::migrate_storage::run_with_options(
-                    args,
-                    aft::migrate_storage::Options::default(),
-                );
-                std::process::exit(i32::from(status.code()));
-            }
-            Err(message) => {
-                eprintln!("{message}");
-                std::process::exit(2);
-            }
-        }
-    }
+    // Serving and maintenance modes hold their startup executable open now
+    // (macOS): a build's resume checkpoints are tied to the running image,
+    // which must be read before an upgrade replaces it at the same path.
+    aft::pinned_executable::capture_at_startup();
+    startup_phase("executable_source_captured");
 
     // The index command is a serial CLI handoff: it performs one finite
     // snapshot and exits before logging, the App, runtime registry, or subc
@@ -382,12 +371,6 @@ fn main() {
         let args = std::env::args_os().skip(2).collect::<Vec<_>>();
         std::process::exit(cli::fix_config::run(args));
     }
-    if std::env::args().nth(1).as_deref() == Some("clean-old-caches") {
-        std::process::exit(cli::clean_old_caches::run(
-            std::env::args_os().skip(2).collect(),
-        ));
-    }
-
     // `aft backups purge` removes undo backups early. It runs before logging
     // and the application start: it either hands the purge to the running
     // daemon or performs it once and exits.
@@ -402,9 +385,7 @@ fn main() {
         }
     }
 
-    // `aft cache prune-legacy` deletes the index folders AFT used before
-    // 0.64. Like `backups`, it runs before logging and the application start;
-    // it opens none of AFT's stores, so daemons can keep running meanwhile.
+    // Cache maintenance runs before logging and the application start.
     if std::env::args().nth(1).as_deref() == Some("cache") {
         let args = std::env::args_os().skip(2).collect::<Vec<_>>();
         std::process::exit(cli::prune_legacy::run(args));

@@ -1447,6 +1447,101 @@ fn held_request(expires_at_ms: u64) -> SecretConsentRequest {
     }
 }
 
+fn assert_secret_card_lifecycle_logs(reason: CancellationReason) {
+    use base64::Engine;
+    let runtime = secret_consent_runtime();
+    let endpoint = Arc::new(HeldCardEndpoint::default());
+    let transport = Arc::new(SubcSecretConsent {
+        transport: endpoint.clone(),
+        runtime: runtime.handle().clone(),
+        cards: Default::default(),
+    });
+    let mut request = held_request(crate::secret::vault::now_ms() + 600_000);
+    let statement = json!({
+        "use":{"host":"api.hetzner.cloud", "path_prefix":"/private-path"},
+        "request_expires_at_ms": 1_900_000_000_000_u64,
+        "private":"never-log-statement-data-or-secret-material"
+    });
+    request.statement_b64url = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&statement).unwrap());
+    let (_, lines) = crate::logging::capture_log_lines(|| {
+        runtime.block_on(async {
+            assert_eq!(
+                transport.file(&request, Duration::ZERO).await,
+                ConsentOutcome::Pending
+            );
+            assert_eq!(
+                transport.file(&request, Duration::ZERO).await,
+                ConsentOutcome::Pending
+            );
+            let cancel = crate::secret::consent::Cancellation::default();
+            match reason {
+                CancellationReason::Expired => request.expires_at_ms = Some(0),
+                CancellationReason::Cancelled => cancel.cancel(),
+                CancellationReason::ClientDropped => cancel.cancel_with_reason(reason),
+            }
+            assert_eq!(
+                transport.wait(request.clone(), cancel).await,
+                ConsentOutcome::Cancelled
+            );
+        });
+    });
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[0].starts_with("INFO secret consent card filed: "),
+        "{lines:?}"
+    );
+    assert!(
+        lines[1].starts_with("INFO secret consent card withdrawn: "),
+        "{lines:?}"
+    );
+    assert!(
+        lines[1].ends_with(&format!(" reason={}", reason.code())),
+        "{lines:?}"
+    );
+    for line in lines {
+        assert!(
+            line.contains("request_id=\"01HF7YAT000000000000000001\""),
+            "{line}"
+        );
+        assert!(line.contains("card_id=\"el_held\" label=\"key\" host=\"api.hetzner.cloud\" expires_at_ms=1900000000000"), "{line}");
+        assert!(!line.contains(&request.statement_b64url), "{line}");
+        assert!(!line.contains("never-log-statement"), "{line}");
+        assert!(!line.contains("private-path"), "{line}");
+        assert_eq!(line.lines().count(), 1);
+    }
+    let calls = endpoint.calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.method == "consent.request")
+            .count(),
+        1
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.method == "consent.withdraw")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn secret_card_logs_client_dropped_withdrawal() {
+    assert_secret_card_lifecycle_logs(CancellationReason::ClientDropped);
+}
+
+#[test]
+fn secret_card_logs_expired_withdrawal() {
+    assert_secret_card_lifecycle_logs(CancellationReason::Expired);
+}
+
+#[test]
+fn secret_card_logs_cancelled_withdrawal() {
+    assert_secret_card_lifecycle_logs(CancellationReason::Cancelled);
+}
+
 #[tokio::test(start_paused = true)]
 async fn production_secret_cards_reawait_the_same_id_at_the_service_cap_and_keep_the_request_expiry(
 ) {

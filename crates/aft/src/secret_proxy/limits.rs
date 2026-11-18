@@ -18,7 +18,8 @@ pub(super) struct IdleIo<T> {
     inner: T,
     timeout: Duration,
     timer: Pin<Box<Sleep>>,
-    approval_waits: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    approval_waits: Option<std::sync::Arc<crate::secret::requests::RequestActivity>>,
+    last_activity: Option<Instant>,
 }
 
 impl<T> IdleIo<T> {
@@ -28,11 +29,12 @@ impl<T> IdleIo<T> {
             timeout,
             timer: Box::pin(tokio::time::sleep(timeout)),
             approval_waits: None,
+            last_activity: None,
         }
     }
     pub(super) fn with_approval_waits(
         mut self,
-        waits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        waits: std::sync::Arc<crate::secret::requests::RequestActivity>,
     ) -> Self {
         self.approval_waits = Some(waits);
         self
@@ -40,14 +42,23 @@ impl<T> IdleIo<T> {
     fn expired(&mut self, cx: &mut Context<'_>) -> bool {
         // A held approval has its own ten-minute deadline. Quiet sockets must
         // remain usable long enough to return the card's result to the client.
-        if self
-            .approval_waits
-            .as_ref()
-            .is_some_and(|waits| waits.load(std::sync::atomic::Ordering::Acquire) != 0)
-        {
-            let _ = self.timer.as_mut().poll(cx);
-            self.touch();
-            return false;
+        if let Some(activity) = &self.approval_waits {
+            let (waiting, last_activity) = activity.snapshot();
+            if last_activity != self.last_activity {
+                self.last_activity = last_activity;
+                if let Some(at) = last_activity {
+                    // Approval completion and a fresh TLS-verified upstream
+                    // connection must leave time to send the client's response.
+                    // A later socket read/write must retain its newer budget.
+                    let deadline = self.timer.deadline().max(at + self.timeout);
+                    self.timer.as_mut().reset(deadline);
+                }
+            }
+            if waiting {
+                let _ = self.timer.as_mut().poll(cx);
+                self.touch();
+                return false;
+            }
         }
         self.timer.as_mut().poll(cx).is_ready()
     }
@@ -112,5 +123,81 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for IdleIo<T> {
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::secret::requests::RequestActivity;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test(start_paused = true)]
+    async fn approval_release_starts_a_fresh_production_idle_budget() {
+        let waits = Arc::new(RequestActivity::default());
+        waits.begin_wait();
+        let (socket, _peer) = tokio::io::duplex(64);
+        let mut socket = IdleIo::new(socket, IDLE).with_approval_waits(waits.clone());
+        assert!(futures_util::poll!(Box::pin(socket.read_u8())).is_pending());
+        tokio::time::advance(IDLE + Duration::from_secs(1)).await;
+        assert!(futures_util::poll!(Box::pin(socket.read_u8())).is_pending());
+        // No socket polls accompany this part of the approval hold. Releasing
+        // it must revive the idle budget even when the old deadline elapsed.
+        tokio::time::advance(IDLE + Duration::from_secs(1)).await;
+        waits.finish_wait();
+        socket
+            .write_all(b"response")
+            .await
+            .expect("approval release must leave time to return the response");
+        tokio::time::advance(IDLE - Duration::from_secs(1)).await;
+        socket.flush().await.unwrap();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(
+            socket.read_u8().await.unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn verified_reconnect_starts_a_fresh_downstream_idle_budget() {
+        let activity = Arc::new(RequestActivity::default());
+        let (socket, _peer) = tokio::io::duplex(64);
+        let mut socket = IdleIo::new(socket, IDLE).with_approval_waits(activity.clone());
+        tokio::time::advance(IDLE - Duration::from_secs(1)).await;
+        activity.record_activity();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        socket.write_all(b"response").await.unwrap();
+        tokio::time::advance(IDLE + Duration::from_secs(1)).await;
+        assert_eq!(
+            socket.read_u8().await.unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_approval_budget_starts_at_release_not_the_next_socket_poll() {
+        let activity = Arc::new(RequestActivity::default());
+        activity.begin_wait();
+        let (socket, _peer) = tokio::io::duplex(64);
+        let mut socket = IdleIo::new(socket, IDLE).with_approval_waits(activity.clone());
+        tokio::time::advance(IDLE + Duration::from_secs(1)).await;
+        activity.finish_wait();
+        tokio::time::advance(IDLE + Duration::from_secs(1)).await;
+        assert_eq!(
+            socket.write_all(b"late").await.unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unheld_sockets_keep_the_production_idle_deadline() {
+        let (socket, _peer) = tokio::io::duplex(64);
+        let mut socket = IdleIo::new(socket, IDLE);
+        tokio::time::advance(IDLE + Duration::from_secs(1)).await;
+        assert_eq!(
+            socket.write_all(b"late").await.unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
     }
 }

@@ -28,6 +28,7 @@ pub(crate) struct LspChildRootSnapshot {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct LspCensus {
+    pub process_probe_age_ms: u64,
     /// Worker rust-analyzer admission refusals since process start, not start failures.
     pub capacity_refusals: u64,
     pub children_total: u64,
@@ -77,6 +78,7 @@ pub(crate) struct FdCensus {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct LifecycleCensusSnapshot {
+    pub measured_age_ms: Option<u64>,
     pub lsp: LspCensus,
     pub threads: ThreadCensus,
     pub sqlite: crate::db::SqliteConnectionSnapshot,
@@ -87,25 +89,35 @@ pub(crate) struct LifecycleCensusSnapshot {
 /// A published snapshot is cheap to clone and avoids control-path OS probes.
 #[derive(Default)]
 pub(crate) struct LifecycleCensusCache {
-    snapshot: RwLock<LifecycleCensusSnapshot>,
+    snapshot: RwLock<(Option<std::time::Instant>, LifecycleCensusSnapshot)>,
 }
 
 impl LifecycleCensusCache {
     pub(crate) fn publish(&self, snapshot: LifecycleCensusSnapshot) {
+        let stamped = (Some(std::time::Instant::now()), snapshot);
         match self.snapshot.write() {
-            Ok(mut target) => *target = snapshot,
-            Err(error) => *error.into_inner() = snapshot,
+            Ok(mut target) => *target = stamped,
+            Err(error) => *error.into_inner() = stamped,
         }
     }
 
     pub(crate) fn snapshot(&self) -> LifecycleCensusSnapshot {
-        match self.snapshot.try_read() {
-            Ok(snapshot) => snapshot.clone(),
-            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner().clone(),
+        let snapshot = match self.snapshot.try_read() {
+            Ok(snapshot) => snapshot,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
             // Preserve every field with honest zero values instead of making a
             // reply block behind a concurrent rollup publication.
-            Err(std::sync::TryLockError::WouldBlock) => LifecycleCensusSnapshot::default(),
+            Err(std::sync::TryLockError::WouldBlock) => return LifecycleCensusSnapshot::default(),
+        };
+        let mut value = snapshot.1.clone();
+        if let Some(published_at) = snapshot.0 {
+            let elapsed = u64::try_from(published_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            value.measured_age_ms = Some(elapsed);
+            value.lsp.process_probe_age_ms = value.lsp.process_probe_age_ms.saturating_add(elapsed);
+            value.threads.classified_age_ms =
+                value.threads.classified_age_ms.saturating_add(elapsed);
         }
+        value
     }
 
     pub(crate) fn lsp_applicability_for_root(
@@ -117,7 +129,7 @@ impl LifecycleCensusCache {
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return None,
         };
-        snapshot.lsp.applicability_by_root.get(root).cloned()
+        snapshot.1.lsp.applicability_by_root.get(root).cloned()
     }
 }
 
@@ -130,6 +142,7 @@ pub(crate) fn collect(
 ) -> LifecycleCensusSnapshot {
     let lsp_health = app.lsp_child_registry().health_snapshot();
     let lsp = LspCensus {
+        process_probe_age_ms: lsp_health.process_probe_age_ms,
         capacity_refusals: crate::lsp::client::rust_analyzer_capacity_refusals(),
         children_total: lsp_health.children_total as u64,
         children_by_root: lsp_health
@@ -167,6 +180,7 @@ pub(crate) fn collect(
         .sum::<usize>() as u64;
 
     LifecycleCensusSnapshot {
+        measured_age_ms: Some(0),
         lsp,
         threads: sampled_thread_census(),
         sqlite: crate::db::connection_snapshot(),
@@ -584,6 +598,22 @@ fn soft_fd_limit() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rollup_lifecycle_cache_advances_published_probe_ages() {
+        let cache = super::LifecycleCensusCache::default();
+        let mut snapshot = super::LifecycleCensusSnapshot::default();
+        snapshot.lsp.process_probe_age_ms = 2_000;
+        snapshot.threads.classified_age_ms = 10_000;
+        *cache.snapshot.write().unwrap() = (
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(30)),
+            snapshot,
+        );
+        let reused = cache.snapshot();
+        let age = reused.measured_age_ms.unwrap();
+        assert!(age >= 30_000);
+        assert_eq!(reused.lsp.process_probe_age_ms, 2_000 + age);
+        assert_eq!(reused.threads.classified_age_ms, 10_000 + age);
+    }
     use super::thread_class;
 
     /// The health rollup counts threads on every pass but must not read every

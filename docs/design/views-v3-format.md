@@ -88,9 +88,8 @@ listing is not descent into it.
 | Inspect manager file walk, view projection and non-view callgraph maintenance | `crates/aft/src/inspect/manager.rs:1503-1573,4526-4532,4983-5026,5190-5350,5570-5589` | `:1583-1666,4858-4866,5377-5480,5584-5775,5964-5985`; current-checkout projection now receives its file list | Project walk is rooted at the bound project and scope-filtered, not at storage. View projection uses `views/<scope>` and query pins; views-off maintenance uses `callgraph/<key>`. **No v3 storage walk** in ordinary routing. |
 | Legacy partition inventory / sizing | `crates/aft/src/legacy_partitions.rs:202-244,281-358,447-479` | Same roots and key filters; lexical normalization now delegates to `path_identity` (including unmatched parent components) | Lists direct storage children, then only their `callgraph` and `inspect` partition-key entries; recursively sizes selected legacy partitions. **No v3 count/touch/delete**. |
 | Private storage permission tightening | `crates/aft/src/private_storage.rs:87-147,150-195` | File unchanged byte-for-byte | Root opening tightens the root and immediate directory children only; keyed opening tightens only its ancestor chain. May chmod `blobs` itself, never descends to `blobs/v3`. **No v3 member/store mode change**. |
-| Explicit migration preflight, copy and staging cleanup | `crates/aft/src/migrate_storage.rs:145-157,260-272,356-407,450-533,720-765` | `:145-157,265-277,361-411,455-539,725-770,842-907`; B groups free-space admission by destination volume | **Read-only count exception:** recursive source sizing enters v3 when `--from` contains it. Actual migration items exclude `blobs` and `views`; staging cleanup selects only `staging-*` under migration targets. No v3 migration/deletion in ordinary layouts. |
 
-### Audit decision and explicit migration exception
+### Audit decision
 
 Neither release's automatic startup, retention, GC, family sweep, eviction or
 legacy pruning discovers, counts, changes permissions on or deletes the chosen
@@ -98,26 +97,6 @@ v3 family/member trees. The two releases differ in reclaim policy, measurement
 caching, due-view scheduling and mounted-cache trash handling, not in their
 v1/v2 namespace roots. This is a source audit, not the later actual-binary G7
 coexistence test.
-
-One user-invoked operation is an explicit exception: `aft migrate-storage
---from <storage>` recursively sizes the entire supplied source root, including
-v3 (A `crates/aft/src/migrate_storage.rs:145-157,752-765`; B
-`:145-157,757-770`). Its fixed migration list excludes blobs/views, so it
-counts those bytes without moving them. The owner approved continuing with
-this shipped-release exception: it cannot delete or corrupt v3; at worst its
-space estimate refuses a migration that could have fit. Forged v2 `view_dir`
-paths remain a corrupt-metadata caveat only, not an ordinary routing path.
-
-**Completed in slice 3a-2:** current migration excludes the source-root-relative
-`blobs/v3` subtree from **both** source-size/free-space accounting and recursive
-copying. V3 is rebuildable and remains at the source. The change landed in
-`2cb838f2436f7d22ad4aee18043085a1d93539b2` (through #675); the test in
-`crates/aft/src/migrate_storage.rs` seeds an 8 GiB v3 payload, admits migration
-with space for only the actual migration fixtures, and verifies that no v3
-target is created and the source payload is unchanged. Accounting for actual
-migration items and destination-volume checks is preserved. This current-main
-fix does not change the explicit-migration exception in the two shipped
-releases audited above.
 
 ## Floor domains and publication protocol
 

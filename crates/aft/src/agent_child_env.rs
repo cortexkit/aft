@@ -2461,6 +2461,10 @@ mod tests {
             .split("#[cfg(test)]\nmod tests")
             .next()
             .unwrap();
+        let detached = format!(
+            "{registry}\n{}",
+            include_str!("bash_background/scope_spawn.rs").replace("\r\n", "\n")
+        );
         let pty_source = include_str!("bash_background/pty_process.rs").replace("\r\n", "\n");
         let pty = pty_source
             .split("// Every test in this module")
@@ -2469,13 +2473,13 @@ mod tests {
         let sandbox = include_str!("sandbox_spawn.rs");
 
         // Unix uses the native/fallback adapter; Windows retains Command::spawn.
-        let detached_spawns = registry.matches(".spawn()").count()
-            + registry
+        let detached_spawns = detached.matches(".spawn()").count()
+            + detached
                 .matches("sandbox_spawn::spawn_detached_for_plan(")
                 .count();
         assert_eq!(detached_spawns, 2, "agent detached spawn inventory drifted");
         assert_eq!(
-            registry
+            detached
                 .matches("agent_child_env::apply_to_command")
                 .count(),
             detached_spawns,

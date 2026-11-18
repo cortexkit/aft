@@ -329,6 +329,15 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
     },
     SurfaceSpec {
         requires: None,
+        command: "grep",
+        mode: "",
+        list_id: "payload.ignored_entries",
+        unit: Unit::Paths,
+        narrow: &["path"],
+        reasons: WALK_CAP,
+    },
+    SurfaceSpec {
+        requires: None,
         command: "glob",
         mode: "",
         list_id: "payload.files",
@@ -404,6 +413,9 @@ pub struct KindBoundCase {
 }
 
 pub fn surface_name(surface: SurfaceSpec) -> String {
+    if surface.list_id == "payload.ignored_entries" {
+        return "grep.ignored_entries".to_string();
+    }
     if surface.list_id == "payload.skipped_files" {
         return format!("{}.skipped_files", surface.command);
     }
@@ -430,6 +442,12 @@ fn sorted_causes(causes: &[Reason]) -> Vec<Reason> {
 }
 
 fn build_case_envelope(surface: SurfaceSpec, fired: &[Reason]) -> Option<ListEnvelope> {
+    if surface.list_id == "payload.ignored_entries" {
+        return aft::list_surfaces::grep::build_ignored_entries_envelope(&json!({
+            "ignored_entries": if fired.contains(&Reason::Cap) { json!(["a/", "b/", "c/"]) } else { json!(["a/"]) },
+            "ignored_entries_total": if fired.contains(&Reason::Walk) { Value::Null } else { json!(6) },
+        }));
+    }
     if surface.list_id == "payload.unresolved_callers.sites" {
         return fired.contains(&Reason::Cap).then(|| {
             ListEnvelope::new(
@@ -558,6 +576,13 @@ fn build_case_envelope(surface: SurfaceSpec, fired: &[Reason]) -> Option<ListEnv
 }
 
 fn expected_total(surface: SurfaceSpec, fired: &[Reason]) -> Total {
+    if surface.list_id == "payload.ignored_entries" {
+        return if fired.contains(&Reason::Walk) {
+            Total::AtLeast(if fired.contains(&Reason::Cap) { 3 } else { 1 })
+        } else {
+            Total::Exact(6)
+        };
+    }
     if surface.list_id == "payload.unresolved_callers.sites" {
         return Total::Exact(7);
     }
@@ -930,6 +955,7 @@ fn registered_surface(command: &str, mode: &str) -> SurfaceSpec {
             surface.command == command
                 && surface.mode == mode
                 && surface.list_id != "payload.skipped_files"
+                && surface.list_id != "payload.ignored_entries"
         })
         .unwrap_or_else(|| panic!("missing test surface {command}.{mode}"))
 }
@@ -979,8 +1005,32 @@ fn skipped_files_fixture() -> Value {
     reply
 }
 
+fn ignored_entries_fixture() -> Value {
+    let mut reply = json!({
+        "text": "top.txt\n1: needle\n\nFound 1 match in 1 file\n\nNot searched (ignore rules): a/, b/, c/ and 3 more in this folder. Name a path inside one to search it.",
+        "matches": [{"file":"top.txt", "line":1, "column":1, "line_text":"needle", "match_text":"needle"}],
+        "total_matches": 1, "files_with_matches": 1,
+        "ignored_entries": ["a/", "b/", "c/"],
+        "ignored_entries_total": 6, "ignored_entries_truncated": true,
+    });
+    reply["ignored_entries_list_envelope"] = serde_json::to_value(
+        aft::list_surfaces::grep::build_ignored_entries_envelope(&reply).unwrap(),
+    )
+    .unwrap();
+    reply
+}
+
 pub fn capped_fixtures() -> Vec<FixtureRecord> {
     let mut fixtures = Vec::new();
+    push_root_fixture(
+        &mut fixtures,
+        "grep/ignored_entries",
+        "grep",
+        "",
+        "payload.ignored_entries",
+        ignored_entries_fixture(),
+        "ignored_entries_list_envelope",
+    );
     for command in ["search", "grep"] {
         push_root_fixture(
             &mut fixtures,
@@ -1342,7 +1392,15 @@ pub fn validate_trailer(fixture: &FixtureRecord) -> Vec<String> {
             fixture.name, expected, actual
         ));
     }
-    if !fixture.rendered.contains(&expected) {
+    if fixture.surface.list_id == "payload.ignored_entries" {
+        let sentence = "Not searched (ignore rules): a/, b/, c/ and 3 more in this folder. Name a path inside one to search it.";
+        if !fixture.rendered.contains(sentence) || fixture.rendered.contains(&expected) {
+            errors.push(format!(
+                "{}: ignored-boundary preview must use its remainder sentence, not a second trailer",
+                fixture.name
+            ));
+        }
+    } else if !fixture.rendered.contains(&expected) {
         errors.push(format!(
             "{}: surface text omitted canonical trailer {:?}",
             fixture.name, expected
@@ -1848,6 +1906,13 @@ fn changed_files_fixture(mode: &str) -> Value {
 pub fn capped_parity_fixtures() -> Vec<CappedParityFixture> {
     vec![
         CappedParityFixture {
+            name: "grep/ignored_entries",
+            command: "grep",
+            mode: "",
+            list_id: "payload.ignored_entries",
+            reply: ignored_entries_fixture(),
+        },
+        CappedParityFixture {
             name: "callgraph/unresolved_callers_7",
             command: "callgraph",
             mode: "callers",
@@ -2023,6 +2088,18 @@ pub fn validate_capped_parity_coverage(fixtures: &[CappedParityFixture]) -> Vec<
 
 pub fn render_transports(fixture: &CappedParityFixture) -> (String, String) {
     let subc_text = render(fixture.command, fixture.mode, &fixture.reply);
+    if fixture.list_id == "payload.ignored_entries" {
+        // This secondary list's sentence already names the omitted remainder.
+        // Both transports still select the primary match-row envelope, not a
+        // second generic trailer for the informational boundary preview.
+        let ndjson = build_ndjson_text(
+            fixture.reply["text"].as_str().unwrap(),
+            &fixture.reply,
+            Some("payload.matches"),
+            false,
+        );
+        return (subc_text, ndjson);
+    }
     let base_text = if fixture.list_id == "payload.skipped_files" {
         let trailer = build_ndjson_text("", &fixture.reply, Some(fixture.list_id), false);
         let producer_text = fixture.reply["text"].as_str().unwrap();
@@ -2597,7 +2674,11 @@ fn surface_matches_file(command: &str, file: &str) -> bool {
         }
         "read" => file == "commands/read.rs" || file == "subc_format.rs",
         "outline" => file == "commands/outline.rs" || file == "subc_format.rs",
-        "inspect" => file == "commands/inspect.rs" || file == "subc_format.rs",
+        "inspect" => {
+            file == "commands/inspect.rs"
+                || file.starts_with("commands/inspect/")
+                || file == "subc_format.rs"
+        }
         "bash" => {
             file == "bash_changed_files.rs"
                 || file.starts_with("compress/")

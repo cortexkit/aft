@@ -757,7 +757,7 @@ fn audit_live_vault_key_never_reaches_task_logs_previews_or_status() {
             let waiting = crate::commands::bash_status::handle(&status_request, &f.ctx);
             let waiting_json = serde_json::to_string(&waiting).unwrap();
             assert!(waiting.success, "{waiting:?}");
-            assert!(waiting_json.contains("secret test: waiting for approval on the phone for localhost (requests wait up to 10 minutes)"));
+            assert!(waiting_json.contains("secret test: waiting for your approval for localhost (requests wait up to 10 minutes)"));
             assert!(!waiting_json.contains(std::str::from_utf8(KEY).unwrap()));
             daemon
                 .state

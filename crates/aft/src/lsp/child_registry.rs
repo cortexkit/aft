@@ -60,6 +60,8 @@ pub struct LspChildRootHealth {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LspChildHealth {
+    /// Age of the oldest reused PID probe, not of registry ownership metadata.
+    pub process_probe_age_ms: u64,
     /// Compatibility fields retain the older `spawned` and `cwd_gone` names.
     pub spawned: usize,
     pub cwd_gone: usize,
@@ -80,6 +82,7 @@ pub struct LspChildHealth {
 /// can reap children that no live client still references.
 #[derive(Clone, Debug, Default)]
 struct TrackedChild {
+    health_probe: Arc<health_probes::HealthProbeCache>,
     root: Option<PathBuf>,
     server_root: Option<PathBuf>,
     kind: Option<ServerKind>,
@@ -145,6 +148,7 @@ impl LspChildRegistry {
             children.insert(
                 pid,
                 TrackedChild {
+                    health_probe: Arc::default(),
                     root: root.map(Path::to_path_buf),
                     server_root: server_root.map(Path::to_path_buf),
                     kind: kind.cloned(),
@@ -193,6 +197,7 @@ impl LspChildRegistry {
         children.insert(
             child.id(),
             TrackedChild {
+                health_probe: Arc::default(),
                 root: root.map(Path::to_path_buf),
                 server_root: server_root.map(Path::to_path_buf),
                 kind: kind.cloned(),
@@ -474,6 +479,9 @@ fn root_has_reclaim_marker(root: &Path) -> bool {
 
 const LSP_CHILD_ROOT_DETAIL_CAP: usize = 8;
 
+#[path = "child_registry/health_probes.rs"]
+mod health_probes;
+
 fn health_for_children(children: Vec<(u32, TrackedChild)>) -> LspChildHealth {
     #[derive(Default)]
     struct RootAggregate {
@@ -485,9 +493,17 @@ fn health_for_children(children: Vec<(u32, TrackedChild)>) -> LspChildHealth {
     let mut roots = BTreeMap::<String, RootAggregate>::new();
     let mut cwd_gone = 0;
     let mut without_client = 0;
+    let mut process_probe_age_ms = 0;
     let now = Instant::now();
     for (pid, tracked) in &children {
-        if matches!(child_cwd_state(*pid), ChildCwdState::Gone) {
+        let (probe, age_ms) = tracked
+            .health_probe
+            .read(now, || health_probes::ProcessProbe {
+                cwd: child_cwd_state(*pid),
+                rss_bytes: child_rss_bytes(*pid),
+            });
+        process_probe_age_ms = process_probe_age_ms.max(age_ms);
+        if matches!(probe.cwd, ChildCwdState::Gone) {
             cwd_gone += 1;
         }
         if tracked.ownership.is_orphan(now) {
@@ -504,7 +520,7 @@ fn health_for_children(children: Vec<(u32, TrackedChild)>) -> LspChildHealth {
             .as_ref()
             .map(|kind| kind.id_str().to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        let rss_bytes = child_rss_bytes(*pid);
+        let rss_bytes = probe.rss_bytes;
         let aggregate = roots.entry(root).or_default();
         aggregate.count += 1;
         aggregate.rss_bytes = aggregate.rss_bytes.saturating_add(rss_bytes);
@@ -552,6 +568,7 @@ fn health_for_children(children: Vec<(u32, TrackedChild)>) -> LspChildHealth {
     });
 
     LspChildHealth {
+        process_probe_age_ms,
         spawned: children.len(),
         cwd_gone,
         children_total: children.len(),
@@ -648,7 +665,7 @@ fn child_rss_bytes(_pid: u32) -> u64 {
     0
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 enum ChildCwdState {
     Present,
     Gone,

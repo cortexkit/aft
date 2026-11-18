@@ -1,0 +1,8 @@
+{
+  "memory": "balanced",
+  "harnesses": {
+    "opencode": {
+      "memory": "fast"
+    }
+  }
+}

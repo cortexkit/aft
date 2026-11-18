@@ -10,6 +10,7 @@ import {
   loadV1HostProviderConfigContract,
 } from "./contracts.js";
 import { fail } from "./errors.js";
+import { expectedIgnoredEntriesDisclosure, IGNORED_ENTRIES_SURFACE_ID } from "./ignored-entries-t6.js";
 import { readPermissionAskInventory, validatePermissionInventory } from "./inventory.js";
 import { readPinnedV1HostVersion } from "./pin.js";
 import { projectedField, TRUNCATION_TRAILER_PATTERN } from "./projection.js";
@@ -892,6 +893,18 @@ export function validateT6(
       }
       const fixtureKind = fixture.t6?.fixture;
       const expectedTrailer = fixture.t6?.expected_trailer;
+      if (surface.id === IGNORED_ENTRIES_SURFACE_ID) {
+        const expected = expectedIgnoredEntriesDisclosure(fixtureKind);
+        if (
+          expected === undefined ||
+          fixture.t6?.expected_disclosure !== expected ||
+          expectedTrailer !== undefined ||
+          reason !== (fixtureKind === "incomplete" ? "cap" : undefined)
+        ) {
+          fail("matrix_invalid", `${fixture.scenario.id} must pin its approved ignored_entries sentence without a generic trailer`);
+        }
+        continue;
+      }
       if (fixtureKind === "complete" && expectedTrailer !== undefined) {
         fail("matrix_invalid", `${fixture.scenario.id} complete fixture must not expect a trailer`);
       }

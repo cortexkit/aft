@@ -1,0 +1,17 @@
+{
+  "name": "refused-job-log-download-failed",
+  "reply": {
+    "content": [
+      {
+        "text": "job_log_download_failed: The job log download failed or returned an invalid response",
+        "type": "text"
+      }
+    ],
+    "error": {
+      "code": "job_log_download_failed",
+      "message": "The job log download failed or returned an invalid response",
+      "transmission": "sent"
+    },
+    "isError": true
+  }
+}

@@ -1,5 +1,8 @@
 //! Remote jobs use the ordinary task registry and its raw output artifacts.
 #[cfg(unix)]
+#[path = "remote_scope_fallback.rs"]
+mod scope_fallback;
+#[cfg(unix)]
 use super::*;
 #[cfg(unix)]
 use crate::commands::inspect::thousands;
@@ -2442,6 +2445,7 @@ struct LocalFallback {
     // Keep the submitting request's local ceiling even if configuration reloads.
     memory_limit_mib: Option<u64>,
     linux_scope: bool,
+    linux_scope_max_runtime_secs: u64,
 }
 
 /// How `attach_remote` ended when it did not fail.
@@ -2757,6 +2761,7 @@ impl BgTaskRegistry {
             notify,
             compressed,
             root,
+            false,
         )
         .map_err(|error| error.to_string())
     }
@@ -2778,6 +2783,7 @@ impl BgTaskRegistry {
         notify: bool,
         compressed: bool,
         root: Option<PathBuf>,
+        linux_scope: bool,
     ) -> Result<String, RegistryError> {
         let mut timings = super::super::take_runon_timings();
         timings.enter("task_setup");
@@ -2877,15 +2883,16 @@ impl BgTaskRegistry {
         );
         attach_sandbox_metadata(&mut metadata, &plan);
         timings.enter("fallback_snapshot");
+        let linux_scope_max_runtime_secs = self.inner.task_scopes.max_runtime().as_secs();
         let digest = crate::sandbox_spawn::save_local_launch(
             &plan,
             root.as_deref().unwrap_or(&workdir),
             &workdir,
             &crate::sandbox_spawn::current_authenticated_principal(),
             &shell_path,
-            env.get("AFT_INTERNAL_LINUX_SCOPE")
-                .is_some_and(|v| v == "1"),
+            linux_scope,
             memory_limit_mib,
+            linux_scope_max_runtime_secs,
         )?;
         metadata.remote.as_mut().unwrap().fallback_digest = Some(digest);
         timings.enter("task_registration");
@@ -2922,9 +2929,7 @@ impl BgTaskRegistry {
             .io_handles = Some(handles);
         let request_root = root.as_deref().unwrap_or(&workdir);
         timings.enter("remote_environment");
-        let linux_scope = env
-            .remove("AFT_INTERNAL_LINUX_SCOPE")
-            .is_some_and(|v| v == "1");
+        env.remove(super::LINUX_SCOPE_ENV);
         // Configured `bash.env` values apply to local commands only: the
         // ambient environment must not carry one to a build server just
         // because it happens to be exported here. The request's own map is a
@@ -3035,6 +3040,7 @@ impl BgTaskRegistry {
             plan,
             shell_path,
             linux_scope,
+            linux_scope_max_runtime_secs,
             memory_limit_mib,
             env,
             capture_pipeline,
@@ -4560,247 +4566,6 @@ impl BgTaskRegistry {
         })
         .await
         .map_err(|error| error.to_string())?
-    }
-
-    fn remote_fallback(
-        &self,
-        task: &Arc<BgTask>,
-        local: LocalFallback,
-        reason: &str,
-        refusal_detail: Option<&str>,
-    ) -> Result<(), String> {
-        let mut db = DeferredDbWrites::new(self, task);
-        let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
-        let metadata = state.metadata.clone();
-        // Automatic prefix routing may fall back; an explicit remote demand
-        // must fail before any local launch state or process is created. A
-        // refusal of return_paths is final too: running the command here
-        // would not copy back the files it was asked for.
-        if metadata.remote.as_ref().is_some_and(|r| r.explicit_runon)
-            || return_paths_unsupported(reason, refusal_detail)
-        {
-            drop(state);
-            drop(db);
-            return self.refuse_remote_executor(task, reason, refusal_detail);
-        }
-        let layout = resolve_task_layout(&task.paths.session_dir, &task.task_id)
-            .map_err(|e| e.to_string())?;
-        let durable = read_task_at(&layout).map_err(|e| e.to_string())?;
-        // Checked under the state lock that every cancellation intent is
-        // recorded under, so an intent recorded first always prevents the
-        // local start.
-        let cancel_requested = state
-            .metadata
-            .remote
-            .as_ref()
-            .is_some_and(|r| r.cancel_requested)
-            || durable.remote.as_ref().is_some_and(|r| r.cancel_requested);
-        if cancel_requested {
-            if let Some(remote) = state.metadata.remote.as_mut() {
-                remote.cancel_requested = true;
-            }
-            drop(state);
-            drop(db);
-            // For an owner pause, not starting the command is the whole
-            // cancellation: the runner refused the job.
-            if self.finish_owner_pause_cancel(task, Ok(())) {
-                return Ok(());
-            }
-            self.remote_terminal(
-                task,
-                Verdict::RunLocally {
-                    reason: RefusalReason::Unknown(reason.into()),
-                    refusal_detail: refusal_detail.map(str::to_owned),
-                },
-                Some("remote refused before start; local fallback skipped because cancellation was requested".into()),
-            );
-            return Ok(());
-        }
-        // Commit the switch to local before spawning. A crash before the PID
-        // write must report an uncertain local start, never submit it again.
-        state.metadata.remote = None;
-        state.metadata.local_fallback_started = true;
-        state.metadata.started_at = unix_millis();
-        let reason = rendered_refusal_reason(reason, refusal_detail).replace(['\n', '\r'], " ");
-        state.metadata.execution_note = Some(format!(
-            "ran locally on {}: remote refused: {reason}",
-            local_os_name()
-        ));
-        if metadata
-            .remote
-            .as_ref()
-            .is_some_and(|remote| !remote.return_paths.is_empty())
-        {
-            let note = state.metadata.execution_note.as_mut().unwrap();
-            note.push('\n');
-            note.push_str(super::return_files::LOCAL_RUN_NOTE);
-        }
-        if let Some(changes) = metadata
-            .remote
-            .as_ref()
-            .and_then(|r| r.terminal.as_ref())
-            .and_then(|t| t.workspace_changes.as_ref())
-            .filter(|c| !c.is_empty())
-        {
-            state
-                .metadata
-                .execution_note
-                .as_mut()
-                .unwrap()
-                .push_str(&format!(
-                    "\nremote workspace_changes (not copied back): {}",
-                    serde_json::to_string(changes).unwrap()
-                ));
-        }
-        append_output_loss(&mut state.metadata);
-        self.persist_task_locked(task, &state.metadata, &mut db)
-            .map_err(|e| e.to_string())?;
-        #[cfg(test)]
-        tests::after_local_fallback_marker(&task.task_id);
-        let mut memory_monitor = Self::prepare_memory_limit(local.memory_limit_mib, &task.task_id)?;
-        let mut child = spawn_detached_child(
-            &local.plan,
-            &metadata.command,
-            super::super::BashShell::Bash,
-            &local.shell_path,
-            &task.paths,
-            &metadata.workdir,
-            &local.env,
-            state.io_handles.as_mut().ok_or("task handles absent")?,
-            local.capture_pipeline,
-            memory_monitor.is_some(),
-            local.linux_scope,
-            // The fallback's execution marker is already durable. Only capped
-            // commands need a second gate here, to attach the memory container.
-            if memory_monitor.is_some() {
-                LocalIdentityGate::Required
-            } else {
-                LocalIdentityGate::CommittedFallback
-            },
-        )?;
-        if let Some(mut monitor) = memory_monitor.take() {
-            if let Err(error) = monitor.attach(child.id()) {
-                drop(state);
-                super::super::process::terminate_pgid_with(child.id() as i32, || {
-                    matches!(child.try_wait(), Ok(Some(_)))
-                });
-                let _ = child.wait();
-                return Err(error);
-            }
-            state.metadata.memory_policy = Some(monitor.policy.clone());
-            // Persist the chosen enforcer before the gated fallback command can run.
-            if let Err(error) = self.persist_task_locked(task, &state.metadata, &mut db) {
-                drop(child.stdin.take());
-                let _ = child.wait();
-                return Err(error.to_string());
-            }
-            self.inner
-                .memory_monitors
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .insert(task.task_id.clone(), monitor);
-            use std::io::Write;
-            child
-                .stdin
-                .take()
-                .ok_or("memory cap launch gate missing")?
-                .write_all(b"run\n")
-                .map_err(|error| error.to_string())?;
-        }
-        #[cfg(test)]
-        if tests::simulate_crash_before_local_pid(&task.task_id) {
-            return Ok(());
-        }
-        state.metadata.mark_running(child.id(), child.id() as i32);
-        state.runtime = TaskRuntime::Piped(Some(child));
-        state.detached = false;
-        let persisted = (|| {
-            #[cfg(test)]
-            tests::fail_running_metadata_after_spawn(&task.task_id)?;
-            self.persist_task_locked(task, &state.metadata, &mut db)
-                .map_err(|e| e.to_string())
-        })();
-        drop(state);
-        drop(db);
-        if let Err(error) = persisted {
-            // Spawn succeeded. This is not a no-start refusal, even when the
-            // PID publication fails; both live and restarted callers end here.
-            self.remote_terminal(
-                task,
-                Verdict::OutcomeUnknown,
-                Some(format!(
-                    "the command started locally; AFT lost track of it: {error}; never rerun"
-                )),
-            );
-        }
-        Ok(())
-    }
-
-    fn restored_remote_fallback(
-        &self,
-        task: &Arc<BgTask>,
-        remote: &RemoteTask,
-        reason: &str,
-        refusal_detail: Option<&str>,
-    ) -> Result<(), String> {
-        // Decide before even restoring a local launch plan: this also covers
-        // a refusal persisted just before the previous AFT process stopped.
-        if remote.explicit_runon || return_paths_unsupported(reason, refusal_detail) {
-            return self.refuse_remote_executor(task, reason, refusal_detail);
-        }
-        let restore = (|| {
-            let layout = resolve_task_layout(&task.paths.session_dir, &task.task_id)
-                .map_err(|e| e.to_string())?;
-            let (plan, shell_path, env, linux_scope, memory_limit_mib) =
-                crate::sandbox_spawn::restore_local_launch(
-                    &layout,
-                    remote
-                        .fallback_digest
-                        .as_deref()
-                        .ok_or("local snapshot digest absent")?,
-                )?;
-            let metadata = task
-                .state
-                .lock()
-                .map_err(|_| "task lock poisoned")?
-                .metadata
-                .clone();
-            let capture_pipeline = should_capture_pipeline_status(
-                &plan,
-                !metadata.pipeline_segments.is_empty(),
-                &shell_path,
-            );
-            // Replay has validated handles, but no local runtime retained them.
-            let handles = TaskIoHandles::reopen(&layout).map_err(|e| e.to_string())?;
-            task.state
-                .lock()
-                .map_err(|_| "task lock poisoned")?
-                .io_handles = Some(handles);
-            self.remote_fallback(
-                task,
-                LocalFallback {
-                    plan,
-                    shell_path,
-                    env,
-                    capture_pipeline,
-                    linux_scope,
-                    memory_limit_mib,
-                },
-                reason,
-                refusal_detail,
-            )
-        })();
-        if let Err(error) = restore {
-            self.remote_terminal(
-                task,
-                Verdict::RunLocally {
-                    reason: RefusalReason::Unknown(reason.into()),
-                    refusal_detail: refusal_detail.map(str::to_owned),
-                },
-                Some(format!("remote refused before start; the local fallback could not be restored after restart, so the command did not run: {error}")),
-            );
-        }
-        Ok(())
     }
 
     fn refuse_remote_executor(

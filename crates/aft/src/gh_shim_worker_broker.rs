@@ -48,7 +48,7 @@ const MAX_ENCODED_RESPONSE: usize =
 #[cfg(unix)]
 const FRAME_DEADLINE: Duration = Duration::from_secs(2);
 #[cfg(unix)]
-const CALL_DEADLINE: Duration = Duration::from_secs(20);
+pub(crate) const CALL_DEADLINE: Duration = Duration::from_secs(20);
 #[cfg(unix)]
 const CONNECTIONS: usize = 4;
 #[cfg(unix)]

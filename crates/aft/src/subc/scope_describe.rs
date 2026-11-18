@@ -375,7 +375,7 @@ where
             watches.reconcile(&held_scopes, &control, interval);
             let protected = watches.coverage(held_scopes.len());
             let protected_keys = &protected.keys;
-            verifications.reconcile(protected_keys, &held_scopes);
+            verifications.reconcile(&watches.healthy_keys(), &held_scopes);
             if let Some(key) = verifications.take_due() {
                 if let Some(stamp) = held_scopes.get(&key) {
                     verification_keys.insert(key.clone());

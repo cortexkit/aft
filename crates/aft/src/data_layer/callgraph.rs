@@ -2187,7 +2187,7 @@ pub(crate) fn pool(threads: usize) -> Result<rayon::ThreadPool, ManifestJoinErro
 
 /// The thread pool every live call-graph engine (`LiveCheckout`) resolves
 /// on: one for the whole process, started the first time an engine needs
-/// it, with a thread per available core. A pool per engine kept a full set
+/// it, with the current profile's resolver thread count. A pool per engine kept a full set
 /// of resolver threads alive for as long as each edited checkout's engine
 /// lived: with dozens of worktrees, hundreds of idle threads.
 ///
@@ -2195,21 +2195,26 @@ pub(crate) fn pool(threads: usize) -> Result<rayon::ThreadPool, ManifestJoinErro
 /// parallel iterators nested inside stay in this pool. Refreshes of
 /// different checkouts share its threads; the runtime runs at most four of
 /// them at once. Cold builds keep pools of their own ([`pool`]).
+/// A profile change replaces the shared pool; running work keeps its old Arc.
 ///
 /// # Errors
 ///
 /// When the pool's threads cannot start.
 pub(crate) fn engine_pool() -> Result<Arc<rayon::ThreadPool>, ManifestJoinError> {
-    static POOL: Mutex<Option<Arc<rayon::ThreadPool>>> = Mutex::new(None);
+    static POOL: Mutex<Option<(usize, Arc<rayon::ThreadPool>)>> = Mutex::new(None);
     let mut slot = POOL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(pool) = slot.as_ref() {
-        return Ok(Arc::clone(pool));
+    let threads = crate::memory::profile::current()
+        .resolver_threads
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, usize::from));
+    if let Some((size, pool)) = slot.as_ref() {
+        if *size == threads {
+            return Ok(Arc::clone(pool));
+        }
     }
-    let threads = std::thread::available_parallelism().map_or(4, usize::from);
     let shared = Arc::new(pool(threads)?);
-    *slot = Some(Arc::clone(&shared));
+    *slot = Some((threads, Arc::clone(&shared)));
     Ok(shared)
 }
 

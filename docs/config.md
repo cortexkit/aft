@@ -8,6 +8,14 @@ Both files are JSONC (comments allowed). One location serves every harness:
 | User | `~/.config/cortexkit/aft.jsonc` |
 | Project | `<project>/.cortexkit/aft.jsonc` |
 
+Agents may read and edit the entire CortexKit settings folder, `~/.config/cortexkit`
+or `$XDG_CONFIG_HOME/cortexkit`, including any key or token files still there.
+Secrets belong in the vault, not in the settings folder. When Subconscious's settings
+protection is on, edits become proposals for the user to approve. CortexKit's private data
+and state folders (`~/.local/share/cortexkit`, `~/.local/state/cortexkit`, and their
+`XDG_DATA_HOME` and `XDG_STATE_HOME` equivalents), AFT's storage directory, and the
+daemon connection file remain blocked.
+
 For the removal order and harness-specific registration steps, see [Uninstall](../README.md#uninstall).
 
 OMP uses this same CortexKit user file; register its Pi-compatible plugin with `npx @cortexkit/aft@latest setup --harness omp`.
@@ -33,13 +41,25 @@ The list covers a time window, so changes made by other processes in that window
 
 Per-call `env` entries and the command's own `export` both override configured values, and config changes apply to future commands without a restart. The first bash reply in each session lists the applied names with their tier, never their values, and says when a project map was ignored as untrusted or shadowed by a user value. When a command starts while the same trimmed command is already running in the same project and canonical working directory, AFT adds a warning with its task ID, age, and whether it belongs to this session; the command still runs.
 
-On Linux, user config may set `bash.linux_scope: true` to launch non-PTY tool shells through `systemd-run --user --scope --collect --quiet`. The default is `false`. AFT uses the scope only when `systemd-run` exists and the user manager is reachable; otherwise it falls back to the normal process-group-isolated spawn and writes one informational log line. Native-sandbox launches also use the normal spawn because their launcher cannot contact the user manager. Project config cannot enable or disable this host-level containment option.
+On Linux, daemon mode puts non-PTY bash tasks in systemd user scopes by default (`bash.linux_scope: true`). Tasks can continue to run through an AFT module restart while the same systemd user manager is active.
+
+Use user config to set `bash.linux_scope: false` and disable these scopes. Projects cannot change this option or its ceiling. Changes apply to future tasks only. Standalone mode, PTY tasks, and native-sandbox launches do not use these scopes. If `systemd-run`, the user manager, or the unified cgroup view is unavailable, AFT uses its usual process-group launch path.
+
+`bash.linux_scope_max_runtime_secs` is a user-only integer from `1` through `4294967295`. Its default is `86400` (24 hours). With no explicit `timeout`, a new worker wait does not extend the scope ceiling. With an explicit `timeout`, the scope limit is that timeout plus 60 seconds. AFT's per-call timeout and default background-task deadline still apply.
+
+A same-user command can move processes with `systemd-run --user` to a different cgroup, where the memory limit, scope kill, and time limit do not apply.
+
+After replay, AFT uses the wrapper's `io/exit` marker for the command's exit code. If the exit marker is missing and the recorded process has exited, AFT reports an unknown outcome (`FateUnknown`). An unreachable user manager does not change a live task's `Running` status. Systemd unit results do not prove a shell exit code. Logout, a host restart, or a user-manager stop can end the tasks.
+
+To stop all task scopes for your user, run `systemctl --user stop aft.slice`. WARNING: This command stops tasks from all AFT instances for that user.
+
+The daemon maintainer must supply the `module.draining` handler independently. Task scopes do not install that handler.
 
 `bash.memory_limit_mib` optionally caps aggregate memory for each local command, including foreground, background, and PTY commands. It is off by default; set a positive integer in MiB (for example, `4096` for 4 GiB; maximum `4294967295`) in user config. Projects may tighten the cap, never raise or remove it. Changes affect future commands; there is no per-call override. Remote `runon` jobs use the build server's own limits and are not covered.
 
 On Linux, local agent shells always raise their `oom_score_adj` to `1000` before running the command, so the kernel prefers them and their descendants over AFT and desktop processes during an out-of-memory event; this has no setting and does not change AFT's own value. If the adjustment cannot be verified, the command still runs, AFT logs one warning per process, and the `bash_oom_priority_failures` health counter records the failures.
 
-- **Linux:** cgroup v2 `memory.max` (using a delegated transient systemd user scope when needed); if unavailable, the result explicitly names the process-group RSS watcher fallback.
+- **Linux:** cgroup v2 `memory.max` in the task's own scope when daemon scopes apply. This limit includes descendants in different process groups. The `memory.swap.max` and `memory.oom.group` controls apply to that cgroup. AFT refuses a scoped launch if it cannot set the necessary memory controls. Other local tasks use a delegated cgroup when available. If the delegated cgroup is unavailable, the result names the process-group RSS watcher fallback.
 - **Windows:** a job-object aggregate memory limit refuses allocations; AFT stops the job when a limit notification or peak accounting confirms the cap was hit.
 - **macOS:** a physical-footprint process-group watcher samples every 500 ms. Fast allocations can overshoot for a fraction of a second, and processes that leave the group are not counted. The Linux watcher has the same limits. Watcher scans are bounded to 4096 processes and stop the command explicitly if accounting cannot complete.
 
@@ -121,7 +141,7 @@ Leaving the setting unset preserves the existing layout for a storage root that 
 
 Changing the setting builds fresh caches; nothing is migrated. Stop AFT sessions using the storage root being cleaned. Updated cache-using processes, including standalone sessions and `aft index`, hold a shared kernel lock at `<storage_dir>/retention/daemon-use.lock` before cache access; the main process retains it until the main process exits. Configuration snapshots hold a lease for any additional storage root they select. Cleanup takes the same lock exclusively before preparing cache namespaces and retains it across inventory, confirmation and deletion. For this release's upgrade window, a conservative host-wide subc-daemon check additionally refuses cleanup while a daemon is running, including older daemon versions that do not hold the root lock. Stop those daemons before cleanup. `aft doctor --fix` reclaims only `views/`, `blobs/`, `callgraph/`, `semantic/`, `index/`, `symbols/` and `inspect/` inside recorded, marked, inactive artifact roots. It never removes unmarked folders under the durable storage root.
 
-For the original storage-root caches, run the separate `aft doctor --clean-old-caches` operation (native `aft clean-old-caches`). This is an explicit, confirmation-gated exception for old unmarked caches: **only** `views/`, `blobs/`, `callgraph/`, `semantic/`, `index/`, `symbols/` and `inspect/` directly under the resolved durable storage root are eligible. The root must already contain a regular `aft.db` or its matching AFT owner marker; cleanup cannot create its own ownership proof. It must not be the active artifact root, and `storage.cache_dir` must be active, enrolled and on a different device. Harness folders, other names and durable state are never selected. Symlinked or foreign-device domains, nested mounts and hardlinked files refuse the operation. The prompt lists every exact candidate path and byte size plus the total, then requires the exact word `delete`; without a terminal, explicit `--yes` is required. See `aft doctor --clean-old-caches --help` for this exception and its prerequisites.
+For the original storage-root caches, run the separate `aft cache clean-old` operation (also available via `npx @cortexkit/aft cache clean-old`). This is an explicit, confirmation-gated exception for old unmarked caches: **only** `views/`, `blobs/`, `callgraph/`, `semantic/`, `index/`, `symbols/` and `inspect/` directly under the resolved durable storage root are eligible. The root must already contain a regular `aft.db` or its matching AFT owner marker; cleanup cannot create its own ownership proof. It must not be the active artifact root, and `storage.cache_dir` must be active, enrolled and on a different device. Harness folders, other names and durable state are never selected. Symlinked or foreign-device domains, nested mounts and hardlinked files refuse the operation. The prompt lists every exact candidate path and byte size plus the total, then requires the exact word `delete`; without a terminal, explicit `--yes` is required. See `aft cache clean-old --help` for this exception and its prerequisites.
 
 Both operations preflight every root and candidate before deleting anything, refuse live daemons independently of cache leases, and delete through pinned directory handles. Cache directory/file creation also walks from the admitted root handle, refusing symlinks and foreign mounts below it; a pathname is not reused as creation authority after that walk. Root/candidate symlinks, changed identities, nested mounts and aliases of durable or active directories refuse cleanup. Preflight is read-only and refuses symlinks, special files and linked coordination files anywhere it inspects; marker inspection and any marker sweeping use bounded, no-follow, directory-handle-relative operations. Existing coordination files also refuse cleanup rather than being reclaimed or heartbeated: stop their owner and repair stale locks before retrying. Each context holds `.aft-in-use.lock` shared while using a root, including retired roots with in-flight readers; cache/semantic/symbol/writer locks and pins provide additional protection. Unavailable configured roots refuse cleanup altogether. Partial failures report completed removals and partial-directory progress. On Windows filesystems without POSIX delete disposition, an accepted legacy disposition counts as removed with a `removed_with_warning` entry explaining that removal remains pending until handles close. Root directories and durable state are never removed; ordinary startup and plain `aft doctor` do not delete caches.
 
@@ -214,6 +234,36 @@ contain function names and line tables, not full local-variable/type information
 
 ## Config Options
 
+### Memory profile (user config only)
+
+Set `"memory": "lean"` or `"balanced"` at the top level of your user
+configuration. Project values and values inside `harnesses.*` are ignored with
+the user-only-key notice, even when malformed.
+
+| Value | Trade-off |
+|---|---|
+| `lean` | Uses less memory and can build more slowly: a smaller shared block cache, four call-graph resolver threads on Linux and macOS, and immediate return of freed memory on Linux. Windows keeps all CPUs because limiting resolver threads did not lower the measured peak and made builds slower. |
+| `balanced` | Keeps the previous resource limits. |
+
+When omitted, AFT chooses from total physical RAM: below 8 GiB selects `lean`,
+otherwise it selects `balanced`. If RAM cannot be read, it uses `balanced`. Health output includes
+`memory_profile: { value, source, total_ram_bytes }`; `source` is `config` or `auto`
+and unavailable RAM is reported as `null`.
+
+The shared block cache holds 128 MiB in `lean` and 256 MiB in `balanced`.
+Both modes keep the same limits for simultaneous builds of uncached indexes,
+call graphs held in memory, jobs that prepare meaning-search data, and build
+caches.
+
+Changes apply to subsequent builds, cache sizing, and admissions without a
+restart. Work already admitted keeps its profile. Meaning search is not disabled
+by `lean`; its own settings still control whether it runs. The allocator change
+applies only to Linux builds using jemalloc, not macOS or Windows.
+
+The unused `callgraph_chunk_size` key is removed. From 0.67, user configuration
+that still sets it is refused with `removed_config_key`; projects drop it with a
+notice. Run `npx @cortexkit/aft doctor --fix` to remove it.
+
 ```jsonc
 {
    // Edit/read surface: "default" (default) or "hashline". User and project
@@ -223,6 +273,9 @@ contain function names and line tables, not full local-variable/type information
    // Optional existing rebuildable-cache parent, user base only. Omit to keep
    // the default storage-root layout. See "Rebuildable cache root" above.
    // "storage": { "cache_dir": "/existing/cache-parent" },
+
+   // Optional machine-local profile; user base only. Omit for automatic choice.
+   // "memory": "balanced",
 
   // Auto-format files after edits. Default: false. When enabled, formatting is
   // queued and runs after ~90s without further edits to the file.
@@ -483,9 +536,13 @@ contain function names and line tables, not full local-variable/type information
     // 1800000 (30 minutes); values below 60000 are a config error.
     "worker_wait_max_ms": 1800000,
 
-    // Linux-only and user-tier only. Put non-PTY tool shells in transient
-    // systemd user scopes when the user manager is reachable. Default false.
-    "linux_scope": false
+    // Linux daemon scopes are on by default. User config can disable them.
+    // Standalone mode, PTY tasks, and native-sandbox launches do not use them.
+    "linux_scope": true,
+    // User-only scope ceiling without an explicit timeout (seconds).
+    // Range: 1 through 4294967295. Default 86400 (24 hours).
+    // A new worker wait does not extend it.
+    "linux_scope_max_runtime_secs": 86400
   },
 
   // aft_inspect codebase-health scanner (recommended/all tiers).
@@ -722,6 +779,32 @@ The AFT sidebar and the OpenCode 2 prompt footer read their display settings fro
 
 `git.co_author` controls commit attribution for AFT-spawned agent children. `"off"` is the default, `"auto"` derives the repository's bound agent from the gh-shim manifest and cached GitHub numeric ID, and an explicit `"Name <email>"` value is used verbatim. When enabled, AFT selects a complete dispatcher set through child-only `GIT_CONFIG_*` variables; it does not edit global or repository Git configuration. The dispatchers are identical for every project and storage root, so AFT writes them once per user to a directory named by a hash of their content, `<aft-cache>/git-hooks/<content-hash>`, where `<aft-cache>` is `AFT_CACHE_DIR` when set, otherwise `%LOCALAPPDATA%\aft` on Windows and `$XDG_CACHE_HOME/aft` or `~/.cache/aft` elsewhere (`<storage_root>/git-hooks/<content-hash>` when no home directory is known). The set is created atomically and never rewritten while intact, so each hook version is a single new executable per user. Each dispatcher preserves arguments, stdin, and exit status while chaining to the first executable repository hook from local `core.hooksPath`, the repository's Git directory, or `.githooks`. The `prepare-commit-msg` dispatcher adds attribution first so the repository hook can validate or amend it. AFT quarantines unknown or modified entries in its managed directory and regenerates the expected dispatchers before child launch. Project config may override this attribution key because attribution is not a trust boundary.
 
+## Project environment in agent shells (`shell.env_provider`)
+
+By default, agent shells get the environment AFT itself started with, so a project's pinned tool versions (from mise, direnv or similar) don't apply. `shell.env_provider` asks a provider for each project's environment before a shell command starts:
+
+```jsonc
+// ~/.config/cortexkit/aft.jsonc
+{ "shell": { "env_provider": { "kind": "mise" } } }
+```
+
+- `kind`: `mise` (runs `mise env --json`), `direnv` (runs `direnv export json`; not supported on Windows) or `custom`.
+- `command`: the provider's argument list. Optional for `mise` and `direnv`, required for `custom`.
+- `timeout_ms`: 100 to 10000, default 2000. The provider also has to fit in the time a bash call allows for starting its command: when less than `timeout_ms` of that is left, the provider gets what is left minus one second.
+- `watch` (`custom` only): file names whose change makes AFT ask the provider again. A custom provider with no watch files runs before every command.
+
+The provider runs in the command's working directory, inside the same sandbox as the command. It must print one JSON object of string values, in UTF-8 and at most 256 KiB. A value of `null` removes that variable. `PATH` may be replaced. Names AFT never accepts from user configuration are silently dropped: loader variables (`LD_*`, `DYLD_*`), shell start-up variables (`BASH_ENV`, `ENV`, `IFS`, `SHELLOPTS`, `BASHOPTS`, `BASH_FUNC_*`), `GIT_CONFIG*`, and CortexKit and AFT control variables.
+
+AFT caches each answer per working directory and starting environment. It asks again when a watched file changes, checking every parent folder of the working directory. For `mise` these are `mise.toml`, `.mise.toml`, `mise.local.toml`, `.mise.local.toml`, `.tool-versions`, `.config/mise.toml`, `.config/mise/config.toml`, `.mise/config.toml` and `mise/config.toml`; for `direnv`, `.envrc` and `.env`.
+
+If the provider fails, times out or prints something AFT can't use, the command still runs, with AFT's default environment, and its output starts with one line naming the reason:
+
+```text
+Project environment not loaded (<reason>); this command used AFT's default PATH.
+```
+
+The setting is honored only in user config; a project config can't select a provider, because the provider runs a command. Changes apply to the next command without a restart. Commands run on a build server (`runon`) don't use it. Omit the setting to keep today's environment exactly.
+
 ## Remote runs
 
 `remote_exec.enabled` is the single user switch for whole-line `runon` and defaults to false. The retired `bash.runon_enabled` key is translated with a notice: an explicit false keeps remote runs off by setting `remote_exec.enabled: false`, and true leaves that setting unchanged; then the old key is removed. An absent old key already uses the current one-switch configuration. AFT rewrites the user file with its existing comment-preserving migration and backup, including each first-level harness block independently. Project files are not rewritten; their retired key is dropped with a notice.
@@ -771,14 +854,14 @@ Strict native profiles and relaxed macOS profiles enforce credential-file denies
 Read and write protection covers:
 
 - `~/.ssh`, `~/.gnupg`, `~/Library/Keychains`, `~/.aws`, `~/.config/gcloud`, `~/.azure`, `~/.config/gh`, `~/.netrc`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.docker/config.json`, `~/.npmrc`, `~/.pypirc`, `~/.kube/config` and `~/.cargo/credentials*` (including future filename suffixes).
-- CortexKit config, data and state: `~/.config/cortexkit`, `~/.local/share/cortexkit`, `~/.local/state/cortexkit`, their absolute XDG equivalents, AFT's resolved storage and the session store. This includes other agents' private stores. Daemon connection files selected through trusted configuration, `SUBC_CONNECTION_FILE`, `XDG_RUNTIME_DIR/subc-connection.json` and the production runtime path are protected even outside those trees. User `sandbox.read_deny` paths are protected as well.
+- CortexKit data and state: `~/.local/share/cortexkit`, `~/.local/state/cortexkit`, their absolute XDG equivalents, AFT's resolved storage and the session store. This includes other agents' private stores. Daemon connection files selected through trusted configuration, `SUBC_CONNECTION_FILE`, `XDG_RUNTIME_DIR/subc-connection.json` and the production runtime path are protected even outside those trees. User `sandbox.read_deny` paths are protected as well. The settings folder (`~/.config/cortexkit` or `$XDG_CONFIG_HOME/cortexkit`) is open to agents for reading and editing; secrets belong in the vault, not there.
 
 Private-store read exceptions are the checkout pool (so sibling checkout reads work), the current checkout and task I/O/temp, placed CortexKit binaries (`~/.local/share/cortexkit/bin` and the XDG equivalent), and the exact shim executable, `<storage>/shims`, content-keyed Git hook directory, and Git-resolved metadata/hook paths. AFT storage defaults to `<XDG_DATA_HOME>/cortexkit/aft` or `~/.local/share/cortexkit/aft`; [storage overrides](#storage-root-environment-override) can relocate it. The session store is the task directory under `<storage>/bash-tasks/<session-hash>`. These exceptions do not expose other agents' stores. Sandboxed shells can also read the file-tool-readable saved command files in their own harness/session (including local captures of remote commands), never saved launch environments or other private storage; macOS matches only those filenames, while Linux strict snapshots existing files from the 500 most recently modified task entries at launch and leaves older or later-created files unreadable until a subsequent eligible snapshot, without adding write access beyond the current task's existing I/O grant.
 
 Additional write denies cover:
 
 - `~/Work` and the Alfonso worktree pool, except the current checkout and the narrow shared Git object/ref/log/packed-ref grants needed for commits and branch deletion. Registered main and sibling worktrees outside those trees are also protected. This is a known-checkout boundary: a previously unknown, unrelated checkout outside these locations is not discovered by a filesystem-wide scan.
-- CortexKit config/data/state and AFT storage, except the current checkout and the current task's AFT-owned I/O/temp/scratch. Managed shim and hook executables remain immutable.
+- CortexKit data/state and AFT storage, except the current checkout and the current task's AFT-owned I/O/temp/scratch. Managed shim and hook executables remain immutable.
 - `~/.zshrc`, `~/.zprofile`, `~/.bashrc`, `~/.profile`, `~/.gitconfig`, `~/.config/git` and `~/Library/LaunchAgents`.
 - The repository's Git `config`, linked `config.worktree`, default and effective hooks directories, core's hook stubs, and the resolved `mason.originalHooksPath` target. Git binding files and executable project policy (`.cortexkit/aft.jsonc`, `.cortexkit/aft/filters`) remain protected too.
 

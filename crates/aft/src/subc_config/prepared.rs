@@ -256,24 +256,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         put(
             &dir.path().join(".pi/aft.jsonc"),
-            r#"{"callgraph_chunk_size":7}"#,
+            r#"{"idle": {"checkout_hours": 7}}"#,
         );
         put(
             &dir.path().join(".opencode/aft.jsonc"),
-            r#"{"callgraph_chunk_size":8}"#,
+            r#"{"idle": {"checkout_hours": 8}}"#,
         );
         assert_eq!(
             PreparedBindConfig::read(None, dir.path(), &Harness::Pi)
                 .unwrap()
                 .resolved()
-                .callgraph_chunk_size,
+                .idle
+                .checkout_hours,
             7
         );
         assert_eq!(
             PreparedBindConfig::read(None, dir.path(), &Harness::Opencode)
                 .unwrap()
                 .resolved()
-                .callgraph_chunk_size,
+                .idle
+                .checkout_hours,
             8
         );
         std::fs::create_dir_all(dir.path().join(".cortexkit/aft.jsonc")).unwrap();

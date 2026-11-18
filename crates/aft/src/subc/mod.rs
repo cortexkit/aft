@@ -228,6 +228,10 @@ mod diagnostics_findings;
 mod drain;
 mod flow_read;
 mod health;
+mod installed_routes;
+use installed_routes::{insert_route_channel, remove_route_channel};
+mod legacy_root;
+use legacy_root::*;
 pub(crate) mod held_task_recovery;
 pub(crate) use runner_notices::retry_held_notice_fallback;
 #[cfg(test)]
@@ -2421,6 +2425,7 @@ fn quiesce_connection_roots(
     }
 
     for route in routes.values() {
+        installed_routes::status_unbound(route);
         runner_notices::route_unbound(route);
     }
     routes.clear();
@@ -3941,20 +3946,6 @@ fn remove_root_channel(
     }
 }
 
-fn remove_route_channel(
-    routes: &mut HashMap<RouteChannel, RouteIdentity>,
-    root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
-    channel: RouteChannel,
-) -> Option<RouteIdentity> {
-    let removed = routes.remove(&channel);
-    if let Some(identity) = &removed {
-        runner_notices::route_unbound(identity);
-        remove_root_channel(root_channels, &identity.root, channel);
-        release_semantic_opener_if_unrouted(routes, identity);
-    }
-    removed
-}
-
 /// Keeps semantic admission (see `semantic_admission`) in step with the
 /// installed routes: a session whose last route on a root is gone no longer
 /// holds that root open. Configure records the opening, before the route is
@@ -3969,26 +3960,6 @@ fn release_semantic_opener_if_unrouted(
     if !still_routed {
         crate::semantic_admission::note_closed(&identity.session, identity.root.as_path());
     }
-}
-
-fn insert_route_channel(
-    routes: &mut HashMap<RouteChannel, RouteIdentity>,
-    root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
-    channel: RouteChannel,
-    identity: RouteIdentity,
-) {
-    if crate::semantic_admission::harness_opens_root(&identity.harness) {
-        crate::semantic_admission::note_opened(&identity.session, identity.root.as_path());
-    }
-    if let Some(previous) = routes.insert(channel, identity.clone()) {
-        runner_notices::route_unbound(&previous);
-        remove_root_channel(root_channels, &previous.root, channel);
-        release_semantic_opener_if_unrouted(routes, &previous);
-    }
-    root_channels
-        .entry(identity.root.clone())
-        .or_default()
-        .insert(channel);
 }
 
 fn sync_bg_live_delivery_sessions(
@@ -4464,29 +4435,6 @@ enum ModuleLoopExit {
     SkipSearchFlush,
 }
 
-/// Entry point for `aft --subc <connection-file>`. Synchronous on the outside;
-/// owns an isolated current-thread tokio runtime on a dedicated, explicitly
-/// sized stack for the async transport. The caller joins that thread.
-/// Returns `Err` (fail-loud) on any connect/auth/protocol failure — we never
-/// fall back to the standalone loop, to avoid split-brain index state.
-pub fn run_subc_mode(
-    connection_file_path: &Path,
-    ctx: Arc<AppContext>,
-    executor: Arc<Executor>,
-    dispatch: DispatchFn,
-    user_config_path: Option<PathBuf>,
-) -> Result<(), SubcError> {
-    perf_sweep::initialize();
-    run_subc_mode_with_probe(
-        connection_file_path,
-        ctx,
-        executor,
-        dispatch,
-        user_config_path,
-        None,
-    )
-}
-
 /// Production-wire test entry with an owned health-publication rendezvous.
 #[doc(hidden)]
 pub fn run_subc_mode_for_test_with_health_rollup_probe(
@@ -4618,6 +4566,11 @@ fn run_subc_mode_on_runtime_thread(
         if crate::launch_nonce::current().is_some() {
             crate::agent_commands::enable(&storage_dir);
         }
+        let base_task_scope_runtime = Some((
+            ctx.bash_background().clone(),
+            Duration::from_secs(ctx.config().bash.linux_scope_max_runtime_secs),
+            ctx.storage_dir(),
+        ));
         drop(ctx);
         // Saved paused tasks may still owe their runner a cancel; send those
         // now rather than when (if ever) their projects bind again.
@@ -4633,7 +4586,7 @@ fn run_subc_mode_on_runtime_thread(
         );
         let (read_half, write_half) = tokio::io::split(stream);
         heap_module_future(|| {
-            run_module_loop(
+            run_module_loop_with_task_scopes(
                 read_half,
                 write_half,
                 connection_file_path,
@@ -4645,6 +4598,7 @@ fn run_subc_mode_on_runtime_thread(
                 tool_response_body_limit,
                 lifecycle_probe,
                 &storage_dir,
+                base_task_scope_runtime,
                 // The exit phase below takes and shuts down every root's servers.
                 QuiescedLsp::LeaveForExitSweep,
                 Some(dispatch_path_metrics),
@@ -5231,18 +5185,16 @@ async fn drain_pending_route_bind_completions(
     Ok(drained)
 }
 
-// Construct the large protocol future in a separate stack frame, then keep its
-// state on the heap while polling. Native Windows main threads have a smaller
-// default stack than Rust worker threads, and must still handle ordinary calls.
-#[inline(never)]
-fn heap_module_future<F: std::future::Future>(build: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
-    Box::pin(build())
-}
+#[path = "task_scope_runtime.rs"]
+mod task_scope_runtime;
+use task_scope_runtime::heap_module_future;
+#[cfg(test)]
+use task_scope_runtime::run_module_loop;
+pub use task_scope_runtime::run_subc_mode;
 
-/// ModuleHello → HelloAck → control/route loop. Runs until the daemon closes
-/// the connection (EOF), sends channel-0 Goodbye, or a fatal mutating executor
-/// response requests whole-connection teardown.
-async fn run_module_loop<R, W>(
+/// Runs the `ModuleHello` → `HelloAck` sequence and the control/route loop.
+/// Stops on connection EOF, channel-0 Goodbye, or an executor response that requests whole-connection teardown.
+async fn run_module_loop_with_task_scopes<R, W>(
     mut read: R,
     mut write: W,
     connection_file_path: &Path,
@@ -5254,6 +5206,7 @@ async fn run_module_loop<R, W>(
     tool_response_body_limit: usize,
     lifecycle_probe: Option<SubcTestLifecycleProbe>,
     storage_dir: &Path,
+    base_task_scope_runtime: Option<(crate::bash_background::BgTaskRegistry, Duration, PathBuf)>,
     connection_end_lsp: QuiescedLsp,
     runtime_metrics: Option<Arc<DispatchPathMetrics>>,
     #[cfg(test)] standing_actor_override: Option<Arc<standing::StandingActor>>,
@@ -5331,6 +5284,13 @@ where
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(probe);
     }
     shared_app.set_subc_connection_file(connection_file_path.to_path_buf());
+    if let Some((registry, max_runtime, storage_dir)) = base_task_scope_runtime.as_ref() {
+        registry.configure_task_scope_runtime(
+            shared_app.subc_connection_file().is_some(),
+            *max_runtime,
+        );
+        registry.start_task_scope_cleanup(storage_dir);
+    }
     #[cfg(test)]
     let dispatch_path_metrics = watchdog_test
         .as_ref()
@@ -8253,300 +8213,6 @@ async fn send_cached_health_response(
     send_frame(tx, metrics, response).await
 }
 
-fn normalized_scope_workdir(workdir: &Path) -> Option<PathBuf> {
-    let mut ancestor = workdir;
-    let mut missing = Vec::new();
-    loop {
-        match ProjectRootId::from_path(ancestor) {
-            Ok(root) => {
-                let mut normalized = root.into_path_buf();
-                for component in missing.iter().rev() {
-                    normalized.push(component);
-                }
-                return Some(normalized);
-            }
-            Err(crate::path_identity::IdentityError::NonExistentPath { .. }) => {
-                missing.push(ancestor.file_name()?.to_os_string());
-                ancestor = ancestor.parent()?;
-            }
-            Err(_) => return None,
-        }
-    }
-}
-
-fn resolve_route_project_root(
-    legacy_root: Option<&Path>,
-    scope: Option<&subc_protocol::scope::ScopeStamp>,
-) -> Result<Option<PathBuf>, &'static str> {
-    let stamped_workdir = scope.and_then(|stamp| stamp.workdir.as_deref());
-    let root = stamped_workdir.map(Path::new).or(legacy_root);
-    match root {
-        Some(root) if root.as_os_str() == "/" => Ok(None),
-        Some(root) if root.is_absolute() => {
-            let normalized = normalized_scope_workdir(root).unwrap_or_else(|| root.to_path_buf());
-            // The daemon uses / when an opener has no project. Aliases of that
-            // sentinel must not accidentally configure or index the filesystem.
-            if normalized.as_os_str() == "/" {
-                Ok(None)
-            } else {
-                Ok(Some(if stamped_workdir.is_some() {
-                    normalized
-                } else {
-                    root.to_path_buf()
-                }))
-            }
-        }
-        Some(_) => Err(PROJECT_REQUIRED),
-        None => Ok(None),
-    }
-}
-
-const PROJECT_REQUIRED: &str =
-    "This connection has no project folder, so AFT cannot run project tools on it.";
-const PROJECT_REQUIRED_CODE: &str = "project_required";
-
-fn project_folder_refusal(
-    code: &str,
-    workdir: Option<&str>,
-    legacy_root: Option<&Path>,
-    route: RouteChannel,
-    corr: u64,
-) -> ErrorBody {
-    let (source, folder) = match workdir {
-        Some(workdir) => ("scope_workdir", Some(workdir.to_owned())),
-        None => (
-            if legacy_root.is_some() {
-                "legacy_bind"
-            } else {
-                "none"
-            },
-            legacy_root.map(|root| root.to_string_lossy().into_owned()),
-        ),
-    };
-    let cause = if code == "invalid_workdir" {
-        "invalid_workdir"
-    } else if folder.is_some() {
-        "filesystem_root"
-    } else {
-        "project_folder_missing"
-    };
-    let detail = json!({
-        "cause": cause,
-        "source": source,
-        "folder": folder,
-        "requirement": "absolute_non_root_project_directory",
-    });
-    crate::slog_warn!(
-        "subc project folder refused: code={} route={} corr={} detail={}",
-        code,
-        route,
-        corr,
-        detail,
-    );
-    ErrorBody::new(code, PROJECT_REQUIRED).with_detail(detail)
-}
-
-fn legacy_route_project_root(frame: &Frame) -> Option<PathBuf> {
-    serde_json::from_slice::<Value>(&frame.body)
-        .ok()
-        .and_then(|body| body["identity"]["project_root"].as_str().map(PathBuf::from))
-}
-
-fn log_route_project_key_change(
-    identity: &subc_protocol::BindIdentity,
-    legacy_root: Option<&Path>,
-    project_root: &Path,
-    route: RouteChannel,
-) {
-    // Catalog and consent keys use literal display strings. Compare those strings
-    // so aliases that canonicalize to one folder still produce a key-change log.
-    let Some(legacy_root) = legacy_root else {
-        return;
-    };
-    let bind_key = legacy_root.display().to_string();
-    let resolved_key = project_root.display().to_string();
-    if bind_key != resolved_key {
-        crate::slog_info!(
-            "subc route project key changed: bind_project_root={} resolved_project_root={} session={} route={}",
-            bind_key,
-            resolved_key,
-            identity.session,
-            route,
-        );
-    }
-}
-
-const MAX_SCOPE_WORKDIR_DIAGNOSTICS: usize = 2;
-
-#[derive(Default)]
-struct ScopeWorkdirDiagnostics {
-    in_flight: StdMutex<HashSet<String>>,
-    pool: OnceLock<crate::bounded_io::IsolatedPool>,
-    #[cfg(test)]
-    idle: std::sync::Condvar,
-}
-
-static SCOPE_WORKDIR_DIAGNOSTICS: LazyLock<Arc<ScopeWorkdirDiagnostics>> =
-    LazyLock::new(|| Arc::new(ScopeWorkdirDiagnostics::default()));
-
-struct ScopeWorkdirPermit {
-    diagnostics: Arc<ScopeWorkdirDiagnostics>,
-    workdir: String,
-}
-
-impl ScopeWorkdirDiagnostics {
-    fn try_admit(self: &Arc<Self>, workdir: &str) -> Result<ScopeWorkdirPermit, &'static str> {
-        let mut in_flight = self
-            .in_flight
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if in_flight.contains(workdir) {
-            return Err("workdir_already_in_flight");
-        }
-        if in_flight.len() >= MAX_SCOPE_WORKDIR_DIAGNOSTICS {
-            return Err("diagnostic_capacity_exhausted");
-        }
-        // The daemon supplies the canonical spelling, including missing tails.
-        // Admission must not touch the filesystem to derive a different key.
-        in_flight.insert(workdir.to_owned());
-        Ok(ScopeWorkdirPermit {
-            diagnostics: Arc::clone(self),
-            workdir: workdir.to_owned(),
-        })
-    }
-}
-
-impl Drop for ScopeWorkdirPermit {
-    fn drop(&mut self) {
-        self.diagnostics
-            .in_flight
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(&self.workdir);
-        #[cfg(test)]
-        self.diagnostics.idle.notify_all();
-    }
-}
-
-fn schedule_scope_workdir_comparison(
-    identity: &subc_protocol::BindIdentity,
-    legacy_root: Option<&Path>,
-    scope: Option<&subc_protocol::scope::ScopeStamp>,
-) {
-    let Some(legacy_root) = legacy_root else {
-        return;
-    };
-    let Some(stamp) = scope else { return };
-    let Some(workdir) = stamp.workdir.as_deref() else {
-        return;
-    };
-    #[cfg(test)]
-    let observed = scope_workdir_tests::take_comparison_observer();
-    let permit = match SCOPE_WORKDIR_DIAGNOSTICS.try_admit(workdir) {
-        Ok(permit) => permit,
-        Err(reason) => {
-            log_scope_workdir_comparison(
-                identity,
-                legacy_root,
-                stamp,
-                Err(io::Error::other(reason)),
-            );
-            #[cfg(test)]
-            if let Some(observed) = observed {
-                let _ = observed.send(());
-            }
-            return;
-        }
-    };
-    let budget = crate::bounded_io::Budget::after(crate::bounded_io::IO_BUDGET);
-    let deadline = tokio::time::Instant::from_std(budget.deadline);
-    let project_root = legacy_root.to_path_buf();
-    let legacy_root = legacy_root.to_path_buf();
-    let workdir = workdir.to_owned();
-    // A diagnostic must not delay frame processing or serialize project work. The
-    // bounded helper owns all filesystem work; the blocking task only waits for it.
-    let worker = tokio::task::spawn_blocking(move || {
-        compare_scope_workdir(project_root, workdir, budget, permit)
-    });
-    let identity = identity.clone();
-    let stamp = stamp.clone();
-    tokio::spawn(async move {
-        // Include time queued in Tokio's blocking pool in the same budget. Late
-        // filesystem results are discarded and cannot produce a mismatch record.
-        let result = match tokio::time::timeout_at(deadline, worker).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) => Err(io::Error::other(format!(
-                "comparison worker failed: {error}"
-            ))),
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "filesystem comparison budget expired",
-            )),
-        };
-        log_scope_workdir_comparison(&identity, &legacy_root, &stamp, result);
-        #[cfg(test)]
-        if let Some(observed) = observed {
-            let _ = observed.send(());
-        }
-    });
-}
-
-fn compare_scope_workdir(
-    project_root: PathBuf,
-    workdir: String,
-    budget: crate::bounded_io::Budget,
-    permit: ScopeWorkdirPermit,
-) -> io::Result<Option<(PathBuf, PathBuf)>> {
-    // Either folder can have a missing tail. Normalize each existing prefix
-    // like a routing root, including Windows path spelling, then append that tail.
-    // Bound both walks so a diagnostic never waits indefinitely on filesystem I/O.
-    let pool = permit
-        .diagnostics
-        .pool
-        .get_or_init(|| crate::bounded_io::IsolatedPool::new(MAX_SCOPE_WORKDIR_DIAGNOSTICS))
-        .clone();
-    crate::bounded_io::with_budget(Some(budget), || {
-        pool.run(Path::new(&workdir), None, move |workdir| {
-            // Keep both the capacity slot and this folder's deduplication key
-            // until the actual filesystem job exits, not merely until timeout.
-            let _permit = permit;
-            let (Some(project_root), Some(workdir)) = (
-                normalized_scope_workdir(&project_root),
-                normalized_scope_workdir(&workdir),
-            ) else {
-                return Ok(None);
-            };
-            Ok((workdir != project_root).then_some((project_root, workdir)))
-        })
-    })
-}
-
-fn log_scope_workdir_comparison(
-    identity: &subc_protocol::BindIdentity,
-    legacy_root: &Path,
-    stamp: &subc_protocol::scope::ScopeStamp,
-    result: io::Result<Option<(PathBuf, PathBuf)>>,
-) {
-    match result {
-        Ok(Some((project_root, workdir))) => crate::slog_warn!(
-            "subc scope workdir differs: project_root={} workdir={} session={} project_id={}",
-            project_root.display(),
-            workdir.display(),
-            identity.session,
-            stamp.project_id.as_deref().unwrap_or("none"),
-        ),
-        Ok(None) => {}
-        Err(error) => crate::slog_info!(
-            "subc scope workdir comparison skipped: project_root={} workdir={} session={} project_id={} reason={}",
-            legacy_root.display(),
-            stamp.workdir.as_deref().unwrap_or("none"),
-            identity.session,
-            stamp.project_id.as_deref().unwrap_or("none"),
-            error,
-        ),
-    }
-}
-
 /// Channel-0 control requests: RouteBind plus the cached health probe.
 /// Tool-provider binds reconcile RootConfig through the executor's Mutating lane;
 /// management binds install immediately without creating project state.
@@ -10544,22 +10210,7 @@ fn admit_management_flow_request(
         };
     }
     if identity.admission == ManagementAdmission::Occipital {
-        return if body.is_some_and(|body| {
-            user_commands::is_request(body)
-                || matches!(
-                    body.get("op")
-                        .or_else(|| body.get("name"))
-                        .and_then(Value::as_str),
-                    Some("role.describe" | "tool.views" | "tool.catalog")
-                )
-        }) {
-            Ok(())
-        } else {
-            Err(ErrorBody::new(
-                "route_not_admitted",
-                "Occipital's AFT management route serves only user-commands/v1 and provider metadata",
-            ))
-        };
+        return user_commands::admit_occipital_route(body);
     }
     if identity.admission == ManagementAdmission::ShellsOnly {
         return if body.is_some_and(shells::is_request) {
@@ -15893,9 +15544,23 @@ mod tests {
             admission: ManagementAdmission::Occipital,
             ..Default::default()
         };
-        for name in ["role.describe", "tool.views", "tool.catalog"] {
-            assert!(admit_management_flow_request(&occipital, Some(&json!({"name":name}))).is_ok());
+        for name in [
+            "role.describe",
+            "tool.views",
+            "tool.catalog",
+            cortexkit_role_tool_display::DISPLAY_READ,
+        ] {
+            assert!(
+                admit_management_flow_request(&occipital, Some(&json!({"name":name}))).is_ok(),
+                "{name}"
+            );
         }
+        // Occipital's live display reads name the operation with `op`.
+        assert!(admit_management_flow_request(
+            &occipital,
+            Some(&json!({"op":cortexkit_role_tool_display::DISPLAY_READ,"record_id":"r"}))
+        )
+        .is_ok());
         for name in ["health.digest", "late_results", "memory.census"] {
             assert!(
                 admit_management_flow_request(&occipital, Some(&json!({"name":name}))).is_err()
@@ -23254,7 +22919,7 @@ mod compile_fence_tests {
     fn frame_loop_contains_no_direct_stderr_io() {
         let source = include_str!("mod.rs");
         let body = source
-            .split_once("async fn run_module_loop<")
+            .split_once("async fn run_module_loop_with_task_scopes<")
             .unwrap()
             .1
             .split_once("fn classify_connection_end(")
@@ -23608,7 +23273,7 @@ mod writer_setup_tests {
             .unwrap();
         assert!(!reader.contains("tool_received"));
         let loop_source = source
-            .split("async fn run_module_loop<R, W>(")
+            .split("async fn run_module_loop_with_task_scopes<")
             .nth(1)
             .unwrap()
             .split("fn classify_connection_end")

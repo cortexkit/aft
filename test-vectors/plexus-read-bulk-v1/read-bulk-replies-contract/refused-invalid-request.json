@@ -1,0 +1,17 @@
+{
+  "name": "refused-invalid-request",
+  "reply": {
+    "content": [
+      {
+        "text": "invalid_request: github_read requires only action, repository (string or string array), and args (object)",
+        "type": "text"
+      }
+    ],
+    "error": {
+      "code": "invalid_request",
+      "message": "github_read requires only action, repository (string or string array), and args (object)",
+      "transmission": "not_sent"
+    },
+    "isError": true
+  }
+}

@@ -57,8 +57,18 @@ use crate::sandbox_profile::SandboxProfile;
 
 mod requirement;
 #[cfg(unix)]
+mod settings_grants;
+#[cfg(unix)]
 mod task_temp;
+#[cfg(unix)]
+mod worker_reads;
 pub(crate) use requirement::{resolve_command_sandbox_spawn, SandboxRequirement};
+#[cfg(unix)]
+use settings_grants::absolute_env_path;
+#[cfg(target_os = "macos")]
+use worker_reads::grant_worker_pool_reads;
+#[cfg(unix)]
+use worker_reads::{worker_cargo_configs, worker_container_names, worker_target_roots};
 
 pub const SANDBOX_UNAVAILABLE_EXIT_CODE: i32 = 78;
 
@@ -433,182 +443,10 @@ pub enum SpawnPlan {
 }
 
 #[cfg(unix)]
-#[derive(serde::Serialize, serde::Deserialize)]
-enum SavedSpawnPolicy {
-    Unsandboxed,
-    Host {
-        shell_path: PathBuf,
-    },
-    Launcher {
-        profile: SandboxProfile,
-        launcher_path: PathBuf,
-    },
-}
-
-/// Private recovery data, never serialized into agent-readable task metadata.
-/// The environment is exactly the one already in the verified private payload;
-/// memory-only shim tickets and daemon credentials are not added to it.
+#[path = "sandbox_spawn/local_launch.rs"]
+mod local_launch;
 #[cfg(unix)]
-#[derive(serde::Serialize, serde::Deserialize)]
-struct SavedLocalLaunch {
-    policy: SavedSpawnPolicy,
-    root: PathBuf,
-    cwd: PathBuf,
-    principal: AuthenticatedPrincipal,
-    shell_path: PathBuf,
-    environment: Vec<(OsString, OsString)>,
-    command: Vec<u8>,
-    payload_digest: [u8; 32],
-    linux_scope: bool,
-    // Snapshots without a stored ceiling represent originally uncapped launches.
-    #[serde(default)]
-    memory_limit_mib: Option<u64>,
-}
-
-#[cfg(unix)]
-pub(crate) const REMOTE_LOCAL_LAUNCH: &str = "remote-local-launch";
-
-#[cfg(unix)]
-pub(crate) fn save_local_launch(
-    plan: &SpawnPlan,
-    root: &Path,
-    cwd: &Path,
-    principal: &AuthenticatedPrincipal,
-    shell: &Path,
-    linux_scope: bool,
-    memory_limit_mib: Option<u64>,
-) -> Result<String, String> {
-    let prepared = plan
-        .prepared_task()
-        .ok_or("local fallback payload absent")?;
-    let policy = match plan.policy() {
-        SpawnPlan::Unsandboxed => SavedSpawnPolicy::Unsandboxed,
-        SpawnPlan::RelaxedUnenforced => {
-            return Err("an unenforced Windows plan cannot be saved on Unix".into());
-        }
-        SpawnPlan::Host { shell_path, .. } => SavedSpawnPolicy::Host {
-            shell_path: shell_path.clone(),
-        },
-        SpawnPlan::Launcher {
-            profile,
-            launcher_path,
-        } => SavedSpawnPolicy::Launcher {
-            profile: profile.clone(),
-            launcher_path: launcher_path.clone(),
-        },
-        _ => return Err("refused local launch cannot be saved".into()),
-    };
-    let snapshot = SavedLocalLaunch {
-        policy,
-        root: root.into(),
-        cwd: cwd.into(),
-        principal: principal.clone(),
-        shell_path: plan.host_shell_path().unwrap_or(shell).into(),
-        environment: prepared
-            .environment()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
-        command: prepared.0.command_bytes.as_ref().clone(),
-        payload_digest: *prepared.0.digest.as_bytes(),
-        linux_scope,
-        memory_limit_mib,
-    };
-    let bytes = serde_json::to_vec(&snapshot).map_err(|e| e.to_string())?;
-    let mut file = crate::bash_background::persistence::create_control_file(
-        &prepared.0.dirs,
-        REMOTE_LOCAL_LAUNCH,
-        &bytes,
-    )
-    .map_err(|e| e.to_string())?;
-    use std::io::Write;
-    file.flush().map_err(|e| e.to_string())?;
-    aft_store::sync::sync_all(
-        &file,
-        &prepared.0.dirs.control.path().join(REMOTE_LOCAL_LAUNCH),
-    )
-    .map_err(|e| e.to_string())?;
-    let mut hash = blake3::Hasher::new();
-    hash.update(prepared.0.paths.task_id.as_bytes());
-    hash.update(&bytes);
-    Ok(hash.finalize().to_hex().to_string())
-}
-
-/// Reopen the frozen launch policy and verify the original payload. A missing
-/// or changed snapshot refuses recovery; current configuration is never used.
-#[cfg(unix)]
-pub(crate) fn restore_local_launch(
-    task: &crate::bash_background::persistence::ResolvedTask,
-    expected: &str,
-) -> Result<
-    (
-        SpawnPlan,
-        PathBuf,
-        HashMap<String, String>,
-        bool,
-        Option<u64>,
-    ),
-    String,
-> {
-    let mut file =
-        crate::bash_background::persistence::open_control_file(task, REMOTE_LOCAL_LAUNCH)
-            .map_err(|e| e.to_string())?;
-    let bytes = read_held_payload(&mut file)?;
-    let mut hash = blake3::Hasher::new();
-    hash.update(task.paths.task_id.as_bytes());
-    hash.update(&bytes);
-    if hash.finalize().to_hex().as_str() != expected {
-        return Err("local fallback snapshot digest mismatch".into());
-    }
-    let snapshot: SavedLocalLaunch = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    let environment: ChildEnvironment = snapshot.environment.into_iter().collect();
-    let plan = match snapshot.policy {
-        SavedSpawnPolicy::Unsandboxed => SpawnPlan::Unsandboxed,
-        SavedSpawnPolicy::Host { shell_path } => SpawnPlan::Host {
-            shell_path,
-            environment: environment.clone(),
-        },
-        SavedSpawnPolicy::Launcher {
-            profile,
-            launcher_path,
-        } => SpawnPlan::Launcher {
-            profile,
-            launcher_path,
-        },
-    };
-    let prepared = verify_payload(
-        crate::bash_background::persistence::ResolvedTask {
-            paths: task.paths.clone(),
-            dirs: task.dirs.clone(),
-        },
-        &snapshot.command,
-        &snapshot.root,
-        &snapshot.cwd,
-        &snapshot.principal,
-        &snapshot.shell_path,
-        &environment,
-        Some(blake3::Hash::from_bytes(snapshot.payload_digest)),
-        false,
-    )?;
-    let env = environment
-        .into_iter()
-        .map(|(k, v)| {
-            Ok((
-                k.into_string()
-                    .map_err(|_| "non-Unicode fallback environment key")?,
-                v.into_string()
-                    .map_err(|_| "non-Unicode fallback environment value")?,
-            ))
-        })
-        .collect::<Result<HashMap<_, _>, String>>()?;
-    Ok((
-        plan.with_prepared_task(prepared),
-        snapshot.shell_path,
-        env,
-        snapshot.linux_scope,
-        snapshot.memory_limit_mib,
-    ))
-}
+pub(crate) use local_launch::{restore_local_launch, save_local_launch, REMOTE_LOCAL_LAUNCH};
 
 impl SpawnPlan {
     fn policy(&self) -> &Self {
@@ -1996,6 +1834,15 @@ fn build_native_profile(
         let mut shell_write_deny = Vec::new();
         let mut shell_read_deny = Vec::new();
         let jailed = worker_jail_active();
+        #[cfg(target_os = "macos")]
+        if jailed {
+            grant_worker_pool_reads(
+                &home,
+                &project_roots,
+                &mut policy.private_stores,
+                &mut shell_write_deny,
+            );
+        }
         // Ordinary sessions retain writable project Git configuration; jailed
         // workers and delegated write roots must not change execution controls.
         let mut control_roots = if jailed {
@@ -2179,6 +2026,17 @@ fn build_native_profile(
                 };
                 profile.socket_deny.push(path);
             }
+            #[cfg(target_os = "macos")]
+            {
+                profile
+                    .data_policy
+                    .read_allow
+                    .extend(jail.roots.iter().cloned());
+                profile
+                    .data_policy
+                    .write_allow
+                    .extend(jail.roots.iter().cloned());
+            }
             profile.writable_roots.extend(jail.roots);
             profile.writable_roots.sort_unstable();
             profile.writable_roots.dedup();
@@ -2245,6 +2103,7 @@ fn verify_worker_gh_fence(profile: &SandboxProfile) -> Result<(), String> {
         let read_grants = profile
             .read_allow
             .iter()
+            .chain(&profile.data_policy.read_files)
             .chain(&profile.data_policy.read_allow)
             .chain(&profile.data_policy.session_task_read_dir);
         let write_grants = profile
@@ -2301,13 +2160,12 @@ fn build_relaxed_profile(
     let mut stores = policy.private_stores.clone();
     stores.deny.push(session_store.to_path_buf());
     stores.session_task_read_dir = Some(session_store.to_path_buf());
-    stores.deny.push(home.join(".config/cortexkit"));
     stores.deny.extend([
         home.join(".local/share/cortexkit"),
         home.join(".local/state/cortexkit"),
         ctx.storage_dir(),
     ]);
-    for key in ["XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME"] {
+    for key in ["XDG_DATA_HOME", "XDG_STATE_HOME"] {
         if let Some(base) = absolute_env_path(key) {
             stores
                 .deny
@@ -2323,9 +2181,14 @@ fn build_relaxed_profile(
     .into_iter()
     .flatten()
     {
-        stores
-            .read_allow
-            .push(data.join("cortexkit/alfonso/worktrees"));
+        // macOS workers already have their canonical checkout roots above.
+        // Other workers' checkouts stay private; ancestor metadata does not
+        // grant directory listings or access to their descendants.
+        if !cfg!(target_os = "macos") || !worker_jail_active() {
+            stores
+                .read_allow
+                .push(data.join("cortexkit/alfonso/worktrees"));
+        }
         stores.read_allow.push(data.join("cortexkit/bin"));
     }
     stores
@@ -2334,6 +2197,10 @@ fn build_relaxed_profile(
     stores
         .write_allow
         .extend([temp.to_path_buf(), task_io.to_path_buf()]);
+    #[cfg(target_os = "macos")]
+    if worker_jail_active() {
+        grant_worker_pool_reads(home, roots, &mut stores, &mut write_deny);
+    }
     // Select grants against the complete credential and store floors before
     // protecting their control files or carving out sibling checkout denies.
     policy.absolute_floor = read_deny.clone();
@@ -2349,6 +2216,12 @@ fn build_relaxed_profile(
         .collect::<Result<Vec<_>, _>>()?;
     let mut writable = roots.to_vec();
     writable.extend(linked_git_grants(git_policies));
+    #[cfg(target_os = "macos")]
+    if worker_jail_active() {
+        let targets = worker_target_roots(home, roots, &policy, &worker_cargo_configs(home, roots));
+        stores.read_allow.extend(targets.iter().cloned());
+        writable.extend(targets);
+    }
     let files = linked_git_file_grants(git_policies);
     stores.write_allow.extend(writable.iter().cloned());
     stores.write_allow.extend(files.iter().cloned());
@@ -2497,6 +2370,7 @@ fn protect_worker_private_temp(profile: &mut SandboxProfile) -> Result<(), Strin
         Ok(())
     };
     keep(&mut profile.data_policy.read_allow)?;
+    keep(&mut profile.data_policy.read_files)?;
     keep(&mut profile.data_policy.write_allow)?;
     keep(&mut profile.data_policy.read_metadata_allow)?;
     profile.data_policy.deny.push(root.to_owned());
@@ -2736,7 +2610,6 @@ fn credential_floor_paths(
                 ".pypirc",
                 ".git-credentials",
                 ".config/git/credentials",
-                ".config/cortexkit",
             ]
             .map(|path| home.join(path)),
         );
@@ -2880,7 +2753,7 @@ fn credential_paths_with_resolver(
         denies.extend(paths(key, ""));
     }
     denies.extend(paths("DOCKER_CONFIG", "config.json"));
-    for suffix in ["gh", "gcloud", "git/credentials", "cortexkit"] {
+    for suffix in ["gh", "gcloud", "git/credentials"] {
         denies.extend(paths("XDG_CONFIG_HOME", suffix));
     }
     if let Some(value) = getenv("KUBECONFIG") {
@@ -2982,13 +2855,6 @@ const CARGO_HOME_FILES: &[&str] = &[
     ".global-cache-shm",
 ];
 
-#[cfg(unix)]
-fn absolute_env_path(name: &str) -> Option<PathBuf> {
-    crate::environment::non_empty_os_var(name)
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-}
-
 /// What a jailed worker's shell may write outside its worktree. Every entry
 /// comes from operator configuration: the AFT process environment, cargo
 /// configuration files outside the worktree, and the standard cache homes.
@@ -3039,24 +2905,9 @@ fn worker_jail_grants(
         }
     }
 
-    // Cargo reads configuration from CARGO_HOME and from every ancestor of the
-    // working directory. Only files outside the worktree are operator-owned.
-    let mut configs = vec![
-        (
-            cargo_home.join("config.toml"),
-            cargo_home.parent().map(Path::to_path_buf),
-        ),
-        (
-            cargo_home.join("config"),
-            cargo_home.parent().map(Path::to_path_buf),
-        ),
-    ];
     for root in project_roots {
         if let Some(container) = root.parent() {
-            for path in [
-                container.join(".cargo/alfonso-test-threads"),
-                container.join(".rust-build-seeds"),
-            ] {
+            for path in worker_container_names().map(|name| container.join(name)) {
                 if let Ok(path) = path.canonicalize() {
                     if !project_roots.iter().any(|root| path.starts_with(root)) {
                         grants.read_only.push(path);
@@ -3064,34 +2915,12 @@ fn worker_jail_grants(
                 }
             }
         }
-        for ancestor in root.ancestors().skip(1) {
-            for name in ["config.toml", "config"] {
-                configs.push((
-                    ancestor.join(".cargo").join(name),
-                    Some(ancestor.to_path_buf()),
-                ));
-            }
-        }
     }
-    let mut targets = ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"]
-        .into_iter()
-        .filter_map(absolute_env_path)
-        .collect::<Vec<_>>();
-    let mut seen = std::collections::BTreeSet::new();
-    for (path, base) in configs {
-        if !seen.insert(path.clone()) {
-            continue;
-        }
-        let Ok(config_path) = canonicalize_profile_candidate(&path) else {
-            continue;
-        };
-        if !profile_candidate_is_file(&config_path)
-            || project_roots
-                .iter()
-                .any(|root| config_path.starts_with(root))
-        {
-            continue;
-        }
+    let configs = worker_cargo_configs(home, project_roots);
+    grants
+        .roots
+        .extend(worker_target_roots(home, project_roots, policy, &configs));
+    for (config_path, base) in configs {
         grants.read_only.push(config_path.clone());
         let Some(build) = cargo_build_settings(&config_path) else {
             continue;
@@ -3106,28 +2935,6 @@ fn worker_jail_grants(
             if let Some(wrapper) = wrapper {
                 add_build_slot_grants(&wrapper, project_roots, policy, &mut grants);
             }
-        }
-        if let Some(target) = build.target_dir {
-            let target = PathBuf::from(target);
-            match (&base, target.is_absolute()) {
-                (_, true) => targets.push(target),
-                (Some(base), false) => targets.push(base.join(target)),
-                (None, false) => {}
-            }
-        }
-    }
-
-    for target in targets {
-        let target = crate::inspect::job::normalize_path(&target);
-        if !jail_target_allowed(&target, home, project_roots, policy) {
-            log::warn!(
-                "worker sandbox: ignoring configured cargo target {}: it would contain the home, a project root, or a protected path",
-                target.display()
-            );
-            continue;
-        }
-        if create_profile_candidate_dir(&target) {
-            grants.roots.push(target);
         }
     }
     grants
@@ -5329,10 +5136,11 @@ fn create_profile_candidate_dir(path: &Path) -> bool {
 
 #[cfg(target_os = "linux")]
 fn build_linux_profile(
-    profile: SandboxProfile,
+    mut profile: SandboxProfile,
     home: &Path,
     git_read_roots: &[PathBuf],
 ) -> Result<SandboxProfile, String> {
+    settings_grants::add_existing(&mut profile, home)?;
     let mut intended = Vec::new();
     for path in [
         "/usr",
@@ -6763,6 +6571,7 @@ fn sandboxed_child_environment(
         // Workers also drop session-bus discovery; Linux still reports that
         // direct connections to a known bus path are not isolated by Landlock.
         if crate::bash_env::is_preexec_hijack_env_key(key.as_str())
+            || key == crate::bash_background::registry::LINUX_SCOPE_ENV
             || key == crate::privacy_spawn::CONTROL_ENV
             || crate::agent_child_env::is_subc_credential_env_key(key)
             || key == crate::gh_shim_ticket::GH_SHIM_TICKET_ENV
@@ -11279,6 +11088,30 @@ mod policy_tests {
                                             mode
                                         };
                                         assert_eq!(tool.mode, expected);
+                                        let home = absolute_env_path("HOME")
+                                            .unwrap()
+                                            .canonicalize()
+                                            .unwrap();
+                                        for profile in [tool, bash] {
+                                            let settings = home.join(".config/cortexkit/x.jsonc");
+                                            assert!(!profile
+                                                .read_deny
+                                                .iter()
+                                                .chain(&profile.write_deny)
+                                                .chain(&profile.data_policy.deny)
+                                                .any(|deny| settings.starts_with(deny)));
+                                            if expected != SandboxMode::Off {
+                                                for relative in [
+                                                    ".local/share/cortexkit",
+                                                    ".local/state/cortexkit",
+                                                ] {
+                                                    assert!(profile
+                                                        .data_policy
+                                                        .deny
+                                                        .contains(&home.join(relative)));
+                                                }
+                                            }
+                                        }
                                         if expected == SandboxMode::Strict {
                                             assert!(tool.cache_roots.contains(&cache_marker));
                                             assert!(bash.cache_roots.contains(&cache_marker));
@@ -13087,6 +12920,7 @@ mod read_allow_tests {
                     binary.clone().into(),
                 ],
                 write_allow: vec![project.clone().into(), temp.clone().into()],
+                read_files: Vec::new(),
                 read_metadata_allow: Vec::new(),
                 session_task_read_dir: None,
             },
@@ -13425,6 +13259,7 @@ mod read_allow_tests {
                 &[
                     (".ssh", true),
                     (".config", true),
+                    (".local", true),
                     ("work", true),
                     ("notes", false),
                 ],
@@ -13433,11 +13268,15 @@ mod read_allow_tests {
                 "/home/alice/.config",
                 &[("gcloud", true), ("cortexkit", true), ("editor", true)],
             )
+            .directory("/home/alice/.local", &[("share", true), ("state", true)])
+            .directory("/home/alice/.local/share", &[("cortexkit", true)])
+            .directory("/home/alice/.local/state", &[("cortexkit", true)])
             .directory("/home/alice/work", &[("private", true), ("src", true)]);
         let denies = [
             "/home/alice/.ssh",
             "/home/alice/.config/gcloud",
-            "/home/alice/.config/cortexkit",
+            "/home/alice/.local/share/cortexkit",
+            "/home/alice/.local/state/cortexkit",
             "/home/alice/work/private",
         ]
         .map(PathBuf::from);
@@ -13448,6 +13287,7 @@ mod read_allow_tests {
         assert_eq!(
             emitted,
             [
+                "/home/alice/.config/cortexkit",
                 "/home/alice/.config/editor",
                 "/home/alice/notes",
                 "/home/alice/work/src",
@@ -13846,7 +13686,6 @@ mod credential_floor_tests {
                 ".pypirc",
                 ".kube/config",
                 "Library/Keychains",
-                ".config/cortexkit",
             ] {
                 assert!(
                     denies.contains(&home.join(relative)),
@@ -13855,6 +13694,7 @@ mod credential_floor_tests {
                 );
             }
             assert!(cargo.contains(&home.join(".cargo")));
+            assert!(!denies.contains(&home.join(".config/cortexkit")));
         }
         for path in [
             gh,
@@ -13894,7 +13734,7 @@ mod worker_broker_floor_tests {
     use super::*;
 
     #[test]
-    fn worker_gh_read_floor_xdg_config_is_denied_when_set() {
+    fn worker_gh_read_floor_allows_cortexkit_settings_when_xdg_set() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let xdg = dir.path().join("xdg-config");
@@ -13904,18 +13744,17 @@ mod worker_broker_floor_tests {
             (key == "XDG_CONFIG_HOME").then(|| xdg.as_os_str().to_owned())
         })
         .unwrap();
-        assert!(denies.contains(&home.join(".config/cortexkit")));
-        assert!(
-            denies.contains(&xdg.join("cortexkit")),
-            "the configured user config must remain credential-floored"
-        );
+        assert!(!denies.contains(&home.join(".config/cortexkit")));
+        assert!(!denies.contains(&xdg.join("cortexkit")));
+        assert!(denies.contains(&xdg.join("gh")));
     }
 
     #[test]
-    fn worker_gh_read_floor_home_config_is_denied_when_xdg_unset() {
+    fn worker_gh_read_floor_allows_cortexkit_settings_when_xdg_unset() {
         let dir = tempfile::tempdir().unwrap();
         let (denies, _) = credential_floor_paths(dir.path(), None, &[], |_| None).unwrap();
-        assert!(denies.contains(&dir.path().join(".config/cortexkit")));
+        assert!(!denies.contains(&dir.path().join(".config/cortexkit")));
+        assert!(denies.contains(&dir.path().join(".config/gh")));
     }
 
     #[test]

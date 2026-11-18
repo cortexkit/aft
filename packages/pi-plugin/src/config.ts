@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { isAbsolute } from "node:path";
 import {
   type AftConfigFileMigrationResult,
+  CALLGRAPH_CHUNK_KEY,
   ConfigRejectedError,
   type ConfigTier,
   DATA_LAYER_RETIRED_PATHS,
@@ -384,8 +385,10 @@ export interface BashConfig {
    */
   worker_wait_max_ms?: number;
   memory_limit_mib?: number;
-  /** Linux-only user-tier opt-in for transient systemd user scopes. Default false. */
+  /** Linux daemon scopes are on by default. Projects cannot change this containment. */
   linux_scope?: boolean;
+  /** User-only scope ceiling without an explicit timeout, in seconds. Default 86400. */
+  linux_scope_max_runtime_secs?: number;
   /** macOS agent commands do not inherit the supervisor's privacy grants. Default false. */
   disclaim_privacy?: boolean;
   /** Manual fallback for Pi versions that do not expose enabled default tools. */
@@ -486,8 +489,8 @@ export interface AftConfig {
   storage?: { cache_dir?: string | null };
   /** User-base-only macOS file flush policy. Full drive-cache flushes default off. */
   durability?: { macos_full_sync?: boolean };
-  /** Number of files to parse in a single batch during callgraph store cold build. Lower values reduce peak memory during cold build. Default: 100. */
-  callgraph_chunk_size?: number;
+  /** Machine-local limits; only the user config base may select a profile. */
+  memory?: "lean" | "balanced";
   /** Codebase health inspection config. `inspect.enabled=false` makes aft_inspect report inspect_disabled. */
   inspect?: InspectConfig;
   /**
@@ -896,9 +899,11 @@ const BashFeaturesSchema = z.object({
       message: `bash.worker_wait_max_ms must be at least ${MIN_WORKER_WAIT_MAX_MS}`,
     })
     .optional(),
-  /** Linux-only user-tier opt-in for transient systemd user scopes. Default false. */
   memory_limit_mib: z.number().int().min(1).max(4_294_967_295).optional(),
+  /** Linux daemon scopes are on by default. Projects cannot change this containment. */
   linux_scope: z.boolean().optional(),
+  /** User-only scope ceiling without an explicit timeout, in seconds. Default 86400. */
+  linux_scope_max_runtime_secs: z.number().int().min(1).max(4_294_967_295).optional(),
   disclaim_privacy: z.boolean().optional(),
   // Pi mirrors the host's optional PowerShell default tool when its API can
   // report that state. This project-safe fallback is used only on older hosts.
@@ -1123,7 +1128,7 @@ const AftConfigFieldsSchema = z.object({
   index: IndexConfigSchema.optional(),
   storage: z.object({ cache_dir: z.string().nullable().optional() }).optional(),
   durability: z.object({ macos_full_sync: z.boolean().optional() }).strict().optional(),
-  callgraph_chunk_size: z.number().optional(),
+  memory: z.enum(["lean", "balanced"]).optional(),
   inspect: InspectConfigSchema.optional(),
   idle: IdleConfigSchema.optional(),
   backup: BackupConfigSchema.optional(),
@@ -1177,6 +1182,8 @@ function applyActiveHarnessOverride(config: AftConfig, trusted: boolean): AftCon
   const merged = { ...base, ...override } as AftConfigFields;
   if (base.storage) merged.storage = base.storage;
   else delete merged.storage;
+  if (base.memory !== undefined) merged.memory = base.memory;
+  else delete merged.memory;
   if (override.durability?.macos_full_sync !== undefined) {
     warn(
       `Ignoring durability.macos_full_sync from harnesses.${ACTIVE_HARNESS} (the process-wide policy only honors the user config base)`,
@@ -1299,8 +1306,6 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
 
   overrides.indexes = resolvedIndexes(config);
   if (config.index !== undefined) overrides.index = config.index;
-  if (config.callgraph_chunk_size !== undefined)
-    overrides.callgraph_chunk_size = config.callgraph_chunk_size;
 
   Object.assign(overrides, resolveExperimentalConfigForConfigure(config));
   if (
@@ -1588,8 +1593,8 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   if (tier === "user") {
     removed.push(
       ...removedConfigKeyErrors(cleanConfig).filter((error) =>
-        [...REMOVED_DATA_LAYER_PATHS, ...DATA_LAYER_RETIRED_PATHS].some((path) =>
-          error.endsWith(`${path}; run npx @cortexkit/aft doctor --fix`),
+        [...REMOVED_DATA_LAYER_PATHS, ...DATA_LAYER_RETIRED_PATHS, CALLGRAPH_CHUNK_KEY].some(
+          (path) => error.endsWith(`${path}; run npx @cortexkit/aft doctor --fix`),
         ),
       ),
     );
@@ -1636,6 +1641,24 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   }
 
   warnIgnoredHarnessSpecificConfigKeys(cleanConfig, configPath);
+  // Drop machine limits before validation so malformed ignored values cannot
+  // discard otherwise-valid security settings in the same block.
+  if (tier === "project" && Object.hasOwn(cleanConfig, "memory")) {
+    delete cleanConfig.memory;
+    warn(
+      `Ignoring memory from project config ${configPath} (security: these settings only honor user-level config — a project should not weaken security boundaries for the user)`,
+    );
+  }
+  if (isConfigRecord(cleanConfig.harnesses)) {
+    for (const [name, block] of Object.entries(cleanConfig.harnesses)) {
+      if (isConfigRecord(block) && Object.hasOwn(block, "memory")) {
+        delete block.memory;
+        warn(
+          `Ignoring memory from harnesses.${name} (the process-wide policy only honors the user config base)`,
+        );
+      }
+    }
+  }
   warnIgnoredNestedHarnesses(cleanConfig, configPath);
   const result = AftConfigSchema.safeParse(cleanConfig);
   let parsed: AftConfig;
@@ -2003,7 +2026,6 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   "validate_on_edit",
   "configure_warnings_delivery",
   // "indexes" handled separately — a project can only switch an index off.
-  "callgraph_chunk_size",
   "inspect",
   "idle",
   // Git attribution only changes commit metadata; it grants no capabilities and
@@ -2070,6 +2092,7 @@ function getStrippedTopLevelKeys(override: AftConfig, base: AftConfig): string[]
     stripped.push("backup");
   if (override.index?.roots !== undefined) stripped.push("index.roots");
   if (override.storage?.cache_dir !== undefined) stripped.push("storage.cache_dir");
+  if (override.memory !== undefined) stripped.push("memory");
   if (override.durability?.macos_full_sync !== undefined)
     stripped.push("durability.macos_full_sync");
   const order = { off: 0, relaxed: 1, strict: 2 };
@@ -2083,6 +2106,11 @@ function getStrippedTopLevelKeys(override: AftConfig, base: AftConfig): string[]
     stripped.push("bash.disclaim_privacy");
   if (typeof override.bash === "object" && override.bash.runon_env !== undefined)
     stripped.push("bash.runon_env");
+  if (typeof override.bash === "object") {
+    for (const key of ["linux_scope", "linux_scope_max_runtime_secs"] as const) {
+      if (override.bash[key] !== undefined) stripped.push(`bash.${key}`);
+    }
+  }
   if (override.sandbox?.write_allow !== undefined) stripped.push("sandbox.write_allow");
   if (override.subc !== undefined) stripped.push("subc");
   if (override.pi?.external_access_ask === false) stripped.push("pi.external_access_ask");
@@ -2160,6 +2188,8 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   if (typeof projectBash === "object") {
     if (projectBash.changed_files !== "off") delete projectBash.changed_files;
     delete projectBash.runon_env;
+    delete projectBash.linux_scope;
+    delete projectBash.linux_scope_max_runtime_secs;
     delete projectBash.env;
   }
   const bash = mergeBashConfig(base.bash, projectBash, "project");

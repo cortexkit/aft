@@ -294,7 +294,19 @@ pub fn format_response_with_context(
     response: &Response,
     ctx: &FormatContext,
 ) -> String {
-    format_response_unbounded(bare_name, response, ctx)
+    let mut text = format_response_unbounded(bare_name, response, ctx);
+    if response
+        .data
+        .get("diff_preview_omitted")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(crate::edit::DIFF_OMITTED_NOTICE);
+    }
+    text
 }
 
 pub(crate) fn format_response_unbounded(

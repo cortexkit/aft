@@ -8,8 +8,8 @@
 //! is always good bytes, and its size is the data layer's resident read memory.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::segment::BLOCK_LEN;
 
@@ -61,7 +61,8 @@ pub struct CacheStats {
 /// exact.
 #[derive(Debug)]
 pub struct BlockCache {
-    budget: usize,
+    budget: AtomicUsize,
+    resize: Mutex<()>,
     shards: Box<[Shard]>,
 }
 
@@ -70,7 +71,7 @@ pub struct BlockCache {
 #[derive(Debug)]
 #[repr(align(128))]
 struct Shard {
-    budget: usize,
+    budget: AtomicUsize,
     /// Stamps of use, increasing; every touch and insert takes a new one,
     /// so no two blocks share a stamp.
     clock: AtomicU64,
@@ -125,11 +126,11 @@ impl BlockCache {
         let share = budget_bytes / count;
         let shards = (0..count)
             .map(|index| Shard {
-                budget: if index == 0 {
+                budget: AtomicUsize::new(if index == 0 {
                     budget_bytes - share * (count - 1)
                 } else {
                     share
-                },
+                }),
                 clock: AtomicU64::new(0),
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
@@ -137,15 +138,62 @@ impl BlockCache {
             })
             .collect();
         Self {
-            budget: budget_bytes,
+            budget: AtomicUsize::new(budget_bytes),
+            resize: Mutex::new(()),
             shards,
         }
+    }
+
+    /// Resize without invalidating blocks readers already hold. Each shard
+    /// keeps its identity; a shrink releases at most 64 entries per lock hold.
+    /// The budget must still allow at least one block per existing shard.
+    pub fn set_budget(&self, bytes: usize) {
+        assert!(bytes >= self.shards.len() * BLOCK_LEN);
+        let _resize = self
+            .resize
+            .lock()
+            .expect("block cache resize lock poisoned");
+        if self.budget.load(Ordering::Acquire) == bytes {
+            return;
+        }
+        let share = bytes / self.shards.len();
+        for (index, shard) in self.shards.iter().enumerate() {
+            let budget = if index == 0 {
+                bytes - share * (self.shards.len() - 1)
+            } else {
+                share
+            };
+            shard.budget.store(budget, Ordering::Release);
+            loop {
+                let mut state = shard.write();
+                for _ in 0..64 {
+                    if state.resident <= budget {
+                        break;
+                    }
+                    // A shrink need not preserve recency: removing one entry
+                    // directly bounds work even while readers stamp hot blocks.
+                    let Some((_, key)) = state.by_use.first_key_value() else {
+                        break;
+                    };
+                    let key = *key;
+                    state.remove(key);
+                    state.evictions += 1;
+                }
+                let done = state.resident <= budget;
+                drop(state);
+                if done {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
+        self.budget.store(bytes, Ordering::Release);
     }
 
     #[must_use]
     pub fn stats(&self) -> CacheStats {
         let mut stats = CacheStats {
-            budget_bytes: self.budget,
+            budget_bytes: self.budget.load(Ordering::Acquire),
             ..CacheStats::default()
         };
         for shard in &*self.shards {
@@ -180,7 +228,12 @@ impl BlockCache {
             return Ok(bytes);
         }
         state.insert(key, Arc::clone(&loaded), &shard.clock);
-        while state.resident > shard.budget {
+        // A resize may have lowered the budget before its bounded eviction
+        // pass reaches this shard. Leave the remaining shrink to that pass.
+        for _ in 0..64 {
+            if state.resident <= shard.budget.load(Ordering::Acquire) {
+                break;
+            }
             state.evict_oldest();
         }
         Ok(loaded)
@@ -440,8 +493,12 @@ mod tests {
         let cache = BlockCache::new(4 * MIN_SHARD_BLOCKS * BLOCK_LEN);
         assert_eq!(cache.shards.len(), 4);
         assert_eq!(
-            cache.shards.iter().map(|shard| shard.budget).sum::<usize>(),
-            cache.budget
+            cache
+                .shards
+                .iter()
+                .map(|shard| shard.budget.load(Ordering::Acquire))
+                .sum::<usize>(),
+            cache.budget.load(Ordering::Acquire)
         );
         let (closed, open) = (FileToken::next(), FileToken::next());
         let loads = 6 * MIN_SHARD_BLOCKS as u64;
@@ -517,6 +574,50 @@ mod tests {
                 assert_eq!(state.entries[key].listed_at, *listed);
             }
         }
+    }
+
+    #[test]
+    fn cache_shrink_while_readers_are_active_preserves_their_blocks() {
+        let cache = Arc::new(BlockCache::new(4 * MIN_SHARD_BLOCKS * BLOCK_LEN));
+        let file = FileToken::next();
+        for index in 0..256 {
+            cache
+                .get_or_load(key(file, index), || Ok::<_, ()>(block(index as u8)))
+                .unwrap();
+        }
+        let held = cache
+            .get_or_load(key(file, 0), || Ok::<_, ()>(block(0)))
+            .unwrap();
+        let started = std::sync::Barrier::new(5);
+        let finish = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for reader in 0..4 {
+                let cache = &cache;
+                let started = &started;
+                let finish = &finish;
+                scope.spawn(move || {
+                    started.wait();
+                    let mut index = reader;
+                    while !finish.load(Ordering::Acquire) {
+                        index = (index + 7) % 256;
+                        let bytes = cache
+                            .get_or_load(key(file, index), || Ok::<_, ()>(block(index as u8)))
+                            .unwrap();
+                        assert!(bytes.iter().all(|byte| *byte == index as u8));
+                    }
+                });
+            }
+            started.wait();
+            cache.set_budget(4 * BLOCK_LEN);
+            finish.store(true, Ordering::Release);
+        });
+        assert!(held.iter().all(|byte| *byte == 0));
+        let stats = cache.stats();
+        assert_eq!(stats.budget_bytes, 4 * BLOCK_LEN);
+        assert!(stats.resident_bytes <= stats.budget_bytes, "{stats:?}");
+        assert!(stats.evictions > 0);
+        cache.set_budget(8 * BLOCK_LEN);
+        assert_eq!(cache.stats().budget_bytes, 8 * BLOCK_LEN);
     }
 
     #[test]

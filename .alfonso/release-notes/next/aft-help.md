@@ -1,0 +1,1 @@
+- `aft --help` and `aft -h` now print usage without opening storage or starting the server; unknown options fail with a usage error (#1466).

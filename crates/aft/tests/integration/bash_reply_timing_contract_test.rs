@@ -1086,10 +1086,12 @@ fn subc_worker_bash_watch_hands_back_at_the_worker_wait_limit() {
                 "{text}"
             );
             assert!(text.contains("Recent output:\nstill-going"), "{text}");
-            assert!(
-                text.contains("each wait you make on it moves that kill"),
-                "{text}"
-            );
+            let expected_deadline_source = match structured["hard_kill"]["source"].as_str() {
+                Some("scoped_default") => "(its default background limit; worker waits can extend this deadline, but cannot extend the fixed Linux task scope limit)",
+                Some("default") => "(its default background limit), but each wait you make on it moves that kill to at least the worker wait limit (`bash.worker_wait_max_ms`) after the wait, so it is not killed while you keep waiting; pass a `timeout` to set your own limit",
+                source => panic!("unexpected default deadline source: {source:?}: {structured}"),
+            };
+            assert!(text.contains(expected_deadline_source), "{text}");
             assert!(!text.contains("completion reminder"), "{text}");
             send_tool_call_with_preset(
                 &mut harness.stream,

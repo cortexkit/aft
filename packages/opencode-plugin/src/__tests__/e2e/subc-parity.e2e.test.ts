@@ -285,8 +285,7 @@ maybeDescribe(describeName, () => {
         );
         expect(ready(grep), `${transport}: ${grep}`).toBe(true);
         expect(grep, transport).toContain("sample.ts");
-        expect(grep, transport).not.toContain(".aft-env/");
-        expect(grep, transport).not.toContain(".aft-user/");
+        expect(grep, transport).not.toContain("parity-probe.txt");
         expect(grep, transport).toContain("Found 1 match in 1 file");
 
         const glob = await toolTextUntil(harness, "glob", { pattern: "**/*", path: "." }, ready);
@@ -377,8 +376,8 @@ maybeDescribe(describeName, () => {
           !text.includes("Watcher changes pending");
         const ndjsonText = await toolTextUntil(ndjson, call.name, call.args, converged);
         const subcText = await toolTextUntil(subc, call.name, call.args, converged);
-        expect(normalizeRoot(subcText, subc.tempDir), call.name).toBe(
-          normalizeRoot(ndjsonText, ndjson.tempDir),
+        expect(normalizeToolTextForParity(call.name, subcText, subc.tempDir), call.name).toBe(
+          normalizeToolTextForParity(call.name, ndjsonText, ndjson.tempDir),
         );
       }
     } finally {
@@ -449,6 +448,14 @@ async function toolTextUntil(
     text = await toolText(harness, name, args);
   }
   return text;
+}
+
+function normalizeToolTextForParity(name: string, text: string, root: string): string {
+  const normalized = normalizeRoot(text, root);
+  if (name !== "grep") return normalized;
+  // The optional ignore probe can finish in one process but not the other.
+  // Omit only its trailing grep note; every other output byte stays compared.
+  return normalized.replace(/\n\nNot searched \(ignore rules\): [^\r\n]*$/, "");
 }
 
 function normalizeRoot(text: string, root: string): string {

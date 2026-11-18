@@ -535,13 +535,13 @@ fn cache_root_doctor_body_child() {
         legacy.is_file(),
         "doctor must leave unmarked storage-root caches alone"
     );
-    let refused = run(&["clean-old-caches"]);
+    let refused = run(&["cache", "clean-old"]);
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stdout).contains("old_cache_confirmation_required"));
     assert!(legacy.is_file());
     eprintln!("cache-root doctor: acquiring second child storage lease");
     let daemon = StorageLockChild::spawn(&storage, &home);
-    let busy = run(&["clean-old-caches", "--yes"]);
+    let busy = run(&["cache", "clean-old", "--yes"]);
     assert!(!busy.status.success(), "{busy:?}");
     assert!(
         String::from_utf8_lossy(&busy.stdout)
@@ -551,7 +551,7 @@ fn cache_root_doctor_body_child() {
     assert!(legacy.is_file());
     eprintln!("cache-root doctor: releasing second child storage lease");
     daemon.stop();
-    let cleaned = run(&["clean-old-caches", "--yes"]);
+    let cleaned = run(&["cache", "clean-old", "--yes"]);
     assert!(
         cleaned.status.success(),
         "{} {}",

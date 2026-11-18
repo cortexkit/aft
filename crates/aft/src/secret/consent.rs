@@ -198,23 +198,55 @@ pub fn file_consent(request: &SecretConsentRequest) -> ConsentOutcome {
 
 /// Cancellation shared by a request's labels and its approval worker.
 #[derive(Clone)]
-pub struct Cancellation(tokio::sync::watch::Sender<bool>);
+pub struct Cancellation(tokio::sync::watch::Sender<Option<CancellationReason>>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CancellationReason {
+    ClientDropped,
+    Expired,
+    Cancelled,
+}
+
+impl CancellationReason {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::ClientDropped => "client_dropped",
+            Self::Expired => "expired",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 impl Default for Cancellation {
     fn default() -> Self {
-        Self(tokio::sync::watch::channel(false).0)
+        Self(tokio::sync::watch::channel(None).0)
     }
 }
 impl Cancellation {
     pub fn cancel(&self) {
-        self.0.send_replace(true);
+        self.cancel_with_reason(CancellationReason::Cancelled);
+    }
+    pub(crate) fn cancel_with_reason(&self, reason: CancellationReason) {
+        // Preserve the first cause when a deadline and a client departure race.
+        self.0.send_if_modified(|current| {
+            if current.is_none() {
+                *current = Some(reason);
+                true
+            } else {
+                false
+            }
+        });
+    }
+    pub(crate) fn reason(&self) -> Option<CancellationReason> {
+        *self.0.borrow()
     }
     pub fn is_cancelled(&self) -> bool {
-        *self.0.borrow()
+        self.reason().is_some()
     }
     pub async fn cancelled(&self) {
         let mut receiver = self.0.subscribe();
         loop {
-            if *receiver.borrow_and_update() {
+            if receiver.borrow_and_update().is_some() {
                 return;
             }
             if receiver.changed().await.is_err() {
@@ -266,7 +298,9 @@ impl Drop for Waiter {
             == 1
             && self.0.outcome.borrow().is_none()
         {
-            self.0.cancel.cancel();
+            self.0
+                .cancel
+                .cancel_with_reason(CancellationReason::ClientDropped);
         }
     }
 }
@@ -323,6 +357,10 @@ mod waiter_tests {
         );
         drop(Waiter(card.clone()));
         assert!(card.cancel.is_cancelled());
+        assert_eq!(
+            card.cancel.reason(),
+            Some(CancellationReason::ClientDropped)
+        );
     }
 }
 

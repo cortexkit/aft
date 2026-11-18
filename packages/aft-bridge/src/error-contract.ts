@@ -123,6 +123,9 @@ export const SUBC_MODULE_RESTART_DISPOSITION =
 export const BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION =
   "The standalone AFT transport failed after this call may have been sent, so its outcome is UNKNOWN: it may or may not have executed. Verify actual state before re-running, and never blind-retry a mutation.";
 
+const RELEASED_LOCATION_DISPOSITION =
+  "AFT's plugin reloaded while this call was waiting, so the call was not sent. Nothing was started; it is safe to retry now.";
+
 /**
  * Agent-facing guidance for a call whose route the plugin closed while the
  * request was already in flight (transport shutdown, session close, project
@@ -460,7 +463,10 @@ export function adaptToolError(command: string, error: unknown): unknown {
 
   if (command !== "bash" && isBashTransportDeadError(error)) {
     return new AftModuleUnavailableError(
-      "The AFT module connection is down or unavailable; this AFT-backed option has no host fallback. Nothing was started, so it is safe to retry after the connection is restored.",
+      error instanceof BridgeTransportUnavailableError &&
+        error.message === "AFT bridge Location lease has already been released"
+        ? RELEASED_LOCATION_DISPOSITION
+        : "The AFT module connection is down or unavailable; this AFT-backed option has no host fallback. Nothing was started, so it is safe to retry after the connection is restored.",
       error,
     );
   }

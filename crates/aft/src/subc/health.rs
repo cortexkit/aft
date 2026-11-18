@@ -18,6 +18,14 @@ use super::{
 use crate::context::{App, AppContext, ArtifactEvictionBlocker};
 use crate::executor::BindBlockerSnapshot;
 
+#[path = "health/allocator.rs"]
+mod allocator;
+use allocator::CachedAllocatorObservation;
+#[path = "health/demand.rs"]
+mod demand;
+#[path = "health/legacy_root.rs"]
+mod legacy_root;
+
 const EXECUTOR_SCHEDULER_CONTENTION_DETAIL: &str =
     "executor scheduler state could not be snapshotted without contention";
 const UNANSWERED_TOOL_DEADLINE: Duration = Duration::from_secs(25);
@@ -1043,14 +1051,7 @@ impl DispatchPathMetrics {
                 identity, scope, ..
             } = request
             {
-                operation.root = scope
-                    .as_ref()
-                    .and_then(|stamp| stamp.workdir.clone())
-                    .or_else(|| {
-                        super::legacy_route_project_root(frame)
-                            .map(|root| root.to_string_lossy().into_owned())
-                    })
-                    .unwrap_or_default();
+                operation.root = legacy_root::project_root(scope.as_ref(), frame);
                 operation.session.clone_from(&identity.session);
             }
         }
@@ -1918,9 +1919,6 @@ const HEALTH_PROJECT_FIELDS: [&str; 7] = [
 const HEALTH_REPLY_HARD_LIMIT_BYTES: usize = 16 * 1024;
 pub(super) const HEALTH_ROLLUP_TTL: Duration = Duration::from_secs(3);
 const HEALTH_RETENTION_COUNT_MAX_AGE_MS: u64 = 30_000;
-/// The rollup reuses its allocator observation for at least this long, and
-/// longer when the walk that produced it was expensive.
-const HEALTH_ALLOCATOR_MIN_REUSE_MS: u64 = 30_000;
 /// How long the health rollup carries the full memory census forward while
 /// no `memory.census` read asked for a new one. Measuring it renders an
 /// uncapped row for every actor root, and only `memory.census` reads it; the
@@ -3092,17 +3090,6 @@ struct PlaneTiming {
     progress_signature: String,
 }
 
-/// The rollup's last allocator observation, reused across refreshes until it
-/// is older than `reuse_ms`.
-struct CachedAllocatorObservation {
-    /// Cache clock time when the walk finished.
-    cached_at_ms: u64,
-    /// How long this observation may be reused: longer when its walk was
-    /// expensive (see `crate::memory::allocator_reuse_window_ms`).
-    reuse_ms: u64,
-    observation: crate::memory::AllocatorObservation,
-}
-
 struct RetentionCountSample {
     database: std::sync::Weak<std::sync::Mutex<crate::db::TrackedConnection>>,
     measured_at_ms: u64,
@@ -3129,6 +3116,8 @@ pub(super) struct HealthRollupCache {
     snapshot: std::sync::RwLock<Arc<HealthDiagnosticRollup>>,
     plane_timings: std::sync::Mutex<HashMap<(String, &'static str), PlaneTiming>>,
     allocator: std::sync::Mutex<Option<CachedAllocatorObservation>>,
+    allocator_requested: AtomicBool,
+    health_requested: AtomicBool,
     /// Replaces the measured duration of the rollup's allocator walk when not
     /// `u64::MAX`, so tests can model an expensive walk.
     #[cfg(test)]
@@ -3204,6 +3193,8 @@ impl HealthRollupCache {
             snapshot: std::sync::RwLock::new(Arc::new(HealthDiagnosticRollup::unavailable())),
             plane_timings: std::sync::Mutex::new(HashMap::new()),
             allocator: std::sync::Mutex::new(None),
+            allocator_requested: AtomicBool::new(false),
+            health_requested: AtomicBool::new(false),
             #[cfg(test)]
             allocator_walk_ms_for_test: AtomicU64::new(u64::MAX),
             retention_count: std::sync::Mutex::new(None),
@@ -3217,42 +3208,6 @@ impl HealthRollupCache {
             #[cfg(test)]
             census_builds: AtomicU64::new(0),
         }
-    }
-
-    fn allocator_observation(&self) -> (crate::memory::AllocatorObservation, u64) {
-        let mut cached = self
-            .allocator
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(cached) = cached.as_ref() {
-            let observation = &cached.observation;
-            let elapsed_ms = self.now_ms().saturating_sub(cached.cached_at_ms);
-            let age_ms = observation.age_ms.unwrap_or(0).saturating_add(elapsed_ms);
-            if age_ms <= cached.reuse_ms {
-                let mut reused = observation.clone();
-                // Unsupported platforms keep a null age, not a measured zero.
-                reused.age_ms = observation.age_ms.map(|_| age_ms);
-                return (reused, cached.reuse_ms);
-            }
-        }
-        let walk_started = Instant::now();
-        let observation = crate::memory::AllocatorObservation::measure();
-        let walk_ms = duration_millis_u64(walk_started.elapsed());
-        #[cfg(test)]
-        let walk_ms = match self.allocator_walk_ms_for_test.load(Ordering::Relaxed) {
-            u64::MAX => walk_ms,
-            stubbed => stubbed,
-        };
-        // The observation already includes time spent walking the allocator.
-        // Start the reuse clock after that walk so its duration is not counted twice.
-        let reuse_ms =
-            crate::memory::allocator_reuse_window_ms(HEALTH_ALLOCATOR_MIN_REUSE_MS, walk_ms);
-        *cached = Some(CachedAllocatorObservation {
-            cached_at_ms: self.now_ms(),
-            reuse_ms,
-            observation: observation.clone(),
-        });
-        (observation, reuse_ms)
     }
 
     fn step_log_due(&self) -> bool {
@@ -3470,6 +3425,7 @@ impl HealthRollupCache {
     /// rollup measures the census. Returns the request's number; a census
     /// whose `memory_census_answers` reaches it was measured after the read.
     fn request_census(&self) -> u64 {
+        self.allocator_requested.store(true, Ordering::Release);
         self.census_requests.fetch_add(1, Ordering::AcqRel) + 1
     }
 
@@ -3661,7 +3617,7 @@ pub(super) async fn fresh_memory_census(cache: &HealthRollupCache, deadline: Ins
     let current = cache
         .census_age_ms(&snapshot)
         .is_some_and(|age| age <= duration_millis_u64(HEALTH_ROLLUP_TTL));
-    if current || answered(&snapshot) {
+    if (current || answered(&snapshot)) && !cache.allocator_breakdown_due() {
         return cache.render_memory_census(&snapshot);
     }
     let Some(wait_until) = deadline.checked_sub(MEMORY_CENSUS_REPLY_MARGIN) else {
@@ -3733,6 +3689,8 @@ impl SubcTestHealthRollupProbe {
 enum RollupWake {
     /// Something changed (a bind completed); refresh after the quiet period.
     Refresh,
+    /// A health read found the cached rollup older than its TTL.
+    Health,
     /// A `memory.census` read waits for a census; refresh now.
     Census,
     Stop,
@@ -3788,7 +3746,7 @@ impl HealthRollupWorker {
         executor: Arc<Executor>,
         shared_app: Arc<App>,
     ) -> Self {
-        Self::start_with_interval(cache, executor, shared_app, HEALTH_ROLLUP_TTL)
+        Self::start_with_interval(cache, executor, shared_app, demand::BACKGROUND_INTERVAL)
     }
 
     fn start_with_interval(
@@ -3806,14 +3764,24 @@ impl HealthRollupWorker {
         let join = std::thread::Builder::new()
             .name("aft-health-rollup".to_string())
             .spawn(move || 'worker: loop {
+                worker_cache
+                    .health_requested
+                    .store(false, Ordering::Release);
                 worker_cache.refresh(&executor, &shared_app);
                 // Bind completions can arrive during a rollup. A queued request
                 // must not start another full census immediately; the interval
                 // is a minimum quiet period after each completed refresh. A
-                // census read that waits is the exception: it is answered now.
-                let next_refresh = Instant::now() + interval;
+                // census read that waits is answered now; a health liveness
+                // read can shorten the slow cadence to HEALTH_ROLLUP_TTL.
+                let completed = Instant::now();
+                let next_refresh = completed + interval;
                 loop {
-                    let remaining = next_refresh.saturating_duration_since(Instant::now());
+                    let next = if worker_cache.health_requested.load(Ordering::Acquire) {
+                        next_refresh.min(completed + HEALTH_ROLLUP_TTL)
+                    } else {
+                        next_refresh
+                    };
+                    let remaining = next.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         break;
                     }
@@ -3821,8 +3789,12 @@ impl HealthRollupWorker {
                         Ok(RollupWake::Census) => break,
                         // The one-slot channel may have held a bind wake when
                         // the census read tried to send its own.
-                        Ok(RollupWake::Refresh) if worker_cache.census_read_waiting() => break,
-                        Ok(RollupWake::Refresh) => continue,
+                        Ok(RollupWake::Refresh | RollupWake::Health)
+                            if worker_cache.census_read_waiting() =>
+                        {
+                            break
+                        }
+                        Ok(RollupWake::Refresh | RollupWake::Health) => continue,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
                         Ok(RollupWake::Stop)
                         | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 'worker,
@@ -5124,6 +5096,7 @@ fn assemble_health_report(
     // The diagnostic payload is fixed-size and cached. Only probe-purpose
     // liveness signals are read fresh, using atomics or non-blocking snapshots.
     let (rollup, snapshot_age_ms) = cache.snapshot();
+    cache.request_health_refresh(snapshot_age_ms);
     // A contended refresh, now or at the last rollup, leaves the retained
     // census in place and reports it as stale.
     let scheduler_busy = executor.try_actor_count().is_none() || cache.census_contended(&rollup);
@@ -5137,6 +5110,7 @@ fn assemble_health_report(
         .as_object()
         .cloned()
         .unwrap_or_else(serde_json::Map::new);
+    demand::advance_memory_ages(&mut metrics, snapshot_age_ms.unwrap_or(0));
     // Findings read their evidence from the cached rollup, not the public
     // health reply. Do not let that internal evidence displace root diagnostics
     // under the public reply's byte budget.
@@ -5190,6 +5164,10 @@ fn assemble_health_report(
         json!(aft_store::sync::full_sync_fallbacks()),
     );
     metrics.insert("sync_mode".to_string(), json!(aft_store::sync::mode()));
+    metrics.insert(
+        "memory_profile".to_string(),
+        json!(crate::memory::profile::current_effective()),
+    );
     metrics.insert(
         "runtime".to_string(),
         json!({
@@ -9059,6 +9037,7 @@ mod tests {
     }
 
     fn allocator_rollup(cache: &HealthRollupCache) -> HealthDiagnosticRollup {
+        cache.request_census();
         build_health_diagnostic_rollup_from_actors(
             cache,
             &Executor::new(),
@@ -9073,14 +9052,14 @@ mod tests {
         cache.clock_ms.store(0, Ordering::Relaxed);
         cache
             .allocator_walk_ms_for_test
-            .store(600, Ordering::Relaxed);
+            .store(1_800, Ordering::Relaxed);
         cache.publish(Some(allocator_rollup(&cache)));
 
         cache.clock_ms.store(90_000, Ordering::Relaxed);
         let rollup = allocator_rollup(&cache);
         assert_eq!(
             rollup.findings_metrics["memory"]["allocator_reuse_ms"],
-            120_000
+            360_000
         );
         #[cfg(target_os = "linux")]
         assert!(
@@ -9224,13 +9203,13 @@ mod tests {
     #[test]
     fn rollup_allocator_remeasures_expired_observation() {
         let cache = HealthRollupCache::new();
-        // Model a cheap walk, so the reuse window stays at its 30 s floor even
+        // Model a cheap walk, so the reuse window stays at its five-minute floor even
         // if a loaded test host makes the real walk slow.
         cache.allocator_walk_ms_for_test.store(0, Ordering::Relaxed);
         cache.clock_ms.store(0, Ordering::Relaxed);
         allocator_rollup(&cache);
         let before = crate::memory::allocator_snapshot_calls_for_test();
-        cache.clock_ms.store(30_001, Ordering::Relaxed);
+        cache.clock_ms.store(300_001, Ordering::Relaxed);
         allocator_rollup(&cache);
         assert_eq!(
             crate::memory::allocator_snapshot_calls_for_test() - before,
@@ -9246,28 +9225,28 @@ mod tests {
             cache.clock_ms.store(now_ms, Ordering::Relaxed);
             allocator_rollup(&cache);
         };
-        // A one-second walk, as glibc takes on a fragmented multi-GiB heap:
+        // A two-second walk on a fragmented multi-GiB heap:
         // the next walk waits 200 times as long.
         cache
             .allocator_walk_ms_for_test
-            .store(1_000, Ordering::Relaxed);
+            .store(2_000, Ordering::Relaxed);
         let before = walks();
-        for now_ms in (0..=198_000).step_by(3_000) {
+        for now_ms in (0..=399_000).step_by(3_000) {
             refresh_at(now_ms);
         }
         assert_eq!(
             walks() - before,
             1,
-            "67 refreshes over 198 s must share one expensive walk"
+            "134 explicit requests over 399 s must share one expensive walk"
         );
         // Past the stretched window the rollup walks again; this walk is
-        // cheap, so the window drops back to its 30 s floor.
+        // cheap, so the window drops back to its five-minute floor.
         cache.allocator_walk_ms_for_test.store(0, Ordering::Relaxed);
-        refresh_at(200_001);
+        refresh_at(400_001);
         assert_eq!(walks() - before, 2);
-        refresh_at(227_001);
+        refresh_at(699_001);
         assert_eq!(walks() - before, 2);
-        refresh_at(230_002);
+        refresh_at(700_002);
         assert_eq!(walks() - before, 3);
     }
 
@@ -10539,6 +10518,35 @@ mod tests {
     }
 
     #[test]
+    fn health_report_exposes_memory_profile_choice_and_ram() {
+        let report = build_health_report(
+            &HealthRollupCache::new(),
+            &Executor::new(),
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &App::default_shared(),
+        );
+        let metrics = report.metrics.expect("health metrics");
+        let profile = &metrics["memory_profile"];
+        assert!(matches!(
+            profile["value"].as_str(),
+            Some("lean" | "balanced" | "fast")
+        ));
+        assert!(matches!(
+            profile["source"].as_str(),
+            Some("auto" | "config")
+        ));
+        assert!(profile.get("total_ram_bytes").is_some());
+        assert!(
+            profile["total_ram_bytes"].is_null()
+                || profile["total_ram_bytes"]
+                    .as_u64()
+                    .is_some_and(|bytes| bytes > 0)
+        );
+        assert_eq!(profile.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
     fn health_report_lists_stopped_routes() {
         let executor = Executor::new();
         let metrics = DispatchPathMetrics::new();
@@ -10700,7 +10708,16 @@ mod tests {
         let app = crate::context::App::default_shared();
         let registry = app.lsp_child_registry();
         registry.track(std::process::id());
-        let report = test_health_report(&executor, &HashMap::new(), &dispatch_path_metrics, &app);
+        let cache = HealthRollupCache::new();
+        cache.request_census();
+        cache.refresh(&executor, &app);
+        let report = build_health_report(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &dispatch_path_metrics,
+            &app,
+        );
         let metrics = report.metrics.expect("health metrics present");
         let memory = metrics.get("memory").expect("memory rollup present");
         // No actors registered: ready rollup with zero roots and process totals.

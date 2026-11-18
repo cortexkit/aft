@@ -38,8 +38,15 @@ static LAYER: OnceLock<Arc<DataLayer>> = OnceLock::new();
 fn layer() -> Arc<DataLayer> {
     Arc::clone(LAYER.get_or_init(|| {
         let threads = std::thread::available_parallelism().map_or(4, usize::from);
-        Arc::new(DataLayer::new(256 << 20, threads))
+        let layer = DataLayer::with_memory_profile(threads);
+        Arc::new(layer)
     }))
+}
+
+pub(crate) fn memory_profile_changed() {
+    if let Some(layer) = LAYER.get() {
+        layer.apply_memory_profile(crate::memory::profile::current_effective().value.profile());
+    }
 }
 
 /// The family a checkout at `root` belongs to: its repository's root
@@ -220,8 +227,7 @@ enum Pool {
 impl Pool {
     fn cap(self) -> usize {
         match self {
-            Pool::Build => 2,
-            Pool::Fill => 2,
+            Pool::Build | Pool::Fill => 2,
             Pool::Refresh => 4,
         }
     }
@@ -240,24 +246,24 @@ impl Pool {
     /// Runs `job` when a place in the pool is free.
     fn submit(self, job: PoolJob) {
         let mut state = self.state().lock();
-        if state.running >= self.cap() {
-            state.queue.push_back(job);
+        state.queue.push_back(job);
+        let profile = crate::memory::profile::current_effective().value.profile();
+        let Some(job) = state.admit(self.cap()) else {
             return;
-        }
-        state.running += 1;
+        };
         drop(state);
-        self.spawn(job);
+        self.spawn(job, profile);
     }
 
     /// A thread that runs `job`, then whatever queued behind it, until the
     /// queue is empty.
-    fn spawn(self, job: PoolJob) {
+    fn spawn(self, job: PoolJob, mut profile: crate::memory::profile::MemoryProfile) {
         let spawned = std::thread::Builder::new()
             .name(format!("aft-data-{self:?}").to_lowercase())
             .spawn(move || {
                 let mut next = Some(job);
                 while let Some(job) = next.take() {
-                    job();
+                    crate::memory::profile::admitted(profile, job);
                     if matches!(self, Pool::Build) {
                         // A build frees most of what it allocated when it
                         // ends. Hand those pages back now, as dead code does
@@ -267,10 +273,9 @@ impl Pool {
                         let _ = crate::memory::relieve_allocator_pressure();
                     }
                     let mut state = self.state().lock();
-                    next = state.queue.pop_front();
-                    if next.is_none() {
-                        state.running -= 1;
-                    }
+                    state.running -= 1;
+                    profile = crate::memory::profile::current();
+                    next = state.admit(self.cap());
                 }
             });
         if let Err(error) = spawned {
@@ -288,6 +293,15 @@ struct PoolState {
 }
 
 impl PoolState {
+    fn admit(&mut self, cap: usize) -> Option<PoolJob> {
+        if self.running >= cap {
+            return None;
+        }
+        let job = self.queue.pop_front()?;
+        self.running += 1;
+        Some(job)
+    }
+
     const fn new() -> Self {
         Self {
             running: 0,
@@ -2377,6 +2391,64 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
+
+    #[test]
+    fn memory_live_change_applies_to_next_cold_build_admission() {
+        use crate::memory::profile::{self as memory_profile, MemoryMode};
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let original = memory_profile::current_effective();
+        struct Restore(Option<MemoryMode>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                memory_profile::publish(self.0);
+            }
+        }
+        let _restore = Restore((original.source == "config").then_some(original.value));
+        let published = crate::config::Config {
+            memory: Some(MemoryMode::Balanced),
+            ..Default::default()
+        };
+        ctx.set_config(published.clone());
+        assert_eq!(Pool::Build.cap(), 2);
+        assert_eq!(Pool::Fill.cap(), 2);
+        let old_profile = memory_profile::current();
+        let mut state = PoolState::new();
+        state.queue.push_back(Box::new(|| {}));
+        state.queue.push_back(Box::new(|| {}));
+        assert!(state.admit(Pool::Build.cap()).is_some());
+        let candidate = crate::config::Config {
+            memory: Some(MemoryMode::Lean),
+            ..published.clone()
+        };
+        let live = crate::config_live::apply_live_config(&published, &candidate, &published);
+        assert_eq!(live.applied, vec!["memory"]);
+        assert!(live.deferred.is_empty());
+        ctx.set_config(live.next);
+        assert_eq!(Pool::Build.cap(), 2);
+        assert_eq!(Pool::Fill.cap(), 2);
+        memory_profile::admitted(old_profile, || {
+            assert_eq!(memory_profile::current().resolver_threads, None);
+            assert_eq!(
+                memory_profile::current().block_cache_bytes,
+                256 * 1024 * 1024
+            );
+        });
+        let job = state
+            .admit(Pool::Build.cap())
+            .expect("lean keeps the second cold-build slot available");
+        let next = memory_profile::current();
+        assert_eq!(
+            next.resolver_threads,
+            if cfg!(windows) { None } else { Some(4) }
+        );
+        assert_eq!(next.block_cache_bytes, 128 * 1024 * 1024);
+        memory_profile::admitted(next, job);
+        ctx.set_config(published);
+        assert_eq!(Pool::Build.cap(), 2);
+    }
 
     fn planned_pause(until: u64) -> crate::synapse_embed::LanePause {
         crate::synapse_embed::LanePause {

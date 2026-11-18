@@ -1,0 +1,21 @@
+{
+  "name": "refused-read-dispatch-failed-not-sent",
+  "reply": {
+    "content": [
+      {
+        "text": "read_dispatch_failed",
+        "type": "text"
+      }
+    ],
+    "error": {
+      "code": "read_dispatch_failed",
+      "outcome": {
+        "code": "transport_transient",
+        "message": "GitHub read dispatch did not complete",
+        "transmission": "not_sent"
+      },
+      "transmission": "not_sent"
+    },
+    "isError": true
+  }
+}

@@ -340,7 +340,9 @@ fn luau_s4_feature_matrix() {
             .env("AFT_S4_PHASE", phase)
             .env(
                 "AFT_TEST_GRAMMAR_PARSE_DEADLINE_MS",
-                if phase == "timeout" { "100" } else { "30000" },
+                // Debug WASM parses of b.luau measured 2-14 ms on macOS/Linux;
+                // leave ample scheduling headroom instead of relying on 100 ms.
+                if phase == "timeout" { "2000" } else { "30000" },
             )
             .env("AFT_S4_ROOT", dir.path())
             .env("AFT_TEST_GRAMMAR_MANIFEST", manifest_dir.join(manifest))
@@ -386,7 +388,10 @@ fn scenario(phase: &str) {
         write(
             &root,
             "slow.luau",
-            "local function slow(x) if x then return x + 1 else return 0 end end\n".repeat(500),
+            // This 3.4 MB source parsed in 129-188 s on macOS/Linux debug
+            // builds, far beyond the 2 s deadline. It stays below the scan's
+            // 4 MiB read cap; the 1 MiB text-index cap does not skip parsing.
+            "local function slow(x) if x then return x + 1 else return 0 end end\n".repeat(50_000),
         );
         let checkout = bind(&root, &dir.join("timeout-store"));
         let report = checkout.build().unwrap();

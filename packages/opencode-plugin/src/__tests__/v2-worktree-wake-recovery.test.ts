@@ -75,7 +75,6 @@ test("V2 linked-worktree restart recovers missed matches and completions from th
           configLoadTexts: () => new Map(),
           deliverLoadNotices: () => {},
           migrateConfigLocations: () => [],
-          ensureStorageMigrated: async () => {},
           ensureOnnxRuntime: async () => null,
           startLspAutoInstall: () => null,
           pushLspPaths: async () => {},

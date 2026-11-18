@@ -16,7 +16,6 @@
  *     putting an unusable configuration into the config error state and
  *     delivering migration notices;
  *   - resolving the `aft` binary (with a background download when uncached);
- *   - the one-time storage migration into the shared CortexKit root;
  *   - the flat configure overrides: config tiers, `storage_dir`,
  *     `bash_permissions`, `harness`, and the LSP install cache
  *     (`lsp_auto_install_binaries`, `lsp_paths_extra`, `lsp_inflight_installs`);
@@ -35,7 +34,6 @@ import {
   DEFAULT_DISABLED_TOOLS,
   ensureBinary,
   ensureOnnxRuntime,
-  ensureStorageMigrated,
   findBinary,
   findBinarySync,
   formatConfigErrorMessage,
@@ -101,8 +99,6 @@ export interface BridgeBootstrapDependencies {
   /** Moves legacy config files into the CortexKit layout; returns user-facing warnings. */
   migrateConfigLocations(directory: string): string[];
   resolveBinary(version: string): Promise<string>;
-  /** `binaryPath` is null when the subc daemon owns the binary; migration then resolves one only if it has work. */
-  ensureStorageMigrated(binaryPath: string | null, pluginVersion: string): Promise<void>;
   resolveStorageRoot(): string;
   buildConfigureParams(
     directory: string,
@@ -347,13 +343,6 @@ export const defaultBridgeBootstrapDependencies: BridgeBootstrapDependencies = {
   migrateConfigLocations: (directory) =>
     migrateAftConfigLocations(directory, bridgeLogger).flatMap((result) => result.warnings),
   resolveBinary: resolveBinaryWithWarmup,
-  ensureStorageMigrated: (binaryPath, pluginVersion) =>
-    ensureStorageMigrated({
-      harness: "opencode",
-      binaryPath: binaryPath ?? undefined,
-      expectedVersion: pluginVersion,
-      logger: bridgeLogger,
-    }),
   resolveStorageRoot: resolveCortexKitStorageRoot,
   buildConfigureParams: buildConfigTierConfigureParams,
   ensureOnnxRuntime: ensureOnnxRuntimeOncePerProcess,
@@ -545,8 +534,6 @@ export async function prepareBridgeEnvironment(
   // to a standalone bridge), so resolving a local binary would be wasted work.
   const usesSubc = Boolean(config.subc?.connection_file?.trim());
   const binaryPath = usesSubc ? null : await dependencies.resolveBinary(options.pluginVersion);
-  // Must complete before anything reads or writes the storage root.
-  await dependencies.ensureStorageMigrated(binaryPath, options.pluginVersion);
 
   // Flat params are plugin-computed process state shared by every bridge.
   // Core-domain config flows only through the `config` tiers; per-project

@@ -4548,6 +4548,9 @@ pub fn callgraph_cold_build_spawn_count_for_test() -> usize {
     CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst)
 }
 
+#[path = "context/runtime_handles.rs"]
+mod runtime_handles;
+
 impl AppContext {
     /// Register the owning handle without making the status worker retain a root.
     pub(crate) fn bind_status_context(self: &Arc<Self>) {
@@ -4665,6 +4668,7 @@ impl AppContext {
         // so the documented `lsp.diagnostic_cache_size` knob takes effect.
         lsp_manager.set_diagnostic_capacity(config.diagnostic_cache_size);
         let bash_background = BgTaskRegistry::new(Arc::clone(&progress_sender));
+        runtime_handles::configure_background_scope(&bash_background, &app, &config);
         let compression_aggregates = bash_background.compression_aggregate_cache();
         let checkpoint_store = CheckpointStore::new();
         let checkpoint_namespace_request = checkpoint_store.namespace_request();
@@ -5675,20 +5679,6 @@ impl AppContext {
         if self.filter_registry_released.swap(false, Ordering::AcqRel) {
             self.ensure_filter_registry_loaded();
         }
-    }
-
-    pub fn app(&self) -> Arc<App> {
-        Arc::clone(&self.app)
-    }
-
-    /// Clone the LSP child registry handle. Used by main.rs to give the
-    /// signal handler thread a way to SIGKILL LSP children on shutdown.
-    pub fn lsp_child_registry(&self) -> crate::lsp::child_registry::LspChildRegistry {
-        self.app.lsp_child_registry()
-    }
-
-    pub fn stdout_writer(&self) -> SharedStdoutWriter {
-        self.app.stdout_writer()
     }
 
     pub fn set_progress_sender(&self, sender: Option<ProgressSender>) {
@@ -7639,6 +7629,7 @@ impl AppContext {
             // reset it when another root starts with a default config. Before
             // the first configure publishes, syncs use the plain fsync default.
             aft_store::sync::set_macos_full_sync(next.durability.macos_full_sync);
+            crate::memory::profile::publish(next.memory);
             (next, changed)
         };
         if replace_pin {
@@ -13933,7 +13924,6 @@ mod callgraph_store_for_ops_tests {
             Config {
                 project_root: Some(project.path().to_path_buf()),
                 storage_dir: Some(storage.path().to_path_buf()),
-                callgraph_chunk_size: 1,
                 ..Config::default()
             },
         ));

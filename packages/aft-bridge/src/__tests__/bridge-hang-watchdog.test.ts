@@ -278,7 +278,7 @@ describe("request timeouts are isolated from other requests", () => {
       for (const timedOut of timeouts) {
         const message = String((timedOut.error as Error | undefined)?.message);
         expect(message).toContain("timed out after 30ms");
-        expect(message).toContain("inspect before repeating it");
+        expect(message).toContain("check its result before repeating it");
         expect((timedOut.error as Error).name).not.toBe("BridgeRestartedError");
       }
     } finally {

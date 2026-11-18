@@ -190,6 +190,66 @@ jobs:
     with:
       storm_profile_probe: ${{ github.event_name == 'workflow_dispatch' && inputs.storm_profile_probe }}
 
+  unit-linux-task-scopes:
+    name: Linux background task scopes (systemd user manager)
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: unit-linux-task-scopes
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Start the runner's systemd user manager
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@$(id -u).service"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          test -S "$XDG_RUNTIME_DIR/bus"
+          systemctl --user show-environment
+          printf 'XDG_RUNTIME_DIR=%s\nDBUS_SESSION_BUS_ADDRESS=%s\n' \
+            "$XDG_RUNTIME_DIR" "$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
+      - name: Run every user-manager test, with no skips
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo --version
+          inventory="$RUNNER_TEMP/task-scope-inventory.txt"
+          output="$RUNNER_TEMP/task-scope-tests.txt"
+          cargo test --features test-hooks -p agent-file-tools --lib -- task_scope --ignored --list > "$inventory"
+          python3 - "$inventory" <<'PY'
+          import pathlib, sys
+          tests = [line for line in pathlib.Path(sys.argv[1]).read_text().splitlines() if line.endswith(': test')]
+          if len(tests) != 21:
+              raise SystemExit(f'expected 21 systemd user-manager tests, found {len(tests)}: {tests}')
+          print(f'Found {len(tests)} systemd user-manager tests')
+          PY
+          # These tests assert manager availability; --ignored opts them in,
+          # rather than treating an unavailable manager as a passing skip.
+          if cargo test --features test-hooks -p agent-file-tools --lib -- task_scope --ignored --test-threads=1 --nocapture > "$output" 2>&1; then
+            cat "$output"
+          else
+            cat "$output"
+            exit 1
+          fi
+          python3 - "$output" <<'PY'
+          import pathlib, re, sys
+          output = pathlib.Path(sys.argv[1]).read_text()
+          if not re.search(r'^test result: ok\. 21 passed; 0 failed; 0 ignored;', output, re.M):
+              raise SystemExit('systemd task-scope tests must run: expected 21 passed and zero skipped')
+          print('Systemd task-scope gate passed: 21 tests ran, zero skipped')
+          PY
+
   # ---------------------------------------------------------------------------
   # Linux Docker e2e + Pi RPC e2e + macOS native e2e + Windows native e2e.
   #

@@ -60,7 +60,7 @@ them come from `aft profile --writes`, which the health sentinel runs every
 | Standalone bridge, `aft` over stdin NDJSON (one per harness bridge/project) | init + tee. The TS bridge **also relays** every stderr line into `aft-plugin.log` (`bridge.ts:1475-1485`, `logVia`), so each line is stored twice. | **Durable.** Bound `pid role=bridge harness=<h>`, with the harness passed by the bridge in an env var at spawn. The bridge keeps its in-memory stderr tail for crash messages but **stops persisting** relayed lines, because they would land twice in the same segment. |
 | `aft warmup` | init (after `main.rs:152`) | **Durable**, `role=warmup`: it builds indexes in-process, and a failure there is worth keeping. |
 | `aft profile` (memory/CPU/`--writes` census) | init | **stderr only**, never a file. It is a read-only probe that runs every 2 minutes. |
-| `aft index`, `migrate-storage`, `sandbox-launch`, `--probe-login-shell-path`, gh shim (`gh …` via argv0/env) | Exit **before** `logging::init()` (`main.rs:62-139`), so `log` macros are no-ops. | Unchanged: no logger. The gh shim in particular must stay logger-free, because it runs in agent shells with `gh` arguments and tokens. |
+| `aft index`, `sandbox-launch`, `--probe-login-shell-path`, gh shim (`gh …` via argv0/env) | Exit **before** `logging::init()` (`main.rs:62-139`), so `log` macros are no-ops. | Unchanged: no logger. The gh shim in particular must stay logger-free, because it runs in agent shells with `gh` arguments and tokens. |
 | `aft doctor` | This is the **TS** CLI (`packages/aft-cli`). There is no Rust `doctor` subcommand (`crates/aft/src/cli/` has index/profile/warmup/probe/sandbox_launch). | Reader only (§6). |
 | Test binaries | Isolated by `AFT_STORAGE_DIR`. | Unchanged. |
 

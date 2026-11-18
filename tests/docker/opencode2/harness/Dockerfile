@@ -16,7 +16,9 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY benchmarks/aft-search/engine-fixtures/*.json benchmarks/aft-search/engine-fixtures/
-RUN test -n "$AFT_GIT_SHA" && cargo build --locked --profile "$CARGO_PROFILE" -p agent-file-tools
+# The two ignored-entry fixtures set AFT_TEST_GREP_IGNORE_PROBE=ready so their
+# directory comparison finishes before the reply instead of racing the worker.
+RUN test -n "$AFT_GIT_SHA" && cargo build --locked --profile "$CARGO_PROFILE" -p agent-file-tools --features test-hooks
 RUN mkdir -p /out && cp "/build/target/$CARGO_PROFILE/aft" /out/aft.real && \
     printf '%s\n' \
       '#!/bin/sh' \

@@ -107,6 +107,7 @@ pub struct ResolveResult {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RawAftConfig {
+    pub memory: Option<crate::memory::profile::MemoryMode>,
     pub durability: Option<RawDurability>,
     pub storage: Option<RawStorage>,
     #[serde(rename = "$schema")]
@@ -128,8 +129,6 @@ pub struct RawAftConfig {
     pub restrict_to_project_root: Option<bool>,
     pub indexes: Option<RawIndexes>,
     pub index: Option<RawIndex>,
-    #[serde(deserialize_with = "deserialize_opt_usize")]
-    pub callgraph_chunk_size: Option<usize>,
     pub inspect: Option<RawInspect>,
     pub idle: Option<RawIdle>,
     pub backup: Option<RawBackup>,
@@ -462,6 +461,8 @@ pub struct RawBashFeatures {
     #[serde(deserialize_with = "deserialize_opt_worker_wait_max_ms")]
     pub worker_wait_max_ms: Option<u64>,
     pub linux_scope: Option<bool>,
+    #[serde(deserialize_with = "deserialize_opt_linux_scope_max_runtime_secs")]
+    pub linux_scope_max_runtime_secs: Option<u64>,
     #[serde(deserialize_with = "deserialize_opt_memory_limit_mib")]
     pub memory_limit_mib: Option<u64>,
     pub disclaim_privacy: Option<bool>,
@@ -711,7 +712,7 @@ pub fn resolve_config_for_harness(
 
     let mut parsed = Vec::with_capacity(tiers.len());
     for tier in tiers {
-        let outcome = match parse_tier(tier, harness, &mut warnings) {
+        let outcome = match parse_tier(tier, harness, &mut warnings, &mut dropped) {
             Ok(outcome) => outcome,
             Err(errors) => {
                 // A rejected candidate still records where caches belong, or
@@ -1092,6 +1093,7 @@ fn parse_tier(
     tier: &ConfigTier,
     harness: Option<&Harness>,
     warnings: &mut Vec<ConfigWarning>,
+    dropped: &mut Vec<DroppedKey>,
 ) -> Result<(RawAftConfig, feature_config::DocumentTranslation), Vec<String>> {
     let stripped = strip_jsonc(&tier.doc);
     let value = serde_json::from_str::<Value>(&stripped)
@@ -1109,6 +1111,18 @@ fn parse_tier(
         feature_config::DocumentTier::Project
     };
     let translation = feature_config::translate_document(&mut map, document_tier);
+    // Machine limits cannot be selected by repositories or harness blocks.
+    // Drop even malformed values before validating neighbouring security keys.
+    if tier.tier != "user" && map.remove("memory").is_some() {
+        push_drop(dropped, "memory", &tier.tier, USER_ONLY_REASON);
+    }
+    if let Some(blocks) = map.get_mut("harnesses").and_then(Value::as_object_mut) {
+        for block in blocks.values_mut().filter_map(Value::as_object_mut) {
+            if block.remove("memory").is_some() {
+                push_drop(dropped, "memory", &tier.tier, USER_ONLY_REASON);
+            }
+        }
+    }
     normalize_config_for_harness(&mut map, harness);
 
     let security_errors = malformed_security_config_errors(&map, harness);
@@ -1699,8 +1713,8 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.index.is_some() {
         base.index = override_config.index;
     }
-    if override_config.callgraph_chunk_size.is_some() {
-        base.callgraph_chunk_size = override_config.callgraph_chunk_size;
+    if override_config.memory.is_some() {
+        base.memory = override_config.memory;
     }
     if override_config.inspect.is_some() {
         base.inspect = override_config.inspect;
@@ -1810,9 +1824,6 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     }
     // A project may switch an index off but never back on.
     base.indexes = merge_indexes(base.indexes, project.indexes, true);
-    if project.callgraph_chunk_size.is_some() {
-        base.callgraph_chunk_size = project.callgraph_chunk_size;
-    }
 
     merge_formatter_map(&mut base.formatter, project.formatter);
     merge_checker_map(&mut base.checker, project.checker);
@@ -2100,6 +2111,7 @@ fn project_safe_bash(project: Option<RawBash>) -> Option<RawBash> {
                 .changed_files
                 .filter(|mode| *mode == crate::config::BashChangedFiles::Off);
             features.linux_scope = None;
+            features.linux_scope_max_runtime_secs = None;
             // `project_env` is carried separately: the resolver never applies a
             // project's environment, so it must not reach the user-tier map.
             features.project_env = features.env.take();
@@ -2309,6 +2321,9 @@ fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> O
                     .worker_wait_max_ms
                     .or(base.worker_wait_max_ms),
                 linux_scope: override_features.linux_scope.or(base.linux_scope),
+                linux_scope_max_runtime_secs: override_features
+                    .linux_scope_max_runtime_secs
+                    .or(base.linux_scope_max_runtime_secs),
                 memory_limit_mib: override_features.memory_limit_mib.or(base.memory_limit_mib),
                 disclaim_privacy: override_features.disclaim_privacy.or(base.disclaim_privacy),
                 powershell_tool: override_features.powershell_tool.or(base.powershell_tool),
@@ -2357,6 +2372,7 @@ fn expand_bash_for_merge(value: &RawBash) -> RawBashFeatures {
             watch_sync_max_ms: None,
             worker_wait_max_ms: None,
             linux_scope: None,
+            linux_scope_max_runtime_secs: None,
             memory_limit_mib: None,
             disclaim_privacy: None,
             powershell_tool: None,
@@ -2660,6 +2676,11 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     ) {
         push_drop(dropped, "bash.linux_scope", tier, USER_ONLY_REASON);
     }
+    if raw.bash.as_ref().is_some_and(
+        |bash| matches!(bash, RawBash::Features(features) if features.linux_scope_max_runtime_secs.is_some()),
+    ) {
+        push_drop(dropped, "bash.linux_scope_max_runtime_secs", tier, USER_ONLY_REASON);
+    }
     for tool in feature_config::normalize_tool_list(
         raw.disabled_tools
             .iter()
@@ -2819,9 +2840,7 @@ fn apply_resolved_config(
     if let Some(value) = raw.restrict_to_project_root {
         config.restrict_to_project_root = value;
     }
-    if let Some(value) = raw.callgraph_chunk_size {
-        config.callgraph_chunk_size = value;
-    }
+    config.memory = raw.memory;
     if let Some(value) = raw.url_fetch_allow_private {
         config.url_fetch_allow_private = value;
     }
@@ -3295,6 +3314,7 @@ struct ResolvedBashConfig {
     watch_sync_max_ms: u64,
     worker_wait_max_ms: u64,
     linux_scope: bool,
+    linux_scope_max_runtime_secs: u64,
     memory_limit_mib: Option<u64>,
     disclaim_privacy: bool,
     powershell_tool: bool,
@@ -3316,6 +3336,7 @@ fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config, warnings: &mut V
     config.bash.watch_sync_max_ms = bash.watch_sync_max_ms;
     config.bash.worker_wait_max_ms = bash.worker_wait_max_ms;
     config.bash.linux_scope = bash.linux_scope;
+    config.bash.linux_scope_max_runtime_secs = bash.linux_scope_max_runtime_secs;
     config.bash.memory_limit_mib = bash.memory_limit_mib;
     config.bash.disclaim_privacy = bash.disclaim_privacy;
     config.bash.powershell_tool = bash.powershell_tool;
@@ -3366,7 +3387,7 @@ fn resolve_bash_config(
         .unwrap_or(DEFAULT_BASH_WORKER_WAIT_MAX_MS);
     let top_linux_scope = top_features
         .and_then(|features| features.linux_scope)
-        .unwrap_or(false);
+        .unwrap_or(true);
     let top_powershell_tool = top_features
         .and_then(|features| features.powershell_tool)
         .unwrap_or(false);
@@ -3394,6 +3415,9 @@ fn resolve_bash_config(
         watch_sync_max_ms,
         worker_wait_max_ms,
         linux_scope: top_linux_scope,
+        linux_scope_max_runtime_secs: top_features
+            .and_then(|features| features.linux_scope_max_runtime_secs)
+            .unwrap_or(crate::config::DEFAULT_LINUX_SCOPE_MAX_RUNTIME_SECS),
         memory_limit_mib: top_features.and_then(|features| features.memory_limit_mib),
         disclaim_privacy: top_features
             .and_then(|features| features.disclaim_privacy)
@@ -3578,16 +3602,6 @@ where
         .transpose()
 }
 
-fn deserialize_opt_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Option::<u64>::deserialize(deserializer)?;
-    value
-        .map(|value| usize::try_from(value).map_err(|_| de::Error::custom("value is too large")))
-        .transpose()
-}
-
 fn deserialize_opt_positive_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
 where
     D: Deserializer<'de>,
@@ -3597,6 +3611,22 @@ where
         Some(0) => Err(de::Error::custom("must be a positive integer")),
         other => Ok(other),
     }
+}
+
+fn deserialize_opt_linux_scope_max_runtime_secs<'de, D>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<u64>::deserialize(deserializer)
+        .map_err(|error| de::Error::custom(format!("linux_scope_max_runtime_secs: {error}")))?;
+    if value.is_some_and(|value| !(1..=4_294_967_295).contains(&value)) {
+        return Err(de::Error::custom(
+            "linux_scope_max_runtime_secs must be from 1 to 4294967295",
+        ));
+    }
+    Ok(value)
 }
 
 fn deserialize_opt_memory_limit_mib<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
@@ -3692,6 +3722,46 @@ mod tests {
             r#"{"storage":{"cache_dir":"/cache/aft"}}"#,
         );
         assert!(raw.is_ok(), "storage.cache_dir must be recognized: {raw:?}");
+    }
+
+    #[test]
+    fn memory_config_only_user_base_selects_machine_limits() {
+        use crate::memory::profile::MemoryMode;
+        for (name, expected) in [
+            ("lean", MemoryMode::Lean),
+            ("balanced", MemoryMode::Balanced),
+        ] {
+            for harness in [Harness::Pi, Harness::Opencode] {
+                let result = resolve_config_for_harness(
+                    &[
+                        tier(
+                            "user",
+                            &format!(
+                                r#"{{"memory":"{name}","harnesses":{{"pi":{{"memory":{{}},"sandbox":{{"profile":{{"worker":"strict"}}}}}},"opencode":{{"memory":null,"sandbox":{{"profile":{{"worker":"strict"}}}}}}}}}}"#
+                            ),
+                        ),
+                        tier(
+                            "project",
+                            r#"{"memory":5,"harnesses":{"pi":{"memory":"fast"},"opencode":{"memory":"lean"}}}"#,
+                        ),
+                    ],
+                    Some(&harness),
+                );
+                assert!(result.errors.is_empty(), "{:?}", result.errors);
+                assert_eq!(result.config.memory, Some(expected));
+                assert!(result
+                    .dropped
+                    .iter()
+                    .any(|drop| drop.key == "memory" && drop.tier == "user"));
+                assert!(result
+                    .dropped
+                    .iter()
+                    .any(|drop| drop.key == "memory" && drop.tier == "project"));
+            }
+        }
+        let project = resolve_config(&[tier("project", r#"{"memory":"lean"}"#)]);
+        assert!(project.errors.is_empty());
+        assert_eq!(project.config.memory, None);
     }
 
     #[test]
@@ -3899,7 +3969,9 @@ mod tests {
                     .warnings
                     .iter()
                     .any(|warning| warning.code == "invalid_harness_override"));
-                let (raw, _) = parse_tier(&input, Some(&Harness::Pi), &mut Vec::new()).unwrap();
+                let (raw, _) =
+                    parse_tier(&input, Some(&Harness::Pi), &mut Vec::new(), &mut Vec::new())
+                        .unwrap();
                 assert!(raw.harnesses.unwrap()["pi"].get("auto_update").is_none());
             }
         }
@@ -3930,7 +4002,9 @@ mod tests {
                     crate::config::SandboxMode::Strict
                 );
                 assert!(strict_tier_error(&input, Some(&Harness::Pi)).is_none());
-                let (raw, _) = parse_tier(&input, Some(&Harness::Pi), &mut Vec::new()).unwrap();
+                let (raw, _) =
+                    parse_tier(&input, Some(&Harness::Pi), &mut Vec::new(), &mut Vec::new())
+                        .unwrap();
                 assert_eq!(raw.auto_update, None);
             }
         }
@@ -3939,7 +4013,13 @@ mod tests {
     #[test]
     fn opencode_owned_auto_update_remains_security_validated() {
         let valid = tier("user", r#"{"auto_update":false}"#);
-        let (raw, _) = parse_tier(&valid, Some(&Harness::Opencode), &mut Vec::new()).unwrap();
+        let (raw, _) = parse_tier(
+            &valid,
+            Some(&Harness::Opencode),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(raw.auto_update, Some(false));
         for tier_name in ["user", "project"] {
             let root = tier(
@@ -5022,7 +5102,7 @@ mod tests {
               "checker": { "rust": "cargo", "typescript": "tsc" },
               "restrict_to_project_root": true,
               "indexes": { "trigram": true, "semantic": true, "callgraph": false },
-              "callgraph_chunk_size": 17,
+              "memory": "balanced",
               "url_fetch_allow_private": true,
               "semantic": {
                 "backend": "openai_compatible",
@@ -5067,7 +5147,10 @@ mod tests {
         assert!(result.config.indexes.trigram);
         assert!(result.config.indexes.semantic);
         assert!(!result.config.indexes.callgraph);
-        assert_eq!(result.config.callgraph_chunk_size, 17);
+        assert_eq!(
+            result.config.memory,
+            Some(crate::memory::profile::MemoryMode::Balanced)
+        );
         assert!(result.config.url_fetch_allow_private);
         assert_eq!(
             result.config.semantic.backend,
@@ -6182,8 +6265,8 @@ mod tests {
     }
 
     #[test]
-    fn bash_linux_scope_is_user_only_and_defaults_off() {
-        assert!(!resolve_config(&[]).config.bash.linux_scope);
+    fn bash_linux_scope_is_user_only_and_defaults_on() {
+        assert!(resolve_config(&[]).config.bash.linux_scope);
 
         let result = resolve_config(&[
             tier("user", r#"{ "bash": { "linux_scope": true } }"#),
@@ -6191,6 +6274,34 @@ mod tests {
         ]);
         assert!(result.config.bash.linux_scope);
         assert!(drop_keys(&result).contains(&"bash.linux_scope".to_string()));
+    }
+
+    #[test]
+    fn task_scope_config_contract() {
+        let direct = crate::config::BashConfig::default();
+        assert!(direct.linux_scope);
+        assert_eq!(direct.linux_scope_max_runtime_secs, 86_400);
+        let defaults = resolve_config(&[]).config.bash;
+        assert!(defaults.linux_scope);
+        assert_eq!(defaults.linux_scope_max_runtime_secs, 86_400);
+        let result = resolve_config(&[
+            tier(
+                "user",
+                r#"{"bash":{"linux_scope":false,"linux_scope_max_runtime_secs":7200}}"#,
+            ),
+            tier(
+                "project",
+                r#"{"bash":{"linux_scope":true,"linux_scope_max_runtime_secs":1}}"#,
+            ),
+        ]);
+        assert!(!result.config.bash.linux_scope);
+        assert_eq!(result.config.bash.linux_scope_max_runtime_secs, 7200);
+        assert!(drop_keys(&result).contains(&"bash.linux_scope_max_runtime_secs".into()));
+        for value in ["0", "-1", "1.5", "4294967296", "true", "\"86400\""] {
+            let text = format!("{{\"linux_scope_max_runtime_secs\":{value}}}");
+            let error = serde_json::from_str::<RawBashFeatures>(&text).unwrap_err();
+            assert!(error.to_string().contains("linux_scope_max_runtime_secs"));
+        }
     }
 
     #[test]
@@ -6276,6 +6387,7 @@ mod tests {
                 r#"{ "bash": { "foreground_wait_window_ms": 1, "subagent_background": true } }"#,
             ),
             None,
+            &mut Vec::new(),
             &mut Vec::new(),
         ) else {
             panic!("test tier should parse");

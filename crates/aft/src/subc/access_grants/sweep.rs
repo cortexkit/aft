@@ -58,6 +58,28 @@ where
     tick_unwatched(db, cursor, describe, |_| false, |_| false).await
 }
 
+#[cfg(all(test, unix))]
+pub(in crate::subc) async fn tick_covered<F, Fut>(
+    db: Db,
+    covered: &super::super::scope_watch::Coverage,
+    describe: F,
+) -> Stats
+where
+    F: Fn(ScopeStamp) -> Fut,
+    Fut: std::future::Future<
+        Output = Result<ModuleControlResponseToModule, readiness::ControlError>,
+    >,
+{
+    tick_unwatched(
+        db,
+        &mut None,
+        describe,
+        |stamp| covered.covers_reference(stamp),
+        |_| false,
+    )
+    .await
+}
+
 async fn tick_unwatched<F, Fut, C, D>(
     db: Db,
     cursor: &mut Option<store::ScopeKey>,
@@ -237,7 +259,7 @@ pub(in crate::subc) async fn run(
                         // A snapshot may arrive while the database batch is
                         // being read. Check coverage at the actual RPC boundary.
                         let latest = covered.borrow();
-                        latest.all || latest.keys.contains(&scope_describe::stamp_key(stamp))
+                        latest.covers_reference(stamp)
                     },
                     |stamp| {
                         crate::access_policy::prefrontal::counterpart_in_catalog(

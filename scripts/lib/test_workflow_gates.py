@@ -200,13 +200,13 @@ class LightPREventGateTests(unittest.TestCase):
             "${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}",
         ), "ref")
 
-    def test_prs_report_all_27_required_contexts_including_the_live_worker_gate(self) -> None:
+    def test_prs_report_all_28_required_contexts_including_the_live_worker_gate(self) -> None:
         root = Path(__file__).resolve().parents[2]
         required = {
             line for line in (root / ".github/required-checks.txt").read_text().splitlines()
             if line.startswith(("Unit / ", "E2E / "))
         }
-        self.assertEqual(len(required), 27)
+        self.assertEqual(len(required), 28)
         jobs = {}
         for caller, file in (("Unit", "_unit-suite.yml"), ("E2E", "_e2e-suite.yml")):
             suite = workflow_gates.parse_workflow(str(root / ".github/workflows" / file))

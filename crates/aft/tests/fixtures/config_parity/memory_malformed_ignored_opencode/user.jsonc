@@ -1,0 +1,12 @@
+{
+  "harnesses": {
+    "opencode": {
+      "memory": {},
+      "sandbox": {
+        "profile": {
+          "worker": "strict"
+        }
+      }
+    }
+  }
+}

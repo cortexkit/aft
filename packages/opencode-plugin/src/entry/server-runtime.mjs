@@ -35,7 +35,7 @@ import {
   registerAftTools,
 } from "../tool-registration.js";
 
-// The bridge environment (binary, storage migration, configure overrides, ONNX
+// The bridge environment (binary, configure overrides, ONNX
 // Runtime, LSP installs) comes from the bootstrap shared with the OpenCode 1
 // entry; every one of those steps can be replaced here through overrides.
 const defaults = {

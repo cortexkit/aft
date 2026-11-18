@@ -1,0 +1,17 @@
+{
+  "name": "refused-job-not-finished",
+  "reply": {
+    "content": [
+      {
+        "text": "job_not_finished: the job has not completed",
+        "type": "text"
+      }
+    ],
+    "error": {
+      "code": "job_not_finished",
+      "message": "the job has not completed",
+      "transmission": "sent"
+    },
+    "isError": true
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "memory": "lean",
+  "harnesses": {
+    "opencode": {
+      "memory": "lean"
+    }
+  }
+}

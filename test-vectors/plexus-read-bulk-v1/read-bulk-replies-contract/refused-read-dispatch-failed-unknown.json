@@ -1,0 +1,21 @@
+{
+  "name": "refused-read-dispatch-failed-unknown",
+  "reply": {
+    "content": [
+      {
+        "text": "read_dispatch_failed",
+        "type": "text"
+      }
+    ],
+    "error": {
+      "code": "read_dispatch_failed",
+      "outcome": {
+        "code": null,
+        "message": "GitHub read dispatch did not complete",
+        "transmission": "unknown"
+      },
+      "transmission": "unknown"
+    },
+    "isError": true
+  }
+}

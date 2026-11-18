@@ -132,7 +132,7 @@ This owner integrates the four workstreams through slice-1 hooks, including warm
 
 Help and dry-run output must contain r5's operator contract: “Stop every AFT process (the daemon, OpenCode and Pi hosts) before running this. The check below refuses when it sees one, but it can't stop a process that starts after the check.” After a clean census, atomically rename each entire legacy set within the filesystem into `<storage>/.prune-legacy-<timestamp>/`; re-census before deleting. If a process appeared, retain/report moved path and bytes and exit nonzero. A later clean run may remove leftovers. Refused/non-atomic rename means skip/report, never delete in place. The census narrows an accepted race; it is not process exclusion.
 
-**Owns:** `migration/`, `migrate_storage.rs`, `migrate_storage/`, `legacy_partitions.rs`, `cli/`, `main.rs`, `views/io.rs`, `context.rs`, `commands/configure.rs`; new `migration/per_checkout.rs` and `cli/prune_legacy.rs`, plus only the CLI package adapter files actually required by command routing, serially after slice 6.
+**Owns:** `migration/`, `legacy_partitions.rs`, `cli/`, `main.rs`, `views/io.rs`, `context.rs`, `commands/configure.rs`; new `migration/per_checkout.rs` and `cli/prune_legacy.rs`, plus only the CLI package adapter files actually required by command routing, serially after the disk-limit and LRU-eviction work in section 6.
 
 **Depends on:** 6; full migration gate completes before trial/cutover.
 

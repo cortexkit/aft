@@ -6,9 +6,9 @@ use super::*;
 use crate::subc::test_support::{test_ctx, test_root};
 
 #[test]
-#[ignore = "manual per-stage health rollup CPU profile over 80 roots"]
-fn profile_rollup_stages_over_eighty_roots() {
-    const ROOTS: usize = 80;
+#[ignore = "manual per-stage health rollup CPU profile over 100 roots"]
+fn profile_rollup_stages_over_one_hundred_roots() {
+    const ROOTS: usize = 100;
     const TICKS: u64 = 40;
     let executor = Executor::with_config(crate::executor::ExecutorConfig {
         pool_size: 1,

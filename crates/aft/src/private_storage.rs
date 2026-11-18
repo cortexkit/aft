@@ -112,26 +112,6 @@ pub fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Result<(
     create(path)?.write_all(contents.as_ref())
 }
 
-/// std::fs::copy copies source permissions too, which would expose snapshots of
-/// public files. Stream into an owner-only destination instead on Unix.
-pub(crate) fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<u64> {
-    if let Some(access) = crate::cache_location::pin_cache_path(to.as_ref())? {
-        let (parent, name) = access.parent()?;
-        return io::copy(
-            &mut File::open(from)?,
-            &mut parent.repair_create_file(&name)?,
-        );
-    }
-    #[cfg(unix)]
-    {
-        io::copy(&mut File::open(from)?, &mut create(to)?)
-    }
-    #[cfg(not(unix))]
-    {
-        fs::copy(from, to)
-    }
-}
-
 /// Open a storage root and protect its immediate domains, without traversing
 /// histories or indexes. Existing files need no walk behind a private directory.
 pub(crate) fn open_root(root: &Path) -> io::Result<()> {

@@ -2039,7 +2039,7 @@ fn configure_warm_key(
 ) -> String {
     // Keys a live config reload may change are left out: they select no
     // artifact, so a connect after a live edit must not reload artifacts
-    // because of them. `callgraph_chunk_size` is read at the next cold build,
+    // because of them. `memory` is read at the next build or admission,
     // the semantic query fields per query, and `inspect.enabled` per call.
     let mut semantic = config.semantic.clone();
     semantic.query_timeout_ms = 0;
@@ -6749,7 +6749,7 @@ mod tests {
         let base = Config::default();
 
         let mut live = base.clone();
-        live.callgraph_chunk_size += 7;
+        live.memory = Some(crate::memory::profile::MemoryMode::Lean);
         live.inspect.enabled = !live.inspect.enabled;
         live.semantic.query_timeout_ms += 1;
         live.semantic.query_instruction = "off".to_string();
@@ -6775,7 +6775,7 @@ mod tests {
             "cortexkit_user_config_path": user_path,
             "config": [
                 user_tier(json!({ "format_on_edit": true, "url_fetch_allow_private": true })),
-                project_tier(json!({ "callgraph_chunk_size": 3 }))
+                project_tier(json!({ "idle": {"checkout_hours": 3} }))
             ]
         }));
 
@@ -6783,7 +6783,7 @@ mod tests {
         assert!(response.success, "configure failed: {:?}", response.data);
         assert!(!ctx.config().format_on_edit);
         assert!(!ctx.config().url_fetch_allow_private);
-        assert_eq!(ctx.config().callgraph_chunk_size, 3);
+        assert_eq!(ctx.config().idle.checkout_hours, 3);
     }
 
     /// Configure migrates a user file that uses retired keys and reports it
@@ -6898,10 +6898,10 @@ mod tests {
         let project = temp.path().join(".pi/aft.jsonc");
         let canonical = temp.path().join(".cortexkit/aft.jsonc");
         write_config(&user, r#"{"url_fetch_allow_private":true}"#);
-        write_config(&project, r#"{"callgraph_chunk_size":7}"#);
+        write_config(&project, r#"{"idle": {"checkout_hours": 7}}"#);
         write_config(
             &temp.path().join(".opencode/aft.jsonc"),
-            r#"{"callgraph_chunk_size":8}"#,
+            r#"{"idle": {"checkout_hours": 8}}"#,
         );
         let snapshot = crate::subc_config::PreparedBindConfig::read(
             Some(&user),
@@ -6910,7 +6910,7 @@ mod tests {
         )
         .unwrap();
         write_config(&user, r#"{"url_fetch_allow_private":false}"#);
-        write_config(&canonical, r#"{"callgraph_chunk_size":9}"#);
+        write_config(&canonical, r#"{"idle": {"checkout_hours": 9}}"#);
         fs::remove_file(&project).unwrap();
         let request = configure_request_with_params(json!({
             "project_root": temp.path(), "harness":"pi", "cortexkit_user_config_path":user,
@@ -6921,14 +6921,14 @@ mod tests {
                     handle_configure_for_test(&request, &ctx)
                 });
             assert!(response.success, "{:?}", response.data);
-            assert_eq!(ctx.config().callgraph_chunk_size, 7);
+            assert_eq!(ctx.config().idle.checkout_hours, 7);
             assert!(ctx.config().url_fetch_allow_private);
             let sources = ctx.config_live().sources().expect("applied sources");
             assert_eq!(sources.project.path.as_deref(), Some(project.as_path()));
             assert!(sources.project.from_file);
             assert_eq!(
                 sources.project.text.as_deref(),
-                Some(r#"{"callgraph_chunk_size":7}"#)
+                Some(r#"{"idle": {"checkout_hours": 7}}"#)
             );
             assert!(response.data["warnings"]
                 .as_array()
@@ -6949,17 +6949,17 @@ mod tests {
             // "dir/file" literal keeps its `/` on Windows and would not match.
             let project_path = temp.path().join(format!(".{harness}")).join("aft.jsonc");
             let canonical = temp.path().join(".cortexkit").join("aft.jsonc");
-            let text = "{\n // committed config\n \"bash\": { \"compress\": false },\n \"callgraph_chunk_size\": 7,\n \"url_fetch_allow_private\": true\n}\n";
+            let text = "{\n // committed config\n \"bash\": { \"compress\": false },\n \"idle\": {\"checkout_hours\": 7},\n \"url_fetch_allow_private\": true\n}\n";
             write_config(&project_path, text);
             let request = configure_request_with_params(json!({
                 "project_root": temp.path(),
                 "harness": harness,
                 "cortexkit_user_config_path": temp.path().join("missing-user.jsonc"),
-                "config": [project_tier(json!({"callgraph_chunk_size": 4}))],
+                "config": [project_tier(json!({"idle": {"checkout_hours": 4}}))],
             }));
             let response = handle_configure_for_test(&request, &ctx);
             assert!(response.success, "{:?}", response.data);
-            assert_eq!(ctx.config().callgraph_chunk_size, 7);
+            assert_eq!(ctx.config().idle.checkout_hours, 7);
             assert!(!ctx.config().experimental_bash_compress);
             assert!(
                 !ctx.config().url_fetch_allow_private,
@@ -6985,21 +6985,21 @@ mod tests {
         let ctx = test_context();
         let user_path = temp.path().join("xdg/cortexkit/aft.jsonc");
         let project_path = temp.path().join(".cortexkit/aft.jsonc");
-        write_config(&project_path, r#"{ "callgraph_chunk_size": 7 }"#);
+        write_config(&project_path, r#"{ "idle": {"checkout_hours": 7} }"#);
         let req = configure_request_with_params(json!({
             "project_root": temp.path(),
             "harness": "opencode",
             "cortexkit_user_config_path": user_path,
             "config": [
                 user_tier(json!({ "url_fetch_allow_private": true })),
-                project_tier(json!({ "callgraph_chunk_size": 4 }))
+                project_tier(json!({ "idle": {"checkout_hours": 4} }))
             ]
         }));
 
         let response = handle_configure_for_test(&req, &ctx);
         assert!(response.success, "configure failed: {:?}", response.data);
         assert!(ctx.config().url_fetch_allow_private);
-        assert_eq!(ctx.config().callgraph_chunk_size, 7);
+        assert_eq!(ctx.config().idle.checkout_hours, 7);
     }
 
     #[test]
@@ -7012,14 +7012,14 @@ mod tests {
             &user_path,
             r#"{ "format_on_edit": false, "url_fetch_allow_private": false }"#,
         );
-        write_config(&project_path, r#"{ "callgraph_chunk_size": 9 }"#);
+        write_config(&project_path, r#"{ "idle": {"checkout_hours": 9} }"#);
         let req = configure_request_with_params(json!({
             "project_root": temp.path(),
             "harness": "opencode",
             "cortexkit_user_config_path": user_path,
             "config": [
                 user_tier(json!({ "format_on_edit": true, "url_fetch_allow_private": true })),
-                project_tier(json!({ "callgraph_chunk_size": 2 }))
+                project_tier(json!({ "idle": {"checkout_hours": 2} }))
             ]
         }));
 
@@ -7027,7 +7027,7 @@ mod tests {
         assert!(response.success, "configure failed: {:?}", response.data);
         assert!(!ctx.config().format_on_edit);
         assert!(!ctx.config().url_fetch_allow_private);
-        assert_eq!(ctx.config().callgraph_chunk_size, 9);
+        assert_eq!(ctx.config().idle.checkout_hours, 9);
     }
 
     #[test]
@@ -7041,7 +7041,7 @@ mod tests {
             "cortexkit_user_config_path": user_path,
             "config": [
                 user_tier(json!({ "format_on_edit": false, "url_fetch_allow_private": true })),
-                project_tier(json!({ "callgraph_chunk_size": 11 }))
+                project_tier(json!({ "idle": {"checkout_hours": 11} }))
             ]
         }));
 
@@ -7049,7 +7049,7 @@ mod tests {
         assert!(response.success, "configure failed: {:?}", response.data);
         assert!(!ctx.config().format_on_edit);
         assert!(ctx.config().url_fetch_allow_private);
-        assert_eq!(ctx.config().callgraph_chunk_size, 11);
+        assert_eq!(ctx.config().idle.checkout_hours, 11);
     }
 
     #[test]
@@ -7061,14 +7061,14 @@ mod tests {
             "harness": "opencode",
             "config": [
                 user_tier(json!({ "format_on_edit": false })),
-                project_tier(json!({ "callgraph_chunk_size": 13 }))
+                project_tier(json!({ "idle": {"checkout_hours": 13} }))
             ]
         }));
 
         let response = handle_configure_for_test(&req, &ctx);
         assert!(response.success, "configure failed: {:?}", response.data);
         assert!(!ctx.config().format_on_edit);
-        assert_eq!(ctx.config().callgraph_chunk_size, 13);
+        assert_eq!(ctx.config().idle.checkout_hours, 13);
     }
 
     #[test]
@@ -7676,7 +7676,7 @@ mod tests {
             &user,
             r#"{"indexes":{"trigram":true,"semantic":false,"callgraph":false},"url_fetch_allow_private":true}"#,
         );
-        write_config(&legacy, r#"{"callgraph_chunk_size":7}"#);
+        write_config(&legacy, r#"{"idle":{"checkout_hours":7}}"#);
         let snapshot = crate::subc_config::PreparedBindConfig::read(
             Some(&user),
             &root,
@@ -7699,14 +7699,14 @@ mod tests {
                 write_config(&user, r#"{"url_fetch_allow_private":false}"#);
                 write_config(
                     &root.join(".cortexkit/aft.jsonc"),
-                    r#"{"callgraph_chunk_size":9}"#,
+                    r#"{"idle":{"checkout_hours":9}}"#,
                 );
                 fs::remove_file(&legacy).unwrap();
                 lock.execute_batch("ROLLBACK").unwrap();
                 drop(lock);
                 super::drain_deferred_configure_maintenance(&ctx);
                 assert!(!ctx.provisional_identity_retry().is_armed());
-                assert_eq!(ctx.config().callgraph_chunk_size, 7);
+                assert_eq!(ctx.config().idle.checkout_hours, 7);
                 assert!(ctx.config().url_fetch_allow_private);
                 assert_eq!(
                     ctx.config_live().sources().unwrap().project.path.as_deref(),

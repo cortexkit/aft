@@ -12,6 +12,10 @@ pub const SANDBOX_PROFILE_VERSION: u32 = 7;
 pub struct SandboxDataPolicy {
     pub deny: Vec<PathBuf>,
     pub read_allow: Vec<PathBuf>,
+    /// Exact read-only file exceptions for macOS, even if a file is absent or
+    /// replaced by a directory before launch. Never grants descendant access.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_files: Vec<PathBuf>,
     pub write_allow: Vec<PathBuf>,
     /// Exact symlink paths on the way to a readable configured directory.
     /// These aliases permit metadata only; directory contents are allowed only
@@ -46,6 +50,17 @@ impl SandboxDataPolicy {
                 exact_files,
                 "data_policy.read_allow",
             )?,
+            read_files: {
+                let mut files = Vec::new();
+                for path in self.read_files {
+                    validate_absolute(&path, "data_policy.read_files")?;
+                    validate_normalized(&path, "data_policy.read_files")?;
+                    files.push(canonicalize_missing_path(path, "data_policy.read_files")?);
+                }
+                files.sort_unstable();
+                files.dedup();
+                files
+            },
             write_allow: canonicalize_data_allows(
                 self.write_allow,
                 exact_files,
@@ -788,6 +803,7 @@ mod tests {
         profile.data_policy = SandboxDataPolicy {
             deny: vec![common.clone()],
             read_allow: files.to_vec(),
+            read_files: Vec::new(),
             write_allow: files.to_vec(),
             read_metadata_allow: Vec::new(),
             session_task_read_dir: None,
@@ -888,6 +904,7 @@ mod tests {
         let policy = SandboxDataPolicy {
             deny: vec![store.clone()],
             read_allow: vec![lock.clone()],
+            read_files: Vec::new(),
             write_allow: vec![lock.clone()],
             read_metadata_allow: Vec::new(),
             session_task_read_dir: None,
@@ -918,6 +935,7 @@ mod tests {
         let policy = SandboxDataPolicy {
             deny: vec![store.clone()],
             read_allow: vec![own.clone(), io.clone(), hooks.clone()],
+            read_files: Vec::new(),
             write_allow: vec![own.clone(), io.clone()],
             read_metadata_allow: Vec::new(),
             session_task_read_dir: None,
@@ -957,20 +975,37 @@ mod tests {
     }
 
     #[test]
+    fn cortexkit_settings_grants_do_not_open_private_data_or_state() {
+        let root = tempfile::tempdir().unwrap();
+        // Policy paths omit the verbatim prefix Windows adds during canonicalization.
+        let home = crate::access_policy::policy_path(root.path());
+        let policy = crate::access_policy::AccessPolicy::from_config(
+            &crate::config::Config::default(),
+            &home.join(".local/share/cortexkit/aft"),
+            vec![home.clone()],
+            &home,
+        );
+        let settings = home.join(".config/cortexkit/x.jsonc");
+        policy
+            .private_stores
+            .validate_grants([settings.as_path()], &[], &[])
+            .unwrap();
+        for relative in [".local/share/cortexkit", ".local/state/cortexkit"] {
+            assert!(policy
+                .private_stores
+                .validate_grants([home.join(relative).as_path()], &[], &[])
+                .is_err());
+        }
+    }
+
+    #[test]
     fn native_credential_floor_normalizes_each_path_once_per_profile() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();
-        let deny: Vec<_> = [
-            ".ssh",
-            ".aws",
-            ".gnupg",
-            ".config/gcloud",
-            ".azure",
-            ".config/cortexkit",
-        ]
-        .into_iter()
-        .map(|name| root.join(name))
-        .collect();
+        let deny: Vec<_> = [".ssh", ".aws", ".gnupg", ".config/gcloud", ".azure"]
+            .into_iter()
+            .map(|name| root.join(name))
+            .collect();
         CANONICALIZE_CALLS.with(|count| count.set(0));
         let profile = SandboxProfile::build(
             vec![root.clone()],
@@ -985,14 +1020,15 @@ mod tests {
         .unwrap();
         let calls = CANONICALIZE_CALLS.with(std::cell::Cell::get);
         eprintln!("credential-floor canonicalize calls per profile: {calls}");
-        assert_eq!(calls, 22);
+        assert_eq!(calls, 18);
         let mut expected = deny;
         expected.sort_unstable();
         assert_eq!(profile.write_deny, expected);
         assert_eq!(profile.read_deny, expected);
+        assert!(!profile.read_deny.contains(&root.join(".config/cortexkit")));
         CANONICALIZE_CALLS.with(|count| count.set(0));
         assert_eq!(profile.clone().canonicalize_for_launch().unwrap(), profile);
-        assert_eq!(CANONICALIZE_CALLS.with(std::cell::Cell::get), 22);
+        assert_eq!(CANONICALIZE_CALLS.with(std::cell::Cell::get), 18);
     }
 
     #[cfg(unix)]

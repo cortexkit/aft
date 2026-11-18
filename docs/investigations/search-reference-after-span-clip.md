@@ -70,8 +70,8 @@ Behaviour moves (old rank -> new rank, MRR@10 old -> new):
   1.0 -> 1.0. Top ten reorders from position 2 (`configure.rs`, ... becomes
   `main.rs`, `url_fetch_test.rs`, `configure.rs`, ...).
 - `followup-census:9372` (mechanism `not_a_search_failure`): miss -> miss,
-  MRR 0.0 -> 0.0. Top ten reorders (`search_index.rs`, `migrate_storage.rs`,
-  ... becomes `inspect/cache.rs`, `backup.rs`, `migrate_storage.rs`, ...).
+  Mean reciprocal rank (MRR) 0.0 -> 0.0. Top ten reorders (`search_index.rs`,
+  ... becomes `inspect/cache.rs`, `backup.rs`, ...).
 
 Byte-only moves (top ten and metrics identical):
 

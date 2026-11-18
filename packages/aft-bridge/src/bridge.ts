@@ -23,6 +23,30 @@ import { HOST_TOOL_NAMES_FIELD, WORKER_SESSION_FIELD } from "./transport.js";
 import { DEADLINE_POLL_MS, RequestDeadline, WaitClock } from "./wait-clock.js";
 
 const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
+const MUTATION_TIMEOUT_GUIDANCE =
+  "The change may still complete; check its result before repeating it.";
+
+function toolMayChangeState(name: unknown, args: unknown): boolean {
+  if (name === "safety" || name === "aft_safety") {
+    const op = args && typeof args === "object" ? (args as Record<string, unknown>).op : undefined;
+    return op !== "history" && op !== "list";
+  }
+  return !new Set([
+    "read",
+    "outline",
+    "zoom",
+    "grep",
+    "glob",
+    "search",
+    "semantic_search",
+    "callgraph",
+    "inspect",
+    "conflicts",
+    "ast_search",
+    "ast_grep_search",
+    "hashline_preflight",
+  ]).has(typeof name === "string" ? name : "");
+}
 /** Default floor of the hang watchdog's silence window (`hangWindowMinMs`). */
 const DEFAULT_MIN_HANG_WINDOW_MS = 60_000;
 /** Default wait for the answer to the hang watchdog's `ping` (`hangProbeTimeoutMs`). */
@@ -1391,7 +1415,9 @@ export class BinaryBridge implements AftProjectTransport {
           }
           entry.reject(
             new Error(
-              `${this.errorPrefix} request "${command}" timed out after ${effectiveTimeoutMs}ms (bridge busy/under load); bridge kept warm — retry. A timed-out mutation may still complete; inspect before repeating it.`,
+              command === "tool_call" && toolMayChangeState(params.name, params.arguments)
+                ? `${this.errorPrefix} request "${command}" timed out after ${effectiveTimeoutMs}ms (bridge busy/under load). ${MUTATION_TIMEOUT_GUIDANCE}`
+                : `${this.errorPrefix} request "${command}" timed out after ${effectiveTimeoutMs}ms (bridge busy/under load); bridge kept warm — retry. A timed-out mutation may still complete; inspect before repeating it.`,
             ),
           );
         };

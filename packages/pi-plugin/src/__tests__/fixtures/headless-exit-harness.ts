@@ -8,7 +8,7 @@
  * lives after the shutdown hook returns.
  *
  * Only the seams that would need a real aft binary or a network download are
- * replaced (binary resolution, storage migration, ONNX Runtime download, and
+ * replaced (binary resolution, ONNX Runtime download, and
  * the concrete bridge pool). The pool is still wrapped in the real
  * RevivableTransportPool, so anything that calls into the pool after shutdown
  * really does revive it. A "bridge" in the fake pool is a ref'd interval, the
@@ -160,7 +160,6 @@ Bun.plugin({
         findBinarySync: () => "/fake/aft",
         findBinary: async () => "/fake/aft",
         ensureBinary: async () => "/fake/aft",
-        ensureStorageMigrated: async () => undefined,
         // Outside plugin-validate mode this resolves only after shutdown, so
         // the eager warmup is still waiting on it when the host tears the
         // session down.

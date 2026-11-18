@@ -112,7 +112,15 @@ fn changing_trailer_wording_fails_every_capped_fixture_assertion() {
     let mut fixtures = capped_fixtures();
     let fixture_count = fixtures.len();
     for fixture in &mut fixtures {
-        fixture.rendered = fixture.rendered.replace("shown ", "displayed ");
+        fixture.rendered = if fixture.surface.list_id == "payload.ignored_entries" {
+            // The boundary preview discloses its cap in its own sentence,
+            // rather than adding a second generic trailer to grep's matches.
+            fixture
+                .rendered
+                .replace("Not searched (ignore rules):", "Ignored:")
+        } else {
+            fixture.rendered.replace("shown ", "displayed ")
+        };
     }
 
     let failures = fixtures
@@ -124,6 +132,7 @@ fn changing_trailer_wording_fails_every_capped_fixture_assertion() {
     assert!(failures.contains(&"search/both_flags_mixed".to_string()));
     assert!(failures.contains(&"bash/capped_4000_in_61_out".to_string()));
     assert!(failures.contains(&"table/callgraph.impact:cap".to_string()));
+    assert!(failures.contains(&"grep/ignored_entries".to_string()));
 }
 
 #[test]

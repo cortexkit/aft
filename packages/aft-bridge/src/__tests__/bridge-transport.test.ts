@@ -36,6 +36,76 @@ function writeExecutable(_name: string, source: string): string {
 }
 
 describe("BinaryBridge transport regressions", () => {
+  test("tool_call timeout gives exact guidance for mutations and reads", async () => {
+    const script = writeExecutable(
+      "tool-timeout.js",
+      `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const req = JSON.parse(buffer.slice(0, newline));
+    buffer = buffer.slice(newline + 1);
+    if (req.command === "configure") process.stdout.write(JSON.stringify({ id: req.id, success: true, warnings: [] }) + "\\n");
+  }
+});
+`,
+    );
+    const bridge = new BinaryBridge(script, workDir, { timeoutMs: 1_000, maxRestarts: 0 });
+    try {
+      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 5_000 });
+      const mutations: Array<[string, Record<string, unknown>]> = [
+        ...[
+          "write",
+          "edit",
+          "apply_patch",
+          "delete",
+          "move",
+          "ast_replace",
+          "ast_grep_replace",
+          "bash",
+          "future_tool",
+        ].map((name): [string, Record<string, unknown>] => [name, {}]),
+        ...["add", "remove", "organize"].map((op): [string, Record<string, unknown>] => [
+          "import",
+          { op },
+        ]),
+        ...["undo", "restore", "purge", "checkpoint"].map(
+          (op): [string, Record<string, unknown>] => ["safety", { op }],
+        ),
+      ];
+      const reads: Array<[string, Record<string, unknown>]> = [
+        ["read", {}],
+        ["ast_search", {}],
+        ["safety", { op: "history" }],
+        ["safety", { op: "list" }],
+      ];
+      const message = async ([name, args]: [string, Record<string, unknown>]) =>
+        bridge.toolCall(undefined, name, args, { timeoutMs: 20 }).then(
+          () => "resolved",
+          (error) => error.message,
+        );
+      const [mutationMessages, readMessages] = await Promise.all([
+        Promise.all(mutations.map(message)),
+        Promise.all(reads.map(message)),
+      ]);
+      for (const text of mutationMessages) {
+        expect(text).toBe(
+          '[aft-bridge] request "tool_call" timed out after 20ms (bridge busy/under load). The change may still complete; check its result before repeating it.',
+        );
+      }
+      for (const text of readMessages) {
+        expect(text).toBe(
+          '[aft-bridge] request "tool_call" timed out after 20ms (bridge busy/under load); bridge kept warm — retry. A timed-out mutation may still complete; inspect before repeating it.',
+        );
+      }
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
   test("a retiring bridge rejects new work as transport unavailable before dispatch", async () => {
     const bridge = new BinaryBridge(
       writeExecutable("retiring-bridge.js", "#!/usr/bin/env node\n"),
@@ -795,7 +865,9 @@ process.stdin.on("data", (chunk) => {
           () => "resolved",
           (err) => String(err instanceof Error ? err.message : err),
         );
-      expect(first).toContain("bridge kept warm");
+      expect(first).toContain(
+        "The change may still complete; check its result before repeating it.",
+      );
 
       const secondResult = bridge
         .toolCall("timeout-session", "aft_inspect", {}, { timeoutMs: 20 })

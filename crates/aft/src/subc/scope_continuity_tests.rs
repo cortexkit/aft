@@ -117,11 +117,9 @@ impl Fixture {
         persistence::read_task_at(&layout).unwrap()
     }
 
-    async fn opened(&mut self, scope: &ScopeStamp) -> WriterFrame {
+    async fn opened(&mut self, _scope: &ScopeStamp) -> WriterFrame {
         let watch = request(&mut self.frames, "scope.watch").await;
         snapshot(&self.pending, &watch);
-        self.reply(scope, described(ScopeStatus::Live, true, true))
-            .await;
         turns().await;
         watch
     }
@@ -153,8 +151,7 @@ impl Fixture {
             serde_json::to_value(&live.owner).unwrap()
         );
         snapshot(&self.pending, &watch);
-        self.reply(live, described(ScopeStatus::Live, true, true))
-            .await;
+        turns().await;
         assert_eq!(self.status(), BgTaskStatus::Running);
         assert_eq!(self.metadata().lifecycle_scope(), Some(live));
         watch

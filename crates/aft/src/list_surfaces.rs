@@ -281,6 +281,18 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
     },
     SurfaceEntry {
         requires: None,
+        command: "grep",
+        mode: "",
+        list_id: "payload.ignored_entries",
+        unit: Unit::Paths,
+        narrow: &["path"],
+        reasons: &[
+            ReasonEntry { reason: Reason::Walk, kind: ReasonKind::Bounding, predicate_name: "MAX_IGNORE_PROBE_ENTRIES, ignored_entries_in_folder" },
+            ReasonEntry { reason: Reason::Cap, kind: ReasonKind::Selecting, predicate_name: "MAX_IGNORED_SCOPE_NAMES, ignored_entries_in_folder" },
+        ],
+    },
+    SurfaceEntry {
+        requires: None,
         command: "glob",
         mode: "",
         list_id: "payload.files",
@@ -363,7 +375,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         reasons: &[ReasonEntry {
             reason: Reason::Cap,
             kind: ReasonKind::Selecting,
-            predicate_name: "details_for, generated_details_for, test_only_details_for, uncovered_files_details_for, topk_limiting, write_skipped_files, filter_payload_for_scope, SKIPPED_FILES_LIMIT",
+            predicate_name: "details_for, generated_details_for, test_only_details_for, uncovered_files_details_for, topk_limiting, write_skipped_files, filter_payload_for_scope, SKIPPED_FILES_LIMIT, attach_complexity_size_skips",
         }],
     },
     SurfaceEntry {
@@ -922,6 +934,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "cap_text",
         location_or_primitive: "URL rendered text byte ceiling",
         reason: "remote document previews use an explicit truncated-at-N-of-M-bytes footer with URL and symbol narrowing advice; this is a byte cut, not a paginated list of records",
+    },
+    ExclusionEntry {
+        file: "edit.rs",
+        enclosing_item: "render_diff, separator, write_str, finish",
+        location_or_primitive: "shared optional diff response byte budget",
+        reason: "optional diff text is omitted as a whole with an explicit notice when its byte allowance is exceeded; every file outcome and line count remains, so this does not cut a result list",
     },
     ExclusionEntry {
         file: "commands/file_read_exact.rs",
@@ -1498,8 +1516,8 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "the PARTIAL status line shows every explicitly requested cause first, then previews unrequested causes up to MAX_INSPECT_HEADER_PARTS total parts and says `+N more`; every scanner reason stays in the body and the structured gaps, diagnostic overflow reasons are rendered in the body, and the cap never changes `complete`",
     },
     ExclusionEntry {
-        file: "commands/inspect.rs",
-        enclosing_item: "incomplete_analysis_reason",
+        file: "commands/inspect/gap_render.rs",
+        enclosing_item: "incomplete_analysis_reason_with_files",
         location_or_primitive: "commands::inspect::MAX_PARSE_FAILURE_FILES",
         reason: "an incomplete-analysis explanation previews five parse-failure paths with their parse reasons and says `+N more`; this is a coverage gap, not a findings page. The full failure count and structured parse_errors stay visible and scope can narrow the affected files; the preview never changes completeness",
     },

@@ -227,11 +227,11 @@ function buildSchema(): Record<string, unknown> {
           "Background indexes. Each defaults on and builds independently of which tools are registered. Project config can only turn an index off.",
       },
 
-      callgraph_chunk_size: {
-        type: "number",
-        default: 100,
+      memory: {
+        type: "string",
+        enum: ["lean", "balanced"],
         description:
-          "Number of files to parse in a single batch during callgraph store cold build. Lower values reduce peak memory during cold build; set to 0 to parse all files at once.",
+          "Machine-local resource profile, user config base only. lean uses less memory and can build more slowly: it uses a smaller shared block cache, four call-graph resolver threads on Linux and macOS, and immediate freed-memory return on Linux. Windows keeps all CPUs. balanced keeps the previous limits. When unset, total physical RAM selects lean below 8 GiB, otherwise balanced; unreadable RAM selects balanced. Changes apply to subsequent builds and shared block cache sizing without a restart. Other limits and meaning-search settings stay unchanged.",
       },
 
       inspect: {
@@ -513,9 +513,17 @@ function buildSchema(): Record<string, unknown> {
               },
               linux_scope: {
                 type: "boolean",
-                default: false,
+                default: true,
                 description:
-                  "Linux-only, user-tier opt-in. Run tool shells in transient systemd user scopes when systemd-run and the user manager are available; otherwise fall back to the normal spawn.",
+                  "Linux daemon scopes are on by default (user config only). User config can disable them. Standalone mode, PTY tasks, and native-sandbox launches use the usual spawn path. If systemd-run, the user manager, or cgroup access is unavailable, AFT uses the usual path.",
+              },
+              linux_scope_max_runtime_secs: {
+                type: "integer",
+                minimum: 1,
+                maximum: 4294967295,
+                default: 86400,
+                description:
+                  "User-only Linux daemon scope ceiling in seconds. Worker waits do not extend it. An explicit timeout uses its own limit plus 60 seconds.",
               },
               disclaim_privacy: {
                 type: "boolean",
@@ -923,7 +931,7 @@ function buildSchema(): Record<string, unknown> {
   configProperties.harnesses = {
     type: "object",
     description:
-      "Per-harness overrides. The active harness applies its override after the base config within each tier: user base, user override, project base, project override. storage.cache_dir is storage-wide and durability.macos_full_sync is process-wide; neither can be overridden here. Nested harnesses are ignored; unknown harness names are reserved for forward compatibility.",
+      "Per-harness overrides. The active harness applies its override after the base config within each tier: user base, user override, project base, project override. storage.cache_dir, durability.macos_full_sync and memory apply to the whole process; none can be overridden here. Nested harnesses are ignored; unknown harness names are reserved for forward compatibility.",
     additionalProperties: {
       type: "object",
       properties: { ...configProperties },

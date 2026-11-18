@@ -125,6 +125,10 @@ pub const RETIRED_IDLE_CHECKOUT_HOURS: (&str, &str) =
 /// `DATA_LAYER_KEYS_REFUSED_FROM`.
 pub const DATA_LAYER_KEYS_REFUSED_FROM: (u64, u64) = (0, 65);
 
+pub const CALLGRAPH_CHUNK_KEY: &str = "callgraph_chunk_size";
+pub const CALLGRAPH_CHUNK_REFUSED_FROM: (u64, u64) = (0, 67);
+pub const CALLGRAPH_CHUNK_NOTE: &str = "callgraph_chunk_size never had an effect, so the setting can be removed. From 0.67.0 AFT refuses a user config file that still sets it; run npx @cortexkit/aft doctor --fix.";
+
 /// The remaining version-gated data-layer rename. The removed no-effect keys
 /// already follow [`REFUSED_RETIRED_PATHS`]' user-only refusal policy.
 pub const DATA_LAYER_RETIRED_PATHS: [&str; 1] = ["views.idle_checkout_hours"];
@@ -246,6 +250,14 @@ fn removed_block_key_errors(
                 ));
             }
         }
+    }
+    if refuse_retired
+        && release >= CALLGRAPH_CHUNK_REFUSED_FROM
+        && map.contains_key(CALLGRAPH_CHUNK_KEY)
+    {
+        errors.push(format!(
+            "removed_config_key:{CALLGRAPH_CHUNK_KEY}; run npx @cortexkit/aft doctor --fix"
+        ));
     }
     errors
 }
@@ -666,6 +678,9 @@ fn translate_data_layer_paths(
     prefix: &str,
     out: &mut DocumentTranslation,
 ) {
+    if map.remove(CALLGRAPH_CHUNK_KEY).is_some() {
+        record_retired(out, prefix, CALLGRAPH_CHUNK_KEY);
+    }
     let (retired, replacement) = RETIRED_IDLE_CHECKOUT_HOURS;
     if let Some(value) = take_nested(map, "views", "idle_checkout_hours") {
         record_retired(out, prefix, retired);
@@ -1172,6 +1187,9 @@ pub const NO_EFFECT_RETIRED_NOTES: [(&str, &str); 4] = [
 /// The no-effect sentence for a retired key, which may carry a
 /// `harnesses.<id>.` prefix.
 fn no_effect_note(key: &str) -> Option<&'static str> {
+    if names_path(key, CALLGRAPH_CHUNK_KEY) {
+        return Some(CALLGRAPH_CHUNK_NOTE);
+    }
     NO_EFFECT_RETIRED_NOTES
         .iter()
         .chain(REMOVED_DATA_LAYER_NOTES.iter())
@@ -1384,6 +1402,7 @@ fn project_block(block: &Map<String, Value>) -> Value {
         .chain(DATA_LAYER_RETIRED_PATHS)
         .chain(["bash.runon_enabled"])
         .chain(REMOVED_DATA_LAYER_PATHS)
+        .chain([CALLGRAPH_CHUNK_KEY])
     {
         let value = match path.split_once('.') {
             Some((container, leaf)) => block
@@ -2111,6 +2130,32 @@ mod tests {
             for doc in [&base, &harness] {
                 assert!(removed_errors(doc.as_object().unwrap(), (0, 65), false).is_empty());
             }
+        }
+    }
+
+    #[test]
+    fn callgraph_chunk_size_config_refuses_user_only_from_067() {
+        for (doc, prefix) in [
+            (json!({"callgraph_chunk_size":100}), ""),
+            (
+                json!({"harnesses":{"pi":{"callgraph_chunk_size":100}}}),
+                "harnesses.pi.",
+            ),
+        ] {
+            let map = doc.as_object().unwrap();
+            assert!(removed_errors(map, (0, 66), true).is_empty());
+            assert_eq!(removed_errors(map, (0, 67), true), vec![format!("removed_config_key:{prefix}callgraph_chunk_size; run npx @cortexkit/aft doctor --fix")]);
+            assert!(removed_errors(map, (0, 67), false).is_empty());
+            let mut translated = map.clone();
+            let out = translate_document(&mut translated, DocumentTier::Project);
+            assert!(out.legacy_input);
+            assert!(!serde_json::to_string(&translated)
+                .unwrap()
+                .contains("callgraph_chunk_size"));
+            assert_eq!(
+                project_retired_keys_notice("/project/aft.jsonc", &out),
+                CALLGRAPH_CHUNK_NOTE
+            );
         }
     }
 

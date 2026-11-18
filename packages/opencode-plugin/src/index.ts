@@ -296,7 +296,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     client: input.client,
     directory: input.directory,
   };
-  // Binary resolution, storage migration, the flat configure overrides, ONNX
+  // Binary resolution, the flat configure overrides, ONNX
   // Runtime, and LSP auto-install all come from the bootstrap shared with the
   // OpenCode 2 entry, so both hosts configure bridges identically.
   const bridgeEnvironment = await prepareBridgeEnvironment({

@@ -3098,11 +3098,14 @@ mod tests {
                 assert_eq!(result["diff"]["deletions"], original["diff"]["deletions"]);
                 let saved = serde_json::to_vec(&original).unwrap().len() as isize
                     - serde_json::to_vec(&result).unwrap().len() as isize;
-                if before.len().max(after.len()) <= 512 * 1024 {
+                if before.len().max(after.len()) < 512 * 1024 {
                     assert_eq!(original["diff"]["before"], *before);
                     assert_eq!(original["diff"]["after"], *after);
                     assert!(saved > 0);
                 } else {
+                    assert_eq!(original["diff_preview_omitted"], true);
+                    assert!(original["diff"].get("before").is_none());
+                    assert!(original["diff"].get("after").is_none());
                     assert_eq!(original["diff"]["truncated"], true);
                 }
                 println!(

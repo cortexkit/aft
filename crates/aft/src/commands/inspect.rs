@@ -2618,80 +2618,13 @@ fn compact_inspect_reason(reason: &str) -> String {
         .join(" ")
 }
 
-const MAX_PARSE_FAILURE_FILES: usize = 5;
+mod gap_render;
+use gap_render::{
+    attach_complexity_size_skips, incomplete_analysis_reason,
+    incomplete_analysis_reason_with_files, render_complexity_skipped_files,
+};
 
-fn incomplete_analysis_reason(value: &Value) -> String {
-    let mut reasons = Vec::new();
-    if let Some(files) = value
-        .get("parse_errors")
-        .and_then(Value::as_array)
-        .filter(|files| !files.is_empty())
-    {
-        let label = if files.len() == 1 { "file" } else { "files" };
-        let names = files
-            .iter()
-            .take(MAX_PARSE_FAILURE_FILES)
-            .filter_map(|file| {
-                let path = file.get("file").and_then(Value::as_str)?;
-                Some(
-                    match file
-                        .get("message")
-                        .or_else(|| file.get("reason"))
-                        .and_then(Value::as_str)
-                    {
-                        Some(reason) => format!(
-                            "{path} ({})",
-                            reason.split_whitespace().collect::<Vec<_>>().join(" ")
-                        ),
-                        None => path.to_string(),
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut reason = format!("{} {label} could not be parsed", files.len());
-        if !names.is_empty() {
-            reason.push_str(": ");
-            reason.push_str(&names.join(", "));
-            let remaining = files.len().saturating_sub(names.len());
-            if remaining > 0 {
-                reason.push_str(&format!(", +{remaining} more"));
-            }
-        }
-        reasons.push(reason);
-    }
-    if let Some(files) = value
-        .get("skipped_files")
-        .and_then(Value::as_array)
-        .filter(|files| !files.is_empty())
-    {
-        // Complexity and duplicates cap their list and carry the full total
-        // in `skipped_files_count`; their line says how many files were
-        // skipped and why. Other categories keep their own wording.
-        let total = value.get("skipped_files_count").and_then(Value::as_u64);
-        let count = total.unwrap_or(files.len() as u64);
-        let label = if count == 1 { "file" } else { "files" };
-        let mut causes = files
-            .iter()
-            .map(|file| file.get("reason").and_then(Value::as_str));
-        let first = causes.next().flatten();
-        let shared_cause = first.filter(|first| causes.all(|cause| cause == Some(*first)));
-        match (total, shared_cause) {
-            (Some(_), Some(cause)) => reasons.push(format!("{count} {label} skipped ({cause})")),
-            (Some(_), None) => reasons.push(format!("{count} {label} skipped")),
-            (None, _) => reasons.push(format!("{count} {label} could not be analyzed")),
-        }
-    }
-    if !reasons.is_empty() {
-        return reasons.join("; ");
-    }
-    compact_inspect_reason(
-        value
-            .get("reason")
-            .or_else(|| value.get("callgraph_unavailable_reason"))
-            .and_then(Value::as_str)
-            .unwrap_or("analysis did not finish"),
-    )
-}
+const MAX_PARSE_FAILURE_FILES: usize = 5;
 
 fn incomplete_category_gaps(category: InspectCategory, value: &Value) -> Vec<Value> {
     if let Some(gaps) = value
@@ -2730,13 +2663,21 @@ fn incomplete_summary_parts(
             Some("rebuilding") => "still rebuilding".to_string(),
             Some(state) => format!("still building ({})", state.replace('_', " ")),
             None => {
-                let reason = value
-                    .get("gaps")
+                let reason = if value
+                    .get("parse_errors")
                     .and_then(Value::as_array)
-                    .and_then(|gaps| gaps.first())
-                    .and_then(|gap| gap["reason"].as_str())
-                    .map(compact_inspect_reason)
-                    .unwrap_or_else(|| incomplete_analysis_reason(value));
+                    .is_some_and(|files| !files.is_empty())
+                {
+                    incomplete_analysis_reason_with_files(value, false)
+                } else {
+                    value
+                        .get("gaps")
+                        .and_then(Value::as_array)
+                        .and_then(|gaps| gaps.first())
+                        .and_then(|gap| gap["reason"].as_str())
+                        .map(compact_inspect_reason)
+                        .unwrap_or_else(|| incomplete_analysis_reason(value))
+                };
                 let status =
                     if value["unavailable"] == true || value["callgraph_available"] == false {
                         "unavailable"
@@ -3695,6 +3636,13 @@ fn build_inspect_payload_with_offset(
         }
     }
 
+    attach_complexity_size_skips(
+        &summary,
+        &mut details,
+        &snapshot.project_root,
+        top_k,
+        offset,
+    );
     let complete = partial_summary_reason(&summary, sections).is_none() && scope_complete;
     let text = render_inspect_text(
         &summary,
@@ -3967,6 +3915,7 @@ fn render_incomplete_categories(
     {
         lines.push(format!("Incomplete diagnostics: {}", part.text));
     }
+    let mut listed_gaps = BTreeMap::<String, &str>::new();
     for (category, value) in summary {
         if value.get("complete").and_then(Value::as_bool) != Some(false) {
             continue;
@@ -3985,6 +3934,31 @@ fn render_incomplete_categories(
                 .get("reason")
                 .and_then(Value::as_str)
                 .unwrap_or("unavailable");
+            if gap["kind"] == "analysis_incomplete"
+                && ["parse_errors", "skipped_files"].iter().any(|key| {
+                    value
+                        .get(key)
+                        .and_then(Value::as_array)
+                        .is_some_and(|files| !files.is_empty())
+                })
+            {
+                // Compare the full file sets, not just the capped preview: two
+                // lists with the same first five files can have different gaps.
+                let key = serde_json::json!([
+                    gap,
+                    value["parse_errors"],
+                    value["skipped_files"],
+                    value["skipped_files_count"]
+                ])
+                .to_string();
+                if let Some(owner) = listed_gaps.get(&key) {
+                    lines.push(format!(
+                        "Incomplete {category}: same gap as {owner} (see above)"
+                    ));
+                    continue;
+                }
+                listed_gaps.insert(key, category);
+            }
             if gap.get("kind").and_then(Value::as_str) == Some("tier2_unavailable") {
                 lines.push(format!(
                     "Incomplete {category}: Tier-2 unavailable ({reason})"
@@ -4086,6 +4060,7 @@ fn render_complexity_category(
         .unwrap_or(10);
     if count == 0 {
         lines.push(format!("Cyclomatic complexity: 0 functions >= {threshold}"));
+        render_complexity_skipped_files(lines, details);
         return;
     }
     let worst = section.get("worst").and_then(Value::as_object);
@@ -4098,6 +4073,7 @@ fn render_complexity_category(
     lines.push(format!(
         "Cyclomatic complexity: {count} functions >= {threshold}{worst_text}"
     ));
+    render_complexity_skipped_files(lines, details);
     let Some(items) = details.get("complexity").and_then(Value::as_array) else {
         return;
     };
@@ -5726,6 +5702,171 @@ mod status_bar_refresh_tests {
 mod render_text_tests {
     use super::*;
 
+    #[test]
+    fn inspect_gap_lists_compare_hidden_files_and_keep_the_parse_cap() {
+        let shared = (0..6).map(|index| serde_json::json!({"file": format!("file{index}.ts"), "message": "invalid"})).collect::<Vec<_>>();
+        let mut different = shared.clone();
+        different[5]["file"] = serde_json::json!("other.ts");
+        let mut summary = Map::new();
+        for (category, files) in [
+            ("unused_exports", &shared),
+            ("cycles", &shared),
+            ("dead_code", &different),
+        ] {
+            let mut value = serde_json::json!({"complete": false, "parse_errors": files});
+            value["gaps"] = serde_json::json!([{"kind": "analysis_incomplete", "reason": incomplete_analysis_reason(&value)}]);
+            summary.insert(category.to_string(), value);
+        }
+        let text = render_inspect_text(&summary, &Map::new(), None, &Sections::summary_only());
+        assert!(
+            text.contains("Incomplete cycles: same gap as unused_exports (see above)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Incomplete dead_code: 6 files could not be parsed: file0.ts"),
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("file4.ts (invalid), +1 more").count(),
+            2,
+            "{text}"
+        );
+        assert!(
+            !text.contains("file5.ts") && !text.contains("other.ts"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn inspect_complexity_skips_are_counted_only_after_the_display_cap() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("visible.rs"), "one\ntwo\n").unwrap();
+        let summary = summary_map(serde_json::json!({"complexity": {
+            "count": 0, "skipped_files_count": 2,
+            "skipped_files": [
+                {"file": "visible.rs", "reason": "over the 1 MiB size limit"},
+                {"file": "hidden.rs", "reason": "over the 1 MiB size limit"}
+            ]
+        }}));
+        let mut details = Map::new();
+        attach_complexity_size_skips(&summary, &mut details, root.path(), 1, 0);
+        assert_eq!(
+            details["complexity_skipped_files"],
+            serde_json::json!([
+                {"file": "visible.rs", "reason": "over the 1 MiB size limit", "lines": 2, "lines_exact": true}
+            ])
+        );
+        let text = render_inspect_text(&summary, &details, None, &Sections::summary_only());
+        assert_eq!(text, "Cyclomatic complexity: 0 functions >= 10\nComplexity skipped files:\n  visible.rs (2 lines; over the 1 MiB size limit)\nshown 1 of 2 items (cap) · narrow: topK, scope, sections");
+        details["complexity_skipped_files"][0]["lines_exact"] = Value::Bool(false);
+        assert!(
+            render_inspect_text(&summary, &details, None, &Sections::summary_only())
+                .contains("visible.rs (at least 2 lines; over the 1 MiB size limit)")
+        );
+    }
+
+    #[test]
+    fn inspect_gap_fixture_golden() {
+        use crate::inspect::oxc_engine::{analyze_files, AnalyzeOptions};
+        use crate::inspect::scanners::{complexity, cycles, metrics, unused_exports};
+        use crate::inspect::{InspectJob, JobKey};
+
+        let root = tempfile::tempdir().unwrap();
+        let files = [
+            ("broken.mjs", "return;\n".repeat(8)),
+            ("script.js", "return;\n".to_string()),
+            ("script.cjs", "return;\n".to_string()),
+            ("large.rs", "// handwritten source\n".repeat(50_000)),
+        ];
+        let paths = files
+            .iter()
+            .map(|(name, source)| {
+                let path = root.path().join(name);
+                std::fs::write(&path, source).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let graph = analyze_files(root.path(), &paths, AnalyzeOptions::default()).unwrap();
+        let mut job = InspectJob {
+            job_id: 1,
+            key: JobKey::for_project_category(InspectCategory::Complexity),
+            category: InspectCategory::Complexity,
+            scope_files: paths,
+            project_root: root.path().to_path_buf(),
+            inspect_dir: root.path().join(".aft"),
+            config: Arc::new(Config::default()),
+            symbol_cache: Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new())),
+            inspect_writer: true,
+            callgraph_writer: true,
+            callgraph_snapshot: None,
+        };
+        let mut summary = Map::new();
+        let mut details = summary_map(serde_json::json!({"cycles": []}));
+        for category in [
+            InspectCategory::Complexity,
+            InspectCategory::Metrics,
+            InspectCategory::UnusedExports,
+            InspectCategory::Cycles,
+        ] {
+            job.category = category;
+            job.key = JobKey::for_project_category(category);
+            let result = match category {
+                InspectCategory::Complexity => complexity::run_complexity_scan(&job),
+                InspectCategory::Metrics => metrics::run_metrics_scan(&job),
+                InspectCategory::UnusedExports => {
+                    unused_exports::run_unused_exports_scan_with_oxc(&job, Some(&graph))
+                }
+                InspectCategory::Cycles => cycles::run_cycles_scan_with_oxc(&job, Some(&graph)),
+                _ => unreachable!(),
+            };
+            let payload = result.outcome.unwrap().aggregate;
+            let mut value = summary_for(category, &payload);
+            if category_is_incomplete(&payload) {
+                value["complete"] = Value::Bool(false);
+                value["gaps"] = serde_json::json!(incomplete_category_gaps(category, &payload));
+                for key in ["parse_errors", "skipped_files", "skipped_files_count"] {
+                    if let Some(field) = payload.get(key) {
+                        value[key] = field.clone();
+                    }
+                }
+            }
+            summary.insert(category.as_str().to_string(), value);
+        }
+        attach_complexity_size_skips(&summary, &mut details, root.path(), 40, 0);
+        let text = render_inspect_text(&summary, &details, None, &Sections::summary_only());
+        assert_eq!(graph.errors.len(), 1);
+        for fact in graph.facts.iter().filter(|fact| {
+            fact.path
+                .extension()
+                .is_some_and(|ext| ext == "js" || ext == "cjs")
+        }) {
+            assert!(fact.parse_error.is_none());
+            assert!(fact.exports.is_empty());
+        }
+        assert_eq!(text, concat!(
+            "PARTIAL — unused exports, cycles incomplete: 1 file could not be parsed; complexity, metrics incomplete: 1 file skipped (over the 1 MiB size limit); retry aft_inspect.\n",
+            "Incomplete complexity: 1 file skipped (over the 1 MiB size limit)\n",
+            "Incomplete metrics: same gap as complexity (see above)\n",
+            "Incomplete unused_exports: 1 file could not be parsed: broken.mjs (parse: A 'return' statement can only be used within a function body. (×8))\n",
+            "Incomplete cycles: same gap as unused_exports (see above)\n",
+            "Cyclomatic complexity: 0 functions >= 10\n",
+            "Complexity skipped files:\n",
+            "  large.rs (50000 lines; over the 1 MiB size limit)\n",
+            "Import cycles: 0\n",
+            "Unused exports: 0\n",
+            "A symbol used only from files that could not be parsed may appear in this list."
+        ));
+        let response = Response::success(
+            "inspect-fixture",
+            serde_json::json!({
+                "inspect_terminal": "partial", "text": text,
+                "partial_reason": partial_summary_reason(&summary, &Sections::summary_only()),
+                "summary": summary, "details": details,
+            }),
+        );
+        assert_eq!(crate::subc_format::format_inspect_for_test(&response), text);
+    }
+
     fn summary_map(value: Value) -> Map<String, Value> {
         value.as_object().cloned().unwrap_or_default()
     }
@@ -6784,13 +6925,12 @@ mod fresh_payload_tests {
         let response = header_response(&payloads, &Sections::summary_only());
         assert_header(
             &response,
-            "PARTIAL — unused exports incomplete: 1 file could not be parsed: a.ts (parse failed); retry aft_inspect.",
+            "PARTIAL — unused exports incomplete: 1 file could not be parsed; retry aft_inspect.",
             false,
         );
-        assert!(response.data["text"]
-            .as_str()
-            .unwrap()
-            .contains("1 file could not be parsed"));
+        assert!(response.data["text"].as_str().unwrap().contains(
+            "Incomplete unused_exports: 1 file could not be parsed: a.ts (parse failed)"
+        ));
     }
 
     #[test]

@@ -37,6 +37,32 @@ thread_local! {
     /// wall-clock time cannot show on a loaded machine.
     static FALLBACK_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TARGET_WALK_BUILDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static IGNORE_PROBE_STATE: std::cell::Cell<Option<IgnoreProbeStateForTest>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum IgnoreProbeStateForTest {
+    Ready,
+    Pending,
+    Busy,
+}
+
+/// Pin completion on the calling thread without changing process-wide state
+/// or racing the optional worker. Evidence still comes from the real folder.
+#[cfg(test)]
+pub(crate) fn with_ignore_probe_state_for_test<R>(
+    state: IgnoreProbeStateForTest,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<IgnoreProbeStateForTest>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            IGNORE_PROBE_STATE.with(|current| current.set(self.0));
+        }
+    }
+    let _restore = Restore(IGNORE_PROBE_STATE.with(|current| current.replace(Some(state))));
+    run()
 }
 
 /// Records that a fallback filesystem walk started on this thread.
@@ -274,6 +300,199 @@ pub(crate) struct ScopeFileCounts {
     pub filtered: usize,
     pub eligible: usize,
     pub entries_visited: usize,
+}
+
+pub(crate) const MAX_IGNORE_PROBE_ENTRIES: usize = 4096;
+pub(crate) const MAX_IGNORED_SCOPE_NAMES: usize = 3;
+
+#[derive(Debug, Default)]
+pub(crate) struct IgnoredScopeEntries {
+    pub names: Vec<String>,
+    pub total: usize,
+    pub truncated: bool,
+}
+
+const IGNORE_PROBE_JOIN_BUDGET: Duration = Duration::from_millis(1);
+
+#[derive(Debug)]
+pub(crate) struct IgnoredScopeProbe {
+    result: std::sync::mpsc::Receiver<Option<IgnoredScopeEntries>>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    deadline: Instant,
+    #[cfg(any(test, feature = "test-hooks"))]
+    _pending: Option<std::sync::mpsc::SyncSender<Option<IgnoredScopeEntries>>>,
+}
+
+impl IgnoredScopeProbe {
+    pub(crate) fn finish(self) -> Option<IgnoredScopeEntries> {
+        let wait =
+            IGNORE_PROBE_JOIN_BUDGET.min(self.deadline.saturating_duration_since(Instant::now()));
+        self.result.recv_timeout(wait).ok().flatten()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn ready(result: Option<IgnoredScopeEntries>, deadline: Instant) -> Self {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let _ = sender.send(result);
+        Self {
+            result: receiver,
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            deadline,
+            _pending: None,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn pending(deadline: Instant) -> Self {
+        let (sender, result) = std::sync::mpsc::sync_channel(1);
+        Self {
+            result,
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            deadline,
+            _pending: Some(sender),
+        }
+    }
+}
+
+impl Drop for IgnoredScopeProbe {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+type IgnoreProbeJob = Box<dyn FnOnce() + Send>;
+
+struct IgnoreProbeWorker {
+    sender: std::sync::mpsc::SyncSender<IgnoreProbeJob>,
+    busy: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct IgnoreProbeBusy(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for IgnoreProbeBusy {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl IgnoreProbeWorker {
+    fn new() -> Option<Self> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<IgnoreProbeJob>(1);
+        std::thread::Builder::new()
+            .name("aft-grep-ignore-probe".into())
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                }
+            })
+            .ok()?;
+        Some(Self {
+            sender,
+            busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+
+    fn start(
+        &self,
+        deadline: Instant,
+        work: impl FnOnce(Arc<std::sync::atomic::AtomicBool>) -> Option<IgnoredScopeEntries>
+            + Send
+            + 'static,
+    ) -> Option<IgnoredScopeProbe> {
+        if self
+            .busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return None;
+        }
+        let busy = IgnoreProbeBusy(Arc::clone(&self.busy));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = Arc::clone(&cancelled);
+        let (sender, result) = std::sync::mpsc::sync_channel(1);
+        self.sender
+            .try_send(Box::new(move || {
+                let _busy = busy;
+                if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+                    return;
+                }
+                let answer = work(Arc::clone(&stop));
+                if !stop.load(Ordering::Acquire) {
+                    let _ = sender.send(answer);
+                }
+            }))
+            .ok()?;
+        Some(IgnoredScopeProbe {
+            result,
+            cancelled,
+            deadline,
+            #[cfg(any(test, feature = "test-hooks"))]
+            _pending: None,
+        })
+    }
+}
+
+/// Ignore coverage is optional: it never queues behind another probe or uses
+/// search's Rayon workers. A late answer is discarded after a one-ms join.
+pub(crate) fn start_scope_ignored_probe(scope: &GrepScope) -> Option<IgnoredScopeProbe> {
+    let [root] = scope.roots.as_slice() else {
+        return None;
+    };
+    if crate::context::confinement::active() || root.ignored_target {
+        return None;
+    }
+    let deadline = crate::bounded_io::deadline_before_io_timeout(
+        &root.search_root,
+        fallback_walk_budget(),
+        FALLBACK_WALK_RETURN_MARGIN,
+    );
+    if Instant::now() >= deadline {
+        return None;
+    }
+    #[cfg(test)]
+    if let Some(state) = IGNORE_PROBE_STATE.with(std::cell::Cell::get) {
+        return match state {
+            IgnoreProbeStateForTest::Ready => Some(IgnoredScopeProbe::ready(
+                scope_ignored_entries(scope),
+                deadline,
+            )),
+            IgnoreProbeStateForTest::Pending => Some(IgnoredScopeProbe::pending(deadline)),
+            IgnoreProbeStateForTest::Busy => None,
+        };
+    }
+    #[cfg(feature = "test-hooks")]
+    match std::env::var("AFT_TEST_GREP_IGNORE_PROBE").as_deref() {
+        Ok("ready") => {
+            return Some(IgnoredScopeProbe::ready(
+                scope_ignored_entries(scope),
+                deadline,
+            ));
+        }
+        Ok("pending") => return Some(IgnoredScopeProbe::pending(deadline)),
+        Ok("busy") => return None,
+        _ => {}
+    }
+    static WORKER: std::sync::OnceLock<Option<IgnoreProbeWorker>> = std::sync::OnceLock::new();
+    let worker = WORKER.get_or_init(IgnoreProbeWorker::new).as_ref()?;
+    let scope = scope.clone();
+    let fence = crate::context::confinement::capture().without_floor_disclosure();
+    let alloc_label = crate::alloc_trace::carry();
+    let cancellation = crate::executor::current_job_cancellation();
+    // Do not retain the request's mutable failure/skip collectors in work that
+    // may outlive its reply. The independent budget still ends with the request.
+    let budget = crate::bounded_io::with_budget(None, || {
+        crate::bounded_io::Budget::after(deadline.saturating_duration_since(Instant::now()))
+            .capped(deadline)
+    });
+    worker.start(deadline, move |cancelled| {
+        let _alloc_label = alloc_label.enter();
+        let _cancellation = cancellation.map(crate::executor::install_job_cancellation);
+        crate::context::confinement::inherit(fence, || {
+            crate::bounded_io::with_budget(Some(budget), || {
+                scope_ignored_entries_cancellable(&scope, cancelled)
+            })
+        })
+    })
 }
 
 impl ScopeFileCounts {
@@ -1312,6 +1531,7 @@ pub(crate) fn fallback_project_walk_builder(
         false,
         false,
         Some(search_root),
+        None,
     )
 }
 
@@ -1336,6 +1556,7 @@ fn fallback_target_walk_builder(
         ignored_target,
         ignore_ancestors,
         filter_root,
+        None,
     ))
 }
 
@@ -1347,6 +1568,7 @@ fn target_walk_builder(
     ignored_target: bool,
     ignore_ancestors: bool,
     filter_root: Option<&Path>,
+    max_depth: Option<usize>,
 ) -> WalkBuilder {
     #[cfg(test)]
     TARGET_WALK_BUILDERS.with(|count| count.set(count.get() + 1));
@@ -1364,7 +1586,10 @@ fn target_walk_builder(
         .unwrap_or_default();
     // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
     // the daemon, so never open directories outside this walk root's filesystem.
-    builder.same_file_system(true).hidden(false);
+    builder
+        .same_file_system(true)
+        .hidden(false)
+        .max_depth(max_depth);
     // Skip nested linked worktrees of this repository: their files are indexed
     // under their own roots, and walking them here duplicates every file.
     // The named starting path itself is always admitted (depth 0), so an
@@ -1430,7 +1655,11 @@ fn target_walk_builder(
                     return false;
                 }
             }
+            // A directory at the depth limit is only named, never opened.
+            // Probing its contents would turn a shallow ignore comparison
+            // into extra reads below the searched folder.
             !is_dir
+                || max_depth.is_some_and(|depth| entry.depth() >= depth)
                 || crate::bounded_io::probe_walk_directory(&permission_root, entry.path()).is_ok()
         });
     if ignored_target {
@@ -1511,6 +1740,168 @@ impl TargetIgnoreRules {
 pub(crate) fn target_is_ignored(path: &Path) -> bool {
     crate::bounded_io::run(path, None, |path| Ok(target_is_ignored_unbounded(&path)))
         .unwrap_or(false)
+}
+
+/// Compare the walker's admitted names with one immediate directory listing.
+/// The iterator is lazy so callers can stop before reading an oversized folder.
+fn compared_directory_entries<'a>(
+    directory: &Path,
+    accepted: &'a HashSet<std::ffi::OsString>,
+) -> std::io::Result<impl Iterator<Item = std::io::Result<(std::fs::DirEntry, bool)>> + 'a> {
+    Ok(std::fs::read_dir(directory)?.map(move |entry| {
+        entry.map(|entry| {
+            let admitted = accepted.contains(&entry.file_name());
+            (entry, admitted)
+        })
+    }))
+}
+
+/// Only ignored project content belongs in the disclosure. Repository pointers,
+/// nested worktrees, OS metadata and AFT's storage are not searchable content;
+/// naming those implementation details would add a line to every Git checkout.
+fn is_disclosable_ignore_boundary(
+    entry: &std::fs::DirEntry,
+    kind: &std::fs::FileType,
+    worktrees: &crate::project_content::NestedWorktreeBoundary,
+) -> bool {
+    entry.file_name() != ".git"
+        && !crate::project_content::is_excluded_with_file_type(&entry.path(), Some(kind))
+        && !(kind.is_dir() && worktrees.is_nested_worktree_root(&entry.path()))
+        && crate::bash_background::registry::safe_task_entry(&entry.path())
+}
+
+/// Evidence is limited to the named folder's children, never ignored subtrees.
+/// An incomplete accepted-name set cannot prove that a missing name was ignored.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn scope_ignored_entries(scope: &GrepScope) -> Option<IgnoredScopeEntries> {
+    scope_ignored_entries_cancellable(scope, Arc::new(std::sync::atomic::AtomicBool::new(false)))
+}
+
+fn scope_ignored_entries_cancellable(
+    scope: &GrepScope,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+) -> Option<IgnoredScopeEntries> {
+    let [root] = scope.roots.as_slice() else {
+        return None;
+    };
+    if cancelled.load(Ordering::Acquire)
+        || crate::context::confinement::active()
+        || root.ignored_target
+    {
+        return None;
+    }
+    let filter_root = root.filter_root.clone();
+    let deadline = crate::bounded_io::deadline_before_io_timeout(
+        &root.search_root,
+        fallback_walk_budget(),
+        FALLBACK_WALK_RETURN_MARGIN,
+    );
+    if Instant::now() >= deadline {
+        return None;
+    }
+    // This optional qualification must not turn already-found matches into an
+    // I/O error. Honor the remaining request time, but keep probe failures out
+    // of the search's recorded I/O failures and skipped-file reports.
+    let budget =
+        crate::bounded_io::Budget::after(deadline.saturating_duration_since(Instant::now()))
+            .capped(deadline);
+    crate::bounded_io::with_budget(Some(budget), || {
+        if !crate::bounded_io::metadata(&root.search_root).is_ok_and(|meta| meta.is_dir()) {
+            return None;
+        }
+        let cancellation = crate::executor::current_job_cancellation();
+        crate::bounded_io::run(&root.search_root, None, move |search_root| {
+            let _cancellation = cancellation.map(crate::executor::install_job_cancellation);
+            Ok(ignored_entries_in_folder(
+                &filter_root,
+                &search_root,
+                deadline,
+                &cancelled,
+            ))
+        })
+        .ok()
+        .flatten()
+    })
+}
+
+fn ignored_entries_in_folder(
+    filter_root: &Path,
+    search_root: &Path,
+    deadline: Instant,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Option<IgnoredScopeEntries> {
+    let within_budget = || {
+        !cancelled.load(Ordering::Acquire)
+            && Instant::now() < deadline
+            && !crate::executor::current_job_cancelled()
+    };
+    if !within_budget() {
+        return None;
+    }
+    let skipped = Arc::new(AtomicUsize::new(0));
+    let builder = target_walk_builder(
+        search_root,
+        Arc::clone(&skipped),
+        false,
+        false,
+        Some(filter_root),
+        Some(1),
+    );
+    let mut accepted = HashSet::new();
+    for entry in builder.build() {
+        if !within_budget() {
+            return None;
+        }
+        let entry = entry.ok()?;
+        if entry.depth() == 0 {
+            continue;
+        }
+        if accepted.len() == MAX_IGNORE_PROBE_ENTRIES {
+            return None;
+        }
+        accepted.insert(entry.file_name().to_os_string());
+    }
+    if skipped.load(Ordering::Relaxed) > 0 {
+        return None;
+    }
+    let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(search_root);
+    let mut result = IgnoredScopeEntries::default();
+    for (visited, entry) in compared_directory_entries(search_root, &accepted)
+        .ok()?
+        .enumerate()
+    {
+        if !within_budget() {
+            return None;
+        }
+        if visited == MAX_IGNORE_PROBE_ENTRIES {
+            result.truncated = true;
+            break;
+        }
+        let (entry, admitted) = entry.ok()?;
+        if admitted {
+            continue;
+        }
+        let kind = entry.file_type().ok()?;
+        if !is_disclosable_ignore_boundary(&entry, &kind, &worktrees) {
+            continue;
+        }
+        result.total += 1;
+        let name = format!(
+            "{}{}",
+            entry.file_name().to_string_lossy(),
+            if kind.is_dir() { "/" } else { "" }
+        );
+        // Retain only the first display names in lexical order, not every
+        // ignored entry in a wide folder.
+        let position = result.names.binary_search(&name).unwrap_or_else(|pos| pos);
+        if position < MAX_IGNORED_SCOPE_NAMES {
+            result.names.insert(position, name);
+            if result.names.len() > MAX_IGNORED_SCOPE_NAMES {
+                result.names.pop();
+            }
+        }
+    }
+    Some(result)
 }
 
 fn target_is_ignored_unbounded(path: &Path) -> bool {
@@ -1631,17 +2022,17 @@ fn diagnose_scope_counts_unbounded(
         if directory != search_root {
             counts.entries_visited += 1;
         }
-        for entry in std::fs::read_dir(&directory).ok()? {
+        for entry in compared_directory_entries(&directory, &accepted).ok()? {
             if !within_budget(counts.entries_visited) {
                 return None;
             }
             counts.entries_visited += 1;
-            let entry = entry.ok()?;
+            let (entry, admitted) = entry.ok()?;
             let kind = entry.file_type().ok()?;
             if kind.is_file() {
                 counts.examined += 1;
             }
-            if !accepted.contains(&entry.file_name()) {
+            if !admitted {
                 counts.ignored += 1;
                 continue;
             }
@@ -3893,6 +4284,7 @@ mod tests {
                 file_roots: &[],
                 offset: 0,
                 explicit_page_rows: None,
+                ignored_scope_note: None,
             },
         )
         .text;
@@ -4006,6 +4398,123 @@ mod tests {
         };
         assert!(!scope.multi_root);
         assert_eq!(scope.per_root_max, 10);
+    }
+
+    #[test]
+    fn grep_ignore_disclosure_is_suppressed_while_confined() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), ".agents/\n").unwrap();
+        std::fs::create_dir(dir.path().join(".agents")).unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
+        let scope = GrepScope {
+            roots: vec![ResolvedRoot {
+                search_root: dir.path().to_path_buf(),
+                filter_root: dir.path().to_path_buf(),
+                use_index: false,
+                is_external: false,
+                ignored_target: false,
+                authorized_task_artifact: false,
+            }],
+            multi_root: false,
+            per_root_max: 10,
+        };
+        assert_eq!(scope_ignored_entries(&scope).unwrap().names, [".agents/"]);
+        crate::context::confinement::with_root(&ctx, "ignore-disclosure", || {
+            TARGET_WALK_BUILDERS.with(|count| count.set(0));
+            assert!(scope_ignored_entries(&scope).is_none());
+            TARGET_WALK_BUILDERS.with(|count| assert_eq!(count.get(), 0));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn ignore_probe_answer() -> IgnoredScopeEntries {
+        IgnoredScopeEntries {
+            names: vec![".agents/".to_string()],
+            total: 1,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn grep_ignore_disclosure_ready_probe_keeps_its_result() {
+        let probe = IgnoredScopeProbe::ready(
+            Some(ignore_probe_answer()),
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert_eq!(probe.finish().unwrap().names, [".agents/"]);
+    }
+
+    #[test]
+    fn grep_ignore_disclosure_late_probe_is_cancelled_without_waiting_for_work() {
+        let worker = IgnoreProbeWorker::new().unwrap();
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (finished, observed) = std::sync::mpsc::channel();
+        let probe = worker
+            .start(Instant::now() + Duration::from_secs(1), move |cancelled| {
+                entered.send(()).unwrap();
+                let _ = blocked.recv();
+                finished.send(cancelled.load(Ordering::Acquire)).unwrap();
+                Some(ignore_probe_answer())
+            })
+            .unwrap();
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        let before = Instant::now();
+        assert!(probe.finish().is_none());
+        assert!(before.elapsed() < Duration::from_millis(100));
+        release.send(()).unwrap();
+        assert!(observed.recv_timeout(Duration::from_secs(1)).unwrap());
+    }
+
+    #[test]
+    fn grep_ignore_disclosure_busy_worker_does_not_enqueue_or_wait() {
+        let worker = IgnoreProbeWorker::new().unwrap();
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (finished, observed) = std::sync::mpsc::channel();
+        let probe = worker
+            .start(Instant::now() + Duration::from_secs(1), move |_| {
+                entered.send(()).unwrap();
+                let _ = blocked.recv();
+                finished.send(()).unwrap();
+                None
+            })
+            .unwrap();
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        let before = Instant::now();
+        assert!(worker
+            .start(Instant::now() + Duration::from_secs(1), |_| {
+                panic!("busy worker must not run another probe")
+            })
+            .is_none());
+        assert!(before.elapsed() < Duration::from_millis(100));
+        drop(probe);
+        release.send(()).unwrap();
+        observed.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn grep_ignore_disclosure_cancelled_queued_probe_does_no_work() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let worker = IgnoreProbeWorker {
+            sender,
+            busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let probe = worker
+            .start(Instant::now() + Duration::from_secs(1), |_| {
+                panic!("cancelled queued probe must not start filesystem work")
+            })
+            .unwrap();
+        drop(probe);
+        receiver.recv().unwrap()();
+        assert!(!worker.busy.load(Ordering::Acquire));
     }
 
     #[test]

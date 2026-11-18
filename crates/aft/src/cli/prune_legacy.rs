@@ -18,6 +18,13 @@ const EXIT_REFUSED: i32 = 3;
 /// At least one folder was (or in a dry run, would be) left in place.
 const EXIT_SKIPPED: i32 = 5;
 
+const CACHE_USAGE: &str = "Usage: aft cache <subcommand> [--yes]
+
+Subcommands:
+  prune-legacy  Preview or remove index folders used before AFT 0.64.
+  clean-old     Remove old caches after moving them to a separate device.
+";
+
 const USAGE: &str = "Usage: aft cache prune-legacy [--yes]
 
 Deletes the index folders AFT used before version 0.64. AFT 0.64 and later
@@ -56,13 +63,14 @@ const SEMANTIC_NOTE: &str = "If a repository's meaning search has not finished i
 pub fn run(args: Vec<OsString>) -> i32 {
     let mut args = args.into_iter();
     match args.next().as_deref().and_then(|arg| arg.to_str()) {
+        Some("clean-old") => return super::clean_old::run(args.collect()),
         Some("prune-legacy") => {}
         Some("--help" | "-h") | None => {
-            print!("{USAGE}");
+            print!("{CACHE_USAGE}");
             return 0;
         }
         Some(other) => {
-            eprintln!("Unknown cache command: {other}\n\n{USAGE}");
+            eprintln!("Unknown cache command: {other}\n\n{CACHE_USAGE}");
             return EXIT_USAGE;
         }
     }

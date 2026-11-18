@@ -1,3 +1,5 @@
+pub mod profile;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -393,7 +395,7 @@ pub(crate) struct AllocatorObservation {
 }
 
 impl AllocatorObservation {
-    fn from_source(source: AllocatorSource) -> Self {
+    pub(crate) fn from_source(source: AllocatorSource) -> Self {
         let (snapshot, age_ms) = allocator_observation(source);
         Self { snapshot, age_ms }
     }
@@ -1214,10 +1216,10 @@ pub(crate) fn allocator_reuse_window_ms(floor_ms: u64, walk_ms: u64) -> u64 {
         .clamp(floor_ms, ALLOCATOR_WALK_MAX_REUSE_MS.max(floor_ms))
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-/// The module loop ticks every 250ms. Sampling at this cadence would repeatedly
-/// take allocator-zone locks, so cache a process-wide observation for at least
-/// 60s, longer when walks are expensive (see `allocator_reuse_window_ms`).
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+/// The Linux module loop ticks every 250ms. Reuse its process-wide jemalloc
+/// observation for at least 60s to bound telemetry work, longer when walks
+/// are expensive (see `allocator_reuse_window_ms`).
 /// This bounds allocator statistics walks to one per idle minute, or two for a
 /// relief pass that uses its before/after snapshots.
 const ALLOCATOR_SLACK_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -1346,7 +1348,7 @@ fn allocator_slack_elapsed_ms(now: std::time::Instant) -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn cached_allocator_slack() -> Option<u64> {
     let slack = LAST_OBSERVED_ALLOCATOR_SLACK_BYTES.load(std::sync::atomic::Ordering::Acquire);
     (slack != UNKNOWN_ALLOCATOR_SLACK).then_some(slack)
@@ -1483,7 +1485,7 @@ fn publish_allocator_slack(snapshot: &AllocatorMemorySnapshot, sampled_at_ms: u6
     LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS.store(sampled_at_ms, std::sync::atomic::Ordering::Release);
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn sample_is_stale(now_ms: u64) -> bool {
     sample_is_stale_after(
         LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS.load(std::sync::atomic::Ordering::Acquire),
@@ -1494,7 +1496,7 @@ fn sample_is_stale(now_ms: u64) -> bool {
 
 /// Whether a sample taken at `sampled_at` is due for replacement at `now_ms`
 /// when the last walk took `walk_ms`.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 fn sample_is_stale_after(sampled_at: u64, now_ms: u64, walk_ms: u64) -> bool {
     sampled_at == UNSAMPLED_AT_MS
         || now_ms.saturating_sub(sampled_at)
@@ -1504,7 +1506,7 @@ fn sample_is_stale_after(sampled_at: u64, now_ms: u64, walk_ms: u64) -> bool {
             )
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn reserve_sample(now_ms: u64) -> Option<u64> {
     let previous = LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS.load(std::sync::atomic::Ordering::Acquire);
     if !sample_is_stale(now_ms) {
@@ -1520,7 +1522,7 @@ fn reserve_sample(now_ms: u64) -> Option<u64> {
         .ok()
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn reserve_relief(now_ms: u64) -> Option<u64> {
     let previous = LAST_ALLOCATOR_SLACK_RELIEF_AT_MS.load(std::sync::atomic::Ordering::Acquire);
     let due = cached_allocator_slack().is_some_and(|slack| {
@@ -1541,7 +1543,7 @@ fn reserve_relief(now_ms: u64) -> Option<u64> {
     })?
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn log_allocator_relief(relief: AllocatorPressureRelief) {
     log::info!(
         "allocator slack relief: allocator_accounting_bytes={} allocator_accounting_source={} rss_drop_bytes={:?} phys_footprint_drop_bytes={:?} rss_bytes_before={:?} rss_bytes_after={:?} address_space_slack_bytes_before={:?} address_space_slack_bytes_after={:?}",
@@ -1557,7 +1559,7 @@ fn log_allocator_relief(relief: AllocatorPressureRelief) {
 }
 
 /// Record the latest periodic relief pass for the memory census.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn record_last_allocator_relief(relief: &AllocatorPressureRelief) {
     let ordering = std::sync::atomic::Ordering::Release;
     LAST_ALLOCATOR_SLACK_RELIEF_ACCOUNTING_BYTES.store(relief.allocator_accounting_bytes, ordering);
@@ -1665,7 +1667,7 @@ pub fn allocator_slack_relief_due(
     }
 }
 
-/// Opportunistically return unused allocator pages without reading allocator
+/// On Linux, opportunistically return unused allocator pages without reading allocator
 /// statistics on the module loop. The loop only reads cached atomics. When the
 /// cached observation is stale, one sampler takes an initial snapshot; if it
 /// finds enough slack, the page-return operation reuses it and takes only one
@@ -1674,7 +1676,7 @@ pub fn allocator_slack_relief_due(
 /// `phys_footprint_bytes` cannot make this decision: it includes file mappings
 /// and other resident memory, so it cannot identify mapped-but-unused allocator
 /// arenas without allocator-zone statistics.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub fn spawn_allocator_slack_relief_if_due(now: std::time::Instant) -> bool {
     let now_ms = allocator_slack_elapsed_ms(now);
     if sample_is_stale(now_ms) {
@@ -1734,9 +1736,9 @@ pub fn spawn_allocator_slack_relief_if_due(now: std::time::Instant) -> bool {
     spawned
 }
 
-/// No allocator-statistics API is wired on this target; the loop-side decision
-/// is a no-op and the cache statics above stay at their unsampled sentinels.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// macOS statistics take every allocator-zone lock; sampling and relief there
+/// are explicit-only. Other non-Linux targets have no automatic sampler.
+#[cfg(not(target_os = "linux"))]
 pub fn spawn_allocator_slack_relief_if_due(_now: std::time::Instant) -> bool {
     false
 }
@@ -1927,7 +1929,7 @@ mod tests {
         assert_eq!(allocator_snapshot_calls_for_test(), calls_before);
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn loop_slack_decision_never_reads_allocator_statistics() {
         LAST_OBSERVED_ALLOCATOR_SLACK_BYTES.store(
@@ -1975,6 +1977,18 @@ mod tests {
             !threads.iter().any(|name| *name == loop_thread),
             "the loop-side decision must never read allocator statistics: {threads:?}"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_automatic_slack_sampling_and_relief_are_explicit_only() {
+        let before = allocator_snapshot_calls_for_test();
+        for seconds in [0, 30, 300, 3_600] {
+            assert!(!spawn_allocator_slack_relief_if_due(
+                std::time::Instant::now() + std::time::Duration::from_secs(seconds)
+            ));
+        }
+        assert_eq!(allocator_snapshot_calls_for_test(), before);
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

@@ -430,12 +430,13 @@ pub(super) fn code_search_notice(
     })
 }
 
+/// Builds a nudge's ordered send. Callers send it only to a runner that
+/// confirmed `delivery_order`; a plain send would start a turn of its own.
 pub(super) fn nudge_request(
     call_key: &str,
     notice: &crate::subc::runner_notices::notice_templates::Notice,
     preset: &str,
     now_ms: u64,
-    modern: bool,
     cleared: bool,
     fallback: bool,
 ) -> SendRequest {
@@ -447,9 +448,6 @@ pub(super) fn nudge_request(
         "aft:nudge:{kind}:{call_key}{}",
         if fallback { ":fallback" } else { "" }
     );
-    if !modern {
-        return SendRequest::new(&notice.text, send_id).with_notice(true);
-    }
     let mut order = DeliveryOrder::new(vec![Mode::ToolResult]);
     order.dedupe_key = Some(format!("aft:nudge:{kind}"));
     order.expires_at_ms = Some(now_ms.saturating_add(60_000));
@@ -576,12 +574,24 @@ impl CodeSearchNotice {
                     remaining,
                     async {
                         let modern = runner_delivery_order(&path, address).await == Some(true);
+                        if !modern {
+                            // A send without a delivery order queues behind the
+                            // running turn and then starts a turn of its own at
+                            // idle. A nudge that costs the agent a whole turn
+                            // defeats its purpose, so unless the runner confirms
+                            // ordered delivery the nudge is dropped. That covers
+                            // an older runner and a capability probe that failed.
+                            return Outcome::Final(Failure::new(
+                                FailureClass::NoOrderedDelivery,
+                                "runner did not confirm delivery_order",
+                            ));
+                        }
                         let cleared = modern && runner_capability(&path, address, "delivery_order_modes:turn_system_cleared").await == Some(true);
-                        let request = nudge_request(&self.call_key, notice, &self.preset, now, modern, cleared, false);
+                        let request = nudge_request(&self.call_key, notice, &self.preset, now, cleared, false);
                         let outcome = send(&path, address, &request, modern).await;
                         let refused = matches!(&outcome, Outcome::Final(failure) | Outcome::Retry(failure) if failure.code.as_deref() == Some("invalid_params") && failure.field.as_deref() == Some("template"));
                         if request.runner_params.contains_key("template") && refused {
-                            send(&path, address, &nudge_request(&self.call_key, notice, &self.preset, now, true, false, true), true).await
+                            send(&path, address, &nudge_request(&self.call_key, notice, &self.preset, now, false, true), true).await
                         } else { outcome }
                     },
                 )
@@ -777,19 +787,107 @@ impl RunnerCapabilities {
 
 static RUNNER_CAPABILITIES: OnceLock<std::sync::Mutex<RunnerCapabilities>> = OnceLock::new();
 
-async fn runner_incarnation(consumer: &SubcConsumer, module: &str) -> Option<RunnerIncarnation> {
+type ProbeFailure = (&'static str, Option<String>);
+
+async fn runner_incarnation(
+    consumer: &SubcConsumer,
+    module: &str,
+) -> Result<RunnerIncarnation, ProbeFailure> {
     let snapshot = tokio::time::timeout(Duration::from_secs(5), consumer.spawn_snapshot())
         .await
-        .ok()?
-        .ok()?;
+        .map_err(|_| ("incarnation", None))?
+        .map_err(|error| ("incarnation", error.code().map(str::to_owned)))?;
     let spawn = snapshot
         .live
         .iter()
-        .find(|spawn| spawn.module_id == module)?;
-    Some(RunnerIncarnation {
+        .find(|spawn| spawn.module_id == module)
+        .ok_or(("incarnation", None))?;
+    Ok(RunnerIncarnation {
         daemon: snapshot.cursor.daemon_incarnation,
         generation: spawn.spawn_generation,
     })
+}
+
+enum CapabilityConsumer {
+    Runner(SubcConsumer),
+    #[cfg(test)]
+    Endpoint(test_endpoint::Probe),
+}
+
+impl CapabilityConsumer {
+    async fn connect(path: &Path, _address: &Address) -> Result<Self, ProbeFailure> {
+        #[cfg(test)]
+        if let Some(probe) = test_endpoint::probe(_address) {
+            return Ok(Self::Endpoint(probe));
+        }
+        SubcConsumer::connect(path, ConsumerOptions::default())
+            .await
+            .map(Self::Runner)
+            .map_err(|_| ("connect", None))
+    }
+
+    async fn incarnation(&self, module: &str) -> Result<RunnerIncarnation, ProbeFailure> {
+        match self {
+            Self::Runner(consumer) => runner_incarnation(consumer, module).await,
+            #[cfg(test)]
+            Self::Endpoint(probe) => Ok(probe.incarnation()),
+        }
+    }
+
+    async fn describe(
+        &self,
+        address: &Address,
+        before: &RunnerIncarnation,
+    ) -> Result<Vec<u8>, ProbeFailure> {
+        let body = br#"{"method":"role.describe","params":{}}"#.to_vec();
+        let consumer = match self {
+            Self::Runner(consumer) => consumer,
+            #[cfg(test)]
+            Self::Endpoint(probe) => return probe.describe(address, &body),
+        };
+        let route = open_notice_route(consumer, address)
+            .await
+            .map_err(|outcome| {
+                let code = match outcome {
+                    Outcome::Retry(failure) | Outcome::Final(failure) => failure.code,
+                    _ => None,
+                };
+                ("route_open", code)
+            })?;
+        let result = async {
+            // A route is tied to one runner process. Check both sides of the
+            // probe so a restart cannot label an old reply as a new capability.
+            if self.incarnation(&address.module).await? != *before {
+                return Err(("runner_restarted", None));
+            }
+            consumer
+                .request(
+                    &route,
+                    body,
+                    CallOptions {
+                        timeout: Duration::from_secs(5),
+                        ..CallOptions::default()
+                    },
+                )
+                .await
+                .map_err(|error| ("describe", error.code().map(str::to_owned)))
+        }
+        .await;
+        let _ = consumer
+            .close_handle(&route, CloseRouteOptions::default())
+            .await;
+        result
+    }
+
+    async fn close(self) {
+        match self {
+            Self::Runner(consumer) => {
+                let _ = consumer.close().await;
+            }
+            #[cfg(test)]
+            Self::Endpoint(_) => {}
+        }
+    }
 }
 
 fn described_delivery_order(bytes: &[u8]) -> Option<bool> {
@@ -817,66 +915,71 @@ async fn runner_delivery_order(path: &Path, address: &Address) -> Option<bool> {
     runner_capability(path, address, "delivery_order").await
 }
 
+fn capability_address(address: &Address) -> Address {
+    // The SDK requires a session identity even on an unscoped route. This
+    // AFT-owned session is only for runner-wide describes, never sends, so a
+    // head session's plan cannot restrict the probe to its readers.
+    Address {
+        identity: BindIdentity::new(&address.identity.harness, "aft:runner-capability-probe"),
+        scope: None,
+        ..address.clone()
+    }
+}
+
 async fn runner_capability(path: &Path, address: &Address, capability: &str) -> Option<bool> {
     #[cfg(test)]
     if let Some(supported) = test_endpoint::capability(address, capability) {
         return supported;
     }
-    let consumer = SubcConsumer::connect(path, ConsumerOptions::default())
-        .await
-        .ok()?;
+    // Every failed step is logged by name: an unknown answer turns notices
+    // off, so the log has to say why the runner could not be asked.
+    let failed = |(step, code): ProbeFailure| {
+        log::info!(
+            "runner capability probe module={} capability={capability} failed at {step} code={}",
+            address.module,
+            code.as_deref().unwrap_or("none")
+        );
+        None
+    };
+    let consumer = match CapabilityConsumer::connect(path, address).await {
+        Ok(consumer) => consumer,
+        Err(error) => return failed(error),
+    };
     let result = async {
-        let before = runner_incarnation(&consumer, &address.module).await?;
-        let route = open_notice_route(&consumer, address).await.ok()?;
-        let result = async {
-            // A route is tied to one runner process. Check both sides of the
-            // probe so a restart cannot label an old reply as a new capability.
-            if runner_incarnation(&consumer, &address.module).await? != before {
-                return None;
-            }
-            let cache = RUNNER_CAPABILITIES.get_or_init(Default::default);
-            if let Some(supported) =
-                cache
-                    .lock()
-                    .unwrap()
-                    .get(path, &address.module, &before, capability)
-            {
-                return Some(supported);
-            }
-            let bytes = consumer
-                .request(
-                    &route,
-                    br#"{"method":"role.describe","params":{}}"#.to_vec(),
-                    CallOptions {
-                        timeout: Duration::from_secs(5),
-                        ..CallOptions::default()
-                    },
-                )
-                .await
-                .ok()?;
-            let supported = if capability == "delivery_order" {
-                described_delivery_order(&bytes)?
-            } else {
-                described_capability(&bytes, capability)?
-            };
-            if runner_incarnation(&consumer, &address.module).await? != before {
-                return None;
-            }
+        let before = consumer.incarnation(&address.module).await?;
+        let cache = RUNNER_CAPABILITIES.get_or_init(Default::default);
+        if let Some(supported) =
             cache
                 .lock()
                 .unwrap()
-                .insert(path, &address.module, before, supported, capability);
-            Some(supported)
+                .get(path, &address.module, &before, capability)
+        {
+            return Ok(supported);
         }
-        .await;
-        let _ = consumer
-            .close_handle(&route, CloseRouteOptions::default())
-            .await;
-        result
+        let bytes = consumer
+            .describe(&capability_address(address), &before)
+            .await?;
+        let supported = if capability == "delivery_order" {
+            described_delivery_order(&bytes)
+        } else {
+            described_capability(&bytes, capability)
+        }
+        .ok_or(("decode", None))?;
+        if consumer.incarnation(&address.module).await? != before {
+            return Err(("runner_restarted", None));
+        }
+        cache
+            .lock()
+            .unwrap()
+            .insert(path, &address.module, before, supported, capability);
+        Ok(supported)
     }
     .await;
-    let _ = consumer.close().await;
-    result
+    consumer.close().await;
+    match result {
+        Ok(supported) => Some(supported),
+        Err(error) => failed(error),
+    }
 }
 
 fn envelope(request: &SendRequest) -> Vec<u8> {
@@ -917,6 +1020,8 @@ pub(super) mod test_endpoint {
         reply_delay_ms: AtomicU64,
         gate:
             std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+        probe_incarnation: std::sync::Mutex<Option<RunnerIncarnation>>,
+        probe_routes: AtomicU64,
     }
     fn endpoints() -> &'static std::sync::Mutex<HashMap<String, Arc<Endpoint>>> {
         static ENDPOINTS: OnceLock<std::sync::Mutex<HashMap<String, Arc<Endpoint>>>> =
@@ -940,6 +1045,15 @@ pub(super) mod test_endpoint {
         endpoint: Arc<Endpoint>,
     }
     impl Capture {
+        pub(super) fn probe_incarnation(&self, daemon: &str, generation: u64) {
+            *self.endpoint.probe_incarnation.lock().unwrap() = Some(RunnerIncarnation {
+                daemon: daemon.into(),
+                generation,
+            });
+        }
+        pub(super) fn probe_routes(&self) -> u64 {
+            self.endpoint.probe_routes.load(Ordering::Relaxed)
+        }
         pub(super) fn delivery_order(&self, supported: Option<bool>) {
             *self.endpoint.delivery_order.lock().unwrap() = supported;
         }
@@ -1020,6 +1134,8 @@ pub(super) mod test_endpoint {
             max_active: AtomicU64::new(0),
             reply_delay_ms: AtomicU64::new(0),
             gate: Default::default(),
+            probe_incarnation: Default::default(),
+            probe_routes: AtomicU64::new(0),
         });
         assert!(endpoints()
             .lock()
@@ -1039,6 +1155,9 @@ pub(super) mod test_endpoint {
             .unwrap()
             .get(&format!("aft:bash:{}", address.identity.session))
             .cloned()?;
+        if endpoint.probe_incarnation.lock().unwrap().is_some() {
+            return None;
+        }
         let supported = if capability == "delivery_order_modes:turn_system_cleared" {
             Some(endpoint.cleared.load(Ordering::Relaxed))
         } else if capability == "send_status" {
@@ -1047,6 +1166,71 @@ pub(super) mod test_endpoint {
             *endpoint.delivery_order.lock().unwrap()
         };
         Some(supported)
+    }
+
+    pub(super) struct Probe {
+        endpoint: Arc<Endpoint>,
+        readers_session: String,
+    }
+    pub(super) fn probe(address: &Address) -> Option<Probe> {
+        let endpoint = endpoints()
+            .lock()
+            .unwrap()
+            .get(&format!("aft:bash:{}", address.identity.session))
+            .cloned()?;
+        endpoint.probe_incarnation.lock().unwrap().as_ref()?;
+        Some(Probe {
+            endpoint,
+            readers_session: address.identity.session.clone(),
+        })
+    }
+    impl Probe {
+        pub(super) fn incarnation(&self) -> RunnerIncarnation {
+            self.endpoint
+                .probe_incarnation
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap()
+        }
+        pub(super) fn describe(
+            &self,
+            address: &Address,
+            bytes: &[u8],
+        ) -> Result<Vec<u8>, ProbeFailure> {
+            self.endpoint.probe_routes.fetch_add(1, Ordering::Relaxed);
+            let request: Value = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(request, json!({"method":"role.describe", "params":{}}));
+            let _ = self.endpoint.sender.send(Received {
+                harness: address.identity.harness.clone(),
+                session: address.identity.session.clone(),
+                scope: address.scope.clone(),
+                bytes: bytes.to_vec(),
+                request,
+            });
+            if address.identity.session == self.readers_session {
+                return Err(("describe", Some("read_access_refused".into())));
+            }
+            let Some(delivery_order) = *self.endpoint.delivery_order.lock().unwrap() else {
+                return Err(("describe", Some("unavailable".into())));
+            };
+            let mut capabilities = Vec::new();
+            if delivery_order {
+                capabilities.push("delivery_order");
+            }
+            if self.endpoint.send_status.load(Ordering::Relaxed) {
+                capabilities.push("send_status");
+            }
+            let modes = if self.endpoint.cleared.load(Ordering::Relaxed) {
+                vec!["turn_system_cleared"]
+            } else {
+                Vec::new()
+            };
+            Ok(cortexkit_role_llm_runner::wire::reply_body(&json!({
+                "capabilities": capabilities, "delivery_order_modes": modes,
+            }))
+            .unwrap())
+        }
     }
     pub(super) async fn call(address: &Address, bytes: &[u8]) -> Option<Result<Vec<u8>, Outcome>> {
         let body: Value = serde_json::from_slice(bytes).unwrap();
@@ -1188,6 +1372,9 @@ enum FailureClass {
     Address,
     Persistence,
     Expired,
+    /// The runner did not confirm ordered delivery, so a notice that must ride
+    /// a tool result is not sent at all.
+    NoOrderedDelivery,
     #[cfg(test)]
     TestEndpoint,
 }

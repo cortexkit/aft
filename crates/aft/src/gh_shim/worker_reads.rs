@@ -58,6 +58,8 @@ struct ByteRange {
 enum ReadError {
     Budget { retry_after_ms: u64 },
     Vendor { status: u16, message: String },
+    Retryable { code: String, message: String },
+    JobLog { code: String, message: String },
     ResponseTooLarge(String),
     Refused(String),
     Failed(String),
@@ -66,7 +68,10 @@ enum ReadError {
 impl ReadError {
     fn status(&self) -> i32 {
         match self {
-            Self::Failed(_) | Self::Vendor { .. } => 1,
+            Self::Failed(_)
+            | Self::Vendor { .. }
+            | Self::Retryable { .. }
+            | Self::JobLog { .. } => 1,
             _ => REFUSAL_EXIT_STATUS,
         }
     }
@@ -78,9 +83,23 @@ impl ReadError {
                 retry_after_ms.div_ceil(60_000).max(1)
             ),
             Self::Vendor { status, message } => format!("HTTP {status}: {message}"),
+            Self::Retryable { code, message } => format!("{code}: {message}"),
+            Self::JobLog { code, message } => job_log_reason(code, message).into(),
             Self::ResponseTooLarge(text) | Self::Refused(text) | Self::Failed(text) => text.clone(),
         }
         .replace(['\n', '\r'], " ")
+    }
+}
+
+fn job_log_reason<'a>(code: &str, message: &'a str) -> &'a str {
+    // Keep command-line reasons stable even when backend diagnostics change.
+    match code {
+        "job_not_finished" => "the job hasn't finished",
+        "job_log_unavailable" => "GitHub has no log for this job",
+        "job_log_redirect_refused" => "the download failed; retry later",
+        "job_log_read_limit" => "the log is over the read limit",
+        "job_log_download_failed" => "the download failed; retry later",
+        _ => message,
     }
 }
 

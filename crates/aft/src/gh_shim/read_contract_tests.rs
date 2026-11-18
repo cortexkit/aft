@@ -34,6 +34,17 @@ fn bulk_vectors() -> Vec<(&'static str, &'static [u8], &'static [u8])> {
         vector!("job-log-range"),
         vector!("refused-response-too-large"),
         vector!("refused-endpoint-not-allowed-path"),
+        vector!("refused-denied"),
+        vector!("refused-invalid-request"),
+        vector!("refused-job-log-download-failed"),
+        vector!("refused-job-log-read-limit"),
+        vector!("refused-job-log-redirect-refused"),
+        vector!("refused-job-log-unavailable"),
+        vector!("refused-job-not-finished"),
+        vector!("refused-read-dispatch-failed-not-sent"),
+        vector!("refused-read-dispatch-failed-unknown"),
+        vector!("refused-read-response-invalid"),
+        vector!("refused-vendor-error"),
     ]
 }
 
@@ -41,8 +52,15 @@ fn bulk_vectors() -> Vec<(&'static str, &'static [u8], &'static [u8])> {
 fn plexus_read_bulk_requests_encode_each_upstream_vector_byte_for_byte() {
     for (name, request, _) in bulk_vectors() {
         let mut vector: Value = serde_json::from_slice(request).unwrap();
-        let parsed: WireRequest =
-            serde_json::from_value(vector["request"]["params"].clone()).unwrap();
+        let parsed = serde_json::from_value::<WireRequest>(vector["request"]["params"].clone());
+        if name == "refused-invalid-request" {
+            assert!(
+                parsed.is_err(),
+                "the invalid request must not encode as a typed read"
+            );
+            continue;
+        }
+        let parsed = parsed.unwrap();
         vector["request"] = crate::gh_shim_relay::read_call(&parsed, true);
         let mut encoded = serde_json::to_vec_pretty(&vector).unwrap();
         encoded.push(b'\n');
@@ -61,8 +79,12 @@ async fn plexus_read_bulk_replies_use_the_tool_decoder_and_preserve_visible_byte
     }
     for (name, request, reply) in bulk_vectors() {
         let request: Value = serde_json::from_slice(request).unwrap();
-        let request: WireRequest =
-            serde_json::from_value(request["request"]["params"].clone()).unwrap();
+        let request: WireRequest = serde_json::from_value(request["request"]["params"].clone())
+            .unwrap_or_else(|_| {
+                assert_eq!(name, "refused-invalid-request");
+                // Error replies decode before any request-specific success validation.
+                wire(&get())
+            });
         let vector: Value = serde_json::from_slice(reply).unwrap();
         let bulk_reply = &vector["reply"];
         let expected = match name {
@@ -72,6 +94,15 @@ async fn plexus_read_bulk_replies_use_the_tool_decoder_and_preserve_visible_byte
             "job-log-range" => (0, "test parser::rejects_bad_input ... FAILED\n", ""),
             "refused-response-too-large" => (86, "", "worker read response exceeds 1 MiB; narrow the request: GitHub's reply is larger than 1 MiB and was not returned"),
             "refused-endpoint-not-allowed-path" => (86, "", "worker read endpoint or field path is not allowed; the read was not sent: this argument is not one GitHub bot reads serve"),
+            "refused-denied" => (86, "", "grant_action_selector: governance denied the connector operation"),
+            "refused-invalid-request" => (86, "", "invalid_request: github_read requires only action, repository (string or string array), and args (object)"),
+            "refused-job-log-download-failed" | "refused-job-log-redirect-refused" => (1, "", "the download failed; retry later"),
+            "refused-job-log-read-limit" => (1, "", "the log is over the read limit"),
+            "refused-job-log-unavailable" => (1, "", "GitHub has no log for this job"),
+            "refused-job-not-finished" => (1, "", "the job hasn't finished"),
+            "refused-read-dispatch-failed-not-sent" | "refused-read-dispatch-failed-unknown" => (1, "", "read_dispatch_failed: GitHub read dispatch did not complete"),
+            "refused-read-response-invalid" => (1, "", "read_response_invalid: GitHub returned an unusable read response"),
+            "refused-vendor-error" => (1, "", "HTTP 404: GitHub refused the read"),
             _ => unreachable!(),
         };
         for bulk in [false, true] {
@@ -103,6 +134,147 @@ async fn plexus_read_bulk_replies_use_the_tool_decoder_and_preserve_visible_byte
                 ),
                 "{name}, bulk={bulk}"
             );
+        }
+    }
+}
+
+#[test]
+fn plexus_read_bulk_refusals_retry_only_the_three_safe_read_vectors() {
+    let binding = AgentBinding {
+        repo: "cortexkit/aft".into(),
+        agent_id: "aft-bot".into(),
+    };
+    let manifest: Manifest = serde_json::from_str(include_str!(
+        "../../tests/fixtures/gh_shim/v20-manifest.json"
+    ))
+    .unwrap();
+    let relay = RelayContext {
+        worker_broker: None,
+        connection_file: None,
+        ticket: None,
+        transient_delays: [Duration::ZERO; 2],
+        relay_budget: Duration::from_secs(5),
+    };
+    let context = ExecutionContext {
+        binding: &binding,
+        manifest: &manifest,
+        relay: &relay,
+    };
+    for (name, _, bytes) in bulk_vectors()
+        .into_iter()
+        .filter(|(name, _, _)| name.starts_with("refused-"))
+    {
+        let fixture: Value = serde_json::from_slice(bytes).unwrap();
+        let clock = std::cell::Cell::new(std::time::Instant::now());
+        let mut attempts = 0;
+        let mut sleeps = Vec::new();
+        let error = executor::execute_read_with_clock(
+            &context,
+            &get(),
+            &mut |_, _| {
+                attempts += 1;
+                Ok(fixture["reply"].clone())
+            },
+            &mut || clock.get(),
+            &mut |delay| {
+                sleeps.push(delay);
+                clock.set(clock.get() + delay);
+            },
+        )
+        .unwrap_err();
+        let retry = matches!(
+            name,
+            "refused-read-dispatch-failed-not-sent"
+                | "refused-read-dispatch-failed-unknown"
+                | "refused-read-response-invalid"
+        );
+        assert_eq!(attempts, if retry { 3 } else { 1 }, "{name}");
+        assert_eq!(
+            sleeps,
+            if retry {
+                vec![Duration::from_millis(100), Duration::from_millis(200)]
+            } else {
+                vec![]
+            },
+            "{name}"
+        );
+        if matches!(name, "refused-denied" | "refused-invalid-request") {
+            assert!(matches!(error, ReadError::Refused(_)), "{name}: {error:?}");
+            assert_eq!(error.status(), REFUSAL_EXIT_STATUS);
+        }
+    }
+}
+
+#[test]
+fn plexus_read_bulk_job_refusals_preserve_run_logs_and_single_job_exits() {
+    for (name, _, bytes) in bulk_vectors() {
+        let reason = match name {
+            "refused-job-not-finished" => "the job hasn't finished",
+            "refused-job-log-unavailable" => "GitHub has no log for this job",
+            "refused-job-log-read-limit" => "the log is over the read limit",
+            "refused-job-log-redirect-refused" | "refused-job-log-download-failed" => {
+                "the download failed; retry later"
+            }
+            _ => continue,
+        };
+        let fixture: Value = serde_json::from_slice(bytes).unwrap();
+        for single in [false, true] {
+            let raw = if single {
+                vec!["run", "view", "--job", "42", "--log"]
+            } else {
+                vec!["run", "view", "8", "--log"]
+            };
+            let plan = plan(
+                &raw.into_iter().map(OsString::from).collect::<Vec<_>>(),
+                "cortexkit/aft",
+            )
+            .unwrap();
+            let mut output = Vec::new();
+            let mut diagnostics = Vec::new();
+            let mut ids = Vec::new();
+            let refused_job = json!({"id":42,"name":"refused job"});
+            let status = render::run_with_io(
+                &plan,
+                &mut |request| match request {
+                    ReadRequest::Get { .. } => Ok(ReadReply::Get(GetReply { status: 200, body: if single { refused_job.clone() } else { json!({"jobs":[{"id":1,"name":"first"},refused_job,{"id":3,"name":"last"}]}) }, next_page: None })),
+                    ReadRequest::JobLog { job_id, .. } => {
+                        ids.push(*job_id);
+                        if *job_id == 42 {
+                            executor::decode_reply(&wire(request), &fixture["reply"])
+                        } else {
+                            Ok(ReadReply::JobLog(LogReply { body: "kept\n".into(), offset: 0, length: 5, total_bytes: 5 }))
+                        }
+                    }
+                    _ => panic!("unexpected request {request:?}"),
+                },
+                &mut output,
+                &mut diagnostics,
+                &mut |_| panic!("job-log refusals are terminal"),
+            ).unwrap();
+            assert_eq!(
+                status,
+                if !single && name == "refused-job-log-unavailable" {
+                    0
+                } else {
+                    1
+                },
+                "{name}"
+            );
+            assert_eq!(
+                output,
+                if single {
+                    b"".as_slice()
+                } else {
+                    b"first\tUNKNOWN STEP\tkept\nlast\tUNKNOWN STEP\tkept\n".as_slice()
+                },
+                "{name}"
+            );
+            assert_eq!(
+                String::from_utf8(diagnostics).unwrap(),
+                format!("refused job: no log ({reason})\n"),
+                "{name}"
+            );
+            assert_eq!(ids, if single { vec![42] } else { vec![1, 42, 3] });
         }
     }
 }
@@ -325,6 +497,90 @@ fn read_draft_transmission_guard_rejects_refusal_and_vendor_mismatches() {
         assert!(error.message("bot").contains("unexpected transmission"));
         assert!(error.message("bot").contains(code));
     }
+}
+
+#[test]
+fn actions_log_refusals_decode_as_readable_job_errors() {
+    // Plexus can return lean errors without an MCP presentation wrapper.
+    let unavailable = br#"{"error":{"code":"job_log_unavailable","message":"job_log_unavailable","transmission":"sent"}}"#;
+    assert_eq!(
+        decode(&serde_json::from_slice(unavailable).unwrap())
+            .unwrap_err()
+            .message("bot"),
+        "GitHub has no log for this job"
+    );
+    for (code, expected) in [
+        ("job_not_finished", "the job hasn't finished"),
+        ("job_log_unavailable", "GitHub has no log for this job"),
+        (
+            "job_log_redirect_refused",
+            "the download failed; retry later",
+        ),
+        ("job_log_read_limit", "the log is over the read limit"),
+        (
+            "job_log_download_failed",
+            "the download failed; retry later",
+        ),
+    ] {
+        let value = json!({"error":{"code":code,"message":code,"transmission":"sent"}});
+        let error = decode(&value).unwrap_err();
+        assert!(matches!(error, ReadError::JobLog { .. }), "{error:?}");
+        assert_eq!(error.status(), 1);
+        assert_eq!(error.message("bot"), expected);
+        let mut readable = value.clone();
+        readable["error"]["message"] = json!("Readable upstream reason");
+        assert_eq!(decode(&readable).unwrap_err().message("bot"), expected);
+        for (transmission, reason) in [
+            (json!("not_sent"), "unexpected transmission"),
+            (json!("unknown"), "unexpected transmission"),
+            (json!(null), "transmission is missing"),
+        ] {
+            let mut invalid = value.clone();
+            invalid["error"]["transmission"] = transmission;
+            let error = decode(&invalid).unwrap_err();
+            assert_eq!(error.status(), REFUSAL_EXIT_STATUS);
+            assert_eq!(
+                error.message("bot"),
+                format!("malformed Plexus github_read reply (code {code}): {reason}")
+            );
+        }
+    }
+}
+
+#[test]
+fn actions_log_dispatch_failure_accepts_nested_and_top_level_transmission() {
+    let legacy = br#"{"error":{"code":"read_dispatch_failed","outcome":{"transmission":"unknown","code":null,"message":"connection dropped"}}}"#;
+    let mut value: Value = serde_json::from_slice(legacy).unwrap();
+    for top_level in [false, true] {
+        if top_level {
+            value["error"]["transmission"] = json!("unknown");
+        }
+        let error = decode(&value).unwrap_err();
+        assert_eq!(error.status(), 1);
+        assert_eq!(
+            error.message("bot"),
+            "read_dispatch_failed: connection dropped"
+        );
+    }
+    value["error"]["transmission"] = json!("not_sent");
+    value["error"]["message"] = json!("top-level reason");
+    assert_eq!(
+        decode(&value).unwrap_err().message("bot"),
+        "read_dispatch_failed: top-level reason"
+    );
+    value["error"]["transmission"] = json!("future");
+    assert_eq!(decode(&value).unwrap_err().status(), REFUSAL_EXIT_STATUS);
+}
+
+#[test]
+fn actions_log_invalid_response_needs_no_transmission() {
+    let value = br#"{"error":{"code":"read_response_invalid","message":"invalid response body"}}"#;
+    let error = decode(&serde_json::from_slice(value).unwrap()).unwrap_err();
+    assert_eq!(error.status(), 1);
+    assert_eq!(
+        error.message("bot"),
+        "read_response_invalid: invalid response body"
+    );
 }
 
 #[test]

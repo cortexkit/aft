@@ -944,7 +944,7 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     later!("indexes.semantic", indexes.semantic);
     later!("indexes.callgraph", indexes.callgraph);
     later!("index.roots", index.roots);
-    live!("callgraph_chunk_size", callgraph_chunk_size);
+    live!("memory", memory);
     // Inspect.
     live!("inspect.enabled", inspect.enabled);
     live!("inspect.categories", inspect.categories);
@@ -977,6 +977,10 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     later!("bash.compress", experimental_bash_compress);
     later!("bash.background", experimental_bash_background);
     live!("bash.linux_scope", bash.linux_scope);
+    live!(
+        "bash.linux_scope_max_runtime_secs",
+        bash.linux_scope_max_runtime_secs
+    );
     live!("bash.memory_limit_mib", bash.memory_limit_mib);
     live!("bash.disclaim_privacy", bash.disclaim_privacy);
     live!("bash.foreground_wait_window_ms", foreground_wait_window_ms);
@@ -1089,7 +1093,7 @@ fn classification_is_exhaustive(config: &Config) {
         restrict_to_project_root: _,
         indexes,
         index: _,
-        callgraph_chunk_size: _,
+        memory: _,
         experimental_bash_rewrite: _,
         experimental_bash_compress: _,
         experimental_bash_background: _,
@@ -1132,6 +1136,7 @@ fn classification_is_exhaustive(config: &Config) {
         watch_sync_max_ms: _,
         worker_wait_max_ms: _,
         linux_scope: _,
+        linux_scope_max_runtime_secs: _,
         memory_limit_mib: _,
         disclaim_privacy: _,
         powershell_tool: _,

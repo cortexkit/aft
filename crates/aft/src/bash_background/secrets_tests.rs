@@ -471,6 +471,7 @@ fn secret_bash_sandbox_raise_saved_plan_keeps_strict_profile() {
                 shell,
                 false,
                 None,
+                crate::config::DEFAULT_LINUX_SCOPE_MAX_RUNTIME_SECS,
             )
             .unwrap();
             let (restored, ..) = crate::sandbox_spawn::restore_local_launch(task, &digest).unwrap();

@@ -1,0 +1,37 @@
+{
+  "github": {
+    "expected_requests": [
+      {
+        "action": "github.repo.get",
+        "args": {
+          "accept": "application/vnd.github.diff",
+          "owner": "o",
+          "path": "pulls/12",
+          "repo": "x"
+        },
+        "connection_id": "github-handle-app-x"
+      }
+    ],
+    "replies": {
+      "github.repo.get": {
+        "transport": "unknown"
+      }
+    }
+  },
+  "name": "refused-read-dispatch-failed-unknown",
+  "request": {
+    "method": "github.read.bulk",
+    "params": {
+      "action": "github.repo.get",
+      "args": {
+        "accept": "application/vnd.github.diff",
+        "path": "pulls/12"
+      },
+      "repository": "o/x"
+    }
+  },
+  "scope": {
+    "agent_id": "agent-x",
+    "kind": "head"
+  }
+}

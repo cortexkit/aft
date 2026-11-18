@@ -2,7 +2,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { type SpawnSyncReturns, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -67,6 +67,26 @@ function cacheOnlyInstall(prefix: string, versionDir: string | null): CacheOnlyI
 }
 
 describe("commands that need the native binary", () => {
+  test("aft cache clean-old forwards the command and confirmation flags unchanged", () => {
+    const version = `v${getSelfVersion()}`;
+    const install = cacheOnlyInstall("aft-cli-clean-old-", version);
+    rmSync(join(install.cacheBinDir, version, getAftBinaryName()));
+    linkCachedExecutable(
+      join(install.cacheBinDir, version, getAftBinaryName()),
+      `#!/bin/sh\nprintf '%s\\n' "$@"\nexit ${FIXTURE_EXIT_CODE}\n`,
+    );
+    for (const flags of [[], ["--yes"], ["--help"], ["-h"]]) {
+      const result = runCli(["cache", "clean-old", ...flags], install.env);
+      expect(result.status).toBe(FIXTURE_EXIT_CODE);
+      expect(result.stdout.trim().split("\n")).toEqual(["cache", "clean-old", ...flags]);
+      expect(result.stderr).toBe("");
+    }
+    const rejected = runCli(["cache", "clean-old", "--unknown"], install.env);
+    expect(rejected.status).toBe(2);
+    expect(rejected.stdout).toBe("");
+    expect(rejected.stderr).toContain("usage: aft cache clean-old [--yes]");
+  });
+
   test("aft index runs the binary that doctor --fix left in the cache", async () => {
     const install = cacheOnlyInstall("aft-cli-index-cache-only-", `v${getSelfVersion()}`);
 

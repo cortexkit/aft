@@ -101,8 +101,37 @@ pub(crate) fn retired(stamp: &ScopeStamp, reply: &ModuleControlResponseToModule)
         )
 }
 
+/// Logs a continuity decision once per change. The grant sweep and scope
+/// describes re-check the same scopes every few seconds, so logging each check
+/// filled half the daemon log with identical lines; a repeated decision for the
+/// same scope and counterpart says nothing new.
 pub(crate) fn log_continuation(from: &ScopeStamp, to: &ScopeStamp, outcome: &str) {
-    log::info!("prefrontal scope continuity owner={:?} scope_ref={:?} scope_epoch={} counterpart_owner={:?} counterpart_ref={:?} counterpart_epoch={} outcome={outcome}", from.owner, from.scope_ref, from.scope_epoch, to.owner, to.scope_ref, to.scope_epoch);
+    let line = format!("prefrontal scope continuity owner={:?} scope_ref={:?} scope_epoch={} counterpart_owner={:?} counterpart_ref={:?} counterpart_epoch={} outcome={outcome}", from.owner, from.scope_ref, from.scope_epoch, to.owner, to.scope_ref, to.scope_epoch);
+    if continuity_line_is_new(format!("{:?}/{:?}", from.owner, from.scope_ref), &line) {
+        log::info!("{line}");
+    }
+}
+
+/// Remembers the last continuity line logged for each scope and reports
+/// whether `line` differs from it.
+fn continuity_line_is_new(key: String, line: &str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    // Bounded: a full map is cleared, which at worst logs each live decision once more.
+    const MAX_REMEMBERED: usize = 4096;
+    static LAST: LazyLock<Mutex<HashMap<String, String>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let mut last = LAST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if last.get(&key).map(String::as_str) == Some(line) {
+        return false;
+    }
+    if last.len() >= MAX_REMEMBERED {
+        last.clear();
+    }
+    last.insert(key, line.to_owned());
+    true
 }
 
 pub(crate) fn retained_outcome(reply: Option<&ModuleControlResponseToModule>) -> &'static str {
@@ -221,6 +250,25 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn prefrontal_scope_continuity_logs_each_decision_once_per_change() {
+        let key = || "continuity-log-dedupe-agent".to_owned();
+        let decisions = [
+            "outcome=source_live",
+            "outcome=source_live",
+            "outcome=hold_source",
+            "outcome=hold_source",
+            "outcome=source_live",
+        ]
+        .map(|line| continuity_line_is_new(key(), line));
+        assert_eq!(decisions, [true, false, true, false, true]);
+        // Another scope keeps its own last line.
+        assert!(continuity_line_is_new(
+            "continuity-log-dedupe-other".into(),
+            "outcome=source_live"
+        ));
     }
 
     #[test]

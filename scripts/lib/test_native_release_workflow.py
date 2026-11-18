@@ -301,10 +301,9 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
         # crates.io refuses a crate whose dependencies it can't resolve, and it
         # does so only at release time, after every build has passed: 0.63.2
         # failed this way when a path dependency was marked `publish = false`.
-        run = next(
-            step["run"] for step in self.workflow("release.yml")["jobs"]["publish-crates"]["steps"]
-            if "cargo publish --package agent-file-tools" in step.get("run", "")
-        )
+        publish = self.workflow("release.yml")["jobs"]["publish-crates"]
+        self.assertIn('bash scripts/publish-crates.sh "$GITHUB_REF_NAME"', commands(publish))
+        run = (ROOT / "scripts/publish-crates.sh").read_text()
         sync = (ROOT / "scripts/version-sync.mjs").read_text()
 
         def path_dependencies(manifest_dir):
@@ -331,7 +330,7 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
                     self.assertNotEqual(package.get("publish"), False, f"{name} must be publishable")
                     self.assertIn("version", spec, f"{key} needs a version pin to publish")
                     publish = f"cargo publish --package {name} "
-                    self.assertIn(publish, run, f"release.yml must publish {name}")
+                    self.assertIn(publish, run, f"publish-crates.sh must publish {name}")
                     self.assertLess(run.index(publish), published_before, f"{name} must publish before agent-file-tools")
                     relative = dep_dir.relative_to(ROOT).parts
                     self.assertIn(
@@ -374,7 +373,7 @@ class ReleaseRehearsalWorkflowTests(unittest.TestCase):
                 publishes = any(
                     "--dry-run" not in line
                     for line in re.findall(r"(?m)^\s*(?:cargo|npm) publish\b[^\n]*", run)
-                )
+                ) or "bash scripts/publish-crates.sh" in run
                 mutates_release = re.search(r"\b(?:gh release (?:create|upload|edit)|git (?:push|tag))\b", run)
                 external_action = "github-releases-to-discord@" in step.get("uses", "")
                 if publishes or mutates_release or external_action:

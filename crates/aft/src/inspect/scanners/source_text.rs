@@ -27,6 +27,32 @@ pub(crate) const MAX_GRAPH_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
 pub(crate) const TOO_LARGE: &str = "over the 1 MiB size limit";
 pub(crate) const GRAPH_TOO_LARGE: &str = "over the 4 MiB size limit";
 
+const MAX_LINE_COUNT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Count lines without allocating even when a file contains one enormous line.
+/// The extra byte distinguishes an exact count from a bounded lower estimate.
+pub(crate) fn bounded_line_count(path: &Path) -> std::io::Result<(usize, bool)> {
+    let file = crate::project_content::open(path)?;
+    count_lines_bounded(std::io::BufReader::new(file), MAX_LINE_COUNT_BYTES)
+}
+
+fn count_lines_bounded(reader: impl Read, limit: usize) -> std::io::Result<(usize, bool)> {
+    let mut newlines = 0;
+    let mut last = None;
+    for (index, byte) in reader.bytes().take(limit.saturating_add(1)).enumerate() {
+        let byte = byte?;
+        if index == limit {
+            return Ok((newlines + 1, false));
+        }
+        newlines += usize::from(byte == b'\n');
+        last = Some(byte);
+    }
+    Ok((
+        newlines + usize::from(last.is_some_and(|byte| byte != b'\n')),
+        true,
+    ))
+}
+
 // Charge source bytes, not file count, so small files can use the whole Rayon
 // pool. Reservations stay live through parsing and tree traversal. Source-byte
 // limits bound input, not the amplified size of parser trees and scratch space.
@@ -322,6 +348,24 @@ pub(crate) fn handwritten_graph_source_for_test(bytes: usize, header: &str) -> S
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inspect_bounded_line_count_handles_endings_and_cut_reads() {
+        for (bytes, limit, expected) in [
+            (b"".as_slice(), 10, (0, true)),
+            (b"one\n".as_slice(), 4, (1, true)),
+            (b"one\ntwo".as_slice(), 7, (2, true)),
+            (b"one\ntwo".as_slice(), 4, (2, false)),
+            (b"unbroken".as_slice(), 3, (1, false)),
+        ] {
+            assert_eq!(super::count_lines_bounded(bytes, limit).unwrap(), expected);
+        }
+        let mut reader = std::io::repeat(b'x').take(100);
+        assert_eq!(
+            super::count_lines_bounded(&mut reader, 8).unwrap(),
+            (1, false)
+        );
+        assert_eq!(reader.limit(), 91);
+    }
     #[cfg(unix)]
     #[test]
     fn non_regular_source_reads_do_not_wait_for_fifo_writers() {

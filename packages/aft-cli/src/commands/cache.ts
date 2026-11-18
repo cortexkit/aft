@@ -1,10 +1,11 @@
 import { forwardToNative } from "../lib/native-forward.js";
+import { runOldCacheCleanup } from "./clean-old.js";
 
 /**
- * Forward `cache <subcommand>` to the native binary. The Rust command owns
- * argument validation, the dry-run default, the safety checks and every
- * printed line, so this wrapper adds no behavior of its own.
+ * Forward cache maintenance to the native binary, retaining the cleanup
+ * adapter's argument checks and launch-error reporting for `clean-old`.
  */
 export function runCache(argv: string[]): number {
+  if (argv[0] === "clean-old") return runOldCacheCleanup(argv.slice(1));
   return forwardToNative("cache", argv);
 }

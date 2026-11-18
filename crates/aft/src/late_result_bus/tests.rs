@@ -75,7 +75,12 @@ async fn prefrontal_rename_bus_preserves_custody_and_reader_subjects() {
             .unwrap();
         assert_eq!(
             names
-                .event_subject_with_reader("aft", EVENT, 1, reader)
+                .event_subject_with_reader(
+                    "aft",
+                    LATE_RESULT_READY_EVENT,
+                    LATE_RESULT_READY_VERSION.try_into().unwrap(),
+                    reader,
+                )
                 .unwrap(),
             format!("ck.box_test.event.aft.late_result_ready.v1.{module}")
         );
@@ -139,6 +144,87 @@ async fn retry_due(
     state.retry(publisher, retained).await;
 }
 
+#[derive(Serialize)]
+struct LegacyBody {
+    call_key: String,
+    outcome: String,
+}
+
+#[test]
+fn late_result_bus_legacy_and_contract_serialization_match() {
+    for (call_key, outcome) in [
+        ("call:ok", "ok"),
+        ("call:error", "tool_denied"),
+        ("call:unknown", "unknown"),
+    ] {
+        let old = LegacyBody {
+            call_key: call_key.into(),
+            outcome: outcome.into(),
+        };
+        let new = cortexkit_role_tool_provider::LateResultReady::new(call_key, outcome);
+        assert_eq!(
+            serde_json::to_vec(&old).unwrap(),
+            serde_json::to_vec(&new).unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn late_result_bus_publisher_matches_provider_vectors() {
+    use cortexkit_role_tool_provider::vectors::late_result_ready::FILES;
+
+    fn fixture(name: &str) -> &'static str {
+        FILES
+            .iter()
+            .find_map(|(path, contents)| (*path == name).then_some(*contents))
+            .unwrap_or_else(|| panic!("missing provider vector: {name}"))
+    }
+
+    for (case, call_key, event_id, outcome) in [
+        ("ok", "call:ok", "settlement:1", Some("ok")),
+        ("error", "call:error", "settlement:2", Some("tool_denied")),
+        ("unknown", "call:unknown", "settlement:3", None),
+    ] {
+        let (_dir, conn) = database();
+        let key = key(call_key);
+        admit(&conn, &key, "reserved:reader");
+        ledger::settle(&conn, &key, &frame(), "ok", None, ledger::now_ms()).unwrap();
+        conn.execute(
+            "UPDATE call_ledger SET event_id=?1, outcome=?2 WHERE carrier=?3 AND call_key=?4",
+            params![event_id, outcome, key.carrier, key.call_key],
+        )
+        .unwrap();
+        let mut publisher = RecordingPublisher::default();
+        drain(&conn, &mut DeliveryState::default(), &mut publisher).await;
+        assert_eq!(publisher.attempts.len(), 1, "{case}");
+        let (reader, msg_id, body) = &publisher.attempts[0];
+        assert_eq!(
+            body.as_slice(),
+            fixture(&format!("{case}/payload.json")).as_bytes(),
+            "{case}"
+        );
+        assert_eq!(
+            msg_id,
+            fixture(&format!("{case}/nats-msg-id.txt")).trim_end_matches('\n'),
+            "{case}"
+        );
+        let subject = AccountNames::derive("box_test")
+            .unwrap()
+            .event_subject_with_reader(
+                "provider",
+                LATE_RESULT_READY_EVENT,
+                LATE_RESULT_READY_VERSION as u32,
+                reader,
+            )
+            .unwrap();
+        assert_eq!(
+            subject.strip_prefix("ck.box_test.").unwrap(),
+            fixture(&format!("{case}/subject.txt")).trim_end_matches('\n'),
+            "{case}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn late_result_bus_committed_entry_is_sent_once_with_only_public_fields() {
     let (_dir, conn) = database();
@@ -165,7 +251,12 @@ async fn late_result_bus_committed_entry_is_sent_once_with_only_public_fields() 
     let names = AccountNames::derive("box_test").unwrap();
     assert_eq!(
         names
-            .event_subject_with_reader("aft", EVENT, 1, reader)
+            .event_subject_with_reader(
+                "aft",
+                LATE_RESULT_READY_EVENT,
+                LATE_RESULT_READY_VERSION as u32,
+                reader
+            )
             .unwrap(),
         "ck.box_test.event.aft.late_result_ready.v1.broca"
     );

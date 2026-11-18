@@ -35,7 +35,7 @@ All four keep the same agent-facing parameters as Pi's built-ins, so your prompt
 
 On Oh My Pi (OMP), these five overrides delegate internal resources to OMP's native tool when its internal URL router and `ctx.invokeTool` are available. Reads and grep include MCP resource URIs; write and edit delegate schemes with an OMP write policy (including content-less `proc://<id>/kill`). OMP's read-only `issue://` and `pr://` routes handle reads, while AFT retains its opt-in GitHub comment write/edit behavior. Bash delegates internal-URL working directories and registered URL words in commands, including quoted URLs and `skill://`; OMP owns the resulting background jobs and exposes loaded skills in its system prompt. Plain filesystem targets continue through AFT. Upstream Pi's schemas and behavior are unchanged.
 
-Filesystem calls on OMP use AFT's argument forms; unsupported native-only arguments produce errors naming the fields and their AFT alternatives. Extension validation performs no binary resolution, downloads, storage migration, or transport startup: those wait until a session warmup or filesystem tool request needs AFT.
+Filesystem calls on oh-my-pi (OMP) use AFT's argument forms; unsupported native-only arguments produce errors naming the fields and their AFT alternatives. Extension validation performs no binary resolution, downloads or transport startup: those wait until a session warmup or filesystem tool request needs AFT.
 
 ### AFT-specific tools
 

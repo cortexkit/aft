@@ -64,7 +64,6 @@ describe.skipIf(posixOnly)("OpenCode plugin init never executes the aft binary",
   ): BridgeBootstrapDependencies {
     return {
       ...defaultBridgeBootstrapDependencies,
-      ensureStorageMigrated: async () => {},
       resolveStorageRoot: () => join(root, "storage"),
       buildConfigureParams: (_directory, state) => ({ ...state }),
       ensureOnnxRuntime: async () => null,

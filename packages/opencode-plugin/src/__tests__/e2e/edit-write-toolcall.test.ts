@@ -144,8 +144,9 @@ export function runEditWriteToolcallSuite(
     test("edit on a >512KB file returns the preview hunk as a patch filediff", async () => {
       const h = await harness();
       // Over Rust's 512KB diff-content cap, the response diff is counts-only.
-      // The preview remains hunk-scoped so the UI can render the changed lines.
-      const big = `${"a".repeat(600_000)}\nbeta\n`;
+      // Short context lines keep the preview hunk within its response budget.
+      const padding = `${"a".repeat(600)}\n`.repeat(1000);
+      const big = `${padding}beta\n`;
       await writeFile(h.path("big.txt"), big);
 
       const result = await executeEdit(h, {
@@ -229,12 +230,13 @@ export function runEditWriteToolcallSuite(
 
     test("write on a >512KB file returns the preview hunk as a patch filediff", async () => {
       const h = await harness();
-      const big = `${"a".repeat(600_000)}\nbeta\n`;
+      const padding = `${"a".repeat(600)}\n`.repeat(1000);
+      const big = `${padding}beta\n`;
       await writeFile(h.path("big-write.txt"), big);
 
       const result = await executeWrite(h, {
         filePath: "big-write.txt",
-        content: `${"a".repeat(600_000)}\nBETA\n`,
+        content: `${padding}BETA\n`,
       });
 
       expect(await readTextFile(h.path("big-write.txt"))).toContain("BETA");

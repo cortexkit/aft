@@ -81,6 +81,11 @@ use crate::db::bash_watches::BashPatternWatchRow;
 
 #[path = "lifecycle_scope.rs"]
 mod lifecycle_scope;
+#[path = "scope_runtime.rs"]
+mod scope_runtime;
+#[path = "scope_spawn.rs"]
+mod scope_spawn;
+use scope_spawn::spawn_detached_child;
 
 struct UncommittedLayout<'a> {
     task: &'a ResolvedTask,
@@ -233,7 +238,6 @@ pub(crate) mod folder_grants;
 pub(crate) mod remote;
 #[path = "return_files.rs"]
 pub(crate) mod return_files;
-#[cfg(target_os = "linux")]
 pub(crate) const LINUX_SCOPE_ENV: &str = "AFT_INTERNAL_LINUX_SCOPE";
 
 #[cfg(test)]
@@ -897,6 +901,8 @@ pub enum HardKillSource {
     Default,
     /// The caller's explicit `timeout`.
     Timeout,
+    Scope,
+    ScopedDefault,
 }
 
 /// A task's own kill deadline: it is killed once it has run `limit_ms`.
@@ -908,6 +914,26 @@ pub struct HardKillDeadline {
 }
 
 impl HardKillDeadline {
+    fn reported(metadata: &PersistedTask, renewable: bool) -> Option<Self> {
+        let deadline = Self::from_metadata(metadata.timeout_ms, renewable);
+        match metadata.task_scope_runtime_ms {
+            Some(limit_ms) if deadline.is_none_or(|deadline| limit_ms <= deadline.limit_ms) => {
+                Some(Self {
+                    limit_ms,
+                    source: HardKillSource::Scope,
+                })
+            }
+            Some(_) => deadline.map(|mut deadline| {
+                if deadline.source == HardKillSource::Default {
+                    deadline.source = HardKillSource::ScopedDefault;
+                }
+                deadline
+            }),
+            // Old records have no saved scope runtime. Report only their task deadline.
+            None => deadline,
+        }
+    }
+
     /// The deadline a task record carries. `renewable` is the record's
     /// `default_hard_kill`; for a record written before AFT stored it, a
     /// limit equal to the default is taken to be the default.
@@ -1441,6 +1467,7 @@ pub(crate) struct RegistryInner {
     #[cfg(unix)]
     revoked_secret_authorizations: Mutex<HashSet<(String, String, u64)>>,
     memory_monitors: Mutex<HashMap<String, super::memory_limit::Monitor>>,
+    task_scopes: super::task_scope::TaskScopes,
     #[cfg(unix)]
     db_hint_jobs:
         Mutex<HashMap<String, (std::sync::Weak<BgTask>, Arc<crate::bash_db_hints::HintJob>)>>,
@@ -1642,7 +1669,7 @@ pub(crate) struct BashDrainReplyState {
 impl BashDrainReplyCache {
     fn publish_metadata(&self, metadata: &PersistedTask, renewable: bool) {
         let note = rendered_execution_note(metadata);
-        let deadline = HardKillDeadline::from_metadata(metadata.timeout_ms, renewable)
+        let deadline = HardKillDeadline::reported(metadata, renewable)
             .map(|deadline| (deadline, metadata.started_at));
         let inputs_captured = metadata
             .remote
@@ -2195,6 +2222,7 @@ impl BgTaskRegistry {
         Self {
             inner: Arc::new(RegistryInner {
                 memory_monitors: Mutex::new(HashMap::new()),
+                task_scopes: super::task_scope::TaskScopes::default(),
                 #[cfg(unix)]
                 secret_proxies: Mutex::new(HashMap::new()),
                 #[cfg(unix)]
@@ -5650,146 +5678,6 @@ impl BgTaskRegistry {
             .store(interval_ms, Ordering::SeqCst);
     }
 
-    fn prepare_memory_limit(
-        memory_limit_mib: Option<u64>,
-        task_id: &str,
-    ) -> Result<Option<super::memory_limit::Monitor>, String> {
-        #[cfg(test)]
-        if let Some(gate) = MEMORY_PREPARE_GATE_FOR_TEST.with(|slot| slot.borrow_mut().take()) {
-            gate();
-        }
-        let mib = memory_limit_mib.unwrap_or(0);
-        if mib == 0 {
-            return Ok(None);
-        }
-        super::memory_limit::Monitor::prepare(mib, task_id).map(Some)
-    }
-
-    fn fail_memory_spawn(
-        &self,
-        metadata: &mut PersistedTask,
-        paths: &TaskPaths,
-        error: &str,
-        canonical_project_root: PathBuf,
-    ) {
-        metadata.mark_terminal(BgTaskStatus::Failed, None, Some(error.into()));
-        let _ = self.persist_task(paths, metadata);
-        let _ = self.insert_rehydrated_task_with_root(
-            metadata.clone(),
-            paths.clone(),
-            true,
-            canonical_project_root,
-        );
-        self.record_live_delivery_session(&metadata.session_id);
-        self.enqueue_completion_if_needed(metadata, Some(paths), true);
-    }
-
-    pub(crate) fn memory_limit_exceeded(&self, task: &Arc<BgTask>) -> Option<String> {
-        let mut state = task.lock_state().ok()?;
-        if (state.metadata.remote.is_some() && !state.metadata.local_fallback_started)
-            || state.metadata.is_terminal()
-        {
-            return None;
-        }
-        let pgid = state
-            .metadata
-            .pgid
-            .or(state.metadata.child_pid.map(|pid| pid as i32))?;
-        let mut monitors = self.inner.memory_monitors.lock().ok()?;
-        if !monitors.contains_key(&task.task_id) {
-            let policy = state.metadata.memory_policy.clone()?;
-            match super::memory_limit::Monitor::recover(policy, &task.task_id) {
-                Ok(monitor) => {
-                    monitors.insert(task.task_id.clone(), monitor);
-                }
-                Err(error) => return Some(error),
-            }
-        }
-        let monitor = monitors.get_mut(&task.task_id)?;
-        if monitor.exceeded(pgid) {
-            let reason = monitor.reason();
-            // A terminal observer can run before the stop worker gets its turn.
-            // Preserve the known cap outcome for that observer as well.
-            state.pending_terminal_override = Some(BgTaskStatus::Failed);
-            state.metadata.status_reason = Some(reason.clone());
-            Some(reason)
-        } else {
-            None
-        }
-    }
-
-    pub(crate) fn kill_for_memory(&self, task: &Arc<BgTask>, reason: String) {
-        if let Ok(mut state) = task.lock_state() {
-            if !state.metadata.is_terminal() {
-                state.pending_terminal_override = Some(BgTaskStatus::Failed);
-                state.metadata.status_reason = Some(reason.clone());
-            }
-        }
-        if let Ok(monitors) = self.inner.memory_monitors.lock() {
-            if let Some(monitor) = monitors.get(&task.task_id) {
-                monitor.terminate();
-            }
-        }
-        let _ = self.kill_with_status_reason(
-            &task.task_id,
-            &task.session_id,
-            BgTaskStatus::Failed,
-            Some(reason),
-        );
-    }
-
-    fn settle_memory_accounting(&self, task: &Arc<BgTask>) -> Result<(), String> {
-        let mut db = DeferredDbWrites::new(self, task);
-        let mut state = task.lock_state().map_err(|error| error.to_string())?;
-        if !state.metadata.is_terminal() || state.kill_in_flight {
-            return Ok(());
-        }
-        let mut monitors = self
-            .inner
-            .memory_monitors
-            .lock()
-            .map_err(|error| error.to_string())?;
-        let Some(monitor) = monitors.get_mut(&task.task_id) else {
-            return Ok(());
-        };
-        let pgid = state
-            .metadata
-            .pgid
-            .or(state.metadata.child_pid.map(|pid| pid as i32))
-            .unwrap_or(0);
-        let mut updated = false;
-        if monitor.exceeded(pgid) {
-            monitor.terminate();
-            state
-                .metadata
-                .mark_terminal(BgTaskStatus::Failed, Some(137), Some(monitor.reason()));
-            state.terminal_output_cache = None;
-            updated = true;
-        }
-        #[cfg(windows)]
-        if let Some(note) = monitor
-            .outcome_note()
-            .filter(|_| state.metadata.exit_code != Some(0))
-        {
-            state.metadata.execution_note = Some(note.into());
-            updated = true;
-        }
-        if updated {
-            // Accounting refines an observed exit; failed storage must not skip
-            // the shared survivor check and completion publication.
-            task.terminal_persist_dirty.store(true, Ordering::SeqCst);
-            if let Err(error) = self.persist_task_locked(task, &state.metadata, &mut db) {
-                crate::slog_warn!(
-                    "failed to persist terminal state for {}: {error}",
-                    task.task_id
-                );
-            } else {
-                task.terminal_persist_dirty.store(false, Ordering::SeqCst);
-            }
-        }
-        Ok(())
-    }
-
     #[cfg(unix)]
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
@@ -5897,6 +5785,7 @@ impl BgTaskRegistry {
             notify_on_completion,
             compressed,
             project_root,
+            false,
         )
         .map_err(|error| error.to_string())
     }
@@ -5962,15 +5851,13 @@ impl BgTaskRegistry {
         notify_on_completion: bool,
         compressed: bool,
         project_root: Option<PathBuf>,
+        linux_scope: bool,
     ) -> Result<String, RegistryError> {
         let canonical_project_root =
             canonicalized_path(project_root.as_deref().unwrap_or(&workdir));
         self.start_watchdog();
 
-        #[cfg(target_os = "linux")]
-        let linux_scope = env.remove(LINUX_SCOPE_ENV).as_deref() == Some("1");
-        #[cfg(not(target_os = "linux"))]
-        let linux_scope = false;
+        env.remove(LINUX_SCOPE_ENV);
 
         let _admission = self.background_admission_guard(slot);
         if let Err(refusal) = self.check_background_slot_typed(slot, &session_id) {
@@ -6080,8 +5967,28 @@ impl BgTaskRegistry {
             Some(completion_secrets.has_non_ticket_secrets);
         metadata.completion_ticket_digest = completion_secrets.ticket_digest.clone();
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
+        let mut scope = self
+            .inner
+            .task_scopes
+            .policy(linux_scope, None, spawn_plan.is_native_launcher())
+            .map(|policy| {
+                self.inner.task_scopes.prepare(
+                    policy,
+                    &task_id,
+                    hard_kill,
+                    memory_limit_mib,
+                    super::persistence::task_store_root(&paths.session_dir)
+                        .ok_or("task store root is unavailable")?,
+                )
+            })
+            .transpose()?
+            .flatten();
         super::enter_bash_startup_step(super::BashStartupStep::ControlFiles);
-        let mut memory_monitor = Self::prepare_memory_limit(memory_limit_mib, &task_id)?;
+        let mut memory_monitor = if scope.is_some() {
+            None
+        } else {
+            Self::prepare_memory_limit(memory_limit_mib, &task_id)?
+        };
         metadata.memory_policy = memory_monitor
             .as_ref()
             .map(|monitor| monitor.policy.clone());
@@ -6103,20 +6010,33 @@ impl BgTaskRegistry {
         }
         layout_cleanup.disarm();
         self.dual_write_task(&paths, &metadata);
-        let mut child = match spawn_detached_child(
-            &spawn_plan,
-            command,
-            shell,
-            &shell_path,
-            &paths,
-            &workdir,
-            &env,
-            &mut io_handles,
-            capture_pipeline_status,
-            memory_monitor.is_some(),
-            linux_scope,
-            LocalIdentityGate::Required,
-        ) {
+        let mut spawn_child = |scope: Option<&super::task_scope::ScopeLaunch>| {
+            spawn_detached_child(
+                &spawn_plan,
+                command,
+                shell,
+                &shell_path,
+                &paths,
+                &workdir,
+                &env,
+                &mut io_handles,
+                capture_pipeline_status,
+                memory_limit_mib.is_some(),
+                scope,
+                LocalIdentityGate::Required,
+            )
+        };
+        let child_result = spawn_child(scope.as_ref()).and_then(|mut child| {
+            if let Some(launch) = scope.as_ref() {
+                if self.place_task_scope(&mut child, launch)? {
+                    scope = None;
+                    memory_monitor = Self::prepare_memory_limit(memory_limit_mib, &task_id)?;
+                    return spawn_child(None);
+                }
+            }
+            Ok(child)
+        });
+        let mut child = match child_result {
             Ok(child) => child,
             Err(error) => {
                 crate::slog_warn!("failed to spawn background bash task {task_id}: {error}");
@@ -6141,12 +6061,31 @@ impl BgTaskRegistry {
 
         let child_pid = child.id();
         child.declare_agent();
+        #[cfg(target_os = "linux")]
+        if scope.is_some() {
+            match self.scoped_memory_limit(memory_limit_mib, &task_id) {
+                Ok(monitor) => memory_monitor = monitor,
+                Err(error) => {
+                    drop(child.stdin.take());
+                    if let Some(scope) = scope.as_ref() {
+                        let _ = scope.stop();
+                    }
+                    let _ = child.wait();
+                    self.fail_memory_spawn(&mut metadata, &paths, &error, canonical_project_root);
+                    return Err(error.into());
+                }
+            }
+        }
         if let Err(error) = self.arm_secret_proxy(&spawn_plan, &task_id, child_pid) {
             drop(_admission);
             super::process::terminate_pgid_with(child_pid as i32, || {
                 matches!(child.try_wait(), Ok(Some(_)))
             });
-            let _ = child.wait();
+            if let Err(kill_error) =
+                self.cleanup_failed_scope_spawn(&task_id, &mut child, scope.as_ref())
+            {
+                crate::slog_warn!("failed spawn scope cleanup: {kill_error}");
+            }
             return Err(error.into());
         }
         if let Some(mut monitor) = memory_monitor.take() {
@@ -6155,7 +6094,11 @@ impl BgTaskRegistry {
                 super::process::terminate_pgid_with(child_pid as i32, || {
                     matches!(child.try_wait(), Ok(Some(_)))
                 });
-                let _ = child.wait();
+                if let Err(kill_error) =
+                    self.cleanup_failed_scope_spawn(&task_id, &mut child, scope.as_ref())
+                {
+                    crate::slog_warn!("failed spawn scope cleanup: {kill_error}");
+                }
                 self.fail_memory_spawn(&mut metadata, &paths, &error, canonical_project_root);
                 return Err(error.into());
             }
@@ -6172,8 +6115,15 @@ impl BgTaskRegistry {
         metadata.child_pid = Some(child_pid);
         metadata.pgid = Some(child_pid as i32);
         metadata.child_start_time_ms = crate::root_cache::process_start_time_ms(child_pid);
+        #[cfg(target_os = "linux")]
+        {
+            metadata.task_scope_runtime_ms = scope.as_ref().map(|scope| scope.runtime_ms());
+        }
         if let Err(error) = self.persist_task(&paths, &metadata) {
             drop(child.stdin.take());
+            if let Some(scope) = scope.as_ref() {
+                let _ = scope.stop();
+            }
             let _ = child.wait();
             metadata.mark_terminal(
                 BgTaskStatus::Failed,
@@ -6902,6 +6852,7 @@ impl BgTaskRegistry {
         notify_on_completion: bool,
         compressed: bool,
         project_root: Option<PathBuf>,
+        _linux_scope: bool,
     ) -> Result<String, RegistryError> {
         let canonical_project_root =
             canonicalized_path(project_root.as_deref().unwrap_or(&workdir));
@@ -6969,7 +6920,7 @@ impl BgTaskRegistry {
             &mut io_handles,
             false,
             memory_monitor.is_some(),
-            false,
+            None,
         ) {
             Ok(child) => child,
             Err(error) => {
@@ -7245,6 +7196,19 @@ impl BgTaskRegistry {
         // own harness and checks recorded processes under every harness, so
         // the harness that configured this root has no bearing on it.
         let key = canonicalized_path(storage_dir);
+        // Scope cleanup must identify records to keep before GC starts.
+        #[cfg(target_os = "linux")]
+        self.start_task_scope_cleanup(storage_dir);
+        #[cfg(target_os = "linux")]
+        if self.inner.task_scopes.is_daemon()
+            && !task_scope_cleanup_slots()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(&key)
+                .is_some_and(|slot| slot.done || slot.pending_records.is_some())
+        {
+            return;
+        }
         {
             let mut slots = persisted_gc_slots()
                 .lock()
@@ -7708,6 +7672,7 @@ impl BgTaskRegistry {
             self.retire_orphaned_watch_tombstones(session_id)?;
             self.start_watchdog();
         }
+        self.start_task_scope_cleanup(storage_dir);
         if !self.inner.persisted_gc_started.swap(true, Ordering::SeqCst) {
             // The persisted GC walks every session under the shared storage root
             // (liveness probes, row deletes, quarantines) and scales with the
@@ -8420,6 +8385,50 @@ impl BgTaskRegistry {
                 && (metadata.status == BgTaskStatus::Starting || metadata.mode != BgMode::Pty)
             {
                 let alive = process_is_alive(&metadata);
+                #[cfg(target_os = "linux")]
+                let alive = if alive && metadata.mode == BgMode::Pipes && metadata.remote.is_none()
+                {
+                    let recovered = (|| -> Result<(), String> {
+                        if let Some(pid) = metadata.child_pid {
+                            let answer = if let Some(start) = metadata.child_start_time_ms {
+                                self.inner
+                                    .task_scopes
+                                    .adopt(&metadata.task_id, pid, start)?
+                            } else {
+                                match super::task_scope::lookup_state(&metadata.task_id)? {
+                                    super::task_scope::ScopeLookup::Present(_) => {
+                                        return Err(
+                                            "task scope replay has no exact child identity".into()
+                                        )
+                                    }
+                                    other => other,
+                                }
+                            };
+                            if let super::task_scope::ScopeLookup::Present(scope) = answer {
+                                if let Some(policy) = metadata.memory_policy.as_mut() {
+                                    let monitor = super::memory_limit::Monitor::recover_task_scope(
+                                        policy.mib, &scope,
+                                    );
+                                    *policy = monitor.policy.clone();
+                                    self.inner
+                                        .memory_monitors
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner())
+                                        .insert(metadata.task_id.clone(), monitor);
+                                }
+                            }
+                        }
+                        Ok(())
+                    })();
+                    if recovered.is_err() {
+                        super::task_scope::log_unconfirmed_scope();
+                        false
+                    } else {
+                        alive
+                    }
+                } else {
+                    alive
+                };
                 if !alive {
                     // The wrapper writes its exit marker before exiting. It may
                     // have done both since our first read, so observe the marker
@@ -8512,6 +8521,18 @@ impl BgTaskRegistry {
                             metadata.child_pid,
                             None,
                         );
+                        #[cfg(target_os = "linux")]
+                        self.inner.task_scopes.kill(
+                            &metadata.task_id,
+                            metadata
+                                .memory_policy
+                                .as_ref()
+                                .filter(|policy| {
+                                    policy.kind
+                                        == super::memory_limit::MemoryPolicy::TASK_SCOPE_MEMORY_KIND
+                                })
+                                .and_then(|policy| policy.cgroup.as_deref()),
+                        )?;
                         settle_killed_process_group(&metadata.task_id, metadata.pgid);
                     }
                     let recovered = "recovered from inconsistent killing state on replay";
@@ -10615,6 +10636,15 @@ impl BgTaskRegistry {
         }
         let _record_thread = RecordThreadOnExit(&self.inner);
 
+        #[cfg(target_os = "linux")]
+        let protected_scope_ids: HashSet<String> = task_scope_cleanup_slots()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&canonicalized_path(storage_dir))
+            .and_then(|slot| slot.pending_records.as_ref())
+            .map(|records| records.keys().cloned().collect())
+            .unwrap_or_default();
+
         let mut deleted = 0usize;
 
         let mut image_cleanup = task_image_cleanup::ImageCleanupPass::default();
@@ -10710,6 +10740,10 @@ impl BgTaskRegistry {
                 // invalidates what this batch remembers about them.
                 let session_stamp = super::gc_memo::Stamp::of(&session_dir).ok();
                 for task_id in &task_ids {
+                    #[cfg(target_os = "linux")]
+                    if protected_scope_ids.contains(task_id) {
+                        continue;
+                    }
                     if !examined.insert((session_dir.clone(), task_id.clone())) {
                         continue;
                     }
@@ -11647,7 +11681,7 @@ impl BgTaskRegistry {
         if state.metadata.remote.is_some() {
             return None;
         }
-        HardKillDeadline::from_metadata(state.metadata.timeout_ms, task.hard_kill_renewable)
+        HardKillDeadline::reported(&state.metadata, task.hard_kill_renewable)
     }
 
     /// Time left until the task's own hard kill, measured from its monotonic
@@ -11672,7 +11706,7 @@ impl BgTaskRegistry {
         let task = self.task_for_session(task_id, session_id)?;
         let state = task.lock_state().ok()?;
         Some((
-            HardKillDeadline::from_metadata(state.metadata.timeout_ms, task.hard_kill_renewable)?,
+            HardKillDeadline::reported(&state.metadata, task.hard_kill_renewable)?,
             state.metadata.started_at,
         ))
     }
@@ -14833,6 +14867,7 @@ impl BgTaskRegistry {
             }
         };
 
+        let mut scope_kill_attempted = false;
         match plan {
             KillSignalPlan::Nothing => {}
             #[cfg(any(windows, test))]
@@ -14884,6 +14919,8 @@ impl BgTaskRegistry {
                     crate::slog_info!("scope diagnostic phase=signal_started task={task_id} child_pid={child_pid:?} elapsed_ms={}", diagnostic_start.elapsed().as_millis());
                 }
                 terminate_piped_task(&task.task_id, pgid, child_pid, child.as_mut());
+                let scope_result = self.kill_task_scope(&task.task_id);
+                scope_kill_attempted = true;
                 #[cfg(feature = "test-timing-hooks")]
                 if scope_diagnostic {
                     crate::slog_info!(
@@ -14919,7 +14956,15 @@ impl BgTaskRegistry {
                         terminal_status
                     };
 
-                    if let Some(marker) = natural_exit_before_signal.filter(|_| !memory_kill) {
+                    if let Err(error) = scope_result {
+                        // An unconfirmed scope stop must not schedule the same kill on each poll.
+                        state.metadata.mark_terminal(
+                            BgTaskStatus::FateUnknown,
+                            None,
+                            Some(format!("Task outcome is unknown: {error}.")),
+                        );
+                    } else if let Some(marker) = natural_exit_before_signal.filter(|_| !memory_kill)
+                    {
                         state.metadata =
                             terminal_metadata_from_marker(state.metadata.clone(), marker, None);
                     } else {
@@ -14998,6 +15043,9 @@ impl BgTaskRegistry {
             }
         }
 
+        if !scope_kill_attempted {
+            self.kill_task_scope(&task.task_id)?;
+        }
         if terminalized {
             #[cfg(test)]
             wait_on_kill_signal_gate_for_test(&format!("{task_id}:terminal-published"));
@@ -15040,6 +15088,7 @@ impl BgTaskRegistry {
     #[cfg(unix)]
     fn terminate_terminal_survivors(&self, task: &Arc<BgTask>, pgid: i32) -> Result<(), String> {
         terminate_pgid(pgid, None);
+        self.kill_task_scope(&task.task_id)?;
         settle_killed_process_group(&task.task_id, Some(pgid));
         let sample = live_process_group_members(pgid);
         let mut db = DeferredDbWrites::new(self, task);
@@ -17626,6 +17675,27 @@ thread_local! {
     static TERMINAL_PERSIST_AFTER_DIRTY_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(target_os = "linux")]
+const CLEANUP_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct TaskScopeCleanupSlot {
+    running: bool,
+    done: bool,
+    retry_at: Option<Instant>,
+    pending_records: Option<HashMap<String, super::persistence::TaskRecordRef>>,
+    #[cfg(test)]
+    runs: usize,
+}
+
+#[cfg(target_os = "linux")]
+fn task_scope_cleanup_slots() -> &'static Mutex<HashMap<PathBuf, TaskScopeCleanupSlot>> {
+    static SLOTS: std::sync::OnceLock<Mutex<HashMap<PathBuf, TaskScopeCleanupSlot>>> =
+        std::sync::OnceLock::new();
+    SLOTS.get_or_init(Default::default)
+}
+
 /// The remote cancellation outcome `bash.kill_scope` reports for a stopped
 /// task, or `None` for a local one.
 fn scope_remote_cancel(task: &BgTask) -> Option<ScopeRemoteCancel> {
@@ -17957,11 +18027,7 @@ fn gc_batches(root: &Path, key: PathBuf) -> GcWalk {
 fn is_harness_store(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            matches!(name, "opencode" | "pi" | "runner")
-                || name.starts_with("mcp--")
-                || name.starts_with("fed--")
-        })
+        .is_some_and(super::persistence::is_harness_store_name)
 }
 
 /// One bounded, resumable namespace discovery per storage base per minute,
@@ -18081,6 +18147,10 @@ pub(crate) fn hard_kill_reason(deadline: HardKillDeadline) -> String {
         HardKillSource::Timeout => {
             format!("killed by the `timeout` of {limit} you passed (exit 124)")
         }
+        // This path enforces task timeouts. Scope deadlines are report-only.
+        HardKillSource::Scope | HardKillSource::ScopedDefault => {
+            format!("killed by AFT's task time limit of {limit} (exit 124)")
+        }
     }
 }
 
@@ -18108,8 +18178,7 @@ fn terminal_metadata_snapshot(metadata: PersistedTask) -> BgTaskSnapshot {
     });
     let live_descendants_summary = live_descendants_summary(&metadata);
     let live_descendants_unavailable = live_descendants_unavailable(&metadata);
-    let hard_kill =
-        HardKillDeadline::from_metadata(metadata.timeout_ms, metadata.default_hard_kill);
+    let hard_kill = HardKillDeadline::reported(&metadata, metadata.default_hard_kill);
     let remote_refusal = remote::remote_refusal(&metadata);
     let remote_inputs_captured = metadata
         .remote
@@ -18360,7 +18429,7 @@ impl BgTask {
             kill_reached: 0,
             remote_cancel: None,
             hard_kill: if metadata.remote.is_none() {
-                HardKillDeadline::from_metadata(metadata.timeout_ms, self.hard_kill_renewable)
+                HardKillDeadline::reported(metadata, self.hard_kill_renewable)
             } else {
                 None
             },
@@ -18839,295 +18908,6 @@ impl Drop for BootstrapGateGuard<'_> {
     }
 }
 
-/// Spawn a detached background bash child process.
-///
-/// On Unix this is a single spawn against `/bin/sh`. On Windows it walks
-/// `WindowsShell::shell_candidates()` (pwsh.exe → powershell.exe →
-/// cmd.exe) and retries with the next candidate when the previous one
-/// fails to spawn with `NotFound` — the same runtime safety net the
-/// foreground bash path has, so issue #27 callers landing on cmd.exe
-/// fallback can also use background bash. The wrapper script is
-/// regenerated per attempt because PowerShell wrappers embed the shell
-/// binary by name; the stdout/stderr capture handles are also reopened
-/// per attempt because `Command::spawn()` consumes them.
-///
-/// Errors other than `NotFound` (PermissionDenied, OutOfMemory, etc.)
-/// return immediately without retry — they indicate a problem with the
-/// resolved shell that retrying with a different shell won't fix.
-fn spawn_detached_child(
-    spawn_plan: &SpawnPlan,
-    command: &str,
-    shell: super::BashShell,
-    shell_path: &Path,
-    paths: &TaskPaths,
-    workdir: &Path,
-    env: &HashMap<String, String>,
-    io_handles: &mut TaskIoHandles,
-    capture_pipeline_status: bool,
-    memory_gated: bool,
-    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] linux_scope: bool,
-    #[cfg(unix)] identity_gate: LocalIdentityGate,
-) -> Result<Child, String> {
-    #[cfg(windows)]
-    let _ = capture_pipeline_status;
-    #[cfg(not(windows))]
-    let _ = (command, shell, memory_gated);
-    #[cfg(not(windows))]
-    {
-        use std::os::fd::AsRawFd;
-
-        let stdout = io_handles
-            .clone_file(TaskArtifact::Stdout)
-            .map_err(|e| format!("failed to clone stdout capture handle: {e}"))?;
-        let stderr = io_handles
-            .clone_file(TaskArtifact::Stderr)
-            .map_err(|e| format!("failed to clone stderr capture handle: {e}"))?;
-        let prepared = spawn_plan
-            .prepared_task()
-            .ok_or_else(|| "background task payload was not prepared".to_string())?;
-        let payload = prepared.invocation()?;
-        let exit = io_handles
-            .inheritable_file(TaskArtifact::Exit)
-            .map_err(|e| format!("failed to inherit exit marker handle: {e}"))?;
-        let failure = io_handles
-            .inheritable_file(TaskArtifact::SandboxUnavailable)
-            .map_err(|e| format!("failed to inherit sandbox failure marker handle: {e}"))?;
-        let shell_path = spawn_plan.host_shell_path().unwrap_or(shell_path);
-        let pipeline_shell = super::process::pipeline_shell_kind(shell_path).unwrap_or("");
-        // Native launchers disable path-based pipeline capture. Ordinary/host
-        // children can publish in io after the user's pipeline exits without
-        // giving native shells a path grant to their capture files.
-        let pipeline_status_path = if capture_pipeline_status {
-            paths.pipeline_status.as_os_str().to_owned()
-        } else {
-            OsString::new()
-        };
-        let base_executable = PathBuf::from("/bin/sh");
-        let base_args = vec![
-            OsString::from("-c"),
-            payload.wrapper_text.clone(),
-            OsString::from("aft-payload-wrapper"),
-            shell_path.as_os_str().to_os_string(),
-            payload.command_text.clone(),
-            OsString::from(crate::sandbox_spawn::CHILD_EXIT_FD.to_string()),
-            pipeline_status_path,
-            OsString::from(pipeline_shell),
-            OsString::from(match identity_gate {
-                LocalIdentityGate::Required => "wait-for-identity",
-                LocalIdentityGate::CommittedFallback => "",
-            }),
-            #[cfg(target_os = "linux")]
-            super::process::oom_priority_marker(spawn_plan.temp_dir(), &paths.io_dir)
-                .into_os_string(),
-        ];
-        #[cfg(target_os = "linux")]
-        let (executable, args) = if linux_scope && !memory_gated {
-            if spawn_plan.is_native_launcher() {
-                crate::slog_info!(
-                    "bash.linux_scope requested but native sandbox launch cannot reach the user manager; spawning without a systemd scope"
-                );
-                (base_executable, base_args)
-            } else if let Some(launcher) = super::process::select_systemd_scope_launcher() {
-                super::process::systemd_scope_argv(&launcher, &base_executable, &base_args)
-            } else {
-                crate::slog_info!(
-                    "bash.linux_scope requested but systemd-run or the user manager is unavailable; spawning without a systemd scope"
-                );
-                (base_executable, base_args)
-            }
-        } else {
-            (base_executable, base_args)
-        };
-        #[cfg(not(target_os = "linux"))]
-        let (executable, args) = {
-            let _ = linux_scope;
-            (base_executable, base_args)
-        };
-        let (mut child_command, profile_handle) = crate::sandbox_spawn::detached_command_for_plan(
-            spawn_plan,
-            executable.as_os_str(),
-            &args,
-            &paths.json,
-            crate::sandbox_spawn::CHILD_EXIT_FD,
-            crate::sandbox_spawn::CHILD_FAILURE_FD,
-        )?;
-        child_command.current_dir(workdir);
-        crate::agent_child_env::apply_to_command(&mut child_command, env);
-        crate::sandbox_spawn::apply_sandbox_environment(spawn_plan, &mut child_command, env);
-        let child = crate::sandbox_spawn::spawn_detached_for_plan(
-            spawn_plan,
-            &mut child_command,
-            env,
-            &crate::posix_spawn::PipeIo {
-                gated_stdin: matches!(identity_gate, LocalIdentityGate::Required),
-                stdout: &stdout,
-                stderr: &stderr,
-                exit: exit.as_raw_fd(),
-                failure: failure.as_raw_fd(),
-            },
-        )
-        .map_err(|error| {
-            super::format_spawn_failure(
-                "failed to spawn background bash command",
-                Path::new(child_command.get_program()),
-                child_command.get_current_dir().unwrap_or(workdir),
-                error,
-            )
-        });
-        drop((payload, exit, failure, profile_handle));
-        child
-    }
-    #[cfg(windows)]
-    {
-        let _ = shell_path;
-        use crate::windows_shell::shell_candidates;
-        match spawn_plan {
-            SpawnPlan::Unsandboxed | SpawnPlan::RelaxedUnenforced | SpawnPlan::Host { .. } => {}
-            SpawnPlan::Refused { code, .. } => return Err((*code).to_string()),
-            SpawnPlan::Launcher { .. } => return Err("sandbox_unavailable".to_string()),
-        }
-        // Spawn priority: pwsh → powershell → git-bash → cmd. Same as the
-        // legacy foreground bash spawn path. v0.20 routes ALL bash through
-        // this background spawn helper, including foreground tool calls
-        // where the model writes PowerShell-syntax (`$var = ...`,
-        // `Start-Sleep`, `Add-Content`) — those fail outright under cmd.
-        // The earlier v0.18-era cmd-first override worked around a
-        // PowerShell detached-output bug; that bug is fixed at the
-        // process-flag layer (CREATE_NO_WINDOW instead of DETACHED_PROCESS,
-        // see flag block below), so we no longer need to misroute PS
-        // commands through cmd.
-        let candidates: Vec<crate::windows_shell::WindowsShell> = if shell.is_powershell() {
-            vec![crate::windows_shell::WindowsShell::Pwsh]
-        } else {
-            shell_candidates()
-        };
-        // Win32 process creation flags. We try with CREATE_BREAKAWAY_FROM_JOB
-        // first (so the bg child outlives the AFT process when AFT is killed),
-        // then fall back without it for environments where the parent is in a
-        // Job Object that doesn't grant `JOB_OBJECT_LIMIT_BREAKAWAY_OK`. CI
-        // runners (GitHub Actions windows-2022) and some MDM-managed corp
-        // environments hit this — `CreateProcess` returns Access Denied (5).
-        // Without breakaway, the child still runs detached but will be torn
-        // down with the parent if the parent process group is signaled.
-        //
-        // CREATE_NO_WINDOW avoids a visible console while retaining the
-        // hidden console services PowerShell needs for reliable redirected
-        // stdout/stderr. DETACHED_PROCESS can drop redirected output.
-        const FLAG_CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const FLAG_CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-        const FLAG_CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let with_breakaway =
-            FLAG_CREATE_NO_WINDOW | FLAG_CREATE_NEW_PROCESS_GROUP | FLAG_CREATE_BREAKAWAY_FROM_JOB;
-        let without_breakaway = FLAG_CREATE_NO_WINDOW | FLAG_CREATE_NEW_PROCESS_GROUP;
-        use crate::windows_shell::{CandidateFailure, PipedAttemptError};
-        let attempt = crate::windows_shell::spawn_piped_candidates(
-            &candidates,
-            |shell, breakaway| {
-                let flags = if breakaway {
-                    with_breakaway
-                } else {
-                    without_breakaway
-                };
-                // Each attempt consumes its Stdio wrappers, so clone the retained
-                // exclusive capture handles rather than reopening output paths.
-                let stdout = io_handles.clone_file(TaskArtifact::Stdout).map_err(|e| {
-                    PipedAttemptError::Setup(format!("failed to clone stdout capture handle: {e}"))
-                })?;
-                let stderr = io_handles.clone_file(TaskArtifact::Stderr).map_err(|e| {
-                    PipedAttemptError::Setup(format!("failed to clone stderr capture handle: {e}"))
-                })?;
-                let (mut cmd, waiter_environment, memory_file_gate) = detached_shell_command_for(
-                    shell.clone(),
-                    command,
-                    &paths.exit,
-                    paths,
-                    flags,
-                    memory_gated,
-                    workdir,
-                    env,
-                )
-                .map_err(PipedAttemptError::Setup)?;
-                cmd.current_dir(workdir)
-                    .stdin(if memory_gated && !memory_file_gate {
-                        Stdio::piped()
-                    } else {
-                        Stdio::null()
-                    })
-                    .stdout(Stdio::from(stdout))
-                    .stderr(Stdio::from(stderr));
-                crate::agent_child_env::apply_to_command(&mut cmd, env);
-                crate::sandbox_spawn::apply_sandbox_environment(spawn_plan, &mut cmd, env);
-                if let Some((key, value)) = waiter_environment {
-                    cmd.env(key, value);
-                }
-                if let Some((key, value)) = shell.wrapper_environment(command) {
-                    cmd.env(key, value);
-                }
-                cmd.spawn().map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    crate::slog_warn!("background bash spawn: {} returned NotFound at runtime — trying next candidate", shell.binary());
-                } else if breakaway && error.raw_os_error() == Some(5) {
-                    crate::slog_warn!("background bash spawn: CREATE_BREAKAWAY_FROM_JOB rejected with Access Denied — retrying {} without breakaway", shell.binary());
-                }
-                PipedAttemptError::Spawn(error)
-            })
-            },
-        );
-        match attempt {
-            Ok((child, index, without_breakaway)) => {
-                if index > 0 {
-                    crate::slog_warn!("background bash spawn fell back to {} after {} earlier candidate(s) failed; \
-                        the cached PATH probe disagreed with runtime spawn — likely PATH \
-                        inheritance, antivirus / AppLocker / Defender ASR, or sandbox policy.", candidates[index].binary(), index);
-                }
-                if without_breakaway {
-                    crate::slog_warn!(
-                        "background bash spawn: CREATE_BREAKAWAY_FROM_JOB rejected \
-                        (likely a restrictive Job Object — CI sandbox or MDM policy). \
-                        Spawned without breakaway; the bg task will be torn down if the \
-                        AFT process group is killed."
-                    );
-                }
-                Ok(child.into())
-            }
-            Err(CandidateFailure::Stopped {
-                error: PipedAttemptError::Setup(message),
-                ..
-            }) => Err(message),
-            Err(CandidateFailure::Stopped {
-                index,
-                error: PipedAttemptError::Spawn(error),
-            }) => Err(super::format_spawn_failure(
-                &format!(
-                    "failed to spawn background bash command via {}",
-                    candidates[index].binary()
-                ),
-                Path::new(candidates[index].binary().as_ref()),
-                workdir,
-                error,
-            )),
-            Err(CandidateFailure::Exhausted { last }) => {
-                let names = candidates
-                    .iter()
-                    .map(|shell| shell.binary())
-                    .collect::<Vec<_>>();
-                let context = format!("failed to spawn background bash command: no Windows shell could be spawned. PATH-probed candidates: {names:?}");
-                match last {
-                    Some((index, PipedAttemptError::Spawn(error))) => {
-                        Err(super::format_spawn_failure(
-                            &context,
-                            Path::new(candidates[index].binary().as_ref()),
-                            workdir,
-                            format!("{}: {error}", candidates[index].binary()),
-                        ))
-                    }
-                    _ => Err(format!("{context}: no candidates were attempted")),
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 fn random_slug() -> String {
     // 8 bytes = 64-bit entropy → `bash-{16hex}`, matching the documented contract
@@ -19254,6 +19034,10 @@ fn append_source_read_only_note(output: &mut String, metadata: &PersistedTask, b
 #[cfg(all(test, unix))]
 #[path = "spawn_tests.rs"]
 mod spawn_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "task_scope_tests.rs"]
+mod task_scope_tests;
 
 #[cfg(test)]
 #[path = "default_kill_test.rs"]
@@ -27428,6 +27212,7 @@ mod tests {
                         true,
                         false,
                         Some(dir.path().into()),
+                        false,
                     )
                     .unwrap();
                 let task = registry.task_for_test(&id).unwrap();
@@ -28057,6 +27842,7 @@ mod tests {
                     true,
                     false,
                     Some(dir.path().into()),
+                    false,
                 )
                 .unwrap();
             let paths = original.task(&task_id).unwrap().paths.clone();

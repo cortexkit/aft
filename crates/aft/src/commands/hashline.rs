@@ -37,6 +37,16 @@ impl From<HashlineRejection> for EditFailure {
     }
 }
 
+/// Removes the fields the tool-call pipeline adds to every native request from
+/// the caller's envelope, so the strict `{patch}` validator sees only what the
+/// agent sent. `run_tool_call` re-inserts the trusted worker flag and the
+/// caller's tool names after dropping any agent-supplied copies; without this,
+/// every patch from a worker would be refused for carrying a second key.
+fn strip_envelope_fields(arguments: &mut serde_json::Map<String, Value>) {
+    arguments.remove(crate::host_tool_names::HOST_TOOL_NAMES_FIELD);
+    arguments.remove(crate::protocol::WORKER_SESSION_FIELD);
+}
+
 pub fn handle_preflight(req: &RawRequest, ctx: &AppContext) -> Response {
     let Some((_guard, root)) = effective_binding(req, ctx) else {
         return rejection_response(
@@ -47,8 +57,7 @@ pub fn handle_preflight(req: &RawRequest, ctx: &AppContext) -> Response {
     };
     let mut agent_arguments = req.params.clone();
     if let Some(arguments) = agent_arguments.as_object_mut() {
-        // Envelope field, not an agent argument (see `RawRequest::host_tool_names`).
-        arguments.remove(crate::host_tool_names::HOST_TOOL_NAMES_FIELD);
+        strip_envelope_fields(arguments);
     }
     match hashline_preflight_from_args(&agent_arguments, Some(&root)) {
         Ok(result) => Response::success(&req.id, result.to_json()),
@@ -72,8 +81,7 @@ pub fn handle_edit(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut agent_arguments = req.params.clone();
     if let Some(arguments) = agent_arguments.as_object_mut() {
         arguments.remove("preview");
-        // Envelope field, not an agent argument (see `RawRequest::host_tool_names`).
-        arguments.remove(crate::host_tool_names::HOST_TOOL_NAMES_FIELD);
+        strip_envelope_fields(arguments);
     }
     let patch_text = match crate::hashline::syntax::validate_raw_arguments(&agent_arguments) {
         Ok(request) => request.patch,
@@ -430,6 +438,21 @@ mod tests {
             ),
             &ctx,
         );
+        assert!(applied.success, "{}", applied.data);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "omega\nbeta\n");
+    }
+
+    #[test]
+    fn worker_envelope_flag_is_not_a_patch_argument() {
+        // The pipeline adds `worker_session: true` to a worker's native
+        // request params; it must not reach the `{patch}`-only validator.
+        let (_temp, _root, path, ctx, tag) = registered_fixture("alpha\nbeta\n");
+        let patch = format!("*** Begin Patch\n[sample.txt#{tag}]\nPUT 1:\n+omega\n*** End Patch");
+        let params = json!({ "patch": patch, "worker_session": true });
+        assert!(params.get(crate::protocol::WORKER_SESSION_FIELD).is_some());
+        let preflight = handle_preflight(&request("hashline_preflight", params.clone()), &ctx);
+        assert!(preflight.success, "{}", preflight.data);
+        let applied = handle_edit(&request("hashline_edit", params), &ctx);
         assert!(applied.success, "{}", applied.data);
         assert_eq!(std::fs::read_to_string(path).unwrap(), "omega\nbeta\n");
     }

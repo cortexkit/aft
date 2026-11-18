@@ -454,6 +454,16 @@ pub(super) fn run_with_sleep(
     output: &mut impl Write,
     sleep: &mut impl FnMut(Duration),
 ) -> Result<i32, ReadError> {
+    run_with_io(plan, execute, output, &mut io::stderr().lock(), sleep)
+}
+
+pub(super) fn run_with_io(
+    plan: &Plan,
+    execute: &mut impl FnMut(&ReadRequest) -> Result<ReadReply, ReadError>,
+    output: &mut impl Write,
+    diagnostics: &mut impl Write,
+    sleep: &mut impl FnMut(Duration),
+) -> Result<i32, ReadError> {
     // Remember the stdout error before renderers turn it into display text.
     // A closed downstream reader is normal pipeline termination, unlike a
     // failed jq child or a real output error such as a full disk.
@@ -484,7 +494,7 @@ pub(super) fn run_with_sleep(
     let result = if plan.tuple == "run watch" {
         run_watch(plan, execute, &mut output, sleep)
     } else {
-        render(plan, execute, &mut output)
+        render(plan, execute, &mut output, diagnostics)
     };
     if output.broken_pipe {
         Ok(0)
@@ -550,12 +560,13 @@ fn render(
     plan: &Plan,
     execute: &mut impl FnMut(&ReadRequest) -> Result<ReadReply, ReadError>,
     output: &mut impl Write,
+    diagnostics: &mut impl Write,
 ) -> Result<i32, ReadError> {
     if let Some(request) = &plan.api {
         return api(plan, request, execute, output);
     }
     if plan.tuple == "run view" && (plan.flag("log") || plan.flag("log-failed")) {
-        return run_logs(plan, execute, output);
+        return run_logs(plan, execute, output, diagnostics);
     }
     if plan.tuple == "pr diff" && !plan.flag("name-only") {
         let number = target_number(plan)?;
@@ -1680,6 +1691,7 @@ fn run_logs(
     plan: &Plan,
     execute: &mut impl FnMut(&ReadRequest) -> Result<ReadReply, ReadError>,
     output: &mut impl Write,
+    diagnostics: &mut impl Write,
 ) -> Result<i32, ReadError> {
     let jobs = if let Some(job) = plan.value("job") {
         vec![get(plan.path(&format!("actions/jobs/{job}")), execute)?]
@@ -1691,6 +1703,9 @@ fn run_logs(
             .unwrap_or_else(|| format!("actions/runs/{id}/jobs"));
         list(plan.path(&suffix), Some("jobs"), None, execute)?
     };
+    let mut printed = false;
+    let mut refused = false;
+    let mut incomplete = false;
     for job in &jobs {
         if plan.flag("log-failed")
             && !matches!(
@@ -1707,18 +1722,32 @@ fn run_logs(
             job,
             pending: Vec::new(),
             output,
+            printed: false,
         };
-        stream_log(id, execute, &mut formatter)?;
+        let result = stream_log(id, execute, &mut formatter);
         formatter.finish()?;
+        printed |= formatter.printed;
+        match result {
+            Ok(()) => {}
+            Err(error @ ReadError::JobLog { .. }) => {
+                if let ReadError::JobLog { code, .. } = &error {
+                    incomplete |= code != "job_log_unavailable";
+                }
+                refused = true;
+                log_refusal(job, &error, diagnostics)?;
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(
-        if plan.flag("exit-status")
-            && jobs.iter().any(|job| {
-                matches!(
-                    job["conclusion"].as_str(),
-                    Some("failure" | "timed_out" | "cancelled")
-                )
-            })
+        if refused && (!printed || incomplete || plan.value("job").is_some())
+            || plan.flag("exit-status")
+                && jobs.iter().any(|job| {
+                    matches!(
+                        job["conclusion"].as_str(),
+                        Some("failure" | "timed_out" | "cancelled")
+                    )
+                })
         {
             1
         } else {
@@ -1727,10 +1756,24 @@ fn run_logs(
     )
 }
 
+fn log_refusal(
+    job: &Value,
+    error: &ReadError,
+    diagnostics: &mut impl Write,
+) -> Result<(), ReadError> {
+    let name = job["name"]
+        .as_str()
+        .unwrap_or("job")
+        .replace(['\n', '\r'], " ");
+    writeln!(diagnostics, "{name}: no log ({})", error.message(""))
+        .map_err(|error| failed(error.to_string()))
+}
+
 struct LogFormatter<'a, W> {
     job: &'a Value,
     pending: Vec<u8>,
     output: &'a mut W,
+    printed: bool,
 }
 
 impl<W: Write> LogFormatter<'_, W> {
@@ -1746,7 +1789,9 @@ impl<W: Write> LogFormatter<'_, W> {
         let line = line.strip_suffix(b"\n").unwrap_or(line);
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         self.output.write_all(line)?;
-        self.output.write_all(b"\n")
+        self.output.write_all(b"\n")?;
+        self.printed = true;
+        Ok(())
     }
     fn finish(&mut self) -> Result<(), ReadError> {
         if !self.pending.is_empty() {

@@ -33,6 +33,226 @@ fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
     temp_dir
 }
 
+mod grep_ignore_disclosure {
+    use super::*;
+
+    const NEEDLE: &str = "ignore_disclosure_needle";
+
+    fn start(root: &Path, indexed: bool) -> AftProcess {
+        start_with_probe(root, indexed, "ready")
+    }
+
+    fn start_with_probe(root: &Path, indexed: bool, mode: &str) -> AftProcess {
+        // Pin only probe completion timing; evidence collection and normal
+        // command rendering still run against the fixture's real ignore rules.
+        let mut aft = AftProcess::spawn_with_env(&[(
+            "AFT_TEST_GREP_IGNORE_PROBE",
+            std::ffi::OsStr::new(mode),
+        )]);
+        if indexed {
+            configure_with_index(&mut aft, root);
+            wait_for_index_ready(
+                &mut aft,
+                || json!({"id":"ready", "command":"grep", "pattern":NEEDLE}),
+            );
+        } else {
+            configure(&mut aft, root);
+        }
+        aft
+    }
+
+    fn grep(aft: &mut AftProcess, path: Option<&str>) -> Value {
+        let mut request = json!({"id":"ignore-disclosure", "command":"grep", "pattern":NEEDLE});
+        if let Some(path) = path {
+            request["path"] = json!(path);
+        }
+        let response = send(aft, request);
+        assert_eq!(response["success"], true, "{response}");
+        response
+    }
+
+    #[test]
+    fn reported_agents_boundary_and_explicit_path_override() {
+        for indexed in [false, true] {
+            let project = setup_project(&[
+                (".git/info/exclude", ""),
+                (".gitignore", ".agents/\n"),
+                ("top.txt", NEEDLE),
+                (".agents/research/note.md", NEEDLE),
+            ]);
+            let mut aft = start(project.path(), indexed);
+            let response = grep(&mut aft, None);
+            assert_eq!(response["total_matches"], 1, "{response}");
+            assert_eq!(response["ignored_entries"], json!([".agents/"]));
+            assert_eq!(response["ignored_entries_total"], 1);
+            assert_eq!(response["ignored_entries_truncated"], false);
+            assert!(response["text"].as_str().unwrap().contains(
+                "Not searched (ignore rules): .agents/ in this folder. Name a path inside one to search it."
+            ), "{response}");
+            for path in [".agents/research", ".agents/research/note.md", "top.txt"] {
+                let response = grep(&mut aft, Some(path));
+                assert_eq!(response["total_matches"], 1, "{response}");
+                assert!(
+                    !response["text"].as_str().unwrap().contains("Not searched"),
+                    "{response}"
+                );
+                assert!(response.get("ignored_entries").is_none(), "{response}");
+            }
+            assert!(aft.shutdown().success());
+        }
+    }
+
+    #[test]
+    fn late_and_busy_probes_omit_the_line_without_holding_the_reply() {
+        for mode in ["pending", "busy"] {
+            let project = setup_project(&[
+                (".git/info/exclude", ""),
+                (".gitignore", ".agents/\n"),
+                ("top.txt", NEEDLE),
+                (".agents/note.md", NEEDLE),
+            ]);
+            let mut aft = start_with_probe(project.path(), true, mode);
+            let started = Instant::now();
+            let response = grep(&mut aft, None);
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "{mode}: {response}"
+            );
+            assert_eq!(response["total_matches"], 1, "{response}");
+            assert!(
+                !response["text"].as_str().unwrap().contains("Not searched"),
+                "{response}"
+            );
+            assert!(response.get("ignored_entries").is_none(), "{response}");
+            assert!(aft.shutdown().success());
+        }
+    }
+
+    #[test]
+    fn clean_folder_and_deeper_ignored_boundary_have_no_line() {
+        for indexed in [false, true] {
+            let project = setup_project(&[(".git/info/exclude", ""), ("top.txt", NEEDLE)]);
+            let mut aft = start(project.path(), indexed);
+            let response = grep(&mut aft, None);
+            assert!(
+                !response["text"].as_str().unwrap().contains("Not searched"),
+                "{response}"
+            );
+            assert!(response.get("ignored_entries").is_none(), "{response}");
+            assert!(aft.shutdown().success());
+
+            let project = setup_project(&[
+                (".git/info/exclude", ""),
+                ("top.txt", NEEDLE),
+                ("src/.gitignore", "cache/\n"),
+                ("src/visible.txt", NEEDLE),
+                ("src/cache/hidden.txt", NEEDLE),
+            ]);
+            let mut aft = start(project.path(), indexed);
+            let response = grep(&mut aft, None);
+            assert_eq!(response["total_matches"], 2, "{response}");
+            assert!(
+                !response["text"].as_str().unwrap().contains("Not searched"),
+                "{response}"
+            );
+            let response = grep(&mut aft, Some("src"));
+            assert_eq!(response["ignored_entries"], json!(["cache/"]));
+            assert!(
+                !response["text"].as_str().unwrap().contains("src/cache"),
+                "{response}"
+            );
+            assert!(aft.shutdown().success());
+        }
+    }
+
+    #[test]
+    fn three_names_and_exact_remaining_boundaries() {
+        for indexed in [false, true] {
+            let project = setup_project(&[
+                (".git/info/exclude", ""),
+                (".gitignore", "a.log\nb/\nc/\nd/\n"),
+                (".aftignore", "e/\n"),
+                ("top.txt", NEEDLE),
+                ("a.log", NEEDLE),
+                ("b/one.txt", NEEDLE),
+                ("b/nested/two.txt", NEEDLE),
+                ("c/one.txt", NEEDLE),
+                ("d/one.txt", NEEDLE),
+                ("e/one.txt", NEEDLE),
+                ("target/one.txt", NEEDLE),
+            ]);
+            let mut aft = start(project.path(), indexed);
+            let response = grep(&mut aft, None);
+            assert_eq!(response["total_matches"], 1, "{response}");
+            assert_eq!(response["ignored_entries"], json!(["a.log", "b/", "c/"]));
+            assert_eq!(response["ignored_entries_total"], 6);
+            assert_eq!(response["ignored_entries_truncated"], true);
+            assert!(response["text"].as_str().unwrap().contains(
+                "Not searched (ignore rules): a.log, b/, c/ and 3 more in this folder. Name a path inside one to search it."
+            ), "{response}");
+            assert_eq!(response["ignored_entries_list_envelope"]["reason"], "cap");
+            assert!(
+                response.get("matches_list_envelope").is_none(),
+                "{response}"
+            );
+            assert!(aft.shutdown().success());
+        }
+    }
+
+    #[test]
+    fn raw_listing_bound_uses_unknown_remainder() {
+        let project = setup_project(&[
+            (".git/info/exclude", ""),
+            (".gitignore", "hidden-*\n"),
+            ("top.txt", NEEDLE),
+        ]);
+        for number in 0..4097 {
+            fs::write(project.path().join(format!("hidden-{number:04}")), NEEDLE).unwrap();
+        }
+        let mut aft = start(project.path(), true);
+        let response = grep(&mut aft, None);
+        assert_eq!(response["total_matches"], 1, "{response}");
+        assert_eq!(response["ignored_entries"].as_array().unwrap().len(), 3);
+        assert!(response["ignored_entries_total"].is_null(), "{response}");
+        assert_eq!(response["ignored_entries_truncated"], true);
+        assert!(
+            response["text"]
+                .as_str()
+                .unwrap()
+                .contains(" and more in this folder."),
+            "{response}"
+        );
+        assert_eq!(response["ignored_entries_list_envelope"]["reason"], "walk");
+        assert!(aft.shutdown().success());
+    }
+
+    #[test]
+    fn incomplete_accepted_name_walk_suppresses_line() {
+        let project = setup_project(&[
+            (".git/info/exclude", ""),
+            (".gitignore", ".agents/\n"),
+            ("top.txt", NEEDLE),
+            (".agents/note.md", NEEDLE),
+        ]);
+        for number in 0..4097 {
+            fs::write(
+                project.path().join(format!("visible-{number:04}")),
+                "no match",
+            )
+            .unwrap();
+        }
+        let mut aft = start(project.path(), true);
+        let response = grep(&mut aft, None);
+        assert_eq!(response["total_matches"], 1, "{response}");
+        assert!(
+            !response["text"].as_str().unwrap().contains("Not searched"),
+            "{response}"
+        );
+        assert!(response.get("ignored_entries").is_none(), "{response}");
+        assert!(aft.shutdown().success());
+    }
+}
+
 /// Configure with the trigram index switched off, so grep and glob exercise
 /// the direct-scan fallback path. The index defaults on, so the fallback cases
 /// must turn it off explicitly.

@@ -76,7 +76,6 @@ export async function bootV2Runtime(config: Record<string, unknown> = {}) {
         configLoadTexts: () => new Map(),
         deliverLoadNotices: () => {},
         migrateConfigLocations: () => [],
-        ensureStorageMigrated: async () => {},
         ensureOnnxRuntime: async () => null,
         startLspAutoInstall: () => null,
         pushLspPaths: async () => {},
