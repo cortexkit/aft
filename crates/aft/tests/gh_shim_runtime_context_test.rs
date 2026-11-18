@@ -1835,7 +1835,7 @@ fn gh_shim_bound_governed_write_refuses_ambient_credential_identity_ambiguity() 
 }
 
 #[test]
-fn gh_shim_without_manifest_keeps_unreachable_daemon_passthrough() {
+fn gh_shim_without_manifest_refuses_write_when_daemon_is_unreachable() {
     let temp = tempfile::tempdir().expect("create test root");
     let config_home = temp.path().join("config");
     let state_home = temp.path().join("state");
@@ -1858,13 +1858,12 @@ fn gh_shim_without_manifest_keeps_unreachable_daemon_passthrough() {
     )
     .output()
     .expect("spawn dormant gh shim invocation");
-    assert_eq!(output.status.code(), Some(73));
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "r2-passthrough\n");
-    assert!(output.stderr.is_empty());
-    assert_eq!(
-        fs::read_to_string(&recorder).expect("read upstream invocation record"),
-        "issue comment 42 --body hello\n"
-    );
+    assert_eq!(output.status.code(), Some(86));
+    assert!(output.stdout.is_empty());
+    assert!(output
+        .stderr
+        .starts_with(b"gh-shim: gh_shim_manifest_unavailable: "));
+    assert!(!recorder.exists());
 }
 
 #[test]
@@ -1874,12 +1873,10 @@ fn gh_shim_invalid_manifest_announces_ambient_credential_fallback() {
     let state_home = temp.path().join("state");
     let home = temp.path().join("home");
     let project = write_project_repo(temp.path());
-    let connection_file = write_dead_connection_file(temp.path());
     let upstream_bin = temp.path().join("upstream-bin");
     let recorder = temp.path().join("upstream-invocations.txt");
     write_upstream_gh(&upstream_bin);
     write_invalid_manifest(&state_home, unix_seconds());
-    write_user_config(&config_home, &connection_file, None);
 
     let output = shim_command(
         &["issue", "comment", "42", "--body", "hello"],
