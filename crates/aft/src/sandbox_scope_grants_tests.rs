@@ -104,7 +104,8 @@ fn worker_scope_grants_reach_both_shell_profiles_without_widening() {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().canonicalize().unwrap();
     let home = base.join("home");
-    let root = home.join("Work/own");
+    let worktrees = home.join(".local/share/cortexkit/alfonso/worktrees");
+    let root = worktrees.join("hash-a/own");
     let granted = home.join("Work/shared");
     let sibling = home.join("Work/sibling");
     let read_only = home.join("Work/reference");
@@ -130,6 +131,10 @@ fn worker_scope_grants_reach_both_shell_profiles_without_widening() {
     }
     let file = sibling.join("one-file");
     std::fs::write(&file, "file").unwrap();
+    let cargo_config = root.parent().unwrap().join(".cargo/config.toml");
+    let target = home.join("Work/configured-target");
+    std::fs::create_dir_all(cargo_config.parent().unwrap()).unwrap();
+    std::fs::write(&cargo_config, format!("[build]\ntarget-dir = {target:?}\n")).unwrap();
     let ctx = AppContext::new(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
@@ -190,16 +195,46 @@ fn worker_scope_grants_reach_both_shell_profiles_without_widening() {
     crate::access_policy::with_scope(Some(scope), || {
         let policy = ctx.access_policy("").unwrap();
         let strict = policy.compile_shell(temp.clone(), vec![], vec![]).unwrap();
-        let relaxed = build_relaxed_profile(
-            &ctx,
-            &home,
-            &[root.clone()],
-            &[resolve_git_policy(&root).unwrap()],
-            &store,
-            &task_io,
-            &temp,
-        )
-        .unwrap();
+        let relaxed_profile = |jailed: bool| {
+            crate::worker_jail_canary::with_test_preparation_home(
+                &home,
+                usize::from(!jailed || cfg!(target_os = "macos")),
+                || {
+                    with_worker_jail(jailed, || {
+                        build_relaxed_profile(
+                            &ctx,
+                            &home,
+                            &[root.clone()],
+                            &[resolve_git_policy(&root).unwrap()],
+                            &store,
+                            &task_io,
+                            &temp,
+                        )
+                        .unwrap()
+                    })
+                },
+            )
+        };
+        let relaxed = relaxed_profile(true);
+        let head = relaxed_profile(false);
+        assert!(head.data_policy.read_allow.contains(&worktrees));
+        assert_eq!(
+            relaxed.data_policy.read_allow.contains(&worktrees),
+            !cfg!(target_os = "macos"),
+            "only macOS worker profiles narrow the pool read exception"
+        );
+        assert!(!strict.data_policy.read_allow.contains(&worktrees));
+        assert!(head.data_policy.read_files.is_empty());
+        if cfg!(target_os = "macos") {
+            assert!(relaxed.data_policy.read_files.contains(&cargo_config));
+            assert!(relaxed.data_policy.read_allow.contains(&target));
+            assert!(relaxed.data_policy.write_allow.contains(&target));
+            assert!(relaxed.writable_roots.contains(&target));
+        }
+        for profile in [&strict, &relaxed] {
+            assert!(profile.data_policy.read_allow.contains(&root));
+            assert!(profile.data_policy.read_allow.contains(&temp));
+        }
         for profile in [&strict, &relaxed] {
             assert!(
                 profile.writable_roots.contains(&granted),

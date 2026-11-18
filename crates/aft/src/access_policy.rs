@@ -790,6 +790,7 @@ impl AccessPolicy {
             private_stores: SandboxDataPolicy {
                 deny,
                 read_allow,
+                read_files: Vec::new(),
                 write_allow: roots.clone(),
                 read_metadata_allow: Vec::new(),
                 session_task_read_dir: None,

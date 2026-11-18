@@ -83,12 +83,25 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
         &profile.data_policy.write_allow,
         &profile.writable_files,
     )?;
+    let reads = profile
+        .data_policy
+        .read_allow
+        .iter()
+        .chain(&profile.data_policy.read_files)
+        .cloned()
+        .collect::<Vec<_>>();
+    let read_files = profile
+        .writable_files
+        .iter()
+        .chain(&profile.data_policy.read_files)
+        .cloned()
+        .collect::<Vec<_>>();
     render_data_denies(
         &mut source,
         "file-read*",
         &profile.data_policy.deny,
-        &profile.data_policy.read_allow,
-        &profile.writable_files,
+        &reads,
+        &read_files,
     )?;
     render_session_task_reads(&mut source, profile)?;
     // Git resolves the cwd by statting each ancestor. Permit metadata on the
@@ -97,6 +110,7 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
         .data_policy
         .read_allow
         .iter()
+        .chain(&profile.data_policy.read_files)
         .chain(&profile.data_policy.read_metadata_allow)
     {
         for ancestor in allow.ancestors() {
@@ -204,12 +218,25 @@ fn render_relaxed_profile(profile: &SandboxProfile) -> Result<String, String> {
         &profile.writable_files,
         &[],
     )?;
+    let reads = profile
+        .data_policy
+        .read_allow
+        .iter()
+        .chain(&profile.data_policy.read_files)
+        .cloned()
+        .collect::<Vec<_>>();
+    let read_files = profile
+        .writable_files
+        .iter()
+        .chain(&profile.data_policy.read_files)
+        .cloned()
+        .collect::<Vec<_>>();
     render_relaxed_scopes(
         &mut source,
         "file-read*",
         &profile.data_policy.deny,
-        &profile.data_policy.read_allow,
-        &profile.writable_files,
+        &reads,
+        &read_files,
         &[],
     )?;
     render_session_task_reads(&mut source, profile)?;
@@ -217,6 +244,7 @@ fn render_relaxed_profile(profile: &SandboxProfile) -> Result<String, String> {
         .data_policy
         .read_allow
         .iter()
+        .chain(&profile.data_policy.read_files)
         .chain(&profile.data_policy.read_metadata_allow)
     {
         for ancestor in allow.ancestors() {
@@ -1389,5 +1417,287 @@ mod broker_root_render_tests {
             !render_profile(&profile).unwrap().contains("gh-read[.]sock"),
             "head profiles must not receive the worker socket restriction"
         );
+    }
+}
+
+#[cfg(test)]
+mod data_ancestor_read_tests {
+    use super::*;
+
+    fn nested_profile(root: &Path) -> SandboxProfile {
+        let data = root.join("private-data");
+        let exception = data.join("alfonso/worktrees/hash-a/own");
+        let credential_floor = data.join("credentials");
+        std::fs::create_dir_all(&exception).unwrap();
+        std::fs::create_dir_all(credential_floor.join("checkout")).unwrap();
+        std::fs::create_dir_all(data.join("alias")).unwrap();
+        let mut profile = SandboxProfile::build(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![credential_floor.clone()],
+            Vec::new(),
+            Vec::new(),
+            root.to_path_buf(),
+        )
+        .unwrap();
+        profile.data_policy.deny = vec![data.clone()];
+        profile.data_policy.read_allow = vec![exception, credential_floor.join("checkout")];
+        profile.data_policy.read_metadata_allow = vec![data.join("alias")];
+        profile
+    }
+
+    #[test]
+    fn own_checkout_read_exceptions_grant_only_ancestor_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut profile = nested_profile(&root);
+        let data = root.join("private-data");
+        let intermediate = data.join("alfonso");
+        let worktrees = intermediate.join("worktrees");
+        let hash = worktrees.join("hash-a");
+        let own = hash.join("own");
+        for mode in [
+            aft::config::SandboxMode::Strict,
+            aft::config::SandboxMode::Relaxed,
+        ] {
+            profile.mode = mode;
+            let source = render_profile(&profile).unwrap();
+            let grants = source
+                .lines()
+                .filter(|line| line.starts_with("(allow file-read-metadata file-read-data "))
+                .collect::<Vec<_>>();
+            assert!(profile.data_policy.read_allow.contains(&own));
+            assert!(!profile.data_policy.read_allow.contains(&worktrees));
+            assert!(
+                grants.is_empty(),
+                "ancestor listings must remain denied: {mode:?}"
+            );
+            for ancestor in [&data, &intermediate, &worktrees, &hash] {
+                assert!(source.contains(&format!(
+                    "(allow file-read-metadata (literal \"{}\"))",
+                    escape_path(ancestor).unwrap()
+                )));
+                assert!(!source.contains(&format!(
+                    "(require-not {})",
+                    relaxed_filter(ancestor, false).unwrap()
+                )));
+                for operation in [
+                    "file-read*",
+                    "file-read-data",
+                    "file-read-metadata file-read-data",
+                ] {
+                    assert!(!source.contains(&format!(
+                        "(allow {operation} (literal \"{}\"))",
+                        escape_path(ancestor).unwrap()
+                    )));
+                    assert!(
+                        !source.contains(&format!(
+                            "(allow {operation} (subpath \"{}\"))",
+                            escape_path(ancestor).unwrap()
+                        )),
+                        "ancestor grant must not cover descendants: {mode:?}"
+                    );
+                }
+            }
+            let own_filter = if mode == aft::config::SandboxMode::Relaxed {
+                relaxed_filter(&own, false).unwrap()
+            } else {
+                format!("(subpath \"{}\")", escape_path(&own).unwrap())
+            };
+            assert!(source.contains(&format!("(require-not {own_filter})")));
+            assert!(source.contains(&format!(
+                "(allow file-read-metadata (literal \"{}\"))",
+                escape_path(&data.join("alias")).unwrap()
+            )));
+        }
+    }
+
+    #[test]
+    fn exact_worker_ancestor_files_never_become_subtree_or_write_exceptions() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut profile = nested_profile(&root);
+        let container = root.join("private-data/alfonso/worktrees/hash-a");
+        let replaced = container.join(".cargo/config.toml");
+        let missing = container.join(".cargo/config");
+        std::fs::create_dir_all(&replaced).unwrap();
+        profile.data_policy.read_files = vec![replaced.clone(), missing.clone()];
+        let transferred: SandboxProfile =
+            serde_json::from_slice(&serde_json::to_vec(&profile).unwrap()).unwrap();
+        profile = transferred.canonicalize_for_launch().unwrap();
+        assert_eq!(profile.data_policy.read_files.len(), 2);
+        for mode in [
+            aft::config::SandboxMode::Strict,
+            aft::config::SandboxMode::Relaxed,
+        ] {
+            profile.mode = mode;
+            let source = render_profile(&profile).unwrap();
+            let reads = source
+                .lines()
+                .filter(|line| line.starts_with("(deny file-read* "))
+                .collect::<Vec<_>>();
+            let writes = source
+                .lines()
+                .find(|line| line.starts_with("(deny file-write* (require-all "))
+                .unwrap();
+            for path in [&replaced, &missing] {
+                let literal = format!("(literal \"{}\")", escape_path(path).unwrap());
+                assert!(
+                    reads
+                        .iter()
+                        .any(|line| line.contains(&format!("(require-not {literal})"))),
+                    "{mode:?}"
+                );
+                assert!(
+                    !writes.contains(&literal),
+                    "read file must not be a write exception"
+                );
+                assert!(!source.contains(&format!("(subpath \"{}\")", escape_path(path).unwrap())));
+                assert!(!source.contains(&relaxed_filter(path, false).unwrap()));
+                assert!(!profile.writable_files.contains(path));
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_own_checkout_reads_preserve_ancestor_listing_and_sibling_denials() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut profile = nested_profile(&root);
+        let data = root.join("private-data");
+        let intermediate = data.join("alfonso");
+        let worktrees = intermediate.join("worktrees");
+        let own = worktrees.join("hash-a/own");
+        let allowed = own.join("allowed.txt");
+        let sibling = worktrees.join("hash-a/sibling/secret.txt");
+        let other_repo = worktrees.join("hash-b/other/secret.txt");
+        let main = data.join("repositories/main");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |args: &[&std::ffi::OsStr]| {
+            let output = std::process::Command::new("/usr/bin/git")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init".as_ref(), "-q".as_ref(), main.as_os_str()]);
+        git(&[
+            "-C".as_ref(),
+            main.as_os_str(),
+            "-c".as_ref(),
+            "user.name=Sandbox Test".as_ref(),
+            "-c".as_ref(),
+            "user.email=sandbox@example.invalid".as_ref(),
+            "commit".as_ref(),
+            "--allow-empty".as_ref(),
+            "-qm".as_ref(),
+            "initial".as_ref(),
+        ]);
+        git(&[
+            "-C".as_ref(),
+            main.as_os_str(),
+            "worktree".as_ref(),
+            "add".as_ref(),
+            "--detach".as_ref(),
+            own.as_os_str(),
+        ]);
+        // The linked checkout's common Git directory can itself be inside the
+        // private store. Its explicit read exception must survive the boundary.
+        profile.data_policy.read_allow.push(main.join(".git"));
+        let config = worktrees.join("hash-a/.cargo/config.toml");
+        let target = worktrees.join("hash-a/configured-target");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(&config, format!("[build]\ntarget-dir = {target:?}\n")).unwrap();
+        profile.data_policy.read_files.push(config.clone());
+        profile.data_policy.read_allow.push(target.clone());
+        profile.data_policy.write_allow.push(target.clone());
+        profile.writable_roots.push(target.clone());
+        let sibling_target = worktrees.join("hash-a/sibling/target/artifact");
+        std::fs::create_dir_all(sibling_target.parent().unwrap()).unwrap();
+        std::fs::write(&sibling_target, "sibling artifact").unwrap();
+        for path in [&sibling, &other_repo] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "sibling private").unwrap();
+        }
+        std::fs::write(&allowed, "exception readable").unwrap();
+        for mode in [
+            aft::config::SandboxMode::Strict,
+            aft::config::SandboxMode::Relaxed,
+        ] {
+            profile.mode = mode;
+            let rendered = root.join("profile.sb");
+            std::fs::write(&rendered, render_profile(&profile).unwrap()).unwrap();
+            let output = std::process::Command::new("/usr/bin/sandbox-exec")
+                .current_dir(&own)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(["-f"])
+                .arg(&rendered)
+                .args([
+                    "/bin/sh",
+                    "-c",
+                    r#"set -eu
+for ancestor in "$1" "$2" "$3" "$3/hash-a"; do
+    if /bin/ls "$ancestor" >/dev/null 2>&1; then
+        echo 'ancestor directory unexpectedly listable' >&2
+        exit 1
+    fi
+done
+for sibling in "$5" "$6"; do
+    if /bin/cat "$sibling" >/dev/null 2>&1; then
+        echo 'sibling file unexpectedly readable' >&2
+        exit 1
+    fi
+done
+[ "$(/bin/cat "$4/allowed.txt")" = 'exception readable' ]
+/bin/cat "$4/../.cargo/config.toml" >/dev/null
+"$7" --version
+printf build > "$4/../configured-target/artifact"
+[ "$(/bin/cat "$4/../configured-target/artifact")" = build ]
+if /bin/cat "$4/../sibling/target/artifact" >/dev/null 2>&1; then
+    echo 'sibling target unexpectedly readable' >&2
+    exit 1
+fi
+if (printf tamper >> "$4/../.cargo/config.toml") 2>/dev/null; then
+    echo 'container config unexpectedly writable' >&2
+    exit 1
+fi
+status=$(/usr/bin/git -C "$4" status --porcelain)
+[ "$status" = '?? allowed.txt' ]
+echo 'ancestor listing denials and read boundaries passed'
+"#,
+                    "ancestor-read-probe",
+                ])
+                .args([
+                    &data,
+                    &intermediate,
+                    &worktrees,
+                    &own,
+                    &sibling,
+                    &other_repo,
+                ])
+                .arg(env!("CARGO"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode:?}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.lines().any(|line| line.starts_with("cargo ")));
+            assert!(stdout.ends_with("ancestor listing denials and read boundaries passed\n"));
+        }
     }
 }

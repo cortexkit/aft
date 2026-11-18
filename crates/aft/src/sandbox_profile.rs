@@ -12,6 +12,10 @@ pub const SANDBOX_PROFILE_VERSION: u32 = 7;
 pub struct SandboxDataPolicy {
     pub deny: Vec<PathBuf>,
     pub read_allow: Vec<PathBuf>,
+    /// Exact read-only file exceptions for macOS, even if a file is absent or
+    /// replaced by a directory before launch. Never grants descendant access.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_files: Vec<PathBuf>,
     pub write_allow: Vec<PathBuf>,
     /// Exact symlink paths on the way to a readable configured directory.
     /// These aliases permit metadata only; directory contents are allowed only
@@ -46,6 +50,17 @@ impl SandboxDataPolicy {
                 exact_files,
                 "data_policy.read_allow",
             )?,
+            read_files: {
+                let mut files = Vec::new();
+                for path in self.read_files {
+                    validate_absolute(&path, "data_policy.read_files")?;
+                    validate_normalized(&path, "data_policy.read_files")?;
+                    files.push(canonicalize_missing_path(path, "data_policy.read_files")?);
+                }
+                files.sort_unstable();
+                files.dedup();
+                files
+            },
             write_allow: canonicalize_data_allows(
                 self.write_allow,
                 exact_files,
@@ -788,6 +803,7 @@ mod tests {
         profile.data_policy = SandboxDataPolicy {
             deny: vec![common.clone()],
             read_allow: files.to_vec(),
+            read_files: Vec::new(),
             write_allow: files.to_vec(),
             read_metadata_allow: Vec::new(),
             session_task_read_dir: None,
@@ -888,6 +904,7 @@ mod tests {
         let policy = SandboxDataPolicy {
             deny: vec![store.clone()],
             read_allow: vec![lock.clone()],
+            read_files: Vec::new(),
             write_allow: vec![lock.clone()],
             read_metadata_allow: Vec::new(),
             session_task_read_dir: None,
@@ -918,6 +935,7 @@ mod tests {
         let policy = SandboxDataPolicy {
             deny: vec![store.clone()],
             read_allow: vec![own.clone(), io.clone(), hooks.clone()],
+            read_files: Vec::new(),
             write_allow: vec![own.clone(), io.clone()],
             read_metadata_allow: Vec::new(),
             session_task_read_dir: None,

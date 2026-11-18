@@ -1828,6 +1828,15 @@ fn build_native_profile(
         let mut shell_write_deny = Vec::new();
         let mut shell_read_deny = Vec::new();
         let jailed = worker_jail_active();
+        #[cfg(target_os = "macos")]
+        if jailed {
+            let files = worker_pool_read_files(&home, &project_roots);
+            policy
+                .private_stores
+                .read_files
+                .extend(files.iter().cloned());
+            shell_write_deny.extend(files);
+        }
         // Ordinary sessions retain writable project Git configuration; jailed
         // workers and delegated write roots must not change execution controls.
         let mut control_roots = if jailed {
@@ -2011,6 +2020,17 @@ fn build_native_profile(
                 };
                 profile.socket_deny.push(path);
             }
+            #[cfg(target_os = "macos")]
+            {
+                profile
+                    .data_policy
+                    .read_allow
+                    .extend(jail.roots.iter().cloned());
+                profile
+                    .data_policy
+                    .write_allow
+                    .extend(jail.roots.iter().cloned());
+            }
             profile.writable_roots.extend(jail.roots);
             profile.writable_roots.sort_unstable();
             profile.writable_roots.dedup();
@@ -2077,6 +2097,7 @@ fn verify_worker_gh_fence(profile: &SandboxProfile) -> Result<(), String> {
         let read_grants = profile
             .read_allow
             .iter()
+            .chain(&profile.data_policy.read_files)
             .chain(&profile.data_policy.read_allow)
             .chain(&profile.data_policy.session_task_read_dir);
         let write_grants = profile
@@ -2154,9 +2175,14 @@ fn build_relaxed_profile(
     .into_iter()
     .flatten()
     {
-        stores
-            .read_allow
-            .push(data.join("cortexkit/alfonso/worktrees"));
+        // macOS workers already have their canonical checkout roots above.
+        // Other workers' checkouts stay private; ancestor metadata does not
+        // grant directory listings or access to their descendants.
+        if !cfg!(target_os = "macos") || !worker_jail_active() {
+            stores
+                .read_allow
+                .push(data.join("cortexkit/alfonso/worktrees"));
+        }
         stores.read_allow.push(data.join("cortexkit/bin"));
     }
     stores
@@ -2165,6 +2191,12 @@ fn build_relaxed_profile(
     stores
         .write_allow
         .extend([temp.to_path_buf(), task_io.to_path_buf()]);
+    #[cfg(target_os = "macos")]
+    if worker_jail_active() {
+        let files = worker_pool_read_files(home, roots);
+        stores.read_files.extend(files.iter().cloned());
+        write_deny.extend(files);
+    }
     // Select grants against the complete credential and store floors before
     // protecting their control files or carving out sibling checkout denies.
     policy.absolute_floor = read_deny.clone();
@@ -2180,6 +2212,12 @@ fn build_relaxed_profile(
         .collect::<Result<Vec<_>, _>>()?;
     let mut writable = roots.to_vec();
     writable.extend(linked_git_grants(git_policies));
+    #[cfg(target_os = "macos")]
+    if worker_jail_active() {
+        let targets = worker_target_roots(home, roots, &policy, &worker_cargo_configs(home, roots));
+        stores.read_allow.extend(targets.iter().cloned());
+        writable.extend(targets);
+    }
     let files = linked_git_file_grants(git_policies);
     stores.write_allow.extend(writable.iter().cloned());
     stores.write_allow.extend(files.iter().cloned());
@@ -2328,6 +2366,7 @@ fn protect_worker_private_temp(profile: &mut SandboxProfile) -> Result<(), Strin
         Ok(())
     };
     keep(&mut profile.data_policy.read_allow)?;
+    keep(&mut profile.data_policy.read_files)?;
     keep(&mut profile.data_policy.write_allow)?;
     keep(&mut profile.data_policy.read_metadata_allow)?;
     profile.data_policy.deny.push(root.to_owned());
@@ -2812,6 +2851,46 @@ const CARGO_HOME_FILES: &[&str] = &[
     ".global-cache-shm",
 ];
 
+#[cfg(unix)]
+const WORKER_ANCESTOR_CARGO_CONFIG_FILES: &[&str] = &[".cargo/config.toml", ".cargo/config"];
+#[cfg(unix)]
+const WORKER_CONTAINER_FILES: &[&str] = &[".cargo/alfonso-test-threads", ".rust-build-seeds"];
+
+#[cfg(all(unix, any(target_os = "macos", test)))]
+fn worker_pool_read_files(home: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for data in [
+        Some(home.join(".local/share")),
+        absolute_env_path("XDG_DATA_HOME"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let Ok(pool) = canonicalize_profile_candidate(&data.join("cortexkit/alfonso/worktrees"))
+        else {
+            continue;
+        };
+        for root in roots {
+            for ancestor in root.ancestors().skip(1) {
+                if !ancestor.starts_with(&pool) {
+                    break;
+                }
+                // Preserve exact-file intent even for absent Cargo probes. A
+                // missing setting must not become a recursive directory grant.
+                files.extend(
+                    WORKER_ANCESTOR_CARGO_CONFIG_FILES
+                        .iter()
+                        .chain(WORKER_CONTAINER_FILES)
+                        .map(|name| ancestor.join(name)),
+                );
+            }
+        }
+    }
+    files.sort_unstable();
+    files.dedup();
+    files
+}
+
 /// What a jailed worker's shell may write outside its worktree. Every entry
 /// comes from operator configuration: the AFT process environment, cargo
 /// configuration files outside the worktree, and the standard cache homes.
@@ -2862,24 +2941,12 @@ fn worker_jail_grants(
         }
     }
 
-    // Cargo reads configuration from CARGO_HOME and from every ancestor of the
-    // working directory. Only files outside the worktree are operator-owned.
-    let mut configs = vec![
-        (
-            cargo_home.join("config.toml"),
-            cargo_home.parent().map(Path::to_path_buf),
-        ),
-        (
-            cargo_home.join("config"),
-            cargo_home.parent().map(Path::to_path_buf),
-        ),
-    ];
     for root in project_roots {
         if let Some(container) = root.parent() {
-            for path in [
-                container.join(".cargo/alfonso-test-threads"),
-                container.join(".rust-build-seeds"),
-            ] {
+            for path in WORKER_CONTAINER_FILES
+                .iter()
+                .map(|name| container.join(name))
+            {
                 if let Ok(path) = path.canonicalize() {
                     if !project_roots.iter().any(|root| path.starts_with(root)) {
                         grants.read_only.push(path);
@@ -2887,34 +2954,12 @@ fn worker_jail_grants(
                 }
             }
         }
-        for ancestor in root.ancestors().skip(1) {
-            for name in ["config.toml", "config"] {
-                configs.push((
-                    ancestor.join(".cargo").join(name),
-                    Some(ancestor.to_path_buf()),
-                ));
-            }
-        }
     }
-    let mut targets = ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"]
-        .into_iter()
-        .filter_map(absolute_env_path)
-        .collect::<Vec<_>>();
-    let mut seen = std::collections::BTreeSet::new();
-    for (path, base) in configs {
-        if !seen.insert(path.clone()) {
-            continue;
-        }
-        let Ok(config_path) = canonicalize_profile_candidate(&path) else {
-            continue;
-        };
-        if !profile_candidate_is_file(&config_path)
-            || project_roots
-                .iter()
-                .any(|root| config_path.starts_with(root))
-        {
-            continue;
-        }
+    let configs = worker_cargo_configs(home, project_roots);
+    grants
+        .roots
+        .extend(worker_target_roots(home, project_roots, policy, &configs));
+    for (config_path, base) in configs {
         grants.read_only.push(config_path.clone());
         let Some(build) = cargo_build_settings(&config_path) else {
             continue;
@@ -2930,7 +2975,60 @@ fn worker_jail_grants(
                 add_build_slot_grants(&wrapper, project_roots, policy, &mut grants);
             }
         }
-        if let Some(target) = build.target_dir {
+    }
+    grants
+}
+
+#[cfg(unix)]
+fn worker_cargo_configs(home: &Path, project_roots: &[PathBuf]) -> Vec<(PathBuf, Option<PathBuf>)> {
+    // Cargo walks every ancestor, but only configurations outside the worker's
+    // own checkout may authorize shared build locations.
+    let cargo_home = absolute_env_path("CARGO_HOME").unwrap_or_else(|| home.join(".cargo"));
+    let mut configs = vec![
+        (
+            cargo_home.join("config.toml"),
+            cargo_home.parent().map(Path::to_path_buf),
+        ),
+        (
+            cargo_home.join("config"),
+            cargo_home.parent().map(Path::to_path_buf),
+        ),
+    ];
+    for root in project_roots {
+        for ancestor in root.ancestors().skip(1) {
+            for name in WORKER_ANCESTOR_CARGO_CONFIG_FILES {
+                configs.push((ancestor.join(name), Some(ancestor.to_path_buf())));
+            }
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    configs
+        .into_iter()
+        .filter_map(|(path, base)| {
+            if !seen.insert(path.clone()) {
+                return None;
+            }
+            let path = canonicalize_profile_candidate(&path).ok()?;
+            (profile_candidate_is_file(&path)
+                && !project_roots.iter().any(|root| path.starts_with(root)))
+            .then_some((path, base))
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn worker_target_roots(
+    home: &Path,
+    project_roots: &[PathBuf],
+    policy: &crate::access_policy::AccessPolicy,
+    configs: &[(PathBuf, Option<PathBuf>)],
+) -> Vec<PathBuf> {
+    let mut targets = ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"]
+        .into_iter()
+        .filter_map(absolute_env_path)
+        .collect::<Vec<_>>();
+    for (path, base) in configs {
+        if let Some(target) = cargo_build_settings(path).and_then(|build| build.target_dir) {
             let target = PathBuf::from(target);
             match (&base, target.is_absolute()) {
                 (_, true) => targets.push(target),
@@ -2940,6 +3038,7 @@ fn worker_jail_grants(
         }
     }
 
+    let mut roots = Vec::new();
     for target in targets {
         let target = crate::inspect::job::normalize_path(&target);
         if !jail_target_allowed(&target, home, project_roots, policy) {
@@ -2950,10 +3049,10 @@ fn worker_jail_grants(
             continue;
         }
         if create_profile_candidate_dir(&target) {
-            grants.roots.push(target);
+            roots.push(target);
         }
     }
-    grants
+    roots
 }
 
 /// Retain only the operator-configured `prefrontal-build-slot` launcher and its
@@ -10766,6 +10865,71 @@ mod policy_tests {
     use super::*;
 
     #[cfg(unix)]
+    #[test]
+    fn worker_pool_read_files_are_exact_and_stop_at_the_canonical_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let real = home.join("real-pool");
+        let pool = home.join(".local/share/cortexkit/alfonso/worktrees");
+        std::fs::create_dir_all(real.join("hash-a/own")).unwrap();
+        std::fs::create_dir_all(pool.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, &pool).unwrap();
+        let own = pool.join("hash-a/own").canonicalize().unwrap();
+        let outside = home.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let files = worker_pool_read_files(&home, &[own, outside]);
+        let mut expected = [
+            ".cargo/config.toml",
+            ".cargo/config",
+            ".cargo/alfonso-test-threads",
+            ".rust-build-seeds",
+            "hash-a/.cargo/config.toml",
+            "hash-a/.cargo/config",
+            "hash-a/.cargo/alfonso-test-threads",
+            "hash-a/.rust-build-seeds",
+        ]
+        .map(|name| real.join(name))
+        .to_vec();
+        expected.sort_unstable();
+        assert_eq!(files, expected);
+        assert!(files.iter().all(|path| !path.exists()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_targets_inside_the_pool_require_operator_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let pool = home.join(".local/share/cortexkit/alfonso/worktrees");
+        let own = pool.join("hash-a/own");
+        let config = pool.join("hash-a/.cargo/config.toml");
+        let target = pool.join("hash-a/configured-target");
+        let sibling = pool.join("hash-a/sibling/target");
+        for path in [&own, config.parent().unwrap(), &sibling] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(&config, "[build]\ntarget-dir = 'configured-target'\n").unwrap();
+        std::fs::create_dir_all(own.join(".cargo")).unwrap();
+        std::fs::write(
+            own.join(".cargo/config.toml"),
+            format!("[build]\ntarget-dir = {sibling:?}\n"),
+        )
+        .unwrap();
+        let policy = crate::access_policy::AccessPolicy::from_config(
+            &crate::config::Config::default(),
+            &home.join("store"),
+            vec![own.clone()],
+            &home,
+        );
+        let configs = worker_cargo_configs(&home, &[own.clone()]);
+        let targets = worker_target_roots(&home, &[own], &policy, &configs);
+        assert!(targets.contains(&target));
+        assert!(target.is_dir());
+        assert!(!targets.iter().any(|grant| sibling.starts_with(grant)));
+        assert!(!targets.iter().any(|grant| pool.starts_with(grant)));
+    }
+
+    #[cfg(unix)]
     fn provider_layout_grant(ttl: Duration) -> (AppContext, String, PathBuf) {
         let ctx = AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
@@ -12936,6 +13100,7 @@ mod read_allow_tests {
                     binary.clone().into(),
                 ],
                 write_allow: vec![project.clone().into(), temp.clone().into()],
+                read_files: Vec::new(),
                 read_metadata_allow: Vec::new(),
                 session_task_read_dir: None,
             },
