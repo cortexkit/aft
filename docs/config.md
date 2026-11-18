@@ -264,6 +264,10 @@ The unused `callgraph_chunk_size` key is removed. From 0.67, user configuration
 that still sets it is refused with `removed_config_key`; projects drop it with a
 notice. Run `npx @cortexkit/aft doctor --fix` to remove it.
 
+- `index`: Configure indexes for folders even when no session is open in them. By default, no folders are configured for standing indexing.
+- `index.roots`: List the folders to index, with a path and a list of indexes to build for each folder. The default is an empty list.
+- `type_checker_timeout_secs`: Maximum time in seconds for an external type checker to run. The default is 30 seconds.
+
 ```jsonc
 {
    // Edit/read surface: "default" (default) or "hashline". User and project
@@ -760,6 +764,8 @@ The removed `opencode.server_url` and `opencode.server_password_env` settings no
 ## OpenCode 2 background wakes over subc
 
 With `subc.connection_file` set, background shell completions and pattern matches wake their owning OpenCode 2 session through a session-scoped subscription. Notifications remain unacknowledged until the host admits the wake.
+
+- `subc.client_reaper`: Close the plugin's Subconscious routes to a checkout after two consecutive checks find the folder missing. Off by default.
 
 After a Location reload or host restart, AFT restores subscriptions in the background for up to 20 of that Location directory's newest sessions whose last update was within 24 hours. Recovery is sequential and does not delay Location startup or inspect another workspace's sessions. Sessions outside that window or cap recover on their next tool call or prompt.
 

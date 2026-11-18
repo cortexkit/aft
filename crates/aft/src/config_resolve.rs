@@ -27,6 +27,8 @@ use crate::feature_config;
 use crate::harness::Harness;
 use crate::jsonc::strip_jsonc;
 
+pub mod schema;
+
 const FOREGROUND_WAIT_WINDOW_DEFAULT_MS: u64 = 15_000;
 const FOREGROUND_WAIT_WINDOW_MIN_MS: u64 = 5_000;
 
@@ -106,50 +108,147 @@ pub struct ResolveResult {
 /// absent and therefore rejected by `deny_unknown_fields`.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default, deny_unknown_fields)]
+#[schemars(
+    description = "Configuration schema for the @cortexkit/aft-opencode and @cortexkit/aft-pi plugins. Place as aft.jsonc in ~/.config/opencode/, <project>/.opencode/, ~/.pi/agent/, or <project>/.pi/."
+)]
 pub struct RawAftConfig {
+    #[schemars(
+        description = "Machine-local resource profile, user config base only. lean uses less memory and can build more slowly: it uses a smaller shared block cache, four call-graph resolver threads on Linux and macOS, and immediate freed-memory return on Linux. Windows keeps all CPUs. balanced keeps the previous limits. When unset, total physical RAM selects lean below 8 GiB, otherwise balanced; unreadable RAM selects balanced. Changes apply to subsequent builds and shared block cache sizing without a restart. Other limits and meaning-search settings stay unchanged."
+    )]
     pub memory: Option<crate::memory::profile::MemoryMode>,
+    #[schemars(
+        description = "Process-wide file flush policy from the user config base only. Project values and all harness overrides have no effect."
+    )]
     pub durability: Option<RawDurability>,
+    #[schemars(
+        description = "Storage-wide settings from the user config base only. Project values and every harness override are ignored."
+    )]
     pub storage: Option<RawStorage>,
     #[serde(rename = "$schema")]
     pub schema: Option<String>,
+    #[schemars(
+        description = "Select the edit/read surface. Hashline mode renders tagged reads and changes edit arguments to exactly { patch }."
+    )]
     pub edit_mode: Option<RawEditMode>,
+    #[schemars(
+        description = "Auto-format files after edits with the language's configured formatter. Default false: formatting can reflow the file under the agent and stale the next edit's context."
+    )]
     pub format_on_edit: Option<bool>,
+    #[schemars(
+        description = "Let read, aft_outline and aft_zoom take a `ref` argument that reads a file as it is at a git revision (branch, tag, SHA, or forms like HEAD~2) from the repository's object store, without touching the working tree. Default false: the argument is not offered and a call that passes it is refused."
+    )]
     pub revision_reads: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_timeout_secs")]
     #[schemars(range(min = 1, max = 600))]
+    #[schemars(
+        description = "Maximum seconds an external formatter is allowed to run before AFT kills it and reports `format_skipped_reason: \"timeout\"`. Raise for slow formatters in large projects."
+    )]
     pub formatter_timeout_secs: Option<u32>,
     #[serde(deserialize_with = "deserialize_opt_timeout_secs")]
     #[schemars(range(min = 1, max = 600))]
+    #[schemars(
+        description = "Maximum time in seconds for an external type checker to run. The default is 30 seconds."
+    )]
     pub type_checker_timeout_secs: Option<u32>,
+    #[schemars(
+        description = "Auto-validate after edits: 'syntax' (tree-sitter parse check) or 'full' (also runs type checker)."
+    )]
     pub validate_on_edit: Option<RawValidateOnEdit>,
+    #[schemars(
+        description = "Per-language formatter overrides keyed by language (e.g. 'typescript', 'python', 'rust', 'go')."
+    )]
     pub formatter: Option<HashMap<String, RawFormatter>>,
+    #[schemars(
+        description = "Per-language type checker overrides keyed by language (e.g. 'typescript', 'python', 'rust', 'go')."
+    )]
     pub checker: Option<HashMap<String, RawChecker>>,
+    #[schemars(
+        description = "How missing formatter/checker/LSP binary warnings are shown after configure. 'toast' (default) uses a 10s TUI or HTTP toast without adding session chat messages. 'log' writes to the plugin log only. 'chat' uses legacy ignored user messages in the session transcript. Warnings for formatters/checkers are only emitted when format_on_edit is true or a per-language formatter is set; checker warnings require validate_on_edit 'syntax' or 'full' or an explicit checker. There is no top-level 'formatters' key — use format_on_edit, formatter, and checker instead."
+    )]
     pub configure_warnings_delivery: Option<RawConfigureWarningsDelivery>,
     /// Raw presence is preserved: `None` (absent) and `Some([])` (explicit
     /// empty choice) mean different things until user-base resolution.
+    #[schemars(
+        description = "Tool names that are not registered; every other AFT tool is registered. When absent from the user config it defaults to [\"aft_move\", \"aft_delete\"]; an explicit list (including []) replaces that default. Host tool names ('read', 'grep', 'bash', ...) leave the host's own tool in place. Project config may only add names and cannot disable aft_safety or a host tool slot."
+    )]
     pub disabled_tools: Option<Vec<String>>,
+    #[schemars(
+        description = "Restrict file operations to within project root. When true, write-capable commands reject paths outside project_root. Default: false (matches OpenCode built-in behavior)."
+    )]
     pub restrict_to_project_root: Option<bool>,
+    #[schemars(
+        description = "Background indexes. Each defaults on and builds independently of which tools are registered. Project config can only turn an index off."
+    )]
     pub indexes: Option<RawIndexes>,
+    #[schemars(
+        description = "Configure indexes for folders even when no session is open in them. By default, no folders are configured for standing indexing."
+    )]
     pub index: Option<RawIndex>,
+    #[schemars(
+        description = "Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect."
+    )]
     pub inspect: Option<RawInspect>,
+    #[schemars(
+        description = "Idle windows: when an unbound root's indexes are evicted, and when an unused checkout drops its in-memory index state."
+    )]
     pub idle: Option<RawIdle>,
     pub backup: Option<RawBackup>,
+    #[schemars(
+        description = "User-scoped GitHub integration gates. Project config cannot change capabilities or host-wide tool descriptions."
+    )]
     pub github: Option<RawGithub>,
+    #[schemars(
+        description = "Managed gh shim binary override. Whether the shim is used is github.shim; binary_path is the advanced AFT-image override."
+    )]
     pub gh_shim: Option<RawGhShim>,
+    #[schemars(
+        description = "Agent-child Git attribution injected through environment-scoped core.hooksPath configuration."
+    )]
     pub git: Option<RawGit>,
+    #[schemars(description = "Pi and OMP harness-specific configuration.")]
     pub pi: Option<RawPi>,
+    #[schemars(
+        description = "Shell sandbox profiles: stamped workers default to relaxed, all other sessions to off; untrusted routes always use strict."
+    )]
     pub sandbox: Option<RawSandbox>,
+    #[schemars(
+        description = "Bash runtime configuration (runtime gate + rewrite + compress + background execution and user-only environment defaults). Registration of bash and its companions is controlled by disabled_tools. Replaces `experimental.bash.*`."
+    )]
     pub bash: Option<RawBash>,
+    #[schemars(
+        description = "User-only shell environment settings. Project configuration cannot select an environment provider."
+    )]
     pub shell: Option<crate::config::ShellConfig>,
+    #[schemars(description = "Experimental opt-in features. May change between releases.")]
     pub experimental: Option<RawExperimental>,
+    #[schemars(description = "User-defined and built-in LSP server configuration.")]
     pub lsp: Option<RawLsp>,
+    #[schemars(
+        description = "Allow `aft_outline`/`aft_zoom` URL fetches to request private/link-local hosts. Default: false (rejects RFC1918, loopback, and link-local)."
+    )]
     pub url_fetch_allow_private: Option<bool>,
+    #[schemars(
+        description = "External semantic backend configuration for embedding and retrieval."
+    )]
     pub semantic: Option<RawSemantic>,
+    #[schemars(description = "aft_search settings.")]
     pub search: Option<RawSearch>,
+    #[schemars(
+        description = "OpenCode only: auto-refresh the cached @cortexkit/aft-opencode package when a newer channel version is published. User-scoped only — project configs cannot disable updates silently."
+    )]
     pub auto_update: Option<bool>,
+    #[schemars(
+        description = "Shared NDJSON bridge transport tuning (OpenCode and Pi). User-scoped only — project configs cannot set this block (bridge safety and per-machine transport budget)."
+    )]
     pub bridge: Option<RawBridge>,
+    #[schemars(
+        description = "Subconscious (subc) daemon transport selection. User-scoped only — a project config cannot redirect transport. Presence of connection_file switches AFT from a spawned child process to a daemon-supervised module."
+    )]
     pub subc: Option<RawSubc>,
 
+    #[schemars(
+        description = "Remote runs requested per bash call with runon. See docs/tools.md (bash: running on the remote build server)."
+    )]
     pub remote_exec: Option<RawRemoteExec>,
     /// Set by the resolver, never read from a file: a project tier turned
     /// `remote_exec.enabled` off.
@@ -157,12 +256,18 @@ pub struct RawAftConfig {
     pub remote_exec_project_off: bool,
     /// Raw per-harness objects stay opaque until the resolver knows the active
     /// configure harness. Unknown harness names are intentionally ignored.
+    #[schemars(
+        description = "Per-harness overrides. The active harness applies its override after the base config within each tier: user base, user override, project base, project override. storage.cache_dir, durability.macos_full_sync and memory apply to the whole process; none can be overridden here. Nested harnesses are ignored; unknown harness names are reserved for forward compatibility."
+    )]
     pub harnesses: Option<BTreeMap<String, Value>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct RawDurability {
+    #[schemars(
+        description = "On macOS, restore F_FULLFSYNC drive-cache flushes instead of faster plain fsync. Plain fsync can lose recent writes on power loss, but adds no loss on daemon kill or OS crash. Applies to AFT files and directories, not SQLite; ignored on Linux and Windows. Takes effect on the next sync."
+    )]
     pub macos_full_sync: Option<bool>,
 }
 
@@ -277,14 +382,24 @@ pub enum RawConfigureWarningsDelivery {
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawIndexes {
+    #[schemars(
+        description = "Trigram index for indexed grep/glob and the lexical aft_search lane. With false, no text index is built, and grep and glob walk the folder."
+    )]
     pub trigram: Option<bool>,
+    #[schemars(
+        description = "Semantic (embedding) index for the semantic aft_search lane. The default local backend may download an ONNX runtime and model and use CPU."
+    )]
     pub semantic: Option<bool>,
+    #[schemars(description = "Persisted call-graph store used by aft_callgraph and enrichment.")]
     pub callgraph: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawStorage {
+    #[schemars(
+        description = "Existing absolute cache parent (~ is expanded); AFT creates only its marked aft/ namespace. A path through symlinks is resolved once when first used and pinned by device and inode; if it later names a different directory, or is missing, unwritable or identity-changed, all disk caches turn off with cache_dir_unavailable and never fall back to storage. Rechecked on binds and at most once a minute. First enrollment requires a different device from durable storage; cache_dir_on_storage_device refuses main-disk mount stubs on every platform. Once a storage root has used a cache directory, removing this key keeps caches off; set it to null to move caches back to the storage root. Only the user config base may set this; harness/project overrides are dropped. Old caches are not migrated; doctor --fix reclaims only identity- and ownership-verified inactive cache domains."
+    )]
     pub cache_dir: Option<String>,
 }
 
@@ -294,26 +409,52 @@ pub struct RawStorage {
 // RawAftConfig is strict (matches AftConfigSchema.strict()). Privileged denylist
 // fields are all top-level, so nested unknowns are harmlessly ignored.
 pub struct RawSemantic {
+    #[schemars(
+        description = "Embedding backend. 'fastembed' uses local ONNX runtime, 'openai_compatible' calls a configured OpenAI-style API, 'ollama' calls a local Ollama embedding endpoint, and 'synapse' dials CortexKit Synapse over SubC."
+    )]
     pub backend: Option<SemanticBackend>,
     #[serde(default, deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    #[schemars(
+        description = "Model identifier passed to the backend. Required for synapse; fastembed defaults to all-MiniLM-L6-v2."
+    )]
     pub model: Option<String>,
     #[serde(default, deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    #[schemars(
+        description = "Base URL of the backend API endpoint. Required for openai_compatible. Default for ollama: http://localhost:11434."
+    )]
     pub base_url: Option<String>,
     #[serde(default, deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    #[schemars(
+        description = "Environment variable name containing the API key (e.g. 'OPENAI_API_KEY'). Project-scoped configs cannot set this field — only user-scoped configs can."
+    )]
     pub api_key_env: Option<String>,
     /// Background embedding request floor in milliseconds. HTTP batch deadlines
     /// scale above it using measured per-item latency.
     #[serde(default, deserialize_with = "deserialize_opt_positive_u64")]
+    #[schemars(description = "Background build embedding request timeout in milliseconds.")]
     pub timeout_ms: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_u64")]
+    #[schemars(
+        description = "Interactive query embedding deadline in milliseconds. Project-scoped configs cannot set this field; values are clamped to 500..30000."
+    )]
     pub query_timeout_ms: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    #[schemars(
+        description = "Query-only task instruction sent to the embedding backend: \"auto\" applies the model family's documented recipe (Qwen3-Embedding: the model-card retrieval task; fastembed and other families stay bare), \"off\" sends bare queries, any other value is used as literal task text. Never changes document vectors or the index fingerprint."
+    )]
     pub query_instruction: Option<String>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_usize")]
+    #[schemars(description = "Maximum batch size used by the semantic embedding pipeline.")]
     pub max_batch_size: Option<usize>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_usize")]
+    #[schemars(
+        description = "Whole-row input token budget for remote embedding backends. Absent keeps the MiniLM-era chunk caps. Fingerprinted: changing it rebuilds the semantic index."
+    )]
     pub max_input_tokens: Option<usize>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_usize")]
+    #[schemars(
+        description = "Most project files to embed for semantic search (default 20000): a limit on embedding cost and time; files past it are not embedded. Raise it for remote backends that embed server-side."
+    )]
     pub max_files: Option<usize>,
 }
 
@@ -335,6 +476,9 @@ impl RawSemantic {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawSearch {
+    #[schemars(
+        description = "Optional cross-encoder reranking of aft_search results. Default off."
+    )]
     pub rerank: Option<RawRerank>,
 }
 
@@ -343,37 +487,82 @@ pub struct RawSearch {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawRerank {
+    #[schemars(
+        description = "Cross-encoder reranker for the head of aft_search results. Only prose questions are reranked, and exact matches keep their order. 'off' keeps fused order, 'onnx' runs a local model through ONNX Runtime (downloaded in the background on first use), 'remote' calls a Cohere-style /rerank endpoint, 'synapse' uses CortexKit Synapse. A project config may only set 'off'."
+    )]
     pub backend: Option<RerankBackendKind>,
     #[serde(deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    #[schemars(
+        description = "Reranker model. For onnx: bge-reranker-base (default), bge-reranker-v2-m3, jina-reranker-v1-turbo or gte-reranker-modernbert-base. Required for remote and synapse. User config only."
+    )]
     pub model: Option<String>,
     #[serde(deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    #[schemars(
+        description = "Base URL of the remote rerank endpoint; AFT appends /rerank. Prefix with tei+ for a TEI server. User config only."
+    )]
     pub endpoint: Option<String>,
     #[serde(deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    #[schemars(
+        description = "Environment variable holding the remote rerank endpoint's API key. User config only."
+    )]
     pub api_key_env: Option<String>,
     #[serde(deserialize_with = "deserialize_opt_positive_u64")]
+    #[schemars(
+        description = "How many leading results are reranked (default 20, at most 200). User config only."
+    )]
     pub top_n: Option<u64>,
     #[serde(deserialize_with = "deserialize_opt_positive_u64")]
+    #[schemars(
+        description = "Reranking budget per search in milliseconds (default 1500, clamped to 50..15000). On timeout the fused order is kept. User config only."
+    )]
     pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, schemars::JsonSchema)]
 pub struct RawLsp {
-    #[schemars(schema_with = "crate::config_schema::lsp_idle_minutes")]
+    #[schemars(schema_with = "schema::lsp_idle_minutes")]
+    #[schemars(
+        description = "Minutes since the last AFT tool call on that repository. Default 60; integers are clamped to 5..=1440. 'never' disables only idle reaping; servers still stop on unbind, eviction and shutdown. Project config may only lower the user value, or set a number when the user has 'never'. Applies live."
+    )]
     pub idle_minutes: Option<LspIdleMinutes>,
+    #[schemars(
+        description = "Maximum live language servers process-wide, including starts in progress. Evicts the least recently used client with no pending requests before refusing a start. Project config may only lower the user value. Zero prevents new starts."
+    )]
     pub max_servers: Option<usize>,
     #[serde(default, deserialize_with = "deserialize_opt_lsp_servers")]
+    #[schemars(
+        description = "User-defined LSP server map keyed by server id (e.g. { 'terraform-ls': { ... } })."
+    )]
     pub servers: Option<BTreeMap<String, RawLspServerEntry>>,
     #[serde(
         default,
         deserialize_with = "deserialize_opt_trimmed_non_empty_string_vec"
     )]
+    #[schemars(
+        description = "Built-in LSP server ids to disable (e.g. ['python', 'biome']). See README for the full list."
+    )]
     pub disabled: Option<Vec<String>>,
+    #[schemars(
+        description = "Which Python LSP to use. 'auto' stays on Pyright while ty is experimental; select 'ty' explicitly to opt in without fallback."
+    )]
     pub python: Option<RawPythonLsp>,
+    #[schemars(
+        description = "Wait for inline LSP diagnostics on every edit/write/apply_patch call. Default: false."
+    )]
     pub diagnostics_on_edit: Option<bool>,
+    #[schemars(
+        description = "Auto-install npm-distributed and GitHub-release LSP servers when the project needs them. Set false to require manual install on PATH."
+    )]
     pub auto_install: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_u64")]
+    #[schemars(
+        description = "Supply-chain grace window. AFT only installs versions that have been on the registry / GitHub releases for at least this many days. User pins via `lsp.versions` bypass this."
+    )]
     pub grace_days: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_opt_versions_map")]
+    #[schemars(
+        description = "Per-package version pin map keyed by npm package or GitHub repo. Pins bypass the grace filter and any weekly version recheck (e.g. { 'typescript-language-server': '5.0.0', 'clangd/clangd': '21.1.0' })."
+    )]
     pub versions: Option<HashMap<String, String>>,
 }
 
@@ -403,20 +592,40 @@ pub enum RawPythonLsp {
 #[serde(default)]
 pub struct RawLspServerEntry {
     #[serde(deserialize_with = "deserialize_opt_lsp_extensions")]
+    #[schemars(
+        description = "File extensions this server handles (e.g. ['.tf', '.tfvars']). Optional when overriding a built-in server — the built-in's extensions are inherited."
+    )]
     pub extensions: Option<Vec<String>>,
     #[serde(deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    #[schemars(
+        description = "LSP binary command (must be on PATH or absolute path). Optional when overriding a built-in server — the built-in's binary is inherited."
+    )]
     pub binary: Option<String>,
+    #[schemars(description = "Extra command-line arguments passed to the LSP binary.")]
     pub args: Option<Vec<String>>,
     #[serde(deserialize_with = "deserialize_opt_trimmed_non_empty_string_vec")]
+    #[schemars(
+        description = "Workspace root marker files. AFT walks up from each opened file looking for any of these."
+    )]
     pub root_markers: Option<Vec<String>>,
+    #[schemars(description = "Disable this server entirely without removing the config block.")]
     pub disabled: Option<bool>,
+    #[schemars(
+        description = "Extra environment variables passed to the LSP server child process."
+    )]
     pub env: Option<HashMap<String, String>>,
+    #[schemars(
+        description = "JSON value passed as `initializationOptions` in the LSP `initialize` request."
+    )]
     pub initialization_options: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, schemars::JsonSchema)]
 #[schemars(untagged)]
 pub enum RawBash {
+    #[schemars(
+        description = "Shorthand: `true` turns the bash runtime on with rewrite + compress + background; `false` turns the runtime gate off (bash operations report bash_disabled)."
+    )]
     Bool(bool),
     Features(RawBashFeatures),
 }
@@ -445,46 +654,112 @@ impl<'de> Deserialize<'de> for RawBash {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawBashFeatures {
+    #[schemars(
+        description = "Report watcher-observed project changes after bash commands. User opt-in; projects may only set off. Diff mode uses clean git before-images and bounded output."
+    )]
     pub changed_files: Option<crate::config::BashChangedFiles>,
     /// Runtime gate for bash execution. Absent means on.
+    #[schemars(
+        description = "Runtime gate for every bash operation, including bash_status/bash_write/bash_watch/bash_kill. When false they report bash_disabled; registration is controlled by disabled_tools."
+    )]
     pub enabled: Option<bool>,
+    #[schemars(
+        description = "Rewrite common bash commands (cat, grep, find, sed, ls) into AFT tool calls for faster, formatted output."
+    )]
     pub rewrite: Option<bool>,
+    #[schemars(
+        description = "Compress bash output via per-tool compressors (git, cargo, npm, bun, pnpm, pytest, tsc, eslint, biome, vitest, prettier, ruff, mypy, go, golangci-lint, playwright, next) plus TOML filter pipeline. Adds `[cmpaft]` marker."
+    )]
     pub compress: Option<bool>,
+    #[schemars(
+        description = "Allow agents to launch bash with `{ background: true }` for long-running tasks. Foreground bash always auto-promotes to background after the foreground wait window (default 8s) regardless of this flag."
+    )]
     pub background: Option<bool>,
+    #[schemars(
+        description = "Break-glass host execution when AFT's module transport is unavailable. Project-settable. Every fallback command requires a fresh host permission prompt and runs without AFT rewrites, compression, or background support."
+    )]
     pub host_fallback: Option<bool>,
+    #[schemars(
+        description = "Allow subagents to run background bash. Default true because workers are multi-turn and wait with bash_watch; when false, subagent `background: true` requests are converted to foreground calls that block up to the hard cap."
+    )]
     pub subagent_background: Option<bool>,
+    #[schemars(
+        description = "Detach a `wait: true` bash call when a new user message arrives. Default true. Set false to keep the wait blocking; a message containing the literal `&detach` still forces detachment, the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Project-safe."
+    )]
     pub detach_on_user_message: Option<bool>,
+    #[schemars(
+        description = "Append AFT read-only database schema hints after missing-table or missing-column errors. SQLite on Unix only; supported literal database paths only. Project-safe."
+    )]
     pub db_schema_hints: Option<bool>,
+    #[schemars(
+        description = "Periodically remind the agent that a background bash task is still running. When false, completion is delivered but mid-flight reminders are suppressed."
+    )]
     pub long_running_reminder_enabled: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_positive_u64")]
+    #[schemars(
+        description = "Interval in milliseconds between mid-flight reminders for a still-running background bash task."
+    )]
     pub long_running_reminder_interval_ms: Option<u64>,
     #[serde(deserialize_with = "deserialize_opt_positive_u64")]
+    #[schemars(
+        description = "How long foreground bash blocks before auto-promoting the task to background, in milliseconds. Minimum 5000; values below the floor are clamped up."
+    )]
     pub foreground_wait_window_ms: Option<u64>,
     #[serde(deserialize_with = "deserialize_opt_positive_u64")]
+    #[schemars(
+        description = "Maximum synchronous bash_watch wait in milliseconds. Defaults to 120 seconds for short remaining waits; set to 1800000 to restore the old 30-minute cap."
+    )]
     pub watch_sync_max_ms: Option<u64>,
     #[serde(deserialize_with = "deserialize_opt_worker_wait_max_ms")]
+    #[schemars(
+        description = "Longest a delegated worker (subagent) waits on one command before control returns to it, in milliseconds: a bash_watch without a timeout, or a bash call that blocks until the command finishes (wait: true, or every foreground call when subagent_background is false). The command keeps running in the background; the worker is told it is still running and can wait again or kill it. While a worker keeps waiting, the command's default 30-minute hard kill is pushed back by this much. Default 1800000 (30 minutes); values below 60000 are a config error. Project-safe."
+    )]
     pub worker_wait_max_ms: Option<u64>,
+    #[schemars(
+        description = "Linux daemon scopes are on by default (user config only). User config can disable them. Standalone mode, PTY tasks, and native-sandbox launches use the usual spawn path. If systemd-run, the user manager, or cgroup access is unavailable, AFT uses the usual path."
+    )]
     pub linux_scope: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_linux_scope_max_runtime_secs")]
     #[schemars(range(min = 1, max = 4294967295_u64))]
+    #[schemars(
+        description = "User-only Linux daemon scope ceiling in seconds. Worker waits do not extend it. An explicit timeout uses its own limit plus 60 seconds."
+    )]
     pub linux_scope_max_runtime_secs: Option<u64>,
     #[serde(deserialize_with = "deserialize_opt_memory_limit_mib")]
     #[schemars(range(min = 1, max = 4294967295_u64))]
+    #[schemars(
+        description = "Optional aggregate local-command memory cap in MiB. Off by default; projects may only lower a user cap. Remote runon jobs use server limits."
+    )]
     pub memory_limit_mib: Option<u64>,
+    #[schemars(
+        description = "On macOS, agent shells and governed gh commands do not inherit the supervisor's privacy grants. Default false. Live for future commands; user tier controls it and projects may only enable it. Protected folders such as ~/Downloads should be read with AFT's read tool. Accepted but inert on other platforms; unavailable spawn attributes refuse the command instead of inheriting grants."
+    )]
     pub disclaim_privacy: Option<bool>,
+    #[schemars(
+        description = "Pi-only fallback for manually mirroring Pi's optional PowerShell default tool when the host does not expose its enabled-tool registry. OpenCode never registers this tool."
+    )]
     pub powershell_tool: Option<bool>,
+    #[schemars(
+        description = "Fixed environment variables for local shell commands, at either tier. A project's names apply only while the project is trusted (aft doctor filters trust; a linked worktree inherits its main checkout); a user value wins when both tiers set the same name, and the first bash reply in a session names each applied variable with its tier, never its value. Per-call env values and the command's own export both override these. Names that hijack startup, redirect lookup roots, inject into interpreters or Git, or drive AFT, the sandbox, or a build worker are rejected at every tier; credentials, identity, proxy, and TLS-trust names are rejected at the project tier. These values never reach a runon build-server job unless a user name is listed in bash.runon_env."
+    )]
     pub env: Option<BTreeMap<String, String>>,
     /// Project-tier `bash.env` values, carried separately so the user-tier map
     /// stays user-only. Only `project_safe_bash` fills this field.
     #[serde(skip)]
     pub project_env: Option<BTreeMap<String, String>>,
     /// User-only: `bash.env` names that are also sent to a `runon` job.
+    #[schemars(
+        description = "User-only list of bash.env names that are also sent to a runon build-server job. Every other bash.env value applies to local commands only; a project's values are never sent, even when their name is listed. Unlisted names appear in the job's \"does not receive\" disclosure."
+    )]
     pub runon_env: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawExperimental {
+    #[schemars(
+        description = "Run the experimental Python `ty` type checker alongside Pyright. Use lsp.python = 'ty' to select ty exclusively."
+    )]
     pub lsp_ty: Option<bool>,
 }
 
@@ -497,13 +772,27 @@ impl RawExperimental {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawInspect {
+    #[schemars(
+        description = "Runtime switch for aft_inspect. Defaults to true. When false the registered tool reports inspect_disabled; use disabled_tools to unregister it."
+    )]
     pub enabled: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_u64")]
+    #[schemars(
+        description = "Blocking LSP diagnostics deadline in milliseconds. Values are clamped to 10000..600000. User config sets the baseline; project config may only raise the effective deadline so a repository cannot silently reduce diagnostic completeness for another consumer."
+    )]
     pub diagnostics_timeout_ms: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_u64")]
+    #[schemars(
+        description = "Hard deadline for one Tier-2 pass, including projection and scanning. On expiry AFT cooperatively cancels the pass and releases its cold-build slot."
+    )]
     pub tier2_pass_timeout_ms: Option<u64>,
     #[serde(deserialize_with = "deserialize_opt_inspect_categories")]
+    #[schemars(with = "Option<InspectCategories>")]
+    #[schemars(
+        description = "Per-category computation switches, all true by default. Off categories run no scans or refreshes and render as off, never incomplete. Project config may only turn a category off."
+    )]
     pub categories: Option<BTreeMap<String, bool>>,
+    #[schemars(description = "Duplicate suppression config for the duplicates inspect category.")]
     pub duplicates: Option<RawInspectDuplicates>,
 }
 
@@ -524,6 +813,9 @@ impl RawInspect {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawInspectDuplicates {
+    #[schemars(
+        description = "Intentional mirror path pairs for duplicate suppression. Each [globA, globB] pair matches project-root-relative forward-slash paths; groups fully straddling the pair are counted as suppressed instead of reported."
+    )]
     pub expected_mirrors: Option<Vec<[String; 2]>>,
 }
 
@@ -536,7 +828,13 @@ impl RawInspectDuplicates {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawIdle {
+    #[schemars(
+        description = "Minutes without tool traffic before an unbound root's indexes are evicted. Default 30; values outside 5..=30 are clamped. Reclaimed state rebuilds on the next request. User and project tiers."
+    )]
     pub root_ttl_minutes: Option<Value>,
+    #[schemars(
+        description = "Hours without use after which a checkout counts as idle and drops its in-memory index state; its state on disk stays. Default 168 (one week); values outside 1..=8760 are clamped. Replaces views.idle_checkout_hours. User and project tiers. Applies live."
+    )]
     pub checkout_hours: Option<Value>,
 }
 
@@ -550,21 +848,37 @@ impl RawIdle {
 #[serde(default)]
 pub struct RawBridge {
     #[serde(deserialize_with = "deserialize_opt_bridge_request_timeout_ms")]
+    #[schemars(
+        description = "Per-request bridge transport timeout in milliseconds. Default 30000. Raise on slow filesystems (WSL/DrvFs/NFS) where cold aft operations exceed the default."
+    )]
     pub request_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawSubc {
+    #[schemars(
+        description = "Absolute path to the Subconscious (subc) daemon connection file. When present (non-empty), the plugin talks to AFT as a daemon-supervised module over subc instead of spawning the aft binary; absent/empty means standalone NDJSON (the default). macOS default: ~/.local/share/cortexkit/run/subc-connection.json."
+    )]
     pub connection_file: Option<String>,
+    #[schemars(
+        description = "Close the plugin's Subconscious routes to a checkout after two consecutive checks find the folder missing. Off by default."
+    )]
     pub client_reaper: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawGithub {
+    #[schemars(description = "Interpose the governed gh shim in agent child PATHs.")]
     pub shim: Option<bool>,
+    #[schemars(
+        description = "Enable structured issue:// and pr:// reads. github.write=true also enables this to keep comment ordinals visible."
+    )]
     pub read: Option<bool>,
+    #[schemars(
+        description = "Enable creating and editing issue and pull-request conversation comments. Implies github.read."
+    )]
     pub write: Option<bool>,
 }
 
@@ -572,6 +886,9 @@ pub struct RawGithub {
 #[serde(default)]
 pub struct RawGhShim {
     #[serde(deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    #[schemars(
+        description = "Absolute deployed or development AFT binary used by the managed gh entry. Defaults to the running AFT image. User-scoped only."
+    )]
     pub binary_path: Option<String>,
 }
 
@@ -579,15 +896,24 @@ pub struct RawGhShim {
 #[serde(default)]
 pub struct RawGit {
     #[serde(deserialize_with = "deserialize_opt_git_co_author")]
+    #[schemars(
+        description = "Git co-author attribution for AFT-spawned agent children: 'off', 'auto', or an explicit 'Name <email>' identity. User and project tiers are accepted with project precedence."
+    )]
     pub co_author: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawPi {
+    #[schemars(
+        description = "Pi and OMP tool presentation mode. 'top_level' registers tools with loadMode: essential on OMP so they appear at top level (default). 'host_default' uses host default loadMode (mounting tools under xd:// on OMP). User and project tiers are accepted with project precedence."
+    )]
     pub tool_presentation: Option<RawPiToolPresentation>,
     /// Plain Pi asks before outside-project access (default on). A project
     /// tier may turn it on, never off; see `merge_pi_config`.
+    #[schemars(
+        description = "Plain Pi only: ask before an AFT tool reaches a path outside the project. On (default), Pi's own terminal UI asks; print, JSON and RPC sessions have no screen to ask on and allow it without asking. Off, outside access is allowed without asking. Credentials, AFT's data folder, sandbox.read_deny and restrict_to_project_root: true refuse either way. Does not apply on OMP, where OMP's approval mode (tools.approvalMode) decides through the tools' declared approval tiers. A project config may turn it on, never off."
+    )]
     pub external_access_ask: Option<bool>,
 }
 
@@ -621,9 +947,16 @@ impl<'de> Deserialize<'de> for RawPiToolPresentation {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawBackup {
+    #[schemars(
+        description = "Master switch for agent-facing undo backups. When false aft_safety stays registered and reports that backups are disabled. User-only; project config is ignored."
+    )]
     pub enabled: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_usize")]
+    #[schemars(description = "Per-file undo stack depth. User-only; project config is ignored.")]
     pub max_depth: Option<usize>,
+    #[schemars(
+        description = "Maximum existing-file size captured for undo, in bytes. Defaults to 64 MiB. User and project tiers may set it; explicit larger values are honored. Zero disables automatic snapshots. Mutations still proceed when capture is skipped."
+    )]
     pub max_file_size: Option<u64>,
 }
 
@@ -632,15 +965,30 @@ pub struct RawBackup {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawRemoteExec {
+    #[schemars(
+        description = "Offer bash's runon argument, which runs a command line on the remote Linux build server (subc mode only). User-scoped: a project config may set false to turn remote runs off for itself, never true."
+    )]
     pub enabled: Option<bool>,
+    #[schemars(
+        description = "The runner demand a runon call without specifics runs under (today only \"linux\"). Never makes a call remote by itself. User-scoped only."
+    )]
     pub default_demand: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawSandbox {
+    #[schemars(
+        description = "User-selected sandbox profiles by role. Projects may only select a stricter profile (off < relaxed < strict)."
+    )]
     pub profile: Option<RawSandboxRoles>,
+    #[schemars(
+        description = "Additional absolute writable directories. User-scoped only; project config cannot add write access."
+    )]
     pub write_allow: Option<Vec<PathBuf>>,
+    #[schemars(
+        description = "Additional absolute paths sandboxed commands may not read. Project config may add deny entries but cannot remove user or built-in entries."
+    )]
     pub read_deny: Option<Vec<PathBuf>>,
 }
 
@@ -657,6 +1005,9 @@ pub struct RawSandboxRoles {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawIndex {
+    #[schemars(
+        description = "List the folders to index, with a path and a list of indexes to build for each folder. The default is an empty list."
+    )]
     pub roots: Option<Vec<RawIndexRoot>>,
 }
 

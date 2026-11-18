@@ -100,6 +100,7 @@ fn object_alternative(schema: &mut Value) -> Option<&mut Value> {
 mod tests {
     use super::*;
     use serde::Deserialize;
+    use std::collections::BTreeMap;
 
     #[test]
     fn config_schema_keys_match_the_raw_parser() {
@@ -131,6 +132,89 @@ mod tests {
         assert_eq!(schema_fields.len(), parser_fields.len());
         for key in parser_fields {
             assert!(schema_fields.contains_key(*key), "missing {key}");
+        }
+    }
+
+    fn annotations<'a>(
+        node: &'a Value,
+        path: &str,
+        found: &mut BTreeMap<(String, &'a str), &'a str>,
+    ) {
+        for keyword in ["description", "markdownDescription"] {
+            if let Some(text) = node.get(keyword).and_then(Value::as_str) {
+                assert!(
+                    found.insert((path.to_owned(), keyword), text).is_none(),
+                    "duplicate {keyword} at {path}"
+                );
+            }
+        }
+        if let Some(properties) = node.get("properties").and_then(Value::as_object) {
+            for (name, child) in properties {
+                annotations(child, &format!("{path}.{name}"), found);
+            }
+        }
+        for (keyword, suffix) in [("additionalProperties", ".*"), ("items", "[]")] {
+            if let Some(child) = node.get(keyword) {
+                annotations(child, &format!("{path}{suffix}"), found);
+            }
+        }
+        for keyword in ["oneOf", "anyOf", "allOf"] {
+            if let Some(branches) = node.get(keyword).and_then(Value::as_array) {
+                for branch in branches {
+                    // Object branches do not change the path users type. The
+                    // bash shorthand, however, has its own separate hover.
+                    if branch.get("type").and_then(Value::as_str) == Some("boolean") {
+                        annotations(branch, &format!("{path}<boolean>"), found);
+                    } else {
+                        annotations(branch, path, found);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn config_schema_preserves_legacy_editor_annotations() {
+        let legacy: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/config_schema/legacy_editor_schema.json"
+        ))
+        .unwrap();
+        let generated = editor_schema();
+        let (mut expected, mut actual) = (BTreeMap::new(), BTreeMap::new());
+        annotations(&legacy, "", &mut expected);
+        annotations(&generated, "", &mut actual);
+        assert!(
+            expected.len() >= 244,
+            "legacy schema snapshot is incomplete"
+        );
+        for (key, text) in expected {
+            assert_eq!(
+                actual.get(&key),
+                Some(&text),
+                "missing or changed {} at {}",
+                key.1,
+                key.0
+            );
+        }
+    }
+
+    #[test]
+    fn config_schema_suggests_every_inspect_category() {
+        let schema = editor_schema();
+        for path in [
+            "/properties",
+            "/properties/harnesses/additionalProperties/properties",
+        ] {
+            let categories =
+                &schema.pointer(path).unwrap()["inspect"]["properties"]["categories"]["properties"];
+            assert_eq!(
+                categories.as_object().unwrap().len(),
+                crate::config::InspectCategories::KEYS.len()
+            );
+            for name in crate::config::InspectCategories::KEYS {
+                assert_eq!(categories[name]["type"], "boolean");
+                assert_eq!(categories[name]["default"], true);
+            }
         }
     }
 }

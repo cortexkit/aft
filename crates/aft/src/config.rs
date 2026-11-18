@@ -428,7 +428,7 @@ pub struct InspectDuplicatesConfig {
     pub expected_mirrors: Vec<[String; 2]>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct InspectCategories {
     pub diagnostics: bool,
@@ -837,6 +837,9 @@ pub struct BashConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ShellConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "Opt-in per-project environment export, run in the command workdir under its sandbox. Omit to preserve AFT's default environment. direnv is unsupported on Windows."
+    )]
     pub env_provider: Option<ShellEnvProvider>,
 }
 
@@ -853,10 +856,16 @@ pub enum ShellEnvProviderKind {
 pub struct ShellEnvProvider {
     pub kind: ShellEnvProviderKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "Provider argv. Defaults to mise env --json or direnv export json; required for custom."
+    )]
     pub command: Option<Vec<String>>,
     #[serde(default = "default_env_provider_timeout_ms")]
     pub timeout_ms: u64,
     #[serde(default)]
+    #[schemars(
+        description = "Custom provider watch files, checked at every ancestor. A custom provider with no watches runs on every call."
+    )]
     pub watch: Vec<String>,
 }
 
