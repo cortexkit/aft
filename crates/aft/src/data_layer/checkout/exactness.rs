@@ -8,6 +8,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::callgraph_store::CallGraphRead;
+use crate::inspect::job::is_test_file;
+
 type GateResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Serialize, Deserialize)]
@@ -29,6 +32,15 @@ struct QuerySpec {
     to_symbol: Option<String>,
     expression: Option<String>,
     positive: bool,
+}
+
+impl QuerySpec {
+    fn requires_positive_path(&self, include_tests: bool) -> bool {
+        self.positive
+            && (include_tests
+                || (!is_test_file(&self.file)
+                    && !self.to_file.as_deref().is_some_and(is_test_file)))
+    }
 }
 
 /// Negative control: change a real method-call target before the cold
@@ -205,7 +217,7 @@ fn export(checkout: &Checkout, out: &Path, reference: Option<&Path>) -> GateResu
 fn query_plan(view: &CheckoutView, sample: usize) -> GateResult<Vec<QuerySpec>> {
     let mut symbols = BTreeSet::new();
     let mut incoming = BTreeMap::<(String, String), usize>::new();
-    let mut outgoing = BTreeMap::new();
+    let mut callers = BTreeSet::new();
     for record in view.published.state.paths() {
         let path = std::str::from_utf8(&record.path)?;
         let Some(slice) = view.graph.slice(path) else {
@@ -223,8 +235,7 @@ fn query_plan(view: &CheckoutView, sample: usize) -> GateResult<Vec<QuerySpec>> 
             let Some(caller) = slice.node(edge.source()) else {
                 continue;
             };
-            let origin = (path.to_string(), caller.scoped_name().to_string());
-            outgoing.entry(origin).or_insert(target);
+            callers.insert((path.to_string(), caller.scoped_name().to_string()));
         }
     }
     let mut ranked = symbols.iter().cloned().collect::<Vec<_>>();
@@ -243,7 +254,7 @@ fn query_plan(view: &CheckoutView, sample: usize) -> GateResult<Vec<QuerySpec>> 
     }
     let mut leaves = 0;
     for symbol in &symbols {
-        if !outgoing.contains_key(symbol) && leaves < sample {
+        if !callers.contains(symbol) && leaves < sample {
             selected.insert(symbol.clone(), "leaf");
             leaves += 1;
         }
@@ -251,8 +262,21 @@ fn query_plan(view: &CheckoutView, sample: usize) -> GateResult<Vec<QuerySpec>> 
     // A small mixed-language island ensures every edited project exercises
     // the same positive data-flow and inter-file path witnesses.
     selected.insert(("exactness_gate/main.ts".into(), "entry".into()), "witness");
+    // Slices contain non-call edges as well. The trace's outgoing lookup
+    // includes callable constructions but excludes type-only constructions
+    // and callback references.
+    let sources = selected.keys().cloned().collect::<Vec<_>>();
+    let mut outgoing = view.callgraph().outgoing_calls_for_symbols(&sources)?;
     let mut plan = Vec::new();
-    for ((file, symbol), stratum) in selected {
+    for (source, stratum) in selected {
+        let target = outgoing.remove(&source).and_then(|calls| {
+            calls
+                .into_iter()
+                .filter_map(|site| site.target)
+                .map(|target| (target.file, target.symbol))
+                .find(|target| target != &source)
+        });
+        let (file, symbol) = source;
         for op in ["callers", "impact", "trace_to", "call_tree", "trace_data"] {
             plan.push(QuerySpec {
                 op: op.into(),
@@ -265,17 +289,14 @@ fn query_plan(view: &CheckoutView, sample: usize) -> GateResult<Vec<QuerySpec>> 
                 positive: false,
             });
         }
-        if let Some(target) = outgoing
-            .get(&(file.clone(), symbol.clone()))
-            .filter(|target| symbols.contains(*target))
-        {
+        if let Some((target_file, target_symbol)) = target {
             plan.push(QuerySpec {
                 op: "trace_to_symbol".into(),
                 file: file.clone(),
                 symbol: symbol.clone(),
                 stratum: stratum.into(),
-                to_file: Some(target.0.clone()),
-                to_symbol: Some(target.1.clone()),
+                to_file: Some(target_file),
+                to_symbol: Some(target_symbol),
                 expression: None,
                 positive: true,
             });
@@ -456,10 +477,15 @@ fn queries(
                 )),
                 _ => return Err("unknown exactness query".into()),
             }?;
-            if spec.positive && answer.pointer("/ok/path").is_none_or(Value::is_null) {
+            if spec.requires_positive_path(tests)
+                && answer.pointer("/ok/path").is_none_or(Value::is_null)
+            {
                 return Err(format!(
-                    "positive path witness failed: {}:{}: {answer}",
-                    spec.file, spec.symbol
+                    "positive path witness failed: {}:{} -> {}:{} (tests={tests}): {answer}",
+                    spec.file,
+                    spec.symbol,
+                    spec.to_file.as_deref().unwrap_or("<any file>"),
+                    spec.to_symbol.as_deref().unwrap_or("<unknown>"),
                 )
                 .into());
             }
@@ -580,4 +606,89 @@ pub fn run(args: Vec<String>) -> GateResult<()> {
     queries(&checkout, out, reference, sample)?;
     println!("EXACTNESS snapshot: {count} full FileResolutions; StoredSlices::failures()=[]");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn positive_path_expectation_respects_test_endpoints() {
+        for (file, to_file, required_without_tests) in [
+            ("src/start.ts", "src/end.ts", true),
+            ("tests/start.ts", "src/end.ts", false),
+            ("src/start.ts", "src/end.test.ts", false),
+            ("tests/start.ts", "tests/end.ts", false),
+        ] {
+            let mut spec = QuerySpec {
+                op: "trace_to_symbol".into(),
+                file: file.into(),
+                symbol: "start".into(),
+                stratum: "busy".into(),
+                to_file: Some(to_file.into()),
+                to_symbol: Some("end".into()),
+                expression: None,
+                positive: true,
+            };
+            assert_eq!(spec.requires_positive_path(false), required_without_tests);
+            assert!(spec.requires_positive_path(true));
+            spec.positive = false;
+            assert!(!spec.requires_positive_path(false));
+            assert!(!spec.requires_positive_path(true));
+        }
+    }
+
+    #[test]
+    fn plan_uses_traversable_calls_not_raw_reference_edges() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("main.ts"),
+            "function callback() {}\n\
+             function invoked() {}\n\
+             class Service { constructor() {} }\n\
+             function callbackOnly() { items.map(callback); }\n\
+             function construct() { new Service(); }\n\
+             function direct() { invoked(); }\n",
+        )
+        .unwrap();
+        let checkout = Checkout::bind(
+            Arc::new(DataLayer::new(8 << 20, 1)),
+            store.path(),
+            FamilyId::from_digest(Digest128::of(b"exactness plan test")),
+            root.path(),
+        )
+        .unwrap();
+        checkout.build().unwrap();
+        let view = checkout.view().unwrap();
+        let slice = view.graph.slice("main.ts").unwrap();
+        assert!(slice.edges().any(|edge| {
+            edge.kind() == "callback_ref"
+                && edge.target_symbol() == "callback"
+                && slice.node(edge.source()).unwrap().scoped_name() == "callbackOnly"
+        }));
+
+        let plan = query_plan(&view, 16).unwrap();
+        assert!(plan.iter().any(|spec| {
+            spec.file == "main.ts" && spec.symbol == "callbackOnly" && spec.op == "callers"
+        }));
+        let native_witnesses = plan
+            .iter()
+            .filter(|spec| spec.positive && spec.file == "main.ts")
+            .map(|spec| (spec.symbol.as_str(), spec.to_symbol.as_deref().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            native_witnesses,
+            [("construct", "Service::constructor"), ("direct", "invoked")]
+        );
+        for (target, positive) in [("sink", true), ("orphan", false)] {
+            assert!(plan.iter().any(|spec| {
+                spec.file == "exactness_gate/main.ts"
+                    && spec.symbol == "entry"
+                    && spec.to_file.as_deref() == Some("exactness_gate/lib.ts")
+                    && spec.to_symbol.as_deref() == Some(target)
+                    && spec.positive == positive
+            }));
+        }
+    }
 }
