@@ -96,6 +96,21 @@ async fn accept_module_hello(listener: &TcpListener) -> (TcpStream, ModuleHelloB
 
     let hello = read_any_frame_timeout(&mut stream, "ModuleHello").await;
     assert_eq!(hello.header.ty, FrameType::Hello);
+    assert_eq!(hello.header.channel, 0);
+    assert_eq!(hello.header.epoch, 0);
+    assert_eq!(hello.header.corr, 1);
+    assert_eq!(hello.header.flags, control_flags());
+    // Keep the legacy envelope's order and bytes explicit, independently of
+    // the protocol struct that the module uses to serialize it. The manifest
+    // itself varies with the host's supported tools and build provenance.
+    let suffix = format!(
+        r#","protocol_ver":{PROTOCOL_VERSION},"control_ops":["route.bind","route.status","health.check"],"launch_nonce":"{PIPE_NONCE}"}}"#
+    );
+    assert!(hello.body.starts_with(br#"{"manifest":{"#));
+    assert!(
+        hello.body.ends_with(suffix.as_bytes()),
+        "legacy HELLO wire envelope changed"
+    );
     let body: ModuleHelloBody = serde_json::from_slice(&hello.body).expect("hello body");
     send_frame(
         &mut stream,
