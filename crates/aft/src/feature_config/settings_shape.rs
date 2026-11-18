@@ -35,19 +35,26 @@ impl Edit {
     }
 }
 
-pub(crate) fn edits(block: &Map<String, Value>) -> Vec<Edit> {
+pub(crate) fn edits(block: &Map<String, Value>, tier: super::DocumentTier) -> Vec<Edit> {
     let mut edits = Vec::new();
     if let Some(enabled) = block.get("bash").and_then(Value::as_bool) {
         let value = if enabled {
-            json!({"enabled": true, "rewrite": true, "compress": true, "background": true})
+            let mut enabled = json!({"rewrite": true, "compress": true, "background": true});
+            // A project boolean used to change only the feature switches if a
+            // user set the gate. Rewriting it must not re-enable that gate.
+            if tier == super::DocumentTier::User {
+                enabled["enabled"] = Value::Bool(true);
+            }
+            enabled
         } else {
             json!({"enabled": false})
         };
-        edits.push(Edit::at(
-            &["bash"],
-            Some(value),
-            "bash boolean → bash.enabled",
-        ));
+        let notice = if enabled && tier == super::DocumentTier::Project {
+            "bash boolean → bash.rewrite, bash.compress and bash.background"
+        } else {
+            "bash boolean → bash.enabled"
+        };
+        edits.push(Edit::at(&["bash"], Some(value), notice));
     }
     if let Some(lsp) = block.get("lsp").and_then(Value::as_object) {
         if lsp.get("idle_minutes").and_then(Value::as_str) == Some("never") {

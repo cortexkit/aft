@@ -68,13 +68,13 @@ pub fn editor_schema() -> Value {
     fields.get_mut("harnesses").expect("harness schema")["additionalProperties"] = json!({
         "properties": harness_fields,
     });
-    exclude_null(&mut schema, false);
+    exclude_null(&mut schema, &["storage", "cache_dir"]);
     schema
 }
 
 // Rust uses Option for presence. In JSONC an omitted setting is allowed, but
 // an explicit null is not, except for the storage cache opt-out.
-fn exclude_null(schema: &mut Value, storage: bool) {
+fn exclude_null(schema: &mut Value, cache_exception: &[&str]) {
     if *schema == Value::Bool(true) {
         *schema = json!({"not": {"type": "null"}});
         return;
@@ -96,20 +96,22 @@ fn exclude_null(schema: &mut Value, storage: bool) {
         if let Some(Value::Array(branches)) = node.get_mut(keyword) {
             branches.retain(|branch| branch.get("type").and_then(Value::as_str) != Some("null"));
             for branch in branches {
-                exclude_null(branch, storage);
+                exclude_null(branch, cache_exception);
             }
         }
     }
     if let Some(Value::Object(fields)) = node.get_mut("properties") {
         for (name, child) in fields {
-            if !(storage && name == "cache_dir") {
-                exclude_null(child, name == "storage");
+            match cache_exception.split_first() {
+                Some((part, [])) if name == *part => {}
+                Some((part, rest)) if name == *part => exclude_null(child, rest),
+                _ => exclude_null(child, &[]),
             }
         }
     }
     for keyword in ["items", "additionalProperties"] {
         if let Some(child) = node.get_mut(keyword) {
-            exclude_null(child, false);
+            exclude_null(child, &[]);
         }
     }
     if !node.contains_key("type") && !node.contains_key("const") && !node.contains_key("not") {

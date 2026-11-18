@@ -1117,13 +1117,13 @@ pub fn translate_document(map: &mut Map<String, Value>, tier: DocumentTier) -> D
     let mut out = DocumentTranslation::default();
     translate_runon_enabled(map, tier, "", &mut out);
     translate_block(map, tier == DocumentTier::User, "base", &mut out);
-    translate_shapes(map, "", &mut out);
+    translate_shapes(map, tier, "", &mut out);
     if let Some(Value::Object(harnesses)) = map.get_mut("harnesses") {
         for (name, block) in harnesses.iter_mut() {
             if let Value::Object(block) = block {
                 translate_runon_enabled(block, tier, &format!("harnesses.{name}."), &mut out);
                 translate_block(block, false, &format!("harnesses.{name}"), &mut out);
-                translate_shapes(block, &format!("harnesses.{name}."), &mut out);
+                translate_shapes(block, tier, &format!("harnesses.{name}."), &mut out);
             }
         }
     }
@@ -1132,8 +1132,13 @@ pub fn translate_document(map: &mut Map<String, Value>, tier: DocumentTier) -> D
     out
 }
 
-fn translate_shapes(map: &mut Map<String, Value>, prefix: &str, out: &mut DocumentTranslation) {
-    for edit in settings_shape::edits(map) {
+fn translate_shapes(
+    map: &mut Map<String, Value>,
+    tier: DocumentTier,
+    prefix: &str,
+    out: &mut DocumentTranslation,
+) {
+    for edit in settings_shape::edits(map, tier) {
         record_retired(out, prefix, edit.notice);
         edit.apply(map);
     }
@@ -1455,6 +1460,16 @@ fn project_block(block: &Map<String, Value>) -> Value {
         _ => {}
     }
     projected.insert("runtime_gates".to_string(), Value::Object(gates));
+    // The notice identity records which shapes changed, not the potentially
+    // sensitive initialization options. Bash booleans are projected above.
+    let shapes: std::collections::BTreeSet<_> = settings_shape::edits(block, DocumentTier::Project)
+        .into_iter()
+        .filter(|edit| edit.path[0] != "bash")
+        .map(|edit| edit.notice)
+        .collect();
+    if !shapes.is_empty() {
+        projected.insert("legacy_shapes".into(), serde_json::json!(shapes));
+    }
 
     let (aliases, disabled) = match block.get("disabled_tools") {
         Some(Value::Array(entries)) => {
@@ -1707,7 +1722,7 @@ mod tests {
         ] {
             let (value, out) = translate(doc.clone());
             assert!(value.get("disabled_tools").is_none(), "{doc}");
-            assert!(!out.legacy_input, "{doc}");
+            assert_eq!(out.legacy_input, gate["bash"] == false, "{doc}");
             assert!(
                 out.warnings
                     .iter()
@@ -1906,7 +1921,7 @@ mod tests {
             "idle": {"lsp_ttl_minutes": 10},
             "lsp": {"idle_minutes": "never"}
         }));
-        assert_eq!(value, json!({"lsp": {"idle_minutes": "never"}}));
+        assert_eq!(value, json!({"lsp": {"idle_shutdown": false}}));
         assert_eq!(out.warnings[0].code, "superseded_legacy_config");
     }
 

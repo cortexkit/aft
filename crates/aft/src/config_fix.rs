@@ -166,11 +166,22 @@ fn migrate_block(
     notes: &mut Vec<String>,
 ) -> Result<(), String> {
     let label = block_label(prefix);
-    for edit in feature_config::settings_shape::edits(raw) {
-        let path: Vec<_> = prefix.iter().chain(&edit.path).cloned().collect();
+    let document_tier = if tier == FixTier::User {
+        feature_config::DocumentTier::User
+    } else {
+        feature_config::DocumentTier::Project
+    };
+    for edit in feature_config::settings_shape::edits(raw, document_tier) {
+        let path: Vec<_> = prefix
+            .iter()
+            .chain(&edit.path)
+            .map(String::as_str)
+            .collect();
         match edit.value {
             Some(value) => doc.set(&path, &value)?,
-            None => doc.remove(&path)?,
+            None => {
+                doc.remove(&path)?;
+            }
         }
     }
     if let Some(profile) = translated

@@ -6714,9 +6714,7 @@ mod tests {
         assert!(true_result.config.experimental_bash_background);
 
         let false_result = resolve_config(&[tier("user", r#"{ "bash": false }"#)]);
-        assert!(!false_result.config.experimental_bash_rewrite);
-        assert!(!false_result.config.experimental_bash_compress);
-        assert!(!false_result.config.experimental_bash_background);
+        assert!(!false_result.config.bash.enabled);
 
         let object_default_result = resolve_config(&[tier("user", r#"{ "bash": {} }"#)]);
         assert!(object_default_result.config.experimental_bash_rewrite);
@@ -6739,6 +6737,7 @@ mod tests {
         let explicit_off = resolve_config(&[tier("user", r#"{ "bash": { "enabled": false } }"#)]);
         assert!(!explicit_off.config.bash.enabled);
         assert!(explicit_off.config.experimental_bash_rewrite);
+        assert_eq!(false_result.config.bash, explicit_off.config.bash);
 
         let merged_result = resolve_config(&[
             tier("user", r#"{ "bash": true }"#),
@@ -6752,9 +6751,26 @@ mod tests {
             tier("user", r#"{ "bash": false }"#),
             tier("project", r#"{ "bash": { "compress": true } }"#),
         ]);
-        assert!(!false_then_object_result.config.experimental_bash_rewrite);
+        assert!(!false_then_object_result.config.bash.enabled);
+        assert!(false_then_object_result.config.experimental_bash_rewrite);
         assert!(false_then_object_result.config.experimental_bash_compress);
-        assert!(!false_then_object_result.config.experimental_bash_background);
+        assert!(false_then_object_result.config.experimental_bash_background);
+    }
+
+    #[test]
+    fn settings_shapes_project_bash_true_cannot_reenable_user_gate() {
+        let result = resolve_config(&[
+            tier(
+                "user",
+                r#"{"bash":{"enabled":false,"rewrite":false,"compress":false,"background":false}}"#,
+            ),
+            tier("project", r#"{"bash":true}"#),
+        ]);
+        assert!(result.errors.is_empty());
+        assert!(!result.config.bash.enabled);
+        assert!(result.config.experimental_bash_rewrite);
+        assert!(result.config.experimental_bash_compress);
+        assert!(result.config.experimental_bash_background);
     }
 
     #[test]

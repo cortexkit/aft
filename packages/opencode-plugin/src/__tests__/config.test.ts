@@ -629,12 +629,16 @@ describe("loadAftConfig", () => {
     );
     const merged = JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout);
     expect(merged.lsp.idle_minutes).toBe(30);
+    expect(merged.lsp.idle_shutdown).not.toBe(false);
     expect(merged.inspect.categories).toEqual({ dead_code: false, todos: false });
     writeFileSync(fixture.userConfigPath, JSON.stringify({ lsp: { idle_minutes: "never" } }));
     writeFileSync(fixture.projectConfigPath, JSON.stringify({ lsp: { idle_minutes: 5 } }));
-    expect(JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout).lsp.idle_minutes).toBe(
-      5,
-    );
+    const idleOff = JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout).lsp;
+    expect(idleOff).toMatchObject({ idle_minutes: 5, idle_shutdown: false });
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({ lsp: { idle_shutdown: true } }));
+    expect(
+      JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout).lsp.idle_shutdown,
+    ).toBe(true);
   });
 
   test("lsp.max_servers can only be lowered by a project", () => {
@@ -659,9 +663,8 @@ describe("loadAftConfig", () => {
   test("inspect categories use exact boolean keys and idle minutes clamp the new range", () => {
     expect(AftConfigSchema.parse({ lsp: { idle_minutes: 0 } }).lsp?.idle_minutes).toBe(5);
     expect(AftConfigSchema.parse({ lsp: { idle_minutes: 2000 } }).lsp?.idle_minutes).toBe(1440);
-    expect(AftConfigSchema.parse({ lsp: { idle_minutes: "never" } }).lsp?.idle_minutes).toBe(
-      "never",
-    );
+    expect(AftConfigSchema.safeParse({ lsp: { idle_minutes: "never" } }).success).toBe(false);
+    expect(AftConfigSchema.parse({ lsp: { idle_shutdown: false } }).lsp?.idle_shutdown).toBe(false);
     expect(AftConfigSchema.safeParse({ inspect: { categories: { metrics: false } } }).success).toBe(
       false,
     );

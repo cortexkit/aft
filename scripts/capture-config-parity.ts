@@ -1350,6 +1350,11 @@ const CASES: ParityCase[] = [
     name: "settings_shapes_null_initialization_options_refused",
     user: { lsp: { servers: { rust: { initialization_options: null } } } },
   },
+  {
+    name: "settings_shapes_legacy_project_bash_true_keeps_user_gate_off",
+    user: { bash: { enabled: false, rewrite: false, compress: false, background: false } },
+    project: { bash: true },
+  },
 ];
 
 const savedOpencodeConfigDir = process.env.OPENCODE_CONFIG_DIR;

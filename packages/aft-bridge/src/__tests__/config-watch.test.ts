@@ -103,11 +103,11 @@ describe("applyLiveConfigKeys", () => {
       inspect: { categories: { dead_code: true } },
     };
     const next: TestConfig = {
-      lsp: { idle_minutes: "never", max_servers: 3 },
+      lsp: { idle_shutdown: false, max_servers: 3 },
       inspect: { categories: { dead_code: false } },
     };
     const result = applyLiveConfigKeys(current, next, KEYS);
-    expect(result.applied).toContain("lsp.idle_minutes");
+    expect(result.applied).toContain("lsp.idle_shutdown");
     expect(result.applied).toContain("lsp.max_servers");
     expect(result.applied).toContain("inspect.categories.dead_code");
     expect(result.deferred).toEqual([]);

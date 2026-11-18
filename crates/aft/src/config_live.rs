@@ -1008,7 +1008,7 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     }
     macro_rules! later {
         ($key:expr, $($field:ident).+) => {
-            if connected.$($field).+ != candidate.$($field).+ {
+            if connected.$($field).+ != candidate.$($field).+ && !deferred.contains(&$key) {
                 deferred.push($key);
             }
         };

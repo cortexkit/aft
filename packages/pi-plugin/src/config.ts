@@ -1267,7 +1267,7 @@ export function resolveLspConfigForConfigure(config: AftConfig): ConfigureLspOve
         entry.initialization_options = JSON.parse(server.initialization_options);
       } catch {
         // This helper projects effective values for compatibility diagnostics.
-        // The unparsed settings tier still reaches Rust, which refuses this server.
+        // The original settings still reach Rust, which refuses this server.
       }
     }
     return entry;
@@ -1678,23 +1678,19 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   }
   warnIgnoredNestedHarnesses(cleanConfig, configPath);
   const result = AftConfigSchema.safeParse(cleanConfig);
+  const normalized = normalizeConfigForActiveHarness(cleanConfig);
+  if (!result.success) {
+    const rejected = malformedSecurityConfigErrors(normalized, ACTIVE_HARNESS, result.error.issues);
+    if (rejected.length > 0) throw new ConfigRejectedError(rejected, configPath);
+  }
+  const invalidNull = nullSettingPath(normalized);
+  if (invalidNull !== undefined)
+    throw new ConfigRejectedError([`invalid_config_null:${invalidNull}`], configPath);
   let parsed: AftConfig;
   if (result.success) {
-    const invalidNull = nullSettingPath(normalizeConfigForActiveHarness(cleanConfig));
-    if (invalidNull !== undefined)
-      throw new ConfigRejectedError([`invalid_config_null:${invalidNull}`], configPath);
     log(`Config loaded from ${configPath}`);
     parsed = result.data;
   } else {
-    const rejected = malformedSecurityConfigErrors(
-      normalizeConfigForActiveHarness(cleanConfig),
-      ACTIVE_HARNESS,
-      result.error.issues,
-    );
-    if (rejected.length > 0) throw new ConfigRejectedError(rejected, configPath);
-    const invalidNull = nullSettingPath(normalizeConfigForActiveHarness(cleanConfig));
-    if (invalidNull !== undefined)
-      throw new ConfigRejectedError([`invalid_config_null:${invalidNull}`], configPath);
     const shellIssues = result.error.issues.filter(
       (issue) =>
         issue.path[0] === "shell" ||
@@ -1977,12 +1973,10 @@ function mergeBashConfig(
   // before. `"project"` is the project tier over the user tier: the memory cap
   // may only tighten, so the lower value wins.
   mode: "tier" | "project" = "tier",
-): AftConfig["bash"] {
+): Exclude<AftConfig["bash"], boolean> {
   if (baseBash === undefined && overrideBash === undefined) return undefined;
-  if (baseBash === undefined) return overrideBash;
-  if (overrideBash === undefined) return baseBash;
 
-  const expand = (value: AftConfig["bash"]): Record<string, unknown> => {
+  const expand = (value: AftConfig["bash"]): NonNullable<Exclude<AftConfig["bash"], boolean>> => {
     if (value === true) return { rewrite: true, compress: true, background: true };
     if (value === false) return { rewrite: false, compress: false, background: false };
     return { ...(value ?? {}) };

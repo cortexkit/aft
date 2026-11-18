@@ -7,13 +7,23 @@ function object(value: unknown): ConfigObject | undefined {
 }
 
 // Keep the compatibility translation in step with Rust's feature_config/settings_shape.rs.
-export function translateSettingsShape(block: ConfigObject): string[] {
+export function translateSettingsShape(block: ConfigObject, tier: "user" | "project"): string[] {
   const notices: string[] = [];
   if (typeof block.bash === "boolean") {
+    const projectTrue = block.bash && tier === "project";
     block.bash = block.bash
-      ? { enabled: true, rewrite: true, compress: true, background: true }
+      ? {
+          ...(projectTrue ? {} : { enabled: true }),
+          rewrite: true,
+          compress: true,
+          background: true,
+        }
       : { enabled: false };
-    notices.push("bash boolean → bash.enabled");
+    notices.push(
+      projectTrue
+        ? "bash boolean → bash.rewrite, bash.compress and bash.background"
+        : "bash boolean → bash.enabled",
+    );
   }
   const lsp = object(block.lsp);
   if (lsp?.idle_minutes === "never") {

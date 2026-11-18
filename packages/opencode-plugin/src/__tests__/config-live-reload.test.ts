@@ -136,10 +136,10 @@ describe.serial("OpenCode live config reload", () => {
       '{"lsp":{"idle_minutes":"never"},"inspect":{"categories":{"dead_code":false}}}',
     );
     const result = f.reload.reload();
-    expect(result?.applied).toContain("lsp.idle_minutes");
+    expect(result?.applied).toContain("lsp.idle_shutdown");
     expect(result?.applied).toContain("inspect.categories.dead_code");
     expect(result?.deferred).toEqual([]);
-    expect(f.ctx.config.lsp?.idle_minutes).toBe("never");
+    expect(f.ctx.config.lsp?.idle_shutdown).toBe(false);
     expect(f.ctx.config.inspect?.categories?.dead_code).toBe(false);
   });
   test("a bash_watch cap edit reaches the next call; a restart-only key does not", async () => {

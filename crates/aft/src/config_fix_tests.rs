@@ -1183,7 +1183,12 @@ fn settings_shapes_rewrite_user_with_backup_and_project_with_notice() {
         project.as_object_mut().unwrap(),
         feature_config::DocumentTier::Project,
     );
-    assert_eq!(project, migrated);
+    let mut expected_project = migrated.clone();
+    expected_project["harnesses"]["pi"]["bash"]
+        .as_object_mut()
+        .unwrap()
+        .remove("enabled");
+    assert_eq!(project, expected_project);
     let project_notice =
         feature_config::project_retired_keys_notice("/project/.cortexkit/aft.jsonc", &translated);
     for replacement in [
