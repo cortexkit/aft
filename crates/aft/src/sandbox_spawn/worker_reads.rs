@@ -138,3 +138,111 @@ pub(super) fn worker_target_roots(
     }
     roots
 }
+
+/// Adds a macOS worker's read-only exceptions above its own checkout to a data
+/// policy: the exact Cargo and container files, and the `.rust-build-seeds`
+/// directories (prebuilt dependency outputs a new worktree's build copies from)
+/// read recursively. Each path is also denied for writing.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(super) fn grant_worker_pool_reads(
+    home: &Path,
+    roots: &[PathBuf],
+    stores: &mut crate::sandbox_profile::SandboxDataPolicy,
+    write_deny: &mut Vec<PathBuf>,
+) {
+    let files = worker_pool_read_files(home, roots);
+    stores.read_files.extend(files.iter().cloned());
+    write_deny.extend(files);
+    let dirs = worker_pool_read_dirs(home, roots);
+    stores.read_allow.extend(dirs.iter().cloned());
+    write_deny.extend(dirs);
+}
+
+/// Every name a jailed worker may read in its checkout's container folder:
+/// the exact files, then the directories.
+pub(super) fn worker_container_names() -> impl Iterator<Item = &'static str> {
+    WORKER_CONTAINER_FILES
+        .iter()
+        .chain(WORKER_CONTAINER_DIRS)
+        .copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_pool_read_files_and_dirs_stop_at_the_canonical_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let real = home.join("real-pool");
+        let pool = home.join(".local/share/cortexkit/alfonso/worktrees");
+        std::fs::create_dir_all(real.join("hash-a/own")).unwrap();
+        std::fs::create_dir_all(pool.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, &pool).unwrap();
+        let own = pool.join("hash-a/own").canonicalize().unwrap();
+        let outside = home.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let roots = [own, outside];
+        let files = worker_pool_read_files(&home, &roots);
+        let mut expected = [
+            ".cargo/config.toml",
+            ".cargo/config",
+            ".cargo/alfonso-test-threads",
+            "hash-a/.cargo/config.toml",
+            "hash-a/.cargo/config",
+            "hash-a/.cargo/alfonso-test-threads",
+        ]
+        .map(|name| real.join(name))
+        .to_vec();
+        expected.sort_unstable();
+        assert_eq!(files, expected);
+        assert!(files.iter().all(|path| !path.exists()));
+        assert!(worker_pool_read_dirs(&home, &roots).is_empty());
+        let dirs = [
+            real.join(".rust-build-seeds"),
+            real.join("hash-a/.rust-build-seeds"),
+        ];
+        for dir in &dirs {
+            std::fs::create_dir(dir).unwrap();
+        }
+        std::fs::create_dir_all(roots[0].join(".rust-build-seeds")).unwrap();
+        std::fs::create_dir_all(roots[1].join(".rust-build-seeds")).unwrap();
+        assert_eq!(worker_pool_read_dirs(&home, &roots), dirs);
+        assert!(dirs.iter().all(|dir| !files.contains(dir)));
+    }
+
+    #[test]
+    fn worker_targets_inside_the_pool_require_operator_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let pool = home.join(".local/share/cortexkit/alfonso/worktrees");
+        let own = pool.join("hash-a/own");
+        let config = pool.join("hash-a/.cargo/config.toml");
+        let target = pool.join("hash-a/configured-target");
+        let sibling = pool.join("hash-a/sibling/target");
+        for path in [&own, config.parent().unwrap(), &sibling] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(&config, "[build]\ntarget-dir = 'configured-target'\n").unwrap();
+        std::fs::create_dir_all(own.join(".cargo")).unwrap();
+        std::fs::write(
+            own.join(".cargo/config.toml"),
+            format!("[build]\ntarget-dir = {sibling:?}\n"),
+        )
+        .unwrap();
+        let policy = crate::access_policy::AccessPolicy::from_config(
+            &crate::config::Config::default(),
+            &home.join("store"),
+            vec![own.clone()],
+            &home,
+        );
+        let configs = worker_cargo_configs(&home, &[own.clone()]);
+        let targets = worker_target_roots(&home, &[own], &policy, &configs);
+        assert!(targets.contains(&target));
+        assert!(target.is_dir());
+        assert!(!targets.iter().any(|grant| sibling.starts_with(grant)));
+        assert!(!targets.iter().any(|grant| pool.starts_with(grant)));
+    }
+}

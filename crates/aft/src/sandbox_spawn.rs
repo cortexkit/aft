@@ -65,12 +65,10 @@ mod worker_reads;
 pub(crate) use requirement::{resolve_command_sandbox_spawn, SandboxRequirement};
 #[cfg(unix)]
 use settings_grants::absolute_env_path;
+#[cfg(target_os = "macos")]
+use worker_reads::grant_worker_pool_reads;
 #[cfg(unix)]
-use worker_reads::{
-    worker_cargo_configs, worker_target_roots, WORKER_CONTAINER_DIRS, WORKER_CONTAINER_FILES,
-};
-#[cfg(all(unix, any(target_os = "macos", test)))]
-use worker_reads::{worker_pool_read_dirs, worker_pool_read_files};
+use worker_reads::{worker_cargo_configs, worker_container_names, worker_target_roots};
 
 pub const SANDBOX_UNAVAILABLE_EXIT_CODE: i32 = 78;
 
@@ -1838,18 +1836,12 @@ fn build_native_profile(
         let jailed = worker_jail_active();
         #[cfg(target_os = "macos")]
         if jailed {
-            let files = worker_pool_read_files(&home, &project_roots);
-            policy
-                .private_stores
-                .read_files
-                .extend(files.iter().cloned());
-            shell_write_deny.extend(files);
-            let dirs = worker_pool_read_dirs(&home, &project_roots);
-            policy
-                .private_stores
-                .read_allow
-                .extend(dirs.iter().cloned());
-            shell_write_deny.extend(dirs);
+            grant_worker_pool_reads(
+                &home,
+                &project_roots,
+                &mut policy.private_stores,
+                &mut shell_write_deny,
+            );
         }
         // Ordinary sessions retain writable project Git configuration; jailed
         // workers and delegated write roots must not change execution controls.
@@ -2207,12 +2199,7 @@ fn build_relaxed_profile(
         .extend([temp.to_path_buf(), task_io.to_path_buf()]);
     #[cfg(target_os = "macos")]
     if worker_jail_active() {
-        let files = worker_pool_read_files(home, roots);
-        stores.read_files.extend(files.iter().cloned());
-        write_deny.extend(files);
-        let dirs = worker_pool_read_dirs(home, roots);
-        stores.read_allow.extend(dirs.iter().cloned());
-        write_deny.extend(dirs);
+        grant_worker_pool_reads(home, roots, &mut stores, &mut write_deny);
     }
     // Select grants against the complete credential and store floors before
     // protecting their control files or carving out sibling checkout denies.
@@ -2920,11 +2907,7 @@ fn worker_jail_grants(
 
     for root in project_roots {
         if let Some(container) = root.parent() {
-            for path in WORKER_CONTAINER_FILES
-                .iter()
-                .chain(WORKER_CONTAINER_DIRS)
-                .map(|name| container.join(name))
-            {
+            for path in worker_container_names().map(|name| container.join(name)) {
                 if let Ok(path) = path.canonicalize() {
                     if !project_roots.iter().any(|root| path.starts_with(root)) {
                         grants.read_only.push(path);
@@ -10765,82 +10748,6 @@ mod scope_grant_tests;
 #[cfg(test)]
 mod policy_tests {
     use super::*;
-
-    #[cfg(unix)]
-    #[test]
-    fn worker_pool_read_files_and_dirs_stop_at_the_canonical_pool() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().canonicalize().unwrap();
-        let real = home.join("real-pool");
-        let pool = home.join(".local/share/cortexkit/alfonso/worktrees");
-        std::fs::create_dir_all(real.join("hash-a/own")).unwrap();
-        std::fs::create_dir_all(pool.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(&real, &pool).unwrap();
-        let own = pool.join("hash-a/own").canonicalize().unwrap();
-        let outside = home.join("outside");
-        std::fs::create_dir(&outside).unwrap();
-        let roots = [own, outside];
-        let files = worker_pool_read_files(&home, &roots);
-        let mut expected = [
-            ".cargo/config.toml",
-            ".cargo/config",
-            ".cargo/alfonso-test-threads",
-            "hash-a/.cargo/config.toml",
-            "hash-a/.cargo/config",
-            "hash-a/.cargo/alfonso-test-threads",
-        ]
-        .map(|name| real.join(name))
-        .to_vec();
-        expected.sort_unstable();
-        assert_eq!(files, expected);
-        assert!(files.iter().all(|path| !path.exists()));
-        assert!(worker_pool_read_dirs(&home, &roots).is_empty());
-        let dirs = [
-            real.join(".rust-build-seeds"),
-            real.join("hash-a/.rust-build-seeds"),
-        ];
-        for dir in &dirs {
-            std::fs::create_dir(dir).unwrap();
-        }
-        std::fs::create_dir_all(roots[0].join(".rust-build-seeds")).unwrap();
-        std::fs::create_dir_all(roots[1].join(".rust-build-seeds")).unwrap();
-        assert_eq!(worker_pool_read_dirs(&home, &roots), dirs);
-        assert!(dirs.iter().all(|dir| !files.contains(dir)));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn worker_targets_inside_the_pool_require_operator_configuration() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().canonicalize().unwrap();
-        let pool = home.join(".local/share/cortexkit/alfonso/worktrees");
-        let own = pool.join("hash-a/own");
-        let config = pool.join("hash-a/.cargo/config.toml");
-        let target = pool.join("hash-a/configured-target");
-        let sibling = pool.join("hash-a/sibling/target");
-        for path in [&own, config.parent().unwrap(), &sibling] {
-            std::fs::create_dir_all(path).unwrap();
-        }
-        std::fs::write(&config, "[build]\ntarget-dir = 'configured-target'\n").unwrap();
-        std::fs::create_dir_all(own.join(".cargo")).unwrap();
-        std::fs::write(
-            own.join(".cargo/config.toml"),
-            format!("[build]\ntarget-dir = {sibling:?}\n"),
-        )
-        .unwrap();
-        let policy = crate::access_policy::AccessPolicy::from_config(
-            &crate::config::Config::default(),
-            &home.join("store"),
-            vec![own.clone()],
-            &home,
-        );
-        let configs = worker_cargo_configs(&home, &[own.clone()]);
-        let targets = worker_target_roots(&home, &[own], &policy, &configs);
-        assert!(targets.contains(&target));
-        assert!(target.is_dir());
-        assert!(!targets.iter().any(|grant| sibling.starts_with(grant)));
-        assert!(!targets.iter().any(|grant| pool.starts_with(grant)));
-    }
 
     #[cfg(unix)]
     fn provider_layout_grant(ttl: Duration) -> (AppContext, String, PathBuf) {
