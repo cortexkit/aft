@@ -3,7 +3,7 @@ use crate::subc::test_support::{bind_config_without_indexes, route_identity, tes
 use cortexkit_project_identity::RootIdentity;
 use std::sync::atomic::AtomicUsize;
 
-const REMOTE: &str = "fed:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+pub(super) const REMOTE: &str = "fed:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 pub(super) fn stamp(claim: Value) -> Value {
     json!({
@@ -38,7 +38,13 @@ pub(super) fn registry(root: &Path) -> EnumerateReply {
     .unwrap()
 }
 
-fn bind(channel: u16, harness: &str, scope: Value, legacy: &Path, target: &str) -> Value {
+pub(super) fn bind(
+    channel: u16,
+    harness: &str,
+    scope: Value,
+    legacy: &Path,
+    target: &str,
+) -> Value {
     json!({
         "op": "route.bind", "route_channel":channel, "epoch":1,
         "target":{"kind":target, "module_id":"aft"},
@@ -48,7 +54,12 @@ fn bind(channel: u16, harness: &str, scope: Value, legacy: &Path, target: &str) 
     })
 }
 
-async fn rpc(stream: &mut tokio::io::DuplexStream, channel: u16, corr: u64, body: Value) -> Frame {
+pub(super) async fn rpc(
+    stream: &mut tokio::io::DuplexStream,
+    channel: u16,
+    corr: u64,
+    body: Value,
+) -> Frame {
     let epoch = u32::from(channel != 0);
     write_frame(
         stream,
