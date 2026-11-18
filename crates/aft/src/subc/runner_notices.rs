@@ -1412,11 +1412,14 @@ fn retry(class: FailureClass, detail: impl ToString) -> Outcome {
 }
 
 fn refusal(code: &str) -> Outcome {
+    // `session_held_elsewhere`: the session moved to another computer, whose
+    // own AFT serves it now, so a resend from here can never land.
     match code {
         "scope_owner_mismatch"
         | "expired"
         | "session_released"
         | "session_unconverted"
+        | "session_held_elsewhere"
         | "send_id_reuse"
         | "delivery_unsupported"
         | "invalid_params" => Outcome::Final(Failure::coded(FailureClass::PeerRefusal, code, code)),
