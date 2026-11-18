@@ -1,8 +1,9 @@
 //! Linux tests against the config.gate daemon. Use CK_SUBC_BIN for the ordinary
 //! build and CK_SUBC_DEV_BIN for the test-only scripted approval build. Both
 //! use isolated homes and an explicit binary, never the operator's daemon.
-//! Stamped cases launch AFT on the supervised registration channel. The
-//! ordinary case exercises the legacy TCP module connection.
+//! Cases that approve a settings stamp launch AFT on the supervised
+//! registration channel. The unstamped case exercises the legacy TCP module
+//! connection.
 
 use serde_json::{json, Value};
 use std::{
@@ -21,8 +22,8 @@ fn fixture_aft_binary() -> &'static Path {
         let source = crate::test_helpers::aft_binary::source_binary();
         let scratch = tempfile::tempdir().unwrap();
         let stripped = scratch.path().join("aft");
-        // Stamp hashes the whole executable and limits it to 512 MiB. The
-        // debug test binary can be larger; keep its test hooks, not its DWARF.
+        // To approve a settings stamp, the daemon hashes the entire executable
+        // and limits it to 512 MiB. Keep the debug binary's test hooks, not its DWARF.
         let output = Command::new("objcopy")
             .arg("--strip-debug")
             .arg(source)
@@ -414,7 +415,7 @@ async fn subc_settings_real_dev_daemon_reviews_applies_and_serves_declaration_pe
     changed["properties"]["format_on_edit"] = json!({"type":"boolean","description":"Format after edit","default":true,"x-ck-apply":"live"});
     fs::write(path, changed.to_string()).unwrap();
     fs::write(daemon.user_file(), r#"{"memory":"lean"}"#).unwrap();
-    // Root-relative test inputs changed, but the approved launch command did not.
+    // The schema and settings file changed, but the approved launch command did not.
     let (kind, reply) = rpc(
         &mut operator,
         json!({"op":"supervisor.restart","module_id":"aft"}),

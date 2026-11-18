@@ -105,7 +105,7 @@ pub(in crate::subc) async fn negotiate<R: AsyncRead + Unpin, W: AsyncWrite + Unp
             ty => return Err(SubcError::UnexpectedFrame { ty }),
         },
     };
-    // A malformed acknowledgement is not proof that the daemon lacks the gate.
+    // A malformed acknowledgement cannot establish whether the daemon supports config.gate.
     if opt_in && ack.is_none() {
         return Err(SubcError::UnexpectedFrame {
             ty: FrameType::HelloAck,

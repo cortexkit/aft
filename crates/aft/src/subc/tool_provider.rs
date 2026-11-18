@@ -5445,8 +5445,9 @@ mod tests {
         use crate::config_resolve::{resolve_config, ConfigTier};
 
         // Captured from the pre-migration resolver and renderer at 4d0a522e.
-        // Hashline mode exposes rewrite-dependent wording as well as the
-        // background tool list.
+        // In hashline edit mode the description names shell reads that mint
+        // line tags only when Bash rewriting is enabled. Pin that wording and
+        // the background tool list in the same catalog.
         let expected = include_bytes!("../../tests/fixtures/tool_provider_bash_false_catalog.json");
         let legacy = r#"{"bash":false,"edit_mode":"hashline"}"#;
         let rewritten = crate::config_fix::migrate_user_config_text(legacy).unwrap();
