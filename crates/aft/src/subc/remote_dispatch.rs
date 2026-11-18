@@ -79,6 +79,12 @@ impl FileTool {
         ctx: &AppContext,
     ) -> Result<(Self, Preflight), ErrorBody> {
         let (operation, mode) = operation(&call.name).ok_or_else(tool_unavailable)?;
+        // A hashline patch needs anchors from a prior read. Remote file tools
+        // use fresh sessions and cannot share those anchors, so only standard
+        // edits run here even if the caller pins the hashline edit schema.
+        if operation == "edit" && call.arguments.get("patch").is_some() {
+            return Err(tool_unavailable());
+        }
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).map_err(|_| admission_refusal())?;
         let request_id = format!("remote-{:032x}", u128::from_le_bytes(nonce));
