@@ -96,7 +96,6 @@ test("published schema advertises the same MiB ceiling in base and harness block
   const cap = { type: "integer", minimum: 1, maximum: 4294967295 };
   expect(schema.properties.bash.properties.memory_limit_mib).toMatchObject(cap);
   expect(
-    schema.properties.harnesses.additionalProperties.properties.bash.properties
-      .memory_limit_mib,
+    schema.properties.harnesses.additionalProperties.properties.bash.properties.memory_limit_mib,
   ).toMatchObject(cap);
 });

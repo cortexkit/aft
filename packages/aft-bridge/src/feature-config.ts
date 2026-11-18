@@ -15,6 +15,7 @@
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { translateSettingsShape } from "./settings-shape.js";
+
 export { nullSettingPath } from "./settings-shape.js";
 
 /** Every agent-visible tool name a registration adapter may publish (sorted). */
