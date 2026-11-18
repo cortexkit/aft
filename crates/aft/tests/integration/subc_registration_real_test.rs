@@ -70,7 +70,8 @@ async fn registration_real_daemon_peer() {
         .build();
     let home = PathBuf::from(std::env::var_os("HOME").unwrap());
     let witness = home.join(format!("{module}.attested"));
-    let (_, serve) = subc_client_rs::serve_from_env_with_handle(manifest, Peer { witness, method })
+    let path = home.parent().unwrap().join("runtime/subc-connection.json");
+    let (_, serve) = subc_client_rs::serve_with_handle(&path, manifest, Peer { witness, method })
         .await
         .unwrap();
     serve.await.unwrap();
@@ -215,17 +216,21 @@ async fn registration_real_daemon_binds_vault_and_bus() {
     .await
     .is_err()
     {
-        let mut tails = Vec::new();
         for id in ["aft", "claustrum", "ckbus"] {
-            tails.push((
-                id,
-                client
-                    .supervisor_stderr_tail(id, Some(35), Some(8192))
-                    .await,
-            ));
+            match client
+                .supervisor_stderr_tail(id, Some(25), Some(4096))
+                .await
+            {
+                Ok(reply) => {
+                    for entry in reply.tail.entries {
+                        eprintln!("{id}: {entry:?}");
+                    }
+                }
+                Err(error) => eprintln!("{id}: stderr tail unavailable: {error}"),
+            }
         }
         panic!(
-            "AFT never became ready with both attested consumers: {}\n{tails:?}",
+            "AFT never became ready with both attested consumers: {}",
             daemon.diagnostics()
         );
     }
