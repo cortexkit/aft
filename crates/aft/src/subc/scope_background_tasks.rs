@@ -2,9 +2,9 @@
 //! behind tool execution, so core can promptly check whether a worker is done.
 
 use super::*;
-use crate::bash_background::scoped_tasks::{running, Running, Selector};
 #[cfg(test)]
-use crate::bash_background::scoped_tasks::{Remote, COMMAND_BYTES};
+use crate::bash_background::scoped_tasks::{running, Remote, COMMAND_BYTES};
+use crate::bash_background::scoped_tasks::{Running, Selector};
 use serde::{Deserialize, Serialize};
 
 pub(super) const CAPABILITY: &str = "scope-background-tasks/v1";
