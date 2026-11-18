@@ -1442,8 +1442,9 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unsupported sandbox profile version 4; expected 7"));
-        let error = serde_json::from_value::<LegacyProfile>(
-            serde_json::to_value(current).expect("serialize current profile"),
+        // Read the launch wire directly; a Value roundtrip can reorder unknown fields.
+        let error = serde_json::from_slice::<LegacyProfile>(
+            &serde_json::to_vec(&current).expect("serialize current profile"),
         )
         .expect_err("v1 launcher shape must reject the current profile fields");
         assert!(error.to_string().contains("unknown field `mode`"));
