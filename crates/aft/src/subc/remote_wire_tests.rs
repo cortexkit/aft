@@ -122,10 +122,8 @@ async fn remote_wire_admission_audit_read_and_pairing_custody() {
     let card_count = Arc::new(AtomicU64::new(0));
     consent::install_test_transport(Some(Arc::new(Deny(card_count.clone()))));
     READS.lock().unwrap().clear();
-    let (storage, _) = test_root("remote-wire-on-b");
-    let folder = storage.path().join("registered-project");
-    std::fs::create_dir(&folder).unwrap();
-    let root = ProjectRootId::from_path(&folder).unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let (_project, root) = test_root("remote-wire-on-b");
     for (path, contents) in [
         ("a.txt", "first pairing contents"),
         ("b.txt", "second pairing contents"),
@@ -165,7 +163,7 @@ async fn remote_wire_admission_audit_read_and_pairing_custody() {
             write,
             &connection,
             app,
-            executor,
+            executor.clone(),
             tool_dispatch,
             Some(bind_config_without_indexes(storage.path())),
             false,
@@ -434,9 +432,21 @@ async fn remote_wire_admission_audit_read_and_pairing_custody() {
             }
         }
         assert_eq!(card_count.load(Ordering::Relaxed), 1);
+        executor
+            .actor_context(&root)
+            .unwrap()
+            .update_config(|config| {
+                config.disabled_tools.push("read".into());
+            });
+        refusal(
+            rpc(&mut daemon, 1, corr, read("reader", "a.txt", "disabled")).await,
+            "remote_tool_not_available",
+        );
+        assert_eq!(*READS.lock().unwrap(), expected);
+        assert_eq!(card_count.load(Ordering::Relaxed), 1);
         write_frame(
             &mut daemon,
-            &Frame::build(FrameType::Goodbye, control_flags(), 0, 0, corr, vec![]).unwrap(),
+            &Frame::build(FrameType::Goodbye, control_flags(), 0, 0, corr + 1, vec![]).unwrap(),
         )
         .await
         .unwrap();
