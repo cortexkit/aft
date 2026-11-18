@@ -1,8 +1,48 @@
 use super::*;
-use crate::secret_proxy::diagnostics::log_refusal;
-use crate::secret_proxy::diagnostics::Reason;
+use crate::secret_proxy::diagnostics::{log_refusal, refusal_line, Reason};
 
 const PRIVATE_HEADER: &str = "private-header-value-do-not-log";
+
+#[test]
+fn refusal_lines_match_the_exact_user_facing_copy() {
+    let cases = [
+        (Reason::RequestLimit, "Too many requests at once. Try again shortly."),
+        (Reason::Stopped, "The proxy for this command has stopped."),
+        (Reason::GenerationInvalid, "AFT restarted the proxy. Run the command again."),
+        (Reason::HostMismatch, "This secret is not saved for this host."),
+        (Reason::InvalidRequest, "The request could not be read."),
+        (Reason::UnscannedLabel, "This secret was not named in the command when it started."),
+        (Reason::BodyInvalid, "The body is not valid JSON or is larger than 1 MiB, so it could not be checked for a placeholder."),
+        (Reason::UpstreamConnectTimeout, "The host did not answer in time."),
+        (Reason::UpstreamConnect, "AFT could not connect to the host."),
+        (Reason::UpstreamTls, "The host's certificate was not accepted."),
+        (Reason::UpstreamHttp, "The request could not be sent to the host."),
+        (Reason::UpstreamSend, "The request could not be sent to the host."),
+        (Reason::ResponseInvalid, "The host's reply could not be checked for the secret."),
+        (Reason::VaultUnavailable, "The vault did not release the secret."),
+        (Reason::LocationMismatch, "The placeholder is not in a place where this secret may go."),
+        (Reason::MaterialInvalid, "The saved secret cannot be used in this place."),
+        (Reason::MaterialInstall, "AFT's proxy had an internal error. Nothing was sent."),
+        (Reason::AuditFailed, "AFT's proxy had an internal error. Nothing was sent."),
+        (Reason::ScrubFailed, "AFT's proxy had an internal error. Nothing was sent."),
+        (Reason::TlsConfiguration, "AFT's proxy had an internal error. Nothing was sent."),
+        (Reason::ConnectMethod, "The command's proxy request is not supported."),
+        (Reason::ProxyAuth, "The command's proxy request is not supported."),
+        (Reason::ConnectAuthority, "The command's proxy request is not supported."),
+        (Reason::ApprovalExpired, "The approval request expired."),
+        (Reason::ApprovalDeclined, "The approval was declined."),
+        (Reason::ApprovalWithdrawn, "The approval request was withdrawn."),
+        (Reason::ApprovalNotGranted, "The approval was not granted."),
+        (Reason::ApprovalPendingAtDeadline, "No answer to the approval arrived in time."),
+    ];
+    for (reason, explanation) in cases {
+        let line = refusal_line(reason, "models-import", "models.example");
+        let expected = format!(
+            "AFT's secret proxy refused the request: models-import (models.example). {explanation}"
+        );
+        assert_eq!(line.as_bytes(), expected.as_bytes(), "{reason:?}");
+    }
+}
 
 fn assert_safe_line(line: &str, code: &str) {
     assert!(line.contains(&format!("reason={code} ")), "{line}");
@@ -197,7 +237,7 @@ async fn curl_shaped_legacy_whole_host_bearer_reaches_vault_over_h1_and_h2() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn curl_shaped_unavailable_vault_reproduces_generic_refusal_exactly() {
+async fn curl_shaped_unavailable_vault_reports_why_the_proxy_refused() {
     let server = Server::new("echo-request").await;
     let mut cfg = config(Vault::new(), 443, &[("hetzner", Location::Bearer)]);
     cfg.vault = Arc::new(crate::secret::UnavailableVault);
@@ -218,7 +258,7 @@ async fn curl_shaped_unavailable_vault_reproduces_generic_refusal_exactly() {
     assert_eq!(response["status"], 403, "{response}");
     assert_eq!(
         response["body"],
-        "Secret proxy refused the request: hetzner (api.hetzner.cloud)\n"
+        "AFT's secret proxy refused the request: hetzner (api.hetzner.cloud). The vault did not release the secret."
     );
     assert!(server.seen.lock().is_empty());
     let lines = proxy.state.test_refusals.lock();
@@ -249,7 +289,7 @@ async fn curl_shaped_upstream_tls_failure_refuses_before_vault_and_logs_once() {
     assert_eq!(response["status"], 403, "{response}");
     assert_eq!(
         response["body"],
-        "Secret proxy refused the request: hetzner (api.hetzner.cloud)\n"
+        "AFT's secret proxy refused the request: hetzner (api.hetzner.cloud). The host's certificate was not accepted."
     );
     assert_eq!(vault.calls.load(Ordering::SeqCst), 0);
     assert!(server.seen.lock().is_empty());

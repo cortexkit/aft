@@ -1,4 +1,6 @@
 use super::State;
+use bytes::Bytes;
+use zeroize::Zeroizing;
 
 /// Only fixed codes cross the diagnostic boundary, never transport errors or
 /// request data that could contain credentials.
@@ -67,6 +69,50 @@ impl Reason {
             Self::ApprovalPendingAtDeadline => "approval_pending_at_deadline",
         }
     }
+}
+
+pub(super) fn refusal_line(reason: Reason, label: &str, host: &str) -> String {
+    let explanation = match reason {
+        Reason::RequestLimit => "Too many requests at once. Try again shortly.",
+        Reason::Stopped => "The proxy for this command has stopped.",
+        Reason::GenerationInvalid => "AFT restarted the proxy. Run the command again.",
+        Reason::HostMismatch => "This secret is not saved for this host.",
+        Reason::InvalidRequest => "The request could not be read.",
+        Reason::UnscannedLabel => "This secret was not named in the command when it started.",
+        Reason::BodyInvalid => {
+            "The body is not valid JSON or is larger than 1 MiB, so it could not be checked for a placeholder."
+        }
+        Reason::UpstreamConnectTimeout => "The host did not answer in time.",
+        Reason::UpstreamConnect => "AFT could not connect to the host.",
+        Reason::UpstreamTls => "The host's certificate was not accepted.",
+        Reason::UpstreamHttp | Reason::UpstreamSend => "The request could not be sent to the host.",
+        Reason::ResponseInvalid => "The host's reply could not be checked for the secret.",
+        Reason::VaultUnavailable => "The vault did not release the secret.",
+        Reason::LocationMismatch => "The placeholder is not in a place where this secret may go.",
+        Reason::MaterialInvalid => "The saved secret cannot be used in this place.",
+        Reason::MaterialInstall | Reason::AuditFailed | Reason::ScrubFailed | Reason::TlsConfiguration => {
+            "AFT's proxy had an internal error. Nothing was sent."
+        }
+        Reason::ConnectMethod | Reason::ProxyAuth | Reason::ConnectAuthority => {
+            "The command's proxy request is not supported."
+        }
+        Reason::ApprovalExpired => "The approval request expired.",
+        Reason::ApprovalDeclined => "The approval was declined.",
+        Reason::ApprovalWithdrawn => "The approval request was withdrawn.",
+        Reason::ApprovalNotGranted => "The approval was not granted.",
+        Reason::ApprovalPendingAtDeadline => "No answer to the approval arrived in time.",
+    };
+    format!("AFT's secret proxy refused the request: {label} ({host}). {explanation}")
+}
+
+pub(super) fn scrubbed_refusal_body(
+    state: &State,
+    reason: Reason,
+    label: &str,
+    host: &str,
+) -> Result<Bytes, ()> {
+    let line = Zeroizing::new(refusal_line(reason, label, host));
+    state.scrub(line.as_bytes()).map(Bytes::from)
 }
 
 #[derive(Clone)]

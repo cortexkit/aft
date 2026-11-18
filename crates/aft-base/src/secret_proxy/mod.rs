@@ -612,7 +612,7 @@ async fn connect(
                 .map_or("", String::as_str),
             &host,
         );
-        refusal("", "")
+        refusal(Bytes::from(diagnostics::refusal_line(reason, "", "")))
     };
     if request.method() != Method::CONNECT {
         return Ok(refused(Reason::ConnectMethod));
@@ -726,10 +726,8 @@ pub(super) fn network_host(host: &str) -> &str {
         .unwrap_or(host)
 }
 
-pub(crate) fn refusal(label: &str, host: &str) -> Response<Body> {
-    let mut response = Response::new(full(Bytes::from(format!(
-        "{PROXY_REFUSAL}: {label} ({host})\n"
-    ))));
+fn refusal(bytes: Bytes) -> Response<Body> {
+    let mut response = Response::new(full(bytes));
     *response.status_mut() = StatusCode::FORBIDDEN;
     response.headers_mut().insert(
         "content-type",
