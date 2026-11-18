@@ -163,6 +163,7 @@ fn edit_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
         "read" => crate::commands::read::handle_read(&request, ctx),
         "write" => crate::commands::write::handle_write(&request, ctx),
         "edit_match" => crate::commands::edit_match::handle_edit_match(&request, ctx),
+        "batch" => crate::commands::batch::handle_batch(&request, ctx),
         "apply_patch" => crate::commands::apply_patch::handle_apply_patch(&request, ctx),
         "move_file" => crate::commands::move_file::handle_move_file(&request, ctx),
         _ => panic!("unexpected dispatch: {}", request.command),
@@ -185,6 +186,23 @@ fn allow(answer: oneshot::Sender<Value>) {
     answer
         .send(json!({"state":"settled", "answered_by":"user", "outcome":"allow_scope"}))
         .unwrap();
+}
+
+#[test]
+fn every_remote_edit_spelling_requires_read_write() {
+    for (name, canonical) in [
+        ("write", "write"),
+        ("edit", "edit"),
+        ("apply_patch", "apply_patch"),
+        ("delete", "aft_delete"),
+        ("move", "aft_move"),
+        ("import", "aft_import"),
+        ("ast_replace", "ast_grep_replace"),
+    ] {
+        for spelling in [name, canonical] {
+            assert_eq!(dispatch::operation(spelling), Some((name, Mode::ReadWrite)));
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -216,7 +234,8 @@ async fn exercise_external_tools(
             .insert("typescript".into(), "prettier".into());
         config.checker.insert("typescript".into(), "tsc".into());
     });
-    let args = json!({"path":"fixture.ts", "oldString":"value = 0", "newString":"value = 1"});
+    let args =
+        json!({"path":"fixture.ts", "edits":[{"oldString":"value = 0", "newString":"value = 1"}]});
     peer.send(4, 725, tool("edit", args, 725)).await;
     allow(card(cards, "write").await);
     let answer = reply(peer.receive(4, 725).await);
@@ -352,13 +371,17 @@ async fn remote_edit_and_scope_end_enforce_attributed_authority() {
         run["scope"]["attributes"]["federated"]["remote_claim"] =
             json!({"kind":"run", "agent_id":"remote-agent", "run_id":"run-remote"});
         reply(peer.call(0, 704, run).await);
+        reply(
+            peer.call(0, 705, remote_bind(5, "pairing-A", &[HELD, RESULT, YIELD]))
+                .await,
+        );
         peer.saw_probe("remote-session").await;
         peer.saw_probe("run-session").await;
         let read = |corr| tool("read", json!({"path":"in.txt"}), corr);
         let edit = |corr| {
             tool(
                 "edit",
-                json!({"path":"in.txt", "oldString":"original", "newString":"changed"}),
+                json!({"path":"in.txt", "edits":[{"oldString":"original", "newString":"changed"}]}),
                 corr,
             )
         };
@@ -422,14 +445,19 @@ async fn remote_edit_and_scope_end_enforce_attributed_authority() {
 
         peer.send(1, 722, edit(722)).await;
         let late = card(&mut cards, "write").await;
+        peer.send(5, 726, read(726)).await;
+        let late_save = card(&mut cards, "read").await;
         assert_eq!(std::fs::read_to_string(&original).unwrap(), "original\n");
         peer.ends = true;
         refusal(peer.receive(1, 722).await, "remote_access_denied");
         let _ =
             late.send(json!({"state":"settled", "answered_by":"user", "outcome":"allow_scope"}));
+        refusal(peer.receive(5, 726).await, "remote_access_denied");
+        let _ = late_save
+            .send(json!({"state":"settled", "answered_by":"user", "outcome":"allow_scope"}));
         refusal(peer.call(1, 723, read(723)).await, "remote_access_denied");
         assert!(text(&reply(peer.call(3, 724, read(724)).await)).contains("original"));
-        assert_eq!(transport.count.load(Ordering::Relaxed), 2);
+        assert_eq!(transport.count.load(Ordering::Relaxed), 3);
         assert_eq!(std::fs::read_to_string(&original).unwrap(), "original\n");
         assert!(
             grants::find(&db.lock().unwrap(), &key("pairing-A"), folder, Mode::Read)
