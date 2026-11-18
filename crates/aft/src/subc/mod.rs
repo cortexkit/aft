@@ -9446,8 +9446,9 @@ fn spawn_permissions_request(
         let result = match admitted {
             Err(error) => Err(error),
             Ok(request) => tokio::task::spawn_blocking(move || {
-                permissions::answer(db.as_deref(), &request, |row| {
-                    permissions::stop_folder_tasks(&executor, &row.scope, &row.path)
+                permissions::answer(db.as_deref(), &request, |grant| match grant {
+                    permissions::RevokedGrant::Local(row) => permissions::stop_folder_tasks(&executor, &row.scope, &row.path),
+                    permissions::RevokedGrant::Remote(_) => 0,
                 })
             })
             .await

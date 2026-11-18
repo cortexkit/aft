@@ -373,7 +373,10 @@ fn permissions_revoke_makes_the_scope_ask_again_and_answers_not_found_twice() {
     let reply = answer(
         Some(&db),
         &request(REVOKE_OPERATION, json!({"id": id})),
-        |row| {
+        |grant| {
+            let RevokedGrant::Local(row) = grant else {
+                panic!("expected revoked local grant");
+            };
             stopped_for.push((row.scope.clone(), row.path.clone()));
             0
         },

@@ -19,6 +19,7 @@
 use crate::access_policy::{AccessOperation, GrantKind};
 use crate::db::access_grant_rows::{GrantHolder, GrantRow};
 use crate::db::access_grants::ScopeKey;
+use crate::db::remote_grant_rows;
 use crate::executor::Executor;
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
@@ -244,11 +245,25 @@ pub(super) fn list(
     homes: &[PathBuf],
 ) -> Result<Value, ErrorBody> {
     let rows = crate::db::access_grant_rows::live_rows(conn).map_err(unavailable)?;
-    let grants: Vec<Value> = rows
+    let mut grants: Vec<Value> = rows
         .iter()
         .filter(|row| agent_id.is_none_or(|agent| row.holder.agent_id() == Some(agent)))
         .map(|row| row_json(row, homes))
         .collect();
+    for row in remote_grant_rows::list(conn, agent_id).map_err(unavailable)? {
+        grants.push(json!({
+            "id": row.id,
+            "holder": { "kind": "agent", "agent_id": row.caller_id },
+            "agent_id": row.caller_id,
+            "module": MODULE_ID,
+            "subject_label": display_path(Path::new(&row.folder), homes),
+            "scope": row.mode.as_str(),
+            "scope_label": row.label,
+            "granted_at_ms": row.granted_at_ms,
+            "source": "person",
+            "card_ref": row.card_ref,
+        }));
+    }
     Ok(json!({ "grants": grants }))
 }
 
@@ -325,13 +340,17 @@ pub(super) fn stop_folder_tasks_in(
     count
 }
 
-/// Answer an admitted request. A revoke deletes the grant row first, so no
-/// later call or command gets the folder, then `stop` ends the running
-/// commands whose sandbox was built with it and returns how many it ended.
+pub(super) enum RevokedGrant<'a> {
+    Local(&'a GrantRow),
+    // The remote shell executor will stop jobs indexed by this id.
+    Remote(#[allow(dead_code)] &'a str),
+}
+
+/// Delete before stopping commands, so later calls cannot get the revoked grant.
 pub(super) fn answer(
     db: Option<&std::sync::Mutex<crate::db::TrackedConnection>>,
     request: &Request,
-    stop: impl FnOnce(&GrantRow) -> usize,
+    stop: impl FnOnce(RevokedGrant<'_>) -> usize,
 ) -> Result<Value, ErrorBody> {
     let db = db.ok_or_else(|| unavailable("aft.db is not open"))?;
     let lock = || {
@@ -342,13 +361,21 @@ pub(super) fn answer(
         let conn = lock()?;
         return list(&conn, request.agent_id(), &home_folders());
     }
+    let id = request.grant_id();
+    let remote = {
+        let conn = lock()?;
+        remote_grant_rows::revoke(&conn, id).map_err(unavailable)?
+    };
+    if remote {
+        return Ok(revoked(stop(RevokedGrant::Remote(id))));
+    }
     let row = {
         let conn = lock()?;
-        crate::db::access_grant_rows::revoke_live(&conn, request.grant_id()).map_err(unavailable)?
+        crate::db::access_grant_rows::revoke_live(&conn, id).map_err(unavailable)?
     };
     Ok(match row {
         None => not_found(),
-        Some(row) => revoked(stop(&row)),
+        Some(row) => revoked(stop(RevokedGrant::Local(&row))),
     })
 }
 
