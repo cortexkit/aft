@@ -55,6 +55,8 @@ use crate::context::AppContext;
 use crate::sandbox_profile::resolved_env_deny_paths;
 use crate::sandbox_profile::SandboxProfile;
 
+#[cfg(unix)]
+mod build_slots;
 mod requirement;
 #[cfg(unix)]
 mod settings_grants;
@@ -62,8 +64,6 @@ mod settings_grants;
 mod task_temp;
 #[cfg(unix)]
 mod worker_reads;
-#[cfg(unix)]
-mod build_slots;
 #[cfg(unix)]
 use build_slots::add_build_slot_grants;
 pub(crate) use requirement::{resolve_command_sandbox_spawn, SandboxRequirement};

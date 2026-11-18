@@ -3111,7 +3111,10 @@ with (base / 'queue.lock').open('a') as queue, (base / '0.lock').open('a') as sl
     let linked = jail
         .bash("cat ../main-link/sibling-readable.txt && echo LINK_$((1+1))")
         .await;
-    assert!(linked.contains("sibling-ok") && linked.contains("LINK_2"), "{linked}");
+    assert!(
+        linked.contains("sibling-ok") && linked.contains("LINK_2"),
+        "{linked}"
+    );
     let other = jail.bash("cat ../other-link/private.txt").await;
     assert!(!other.contains("other-worker"), "{other}");
     let built = jail.bash(&cargo_build(&jail, "", "BUILD_SLOT")).await;
