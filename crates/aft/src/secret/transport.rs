@@ -232,7 +232,7 @@ impl SubcSecretUseTransport {
         connection_file: PathBuf,
         identity: BindIdentity,
         timeout: Duration,
-        test_principal: Option<ConsumerIdentity>,
+        principal: ConsumerIdentity,
     ) -> Self {
         Self {
             connection_file,
@@ -247,7 +247,7 @@ impl SubcSecretUseTransport {
         config: &ConnectionConfig,
         consumer: &subc_client_rs::SubcConsumer,
         params: Value,
-        principal: ConsumerIdentity,
+        test_principal: Option<ConsumerIdentity>,
     ) -> Result<Zeroizing<Vec<u8>>, Failure> {
         let target = &params["target"];
         if target["scheme"] != "https"
