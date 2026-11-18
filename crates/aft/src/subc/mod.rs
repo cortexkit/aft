@@ -5483,11 +5483,7 @@ where
             }
         });
     }
-    rich_ui::display::start(
-        connection_file_path.to_path_buf(),
-        shared_app.clone(),
-        storage_dir.join("aft.db"),
-    );
+    rich_ui::display::start(connection_file_path, &shared_app, &storage_dir);
     runner_notices::install(connection_file_path.to_path_buf());
     let push_senders = PushSenders {
         lossy_tx,

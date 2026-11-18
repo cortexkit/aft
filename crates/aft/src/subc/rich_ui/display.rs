@@ -711,7 +711,7 @@ pub(crate) fn reply(
     }
 }
 
-pub(crate) fn start(connection_file: PathBuf, app: Arc<crate::context::App>, database: PathBuf) {
+pub(crate) fn start(connection_file: &Path, app: &Arc<crate::context::App>, storage_dir: &Path) {
     if display_switch().is_err() {
         count(StartDisabled);
         return;
@@ -730,14 +730,14 @@ pub(crate) fn start(connection_file: PathBuf, app: Arc<crate::context::App>, dat
             outbox: Mutex::new(Outbox::new()),
             wake,
             limits: Mutex::new(outbox::ceilings()),
-            store: store::Store::new(app, database),
+            store: store::Store::new(app.clone(), storage_dir.join("aft.db")),
         })
         .is_err()
     {
         count(StartExisting);
         return;
     }
-    tokio::spawn(send_loop(connection_file, receiver));
+    tokio::spawn(send_loop(connection_file.to_path_buf(), receiver));
     count(Started);
 }
 
