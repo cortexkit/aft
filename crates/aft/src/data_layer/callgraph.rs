@@ -2094,7 +2094,7 @@ pub(crate) fn bind_cache_bytes() -> usize {
 /// memory while the next stage runs.
 fn relieve_allocator() {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let _ = crate::memory::relieve_allocator_pressure();
+    crate::memory::return_free_pages();
 }
 
 fn batch_trim_cadence(value: Option<&str>) -> usize {
