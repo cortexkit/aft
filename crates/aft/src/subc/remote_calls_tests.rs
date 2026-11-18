@@ -89,7 +89,7 @@ async fn call(
 }
 
 #[tokio::test]
-async fn real_binds_refuse_every_call_without_opening_a_workdir() {
+async fn real_binds_enforce_admission_without_opening_a_workdir() {
     let _env = crate::test_env::process_env_lock();
     let _comparison = scope_workdir_tests::observe_next_comparison();
     let (storage, root) = test_root("remote-call-folder-on-b");
@@ -282,11 +282,8 @@ async fn real_binds_refuse_every_call_without_opening_a_workdir() {
         );
         for (corr, tool) in [(105, "read"), (107, "write"), (109, "bash")] {
             let error = call(&mut daemon, 1, corr, tool).await;
-            assert_eq!(error.code, "remote_tool_not_available");
-            assert_eq!(
-                error.message,
-                "This tool isn't available to agents on other computers."
-            );
+            assert_eq!(error.code, "invalid_request");
+            assert!(error.message.contains("schema pin"));
         }
 
         for (index, harness) in ["fed-phone:person", "fed-sim:person", "fed-app:person"]

@@ -7,17 +7,19 @@ use subc_protocol::scope::{
     FederatedPeerClass, FederatedProject, RemoteClaim, RootKeyKind, ScopeKind, ScopeStamp,
 };
 
-#[allow(
-    dead_code,
-    reason = "remote dispatch must attach pin, tool and audit preflight first"
-)]
 #[path = "remote_consent.rs"]
 pub(super) mod authorization;
+#[path = "remote_dispatch.rs"]
+mod dispatch;
+#[path = "remote_call_record.rs"]
+mod record;
+#[path = "remote_call_service.rs"]
+mod service;
+pub(super) use service::{Binding, Service};
 
 /// Success of the remote dispatch preflight, minted only after admission,
 /// folder and tool checks, verification of the runner's schema and behavior
 /// pin, transport checks, and creation of the audit record.
-#[allow(dead_code, reason = "remote dispatch does not yet complete preflight")]
 pub(super) struct Preflight {
     scope: ScopeStamp,
     session: String,
@@ -91,6 +93,14 @@ fn without_undecodable_scope(body: &[u8]) -> Option<ModuleControlRequest> {
     }
 }
 
+fn caller(facts: &subc_protocol::scope::FederatedAttributes) -> Option<&str> {
+    match facts.remote_claim.as_ref()? {
+        RemoteClaim::Agent { agent_id, .. } | RemoteClaim::Run { agent_id, .. } => Some(agent_id),
+        RemoteClaim::Worker { on_behalf_of, .. } => on_behalf_of.as_deref(),
+        _ => None,
+    }
+}
+
 fn admit(scope: Option<&ScopeStamp>) -> Result<(&FederatedProject, &str), ErrorBody> {
     let facts = scope
         .filter(|stamp| stamp.kind == ScopeKind::Federated)
@@ -103,17 +113,9 @@ fn admit(scope: Option<&ScopeStamp>) -> Result<(&FederatedProject, &str), ErrorB
     {
         return Err(admission_refusal());
     }
-    let caller = match facts.remote_claim.as_ref() {
-        Some(RemoteClaim::Agent { agent_id, .. } | RemoteClaim::Run { agent_id, .. }) => agent_id,
-        Some(RemoteClaim::Worker {
-            on_behalf_of: Some(agent_id),
-            ..
-        }) => agent_id,
-        _ => return Err(admission_refusal()),
-    };
     Ok((
         facts.project.as_ref().ok_or_else(admission_refusal)?,
-        caller,
+        caller(facts).ok_or_else(admission_refusal)?,
     ))
 }
 
@@ -165,9 +167,6 @@ fn locally_bound_root<'a>(
         .ok_or_else(not_working)
 }
 
-#[derive(Default)]
-pub(super) struct FolderLookups(tokio::task::JoinSet<(Frame, Result<PathBuf, ErrorBody>)>);
-
 async fn enumerate(
     #[cfg(test)] fixture: Option<Arc<dyn Fn() -> EnumerateReply + Send + Sync>>,
     connection_file: PathBuf,
@@ -182,72 +181,6 @@ async fn enumerate(
     ))
     .enumerate_async()
     .await
-}
-
-impl FolderLookups {
-    pub(super) async fn request(
-        &mut self,
-        tx: &WriterSender,
-        metrics: &Arc<DispatchPathMetrics>,
-        frame: &Frame,
-        body: Option<&Value>,
-        identity: &ManagementIdentity,
-        connection_file: &Path,
-    ) -> Result<(), SubcError> {
-        if !body.is_some_and(route_request_is_tool_call) {
-            return send_provider_error(tx, metrics, frame, tool_unavailable()).await;
-        }
-        let project = match admit(identity.scope.as_ref()) {
-            Ok((project, _caller_id)) if self.0.len() < MAX_PENDING_LOOKUPS => project.clone(),
-            _ => return send_provider_error(tx, metrics, frame, admission_refusal()).await,
-        };
-        let frame = frame.clone();
-        let lookup = enumerate(
-            #[cfg(test)]
-            TEST_REGISTRY.try_with(Arc::clone).ok(),
-            connection_file.to_path_buf(),
-        );
-        let task = ResponseTaskGuard::new(metrics);
-        self.0.spawn(async move {
-            let _task = task;
-            let result = match tokio::time::timeout(LOOKUP_TIMEOUT, lookup).await {
-                Ok(Ok(entries)) => registered_root(&project, &entries),
-                _ => Err(admission_refusal()),
-            };
-            (frame, result)
-        });
-        Ok(())
-    }
-
-    pub(super) async fn next(&mut self) -> Option<(Frame, Result<PathBuf, ErrorBody>)> {
-        while let Some(next) = self.0.join_next().await {
-            match next {
-                Ok(completion) => return Some(completion),
-                Err(error) => log::warn!("remote folder lookup task failed: {error}"),
-            }
-        }
-        None
-    }
-}
-
-pub(super) async fn finish_lookup(
-    tx: &WriterSender,
-    metrics: &DispatchPathMetrics,
-    (frame, folder): (Frame, Result<PathBuf, ErrorBody>),
-    management_routes: &HashMap<RouteChannel, ManagementIdentity>,
-    root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
-    routes: &HashMap<RouteChannel, RouteIdentity>,
-) -> Result<(), SubcError> {
-    if !management_routes.contains_key(&route_key(frame.header.channel, frame.header.epoch)) {
-        return Ok(());
-    }
-    // Resolve against the current live binds, not the ones present before the
-    // registry request. No admitted remote tool can execute yet.
-    let error = match folder.and_then(|path| locally_bound_root(&path, root_channels, routes)) {
-        Ok(_) => tool_unavailable(),
-        Err(error) => error,
-    };
-    send_provider_error(tx, metrics, &frame, error).await
 }
 
 #[cfg(test)]

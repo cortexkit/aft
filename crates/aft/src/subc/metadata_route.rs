@@ -1,5 +1,35 @@
 use super::*;
 
+pub(super) fn log_management_refusal(
+    identity: &ManagementIdentity,
+    frame: &Frame,
+    error: &ErrorBody,
+) {
+    let body = serde_json::from_slice::<Value>(&frame.body).ok();
+    let operation = body.as_ref().and_then(|body| {
+        body.get("method")
+            .or_else(|| body.get("op"))
+            .or_else(|| body.get("name"))
+            .and_then(Value::as_str)
+    });
+    let admission = match &identity.admission {
+        ManagementAdmission::FirstParty => "FirstParty",
+        ManagementAdmission::FlowOnly => "FlowOnly",
+        ManagementAdmission::PermissionsOnly => "PermissionsOnly",
+        ManagementAdmission::ShellsOnly => "ShellsOnly",
+        ManagementAdmission::DisplayOnly => "DisplayOnly",
+        ManagementAdmission::Occipital => "Occipital",
+        ManagementAdmission::RemoteTools(_) => "RemoteTools",
+        ManagementAdmission::ProjectFree { .. } => "ProjectFree",
+    };
+    log::warn!(
+        "subc management request refused: operation={operation:?} admission={admission} channel={} epoch={} code={}",
+        frame.header.channel,
+        frame.header.epoch,
+        error.code,
+    );
+}
+
 /// Metadata needs no project. Only rootless provider routes also retain the
 /// custodian feed; Occipital's explicit management route has no custody access.
 pub(super) async fn handle_metadata_route_request(

@@ -28,6 +28,7 @@ pub(crate) mod deferred_checkpoint;
 pub(crate) mod display_records;
 pub(crate) mod gh_speech;
 pub mod github_read_cache;
+pub(crate) mod remote_audit_rows;
 pub mod remote_exec;
 pub(crate) mod remote_grant_rows;
 pub mod removal;

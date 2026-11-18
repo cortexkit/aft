@@ -23,6 +23,8 @@ use crate::hashline::integration::RegistrationRequest;
 mod guidance;
 #[cfg(test)]
 mod guidance_text_tests;
+#[path = "remote_pins.rs"]
+pub(super) mod remote_pins;
 
 #[cfg(test)]
 thread_local! {
