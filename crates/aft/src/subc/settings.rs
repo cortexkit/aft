@@ -23,34 +23,32 @@ const WAITING_HEALTH: &str =
     "AFT is not ready because its settings are unavailable from Subconscious.";
 const PENDING_HEALTH: &str = "AFT is using its last approved settings while a settings update awaits approval in Subconscious.";
 
-// subc-config 0.1.1 rejects editor constructs such as nullable fields and
-// mixed-type unions. Leave opt-in off until the daemon can admit a declaration
-// that preserves the existing aft.jsonc grammar.
+// Keep production opted out until config-gate §6.4 rewrites old settings and
+// retains their original bytes before AFT connects. The daemon captures the
+// on-disk shape; a module review cannot substitute translated values.
 pub fn requested() -> bool {
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     if std::env::var_os("AFT_TEST_SETTINGS_SCHEMA").is_some() {
         return true;
     }
-    builtin_schema().is_some()
-}
-
-fn builtin_schema() -> Option<Value> {
-    None
+    false
 }
 
 fn declaration(path: Option<&Path>) -> Option<(ConfigDeclareRequest, Schema)> {
-    let schema = builtin_schema().or_else(|| {
-        #[cfg(all(feature = "test-hooks", debug_assertions))]
-        if let Some(path) = std::env::var_os("AFT_TEST_SETTINGS_SCHEMA") {
-            return serde_json::from_slice(&std::fs::read(path).ok()?).ok();
-        }
-        None
-    })?;
+    let schema = test_schema()?;
     let validated = Schema::new(schema.clone()).ok()?;
     Some((
         ConfigDeclareRequest::new(schema, path?.to_str()?, vec![]),
         validated,
     ))
+}
+
+fn test_schema() -> Option<Value> {
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    if let Some(path) = std::env::var_os("AFT_TEST_SETTINGS_SCHEMA") {
+        return serde_json::from_slice(&std::fs::read(path).ok()?).ok();
+    }
+    None
 }
 
 async fn request<T: serde::Serialize, R: serde::de::DeserializeOwned>(

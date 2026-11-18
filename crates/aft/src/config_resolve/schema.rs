@@ -82,6 +82,9 @@ fn exclude_null(schema: &mut Value, cache_exception: &[&str]) {
     let Some(node) = schema.as_object_mut() else {
         return;
     };
+    if node.get("default") == Some(&Value::Null) {
+        node.remove("default");
+    }
     if let Some(Value::Array(types)) = node.get_mut("type") {
         types.retain(|kind| kind != "null");
         if types.len() == 1 {

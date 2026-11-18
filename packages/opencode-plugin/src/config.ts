@@ -1614,11 +1614,18 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   warnIgnoredNestedHarnesses(cleanConfig, configPath);
   const result = AftConfigSchema.safeParse(cleanConfig);
   const normalized = normalizeConfigForActiveHarness(cleanConfig);
+  const invalidNull = nullSettingPath(normalized);
+  if (
+    invalidNull !== undefined &&
+    !invalidNull.includes(".bash.env.") &&
+    !invalidNull.startsWith("bash.env.")
+  ) {
+    throw new ConfigRejectedError([`invalid_config_null:${invalidNull}`], configPath);
+  }
   if (!result.success) {
     const rejected = malformedSecurityConfigErrors(normalized, ACTIVE_HARNESS, result.error.issues);
     if (rejected.length > 0) throw new ConfigRejectedError(rejected, configPath);
   }
-  const invalidNull = nullSettingPath(normalized);
   if (invalidNull !== undefined)
     throw new ConfigRejectedError([`invalid_config_null:${invalidNull}`], configPath);
   let parsed: AftConfig | null;

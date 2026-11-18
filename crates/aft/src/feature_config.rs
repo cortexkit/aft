@@ -1722,7 +1722,7 @@ mod tests {
         ] {
             let (value, out) = translate(doc.clone());
             assert!(value.get("disabled_tools").is_none(), "{doc}");
-            assert_eq!(out.legacy_input, gate["bash"] == false, "{doc}");
+            assert_eq!(out.legacy_input, doc["bash"] == false, "{doc}");
             assert!(
                 out.warnings
                     .iter()
