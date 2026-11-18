@@ -1044,20 +1044,40 @@ pub fn terminate_pid(pid: u32) {
         .status();
 }
 
-#[cfg(unix)]
+/// A failed identity probe is not evidence that a task has stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessLiveness {
+    Gone,
+    Alive,
+    Unknown,
+}
+
 pub fn is_process_alive(pid: u32) -> bool {
+    probe_process(pid).1
+}
+
+// The second value is recovery's boolean: OS probe errors remain false.
+// A live PID with an unreadable start time is kept alive by the recorded probe below.
+#[cfg(unix)]
+fn probe_process(pid: u32) -> (ProcessLiveness, bool) {
     let Ok(pid) = i32::try_from(pid) else {
-        return false;
+        return (ProcessLiveness::Unknown, false);
     };
     if pid <= 0 {
-        return false;
+        return (ProcessLiveness::Unknown, false);
     }
-    (unsafe { libc::kill(pid, 0) == 0 })
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    if unsafe { libc::kill(pid, 0) == 0 } {
+        return (ProcessLiveness::Alive, true);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::EPERM) => (ProcessLiveness::Alive, true),
+        Some(libc::ESRCH) => (ProcessLiveness::Gone, false),
+        _ => (ProcessLiveness::Unknown, false),
+    }
 }
 
 #[cfg(windows)]
-pub fn is_process_alive(pid: u32) -> bool {
+fn probe_process(pid: u32) -> (ProcessLiveness, bool) {
     use std::ffi::c_void;
 
     type Handle = *mut c_void;
@@ -1073,18 +1093,30 @@ pub fn is_process_alive(pid: u32) -> bool {
     const STILL_ACTIVE: u32 = 0x103;
 
     if pid == 0 {
-        return false;
+        return (ProcessLiveness::Unknown, false);
     }
 
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
         if handle.is_null() {
-            return false;
+            // Windows reports ERROR_INVALID_PARAMETER for a nonexistent PID.
+            let state = if std::io::Error::last_os_error().raw_os_error() == Some(87) {
+                ProcessLiveness::Gone
+            } else {
+                ProcessLiveness::Unknown
+            };
+            return (state, false);
         }
         let mut exit_code = 0;
-        let ok = GetExitCodeProcess(handle, &mut exit_code) != 0 && exit_code == STILL_ACTIVE;
+        let state = if GetExitCodeProcess(handle, &mut exit_code) == 0 {
+            ProcessLiveness::Unknown
+        } else if exit_code == STILL_ACTIVE {
+            ProcessLiveness::Alive
+        } else {
+            ProcessLiveness::Gone
+        };
         let _ = CloseHandle(handle);
-        ok
+        (state, state == ProcessLiveness::Alive)
     }
 }
 
@@ -1697,14 +1729,55 @@ mod tests {
 /// On platforms without process start-time inspection, a live PID is protected;
 /// deleting a live task is worse than temporarily retaining a recycled PID.
 pub fn is_recorded_process_alive(pid: u32, task_started_at_ms: u64) -> bool {
+    recorded_process_probe(pid, task_started_at_ms).1
+}
+
+pub(crate) fn recorded_process_liveness(pid: u32, task_started_at_ms: u64) -> ProcessLiveness {
+    recorded_process_probe(pid, task_started_at_ms).0
+}
+
+fn recorded_process_probe(pid: u32, task_started_at_ms: u64) -> (ProcessLiveness, bool) {
+    recorded_process_probe_with(probe_process(pid), task_started_at_ms, || {
+        crate::root_cache::process_start_time_ms(pid)
+    })
+}
+
+fn recorded_process_probe_with(
+    probe: (ProcessLiveness, bool),
+    task_started_at_ms: u64,
+    start_time: impl FnOnce() -> Option<u64>,
+) -> (ProcessLiveness, bool) {
     const PROCESS_START_GRACE_MS: u64 = 30_000;
 
-    if !is_process_alive(pid) {
-        return false;
+    if !probe.1 {
+        return probe;
     }
-    crate::root_cache::process_start_time_ms(pid).is_none_or(|started_at_ms| {
-        started_at_ms <= task_started_at_ms.saturating_add(PROCESS_START_GRACE_MS)
-    })
+    match start_time() {
+        None => (ProcessLiveness::Unknown, true),
+        Some(started_at_ms)
+            if started_at_ms <= task_started_at_ms.saturating_add(PROCESS_START_GRACE_MS) =>
+        {
+            (ProcessLiveness::Alive, true)
+        }
+        Some(_) => (ProcessLiveness::Gone, false),
+    }
+}
+
+#[test]
+fn recorded_process_probe_preserves_recovery_decisions() {
+    use ProcessLiveness::{Alive, Gone, Unknown};
+    for (probe, start, expected) in [
+        ((Gone, false), None, (Gone, false)),
+        ((Unknown, false), None, (Unknown, false)),
+        ((Alive, true), None, (Unknown, true)),
+        ((Alive, true), Some(31_000), (Alive, true)),
+        ((Alive, true), Some(31_001), (Gone, false)),
+    ] {
+        assert_eq!(
+            recorded_process_probe_with(probe, 1_000, || start),
+            expected
+        );
+    }
 }
 #[cfg(target_os = "linux")]
 #[test]

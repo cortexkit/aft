@@ -4408,6 +4408,68 @@ impl BgTaskRegistry {
             .any(|pid| is_recorded_process_alive(pid, metadata.started_at))
     }
 
+    /// Unlike replay, withdrawal needs proof of death before storing a stopped answer.
+    pub(crate) fn unregistered_task_process_liveness(
+        &self,
+        metadata: &PersistedTask,
+    ) -> super::process::ProcessLiveness {
+        use super::process::{recorded_process_liveness, ProcessLiveness};
+
+        if metadata.remote.is_some() {
+            return ProcessLiveness::Unknown;
+        }
+        let pids = Self::persisted_task_recorded_pids(metadata);
+        if pids.is_empty() {
+            return ProcessLiveness::Unknown;
+        }
+        let mut gone = true;
+        for pid in pids {
+            match recorded_process_liveness(pid, metadata.started_at) {
+                ProcessLiveness::Gone => {}
+                ProcessLiveness::Unknown => return ProcessLiveness::Unknown,
+                ProcessLiveness::Alive => gone = false,
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if !gone && metadata.mode == BgMode::Pipes {
+            // Reuse replay's exact child/scope identity validation. A failed
+            // adoption says nothing about whether the task has stopped.
+            if self.recover_persisted_task_scope(metadata).is_err() {
+                return ProcessLiveness::Unknown;
+            }
+        }
+        if gone {
+            ProcessLiveness::Gone
+        } else {
+            ProcessLiveness::Alive
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn recover_persisted_task_scope(
+        &self,
+        metadata: &PersistedTask,
+    ) -> Result<Option<super::task_scope::ScopeLookup>, String> {
+        use super::task_scope::{lookup_state, ScopeLookup};
+
+        let Some(pid) = metadata.child_pid else {
+            return Ok(None);
+        };
+        let answer = if let Some(start) = metadata.child_start_time_ms {
+            self.inner
+                .task_scopes
+                .adopt(&metadata.task_id, pid, start)?
+        } else {
+            match lookup_state(&metadata.task_id)? {
+                ScopeLookup::Present(_) => {
+                    return Err("task scope replay has no exact child identity".into())
+                }
+                other => other,
+            }
+        };
+        Ok(Some(answer))
+    }
+
     /// The task's recorded child and process group leader, in that order.
     fn persisted_task_recorded_pids(metadata: &PersistedTask) -> Vec<u32> {
         let group_leader = metadata.pgid.and_then(|pid| u32::try_from(pid).ok());
@@ -8389,33 +8451,19 @@ impl BgTaskRegistry {
                 let alive = if alive && metadata.mode == BgMode::Pipes && metadata.remote.is_none()
                 {
                     let recovered = (|| -> Result<(), String> {
-                        if let Some(pid) = metadata.child_pid {
-                            let answer = if let Some(start) = metadata.child_start_time_ms {
+                        if let Some(super::task_scope::ScopeLookup::Present(scope)) =
+                            self.recover_persisted_task_scope(&metadata)?
+                        {
+                            if let Some(policy) = metadata.memory_policy.as_mut() {
+                                let monitor = super::memory_limit::Monitor::recover_task_scope(
+                                    policy.mib, &scope,
+                                );
+                                *policy = monitor.policy.clone();
                                 self.inner
-                                    .task_scopes
-                                    .adopt(&metadata.task_id, pid, start)?
-                            } else {
-                                match super::task_scope::lookup_state(&metadata.task_id)? {
-                                    super::task_scope::ScopeLookup::Present(_) => {
-                                        return Err(
-                                            "task scope replay has no exact child identity".into()
-                                        )
-                                    }
-                                    other => other,
-                                }
-                            };
-                            if let super::task_scope::ScopeLookup::Present(scope) = answer {
-                                if let Some(policy) = metadata.memory_policy.as_mut() {
-                                    let monitor = super::memory_limit::Monitor::recover_task_scope(
-                                        policy.mib, &scope,
-                                    );
-                                    *policy = monitor.policy.clone();
-                                    self.inner
-                                        .memory_monitors
-                                        .lock()
-                                        .unwrap_or_else(|error| error.into_inner())
-                                        .insert(metadata.task_id.clone(), monitor);
-                                }
+                                    .memory_monitors
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .insert(metadata.task_id.clone(), monitor);
                             }
                         }
                         Ok(())

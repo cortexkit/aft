@@ -541,18 +541,21 @@ pub(crate) fn find_bash_task_session(
         .optional()
 }
 
-/// Whether the persisted record of `task_id` says its process has stopped:
-/// completed, failed, killed or timed out. A missing row, or one still
-/// starting, running, being killed or of unknown fate, is not stopped.
-pub(crate) fn bash_task_stopped(conn: &Connection, task_id: &str) -> rusqlite::Result<bool> {
+/// Task IDs remain unique across the harnesses and sessions of a project root.
+pub(crate) fn bash_task_by_id(
+    conn: &Connection,
+    task_id: &str,
+) -> rusqlite::Result<Option<BashTaskRow>> {
     conn.query_row(
-        "SELECT status IN ('completed','failed','killed','timed_out') FROM bash_tasks
+        "SELECT harness, session_id, task_id, project_key, command, cwd, status,
+                exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,
+                compressed, timeout_ms, completion_delivered, output_bytes, metadata
+         FROM bash_tasks
          WHERE task_id = ?1 LIMIT 1",
         params![task_id],
-        |row| row.get(0),
+        map_bash_task_row,
     )
     .optional()
-    .map(|stopped| stopped.unwrap_or(false))
 }
 
 const SESSION_TASKS_SQL: &str =

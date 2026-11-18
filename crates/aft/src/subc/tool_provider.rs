@@ -2221,9 +2221,9 @@ fn freeze_withdraw_answer(
 
 /// Stop a withdrawn running call's task through `ctx`'s task registry (each
 /// project root has its own), then store the withdraw's answer. When that
-/// registry does not hold the task, the answer is stored only if the task's
-/// record shows it has already stopped; otherwise nothing is stored and the
-/// withdraw is refused as retryable.
+/// registry does not hold the task, its persisted process identity must prove
+/// it stopped, or its record must already be terminal. An uncheckable identity
+/// leaves the answer unfrozen so withdrawal can be retried.
 fn kill_withdrawn_call(
     ctx: &crate::context::AppContext,
     kill: &WithdrawKill,
@@ -2237,10 +2237,19 @@ fn kill_withdrawn_call(
         }
         return freeze_withdraw_answer(ctx, kill);
     }
-    let stopped = ctx.db().is_some_and(|db| {
-        db.lock().ok().is_some_and(|conn| {
-            crate::db::bash_tasks::bash_task_stopped(&conn, &kill.task).unwrap_or(false)
-        })
+    let record = ctx.db().and_then(|db| {
+        let conn = db.lock().ok()?;
+        crate::db::bash_tasks::bash_task_by_id(&conn, &kill.task)
+            .ok()
+            .flatten()
+    });
+    let stopped = record.is_some_and(|row| {
+        matches!(
+            row.status.as_str(),
+            "completed" | "failed" | "killed" | "timed_out"
+        ) || ctx.bash_background().unregistered_task_process_liveness(
+            &crate::bash_background::persistence::PersistedTask::from(row),
+        ) == crate::bash_background::process::ProcessLiveness::Gone
     });
     if stopped {
         return freeze_withdraw_answer(ctx, kill);
@@ -10989,6 +10998,121 @@ mod ledger_terminal_tests {
     use super::*;
     use crate::db::call_ledger::Key;
     use crate::subc::{control_flags, route_key, Frame, FrameType, PersistentCancelSignal};
+
+    fn unregistered_withdraw_fixture(
+        pid: Option<u32>,
+        pgid: Option<i32>,
+    ) -> (
+        tempfile::TempDir,
+        std::sync::Arc<crate::context::AppContext>,
+        WithdrawKill,
+    ) {
+        use crate::db::call_ledger::{self as ledger, State};
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = crate::subc::test_support::test_ctx();
+        let db = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::db::open(&dir.path().join("aft.db")).unwrap(),
+        ));
+        ctx.set_db(db.clone());
+        let key = Key {
+            carrier: "carrier".into(),
+            call_key: "running".into(),
+        };
+        let task = "bash-0123456789abcdef";
+        let conn = db.lock().unwrap();
+        ledger::admit(&conn, &key, "digest", None, State::DispatchStarted).unwrap();
+        ledger::link_task(&conn, &key, task).unwrap();
+        conn.execute(
+            "INSERT INTO bash_tasks(harness,session_id,task_id,project_key,command,cwd,status,started_at,pid,pgid,metadata) VALUES('h','s',?1,'elsewhere','sleep','cwd','running',?2,?3,?4,'{}')",
+            rusqlite::params![task, ledger::now_ms(), pid, pgid],
+        )
+        .unwrap();
+        let ledger::Withdrawal::Answer {
+            body,
+            kill_task: Some(task),
+            ..
+        } = ledger::withdraw(&conn, &key, None, 100, usize::MAX).unwrap()
+        else {
+            panic!("a running linked call must name its task to kill");
+        };
+        assert!(!ctx.bash_background().holds_task(&task));
+        (dir, ctx, WithdrawKill { key, task, body })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn withdraw_unregistered_gone_process_freezes_identical_answer() {
+        use crate::db::call_ledger as ledger;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let (_dir, ctx, kill) = unregistered_withdraw_fixture(Some(pid), None);
+        let db = ctx.db().unwrap();
+        assert_eq!(kill_withdrawn_call(&ctx, &kill).unwrap(), kill.body);
+        let conn = db.lock().unwrap();
+        let row = ledger::get(&conn, &kill.key).unwrap().unwrap();
+        assert_eq!(row.withdraw_answer.as_deref(), Some(kill.body.as_slice()));
+        // Even a later conflicting process snapshot cannot change the frozen reply.
+        conn.execute(
+            "UPDATE bash_tasks SET pid=?1 WHERE task_id=?2",
+            rusqlite::params![std::process::id(), kill.task],
+        )
+        .unwrap();
+        let ledger::Withdrawal::Answer {
+            body, kill_task, ..
+        } = ledger::withdraw(&conn, &kill.key, None, 200, usize::MAX).unwrap()
+        else {
+            panic!("a retry must return the frozen answer");
+        };
+        assert_eq!(body, kill.body);
+        assert!(kill_task.is_none());
+    }
+
+    #[test]
+    fn withdraw_unregistered_live_process_keeps_answer_unfrozen() {
+        use crate::db::call_ledger as ledger;
+        let (_dir, ctx, kill) = unregistered_withdraw_fixture(Some(std::process::id()), None);
+        let refused = kill_withdrawn_call(&ctx, &kill).unwrap_err();
+        assert_eq!(refused.code, "withdraw_incomplete");
+        assert_eq!(
+            refused.detail,
+            Some(json!({"retryable": true, "task_id": kill.task}))
+        );
+        assert_eq!(refused.message, format!(
+            "the withdrawn call's task {} could not be stopped: no bound project root holds the task; retry tool.withdraw",
+            kill.task
+        ));
+        assert!(crate::bash_background::process::is_process_alive(
+            std::process::id()
+        ));
+        let db = ctx.db().unwrap();
+        assert!(ledger::get(&db.lock().unwrap(), &kill.key)
+            .unwrap()
+            .unwrap()
+            .withdraw_answer
+            .is_none());
+    }
+
+    #[test]
+    fn withdraw_unregistered_unknown_identity_keeps_answer_unfrozen() {
+        use crate::db::call_ledger as ledger;
+        let (_dir, ctx, kill) = unregistered_withdraw_fixture(Some(0), None);
+        let refused = kill_withdrawn_call(&ctx, &kill).unwrap_err();
+        assert_eq!(refused.code, "withdraw_incomplete");
+        assert_eq!(
+            refused.detail,
+            Some(json!({"retryable": true, "task_id": kill.task}))
+        );
+        let db = ctx.db().unwrap();
+        assert!(ledger::get(&db.lock().unwrap(), &kill.key)
+            .unwrap()
+            .unwrap()
+            .withdraw_answer
+            .is_none());
+    }
 
     /// A withdraw whose running call could not be stopped stores no answer
     /// and is refused as retryable, so a retry tries again. Once the task's
