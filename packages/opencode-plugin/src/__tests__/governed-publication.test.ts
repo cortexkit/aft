@@ -17,11 +17,12 @@ import { delimiter, dirname, join, resolve } from "node:path";
 const root = resolve(import.meta.dir, "../../../..");
 const gate = "scripts/release-gate-v049.mjs";
 const manifest = "v0.49-agent-surface-manifest.json";
+const maintenanceTrace = ".git/fixture-maintenance.jsonl";
 const surfaceA = "packages/opencode-plugin/src/tools/reading.ts";
 const surfaceB = "packages/pi-plugin/src/tools/reading.ts";
 let fixture: string;
 
-function command(cwd: string, program: string, args: string[]) {
+function command(cwd: string, program: string, args: string[], env: NodeJS.ProcessEnv = {}) {
   const result = spawnSync(
     program,
     program === "git" ? ["-c", `safe.directory=${cwd}`, ...args] : args,
@@ -30,6 +31,7 @@ function command(cwd: string, program: string, args: string[]) {
       encoding: "utf8",
       env: {
         ...process.env,
+        ...env,
         BUN_BIN: process.execPath,
         GIT_CONFIG_GLOBAL: "/dev/null",
         GIT_CONFIG_NOSYSTEM: "1",
@@ -81,6 +83,9 @@ beforeAll(() => {
   git("config", "user.name", "Publication test");
   git("config", "user.email", "publication-test@example.invalid");
   git("config", "commit.gpgsign", "false");
+  // Rapid fixture commits can launch overlapping detached repacks, making
+  // objects unreadable while the publication gate checks their ancestry.
+  git("config", "maintenance.auto", "false");
   // Use a sparse, distinct previous-release fixture so the tests work in a
   // shallow checkout. Production gates still require the real release tag.
   for (const [path, bytes] of [
@@ -91,7 +96,13 @@ beforeAll(() => {
     writeFileSync(join(fixture, path), bytes);
   }
   git("add", ".");
-  git("commit", "--allow-empty", "-qm", "previous-release surface bytes");
+  const initial = command(
+    fixture,
+    "git",
+    ["commit", "--allow-empty", "-qm", "previous-release surface bytes"],
+    { GIT_TRACE2_EVENT: join(fixture, maintenanceTrace) },
+  );
+  expect(initial.status, initial.output).toBe(0);
   git("tag", "v0.48.1");
   const tracked = command(root, "git", ["ls-files", "-z"]);
   expect(tracked.status, tracked.output).toBe(0);
@@ -126,6 +137,19 @@ afterAll(() => {
 });
 
 describe("governed publication", () => {
+  test("fixture commits do not start automatic Git maintenance", () => {
+    const trace = readFileSync(join(fixture, maintenanceTrace), "utf8").trim();
+    const events = trace.split("\n").map((line) => JSON.parse(line));
+    expect(events).toContainEqual(expect.objectContaining({ event: "cmd_name", name: "commit" }));
+    const maintenance = events.filter(
+      (entry) =>
+        entry.event === "child_start" &&
+        entry.argv?.includes("--auto") &&
+        (entry.argv.includes("maintenance") || entry.argv.includes("gc")),
+    );
+    expect(maintenance).toEqual([]);
+  });
+
   test("independent trains merge without generated commits or regeneration", () => {
     for (const [branch, path] of [
       ["train/first", surfaceA],
