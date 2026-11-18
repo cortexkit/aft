@@ -9,7 +9,7 @@ pub enum Source {
 }
 impl Source {
     pub const ALL: [Self; 4] = [Self::Shell, Self::Grants, Self::Held, Self::Parked];
-    fn index(self) -> usize {
+    pub fn index(self) -> usize {
         self as usize
     }
     pub fn name(self) -> &'static str {

@@ -1136,7 +1136,7 @@ mod tests {
 
     #[test]
     fn is_process_alive_returns_true_for_self() {
-        assert!(is_process_alive(std::process::id()));
+        assert!(super::is_process_alive(std::process::id()));
     }
 
     #[cfg(unix)]

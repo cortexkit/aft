@@ -59,7 +59,7 @@ fn encode(segment: &str, generation: u64) -> Vec<u8> {
     .expect("status is JSON")
 }
 
-pub(crate) use aft_base::runner_status_state::{initialize, publish, route_bound, route_unbound};
+pub(crate) use aft_base::runner_status_state::{initialize, route_bound, route_unbound};
 use aft_base::runner_status_state::{notifier, snapshot_segments, Segment};
 #[cfg(test)]
 use aft_base::runner_status_state::{segment_for_test, Sessions};

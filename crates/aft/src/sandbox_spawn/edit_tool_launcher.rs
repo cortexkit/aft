@@ -34,3 +34,25 @@ impl crate::edit::tool_launcher::ToolLauncher for ToolLaunchPolicy<'_> {
         }
     }
 }
+
+impl<'ctx> ToolLaunchPolicy<'ctx> {
+    /// Direct tools carry only their formatter-and-checker launch policy across
+    /// dispatch. General sandbox scopes must not cover dispatch: it can start
+    /// shared LSP servers.
+    pub(crate) fn with_current<R>(
+        policy: Option<std::rc::Rc<RequestToolLaunch>>,
+        run: impl FnOnce() -> R,
+    ) -> R {
+        struct Restore(Option<std::rc::Rc<RequestToolLaunch>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CURRENT_TOOL_POLICY.with(|slot| {
+                    slot.replace(self.0.take());
+                });
+            }
+        }
+        let previous = CURRENT_TOOL_POLICY.with(|slot| slot.replace(policy));
+        let _restore = Restore(previous);
+        run()
+    }
+}

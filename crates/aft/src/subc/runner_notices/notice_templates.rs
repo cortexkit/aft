@@ -4,7 +4,7 @@ use cortexkit_role_llm_runner::delivery_order::{Slot, Template};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-pub(crate) use aft_base::pending_notices::{Notice, PendingNotices, Target};
+pub(crate) use aft_base::pending_notices::{Notice, Target};
 
 pub(crate) fn append_text(text: &mut String, notice: &str) {
     if !text.is_empty() {
