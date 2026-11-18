@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(feature = "test-hooks")]
+use crate::data_layer::refresh_probe;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 #[cfg(test)]
@@ -345,7 +347,7 @@ impl Checkout {
             guard.boundary()?;
             note_source_work(&self.root, |work| work.resolutions += 1);
             #[cfg(feature = "test-hooks")]
-            super::refresh_probe::stage("extraction");
+            refresh_probe::stage("extraction");
             // The changed files are extracted here, all at once on the
             // engine's threads, rather than each when its edit was recorded.
             let extracting = changed
@@ -364,7 +366,7 @@ impl Checkout {
             })?;
             guard.boundary()?;
             #[cfg(feature = "test-hooks")]
-            super::refresh_probe::stage("planning");
+            refresh_probe::stage("planning");
             let next = next_inputs(state, &engine.live.inputs, changes, &changed, guard)?;
             budget
                 .set_parsed(next.parses.len())
@@ -391,7 +393,7 @@ impl Checkout {
             guard.boundary()?;
             log::debug!("callgraph refresh work: changed={} rebound={} replayed={} resolved={} dispatch_replayed={} dispatch_recomputed={} sites={} touched={}", update.changed_paths, update.rebound, update.replayed, update.resolved, update.dispatch_replayed, update.dispatch_recomputed, update.sites_resolved, update.touched.len());
             #[cfg(feature = "test-hooks")]
-            super::refresh_probe::stage("slices");
+            refresh_probe::stage("slices");
             // Only the files this update touched get new slices; every file
             // touched by an earlier update keeps the slice it got then. Each
             // is laid over the publication encoded, as a publication stores

@@ -2251,7 +2251,6 @@ pub(crate) fn thread_facts(inputs: &CheckoutInputs) -> ViewBindingFacts<'_> {
 /// # Errors
 ///
 /// When binding fails on a file.
-#[cfg(test)]
 pub(crate) fn bind_all(
     inputs: &CheckoutInputs,
     paths: &[&String],
