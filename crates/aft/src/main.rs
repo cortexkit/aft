@@ -499,8 +499,11 @@ fn main() {
         let ctx = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
         startup_phase("context_done");
         // Tell the fleet backup service what this storage root holds; a
-        // failure is logged and never stops the module from attaching.
-        aft::engram_catalog::refresh_catalog(&ctx.storage_dir());
+        // failure is logged and never stops the module from attaching. A
+        // settings-gated start refreshes only once it has applied the view.
+        if !aft::subc::settings_gate_requested() {
+            aft::engram_catalog::refresh_catalog(&ctx.storage_dir());
+        }
         let executor = Arc::new(aft::executor::Executor::new());
         install_subc_signal_handler(
             Arc::clone(&executor),

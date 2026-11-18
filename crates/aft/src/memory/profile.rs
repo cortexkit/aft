@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 const GIB: u64 = 1024 * 1024 * 1024;
 const MIB: usize = 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum MemoryMode {
     Lean,

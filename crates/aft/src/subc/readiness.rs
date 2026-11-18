@@ -546,7 +546,7 @@ pub(super) struct DaemonControl {
     advertised_ops: Vec<String>,
     /// The provider roles from the HELLO manifest. `catalog.update` replaces
     /// the module's roles, so the flip must resend exactly these.
-    provides: Vec<ProviderRole>,
+    provides: parking_lot::RwLock<Vec<ProviderRole>>,
     pending: PendingControlReplies,
     next_corr: AtomicU64,
     describe_slots: tokio::sync::Semaphore,
@@ -612,7 +612,7 @@ impl DaemonControl {
             metrics,
             negotiated_ver,
             advertised_ops,
-            provides,
+            provides: parking_lot::RwLock::new(provides),
             pending,
             next_corr: AtomicU64::new(first_corr),
             describe_slots: tokio::sync::Semaphore::new(4),
@@ -629,6 +629,55 @@ impl DaemonControl {
         self.advertised_ops
             .iter()
             .any(|advertised| advertised == op)
+    }
+
+    pub(super) async fn config_request<T: serde::Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        request: &T,
+    ) -> Result<R, ControlError> {
+        let body = serde_json::to_vec(request)
+            .map_err(|_| ControlError::Decode("settings request".into()))?;
+        let corr = self.next_corr.fetch_add(1, Ordering::Relaxed);
+        let frame = self.request_frame(corr, body).await?;
+        if frame.header.ty == FrameType::Error {
+            let error: subc_protocol::ErrorBody = serde_json::from_slice(&frame.body)
+                .map_err(|_| ControlError::Decode("settings refusal".into()))?;
+            return Err(ControlError::Refused {
+                code: error.code,
+                message: String::new(),
+            });
+        }
+        if frame.header.ty != FrameType::Response {
+            return Err(ControlError::Decode("settings response".into()));
+        }
+        serde_json::from_slice(&frame.body)
+            .map_err(|_| ControlError::Decode("settings response".into()))
+    }
+
+    pub(super) async fn install_settings_catalog(
+        &self,
+        provides: Vec<ProviderRole>,
+    ) -> Result<(), ControlError> {
+        match self
+            .request(&ModuleControlRequestFromModule::CatalogUpdate {
+                provides: provides.clone(),
+                capabilities: None,
+                ready: Some(false),
+            })
+            .await?
+        {
+            ModuleControlResponseToModule::CatalogUpdate {} => {
+                self.set_catalog(provides);
+                Ok(())
+            }
+            _ => Err(ControlError::Decode(
+                "expected a catalog.update reply".into(),
+            )),
+        }
+    }
+
+    pub(super) fn set_catalog(&self, provides: Vec<ProviderRole>) {
+        *self.provides.write() = provides;
     }
 
     /// Uses readiness's correlation counter and reply table, so control
@@ -887,9 +936,10 @@ impl ReadinessControl for DaemonControl {
 
     fn flip_ready(&self) -> BoxFuture<'_, Result<(), ControlError>> {
         Box::pin(async move {
+            let provides = self.provides.read().clone();
             match self
                 .request(&ModuleControlRequestFromModule::CatalogUpdate {
-                    provides: self.provides.clone(),
+                    provides,
                     capabilities: None,
                     ready: Some(true),
                 })

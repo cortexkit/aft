@@ -53,17 +53,6 @@ pub(super) fn run_subc_mode_with_probe(
     lifecycle_probe: Option<SubcTestLifecycleProbe>,
     registration: Option<AdoptedRegistration>,
 ) -> Result<(), SubcError> {
-    // One watch on the user config file serves every root in this process:
-    // an edit asks each live root to reload its config.
-    let _user_config_watch = user_config_path.clone().map(|path| {
-        let executor = Arc::downgrade(&executor);
-        crate::config_live::start_process_user_config_watch(path, move || {
-            executor
-                .upgrade()
-                .map(|executor| executor.actor_contexts())
-                .unwrap_or_default()
-        })
-    });
     // This entry point accepts only tools AFT advertises in its HELLO manifest.
     // A separate test entry point can also dispatch synthetic native commands.
     run_subc_mode_inner(

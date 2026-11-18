@@ -9,7 +9,7 @@ test("published JSON schema advertises the opt-in privacy setting", () => {
     readFileSync(new URL("../../../../assets/aft.schema.json", import.meta.url), "utf8"),
   );
   expect(schema.properties.bash.oneOf[1].properties.disclaim_privacy).toMatchObject({
-    type: "boolean",
+    type: ["boolean", "null"],
     default: false,
   });
 });

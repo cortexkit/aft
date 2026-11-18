@@ -104,7 +104,7 @@ pub struct ResolveResult {
 /// Strict raw shape for aft.jsonc. This mirrors the TypeScript Zod schema, not
 /// the flat runtime [`Config`]. Privileged process-state fields are deliberately
 /// absent and therefore rejected by `deny_unknown_fields`.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct RawAftConfig {
     pub memory: Option<crate::memory::profile::MemoryMode>,
@@ -116,8 +116,10 @@ pub struct RawAftConfig {
     pub format_on_edit: Option<bool>,
     pub revision_reads: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_timeout_secs")]
+    #[schemars(range(min = 1, max = 600))]
     pub formatter_timeout_secs: Option<u32>,
     #[serde(deserialize_with = "deserialize_opt_timeout_secs")]
+    #[schemars(range(min = 1, max = 600))]
     pub type_checker_timeout_secs: Option<u32>,
     pub validate_on_edit: Option<RawValidateOnEdit>,
     pub formatter: Option<HashMap<String, RawFormatter>>,
@@ -158,7 +160,7 @@ pub struct RawAftConfig {
     pub harnesses: Option<BTreeMap<String, Value>>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct RawDurability {
     pub macos_full_sync: Option<bool>,
@@ -185,7 +187,7 @@ impl<'de> Deserialize<'de> for RawEditMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RawValidateOnEdit {
     Syntax,
@@ -201,7 +203,7 @@ impl RawValidateOnEdit {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RawFormatter {
     Biome,
@@ -233,7 +235,7 @@ impl RawFormatter {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RawChecker {
     Tsc,
@@ -263,7 +265,7 @@ impl RawChecker {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RawConfigureWarningsDelivery {
     Toast,
@@ -272,7 +274,7 @@ pub enum RawConfigureWarningsDelivery {
 }
 
 /// Raw `indexes` block; each switch keeps its presence until resolution.
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawIndexes {
     pub trigram: Option<bool>,
@@ -280,13 +282,13 @@ pub struct RawIndexes {
     pub callgraph: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawStorage {
     pub cache_dir: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, schemars::JsonSchema)]
 // Nested objects mirror TS sub-schemas, which are non-strict z.object (unknown
 // keys are silently stripped, the object survives). Only the TOP-LEVEL
 // RawAftConfig is strict (matches AftConfigSchema.strict()). Privileged denylist
@@ -330,7 +332,7 @@ impl RawSemantic {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawSearch {
     pub rerank: Option<RawRerank>,
@@ -338,7 +340,7 @@ pub struct RawSearch {
 
 /// Raw `search.rerank`. Parsing only: defaults and clamps belong to the search
 /// engine, which owns every setting that can change result order.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawRerank {
     pub backend: Option<RerankBackendKind>,
@@ -354,8 +356,9 @@ pub struct RawRerank {
     pub timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, schemars::JsonSchema)]
 pub struct RawLsp {
+    #[schemars(schema_with = "crate::config_schema::lsp_idle_minutes")]
     pub idle_minutes: Option<LspIdleMinutes>,
     pub max_servers: Option<usize>,
     #[serde(default, deserialize_with = "deserialize_opt_lsp_servers")]
@@ -388,7 +391,7 @@ impl RawLsp {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RawPythonLsp {
     Pyright,
@@ -396,7 +399,7 @@ pub enum RawPythonLsp {
     Auto,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawLspServerEntry {
     #[serde(deserialize_with = "deserialize_opt_lsp_extensions")]
@@ -411,7 +414,8 @@ pub struct RawLspServerEntry {
     pub initialization_options: Option<Value>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, schemars::JsonSchema)]
+#[schemars(untagged)]
 pub enum RawBash {
     Bool(bool),
     Features(RawBashFeatures),
@@ -438,7 +442,7 @@ impl<'de> Deserialize<'de> for RawBash {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawBashFeatures {
     pub changed_files: Option<crate::config::BashChangedFiles>,
@@ -462,8 +466,10 @@ pub struct RawBashFeatures {
     pub worker_wait_max_ms: Option<u64>,
     pub linux_scope: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_linux_scope_max_runtime_secs")]
+    #[schemars(range(min = 1, max = 4294967295_u64))]
     pub linux_scope_max_runtime_secs: Option<u64>,
     #[serde(deserialize_with = "deserialize_opt_memory_limit_mib")]
+    #[schemars(range(min = 1, max = 4294967295_u64))]
     pub memory_limit_mib: Option<u64>,
     pub disclaim_privacy: Option<bool>,
     pub powershell_tool: Option<bool>,
@@ -476,7 +482,7 @@ pub struct RawBashFeatures {
     pub runon_env: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawExperimental {
     pub lsp_ty: Option<bool>,
@@ -488,7 +494,7 @@ impl RawExperimental {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawInspect {
     pub enabled: Option<bool>,
@@ -515,7 +521,7 @@ impl RawInspect {
 /// `anonymize` were accepted-but-never-read knobs (the scanner hardcodes its
 /// cost bounds and anonymization rules), so they were removed from the schema
 /// rather than wired up.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawInspectDuplicates {
     pub expected_mirrors: Option<Vec<[String; 2]>>,
@@ -527,7 +533,7 @@ impl RawInspectDuplicates {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawIdle {
     pub root_ttl_minutes: Option<Value>,
@@ -540,21 +546,21 @@ impl RawIdle {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawBridge {
     #[serde(deserialize_with = "deserialize_opt_bridge_request_timeout_ms")]
     pub request_timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawSubc {
     pub connection_file: Option<String>,
     pub client_reaper: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawGithub {
     pub shim: Option<bool>,
@@ -562,21 +568,21 @@ pub struct RawGithub {
     pub write: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawGhShim {
     #[serde(deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
     pub binary_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawGit {
     #[serde(deserialize_with = "deserialize_opt_git_co_author")]
     pub co_author: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawPi {
     pub tool_presentation: Option<RawPiToolPresentation>,
@@ -612,7 +618,7 @@ impl<'de> Deserialize<'de> for RawPiToolPresentation {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawBackup {
     pub enabled: Option<bool>,
@@ -623,14 +629,14 @@ pub struct RawBackup {
 
 /// `remote_exec`: whether bash calls may ask to run on the remote build server
 /// with `runon`. User tier only, except that a project may turn it off.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawRemoteExec {
     pub enabled: Option<bool>,
     pub default_demand: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawSandbox {
     pub profile: Option<RawSandboxRoles>,
@@ -638,7 +644,7 @@ pub struct RawSandbox {
     pub read_deny: Option<Vec<PathBuf>>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawSandboxRoles {
     pub worker: Option<crate::config::SandboxMode>,
@@ -648,13 +654,13 @@ pub struct RawSandboxRoles {
 /// Raw user-tier standing index configuration. Unlike normally stripped nested
 /// fields, unknown entry fields are retained only long enough to emit an
 /// explicit warn-and-ignore notice.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawIndex {
     pub roots: Option<Vec<RawIndexRoot>>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawIndexRoot {
     pub path: Option<String>,

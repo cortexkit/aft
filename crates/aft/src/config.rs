@@ -280,7 +280,7 @@ fn expand_configured_absolute_path(
 }
 
 /// Semantic backend selected by the currently resolved runtime configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticBackend {
     Fastembed,
@@ -621,7 +621,7 @@ pub fn normalize_git_co_author(value: &str) -> Option<String> {
 pub const DEFAULT_SEMANTIC_MODEL: &str = "all-MiniLM-L6-v2";
 
 /// Which reranker, if any, reorders the head of `aft_search` results.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RerankBackendKind {
     Off,
@@ -682,7 +682,9 @@ impl Config {
 }
 
 /// Ordered from least to most restrictive for project-tier hardening.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxMode {
     Off,
@@ -757,7 +759,9 @@ pub struct RemoteExecConfig {
     pub project_off: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum BashChangedFiles {
     #[default]
@@ -829,14 +833,14 @@ pub struct BashConfig {
 }
 
 /// User-only project environment selection, separate from shell tool switches.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ShellConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env_provider: Option<ShellEnvProvider>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ShellEnvProviderKind {
     Mise,
@@ -844,7 +848,7 @@ pub enum ShellEnvProviderKind {
     Custom,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ShellEnvProvider {
     pub kind: ShellEnvProviderKind,

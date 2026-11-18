@@ -34,6 +34,7 @@ pub(crate) struct PreparedBindConfig {
     root: PathBuf,
     harness: Harness,
     user_path: Option<PathBuf>,
+    approved_user: Option<ApprovedUser>,
     project_path: PathBuf,
     tiers: Vec<ConfigTier>,
     migration: Option<UserConfigMigration>,
@@ -41,14 +42,26 @@ pub(crate) struct PreparedBindConfig {
 }
 
 impl PreparedBindConfig {
+    #[cfg(test)]
     pub(crate) fn read(
         user_path: Option<&Path>,
         root: &Path,
         harness: &Harness,
     ) -> Result<Arc<Self>, ConfigObservationError> {
+        Self::read_with_approved(user_path, None, root, harness)
+    }
+
+    pub(crate) fn read_with_approved(
+        user_path: Option<&Path>,
+        approved_user: Option<&ApprovedUser>,
+        root: &Path,
+        harness: &Harness,
+    ) -> Result<Arc<Self>, ConfigObservationError> {
         let mut observations = Vec::new();
         let mut migration = None;
-        if let Some(path) = user_path {
+        if let Some(user) = approved_user {
+            observations.push(ConfigObservation::Present(user.snapshot()));
+        } else if let Some(path) = user_path {
             // Distinguish a missing user file from other read errors before
             // migration. Migration's own rereads use the same byte limit.
             let first = observe(path, "user")?;
@@ -91,6 +104,7 @@ impl PreparedBindConfig {
             root: root.into(),
             harness: harness.clone(),
             user_path: user_path.map(Path::to_path_buf),
+            approved_user: approved_user.cloned(),
             project_path,
             tiers,
             migration,
@@ -125,6 +139,12 @@ impl PreparedBindConfig {
             config,
         );
         sources.prepared_bind_snapshot_id = Some(self.snapshot_id);
+        if let Some(user) = &self.approved_user {
+            sources.approved_user = Some(user.clone());
+            sources.owns_user_watch = false;
+            sources.user.path = None;
+            sources.user.from_file = false;
+        }
         sources
     }
     pub(crate) fn legacy_notice(&self) -> Option<String> {

@@ -29,7 +29,7 @@ test("published task scope defaults agree in base and harness blocks", () => {
   ]) {
     expect(properties.linux_scope.default).toBe(true);
     expect(properties.linux_scope_max_runtime_secs).toMatchObject({
-      type: "integer",
+      type: ["integer", "null"],
       minimum: 1,
       maximum: 4294967295,
       default: 86400,

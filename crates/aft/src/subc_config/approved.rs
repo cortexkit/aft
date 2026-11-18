@@ -1,0 +1,28 @@
+use super::ConfigTier;
+use parking_lot::RwLock;
+use std::{fmt, sync::Arc};
+
+/// Connection-scoped user settings. A project bind or reload may take a
+/// snapshot of this tier, but must never substitute the declaration's file.
+#[derive(Clone)]
+pub(crate) struct ApprovedUser(Arc<RwLock<ConfigTier>>);
+
+impl ApprovedUser {
+    pub(crate) fn new(tier: ConfigTier) -> Self {
+        Self(Arc::new(RwLock::new(tier)))
+    }
+
+    pub(crate) fn replace(&self, tier: ConfigTier) {
+        *self.0.write() = tier;
+    }
+
+    pub(crate) fn snapshot(&self) -> ConfigTier {
+        self.0.read().clone()
+    }
+}
+
+impl fmt::Debug for ApprovedUser {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ApprovedUser(..)")
+    }
+}

@@ -84,6 +84,7 @@ pub mod config;
 pub mod config_fix;
 pub mod config_live;
 pub mod config_resolve;
+pub mod config_schema;
 pub mod context;
 pub(crate) mod cross_volume;
 pub mod data_layer;

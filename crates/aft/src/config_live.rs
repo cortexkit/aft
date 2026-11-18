@@ -118,6 +118,7 @@ pub struct TierSource {
 #[derive(Debug, Clone)]
 pub struct ConfigSources {
     pub(crate) prepared_bind_snapshot_id: Option<u64>,
+    pub(crate) approved_user: Option<crate::subc_config::ApprovedUser>,
     pub user: TierSource,
     pub project: TierSource,
     /// The resolver output of the last configure, before configure's own
@@ -169,6 +170,7 @@ impl ConfigSources {
         };
         Self {
             prepared_bind_snapshot_id: None,
+            approved_user: None,
             user: source_for("user", user_path),
             project: source_for("project", Some(project_path)),
             connected: connected.clone(),
@@ -539,11 +541,25 @@ pub fn reload_config_now(ctx: &AppContext) -> ReloadOutcome {
     outcome
 }
 
+pub(crate) fn reload_approved_user(ctx: &AppContext) -> ReloadOutcome {
+    let _reload = ctx.config_live().reload_lock.lock();
+    let outcome = reload_config_inner_with(ctx, true);
+    *ctx.config_live().last_outcome.lock() = Some(outcome.clone());
+    outcome
+}
+
 fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
+    reload_config_inner_with(ctx, false)
+}
+
+fn reload_config_inner_with(ctx: &AppContext, approved_only: bool) -> ReloadOutcome {
     let state = ctx.config_live();
     let Some(sources) = state.sources() else {
         return ReloadOutcome::NotConfigured;
     };
+    if approved_only && sources.approved_user.is_none() {
+        return ReloadOutcome::NotConfigured;
+    }
     // A project event can replace a previously regular config with a symlink.
     // The project watcher still covers the link, but not its external target.
     sync_config_watches(ctx);
@@ -554,7 +570,23 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
         .map(|root| root.display().to_string())
         .unwrap_or_default();
 
-    let (user, project) = match (read_tier(&sources.user), read_tier(&sources.project)) {
+    let user_read = sources.approved_user.as_ref().map_or_else(
+        || read_tier(&sources.user),
+        |approved| {
+            TierRead::Use(TierSource {
+                text: Some(approved.snapshot().doc),
+                ..sources.user.clone()
+            })
+        },
+    );
+    // A malformed on-disk project edit must not prevent an approved user
+    // change from applying. The project watcher validates that edit separately.
+    let project_read = if approved_only {
+        TierRead::Use(sources.project.clone())
+    } else {
+        read_tier(&sources.project)
+    };
+    let (user, project) = match (user_read, project_read) {
         (TierRead::Use(user), TierRead::Use(project)) => (user, project),
         (TierRead::Error(reason), _) => {
             ctx.update_config(|config| config.cache_config_unknown = Some(reason.clone()));
@@ -900,6 +932,58 @@ pub struct LiveApply {
     pub deferred: Vec<&'static str>,
 }
 
+macro_rules! restart_settings {
+    ($field:ident) => {
+        $field!("edit_mode", hashline_enabled);
+        $field!("disabled_tools", disabled_tools);
+        $field!("indexes.trigram", indexes.trigram);
+        $field!("indexes.semantic", indexes.semantic);
+        $field!("indexes.callgraph", indexes.callgraph);
+        $field!("index.roots", index.roots);
+        $field!("backup.enabled", backup.enabled);
+        $field!("backup.max_depth", backup.max_depth);
+        $field!("bash.compress", experimental_bash_compress);
+        $field!("bash.background", experimental_bash_background);
+        $field!("bash.detach_on_user_message", bash.detach_on_user_message);
+        $field!("bash.powershell_tool", bash.powershell_tool);
+        $field!("storage.cache_dir", cache_dir);
+        $field!("storage.cache_dir: null", cache_dir_opt_out);
+        $field!("lsp.servers", lsp_servers);
+        $field!("lsp.disabled", disabled_lsp);
+        $field!("experimental.lsp_ty", experimental_lsp_ty);
+        $field!("semantic.backend", semantic.backend);
+        $field!("semantic.model", semantic.model);
+        $field!("semantic.base_url", semantic.base_url);
+        $field!("semantic.api_key_env", semantic.api_key_env);
+        $field!("semantic.timeout_ms", semantic.timeout_ms);
+        $field!("semantic.max_batch_size", semantic.max_batch_size);
+        $field!("semantic.max_input_tokens", semantic.max_input_tokens);
+        $field!("semantic.max_files", semantic.max_files);
+        $field!("subc.connection_file", semantic.subc_connection_file);
+        $field!("github.shim", github.shim);
+        $field!("github.read", github.read);
+        $field!("github.write", github.write);
+        $field!("gh_shim.binary_path", gh_shim.binary_path);
+        $field!("remote_exec.default_demand", remote_exec.default_demand);
+    };
+}
+
+pub(crate) fn restart_required(key: &str) -> bool {
+    macro_rules! check {
+        ($path:literal, $($field:ident).+) => {
+            if key == $path
+                || key
+                    .strip_prefix($path)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+            {
+                return true;
+            }
+        };
+    }
+    restart_settings!(check);
+    false
+}
+
 /// Copy the live keys that differ from `published` out of `candidate`, and
 /// list the deferred keys that differ from what the last configure resolved
 /// (`connected`). Fields that describe the running process are never
@@ -934,16 +1018,10 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     live!("validate_on_edit", validate_on_edit);
     live!("formatter", formatter);
     live!("checker", checker);
-    later!("edit_mode", hashline_enabled);
     // Tool surface and path restriction.
-    later!("disabled_tools", disabled_tools);
     live!("restrict_to_project_root", restrict_to_project_root);
     live!("url_fetch_allow_private", url_fetch_allow_private);
     // Indexes, views, callgraph, standing roots.
-    later!("indexes.trigram", indexes.trigram);
-    later!("indexes.semantic", indexes.semantic);
-    later!("indexes.callgraph", indexes.callgraph);
-    later!("index.roots", index.roots);
     live!("memory", memory);
     // Inspect.
     live!("inspect.enabled", inspect.enabled);
@@ -963,8 +1041,6 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     live!("lsp.idle_minutes", lsp_idle_minutes);
     live!("lsp.max_servers", lsp_max_servers);
     live!("lsp.max_servers", lsp_user_max_servers);
-    later!("backup.enabled", backup.enabled);
-    later!("backup.max_depth", backup.max_depth);
     live!("backup.max_file_size", backup.max_file_size);
     // Sandbox: every spawn reads the snapshot its request pinned.
     live!("sandbox.profile.worker", sandbox.profile.worker);
@@ -974,8 +1050,6 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     // Bash runtime.
     live!("bash.enabled", bash.enabled);
     live!("bash.rewrite", experimental_bash_rewrite);
-    later!("bash.compress", experimental_bash_compress);
-    later!("bash.background", experimental_bash_background);
     live!("bash.linux_scope", bash.linux_scope);
     live!(
         "bash.linux_scope_max_runtime_secs",
@@ -987,7 +1061,6 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     live!("bash.host_fallback", bash.host_fallback);
     live!("bash.watch_sync_max_ms", bash.watch_sync_max_ms);
     live!("bash.worker_wait_max_ms", bash.worker_wait_max_ms);
-    later!("bash.detach_on_user_message", bash.detach_on_user_message);
     live!("bash.db_schema_hints", bash.db_schema_hints);
     live!("bash.changed_files", bash.changed_files);
     live!("bash.env", bash.env);
@@ -997,7 +1070,6 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     // reconfigure instead of waiting for the next connection.
     live!("bash.project_env", bash.project_env);
     live!("bash.runon_env", bash.runon_env);
-    later!("bash.powershell_tool", bash.powershell_tool);
     live!(
         "bash.long_running_reminder_enabled",
         bash_long_running_reminder_enabled
@@ -1007,39 +1079,22 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
         bash_long_running_reminder_interval_ms
     );
     // LSP.
-    later!("storage.cache_dir", cache_dir);
-    later!("storage.cache_dir: null", cache_dir_opt_out);
-    later!("lsp.servers", lsp_servers);
-    later!("lsp.disabled", disabled_lsp);
-    later!("experimental.lsp_ty", experimental_lsp_ty);
     live!("lsp.diagnostics_on_edit", diagnostics_on_edit);
     // Semantic search.
-    later!("semantic.backend", semantic.backend);
-    later!("semantic.model", semantic.model);
-    later!("semantic.base_url", semantic.base_url);
-    later!("semantic.api_key_env", semantic.api_key_env);
-    later!("semantic.timeout_ms", semantic.timeout_ms);
     live!("semantic.query_timeout_ms", semantic.query_timeout_ms);
     live!("semantic.query_instruction", semantic.query_instruction);
-    later!("semantic.max_batch_size", semantic.max_batch_size);
-    later!("semantic.max_input_tokens", semantic.max_input_tokens);
-    later!("semantic.max_files", semantic.max_files);
-    later!("subc.connection_file", semantic.subc_connection_file);
     // Search reranking is read per request, so a change applies to the next
     // search.
     live!("search.rerank", search.rerank);
     // Integrations.
-    later!("github.shim", github.shim);
-    later!("github.read", github.read);
-    later!("github.write", github.write);
-    later!("gh_shim.binary_path", gh_shim.binary_path);
     live!("git.co_author", git.co_author);
     // The user switch and project refusal apply to the next call, even if
     // the caller still holds a catalog that offered runon. A later catalog
     // fetch reflects the new switch; the runner default waits for reconnect.
     live!("remote_exec.enabled", remote_exec.enabled);
     live!("remote_exec.project_off", remote_exec.project_off);
-    later!("remote_exec.default_demand", remote_exec.default_demand);
+
+    restart_settings!(later);
 
     // `aft_search_registered` is derived from `disabled_tools`, which is
     // deferred, so it is never copied.
