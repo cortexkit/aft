@@ -4334,12 +4334,7 @@ fn hub_summary_line(response: &serde_json::Map<String, Value>) -> Option<String>
         .map(str::to_string)
 }
 
-/// Shared list-envelope rendering funnel for subcommand and search output.
-pub(crate) fn render_envelope_trailer(
-    envelope: &crate::list_envelope::ListEnvelope,
-) -> Option<String> {
-    crate::list_envelope::render_trailer(envelope)
-}
+pub(crate) use crate::list_surfaces::render_envelope_trailer;
 
 pub use crate::list_surfaces::grep::rendered_grep_match_count;
 

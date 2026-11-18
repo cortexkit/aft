@@ -2562,7 +2562,7 @@ pub fn validate_renderer_call_sites(
         .iter()
         .map(|site| site.file.as_str())
         .collect::<Vec<_>>();
-    let expected_render_files = ["list_envelope.rs", "ndjson_text.rs", "subc_format.rs"];
+    let expected_render_files = ["list_envelope.rs", "list_surfaces.rs", "ndjson_text.rs"];
     if render_sites.len() != 3
         || expected_render_files
             .iter()

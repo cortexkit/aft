@@ -15,6 +15,11 @@ pub mod trace;
 pub mod trace_data;
 pub mod trace_to;
 
+/// Shared list-envelope rendering entry point for tool and daemon output.
+pub fn render_envelope_trailer(envelope: &crate::list_envelope::ListEnvelope) -> Option<String> {
+    crate::list_envelope::render_trailer(envelope)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
