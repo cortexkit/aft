@@ -142,7 +142,7 @@ async fn subc_settings_real_daemon_declares_then_filters_ready_catalog_and_appli
                 .find(|entry| entry.module_id == "aft" && entry.ready)
             {
                 let tools: Vec<_> = aft
-                    .provides
+                    .roles
                     .iter()
                     .filter_map(|role| match role {
                         ProviderRole::ToolProvider { tools, .. } => Some(tools),
@@ -171,7 +171,7 @@ async fn subc_settings_real_daemon_declares_then_filters_ready_catalog_and_appli
     assert!(modules
         .modules
         .iter()
-        .any(|module| module.module_id == "aft" && module.gated));
+        .any(|module| module.module_id == "aft" && module.schema_digest.is_some()));
     let health = client.supervisor_health_probe("aft").await.unwrap();
     assert_eq!(health.metrics.unwrap()["memory_profile"]["value"], "lean");
 

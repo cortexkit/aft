@@ -172,6 +172,14 @@ async fn exercise_bootstrap() {
     );
     let temp = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for dir in [temp.path(), cache.path()] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+    let cache_path = std::fs::canonicalize(cache.path()).unwrap();
     let ctx = Arc::new(AppContext::from_app(
         App::default_shared(),
         crate::config::Config {
@@ -182,7 +190,7 @@ async fn exercise_bootstrap() {
     let file = temp.path().join("aft.jsonc");
     std::fs::write(&file, r#"{"format_on_edit":true,"disabled_tools":[]}"#).unwrap();
     let mut schema = sample_schema();
-    schema["properties"]["storage"] = json!({"type":"object","unevaluatedProperties":false,"properties":{"cache_dir":leaf("string", json!(cache.path()))}});
+    schema["properties"]["storage"] = json!({"type":"object","unevaluatedProperties":false,"properties":{"cache_dir":leaf("string", json!(cache_path))}});
     let declaration = ConfigDeclareRequest::new(schema.clone(), file.to_str().unwrap(), vec![]);
     let (boot, ()) = tokio::join!(
         startup::drive_first_view(
@@ -254,19 +262,19 @@ async fn exercise_bootstrap() {
             incoming(&incoming_tx, frame(FrameType::Push, 0, changed)).await;
             let (corr, _) = next(&mut written).await;
             let mut active = json_as::<Value>(golden!("config_get_reply_declaration_pending"));
-            active["active"]["effective"] = json!({"format_on_edit":false,"disabled_tools":["aft_search"],"storage":{"cache_dir":cache.path()}});
+            active["active"]["effective"] = json!({"format_on_edit":false,"disabled_tools":["aft_search"],"storage":{"cache_dir":cache_path}});
             active["active"]["sources"] = json!({"/format_on_edit":"user","/disabled_tools":"user","/storage/cache_dir":"user"});
             active["active"]["layers"] = json!([]);
             active["active"]["attempt"] = json!(39);
             incoming(&incoming_tx, frame(FrameType::Response, corr, active)).await;
             let (corr, catalog) = next(&mut written).await;
-            assert_eq!(catalog["op"], "catalog.update");
+            assert_eq!(catalog["op"], "catalog.update", "{catalog}");
             assert_eq!(catalog["ready"], false);
             assert!(!catalog["provides"].to_string().contains("\"aft_search\""));
             assert!(!ctx.config_unpinned().format_on_edit);
             assert_eq!(
                 ctx.config_unpinned().cache_dir.as_deref(),
-                Some(cache.path())
+                Some(cache_path.as_path())
             );
             incoming(
                 &incoming_tx,
@@ -375,7 +383,11 @@ fn settings_standalone_observation_still_reads_file_and_project() {
     )
     .unwrap();
     let project = root.join(".cortexkit/aft.jsonc");
-    std::fs::write(project, r#"{"restrict_to_project_root":true}"#).unwrap();
+    std::fs::write(
+        project,
+        r#"{"indexes":{"semantic":false},"restrict_to_project_root":true}"#,
+    )
+    .unwrap();
     let snapshot = crate::subc_config::PreparedBindConfig::read(
         Some(&file),
         &root,
@@ -383,7 +395,8 @@ fn settings_standalone_observation_still_reads_file_and_project() {
     )
     .unwrap();
     assert!(!snapshot.resolved().format_on_edit);
-    assert!(snapshot.resolved().restrict_to_project_root);
+    assert!(!snapshot.resolved().indexes.semantic);
+    assert!(!snapshot.resolved().restrict_to_project_root);
     let approved = ApprovedUser::new(validate_user(&json!({"format_on_edit":true})).unwrap());
     let snapshot = crate::subc_config::PreparedBindConfig::read_with_approved(
         Some(&file),
@@ -393,5 +406,6 @@ fn settings_standalone_observation_still_reads_file_and_project() {
     )
     .unwrap();
     assert!(snapshot.resolved().format_on_edit);
-    assert!(snapshot.resolved().restrict_to_project_root);
+    assert!(!snapshot.resolved().indexes.semantic);
+    assert!(!snapshot.resolved().restrict_to_project_root);
 }
