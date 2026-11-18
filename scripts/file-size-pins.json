@@ -64,7 +64,7 @@
     "reason": "Split checkout lifecycle and storage pending; AFT crate split lane."
   },
   "crates/aft/src/bash_background/persistence.rs": {
-    "lines": 6429,
+    "lines": 6415,
     "reason": "Split background-task persistence responsibilities pending; AFT crate split lane."
   },
   "crates/aft/src/bash_background/remote.rs": {
