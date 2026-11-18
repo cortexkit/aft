@@ -55,6 +55,12 @@ pub(crate) struct StagedAt {
     unit: StagedUnit,
 }
 
+impl StagedAt {
+    pub(crate) fn uncompressed_bytes(self) -> usize {
+        self.unit.uncompressed_bytes()
+    }
+}
+
 /// What reading the call graph's inputs needs of a staged record without
 /// reading it back.
 #[derive(Clone, Debug)]

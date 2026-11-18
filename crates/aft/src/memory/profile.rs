@@ -21,6 +21,8 @@ pub struct MemoryProfile {
     /// None restores the allocator's startup defaults.
     pub decay_ms: Option<isize>,
     pub block_cache_bytes: usize,
+    /// Estimated bytes of decoded parses and new bound surfaces in a cold batch.
+    pub(crate) bind_batch_bytes: usize,
 }
 
 impl MemoryMode {
@@ -34,11 +36,13 @@ impl MemoryMode {
                 resolver_threads: if windows { None } else { Some(4) },
                 decay_ms: if linux { Some(0) } else { None },
                 block_cache_bytes: 128 * MIB,
+                bind_batch_bytes: 384 * MIB,
             },
             Self::Balanced => MemoryProfile {
                 resolver_threads: None,
                 decay_ms: None,
                 block_cache_bytes: 256 * MIB,
+                bind_batch_bytes: 768 * MIB,
             },
         }
     }
@@ -241,6 +245,7 @@ mod tests {
                     resolver_threads: threads,
                     decay_ms: decay,
                     block_cache_bytes: 128 * MIB,
+                    bind_batch_bytes: 384 * MIB,
                 },
                 "{platform} lean",
             );
@@ -249,7 +254,8 @@ mod tests {
                 MemoryProfile {
                     resolver_threads: None,
                     decay_ms: None,
-                    block_cache_bytes: 256 * MIB
+                    block_cache_bytes: 256 * MIB,
+                    bind_batch_bytes: 768 * MIB,
                 },
                 "{platform} balanced",
             );

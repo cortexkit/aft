@@ -43,6 +43,7 @@ use crate::callgraph_store::{
     DbFileIndex, LoadedFileIndexes, LoadedIndex, ProjectIndex, WorkspaceCratePrefixCache,
 };
 
+mod binding_batch;
 mod key_order;
 mod site_records;
 mod spool;
@@ -1669,8 +1670,8 @@ fn sites_from_spool(
     Ok(sites)
 }
 
-/// How many files each stage of [`resolve_checkout_into`] takes before it
-/// lets the parses they decoded go.
+/// Files per on-disk range of encoded resolutions, in path order.
+/// Passes 1–3 may process that range in smaller working batches.
 const BATCH: usize = 1024;
 
 /// How many decoded resolutions [`resolve_checkout_into`] hands to its sink
@@ -1736,6 +1737,7 @@ pub(crate) fn resolve_checkout_into(
             .check_space(0)
             .map_err(|error| ManifestJoinError::Parse(error.to_string()))
     };
+    let bind_batch_bytes = crate::memory::profile::current().bind_batch_bytes;
     crate::alloc_trace::install(&pool(threads)?, || {
         let paths = inputs.parses.keys().cloned().collect::<Vec<_>>();
         // An earlier attempt of the build that resolved passes 2-3 from these
@@ -1816,42 +1818,16 @@ pub(crate) fn resolve_checkout_into(
             }
             lap(&mut memory, "bind");
             boundary(inputs)?;
-            // Each batch's encoded resolutions go to the spool, one range per
-            // batch, and come back a batch at a time in pass 4, which visits the
-            // files in the same batches.
             let mut spool =
                 spool::ResolutionSpool::new(workspace, checkpoint.identity, checkpoint.snapshot)
                     .map_err(spool_error)?;
             let mut sites = Vec::with_capacity(paths.len());
             #[cfg(feature = "test-hooks")]
             super::refresh_probe::stage("resolution");
-            for batch in paths.chunks(BATCH) {
-                let parses = &inputs.parses;
-                // Pass 1 for the batch: each parse is decoded once and kept for
-                // the batch, and each file not bound yet is bound in parallel.
-                let carry = crate::alloc_trace::carry();
-                batch.par_iter().for_each(|path| {
-                    let _label = carry.enter();
-                    let _ = parses.get(path);
-                });
-                bound.bind_missing(inputs, &refs(batch))?;
-                let resolved =
-                    resolve_files_with(inputs, &bound, &refs(batch), &|path, resolution| {
-                        let (_, parse) = &parses[path];
-                        let site = Arc::new(SiteFile::new(parse, &resolution));
-                        (site, super::fragment::encode(&resolution))
-                    })?;
-                let mut encoded = Vec::with_capacity(resolved.len());
-                let mut range_paths = Vec::with_capacity(resolved.len());
-                for (path, (site, bytes)) in resolved {
-                    range_paths.push(path.clone());
-                    sites.push((path, site));
-                    encoded.push(bytes);
-                }
-                spool
-                    .write_range(&range_paths, &encoded)
-                    .map_err(spool_error)?;
-                inputs.parses.release_decoded();
+            for range in paths.chunks(BATCH) {
+                let encoded =
+                    binding_batch::resolve(inputs, &bound, range, bind_batch_bytes, &mut sites)?;
+                spool.write_range(range, &encoded).map_err(spool_error)?;
             }
             if let Some(memory) = memory.as_deref_mut() {
                 use aft_store::heap::HeapBytes as _;
