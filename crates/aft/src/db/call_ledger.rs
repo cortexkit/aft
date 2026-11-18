@@ -631,13 +631,13 @@ fn validate_tool_result_source(
     Ok(())
 }
 
-/// Scope identities retained by calls that have not settled, including held
+/// Local scope identities retained by calls that have not settled, including held
 /// calls without a route or a running shell task. Row errors are returned
 /// individually so housekeeping can skip malformed rows without losing peers.
 pub(crate) fn unsettled_scopes(
     conn: &Connection,
 ) -> rusqlite::Result<Vec<rusqlite::Result<ScopeIdentity>>> {
-    let mut statement = conn.prepare("SELECT DISTINCT owner,scope_ref,scope_epoch FROM call_ledger WHERE state IN ('Prepared','Authorized','DispatchStarted') AND owner IS NOT NULL AND scope_ref IS NOT NULL AND scope_epoch IS NOT NULL")?;
+    let mut statement = conn.prepare("SELECT DISTINCT owner,scope_ref,scope_epoch FROM call_ledger WHERE carrier NOT GLOB 'remote#*' AND state IN ('Prepared','Authorized','DispatchStarted') AND owner IS NOT NULL AND scope_ref IS NOT NULL AND scope_epoch IS NOT NULL")?;
     let scopes = statement
         .query_map([], |row| {
             Ok(ScopeIdentity {
@@ -652,10 +652,11 @@ pub(crate) fn unsettled_scopes(
 
 /// Atomically settle Prepared and Authorized calls as scope-ended.
 /// A concurrent approval cannot advance a settled row to DispatchStarted.
+/// The remote service applies its own pairing-qualified scope ends.
 pub fn end_scope(conn: &Connection, scope: &ScopeIdentity, now: i64) -> rusqlite::Result<Vec<Key>> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let keys = {
-        let mut statement = tx.prepare("SELECT carrier,call_key FROM call_ledger WHERE owner=?1 AND scope_ref=?2 AND scope_epoch=?3 AND state IN ('Prepared','Authorized')")?;
+        let mut statement = tx.prepare("SELECT carrier,call_key FROM call_ledger WHERE owner=?1 AND scope_ref=?2 AND scope_epoch=?3 AND carrier NOT GLOB 'remote#*' AND state IN ('Prepared','Authorized')")?;
         let rows = statement.query_map(
             params![scope.owner, scope.scope_ref, scope.scope_epoch],
             |row| {

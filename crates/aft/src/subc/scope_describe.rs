@@ -4,6 +4,9 @@
 use super::*;
 use subc_protocol::{scope::ScopeStamp, session::ModuleControlResponseToModule};
 
+#[path = "scope_describe_remote.rs"]
+pub(super) mod remote;
+
 pub(super) fn describe_timeout() -> Duration {
     timing(
         "AFT_TEST_SCOPE_DESCRIBE_TIMEOUT_MS",

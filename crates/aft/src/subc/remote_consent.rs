@@ -45,6 +45,7 @@ struct Group {
     folder: Folder,
     mode: Mode,
     worker: Option<StampKey>,
+    can_ask: bool,
 }
 
 fn display(value: &str) -> String {
@@ -89,7 +90,7 @@ struct Card {
 }
 
 impl Card {
-    fn prepare(call: &Preflight) -> (Group, Self) {
+    fn prepare(call: &Preflight, can_ask: bool) -> (Group, Self) {
         let (project, caller) = admit(Some(&call.scope)).expect("preflight admitted the scope");
         let facts = call
             .scope
@@ -125,6 +126,7 @@ impl Card {
             },
             mode: call.mode,
             worker,
+            can_ask,
         };
         let path = group.folder.path_text();
         let folder = display(
@@ -272,11 +274,22 @@ impl Authorizer {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::subc) fn request(&mut self, call: Preflight) -> oneshot::Receiver<Decision> {
+        self.request_with_lifetime(call, true)
+    }
+
+    pub(in crate::subc) fn request_with_lifetime(
+        &mut self,
+        call: Preflight,
+        can_ask: bool,
+    ) -> oneshot::Receiver<Decision> {
         let (receiver, result) = oneshot::channel();
-        let (group, card) = Card::prepare(&call);
+        let (group, card) = Card::prepare(&call, can_ask);
         let waiter = Waiter { call, receiver };
-        if group.worker.as_ref().is_some_and(|scope| {
+        if group.worker.is_some() && !can_ask {
+            waiter.finish(Err(admission_refusal()));
+        } else if group.worker.as_ref().is_some_and(|scope| {
             self.worker_grants
                 .get(&(group.folder.clone(), scope.clone()))
                 .is_some_and(|mode| mode.covers(group.mode))
@@ -329,6 +342,9 @@ impl Authorizer {
                     if let Some(id) = grant {
                         return Ok(Outcome::Saved(id));
                     }
+                }
+                if !group.can_ask {
+                    return Err(admission_refusal());
                 }
                 let transport = transport.ok_or_else(admission_refusal)?;
                 if cancel.is_cancelled() {
@@ -430,7 +446,7 @@ impl Authorizer {
         {
             waiters.pop_front().expect("oldest waiter").finish(result);
             if let Some(next) = waiters.front() {
-                let (_, card) = Card::prepare(&next.call);
+                let (_, card) = Card::prepare(&next.call, group.can_ask);
                 self.start(group, card, waiters);
             }
         } else {
@@ -442,10 +458,6 @@ impl Authorizer {
 
     /// A confirmed end retires the cards opened by that stamp, as well as
     /// any worker approvals and followers from the ended scope.
-    #[allow(
-        dead_code,
-        reason = "the remote scope tracker does not yet report confirmed ends"
-    )]
     pub(in crate::subc) fn end_scope(&mut self, pairing: &str, stamp: &ScopeStamp) {
         let ended = scope_describe::stamp_key(stamp);
         self.worker_grants

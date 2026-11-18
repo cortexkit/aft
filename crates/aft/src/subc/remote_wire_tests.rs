@@ -54,6 +54,9 @@ fn tool_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
 fn remote_bind(channel: u16, pairing: &str, caps: &[&str]) -> Value {
     let mut scope = stamp(json!({"kind":"agent", "agent_id":"remote-agent"}));
     scope["attributes"]["federated"]["pairing_id"] = json!(pairing);
+    if pairing == SCOPES[2] {
+        scope["ref"] = json!("deny-session");
+    }
     let mut body = bind(
         channel,
         REMOTE,
@@ -113,6 +116,32 @@ fn feed() -> Value {
 
 fn text(result: &Value) -> &str {
     result["content"][0]["text"].as_str().unwrap()
+}
+
+async fn hello(daemon: &mut tokio::io::DuplexStream, ops: Vec<String>) {
+    let hello = read_frame(daemon).await.unwrap().unwrap();
+    assert_eq!(hello.header.ty, FrameType::Hello);
+    write_frame(
+        daemon,
+        &Frame::build(
+            FrameType::HelloAck,
+            control_flags(),
+            0,
+            0,
+            hello.header.corr,
+            serde_json::to_vec(&ModuleHelloAckBody {
+                negotiated_ver: PROTOCOL_VERSION,
+                subc_ops: ops,
+                subc_capabilities: vec![],
+                storage: None,
+                machine_id: None,
+            })
+            .unwrap(),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -177,24 +206,11 @@ async fn remote_wire_admission_audit_read_and_pairing_custody() {
         ),
     );
     let exercise = async {
-        assert_eq!(
-            read_frame(&mut daemon).await.unwrap().unwrap().header.ty,
-            FrameType::Hello
-        );
-        write_frame(
+        hello(
             &mut daemon,
-            &Frame::build(
-                FrameType::HelloAck,
-                control_flags(),
-                0,
-                0,
-                HELLO_CORR,
-                b"{}".to_vec(),
-            )
-            .unwrap(),
+            vec![subc_protocol::scope::SCOPE_DESCRIBE_OP.into()],
         )
-        .await
-        .unwrap();
+        .await;
         let mut local = bind(90, "opencode", Value::Null, root.as_path(), "tool_provider");
         local["principal"] = json!({"kind":"direct"});
         reply(rpc(&mut daemon, 0, 1, local).await);
@@ -551,3 +567,6 @@ fn check_rows(db: &record::Db, folder: &Path) {
     assert_eq!(rows[12].1[1], SCOPES[1]);
     assert_eq!(&rows[13].1[5..], ["read", "replay", "ok"]);
 }
+
+#[path = "remote_edit_lifetime_tests.rs"]
+mod edit_lifetime;

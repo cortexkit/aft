@@ -1706,6 +1706,9 @@ pub fn auto_format(
     path: &Path,
     config: &Config,
 ) -> (bool, Option<String>) {
+    if crate::context::confinement::remote_mutation() {
+        return (false, Some("sandbox_unavailable".into()));
+    }
     // Check if formatting is disabled via plugin config
     if !config.format_on_edit {
         return (false, Some("no_formatter_configured".to_string()));
@@ -2798,6 +2801,9 @@ pub fn validate_full(
     path: &Path,
     config: &Config,
 ) -> (Vec<ValidationError>, Option<String>) {
+    if crate::context::confinement::remote_mutation() {
+        return (Vec::new(), Some("sandbox_unavailable".into()));
+    }
     let lang = match detect_language(path) {
         Some(l) => l,
         None => {

@@ -1,4 +1,4 @@
-//! The remote read allowlist is independent of the local and confined catalogs.
+//! The remote file-tool allowlist is independent of the local and confined catalogs.
 
 use super::*;
 use crate::context::confinement;
@@ -6,7 +6,10 @@ use crate::db::remote_grant_rows::Mode;
 use cortexkit_role_tool_provider::call::ToolCallRequest;
 use cortexkit_role_tool_provider::errors;
 
-pub(super) fn read_operation(wire_name: &str) -> Option<&'static str> {
+#[path = "remote_edit_paths.rs"]
+mod edit_paths;
+
+fn read_operation(wire_name: &str) -> Option<&'static str> {
     match crate::tool_gate::canonical_tool_name(wire_name)? {
         "read" => Some("read"),
         "grep" => Some("grep"),
@@ -22,25 +25,51 @@ pub(super) fn read_operation(wire_name: &str) -> Option<&'static str> {
     }
 }
 
-pub(super) fn requested_mode(wire_name: &str) -> Option<Mode> {
-    if read_operation(wire_name).is_some() {
-        return Some(Mode::Read);
-    }
+fn edit_operation(wire_name: &str) -> Option<&'static str> {
     match crate::tool_gate::canonical_tool_name(wire_name)? {
-        "aft_conflicts" => Some(Mode::Read),
-        "write" | "edit" | "apply_patch" | "aft_delete" | "aft_move" | "aft_import"
-        | "ast_grep_replace" | "bash" => Some(Mode::ReadWrite),
+        "write" => Some("write"),
+        "edit" => Some("edit"),
+        "apply_patch" => Some("apply_patch"),
+        "aft_delete" => Some("delete"),
+        "aft_move" => Some("move"),
+        "aft_import" => Some("import"),
+        "ast_grep_replace" => Some("ast_replace"),
         _ => None,
     }
 }
 
-pub(super) struct Read {
+pub(super) fn operation(wire_name: &str) -> Option<(&'static str, Mode)> {
+    read_operation(wire_name)
+        .map(|op| (op, Mode::Read))
+        .or_else(|| edit_operation(wire_name).map(|op| (op, Mode::ReadWrite)))
+}
+
+pub(super) fn requested_mode(wire_name: &str) -> Option<Mode> {
+    operation(wire_name).map(|(_, mode)| mode).or_else(|| {
+        match crate::tool_gate::canonical_tool_name(wire_name)? {
+            "aft_conflicts" => Some(Mode::Read),
+            "bash" => Some(Mode::ReadWrite),
+            _ => None,
+        }
+    })
+}
+
+pub(super) struct FileTool {
     operation: &'static str,
+    mode: Mode,
     arguments: Value,
+    write_paths: Vec<String>,
     context: ToolCallContext,
 }
 
-impl Read {
+impl FileTool {
+    pub(super) fn lane(&self) -> Lane {
+        match self.mode {
+            Mode::Read => Lane::PureRead,
+            Mode::ReadWrite => Lane::Mutating,
+        }
+    }
+
     pub(super) fn prepare(
         call: ToolCallRequest,
         scope: ScopeStamp,
@@ -49,7 +78,7 @@ impl Read {
         digest: String,
         ctx: &AppContext,
     ) -> Result<(Self, Preflight), ErrorBody> {
-        let operation = read_operation(&call.name).ok_or_else(tool_unavailable)?;
+        let (operation, mode) = operation(&call.name).ok_or_else(tool_unavailable)?;
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).map_err(|_| admission_refusal())?;
         let request_id = format!("remote-{:032x}", u128::from_le_bytes(nonce));
@@ -62,28 +91,34 @@ impl Read {
             standard_edit_grammar: true,
             ..ToolCallContext::default()
         };
-        let read = Self {
+        let mut tool = Self {
             operation,
+            mode,
             arguments: call.arguments,
+            write_paths: Vec::new(),
             context,
         };
         let _config = ctx.pin_config();
-        confinement::with_root(ctx, &read.context.request_id, || {
-            read.check(ctx)?;
-            let format = read.format();
+        confinement::with_root(ctx, &tool.context.request_id, || {
+            tool.check(ctx)?;
+            let format = tool.format();
             let prepared = prepare_tool_call(
-                read.operation,
-                read.arguments.clone(),
+                tool.operation,
+                tool.arguments.clone(),
                 &format,
-                &read.context,
+                &tool.context,
                 ctx,
                 None,
             )
             .map_err(|failed| failed.response)?;
-            if read.arguments.get("ref").is_some() {
+            if tool.arguments.get("ref").is_some() {
                 // Git revision reads can open an ancestor or linked worktree's
                 // object store outside the registered folder.
                 return Err(crate::revision_read::disabled(&prepared.request));
+            }
+            if mode == Mode::ReadWrite {
+                tool.write_paths = edit_paths::operands(&prepared.request)?;
+                tool.check_writes(ctx)?;
             }
             Ok(())
         })
@@ -92,11 +127,11 @@ impl Read {
             scope,
             session,
             folder,
-            mode: Mode::Read,
+            mode,
             tool: call.name,
             args_hash: digest,
         };
-        Ok((read, consent))
+        Ok((tool, consent))
     }
 
     fn format(&self) -> crate::subc_format::FormatContext {
@@ -120,7 +155,7 @@ impl Read {
             .as_deref()
             .expect("remote file-tool session");
         confinement::preflight(ctx, id, session, &self.arguments)?;
-        for operand in ["paths", "toPath"] {
+        for operand in ["paths", "toPath", "destination"] {
             if let Some(paths) = self.arguments.get(operand) {
                 confinement::preflight(ctx, id, session, &json!({"path": paths}))?;
             }
@@ -140,6 +175,16 @@ impl Read {
         Ok(())
     }
 
+    fn check_writes(&self, ctx: &AppContext) -> Result<(), Response> {
+        let id = &self.context.request_id;
+        let session = self
+            .context
+            .session_id
+            .as_deref()
+            .expect("remote file-tool session");
+        edit_paths::check(ctx, id, session, &self.write_paths)
+    }
+
     pub(super) fn run(
         self,
         ctx: &AppContext,
@@ -152,16 +197,29 @@ impl Read {
             // Consent and scheduling may have delayed this call. Recheck the
             // current path and tool policy immediately before dispatch.
             self.check(ctx)?;
-            let crate::run_tool_call::ToolCallOutcome::Unary(result) = run_tool_call(
-                self.operation,
-                self.arguments,
-                &format,
-                &self.context,
-                ctx,
-                &dispatch,
-                None,
-                None,
-            );
+            self.check_writes(ctx)?;
+            let mutation = self.mode == Mode::ReadWrite;
+            let dispatch = |mut request: RawRequest, ctx: &AppContext| {
+                if mutation {
+                    // Keep normal file-change notifications, but never ask a
+                    // language server to start for post-write diagnostics.
+                    request.params["diagnostics"] = Value::Bool(false);
+                }
+                dispatch(request, ctx)
+            };
+            let crate::run_tool_call::ToolCallOutcome::Unary(result) =
+                confinement::with_remote_mutation(mutation, || {
+                    run_tool_call(
+                        self.operation,
+                        self.arguments,
+                        &format,
+                        &self.context,
+                        ctx,
+                        &dispatch,
+                        None,
+                        None,
+                    )
+                });
             Ok(result)
         })
         .map_err(|refusal| error(&refusal))
