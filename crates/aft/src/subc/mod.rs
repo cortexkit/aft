@@ -235,7 +235,10 @@ mod health;
 mod installed_routes;
 use installed_routes::{insert_route_channel, remove_route_channel};
 mod legacy_root;
+mod metadata_route;
+mod remote_calls;
 use legacy_root::*;
+use metadata_route::handle_metadata_route_request;
 pub(crate) mod held_task_recovery;
 #[cfg(test)]
 mod idle_reap_frame_loop_tests;
@@ -1639,6 +1642,8 @@ enum ManagementAdmission {
     /// Occipital relays person commands and reads provider metadata, but has no
     /// general management authority or project-tool access on this route.
     Occipital,
+    /// An inbound computer route with no authority over a local project actor.
+    RemoteTools,
     /// Tool-provider metadata and custodian feeds without a project root;
     /// grants no management authority or project-tool access.
     ProjectFree {
@@ -5350,6 +5355,7 @@ where
     let mut installed_route_epochs: HashMap<u16, u32> = HashMap::new();
     let mut routes: HashMap<RouteChannel, RouteIdentity> = HashMap::new();
     let mut management_routes: HashMap<RouteChannel, ManagementIdentity> = HashMap::new();
+    let mut remote_folder_lookups = remote_calls::FolderLookups::default();
     let mut bg_subs: HashMap<RouteChannel, BgSub> = HashMap::new();
     let shells_service = shells::Service::new(shared_app.clone(), executor.clone());
     let mut bg_sub_by_session: BgSubsBySession = HashMap::new();
@@ -5740,6 +5746,11 @@ where
                 next_maintenance_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
                 health_rollup_worker.request_refresh();
             }
+            Some(completion) = remote_folder_lookups.next() => {
+                if let Err(error) = remote_calls::finish_lookup(&writer_tx, &dispatch_path_metrics, completion, &management_routes, &root_channels, &routes).await {
+                    break Err(error);
+                }
+            }
             Some(query) = worker_read_scopes.recv() => {
                 dispatch_path_metrics.mark_frame_loop_step("gh_relay_route_scopes", "", 0);
                 let scopes = gh_relay_route_scopes(&routes,&speech);
@@ -5961,6 +5972,12 @@ where
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
                         let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies };
+                        if let Some(identity) = management_routes.get(&route).filter(|identity| identity.admission == ManagementAdmission::RemoteTools) {
+                            if let Err(error) = remote_folder_lookups.request(&writer_tx, &dispatch_path_metrics, &decoded.frame, decoded.body().ok(), identity, connection_file_path).await {
+                                break Err(error);
+                            }
+                            continue;
+                        }
                         if let Ok(body) = decoded.body() {
                             if body.get("name").or_else(|| body.get("op")).and_then(Value::as_str)
                                 == Some(cortexkit_role_tool_display::DISPLAY_READ) {
@@ -8125,7 +8142,7 @@ async fn handle_control_request(
     storage_dir: &Path,
 ) -> Result<(), SubcError> {
     metrics.mark_frame_loop_entry("handle_control_request", frame);
-    let request = match serde_json::from_slice::<ModuleControlRequest>(&frame.body) {
+    let request = match remote_calls::decode_control(&frame.body) {
         Ok(request) => request,
         Err(error) => return refuse_undecodable_control_request(tx, frame, &error, metrics).await,
     };
@@ -8144,6 +8161,7 @@ async fn handle_control_request(
             call_mode,
         } => {
             let route_id = route_key(route_channel, epoch);
+            let remote = harness_forces_untrusted(&identity.harness);
             bind_log::consumer_capabilities(
                 &principal,
                 &identity.harness,
@@ -8165,7 +8183,9 @@ async fn handle_control_request(
             // Protocol 0.34 drops project fields from BindIdentity. Read the
             // legacy claim separately for compatibility clients and mismatch
             // logging; it must never override an explicit stamped workdir.
-            let legacy_root = legacy_route_project_root(frame);
+            let legacy_root = (!remote)
+                .then(|| legacy_route_project_root(frame))
+                .flatten();
             if epoch == 0 {
                 return send_route_bind_error(
                     tx,
@@ -8214,7 +8234,8 @@ async fn handle_control_request(
                 }
             };
             // Refuse an exhausted bind budget before probing project folders.
-            let bind_project_root = if matches!(target, RouteTarget::ToolProvider { .. }) {
+            let bind_project_root = if !remote && matches!(target, RouteTarget::ToolProvider { .. })
+            {
                 match resolve_route_project_root(legacy_root.as_deref(), scope.as_ref()) {
                     Ok(root) => root,
                     Err(_) => {
@@ -8233,7 +8254,13 @@ async fn handle_control_request(
             };
             let project_free =
                 matches!(target, RouteTarget::ToolProvider { .. }) && bind_project_root.is_none();
-            schedule_scope_workdir_comparison(&identity, legacy_root.as_deref(), scope.as_ref());
+            if !remote {
+                schedule_scope_workdir_comparison(
+                    &identity,
+                    legacy_root.as_deref(),
+                    scope.as_ref(),
+                );
+            }
             if matches!(target, RouteTarget::ManagementSurface { .. }) || project_free {
                 let display_reader = crate::late_result_bus::display_reader().ok().flatten();
                 let display_admitted =
@@ -8294,7 +8321,9 @@ async fn handle_control_request(
                     )
                     .await;
                 }
-                let admission = if project_free {
+                let admission = if project_free && remote {
+                    ManagementAdmission::RemoteTools
+                } else if project_free {
                     ManagementAdmission::ProjectFree {
                         workdir: scope.as_ref().and_then(|stamp| stamp.workdir.clone()),
                         legacy_root: legacy_root.clone(),
@@ -8909,105 +8938,6 @@ fn dispatch_display_read(
             log::warn!("display read reply: {error}");
         }
     });
-}
-
-/// Metadata needs no project. Only rootless provider routes also retain the
-/// custodian feed; Occipital's explicit management route has no custody access.
-async fn handle_metadata_route_request(
-    tx: &WriterSender,
-    frame: &Frame,
-    metrics: &Arc<DispatchPathMetrics>,
-    identity: &ManagementIdentity,
-    shared_app: &Arc<App>,
-    storage_dir: &Path,
-) -> Result<(), SubcError> {
-    let mut body = serde_json::from_slice::<Value>(&frame.body).unwrap_or(Value::Null);
-    let operation = body
-        .get("op")
-        .or_else(|| body.get("name"))
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let arguments = if body.get("op").is_some() {
-        body.as_object_mut().unwrap().remove("op");
-        body
-    } else {
-        body.get("arguments").cloned().unwrap_or_else(|| json!({}))
-    };
-    if let Some(op @ ("late_results" | "late_results.ack")) = operation.as_deref() {
-        if let ManagementAdmission::ProjectFree {
-            model_only,
-            held_updates,
-            ..
-        } = &identity.admission
-        {
-            tool_provider::project_free_custody(
-                tx,
-                frame,
-                metrics,
-                shared_app.clone(),
-                storage_dir.join("aft.db"),
-                op,
-                arguments,
-                principal_label(&identity.principal),
-                *model_only,
-                *held_updates,
-            );
-            return Ok(());
-        }
-    }
-    let result = match operation.as_deref() {
-        Some("role.describe") => Ok(tool_provider::describe()),
-        Some("tool.views") => tool_views::answer(arguments),
-        Some("tool.catalog") => {
-            tool_provider::validate_catalog_request(arguments).and_then(|(request, preset)| {
-                tool_provider::catalog_for_request(
-                    request,
-                    preset,
-                    &[],
-                    false,
-                    false,
-                    false,
-                    crate::config::DEFAULT_BASH_WORKER_WAIT_MAX_MS,
-                )
-            })
-        }
-        _ => match &identity.admission {
-            ManagementAdmission::ProjectFree {
-                workdir,
-                legacy_root,
-                ..
-            } => Err(project_folder_refusal(
-                PROJECT_REQUIRED_CODE,
-                workdir.as_deref(),
-                legacy_root.as_deref(),
-                route_key(frame.header.channel, frame.header.epoch),
-                frame.header.corr,
-            )),
-            _ => Err(ErrorBody::new(
-                "route_not_admitted",
-                "not a metadata operation",
-            )),
-        },
-    };
-    match result {
-        Err(error) => {
-            log_management_refusal(identity, frame, &error);
-            send_provider_error(tx, metrics, frame, error).await
-        }
-        Ok(answer) => {
-            let response = Frame::build_with_version(
-                frame.header.ver,
-                FrameType::Response,
-                frame.header.flags,
-                frame.header.channel,
-                frame.header.epoch,
-                frame.header.corr,
-                serde_json::to_vec(&answer).map_err(SubcError::Json)?,
-            )
-            .map_err(SubcError::FrameBuild)?;
-            send_reliable_writer_frame(tx, metrics, response, "provider metadata").await
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10053,6 +9983,7 @@ fn log_management_refusal(identity: &ManagementIdentity, frame: &Frame, error: &
         ManagementAdmission::ShellsOnly => "ShellsOnly",
         ManagementAdmission::DisplayOnly => "DisplayOnly",
         ManagementAdmission::Occipital => "Occipital",
+        ManagementAdmission::RemoteTools => "RemoteTools",
         ManagementAdmission::ProjectFree { .. } => "ProjectFree",
     };
     log::warn!(
