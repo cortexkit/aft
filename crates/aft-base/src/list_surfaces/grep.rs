@@ -28,7 +28,7 @@ pub fn build_ignored_entries_envelope(data: &Value) -> Option<ListEnvelope> {
         causes.push(Reason::Walk);
     }
     if total.is_some_and(|total| total > shown as u64)
-        || total.is_none() && shown == crate::grep_executor::MAX_IGNORED_SCOPE_NAMES
+        || total.is_none() && shown == MAX_IGNORED_SCOPE_NAMES
     {
         causes.push(Reason::Cap);
     }
@@ -253,3 +253,6 @@ pub fn rendered_grep_match_count(data: &Value) -> usize {
         .map(|rendered| (rendered as usize).min(matches_len))
         .unwrap_or(matches_len)
 }
+
+/// Display names retained for an explicitly ignored search scope.
+pub const MAX_IGNORED_SCOPE_NAMES: usize = 3;

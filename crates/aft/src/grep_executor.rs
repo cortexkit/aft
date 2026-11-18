@@ -312,7 +312,7 @@ pub(crate) struct ScopeFileCounts {
 }
 
 pub(crate) const MAX_IGNORE_PROBE_ENTRIES: usize = 4096;
-pub(crate) const MAX_IGNORED_SCOPE_NAMES: usize = 3;
+pub(crate) use crate::list_surfaces::grep::MAX_IGNORED_SCOPE_NAMES;
 
 #[derive(Debug, Default)]
 pub(crate) struct IgnoredScopeEntries {

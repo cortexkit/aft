@@ -531,29 +531,8 @@ fn verify_final_root_stats(
     }
 }
 
-pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
-    if let Some(reason) = ctx.cache_unavailable_reason() {
-        return Response::error(&req.id, crate::root_cache::CACHE_DIR_UNAVAILABLE, reason);
-    }
-    if req.worker_session() {
-        ctx.disable_rust_cargo_for_worker();
-    }
-    handle_inspect_payload(
-        req,
-        ctx,
-        false,
-        false,
-        &[],
-        &[],
-        &[],
-        &[],
-        false,
-        None,
-        None,
-        None,
-        Vec::new(),
-    )
-}
+mod entry;
+pub use entry::handle_inspect;
 
 /// Configure records which language servers apply to the project on a
 /// background walk, and until it finishes the status bar reports project

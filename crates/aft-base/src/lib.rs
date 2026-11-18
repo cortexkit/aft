@@ -112,6 +112,7 @@ pub mod log_ctx;
 pub mod log_redact;
 pub mod logging;
 pub mod memory;
+pub mod memory_profile;
 
 pub mod native_stat;
 pub mod ndjson_text;
@@ -120,6 +121,7 @@ pub mod ort_pin;
 pub mod os_metadata;
 pub mod path_identity;
 pub mod pattern_compile;
+pub mod pending_notices;
 pub mod pending_response;
 pub mod persistence_gate;
 pub mod pinned_dir;
@@ -128,6 +130,7 @@ pub mod platform_tls;
 pub mod policy_path;
 #[cfg(unix)]
 pub mod posix_spawn;
+pub mod prefrontal;
 pub mod privacy_spawn;
 #[doc(hidden)]
 pub mod private_storage;
@@ -142,6 +145,7 @@ pub mod protocol;
 pub mod pty_render;
 pub mod query_shape;
 pub mod read_policy;
+pub mod runner_status_state;
 pub mod scope_watch_events;
 pub mod secret;
 pub mod secret_proxy;

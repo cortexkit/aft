@@ -115,7 +115,7 @@ pub struct RawAftConfig {
     #[schemars(
         description = "Machine-local resource profile, user config base only. lean uses less memory and can build more slowly: it uses a smaller shared block cache, four call-graph resolver threads on Linux and macOS, and immediate freed-memory return on Linux. Windows keeps all CPUs. balanced keeps the previous limits. When unset, total physical RAM selects lean below 8 GiB, otherwise balanced; unreadable RAM selects balanced. Changes apply to subsequent builds and shared block cache sizing without a restart. Other limits and meaning-search settings stay unchanged."
     )]
-    pub memory: Option<crate::memory::profile::MemoryMode>,
+    pub memory: Option<crate::memory_profile::MemoryMode>,
     #[schemars(
         description = "Process-wide file flush policy from the user config base only. Project values and all harness overrides have no effect."
     )]
@@ -4035,7 +4035,7 @@ mod tests {
 
     #[test]
     fn memory_config_only_user_base_selects_machine_limits() {
-        use crate::memory::profile::MemoryMode;
+        use crate::memory_profile::MemoryMode;
         for (name, expected) in [
             ("lean", MemoryMode::Lean),
             ("balanced", MemoryMode::Balanced),
@@ -5532,7 +5532,7 @@ mod tests {
         assert!(!result.config.indexes.callgraph);
         assert_eq!(
             result.config.memory,
-            Some(crate::memory::profile::MemoryMode::Balanced)
+            Some(crate::memory_profile::MemoryMode::Balanced)
         );
         assert!(result.config.url_fetch_allow_private);
         assert_eq!(

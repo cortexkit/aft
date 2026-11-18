@@ -407,6 +407,12 @@ impl PartialEq for CodeSearchNotice {
 }
 impl Eq for CodeSearchNotice {}
 
+impl aft_base::pending_notices::NoticeSink for CodeSearchNotice {
+    fn send(&self, notice: &aft_base::pending_notices::Notice) {
+        CodeSearchNotice::send(self, notice);
+    }
+}
+
 pub(super) fn code_search_notice(
     route: &RouteIdentity,
     call_key: &str,
@@ -493,6 +499,10 @@ pub(super) fn nudge_request(
 }
 
 impl CodeSearchNotice {
+    pub(crate) fn into_sink(self) -> Arc<dyn aft_base::pending_notices::NoticeSink> {
+        Arc::new(self)
+    }
+
     pub(super) fn with_preset(mut self, role: super::tool_provider::CallerRole) -> Self {
         self.preset = match role {
             super::tool_provider::CallerRole::Head => "head",

@@ -73,6 +73,7 @@ fn slices() -> Vec<Slice> {
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/external_pattern.rs"),
                 FenceRule::Exact("crates/aft/src/search_state/generation_token.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/mod.rs"),
+                FenceRule::Exact("crates/aft/src/commands/semantic_search/entry.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/nearest_names.rs"),
                 FenceRule::Exact("crates/aft/src/search_b2/plan_table.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/recall_audit.rs"),
@@ -99,6 +100,7 @@ fn slices() -> Vec<Slice> {
                 "crates/aft/src/commands/semantic_search/external_pattern.rs",
                 "crates/aft/src/search_state/generation_token.rs",
                 "crates/aft/src/commands/semantic_search/mod.rs",
+                "crates/aft/src/commands/semantic_search/entry.rs",
                 "crates/aft/src/commands/semantic_search/nearest_names.rs",
                 "crates/aft/src/search_b2/plan_table.rs",
                 "crates/aft/src/commands/semantic_search/recall_audit.rs",
@@ -308,6 +310,11 @@ fn slices() -> Vec<Slice> {
                 FenceRule::Exact("crates/aft/src/search_b2/contracts.rs"),
                 FenceRule::Exact("crates/aft/src/grep_executor/multi_path.rs"),
                 FenceRule::Exact("crates/aft/src/grep_executor/git_exclude.rs"),
+                FenceRule::Exact("crates/aft-parse/src/parser/file_language.rs"),
+                FenceRule::Exact("crates/aft-parse/src/callgraph_store/dispatch_type_hints.rs"),
+                FenceRule::Exact("crates/aft/src/data_layer/checkout/lifetimes.rs"),
+                FenceRule::Exact("crates/aft/src/commands/inspect/entry.rs"),
+                FenceRule::Exact("crates/aft/src/inspect/manager/flight_lifetime.rs"),
             ],
             landed_paths: vec![
                 "crates/aft/src/commands/semantic_search/planner/mod.rs",
@@ -319,6 +326,11 @@ fn slices() -> Vec<Slice> {
                 "crates/aft/src/search_b2/contracts.rs",
                 "crates/aft/src/grep_executor/multi_path.rs",
                 "crates/aft/src/grep_executor/git_exclude.rs",
+                "crates/aft-parse/src/parser/file_language.rs",
+                "crates/aft-parse/src/callgraph_store/dispatch_type_hints.rs",
+                "crates/aft/src/data_layer/checkout/lifetimes.rs",
+                "crates/aft/src/commands/inspect/entry.rs",
+                "crates/aft/src/inspect/manager/flight_lifetime.rs",
             ],
         },
     ]
@@ -361,6 +373,11 @@ fn constraint_paths(root: &Path) -> BTreeSet<String> {
         "crates/aft/src/search_b2/contracts.rs".to_string(),
         "crates/aft/src/grep_executor/multi_path.rs".to_string(),
         "crates/aft/src/grep_executor/git_exclude.rs".to_string(),
+        "crates/aft-parse/src/parser/file_language.rs".to_string(),
+        "crates/aft-parse/src/callgraph_store/dispatch_type_hints.rs".to_string(),
+        "crates/aft/src/data_layer/checkout/lifetimes.rs".to_string(),
+        "crates/aft/src/commands/inspect/entry.rs".to_string(),
+        "crates/aft/src/inspect/manager/flight_lifetime.rs".to_string(),
         "crates/aft/src/commands/data_search.rs".to_string(),
         "crates/aft/src/data_layer/meaning_query.rs".to_string(),
         "crates/aft/src/data_layer/external_search.rs".to_string(),
@@ -519,7 +536,7 @@ fn semantic_stage_modules_have_one_owner_and_the_first_slice_owns_the_seam() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         modules.len(),
-        41,
+        42,
         "every semantic lane/stage module is inventoried"
     );
     for module in modules {

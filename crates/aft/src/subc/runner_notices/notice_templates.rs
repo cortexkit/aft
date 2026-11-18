@@ -4,43 +4,7 @@ use cortexkit_role_llm_runner::delivery_order::{Slot, Template};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Default)]
-pub struct PendingNotices {
-    pub(crate) route: Option<crate::subc::runner_notices::CodeSearchNotice>,
-    pub(crate) items: Vec<Notice>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct Notice {
-    pub(crate) text: String,
-    pub(crate) template: Option<(&'static str, Value)>,
-    pub(crate) target: Target,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum Target {
-    RewriteFooter,
-    BashOutput,
-    Text,
-}
-
-impl Notice {
-    pub(crate) fn template(id: &'static str, slots: Value, text: String, target: Target) -> Self {
-        Self {
-            text,
-            template: Some((id, slots)),
-            target,
-        }
-    }
-
-    pub(crate) fn diagnostic(text: String) -> Self {
-        Self {
-            text,
-            template: None,
-            target: Target::Text,
-        }
-    }
-}
+pub(crate) use aft_base::pending_notices::{Notice, PendingNotices, Target};
 
 pub(crate) fn append_text(text: &mut String, notice: &str) {
     if !text.is_empty() {
@@ -75,6 +39,55 @@ pub(crate) fn deliver(response: &mut crate::protocol::Response, mut text: Option
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod sink_tests {
+    use super::*;
+    use aft_base::pending_notices::NoticeSink;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[derive(Debug)]
+    struct UpperSink(Arc<AtomicUsize>);
+
+    impl NoticeSink for UpperSink {
+        fn send(&self, notice: &Notice) {
+            assert_eq!(notice.text, "one notice");
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn pending_notice_crosses_the_upper_sink_once_and_none_never_sends() {
+        let sends = Arc::new(AtomicUsize::new(0));
+        let mut routed = crate::protocol::Response::success("routed", json!({"text":"body"}));
+        routed.notices.route = Some(Arc::new(UpperSink(sends.clone())));
+        routed
+            .notices
+            .items
+            .push(Notice::diagnostic("one notice".into()));
+        deliver(&mut routed, None);
+        deliver(&mut routed, None);
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        assert!(routed.notices.items.is_empty());
+        assert_eq!(routed.data["text"], "body");
+
+        let mut standalone =
+            crate::protocol::Response::success("standalone", json!({"text":"body"}));
+        assert!(standalone.notices.route.is_none());
+        standalone
+            .notices
+            .items
+            .push(Notice::diagnostic("one notice".into()));
+        deliver(&mut standalone, None);
+        deliver(&mut standalone, None);
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        assert!(standalone.notices.items.is_empty());
+        assert_eq!(standalone.data["text"], "body\n\none notice");
     }
 }
 

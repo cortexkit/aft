@@ -404,14 +404,8 @@ pub(crate) struct BuildReservation {
     live: Arc<RwLock<Live>>,
 }
 
-impl Drop for BuildReservation {
-    fn drop(&mut self) {
-        self.live
-            .write()
-            .expect("no panics while holding it")
-            .building = false;
-    }
-}
+#[path = "checkout/lifetimes.rs"]
+mod lifetimes;
 
 impl GraphEngine {
     /// This engine moved onto `to`, the publication of what it resolved:
@@ -6389,16 +6383,6 @@ pub(crate) fn hold_call_graph_for_test(root: &Path) -> CallGraphHold {
 #[cfg(test)]
 pub(crate) struct CallGraphHold(PathBuf);
 
-#[cfg(test)]
-impl Drop for CallGraphHold {
-    fn drop(&mut self) {
-        call_graph_holds_for_test()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.0);
-    }
-}
-
 /// Roots whose builds wait before they publish, each with whether a build
 /// is waiting now.
 #[cfg(test)]
@@ -6442,16 +6426,6 @@ impl PublicationHold {
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-    }
-}
-
-#[cfg(test)]
-impl Drop for PublicationHold {
-    fn drop(&mut self) {
-        publication_holds_for_test()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.0);
     }
 }
 

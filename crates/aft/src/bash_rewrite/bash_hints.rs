@@ -25,7 +25,7 @@ impl CallContext {
         ) else {
             return;
         };
-        response.notices.route = self.runner_notice.clone();
+        response.notices.route = self.runner_notice.clone().map(|route| route.into_sink());
         response.notices.items.push(
             crate::subc::runner_notices::notice_templates::Notice::template(
                 crate::subc::runner_notices::notice_templates::CODE_SEARCH,

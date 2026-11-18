@@ -662,7 +662,7 @@ pub struct Response {
     pub data: serde_json::Value,
     /// Delivery decisions are internal and never appear in a tool response.
     #[serde(skip)]
-    pub notices: crate::subc::runner_notices::notice_templates::PendingNotices,
+    pub notices: crate::pending_notices::PendingNotices,
 }
 
 /// Parameters for the `echo` command.

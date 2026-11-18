@@ -1338,7 +1338,10 @@ pub(super) fn finalized_bash_result(
     allow_bg_completions: bool,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
 ) -> ToolCallResult {
-    response.notices.route = format_context.runner_notice.clone();
+    response.notices.route = format_context
+        .runner_notice
+        .clone()
+        .map(|route| route.into_sink());
     crate::subc::runner_notices::notice_templates::deliver(&mut response, None);
     if let Some(hint) = &format_context.bash_code_search_hint {
         let root = ctx.config().project_root.clone().unwrap_or_default();
@@ -1368,7 +1371,10 @@ fn bash_result_from_response(
     mut response: Response,
     format_context: &crate::subc_format::FormatContext,
 ) -> ToolCallResult {
-    response.notices.route = format_context.runner_notice.clone();
+    response.notices.route = format_context
+        .runner_notice
+        .clone()
+        .map(|route| route.into_sink());
     crate::subc::runner_notices::notice_templates::deliver(&mut response, None);
     let mut text =
         crate::subc_format::format_response_with_context("bash", &response, format_context);

@@ -667,7 +667,10 @@ pub(crate) fn finish_tool_call_response(
     finalizer: Option<&FinalizeFn<'_>>,
     mut phase_trace: Option<&mut PhaseTrace>,
 ) -> ToolCallResult {
-    response.notices.route = format_context.runner_notice.clone();
+    response.notices.route = format_context
+        .runner_notice
+        .clone()
+        .map(|route| route.into_sink());
     crate::subc::runner_notices::notice_templates::deliver(&mut response, None);
     if surface_downgraded {
         attach_hashline_downgrade(&mut response);

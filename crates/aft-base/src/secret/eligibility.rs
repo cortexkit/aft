@@ -98,7 +98,7 @@ impl Ineligibility {
 /// eligibility answer is the vault seam's own.
 pub fn alfonso_of_kind(stamp: &subc_protocol::scope::ScopeStamp, kinds: &[ScopeKind]) -> bool {
     stamp.owner_authorized
-        && crate::access_policy::prefrontal::is_principal(&stamp.owner)
+        && crate::prefrontal::is_principal(&stamp.owner)
         && kinds.contains(&stamp.kind)
 }
 

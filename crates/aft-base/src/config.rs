@@ -936,7 +936,7 @@ pub struct DurabilityConfig {
 #[serde(default)]
 pub struct Config {
     /// Machine-local resource profile; only the user config base may select it.
-    pub memory: Option<crate::memory::profile::MemoryMode>,
+    pub memory: Option<crate::memory_profile::MemoryMode>,
     /// User-selected file flush policy; only macOS has a full drive-flush option.
     pub durability: DurabilityConfig,
     /// Existing cache parent; AFT owns only its `aft` namespace. None preserves the storage-root layout.

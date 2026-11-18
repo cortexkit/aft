@@ -8336,11 +8336,8 @@ thread_local! {
 pub(crate) struct RefusalSinkGuard;
 
 #[cfg(test)]
-impl Drop for RefusalSinkGuard {
-    fn drop(&mut self) {
-        REFUSAL_SINK.with(|slot| slot.replace(None));
-    }
-}
+#[path = "gh_shim/refusal_lifetime.rs"]
+mod refusal_lifetime;
 
 /// Records every `refuse` line until the returned guard drops.
 #[cfg(test)]

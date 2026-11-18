@@ -619,19 +619,8 @@ struct Tier2FlightExitGuard<'a> {
     identity: Option<Arc<()>>,
 }
 
-impl Drop for Tier2FlightExitGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(identity) = &self.identity {
-            self.manager.finish_tier2_flight_if_current(
-                &self.key,
-                Some(identity),
-                JobOutcome::Failed {
-                    message: "tier2 reuse worker exited without publishing a result".to_string(),
-                },
-            );
-        }
-    }
-}
+#[path = "manager/flight_lifetime.rs"]
+mod flight_lifetime;
 
 fn cached_tier2_aggregate_usable(
     category: InspectCategory,

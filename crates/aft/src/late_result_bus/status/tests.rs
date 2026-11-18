@@ -18,9 +18,7 @@ fn session(start: u64) -> Sessions {
 }
 
 pub(crate) async fn put_session(session: &str) -> serde_json::Value {
-    let snapshot = SESSIONS
-        .lock()
-        .snapshot()
+    let snapshot = snapshot_segments()
         .into_iter()
         .filter(|(id, _)| id == session)
         .collect();

@@ -4,11 +4,11 @@
     "reason": "Split registry lifecycle and persistence by area pending; AFT crate split lane."
   },
   "crates/aft/src/bash_background/remote_tests.rs": {
-    "lines": 18207,
+    "lines": 18186,
     "reason": "Split remote execution tests by scenario pending; AFT crate split lane."
   },
   "crates/aft/tests/integration/subc_bridge_test.rs": {
-    "lines": 16415,
+    "lines": 16369,
     "reason": "Split bridge integration tests by tool family pending; AFT crate split lane."
   },
   "crates/aft/src/subc/mod.rs": {
@@ -16,11 +16,11 @@
     "reason": "Split daemon orchestration by area pending; AFT crate split lane."
   },
   "crates/aft/src/context.rs": {
-    "lines": 12517,
+    "lines": 11464,
     "reason": "Split workspace context responsibilities pending; AFT crate split lane."
   },
   "crates/aft/src/lsp/manager.rs": {
-    "lines": 11112,
+    "lines": 11109,
     "reason": "Split language-server lifecycle and requests pending; AFT crate split lane."
   },
   "crates/aft/src/sandbox_spawn.rs": {
@@ -28,15 +28,15 @@
     "reason": "Split sandbox spawning by platform pending; AFT crate split lane."
   },
   "crates/aft/src/commands/semantic_search/mod.rs": {
-    "lines": 10781,
+    "lines": 10766,
     "reason": "Split semantic search command responsibilities pending; AFT crate split lane."
   },
   "crates/aft/src/semantic_index.rs": {
     "lines": 10574,
     "reason": "Split semantic indexing by area pending; AFT crate split lane."
   },
-  "crates/aft/src/parser.rs": {
-    "lines": 9955,
+  "crates/aft-parse/src/parser.rs": {
+    "lines": 9943,
     "reason": "Split parser support by language pending; AFT crate split lane."
   },
   "crates/aft/src/gh_shim.rs": {
@@ -48,51 +48,43 @@
     "reason": "Split consent tests by policy scenario pending; AFT crate split lane."
   },
   "crates/aft/tests/integration/inspect_command_test.rs": {
-    "lines": 8027,
+    "lines": 7977,
     "reason": "Split inspect integration tests by diagnostic area pending; AFT crate split lane."
   },
   "crates/aft/src/inspect/scanners/dead_code.rs": {
-    "lines": 7319,
+    "lines": 5057,
     "reason": "Split dead-code analysis by language pending; AFT crate split lane."
   },
   "crates/aft/src/backup.rs": {
-    "lines": 7191,
+    "lines": 7143,
     "reason": "Split backup storage and recovery pending; AFT crate split lane."
   },
   "crates/aft/src/data_layer/checkout.rs": {
     "lines": 6535,
     "reason": "Split checkout lifecycle and storage pending; AFT crate split lane."
   },
-  "crates/aft/src/bash_background/persistence.rs": {
-    "lines": 6415,
-    "reason": "Split background-task persistence responsibilities pending; AFT crate split lane."
-  },
   "crates/aft/src/bash_background/remote.rs": {
-    "lines": 6222,
+    "lines": 6218,
     "reason": "Split remote job transport and lifecycle pending; AFT crate split lane."
   },
   "crates/aft/src/inspect/manager.rs": {
-    "lines": 6057,
+    "lines": 6051,
     "reason": "Split inspection scheduling and coordination pending; AFT crate split lane."
   },
-  "crates/aft/src/callgraph_store/mod.rs": {
-    "lines": 5610,
+  "crates/aft-parse/src/callgraph_store/mod.rs": {
+    "lines": 5528,
     "reason": "Split callgraph storage operations pending; AFT crate split lane."
   },
   "crates/aft/src/commands/inspect.rs": {
-    "lines": 5534,
+    "lines": 5527,
     "reason": "Split inspect command assembly by area pending; AFT crate split lane."
   },
   "crates/aft/src/executor/tests.rs": {
-    "lines": 5301,
+    "lines": 5028,
     "reason": "Split executor tests by command family pending; AFT crate split lane."
   },
   "crates/aft/src/subc/health.rs": {
     "lines": 5568,
     "reason": "Split daemon health monitoring responsibilities pending; AFT crate split lane."
-  },
-  "crates/aft/src/search_index.rs": {
-    "lines": 5020,
-    "reason": "Split search-index maintenance by area pending; AFT crate split lane."
   }
 }

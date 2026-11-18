@@ -259,7 +259,7 @@ pub fn unasked_refusal(
 
 #[path = "access_policy_plugin.rs"]
 pub mod plugin;
-pub mod prefrontal;
+pub use aft_base::prefrontal;
 
 #[path = "access_policy_temp.rs"]
 pub mod temp;

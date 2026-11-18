@@ -84,19 +84,8 @@ impl Drop for BackgroundDocumentPullPause {
     }
 }
 
-impl Drop for DocumentPullWorker {
-    fn drop(&mut self) {
-        if let Some(owner) = self.0.upgrade() {
-            let mut manager = owner.lock();
-            manager.background_pull_running = false;
-            manager.background_pull_inflight = false;
-            for waiter in std::mem::take(&mut manager.background_pull_idle_waiters) {
-                let _ = waiter.send(());
-            }
-            manager.start_background_document_pull_worker();
-        }
-    }
-}
+#[path = "manager/document_pull_lifetime.rs"]
+mod document_pull_lifetime;
 
 fn run_background_document_pulls(owner: Weak<parking_lot::Mutex<LspManager>>) {
     let Some(manager) = owner.upgrade() else {
