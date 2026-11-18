@@ -1,5 +1,5 @@
 //! Decides whether an incremental update is cheaper than a cold build, by
-//! the files it has to work on since the publication: past a tenth of the
+//! the files it has to work on since the call graph was published: past a tenth of the
 //! parsed files (and at least 1,024) the update gives way to a cold build.
 //!
 //! Files are counted in two classes, which the limit counts together and

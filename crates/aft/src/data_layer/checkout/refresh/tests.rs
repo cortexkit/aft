@@ -40,7 +40,7 @@ fn refresh_memory_guard_publishes_the_cold_graph_byte_for_byte() {
 
     std::fs::write(root.path().join("run.go"), "package p\nfunc (T) Run() {}\n").unwrap();
     checkout.record_paths(&[b"run.go".to_vec()]).unwrap();
-    // Admit and start the update, then cross as it works on the first file.
+    // Let the update start, then exceed the simulated ceiling during its first file.
     let guard = RefreshMemory::simulated(1, |files, _| Some(if files > 0 { 2 } else { 0 }));
     let stats = checkout
         .refresh_callgraph_with(false, &guard)
