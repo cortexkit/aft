@@ -11,10 +11,12 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+test_support_visibility! {
 /// The phone's approval window is independent of upstream network deadlines.
 pub(crate) trait ApprovalClock: Send + Sync {
     fn now_ms(&self) -> u64;
     fn deadline(&self) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+}
 }
 struct WallClock;
 impl ApprovalClock for WallClock {

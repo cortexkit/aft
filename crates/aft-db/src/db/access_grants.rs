@@ -762,7 +762,7 @@ mod tests {
             register_agent(&conn, &saved, "rename-agent", true).unwrap();
             set_mode(&conn, &saved, crate::access_policy::ApprovalMode::Ask).unwrap();
             let grant = AccessGrant {
-                path: crate::access_policy::policy_path(dir.path()).join("approved"),
+                path: crate::policy_path::policy_path(dir.path()).join("approved"),
                 kind: GrantKind::Subtree,
                 operation: AccessOperation::Read,
             };

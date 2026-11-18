@@ -99,7 +99,7 @@ pub struct ProxyConfig {
     #[cfg(any(test, feature = "test-support"))]
     pub test_https_port: Option<u16>,
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) approval_clock: Option<Arc<dyn crate::secret::requests::ApprovalClock>>,
+    pub approval_clock: Option<Arc<dyn crate::secret::requests::ApprovalClock>>,
     pub origin: String,
 }
 
