@@ -959,7 +959,8 @@ mod tests {
     #[test]
     fn cortexkit_settings_grants_do_not_open_private_data_or_state() {
         let root = tempfile::tempdir().unwrap();
-        let home = root.path().canonicalize().unwrap();
+        // Policy paths omit the verbatim prefix Windows adds during canonicalization.
+        let home = crate::access_policy::policy_path(root.path());
         let policy = crate::access_policy::AccessPolicy::from_config(
             &crate::config::Config::default(),
             &home.join(".local/share/cortexkit/aft"),
