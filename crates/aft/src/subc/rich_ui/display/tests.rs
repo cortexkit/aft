@@ -166,7 +166,10 @@ fn held_file_completion_excludes_held_time_and_aggregates_actual_changes() {
         "modified",
     );
     f.capture.lock().unwrap().began = Some(Instant::now() - Duration::from_millis(12));
-    handler_ready(Some(&f.key), true);
+    handler_ready(
+        Some(&f.key),
+        &crate::protocol::Response::success("test", json!({})),
+    );
     reply(&f.key, false, false, None);
     let writes = publications();
     assert_eq!(
@@ -885,7 +888,10 @@ fn handler_duration_is_frozen_before_reply_queueing() {
     let f = fixture("edit", "display-handler-duration");
     let _active = enter(Some(&f.key));
     f.capture.lock().unwrap().began = Some(Instant::now() - Duration::from_millis(12));
-    handler_ready(Some(&f.key), true);
+    handler_ready(
+        Some(&f.key),
+        &crate::protocol::Response::success("test", json!({})),
+    );
     let processing = f.capture.lock().unwrap().processing_ms;
     assert!(processing >= 12);
     assert!(f.capture.lock().unwrap().began.is_none());
@@ -922,7 +928,10 @@ fn file_facts_are_frozen_on_the_executor_before_the_reply_is_queued() {
         Some("new\n"),
         "modified",
     );
-    handler_ready(Some(&f.key), true);
+    handler_ready(
+        Some(&f.key),
+        &crate::protocol::Response::success("test", json!({})),
+    );
     f.capture.lock().unwrap().files.clear();
     reply(&f.key, false, false, None);
     let writes = publications();
