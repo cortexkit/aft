@@ -40,8 +40,8 @@ impl ModuleHandler for Peer {
         let request: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(request["method"], self.method);
         fs::write(&self.witness, self.method).unwrap();
-        // Only the attested route and first request matter; neither fake
-        // returns credentials or connects to any downstream service.
+        // The witness records a request after the daemon identified the caller
+        // as AFT. The fake never issues credentials or contacts another service.
         HandlerOutcome::Response(br#"{"result":null}"#.to_vec())
     }
 }
