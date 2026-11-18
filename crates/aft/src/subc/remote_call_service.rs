@@ -183,7 +183,11 @@ impl Service {
             return;
         }
         let Some(body) = body.filter(|body| {
-            body.is_object() && body.get("method").is_none() && route_request_is_tool_call(body)
+            body.is_object()
+                && (body["op"] == "tool.call"
+                    || (body.get("method").is_none()
+                        && body.get("name").is_some_and(Value::is_string)
+                        && route_request_is_tool_call(body)))
         }) else {
             self.jobs.spawn(async move {
                 edge.error(&frame, tool_unavailable()).await;
@@ -240,8 +244,8 @@ impl Service {
             let mode = body
                 .get("name")
                 .and_then(Value::as_str)
-                .and_then(dispatch::read_operation)
-                .map(|_| "read");
+                .and_then(dispatch::requested_mode)
+                .map(|mode| mode.as_str());
             let folder = {
                 let record = record.clone();
                 blocking(move || {
@@ -392,7 +396,7 @@ impl Edge {
                     ledger::Admission::Repeat(row) => row.frame.map(Admission::Replay).ok_or_else(|| {
                         ErrorBody::new("call_in_progress", "This remote call is already in progress.")
                     }),
-                    ledger::Admission::Conflict => Err(ErrorBody::new("call_key_conflict", "This call key already names a different call.")),
+                    ledger::Admission::Conflict => Err(errors::invalid_request("call_key", "key already names different content or scope")),
                 }
             }).await
         };

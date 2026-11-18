@@ -1,6 +1,7 @@
 //! The remote read allowlist is independent of the local and confined catalogs.
 
 use super::*;
+use crate::context::confinement;
 use crate::db::remote_grant_rows::Mode;
 use cortexkit_role_tool_provider::call::ToolCallRequest;
 use cortexkit_role_tool_provider::errors;
@@ -16,6 +17,17 @@ pub(super) fn read_operation(wire_name: &str) -> Option<&'static str> {
         "aft_callgraph" => Some("callgraph"),
         "ast_grep_search" => Some("ast_search"),
         "aft_conflicts" => Some("conflicts"),
+        _ => None,
+    }
+}
+
+pub(super) fn requested_mode(wire_name: &str) -> Option<Mode> {
+    if read_operation(wire_name).is_some() {
+        return Some(Mode::Read);
+    }
+    match crate::tool_gate::canonical_tool_name(wire_name)? {
+        "write" | "edit" | "apply_patch" | "aft_delete" | "aft_move" | "aft_import"
+        | "ast_grep_replace" | "bash" => Some(Mode::ReadWrite),
         _ => None,
     }
 }
@@ -53,7 +65,8 @@ impl Read {
             arguments: call.arguments,
             context,
         };
-        crate::confinement::with_root(ctx, &read.context.request_id, || {
+        let _config = ctx.pin_config();
+        confinement::with_root(ctx, &read.context.request_id, || {
             read.check(ctx)?;
             let format = read.format();
             let prepared = prepare_tool_call(
@@ -102,13 +115,22 @@ impl Read {
             .session_id
             .as_deref()
             .expect("remote file-tool session");
-        crate::confinement::preflight(ctx, id, session, &self.arguments)?;
-        if let Some(paths) = self.arguments.get("paths") {
-            crate::confinement::preflight(ctx, id, session, &json!({"path": paths}))?;
+        confinement::preflight(ctx, id, session, &self.arguments)?;
+        for operand in ["paths", "toPath"] {
+            if let Some(paths) = self.arguments.get(operand) {
+                confinement::preflight(ctx, id, session, &json!({"path": paths}))?;
+            }
+        }
+        if self.operation == "grep" {
+            if let Some(path) = self.arguments["path"].as_str() {
+                let paths =
+                    crate::subc_translate::split_search_path_arg(&self.context.project_root, path);
+                confinement::preflight(ctx, id, session, &json!({"path": paths}))?;
+            }
         }
         if let Some(batch) = self.arguments["batch"].as_array() {
             for item in batch {
-                crate::confinement::preflight(ctx, id, session, item)?;
+                confinement::preflight(ctx, id, session, item)?;
             }
         }
         Ok(())
@@ -122,7 +144,7 @@ impl Read {
         let _config = ctx.pin_config();
         let format = self.format();
         let id = self.context.request_id.clone();
-        crate::confinement::with_root(ctx, &id, || {
+        confinement::with_root(ctx, &id, || {
             // Consent and scheduling may have delayed this call. Recheck the
             // current path and tool policy immediately before dispatch.
             self.check(ctx)?;

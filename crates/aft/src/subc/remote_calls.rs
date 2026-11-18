@@ -186,3 +186,6 @@ async fn enumerate(
 #[cfg(test)]
 #[path = "remote_calls_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "remote_wire_tests.rs"]
+mod wire_tests;
