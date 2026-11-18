@@ -340,7 +340,7 @@ fn target_files(directory: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::callgraph_store_adapter::{
+    use crate::data_layer::callgraph_store_adapter::{
         impact_result, trace_to_result, StoreTraceToResult,
     };
     use crate::data_layer::query::{MemorySlices, SliceReader};

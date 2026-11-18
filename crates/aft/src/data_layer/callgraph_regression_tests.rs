@@ -344,7 +344,7 @@ fn callgraph_callback_references_are_labelled_in_ts_js_and_rust() {
         assert_eq!(reverse_trace.paths.len(), 1);
         assert_eq!(
             reverse_trace.paths[0].root,
-            crate::commands::callgraph_roots::RootKind::NoCallerFound
+            crate::data_layer::callgraph_roots::RootKind::NoCallerFound
         );
         assert_eq!(reverse_trace.paths[0].hops.len(), 1);
         assert_eq!(reverse_trace.paths[0].hops[0].symbol, "transform");
@@ -631,7 +631,7 @@ fn adapter_call_tree_shares_store_node_budget_and_gap() {
     }
     source.push_str("function layer14() {}\n");
     let (dir, store) = fixture(&[("main.ts", &source)]);
-    let tree = crate::commands::callgraph_store_adapter::call_tree_result(
+    let tree = crate::data_layer::callgraph_store_adapter::call_tree_result(
         &store.callgraph(),
         Path::new("main.ts"),
         "layer0",
@@ -639,7 +639,7 @@ fn adapter_call_tree_shares_store_node_budget_and_gap() {
         true,
     )
     .unwrap();
-    fn count(node: &crate::commands::callgraph_store_adapter::StoreCallTreeNode) -> usize {
+    fn count(node: &crate::data_layer::callgraph_store_adapter::StoreCallTreeNode) -> usize {
         1 + node.children.iter().map(count).sum::<usize>()
     }
     assert!(count(&tree) <= 1000);

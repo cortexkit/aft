@@ -3805,7 +3805,7 @@ impl Checkout {
             .view()
             .ok_or_else(|| DataError::Resolve("nothing is published".to_string()))?;
         for (target, symbol) in targets {
-            let callers = crate::commands::callgraph_store_adapter::callers_result(
+            let callers = crate::data_layer::callgraph_store_adapter::callers_result(
                 &view.callgraph(),
                 &view.root().join(target),
                 symbol,
@@ -4613,7 +4613,7 @@ impl CheckoutView {
     /// produced, or the error text.
     #[doc(hidden)]
     pub fn probe_query(&self, command: &str, file: &str, symbol: &str) -> Result<usize, String> {
-        use crate::commands::callgraph_store_adapter as adapter;
+        use crate::data_layer::callgraph_store_adapter as adapter;
         let graph = self.callgraph();
         let path = self.published.root.join(file);
         match command {
@@ -6635,7 +6635,7 @@ mod tests {
         // Resolved callers only: `callers` also lists unresolved call sites
         // that merely share the name, and those would make a negative check
         // ("main.ts is not a caller yet") match on the candidate list.
-        let callers = crate::commands::callgraph_store_adapter::callers_result(
+        let callers = crate::data_layer::callgraph_store_adapter::callers_result(
             &view.callgraph(),
             &view.root().join(file),
             symbol,
@@ -6708,7 +6708,7 @@ mod tests {
     /// share stays unresolved.
     #[test]
     fn forward_queries_follow_macro_template_calls_by_name() {
-        use crate::commands::callgraph_store_adapter as adapter;
+        use crate::data_layer::callgraph_store_adapter as adapter;
         let root = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
         write(
@@ -7407,7 +7407,7 @@ pub fn other() { callee(); }
     fn legacy_restart(stamp: Option<&str>) {
         fn answers(view: &CheckoutView) -> (String, String) {
             let callers = callers_of(view, "p/stop.go", "Stop");
-            let tree = crate::commands::callgraph_store_adapter::call_tree_result(
+            let tree = crate::data_layer::callgraph_store_adapter::call_tree_result(
                 &view.callgraph(),
                 &view.root().join("p/use.go"),
                 "Use",

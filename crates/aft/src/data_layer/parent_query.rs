@@ -323,7 +323,7 @@ pub(crate) fn grep_fan_out(
                 );
                 if let Some(reason) = result.index_read_gaps.first() {
                     gaps.child(&child, reason.clone());
-                } else if let Some(reason) = crate::commands::grep::walk_coverage_note(&result) {
+                } else if let Some(reason) = crate::grep_executor::walk_coverage_note(&result) {
                     gaps.child(&child, reason);
                 } else if result.skipped_foreign_mounts > 0 {
                     gaps.child(&child, format!(

@@ -334,7 +334,7 @@ pub fn run(root: &Path, threads: usize, sample: usize) -> Result<Value, String> 
         .map(|index| symbols[index * step].clone())
         .collect::<Vec<_>>();
 
-    use crate::commands::callgraph_store_adapter as adapter;
+    use crate::data_layer::callgraph_store_adapter as adapter;
     let mut by_op = BTreeMap::<&str, Samples>::new();
     for pass in ["cold", "warm"] {
         let reader = open()?;

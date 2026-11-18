@@ -14,6 +14,9 @@ use rayon::prelude::*;
 
 pub(crate) mod git_exclude;
 pub mod multi_path;
+mod walk_coverage;
+
+pub(crate) use walk_coverage::{plural, walk_coverage_note};
 
 use self::multi_path::{
     canonical_key, dedupe_nested_paths, resolve_path_or_multi, SearchPathResolution,
@@ -4292,7 +4295,7 @@ mod tests {
             },
         )
         .text;
-        if let Some(note) = crate::commands::grep::walk_coverage_note(result) {
+        if let Some(note) = super::walk_coverage_note(result) {
             text.push_str("\n\n");
             text.push_str(&note);
         }

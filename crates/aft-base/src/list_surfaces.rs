@@ -1292,7 +1292,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     // the agent pages through: it states how many mentions exist (or that the
     // count is a lower bound) and says how many of them it spells out.
     ExclusionEntry {
-        file: "commands/callgraph_store_adapter.rs",
+        file: "data_layer/callgraph_store_adapter.rs",
         enclosing_item: "unanalyzed_macro_note",
         location_or_primitive: "macro note site truncate",
         reason: "summary line under the callers list that carries its own count and 'shown N of M' wording; the callers list itself keeps its envelope",

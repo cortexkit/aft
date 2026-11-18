@@ -10,8 +10,8 @@ use crate::callgraph_store::{
     CallGraphRead, CallGraphStoreError, StoreCallSite, StoreNode, StoreUnresolvedCall,
     MACRO_BODY_CALL_REF_KIND, MACRO_MENTION_REF_KIND, UNRESOLVED_CALL_SITE_COUNT_LIMIT,
 };
-use crate::commands::callgraph_roots::{RootKind, RootTally, Roots};
 use crate::context::{AppContext, CallgraphStoreAccess};
+use crate::data_layer::callgraph_roots::{RootKind, RootTally, Roots};
 use crate::edit::line_col_to_byte;
 use crate::error::AftError;
 use crate::feature_status::{cause, IndexObservation};
@@ -30,15 +30,12 @@ pub use crate::list_surfaces::callgraph as callgraph_surface;
 pub use callgraph_surface::*;
 
 const TRACE_DATA_RESOLVER_PROVENANCE: &str = "treesitter+resolver";
-// The agent only receives 15 representative paths once a trace becomes a hub. A
-// 10k expansion budget leaves ample room for ordinary traces while preventing a
+// A hub trace includes only 15 representative paths in the response. A 10k
+// expansion budget leaves ample room for ordinary traces while preventing a
 // layered call graph from unfolding millions of path prefixes synchronously.
 const TRACE_TO_EXPANSION_BUDGET: usize = 10_000;
 // Count examined caller sites, including boundary checks, not symbols: one
-// hub can have thousands of callers before the walk advances a level. At 10k,
-// pinned VS Code's isString and isBoolean return in under two seconds in a
-// release probe without link-time optimization; validateConstraints and upcast need 12 and
-// 42 sites and retain their complete, byte-identical answers.
+// hub can have thousands of callers before the walk advances a level.
 const IMPACT_EXPANSION_BUDGET: usize = 10_000;
 const IMPACT_BUDGET_NOTE: &str = "traversal capped";
 const TRACE_TO_RETAINED_PATH_LIMIT: usize = HUB_SUMMARY_LIMIT * 4;
@@ -747,10 +744,9 @@ pub fn callers_result(
     };
     let shown = visible_sites.len();
 
-    // `total_callers` is a legacy JSON field consumers read as the pre-filter
-    // count (hidden test callers included); it stays that way. The
-    // requested-domain count the agent sees lives in the envelope, and the
-    // text heading renders from the envelope when one is present.
+    // Keep the pre-filter count (including test callers) in the legacy JSON
+    // field. The envelope holds the count after test filtering; the text
+    // heading uses the envelope when present.
     let total_callers = pre_filter_count;
 
     // Omit hub_summary when test filtering changes the caller count to avoid contradictory summary figures in the JSON output.
@@ -1858,8 +1854,8 @@ fn trace_data_inner(
         .ok_or_else(|| CallGraphStoreError::StaleFiles(vec![rel_file.clone()]))?;
     let current_calls = trace_forward_calls_for_nodes(store, &current.nodes)?;
 
-    // Keep the legacy value-flow posture: parse the current source for body walks
-    // and use the store only for cross-hop call facts.
+    // Parse the current source for body walks and use the store only for
+    // cross-hop call facts.
     let Some(facts) = files.load(file)? else {
         return Ok(());
     };

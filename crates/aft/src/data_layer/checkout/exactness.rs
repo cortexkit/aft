@@ -391,7 +391,7 @@ fn queries(
     reference: Option<&Path>,
     sample: usize,
 ) -> GateResult<()> {
-    use crate::commands::callgraph_store_adapter as adapter;
+    use crate::data_layer::callgraph_store_adapter as adapter;
     let view = checkout.view().ok_or("no published view")?;
     let plan: Vec<QuerySpec> = if let Some(reference) = reference {
         serde_json::from_slice(&std::fs::read(reference.join("plan.json"))?)?

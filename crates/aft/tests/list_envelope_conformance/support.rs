@@ -2689,7 +2689,7 @@ fn surface_matches_file(command: &str, file: &str) -> bool {
     match command {
         "grep" => file == "commands/grep.rs" || file == "subc_format.rs",
         "glob" => file == "commands/glob.rs" || file == "subc_format.rs",
-        "callgraph" => file == "commands/callgraph_store_adapter.rs" || file == "subc_format.rs",
+        "callgraph" => file == "data_layer/callgraph_store_adapter.rs" || file == "subc_format.rs",
         "search" => {
             file == "commands/semantic_search/mod.rs"
                 || file == "commands/semantic_search/exact_lane.rs"

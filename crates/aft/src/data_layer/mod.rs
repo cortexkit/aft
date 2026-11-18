@@ -3,6 +3,8 @@
 //! stored records.
 
 pub mod callgraph;
+pub mod callgraph_roots;
+pub mod callgraph_store_adapter;
 pub mod checkout;
 pub mod checkout_gate;
 pub mod content;

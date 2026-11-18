@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::context::AppContext;
 use crate::file_kind::{ContentKind, FileKind, FileKindCache};
-use crate::grep_executor::{self, GrepParams};
+use crate::grep_executor::{self, plural, walk_coverage_note, GrepParams};
 use crate::pattern_compile::{self, CompileOpts, CompileResult};
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
@@ -739,39 +739,6 @@ fn walk_bound_phrase(bound: WalkBound) -> String {
         WalkBound::FileLimit(limit) => format!("the walk's {limit}-file limit"),
         WalkBound::Cancelled => "the request was cancelled".to_string(),
     }
-}
-
-/// A note spelling out what an incomplete fallback walk left unsearched and
-/// how to get an exhaustive answer, or `None` when the walk reached every
-/// file (or no walk ran).
-pub(crate) fn walk_coverage_note(result: &GrepResult) -> Option<String> {
-    let bound = result.walk_bound?;
-    let files = result.files_read_directly;
-    let index = match result.index_status {
-        IndexStatus::Ready => "index ready",
-        IndexStatus::Building => "index building",
-        IndexStatus::Fallback => "index not used",
-        IndexStatus::Disabled => "index disabled",
-    };
-    let exhaustive = if result.index_status == IndexStatus::Building {
-        "For an exhaustive search, narrow with path or include so the walk reaches every file, or retry once the index is ready (an index search reads every indexed file)."
-    } else {
-        "For an exhaustive search, narrow with path or include so the walk reaches every file."
-    };
-    let checked = match bound {
-        WalkBound::FileLimit(limit) => format!(
-            "checked {files} of more than {limit} files ({index}); the fallback walk stops at {limit} files, so files past that limit were not searched and matches may be missing."
-        ),
-        WalkBound::TimeBudget => format!(
-            "checked {} ({index}); the fallback walk ran out of its time budget before reaching every file, so files it did not reach were not searched and matches may be missing.",
-            plural(files, "file")
-        ),
-        WalkBound::Cancelled => format!(
-            "checked {} ({index}); the request was cancelled before the fallback walk reached every file, so matches may be missing.",
-            plural(files, "file")
-        ),
-    };
-    Some(format!("({checked} {exhaustive})"))
 }
 
 /// Cut a matching line at `GREP_MAX_LINE_CHARS` characters and mark the cut.
@@ -1534,14 +1501,6 @@ fn shared_dotted_suffix(names: &[String]) -> String {
         .find('.')
         .map(|dot| shared[dot..].to_string())
         .unwrap_or_default()
-}
-
-fn plural(count: usize, word: &str) -> String {
-    if count == 1 {
-        format!("{count} {word}")
-    } else {
-        format!("{count} {word}s")
-    }
 }
 
 /// Whether an `include` value asks for a counted file: some pattern's last
