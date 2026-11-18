@@ -217,7 +217,7 @@ async fn scope_watch_end_kills_only_after_confirmation_and_live_rebind_kills_not
     );
     drop(conn);
     assert!(
-        !crate::db::gh_speech::Store::new(dir.path().join("aft.db"))
+        !crate::gh_shim_speech::store::Store::new(dir.path().join("aft.db"))
             .scope_ended(&scope)
             .unwrap(),
         "ordinary cleanup must not mint an epoch-mismatched speech authority proof"

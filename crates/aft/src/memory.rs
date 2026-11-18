@@ -1,7 +1,5 @@
 pub mod profile;
 pub use aft_base::memory::*;
-#[cfg(test)]
-use std::collections::BTreeMap;
 
 #[cfg(test)]
 #[allow(unused_imports)]

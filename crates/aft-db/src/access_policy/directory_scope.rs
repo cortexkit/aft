@@ -48,6 +48,7 @@ pub fn worker_read_scope(grant: &AccessGrant) -> AccessGrant {
     }
 }
 
+test_support_visibility! {
 pub(crate) fn repository_scope_with(
     directory: &Path,
     eligible: impl Fn(&Path) -> bool,
@@ -65,6 +66,7 @@ pub(crate) fn repository_scope_with(
         }
     }
     None
+}
 }
 
 pub(crate) const DIRECTORY_SCOPE_PROBE_BUDGET: Duration = Duration::from_millis(250);
@@ -320,6 +322,7 @@ pub(crate) fn probe_directory_scope_with(
     probe_directory_scope_at_home(parent, &home, root_alias_check)
 }
 
+test_support_visibility! {
 pub(crate) fn probe_directory_scope_at_home(
     parent: &Path,
     home: &Path,
@@ -353,6 +356,7 @@ pub(crate) fn probe_directory_scope_at_home(
         return Ok(false);
     }
     Ok(true)
+}
 }
 
 #[rustfmt::skip]

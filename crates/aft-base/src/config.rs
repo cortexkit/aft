@@ -33,7 +33,7 @@ pub const MAX_BASH_WATCH_SYNC_MAX_MS: u64 = 1_800_000;
 /// decides whether to wait again or kill the command, so a stuck command can
 /// never hold a worker for longer than this.
 pub const DEFAULT_BASH_WORKER_WAIT_MAX_MS: u64 = 1_800_000;
-pub(crate) const DEFAULT_LINUX_SCOPE_MAX_RUNTIME_SECS: u64 = 86_400;
+pub const DEFAULT_LINUX_SCOPE_MAX_RUNTIME_SECS: u64 = 86_400;
 /// Smallest accepted `bash.worker_wait_max_ms`. A shorter limit would make a
 /// worker re-wait (and re-read its whole context) every few seconds; a value
 /// below it is a config error rather than a silent clamp.

@@ -1114,7 +1114,7 @@ impl PinnedDir {
     }
 
     #[cfg(unix)]
-    fn unix_entries(&self) -> io::Result<DirectoryEntries> {
+    pub fn unix_entries(&self) -> io::Result<DirectoryEntries> {
         let dot = b".\0";
         let fresh = unsafe {
             libc::openat(
@@ -1640,7 +1640,7 @@ pub(crate) struct IdentityCensus {
 /// Owns a fresh stream opened relative to a pinned directory, so traversal does
 /// not depend on a pathname staying attached to the same directory.
 #[cfg(unix)]
-struct DirectoryEntries {
+pub struct DirectoryEntries {
     directory: *mut libc::DIR,
     #[cfg(any(test, feature = "test-support"))]
     emitted: usize,

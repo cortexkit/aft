@@ -172,18 +172,23 @@ impl FleetStatusInner {
     }
 }
 
+test_support_visibility! {
 /// A holder route the status dial will not open again for one session,
 /// because the holder (or the daemon) refused the open with a code that
 /// subc-protocol classes as terminal: asking again gets the same answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StoppedRoute {
     target: String,
+    #[cfg(any(test, feature = "test-support"))]
+    pub session: String,
+    #[cfg(not(any(test, feature = "test-support")))]
     session: String,
     harness: String,
     project_root: String,
     code: String,
     message: String,
     stopped_at_unix_ms: u64,
+}
 }
 
 impl StoppedRoute {
@@ -596,6 +601,7 @@ async fn run_fleet_status_dial(
 // Keep the dial's discovery and publish loop identical for the real transport and
 // the clock-driven test consumer; the latter can return actual bind errors.
 test_support_visibility! {
+#[cfg_attr(any(test, feature = "test-support"), allow(async_fn_in_trait))]
 trait StatusConsumer {
     type Route;
     type CatalogWatch: StatusCatalogWatch;
@@ -621,6 +627,7 @@ trait StatusConsumer {
 }
 
 test_support_visibility! {
+#[cfg_attr(any(test, feature = "test-support"), allow(async_fn_in_trait))]
 trait StatusCatalogWatch {
     async fn next_generation(&mut self) -> Result<Option<u64>, String>;
 }

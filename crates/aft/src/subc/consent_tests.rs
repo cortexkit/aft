@@ -3619,7 +3619,7 @@ fn worker_read_repository_scope_home_repository_falls_back_to_folder() {
     let _lock = CONSENT_TEST_LOCK.blocking_lock();
     let _probe = DirectoryScopeProbeBudgetOverride::generous();
     let dir = tempfile::tempdir().unwrap();
-    let outer = crate::access_policy::policy_path(dir.path());
+    let outer = crate::policy_path::policy_path(dir.path());
     let home = outer.join("home");
     let parent = home.join("project/src");
     std::fs::create_dir_all(&parent).unwrap();
@@ -3647,7 +3647,7 @@ fn worker_read_repository_scope_without_repository_keeps_folder() {
     let _lock = CONSENT_TEST_LOCK.blocking_lock();
     let _probe = DirectoryScopeProbeBudgetOverride::generous();
     let dir = tempfile::tempdir().unwrap();
-    let parent = crate::access_policy::policy_path(&dir.path().join("plain/src"));
+    let parent = crate::policy_path::policy_path(&dir.path().join("plain/src"));
     std::fs::create_dir_all(&parent).unwrap();
     assert_eq!(repository_scope_with(&parent, |_| true), None);
     let grant = AccessGrant {
@@ -3666,7 +3666,7 @@ fn worker_read_repository_scope_nested_submodule_uses_its_git_file() {
     let _lock = CONSENT_TEST_LOCK.blocking_lock();
     let _probe = DirectoryScopeProbeBudgetOverride::generous();
     let dir = tempfile::tempdir().unwrap();
-    let repo = crate::access_policy::policy_path(&dir.path().join("repo"));
+    let repo = crate::policy_path::policy_path(&dir.path().join("repo"));
     let submodule = repo.join("modules/inner");
     std::fs::create_dir_all(submodule.join("src")).unwrap();
     std::fs::create_dir(repo.join(".git")).unwrap();
@@ -3689,7 +3689,7 @@ fn worker_read_repository_scope_still_denies_protected_and_configured_paths() {
     let _lock = CONSENT_TEST_LOCK.blocking_lock();
     let _probe = DirectoryScopeProbeBudgetOverride::generous();
     let dir = tempfile::tempdir().unwrap();
-    let repo = crate::access_policy::policy_path(&dir.path().join("repo"));
+    let repo = crate::policy_path::policy_path(&dir.path().join("repo"));
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::create_dir(repo.join(".git")).unwrap();
     let scope = worker_read_scope(&AccessGrant {
