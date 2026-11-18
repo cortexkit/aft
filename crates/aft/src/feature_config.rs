@@ -26,6 +26,8 @@
 use std::collections::BTreeSet;
 
 use serde_json::{Map, Value};
+
+pub(crate) mod settings_shape;
 use sha2::{Digest, Sha256};
 
 /// Every agent-visible tool name a registration adapter may publish, in
@@ -1115,17 +1117,26 @@ pub fn translate_document(map: &mut Map<String, Value>, tier: DocumentTier) -> D
     let mut out = DocumentTranslation::default();
     translate_runon_enabled(map, tier, "", &mut out);
     translate_block(map, tier == DocumentTier::User, "base", &mut out);
+    translate_shapes(map, "", &mut out);
     if let Some(Value::Object(harnesses)) = map.get_mut("harnesses") {
         for (name, block) in harnesses.iter_mut() {
             if let Value::Object(block) = block {
                 translate_runon_enabled(block, tier, &format!("harnesses.{name}."), &mut out);
                 translate_block(block, false, &format!("harnesses.{name}"), &mut out);
+                translate_shapes(block, &format!("harnesses.{name}."), &mut out);
             }
         }
     }
     out.retired_keys.sort();
     out.retired_keys.dedup();
     out
+}
+
+fn translate_shapes(map: &mut Map<String, Value>, prefix: &str, out: &mut DocumentTranslation) {
+    for edit in settings_shape::edits(map) {
+        record_retired(out, prefix, edit.notice);
+        edit.apply(map);
+    }
 }
 
 /// The retired bash gate was user-only. Projects drop it without changing

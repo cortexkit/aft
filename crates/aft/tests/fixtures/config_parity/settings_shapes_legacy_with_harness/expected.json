@@ -1,0 +1,44 @@
+{
+  "aft_search_registered": true,
+  "bash": {
+    "enabled": true
+  },
+  "disabled_tools": [
+    "aft_delete",
+    "aft_move"
+  ],
+  "experimental_bash_background": true,
+  "experimental_bash_compress": true,
+  "experimental_bash_rewrite": true,
+  "indexes": {
+    "callgraph": true,
+    "semantic": true,
+    "trigram": true
+  },
+  "inspect": {
+    "duplicates": {
+      "expected_mirrors": [
+        [
+          "app/**",
+          "mirror/**"
+        ]
+      ]
+    }
+  },
+  "lsp_idle_shutdown": false,
+  "lsp_servers": [
+    {
+      "args": [],
+      "disabled": false,
+      "id": "rust",
+      "initialization_options": {
+        "checkOnSave": true,
+        "value": null
+      },
+      "root_markers": [
+        ".git"
+      ]
+    }
+  ],
+  "restrict_to_project_root": false
+}

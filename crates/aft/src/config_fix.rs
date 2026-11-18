@@ -166,6 +166,13 @@ fn migrate_block(
     notes: &mut Vec<String>,
 ) -> Result<(), String> {
     let label = block_label(prefix);
+    for edit in feature_config::settings_shape::edits(raw) {
+        let path: Vec<_> = prefix.iter().chain(&edit.path).cloned().collect();
+        match edit.value {
+            Some(value) => doc.set(&path, &value)?,
+            None => doc.remove(&path)?,
+        }
+    }
     if let Some(profile) = translated
         .get("sandbox")
         .and_then(|sandbox| sandbox.get("profile"))

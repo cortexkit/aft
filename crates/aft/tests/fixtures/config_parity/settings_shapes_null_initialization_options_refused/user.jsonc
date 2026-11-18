@@ -1,0 +1,9 @@
+{
+  "lsp": {
+    "servers": {
+      "rust": {
+        "initialization_options": null
+      }
+    }
+  }
+}

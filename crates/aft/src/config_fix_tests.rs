@@ -1131,3 +1131,71 @@ fn automatic_user_rewrite_moves_idle_checkout_hours_but_keeps_removed_keys() {
     assert_eq!(std::fs::read_to_string(&removed_only).unwrap(), input);
     assert!(backups(dir.path()).len() == 1, "{:?}", backups(dir.path()));
 }
+
+#[test]
+fn settings_shapes_rewrite_user_with_backup_and_project_with_notice() {
+    use serde_json::json;
+
+    let temp = tempfile::tempdir().unwrap();
+    let user = temp.path().join("aft.jsonc");
+    let legacy = r#"{
+        // Keep this note.
+        "bash": false,
+        "lsp": {"idle_minutes": "never", "servers": {"rust": {"initialization_options": {"checkOnSave": true, "other": null}}}},
+        "inspect": {"duplicates": {"expected_mirrors": [["src/**", "mirror/**"]]}},
+        "harnesses": {"pi": {"bash": true}}
+    }"#;
+    std::fs::write(&user, legacy).unwrap();
+    let Some(UserConfigMigration::Migrated { backup, notice, .. }) =
+        auto_migrate_user_config(&user)
+    else {
+        panic!("the user file should be rewritten");
+    };
+    assert_eq!(std::fs::read_to_string(backup).unwrap(), legacy);
+    let migrated = std::fs::read_to_string(&user).unwrap();
+    assert!(migrated.contains("// Keep this note."));
+    let migrated: Value = serde_json::from_str(&crate::jsonc::strip_jsonc(&migrated)).unwrap();
+    assert_eq!(migrated["bash"], json!({"enabled": false}));
+    assert_eq!(
+        migrated["harnesses"]["pi"]["bash"],
+        json!({"enabled": true,"rewrite": true,"compress": true,"background": true})
+    );
+    assert_eq!(migrated["lsp"]["idle_shutdown"], false);
+    assert!(!migrated["lsp"]
+        .as_object()
+        .unwrap()
+        .contains_key("idle_minutes"));
+    assert_eq!(
+        migrated["inspect"]["duplicates"]["expected_mirrors"],
+        json!([{"source":"src/**","mirror":"mirror/**"}])
+    );
+    let options: Value = serde_json::from_str(
+        migrated["lsp"]["servers"]["rust"]["initialization_options"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(options, json!({"checkOnSave": true, "other": null}));
+    assert!(auto_migrate_user_config(&user).is_none());
+
+    let mut project: Value = serde_json::from_str(&crate::jsonc::strip_jsonc(legacy)).unwrap();
+    let translated = feature_config::translate_document(
+        project.as_object_mut().unwrap(),
+        feature_config::DocumentTier::Project,
+    );
+    assert_eq!(project, migrated);
+    let project_notice =
+        feature_config::project_retired_keys_notice("/project/.cortexkit/aft.jsonc", &translated);
+    for replacement in [
+        "bash.enabled",
+        "lsp.idle_shutdown",
+        "source and mirror objects",
+        "initialization_options → JSON text",
+    ] {
+        assert!(notice.contains(replacement), "user: {notice}");
+        assert!(
+            project_notice.contains(replacement),
+            "project: {project_notice}"
+        );
+    }
+}

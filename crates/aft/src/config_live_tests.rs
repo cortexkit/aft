@@ -245,16 +245,13 @@ fn inspect_categories_and_lsp_idle_reload_without_restart() {
         r#"{"lsp":{"idle_minutes":"never","max_servers":3},"inspect":{"categories":{"dead_code":false,"todos":false}}}"#,
     );
     let outcome = fixture.reload();
-    assert!(applied(&outcome).contains(&"lsp.idle_minutes"));
+    assert!(applied(&outcome).contains(&"lsp.idle_shutdown"));
     assert!(applied(&outcome).contains(&"lsp.max_servers"));
     assert_eq!(fixture.ctx.config().lsp_max_servers, 3);
     assert_eq!(fixture.ctx.config().lsp_user_max_servers, Some(3));
     assert!(applied(&outcome).contains(&"inspect.categories"));
     assert!(deferred(&outcome).is_empty());
-    assert_eq!(
-        fixture.ctx.config().lsp_idle_minutes,
-        crate::config::LspIdleMinutes::Never
-    );
+    assert!(!fixture.ctx.config().lsp_idle_shutdown);
     fixture.ctx.update_status_bar_todos(Some(4));
     let counts = fixture.ctx.status_bar_count_values();
     assert!(counts.disabled_categories.contains(&"dead_code"));
@@ -265,10 +262,8 @@ fn inspect_categories_and_lsp_idle_reload_without_restart() {
     );
     let outcome = fixture.reload();
     assert!(applied(&outcome).contains(&"lsp.idle_minutes"));
-    assert_eq!(
-        fixture.ctx.config().lsp_idle_minutes,
-        crate::config::LspIdleMinutes::Minutes(5)
-    );
+    assert_eq!(fixture.ctx.config().lsp_idle_minutes, 5);
+    assert!(fixture.ctx.config().lsp_idle_shutdown);
     assert!(fixture.ctx.config().inspect.categories.dead_code);
     assert!(!fixture
         .ctx

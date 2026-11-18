@@ -8390,6 +8390,7 @@ fn initialization_options_for_spawn(
     server_root: &Path,
     config: &Config,
 ) -> Result<Option<serde_json::Value>, LspError> {
+    config.check_lsp_initialization_options(def.kind.id_str())?;
     if def.kind == ServerKind::Rust {
         // Cargo holds its target directory lock throughout a check, including
         // time spent waiting for compiler resources. Isolate analyzer checks
@@ -8405,7 +8406,6 @@ fn initialization_options_for_spawn(
     if def.kind != ServerKind::Astro {
         return Ok(def.initialization_options.clone());
     }
-
     if def
         .initialization_options
         .as_ref()
@@ -13119,6 +13119,32 @@ exit 1
 #[cfg(test)]
 mod rust_initialization_options_tests {
     use super::*;
+
+    #[test]
+    fn invalid_initialization_json_refuses_only_that_server_before_spawn() {
+        let result = crate::config_resolve::resolve_config(&[crate::config_resolve::ConfigTier {
+            tier: "user".into(), source: "fixture".into(),
+            doc: r#"{"lsp":{"servers":{"rust":{"initialization_options":"{ private-canary"},"go":{"initialization_options":"{\"gofumpt\":true}"}}}}"#.into(),
+        }]);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let root = tempfile::tempdir().unwrap();
+        for (file, kind) in [("lib.rs", ServerKind::Rust), ("main.go", ServerKind::Go)] {
+            let source = root.path().join(file);
+            let server = super::super::registry::servers_for_file(&source, &result.config)
+                .into_iter()
+                .find(|server| server.kind == kind)
+                .unwrap();
+            let options =
+                initialization_options_for_spawn(&server, &source, root.path(), &result.config);
+            if kind == ServerKind::Rust {
+                let refusal = options.unwrap_err().to_string();
+                assert_eq!(refusal, "server not ready: lsp.servers.rust.initialization_options must contain valid JSON text");
+                assert!(!refusal.contains("private-canary"));
+            } else {
+                assert_eq!(options.unwrap().unwrap()["gofumpt"], true);
+            }
+        }
+    }
 
     #[test]
     fn rust_target_dir_default_preserves_configured_options() {

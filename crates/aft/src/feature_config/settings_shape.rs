@@ -1,0 +1,136 @@
+use serde_json::{json, Map, Value};
+
+pub(crate) struct Edit {
+    pub(crate) path: Vec<String>,
+    pub(crate) value: Option<Value>,
+    pub(crate) notice: &'static str,
+}
+
+impl Edit {
+    fn at(path: &[&str], value: Option<Value>, notice: &'static str) -> Self {
+        Self {
+            path: path.iter().map(|part| (*part).into()).collect(),
+            value,
+            notice,
+        }
+    }
+
+    pub(super) fn apply(self, block: &mut Map<String, Value>) {
+        let (key, parents) = self.path.split_last().expect("settings edit has a path");
+        let mut parent = block;
+        for part in parents {
+            parent = parent
+                .get_mut(part)
+                .and_then(Value::as_object_mut)
+                .expect("settings edit's parent exists");
+        }
+        match self.value {
+            Some(value) => {
+                parent.insert(key.clone(), value);
+            }
+            None => {
+                parent.remove(key);
+            }
+        }
+    }
+}
+
+pub(crate) fn edits(block: &Map<String, Value>) -> Vec<Edit> {
+    let mut edits = Vec::new();
+    if let Some(enabled) = block.get("bash").and_then(Value::as_bool) {
+        let value = if enabled {
+            json!({"enabled": true, "rewrite": true, "compress": true, "background": true})
+        } else {
+            json!({"enabled": false})
+        };
+        edits.push(Edit::at(
+            &["bash"],
+            Some(value),
+            "bash boolean → bash.enabled",
+        ));
+    }
+    if let Some(lsp) = block.get("lsp").and_then(Value::as_object) {
+        if lsp.get("idle_minutes").and_then(Value::as_str) == Some("never") {
+            const NOTICE: &str = "lsp.idle_minutes \"never\" → lsp.idle_shutdown";
+            if !lsp.contains_key("idle_shutdown") {
+                edits.push(Edit::at(
+                    &["lsp", "idle_shutdown"],
+                    Some(Value::Bool(false)),
+                    NOTICE,
+                ));
+            }
+            edits.push(Edit::at(&["lsp", "idle_minutes"], None, NOTICE));
+        }
+        if let Some(servers) = lsp.get("servers").and_then(Value::as_object) {
+            for (name, server) in servers {
+                if let Some(value) = server
+                    .get("initialization_options")
+                    .filter(|v| !v.is_null() && !v.is_string())
+                {
+                    edits.push(Edit::at(
+                        &["lsp", "servers", name, "initialization_options"],
+                        Some(Value::String(value.to_string())),
+                        "lsp.servers.<name>.initialization_options → JSON text",
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(mirrors) = block
+        .get("inspect")
+        .and_then(|v| v.get("duplicates"))
+        .and_then(|v| v.get("expected_mirrors"))
+        .and_then(Value::as_array)
+    {
+        let mut changed = false;
+        let current: Vec<_> = mirrors
+            .iter()
+            .map(|entry| {
+                if let Some([Value::String(source), Value::String(mirror)]) =
+                    entry.as_array().map(Vec::as_slice)
+                {
+                    changed = true;
+                    json!({"source": source, "mirror": mirror})
+                } else {
+                    entry.clone()
+                }
+            })
+            .collect();
+        if changed {
+            edits.push(Edit::at(
+                &["inspect", "duplicates", "expected_mirrors"],
+                Some(Value::Array(current)),
+                "inspect.duplicates.expected_mirrors pairs → source and mirror objects",
+            ));
+        }
+    }
+    edits
+}
+
+/// Only the cache setting distinguishes null from omission. JSON embedded in
+/// initialization text is not part of the settings structure.
+pub(crate) fn null_path(block: &Map<String, Value>) -> Option<String> {
+    fn check(value: &Value, path: &mut Vec<String>) -> Option<String> {
+        match value {
+            Value::Null if !matches!(path.as_slice(), [storage, cache] if storage == "storage" && cache == "cache_dir") => {
+                Some(path.join("."))
+            }
+            Value::Object(map) => map.iter().find_map(|(key, value)| {
+                path.push(key.clone());
+                let found = check(value, path);
+                path.pop();
+                found
+            }),
+            Value::Array(values) => values.iter().enumerate().find_map(|(i, value)| {
+                path.push(i.to_string());
+                let found = check(value, path);
+                path.pop();
+                found
+            }),
+            _ => None,
+        }
+    }
+    block
+        .iter()
+        .find_map(|(name, value)| check(value, &mut vec![name.clone()]))
+}

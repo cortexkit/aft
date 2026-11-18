@@ -15,13 +15,13 @@ use serde_json::{Map, Value};
 use crate::config::{
     expand_index_root_path, normalize_git_co_author, BackupConfig, Config, GhShimConfig, GitConfig,
     GithubConfig, IdleConfig, IndexConfig, IndexKind, IndexRootConfig, IndexesConfig,
-    InspectCategories, InspectConfig, LspIdleMinutes, RemoteExecConfig, RerankBackendKind,
-    RerankConfig, SandboxConfig, SearchConfig, SemanticBackend, SemanticBackendConfig,
-    UserServerDef, DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_BASH_WORKER_WAIT_MAX_MS,
-    DEFAULT_IDLE_ROOT_TTL_MINUTES, DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
-    MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_ROOT_TTL_MINUTES, MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
-    MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_BASH_WATCH_SYNC_MAX_MS, MIN_BASH_WORKER_WAIT_MAX_MS,
-    MIN_IDLE_ROOT_TTL_MINUTES, MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
+    InspectCategories, InspectConfig, RemoteExecConfig, RerankBackendKind, RerankConfig,
+    SandboxConfig, SearchConfig, SemanticBackend, SemanticBackendConfig, UserServerDef,
+    DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_BASH_WORKER_WAIT_MAX_MS, DEFAULT_IDLE_ROOT_TTL_MINUTES,
+    DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_ROOT_TTL_MINUTES,
+    MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_BASH_WATCH_SYNC_MAX_MS,
+    MIN_BASH_WORKER_WAIT_MAX_MS, MIN_IDLE_ROOT_TTL_MINUTES, MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+    MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
 use crate::feature_config;
 use crate::harness::Harness;
@@ -214,7 +214,7 @@ pub struct RawAftConfig {
     #[schemars(
         description = "Bash runtime configuration (runtime gate + rewrite + compress + background execution and user-only environment defaults). Registration of bash and its companions is controlled by disabled_tools. Replaces `experimental.bash.*`."
     )]
-    pub bash: Option<RawBash>,
+    pub bash: Option<RawBashFeatures>,
     #[schemars(
         description = "User-only shell environment settings. Project configuration cannot select an environment provider."
     )]
@@ -518,13 +518,16 @@ pub struct RawRerank {
     pub timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 pub struct RawLsp {
-    #[schemars(schema_with = "schema::lsp_idle_minutes")]
     #[schemars(
-        description = "Minutes since the last AFT tool call on that repository. Default 60; integers are clamped to 5..=1440. 'never' disables only idle reaping; servers still stop on unbind, eviction and shutdown. Project config may only lower the user value, or set a number when the user has 'never'. Applies live."
+        description = "Minutes since the last AFT tool call on that repository. Default 60; integers are clamped to 5..=1440. Project config may only lower the user value. Applies live."
     )]
-    pub idle_minutes: Option<LspIdleMinutes>,
+    pub idle_minutes: Option<i64>,
+    #[schemars(
+        description = "Shut down idle language servers (default true). When false, servers still stop on unbind, eviction and shutdown. A project may turn idle shutdown on, never off. Applies live."
+    )]
+    pub idle_shutdown: Option<bool>,
     #[schemars(
         description = "Maximum live language servers process-wide, including starts in progress. Evicts the least recently used client with no pending requests before refusing a start. Project config may only lower the user value. Zero prevents new starts."
     )]
@@ -569,6 +572,7 @@ pub struct RawLsp {
 impl RawLsp {
     fn is_empty(&self) -> bool {
         self.idle_minutes.is_none()
+            && self.idle_shutdown.is_none()
             && self.max_servers.is_none()
             && self.servers.is_none()
             && self.disabled.is_none()
@@ -615,40 +619,9 @@ pub struct RawLspServerEntry {
     )]
     pub env: Option<HashMap<String, String>>,
     #[schemars(
-        description = "JSON value passed as `initializationOptions` in the LSP `initialize` request."
+        description = "JSON text passed as `initializationOptions` in the LSP `initialize` request. Invalid JSON prevents this server from starting."
     )]
-    pub initialization_options: Option<Value>,
-}
-
-#[derive(Debug, Clone, PartialEq, schemars::JsonSchema)]
-#[schemars(untagged)]
-pub enum RawBash {
-    #[schemars(
-        description = "Shorthand: `true` turns the bash runtime on with rewrite + compress + background; `false` turns the runtime gate off (bash operations report bash_disabled)."
-    )]
-    Bool(bool),
-    Features(RawBashFeatures),
-}
-
-/// `bash` is a boolean or an object. Written by hand rather than as an
-/// untagged enum, which would replace every error inside the object with "did
-/// not match any variant": a value below a minimum must be reported with the
-/// key it is about.
-impl<'de> Deserialize<'de> for RawBash {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        match Value::deserialize(deserializer)? {
-            Value::Bool(enabled) => Ok(Self::Bool(enabled)),
-            Value::Object(map) => serde_json::from_value::<RawBashFeatures>(Value::Object(map))
-                .map(Self::Features)
-                .map_err(de::Error::custom),
-            other => Err(de::Error::custom(format!(
-                "bash must be a boolean or an object, not {other}"
-            ))),
-        }
-    }
+    pub initialization_options: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
@@ -814,9 +787,16 @@ impl RawInspect {
 #[serde(default)]
 pub struct RawInspectDuplicates {
     #[schemars(
-        description = "Intentional mirror path pairs for duplicate suppression. Each [globA, globB] pair matches project-root-relative forward-slash paths; groups fully straddling the pair are counted as suppressed instead of reported."
+        description = "Intentional mirror paths for duplicate suppression. Each source and mirror glob matches project-root-relative forward-slash paths; groups fully straddling the pair are counted as suppressed instead of reported."
     )]
-    pub expected_mirrors: Option<Vec<[String; 2]>>,
+    pub expected_mirrors: Option<Vec<RawExpectedMirror>>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RawExpectedMirror {
+    pub source: String,
+    pub mirror: String,
 }
 
 impl RawInspectDuplicates {
@@ -1486,6 +1466,9 @@ fn parse_tier(
     if !security_errors.is_empty() {
         return Err(security_errors);
     }
+    if let Some(path) = feature_config::settings_shape::null_path(&map) {
+        return Err(vec![format!("invalid_config_null:{path}")]);
+    }
 
     let raw = match serde_json::from_value::<RawAftConfig>(Value::Object(map.clone())) {
         Ok(config) => config,
@@ -1793,6 +1776,9 @@ pub fn strict_tier_error(tier: &ConfigTier, harness: Option<&Harness>) -> Option
     };
     feature_config::translate_document(&mut map, document_tier);
     normalize_config_for_harness(&mut map, harness);
+    if let Some(path) = feature_config::settings_shape::null_path(&map) {
+        return Some(format!("invalid_config_null:{path}"));
+    }
     let raw = match serde_json::from_value::<RawAftConfig>(Value::Object(map)) {
         Ok(raw) => raw,
         Err(error) => {
@@ -1873,7 +1859,7 @@ fn raw_bash_env_refusal(
     harness_label: Option<&str>,
 ) -> Option<String> {
     let env = match raw.bash.as_ref() {
-        Some(RawBash::Features(features)) => features.env.as_ref(),
+        Some(features) => features.env.as_ref(),
         _ => None,
     };
     let found = crate::bash_env::first_refused_env_key(env?, tier_kind);
@@ -2189,12 +2175,9 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     base.search = merge_project_search(base.search.take(), project.search);
     base.lsp = merge_lsp_config(base.lsp.take(), project.lsp);
     base.experimental = merge_experimental_config(base.experimental.take(), project.experimental);
-    let ceiling = base
-        .bash
-        .as_ref()
-        .and_then(|bash| expand_bash_for_merge(bash).memory_limit_mib);
+    let ceiling = base.bash.as_ref().and_then(|bash| bash.memory_limit_mib);
     let mut project_bash = project_safe_bash(project.bash);
-    if let Some(RawBash::Features(features)) = &mut project_bash {
+    if let Some(features) = &mut project_bash {
         features.memory_limit_mib = match (ceiling, features.memory_limit_mib) {
             (Some(user), Some(project)) => Some(user.min(project)),
             (_, value) => value,
@@ -2412,17 +2395,7 @@ fn merge_semantic_config(
 }
 
 fn merge_lsp_config(base: Option<RawLsp>, override_lsp: Option<RawLsp>) -> Option<RawLsp> {
-    let mut lsp = base.unwrap_or(RawLsp {
-        idle_minutes: None,
-        max_servers: None,
-        servers: None,
-        disabled: None,
-        python: None,
-        diagnostics_on_edit: None,
-        auto_install: None,
-        grace_days: None,
-        versions: None,
-    });
+    let mut lsp = base.unwrap_or_default();
 
     if let Some(project) = override_lsp {
         if let Some(max_servers) = project.max_servers {
@@ -2431,9 +2404,12 @@ fn merge_lsp_config(base: Option<RawLsp>, override_lsp: Option<RawLsp>) -> Optio
             }
         }
         if let Some(idle) = project.idle_minutes {
-            if idle.tightens(lsp.idle_minutes.unwrap_or_default()) {
+            if lsp_idle_minutes(Some(idle)) <= lsp_idle_minutes(lsp.idle_minutes) {
                 lsp.idle_minutes = Some(idle);
             }
+        }
+        if project.idle_shutdown == Some(true) {
+            lsp.idle_shutdown = Some(true);
         }
         if project.python.is_some() {
             lsp.python = project.python;
@@ -2460,23 +2436,18 @@ fn merge_experimental_config(
     (!experimental.is_empty()).then_some(experimental)
 }
 
-fn project_safe_bash(project: Option<RawBash>) -> Option<RawBash> {
-    project.map(|bash| match bash {
-        RawBash::Bool(enabled) => RawBash::Bool(enabled),
-        RawBash::Features(mut features) => {
-            features.changed_files = features
-                .changed_files
-                .filter(|mode| *mode == crate::config::BashChangedFiles::Off);
-            features.linux_scope = None;
-            features.linux_scope_max_runtime_secs = None;
-            // `project_env` is carried separately: the resolver never applies a
-            // project's environment, so it must not reach the user-tier map.
-            features.project_env = features.env.take();
-            features.runon_env = None;
-            // A repository may tighten privacy, never restore inherited grants.
-            features.disclaim_privacy = features.disclaim_privacy.filter(|value| *value);
-            RawBash::Features(features)
-        }
+fn project_safe_bash(project: Option<RawBashFeatures>) -> Option<RawBashFeatures> {
+    project.map(|mut features| {
+        features.changed_files = features
+            .changed_files
+            .filter(|mode| *mode == crate::config::BashChangedFiles::Off);
+        features.linux_scope = None;
+        features.linux_scope_max_runtime_secs = None;
+        // Project environment entries retain their own tier through resolution.
+        features.project_env = features.env.take();
+        features.runon_env = None;
+        features.disclaim_privacy = features.disclaim_privacy.filter(|value| *value);
+        features
     })
 }
 
@@ -2640,15 +2611,17 @@ fn bash_memory_limit_rejects_invalid_values() {
     }
 }
 
-fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> Option<RawBash> {
+fn merge_bash_config(
+    base: Option<RawBashFeatures>,
+    override_bash: Option<RawBashFeatures>,
+) -> Option<RawBashFeatures> {
     match (base, override_bash) {
         (None, None) => None,
         (None, Some(override_bash)) => Some(override_bash),
         (Some(base), None) => Some(base),
         (Some(base), Some(override_bash)) => {
-            let base = expand_bash_for_merge(&base);
-            let override_features = expand_bash_for_merge(&override_bash);
-            Some(RawBash::Features(RawBashFeatures {
+            let override_features = override_bash;
+            Some(RawBashFeatures {
                 changed_files: override_features.changed_files.or(base.changed_files),
                 enabled: override_features.enabled.or(base.enabled),
                 rewrite: override_features.rewrite.or(base.rewrite),
@@ -2687,7 +2660,7 @@ fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> O
                 env: merge_env_maps(base.env, override_features.env),
                 project_env: merge_env_maps(base.project_env, override_features.project_env),
                 runon_env: override_features.runon_env.or(base.runon_env),
-            }))
+            })
         }
     }
 }
@@ -2706,38 +2679,6 @@ fn merge_env_maps(
             base.extend(override_map);
             Some(base)
         }
-    }
-}
-
-fn expand_bash_for_merge(value: &RawBash) -> RawBashFeatures {
-    match value {
-        // A boolean expands to its sub-features only. The runtime gate is left
-        // unset so a later object tier decides it, matching the TypeScript merge.
-        RawBash::Bool(enabled) => RawBashFeatures {
-            changed_files: None,
-            enabled: None,
-            rewrite: Some(*enabled),
-            compress: Some(*enabled),
-            background: Some(*enabled),
-            host_fallback: None,
-            subagent_background: None,
-            detach_on_user_message: None,
-            db_schema_hints: None,
-            long_running_reminder_enabled: None,
-            long_running_reminder_interval_ms: None,
-            foreground_wait_window_ms: None,
-            watch_sync_max_ms: None,
-            worker_wait_max_ms: None,
-            linux_scope: None,
-            linux_scope_max_runtime_secs: None,
-            memory_limit_mib: None,
-            disclaim_privacy: None,
-            powershell_tool: None,
-            env: None,
-            project_env: None,
-            runon_env: None,
-        },
-        RawBash::Features(features) => features.clone(),
     }
 }
 
@@ -2864,25 +2805,22 @@ fn record_resource_loosening(
             push_drop(dropped, "lsp.max_servers", tier, REASON);
         }
     }
-    let cap = |raw: &RawAftConfig| {
-        raw.bash
-            .as_ref()
-            .and_then(|bash| expand_bash_for_merge(bash).memory_limit_mib)
-    };
+    let cap = |raw: &RawAftConfig| raw.bash.as_ref().and_then(|bash| bash.memory_limit_mib);
     if let (Some(user), Some(project)) = (cap(base), cap(project)) {
         if project > user {
             push_drop(dropped, "bash.memory_limit_mib", tier, REASON);
         }
     }
     if let Some(next) = project.lsp.as_ref().and_then(|lsp| lsp.idle_minutes) {
-        let floor = base
-            .lsp
-            .as_ref()
-            .and_then(|lsp| lsp.idle_minutes)
-            .unwrap_or_default();
-        if !next.tightens(floor) {
+        let floor = base.lsp.as_ref().and_then(|lsp| lsp.idle_minutes);
+        if lsp_idle_minutes(Some(next)) > lsp_idle_minutes(floor) {
             push_drop(dropped, "lsp.idle_minutes", tier, REASON);
         }
+    }
+    if project.lsp.as_ref().and_then(|lsp| lsp.idle_shutdown) == Some(false)
+        && base.lsp.as_ref().and_then(|lsp| lsp.idle_shutdown) != Some(false)
+    {
+        push_drop(dropped, "lsp.idle_shutdown", tier, REASON);
     }
     if let Some(categories) = project
         .inspect
@@ -2931,8 +2869,7 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     {
         push_drop(dropped, "storage.cache_dir", tier, USER_ONLY_REASON);
     }
-    if matches!(&raw.bash, Some(RawBash::Features(features)) if features.disclaim_privacy == Some(false))
-    {
+    if matches!(&raw.bash, Some(features) if features.disclaim_privacy == Some(false)) {
         push_drop(
             dropped,
             "bash.disclaim_privacy",
@@ -2942,7 +2879,7 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     }
     // A project's own `bash.env` is not dropped: it is validated and carried in
     // `project_env`, then applied only while the project is trusted.
-    if matches!(&raw.bash, Some(RawBash::Features(features)) if features.runon_env.is_some()) {
+    if matches!(&raw.bash, Some(features) if features.runon_env.is_some()) {
         push_drop(dropped, "bash.runon_env", tier, USER_ONLY_REASON);
     }
     if raw.restrict_to_project_root.is_some() {
@@ -3024,19 +2961,26 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
         }
     }
     if raw.bash.as_ref().is_some_and(
-        |bash| matches!(bash, RawBash::Features(features) if features.changed_files.is_some_and(|mode| mode != crate::config::BashChangedFiles::Off)),
+        |bash| matches!(bash, features if features.changed_files.is_some_and(|mode| mode != crate::config::BashChangedFiles::Off)),
     ) {
         push_drop(dropped, "bash.changed_files", tier, "a project config may only turn changed-file reporting off");
     }
-    if raw.bash.as_ref().is_some_and(
-        |bash| matches!(bash, RawBash::Features(features) if features.linux_scope.is_some()),
-    ) {
+    if raw
+        .bash
+        .as_ref()
+        .is_some_and(|bash| matches!(bash, features if features.linux_scope.is_some()))
+    {
         push_drop(dropped, "bash.linux_scope", tier, USER_ONLY_REASON);
     }
     if raw.bash.as_ref().is_some_and(
-        |bash| matches!(bash, RawBash::Features(features) if features.linux_scope_max_runtime_secs.is_some()),
+        |bash| matches!(bash, features if features.linux_scope_max_runtime_secs.is_some()),
     ) {
-        push_drop(dropped, "bash.linux_scope_max_runtime_secs", tier, USER_ONLY_REASON);
+        push_drop(
+            dropped,
+            "bash.linux_scope_max_runtime_secs",
+            tier,
+            USER_ONLY_REASON,
+        );
     }
     for tool in feature_config::normalize_tool_list(
         raw.disabled_tools
@@ -3482,7 +3426,10 @@ fn resolve_inspect_config(raw: Option<&RawInspect>) -> InspectConfig {
         .as_ref()
         .and_then(|duplicates| duplicates.expected_mirrors.clone())
     {
-        inspect.duplicates.expected_mirrors = expected_mirrors;
+        inspect.duplicates.expected_mirrors = expected_mirrors
+            .into_iter()
+            .map(|pair| [pair.source, pair.mirror])
+            .collect();
     }
     inspect
 }
@@ -3584,7 +3531,8 @@ fn resolve_remote_exec_config(raw: &RawAftConfig) -> RemoteExecConfig {
 
 fn resolve_lsp_config(raw: &RawAftConfig, config: &mut Config) {
     let lsp = raw.lsp.as_ref();
-    config.lsp_idle_minutes = lsp.and_then(|lsp| lsp.idle_minutes).unwrap_or_default();
+    config.lsp_idle_minutes = lsp_idle_minutes(lsp.and_then(|lsp| lsp.idle_minutes));
+    config.lsp_idle_shutdown = lsp.and_then(|lsp| lsp.idle_shutdown).unwrap_or(true);
     config.lsp_max_servers = lsp.and_then(|lsp| lsp.max_servers).unwrap_or(8);
     let mut disabled: HashSet<String> = lsp
         .and_then(|lsp| lsp.disabled.as_ref())
@@ -3618,6 +3566,7 @@ fn resolve_lsp_config(raw: &RawAftConfig, config: &mut Config) {
     }
 
     if let Some(servers) = lsp.and_then(|lsp| lsp.servers.as_ref()) {
+        let invalid = &mut config.invalid_lsp_initialization_options;
         config.lsp_servers = servers
             .iter()
             .map(|(id, server)| UserServerDef {
@@ -3636,7 +3585,15 @@ fn resolve_lsp_config(raw: &RawAftConfig, config: &mut Config) {
                     .clone()
                     .unwrap_or_else(|| vec![".git".to_string()]),
                 env: server.env.clone().unwrap_or_default(),
-                initialization_options: server.initialization_options.clone(),
+                initialization_options: server.initialization_options.as_deref().and_then(|text| {
+                    match serde_json::from_str(text) {
+                        Ok(options) => Some(options),
+                        Err(_) => {
+                            invalid.push(id.clone());
+                            None
+                        }
+                    }
+                }),
                 disabled: server.disabled.unwrap_or(false),
             })
             .collect();
@@ -3645,6 +3602,14 @@ fn resolve_lsp_config(raw: &RawAftConfig, config: &mut Config) {
     if !disabled.is_empty() {
         config.disabled_lsp = disabled;
     }
+}
+
+fn lsp_idle_minutes(value: Option<i64>) -> u32 {
+    use crate::config::{DEFAULT_LSP_IDLE_MINUTES, MAX_LSP_IDLE_MINUTES, MIN_LSP_IDLE_MINUTES};
+    value.unwrap_or(i64::from(DEFAULT_LSP_IDLE_MINUTES)).clamp(
+        i64::from(MIN_LSP_IDLE_MINUTES),
+        i64::from(MAX_LSP_IDLE_MINUTES),
+    ) as u32
 }
 
 /// A validated `bash.env` map together with the tier it was written at.
@@ -3718,10 +3683,7 @@ fn resolve_bash_config(
 ) -> ResolvedBashConfig {
     let top = raw.bash.as_ref();
 
-    let top_features = match top {
-        Some(RawBash::Features(features)) => Some(features),
-        _ => None,
-    };
+    let top_features = top;
     let reminder_enabled = top_features.and_then(|features| features.long_running_reminder_enabled);
     let reminder_interval =
         top_features.and_then(|features| features.long_running_reminder_interval_ms);
@@ -3786,15 +3748,7 @@ fn resolve_bash_config(
     };
 
     match top {
-        Some(RawBash::Bool(false)) => base,
-        Some(RawBash::Bool(true)) => ResolvedBashConfig {
-            enabled: true,
-            rewrite: true,
-            compress: true,
-            background: true,
-            ..base
-        },
-        Some(RawBash::Features(features)) => ResolvedBashConfig {
+        Some(features) => ResolvedBashConfig {
             enabled: features.enabled.unwrap_or(true),
             rewrite: features.rewrite.unwrap_or(true),
             compress: features.compress.unwrap_or(true),
@@ -4558,33 +4512,103 @@ mod tests {
     }
 
     #[test]
-    fn lsp_idle_default_never_and_project_tightening() {
-        let default = serde_json::to_value(resolve_config(&[]).config).unwrap();
-        assert_eq!(default["lsp_idle_minutes"], 60);
-        for (user, project, expected, refused) in [
-            ("60", "30", serde_json::json!(30), false),
-            ("30", "60", serde_json::json!(30), true),
-            ("30", "\"never\"", serde_json::json!(30), true),
-            ("\"never\"", "1440", serde_json::json!(1440), false),
-            ("\"never\"", "\"never\"", serde_json::json!("never"), false),
+    fn lsp_idle_default_and_project_tightening() {
+        let default = resolve_config(&[]).config;
+        assert_eq!(default.lsp_idle_minutes, 60);
+        assert!(default.lsp_idle_shutdown);
+        for (user, project, minutes, shutdown, refused) in [
+            (
+                r#"{"idle_minutes":60}"#,
+                r#"{"idle_minutes":30}"#,
+                30,
+                true,
+                None,
+            ),
+            (
+                r#"{"idle_minutes":30}"#,
+                r#"{"idle_minutes":60}"#,
+                30,
+                true,
+                Some("lsp.idle_minutes"),
+            ),
+            (
+                r#"{"idle_shutdown":true}"#,
+                r#"{"idle_minutes":"never"}"#,
+                60,
+                true,
+                Some("lsp.idle_shutdown"),
+            ),
+            (
+                r#"{"idle_minutes":30,"idle_shutdown":false}"#,
+                r#"{"idle_shutdown":true}"#,
+                30,
+                true,
+                None,
+            ),
+            (
+                r#"{"idle_minutes":"never"}"#,
+                r#"{"idle_minutes":30,"idle_shutdown":false}"#,
+                30,
+                false,
+                None,
+            ),
         ] {
             let result = resolve_config(&[
-                tier("user", &format!(r#"{{"lsp":{{"idle_minutes":{user}}}}}"#)),
-                tier(
-                    "project",
-                    &format!(r#"{{"lsp":{{"idle_minutes":{project}}}}}"#),
-                ),
+                tier("user", &format!(r#"{{"lsp":{user}}}"#)),
+                tier("project", &format!(r#"{{"lsp":{project}}}"#)),
             ]);
             assert!(result.errors.is_empty(), "{:?}", result.errors);
+            assert_eq!(result.config.lsp_idle_minutes, minutes);
+            assert_eq!(result.config.lsp_idle_shutdown, shutdown);
+            assert_eq!(drop_keys(&result).first().map(String::as_str), refused);
+        }
+    }
+
+    #[test]
+    fn settings_shapes_preserve_legacy_true_in_harness_and_reject_explicit_null() {
+        let harness = resolve_config_for_harness(
+            &[tier(
+                "user",
+                r#"{"bash":{"enabled":false,"rewrite":false,"compress":false,"background":false},"harnesses":{"pi":{"bash":true}}}"#,
+            )],
+            Some(&Harness::Pi),
+        );
+        assert!(harness.errors.is_empty());
+        assert!(harness.config.bash.enabled);
+        assert!(harness.config.experimental_bash_rewrite);
+        assert!(harness.config.experimental_bash_compress);
+        assert!(harness.config.experimental_bash_background);
+
+        for (document, path) in [
+            (r#"{"lsp":{"idle_minutes":null}}"#, "lsp.idle_minutes"),
+            (r#"{"lsp":{"idle_shutdown":null}}"#, "lsp.idle_shutdown"),
+            (
+                r#"{"lsp":{"servers":{"rust":{"initialization_options":null}}}}"#,
+                "lsp.servers.rust.initialization_options",
+            ),
+            (
+                r#"{"inspect":{"duplicates":{"expected_mirrors":null}}}"#,
+                "inspect.duplicates.expected_mirrors",
+            ),
+            (
+                r#"{"harnesses":{"pi":{"format_on_edit":null}}}"#,
+                "harnesses.pi.format_on_edit",
+            ),
+        ] {
+            let candidate = tier("user", document);
+            let expected = format!("invalid_config_null:{path}");
             assert_eq!(
-                serde_json::to_value(&result.config).unwrap()["lsp_idle_minutes"],
-                expected
+                strict_tier_error(&candidate, Some(&Harness::Pi)),
+                Some(expected.clone())
             );
             assert_eq!(
-                drop_keys(&result).contains(&"lsp.idle_minutes".to_string()),
-                refused
+                resolve_config_for_harness(&[candidate], Some(&Harness::Pi)).errors,
+                [expected]
             );
         }
+        let opt_out = resolve_config(&[tier("user", r#"{"storage":{"cache_dir":null}}"#)]);
+        assert!(opt_out.errors.is_empty());
+        assert!(opt_out.config.cache_dir_opt_out);
     }
 
     #[test]
@@ -6175,10 +6199,7 @@ mod tests {
                 &format!(r#"{{"lsp":{{"idle_minutes":{raw}}}}}"#),
             )]);
             assert!(result.errors.is_empty());
-            assert_eq!(
-                result.config.lsp_idle_minutes,
-                LspIdleMinutes::Minutes(expected)
-            );
+            assert_eq!(result.config.lsp_idle_minutes, expected);
         }
     }
 

@@ -1327,6 +1327,29 @@ const CASES: ParityCase[] = [
       lsp: { servers: { evil: { binary: "/tmp/evil", args: [], root_markers: [".git"], disabled: false } } },
     },
   },
+  {
+    name: "settings_shapes_legacy_with_harness",
+    user: {
+      bash: false,
+      harnesses: { pi: { bash: true } },
+      lsp: { idle_minutes: "never", servers: { rust: { initialization_options: { checkOnSave: true, value: null } } } },
+      inspect: { duplicates: { expected_mirrors: [["app/**", "mirror/**"]] } },
+    },
+    harness: "pi",
+  },
+  {
+    name: "settings_shapes_project_enables_idle_shutdown",
+    user: { lsp: { idle_minutes: 20, idle_shutdown: false } },
+    project: { lsp: { idle_minutes: 30, idle_shutdown: true } },
+  },
+  {
+    name: "settings_shapes_project_cannot_disable_idle_shutdown",
+    project: { lsp: { idle_minutes: "never" } },
+  },
+  {
+    name: "settings_shapes_null_initialization_options_refused",
+    user: { lsp: { servers: { rust: { initialization_options: null } } } },
+  },
 ];
 
 const savedOpencodeConfigDir = process.env.OPENCODE_CONFIG_DIR;

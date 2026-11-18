@@ -12,6 +12,6 @@
     "semantic": true,
     "trigram": true
   },
-  "lsp_idle_minutes": 1440,
+  "lsp_idle_shutdown": false,
   "restrict_to_project_root": false
 }

@@ -757,9 +757,13 @@ fn hold_project_loosening(candidate: &mut Config, floor: &Config) -> Vec<&'stati
         candidate.lsp_max_servers = floor.lsp_max_servers;
         held.push("lsp.max_servers");
     }
-    if !candidate.lsp_idle_minutes.tightens(floor.lsp_idle_minutes) {
+    if candidate.lsp_idle_minutes > floor.lsp_idle_minutes {
         candidate.lsp_idle_minutes = floor.lsp_idle_minutes;
         held.push("lsp.idle_minutes");
+    }
+    if floor.lsp_idle_shutdown && !candidate.lsp_idle_shutdown {
+        candidate.lsp_idle_shutdown = true;
+        held.push("lsp.idle_shutdown");
     }
     let next = &mut candidate.inspect.categories;
     let before = &floor.inspect.categories;
@@ -949,6 +953,7 @@ macro_rules! restart_settings {
         $field!("storage.cache_dir", cache_dir);
         $field!("storage.cache_dir: null", cache_dir_opt_out);
         $field!("lsp.servers", lsp_servers);
+        $field!("lsp.servers", invalid_lsp_initialization_options);
         $field!("lsp.disabled", disabled_lsp);
         $field!("experimental.lsp_ty", experimental_lsp_ty);
         $field!("semantic.backend", semantic.backend);
@@ -1039,6 +1044,7 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     live!("idle.root_ttl_minutes", idle.root_ttl_minutes);
     live!("idle.checkout_hours", idle.checkout_hours);
     live!("lsp.idle_minutes", lsp_idle_minutes);
+    live!("lsp.idle_shutdown", lsp_idle_shutdown);
     live!("lsp.max_servers", lsp_max_servers);
     live!("lsp.max_servers", lsp_user_max_servers);
     live!("backup.max_file_size", backup.max_file_size);
@@ -1168,9 +1174,11 @@ fn classification_is_exhaustive(config: &Config) {
         remote_exec,
         experimental_lsp_ty: _,
         lsp_servers: _,
+        invalid_lsp_initialization_options: _,
         disabled_lsp: _,
         diagnostics_on_edit: _,
         lsp_idle_minutes: _,
+        lsp_idle_shutdown: _,
         lsp_max_servers: _,
         lsp_user_max_servers: _,
         url_fetch_allow_private: _,

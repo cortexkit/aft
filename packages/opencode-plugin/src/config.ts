@@ -18,6 +18,7 @@ import {
   legacyProjectConfigLocationNotice,
   MIN_WORKER_WAIT_MAX_MS,
   malformedSecurityConfigErrors,
+  nullSettingPath,
   mergeIndexes,
   migrateAftConfigFile as migrateLegacyAftConfigFile,
   noticeDigest,
@@ -237,8 +238,8 @@ const LspServerEntrySchema = z.object({
   disabled: z.boolean().optional().default(false),
   /** Extra environment variables passed to the LSP server child process. */
   env: z.record(z.string().min(1), z.string()).optional(),
-  /** JSON value passed as `initializationOptions` in the LSP `initialize` request. */
-  initialization_options: z.unknown().optional(),
+  /** JSON text passed as `initializationOptions` in the LSP `initialize` request. */
+  initialization_options: z.string().optional(),
 });
 
 const LspConfigSchema = z.object({
@@ -246,14 +247,11 @@ const LspConfigSchema = z.object({
   max_servers: z.number().int().nonnegative().optional(),
   /** Minutes since the last AFT tool call on that repository; default 60. */
   idle_minutes: z
-    .union([
-      z
-        .number()
-        .int()
-        .transform((value) => Math.min(1440, Math.max(5, value))),
-      z.literal("never"),
-    ])
+    .number()
+    .int()
+    .transform((value) => Math.min(1440, Math.max(5, value)))
     .optional(),
+  idle_shutdown: z.boolean().optional(),
   servers: z.record(z.string().trim().min(1), LspServerEntrySchema).optional(),
   disabled: z.array(z.string().trim().min(1)).optional(),
   python: z.enum(["pyright", "ty", "auto"]).optional(),
@@ -408,7 +406,7 @@ const BashFeaturesSchema = z.object({
   runon_env: z.array(z.string().min(1)).optional(),
 });
 
-const BashConfigSchema = z.union([z.boolean(), BashFeaturesSchema]);
+const BashConfigSchema = BashFeaturesSchema;
 
 const ShellEnvProviderSchema = z
   .object({
@@ -588,7 +586,9 @@ const InspectConfigSchema = z.object({
   duplicates: z
     .object({
       expected_mirrors: z
-        .array(z.tuple([z.string().trim().min(1), z.string().trim().min(1)]))
+        .array(
+          z.strictObject({ source: z.string().trim().min(1), mirror: z.string().trim().min(1) }),
+        )
         .optional(),
     })
     .optional(),
@@ -780,7 +780,11 @@ export const AftConfigSchema = z.preprocess(
   }).strict(),
 );
 
-export type AftConfig = z.infer<typeof AftConfigSchema>;
+type ParsedAftConfig = z.infer<typeof AftConfigSchema>;
+// In-memory callers can still pass the former shorthand to the merge helpers.
+export type AftConfig = Omit<ParsedAftConfig, "bash"> & {
+  bash?: ParsedAftConfig["bash"] | boolean;
+};
 /**
  * `remote_exec` after the tiers are merged: `project_off` records that a
  * project config turned remote runs off, so a `runon` call can be refused with
@@ -960,8 +964,13 @@ export function resolveLspConfigForConfigure(config: AftConfig): ConfigureLspOve
     if (server.env && Object.keys(server.env).length > 0) {
       entry.env = server.env;
     }
-    if (server.initialization_options !== undefined) {
-      entry.initialization_options = server.initialization_options;
+    if (typeof server.initialization_options === "string") {
+      try {
+        entry.initialization_options = JSON.parse(server.initialization_options);
+      } catch {
+        // This helper projects effective values for compatibility diagnostics.
+        // The unparsed settings tier still reaches Rust, which refuses this server.
+      }
     }
     return entry;
   });
@@ -1073,11 +1082,22 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   }
   Object.assign(overrides, resolveLspConfigForConfigure(config));
   if (config.lsp?.idle_minutes !== undefined) overrides.lsp_idle_minutes = config.lsp.idle_minutes;
+  if (config.lsp?.idle_shutdown !== undefined)
+    overrides.lsp_idle_shutdown = config.lsp.idle_shutdown;
   if (config.lsp?.max_servers !== undefined) overrides.lsp_max_servers = config.lsp.max_servers;
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
   const rerank = definedEntries(config.search?.rerank);
   if (rerank !== undefined) overrides.search = { rerank };
-  if (config.inspect !== undefined) overrides.inspect = config.inspect;
+  if (config.inspect !== undefined) {
+    const mirrors = config.inspect.duplicates?.expected_mirrors;
+    overrides.inspect =
+      mirrors === undefined
+        ? config.inspect
+        : {
+            ...config.inspect,
+            duplicates: { expected_mirrors: mirrors.map(({ source, mirror }) => [source, mirror]) },
+          };
+  }
   if (config.idle !== undefined) overrides.idle = config.idle;
   if (config.backup !== undefined) overrides.backup = config.backup;
   if (config.durability?.macos_full_sync !== undefined) overrides.durability = config.durability;
@@ -1595,6 +1615,9 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   const result = AftConfigSchema.safeParse(cleanConfig);
   let parsed: AftConfig | null;
   if (result.success) {
+    const invalidNull = nullSettingPath(normalizeConfigForActiveHarness(cleanConfig));
+    if (invalidNull !== undefined)
+      throw new ConfigRejectedError([`invalid_config_null:${invalidNull}`], configPath);
     log(`Config loaded from ${configPath}`);
     parsed = result.data;
   } else {
@@ -1604,6 +1627,9 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
       result.error.issues,
     );
     if (rejected.length > 0) throw new ConfigRejectedError(rejected, configPath);
+    const invalidNull = nullSettingPath(normalizeConfigForActiveHarness(cleanConfig));
+    if (invalidNull !== undefined)
+      throw new ConfigRejectedError([`invalid_config_null:${invalidNull}`], configPath);
     const shellIssues = result.error.issues.filter(
       (issue) =>
         issue.path[0] === "shell" ||
@@ -1702,9 +1728,10 @@ function mergeLspConfig(
   }
   const floor = baseLsp?.idle_minutes ?? 60;
   const idle = overrideLsp?.idle_minutes;
-  if (idle !== undefined && (floor === "never" || (idle !== "never" && idle <= floor))) {
+  if (idle !== undefined && idle <= floor) {
     projectLsp.idle_minutes = idle;
   }
+  if (overrideLsp?.idle_shutdown === true) projectLsp.idle_shutdown = true;
 
   // disabled comes from user config ONLY.
   const userDisabled = baseLsp?.disabled ?? [];

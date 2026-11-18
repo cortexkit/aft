@@ -9430,7 +9430,7 @@ fn with_census_route_rows(
                     "lsp_idle_ttl_ms".to_string(),
                     json!(executor
                         .actor_context(root_id)
-                        .and_then(|ctx| ctx.config().lsp_idle_minutes.ttl())
+                        .and_then(|ctx| ctx.config().lsp_idle_ttl())
                         .map(|ttl| ttl.as_millis().min(u128::from(u64::MAX)) as u64)),
                 );
                 row.insert(

@@ -1,0 +1,29 @@
+{
+  "bash": false,
+  "harnesses": {
+    "pi": {
+      "bash": true
+    }
+  },
+  "lsp": {
+    "idle_minutes": "never",
+    "servers": {
+      "rust": {
+        "initialization_options": {
+          "checkOnSave": true,
+          "value": null
+        }
+      }
+    }
+  },
+  "inspect": {
+    "duplicates": {
+      "expected_mirrors": [
+        [
+          "app/**",
+          "mirror/**"
+        ]
+      ]
+    }
+  }
+}

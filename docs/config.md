@@ -268,6 +268,8 @@ notice. Run `npx @cortexkit/aft doctor --fix` to remove it.
 - `index.roots`: List the folders to index, with a path and a list of indexes to build for each folder. The default is an empty list.
 - `type_checker_timeout_secs`: Maximum time in seconds for an external type checker to run. The default is 30 seconds.
 
+Omit an optional setting instead of using `null`. The exception is `storage.cache_dir`, where `null` explicitly moves caches back to primary storage.
+
 ```jsonc
 {
    // Edit/read surface: "default" (default) or "hashline". User and project
@@ -438,9 +440,7 @@ notice. Run `npx @cortexkit/aft doctor --fix` to remove it.
         "env": {                  // optional — extra env vars passed to the spawned server
           "TYPST_FONT_PATHS": "/usr/share/fonts"
         },
-        "initialization_options": {  // optional — server-specific LSP `initializationOptions`
-          "formatterMode": "typstyle"
-        }
+        "initialization_options": "{\"formatterMode\":\"typstyle\"}" // optional JSON text
       }
     },
     // Disable any registered server by id. IDs are case-insensitive. Built-in
@@ -568,7 +568,7 @@ notice. Run `npx @cortexkit/aft doctor --fix` to remove it.
       // Intentional mirror pairs, matched against project-root-relative
       // forward-slash paths. Groups fully spanning one pair are suppressed but
       // still counted in the duplicates summary.
-      "expected_mirrors": [["plugin/**", "pi-plugin/**"]]
+      "expected_mirrors": [{ "source": "plugin/**", "mirror": "pi-plugin/**" }]
     }
   },
 
@@ -1060,15 +1060,14 @@ SDKs. Each opened file still uses its nearest TypeScript project configuration.
 
 `lsp.idle_minutes` is **minutes since the last AFT tool call on that repository**,
 not time since the language server last emitted a diagnostic. It defaults to
-`60`; integer values are clamped to `5..=1440`. Set it to `"never"` to disable
-idle reaping. This does not prevent shutdown on unbind, eviction or daemon
+`60`; integer values are clamped to `5..=1440`. Set `lsp.idle_shutdown` to `false`
+to disable idle reaping; it defaults to `true`. This does not prevent shutdown on unbind, eviction or daemon
 shutdown, and is independent of `idle.root_ttl_minutes`. Reaped servers respawn
 when next needed. The same activity definition applies to standalone and subc.
 
-This is a **tighten-only resource setting**: project config may lower the user's
-number, or choose a number when the user chose `"never"`. A larger project value
-or `"never"` over a user number is ignored and reported as a dropped key by the
-Rust resolver. Both plugins apply the same floor. The default `60` is the floor
+These are **tighten-only resource settings**: project config may lower the user's
+number or turn idle shutdown on, but may not raise the number or turn idle shutdown off.
+The Rust resolver reports attempts to loosen these limits. Both plugins apply the same floor. The default `60` is the floor
 when the user did not set it. Active harness overrides obey their tier's trust
 rules. Changes apply live, at the next request/maintenance boundary, without
 restarting AFT. A project edit cannot remove an already published tightening
@@ -1164,7 +1163,7 @@ configuration above shows registering `tinymist` for Typst files. Required field
 | `args` | no | Args passed to the server (default: `[]`) |
 | `root_markers` | no | Filenames whose presence anchors the workspace root (default: `[".git"]`) |
 | `env` | no | Extra environment variables for the spawned process |
-| `initialization_options` | no | Passed to the server's LSP `initialize` request; recursively merged over built-in options. Objects merge, while explicit arrays and scalars replace built-in values (including an empty array). |
+| `initialization_options` | no | JSON text passed to the server's LSP `initialize` request. Objects merge over built-in options; arrays and scalars replace them. Invalid JSON prevents only that server from starting. |
 | `disabled` | no | Skip this server even though it's registered |
 
 Rust-analyzer's automatic diagnostic checks (flycheck) no longer run `cargo check`
@@ -1175,7 +1174,7 @@ To restore automatic checks, set the following in your **user** config:
 
 ```jsonc
 { "lsp": { "servers": { "rust": {
-  "initialization_options": { "checkOnSave": true }
+  "initialization_options": "{\"checkOnSave\":true}"
 } } } }
 ```
 

@@ -24,10 +24,6 @@ macro_rules! string_schema {
 string_schema!(RawEditMode);
 string_schema!(RawPiToolPresentation);
 
-pub(crate) fn lsp_idle_minutes(_: &mut SchemaGenerator) -> Schema {
-    schemars::json_schema!({"anyOf": [{"type":"integer"}, {"const":"never"}, {"type":"null"}]})
-}
-
 pub fn editor_schema() -> Value {
     let mut settings = SchemaSettings::draft2020_12();
     settings.inline_subschemas = true;
@@ -51,8 +47,7 @@ pub fn editor_schema() -> Value {
         .expect("AFT config fields");
     // Annotate optional values with their runtime defaults without filling in
     // missing fields: absence and an explicit choice can merge differently.
-    let bash_schema = fields.get_mut("bash").expect("bash schema");
-    let bash = object_alternative(bash_schema).expect("bash object");
+    let bash = fields.get_mut("bash").expect("bash schema");
     let defaults = crate::config::BashConfig::default();
     for (key, default) in [
         ("linux_scope", json!(defaults.linux_scope)),
@@ -64,10 +59,8 @@ pub fn editor_schema() -> Value {
     ] {
         bash["properties"][key]["default"] = default;
     }
-    // The raw branches have disjoint types; flatten the optional wrapper for
-    // editors that use the top-level alternatives to present completion.
-    bash_schema["oneOf"] = Value::Array(flatten_alternatives(bash_schema));
-    bash_schema.as_object_mut().unwrap().remove("anyOf");
+    fields.get_mut("lsp").expect("lsp schema")["properties"]["idle_shutdown"]["default"] =
+        json!(true);
     // Only the active harness is interpreted as settings. Keep the other
     // blocks opaque while showing the same suggestions as the base settings.
     let mut harness_fields = fields.clone();
@@ -75,25 +68,53 @@ pub fn editor_schema() -> Value {
     fields.get_mut("harnesses").expect("harness schema")["additionalProperties"] = json!({
         "properties": harness_fields,
     });
+    exclude_null(&mut schema, false);
     schema
 }
 
-fn flatten_alternatives(schema: &Value) -> Vec<Value> {
-    match schema.get("anyOf").and_then(Value::as_array) {
-        Some(branches) => branches.iter().flat_map(flatten_alternatives).collect(),
-        None => vec![schema.clone()],
+// Rust uses Option for presence. In JSONC an omitted setting is allowed, but
+// an explicit null is not, except for the storage cache opt-out.
+fn exclude_null(schema: &mut Value, storage: bool) {
+    if *schema == Value::Bool(true) {
+        *schema = json!({"not": {"type": "null"}});
+        return;
     }
-}
-
-fn object_alternative(schema: &mut Value) -> Option<&mut Value> {
-    if schema.get("properties").is_some() {
-        return Some(schema);
+    let Some(node) = schema.as_object_mut() else {
+        return;
+    };
+    if let Some(Value::Array(types)) = node.get_mut("type") {
+        types.retain(|kind| kind != "null");
+        if types.len() == 1 {
+            let kind = types[0].clone();
+            node.insert("type".into(), kind);
+        }
     }
-    schema
-        .get_mut("anyOf")?
-        .as_array_mut()?
-        .iter_mut()
-        .find_map(object_alternative)
+    if let Some(Value::Array(values)) = node.get_mut("enum") {
+        values.retain(|value| !value.is_null());
+    }
+    for keyword in ["anyOf", "oneOf", "allOf"] {
+        if let Some(Value::Array(branches)) = node.get_mut(keyword) {
+            branches.retain(|branch| branch.get("type").and_then(Value::as_str) != Some("null"));
+            for branch in branches {
+                exclude_null(branch, storage);
+            }
+        }
+    }
+    if let Some(Value::Object(fields)) = node.get_mut("properties") {
+        for (name, child) in fields {
+            if !(storage && name == "cache_dir") {
+                exclude_null(child, name == "storage");
+            }
+        }
+    }
+    for keyword in ["items", "additionalProperties"] {
+        if let Some(child) = node.get_mut(keyword) {
+            exclude_null(child, false);
+        }
+    }
+    if !node.contains_key("type") && !node.contains_key("const") && !node.contains_key("not") {
+        node.insert("not".into(), json!({"type": "null"}));
+    }
 }
 
 #[cfg(test)]
@@ -188,6 +209,14 @@ mod tests {
             "legacy schema snapshot is incomplete"
         );
         for (key, text) in expected {
+            // These descriptions explained a spelling that has been retired.
+            if key.0.ends_with(".bash<boolean>")
+                || key.0.ends_with(".lsp.idle_minutes")
+                || key.0.ends_with(".inspect.duplicates.expected_mirrors")
+                || key.0.ends_with(".initialization_options")
+            {
+                continue;
+            }
             assert_eq!(
                 actual.get(&key),
                 Some(&text),
@@ -216,5 +245,30 @@ mod tests {
                 assert_eq!(categories[name]["default"], true);
             }
         }
+    }
+
+    #[test]
+    fn config_schema_uses_canonical_settings_shapes() {
+        let schema = editor_schema();
+        let fields = &schema["properties"];
+        assert_eq!(fields["bash"]["type"], "object");
+        assert_eq!(
+            fields["lsp"]["properties"]["idle_minutes"]["type"],
+            "integer"
+        );
+        let shutdown = &fields["lsp"]["properties"]["idle_shutdown"];
+        assert_eq!(shutdown["type"], "boolean");
+        assert_eq!(shutdown["default"], true);
+        let pair = schema
+            .pointer("/properties/inspect/properties/duplicates/properties/expected_mirrors/items")
+            .unwrap();
+        assert_eq!(pair["properties"]["source"]["type"], "string");
+        assert_eq!(pair["properties"]["mirror"]["type"], "string");
+        let options = schema.pointer("/properties/lsp/properties/servers/additionalProperties/properties/initialization_options").unwrap();
+        assert_eq!(options["type"], "string");
+        assert_eq!(
+            fields["storage"]["properties"]["cache_dir"]["type"],
+            json!(["string", "null"])
+        );
     }
 }
