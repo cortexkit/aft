@@ -11040,15 +11040,21 @@ mod ledger_terminal_tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn withdraw_unregistered_gone_process_freezes_identical_answer() {
-        use crate::db::call_ledger as ledger;
+    fn exited_withdraw_process_pid() -> u32 {
         let mut child = std::process::Command::new("sh")
             .args(["-c", "exit 0"])
             .spawn()
             .unwrap();
         let pid = child.id();
         child.wait().unwrap();
+        pid
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn withdraw_unregistered_gone_process_freezes_identical_answer() {
+        use crate::db::call_ledger as ledger;
+        let pid = exited_withdraw_process_pid();
         let (_dir, ctx, kill) = unregistered_withdraw_fixture(Some(pid), None);
         let db = ctx.db().unwrap();
         assert_eq!(kill_withdrawn_call(&ctx, &kill).unwrap(), kill.body);
@@ -11069,6 +11075,137 @@ mod ledger_terminal_tests {
         };
         assert_eq!(body, kill.body);
         assert!(kill_task.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn unregistered_scoped_withdraw_fixture(
+        events: Option<&str>,
+    ) -> (
+        tempfile::TempDir,
+        std::sync::Arc<crate::context::AppContext>,
+        WithdrawKill,
+        std::path::PathBuf,
+    ) {
+        let (dir, ctx, kill) =
+            unregistered_withdraw_fixture(Some(exited_withdraw_process_pid()), None);
+        let cgroup = dir
+            .path()
+            .join(format!("user@{}.service", unsafe { libc::geteuid() }))
+            .join("aft.slice")
+            .join(format!("aft-task-{}.scope", kill.task));
+        if let Some(events) = events {
+            std::fs::create_dir_all(&cgroup).unwrap();
+            std::fs::write(cgroup.join("cgroup.events"), events).unwrap();
+        }
+        let db = ctx.db().unwrap();
+        let conn = db.lock().unwrap();
+        let row = crate::db::bash_tasks::bash_task_by_id(&conn, &kill.task)
+            .unwrap()
+            .unwrap();
+        let mut metadata = crate::bash_background::persistence::PersistedTask::from(row);
+        metadata.memory_policy = serde_json::from_value(json!({
+            "mib": 64,
+            "kind": "Linux task scope memory.max",
+            "cgroup": cgroup,
+        }))
+        .unwrap();
+        conn.execute(
+            "UPDATE bash_tasks SET metadata=?1 WHERE task_id=?2",
+            rusqlite::params![serde_json::to_string(&metadata).unwrap(), kill.task],
+        )
+        .unwrap();
+        (dir, ctx, kill, cgroup)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_scoped_withdraw_incomplete(ctx: &crate::context::AppContext, kill: &WithdrawKill) {
+        use crate::db::call_ledger as ledger;
+        let refused = kill_withdrawn_call(ctx, kill).unwrap_err();
+        assert_eq!(refused.code, "withdraw_incomplete");
+        assert_eq!(
+            refused.detail,
+            Some(json!({"retryable": true, "task_id": kill.task}))
+        );
+        let db = ctx.db().unwrap();
+        assert!(ledger::get(&db.lock().unwrap(), &kill.key)
+            .unwrap()
+            .unwrap()
+            .withdraw_answer
+            .is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn withdraw_unregistered_recorded_scope_empty_or_absent_freezes_answer() {
+        use crate::db::call_ledger as ledger;
+        for events in [None, Some("populated 0\n")] {
+            let (_dir, ctx, kill, _cgroup) = unregistered_scoped_withdraw_fixture(events);
+            assert_eq!(kill_withdrawn_call(&ctx, &kill).unwrap(), kill.body);
+            let db = ctx.db().unwrap();
+            let conn = db.lock().unwrap();
+            let ledger::Withdrawal::Answer {
+                body, kill_task, ..
+            } = ledger::withdraw(&conn, &kill.key, None, 200, usize::MAX).unwrap()
+            else {
+                panic!("a retry must return the frozen answer");
+            };
+            assert_eq!(body, kill.body);
+            assert!(kill_task.is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn withdraw_unregistered_recorded_scope_populated_keeps_answer_unfrozen() {
+        let (_dir, ctx, kill, _cgroup) =
+            unregistered_scoped_withdraw_fixture(Some("populated 1\n"));
+        assert_scoped_withdraw_incomplete(&ctx, &kill);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn withdraw_unregistered_recorded_runtime_scope_keeps_descendants_unfrozen() {
+        let (dir, ctx, kill, _cgroup) = unregistered_scoped_withdraw_fixture(Some("populated 1\n"));
+        let db = ctx.db().unwrap();
+        {
+            let conn = db.lock().unwrap();
+            let row = crate::db::bash_tasks::bash_task_by_id(&conn, &kill.task)
+                .unwrap()
+                .unwrap();
+            let mut metadata = crate::bash_background::persistence::PersistedTask::from(row);
+            metadata.memory_policy = None;
+            metadata.task_scope_runtime_ms = Some(60_000);
+            conn.execute(
+                "UPDATE bash_tasks SET metadata=?1 WHERE task_id=?2",
+                rusqlite::params![serde_json::to_string(&metadata).unwrap(), kill.task],
+            )
+            .unwrap();
+        }
+        let current = dir.path().join(format!(
+            "user@{}.service/app.slice/module.service",
+            unsafe { libc::geteuid() }
+        ));
+        crate::bash_background::task_scope::with_local_recovery_fixture_for_test(current, || {
+            assert_scoped_withdraw_incomplete(&ctx, &kill);
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn withdraw_unregistered_recorded_scope_lookup_error_keeps_answer_unfrozen() {
+        let (_dir, ctx, kill, cgroup) = unregistered_scoped_withdraw_fixture(Some("populated 0\n"));
+        std::fs::remove_dir_all(&cgroup).unwrap();
+        // A self-referencing link makes try_exists fail, rather than report absence.
+        std::os::unix::fs::symlink(cgroup.file_name().unwrap(), &cgroup).unwrap();
+        assert!(cgroup.try_exists().is_err());
+        assert_scoped_withdraw_incomplete(&ctx, &kill);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn withdraw_unregistered_recorded_scope_unconfirmed_population_keeps_answer_unfrozen() {
+        let (_dir, ctx, kill, _cgroup) = unregistered_scoped_withdraw_fixture(Some(""));
+        assert_scoped_withdraw_incomplete(&ctx, &kill);
     }
 
     #[test]

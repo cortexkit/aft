@@ -4431,6 +4431,15 @@ impl BgTaskRegistry {
             }
         }
         #[cfg(target_os = "linux")]
+        if gone
+            && (metadata.task_scope_runtime_ms.is_some()
+                || metadata.memory_policy.as_ref().is_some_and(|policy| {
+                    policy.kind == super::memory_limit::MemoryPolicy::TASK_SCOPE_MEMORY_KIND
+                }))
+        {
+            return Self::unregistered_task_scope_liveness(metadata);
+        }
+        #[cfg(target_os = "linux")]
         if !gone && metadata.mode == BgMode::Pipes {
             // Reuse replay's exact child/scope identity validation. A failed
             // adoption says nothing about whether the task has stopped.
@@ -4442,6 +4451,53 @@ impl BgTaskRegistry {
             ProcessLiveness::Gone
         } else {
             ProcessLiveness::Alive
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn unregistered_task_scope_liveness(
+        metadata: &PersistedTask,
+    ) -> super::process::ProcessLiveness {
+        use super::process::ProcessLiveness;
+        use super::task_scope::{lookup_local, lookup_state, LocalScopeLookup, ScopeLookup};
+
+        let recorded = metadata
+            .memory_policy
+            .as_ref()
+            .filter(|policy| {
+                policy.kind == super::memory_limit::MemoryPolicy::TASK_SCOPE_MEMORY_KIND
+            })
+            .and_then(|policy| policy.cgroup.as_deref());
+        let scope = match lookup_local(&metadata.task_id, recorded) {
+            Ok(LocalScopeLookup::Absent) => return ProcessLiveness::Gone,
+            Ok(LocalScopeLookup::Present(scope)) => scope,
+            Ok(LocalScopeLookup::Unknown) => match lookup_state(&metadata.task_id) {
+                Ok(ScopeLookup::Absent) => return ProcessLiveness::Gone,
+                Ok(ScopeLookup::Present(scope)) => scope,
+                Ok(ScopeLookup::Unreachable) | Err(_) => return ProcessLiveness::Unknown,
+            },
+            Err(_) => return ProcessLiveness::Unknown,
+        };
+        // A scope can retain descendants after its recorded leader has exited.
+        // cgroup.events includes child cgroups, unlike a direct PID listing.
+        match fs::read_to_string(scope.cgroup().join("cgroup.events")) {
+            Ok(events) if events.lines().any(|line| line == "populated 0") => ProcessLiveness::Gone,
+            Ok(events) if events.lines().any(|line| line == "populated 1") => {
+                log::warn!(
+                    "withdrawn call task {} still has descendants in scope {}",
+                    metadata.task_id,
+                    scope.cgroup().display()
+                );
+                ProcessLiveness::Alive
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // The scope may have disappeared between lookup and reading its events.
+                match scope.cgroup().try_exists() {
+                    Ok(false) => ProcessLiveness::Gone,
+                    _ => ProcessLiveness::Unknown,
+                }
+            }
+            _ => ProcessLiveness::Unknown,
         }
     }
 
