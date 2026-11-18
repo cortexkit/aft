@@ -70,7 +70,7 @@ fn display_read_cache_fresh_upgrade_and_rollback_keep_schema29_and_reader_floor(
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("aft.db");
     let fresh = crate::db::open(&path).unwrap();
-    assert_eq!(crate::db::schema_version(&fresh), 29);
+    assert_eq!(crate::db::current_schema_version(&fresh).unwrap(), 29);
     assert!(available(&fresh).unwrap());
     // Model an existing schema-29 database that predates the optional cache.
     fresh.execute_batch("DROP TABLE display_records").unwrap();
@@ -87,7 +87,7 @@ fn display_read_cache_fresh_upgrade_and_rollback_keep_schema29_and_reader_floor(
     let upgraded = crate::db::open(&path).unwrap();
     let now = now_ms();
     assert!(persist(&upgraded, "retained", b"opaque pull bytes", now).unwrap());
-    assert_eq!(crate::db::schema_version(&upgraded), 29);
+    assert_eq!(crate::db::current_schema_version(&upgraded).unwrap(), 29);
     assert_eq!(std::fs::read(&floor_path).unwrap(), floor_before);
     drop(upgraded);
     // The rollback build uses these unchanged version checks. It never needs
