@@ -206,24 +206,28 @@ impl Service {
         );
         let capacity = self.jobs.len() < MAX_PENDING_LOOKUPS;
         let received_at = ledger::now_ms();
+        let tool = body.get("name").and_then(Value::as_str).map(str::to_owned);
+        // Start the insert at ingress so a connection teardown that drops the
+        // response job cannot erase an already received call from the audit.
+        let insert = {
+            let edge = edge.clone();
+            let scope = scope.clone();
+            tokio::task::spawn_blocking(move || {
+                Record::open(
+                    &edge.app,
+                    &edge.database,
+                    received_at,
+                    scope.as_ref(),
+                    tool.as_deref(),
+                )
+            })
+        };
         self.jobs.spawn(async move {
             let _task = ResponseTaskGuard::new(&edge.metrics);
-            let tool = body.get("name").and_then(Value::as_str).map(str::to_owned);
-            let record = {
-                let edge = edge.clone();
-                let scope = scope.clone();
-                blocking(move || {
-                    Record::open(
-                        &edge.app,
-                        &edge.database,
-                        received_at,
-                        scope.as_ref(),
-                        tool.as_deref(),
-                    )
-                })
-                .await
-            };
-            let record = match record {
+            let record = match insert.await.unwrap_or_else(|error| {
+                log::warn!("remote tool audit insert failed: {error}");
+                Err(admission_refusal())
+            }) {
                 Ok(record) => record,
                 Err(error) => {
                     edge.error(&frame, error).await;
