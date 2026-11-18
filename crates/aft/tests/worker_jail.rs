@@ -3505,6 +3505,97 @@ async fn worker_jail_cannot_write_saved_task_output() {
 mod keychain;
 
 #[cfg(target_os = "linux")]
+fn read_worker_session_bus_probe(
+    listener: &std::os::unix::net::UnixListener,
+    timeout: Duration,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, ErrorKind, Read};
+    let deadline = std::time::Instant::now() + timeout;
+    let time_left = || {
+        deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::TimedOut,
+                    "worker session-bus probe did not arrive",
+                )
+            })
+    };
+    listener.set_nonblocking(true)?;
+    loop {
+        time_left()?;
+        let (mut connection, _) = match listener.accept() {
+            Ok(connection) => connection,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5).min(time_left()?));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        connection.set_nonblocking(false)?;
+        connection.set_read_timeout(Some(time_left()?))?;
+        let mut prefix = [0; b"\0AUTH ".len()];
+        connection.read_exact(&mut prefix)?;
+        // Task-scope cleanup can list units through the daemon's user bus
+        // before the worker connects. Authentication is not the worker probe.
+        if &prefix == b"\0AUTH " {
+            continue;
+        }
+        let mut bytes = prefix.to_vec();
+        // One extra byte keeps a probe with trailing data from matching.
+        let mut tail = [0; b"worker-session-bus-probe".len() + 1 - b"\0AUTH ".len()];
+        let mut received = 0;
+        while received < tail.len() {
+            connection.set_read_timeout(Some(time_left()?))?;
+            let count = connection.read(&mut tail[received..])?;
+            if count == 0 {
+                break;
+            }
+            received += count;
+        }
+        bytes.extend_from_slice(&tail[..received]);
+        return Ok(bytes);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_jail_session_dbus_listener_accepts_probe_after_management() {
+    use std::io::Write;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("bus");
+    let listener = UnixListener::bind(&path).unwrap();
+    for message in [
+        b"\0AUTH EXTERNAL\r\nDATA\r\nNEGOTIATE_UNIX_FD\r\n".as_slice(),
+        b"worker-session-bus-probe",
+    ] {
+        let mut connection = UnixStream::connect(&path).unwrap();
+        connection.write_all(message).unwrap();
+    }
+    let bytes = read_worker_session_bus_probe(&listener, Duration::from_secs(2)).unwrap();
+    assert_eq!(&bytes, b"worker-session-bus-probe");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_jail_session_dbus_listener_requires_a_worker_probe() {
+    use std::io::Write;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("bus");
+    let listener = UnixListener::bind(&path).unwrap();
+    let mut management = UnixStream::connect(&path).unwrap();
+    management
+        .write_all(b"\0AUTH EXTERNAL\r\nDATA\r\nworker-session-bus-probe")
+        .unwrap();
+    drop(management);
+    let error = read_worker_session_bus_probe(&listener, Duration::from_millis(50)).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+}
+
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn worker_jail_session_dbus_socket_is_reachable_and_reported_unenforced() {
     if !native_available() {
@@ -3525,6 +3616,14 @@ async fn worker_jail_session_dbus_socket_is_reachable_and_reported_unenforced() 
                 std::fs::create_dir(&runtime).unwrap();
                 socket = runtime.join("bus");
                 listener = Some(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+                // Exercise management-first ordering even when cleanup loses
+                // the race or the host has no systemd user manager.
+                let mut management = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+                std::io::Write::write_all(
+                    &mut management,
+                    b"\0AUTH EXTERNAL\r\nDATA\r\nNEGOTIATE_UNIX_FD\r\n",
+                )
+                .unwrap();
                 command.env("XDG_RUNTIME_DIR", &runtime).env(
                     "DBUS_SESSION_BUS_ADDRESS",
                     format!("unix:path={}", socket.display()),
@@ -3547,13 +3646,7 @@ async fn worker_jail_session_dbus_socket_is_reachable_and_reported_unenforced() 
         // A real AF_UNIX connect and payload, not merely an environment check,
         // demonstrate data exchange at the configured session-bus socket path.
         let listener = listener.take().unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let (mut connection, _) = listener.accept().unwrap();
-        connection
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        let mut bytes = [0; 24];
-        std::io::Read::read_exact(&mut connection, &mut bytes).unwrap();
+        let bytes = read_worker_session_bus_probe(&listener, Duration::from_secs(2)).unwrap();
         assert_eq!(&bytes, b"worker-session-bus-probe");
     }
 }
