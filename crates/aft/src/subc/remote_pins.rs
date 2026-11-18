@@ -8,6 +8,14 @@ fn spellings(tool: &CatalogTool, name: &str) -> bool {
     tool.name == name || crate::tool_gate::canonical_tool_name(&tool.name) == Some(name)
 }
 
+#[cfg(test)]
+pub(in crate::subc) fn hashline_edit_pin() -> String {
+    let tool = &RUNNER_HEAD_TOOLS.hashline_edit.catalog;
+    SchemaPin::new(&tool.name, &tool.schema_digest, tool.semantics)
+        .encode()
+        .unwrap()
+}
+
 pub(in crate::subc) fn preset_serves(preset: CatalogPreset, name: &str) -> bool {
     served_tools(preset)
         .iter()

@@ -397,6 +397,8 @@ async fn remote_edit_and_scope_end_enforce_attributed_authority() {
         assert_eq!(transport.count.load(Ordering::Relaxed), 0);
         assert!(text(&reply(peer.call(3, 712, read(712)).await)).contains("original"));
 
+        let ctx = executor.actor_context(&root).unwrap();
+        ctx.update_config(|config| config.disabled_tools.clear());
         for (corr, name, args) in [
             (
                 713,
@@ -415,14 +417,17 @@ async fn remote_edit_and_scope_end_enforce_attributed_authority() {
                 json!({"patchText":format!("*** Begin Patch\n*** Update File: in.txt\n*** Move to: {}\n@@\n-original\n+changed\n*** End Patch", outside.display())}),
             ),
         ] {
-            refusal(
-                peer.call(1, corr, tool(name, args, corr)).await,
-                "path_outside_root",
+            let frame = peer.call(1, corr, tool(name, args, corr)).await;
+            assert_eq!(
+                frame.header.ty,
+                FrameType::Error,
+                "{name} escaped preflight"
             );
+            let error: ErrorBody = serde_json::from_slice(&frame.body).unwrap();
+            assert_eq!(error.code, "path_outside_root", "{name}: {error:?}");
         }
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "outside\n");
         assert!(!root.as_path().join("inside.txt").exists());
-        let ctx = executor.actor_context(&root).unwrap();
         ctx.update_config(|config| config.disabled_tools.push("edit".into()));
         refusal(
             peer.call(1, 717, edit(717)).await,
@@ -468,6 +473,39 @@ async fn remote_edit_and_scope_end_enforce_attributed_authority() {
             "SELECT count(*) FROM remote_tool_audit WHERE pairing_id='pairing-saved' AND decision='refused' AND outcome='remote_call_not_admitted'", [], |row| row.get(0),
         ).unwrap();
         assert_eq!(collision_refusals, 2);
+        grants::save(
+            &db.lock().unwrap(),
+            &key("pairing-saved"),
+            folder,
+            Mode::ReadWrite,
+            "Remote on B",
+            "acc_seed",
+        )
+        .unwrap();
+        ctx.update_config(|config| config.disabled_tools.push("edit".into()));
+        refusal(
+            peer.call(3, 727, edit(727)).await,
+            "remote_tool_not_available",
+        );
+        assert_eq!(transport.count.load(Ordering::Relaxed), 3);
+        ctx.update_config(|config| config.disabled_tools.clear());
+        let hashline = request(
+            "edit",
+            "head",
+            json!({"patch":"@@ in.txt\n-1:99|original\n+changed"}),
+            "hashline-edit",
+            tool_provider::remote_pins::hashline_edit_pin(),
+        );
+        refusal(
+            peer.call(3, 729, hashline).await,
+            "remote_tool_not_available",
+        );
+        assert_eq!(std::fs::read_to_string(&original).unwrap(), "original\n");
+        reply(peer.call(3, 728, tool("apply_patch", json!({"patchText":"*** Begin Patch\n*** Add File: inside.txt\n+inside\n*** End Patch"}), 728)).await);
+        assert_eq!(
+            std::fs::read_to_string(root.as_path().join("inside.txt")).unwrap(),
+            "inside\n"
+        );
         #[cfg(unix)]
         exercise_external_tools(&mut peer, &mut cards, &ctx, root.as_path()).await;
         write_frame(
