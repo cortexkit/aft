@@ -112,6 +112,7 @@ async fn exhausted_bind(tool: bool, completion_capacity: bool) {
         &senders,
         |_, _| panic!("configure must not run without reserved reply capacity"),
         Some(&user),
+        None,
         usize::MAX,
         None,
         storage.path(),

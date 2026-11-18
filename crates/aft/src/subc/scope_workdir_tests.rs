@@ -186,6 +186,7 @@ fn bind_observed(
                         expected_project_root
                     },
                 )),
+                None,
                 usize::MAX,
                 None,
                 storage.path(),
