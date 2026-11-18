@@ -290,6 +290,10 @@ impl Authorizer {
         result
     }
 
+    pub(in crate::subc) fn set_db(&mut self, db: Db) {
+        self.db = Some(db);
+    }
+
     fn start(&mut self, group: Group, card: Card, waiters: VecDeque<Waiter>) {
         self.generation += 1;
         let generation = self.generation;
@@ -438,6 +442,10 @@ impl Authorizer {
 
     /// A confirmed end retires the cards opened by that stamp, as well as
     /// any worker approvals and followers from the ended scope.
+    #[allow(
+        dead_code,
+        reason = "the remote scope tracker does not yet report confirmed ends"
+    )]
     pub(in crate::subc) fn end_scope(&mut self, pairing: &str, stamp: &ScopeStamp) {
         let ended = scope_describe::stamp_key(stamp);
         self.worker_grants

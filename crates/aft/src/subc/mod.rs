@@ -238,7 +238,7 @@ mod legacy_root;
 mod metadata_route;
 mod remote_calls;
 use legacy_root::*;
-use metadata_route::handle_metadata_route_request;
+use metadata_route::{handle_metadata_route_request, log_management_refusal};
 pub(crate) mod held_task_recovery;
 #[cfg(test)]
 mod idle_reap_frame_loop_tests;
@@ -1643,7 +1643,7 @@ enum ManagementAdmission {
     /// general management authority or project-tool access on this route.
     Occipital,
     /// An inbound computer route with no authority over a local project actor.
-    RemoteTools,
+    RemoteTools(Arc<remote_calls::Binding>),
     /// Tool-provider metadata and custodian feeds without a project root;
     /// grants no management authority or project-tool access.
     ProjectFree {
@@ -5355,7 +5355,16 @@ where
     let mut installed_route_epochs: HashMap<u16, u32> = HashMap::new();
     let mut routes: HashMap<RouteChannel, RouteIdentity> = HashMap::new();
     let mut management_routes: HashMap<RouteChannel, ManagementIdentity> = HashMap::new();
-    let mut remote_folder_lookups = remote_calls::FolderLookups::default();
+    let mut remote_calls = remote_calls::Service::new(
+        writer_tx.clone(),
+        dispatch_path_metrics.clone(),
+        shared_app.clone(),
+        storage_dir,
+        connection_file_path,
+        executor.clone(),
+        dispatch,
+        tool_response_body_limit,
+    );
     let mut bg_subs: HashMap<RouteChannel, BgSub> = HashMap::new();
     let shells_service = shells::Service::new(shared_app.clone(), executor.clone());
     let mut bg_sub_by_session: BgSubsBySession = HashMap::new();
@@ -5746,11 +5755,7 @@ where
                 next_maintenance_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
                 health_rollup_worker.request_refresh();
             }
-            Some(completion) = remote_folder_lookups.next() => {
-                if let Err(error) = remote_calls::finish_lookup(&writer_tx, &dispatch_path_metrics, completion, &management_routes, &root_channels, &routes).await {
-                    break Err(error);
-                }
-            }
+            event = remote_calls.next() => remote_calls.advance(event, &root_channels, &routes),
             Some(query) = worker_read_scopes.recv() => {
                 dispatch_path_metrics.mark_frame_loop_step("gh_relay_route_scopes", "", 0);
                 let scopes = gh_relay_route_scopes(&routes,&speech);
@@ -5972,10 +5977,9 @@ where
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
                         let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies };
-                        if let Some(identity) = management_routes.get(&route).filter(|identity| identity.admission == ManagementAdmission::RemoteTools) {
-                            if let Err(error) = remote_folder_lookups.request(&writer_tx, &dispatch_path_metrics, &decoded.frame, decoded.body().ok(), identity, connection_file_path).await {
-                                break Err(error);
-                            }
+                        if let Some(identity @ ManagementIdentity { admission: ManagementAdmission::RemoteTools(binding), .. }) = management_routes.get(&route) {
+                            let body = decoded.body().ok().cloned();
+                            remote_calls.request(decoded.frame, body, identity, binding);
                             continue;
                         }
                         if let Ok(body) = decoded.body() {
@@ -8322,7 +8326,10 @@ async fn handle_control_request(
                     .await;
                 }
                 let admission = if project_free && remote {
-                    ManagementAdmission::RemoteTools
+                    ManagementAdmission::RemoteTools(Arc::new(remote_calls::Binding::new(
+                        identity.session.clone(),
+                        consumer_capabilities.as_deref(),
+                    )))
                 } else if project_free {
                     ManagementAdmission::ProjectFree {
                         workdir: scope.as_ref().and_then(|stamp| stamp.workdir.clone()),
@@ -9967,32 +9974,6 @@ fn occipital_carrier_route(identity: &RouteIdentity) -> bool {
             principal_id(&Some(scope.owner.clone())).as_deref()
                 != Some(rich_ui::authorization::OCCIPITAL_PRINCIPAL)
         })
-}
-
-fn log_management_refusal(identity: &ManagementIdentity, frame: &Frame, error: &ErrorBody) {
-    let body = serde_json::from_slice::<Value>(&frame.body).ok();
-    let operation = body.as_ref().and_then(|body| {
-        body.get("method")
-            .or_else(|| body.get("op"))
-            .or_else(|| body.get("name"))
-            .and_then(Value::as_str)
-    });
-    let admission = match &identity.admission {
-        ManagementAdmission::FirstParty => "FirstParty",
-        ManagementAdmission::FlowOnly => "FlowOnly",
-        ManagementAdmission::PermissionsOnly => "PermissionsOnly",
-        ManagementAdmission::ShellsOnly => "ShellsOnly",
-        ManagementAdmission::DisplayOnly => "DisplayOnly",
-        ManagementAdmission::Occipital => "Occipital",
-        ManagementAdmission::RemoteTools => "RemoteTools",
-        ManagementAdmission::ProjectFree { .. } => "ProjectFree",
-    };
-    log::warn!(
-        "subc management request refused: operation={operation:?} admission={admission} channel={} epoch={} code={}",
-        frame.header.channel,
-        frame.header.epoch,
-        error.code,
-    );
 }
 
 fn admit_management_flow_request(

@@ -31,6 +31,8 @@ pub(super) use shell_detaches::ShellDetaches;
 mod guidance_text_tests;
 #[cfg(test)]
 mod late_results_tests;
+#[path = "remote_pins.rs"]
+pub(super) mod remote_pins;
 
 #[cfg(test)]
 thread_local! {

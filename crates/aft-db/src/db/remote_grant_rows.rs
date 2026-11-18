@@ -18,17 +18,17 @@ CREATE TABLE IF NOT EXISTS remote_folder_grants (
 );";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum Mode {
+pub enum Mode {
     Read,
     ReadWrite,
 }
 
 impl Mode {
-    pub(crate) fn covers(self, needed: Self) -> bool {
+    pub fn covers(self, needed: Self) -> bool {
         self == Self::ReadWrite || self == needed
     }
 
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Read => "read",
             Self::ReadWrite => "read_write",
@@ -37,12 +37,12 @@ impl Mode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct Key {
-    pub(crate) pairing_id: String,
-    pub(crate) caller_id: String,
-    pub(crate) project_id: String,
-    pub(crate) root_kind: &'static str,
-    pub(crate) root_key: String,
+pub struct Key {
+    pub pairing_id: String,
+    pub caller_id: String,
+    pub project_id: String,
+    pub root_kind: &'static str,
+    pub root_key: String,
 }
 
 impl Key {
@@ -57,14 +57,14 @@ impl Key {
     }
 }
 
-pub(crate) struct Row {
-    pub(crate) id: String,
-    pub(crate) caller_id: String,
-    pub(crate) folder: String,
-    pub(crate) mode: Mode,
-    pub(crate) label: String,
-    pub(crate) granted_at_ms: i64,
-    pub(crate) card_ref: String,
+pub struct Row {
+    pub id: String,
+    pub caller_id: String,
+    pub folder: String,
+    pub mode: Mode,
+    pub label: String,
+    pub granted_at_ms: i64,
+    pub card_ref: String,
 }
 
 fn present(conn: &Connection) -> rusqlite::Result<bool> {
@@ -87,7 +87,7 @@ fn mode(write: bool) -> Mode {
     dead_code,
     reason = "read by remote authorization before dispatch is enabled"
 )]
-pub(crate) fn find(
+pub fn find(
     conn: &Connection,
     key: &Key,
     folder: &str,
@@ -113,7 +113,7 @@ pub(crate) fn find(
     dead_code,
     reason = "written by remote authorization before dispatch is enabled"
 )]
-pub(crate) fn save(
+pub fn save(
     conn: &Connection,
     key: &Key,
     folder: &str,
@@ -150,7 +150,7 @@ pub(crate) fn save(
     }, Ok)
 }
 
-pub(crate) fn list(conn: &Connection, caller_id: Option<&str>) -> rusqlite::Result<Vec<Row>> {
+pub fn list(conn: &Connection, caller_id: Option<&str>) -> rusqlite::Result<Vec<Row>> {
     if !present(conn)? {
         return Ok(Vec::new());
     }
@@ -173,7 +173,7 @@ pub(crate) fn list(conn: &Connection, caller_id: Option<&str>) -> rusqlite::Resu
     .collect()
 }
 
-pub(crate) fn revoke(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
+pub fn revoke(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
     if !id.starts_with("aftrg_") || !present(conn)? {
         return Ok(false);
     }
