@@ -8,7 +8,9 @@ Do not refresh the matrix pins to make an exactness failure disappear.
 ## Build the reference and candidate
 
 Run from the repository root on the build server. Use one
-`linux,16c,64gb,net` job at a time. Commit the candidate before submitting the job.
+`linux,16c,32gb,net` job at a time (build-server jobs are capped at 32 GB; a
+project whose comparison needs more runs on a rented machine). Commit the
+candidate before submitting the job.
 `build.py` archives the named source revision and overlays only the test probe,
 its feature-gated module declarations, the feature-gated negative-control hook,
 and the dead-code comparison entry point. It does **not** copy today's resolver
