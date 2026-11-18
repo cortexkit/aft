@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicUsize;
 
 const REMOTE: &str = "fed:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-fn stamp(claim: Value) -> Value {
+pub(super) fn stamp(claim: Value) -> Value {
     json!({
         "owner": {"kind":"reserved", "module_id":"callosum"},
         "ref":"remote-session", "kind":"federated", "scope_epoch":1,
@@ -23,7 +23,7 @@ fn stamp(claim: Value) -> Value {
     })
 }
 
-fn registry(root: &Path) -> EnumerateReply {
+pub(super) fn registry(root: &Path) -> EnumerateReply {
     serde_json::from_value(json!({
         "workspaces": [], "generation": 1, "incarnation": "local-registry",
         "projects": [{

@@ -9574,8 +9574,8 @@ fn spawn_permissions_request(
                     .iter()
                     .map(|ctx| ctx.bash_background().clone())
                     .collect::<Vec<_>>();
-                permissions::answer(db.as_deref(), &request, |row| {
-                    permissions::stop_folder_tasks(&registries, row)
+                permissions::answer(db.as_deref(), &request, |grant| {
+                    permissions::stop_tasks(&registries, grant)
                 })
             })
             .await

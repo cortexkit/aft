@@ -29,6 +29,7 @@ pub(crate) mod display_records;
 pub(crate) mod gh_speech;
 pub mod github_read_cache;
 pub mod remote_exec;
+pub(crate) mod remote_grant_rows;
 pub mod removal;
 pub mod rich_ui;
 pub(crate) mod runner_harness_keys;

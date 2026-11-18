@@ -7,6 +7,26 @@ use subc_protocol::scope::{
     FederatedPeerClass, FederatedProject, RemoteClaim, RootKeyKind, ScopeKind, ScopeStamp,
 };
 
+#[allow(
+    dead_code,
+    reason = "remote dispatch must attach pin, tool and audit preflight first"
+)]
+#[path = "remote_consent.rs"]
+pub(super) mod authorization;
+
+/// Success of the remote dispatch preflight, minted only after admission,
+/// folder and tool checks, verification of the runner's schema and behavior
+/// pin, transport checks, and creation of the audit record.
+#[allow(dead_code, reason = "remote dispatch does not yet complete preflight")]
+pub(super) struct Preflight {
+    scope: ScopeStamp,
+    session: String,
+    folder: PathBuf,
+    mode: crate::db::remote_grant_rows::Mode,
+    tool: String,
+    args_hash: String,
+}
+
 const MAX_PENDING_LOOKUPS: usize = 8;
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(30);
 
