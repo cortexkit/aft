@@ -1,5 +1,8 @@
-//! Linux tests against the config.gate daemon. CK_SUBC_BIN is an explicit
-//! opt-in so no test can attach to the operator's default daemon.
+//! Linux tests against the config.gate daemon. Use CK_SUBC_BIN for the ordinary
+//! build and CK_SUBC_DEV_BIN for the test-only scripted approval build. Both
+//! use isolated homes and an explicit binary, never the operator's daemon.
+//! Stamped cases require AFT's supervised registration-channel transport;
+//! the daemon refuses to stamp a TCP-only module (`registration_channel_unsupported`).
 
 use serde_json::{json, Value};
 use std::{
@@ -91,7 +94,7 @@ impl Daemon {
             "AFT_STORAGE_DIR":fixture.join("data/aft"), "AFT_TEST_SETTINGS_SCHEMA":schema_path});
         fs::write(fixture.join("config/cortexkit/subc.jsonc"), json!({
             "version":1,"port":0,"storage":{"backend":"sqlite","data_home":fixture.join("data")},
-            "modules":{"aft":{"program":fixture_aft_binary(),"args":[],"enabled":true,"env":module_env}}
+            "modules":{"aft":{"program":fixture_aft_binary(),"args":[],"enabled":true,"registration_channel":dev,"env":module_env}}
         }).to_string()).unwrap();
         setup(fixture);
         let binary_env = if dev {
@@ -152,7 +155,7 @@ impl Daemon {
         })
         .await
         .unwrap_or_else(|_| panic!("daemon connection deadline: {}", daemon.log()));
-        let consumer = SubcConsumer::connect(&connection, ConsumerOptions::default())
+        let consumer = SubcConsumer::connect_local(&connection, ConsumerOptions::default())
             .await
             .unwrap();
         (daemon, consumer)
@@ -340,7 +343,7 @@ where
 }
 
 #[tokio::test]
-#[ignore = "requires CK_SUBC_DEV_BIN with the upstream scripted Linux approval features"]
+#[ignore = "requires AFT registration-channel support and CK_SUBC_DEV_BIN with scripted Linux approval"]
 async fn subc_settings_real_dev_daemon_reviews_applies_and_serves_declaration_pending() {
     let (daemon, consumer) = Daemon::launch(true, |fixture| {
         fs::write(
@@ -437,7 +440,7 @@ async fn subc_settings_real_dev_daemon_reviews_applies_and_serves_declaration_pe
 }
 
 #[tokio::test]
-#[ignore = "requires CK_SUBC_DEV_BIN with the upstream scripted Linux approval features"]
+#[ignore = "requires AFT registration-channel support and CK_SUBC_DEV_BIN with scripted Linux approval"]
 async fn subc_settings_real_dev_daemon_no_approved_config_keeps_aft_not_ready() {
     let (daemon, consumer) = Daemon::launch(true, |fixture| {
         // Stamp before the supervised process declares its settings. The
