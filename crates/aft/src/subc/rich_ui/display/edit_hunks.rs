@@ -86,7 +86,7 @@ fn bytes(value: &Value) -> usize {
     serde_json::to_vec(value).expect("JSON value").len()
 }
 
-fn redacted(masker: &SecretValues, text: &str) -> Option<String> {
+fn redacted<'a>(masker: &SecretValues, text: &'a str) -> Option<std::borrow::Cow<'a, str>> {
     // Redact the whole snapshot, not individual lines: exact secrets and some
     // credential patterns can span several lines. Don't attach line numbers
     // to a snapshot if redaction changed the number of lines.

@@ -671,8 +671,9 @@ fn batch_edit_no_match_publishes_plain_hunks_with_scalar_marks() {
     }))
     .unwrap();
     let _active = enter(Some(&f.key));
-    assert!(!crate::commands::batch::handle_batch(&request, &ctx).success);
-    handler_ready(Some(&f.key), false);
+    let response = crate::commands::batch::handle_batch(&request, &ctx);
+    assert!(!response.success);
+    handler_ready(Some(&f.key), &response);
     reply(&f.key, false, true, Some("batch_edit_failed"));
 
     let writes = publications();
@@ -681,8 +682,8 @@ fn batch_edit_no_match_publishes_plain_hunks_with_scalar_marks() {
     assert_eq!(
         writes[1].body["hunks"],
         json!([
-            {"title":"Looked for","lines":[{"kind":"plain","text":looked,"marks":[{"start":26,"end":26}]}]},
-            {"title":"Closest text in the file · line 2","lines":[{"kind":"plain","text":closest,"marks":[{"start":26,"end":27}]}]}
+        {"title":"Looked for","lines":[{"kind":"plain","text":looked,"marks":[{"start":26,"end":26}]}]},
+        {"title":"Closest text in the file · line 2","lines":[{"kind":"plain","text":closest,"marks":[{"start":26,"end":27}]}]}
         ])
     );
 }

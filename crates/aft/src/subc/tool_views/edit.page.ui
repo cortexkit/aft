@@ -21,8 +21,11 @@
  ? <ToolText text="The full diff is no longer kept. This shows the changes the agent asked for." tone="warning" /> : null}
 
 {view.call.phase == "answered" && view.call.isError != true && view.detail.truncated != true && Count(view.detail.hunks ?? []) == 0
- ? Each(input.edits ?? [], "edit", <CodeBlock codeString={(edit.oldString ?? "") + "\n→\n" + (edit.newString ?? edit.content ?? "")} maxLines={40} />)
+ ? Each(Slice(input.edits ?? [], 0, 200), "edit", <Diff hunks={[
+     {lines: Each(Lines(edit.oldString ?? ""), "line", {kind: "delete", text: line})},
+     {lines: Each(Lines(edit.newString ?? edit.content ?? ""), "line", {kind: "add", text: line})}
+   ]} />)
  : null}
 
 {view.call.phase == "answered" && view.call.isError != true && view.detail.truncated != true && Count(view.detail.hunks ?? []) == 0 && (input.appendContent != null || input.content != null)
- ? <CodeBlock codeString={"→\n" + (input.appendContent ?? input.content ?? "")} maxLines={40} /> : null}
+ ? <Diff hunks={[{lines: Each(Lines(input.appendContent ?? input.content ?? ""), "line", {kind: "add", text: line})}]} /> : null}

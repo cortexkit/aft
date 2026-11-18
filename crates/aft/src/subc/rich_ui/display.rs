@@ -1308,7 +1308,10 @@ pub(crate) fn person_answered(ledger_key: &crate::db::call_ledger::Key) {
     }
 }
 
-pub(crate) fn handler_ready(ledger_key: Option<&crate::db::call_ledger::Key>, success: bool) {
+pub(crate) fn handler_ready(
+    ledger_key: Option<&crate::db::call_ledger::Key>,
+    response: &crate::protocol::Response,
+) {
     let capture =
         ledger_key.and_then(|ledger_key| CALLS.lock().ok()?.get(&key(ledger_key)).cloned());
     if let Some(capture) = capture {
@@ -1319,7 +1322,12 @@ pub(crate) fn handler_ready(ledger_key: Option<&crate::db::call_ledger::Key>, su
                     .saturating_add(began.elapsed().as_millis() as u64);
             }
             if capture.tool != "bash" && capture.file_snapshot.is_none() {
-                capture.file_snapshot = Some(file_bodies(&capture, success));
+                let (mut record, detail) = file_bodies(&capture, response.success);
+                if capture.tool == "edit" && response.data["syntax_valid"].as_bool() == Some(false)
+                {
+                    record["reason"] = json!("invalid_syntax");
+                }
+                capture.file_snapshot = Some((record, detail));
             }
         }
     }
