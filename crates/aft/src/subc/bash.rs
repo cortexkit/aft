@@ -1264,6 +1264,16 @@ fn bash_settings_from_translated(args: &serde_json::Map<String, Value>) -> BashT
     }
 }
 
+pub(super) fn provider_shell_selector(name: &str, args: &mut serde_json::Map<String, Value>) {
+    // The public selector distinguishes PowerShell from the default bash;
+    // `shell: "bash"` is not part of the bash tool's argument grammar.
+    if name == "powershell" {
+        args.insert("shell".into(), json!("powershell"));
+    } else {
+        args.remove("shell");
+    }
+}
+
 pub(super) fn prepare_bash_elicitation_plan(
     arguments: &Value,
     project_root: &Path,
@@ -3467,6 +3477,7 @@ fn log_runon_refusal(route: RouteChannel, session: &str, response: &Response) {
         crate::access_policy::AskRoute::Deny => "deny",
         crate::access_policy::AskRoute::Consent { .. } => "consent",
         crate::access_policy::AskRoute::Unavailable => "unavailable",
+        crate::access_policy::AskRoute::Fork { .. } => "fork",
     };
     crate::slog_info!(
         "runon refused: session={:?} route={} request={:?} grant_scope={:?} grant_denial={:?} ask_route={} classification={} code={} reason={:?}",

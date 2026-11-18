@@ -613,6 +613,9 @@ fn catalog_entry(
     if *restrict_replace {
         entry.result_ops = Some(vec!["prepend".into(), "append".into()]);
     }
+    if super::fork_call::READ_ONLY_TOOLS.contains(&name) {
+        entry = entry.with_read_only();
+    }
     entry
 }
 
@@ -5215,7 +5218,7 @@ mod tests {
         use crate::subc::runner_notices::notice_templates::{self as notices, Notice, Target};
         use sha2::{Digest, Sha256};
         let mut files = BTreeMap::new();
-        files.insert("README.md".into(), "# AFT notice templates v1\n\nOpt-in `tool.catalog` replies and example `session.send` requests for each preset.\nThe examples use a fixed clock (1700000000000 ms), call key and cleared delivery\nmode; real sends use the current clock and the runner's declared modes.\nTemplate digests use llm-runner's RFC 8785 SHA-256 helper.\n\nRegenerate with `cargo test -p agent-file-tools --lib regenerate_notice_template_vectors -- --ignored`.\nThe `notice_template_vectors_match_samples` test regenerates in memory and compares every byte.\n".into());
+        files.insert("README.md".into(), "# AFT notice templates v1.1\n\nThe same opt-in `tool.catalog` replies and example `session.send` requests as\n`aft-notice-templates-v1` (see its README for the fixed clock, call key and\ndelivery mode they use), except that every catalog now carries the\ntool-provider 0.15.12 `read_only: true` mark on the tools AFT marks read-only.\nThe mark is always sent, so each catalog's `generation` and `catalog_digest`\nchange; the `*.sends.json` files are unchanged. v1 stays as published.\nRegenerate with `cargo test -p agent-file-tools --lib regenerate_notice_template_vectors -- --ignored`;\n`notice_template_vectors_match_samples` compares every byte.\n".into());
         for preset in ["head", "worker", "reader"] {
             let reply = catalog(
                 json!({"preset": preset, "notice_templates": true}),
@@ -5276,7 +5279,7 @@ mod tests {
     #[test]
     fn notice_template_vectors_match_samples() {
         let root = std::path::Path::new(crate::test_support::manifest_dir())
-            .join("../../test-vectors/aft-notice-templates-v1");
+            .join("../../test-vectors/aft-notice-templates-v1.1");
         for (path, expected) in notice_template_vectors() {
             assert_eq!(
                 std::fs::read_to_string(root.join(&path)).unwrap(),
@@ -5290,7 +5293,7 @@ mod tests {
     #[ignore = "explicit sample regeneration, not a verification gate"]
     fn regenerate_notice_template_vectors() {
         let root = std::path::Path::new(crate::test_support::manifest_dir())
-            .join("../../test-vectors/aft-notice-templates-v1");
+            .join("../../test-vectors/aft-notice-templates-v1.1");
         std::fs::create_dir_all(&root).unwrap();
         for (path, text) in notice_template_vectors() {
             std::fs::write(root.join(path), text).unwrap();
@@ -7640,6 +7643,122 @@ pub(in crate::subc) mod route_tests {
                 );
             }
         }
+    }
+
+    /// The role's published fork-call samples.
+    fn fork_call_vectors() -> Value {
+        let (_, text) = cortexkit_role_tool_provider::vectors::FILES
+            .iter()
+            .find(|(file, _)| *file == "fork-calls.json")
+            .expect("the role ships its fork-call samples");
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// A tool-provider/v1 route whose access questions go to an OpenCode
+    /// plugin prompt, so an outside read on it would normally ask the person.
+    fn plugin_prompt_v1_identity(root: &crate::path_identity::ProjectRootId) -> RouteIdentity {
+        RouteIdentity(Arc::new(RouteIdentityData {
+            output_scope: Default::default(),
+            root: root.clone(),
+            project_root: root.as_path().into(),
+            harness: "opencode".into(),
+            session: "head-session".into(),
+            role: RouteRole::ToolProviderV1,
+            trust: BindTrust::FirstParty,
+            spawn_principal: AuthenticatedPrincipal::FirstParty,
+            consumer_elicitation_capable: false,
+            held_reply: false,
+            held_update: false,
+            call_keepalive: false,
+            call_yield: false,
+            tool_result_body: false,
+            disabled_tools: Arc::new(Vec::new()),
+            scope: None,
+            run_scope: std::sync::OnceLock::new(),
+            call_mode: subc_protocol::call_mode::CallMode::Classic,
+            made_tool_call: AtomicBool::new(false),
+            run_owner: None,
+        }))
+    }
+
+    /// Records the ask route a call ran under, then answers as the access
+    /// policy answers a read outside the project: a route that cannot ask
+    /// refuses, any other route reads.
+    fn outside_read_dispatch(request: crate::protocol::RawRequest, _: &AppContext) -> Response {
+        use crate::access_policy::AskRoute;
+        let route = crate::access_policy::current_ask_route();
+        let label = match &route {
+            AskRoute::Plugin { .. } => "plugin".to_owned(),
+            AskRoute::Fork { tool } => format!("fork:{tool}"),
+            other => format!("{other:?}"),
+        };
+        *LAST_DISPATCH.lock().unwrap() = Some(json!(label));
+        let outside = std::path::Path::new("/outside/protected.txt");
+        crate::access_policy::unasked_refusal(
+            &route,
+            &request.id,
+            outside,
+            outside,
+            crate::access_policy::AccessOperation::Read,
+        )
+        .unwrap_or_else(|| Response::success(request.id, json!({"text": "found"})))
+    }
+
+    async fn fork_exchange(body: Value) -> (FrameType, Value, Option<Value>) {
+        let (_dir, root) = test_support::test_root("fork-calls");
+        *LAST_DISPATCH.lock().unwrap() = None;
+        let reply = exchange_with_actor(
+            body,
+            plugin_prompt_v1_identity(&root),
+            test_support::test_ctx(),
+            &Arc::new(DispatchPathMetrics::new()),
+            outside_read_dispatch,
+        )
+        .await;
+        let dispatched = LAST_DISPATCH.lock().unwrap().take();
+        (
+            reply.header.ty,
+            serde_json::from_slice(&reply.body).unwrap(),
+            dispatched,
+        )
+    }
+
+    /// A call without `fork_id` runs exactly as before, under its route's
+    /// own prompt. A fork call to a marked tool runs under a route that
+    /// refuses instead of asking, answered with the role's ERROR, and a fork
+    /// call to an unmarked tool or with a malformed marker never runs. The
+    /// refusals are compared with the role's published samples.
+    #[tokio::test]
+    async fn fork_calls_refuse_instead_of_asking_and_plain_calls_are_unchanged() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        let vectors = fork_call_vectors();
+        let [unmarked, needs_consent] = [&vectors["refusals"][0], &vectors["refusals"][1]];
+        assert_eq!(unmarked["name"], "unmarked");
+        assert_eq!(needs_consent["name"], "needs consent");
+
+        let plain =
+            json!({"op": "tool.call", "name": "read", "arguments": {"path": "protected.txt"}});
+        let (ty, body, dispatched) = fork_exchange(plain).await;
+        assert_eq!(ty, FrameType::Response, "{body}");
+        assert_eq!(dispatched, Some(json!("plugin")));
+
+        let (ty, body, dispatched) = fork_exchange(needs_consent["call"].clone()).await;
+        assert_eq!(ty, FrameType::Error, "{body}");
+        assert_eq!(body, needs_consent["error"]);
+        assert_eq!(dispatched, Some(json!("fork:read")));
+
+        let (ty, body, dispatched) = fork_exchange(unmarked["call"].clone()).await;
+        assert_eq!(ty, FrameType::Error, "{body}");
+        assert_eq!(body, unmarked["error"]);
+        assert_eq!(dispatched, None, "an unmarked tool must not run");
+
+        let mut malformed = vectors["call"].clone();
+        malformed["fork_id"] = json!("not valid");
+        let (ty, body, dispatched) = fork_exchange(malformed).await;
+        assert_eq!(ty, FrameType::Error, "{body}");
+        let error: ErrorBody = serde_json::from_value(body).unwrap();
+        assert_eq!(errors::invalid_request_field(&error), Some("fork_id"));
+        assert_eq!(dispatched, None, "a malformed marker must not run");
     }
 
     #[tokio::test]

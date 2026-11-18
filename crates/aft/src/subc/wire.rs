@@ -1299,6 +1299,22 @@ pub(super) fn build_tool_response_frame_with_limit(
     policy: impl Into<ToolResponsePolicy>,
     max_body_len: usize,
 ) -> Result<WriterFrame, SubcError> {
+    // A fork call refused in place of an access question is answered with the
+    // role's ERROR, like a refusal at admission, never with a tool result.
+    if let Some(error) = super::fork_call::reply_refusal(&result.response) {
+        let body = serde_json::to_vec(&error).map_err(SubcError::Json)?;
+        return Frame::build_with_version(
+            ver,
+            FrameType::Error,
+            flags,
+            route.channel,
+            route.epoch,
+            corr,
+            body,
+        )
+        .map(WriterFrame::plain)
+        .map_err(SubcError::FrameBuild);
+    }
     let _alloc_label = crate::alloc_trace::scope(crate::alloc_trace::Label::FRAME_ENCODE, None);
     let policy = policy.into();
     let mut capped;

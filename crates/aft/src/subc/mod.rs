@@ -227,6 +227,7 @@ mod diagnostics_findings;
 // fields, so they live under `subc` rather than the public `secret` types.
 mod drain;
 mod flow_read;
+mod fork_call;
 mod health;
 mod installed_routes;
 use installed_routes::{insert_route_channel, remove_route_channel};
@@ -11192,9 +11193,12 @@ async fn handle_tool_call_with_capabilities(
     if let Some(error) = occipital_session_refusal(&identity, &envelope) {
         return send_provider_error(tx, metrics, frame, error).await;
     }
-    if let Err(error) = carrier_read_only::admit(&identity, &envelope) {
-        return send_provider_error(tx, metrics, frame, error).await;
-    }
+    let fork_tool = match carrier_read_only::admit(&identity, &envelope)
+        .and_then(|()| fork_call::admit(&envelope))
+    {
+        Ok(tool) => tool,
+        Err(error) => return send_provider_error(tx, metrics, frame, error).await,
+    };
     if envelope
         .get("name")
         .and_then(Value::as_str)
@@ -11435,7 +11439,7 @@ async fn handle_tool_call_with_capabilities(
                 .expect("admission validated arguments");
             args.insert("foreground_orchestrate".into(), json!(true));
             args.insert("block_to_completion".into(), json!(true));
-            provider_shell_selector(&call.name, args);
+            bash::provider_shell_selector(&call.name, args);
         }
         RouteRequest::ToolCall(ToolCallRequest {
             name: call.name,
@@ -11656,6 +11660,7 @@ async fn handle_tool_call_with_capabilities(
     let request_id = format!("subc-{}-{}", frame.header.channel, frame.header.corr);
     format_context.runner_notice =
         runner_notices::code_search_notice(&identity, call_key.as_deref().unwrap_or(&request_id))
+            .filter(|_| fork_tool.is_none())
             .map(|notice| notice.with_preset(role));
     // Pin the response ID only for the fixture's exact probe inputs. Other
     // calls and frame correlation keep their ordinary identities; all native
@@ -12169,12 +12174,14 @@ async fn handle_tool_call_with_capabilities(
             let _grants = crate::access_policy::scope_grants_guard(
                 access_grants::scope_grants_denial(&identity_for_run),
             );
-            let _ask_route =
-                crate::access_policy::ask_route_guard(Some(access_grants::ask_route_for_call(
+            let _ask_route = crate::access_policy::ask_route_guard(Some(fork_call::ask_route(
+                fork_tool.as_deref(),
+                access_grants::ask_route_for_call(
                     &identity_for_run,
                     &bare_name_for_run,
                     &arguments,
-                )));
+                ),
+            )));
             if matches!(
                 crate::access_policy::current_ask_route(),
                 crate::access_policy::AskRoute::Plugin { .. }
@@ -12576,8 +12583,10 @@ async fn handle_tool_call_with_capabilities(
         approved_io_window: None,
         reply_deadline: reply_budget.deadline,
     };
+    let ask_route =
+        access_grants::ask_route_for_call(&identity, &plain_run.bare_name, &plain_run.arguments);
     let job = plain_run.job(
-        access_grants::ask_route_for_call(&identity, &plain_run.bare_name, &plain_run.arguments),
+        fork_call::ask_route(fork_tool.as_deref(), ask_route),
         phase_trace,
         tool_call_tx,
     );
@@ -13227,16 +13236,6 @@ struct BgEventsRequest {
 #[serde(rename_all = "snake_case")]
 enum BgEventsOp {
     BgEvents,
-}
-
-fn provider_shell_selector(name: &str, args: &mut serde_json::Map<String, Value>) {
-    // The public selector distinguishes PowerShell from the default bash;
-    // `shell: "bash"` is not part of the bash tool's argument grammar.
-    if name == "powershell" {
-        args.insert("shell".into(), json!("powershell"));
-    } else {
-        args.remove("shell");
-    }
 }
 
 /// A tool call as AFT decodes it from a route `REQUEST` body.

@@ -616,7 +616,7 @@ async fn cancelled_wait_names_its_task_once_and_delivers_its_completion_after_re
 #[test]
 fn exec_remote_v1_powershell_keeps_its_only_supported_selector() {
     let mut args = serde_json::Map::new();
-    provider_shell_selector("powershell", &mut args);
+    bash::provider_shell_selector("powershell", &mut args);
     assert_eq!(args.get("shell"), Some(&json!("powershell")));
 }
 

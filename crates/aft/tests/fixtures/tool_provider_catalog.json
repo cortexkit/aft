@@ -16,8 +16,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "1a6260325dfb15cb44eb505aaaa60f457fda643f7188c63d451360bf30caa794",
-      "catalog_digest": "1a6260325dfb15cb44eb505aaaa60f457fda643f7188c63d451360bf30caa794",
+      "generation": "97bdadf0fd7628e0562f03251ae0250307affa1d02aaf3b381fdfbc957698f6d",
+      "catalog_digest": "97bdadf0fd7628e0562f03251ae0250307affa1d02aaf3b381fdfbc957698f6d",
       "tools": [
         {
           "name": "status",
@@ -119,6 +119,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "read",
           "schema_digest": "f9ef88233ec21e9968187fd84526076c5853cb62d8397721b76ae8bd0a229f00",
           "semantics": 1,
@@ -317,6 +318,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
@@ -356,6 +358,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
@@ -386,6 +389,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "search",
           "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
@@ -435,6 +439,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "outline",
           "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
           "semantics": 1,
@@ -481,6 +486,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "zoom",
           "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
@@ -607,6 +613,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
@@ -679,6 +686,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
@@ -703,6 +711,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
@@ -1230,8 +1239,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "c975177882c32a675bcd22afbbbc39683c1692657164ac3f4cf46307a39f0641",
-      "catalog_digest": "c975177882c32a675bcd22afbbbc39683c1692657164ac3f4cf46307a39f0641",
+      "generation": "55dca5ad51c8fcbfe801db8af6f87a029d89ecf53318105661345f7bc3320ba2",
+      "catalog_digest": "55dca5ad51c8fcbfe801db8af6f87a029d89ecf53318105661345f7bc3320ba2",
       "tools": [
         {
           "name": "status",
@@ -1333,6 +1342,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "read",
           "schema_digest": "f9ef88233ec21e9968187fd84526076c5853cb62d8397721b76ae8bd0a229f00",
           "semantics": 1,
@@ -1531,6 +1541,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
@@ -1570,6 +1581,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
@@ -1600,6 +1612,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "search",
           "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
@@ -1649,6 +1662,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "outline",
           "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
           "semantics": 1,
@@ -1695,6 +1709,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "zoom",
           "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
@@ -1821,6 +1836,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
@@ -1893,6 +1909,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
@@ -1917,6 +1934,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
@@ -2446,8 +2464,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "0f574858db05bf2f045c392160aded657dc29b9d1bd78b797a4660f96e980bcd",
-      "catalog_digest": "0f574858db05bf2f045c392160aded657dc29b9d1bd78b797a4660f96e980bcd",
+      "generation": "06ec2fc15c4b4c17290c89080e4f0d414828a7521a444a94ccced4b2a86c27e1",
+      "catalog_digest": "06ec2fc15c4b4c17290c89080e4f0d414828a7521a444a94ccced4b2a86c27e1",
       "tools": [
         {
           "name": "status",
@@ -2467,6 +2485,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "read",
           "schema_digest": "f9ef88233ec21e9968187fd84526076c5853cb62d8397721b76ae8bd0a229f00",
           "semantics": 1,
@@ -2665,6 +2684,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
@@ -2704,6 +2724,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
@@ -2734,6 +2755,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "search",
           "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
@@ -2783,6 +2805,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "outline",
           "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
           "semantics": 1,
@@ -2829,6 +2852,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "zoom",
           "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
@@ -2955,6 +2979,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
@@ -3027,6 +3052,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
@@ -3051,6 +3077,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
@@ -3579,8 +3606,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "d9cf7a22b5d12824e58c8d56789bee90d86337ebb15e36327b798b70aed5a9c1",
-      "catalog_digest": "d9cf7a22b5d12824e58c8d56789bee90d86337ebb15e36327b798b70aed5a9c1",
+      "generation": "739a85f8ea852546036fa6cae707cdcfebee20fcb6aa4b7b2feb49064e74f207",
+      "catalog_digest": "739a85f8ea852546036fa6cae707cdcfebee20fcb6aa4b7b2feb49064e74f207",
       "tools": [
         {
           "name": "status",
@@ -3682,6 +3709,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "read",
           "schema_digest": "f9ef88233ec21e9968187fd84526076c5853cb62d8397721b76ae8bd0a229f00",
           "semantics": 1,
@@ -3880,6 +3908,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
@@ -3919,6 +3948,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
@@ -3949,6 +3979,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "search",
           "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
@@ -3998,6 +4029,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "zoom",
           "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
@@ -4124,6 +4156,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
@@ -4196,6 +4229,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
@@ -4220,6 +4254,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
@@ -4748,8 +4783,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "534e2c2de7beecd204c7a6a10757ac83dc20c768a208e21dc7ba4229bfdcc77b",
-      "catalog_digest": "534e2c2de7beecd204c7a6a10757ac83dc20c768a208e21dc7ba4229bfdcc77b",
+      "generation": "49de630b0f06dbee029628561f1d9f9570f5ae193f806e41575f8b310ccb1a68",
+      "catalog_digest": "49de630b0f06dbee029628561f1d9f9570f5ae193f806e41575f8b310ccb1a68",
       "tools": [
         {
           "name": "status",
@@ -4851,6 +4886,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "read",
           "schema_digest": "f9ef88233ec21e9968187fd84526076c5853cb62d8397721b76ae8bd0a229f00",
           "semantics": 1,
@@ -5049,6 +5085,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
@@ -5088,6 +5125,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
@@ -5118,6 +5156,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "outline",
           "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
           "semantics": 1,
@@ -5164,6 +5203,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "zoom",
           "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
@@ -5290,6 +5330,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
@@ -5362,6 +5403,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
@@ -5386,6 +5428,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
@@ -5915,8 +5958,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "cb61c1e59d3855e9fd9740254f0c0bf3c6f78d167d7063027a0a6596ad6048ab",
-      "catalog_digest": "cb61c1e59d3855e9fd9740254f0c0bf3c6f78d167d7063027a0a6596ad6048ab",
+      "generation": "41028d4bf9abd24ef34bafc1a427aece96c824457fb8d2241c94a9a7aa96866a",
+      "catalog_digest": "41028d4bf9abd24ef34bafc1a427aece96c824457fb8d2241c94a9a7aa96866a",
       "tools": [
         {
           "name": "status",
@@ -6018,6 +6061,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "read",
           "schema_digest": "f9ef88233ec21e9968187fd84526076c5853cb62d8397721b76ae8bd0a229f00",
           "semantics": 1,
@@ -6216,6 +6260,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
@@ -6255,6 +6300,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
@@ -6285,6 +6331,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "search",
           "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
@@ -6334,6 +6381,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "zoom",
           "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
@@ -6400,6 +6448,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
@@ -6472,6 +6521,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
@@ -6496,6 +6546,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
@@ -7024,8 +7075,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "d73a71754a2b6ad7e3cb9eedd7ac3ae7183f4eadbb654075645bc401b7526c77",
-      "catalog_digest": "d73a71754a2b6ad7e3cb9eedd7ac3ae7183f4eadbb654075645bc401b7526c77",
+      "generation": "36b9bafc12e61b7413a8535ccdf1b61abea121c1f0fb7613d0dc55ed8acb591b",
+      "catalog_digest": "36b9bafc12e61b7413a8535ccdf1b61abea121c1f0fb7613d0dc55ed8acb591b",
       "tools": [
         {
           "name": "status",
@@ -7127,6 +7178,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "read",
           "schema_digest": "f9ef88233ec21e9968187fd84526076c5853cb62d8397721b76ae8bd0a229f00",
           "semantics": 1,
@@ -7325,6 +7377,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
@@ -7364,6 +7417,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
@@ -7394,6 +7448,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "outline",
           "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
           "semantics": 1,
@@ -7440,6 +7495,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "zoom",
           "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
@@ -7506,6 +7562,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
@@ -7578,6 +7635,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
@@ -7602,6 +7660,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
@@ -8130,8 +8189,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "17c82349e9954d927482c4bd4bc91e406629b5d67dbb3d72e8375f73a5e58b8e",
-      "catalog_digest": "17c82349e9954d927482c4bd4bc91e406629b5d67dbb3d72e8375f73a5e58b8e",
+      "generation": "84baab7eae2f6450049604f363ddf99fe445c0ae4dcec9d5c2253371ae1b571c",
+      "catalog_digest": "84baab7eae2f6450049604f363ddf99fe445c0ae4dcec9d5c2253371ae1b571c",
       "tools": [
         {
           "name": "status",
@@ -8233,6 +8292,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "read",
           "schema_digest": "f9ef88233ec21e9968187fd84526076c5853cb62d8397721b76ae8bd0a229f00",
           "semantics": 1,
@@ -8431,6 +8491,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
@@ -8470,6 +8531,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
@@ -8500,6 +8562,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "search",
           "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
@@ -8609,6 +8672,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
@@ -8681,6 +8745,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
@@ -8705,6 +8770,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
@@ -9233,8 +9299,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "28b9be1058b178c5b8757918b515d815265fe257f279c859d56df87187c31f5e",
-      "catalog_digest": "28b9be1058b178c5b8757918b515d815265fe257f279c859d56df87187c31f5e",
+      "generation": "ab97e13bf4b392423b98f940bb9657feba6cc0c504dae6c950fb9ac71cdc5c40",
+      "catalog_digest": "ab97e13bf4b392423b98f940bb9657feba6cc0c504dae6c950fb9ac71cdc5c40",
       "tools": [
         {
           "name": "status",
@@ -9336,6 +9402,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "read",
           "schema_digest": "f9ef88233ec21e9968187fd84526076c5853cb62d8397721b76ae8bd0a229f00",
           "semantics": 1,
@@ -9534,6 +9601,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
@@ -9573,6 +9641,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
@@ -9603,6 +9672,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "outline",
           "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
           "semantics": 1,
@@ -9709,6 +9779,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
@@ -9781,6 +9852,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
@@ -9805,6 +9877,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
@@ -10330,8 +10403,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "81cd3bde5d7ab44f6065690e0b390d766d0d49a63ce179eeb40c72c6c8b2644a",
-      "catalog_digest": "81cd3bde5d7ab44f6065690e0b390d766d0d49a63ce179eeb40c72c6c8b2644a",
+      "generation": "dc8a586da625ee2da056eb6faac6fcacfb1c06b9ecfc81a1d9bd2187039a5e39",
+      "catalog_digest": "dc8a586da625ee2da056eb6faac6fcacfb1c06b9ecfc81a1d9bd2187039a5e39",
       "tools": [
         {
           "name": "status",
@@ -10507,6 +10580,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "read",
           "schema_digest": "f9ef88233ec21e9968187fd84526076c5853cb62d8397721b76ae8bd0a229f00",
           "semantics": 1,
@@ -10705,6 +10779,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
@@ -10744,6 +10819,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
@@ -10774,6 +10850,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "search",
           "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
@@ -10823,6 +10900,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "outline",
           "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
           "semantics": 1,
@@ -10869,6 +10947,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "zoom",
           "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
@@ -10995,6 +11074,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
@@ -11067,6 +11147,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
@@ -11091,6 +11172,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
@@ -11619,8 +11701,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "877ae77fd3d58188edaf3784030dc8a43359d1170ac2760e458922b1f5d342cd",
-      "catalog_digest": "877ae77fd3d58188edaf3784030dc8a43359d1170ac2760e458922b1f5d342cd",
+      "generation": "42b0d3cfed5c19377b5f7bc9c6cf3ea269986f7a795cfa80dad5df22d0bfa3fc",
+      "catalog_digest": "42b0d3cfed5c19377b5f7bc9c6cf3ea269986f7a795cfa80dad5df22d0bfa3fc",
       "tools": [
         {
           "name": "status",
@@ -11796,6 +11878,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "read",
           "schema_digest": "f9ef88233ec21e9968187fd84526076c5853cb62d8397721b76ae8bd0a229f00",
           "semantics": 1,
@@ -11994,6 +12077,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
@@ -12033,6 +12117,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
@@ -12063,6 +12148,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "search",
           "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
@@ -12112,6 +12198,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "outline",
           "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
           "semantics": 1,
@@ -12158,6 +12245,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "zoom",
           "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
@@ -12284,6 +12372,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
@@ -12356,6 +12445,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
@@ -12380,6 +12470,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
@@ -12910,8 +13001,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "142ba5cd13829bee1e24c62f17cbb76405aeef66958ff9178c3bc4f1c30d6f44",
-      "catalog_digest": "142ba5cd13829bee1e24c62f17cbb76405aeef66958ff9178c3bc4f1c30d6f44",
+      "generation": "620e6ad226ebdf1877d24ec0711f9afe2a5359263d1808629e7fa0af6cb134c7",
+      "catalog_digest": "620e6ad226ebdf1877d24ec0711f9afe2a5359263d1808629e7fa0af6cb134c7",
       "tools": [
         {
           "name": "status",
@@ -13005,6 +13096,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "read",
           "schema_digest": "f9ef88233ec21e9968187fd84526076c5853cb62d8397721b76ae8bd0a229f00",
           "semantics": 1,
@@ -13203,6 +13295,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
@@ -13242,6 +13335,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
@@ -13272,6 +13366,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "search",
           "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
@@ -13321,6 +13416,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "outline",
           "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
           "semantics": 1,
@@ -13367,6 +13463,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "zoom",
           "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
@@ -13493,6 +13590,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
@@ -13565,6 +13663,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
@@ -13589,6 +13688,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
@@ -14118,8 +14218,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "d08fc228070cdf70dc41745a5274dc325bad21c1d481131bc651c586853bddbc",
-      "catalog_digest": "d08fc228070cdf70dc41745a5274dc325bad21c1d481131bc651c586853bddbc",
+      "generation": "5d4d3ed34a10e7a4dd8612144f564c1deca6def33e149507a5255d3037c6deea",
+      "catalog_digest": "5d4d3ed34a10e7a4dd8612144f564c1deca6def33e149507a5255d3037c6deea",
       "tools": [
         {
           "name": "status",
@@ -14295,6 +14395,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "read",
           "schema_digest": "f9ef88233ec21e9968187fd84526076c5853cb62d8397721b76ae8bd0a229f00",
           "semantics": 1,
@@ -14493,6 +14594,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
@@ -14532,6 +14634,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
@@ -14562,6 +14665,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "search",
           "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
@@ -14611,6 +14715,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "zoom",
           "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
@@ -14737,6 +14842,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
@@ -14809,6 +14915,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
@@ -14833,6 +14940,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
@@ -15362,8 +15470,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "44a9239e90b2e929c7319dd9da858cccb108aa1fd634c1ef73c1c56c4fa7d7f6",
-      "catalog_digest": "44a9239e90b2e929c7319dd9da858cccb108aa1fd634c1ef73c1c56c4fa7d7f6",
+      "generation": "c64d7e132efe14d0fe133df4c5e0d7aee0205a3876df28af40154c76c46e4b77",
+      "catalog_digest": "c64d7e132efe14d0fe133df4c5e0d7aee0205a3876df28af40154c76c46e4b77",
       "tools": [
         {
           "name": "status",
@@ -15539,6 +15647,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "read",
           "schema_digest": "f9ef88233ec21e9968187fd84526076c5853cb62d8397721b76ae8bd0a229f00",
           "semantics": 1,
@@ -15737,6 +15846,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
@@ -15776,6 +15886,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
@@ -15806,6 +15917,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "outline",
           "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
           "semantics": 1,
@@ -15852,6 +15964,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "zoom",
           "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
@@ -15978,6 +16091,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
@@ -16050,6 +16164,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
@@ -16074,6 +16189,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
@@ -16604,8 +16720,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "d6b048ff5619064e90ba1fbc7f567da16556962d64532f8be3069fb0d4c128a2",
-      "catalog_digest": "d6b048ff5619064e90ba1fbc7f567da16556962d64532f8be3069fb0d4c128a2",
+      "generation": "ef517c0071890f8b35f96a07adae546fd4328b9b7a732f51f4141bfd25d23639",
+      "catalog_digest": "ef517c0071890f8b35f96a07adae546fd4328b9b7a732f51f4141bfd25d23639",
       "tools": [
         {
           "name": "status",
@@ -16781,6 +16897,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "read",
           "schema_digest": "f9ef88233ec21e9968187fd84526076c5853cb62d8397721b76ae8bd0a229f00",
           "semantics": 1,
@@ -16979,6 +17096,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
@@ -17018,6 +17136,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
@@ -17048,6 +17167,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "search",
           "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
@@ -17097,6 +17217,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "zoom",
           "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
@@ -17163,6 +17284,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
@@ -17235,6 +17357,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
@@ -17259,6 +17382,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
@@ -17788,8 +17912,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "87ffb8642e7b7cb831d917147d5c019cfcb5d632ebc6ed0e36b5fafc91291587",
-      "catalog_digest": "87ffb8642e7b7cb831d917147d5c019cfcb5d632ebc6ed0e36b5fafc91291587",
+      "generation": "fc87f1c4453657a874869ec6e4bb1e07f4aeb772c064ebae61666bfe7e7061da",
+      "catalog_digest": "fc87f1c4453657a874869ec6e4bb1e07f4aeb772c064ebae61666bfe7e7061da",
       "tools": [
         {
           "name": "status",
@@ -17965,6 +18089,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "read",
           "schema_digest": "f9ef88233ec21e9968187fd84526076c5853cb62d8397721b76ae8bd0a229f00",
           "semantics": 1,
@@ -18163,6 +18288,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
@@ -18202,6 +18328,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
@@ -18232,6 +18359,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "outline",
           "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
           "semantics": 1,
@@ -18278,6 +18406,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "zoom",
           "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
@@ -18344,6 +18473,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
@@ -18416,6 +18546,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
@@ -18440,6 +18571,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
@@ -18969,8 +19101,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "60dfa135c363e83cb1df92d6f24c077796151a4e623565292ae636209365b7f5",
-      "catalog_digest": "60dfa135c363e83cb1df92d6f24c077796151a4e623565292ae636209365b7f5",
+      "generation": "5bb098407453a67fa99ba3d349448e656482526387146e243fea5c227e750dc4",
+      "catalog_digest": "5bb098407453a67fa99ba3d349448e656482526387146e243fea5c227e750dc4",
       "tools": [
         {
           "name": "status",
@@ -19146,6 +19278,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "read",
           "schema_digest": "f9ef88233ec21e9968187fd84526076c5853cb62d8397721b76ae8bd0a229f00",
           "semantics": 1,
@@ -19344,6 +19477,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
@@ -19383,6 +19517,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
@@ -19413,6 +19548,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "search",
           "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
@@ -19522,6 +19658,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
@@ -19594,6 +19731,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
@@ -19618,6 +19756,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
@@ -20147,8 +20286,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "7697f9b51555a8b71f41bdb5fc6d626fa68fb6bc62ae1c94b34657eecfb9725a",
-      "catalog_digest": "7697f9b51555a8b71f41bdb5fc6d626fa68fb6bc62ae1c94b34657eecfb9725a",
+      "generation": "f4d803038bf414aa1f9d6bc03a2ca21b65c8e91ca5530da8860411d6694f9706",
+      "catalog_digest": "f4d803038bf414aa1f9d6bc03a2ca21b65c8e91ca5530da8860411d6694f9706",
       "tools": [
         {
           "name": "status",
@@ -20324,6 +20463,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "read",
           "schema_digest": "f9ef88233ec21e9968187fd84526076c5853cb62d8397721b76ae8bd0a229f00",
           "semantics": 1,
@@ -20522,6 +20662,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
@@ -20561,6 +20702,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
@@ -20591,6 +20733,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "outline",
           "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
           "semantics": 1,
@@ -20697,6 +20840,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
@@ -20769,6 +20913,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
@@ -20793,6 +20938,7 @@
           }
         },
         {
+          "read_only": true,
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
