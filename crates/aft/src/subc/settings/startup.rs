@@ -44,6 +44,16 @@ pub(in crate::subc) async fn negotiate<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     opt_in: bool,
     using_registration: bool,
 ) -> Result<Hello, SubcError> {
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    if let Some(marker) = std::env::var_os("AFT_TEST_SETTINGS_HELLO_MARKER") {
+        let marker = PathBuf::from(marker);
+        let _ = tokio::time::timeout(Duration::from_secs(20), async {
+            while !marker.is_file() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+    }
     let disabled = if opt_in {
         Vec::new()
     } else {
@@ -194,7 +204,7 @@ pub(super) async fn drive_first_view(
                         if changed { session.hint.notify_one(); }
                         return Ok(Ok(session));
                     }
-                    Err(error) => { reason = error; break; }
+                    Err(error) => { log::warn!("settings startup waiting: {error}"); reason = error; break; }
                 },
                 incoming = reader.recv() => {
                     let Some(incoming) = incoming else { return Ok(Err(ModuleLoopExit::ConnectionLost)); };

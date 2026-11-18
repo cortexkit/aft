@@ -62,6 +62,10 @@ async fn request<T: serde::Serialize, R: serde::de::DeserializeOwned>(
         Ok(Err(readiness::ControlError::Refused { code, .. })) if code == "config_gated" => {
             Err("no_approved_config")
         }
+        Ok(Err(readiness::ControlError::Refused { code, .. })) => {
+            log::warn!("daemon refused settings control request ({code})");
+            Err("settings_request_failed")
+        }
         _ => Err("settings_request_failed"),
     }
 }

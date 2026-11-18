@@ -94,6 +94,8 @@ impl Daemon {
             .env("TMPDIR", fixture.join("tmp"))
             .env("SUBC_CGROUP_PLACEMENT", "disabled")
             .env("SUBC_PORT", "0")
+            .arg("--config-store-root")
+            .arg(fixture.join("authority"))
             .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -104,8 +106,6 @@ impl Daemon {
             let script = fixture.join("operator");
             fs::write(&script, "approve\n".repeat(16)).unwrap();
             command
-                .arg("--config-store-root")
-                .arg(fixture.join("authority"))
                 .env("SUBC_TEST_CONFIG_GATE", "1")
                 .env("SUBC_TEST_OPERATOR_SCRIPT", script)
                 .env("SUBC_TEST_OPERATOR_EVENTS", fixture.join("operator-events"));
@@ -306,6 +306,14 @@ async fn subc_settings_real_dev_daemon_reviews_applies_and_serves_declaration_pe
     })
     .await;
     eventually(&daemon, "initial AFT readiness", || async {
+        if let Ok(report) = consumer.supervisor_health_probe("aft").await {
+            if let Some(reason) = report
+                .metrics
+                .and_then(|metrics| metrics["settings"]["reason"].as_str().map(str::to_owned))
+            {
+                assert_eq!(reason, "waiting_for_settings", "gated bootstrap failed");
+            }
+        }
         consumer
             .catalog_list()
             .await
@@ -398,15 +406,8 @@ async fn subc_settings_real_dev_daemon_no_approved_config_keeps_aft_not_ready() 
         // launch recipe is approved, but no AFT settings generation exists.
         let path = fixture.join("config/cortexkit/subc.jsonc");
         let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        let program = config["modules"]["aft"]["program"].clone();
-        config["modules"]["aft"]["program"] = json!("/bin/sh");
-        config["modules"]["aft"]["args"] = json!([
-            "-c",
-            "while [ ! -f \"$1\" ]; do sleep 0.05; done; shift; exec \"$@\"",
-            "wait-for-stamp",
-            fixture.join("stamped"),
-            program
-        ]);
+        config["modules"]["aft"]["env"]["AFT_TEST_SETTINGS_HELLO_MARKER"] =
+            json!(fixture.join("stamped"));
         fs::write(path, config.to_string()).unwrap();
         fs::write(
             fixture.join("config/cortexkit/aft.jsonc"),
