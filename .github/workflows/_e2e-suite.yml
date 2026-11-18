@@ -80,12 +80,21 @@ jobs:
           bytes=$(stat -c %s "target/$CARGO_PROFILE_DIR/aft")
           printf 'Shared Linux E2E binary: %.2f MiB (%s bytes)\n' "$(awk "BEGIN { print $bytes / 1048576 }")" "$bytes"
 
+      - uses: ./.github/actions/upload-artifact-retry
+        with:
+          name: e2e-linux-${{ inputs.cargo_profile }}-binary
+          path: target/${{ env.CARGO_PROFILE_DIR }}/aft
+          if-no-files-found: error
+
       # The OpenCode 2 harness verifies the executable against producer-owned
       # metadata and requires the checkout SHA in `aft --version`. Keep the
       # ordinary binary unchanged for existing consumers and publish a sibling
       # wrapper artifact with both properties for the Docker mount.
       - name: Prepare same-SHA OpenCode 2 binary artifact
         run: |
+          # Only this test artifact enables explicit fixture controls. The
+          # ordinary production-feature binary was uploaded before this build.
+          cargo build --profile "$CARGO_PROFILE" -p agent-file-tools --features wasm-grammars,test-hooks
           artifact_dir="target/opencode2-$CARGO_PROFILE_DIR"
           mkdir -p "$artifact_dir"
           cp "target/$CARGO_PROFILE_DIR/aft" "$artifact_dir/aft.real"
@@ -107,12 +116,6 @@ jobs:
           fi
           printf '{"git_sha":"%s","build_profile":"%s","sha256":"%s","source":"same-sha-artifact"}\n' \
             "$GITHUB_SHA" "$manifest_profile" "$sha256" > "$artifact_dir/build-info.json"
-
-      - uses: ./.github/actions/upload-artifact-retry
-        with:
-          name: e2e-linux-${{ inputs.cargo_profile }}-binary
-          path: target/${{ env.CARGO_PROFILE_DIR }}/aft
-          if-no-files-found: error
 
       - uses: ./.github/actions/upload-artifact-retry
         with:

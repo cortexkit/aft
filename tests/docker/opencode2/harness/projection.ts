@@ -1,4 +1,9 @@
 import { fail } from "./errors.js";
+import {
+  expectedIgnoredEntriesDisclosure,
+  IGNORED_ENTRIES_DISCLOSURE_PREFIX,
+  IGNORED_ENTRIES_SURFACE_ID,
+} from "./ignored-entries-t6.js";
 import type {
   ProjectionRule,
   ProjectionTypeMap,
@@ -192,6 +197,20 @@ export function assertT6Trailer(
   const subjectCall = t6.call_id ?? scenario.compare_call_id;
   if (subjectCall !== call.id) return;
   const matches = [...text.matchAll(new RegExp(TRUNCATION_TRAILER_PATTERN, "gm"))];
+  if (t6.surface_id === IGNORED_ENTRIES_SURFACE_ID) {
+    const expected = expectedIgnoredEntriesDisclosure(t6.fixture);
+    if (expected === undefined || t6.expected_disclosure !== expected) {
+      throw new Error(`${scenario.id}: ignored_entries must pin its approved disclosure sentence`);
+    }
+    if (matches.length !== 0) {
+      throw new Error(`${scenario.id}: ignored_entries rendered a generic truncation trailer`);
+    }
+    const notes = text.split(/\r?\n/).filter((line) => line.startsWith(IGNORED_ENTRIES_DISCLOSURE_PREFIX));
+    if (notes.length !== 1 || notes[0] !== expected) {
+      throw new Error(`${scenario.id}: ignored_entries disclosure does not exactly equal ${JSON.stringify(expected)}`);
+    }
+    return;
+  }
   if (t6.fixture === "complete" && matches.length !== 0) {
     throw new Error(`${scenario.id}: complete T6 fixture rendered a truncation trailer`);
   }

@@ -3,8 +3,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { HarnessExtension, HarnessValidationContext } from "../../harness/types.js";
 import { readCeilingHooks } from "../read-ceiling-fixture.js";
+import { ignoredEntriesHooks } from "./ignored-entries-fixture.js";
 const here = dirname(fileURLToPath(import.meta.url));
-const expectedIds = ["grep/T1/happy","grep/T2/invalid_arguments","grep/T2/missing_target","grep/T6/grep-payload-matches/complete","grep/T6/grep-payload-matches/incomplete","grep/T6/grep-payload-skipped-files/complete","grep/T6/grep-payload-skipped-files/incomplete","grep/T7/happy"];
+const expectedIds = ["grep/T1/happy","grep/T2/invalid_arguments","grep/T2/missing_target","grep/T6/grep-payload-ignored-entries/complete","grep/T6/grep-payload-ignored-entries/incomplete","grep/T6/grep-payload-matches/complete","grep/T6/grep-payload-matches/incomplete","grep/T6/grep-payload-skipped-files/complete","grep/T6/grep-payload-skipped-files/incomplete","grep/T7/happy"];
 async function validate(context: HarnessValidationContext): Promise<void> {
   const scenarios = context.scenarios.filter((scenario) => scenario.tool === "grep");
   const actual = scenarios.map((scenario) => scenario.id).sort();
@@ -16,5 +17,18 @@ async function validate(context: HarnessValidationContext): Promise<void> {
   const matrix = JSON.parse(await readFile(join(here, "matrix.json"), "utf8"));
   if (JSON.stringify(matrix.rows?.[0]?.trajectories) !== JSON.stringify({"T1":"applicable","T2":"applicable","T3":"n/a:no-permission-operation","T4":"n/a:no-abortable-operation","T5":"n/a:no-background-capability","T6":"applicable","T7":"applicable"})) throw new Error("grep" + " applicability mismatch");
 }
-const extension: HarnessExtension = { name: "grep-scenarios-v1", validate, ...readCeilingHooks("grep") };
+const readCeiling = readCeilingHooks("grep");
+const ignoredEntries = ignoredEntriesHooks();
+const extension: HarnessExtension = {
+  name: "grep-scenarios-v1",
+  validate,
+  async beforeScenario(context) {
+    await readCeiling.beforeScenario?.(context);
+    await ignoredEntries.beforeScenario?.(context);
+  },
+  async afterScenario(context, result) {
+    await ignoredEntries.afterScenario?.(context, result);
+    await readCeiling.afterScenario?.(context, result);
+  },
+};
 export default extension;

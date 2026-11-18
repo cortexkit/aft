@@ -340,6 +340,81 @@
           "expected_trailer": "shown 20 of 21 files (cap) · narrow: path"
         }
       }
+    },
+    {
+      "schema_version": 1,
+      "id": "grep/T6/grep-payload-ignored-entries/complete",
+      "tool": "grep",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the complete grep..payload.ignored_entries fixture.",
+      "fixture": "./fixture",
+      "env": { "AFT_TEST_GREP_IGNORE_PROBE": "ready" },
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [{
+              "id": "grep-t6-grep-payload-ignored-entries-complete",
+              "name": "grep",
+              "arguments": { "pattern": "ignoredScope ScenarioMarker", "path": "ignore-boundaries" },
+              "non_mutating_evidence": { "reason": "the grep only observes the generated ignored-boundary fixture" }
+            }]
+          }
+        },
+        { "label": "finish", "response": { "kind": "text", "content": "done" } }
+      ],
+      "expected_turns": ["call-tool", "finish"],
+      "compare_call_id": "grep-t6-grep-payload-ignored-entries-complete",
+      "metadata": {
+        "t6": {
+          "surface_id": "grep..payload.ignored_entries",
+          "owner": "grep",
+          "call_id": "grep-t6-grep-payload-ignored-entries-complete",
+          "fixture": "complete",
+          "expected_disclosure": "Not searched (ignore rules): ignored-a/ in this folder. Name a path inside one to search it."
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "grep/T6/grep-payload-ignored-entries/incomplete",
+      "tool": "grep",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the incomplete grep..payload.ignored_entries fixture.",
+      "fixture": "./fixture",
+      "env": { "AFT_TEST_GREP_IGNORE_PROBE": "ready" },
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [{
+              "id": "grep-t6-grep-payload-ignored-entries-incomplete",
+              "name": "grep",
+              "arguments": { "pattern": "ignoredScope ScenarioMarker", "path": "ignore-boundaries" },
+              "non_mutating_evidence": { "reason": "the grep only observes the generated ignored-boundary fixture" }
+            }]
+          }
+        },
+        { "label": "finish", "response": { "kind": "text", "content": "done" } }
+      ],
+      "expected_turns": ["call-tool", "finish"],
+      "compare_call_id": "grep-t6-grep-payload-ignored-entries-incomplete",
+      "metadata": {
+        "t6": {
+          "surface_id": "grep..payload.ignored_entries",
+          "owner": "grep",
+          "call_id": "grep-t6-grep-payload-ignored-entries-incomplete",
+          "fixture": "incomplete",
+          "triggered_reason": "cap",
+          "expected_disclosure": "Not searched (ignore rules): ignored-a/, ignored-b/, ignored-c/ and 3 more in this folder. Name a path inside one to search it."
+        }
+      }
     }
   ]
 }

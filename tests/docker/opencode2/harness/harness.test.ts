@@ -35,6 +35,7 @@ import {
   type PathState,
 } from "./disk-state.js";
 import { HarnessError, type HarnessFailureCode } from "./errors.js";
+import { expectedIgnoredEntriesDisclosure, IGNORED_ENTRIES_SURFACE_ID } from "./ignored-entries-t6.js";
 import { parseArtifactRetention, pruneOldRunRoots } from "./forensics.js";
 import {
   awaitControlToolCall,
@@ -1535,10 +1536,10 @@ describe("source-of-truth derivation", () => {
     expect(() => validateT6(matrix, fixtures, [surface])).toThrow("unknown T6 surface");
   });
 
-  test("all eighteen list surfaces and route requirements come from the Rust registry", async () => {
+  test("all nineteen list surfaces and route requirements come from the Rust registry", async () => {
     const repo = join(import.meta.dir, "../../../..");
     const surfaces = await deriveListSurfaces(repo);
-    expect(surfaces).toHaveLength(18);
+    expect(surfaces).toHaveLength(19);
     expect(surfaces.find((surface) => surface.id === "ast_search.matches.payload.matches"))
       .toMatchObject({
         owner: "ast_search",
@@ -1547,11 +1548,13 @@ describe("source-of-truth derivation", () => {
         reasons: ["budget"],
         narrow: ["paths", "globs", "pattern"],
       });
-    expect(surfaces.filter((surface) => surface.requires == null)).toHaveLength(17);
+    expect(surfaces.filter((surface) => surface.requires == null)).toHaveLength(18);
     for (const owner of ["search", "grep"]) {
       expect(surfaces.find((surface) => surface.id === `${owner}..payload.skipped_files`))
         .toMatchObject({ owner, unit: "files", reasons: ["cap"], narrow: ["path"] });
     }
+    expect(surfaces.find((surface) => surface.id === IGNORED_ENTRIES_SURFACE_ID))
+      .toMatchObject({ owner: "grep", unit: "paths", reasons: ["walk", "cap"], narrow: ["path"] });
     expect(
       surfaces.find((surface) => surface.id === "callgraph.callers.payload.unresolved_callers.sites"),
     ).toMatchObject({ owner: "callgraph", unit: "sites", reasons: ["cap"], narrow: ["includeTests"] });
@@ -1582,6 +1585,11 @@ describe("source-of-truth derivation", () => {
     const scenarios = materializeParityScenarios(
       await loadScenarios(join(repo, "tests/docker/opencode2/scenarios")),
     );
+    expect(scenarios.filter((row) => row.env?.AFT_TEST_GREP_IGNORE_PROBE !== undefined)
+      .map((row) => row.id).sort()).toEqual([
+      "grep/T6/grep-payload-ignored-entries/complete",
+      "grep/T6/grep-payload-ignored-entries/incomplete",
+    ]);
     expect(() => validateT6(matrix, scenarios, surfaces)).not.toThrow();
     const incompatibleGlob = scenarios.find(
       (candidate) => candidate.id === "glob/T6/glob-payload-files/incomplete",
@@ -3562,4 +3570,61 @@ describe("abort controls wait for the call they interrupt", () => {
     await awaitControlToolCall("inspect/T4/abort", control, recorder, record);
     expect(recorded[1]?.value).toMatchObject({ observed: { data: { id: "inspect-abort" } } });
   });
+});
+
+
+describe("T6 ignored_entries informational preview", () => {
+  const surface = {
+    id: IGNORED_ENTRIES_SURFACE_ID, command: "grep", mode: "", list_id: "payload.ignored_entries",
+    owner: "grep", unit: "paths", narrow: ["path"], reasons: ["walk", "cap"],
+  };
+  const matrix: Parameters<typeof validateT6>[0] = {
+    schema_version: 1, platform: "linux",
+    rows: [{ tool: "grep", trajectories: {
+      T1: "applicable", T2: "applicable", T3: "applicable", T4: "applicable",
+      T5: "applicable", T6: "applicable", T7: "applicable",
+    } }],
+  };
+  function fixture(kind: "complete" | "incomplete"): ScenarioDefinition {
+    const result = scenario(call({ id: `ignored-${kind}`, name: "grep", arguments: {} }));
+    result.id = `grep/T6/ignored-entries/${kind}`;
+    result.tool = "grep";
+    result.trajectory = "T6";
+    result.metadata = { t6: {
+      surface_id: IGNORED_ENTRIES_SURFACE_ID, owner: "grep", call_id: `ignored-${kind}`, fixture: kind,
+      expected_disclosure: expectedIgnoredEntriesDisclosure(kind),
+      ...(kind === "incomplete" ? { triggered_reason: "cap" } : {}),
+    } };
+    return result;
+  }
+  const subject = (row: ScenarioDefinition) => {
+    const response = row.turns[0].response;
+    if (response.kind !== "tool_calls") throw new Error("ignored_entries fixture has no tool call");
+    return response.calls[0];
+  };
+
+  for (const kind of ["complete", "incomplete"] as const) {
+    test(`T6 ignored_entries accepts the exact ${kind} sentence`, () => {
+      const rows = [fixture("complete"), fixture("incomplete")];
+      expect(() => validateT6(matrix, rows, [surface])).not.toThrow();
+      const row = rows.find((candidate) => candidate.id.endsWith(`/${kind}`))!;
+      expect(() => assertT6Trailer(row, subject(row), `Found 1 match in 1 file\n\n${expectedIgnoredEntriesDisclosure(kind)}`)).not.toThrow();
+    });
+    test(`T6 ignored_entries rejects a generic trailer in the ${kind} fixture`, () => {
+      const row = fixture(kind);
+      expect(() => assertT6Trailer(row, subject(row), `${expectedIgnoredEntriesDisclosure(kind)}\nshown 3 of 6 paths (cap) · narrow: path`))
+        .toThrow("generic truncation trailer");
+      (row.metadata!.t6 as Record<string, unknown>).expected_trailer = "shown 3 of 6 paths (cap) · narrow: path";
+      const rows = kind === "complete" ? [row, fixture("incomplete")] : [fixture("complete"), row];
+      expect(() => validateT6(matrix, rows, [surface])).toThrow("must pin its approved ignored_entries sentence");
+    });
+    test(`T6 ignored_entries rejects an altered ${kind} sentence`, () => {
+      const row = fixture(kind);
+      const altered = expectedIgnoredEntriesDisclosure(kind)!.replace("Name a path", "Choose a path");
+      expect(() => assertT6Trailer(row, subject(row), altered)).toThrow("does not exactly equal");
+      (row.metadata!.t6 as Record<string, unknown>).expected_disclosure = altered;
+      const rows = kind === "complete" ? [row, fixture("incomplete")] : [fixture("complete"), row];
+      expect(() => validateT6(matrix, rows, [surface])).toThrow("must pin its approved ignored_entries sentence");
+    });
+  }
 });

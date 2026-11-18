@@ -4,5 +4,5 @@
     "noEmit": true,
     "types": ["bun-types", "node"]
   },
-  "include": ["./**/*.ts"]
+  "include": ["./**/*.ts", "../scenarios/grep/**/*.ts"]
 }
