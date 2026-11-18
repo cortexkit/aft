@@ -3026,7 +3026,22 @@ async fn worker_jail_operator_build_slot_and_container_reads() {
     if !native_available() {
         return;
     }
-    let mut jail = Jail::start().await;
+    operator_build_slot_and_container_reads(Jail::start().await).await;
+}
+
+// Workers default to the relaxed profile, which builds its grants on a separate
+// path from the strict one; the build-slot launcher must work under both.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn worker_jail_relaxed_operator_build_slot_and_container_reads() {
+    if !native_available() {
+        return;
+    }
+    operator_build_slot_and_container_reads(Jail::relaxed(false).await).await;
+}
+
+#[cfg(target_os = "macos")]
+async fn operator_build_slot_and_container_reads(mut jail: Jail) {
     let container = jail.worktree.parent().unwrap().to_path_buf();
     let cargo_config = container.join(".cargo/config.toml");
     let budget = container.join(".cargo/alfonso-test-threads");

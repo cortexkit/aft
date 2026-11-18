@@ -4,7 +4,60 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use super::{canonicalize_profile_candidate, profile_candidate_is_file, WorkerJailGrants};
+use super::{
+    canonicalize_profile_candidate, cargo_build_settings, profile_candidate_is_file,
+    worker_cargo_configs, WorkerJailGrants,
+};
+
+/// Build-slot grants for every `prefrontal-build-slot` launcher that a Cargo
+/// configuration above the worker's checkouts names as its rustc wrapper.
+pub(super) fn worker_build_slot_grants(
+    home: &Path,
+    project_roots: &[PathBuf],
+    policy: &crate::access_policy::AccessPolicy,
+) -> WorkerJailGrants {
+    let mut grants = WorkerJailGrants::default();
+    for (config_path, base) in worker_cargo_configs(home, project_roots) {
+        let Some(wrapper) = cargo_build_settings(&config_path)
+            .and_then(|build| build.rustc_wrapper)
+            .map(PathBuf::from)
+        else {
+            continue;
+        };
+        let wrapper = if wrapper.is_absolute() {
+            Some(wrapper)
+        } else {
+            base.map(|base| base.join(wrapper))
+        };
+        if let Some(wrapper) = wrapper {
+            add_build_slot_grants(&wrapper, project_roots, policy, &mut grants);
+        }
+    }
+    grants
+}
+
+/// Adds build-slot grants to a relaxed profile's data policy. The relaxed
+/// profile has no separate jail grant lists: the launcher's directory and
+/// locks become read exceptions to the denied data folder, the locks also
+/// write exceptions, and the launcher itself stays write-denied.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(super) fn add_build_slot_reads(
+    grants: &WorkerJailGrants,
+    stores: &mut crate::sandbox_profile::SandboxDataPolicy,
+    write_deny: &mut Vec<PathBuf>,
+) {
+    stores.read_allow.extend(
+        grants
+            .read_only
+            .iter()
+            .chain(&grants.read_dirs)
+            .chain(&grants.files)
+            .cloned(),
+    );
+    stores.write_allow.extend(grants.files.iter().cloned());
+    write_deny.extend(grants.read_only.iter().cloned());
+}
 
 /// Retain only the operator-configured `prefrontal-build-slot` launcher's
 /// directory: the launcher and its `rustc-lowprio-direct` companion take a
