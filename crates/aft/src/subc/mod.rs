@@ -5157,7 +5157,14 @@ where
 {
     let spawn_role = readiness::SpawnRole::from_process_env();
     let opt_in = startup_ctx.is_some() && settings::requested();
-    let hello = settings::negotiate(&mut read, &mut write, user_config_path.as_deref(), opt_in, using_registration).await?;
+    let hello = settings::negotiate(
+        &mut read,
+        &mut write,
+        user_config_path.as_deref(),
+        opt_in,
+        using_registration,
+    )
+    .await?;
     let gated = opt_in && hello.gated();
     let rich_ui_proofs = hello.rich_ui;
     let hello_at = hello.at;

@@ -1,8 +1,8 @@
 //! Linux tests against the config.gate daemon. Use CK_SUBC_BIN for the ordinary
 //! build and CK_SUBC_DEV_BIN for the test-only scripted approval build. Both
 //! use isolated homes and an explicit binary, never the operator's daemon.
-//! Stamped cases require AFT's supervised registration-channel transport;
-//! the daemon refuses to stamp a TCP-only module (`registration_channel_unsupported`).
+//! Stamped cases launch AFT on the supervised registration channel. The
+//! ordinary case exercises the legacy TCP module connection.
 
 use serde_json::{json, Value};
 use std::{
@@ -343,7 +343,7 @@ where
 }
 
 #[tokio::test]
-#[ignore = "requires AFT registration-channel support and CK_SUBC_DEV_BIN with scripted Linux approval"]
+#[ignore = "requires CK_SUBC_DEV_BIN with scripted Linux approval"]
 async fn subc_settings_real_dev_daemon_reviews_applies_and_serves_declaration_pending() {
     let (daemon, consumer) = Daemon::launch(true, |fixture| {
         fs::write(
@@ -440,7 +440,7 @@ async fn subc_settings_real_dev_daemon_reviews_applies_and_serves_declaration_pe
 }
 
 #[tokio::test]
-#[ignore = "requires AFT registration-channel support and CK_SUBC_DEV_BIN with scripted Linux approval"]
+#[ignore = "requires CK_SUBC_DEV_BIN with scripted Linux approval"]
 async fn subc_settings_real_dev_daemon_no_approved_config_keeps_aft_not_ready() {
     let (daemon, consumer) = Daemon::launch(true, |fixture| {
         // Stamp before the supervised process declares its settings. The

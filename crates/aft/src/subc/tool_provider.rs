@@ -5444,8 +5444,9 @@ mod tests {
     fn legacy_bash_false_catalog_matches_pre_migration_bytes() {
         use crate::config_resolve::{resolve_config, ConfigTier};
 
-        // Captured from the pre-migration resolver and renderer. Hashline mode
-        // exposes rewrite-dependent wording as well as the background tool list.
+        // Captured from the pre-migration resolver and renderer at 4d0a522e.
+        // Hashline mode exposes rewrite-dependent wording as well as the
+        // background tool list.
         let expected = include_bytes!("../../tests/fixtures/tool_provider_bash_false_catalog.json");
         let legacy = r#"{"bash":false,"edit_mode":"hashline"}"#;
         let rewritten = crate::config_fix::migrate_user_config_text(legacy).unwrap();
