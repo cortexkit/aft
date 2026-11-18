@@ -6,41 +6,26 @@
   "properties": {
     "memory": {
       "description": "Machine-local resource profile, user config base only. lean uses less memory and can build more slowly: it uses a smaller shared block cache, four call-graph resolver threads on Linux and macOS, and immediate freed-memory return on Linux. Windows keeps all CPUs. balanced keeps the previous limits. When unset, total physical RAM selects lean below 8 GiB, otherwise balanced; unreadable RAM selects balanced. Changes apply to subsequent builds and shared block cache sizing without a restart. Other limits and meaning-search settings stay unchanged.",
-      "type": [
-        "string",
-        "null"
-      ],
+      "type": "string",
       "enum": [
         "lean",
-        "balanced",
-        null
-      ],
-      "default": null
+        "balanced"
+      ]
     },
     "durability": {
       "description": "Process-wide file flush policy from the user config base only. Project values and all harness overrides have no effect.",
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": "object",
       "properties": {
         "macos_full_sync": {
           "description": "On macOS, restore F_FULLFSYNC drive-cache flushes instead of faster plain fsync. Plain fsync can lose recent writes on power loss, but adds no loss on daemon kill or OS crash. Applies to AFT files and directories, not SQLite; ignored on Linux and Windows. Takes effect on the next sync.",
-          "type": [
-            "boolean",
-            "null"
-          ],
-          "default": null
+          "type": "boolean"
         }
       },
       "additionalProperties": false
     },
     "storage": {
       "description": "Storage-wide settings from the user config base only. Project values and every harness override are ignored.",
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": "object",
       "properties": {
         "cache_dir": {
           "description": "Existing absolute cache parent (~ is expanded); AFT creates only its marked aft/ namespace. A path through symlinks is resolved once when first used and pinned by device and inode; if it later names a different directory, or is missing, unwritable or identity-changed, all disk caches turn off with cache_dir_unavailable and never fall back to storage. Rechecked on binds and at most once a minute. First enrollment requires a different device from durable storage; cache_dir_on_storage_device refuses main-disk mount stubs on every platform. Once a storage root has used a cache directory, removing this key keeps caches off; set it to null to move caches back to the storage root. Only the user config base may set this; harness/project overrides are dropped. Old caches are not migrated; doctor --fix reclaims only identity- and ownership-verified inactive cache domains.",
@@ -53,75 +38,45 @@
       }
     },
     "$schema": {
-      "type": [
-        "string",
-        "null"
-      ],
-      "default": null
+      "type": "string"
     },
     "edit_mode": {
       "description": "Select the edit/read surface. Hashline mode renders tagged reads and changes edit arguments to exactly { patch }.",
-      "type": [
-        "string",
-        "null"
-      ]
+      "type": "string"
     },
     "format_on_edit": {
       "description": "Auto-format files after edits with the language's configured formatter. Default false: formatting can reflow the file under the agent and stale the next edit's context.",
-      "type": [
-        "boolean",
-        "null"
-      ],
-      "default": null
+      "type": "boolean"
     },
     "revision_reads": {
       "description": "Let read, aft_outline and aft_zoom take a `ref` argument that reads a file as it is at a git revision (branch, tag, SHA, or forms like HEAD~2) from the repository's object store, without touching the working tree. Default false: the argument is not offered and a call that passes it is refused.",
-      "type": [
-        "boolean",
-        "null"
-      ],
-      "default": null
+      "type": "boolean"
     },
     "formatter_timeout_secs": {
       "description": "Maximum seconds an external formatter is allowed to run before AFT kills it and reports `format_skipped_reason: \"timeout\"`. Raise for slow formatters in large projects.",
-      "type": [
-        "integer",
-        "null"
-      ],
+      "type": "integer",
       "format": "uint32",
       "minimum": 1,
-      "maximum": 600,
-      "default": null
+      "maximum": 600
     },
     "type_checker_timeout_secs": {
       "description": "Maximum time in seconds for an external type checker to run. The default is 30 seconds.",
-      "type": [
-        "integer",
-        "null"
-      ],
+      "type": "integer",
       "format": "uint32",
       "minimum": 1,
-      "maximum": 600,
-      "default": null
+      "maximum": 600
     },
     "validate_on_edit": {
       "description": "Auto-validate after edits: 'syntax' (tree-sitter parse check) or 'full' (also runs type checker).",
-      "type": [
-        "string",
-        "null"
-      ],
+      "type": "string",
       "enum": [
         "syntax",
-        "full",
-        null
+        "full"
       ]
     },
     "formatter": {
       "description": "Per-language formatter overrides keyed by language (e.g. 'typescript', 'python', 'rust', 'go').",
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": "object",
       "additionalProperties": {
         "type": "string",
         "enum": [
@@ -140,10 +95,7 @@
     },
     "checker": {
       "description": "Per-language type checker overrides keyed by language (e.g. 'typescript', 'python', 'rust', 'go').",
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": "object",
       "additionalProperties": {
         "type": "string",
         "enum": [
@@ -161,149 +113,94 @@
     },
     "configure_warnings_delivery": {
       "description": "How missing formatter/checker/LSP binary warnings are shown after configure. 'toast' (default) uses a 10s TUI or HTTP toast without adding session chat messages. 'log' writes to the plugin log only. 'chat' uses legacy ignored user messages in the session transcript. Warnings for formatters/checkers are only emitted when format_on_edit is true or a per-language formatter is set; checker warnings require validate_on_edit 'syntax' or 'full' or an explicit checker. There is no top-level 'formatters' key — use format_on_edit, formatter, and checker instead.",
-      "type": [
-        "string",
-        "null"
-      ],
+      "type": "string",
       "enum": [
         "toast",
         "log",
-        "chat",
-        null
+        "chat"
       ]
     },
     "disabled_tools": {
       "description": "Tool names that are not registered; every other AFT tool is registered. When absent from the user config it defaults to [\"aft_move\", \"aft_delete\"]; an explicit list (including []) replaces that default. Host tool names ('read', 'grep', 'bash', ...) leave the host's own tool in place. Project config may only add names and cannot disable aft_safety or a host tool slot.",
-      "type": [
-        "array",
-        "null"
-      ],
+      "type": "array",
       "items": {
         "type": "string"
-      },
-      "default": null
+      }
     },
     "restrict_to_project_root": {
       "description": "Restrict file operations to within project root. When true, write-capable commands reject paths outside project_root. Default: false (matches OpenCode built-in behavior).",
-      "type": [
-        "boolean",
-        "null"
-      ],
-      "default": null
+      "type": "boolean"
     },
     "indexes": {
       "description": "Background indexes. Each defaults on and builds independently of which tools are registered. Project config can only turn an index off.",
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": "object",
       "properties": {
         "trigram": {
           "description": "Trigram index for indexed grep/glob and the lexical aft_search lane. With false, no text index is built, and grep and glob walk the folder.",
-          "type": [
-            "boolean",
-            "null"
-          ],
-          "default": null
+          "type": "boolean"
         },
         "semantic": {
           "description": "Semantic (embedding) index for the semantic aft_search lane. The default local backend may download an ONNX runtime and model and use CPU.",
-          "type": [
-            "boolean",
-            "null"
-          ],
-          "default": null
+          "type": "boolean"
         },
         "callgraph": {
           "description": "Persisted call-graph store used by aft_callgraph and enrichment.",
-          "type": [
-            "boolean",
-            "null"
-          ],
-          "default": null
+          "type": "boolean"
         }
       }
     },
     "index": {
       "description": "Configure indexes for folders even when no session is open in them. By default, no folders are configured for standing indexing.",
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": "object",
       "properties": {
         "roots": {
           "description": "List the folders to index, with a path and a list of indexes to build for each folder. The default is an empty list.",
-          "type": [
-            "array",
-            "null"
-          ],
+          "type": "array",
           "items": {
             "type": "object",
             "properties": {
               "path": {
-                "type": [
-                  "string",
-                  "null"
-                ],
-                "default": null
+                "type": "string"
               },
               "indexes": {
-                "type": [
-                  "array",
-                  "null"
-                ],
+                "type": "array",
                 "items": {
                   "type": "string"
-                },
-                "default": null
+                }
               }
             },
-            "additionalProperties": true
+            "additionalProperties": {
+              "not": {
+                "type": "null"
+              }
+            }
           }
         }
       }
     },
     "inspect": {
       "description": "Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect.",
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": "object",
       "properties": {
         "enabled": {
           "description": "Runtime switch for aft_inspect. Defaults to true. When false the registered tool reports inspect_disabled; use disabled_tools to unregister it.",
-          "type": [
-            "boolean",
-            "null"
-          ],
-          "default": null
+          "type": "boolean"
         },
         "diagnostics_timeout_ms": {
           "description": "Blocking LSP diagnostics deadline in milliseconds. Values are clamped to 10000..600000. User config sets the baseline; project config may only raise the effective deadline so a repository cannot silently reduce diagnostic completeness for another consumer.",
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": "integer",
           "format": "uint64",
-          "minimum": 0,
-          "default": null
+          "minimum": 0
         },
         "tier2_pass_timeout_ms": {
           "description": "Hard deadline for one Tier-2 pass, including projection and scanning. On expiry AFT cooperatively cancels the pass and releases its cold-build slot.",
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": "integer",
           "format": "uint64",
-          "minimum": 0,
-          "default": null
+          "minimum": 0
         },
         "categories": {
           "description": "Per-category computation switches, all true by default. Off categories run no scans or refreshes and render as off, never incomplete. Project config may only turn a category off.",
-          "type": [
-            "object",
-            "null"
-          ],
+          "type": "object",
           "properties": {
             "diagnostics": {
               "type": "boolean",
@@ -334,31 +231,31 @@
               "default": true
             }
           },
-          "additionalProperties": false,
-          "default": null
+          "additionalProperties": false
         },
         "duplicates": {
           "description": "Duplicate suppression config for the duplicates inspect category.",
-          "type": [
-            "object",
-            "null"
-          ],
+          "type": "object",
           "properties": {
             "expected_mirrors": {
-              "description": "Intentional mirror path pairs for duplicate suppression. Each [globA, globB] pair matches project-root-relative forward-slash paths; groups fully straddling the pair are counted as suppressed instead of reported.",
-              "type": [
-                "array",
-                "null"
-              ],
+              "description": "Intentional mirror paths for duplicate suppression. Each source and mirror glob matches project-root-relative forward-slash paths; groups fully straddling the pair are counted as suppressed instead of reported.",
+              "type": "array",
               "items": {
-                "type": "array",
-                "items": {
-                  "type": "string"
+                "type": "object",
+                "properties": {
+                  "source": {
+                    "type": "string"
+                  },
+                  "mirror": {
+                    "type": "string"
+                  }
                 },
-                "minItems": 2,
-                "maxItems": 2
-              },
-              "default": null
+                "additionalProperties": false,
+                "required": [
+                  "source",
+                  "mirror"
+                ]
+              }
             }
           }
         }
@@ -366,440 +263,264 @@
     },
     "idle": {
       "description": "Idle windows: when an unbound root's indexes are evicted, and when an unused checkout drops its in-memory index state.",
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": "object",
       "properties": {
         "root_ttl_minutes": {
           "description": "Minutes without tool traffic before an unbound root's indexes are evicted. Default 30; values outside 5..=30 are clamped. Reclaimed state rebuilds on the next request. User and project tiers.",
-          "default": null
+          "not": {
+            "type": "null"
+          }
         },
         "checkout_hours": {
           "description": "Hours without use after which a checkout counts as idle and drops its in-memory index state; its state on disk stays. Default 168 (one week); values outside 1..=8760 are clamped. Replaces views.idle_checkout_hours. User and project tiers. Applies live.",
-          "default": null
+          "not": {
+            "type": "null"
+          }
         }
       }
     },
     "backup": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": "object",
       "properties": {
         "enabled": {
           "description": "Master switch for agent-facing undo backups. When false aft_safety stays registered and reports that backups are disabled. User-only; project config is ignored.",
-          "type": [
-            "boolean",
-            "null"
-          ],
-          "default": null
+          "type": "boolean"
         },
         "max_depth": {
           "description": "Per-file undo stack depth. User-only; project config is ignored.",
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": "integer",
           "format": "uint",
-          "minimum": 0,
-          "default": null
+          "minimum": 0
         },
         "max_file_size": {
           "description": "Maximum existing-file size captured for undo, in bytes. Defaults to 64 MiB. User and project tiers may set it; explicit larger values are honored. Zero disables automatic snapshots. Mutations still proceed when capture is skipped.",
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": "integer",
           "format": "uint64",
-          "minimum": 0,
-          "default": null
+          "minimum": 0
         }
       }
     },
     "github": {
       "description": "User-scoped GitHub integration gates. Project config cannot change capabilities or host-wide tool descriptions.",
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": "object",
       "properties": {
         "shim": {
           "description": "Interpose the governed gh shim in agent child PATHs.",
-          "type": [
-            "boolean",
-            "null"
-          ],
-          "default": null
+          "type": "boolean"
         },
         "read": {
           "description": "Enable structured issue:// and pr:// reads. github.write=true also enables this to keep comment ordinals visible.",
-          "type": [
-            "boolean",
-            "null"
-          ],
-          "default": null
+          "type": "boolean"
         },
         "write": {
           "description": "Enable creating and editing issue and pull-request conversation comments. Implies github.read.",
-          "type": [
-            "boolean",
-            "null"
-          ],
-          "default": null
+          "type": "boolean"
         }
       }
     },
     "gh_shim": {
       "description": "Managed gh shim binary override. Whether the shim is used is github.shim; binary_path is the advanced AFT-image override.",
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": "object",
       "properties": {
         "binary_path": {
           "description": "Absolute deployed or development AFT binary used by the managed gh entry. Defaults to the running AFT image. User-scoped only.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
+          "type": "string"
         }
       }
     },
     "git": {
       "description": "Agent-child Git attribution injected through environment-scoped core.hooksPath configuration.",
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": "object",
       "properties": {
         "co_author": {
           "description": "Git co-author attribution for AFT-spawned agent children: 'off', 'auto', or an explicit 'Name <email>' identity. User and project tiers are accepted with project precedence.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
+          "type": "string"
         }
       }
     },
     "pi": {
       "description": "Pi and OMP harness-specific configuration.",
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": "object",
       "properties": {
         "tool_presentation": {
           "description": "Pi and OMP tool presentation mode. 'top_level' registers tools with loadMode: essential on OMP so they appear at top level (default). 'host_default' uses host default loadMode (mounting tools under xd:// on OMP). User and project tiers are accepted with project precedence.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         },
         "external_access_ask": {
           "description": "Plain Pi only: ask before an AFT tool reaches a path outside the project. On (default), Pi's own terminal UI asks; print, JSON and RPC sessions have no screen to ask on and allow it without asking. Off, outside access is allowed without asking. Credentials, AFT's data folder, sandbox.read_deny and restrict_to_project_root: true refuse either way. Does not apply on OMP, where OMP's approval mode (tools.approvalMode) decides through the tools' declared approval tiers. A project config may turn it on, never off.",
-          "type": [
-            "boolean",
-            "null"
-          ],
-          "default": null
+          "type": "boolean"
         }
       }
     },
     "sandbox": {
       "description": "Shell sandbox profiles: stamped workers default to relaxed, all other sessions to off; untrusted routes always use strict.",
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": "object",
       "properties": {
         "profile": {
           "description": "User-selected sandbox profiles by role. Projects may only select a stricter profile (off < relaxed < strict).",
-          "type": [
-            "object",
-            "null"
-          ],
+          "type": "object",
           "properties": {
             "worker": {
               "description": "Ordered from least to most restrictive for project-tier hardening.",
-              "type": [
-                "string",
-                "null"
-              ],
+              "type": "string",
               "enum": [
                 "off",
                 "relaxed",
-                "strict",
-                null
-              ],
-              "default": null
+                "strict"
+              ]
             },
             "head": {
               "description": "Ordered from least to most restrictive for project-tier hardening.",
-              "type": [
-                "string",
-                "null"
-              ],
+              "type": "string",
               "enum": [
                 "off",
                 "relaxed",
-                "strict",
-                null
-              ],
-              "default": null
+                "strict"
+              ]
             }
           }
         },
         "write_allow": {
           "description": "Additional absolute writable directories. User-scoped only; project config cannot add write access.",
-          "type": [
-            "array",
-            "null"
-          ],
+          "type": "array",
           "items": {
             "type": "string"
-          },
-          "default": null
+          }
         },
         "read_deny": {
           "description": "Additional absolute paths sandboxed commands may not read. Project config may add deny entries but cannot remove user or built-in entries.",
-          "type": [
-            "array",
-            "null"
-          ],
+          "type": "array",
           "items": {
             "type": "string"
-          },
-          "default": null
+          }
         }
       }
     },
     "bash": {
       "description": "Bash runtime configuration (runtime gate + rewrite + compress + background execution and user-only environment defaults). Registration of bash and its companions is controlled by disabled_tools. Replaces `experimental.bash.*`.",
-      "oneOf": [
-        {
-          "description": "Shorthand: `true` turns the bash runtime on with rewrite + compress + background; `false` turns the runtime gate off (bash operations report bash_disabled).",
+      "type": "object",
+      "properties": {
+        "changed_files": {
+          "description": "Report watcher-observed project changes after bash commands. User opt-in; projects may only set off. Diff mode uses clean git before-images and bounded output.",
+          "type": "string",
+          "enum": [
+            "off",
+            "list",
+            "diff"
+          ]
+        },
+        "enabled": {
+          "description": "Runtime gate for every bash operation, including bash_status/bash_write/bash_watch/bash_kill. When false they report bash_disabled; registration is controlled by disabled_tools.",
           "type": "boolean"
         },
-        {
+        "rewrite": {
+          "description": "Rewrite common bash commands (cat, grep, find, sed, ls) into AFT tool calls for faster, formatted output.",
+          "type": "boolean"
+        },
+        "compress": {
+          "description": "Compress bash output via per-tool compressors (git, cargo, npm, bun, pnpm, pytest, tsc, eslint, biome, vitest, prettier, ruff, mypy, go, golangci-lint, playwright, next) plus TOML filter pipeline. Adds `[cmpaft]` marker.",
+          "type": "boolean"
+        },
+        "background": {
+          "description": "Allow agents to launch bash with `{ background: true }` for long-running tasks. Foreground bash always auto-promotes to background after the foreground wait window (default 8s) regardless of this flag.",
+          "type": "boolean"
+        },
+        "host_fallback": {
+          "description": "Break-glass host execution when AFT's module transport is unavailable. Project-settable. Every fallback command requires a fresh host permission prompt and runs without AFT rewrites, compression, or background support.",
+          "type": "boolean"
+        },
+        "subagent_background": {
+          "description": "Allow subagents to run background bash. Default true because workers are multi-turn and wait with bash_watch; when false, subagent `background: true` requests are converted to foreground calls that block up to the hard cap.",
+          "type": "boolean"
+        },
+        "detach_on_user_message": {
+          "description": "Detach a `wait: true` bash call when a new user message arrives. Default true. Set false to keep the wait blocking; a message containing the literal `&detach` still forces detachment, the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Project-safe.",
+          "type": "boolean"
+        },
+        "db_schema_hints": {
+          "description": "Append AFT read-only database schema hints after missing-table or missing-column errors. SQLite on Unix only; supported literal database paths only. Project-safe.",
+          "type": "boolean"
+        },
+        "long_running_reminder_enabled": {
+          "description": "Periodically remind the agent that a background bash task is still running. When false, completion is delivered but mid-flight reminders are suppressed.",
+          "type": "boolean"
+        },
+        "long_running_reminder_interval_ms": {
+          "description": "Interval in milliseconds between mid-flight reminders for a still-running background bash task.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "foreground_wait_window_ms": {
+          "description": "How long foreground bash blocks before auto-promoting the task to background, in milliseconds. Minimum 5000; values below the floor are clamped up.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "watch_sync_max_ms": {
+          "description": "Maximum synchronous bash_watch wait in milliseconds. Defaults to 120 seconds for short remaining waits; set to 1800000 to restore the old 30-minute cap.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "worker_wait_max_ms": {
+          "description": "Longest a delegated worker (subagent) waits on one command before control returns to it, in milliseconds: a bash_watch without a timeout, or a bash call that blocks until the command finishes (wait: true, or every foreground call when subagent_background is false). The command keeps running in the background; the worker is told it is still running and can wait again or kill it. While a worker keeps waiting, the command's default 30-minute hard kill is pushed back by this much. Default 1800000 (30 minutes); values below 60000 are a config error. Project-safe.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "linux_scope": {
+          "description": "Linux daemon scopes are on by default (user config only). User config can disable them. Standalone mode, PTY tasks, and native-sandbox launches use the usual spawn path. If systemd-run, the user manager, or cgroup access is unavailable, AFT uses the usual path.",
+          "type": "boolean",
+          "default": true
+        },
+        "linux_scope_max_runtime_secs": {
+          "description": "User-only Linux daemon scope ceiling in seconds. Worker waits do not extend it. An explicit timeout uses its own limit plus 60 seconds.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 86400
+        },
+        "memory_limit_mib": {
+          "description": "Optional aggregate local-command memory cap in MiB. Off by default; projects may only lower a user cap. Remote runon jobs use server limits.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "disclaim_privacy": {
+          "description": "On macOS, agent shells and governed gh commands do not inherit the supervisor's privacy grants. Default false. Live for future commands; user tier controls it and projects may only enable it. Protected folders such as ~/Downloads should be read with AFT's read tool. Accepted but inert on other platforms; unavailable spawn attributes refuse the command instead of inheriting grants.",
+          "type": "boolean",
+          "default": false
+        },
+        "powershell_tool": {
+          "description": "Pi-only fallback for manually mirroring Pi's optional PowerShell default tool when the host does not expose its enabled-tool registry. OpenCode never registers this tool.",
+          "type": "boolean"
+        },
+        "env": {
+          "description": "Fixed environment variables for local shell commands, at either tier. A project's names apply only while the project is trusted (aft doctor filters trust; a linked worktree inherits its main checkout); a user value wins when both tiers set the same name, and the first bash reply in a session names each applied variable with its tier, never its value. Per-call env values and the command's own export both override these. Names that hijack startup, redirect lookup roots, inject into interpreters or Git, or drive AFT, the sandbox, or a build worker are rejected at every tier; credentials, identity, proxy, and TLS-trust names are rejected at the project tier. These values never reach a runon build-server job unless a user name is listed in bash.runon_env.",
           "type": "object",
-          "properties": {
-            "changed_files": {
-              "description": "Report watcher-observed project changes after bash commands. User opt-in; projects may only set off. Diff mode uses clean git before-images and bounded output.",
-              "type": [
-                "string",
-                "null"
-              ],
-              "enum": [
-                "off",
-                "list",
-                "diff",
-                null
-              ],
-              "default": null
-            },
-            "enabled": {
-              "description": "Runtime gate for every bash operation, including bash_status/bash_write/bash_watch/bash_kill. When false they report bash_disabled; registration is controlled by disabled_tools.",
-              "type": [
-                "boolean",
-                "null"
-              ],
-              "default": null
-            },
-            "rewrite": {
-              "description": "Rewrite common bash commands (cat, grep, find, sed, ls) into AFT tool calls for faster, formatted output.",
-              "type": [
-                "boolean",
-                "null"
-              ],
-              "default": null
-            },
-            "compress": {
-              "description": "Compress bash output via per-tool compressors (git, cargo, npm, bun, pnpm, pytest, tsc, eslint, biome, vitest, prettier, ruff, mypy, go, golangci-lint, playwright, next) plus TOML filter pipeline. Adds `[cmpaft]` marker.",
-              "type": [
-                "boolean",
-                "null"
-              ],
-              "default": null
-            },
-            "background": {
-              "description": "Allow agents to launch bash with `{ background: true }` for long-running tasks. Foreground bash always auto-promotes to background after the foreground wait window (default 8s) regardless of this flag.",
-              "type": [
-                "boolean",
-                "null"
-              ],
-              "default": null
-            },
-            "host_fallback": {
-              "description": "Break-glass host execution when AFT's module transport is unavailable. Project-settable. Every fallback command requires a fresh host permission prompt and runs without AFT rewrites, compression, or background support.",
-              "type": [
-                "boolean",
-                "null"
-              ],
-              "default": null
-            },
-            "subagent_background": {
-              "description": "Allow subagents to run background bash. Default true because workers are multi-turn and wait with bash_watch; when false, subagent `background: true` requests are converted to foreground calls that block up to the hard cap.",
-              "type": [
-                "boolean",
-                "null"
-              ],
-              "default": null
-            },
-            "detach_on_user_message": {
-              "description": "Detach a `wait: true` bash call when a new user message arrives. Default true. Set false to keep the wait blocking; a message containing the literal `&detach` still forces detachment, the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Project-safe.",
-              "type": [
-                "boolean",
-                "null"
-              ],
-              "default": null
-            },
-            "db_schema_hints": {
-              "description": "Append AFT read-only database schema hints after missing-table or missing-column errors. SQLite on Unix only; supported literal database paths only. Project-safe.",
-              "type": [
-                "boolean",
-                "null"
-              ],
-              "default": null
-            },
-            "long_running_reminder_enabled": {
-              "description": "Periodically remind the agent that a background bash task is still running. When false, completion is delivered but mid-flight reminders are suppressed.",
-              "type": [
-                "boolean",
-                "null"
-              ],
-              "default": null
-            },
-            "long_running_reminder_interval_ms": {
-              "description": "Interval in milliseconds between mid-flight reminders for a still-running background bash task.",
-              "type": [
-                "integer",
-                "null"
-              ],
-              "format": "uint64",
-              "minimum": 0,
-              "default": null
-            },
-            "foreground_wait_window_ms": {
-              "description": "How long foreground bash blocks before auto-promoting the task to background, in milliseconds. Minimum 5000; values below the floor are clamped up.",
-              "type": [
-                "integer",
-                "null"
-              ],
-              "format": "uint64",
-              "minimum": 0,
-              "default": null
-            },
-            "watch_sync_max_ms": {
-              "description": "Maximum synchronous bash_watch wait in milliseconds. Defaults to 120 seconds for short remaining waits; set to 1800000 to restore the old 30-minute cap.",
-              "type": [
-                "integer",
-                "null"
-              ],
-              "format": "uint64",
-              "minimum": 0,
-              "default": null
-            },
-            "worker_wait_max_ms": {
-              "description": "Longest a delegated worker (subagent) waits on one command before control returns to it, in milliseconds: a bash_watch without a timeout, or a bash call that blocks until the command finishes (wait: true, or every foreground call when subagent_background is false). The command keeps running in the background; the worker is told it is still running and can wait again or kill it. While a worker keeps waiting, the command's default 30-minute hard kill is pushed back by this much. Default 1800000 (30 minutes); values below 60000 are a config error. Project-safe.",
-              "type": [
-                "integer",
-                "null"
-              ],
-              "format": "uint64",
-              "minimum": 0,
-              "default": null
-            },
-            "linux_scope": {
-              "description": "Linux daemon scopes are on by default (user config only). User config can disable them. Standalone mode, PTY tasks, and native-sandbox launches use the usual spawn path. If systemd-run, the user manager, or cgroup access is unavailable, AFT uses the usual path.",
-              "type": [
-                "boolean",
-                "null"
-              ],
-              "default": true
-            },
-            "linux_scope_max_runtime_secs": {
-              "description": "User-only Linux daemon scope ceiling in seconds. Worker waits do not extend it. An explicit timeout uses its own limit plus 60 seconds.",
-              "type": [
-                "integer",
-                "null"
-              ],
-              "format": "uint64",
-              "minimum": 1,
-              "maximum": 4294967295,
-              "default": 86400
-            },
-            "memory_limit_mib": {
-              "description": "Optional aggregate local-command memory cap in MiB. Off by default; projects may only lower a user cap. Remote runon jobs use server limits.",
-              "type": [
-                "integer",
-                "null"
-              ],
-              "format": "uint64",
-              "minimum": 1,
-              "maximum": 4294967295,
-              "default": null
-            },
-            "disclaim_privacy": {
-              "description": "On macOS, agent shells and governed gh commands do not inherit the supervisor's privacy grants. Default false. Live for future commands; user tier controls it and projects may only enable it. Protected folders such as ~/Downloads should be read with AFT's read tool. Accepted but inert on other platforms; unavailable spawn attributes refuse the command instead of inheriting grants.",
-              "type": [
-                "boolean",
-                "null"
-              ],
-              "default": false
-            },
-            "powershell_tool": {
-              "description": "Pi-only fallback for manually mirroring Pi's optional PowerShell default tool when the host does not expose its enabled-tool registry. OpenCode never registers this tool.",
-              "type": [
-                "boolean",
-                "null"
-              ],
-              "default": null
-            },
-            "env": {
-              "description": "Fixed environment variables for local shell commands, at either tier. A project's names apply only while the project is trusted (aft doctor filters trust; a linked worktree inherits its main checkout); a user value wins when both tiers set the same name, and the first bash reply in a session names each applied variable with its tier, never its value. Per-call env values and the command's own export both override these. Names that hijack startup, redirect lookup roots, inject into interpreters or Git, or drive AFT, the sandbox, or a build worker are rejected at every tier; credentials, identity, proxy, and TLS-trust names are rejected at the project tier. These values never reach a runon build-server job unless a user name is listed in bash.runon_env.",
-              "type": [
-                "object",
-                "null"
-              ],
-              "additionalProperties": {
-                "type": "string"
-              },
-              "default": null
-            },
-            "runon_env": {
-              "description": "User-only list of bash.env names that are also sent to a runon build-server job. Every other bash.env value applies to local commands only; a project's values are never sent, even when their name is listed. Unlisted names appear in the job's \"does not receive\" disclosure.",
-              "type": [
-                "array",
-                "null"
-              ],
-              "items": {
-                "type": "string"
-              },
-              "default": null
-            }
+          "additionalProperties": {
+            "type": "string"
           }
         },
-        {
-          "type": "null"
+        "runon_env": {
+          "description": "User-only list of bash.env names that are also sent to a runon build-server job. Every other bash.env value applies to local commands only; a project's values are never sent, even when their name is listed. Unlisted names appear in the job's \"does not receive\" disclosure.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
-      ]
+      }
     },
     "shell": {
       "description": "User-only shell environment settings. Project configuration cannot select an environment provider.",
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": "object",
       "properties": {
         "env_provider": {
           "description": "Opt-in per-project environment export, run in the command workdir under its sandbox. Omit to preserve AFT's default environment. direnv is unsupported on Windows.",
-          "type": [
-            "object",
-            "null"
-          ],
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
@@ -811,10 +532,7 @@
             },
             "command": {
               "description": "Provider argv. Defaults to mise env --json or direnv export json; required for custom.",
-              "type": [
-                "array",
-                "null"
-              ],
+              "type": "array",
               "items": {
                 "type": "string"
               }
@@ -840,381 +558,233 @@
           ]
         }
       },
-      "additionalProperties": false,
-      "default": null
+      "additionalProperties": false
     },
     "experimental": {
       "description": "Experimental opt-in features. May change between releases.",
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": "object",
       "properties": {
         "lsp_ty": {
           "description": "Run the experimental Python `ty` type checker alongside Pyright. Use lsp.python = 'ty' to select ty exclusively.",
-          "type": [
-            "boolean",
-            "null"
-          ],
-          "default": null
+          "type": "boolean"
         }
       }
     },
     "lsp": {
       "description": "User-defined and built-in LSP server configuration.",
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": "object",
       "properties": {
         "idle_minutes": {
-          "description": "Minutes since the last AFT tool call on that repository. Default 60; integers are clamped to 5..=1440. 'never' disables only idle reaping; servers still stop on unbind, eviction and shutdown. Project config may only lower the user value, or set a number when the user has 'never'. Applies live.",
-          "anyOf": [
-            {
-              "type": "integer"
-            },
-            {
-              "const": "never"
-            },
-            {
-              "type": "null"
-            }
-          ]
+          "description": "Minutes since the last AFT tool call on that repository. Default 60; integers are clamped to 5..=1440. Project config may only lower the user value. Applies live.",
+          "type": "integer",
+          "format": "int64"
+        },
+        "idle_shutdown": {
+          "description": "Shut down idle language servers (default true). When false, servers still stop on unbind, eviction and shutdown. A project may turn idle shutdown on, never off. Applies live.",
+          "type": "boolean",
+          "default": true
         },
         "max_servers": {
           "description": "Maximum live language servers process-wide, including starts in progress. Evicts the least recently used client with no pending requests before refusing a start. Project config may only lower the user value. Zero prevents new starts.",
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": "integer",
           "format": "uint",
           "minimum": 0
         },
         "servers": {
           "description": "User-defined LSP server map keyed by server id (e.g. { 'terraform-ls': { ... } }).",
-          "type": [
-            "object",
-            "null"
-          ],
+          "type": "object",
           "additionalProperties": {
             "type": "object",
             "properties": {
               "extensions": {
                 "description": "File extensions this server handles (e.g. ['.tf', '.tfvars']). Optional when overriding a built-in server — the built-in's extensions are inherited.",
-                "type": [
-                  "array",
-                  "null"
-                ],
+                "type": "array",
                 "items": {
                   "type": "string"
-                },
-                "default": null
+                }
               },
               "binary": {
                 "description": "LSP binary command (must be on PATH or absolute path). Optional when overriding a built-in server — the built-in's binary is inherited.",
-                "type": [
-                  "string",
-                  "null"
-                ],
-                "default": null
+                "type": "string"
               },
               "args": {
                 "description": "Extra command-line arguments passed to the LSP binary.",
-                "type": [
-                  "array",
-                  "null"
-                ],
+                "type": "array",
                 "items": {
                   "type": "string"
-                },
-                "default": null
+                }
               },
               "root_markers": {
                 "description": "Workspace root marker files. AFT walks up from each opened file looking for any of these.",
-                "type": [
-                  "array",
-                  "null"
-                ],
+                "type": "array",
                 "items": {
                   "type": "string"
-                },
-                "default": null
+                }
               },
               "disabled": {
                 "description": "Disable this server entirely without removing the config block.",
-                "type": [
-                  "boolean",
-                  "null"
-                ],
-                "default": null
+                "type": "boolean"
               },
               "env": {
                 "description": "Extra environment variables passed to the LSP server child process.",
-                "type": [
-                  "object",
-                  "null"
-                ],
+                "type": "object",
                 "additionalProperties": {
                   "type": "string"
-                },
-                "default": null
+                }
               },
               "initialization_options": {
-                "description": "JSON value passed as `initializationOptions` in the LSP `initialize` request.",
-                "default": null
+                "description": "JSON text passed as `initializationOptions` in the LSP `initialize` request. Invalid JSON prevents this server from starting.",
+                "type": "string"
               }
             }
           }
         },
         "disabled": {
           "description": "Built-in LSP server ids to disable (e.g. ['python', 'biome']). See README for the full list.",
-          "type": [
-            "array",
-            "null"
-          ],
+          "type": "array",
           "items": {
             "type": "string"
-          },
-          "default": null
+          }
         },
         "python": {
           "description": "Which Python LSP to use. 'auto' stays on Pyright while ty is experimental; select 'ty' explicitly to opt in without fallback.",
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": "string",
           "enum": [
             "pyright",
             "ty",
-            "auto",
-            null
+            "auto"
           ]
         },
         "diagnostics_on_edit": {
           "description": "Wait for inline LSP diagnostics on every edit/write/apply_patch call. Default: false.",
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": "boolean"
         },
         "auto_install": {
           "description": "Auto-install npm-distributed and GitHub-release LSP servers when the project needs them. Set false to require manual install on PATH.",
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": "boolean"
         },
         "grace_days": {
           "description": "Supply-chain grace window. AFT only installs versions that have been on the registry / GitHub releases for at least this many days. User pins via `lsp.versions` bypass this.",
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": "integer",
           "format": "uint64",
-          "minimum": 0,
-          "default": null
+          "minimum": 0
         },
         "versions": {
           "description": "Per-package version pin map keyed by npm package or GitHub repo. Pins bypass the grace filter and any weekly version recheck (e.g. { 'typescript-language-server': '5.0.0', 'clangd/clangd': '21.1.0' }).",
-          "type": [
-            "object",
-            "null"
-          ],
+          "type": "object",
           "additionalProperties": {
             "type": "string"
-          },
-          "default": null
+          }
         }
-      },
-      "required": [
-        "idle_minutes"
-      ]
+      }
     },
     "url_fetch_allow_private": {
       "description": "Allow `aft_outline`/`aft_zoom` URL fetches to request private/link-local hosts. Default: false (rejects RFC1918, loopback, and link-local).",
-      "type": [
-        "boolean",
-        "null"
-      ],
-      "default": null
+      "type": "boolean"
     },
     "semantic": {
       "description": "External semantic backend configuration for embedding and retrieval.",
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": "object",
       "properties": {
         "backend": {
           "description": "Embedding backend. 'fastembed' uses local ONNX runtime, 'openai_compatible' calls a configured OpenAI-style API, 'ollama' calls a local Ollama embedding endpoint, and 'synapse' dials CortexKit Synapse over SubC.",
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": "string",
           "enum": [
             "fastembed",
             "openai_compatible",
             "ollama",
-            "synapse",
-            null
+            "synapse"
           ]
         },
         "model": {
           "description": "Model identifier passed to the backend. Required for synapse; fastembed defaults to all-MiniLM-L6-v2.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
+          "type": "string"
         },
         "base_url": {
           "description": "Base URL of the backend API endpoint. Required for openai_compatible. Default for ollama: http://localhost:11434.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
+          "type": "string"
         },
         "api_key_env": {
           "description": "Environment variable name containing the API key (e.g. 'OPENAI_API_KEY'). Project-scoped configs cannot set this field — only user-scoped configs can.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
+          "type": "string"
         },
         "timeout_ms": {
           "description": "Background build embedding request timeout in milliseconds.",
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": "integer",
           "format": "uint64",
-          "minimum": 0,
-          "default": null
+          "minimum": 0
         },
         "query_timeout_ms": {
           "description": "Interactive query embedding deadline in milliseconds. Project-scoped configs cannot set this field; values are clamped to 500..30000.",
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": "integer",
           "format": "uint64",
-          "minimum": 0,
-          "default": null
+          "minimum": 0
         },
         "query_instruction": {
           "description": "Query-only task instruction sent to the embedding backend: \"auto\" applies the model family's documented recipe (Qwen3-Embedding: the model-card retrieval task; fastembed and other families stay bare), \"off\" sends bare queries, any other value is used as literal task text. Never changes document vectors or the index fingerprint.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
+          "type": "string"
         },
         "max_batch_size": {
           "description": "Maximum batch size used by the semantic embedding pipeline.",
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": "integer",
           "format": "uint",
-          "minimum": 0,
-          "default": null
+          "minimum": 0
         },
         "max_input_tokens": {
           "description": "Whole-row input token budget for remote embedding backends. Absent keeps the MiniLM-era chunk caps. Fingerprinted: changing it rebuilds the semantic index.",
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": "integer",
           "format": "uint",
-          "minimum": 0,
-          "default": null
+          "minimum": 0
         },
         "max_files": {
           "description": "Most project files to embed for semantic search (default 20000): a limit on embedding cost and time; files past it are not embedded. Raise it for remote backends that embed server-side.",
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": "integer",
           "format": "uint",
-          "minimum": 0,
-          "default": null
+          "minimum": 0
         }
       }
     },
     "search": {
       "description": "aft_search settings.",
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": "object",
       "properties": {
         "rerank": {
           "description": "Optional cross-encoder reranking of aft_search results. Default off.",
-          "type": [
-            "object",
-            "null"
-          ],
+          "type": "object",
           "properties": {
             "backend": {
               "description": "Cross-encoder reranker for the head of aft_search results. Only prose questions are reranked, and exact matches keep their order. 'off' keeps fused order, 'onnx' runs a local model through ONNX Runtime (downloaded in the background on first use), 'remote' calls a Cohere-style /rerank endpoint, 'synapse' uses CortexKit Synapse. A project config may only set 'off'.",
-              "type": [
-                "string",
-                "null"
-              ],
+              "type": "string",
               "enum": [
                 "off",
                 "onnx",
                 "remote",
-                "synapse",
-                null
-              ],
-              "default": null
+                "synapse"
+              ]
             },
             "model": {
               "description": "Reranker model. For onnx: bge-reranker-base (default), bge-reranker-v2-m3, jina-reranker-v1-turbo or gte-reranker-modernbert-base. Required for remote and synapse. User config only.",
-              "type": [
-                "string",
-                "null"
-              ],
-              "default": null
+              "type": "string"
             },
             "endpoint": {
               "description": "Base URL of the remote rerank endpoint; AFT appends /rerank. Prefix with tei+ for a TEI server. User config only.",
-              "type": [
-                "string",
-                "null"
-              ],
-              "default": null
+              "type": "string"
             },
             "api_key_env": {
               "description": "Environment variable holding the remote rerank endpoint's API key. User config only.",
-              "type": [
-                "string",
-                "null"
-              ],
-              "default": null
+              "type": "string"
             },
             "top_n": {
               "description": "How many leading results are reranked (default 20, at most 200). User config only.",
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": "integer",
               "format": "uint64",
-              "minimum": 0,
-              "default": null
+              "minimum": 0
             },
             "timeout_ms": {
               "description": "Reranking budget per search in milliseconds (default 1500, clamped to 50..15000). On timeout the fused order is kept. User config only.",
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": "integer",
               "format": "uint64",
-              "minimum": 0,
-              "default": null
+              "minimum": 0
             }
           }
         }
@@ -1222,207 +792,122 @@
     },
     "auto_update": {
       "description": "OpenCode only: auto-refresh the cached @cortexkit/aft-opencode package when a newer channel version is published. User-scoped only — project configs cannot disable updates silently.",
-      "type": [
-        "boolean",
-        "null"
-      ],
-      "default": null
+      "type": "boolean"
     },
     "bridge": {
       "description": "Shared NDJSON bridge transport tuning (OpenCode and Pi). User-scoped only — project configs cannot set this block (bridge safety and per-machine transport budget).",
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": "object",
       "properties": {
         "request_timeout_ms": {
           "description": "Per-request bridge transport timeout in milliseconds. Default 30000. Raise on slow filesystems (WSL/DrvFs/NFS) where cold aft operations exceed the default.",
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": "integer",
           "format": "uint64",
-          "minimum": 0,
-          "default": null
+          "minimum": 0
         }
       }
     },
     "subc": {
       "description": "Subconscious (subc) daemon transport selection. User-scoped only — a project config cannot redirect transport. Presence of connection_file switches AFT from a spawned child process to a daemon-supervised module.",
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": "object",
       "properties": {
         "connection_file": {
           "description": "Absolute path to the Subconscious (subc) daemon connection file. When present (non-empty), the plugin talks to AFT as a daemon-supervised module over subc instead of spawning the aft binary; absent/empty means standalone NDJSON (the default). macOS default: ~/.local/share/cortexkit/run/subc-connection.json.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
+          "type": "string"
         },
         "client_reaper": {
           "description": "Close the plugin's Subconscious routes to a checkout after two consecutive checks find the folder missing. Off by default.",
-          "type": [
-            "boolean",
-            "null"
-          ],
-          "default": null
+          "type": "boolean"
         }
       }
     },
     "remote_exec": {
       "description": "Remote runs requested per bash call with runon. See docs/tools.md (bash: running on the remote build server).",
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": "object",
       "properties": {
         "enabled": {
           "description": "Offer bash's runon argument, which runs a command line on the remote Linux build server (subc mode only). User-scoped: a project config may set false to turn remote runs off for itself, never true.",
-          "type": [
-            "boolean",
-            "null"
-          ],
-          "default": null
+          "type": "boolean"
         },
         "default_demand": {
           "description": "The runner demand a runon call without specifics runs under (today only \"linux\"). Never makes a call remote by itself. User-scoped only.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
+          "type": "string"
         }
       }
     },
     "harnesses": {
       "description": "Per-harness overrides. The active harness applies its override after the base config within each tier: user base, user override, project base, project override. storage.cache_dir, durability.macos_full_sync and memory apply to the whole process; none can be overridden here. Nested harnesses are ignored; unknown harness names are reserved for forward compatibility.",
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": "object",
       "additionalProperties": {
         "properties": {
           "memory": {
             "description": "Machine-local resource profile, user config base only. lean uses less memory and can build more slowly: it uses a smaller shared block cache, four call-graph resolver threads on Linux and macOS, and immediate freed-memory return on Linux. Windows keeps all CPUs. balanced keeps the previous limits. When unset, total physical RAM selects lean below 8 GiB, otherwise balanced; unreadable RAM selects balanced. Changes apply to subsequent builds and shared block cache sizing without a restart. Other limits and meaning-search settings stay unchanged.",
-            "type": [
-              "string",
-              "null"
-            ],
+            "type": "string",
             "enum": [
               "lean",
-              "balanced",
-              null
-            ],
-            "default": null
+              "balanced"
+            ]
           },
           "durability": {
             "description": "Process-wide file flush policy from the user config base only. Project values and all harness overrides have no effect.",
-            "type": [
-              "object",
-              "null"
-            ],
+            "type": "object",
             "properties": {
               "macos_full_sync": {
                 "description": "On macOS, restore F_FULLFSYNC drive-cache flushes instead of faster plain fsync. Plain fsync can lose recent writes on power loss, but adds no loss on daemon kill or OS crash. Applies to AFT files and directories, not SQLite; ignored on Linux and Windows. Takes effect on the next sync.",
-                "type": [
-                  "boolean",
-                  "null"
-                ],
-                "default": null
+                "type": "boolean"
               }
             },
             "additionalProperties": false
           },
           "storage": {
             "description": "Storage-wide settings from the user config base only. Project values and every harness override are ignored.",
-            "type": [
-              "object",
-              "null"
-            ],
+            "type": "object",
             "properties": {
               "cache_dir": {
                 "description": "Existing absolute cache parent (~ is expanded); AFT creates only its marked aft/ namespace. A path through symlinks is resolved once when first used and pinned by device and inode; if it later names a different directory, or is missing, unwritable or identity-changed, all disk caches turn off with cache_dir_unavailable and never fall back to storage. Rechecked on binds and at most once a minute. First enrollment requires a different device from durable storage; cache_dir_on_storage_device refuses main-disk mount stubs on every platform. Once a storage root has used a cache directory, removing this key keeps caches off; set it to null to move caches back to the storage root. Only the user config base may set this; harness/project overrides are dropped. Old caches are not migrated; doctor --fix reclaims only identity- and ownership-verified inactive cache domains.",
-                "type": [
-                  "string",
-                  "null"
-                ],
-                "default": null
+                "type": "string"
               }
             }
           },
           "$schema": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "default": null
+            "type": "string"
           },
           "edit_mode": {
             "description": "Select the edit/read surface. Hashline mode renders tagged reads and changes edit arguments to exactly { patch }.",
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "format_on_edit": {
             "description": "Auto-format files after edits with the language's configured formatter. Default false: formatting can reflow the file under the agent and stale the next edit's context.",
-            "type": [
-              "boolean",
-              "null"
-            ],
-            "default": null
+            "type": "boolean"
           },
           "revision_reads": {
             "description": "Let read, aft_outline and aft_zoom take a `ref` argument that reads a file as it is at a git revision (branch, tag, SHA, or forms like HEAD~2) from the repository's object store, without touching the working tree. Default false: the argument is not offered and a call that passes it is refused.",
-            "type": [
-              "boolean",
-              "null"
-            ],
-            "default": null
+            "type": "boolean"
           },
           "formatter_timeout_secs": {
             "description": "Maximum seconds an external formatter is allowed to run before AFT kills it and reports `format_skipped_reason: \"timeout\"`. Raise for slow formatters in large projects.",
-            "type": [
-              "integer",
-              "null"
-            ],
+            "type": "integer",
             "format": "uint32",
             "minimum": 1,
-            "maximum": 600,
-            "default": null
+            "maximum": 600
           },
           "type_checker_timeout_secs": {
             "description": "Maximum time in seconds for an external type checker to run. The default is 30 seconds.",
-            "type": [
-              "integer",
-              "null"
-            ],
+            "type": "integer",
             "format": "uint32",
             "minimum": 1,
-            "maximum": 600,
-            "default": null
+            "maximum": 600
           },
           "validate_on_edit": {
             "description": "Auto-validate after edits: 'syntax' (tree-sitter parse check) or 'full' (also runs type checker).",
-            "type": [
-              "string",
-              "null"
-            ],
+            "type": "string",
             "enum": [
               "syntax",
-              "full",
-              null
+              "full"
             ]
           },
           "formatter": {
             "description": "Per-language formatter overrides keyed by language (e.g. 'typescript', 'python', 'rust', 'go').",
-            "type": [
-              "object",
-              "null"
-            ],
+            "type": "object",
             "additionalProperties": {
               "type": "string",
               "enum": [
@@ -1441,10 +926,7 @@
           },
           "checker": {
             "description": "Per-language type checker overrides keyed by language (e.g. 'typescript', 'python', 'rust', 'go').",
-            "type": [
-              "object",
-              "null"
-            ],
+            "type": "object",
             "additionalProperties": {
               "type": "string",
               "enum": [
@@ -1462,149 +944,94 @@
           },
           "configure_warnings_delivery": {
             "description": "How missing formatter/checker/LSP binary warnings are shown after configure. 'toast' (default) uses a 10s TUI or HTTP toast without adding session chat messages. 'log' writes to the plugin log only. 'chat' uses legacy ignored user messages in the session transcript. Warnings for formatters/checkers are only emitted when format_on_edit is true or a per-language formatter is set; checker warnings require validate_on_edit 'syntax' or 'full' or an explicit checker. There is no top-level 'formatters' key — use format_on_edit, formatter, and checker instead.",
-            "type": [
-              "string",
-              "null"
-            ],
+            "type": "string",
             "enum": [
               "toast",
               "log",
-              "chat",
-              null
+              "chat"
             ]
           },
           "disabled_tools": {
             "description": "Tool names that are not registered; every other AFT tool is registered. When absent from the user config it defaults to [\"aft_move\", \"aft_delete\"]; an explicit list (including []) replaces that default. Host tool names ('read', 'grep', 'bash', ...) leave the host's own tool in place. Project config may only add names and cannot disable aft_safety or a host tool slot.",
-            "type": [
-              "array",
-              "null"
-            ],
+            "type": "array",
             "items": {
               "type": "string"
-            },
-            "default": null
+            }
           },
           "restrict_to_project_root": {
             "description": "Restrict file operations to within project root. When true, write-capable commands reject paths outside project_root. Default: false (matches OpenCode built-in behavior).",
-            "type": [
-              "boolean",
-              "null"
-            ],
-            "default": null
+            "type": "boolean"
           },
           "indexes": {
             "description": "Background indexes. Each defaults on and builds independently of which tools are registered. Project config can only turn an index off.",
-            "type": [
-              "object",
-              "null"
-            ],
+            "type": "object",
             "properties": {
               "trigram": {
                 "description": "Trigram index for indexed grep/glob and the lexical aft_search lane. With false, no text index is built, and grep and glob walk the folder.",
-                "type": [
-                  "boolean",
-                  "null"
-                ],
-                "default": null
+                "type": "boolean"
               },
               "semantic": {
                 "description": "Semantic (embedding) index for the semantic aft_search lane. The default local backend may download an ONNX runtime and model and use CPU.",
-                "type": [
-                  "boolean",
-                  "null"
-                ],
-                "default": null
+                "type": "boolean"
               },
               "callgraph": {
                 "description": "Persisted call-graph store used by aft_callgraph and enrichment.",
-                "type": [
-                  "boolean",
-                  "null"
-                ],
-                "default": null
+                "type": "boolean"
               }
             }
           },
           "index": {
             "description": "Configure indexes for folders even when no session is open in them. By default, no folders are configured for standing indexing.",
-            "type": [
-              "object",
-              "null"
-            ],
+            "type": "object",
             "properties": {
               "roots": {
                 "description": "List the folders to index, with a path and a list of indexes to build for each folder. The default is an empty list.",
-                "type": [
-                  "array",
-                  "null"
-                ],
+                "type": "array",
                 "items": {
                   "type": "object",
                   "properties": {
                     "path": {
-                      "type": [
-                        "string",
-                        "null"
-                      ],
-                      "default": null
+                      "type": "string"
                     },
                     "indexes": {
-                      "type": [
-                        "array",
-                        "null"
-                      ],
+                      "type": "array",
                       "items": {
                         "type": "string"
-                      },
-                      "default": null
+                      }
                     }
                   },
-                  "additionalProperties": true
+                  "additionalProperties": {
+                    "not": {
+                      "type": "null"
+                    }
+                  }
                 }
               }
             }
           },
           "inspect": {
             "description": "Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect.",
-            "type": [
-              "object",
-              "null"
-            ],
+            "type": "object",
             "properties": {
               "enabled": {
                 "description": "Runtime switch for aft_inspect. Defaults to true. When false the registered tool reports inspect_disabled; use disabled_tools to unregister it.",
-                "type": [
-                  "boolean",
-                  "null"
-                ],
-                "default": null
+                "type": "boolean"
               },
               "diagnostics_timeout_ms": {
                 "description": "Blocking LSP diagnostics deadline in milliseconds. Values are clamped to 10000..600000. User config sets the baseline; project config may only raise the effective deadline so a repository cannot silently reduce diagnostic completeness for another consumer.",
-                "type": [
-                  "integer",
-                  "null"
-                ],
+                "type": "integer",
                 "format": "uint64",
-                "minimum": 0,
-                "default": null
+                "minimum": 0
               },
               "tier2_pass_timeout_ms": {
                 "description": "Hard deadline for one Tier-2 pass, including projection and scanning. On expiry AFT cooperatively cancels the pass and releases its cold-build slot.",
-                "type": [
-                  "integer",
-                  "null"
-                ],
+                "type": "integer",
                 "format": "uint64",
-                "minimum": 0,
-                "default": null
+                "minimum": 0
               },
               "categories": {
                 "description": "Per-category computation switches, all true by default. Off categories run no scans or refreshes and render as off, never incomplete. Project config may only turn a category off.",
-                "type": [
-                  "object",
-                  "null"
-                ],
+                "type": "object",
                 "properties": {
                   "diagnostics": {
                     "type": "boolean",
@@ -1635,31 +1062,31 @@
                     "default": true
                   }
                 },
-                "additionalProperties": false,
-                "default": null
+                "additionalProperties": false
               },
               "duplicates": {
                 "description": "Duplicate suppression config for the duplicates inspect category.",
-                "type": [
-                  "object",
-                  "null"
-                ],
+                "type": "object",
                 "properties": {
                   "expected_mirrors": {
-                    "description": "Intentional mirror path pairs for duplicate suppression. Each [globA, globB] pair matches project-root-relative forward-slash paths; groups fully straddling the pair are counted as suppressed instead of reported.",
-                    "type": [
-                      "array",
-                      "null"
-                    ],
+                    "description": "Intentional mirror paths for duplicate suppression. Each source and mirror glob matches project-root-relative forward-slash paths; groups fully straddling the pair are counted as suppressed instead of reported.",
+                    "type": "array",
                     "items": {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
+                      "type": "object",
+                      "properties": {
+                        "source": {
+                          "type": "string"
+                        },
+                        "mirror": {
+                          "type": "string"
+                        }
                       },
-                      "minItems": 2,
-                      "maxItems": 2
-                    },
-                    "default": null
+                      "additionalProperties": false,
+                      "required": [
+                        "source",
+                        "mirror"
+                      ]
+                    }
                   }
                 }
               }
@@ -1667,440 +1094,264 @@
           },
           "idle": {
             "description": "Idle windows: when an unbound root's indexes are evicted, and when an unused checkout drops its in-memory index state.",
-            "type": [
-              "object",
-              "null"
-            ],
+            "type": "object",
             "properties": {
               "root_ttl_minutes": {
                 "description": "Minutes without tool traffic before an unbound root's indexes are evicted. Default 30; values outside 5..=30 are clamped. Reclaimed state rebuilds on the next request. User and project tiers.",
-                "default": null
+                "not": {
+                  "type": "null"
+                }
               },
               "checkout_hours": {
                 "description": "Hours without use after which a checkout counts as idle and drops its in-memory index state; its state on disk stays. Default 168 (one week); values outside 1..=8760 are clamped. Replaces views.idle_checkout_hours. User and project tiers. Applies live.",
-                "default": null
+                "not": {
+                  "type": "null"
+                }
               }
             }
           },
           "backup": {
-            "type": [
-              "object",
-              "null"
-            ],
+            "type": "object",
             "properties": {
               "enabled": {
                 "description": "Master switch for agent-facing undo backups. When false aft_safety stays registered and reports that backups are disabled. User-only; project config is ignored.",
-                "type": [
-                  "boolean",
-                  "null"
-                ],
-                "default": null
+                "type": "boolean"
               },
               "max_depth": {
                 "description": "Per-file undo stack depth. User-only; project config is ignored.",
-                "type": [
-                  "integer",
-                  "null"
-                ],
+                "type": "integer",
                 "format": "uint",
-                "minimum": 0,
-                "default": null
+                "minimum": 0
               },
               "max_file_size": {
                 "description": "Maximum existing-file size captured for undo, in bytes. Defaults to 64 MiB. User and project tiers may set it; explicit larger values are honored. Zero disables automatic snapshots. Mutations still proceed when capture is skipped.",
-                "type": [
-                  "integer",
-                  "null"
-                ],
+                "type": "integer",
                 "format": "uint64",
-                "minimum": 0,
-                "default": null
+                "minimum": 0
               }
             }
           },
           "github": {
             "description": "User-scoped GitHub integration gates. Project config cannot change capabilities or host-wide tool descriptions.",
-            "type": [
-              "object",
-              "null"
-            ],
+            "type": "object",
             "properties": {
               "shim": {
                 "description": "Interpose the governed gh shim in agent child PATHs.",
-                "type": [
-                  "boolean",
-                  "null"
-                ],
-                "default": null
+                "type": "boolean"
               },
               "read": {
                 "description": "Enable structured issue:// and pr:// reads. github.write=true also enables this to keep comment ordinals visible.",
-                "type": [
-                  "boolean",
-                  "null"
-                ],
-                "default": null
+                "type": "boolean"
               },
               "write": {
                 "description": "Enable creating and editing issue and pull-request conversation comments. Implies github.read.",
-                "type": [
-                  "boolean",
-                  "null"
-                ],
-                "default": null
+                "type": "boolean"
               }
             }
           },
           "gh_shim": {
             "description": "Managed gh shim binary override. Whether the shim is used is github.shim; binary_path is the advanced AFT-image override.",
-            "type": [
-              "object",
-              "null"
-            ],
+            "type": "object",
             "properties": {
               "binary_path": {
                 "description": "Absolute deployed or development AFT binary used by the managed gh entry. Defaults to the running AFT image. User-scoped only.",
-                "type": [
-                  "string",
-                  "null"
-                ],
-                "default": null
+                "type": "string"
               }
             }
           },
           "git": {
             "description": "Agent-child Git attribution injected through environment-scoped core.hooksPath configuration.",
-            "type": [
-              "object",
-              "null"
-            ],
+            "type": "object",
             "properties": {
               "co_author": {
                 "description": "Git co-author attribution for AFT-spawned agent children: 'off', 'auto', or an explicit 'Name <email>' identity. User and project tiers are accepted with project precedence.",
-                "type": [
-                  "string",
-                  "null"
-                ],
-                "default": null
+                "type": "string"
               }
             }
           },
           "pi": {
             "description": "Pi and OMP harness-specific configuration.",
-            "type": [
-              "object",
-              "null"
-            ],
+            "type": "object",
             "properties": {
               "tool_presentation": {
                 "description": "Pi and OMP tool presentation mode. 'top_level' registers tools with loadMode: essential on OMP so they appear at top level (default). 'host_default' uses host default loadMode (mounting tools under xd:// on OMP). User and project tiers are accepted with project precedence.",
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "external_access_ask": {
                 "description": "Plain Pi only: ask before an AFT tool reaches a path outside the project. On (default), Pi's own terminal UI asks; print, JSON and RPC sessions have no screen to ask on and allow it without asking. Off, outside access is allowed without asking. Credentials, AFT's data folder, sandbox.read_deny and restrict_to_project_root: true refuse either way. Does not apply on OMP, where OMP's approval mode (tools.approvalMode) decides through the tools' declared approval tiers. A project config may turn it on, never off.",
-                "type": [
-                  "boolean",
-                  "null"
-                ],
-                "default": null
+                "type": "boolean"
               }
             }
           },
           "sandbox": {
             "description": "Shell sandbox profiles: stamped workers default to relaxed, all other sessions to off; untrusted routes always use strict.",
-            "type": [
-              "object",
-              "null"
-            ],
+            "type": "object",
             "properties": {
               "profile": {
                 "description": "User-selected sandbox profiles by role. Projects may only select a stricter profile (off < relaxed < strict).",
-                "type": [
-                  "object",
-                  "null"
-                ],
+                "type": "object",
                 "properties": {
                   "worker": {
                     "description": "Ordered from least to most restrictive for project-tier hardening.",
-                    "type": [
-                      "string",
-                      "null"
-                    ],
+                    "type": "string",
                     "enum": [
                       "off",
                       "relaxed",
-                      "strict",
-                      null
-                    ],
-                    "default": null
+                      "strict"
+                    ]
                   },
                   "head": {
                     "description": "Ordered from least to most restrictive for project-tier hardening.",
-                    "type": [
-                      "string",
-                      "null"
-                    ],
+                    "type": "string",
                     "enum": [
                       "off",
                       "relaxed",
-                      "strict",
-                      null
-                    ],
-                    "default": null
+                      "strict"
+                    ]
                   }
                 }
               },
               "write_allow": {
                 "description": "Additional absolute writable directories. User-scoped only; project config cannot add write access.",
-                "type": [
-                  "array",
-                  "null"
-                ],
+                "type": "array",
                 "items": {
                   "type": "string"
-                },
-                "default": null
+                }
               },
               "read_deny": {
                 "description": "Additional absolute paths sandboxed commands may not read. Project config may add deny entries but cannot remove user or built-in entries.",
-                "type": [
-                  "array",
-                  "null"
-                ],
+                "type": "array",
                 "items": {
                   "type": "string"
-                },
-                "default": null
+                }
               }
             }
           },
           "bash": {
             "description": "Bash runtime configuration (runtime gate + rewrite + compress + background execution and user-only environment defaults). Registration of bash and its companions is controlled by disabled_tools. Replaces `experimental.bash.*`.",
-            "oneOf": [
-              {
-                "description": "Shorthand: `true` turns the bash runtime on with rewrite + compress + background; `false` turns the runtime gate off (bash operations report bash_disabled).",
+            "type": "object",
+            "properties": {
+              "changed_files": {
+                "description": "Report watcher-observed project changes after bash commands. User opt-in; projects may only set off. Diff mode uses clean git before-images and bounded output.",
+                "type": "string",
+                "enum": [
+                  "off",
+                  "list",
+                  "diff"
+                ]
+              },
+              "enabled": {
+                "description": "Runtime gate for every bash operation, including bash_status/bash_write/bash_watch/bash_kill. When false they report bash_disabled; registration is controlled by disabled_tools.",
                 "type": "boolean"
               },
-              {
+              "rewrite": {
+                "description": "Rewrite common bash commands (cat, grep, find, sed, ls) into AFT tool calls for faster, formatted output.",
+                "type": "boolean"
+              },
+              "compress": {
+                "description": "Compress bash output via per-tool compressors (git, cargo, npm, bun, pnpm, pytest, tsc, eslint, biome, vitest, prettier, ruff, mypy, go, golangci-lint, playwright, next) plus TOML filter pipeline. Adds `[cmpaft]` marker.",
+                "type": "boolean"
+              },
+              "background": {
+                "description": "Allow agents to launch bash with `{ background: true }` for long-running tasks. Foreground bash always auto-promotes to background after the foreground wait window (default 8s) regardless of this flag.",
+                "type": "boolean"
+              },
+              "host_fallback": {
+                "description": "Break-glass host execution when AFT's module transport is unavailable. Project-settable. Every fallback command requires a fresh host permission prompt and runs without AFT rewrites, compression, or background support.",
+                "type": "boolean"
+              },
+              "subagent_background": {
+                "description": "Allow subagents to run background bash. Default true because workers are multi-turn and wait with bash_watch; when false, subagent `background: true` requests are converted to foreground calls that block up to the hard cap.",
+                "type": "boolean"
+              },
+              "detach_on_user_message": {
+                "description": "Detach a `wait: true` bash call when a new user message arrives. Default true. Set false to keep the wait blocking; a message containing the literal `&detach` still forces detachment, the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Project-safe.",
+                "type": "boolean"
+              },
+              "db_schema_hints": {
+                "description": "Append AFT read-only database schema hints after missing-table or missing-column errors. SQLite on Unix only; supported literal database paths only. Project-safe.",
+                "type": "boolean"
+              },
+              "long_running_reminder_enabled": {
+                "description": "Periodically remind the agent that a background bash task is still running. When false, completion is delivered but mid-flight reminders are suppressed.",
+                "type": "boolean"
+              },
+              "long_running_reminder_interval_ms": {
+                "description": "Interval in milliseconds between mid-flight reminders for a still-running background bash task.",
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0
+              },
+              "foreground_wait_window_ms": {
+                "description": "How long foreground bash blocks before auto-promoting the task to background, in milliseconds. Minimum 5000; values below the floor are clamped up.",
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0
+              },
+              "watch_sync_max_ms": {
+                "description": "Maximum synchronous bash_watch wait in milliseconds. Defaults to 120 seconds for short remaining waits; set to 1800000 to restore the old 30-minute cap.",
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0
+              },
+              "worker_wait_max_ms": {
+                "description": "Longest a delegated worker (subagent) waits on one command before control returns to it, in milliseconds: a bash_watch without a timeout, or a bash call that blocks until the command finishes (wait: true, or every foreground call when subagent_background is false). The command keeps running in the background; the worker is told it is still running and can wait again or kill it. While a worker keeps waiting, the command's default 30-minute hard kill is pushed back by this much. Default 1800000 (30 minutes); values below 60000 are a config error. Project-safe.",
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0
+              },
+              "linux_scope": {
+                "description": "Linux daemon scopes are on by default (user config only). User config can disable them. Standalone mode, PTY tasks, and native-sandbox launches use the usual spawn path. If systemd-run, the user manager, or cgroup access is unavailable, AFT uses the usual path.",
+                "type": "boolean",
+                "default": true
+              },
+              "linux_scope_max_runtime_secs": {
+                "description": "User-only Linux daemon scope ceiling in seconds. Worker waits do not extend it. An explicit timeout uses its own limit plus 60 seconds.",
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 1,
+                "maximum": 4294967295,
+                "default": 86400
+              },
+              "memory_limit_mib": {
+                "description": "Optional aggregate local-command memory cap in MiB. Off by default; projects may only lower a user cap. Remote runon jobs use server limits.",
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 1,
+                "maximum": 4294967295
+              },
+              "disclaim_privacy": {
+                "description": "On macOS, agent shells and governed gh commands do not inherit the supervisor's privacy grants. Default false. Live for future commands; user tier controls it and projects may only enable it. Protected folders such as ~/Downloads should be read with AFT's read tool. Accepted but inert on other platforms; unavailable spawn attributes refuse the command instead of inheriting grants.",
+                "type": "boolean",
+                "default": false
+              },
+              "powershell_tool": {
+                "description": "Pi-only fallback for manually mirroring Pi's optional PowerShell default tool when the host does not expose its enabled-tool registry. OpenCode never registers this tool.",
+                "type": "boolean"
+              },
+              "env": {
+                "description": "Fixed environment variables for local shell commands, at either tier. A project's names apply only while the project is trusted (aft doctor filters trust; a linked worktree inherits its main checkout); a user value wins when both tiers set the same name, and the first bash reply in a session names each applied variable with its tier, never its value. Per-call env values and the command's own export both override these. Names that hijack startup, redirect lookup roots, inject into interpreters or Git, or drive AFT, the sandbox, or a build worker are rejected at every tier; credentials, identity, proxy, and TLS-trust names are rejected at the project tier. These values never reach a runon build-server job unless a user name is listed in bash.runon_env.",
                 "type": "object",
-                "properties": {
-                  "changed_files": {
-                    "description": "Report watcher-observed project changes after bash commands. User opt-in; projects may only set off. Diff mode uses clean git before-images and bounded output.",
-                    "type": [
-                      "string",
-                      "null"
-                    ],
-                    "enum": [
-                      "off",
-                      "list",
-                      "diff",
-                      null
-                    ],
-                    "default": null
-                  },
-                  "enabled": {
-                    "description": "Runtime gate for every bash operation, including bash_status/bash_write/bash_watch/bash_kill. When false they report bash_disabled; registration is controlled by disabled_tools.",
-                    "type": [
-                      "boolean",
-                      "null"
-                    ],
-                    "default": null
-                  },
-                  "rewrite": {
-                    "description": "Rewrite common bash commands (cat, grep, find, sed, ls) into AFT tool calls for faster, formatted output.",
-                    "type": [
-                      "boolean",
-                      "null"
-                    ],
-                    "default": null
-                  },
-                  "compress": {
-                    "description": "Compress bash output via per-tool compressors (git, cargo, npm, bun, pnpm, pytest, tsc, eslint, biome, vitest, prettier, ruff, mypy, go, golangci-lint, playwright, next) plus TOML filter pipeline. Adds `[cmpaft]` marker.",
-                    "type": [
-                      "boolean",
-                      "null"
-                    ],
-                    "default": null
-                  },
-                  "background": {
-                    "description": "Allow agents to launch bash with `{ background: true }` for long-running tasks. Foreground bash always auto-promotes to background after the foreground wait window (default 8s) regardless of this flag.",
-                    "type": [
-                      "boolean",
-                      "null"
-                    ],
-                    "default": null
-                  },
-                  "host_fallback": {
-                    "description": "Break-glass host execution when AFT's module transport is unavailable. Project-settable. Every fallback command requires a fresh host permission prompt and runs without AFT rewrites, compression, or background support.",
-                    "type": [
-                      "boolean",
-                      "null"
-                    ],
-                    "default": null
-                  },
-                  "subagent_background": {
-                    "description": "Allow subagents to run background bash. Default true because workers are multi-turn and wait with bash_watch; when false, subagent `background: true` requests are converted to foreground calls that block up to the hard cap.",
-                    "type": [
-                      "boolean",
-                      "null"
-                    ],
-                    "default": null
-                  },
-                  "detach_on_user_message": {
-                    "description": "Detach a `wait: true` bash call when a new user message arrives. Default true. Set false to keep the wait blocking; a message containing the literal `&detach` still forces detachment, the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Project-safe.",
-                    "type": [
-                      "boolean",
-                      "null"
-                    ],
-                    "default": null
-                  },
-                  "db_schema_hints": {
-                    "description": "Append AFT read-only database schema hints after missing-table or missing-column errors. SQLite on Unix only; supported literal database paths only. Project-safe.",
-                    "type": [
-                      "boolean",
-                      "null"
-                    ],
-                    "default": null
-                  },
-                  "long_running_reminder_enabled": {
-                    "description": "Periodically remind the agent that a background bash task is still running. When false, completion is delivered but mid-flight reminders are suppressed.",
-                    "type": [
-                      "boolean",
-                      "null"
-                    ],
-                    "default": null
-                  },
-                  "long_running_reminder_interval_ms": {
-                    "description": "Interval in milliseconds between mid-flight reminders for a still-running background bash task.",
-                    "type": [
-                      "integer",
-                      "null"
-                    ],
-                    "format": "uint64",
-                    "minimum": 0,
-                    "default": null
-                  },
-                  "foreground_wait_window_ms": {
-                    "description": "How long foreground bash blocks before auto-promoting the task to background, in milliseconds. Minimum 5000; values below the floor are clamped up.",
-                    "type": [
-                      "integer",
-                      "null"
-                    ],
-                    "format": "uint64",
-                    "minimum": 0,
-                    "default": null
-                  },
-                  "watch_sync_max_ms": {
-                    "description": "Maximum synchronous bash_watch wait in milliseconds. Defaults to 120 seconds for short remaining waits; set to 1800000 to restore the old 30-minute cap.",
-                    "type": [
-                      "integer",
-                      "null"
-                    ],
-                    "format": "uint64",
-                    "minimum": 0,
-                    "default": null
-                  },
-                  "worker_wait_max_ms": {
-                    "description": "Longest a delegated worker (subagent) waits on one command before control returns to it, in milliseconds: a bash_watch without a timeout, or a bash call that blocks until the command finishes (wait: true, or every foreground call when subagent_background is false). The command keeps running in the background; the worker is told it is still running and can wait again or kill it. While a worker keeps waiting, the command's default 30-minute hard kill is pushed back by this much. Default 1800000 (30 minutes); values below 60000 are a config error. Project-safe.",
-                    "type": [
-                      "integer",
-                      "null"
-                    ],
-                    "format": "uint64",
-                    "minimum": 0,
-                    "default": null
-                  },
-                  "linux_scope": {
-                    "description": "Linux daemon scopes are on by default (user config only). User config can disable them. Standalone mode, PTY tasks, and native-sandbox launches use the usual spawn path. If systemd-run, the user manager, or cgroup access is unavailable, AFT uses the usual path.",
-                    "type": [
-                      "boolean",
-                      "null"
-                    ],
-                    "default": true
-                  },
-                  "linux_scope_max_runtime_secs": {
-                    "description": "User-only Linux daemon scope ceiling in seconds. Worker waits do not extend it. An explicit timeout uses its own limit plus 60 seconds.",
-                    "type": [
-                      "integer",
-                      "null"
-                    ],
-                    "format": "uint64",
-                    "minimum": 1,
-                    "maximum": 4294967295,
-                    "default": 86400
-                  },
-                  "memory_limit_mib": {
-                    "description": "Optional aggregate local-command memory cap in MiB. Off by default; projects may only lower a user cap. Remote runon jobs use server limits.",
-                    "type": [
-                      "integer",
-                      "null"
-                    ],
-                    "format": "uint64",
-                    "minimum": 1,
-                    "maximum": 4294967295,
-                    "default": null
-                  },
-                  "disclaim_privacy": {
-                    "description": "On macOS, agent shells and governed gh commands do not inherit the supervisor's privacy grants. Default false. Live for future commands; user tier controls it and projects may only enable it. Protected folders such as ~/Downloads should be read with AFT's read tool. Accepted but inert on other platforms; unavailable spawn attributes refuse the command instead of inheriting grants.",
-                    "type": [
-                      "boolean",
-                      "null"
-                    ],
-                    "default": false
-                  },
-                  "powershell_tool": {
-                    "description": "Pi-only fallback for manually mirroring Pi's optional PowerShell default tool when the host does not expose its enabled-tool registry. OpenCode never registers this tool.",
-                    "type": [
-                      "boolean",
-                      "null"
-                    ],
-                    "default": null
-                  },
-                  "env": {
-                    "description": "Fixed environment variables for local shell commands, at either tier. A project's names apply only while the project is trusted (aft doctor filters trust; a linked worktree inherits its main checkout); a user value wins when both tiers set the same name, and the first bash reply in a session names each applied variable with its tier, never its value. Per-call env values and the command's own export both override these. Names that hijack startup, redirect lookup roots, inject into interpreters or Git, or drive AFT, the sandbox, or a build worker are rejected at every tier; credentials, identity, proxy, and TLS-trust names are rejected at the project tier. These values never reach a runon build-server job unless a user name is listed in bash.runon_env.",
-                    "type": [
-                      "object",
-                      "null"
-                    ],
-                    "additionalProperties": {
-                      "type": "string"
-                    },
-                    "default": null
-                  },
-                  "runon_env": {
-                    "description": "User-only list of bash.env names that are also sent to a runon build-server job. Every other bash.env value applies to local commands only; a project's values are never sent, even when their name is listed. Unlisted names appear in the job's \"does not receive\" disclosure.",
-                    "type": [
-                      "array",
-                      "null"
-                    ],
-                    "items": {
-                      "type": "string"
-                    },
-                    "default": null
-                  }
+                "additionalProperties": {
+                  "type": "string"
                 }
               },
-              {
-                "type": "null"
+              "runon_env": {
+                "description": "User-only list of bash.env names that are also sent to a runon build-server job. Every other bash.env value applies to local commands only; a project's values are never sent, even when their name is listed. Unlisted names appear in the job's \"does not receive\" disclosure.",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
               }
-            ]
+            }
           },
           "shell": {
             "description": "User-only shell environment settings. Project configuration cannot select an environment provider.",
-            "type": [
-              "object",
-              "null"
-            ],
+            "type": "object",
             "properties": {
               "env_provider": {
                 "description": "Opt-in per-project environment export, run in the command workdir under its sandbox. Omit to preserve AFT's default environment. direnv is unsupported on Windows.",
-                "type": [
-                  "object",
-                  "null"
-                ],
+                "type": "object",
                 "properties": {
                   "kind": {
                     "type": "string",
@@ -2112,10 +1363,7 @@
                   },
                   "command": {
                     "description": "Provider argv. Defaults to mise env --json or direnv export json; required for custom.",
-                    "type": [
-                      "array",
-                      "null"
-                    ],
+                    "type": "array",
                     "items": {
                       "type": "string"
                     }
@@ -2141,381 +1389,233 @@
                 ]
               }
             },
-            "additionalProperties": false,
-            "default": null
+            "additionalProperties": false
           },
           "experimental": {
             "description": "Experimental opt-in features. May change between releases.",
-            "type": [
-              "object",
-              "null"
-            ],
+            "type": "object",
             "properties": {
               "lsp_ty": {
                 "description": "Run the experimental Python `ty` type checker alongside Pyright. Use lsp.python = 'ty' to select ty exclusively.",
-                "type": [
-                  "boolean",
-                  "null"
-                ],
-                "default": null
+                "type": "boolean"
               }
             }
           },
           "lsp": {
             "description": "User-defined and built-in LSP server configuration.",
-            "type": [
-              "object",
-              "null"
-            ],
+            "type": "object",
             "properties": {
               "idle_minutes": {
-                "description": "Minutes since the last AFT tool call on that repository. Default 60; integers are clamped to 5..=1440. 'never' disables only idle reaping; servers still stop on unbind, eviction and shutdown. Project config may only lower the user value, or set a number when the user has 'never'. Applies live.",
-                "anyOf": [
-                  {
-                    "type": "integer"
-                  },
-                  {
-                    "const": "never"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ]
+                "description": "Minutes since the last AFT tool call on that repository. Default 60; integers are clamped to 5..=1440. Project config may only lower the user value. Applies live.",
+                "type": "integer",
+                "format": "int64"
+              },
+              "idle_shutdown": {
+                "description": "Shut down idle language servers (default true). When false, servers still stop on unbind, eviction and shutdown. A project may turn idle shutdown on, never off. Applies live.",
+                "type": "boolean",
+                "default": true
               },
               "max_servers": {
                 "description": "Maximum live language servers process-wide, including starts in progress. Evicts the least recently used client with no pending requests before refusing a start. Project config may only lower the user value. Zero prevents new starts.",
-                "type": [
-                  "integer",
-                  "null"
-                ],
+                "type": "integer",
                 "format": "uint",
                 "minimum": 0
               },
               "servers": {
                 "description": "User-defined LSP server map keyed by server id (e.g. { 'terraform-ls': { ... } }).",
-                "type": [
-                  "object",
-                  "null"
-                ],
+                "type": "object",
                 "additionalProperties": {
                   "type": "object",
                   "properties": {
                     "extensions": {
                       "description": "File extensions this server handles (e.g. ['.tf', '.tfvars']). Optional when overriding a built-in server — the built-in's extensions are inherited.",
-                      "type": [
-                        "array",
-                        "null"
-                      ],
+                      "type": "array",
                       "items": {
                         "type": "string"
-                      },
-                      "default": null
+                      }
                     },
                     "binary": {
                       "description": "LSP binary command (must be on PATH or absolute path). Optional when overriding a built-in server — the built-in's binary is inherited.",
-                      "type": [
-                        "string",
-                        "null"
-                      ],
-                      "default": null
+                      "type": "string"
                     },
                     "args": {
                       "description": "Extra command-line arguments passed to the LSP binary.",
-                      "type": [
-                        "array",
-                        "null"
-                      ],
+                      "type": "array",
                       "items": {
                         "type": "string"
-                      },
-                      "default": null
+                      }
                     },
                     "root_markers": {
                       "description": "Workspace root marker files. AFT walks up from each opened file looking for any of these.",
-                      "type": [
-                        "array",
-                        "null"
-                      ],
+                      "type": "array",
                       "items": {
                         "type": "string"
-                      },
-                      "default": null
+                      }
                     },
                     "disabled": {
                       "description": "Disable this server entirely without removing the config block.",
-                      "type": [
-                        "boolean",
-                        "null"
-                      ],
-                      "default": null
+                      "type": "boolean"
                     },
                     "env": {
                       "description": "Extra environment variables passed to the LSP server child process.",
-                      "type": [
-                        "object",
-                        "null"
-                      ],
+                      "type": "object",
                       "additionalProperties": {
                         "type": "string"
-                      },
-                      "default": null
+                      }
                     },
                     "initialization_options": {
-                      "description": "JSON value passed as `initializationOptions` in the LSP `initialize` request.",
-                      "default": null
+                      "description": "JSON text passed as `initializationOptions` in the LSP `initialize` request. Invalid JSON prevents this server from starting.",
+                      "type": "string"
                     }
                   }
                 }
               },
               "disabled": {
                 "description": "Built-in LSP server ids to disable (e.g. ['python', 'biome']). See README for the full list.",
-                "type": [
-                  "array",
-                  "null"
-                ],
+                "type": "array",
                 "items": {
                   "type": "string"
-                },
-                "default": null
+                }
               },
               "python": {
                 "description": "Which Python LSP to use. 'auto' stays on Pyright while ty is experimental; select 'ty' explicitly to opt in without fallback.",
-                "type": [
-                  "string",
-                  "null"
-                ],
+                "type": "string",
                 "enum": [
                   "pyright",
                   "ty",
-                  "auto",
-                  null
+                  "auto"
                 ]
               },
               "diagnostics_on_edit": {
                 "description": "Wait for inline LSP diagnostics on every edit/write/apply_patch call. Default: false.",
-                "type": [
-                  "boolean",
-                  "null"
-                ]
+                "type": "boolean"
               },
               "auto_install": {
                 "description": "Auto-install npm-distributed and GitHub-release LSP servers when the project needs them. Set false to require manual install on PATH.",
-                "type": [
-                  "boolean",
-                  "null"
-                ]
+                "type": "boolean"
               },
               "grace_days": {
                 "description": "Supply-chain grace window. AFT only installs versions that have been on the registry / GitHub releases for at least this many days. User pins via `lsp.versions` bypass this.",
-                "type": [
-                  "integer",
-                  "null"
-                ],
+                "type": "integer",
                 "format": "uint64",
-                "minimum": 0,
-                "default": null
+                "minimum": 0
               },
               "versions": {
                 "description": "Per-package version pin map keyed by npm package or GitHub repo. Pins bypass the grace filter and any weekly version recheck (e.g. { 'typescript-language-server': '5.0.0', 'clangd/clangd': '21.1.0' }).",
-                "type": [
-                  "object",
-                  "null"
-                ],
+                "type": "object",
                 "additionalProperties": {
                   "type": "string"
-                },
-                "default": null
+                }
               }
-            },
-            "required": [
-              "idle_minutes"
-            ]
+            }
           },
           "url_fetch_allow_private": {
             "description": "Allow `aft_outline`/`aft_zoom` URL fetches to request private/link-local hosts. Default: false (rejects RFC1918, loopback, and link-local).",
-            "type": [
-              "boolean",
-              "null"
-            ],
-            "default": null
+            "type": "boolean"
           },
           "semantic": {
             "description": "External semantic backend configuration for embedding and retrieval.",
-            "type": [
-              "object",
-              "null"
-            ],
+            "type": "object",
             "properties": {
               "backend": {
                 "description": "Embedding backend. 'fastembed' uses local ONNX runtime, 'openai_compatible' calls a configured OpenAI-style API, 'ollama' calls a local Ollama embedding endpoint, and 'synapse' dials CortexKit Synapse over SubC.",
-                "type": [
-                  "string",
-                  "null"
-                ],
+                "type": "string",
                 "enum": [
                   "fastembed",
                   "openai_compatible",
                   "ollama",
-                  "synapse",
-                  null
+                  "synapse"
                 ]
               },
               "model": {
                 "description": "Model identifier passed to the backend. Required for synapse; fastembed defaults to all-MiniLM-L6-v2.",
-                "type": [
-                  "string",
-                  "null"
-                ],
-                "default": null
+                "type": "string"
               },
               "base_url": {
                 "description": "Base URL of the backend API endpoint. Required for openai_compatible. Default for ollama: http://localhost:11434.",
-                "type": [
-                  "string",
-                  "null"
-                ],
-                "default": null
+                "type": "string"
               },
               "api_key_env": {
                 "description": "Environment variable name containing the API key (e.g. 'OPENAI_API_KEY'). Project-scoped configs cannot set this field — only user-scoped configs can.",
-                "type": [
-                  "string",
-                  "null"
-                ],
-                "default": null
+                "type": "string"
               },
               "timeout_ms": {
                 "description": "Background build embedding request timeout in milliseconds.",
-                "type": [
-                  "integer",
-                  "null"
-                ],
+                "type": "integer",
                 "format": "uint64",
-                "minimum": 0,
-                "default": null
+                "minimum": 0
               },
               "query_timeout_ms": {
                 "description": "Interactive query embedding deadline in milliseconds. Project-scoped configs cannot set this field; values are clamped to 500..30000.",
-                "type": [
-                  "integer",
-                  "null"
-                ],
+                "type": "integer",
                 "format": "uint64",
-                "minimum": 0,
-                "default": null
+                "minimum": 0
               },
               "query_instruction": {
                 "description": "Query-only task instruction sent to the embedding backend: \"auto\" applies the model family's documented recipe (Qwen3-Embedding: the model-card retrieval task; fastembed and other families stay bare), \"off\" sends bare queries, any other value is used as literal task text. Never changes document vectors or the index fingerprint.",
-                "type": [
-                  "string",
-                  "null"
-                ],
-                "default": null
+                "type": "string"
               },
               "max_batch_size": {
                 "description": "Maximum batch size used by the semantic embedding pipeline.",
-                "type": [
-                  "integer",
-                  "null"
-                ],
+                "type": "integer",
                 "format": "uint",
-                "minimum": 0,
-                "default": null
+                "minimum": 0
               },
               "max_input_tokens": {
                 "description": "Whole-row input token budget for remote embedding backends. Absent keeps the MiniLM-era chunk caps. Fingerprinted: changing it rebuilds the semantic index.",
-                "type": [
-                  "integer",
-                  "null"
-                ],
+                "type": "integer",
                 "format": "uint",
-                "minimum": 0,
-                "default": null
+                "minimum": 0
               },
               "max_files": {
                 "description": "Most project files to embed for semantic search (default 20000): a limit on embedding cost and time; files past it are not embedded. Raise it for remote backends that embed server-side.",
-                "type": [
-                  "integer",
-                  "null"
-                ],
+                "type": "integer",
                 "format": "uint",
-                "minimum": 0,
-                "default": null
+                "minimum": 0
               }
             }
           },
           "search": {
             "description": "aft_search settings.",
-            "type": [
-              "object",
-              "null"
-            ],
+            "type": "object",
             "properties": {
               "rerank": {
                 "description": "Optional cross-encoder reranking of aft_search results. Default off.",
-                "type": [
-                  "object",
-                  "null"
-                ],
+                "type": "object",
                 "properties": {
                   "backend": {
                     "description": "Cross-encoder reranker for the head of aft_search results. Only prose questions are reranked, and exact matches keep their order. 'off' keeps fused order, 'onnx' runs a local model through ONNX Runtime (downloaded in the background on first use), 'remote' calls a Cohere-style /rerank endpoint, 'synapse' uses CortexKit Synapse. A project config may only set 'off'.",
-                    "type": [
-                      "string",
-                      "null"
-                    ],
+                    "type": "string",
                     "enum": [
                       "off",
                       "onnx",
                       "remote",
-                      "synapse",
-                      null
-                    ],
-                    "default": null
+                      "synapse"
+                    ]
                   },
                   "model": {
                     "description": "Reranker model. For onnx: bge-reranker-base (default), bge-reranker-v2-m3, jina-reranker-v1-turbo or gte-reranker-modernbert-base. Required for remote and synapse. User config only.",
-                    "type": [
-                      "string",
-                      "null"
-                    ],
-                    "default": null
+                    "type": "string"
                   },
                   "endpoint": {
                     "description": "Base URL of the remote rerank endpoint; AFT appends /rerank. Prefix with tei+ for a TEI server. User config only.",
-                    "type": [
-                      "string",
-                      "null"
-                    ],
-                    "default": null
+                    "type": "string"
                   },
                   "api_key_env": {
                     "description": "Environment variable holding the remote rerank endpoint's API key. User config only.",
-                    "type": [
-                      "string",
-                      "null"
-                    ],
-                    "default": null
+                    "type": "string"
                   },
                   "top_n": {
                     "description": "How many leading results are reranked (default 20, at most 200). User config only.",
-                    "type": [
-                      "integer",
-                      "null"
-                    ],
+                    "type": "integer",
                     "format": "uint64",
-                    "minimum": 0,
-                    "default": null
+                    "minimum": 0
                   },
                   "timeout_ms": {
                     "description": "Reranking budget per search in milliseconds (default 1500, clamped to 50..15000). On timeout the fused order is kept. User config only.",
-                    "type": [
-                      "integer",
-                      "null"
-                    ],
+                    "type": "integer",
                     "format": "uint64",
-                    "minimum": 0,
-                    "default": null
+                    "minimum": 0
                   }
                 }
               }
@@ -2523,84 +1623,53 @@
           },
           "auto_update": {
             "description": "OpenCode only: auto-refresh the cached @cortexkit/aft-opencode package when a newer channel version is published. User-scoped only — project configs cannot disable updates silently.",
-            "type": [
-              "boolean",
-              "null"
-            ],
-            "default": null
+            "type": "boolean"
           },
           "bridge": {
             "description": "Shared NDJSON bridge transport tuning (OpenCode and Pi). User-scoped only — project configs cannot set this block (bridge safety and per-machine transport budget).",
-            "type": [
-              "object",
-              "null"
-            ],
+            "type": "object",
             "properties": {
               "request_timeout_ms": {
                 "description": "Per-request bridge transport timeout in milliseconds. Default 30000. Raise on slow filesystems (WSL/DrvFs/NFS) where cold aft operations exceed the default.",
-                "type": [
-                  "integer",
-                  "null"
-                ],
+                "type": "integer",
                 "format": "uint64",
-                "minimum": 0,
-                "default": null
+                "minimum": 0
               }
             }
           },
           "subc": {
             "description": "Subconscious (subc) daemon transport selection. User-scoped only — a project config cannot redirect transport. Presence of connection_file switches AFT from a spawned child process to a daemon-supervised module.",
-            "type": [
-              "object",
-              "null"
-            ],
+            "type": "object",
             "properties": {
               "connection_file": {
                 "description": "Absolute path to the Subconscious (subc) daemon connection file. When present (non-empty), the plugin talks to AFT as a daemon-supervised module over subc instead of spawning the aft binary; absent/empty means standalone NDJSON (the default). macOS default: ~/.local/share/cortexkit/run/subc-connection.json.",
-                "type": [
-                  "string",
-                  "null"
-                ],
-                "default": null
+                "type": "string"
               },
               "client_reaper": {
                 "description": "Close the plugin's Subconscious routes to a checkout after two consecutive checks find the folder missing. Off by default.",
-                "type": [
-                  "boolean",
-                  "null"
-                ],
-                "default": null
+                "type": "boolean"
               }
             }
           },
           "remote_exec": {
             "description": "Remote runs requested per bash call with runon. See docs/tools.md (bash: running on the remote build server).",
-            "type": [
-              "object",
-              "null"
-            ],
+            "type": "object",
             "properties": {
               "enabled": {
                 "description": "Offer bash's runon argument, which runs a command line on the remote Linux build server (subc mode only). User-scoped: a project config may set false to turn remote runs off for itself, never true.",
-                "type": [
-                  "boolean",
-                  "null"
-                ],
-                "default": null
+                "type": "boolean"
               },
               "default_demand": {
                 "description": "The runner demand a runon call without specifics runs under (today only \"linux\"). Never makes a call remote by itself. User-scoped only.",
-                "type": [
-                  "string",
-                  "null"
-                ],
-                "default": null
+                "type": "string"
               }
             }
           }
+        },
+        "not": {
+          "type": "null"
         }
-      },
-      "default": null
+      }
     }
   },
   "$id": "https://raw.githubusercontent.com/cortexkit/aft/main/assets/aft.schema.json",

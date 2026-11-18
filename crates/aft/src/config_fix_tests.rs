@@ -75,7 +75,11 @@ fn inspect_cleanup_doctor_maps_idle_and_drops_inert_keys() {
     )
     .unwrap();
     let value: Value = serde_json::from_str(&migrated.text).unwrap();
-    assert_eq!(value["lsp"]["idle_minutes"], "never", "canonical key wins");
+    assert_eq!(
+        value["lsp"],
+        json!({"idle_shutdown": false}),
+        "the old canonical `never` beats the older TTL alias"
+    );
     // A whole number written as a float migrates as that number, matching
     // the load-time translation in both languages.
     let migrated =
@@ -241,7 +245,7 @@ fn files_without_legacy_input_are_left_byte_identical() {
         // A false runtime gate is a current key that only switches its
         // behaviour off, so there is no registration choice to record.
         r#"{"backup": {"enabled": false}}"#,
-        r#"{"bash": false, "inspect": {"enabled": false}}"#,
+        r#"{"bash": {"enabled": false}, "inspect": {"enabled": false}}"#,
     ] {
         let migration = migrate_config_text(doc, FixTier::User).unwrap();
         assert!(!migration.changed, "{doc}");
@@ -814,7 +818,7 @@ fn auto_migration_ignores_current_missing_and_unparsable_files() {
     let path = dir.path().join("aft.jsonc");
     assert_eq!(auto_migrate_user_config(&path), None);
     for text in [
-        "{\n  \"indexes\": {\"semantic\": false},\n  \"bash\": false\n}\n",
+        "{\n  \"indexes\": {\"semantic\": false},\n  \"bash\": {\"enabled\": false}\n}\n",
         "{ \"search_index\": false",
     ] {
         std::fs::write(&path, text).unwrap();

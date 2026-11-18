@@ -2593,12 +2593,10 @@ fn bash_memory_limit_parses_and_project_cannot_raise_it() {
         ),
         serde_json::json!(32)
     );
-    for project in [r#"{"bash":false}"#, r#"{"bash":{"memory_limit_mib":null}}"#] {
-        assert_eq!(
-            resolve(r#"{"bash":{"memory_limit_mib":64}}"#, project),
-            serde_json::json!(64)
-        );
-    }
+    assert_eq!(
+        resolve(r#"{"bash":{"memory_limit_mib":64}}"#, r#"{"bash":false}"#),
+        serde_json::json!(64)
+    );
 }
 
 #[cfg(test)]
@@ -4583,6 +4581,10 @@ mod tests {
             (r#"{"lsp":{"idle_minutes":null}}"#, "lsp.idle_minutes"),
             (r#"{"lsp":{"idle_shutdown":null}}"#, "lsp.idle_shutdown"),
             (
+                r#"{"bash":{"memory_limit_mib":null}}"#,
+                "bash.memory_limit_mib",
+            ),
+            (
                 r#"{"lsp":{"servers":{"rust":{"initialization_options":null}}}}"#,
                 "lsp.servers.rust.initialization_options",
             ),
@@ -5338,7 +5340,7 @@ mod tests {
         let result = resolve_config(std::slice::from_ref(&project));
         assert_eq!(result.errors, ["invalid_security_config:bash"]);
         let strict = strict_tier_error(&project, None).unwrap_or_default();
-        assert!(strict.contains("invalid type: null"), "{strict}");
+        assert_eq!(strict, "invalid_config_null:bash.env.TZ");
     }
 
     /// One representative name per refused group, at each tier and each place
