@@ -91,7 +91,7 @@ impl FileTool {
             standard_edit_grammar: true,
             ..ToolCallContext::default()
         };
-        let mut tool = Self {
+        let tool = Self {
             operation,
             mode,
             arguments: call.arguments,
@@ -99,7 +99,7 @@ impl FileTool {
             context,
         };
         let _config = ctx.pin_config();
-        confinement::with_root(ctx, &tool.context.request_id, || {
+        let write_paths = confinement::with_root(ctx, &tool.context.request_id, || {
             tool.check(ctx)?;
             let format = tool.format();
             let prepared = prepare_tool_call(
@@ -117,10 +117,11 @@ impl FileTool {
                 return Err(crate::revision_read::disabled(&prepared.request));
             }
             if mode == Mode::ReadWrite {
-                tool.write_paths = edit_paths::operands(&prepared.request)?;
-                tool.check_writes(ctx)?;
+                let paths = edit_paths::operands(&prepared.request)?;
+                tool.check_writes(ctx, &paths)?;
+                return Ok(paths);
             }
-            Ok(())
+            Ok(Vec::new())
         })
         .map_err(|refusal| error(&refusal))?;
         let consent = Preflight {
@@ -131,7 +132,13 @@ impl FileTool {
             tool: call.name,
             args_hash: digest,
         };
-        Ok((tool, consent))
+        Ok((
+            Self {
+                write_paths,
+                ..tool
+            },
+            consent,
+        ))
     }
 
     fn format(&self) -> crate::subc_format::FormatContext {
@@ -175,14 +182,14 @@ impl FileTool {
         Ok(())
     }
 
-    fn check_writes(&self, ctx: &AppContext) -> Result<(), Response> {
+    fn check_writes(&self, ctx: &AppContext, paths: &[String]) -> Result<(), Response> {
         let id = &self.context.request_id;
         let session = self
             .context
             .session_id
             .as_deref()
             .expect("remote file-tool session");
-        edit_paths::check(ctx, id, session, &self.write_paths)
+        edit_paths::check(ctx, id, session, paths)
     }
 
     pub(super) fn run(
@@ -197,7 +204,7 @@ impl FileTool {
             // Consent and scheduling may have delayed this call. Recheck the
             // current path and tool policy immediately before dispatch.
             self.check(ctx)?;
-            self.check_writes(ctx)?;
+            self.check_writes(ctx, &self.write_paths)?;
             let mutation = self.mode == Mode::ReadWrite;
             let dispatch = |mut request: RawRequest, ctx: &AppContext| {
                 if mutation {

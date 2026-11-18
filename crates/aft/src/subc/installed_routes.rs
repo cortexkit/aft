@@ -108,7 +108,7 @@ pub(super) async fn process_route_bind_completion(
     writer_tx: &WriterSender,
     completion: ControlCompletion,
     a0: &A0Egress,
-    remote_calls: &mut remote_calls::Service,
+    on_management_install: impl FnOnce(&ManagementIdentity),
     management_routes: &mut HashMap<RouteChannel, ManagementIdentity>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
@@ -145,7 +145,7 @@ pub(super) async fn process_route_bind_completion(
         } => {
             a0.retire(route);
             if installed_route_epochs.get(&route.channel) == Some(&route.epoch) {
-                remote_calls.enroll(&identity);
+                on_management_install(&identity);
                 management_routes.insert(route, identity);
             }
             return Ok(());
