@@ -305,9 +305,6 @@ impl Drop for Waiter {
     }
 }
 
-#[cfg(test)]
-#[path = "consent_cancel_tests.rs"]
-mod cancellation_cache_tests;
 #[rustfmt::skip]
 test_support_visibility! {
 

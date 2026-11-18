@@ -29,7 +29,7 @@ struct Session {
     live: Arc<()>,
 }
 test_support_visibility! {
-pub(crate) struct Sessions {
+struct Sessions {
     live: HashMap<String, Session>,
     // Seed at process start to fence previous-process generations, assuming
     // no more than one segment change per millisecond of process lifetime and
@@ -40,7 +40,7 @@ pub(crate) struct Sessions {
 }
 impl Sessions {
     test_support_visibility! {
-        pub(crate) fn new(start_ms: u64) -> Self {
+        fn new(start_ms: u64) -> Self {
             Self {
                 live: HashMap::new(),
                 generation_floor: start_ms,
@@ -48,7 +48,7 @@ impl Sessions {
         }
     }
     test_support_visibility! {
-        pub(crate) fn bound(&mut self, route: usize, session: &str) {
+        fn bound(&mut self, route: usize, session: &str) {
             self.live
                 .entry(session.into())
                 .or_default()
@@ -57,7 +57,7 @@ impl Sessions {
         }
     }
     test_support_visibility! {
-        pub(crate) fn unbound(&mut self, route: usize, session: &str) {
+        fn unbound(&mut self, route: usize, session: &str) {
             if let Some(live) = self.live.get_mut(session) {
                 live.routes.remove(&route);
                 if live.routes.is_empty() {
@@ -67,7 +67,7 @@ impl Sessions {
         }
     }
     test_support_visibility! {
-        pub(crate) fn publish(&mut self, session: &str, text: &str) -> bool {
+        fn publish(&mut self, session: &str, text: &str) -> bool {
             let Some(live) = self.live.get_mut(session) else {
                 return false;
             };
@@ -89,7 +89,7 @@ impl Sessions {
         }
     }
     test_support_visibility! {
-        pub(crate) fn snapshot(&self) -> Vec<(String, Segment)> {
+        fn snapshot(&self) -> Vec<(String, Segment)> {
             self.live
                 .iter()
                 .filter_map(|(session, live)| {

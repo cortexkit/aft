@@ -475,7 +475,7 @@ pub fn end_scope_grants(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<(
 
 /// Preserve per-row decoding errors so one corrupt row cannot hide other saved
 /// scopes from the lifecycle census.
-pub(crate) fn saved_scopes(conn: &Connection) -> rusqlite::Result<Vec<rusqlite::Result<ScopeKey>>> {
+pub fn saved_scopes(conn: &Connection) -> rusqlite::Result<Vec<rusqlite::Result<ScopeKey>>> {
     let mut stmt = conn.prepare("SELECT DISTINCT owner,scope_ref,epoch FROM access_grants")?;
     let rows = stmt
         .query_map([], |row| {

@@ -233,6 +233,7 @@ pub fn stopped_routes_snapshot() -> Value {
     )
 }
 
+test_support_visibility! {
 /// Why opening the holder route failed, as far as retrying it goes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RouteOpenFailure {
@@ -243,6 +244,7 @@ pub(crate) enum RouteOpenFailure {
     /// A failure a later attempt can get past: a lost connection, a timeout,
     /// or a holder that is restarting or warming up.
     Transient(String),
+}
 }
 
 impl RouteOpenFailure {
@@ -298,12 +300,14 @@ impl FleetStatusClient {
         }
     }
 
-    /// The holder route this client's dial stopped reopening, if any.
-    #[cfg(any(test, feature = "test-support"))]
-    /// The most recently stopped route.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn stopped_route(&self) -> Option<StoppedRoute> {
-        self.inner.stopped_routes.lock().last().cloned()
+    test_support_visibility! {
+    /// The status destination this client has stopped retrying, if one was recorded.
+        #[cfg(any(test, feature = "test-support"))]
+        /// The most recently stopped route.
+        #[cfg_attr(not(test), allow(dead_code))]
+        pub(crate) fn stopped_route(&self) -> Option<StoppedRoute> {
+            self.inner.stopped_routes.lock().last().cloned()
+        }
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -428,11 +432,16 @@ pub(crate) struct StatusWireRequest {
 }
 }
 
+test_support_visibility! {
 #[derive(Clone, PartialEq, Eq)]
 struct FleetRouteIdentity {
     project_root: String,
     harness: String,
+    #[cfg(any(test, feature = "test-support"))]
+    pub session: String,
+    #[cfg(not(any(test, feature = "test-support")))]
     session: String,
+}
 }
 
 impl StatusWireRequest {
@@ -469,8 +478,10 @@ impl StatusWireRequest {
         &self.harness
     }
 
-    pub(crate) fn session(&self) -> &str {
-        &self.session
+    test_support_visibility! {
+        pub(crate) fn session(&self) -> &str {
+            &self.session
+        }
     }
 
     #[rustfmt::skip]
@@ -584,6 +595,7 @@ async fn run_fleet_status_dial(
 
 // Keep the dial's discovery and publish loop identical for the real transport and
 // the clock-driven test consumer; the latter can return actual bind errors.
+test_support_visibility! {
 trait StatusConsumer {
     type Route;
     type CatalogWatch: StatusCatalogWatch;
@@ -606,9 +618,12 @@ trait StatusConsumer {
     async fn close_handle(&self, route: &Self::Route) -> Result<(), String>;
     async fn request(&self, route: &Self::Route, body: Vec<u8>) -> Result<Vec<u8>, String>;
 }
+}
 
+test_support_visibility! {
 trait StatusCatalogWatch {
     async fn next_generation(&mut self) -> Result<Option<u64>, String>;
+}
 }
 
 impl StatusCatalogWatch for subc_client_rs::CatalogSubscription {
@@ -682,6 +697,7 @@ impl StatusConsumer for SubcConsumer {
     }
 }
 
+test_support_visibility! {
 async fn run_connected_status_dial<C: StatusConsumer>(
     consumer: C,
     client: FleetStatusClient,
@@ -1011,6 +1027,7 @@ async fn run_connected_status_dial<C: StatusConsumer>(
         }
     }
 }
+}
 
 fn encode_status_publish_call(body: &Value) -> Option<Vec<u8>> {
     let mut params = body.as_object()?.clone();
@@ -1139,8 +1156,9 @@ fn next_discovery_backoff(current: Duration) -> Duration {
         .min(DISCOVERY_MAX_BACKOFF)
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(any(test, feature = "test-support"))]
+#[allow(dead_code, unused_imports)]
+pub mod tests {
     use super::*;
     use serde_json::Map;
     use std::collections::HashSet;
@@ -1210,7 +1228,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct FakeCatalogWatch {
+    pub struct FakeCatalogWatch {
         available: std::sync::atomic::AtomicBool,
         renamed: std::sync::atomic::AtomicBool,
         targets: parking_lot::Mutex<Vec<String>>,
@@ -1224,17 +1242,18 @@ mod tests {
         }
     }
 
-    struct RejectingConsumer {
-        attempts: Arc<parking_lot::Mutex<Vec<tokio::time::Instant>>>,
-        advertises_status_line: bool,
-        catalog_calls: Arc<AtomicU64>,
-        publish_calls: Arc<AtomicU64>,
-        succeeds_on: Option<usize>,
-        failure: RouteOpenFailure,
-        connection_callback: Arc<parking_lot::Mutex<Option<Box<dyn Fn(ConnectionState) + Send>>>>,
-        push_sender: Arc<parking_lot::Mutex<Option<mpsc::Sender<PushEvent>>>>,
-        control_sender: Arc<parking_lot::Mutex<Option<mpsc::Sender<ControlPush>>>>,
-        watch: Arc<FakeCatalogWatch>,
+    pub struct RejectingConsumer {
+        pub attempts: Arc<parking_lot::Mutex<Vec<tokio::time::Instant>>>,
+        pub advertises_status_line: bool,
+        pub catalog_calls: Arc<AtomicU64>,
+        pub publish_calls: Arc<AtomicU64>,
+        pub succeeds_on: Option<usize>,
+        pub failure: RouteOpenFailure,
+        pub connection_callback:
+            Arc<parking_lot::Mutex<Option<Box<dyn Fn(ConnectionState) + Send>>>>,
+        pub push_sender: Arc<parking_lot::Mutex<Option<mpsc::Sender<PushEvent>>>>,
+        pub control_sender: Arc<parking_lot::Mutex<Option<mpsc::Sender<ControlPush>>>>,
+        pub watch: Arc<FakeCatalogWatch>,
     }
 
     impl StatusConsumer for RejectingConsumer {
@@ -1317,64 +1336,6 @@ mod tests {
             self.publish_calls.fetch_add(1, Ordering::Relaxed);
             Err("not used in discovery test".to_owned())
         }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn status_kv_publishes_exact_segment_even_when_holder_refuses() {
-        use crate::late_result_bus::status;
-        let session = "status-kv:refused-holder/runner";
-        status::route_bound(1, session);
-        let (client, mut wire_rx) = FleetStatusClient::dial_channel(4);
-        let text = "[AFT E? W1 | T2]";
-        assert!(!client.publish(Path::new("/status-kv-project"), "opencode", session, text));
-        let request = wire_rx.try_recv().unwrap();
-        assert_eq!(request.session(), session);
-        assert_eq!(
-            status::tests::put_session(session).await["segment"],
-            request.body()["text"]
-        );
-        let identity = FleetRouteIdentity::from(&request);
-        let consumer = RejectingConsumer {
-            attempts: Arc::default(),
-            advertises_status_line: true,
-            catalog_calls: Arc::default(),
-            publish_calls: Arc::default(),
-            succeeds_on: None,
-            failure: RouteOpenFailure::Refused {
-                code: "capability_denied".into(),
-                message: "refused".into(),
-            },
-            connection_callback: Arc::default(),
-            push_sender: Arc::default(),
-            control_sender: Arc::default(),
-            watch: Arc::default(),
-        };
-        let task = tokio::spawn(run_connected_status_dial(
-            consumer,
-            client.clone(),
-            wire_rx,
-            identity,
-            Some(request),
-        ));
-        for _ in 0..4 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(client.stopped_route().unwrap().session, session);
-        let before = status::test_value(session).unwrap()["generation"]
-            .as_u64()
-            .unwrap();
-        client.publish(
-            Path::new("/status-kv-project"),
-            "opencode",
-            session,
-            "[AFT E0 W0 | T3]",
-        );
-        let value = status::tests::put_session(session).await;
-        assert_eq!(value["segment"], "[AFT E0 W0 | T3]");
-        assert_eq!(value["generation"].as_u64().unwrap(), before + 1);
-        status::route_unbound(1, session);
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
     }
 
     /// A failure the dial may retry: the holder is restarting.

@@ -1,5 +1,3 @@
-use super::*;
-
 pub(super) fn parse_method_dispatch(full_ref: &str) -> Option<(String, String, String, bool)> {
     let dot = full_ref.rfind('.').map(|index| (index, 1usize, false));
     let colon = full_ref.rfind("::").map(|index| (index, 2usize, true));

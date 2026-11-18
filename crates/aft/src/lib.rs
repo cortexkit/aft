@@ -93,6 +93,8 @@ pub mod commands;
 pub use aft_base::compress;
 #[cfg(test)]
 mod compress_boundary_tests;
+#[cfg(test)]
+mod fleet_status_boundary_tests;
 pub use aft_base::config;
 pub use aft_base::config_fix;
 pub mod config_live;
