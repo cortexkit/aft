@@ -26,6 +26,7 @@ fn dispatch(request: RawRequest, ctx: &AppContext) -> Response {
 #[derive(Default)]
 struct Phone {
     requests: StdMutex<Vec<Value>>,
+    awaiting: AtomicUsize,
     answers: StdMutex<HashMap<String, Value>>,
     withdrawals: StdMutex<Vec<String>>,
 }
@@ -57,6 +58,7 @@ impl ConsentTransport for Phone {
             }
             "consent.await" => {
                 let id = call.params["elicitation_id"].as_str().unwrap().to_owned();
+                self.awaiting.fetch_add(1, Ordering::SeqCst);
                 let phone = PHONE.lock().unwrap().as_ref().unwrap().clone();
                 Box::pin(async move {
                     loop {
@@ -337,6 +339,17 @@ async fn held_foreground_fetch_late_allow(expire: bool) {
     *PHONE.lock().unwrap() = Some(phone.clone());
     super::super::secret_consent::install_subc_transport(phone.clone());
     let (address, tls, sends, server) = server().await;
+    let advance_clock = Arc::new(AtomicBool::new(false));
+    let advanced = advance_clock.clone();
+    let window = Duration::from_secs(60);
+    let start = Instant::now();
+    if expire {
+        // Give the real call and the card holds more wall-clock time than
+        // setup needs. Advance the fetch's clock past the reply deadline only
+        // after both cards have IDs and are awaiting answers.
+        let deadline = crate::secret::vault::now_ms() + window.as_millis() as u64;
+        f.deadlines.lock().unwrap().insert(91, deadline);
+    }
     *FETCH_ENV.lock().unwrap() = Some((
         Arc::new(SubcSecretVault::new(Arc::new(transport))),
         UrlFetchOptions {
@@ -346,18 +359,28 @@ async fn held_foreground_fetch_late_allow(expire: bool) {
                 vec!["93.184.216.34".parse().unwrap()],
             )],
             connect_overrides: vec![("api.secret.test".into(), address)],
+            reply_clock_for_test: if expire {
+                Some(Arc::new(move || {
+                    if advanced.load(Ordering::SeqCst) {
+                        start + window
+                    } else {
+                        start
+                    }
+                }))
+            } else {
+                None
+            },
             ..Default::default()
         },
     ));
     let url = format!("https://api.secret.test:{}/v1/doc.md?first={{{{ck-secret:first}}}}&second={{{{ck-secret:second}}}}", address.port());
-    let reply_deadline_ms = crate::secret::vault::now_ms() + 2000;
-    if expire {
-        f.deadlines.lock().unwrap().insert(91, reply_deadline_ms);
-    }
     let mut replies = f
         .send_tool(&f.head, "outline", json!({"target":url}), 91, dispatch)
         .await;
-    wait_for(|| phone.requests.lock().unwrap().len() == 2).await;
+    wait_for(|| phone.awaiting.load(Ordering::SeqCst) == 2).await;
+    let requests = phone.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    assert!(phone.withdrawals.lock().unwrap().is_empty());
     assert_eq!(
         daemon.state.lock().unwrap().calls,
         2,
@@ -367,7 +390,9 @@ async fn held_foreground_fetch_late_allow(expire: bool) {
     // Cingulate bounds each card by its vault statement, so the filing carries
     // no expiry of its own; the reply deadline ends the local hold, and the
     // abandoned cards are withdrawn below.
-    if !expire {
+    if expire {
+        advance_clock.store(true, Ordering::SeqCst);
+    } else {
         assert!(cancel_active_tool_call(
             &f.active,
             &f.executor,
@@ -380,7 +405,6 @@ async fn held_foreground_fetch_late_allow(expire: bool) {
     wait_for(|| phone.withdrawals.lock().unwrap().len() == 2).await;
     // Deliver both signed allows even after cancellation. Neither answer may
     // revive the executor job, re-ask the vault, or dispatch its HTTP request.
-    let requests = phone.requests.lock().unwrap().clone();
     for (index, request) in requests.iter().enumerate() {
         let item = &request["secret_use"]["items"][0];
         daemon
@@ -391,16 +415,25 @@ async fn held_foreground_fetch_late_allow(expire: bool) {
         phone.answers.lock().unwrap().insert(
             format!("el_{}", index + 1),
             json!({
-                "state":"answered", "answered_choice_id":"allow", "secret_use_answer": {
+                "kind":"secret_use", "state":"answered", "answered_choice_id":"allow", "secret_use_answer": {
                     "decision":"allow", "duration":"once", "envelope_sha256":"00".repeat(32),
                     "items":[{"request_id":item["request_id"],"decision":"allow"}]
                 }
             }),
         );
     }
-    wait_for(|| phone.withdrawals.lock().unwrap().len() == 2).await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), replies.recv()).await;
+    let reply = tokio::time::timeout(Duration::from_secs(5), replies.recv()).await;
+    if expire {
+        let frame = reply
+            .expect("deadline ends the fetch")
+            .expect("fetch replies");
+        let reply: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert!(text(&reply).contains("approval expired"), "{reply}");
+    }
     tokio::time::sleep(Duration::from_millis(150)).await;
+    let mut withdrawals = phone.withdrawals.lock().unwrap().clone();
+    withdrawals.sort();
+    assert_eq!(withdrawals, ["el_1", "el_2"]);
     assert_eq!(
         daemon.state.lock().unwrap().calls,
         2,
