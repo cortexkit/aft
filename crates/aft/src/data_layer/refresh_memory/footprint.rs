@@ -23,32 +23,11 @@ pub(super) fn bytes() -> Option<u64> {
     resident.parse::<u64>().ok()?.checked_mul(size)
 }
 
+/// The kernel's physical footprint (`phys_footprint`), read with the same
+/// `proc_pid_rusage` call the memory census uses for macOS.
 #[cfg(target_os = "macos")]
 pub(super) fn bytes() -> Option<u64> {
-    use mach2::kern_return::KERN_SUCCESS;
-    use mach2::task::task_info;
-    use mach2::task_info::{task_vm_info, TASK_VM_INFO};
-    use mach2::traps::mach_task_self;
-    use std::mem::{offset_of, size_of, MaybeUninit};
-
-    let mut info = MaybeUninit::<task_vm_info>::zeroed();
-    let mut words = (size_of::<task_vm_info>() / size_of::<i32>()) as u32;
-    // SAFETY: the current task is valid and the output buffer holds the number
-    // of integer words passed to task_info. Older kernels can return fewer.
-    let result = unsafe {
-        task_info(
-            mach_task_self(),
-            TASK_VM_INFO,
-            info.as_mut_ptr().cast(),
-            &mut words,
-        )
-    };
-    let needed = offset_of!(task_vm_info, phys_footprint) + size_of::<u64>();
-    if result != KERN_SUCCESS || (words as usize) * size_of::<i32>() < needed {
-        return None;
-    }
-    // SAFETY: task_info supplied the footprint, and the rest was zeroed.
-    Some(unsafe { info.assume_init() }.phys_footprint)
+    crate::memory::process_phys_footprint_bytes()
 }
 
 #[cfg(windows)]
