@@ -1,8 +1,9 @@
 {
-  "generation": "59ff402e31959b3612048411ed521bda1926786a71bd418768992ed53a3c5700",
-  "catalog_digest": "59ff402e31959b3612048411ed521bda1926786a71bd418768992ed53a3c5700",
+  "generation": "b3f4d9f56b21f491aeebf8c00d1cf08007a8e915edef85ca7d1290f5443d63e3",
+  "catalog_digest": "b3f4d9f56b21f491aeebf8c00d1cf08007a8e915edef85ca7d1290f5443d63e3",
   "tools": [
     {
+      "read_only": true,
       "name": "read",
       "schema_digest": "f9ef88233ec21e9968187fd84526076c5853cb62d8397721b76ae8bd0a229f00",
       "semantics": 1,
@@ -59,6 +60,7 @@
       }
     },
     {
+      "read_only": true,
       "name": "grep",
       "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
       "semantics": 1,
@@ -98,6 +100,7 @@
       }
     },
     {
+      "read_only": true,
       "name": "glob",
       "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
       "semantics": 1,
@@ -128,6 +131,7 @@
       }
     },
     {
+      "read_only": true,
       "name": "aft_outline",
       "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
       "semantics": 1,
