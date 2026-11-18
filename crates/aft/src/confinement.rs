@@ -14,6 +14,7 @@ thread_local! {
     static FENCE: RefCell<Fence> = const {
         RefCell::new(Fence {
             requests: Vec::new(),
+            remote_mutation: false,
             gate: None,
             floor_omissions: None,
             floor_filter_root: None,
@@ -162,6 +163,7 @@ mod ignore_probe_tests {
         let gate = Arc::new(ReadGate::new(&ctx, "probe-fence").unwrap());
         let omissions = Arc::new(parking_lot::Mutex::new(FloorOmissions::default()));
         let original = Fence {
+            remote_mutation: false,
             requests: vec!["probe-fence".to_string()],
             gate: Some(Arc::clone(&gate)),
             floor_omissions: Some(Arc::clone(&omissions)),
