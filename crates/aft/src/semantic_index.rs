@@ -4710,7 +4710,8 @@ pub(crate) fn format_ort_version_mismatch(version: &str, lib_name: &str) -> Stri
          changes to '{}'.\n\
          2. Remove the old library and restart (AFT auto-downloads the correct version on next start):\n\
          {}\n\
-         3. Or install ONNX Runtime 1.24 system-wide: https://github.com/microsoft/onnxruntime/releases/tag/v1.24.0\n\
+         3. Or install ONNX Runtime 1.24 system-wide: https://onnxruntime.ai/ \
+         (Microsoft NuGet package: https://www.nuget.org/packages/Microsoft.ML.OnnxRuntime/1.24.4)\n\
          4. Run `npx @cortexkit/aft doctor` for full diagnostics.",
         version,
         lib_name,

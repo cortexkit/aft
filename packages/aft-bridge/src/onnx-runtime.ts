@@ -150,9 +150,9 @@ export function getManualInstallHint(): string {
     return "brew install onnxruntime";
   }
   if (process.platform === "linux") {
-    return "apt install libonnxruntime or download from https://github.com/microsoft/onnxruntime/releases";
+    return "apt install libonnxruntime or extract the native library from https://www.nuget.org/packages/Microsoft.ML.OnnxRuntime/1.24.4";
   }
-  return "Download from https://github.com/microsoft/onnxruntime/releases";
+  return "Install ONNX Runtime 1.24 from https://onnxruntime.ai/ or extract the native library from https://www.nuget.org/packages/Microsoft.ML.OnnxRuntime/1.24.4";
 }
 
 /**

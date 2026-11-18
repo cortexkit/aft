@@ -975,7 +975,7 @@ for prose.
 **Install ONNX Runtime:**
 - **macOS:** `brew install onnxruntime`
 - **Linux (Debian/Ubuntu):** `apt install libonnxruntime`
-- **Linux (other):** Download from [ONNX Runtime releases](https://github.com/microsoft/onnxruntime/releases)
+- **Linux (other):** Extract your architecture's native library from the [Microsoft.ML.OnnxRuntime 1.24.4 NuGet package](https://www.nuget.org/packages/Microsoft.ML.OnnxRuntime/1.24.4).
 - **Windows:** `winget install Microsoft.ONNXRuntime`
 
 Without ONNX Runtime, all other AFT tools work normally — only `aft_search` is unavailable.
