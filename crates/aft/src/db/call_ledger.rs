@@ -817,6 +817,25 @@ pub fn sweep(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
     Ok(keys.len())
 }
 
+/// Before schema 29, a scoped result went to the scope owner instead of its
+/// carrier. Remove those tombstones only after expiry has discarded their
+/// payload, and leave any parent whose deletion would cascade to an update.
+fn drop_expired_legacy_custody(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM call_ledger WHERE rowid IN (
+            SELECT ledger.rowid FROM call_ledger AS ledger
+            WHERE ledger.state='Settled' AND ledger.custodian<>ledger.carrier
+              AND ledger.frame_type='Error'
+              AND CASE WHEN json_valid(ledger.late_entry)
+                       THEN json_extract(ledger.late_entry,'$.kind')='expired' END
+              AND NOT EXISTS (SELECT 1 FROM call_ledger_updates AS updates
+                  WHERE updates.carrier=ledger.carrier AND updates.call_key=ledger.call_key)
+            LIMIT ?1
+        )",
+        [SWEEP_BATCH as i64],
+    )
+}
+
 pub fn drop_entry(conn: &Connection, key: &Key) -> rusqlite::Result<bool> {
     Ok(conn.execute(
         "DELETE FROM call_ledger WHERE carrier=?1 AND call_key=?2 AND state='Settled'",
@@ -1422,6 +1441,9 @@ pub fn recover(conn: &Connection) -> rusqlite::Result<()> {
             }
         }
     }
+    // Clean up only entries that were already reduced, before the normal sweep
+    // can turn any remaining legacy results into expired entries.
+    while drop_expired_legacy_custody(conn)? == SWEEP_BATCH {}
     while sweep(conn, now_ms())? == SWEEP_BATCH {}
     Ok(())
 }
@@ -2818,6 +2840,90 @@ mod tests {
             .unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn late_results_recovery_drops_only_unlinked_expired_legacy_custody() {
+        let conn = database();
+        conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        let scope = scope("owner");
+        let now = now_ms();
+        let old = now - RETENTION_MS;
+        let make = |call_key: String, legacy: bool, expired: bool, linked: bool| {
+            let key = Key {
+                carrier: "carrier".into(),
+                call_key,
+            };
+            admit(&conn, &key, "digest", Some(&scope), State::DispatchStarted).unwrap();
+            if legacy {
+                conn.execute(
+                    "UPDATE call_ledger SET custodian=owner WHERE carrier=?1 AND call_key=?2",
+                    params![key.carrier, key.call_key],
+                )
+                .unwrap();
+            }
+            if linked {
+                // Even a retired update retains its parent for deduplication.
+                conn.execute(
+                    "INSERT INTO call_ledger_updates
+                     (carrier,call_key,approval_key,ordinal,custodian,seq,event_id,settled_at)
+                     VALUES (?1,?2,'approval',1,'owner',1,'retired-update',?3)",
+                    params![key.carrier, key.call_key, old],
+                )
+                .unwrap();
+            }
+            assert!(settle(
+                &conn,
+                &key,
+                &success(),
+                "ok",
+                None,
+                if expired { old } else { now },
+            )
+            .unwrap());
+            if expired {
+                reduce_expired(&conn, &key, now).unwrap();
+            }
+            key
+        };
+        let expired_legacy: Vec<_> = (0..=SWEEP_BATCH)
+            .map(|i| make(format!("legacy-{i}"), true, true, false))
+            .collect();
+        let own_expired = make("carrier-expired".into(), false, true, false);
+        let legacy_live = make("legacy-live".into(), true, false, false);
+        let legacy_linked = make("legacy-linked".into(), true, true, true);
+        let carrier_before = page(&conn, "carrier", None, None, now, usize::MAX);
+        let owner_before = head_seq(&conn, "owner").unwrap();
+
+        recover(&conn).unwrap();
+
+        for key in expired_legacy {
+            assert!(get(&conn, &key).unwrap().is_none(), "{}", key.call_key);
+        }
+        assert_eq!(head_seq(&conn, "owner").unwrap(), owner_before);
+        assert_eq!(
+            page(&conn, "carrier", None, None, now, usize::MAX),
+            carrier_before
+        );
+        assert_eq!(
+            carrier_before["entries"][0]["call_key"],
+            own_expired.call_key
+        );
+        assert_eq!(carrier_before["entries"][0]["kind"], "expired");
+        let owner_page = page(&conn, "owner", None, None, now, usize::MAX);
+        assert_eq!(owner_page["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(owner_page["entries"][0]["call_key"], legacy_live.call_key);
+        assert_eq!(owner_page["entries"][0]["kind"], "result");
+        assert_eq!(owner_page["entries"][1]["call_key"], legacy_linked.call_key);
+        assert_eq!(owner_page["entries"][1]["kind"], "expired");
+        let child: Option<String> = conn
+            .query_row(
+                "SELECT entry FROM call_ledger_updates WHERE event_id='retired-update'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(child, None);
     }
 
     #[test]

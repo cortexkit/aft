@@ -23,6 +23,8 @@ use crate::hashline::integration::RegistrationRequest;
 mod guidance;
 #[cfg(test)]
 mod guidance_text_tests;
+#[cfg(test)]
+mod late_results_tests;
 
 #[cfg(test)]
 thread_local! {
