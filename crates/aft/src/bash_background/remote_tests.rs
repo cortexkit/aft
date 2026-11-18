@@ -6890,7 +6890,7 @@ async fn exec_remote_bash_restart_refusal_uses_original_launch_plan() {
             fs::metadata(
                 paths
                     .control_dir
-                    .join(crate::sandbox_spawn::REMOTE_LOCAL_LAUNCH)
+                    .join(crate::sandbox_spawn::local_launch::REMOTE_LOCAL_LAUNCH)
             )
             .unwrap()
             .permissions()
@@ -7091,7 +7091,7 @@ async fn exec_remote_bash_restart_snapshot_tampering_refuses_without_run() {
         drop(original);
         let snapshot = paths
             .control_dir
-            .join(crate::sandbox_spawn::REMOTE_LOCAL_LAUNCH);
+            .join(crate::sandbox_spawn::local_launch::REMOTE_LOCAL_LAUNCH);
         if missing {
             fs::remove_file(&snapshot).unwrap();
         } else {
