@@ -1,6 +1,7 @@
 //! Which paths outside its own checkout a jailed worker may read: the exact
-//! Cargo and container files above the checkout, and the build targets an
-//! operator configured. Directory listings above the checkout stay denied.
+//! Cargo and container files above the checkout, shared build inputs under
+//! `.rust-build-seeds`, and operator-configured build targets. Seed directories
+//! are read-only; parent listings stay denied.
 
 use std::path::{Path, PathBuf};
 
@@ -10,12 +11,32 @@ use super::{
 };
 
 const WORKER_ANCESTOR_CARGO_CONFIG_FILES: &[&str] = &[".cargo/config.toml", ".cargo/config"];
-pub(super) const WORKER_CONTAINER_FILES: &[&str] =
-    &[".cargo/alfonso-test-threads", ".rust-build-seeds"];
+pub(super) const WORKER_CONTAINER_FILES: &[&str] = &[".cargo/alfonso-test-threads"];
+pub(super) const WORKER_CONTAINER_DIRS: &[&str] = &[".rust-build-seeds"];
 
 #[cfg(any(target_os = "macos", test))]
 pub(super) fn worker_pool_read_files(home: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
-    let mut files = Vec::new();
+    // Missing Cargo probes keep exact-file intent rather than becoming a
+    // recursive directory grant if they appear before launch.
+    let names = WORKER_ANCESTOR_CARGO_CONFIG_FILES
+        .iter()
+        .chain(WORKER_CONTAINER_FILES)
+        .copied()
+        .collect::<Vec<_>>();
+    worker_pool_read_paths(home, roots, &names)
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(super) fn worker_pool_read_dirs(home: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
+    worker_pool_read_paths(home, roots, WORKER_CONTAINER_DIRS)
+        .into_iter()
+        .filter(|path| super::profile_candidate_is_dir(path))
+        .collect()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn worker_pool_read_paths(home: &Path, roots: &[PathBuf], names: &[&str]) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
     for data in [
         Some(home.join(".local/share")),
         absolute_env_path("XDG_DATA_HOME"),
@@ -32,20 +53,13 @@ pub(super) fn worker_pool_read_files(home: &Path, roots: &[PathBuf]) -> Vec<Path
                 if !ancestor.starts_with(&pool) {
                     break;
                 }
-                // Preserve exact-file intent even for absent Cargo probes. A
-                // missing setting must not become a recursive directory grant.
-                files.extend(
-                    WORKER_ANCESTOR_CARGO_CONFIG_FILES
-                        .iter()
-                        .chain(WORKER_CONTAINER_FILES)
-                        .map(|name| ancestor.join(name)),
-                );
+                paths.extend(names.iter().map(|name| ancestor.join(name)));
             }
         }
     }
-    files.sort_unstable();
-    files.dedup();
-    files
+    paths.sort_unstable();
+    paths.dedup();
+    paths
 }
 
 pub(super) fn worker_cargo_configs(

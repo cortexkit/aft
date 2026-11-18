@@ -1427,10 +1427,13 @@ mod data_ancestor_read_tests {
     fn nested_profile(root: &Path) -> SandboxProfile {
         let data = root.join("private-data");
         let exception = data.join("alfonso/worktrees/hash-a/own");
+        let seeds = data.join("alfonso/worktrees/hash-a/.rust-build-seeds");
         let credential_floor = data.join("credentials");
         std::fs::create_dir_all(&exception).unwrap();
         std::fs::create_dir_all(credential_floor.join("checkout")).unwrap();
         std::fs::create_dir_all(data.join("alias")).unwrap();
+        std::fs::create_dir(&seeds).unwrap();
+        std::fs::write(seeds.join("seed"), "build seed").unwrap();
         let mut profile = SandboxProfile::build(
             Vec::new(),
             Vec::new(),
@@ -1443,7 +1446,9 @@ mod data_ancestor_read_tests {
         )
         .unwrap();
         profile.data_policy.deny = vec![data.clone()];
-        profile.data_policy.read_allow = vec![exception, credential_floor.join("checkout")];
+        profile.data_policy.read_allow =
+            vec![exception, credential_floor.join("checkout"), seeds.clone()];
+        profile.write_deny.push(seeds);
         profile.data_policy.read_metadata_allow = vec![data.join("alias")];
         profile
     }
@@ -1558,6 +1563,18 @@ mod data_ancestor_read_tests {
                 assert!(!source.contains(&relaxed_filter(path, false).unwrap()));
                 assert!(!profile.writable_files.contains(path));
             }
+            let seeds = container.join(".rust-build-seeds");
+            let directory_filter = if mode == aft::config::SandboxMode::Relaxed {
+                relaxed_filter(&seeds, false).unwrap()
+            } else {
+                format!("(subpath \"{}\")", escape_path(&seeds).unwrap())
+            };
+            assert!(reads
+                .iter()
+                .any(|line| line.contains(&format!("(require-not {directory_filter})"))));
+            assert!(!writes.contains(&directory_filter));
+            assert!(source.contains(&format!("(deny file-write* {directory_filter})")));
+            assert!(!profile.data_policy.read_files.contains(&seeds));
         }
     }
 
@@ -1625,6 +1642,9 @@ mod data_ancestor_read_tests {
         let sibling_target = worktrees.join("hash-a/sibling/target/artifact");
         std::fs::create_dir_all(sibling_target.parent().unwrap()).unwrap();
         std::fs::write(&sibling_target, "sibling artifact").unwrap();
+        let sibling_seeds = worktrees.join("hash-a/sibling/.rust-build-seeds/seed");
+        std::fs::create_dir_all(sibling_seeds.parent().unwrap()).unwrap();
+        std::fs::write(&sibling_seeds, "sibling seed").unwrap();
         for path in [&sibling, &other_repo] {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, "sibling private").unwrap();
@@ -1661,6 +1681,19 @@ for sibling in "$5" "$6"; do
 done
 [ "$(/bin/cat "$4/allowed.txt")" = 'exception readable' ]
 /bin/cat "$4/../.cargo/config.toml" >/dev/null
+[ "$(/bin/cat "$4/../.rust-build-seeds/seed")" = 'build seed' ]
+if /bin/cat "$4/../sibling/.rust-build-seeds/seed" >/dev/null 2>&1; then
+    echo 'sibling seed unexpectedly readable' >&2
+    exit 1
+fi
+if (printf tamper >> "$4/../.rust-build-seeds/seed") 2>/dev/null; then
+    echo 'container seed unexpectedly writable' >&2
+    exit 1
+fi
+if (printf tamper > "$4/../.rust-build-seeds/new-seed") 2>/dev/null; then
+    echo 'container seed directory unexpectedly writable' >&2
+    exit 1
+fi
 "$7" --version
 printf build > "$4/../configured-target/artifact"
 [ "$(/bin/cat "$4/../configured-target/artifact")" = build ]

@@ -65,10 +65,12 @@ mod worker_reads;
 pub(crate) use requirement::{resolve_command_sandbox_spawn, SandboxRequirement};
 #[cfg(unix)]
 use settings_grants::absolute_env_path;
-#[cfg(all(unix, any(target_os = "macos", test)))]
-use worker_reads::worker_pool_read_files;
 #[cfg(unix)]
-use worker_reads::{worker_cargo_configs, worker_target_roots, WORKER_CONTAINER_FILES};
+use worker_reads::{
+    worker_cargo_configs, worker_target_roots, WORKER_CONTAINER_DIRS, WORKER_CONTAINER_FILES,
+};
+#[cfg(all(unix, any(target_os = "macos", test)))]
+use worker_reads::{worker_pool_read_dirs, worker_pool_read_files};
 
 pub const SANDBOX_UNAVAILABLE_EXIT_CODE: i32 = 78;
 
@@ -1842,6 +1844,12 @@ fn build_native_profile(
                 .read_files
                 .extend(files.iter().cloned());
             shell_write_deny.extend(files);
+            let dirs = worker_pool_read_dirs(&home, &project_roots);
+            policy
+                .private_stores
+                .read_allow
+                .extend(dirs.iter().cloned());
+            shell_write_deny.extend(dirs);
         }
         // Ordinary sessions retain writable project Git configuration; jailed
         // workers and delegated write roots must not change execution controls.
@@ -2202,6 +2210,9 @@ fn build_relaxed_profile(
         let files = worker_pool_read_files(home, roots);
         stores.read_files.extend(files.iter().cloned());
         write_deny.extend(files);
+        let dirs = worker_pool_read_dirs(home, roots);
+        stores.read_allow.extend(dirs.iter().cloned());
+        write_deny.extend(dirs);
     }
     // Select grants against the complete credential and store floors before
     // protecting their control files or carving out sibling checkout denies.
@@ -2911,6 +2922,7 @@ fn worker_jail_grants(
         if let Some(container) = root.parent() {
             for path in WORKER_CONTAINER_FILES
                 .iter()
+                .chain(WORKER_CONTAINER_DIRS)
                 .map(|name| container.join(name))
             {
                 if let Ok(path) = path.canonicalize() {
@@ -10756,7 +10768,7 @@ mod policy_tests {
 
     #[cfg(unix)]
     #[test]
-    fn worker_pool_read_files_are_exact_and_stop_at_the_canonical_pool() {
+    fn worker_pool_read_files_and_dirs_stop_at_the_canonical_pool() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().canonicalize().unwrap();
         let real = home.join("real-pool");
@@ -10767,22 +10779,33 @@ mod policy_tests {
         let own = pool.join("hash-a/own").canonicalize().unwrap();
         let outside = home.join("outside");
         std::fs::create_dir(&outside).unwrap();
-        let files = worker_pool_read_files(&home, &[own, outside]);
+        let roots = [own, outside];
+        let files = worker_pool_read_files(&home, &roots);
         let mut expected = [
             ".cargo/config.toml",
             ".cargo/config",
             ".cargo/alfonso-test-threads",
-            ".rust-build-seeds",
             "hash-a/.cargo/config.toml",
             "hash-a/.cargo/config",
             "hash-a/.cargo/alfonso-test-threads",
-            "hash-a/.rust-build-seeds",
         ]
         .map(|name| real.join(name))
         .to_vec();
         expected.sort_unstable();
         assert_eq!(files, expected);
         assert!(files.iter().all(|path| !path.exists()));
+        assert!(worker_pool_read_dirs(&home, &roots).is_empty());
+        let dirs = [
+            real.join(".rust-build-seeds"),
+            real.join("hash-a/.rust-build-seeds"),
+        ];
+        for dir in &dirs {
+            std::fs::create_dir(dir).unwrap();
+        }
+        std::fs::create_dir_all(roots[0].join(".rust-build-seeds")).unwrap();
+        std::fs::create_dir_all(roots[1].join(".rust-build-seeds")).unwrap();
+        assert_eq!(worker_pool_read_dirs(&home, &roots), dirs);
+        assert!(dirs.iter().all(|dir| !files.contains(dir)));
     }
 
     #[cfg(unix)]
