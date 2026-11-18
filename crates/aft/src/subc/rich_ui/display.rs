@@ -106,7 +106,7 @@ pub(crate) fn health() -> Value {
         Some(reason)
     } else if std::env::var("SUBC_MODULE_ID").as_deref() != Ok("aft") {
         Some("not_module")
-    } else if crate::launch_nonce::consumer_identity().is_none() {
+    } else if !crate::subc::registration::identity_ready() {
         Some("consumer_identity_missing")
     } else {
         Some("not_started")
@@ -720,7 +720,7 @@ pub(crate) fn start(connection_file: &Path, app: &Arc<crate::context::App>, stor
         count(StartNotModule);
         return;
     }
-    if crate::launch_nonce::consumer_identity().is_none() {
+    if !crate::subc::registration::module_consumer_allowed() {
         count(StartNoIdentity);
         return;
     }
@@ -742,7 +742,7 @@ pub(crate) fn start(connection_file: &Path, app: &Arc<crate::context::App>, stor
 }
 
 async fn send_loop(connection_file: PathBuf, mut receiver: tokio::sync::mpsc::Receiver<()>) {
-    use subc_client_rs::{CallOptions, CloseRouteOptions, ConsumerOptions, SubcConsumer};
+    use subc_client_rs::{CallOptions, CloseRouteOptions, ConsumerOptions};
     use subc_protocol::BindIdentity;
     let writer = SENDER.get().expect("display writer started");
     let mut consumer = None;
@@ -771,7 +771,7 @@ async fn send_loop(connection_file: PathBuf, mut receiver: tokio::sync::mpsc::Re
                 call_timeout: std::time::Duration::from_secs(5),
                 ..Default::default()
             };
-            match SubcConsumer::connect(&connection_file, options).await {
+            match crate::subc::registration::connect_consumer(&connection_file, options).await {
                 Ok(client) => consumer = Some(client),
                 Err(_) => count(WriterConnect),
             }

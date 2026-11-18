@@ -1491,11 +1491,14 @@ pub(super) async fn accept_module(listener: &ModuleListener) -> TcpStream {
     stream
 }
 
-pub(super) async fn bind_route(stream: &mut TcpStream, root: &Path) {
+pub(super) trait FixtureIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> FixtureIo for T {}
+
+pub(super) async fn bind_route(stream: &mut impl FixtureIo, root: &Path) {
     bind_route_as(stream, root, ROUTE_CHANNEL, "opencode").await;
 }
 
-async fn bind_route_as(stream: &mut TcpStream, root: &Path, channel: u16, harness: &str) {
+async fn bind_route_as(stream: &mut impl FixtureIo, root: &Path, channel: u16, harness: &str) {
     bind_route_as_at_epoch(stream, root, channel, harness, 1).await;
 }
 
@@ -1504,7 +1507,7 @@ pub(super) async fn bind_route_at_epoch(stream: &mut TcpStream, root: &Path, epo
 }
 
 async fn bind_route_as_at_epoch(
-    stream: &mut TcpStream,
+    stream: &mut impl FixtureIo,
     root: &Path,
     channel: u16,
     harness: &str,
@@ -1565,7 +1568,7 @@ async fn bind_route_as_at_epoch(
 }
 
 pub(super) async fn send_tool_call(
-    stream: &mut TcpStream,
+    stream: &mut impl FixtureIo,
     channel: u16,
     corr: u64,
     name: &str,
@@ -1587,7 +1590,7 @@ pub(super) async fn send_tool_call(
     .await;
 }
 
-async fn bash_status(stream: &mut TcpStream, corr: u64, task_id: &str) -> Value {
+async fn bash_status(stream: &mut impl FixtureIo, corr: u64, task_id: &str) -> Value {
     send_tool_call(
         stream,
         ROUTE_CHANNEL,
@@ -1606,7 +1609,7 @@ async fn bash_status(stream: &mut TcpStream, corr: u64, task_id: &str) -> Value 
 }
 
 pub(super) async fn wait_for_status(
-    stream: &mut TcpStream,
+    stream: &mut impl FixtureIo,
     start_corr: u64,
     task_id: &str,
     expected: &str,
@@ -1627,7 +1630,7 @@ pub(super) async fn wait_for_status(
     }
 }
 
-pub(super) async fn send_connection_goodbye(stream: &mut TcpStream) {
+pub(super) async fn send_connection_goodbye(stream: &mut impl FixtureIo) {
     send_frame(
         stream,
         Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 99, Vec::new())
@@ -1663,11 +1666,11 @@ async fn send_module_draining(stream: &mut TcpStream) {
     .await;
 }
 
-pub(super) async fn send_frame(stream: &mut TcpStream, frame: Frame) {
+pub(super) async fn send_frame(stream: &mut impl FixtureIo, frame: Frame) {
     write_frame(stream, &frame).await.expect("write frame");
 }
 
-pub(super) async fn read_any_frame_timeout(stream: &mut TcpStream, label: &str) -> Frame {
+pub(super) async fn read_any_frame_timeout(stream: &mut impl FixtureIo, label: &str) -> Frame {
     tokio::time::timeout(Duration::from_secs(30), read_frame(stream))
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
@@ -1675,7 +1678,7 @@ pub(super) async fn read_any_frame_timeout(stream: &mut TcpStream, label: &str) 
         .unwrap_or_else(|| panic!("EOF waiting for {label}"))
 }
 
-async fn read_frame_timeout(stream: &mut TcpStream, label: &str) -> Frame {
+async fn read_frame_timeout(stream: &mut impl FixtureIo, label: &str) -> Frame {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let now = Instant::now();
@@ -1692,7 +1695,11 @@ async fn read_frame_timeout(stream: &mut TcpStream, label: &str) -> Frame {
     }
 }
 
-pub(super) async fn read_tool_response(stream: &mut TcpStream, corr: u64, label: &str) -> Frame {
+pub(super) async fn read_tool_response(
+    stream: &mut impl FixtureIo,
+    corr: u64,
+    label: &str,
+) -> Frame {
     let frame = read_frame_timeout(stream, label).await;
     assert_eq!(frame.header.ty, FrameType::Response, "{label} frame type");
     assert_eq!(frame.header.channel, ROUTE_CHANNEL, "{label} channel");

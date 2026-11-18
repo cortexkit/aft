@@ -9,7 +9,7 @@ use cortexkit_project_identity::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
-use subc_client_rs::{CallError, CallOptions, CloseRouteOptions, ConsumerOptions, SubcConsumer};
+use subc_client_rs::{CallError, CallOptions, CloseRouteOptions, ConsumerOptions};
 use subc_protocol::{BindIdentity, RouteTarget};
 
 use super::door::{DoorError, JsonDoorTransport};
@@ -53,13 +53,17 @@ impl ModuleTransport {
                 .build()
                 .map_err(|error| DoorError::unavailable(error.to_string()))?;
             runtime.block_on(async {
-                crate::launch_nonce::consumer_identity().ok_or_else(|| {
-                    DoorError::unavailable("AFT module launch identity is unavailable")
-                })?;
-                let consumer =
-                    SubcConsumer::connect(&this.connection_file, ConsumerOptions::default())
-                        .await
-                        .map_err(|error| DoorError::unavailable(error.to_string()))?;
+                if !crate::subc::registration::module_consumer_allowed() {
+                    return Err(DoorError::unavailable(
+                        "AFT module launch identity is unavailable",
+                    ));
+                }
+                let consumer = crate::subc::registration::connect_consumer(
+                    &this.connection_file,
+                    ConsumerOptions::default(),
+                )
+                .await
+                .map_err(|error| DoorError::unavailable(error.to_string()))?;
                 let route = consumer
                     .open_route(this.target, this.identity, CallOptions::default())
                     .await

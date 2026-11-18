@@ -673,13 +673,20 @@ impl DaemonControl {
         &self,
         body: &ModuleControlRequestFromModule,
     ) -> Result<ModuleControlResponseToModule, ControlError> {
+        decode_control_reply(&self.raw_request(body).await?)
+    }
+
+    pub(super) async fn raw_request(
+        &self,
+        body: &impl serde::Serialize,
+    ) -> Result<Frame, ControlError> {
         let (corr, body) = self.prepare_request(body)?;
-        self.request_prepared(corr, body).await
+        self.request_frame(corr, body).await
     }
 
     fn prepare_request(
         &self,
-        body: &ModuleControlRequestFromModule,
+        body: &impl serde::Serialize,
     ) -> Result<(u64, Vec<u8>), ControlError> {
         let body =
             serde_json::to_vec(body).map_err(|error| ControlError::Decode(error.to_string()))?;
@@ -687,6 +694,7 @@ impl DaemonControl {
         Ok((corr, body))
     }
 
+    #[cfg(feature = "test-timing-hooks")]
     async fn request_prepared(
         &self,
         corr: u64,

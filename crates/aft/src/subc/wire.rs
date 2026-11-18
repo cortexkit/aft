@@ -1723,6 +1723,7 @@ pub(super) fn response_is_fatal_panic(response: &Response) -> bool {
 pub enum SubcError {
     RuntimeThread(std::io::Error),
     Runtime(std::io::Error),
+    Registration(subc_client_rs::registration::RegistrationError),
     StorageLease(std::io::Error),
     ConnectionFile {
         path: PathBuf,
@@ -1775,6 +1776,7 @@ impl fmt::Display for SubcError {
         match self {
             Self::RuntimeThread(e) => write!(f, "failed to start subc runtime thread: {e}"),
             Self::Runtime(e) => write!(f, "failed to build subc tokio runtime: {e}"),
+            Self::Registration(e) => write!(f, "subc registration channel: {e}"),
             Self::StorageLease(e) => write!(f, "failed to acquire subc storage lease: {e}"),
             Self::ConnectionFile { path, source } => {
                 write!(f, "failed to read subc connection file {path:?}: {source}")

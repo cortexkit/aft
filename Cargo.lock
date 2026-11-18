@@ -161,7 +161,7 @@ dependencies = [
  "similar",
  "streaming-iterator",
  "subc-client-rs",
- "subc-control",
+ "subc-control 0.42.2",
  "subc-daemon",
  "subc-os",
  "subc-protocol",
@@ -5183,16 +5183,16 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.41.0"
+version = "0.41.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "296ac56f8e318d7fb29d1b127eb3871b7e361ea969941726f57212b414b602ee"
+checksum = "bd675b5335ba9bc1827aae45a23143209a74a10e7d1a0105e54e47048f3649c5"
 dependencies = [
  "async-trait",
  "serde",
  "serde_json",
  "sha2",
  "subc-config",
- "subc-control",
+ "subc-control 0.42.2",
  "subc-os",
  "subc-protocol",
  "subc-transport",
@@ -5227,6 +5227,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "subc-control"
+version = "0.42.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9405466bf7a65dfe806a57984b7b08d8681fd38dff4dcfd75f0ee221504b9b13"
+dependencies = [
+ "serde",
+ "serde_json",
+ "subc-config",
+ "subc-protocol",
+]
+
+[[package]]
 name = "subc-daemon"
 version = "0.49.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5248,7 +5260,7 @@ dependencies = [
  "sha2",
  "subc-cgroup",
  "subc-config",
- "subc-control",
+ "subc-control 0.41.0",
  "subc-jobobject",
  "subc-jsonc",
  "subc-os",
@@ -5282,9 +5294,9 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.40"
+version = "0.1.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40dad45881b7449d2d55429e2117a7aea18cef401a3fb3f8c3a0f9bd58cd661f"
+checksum = "40b199a6b0fb717dd866f75049cbbe1ba33ae01fc08dbdb39debf69a13bf0a4c"
 dependencies = [
  "libc",
  "rustix",

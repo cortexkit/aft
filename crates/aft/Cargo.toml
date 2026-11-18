@@ -280,13 +280,13 @@ cortexkit-bus-naming = "=0.4.6"
 async-nats = { version = "0.50", default-features = false, features = ["jetstream", "ring"] }
 jsonschema = { version = "0.33", default-features = false }
 subc-protocol = "=0.37.4"
-subc-control = "=0.41.0"
+subc-control = "=0.42.2"
 subc-transport = "=0.18.0"
-subc-client-rs = "=0.41.0"
+subc-client-rs = "=0.41.4"
 # The one reader of the daemon's launch nonce (pipe first, environment copy
 # second). subc-client-rs reads through the same cached accessor, so this pin
 # must match the version subc-client-rs depends on.
-subc-os = { version = "=0.1.40", features = ["tokio"] }
+subc-os = { version = "=0.1.42", features = ["tokio"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 vt100 = "0.16"
 jsonc-parser = { version = "0.33", features = ["cst"] }

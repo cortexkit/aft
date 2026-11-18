@@ -820,7 +820,7 @@ impl CapabilityConsumer {
         if let Some(probe) = test_endpoint::probe(_address) {
             return Ok(Self::Endpoint(probe));
         }
-        SubcConsumer::connect(path, ConsumerOptions::default())
+        super::registration::connect_consumer(path, ConsumerOptions::default())
             .await
             .map(Self::Runner)
             .map_err(|_| ("connect", None))
@@ -1802,16 +1802,17 @@ async fn call(path: &Path, address: &Address, body: Vec<u8>) -> Result<Vec<u8>, 
     if let Some(result) = test_endpoint::call(address, &body).await {
         return result;
     }
-    let Some(_) = crate::launch_nonce::consumer_identity() else {
+    if !super::registration::module_consumer_allowed() {
         return Err(retry(
             FailureClass::ConsumerIdentity,
             "AFT launch has no consumer identity",
         ));
-    };
-    let consumer = match SubcConsumer::connect(path, ConsumerOptions::default()).await {
-        Ok(consumer) => consumer,
-        Err(error) => return Err(retry(FailureClass::Connect, error)),
-    };
+    }
+    let consumer =
+        match super::registration::connect_consumer(path, ConsumerOptions::default()).await {
+            Ok(consumer) => consumer,
+            Err(error) => return Err(retry(FailureClass::Connect, error)),
+        };
     let route = open_notice_route(&consumer, address).await;
     let result = match route {
         Ok(route) => {
@@ -1843,12 +1844,12 @@ async fn open_notice_route(
     consumer: &SubcConsumer,
     address: &Address,
 ) -> Result<subc_client_rs::RouteHandle, Outcome> {
-    let Some(_) = crate::launch_nonce::consumer_identity() else {
+    if !super::registration::module_consumer_allowed() {
         return Err(retry(
             FailureClass::ConsumerIdentity,
             "AFT launch has no consumer identity",
         ));
-    };
+    }
     let target = target(address);
     let options = CallOptions {
         timeout: Duration::from_secs(5),

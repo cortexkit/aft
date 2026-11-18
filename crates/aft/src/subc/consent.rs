@@ -455,7 +455,7 @@ impl SubcConsentTransport {
         if let Some(consumer) = slot.as_ref() {
             return Ok(Arc::clone(consumer));
         }
-        if crate::launch_nonce::consumer_identity().is_none() {
+        if !crate::subc::registration::module_consumer_allowed() {
             return Err(ConsentError::Unavailable(
                 "the daemon has no subc module identity to ask with".into(),
             ));

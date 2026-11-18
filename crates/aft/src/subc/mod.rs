@@ -4456,86 +4456,8 @@ pub fn run_subc_mode_for_test_with_health_rollup_probe(
         dispatch,
         user_config_path,
         Some(probe),
+        None,
     )
-}
-
-fn run_subc_mode_with_probe(
-    connection_file_path: &Path,
-    ctx: Arc<AppContext>,
-    executor: Arc<Executor>,
-    dispatch: DispatchFn,
-    user_config_path: Option<PathBuf>,
-    lifecycle_probe: Option<SubcTestLifecycleProbe>,
-) -> Result<(), SubcError> {
-    // One watch on the user config file serves every root in this process:
-    // an edit asks each live root to reload its config.
-    let _user_config_watch = user_config_path.clone().map(|path| {
-        let executor = Arc::downgrade(&executor);
-        crate::config_live::start_process_user_config_watch(path, move || {
-            executor
-                .upgrade()
-                .map(|executor| executor.actor_contexts())
-                .unwrap_or_default()
-        })
-    });
-    // Production NEVER allows non-manifest tool names on route channels: AFT
-    // fails closed and does not trust subc to enforce the manifest. The
-    // test-only harness sets this through `run_subc_mode_for_test`.
-    run_subc_mode_inner(
-        connection_file_path,
-        ctx,
-        executor,
-        dispatch,
-        user_config_path,
-        false,
-        MAX_FRAME_BODY_LEN as usize,
-        lifecycle_probe,
-    )
-}
-
-// A current-thread runtime polls its root future on the thread calling
-// block_on. Windows gives the process main thread only a 1 MiB stack; the
-// module loop and its callees need headroom even with their futures boxed.
-const MODULE_RUNTIME_STACK_BYTES: usize = 16 * 1024 * 1024;
-
-fn with_module_runtime_stack<T: Send>(run: impl FnOnce() -> T + Send) -> io::Result<T> {
-    std::thread::scope(|scope| {
-        let worker = std::thread::Builder::new()
-            .name("aft-subc-runtime".to_string())
-            .stack_size(MODULE_RUNTIME_STACK_BYTES)
-            .spawn_scoped(scope, run)?;
-        match worker.join() {
-            Ok(result) => Ok(result),
-            // Keep the original panic payload and unwind the caller, rather
-            // than turning a module panic into a clean stop or a new panic.
-            Err(panic) => std::panic::resume_unwind(panic),
-        }
-    })
-}
-
-fn run_subc_mode_inner(
-    connection_file_path: &Path,
-    ctx: Arc<AppContext>,
-    executor: Arc<Executor>,
-    dispatch: DispatchFn,
-    user_config_path: Option<PathBuf>,
-    allow_native_passthrough: bool,
-    tool_response_body_limit: usize,
-    lifecycle_probe: Option<SubcTestLifecycleProbe>,
-) -> Result<(), SubcError> {
-    with_module_runtime_stack(move || {
-        run_subc_mode_on_runtime_thread(
-            connection_file_path,
-            ctx,
-            executor,
-            dispatch,
-            user_config_path,
-            allow_native_passthrough,
-            tool_response_body_limit,
-            lifecycle_probe,
-        )
-    })
-    .map_err(SubcError::RuntimeThread)?
 }
 
 fn run_subc_mode_on_runtime_thread(
@@ -4547,6 +4469,7 @@ fn run_subc_mode_on_runtime_thread(
     allow_native_passthrough: bool,
     tool_response_body_limit: usize,
     lifecycle_probe: Option<SubcTestLifecycleProbe>,
+    registration: Option<AdoptedRegistration>,
 ) -> Result<(), SubcError> {
     // Before any database opens: this process admits keyed calls, so it is
     // the one that recovers the call ledger after a restart.
@@ -4554,17 +4477,21 @@ fn run_subc_mode_on_runtime_thread(
     let _daemon_storage_lease = crate::root_cache::acquire_daemon_storage_lease(&ctx.storage_dir())
         .map_err(SubcError::StorageLease)?;
     crate::db::runner_harness_keys::start(ctx.app(), ctx.storage_dir().join("aft.db"));
-    let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
-    let runtime = dispatch_path_metrics
-        .frame_loop_runtime()
-        .map_err(SubcError::Runtime)?;
+    let (runtime, dispatch_path_metrics, adopted) = match registration {
+        Some(channel) => (channel.runtime, channel.metrics, Some(channel.stream)),
+        None => {
+            let metrics = Arc::new(DispatchPathMetrics::new());
+            let runtime = metrics.frame_loop_runtime().map_err(SubcError::Runtime)?;
+            (runtime, metrics, None)
+        }
+    };
 
     let executor_for_loop = Arc::clone(&executor);
     let loop_result = runtime.block_on(async move {
         let shared_app = ctx.app();
         // Stall captures land under `<storage>/diagnostics`.
         let storage_dir = ctx.storage_dir();
-        if crate::launch_nonce::current().is_some() {
+        if registration::identity_ready() {
             crate::agent_commands::enable(&storage_dir);
         }
         let base_task_scope_runtime = Some((
@@ -4579,8 +4506,13 @@ fn run_subc_mode_on_runtime_thread(
         // Initialize the page snapshot store. The shared storage-use lease
         // excludes cache cleanup, not other AFT daemons.
         crate::page_collect::snapshot::SnapshotStore::for_storage(&storage_dir);
-        let stream =
-            connect_and_authenticate(connection_file_path, lifecycle_probe.as_ref()).await?;
+        let using_registration = adopted.is_some();
+        let stream: Box<dyn subc_client_rs::ModuleStream> = match adopted {
+            Some(stream) => registration::authenticate(stream, connection_file_path).await?,
+            None => Box::new(
+                connect_and_authenticate(connection_file_path, lifecycle_probe.as_ref()).await?,
+            ),
+        };
         log::info!(
             "subc attach: authenticated to daemon via {}",
             connection_file_path.display()
@@ -4603,6 +4535,7 @@ fn run_subc_mode_on_runtime_thread(
                 // The exit phase below takes and shuts down every root's servers.
                 QuiescedLsp::LeaveForExitSweep,
                 Some(dispatch_path_metrics),
+                using_registration,
                 #[cfg(test)]
                 None,
                 #[cfg(test)]
@@ -4804,6 +4737,7 @@ pub fn run_subc_mode_for_test(
         true,
         MAX_FRAME_BODY_LEN as usize,
         None,
+        None,
     )
 }
 
@@ -4826,6 +4760,7 @@ pub fn run_subc_mode_for_test_with_lifecycle_probe(
         true,
         MAX_FRAME_BODY_LEN as usize,
         Some(lifecycle_probe),
+        None,
     )
 }
 
@@ -4849,6 +4784,7 @@ pub fn run_subc_mode_for_test_with_response_body_limit(
         user_config_path,
         true,
         tool_response_body_limit,
+        None,
         None,
     )
 }
@@ -5188,10 +5124,12 @@ async fn drain_pending_route_bind_completions(
 
 #[path = "task_scope_runtime.rs"]
 mod task_scope_runtime;
-use task_scope_runtime::heap_module_future;
+use task_scope_runtime::{heap_module_future, run_subc_mode_inner, run_subc_mode_with_probe};
 #[cfg(test)]
-use task_scope_runtime::run_module_loop;
-pub use task_scope_runtime::run_subc_mode;
+use task_scope_runtime::{run_module_loop, with_module_runtime_stack, MODULE_RUNTIME_STACK_BYTES};
+pub use task_scope_runtime::{run_subc_mode, run_subc_mode_with_registration};
+pub(crate) mod registration;
+pub use registration::AdoptedRegistration;
 
 /// Runs the `ModuleHello` → `HelloAck` sequence and the control/route loop.
 /// Stops on connection EOF, channel-0 Goodbye, or an executor response that requests whole-connection teardown.
@@ -5210,6 +5148,7 @@ async fn run_module_loop_with_task_scopes<R, W>(
     base_task_scope_runtime: Option<(crate::bash_background::BgTaskRegistry, Duration, PathBuf)>,
     connection_end_lsp: QuiescedLsp,
     runtime_metrics: Option<Arc<DispatchPathMetrics>>,
+    using_registration: bool,
     #[cfg(test)] standing_actor_override: Option<Arc<standing::StandingActor>>,
     #[cfg(test)] mut watchdog_test: Option<stall_watchdog::FrameLoopTestHooks>,
 ) -> Result<ModuleLoopExit, SubcError>
@@ -5229,7 +5168,9 @@ where
     // Echo the launch nonce the daemon handed over at spawn (captured once at
     // startup, see `crate::launch_nonce`) so a reserved module_id's HELLO is
     // accepted; absent for non-reserved/self-connect.
-    let launch_nonce = crate::launch_nonce::current();
+    let launch_nonce = (!using_registration)
+        .then(crate::launch_nonce::current)
+        .flatten();
     // Compile immutable call validators before HELLO makes this module available.
     // Discovery only needs catalog entries and must not pay this first-use cost.
     tool_provider::prepare_admission();
@@ -5345,8 +5286,15 @@ where
         control_replies.clone(),
         HELLO_CORR + 1,
     ));
+    let claim_lifetime = if using_registration {
+        let minter = registration::install_minter(&control)?;
+        crate::agent_commands::enable(storage_dir);
+        Some(minter)
+    } else {
+        None
+    };
     let run_scopes = Arc::new(run_scope::RunScopes::new(control.clone()));
-    let agent_commands = crate::launch_nonce::current().map(|_| {
+    let agent_commands = registration::identity_ready().then(|| {
         let control = control.clone();
         crate::agent_commands::connect(move |batch| {
             let control = control.clone();
@@ -7036,6 +6984,7 @@ where
         }
     };
 
+    drop(claim_lifetime);
     shells_service.drain().await;
     shells_service.stop();
     dispatch_path_metrics.held_bash_calls.clear_all_progress();

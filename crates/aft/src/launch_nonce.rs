@@ -88,11 +88,12 @@ pub fn capture_at_startup() {
         Err(error) => Capture::Failed(error.to_string()),
     };
     *slot() = outcome;
-    // The value is cached above and every reader in AFT goes through this
-    // module (the subc client SDK reads the same cached accessor), so nothing
-    // needs the environment copy any more. The descriptor variable goes too:
-    // a child that inherited it without the pipe would find some unrelated
-    // descriptor at that number.
+    strip_environment();
+}
+
+// Both modes scrub these before starting threads or children. Only startup
+// without an adopted registration channel reads the nonce.
+pub(crate) fn strip_environment() {
     std::env::remove_var(subc_os::launch_nonce::LAUNCH_NONCE_ENV);
     std::env::remove_var(subc_os::launch_nonce::LAUNCH_NONCE_FD_ENV);
 }
@@ -121,18 +122,8 @@ pub fn current() -> Option<ModuleLaunchNonce> {
     }
 }
 
-/// AFT's own launch identity, for local checks before opening a route.
-/// Calls leave identity selection to the SDK: a connection claim when bound,
-/// otherwise the implicit identity from the same cached launch nonce.
-pub fn consumer_identity() -> Option<subc_client_rs::ConsumerIdentity> {
-    let module_id = std::env::var(subc_protocol::SUBC_MODULE_ID_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())?;
-    let nonce = current()?;
-    Some(subc_client_rs::ConsumerIdentity {
-        module_id,
-        launch_nonce: nonce.value,
-    })
+pub(crate) fn was_captured() -> bool {
+    matches!(&*slot(), Capture::Captured(Some(_)))
 }
 
 #[derive(Default)]

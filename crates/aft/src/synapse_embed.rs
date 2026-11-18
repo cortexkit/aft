@@ -1433,7 +1433,7 @@ impl SynapseState {
             },
             ..ConsumerOptions::default()
         };
-        let consumer = SubcConsumer::connect(&self.connection_file, options)
+        let consumer = crate::subc::registration::connect_consumer(&self.connection_file, options)
             .await
             .map_err(|error| classify_transport_failure("route setup", &error))?;
         let catalog = consumer

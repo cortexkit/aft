@@ -507,14 +507,14 @@ pub async fn connect_subc_consumer(
     connection_file: &Path,
     options: ConsumerOptions,
 ) -> Result<SubcConsumer, subc_client_rs::ConsumerError> {
-    SubcConsumer::connect(connection_file, options).await
+    crate::subc::registration::connect_consumer(connection_file, options).await
 }
 
 pub(crate) fn spawn_fleet_status_dial(
     connection_file: &Path,
     capacity: usize,
 ) -> (FleetStatusClient, JoinHandle<()>) {
-    if !consumer_identity_is_available() {
+    if !crate::subc::registration::module_consumer_allowed() {
         return (FleetStatusClient::dormant(), tokio::spawn(async {}));
     }
     let (client, wire_rx) = FleetStatusClient::dial_channel(capacity);
@@ -1012,10 +1012,6 @@ fn complete_status_publish_call(request: StatusWireRequest, body: &[u8]) -> bool
         return false;
     };
     request.complete_response(&result)
-}
-
-fn consumer_identity_is_available() -> bool {
-    crate::launch_nonce::consumer_identity().is_some()
 }
 
 fn status_holder(entries: &[subc_client_rs::CatalogEntry]) -> Option<&'static str> {

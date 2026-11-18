@@ -58,7 +58,7 @@ pub struct SubcSecretUseTransport {
 
 struct Work {
     params: Value,
-    principal: ConsumerIdentity,
+    test_principal: Option<ConsumerIdentity>,
     deadline: tokio::time::Instant,
     reply: std::sync::mpsc::Sender<Result<Zeroizing<Vec<u8>>, Failure>>,
     failure: Arc<Mutex<Option<Failure>>>,
@@ -75,7 +75,7 @@ struct ConnectionConfig {
 async fn open_vault_route(
     consumer: &SubcConsumer,
     identity: BindIdentity,
-    principal: ConsumerIdentity,
+    test_principal: Option<ConsumerIdentity>,
     scope: Option<ScopeSelector>,
     timeout: Duration,
 ) -> Result<RouteHandle, CallError> {
@@ -88,9 +88,12 @@ async fn open_vault_route(
         ..CallOptions::default()
     };
     #[cfg(test)]
-    let options = with_test_vault_principal(options, principal);
+    let options = match test_principal {
+        Some(principal) => with_test_vault_principal(options, principal),
+        None => options,
+    };
     #[cfg(not(test))]
-    let _ = principal;
+    let _ = test_principal;
     match scope {
         Some(scope) => {
             consumer
@@ -118,13 +121,13 @@ pub(crate) struct ManagementSession {
 
 impl ManagementSession {
     pub(crate) async fn connect(connection_file: &std::path::Path) -> Result<Self, ()> {
-        let principal = aft_identity().ok_or(())?;
-        Self::connect_as(connection_file, principal).await
+        aft_identity_available().then_some(()).ok_or(())?;
+        Self::connect_as(connection_file, None).await
     }
 
     async fn connect_as(
         connection_file: &std::path::Path,
-        principal: ConsumerIdentity,
+        test_principal: Option<ConsumerIdentity>,
     ) -> Result<Self, ()> {
         let consumer =
             crate::fleet_status::connect_subc_consumer(connection_file, ConsumerOptions::default())
@@ -133,7 +136,7 @@ impl ManagementSession {
         let route = match open_vault_route(
             &consumer,
             BindIdentity::new("aft-manifest-sync", "daemon"),
-            principal,
+            test_principal,
             None,
             Duration::from_secs(15),
         )
@@ -152,10 +155,10 @@ impl ManagementSession {
     pub(crate) async fn for_test(connection_file: &std::path::Path) -> Result<Self, ()> {
         Self::connect_as(
             connection_file,
-            ConsumerIdentity {
+            Some(ConsumerIdentity {
                 module_id: "aft".into(),
                 launch_nonce: "manifest-sync-test-nonce".into(),
-            },
+            }),
         )
         .await
     }
@@ -206,14 +209,14 @@ pub async fn manifest_latest_for_test(
 }
 
 impl SubcSecretUseTransport {
-    /// Use AFT's captured launch-nonce identity, never an agent-supplied principal.
+    /// Use AFT's daemon identity, never an agent-supplied principal.
     /// The deadline includes connection, scoped open, request, and cleanup.
     pub fn new(
         connection_file: PathBuf,
         identity: BindIdentity,
         timeout: Duration,
     ) -> Option<Self> {
-        aft_identity()?;
+        aft_identity_available().then_some(())?;
         Some(Self {
             connection_file,
             identity,
@@ -229,7 +232,7 @@ impl SubcSecretUseTransport {
         connection_file: PathBuf,
         identity: BindIdentity,
         timeout: Duration,
-        principal: ConsumerIdentity,
+        test_principal: Option<ConsumerIdentity>,
     ) -> Self {
         Self {
             connection_file,
@@ -264,7 +267,7 @@ impl SubcSecretUseTransport {
         let route = open_vault_route(
             consumer,
             config.identity.clone(),
-            principal,
+            test_principal,
             Some(scope.clone()),
             config.timeout,
         )
@@ -309,19 +312,20 @@ impl SubcSecretUseTransport {
         }
     }
 
+    #[cfg(test)]
     fn dispatch(
         &self,
         params: Value,
         principal: ConsumerIdentity,
     ) -> Result<Zeroizing<Vec<u8>>, String> {
-        self.dispatch_work(params, principal)
+        self.dispatch_work(params, Some(principal))
             .map_err(Failure::unavailable)
     }
 
     fn dispatch_work(
         &self,
         params: Value,
-        principal: ConsumerIdentity,
+        test_principal: Option<ConsumerIdentity>,
     ) -> Result<Zeroizing<Vec<u8>>, Failure> {
         let sender = self.worker.get_or_init(|| {
             let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -345,7 +349,7 @@ impl SubcSecretUseTransport {
         sender
             .send(Work {
                 params,
-                principal,
+                test_principal,
                 deadline: tokio::time::Instant::now() + self.timeout,
                 reply,
                 failure: Arc::clone(&failure),
@@ -389,7 +393,7 @@ impl SubcSecretUseTransport {
                     &config,
                     consumer.as_ref().expect("connected consumer"),
                     work.params,
-                    work.principal,
+                    work.test_principal,
                 )
                 .await
             })
@@ -412,8 +416,9 @@ impl SubcSecretUseTransport {
     }
 }
 
-fn aft_identity() -> Option<ConsumerIdentity> {
-    crate::launch_nonce::consumer_identity().filter(|identity| identity.module_id == "aft")
+fn aft_identity_available() -> bool {
+    use crate::subc::registration;
+    registration::module_consumer_allowed() && registration::module_id().as_deref() == Some("aft")
 }
 
 impl SecretUseTransport for SubcSecretUseTransport {
@@ -422,9 +427,11 @@ impl SecretUseTransport for SubcSecretUseTransport {
         if let Some(principal) = &self.test_principal {
             return self.dispatch(params, principal.clone());
         }
-        let principal =
-            aft_identity().ok_or_else(|| Failure::local(Stage::IdentityMissing).unavailable())?;
-        self.dispatch(params, principal)
+        if !aft_identity_available() {
+            return Err(Failure::local(Stage::IdentityMissing).unavailable());
+        }
+        self.dispatch_work(params, None)
+            .map_err(Failure::unavailable)
     }
 }
 
