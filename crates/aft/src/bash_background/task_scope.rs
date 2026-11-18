@@ -397,12 +397,9 @@ mod linux {
 
     fn local_cgroup_mount() -> Option<PathBuf> {
         #[cfg(test)]
-        if let Some(mount) = LOCAL_RECOVERY_FIXTURE.with(|fixture| {
-            fixture
-                .borrow()
-                .as_ref()
-                .and_then(|(_, mount)| mount.clone())
-        }) {
+        if let Some(mount) = LOCAL_RECOVERY_FIXTURE
+            .with(|fixture| fixture.borrow().as_ref().map(|(_, mount)| mount.clone()))
+        {
             return Some(mount);
         }
         let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
@@ -903,24 +900,18 @@ mod linux {
 
     #[cfg(test)]
     thread_local! {
-        static LOCAL_RECOVERY_FIXTURE: std::cell::RefCell<Option<(PathBuf, Option<PathBuf>)>> = const { std::cell::RefCell::new(None) };
+        static LOCAL_RECOVERY_FIXTURE: std::cell::RefCell<Option<(PathBuf, PathBuf)>> = const { std::cell::RefCell::new(None) };
     }
 
     #[cfg(test)]
-    pub(crate) fn with_local_recovery_fixture_for_test<T>(
+    /// Synthetic ancestry must also supply a mount so recovery never probes
+    /// the host's cgroup hierarchy by accident.
+    pub(crate) fn with_local_recovery_mount_for_test<T>(
         current: PathBuf,
+        mount: PathBuf,
         run: impl FnOnce() -> T,
     ) -> T {
-        with_local_recovery_mount_for_test(current, None, run)
-    }
-
-    #[cfg(test)]
-    fn with_local_recovery_mount_for_test<T>(
-        current: PathBuf,
-        mount: Option<PathBuf>,
-        run: impl FnOnce() -> T,
-    ) -> T {
-        struct Restore(Option<(PathBuf, Option<PathBuf>)>);
+        struct Restore(Option<(PathBuf, PathBuf)>);
         impl Drop for Restore {
             fn drop(&mut self) {
                 LOCAL_RECOVERY_FIXTURE.with(|fixture| {
@@ -1331,21 +1322,17 @@ mod linux {
             )
             .unwrap();
             let expected = unified_cgroup_path("0::/user.slice/user-1000.slice/user@1000.service/aft.slice/aft-task-bash-0123456789abcdef.scope\n").unwrap();
-            assert_eq!(local_scope_path(&unit, &current, 1000), Some(expected));
-            assert!(local_scope_path(&unit, &current, 1001).is_none());
             let mount = tempfile::tempdir().unwrap();
-            with_local_recovery_mount_for_test(
-                mount.path().join("init.scope"),
-                Some(mount.path().into()),
-                || {
-                    assert!(local_scope_path(
-                        &unit,
-                        &unified_cgroup_path("0::/init.scope\n").unwrap(),
-                        1000
-                    )
-                    .is_none());
-                },
-            );
+            with_local_recovery_mount_for_test(current.clone(), mount.path().into(), || {
+                assert_eq!(local_scope_path(&unit, &current, 1000), Some(expected));
+                assert!(local_scope_path(&unit, &current, 1001).is_none());
+                assert!(local_scope_path(
+                    &unit,
+                    &unified_cgroup_path("0::/init.scope\n").unwrap(),
+                    1000
+                )
+                .is_none());
+            });
         }
 
         #[test]
@@ -1362,7 +1349,7 @@ mod linux {
             std::fs::write(&kill_file, "").unwrap();
             with_local_recovery_mount_for_test(
                 mount.path().join("system.slice/actions.runner.service"),
-                Some(mount.path().into()),
+                mount.path().into(),
                 || {
                     let LocalScopeLookup::Present(handle) = lookup_local(id, None).unwrap() else {
                         panic!("owned user-manager fallback was not resolved");
@@ -1394,7 +1381,7 @@ mod linux {
             let id = "bash-0123456789abcdef";
             let unit = scope_unit(id).unwrap();
             let current = mount.path().join("system.slice/actions.runner.service");
-            with_local_recovery_mount_for_test(current.clone(), Some(mount.path().into()), || {
+            with_local_recovery_mount_for_test(current.clone(), mount.path().into(), || {
                 assert!(local_scope_path(&unit, &current, uid).is_none());
                 assert!(matches!(
                     lookup_local(id, None).unwrap(),
@@ -1433,7 +1420,7 @@ mod linux {
                 mount
                     .path()
                     .join(format!("user@{foreign_uid}.service/app.slice/module.scope")),
-                Some(mount.path().into()),
+                mount.path().into(),
                 || {
                     assert!(matches!(
                         lookup_local(id, None).unwrap(),

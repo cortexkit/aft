@@ -991,9 +991,10 @@ fn task_scope_known_unscoped_launch_needs_no_cgroup_kill() {
     let registry = BgTaskRegistry::default();
     let (id, task) = tests::insert_terminal_piped_task(&registry, &root, "true", "", "", false);
     let foreign_uid = unsafe { libc::geteuid() } + 1;
-    super::super::task_scope::with_local_recovery_fixture_for_test(
+    super::super::task_scope::with_local_recovery_mount_for_test(
         root.path()
             .join(format!("user@{foreign_uid}.service/module.scope")),
+        root.path().to_path_buf(),
         || {
             assert!(matches!(
                 super::super::task_scope::lookup_local(&id, None).unwrap(),
@@ -1026,8 +1027,9 @@ fn task_scope_kill_outside_manager_without_identity_keeps_group_result() {
     let registry = BgTaskRegistry::default();
     let (id, task) = tests::insert_terminal_piped_task(&registry, &root, "true", "", "", false);
     std::fs::remove_file(&task.paths.json).unwrap();
-    super::super::task_scope::with_local_recovery_fixture_for_test(
+    super::super::task_scope::with_local_recovery_mount_for_test(
         root.path().join("system.slice/module.service"),
+        root.path().to_path_buf(),
         || {
             registry
                 .kill_task_scope(&id)
@@ -1056,8 +1058,9 @@ fn task_scope_kill_outside_manager_uses_saved_identity() {
     });
     super::super::persistence::write_task(&task.paths.json, &metadata).unwrap();
     assert!(registry.inner.task_scopes.get(&id).is_none());
-    super::super::task_scope::with_local_recovery_fixture_for_test(
+    super::super::task_scope::with_local_recovery_mount_for_test(
         root.path().join("system.slice/module.service"),
+        root.path().to_path_buf(),
         || {
             registry
                 .kill_task_scope(&id)
@@ -1076,8 +1079,9 @@ fn task_scope_kill_record_error_is_static_and_cached_handle_wins() {
     let registry = BgTaskRegistry::default();
     let (id, task) = tests::insert_terminal_piped_task(&registry, &root, "true", "", "", false);
     std::fs::write(&task.paths.json, "corrupt").unwrap();
-    super::super::task_scope::with_local_recovery_fixture_for_test(
+    super::super::task_scope::with_local_recovery_mount_for_test(
         root.path().join("system.slice/module.service"),
+        root.path().to_path_buf(),
         || {
             assert_eq!(
                 registry.kill_task_scope(&id).unwrap_err(),
@@ -1239,19 +1243,23 @@ fn task_scope_monitor_recovery_uses_local_files_without_manager() {
         kind: super::super::memory_limit::MemoryPolicy::TASK_SCOPE_MEMORY_KIND.into(),
         cgroup: None,
     };
-    super::super::task_scope::with_local_recovery_fixture_for_test(current, || {
-        let mut monitor = super::super::memory_limit::Monitor::recover(policy.clone(), &id)
-            .unwrap()
-            .expect("local scope was not recovered");
-        assert!(monitor.is_task_scope());
-        assert_eq!(monitor.policy.cgroup.as_ref(), Some(&cgroup));
-        assert!(!monitor.exceeded(0));
-        assert!(
-            super::super::memory_limit::Monitor::recover(policy, &random_slug())
+    super::super::task_scope::with_local_recovery_mount_for_test(
+        current,
+        root.path().to_path_buf(),
+        || {
+            let mut monitor = super::super::memory_limit::Monitor::recover(policy.clone(), &id)
                 .unwrap()
-                .is_none()
-        );
-    });
+                .expect("local scope was not recovered");
+            assert!(monitor.is_task_scope());
+            assert_eq!(monitor.policy.cgroup.as_ref(), Some(&cgroup));
+            assert!(!monitor.exceeded(0));
+            assert!(
+                super::super::memory_limit::Monitor::recover(policy, &random_slug())
+                    .unwrap()
+                    .is_none()
+            );
+        },
+    );
     assert_eq!(
         std::fs::read_to_string(cgroup.join("memory.oom.group")).unwrap(),
         "0"
@@ -1281,9 +1289,13 @@ fn task_scope_monitor_recovery_error_fails_closed() {
         kind: super::super::memory_limit::MemoryPolicy::TASK_SCOPE_MEMORY_KIND.into(),
         cgroup: None,
     };
-    super::super::task_scope::with_local_recovery_fixture_for_test(current.clone(), || {
-        assert!(super::super::memory_limit::Monitor::recover(policy.clone(), &id).is_err());
-    });
+    super::super::task_scope::with_local_recovery_mount_for_test(
+        current.clone(),
+        root.path().to_path_buf(),
+        || {
+            assert!(super::super::memory_limit::Monitor::recover(policy.clone(), &id).is_err());
+        },
+    );
     metadata.memory_policy = Some(policy);
     let registry = BgTaskRegistry::default();
     registry
@@ -1297,10 +1309,11 @@ fn task_scope_monitor_recovery_error_fails_closed() {
         .get(&id)
         .unwrap()
         .clone();
-    let stop_reason =
-        super::super::task_scope::with_local_recovery_fixture_for_test(current.clone(), || {
-            registry.memory_limit_exceeded(&task)
-        });
+    let stop_reason = super::super::task_scope::with_local_recovery_mount_for_test(
+        current.clone(),
+        root.path().to_path_buf(),
+        || registry.memory_limit_exceeded(&task),
+    );
     assert_eq!(
         stop_reason.as_deref(),
         Some("Command stopped: memory monitor recovery failed."),
@@ -1310,9 +1323,11 @@ fn task_scope_monitor_recovery_error_fails_closed() {
         task.lock_state().unwrap().pending_terminal_override,
         Some(super::super::BgTaskStatus::Failed)
     );
-    let reason = super::super::task_scope::with_local_recovery_fixture_for_test(current, || {
-        registry.memory_limit_exceeded(&task)
-    })
+    let reason = super::super::task_scope::with_local_recovery_mount_for_test(
+        current,
+        root.path().to_path_buf(),
+        || registry.memory_limit_exceeded(&task),
+    )
     .unwrap();
     let kill_error = root.path().join("kill-error");
     std::fs::create_dir_all(kill_error.join("cgroup.kill")).unwrap();
@@ -1392,8 +1407,9 @@ fn task_scope_monitor_recovery_outside_manager_uses_saved_identity() {
         kind: super::super::memory_limit::MemoryPolicy::TASK_SCOPE_MEMORY_KIND.into(),
         cgroup: Some(cgroup.clone()),
     };
-    super::super::task_scope::with_local_recovery_fixture_for_test(
+    super::super::task_scope::with_local_recovery_mount_for_test(
         root.path().join("system.slice/module.service"),
+        root.path().to_path_buf(),
         || {
             let monitor = super::super::memory_limit::Monitor::recover(policy.clone(), &id)
                 .unwrap()
@@ -1418,18 +1434,43 @@ fn task_scope_monitor_recovery_outside_manager_uses_saved_identity() {
 #[test]
 fn task_scope_monitor_recovery_outside_manager_is_unknown_without_identity() {
     let root = tempfile::tempdir().unwrap();
+    let ambient_mount = tempfile::tempdir().unwrap();
+    let uid = unsafe { libc::geteuid() };
+    std::fs::create_dir_all(
+        ambient_mount
+            .path()
+            .join(format!("user.slice/user-{uid}.slice/user@{uid}.service")),
+    )
+    .unwrap();
+    let id = random_slug();
+    let current = root.path().join("system.slice/module.service");
     let policy = super::super::memory_limit::MemoryPolicy {
         mib: 64,
         kind: super::super::memory_limit::MemoryPolicy::TASK_SCOPE_MEMORY_KIND.into(),
         cgroup: None,
     };
-    super::super::task_scope::with_local_recovery_fixture_for_test(
-        root.path().join("system.slice/module.service"),
+    super::super::task_scope::with_local_recovery_mount_for_test(
+        current.clone(),
+        ambient_mount.path().to_path_buf(),
         || {
-            assert!(
-                super::super::memory_limit::Monitor::recover(policy, &random_slug()).is_err(),
-                "unknown scope location was reported absent"
+            assert!(matches!(
+                super::super::task_scope::lookup_local(&id, None).unwrap(),
+                super::super::task_scope::LocalScopeLookup::Absent
+            ));
+            super::super::task_scope::with_local_recovery_mount_for_test(
+                current,
+                root.path().to_path_buf(),
+                || {
+                    assert!(
+                        super::super::memory_limit::Monitor::recover(policy, &id).is_err(),
+                        "unknown scope location was reported absent"
+                    );
+                },
             );
+            assert!(matches!(
+                super::super::task_scope::lookup_local(&id, None).unwrap(),
+                super::super::task_scope::LocalScopeLookup::Absent
+            ));
         },
     );
 }
