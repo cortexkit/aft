@@ -52,43 +52,43 @@ impl ModuleTransport {
                 .enable_all()
                 .build()
                 .map_err(|error| DoorError::unavailable(error.to_string()))?;
-            runtime.block_on(async {
-                crate::launch_nonce::consumer_identity().ok_or_else(|| {
-                    DoorError::unavailable("AFT module launch identity is unavailable")
-                })?;
-                let consumer =
-                    SubcConsumer::connect(&this.connection_file, ConsumerOptions::default())
-                        .await
-                        .map_err(|error| DoorError::unavailable(error.to_string()))?;
-                let route = consumer
-                    .open_route(this.target, this.identity, CallOptions::default())
-                    .await
-                    .map_err(|error| DoorError::unavailable(error.to_string()))?;
-                let result = consumer
-                    .request(
-                        &route,
-                        body,
-                        CallOptions {
-                            timeout,
-                            ..CallOptions::default()
-                        },
-                    )
-                    .await;
-                let _ = consumer
-                    .close_handle(&route, CloseRouteOptions::default())
-                    .await;
-                let _ = consumer.close().await;
-                match result {
-                    Ok(bytes) => serde_json::from_slice(&bytes)
-                        .map_err(|error| DoorError::unavailable(error.to_string())),
-                    Err(CallError::Module(body)) => serde_json::to_value(body)
-                        .map_err(|error| DoorError::unavailable(error.to_string())),
-                    Err(error) => Err(DoorError::unavailable(error.to_string())),
-                }
-            })
+            runtime.block_on(this.request_async(body, timeout))
         })
         .join()
         .map_err(|_| DoorError::unavailable("module transport thread panicked"))?
+    }
+
+    async fn request_async(self, body: Vec<u8>, timeout: Duration) -> Result<Value, DoorError> {
+        crate::launch_nonce::consumer_identity()
+            .ok_or_else(|| DoorError::unavailable("AFT module launch identity is unavailable"))?;
+        let consumer = SubcConsumer::connect(&self.connection_file, ConsumerOptions::default())
+            .await
+            .map_err(|error| DoorError::unavailable(error.to_string()))?;
+        let route = consumer
+            .open_route(self.target, self.identity, CallOptions::default())
+            .await
+            .map_err(|error| DoorError::unavailable(error.to_string()))?;
+        let result = consumer
+            .request(
+                &route,
+                body,
+                CallOptions {
+                    timeout,
+                    ..CallOptions::default()
+                },
+            )
+            .await;
+        let _ = consumer
+            .close_handle(&route, CloseRouteOptions::default())
+            .await;
+        let _ = consumer.close().await;
+        match result {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|error| DoorError::unavailable(error.to_string())),
+            Err(CallError::Module(body)) => serde_json::to_value(body)
+                .map_err(|error| DoorError::unavailable(error.to_string())),
+            Err(error) => Err(DoorError::unavailable(error.to_string())),
+        }
     }
 }
 
@@ -136,6 +136,16 @@ impl JsonDoorTransport for ModuleTransport {
 pub struct EntorhinalRegistry(pub ModuleTransport);
 
 impl EntorhinalRegistry {
+    pub(crate) async fn enumerate_async(self) -> Result<EnumerateReply, String> {
+        let body = serde_json::to_vec(&enumerate_request()).map_err(|error| error.to_string())?;
+        let reply = self
+            .0
+            .request_async(body, Duration::from_secs(30))
+            .await
+            .map_err(|error| error.code)?;
+        Self::decode(reply)
+    }
+
     fn read<P: serde::Serialize, R: DeserializeOwned>(
         &self,
         request: Request<P>,
@@ -145,6 +155,10 @@ impl EntorhinalRegistry {
             .0
             .request(body, Duration::from_secs(30))
             .map_err(|error| error.code)?;
+        Self::decode(reply)
+    }
+
+    fn decode<R: DeserializeOwned>(reply: Value) -> Result<R, String> {
         match serde_json::from_value::<Outcome<R>>(reply).map_err(|error| error.to_string())? {
             Outcome::Success(success) => Ok(success.result),
             Outcome::Refusal(error) => Err(format!("registry unavailable: {}", error.message)),
@@ -161,8 +175,12 @@ impl ProjectRegistry for EntorhinalRegistry {
         ))
     }
     fn enumerate(&self) -> Result<EnumerateReply, String> {
-        self.read(Request::new("enumerate", EnumerateParams::new(None)))
+        self.read(enumerate_request())
     }
+}
+
+fn enumerate_request() -> Request<EnumerateParams> {
+    Request::new("enumerate", EnumerateParams::new(None))
 }
 
 /// Use the published envelope and refusal vocabulary for both DATA and ERROR
