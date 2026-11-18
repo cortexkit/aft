@@ -501,30 +501,35 @@ fn created_deleted_moved_and_repeated_hunks_count_actual_final_states() {
 
 #[test]
 fn exact_file_producer_matches_frozen_example_before_the_canonical_limit() {
-    let f = fixture("edit", "display-file-exact");
-    let _active = enter(Some(&f.key));
-    let path = f._dir.path().join("src/a.rs");
-    std::fs::create_dir(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, "new\n").unwrap();
-    file(
-        path.to_str().unwrap(),
-        None,
-        Some("old\n"),
-        Some("new\n"),
-        "modified",
-    );
-    let mut capture = f.capture.lock().unwrap();
-    capture.masker = Some(crate::log_redact::SecretValues::default());
-    let (mut record, detail) = file_bodies(&capture, true);
-    record["durationMs"] = json!(12);
-    assert_eq!(
-        record,
-        json!({"durationMs":12,"outcome":"success","fileCount":1,"modifiedCount":1,"createdCount":0,"deletedCount":0,"movedCount":0,"addedLines":1,"removedLines":1,"path":"src/a.rs"})
-    );
-    assert_eq!(
-        detail.unwrap(),
-        json!({"schema":"aft/files-detail/1","revision":1,"files":[{"change":"modified","path":"src/a.rs","diff":"--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n"}]})
-    );
+    for tool in ["write", "apply_patch", "edit"] {
+        let f = fixture(tool, &format!("display-file-exact-{tool}"));
+        let _active = enter(Some(&f.key));
+        let path = f._dir.path().join("src/a.rs");
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "new\n").unwrap();
+        file(
+            path.to_str().unwrap(),
+            None,
+            Some("old\n"),
+            Some("new\n"),
+            "modified",
+        );
+        let mut capture = f.capture.lock().unwrap();
+        capture.masker = Some(crate::log_redact::SecretValues::default());
+        let (mut record, detail) = file_bodies(&capture, true);
+        record["durationMs"] = json!(12);
+        assert_eq!(
+            record,
+            json!({"durationMs":12,"outcome":"success","fileCount":1,"modifiedCount":1,"createdCount":0,"deletedCount":0,"movedCount":0,"addedLines":1,"removedLines":1,"path":"src/a.rs"})
+        );
+        let expected = if tool == "edit" {
+            json!({"schema":"aft/files-detail/1","revision":1,"files":[{"change":"modified","path":"src/a.rs"}],
+            "hunks":[{"title":"Change 1 · line 1","oldStart":1,"newStart":1,"lines":[{"kind":"delete","text":"old"},{"kind":"add","text":"new"}]}]})
+        } else {
+            json!({"schema":"aft/files-detail/1","revision":1,"files":[{"change":"modified","path":"src/a.rs","diff":"--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n"}]})
+        };
+        assert_eq!(detail.unwrap(), expected, "{tool}");
+    }
 }
 
 #[test]
@@ -665,7 +670,7 @@ fn batch_edit_no_match_publishes_plain_hunks_with_scalar_marks() {
     });
     let path = f._dir.path().join("a.txt");
     let looked = "héllo 🙂 a value at the end";
-    let closest = "héllo 🙂 a value at the end!";
+    let closest = "héllo 🙂 a value at the best end";
     std::fs::write(&path, format!("unrelated\n{closest}\n")).unwrap();
     f.capture.lock().unwrap().masker = Some(crate::log_redact::SecretValues::from_environment([]));
     let request = serde_json::from_value(json!({
@@ -685,8 +690,8 @@ fn batch_edit_no_match_publishes_plain_hunks_with_scalar_marks() {
     assert_eq!(
         writes[1].body["hunks"],
         json!([
-        {"title":"Looked for","lines":[{"kind":"plain","text":looked,"marks":[{"start":26,"end":26}]}]},
-        {"title":"Closest text in the file · line 2","lines":[{"kind":"plain","text":closest,"marks":[{"start":26,"end":27}]}]}
+        {"title":"Looked for","lines":[{"kind":"plain","text":looked,"marks":[{"start":23,"end":23}]}]},
+        {"title":"Closest text in the file · line 2","lines":[{"kind":"plain","text":closest,"marks":[{"start":23,"end":28}]}]}
         ])
     );
 }
