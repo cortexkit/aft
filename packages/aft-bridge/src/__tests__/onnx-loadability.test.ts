@@ -130,7 +130,7 @@ describe("detectOnnxVersion", () => {
 });
 
 describe.skipIf(process.platform === "win32")("ONNX Runtime resolution order", () => {
-  const platformInfo = { assetName: "onnxruntime-test", libName: LIB, archiveType: "tgz" as const };
+  const platformInfo = { rid: "osx-arm64", libName: LIB, librarySha256: "unused" };
 
   function systemRuntime(dependency: string): string {
     const dir = join(workDir, "homebrew", "lib");

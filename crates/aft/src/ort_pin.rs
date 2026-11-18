@@ -9,8 +9,8 @@
 //! the `com.apple.security.cs.disable-library-validation` entitlement. Hardened
 //! runtime is what keeps other processes of the same user from attaching a
 //! debugger and reading the module's launch secret; the entitlement is needed
-//! because Microsoft's library carries no Team ID and library validation would
-//! refuse it. With library validation off, the loader no longer checks who
+//! because library validation would refuse a library that does not carry AFT's
+//! Team ID. With library validation off, the loader no longer checks who
 //! signed the file, so without this pin any same-user process could replace
 //! the downloaded library and run its code inside AFT.
 //!
@@ -91,12 +91,12 @@ use crate::semantic_index::ONNX_RUNTIME_MISSING_PREFIX;
 /// Environment variable naming the ONNX Runtime library to load.
 pub const ORT_DYLIB_PATH_ENV: &str = "ORT_DYLIB_PATH";
 
-/// One ONNX Runtime library build AFT's installer downloads.
+/// One ONNX Runtime library build AFT accepts without an override.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PinnedOrtLibrary {
     /// ONNX Runtime release version.
     pub version: &'static str,
-    /// Microsoft's release asset the library comes from.
+    /// Microsoft's package or legacy release asset the library comes from.
     pub asset: &'static str,
     /// Path of the library inside that asset.
     pub library: &'static str,
@@ -106,15 +106,13 @@ pub struct PinnedOrtLibrary {
 
 /// The ONNX Runtime libraries AFT accepts without an operator override.
 ///
-/// Each entry is the main library inside the release asset that
-/// `packages/aft-bridge/src/onnx-runtime.ts` downloads (`ORT_PLATFORM_MAP`,
-/// `ORT_VERSION`), fetched from
-/// `https://github.com/microsoft/onnxruntime/releases/download/v1.24.4/<asset>`
-/// and hashed after extraction. On Linux `lib/libonnxruntime.so` is a symlink
-/// chain ending at `libonnxruntime.so.1.24.4`; the hash is of the file it
-/// resolves to, which is what the installer copies and what a load maps.
-/// The installer checks the same hashes (`librarySha256`) before it publishes
-/// a download. Bumping `ORT_VERSION` there means adding the new builds here.
+/// The installer in `packages/aft-bridge/src/onnx-runtime.ts` downloads and
+/// checks the main libraries under `runtimes/<rid>/native/` in Microsoft's
+/// `Microsoft.ML.OnnxRuntime` NuGet package from `api.nuget.org`. The other
+/// four NuGet libraries match the previous GitHub release builds byte for
+/// byte. On macOS the NuGet library is signed by Microsoft; the pin for the
+/// previous macOS build keeps existing managed caches usable.
+/// Bumping the installer's `ORT_VERSION` means adding the new builds here.
 ///
 /// Every entry is accepted on every platform: a library built for another
 /// platform cannot load anyway, and all of them are genuine Microsoft builds.
@@ -127,26 +125,32 @@ pub const PINNED_ORT_LIBRARIES: &[PinnedOrtLibrary] = &[
     },
     PinnedOrtLibrary {
         version: "1.24.4",
-        asset: "onnxruntime-linux-x64-1.24.4.tgz",
-        library: "onnxruntime-linux-x64-1.24.4/lib/libonnxruntime.so",
+        asset: "microsoft.ml.onnxruntime.1.24.4.nupkg",
+        library: "runtimes/osx-arm64/native/libonnxruntime.dylib",
+        sha256: "0db33e160224e480c17932799d1dfaea59853b8e722b57bf61932c87e03586f0",
+    },
+    PinnedOrtLibrary {
+        version: "1.24.4",
+        asset: "microsoft.ml.onnxruntime.1.24.4.nupkg",
+        library: "runtimes/linux-x64/native/libonnxruntime.so",
         sha256: "d132535d051344ff5c64c9c200004150559049a81ed330eb4422c1962fb6b7e4",
     },
     PinnedOrtLibrary {
         version: "1.24.4",
-        asset: "onnxruntime-linux-aarch64-1.24.4.tgz",
-        library: "onnxruntime-linux-aarch64-1.24.4/lib/libonnxruntime.so",
+        asset: "microsoft.ml.onnxruntime.1.24.4.nupkg",
+        library: "runtimes/linux-arm64/native/libonnxruntime.so",
         sha256: "52b2a0e75e79468404284fec38ad5ee1a7a996232274f5e1b84f3e793fb07554",
     },
     PinnedOrtLibrary {
         version: "1.24.4",
-        asset: "onnxruntime-win-x64-1.24.4.zip",
-        library: "onnxruntime-win-x64-1.24.4/lib/onnxruntime.dll",
+        asset: "microsoft.ml.onnxruntime.1.24.4.nupkg",
+        library: "runtimes/win-x64/native/onnxruntime.dll",
         sha256: "b95efb2113b603bbbf3f191061c5516a871ed546893c820e4f3b7b6c358dbf2a",
     },
     PinnedOrtLibrary {
         version: "1.24.4",
-        asset: "onnxruntime-win-arm64-1.24.4.zip",
-        library: "onnxruntime-win-arm64-1.24.4/lib/onnxruntime.dll",
+        asset: "microsoft.ml.onnxruntime.1.24.4.nupkg",
+        library: "runtimes/win-arm64/native/onnxruntime.dll",
         sha256: "724d81ac50b11bfaa01ab3ce01b99fb6734a4b762259a8be4395ca662ce99fe6",
     },
 ];
@@ -1126,6 +1130,7 @@ mod tests {
             .collect();
         let mut rust_pins: Vec<&str> = PINNED_ORT_LIBRARIES
             .iter()
+            .filter(|library| library.asset.ends_with(".nupkg"))
             .map(|library| library.sha256)
             .collect();
         let mut installer_sorted = installer_pins.clone();
@@ -1136,25 +1141,32 @@ mod tests {
 
     #[test]
     fn pinned_list_covers_every_platform_the_installer_downloads() {
-        for asset in [
-            "onnxruntime-osx-arm64-1.24.4.tgz",
-            "onnxruntime-linux-x64-1.24.4.tgz",
-            "onnxruntime-linux-aarch64-1.24.4.tgz",
-            "onnxruntime-win-x64-1.24.4.zip",
-            "onnxruntime-win-arm64-1.24.4.zip",
+        for library in [
+            "runtimes/osx-arm64/native/libonnxruntime.dylib",
+            "runtimes/linux-x64/native/libonnxruntime.so",
+            "runtimes/linux-arm64/native/libonnxruntime.so",
+            "runtimes/win-x64/native/onnxruntime.dll",
+            "runtimes/win-arm64/native/onnxruntime.dll",
         ] {
             let entry = PINNED_ORT_LIBRARIES
                 .iter()
-                .find(|library| library.asset == asset)
-                .unwrap_or_else(|| panic!("no pin for {asset}"));
-            assert_eq!(entry.sha256.len(), 64, "{asset}");
+                .find(|entry| entry.library == library)
+                .unwrap_or_else(|| panic!("no pin for {library}"));
+            assert_eq!(entry.sha256.len(), 64, "{library}");
             assert!(
                 entry
                     .sha256
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-                "{asset}: pins are lowercase hex"
+                "{library}: pins are lowercase hex"
             );
         }
+    }
+
+    #[test]
+    fn accepts_the_legacy_macos_cache_hash() {
+        assert!(PINNED_ORT_LIBRARIES.iter().any(|entry| {
+            entry.sha256 == "872533f130f1839a5bc01788ddb4f75c83a189763441ba1178788ed965449289"
+        }));
     }
 }
