@@ -104,7 +104,7 @@ impl Verifications {
 
 #[cfg(all(test, unix))]
 pub(crate) use aft_base::scope_watch_events::revision;
-pub(crate) use aft_base::scope_watch_events::{changed, context_changed, Source};
+pub(crate) use aft_base::scope_watch_events::{changed, Source};
 pub(super) use aft_base::scope_watch_events::{notifier, revisions};
 
 #[derive(Default)]

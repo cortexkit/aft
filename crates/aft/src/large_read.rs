@@ -381,7 +381,7 @@ fn utf8_width(lead: u8) -> usize {
 // ---------------------------------------------------------------------------
 // Streamed exact-phrase normalization and presence
 
-/// [`crate::commands::semantic_search::exact_lane::normalize_exact_phrase`]
+/// [`crate::search_index::exact_lane::normalize_exact_phrase`]
 /// over text that arrives in pieces: words (split on Unicode White_Space, as
 /// `str::split_whitespace` splits) joined by single spaces, ASCII-lowercased.
 /// A space is written only once the next word starts, so there is never a

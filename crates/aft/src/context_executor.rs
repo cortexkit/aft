@@ -66,10 +66,10 @@ impl ExecutorApp<AppContext> for App {
     }
     fn actor_root_registered(&self) {
         App::actor_root_registered(self);
-        crate::subc::scope_watch::context_changed();
+        aft_base::scope_watch_events::context_changed();
     }
     fn actor_root_unregistered(&self) {
         App::actor_root_unregistered(self);
-        crate::subc::scope_watch::context_changed();
+        aft_base::scope_watch_events::context_changed();
     }
 }

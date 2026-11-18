@@ -344,14 +344,14 @@ pub fn run(root: &Path, threads: usize, sample: usize) -> Result<Value, String> 
                 let started = Instant::now();
                 let value = if op == "trace_to" {
                     adapter::trace_to_result(&reader, path, symbol, 10, false).map(|result| {
-                        let envelope = crate::commands::trace_to::trace::build_trace_to_envelope(
+                        let envelope = crate::list_surfaces::trace::build_trace_to_envelope(
                             result.paths.len(),
                             result.total_paths,
                             result.max_depth_reached,
                             result.total_paths_is_lower_bound,
                         );
                         let mut value = serde_json::to_value(&result).unwrap_or(Value::Null);
-                        crate::commands::trace_to::trace::attach_trace_to_envelope(
+                        crate::list_surfaces::trace::attach_trace_to_envelope(
                             &mut value,
                             envelope.as_ref(),
                         );

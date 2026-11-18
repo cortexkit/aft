@@ -521,7 +521,7 @@ pub(crate) fn disclose_parse_gaps(
     response.data["skipped_parses"] = count.into();
     response.data["skipped_parses_omitted"] = omitted.into();
     let preview = parse_gap_preview(gaps.len(), count);
-    if let Some(trailer) = crate::subc_format::render_envelope_trailer(&preview) {
+    if let Some(trailer) = crate::list_envelope::render_trailer(&preview) {
         lines.push(trailer);
     }
     response.data["parse_gaps_list"] = serde_json::json!(preview);

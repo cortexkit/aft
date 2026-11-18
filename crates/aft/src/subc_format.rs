@@ -71,6 +71,42 @@ pub struct BashCodeSearchHint {
     pub(crate) runner_notice: Option<crate::subc::runner_notices::CodeSearchNotice>,
 }
 
+impl BashCodeSearchHint {
+    pub(crate) fn deliver(&self, response: &mut crate::protocol::Response, root: &Path) {
+        // Only foreground terminal native replies carry both status and task
+        // identity. Rewrites, background launches and replies handing a still-
+        // running foreground task back to the caller are left alone.
+        if !crate::bash_rewrite::bash_hints::is_terminal_native_reply(response) {
+            return;
+        }
+        let Some(hint) = crate::bash_rewrite::bash_hints::code_search_nudge(
+            response.data["output"].as_str().unwrap_or_default(),
+            &self.command,
+            Some(root),
+            self.workdir.as_deref(),
+            self.search_tool.as_deref(),
+            self.grep_tool.as_deref(),
+            &self.shell_tool,
+        ) else {
+            return;
+        };
+        response.notices.route = self.runner_notice.clone().map(|route| route.into_sink());
+        response
+            .notices
+            .items
+            .push(crate::bash_rewrite::notices::Notice::template(
+                crate::bash_rewrite::notices::CODE_SEARCH,
+                crate::bash_rewrite::notices::code_search_slots(
+                    self.search_tool.as_deref(),
+                    &self.shell_tool,
+                ),
+                hint,
+                crate::bash_rewrite::notices::Target::BashOutput,
+            ));
+        crate::bash_rewrite::notices::deliver(response, None);
+    }
+}
+
 impl Default for FormatContext {
     fn default() -> Self {
         Self {

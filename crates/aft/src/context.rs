@@ -2630,7 +2630,7 @@ impl App {
         let conn = Arc::new(Mutex::new(crate::db::open_with_mode(path, mode)?));
         crate::db::deferred_checkpoint::register_shared(&conn);
         *slot = Some((key, Arc::clone(&conn)));
-        crate::subc::scope_watch::context_changed();
+        aft_base::scope_watch_events::context_changed();
         drop(slot);
         if created {
             // The startup catalog cannot declare a database that does not
@@ -2677,12 +2677,12 @@ impl App {
     pub fn set_db(&self, conn: Arc<Mutex<TrackedConnection>>) {
         crate::db::deferred_checkpoint::register_shared(&conn);
         *self.db.lock() = Some((PathBuf::new(), conn));
-        crate::subc::scope_watch::context_changed();
+        aft_base::scope_watch_events::context_changed();
     }
 
     pub fn clear_db(&self) {
         *self.db.lock() = None;
-        crate::subc::scope_watch::context_changed();
+        aft_base::scope_watch_events::context_changed();
     }
 
     /// Clear the shared handle only when it still refers to `path`. A failed
@@ -2695,7 +2695,7 @@ impl App {
             existing_path.as_os_str().is_empty() || existing_path == &key
         }) {
             *slot = None;
-            crate::subc::scope_watch::context_changed();
+            aft_base::scope_watch_events::context_changed();
         }
     }
 

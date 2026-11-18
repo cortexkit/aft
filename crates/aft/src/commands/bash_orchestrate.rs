@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 
 use crate::bash_background::registry::remote::{RemotePhase, RemoteProgress};
 use crate::bash_background::registry::{BgTaskSnapshot, HardKillDeadline, HardKillSource};
+use crate::bash_rewrite::bash_hints::split_reply_tail;
 use crate::context::AppContext;
 use crate::protocol::BgTaskStatus;
 use crate::protocol::{RawRequest, Response};
@@ -1308,8 +1309,6 @@ pub(crate) fn foreground_task_line(snapshot: &BgTaskSnapshot) -> String {
     }
 }
 
-pub(crate) use crate::list_surfaces::bash::is_foreground_task_line;
-
 /// Appends `line` to `output` on a line of its own.
 fn push_line(output: &mut String, line: &str) {
     if !output.is_empty() && !output.ends_with('\n') {
@@ -1366,24 +1365,6 @@ fn append_bash_reply_notices(
     if let Some(data) = response.data.as_object_mut() {
         data.insert("output".to_string(), Value::String(combined));
     }
-}
-
-/// Split a bash reply into its body and the closing lines AFT adds after the
-/// command output: an optional `[task <id>]` line followed by the optional
-/// list-envelope `trailer`. The tail is returned with its own line breaks.
-pub(crate) fn split_reply_tail<'a>(output: &'a str, trailer: Option<&str>) -> (&'a str, &'a str) {
-    let mut tail_start = output.len();
-    if let Some(trailer) = trailer.filter(|trailer| !trailer.is_empty()) {
-        if output.ends_with(trailer) {
-            tail_start -= trailer.len();
-        }
-    }
-    let before = output[..tail_start].trim_end_matches('\n');
-    let last_line_start = before.rfind('\n').map_or(0, |index| index + 1);
-    if is_foreground_task_line(&before[last_line_start..]) {
-        tail_start = last_line_start;
-    }
-    (&output[..tail_start], &output[tail_start..])
 }
 
 fn background_launch_response(

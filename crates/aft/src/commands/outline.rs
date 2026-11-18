@@ -40,6 +40,7 @@ thread_local! {
     static TABLE_RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+pub(crate) use crate::parser::outline_facts::symbol_to_entry;
 pub use crate::parser::outline_facts::OutlineEntry;
 
 /// Handle an `outline` request.
@@ -4036,20 +4037,6 @@ impl MultiFileTreeWriter {
             footer,
             content_files: self.content_files,
         }
-    }
-}
-
-pub(crate) fn symbol_to_entry(sym: &Symbol) -> OutlineEntry {
-    OutlineEntry {
-        name: sym.name.clone(),
-        kind: serde_json::to_value(&sym.kind)
-            .ok()
-            .and_then(|v| v.as_str().map(String::from))
-            .unwrap_or_else(|| format!("{:?}", sym.kind).to_lowercase()),
-        range: sym.range.clone(),
-        signature: sym.signature.clone(),
-        exported: sym.exported,
-        members: Vec::new(),
     }
 }
 

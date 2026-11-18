@@ -1,6 +1,6 @@
 //! Syntax facts shared by the parser cache and outline renderer.
 
-use crate::symbols::Range;
+use crate::symbols::{Range, Symbol};
 use serde::Serialize;
 
 /// A single entry in the outline tree.
@@ -16,6 +16,20 @@ pub struct OutlineEntry {
     pub signature: Option<String>,
     pub exported: bool,
     pub members: Vec<OutlineEntry>,
+}
+
+pub fn symbol_to_entry(sym: &Symbol) -> OutlineEntry {
+    OutlineEntry {
+        name: sym.name.clone(),
+        kind: serde_json::to_value(&sym.kind)
+            .ok()
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_else(|| format!("{:?}", sym.kind).to_lowercase()),
+        range: sym.range.clone(),
+        signature: sym.signature.clone(),
+        exported: sym.exported,
+        members: Vec::new(),
+    }
 }
 
 #[derive(Clone)]

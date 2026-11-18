@@ -3795,8 +3795,8 @@ impl SemanticEmbeddingModel {
                 EmbeddingRequestPolicy::Query(budget)
                     if matches!(&self.engine, SemanticEmbeddingEngine::Local(_)) =>
                 {
-                    Some(crate::commands::semantic_search::waits::timed(
-                        crate::commands::semantic_search::waits::SearchWait::EmbedBackend,
+                    Some(crate::search_state::waits::timed(
+                        crate::search_state::waits::SearchWait::EmbedBackend,
                         || {
                             self.embed_local_query(
                                 texts.clone(),
@@ -3841,9 +3841,8 @@ impl SemanticEmbeddingModel {
 
         // A query that missed the cache waits here for its remote backend
         // (Synapse or HTTP) or the in-process model.
-        let backend_wait = crate::commands::semantic_search::waits::time(
-            crate::commands::semantic_search::waits::SearchWait::EmbedBackend,
-        );
+        let backend_wait =
+            crate::search_state::waits::time(crate::search_state::waits::SearchWait::EmbedBackend);
         let result = (|| match &mut self.engine {
             SemanticEmbeddingEngine::Local(engine) => engine
                 .model

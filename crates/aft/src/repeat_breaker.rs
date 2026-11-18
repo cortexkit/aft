@@ -35,7 +35,7 @@ impl std::ops::Deref for RepeatCall {
 /// same output would never hash alike and the breaker would report the output
 /// as drifting.
 pub fn output_hash(rendered_text: &str) -> u64 {
-    use crate::commands::bash_orchestrate::is_foreground_task_line;
+    use crate::list_surfaces::bash::is_foreground_task_line;
     if !rendered_text.split('\n').any(is_foreground_task_line) {
         return hash_value(&rendered_text);
     }

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::commands::outline::symbol_to_entry;
+use crate::parser::outline_facts::symbol_to_entry;
 use crate::parser::{detect_language, extract_symbols_from_tree, parse_resolved_source, LangId};
 use crate::symbols::Symbol;
 

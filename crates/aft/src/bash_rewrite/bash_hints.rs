@@ -1,42 +1,26 @@
 //! Native code-search steering, kept separate from result/runner delivery.
 
-use crate::subc_format::BashCodeSearchHint as CallContext;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const HINT_PREFIX: &str = "DO NOT search code by running grep/rg in ";
 
-impl CallContext {
-    pub(crate) fn deliver(&self, response: &mut crate::protocol::Response, root: &Path) {
-        // Only foreground terminal native replies carry both status and task
-        // identity. Rewrites, background launches and replies handing a still-
-        // running foreground task back to the caller are left alone.
-        if !is_terminal_native_reply(response) {
-            return;
+/// Split a bash reply into its body and the closing lines AFT adds after the
+/// command output: an optional `[task <id>]` line followed by `trailer` when
+/// one is present. The tail is returned with its own line breaks.
+pub(crate) fn split_reply_tail<'a>(output: &'a str, trailer: Option<&str>) -> (&'a str, &'a str) {
+    let mut tail_start = output.len();
+    if let Some(trailer) = trailer.filter(|trailer| !trailer.is_empty()) {
+        if output.ends_with(trailer) {
+            tail_start -= trailer.len();
         }
-        let Some(hint) = code_search_nudge(
-            response.data["output"].as_str().unwrap_or_default(),
-            &self.command,
-            Some(root),
-            self.workdir.as_deref(),
-            self.search_tool.as_deref(),
-            self.grep_tool.as_deref(),
-            &self.shell_tool,
-        ) else {
-            return;
-        };
-        response.notices.route = self.runner_notice.clone().map(|route| route.into_sink());
-        response
-            .notices
-            .items
-            .push(super::notices::Notice::template(
-                super::notices::CODE_SEARCH,
-                super::notices::code_search_slots(self.search_tool.as_deref(), &self.shell_tool),
-                hint,
-                super::notices::Target::BashOutput,
-            ));
-        super::notices::deliver(response, None);
     }
+    let before = output[..tail_start].trim_end_matches('\n');
+    let last_line_start = before.rfind('\n').map_or(0, |index| index + 1);
+    if crate::list_surfaces::bash::is_foreground_task_line(&before[last_line_start..]) {
+        tail_start = last_line_start;
+    }
+    (&output[..tail_start], &output[tail_start..])
 }
 
 pub(crate) fn is_terminal_native_reply(response: &crate::protocol::Response) -> bool {
@@ -59,8 +43,7 @@ pub(crate) fn append_nudge(response: &mut crate::protocol::Response, nudge: &str
         })
         .map(|envelope| crate::list_surfaces::bash::envelope_trailer(&envelope));
     if let Some(text) = response.data["output"].as_str() {
-        let (body, tail) =
-            crate::commands::bash_orchestrate::split_reply_tail(text, trailer.as_deref());
+        let (body, tail) = split_reply_tail(text, trailer.as_deref());
         let combined = format!(
             "{}\n\n{nudge}{}{tail}",
             body.trim_end_matches('\n'),
@@ -652,7 +635,7 @@ mod tests {
     #[test]
     fn code_search_nudge_standalone_appends_once_only_to_native_terminal_results() {
         let root = fixture();
-        let context = CallContext {
+        let context = crate::subc_format::BashCodeSearchHint {
             command: "cd src && echo marker && rg foo . | head".into(),
             workdir: None,
             search_tool: Some("aft_search".into()),

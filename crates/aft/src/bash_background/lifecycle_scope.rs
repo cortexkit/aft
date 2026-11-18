@@ -44,7 +44,7 @@ impl BgTaskRegistry {
             changed += 1;
         }
         if changed > 0 {
-            crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
+            aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Shell);
         }
         Ok(changed)
     }
