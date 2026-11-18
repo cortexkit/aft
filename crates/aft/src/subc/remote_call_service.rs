@@ -1,8 +1,9 @@
 //! Remote route ingress and its audit → preflight → consent → dispatch sequence.
 
-use super::{dispatch::Read, record::Record, *};
+use super::{dispatch::FileTool, record::Record, *};
 use crate::db::call_ledger::{self as ledger, RecordedFrame};
 use cortexkit_role_tool_provider::{call::ToolCallRequest, catalog::composition_digest, errors};
+use scope_describe::remote::{self as scope_lifetime, Lifetime};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tool_provider::{remote_pins, CatalogPreset};
@@ -72,6 +73,7 @@ pub(in crate::subc) struct Service {
     connection_file: PathBuf,
     jobs: JoinSet<Option<Event>>,
     authorizer: authorization::Authorizer,
+    scopes: scope_lifetime::Tracker,
 }
 
 pub(in crate::subc) struct Event(Progress);
@@ -81,6 +83,7 @@ enum Progress {
     Preflight(Ready, Preflight),
     Authorized(Ready, authorization::Decision),
     Consent(authorization::Completion),
+    Ended(ScopeStamp),
 }
 
 struct Call {
@@ -90,11 +93,12 @@ struct Call {
     scope: ScopeStamp,
     carrier: String,
     cancel: CancellationToken,
+    lifetime: Lifetime,
 }
 
 struct Ready {
     call: Call,
-    read: Read,
+    tool: FileTool,
     root: ProjectRootId,
     key: ledger::Key,
 }
@@ -102,6 +106,7 @@ struct Ready {
 impl Service {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::subc) fn new(
+        control: Arc<readiness::DaemonControl>,
         writer: WriterSender,
         metrics: Arc<DispatchPathMetrics>,
         app: Arc<App>,
@@ -124,6 +129,19 @@ impl Service {
             connection_file: connection_file.to_path_buf(),
             jobs: JoinSet::new(),
             authorizer: authorization::Authorizer::new(None, connection_file.to_path_buf()),
+            scopes: scope_lifetime::Tracker::new(control),
+        }
+    }
+
+    pub(in crate::subc) fn enroll(&mut self, identity: &ManagementIdentity) {
+        if let ManagementAdmission::RemoteTools(_) = &identity.admission {
+            if let Some(stamp) = identity
+                .scope
+                .as_ref()
+                .filter(|stamp| admit(Some(stamp)).is_ok())
+            {
+                self.scopes.enroll(stamp);
+            }
         }
     }
 
@@ -196,6 +214,11 @@ impl Service {
             return;
         };
         let scope = identity.scope.clone();
+        let lifetime = scope
+            .as_ref()
+            .filter(|stamp| admit(Some(stamp)).is_ok())
+            .map(|stamp| self.scopes.lifetime(stamp))
+            .unwrap_or_default();
         let principal = principal_label(&identity.principal);
         let binding = binding.clone();
         let cancel = identity.shells_cancel.0.clone();
@@ -239,6 +262,9 @@ impl Service {
                 if !capacity || cancel.is_cancelled() {
                     return Err(admission_refusal());
                 }
+                if lifetime.ended() {
+                    return Err(authorization::denied());
+                }
                 match tokio::time::timeout(LOOKUP_TIMEOUT, lookup).await {
                     Ok(Ok(entries)) => registered_root(project, &entries),
                     _ => Err(admission_refusal()),
@@ -275,6 +301,7 @@ impl Service {
                             scope,
                             carrier,
                             cancel,
+                            lifetime,
                         },
                         folder,
                         request,
@@ -291,12 +318,14 @@ impl Service {
     pub(in crate::subc) async fn next(&mut self) -> Event {
         loop {
             tokio::select! {
+                biased;
+                stamp = self.scopes.next() => return Event(Progress::Ended(stamp)),
+                completion = self.authorizer.next() => return Event(Progress::Consent(completion)),
                 Some(job) = self.jobs.join_next() => match job {
                     Ok(Some(event)) => return event,
                     Ok(None) => {},
                     Err(error) => log::warn!("remote tool call task failed: {error}"),
                 },
-                completion = self.authorizer.next() => return Event(Progress::Consent(completion)),
             }
         }
     }
@@ -315,10 +344,21 @@ impl Service {
                     .spawn(async move { edge.preflight(call, folder, request, root).await });
             }
             Progress::Preflight(ready, consent) => {
-                let live = locally_bound_root(&consent.folder, root_channels, routes).map(|_| ());
+                let live = locally_bound_root(&consent.folder, root_channels, routes)
+                    .map(|_| ())
+                    .and_then(|()| {
+                        if ready.call.lifetime.ended() {
+                            Err(authorization::denied())
+                        } else {
+                            Ok(())
+                        }
+                    });
                 self.authorizer.set_db(ready.call.record.db.clone());
                 let decision = if live.is_ok() && !ready.call.cancel.is_cancelled() {
-                    Some(self.authorizer.request(consent))
+                    Some(
+                        self.authorizer
+                            .request_with_lifetime(consent, ready.call.lifetime.can_ask()),
+                    )
                 } else {
                     None
                 };
@@ -337,6 +377,11 @@ impl Service {
             Progress::Consent(completion) => {
                 self.authorizer.finish(completion, root_channels, routes)
             }
+            Progress::Ended(stamp) => {
+                self.scopes.finish_confirmed_end(&stamp);
+                self.authorizer
+                    .end_scope(scope_lifetime::pairing(&stamp), &stamp);
+            }
             Progress::Authorized(ready, decision) => {
                 let decision = decision.and_then(|(consent, authorization)| {
                     locally_bound_root(&consent.folder, root_channels, routes)?;
@@ -352,7 +397,7 @@ impl Service {
 }
 
 enum Admission {
-    New(ledger::Key, Read, Preflight),
+    New(ledger::Key, FileTool, Preflight),
     Replay(RecordedFrame),
 }
 
@@ -383,7 +428,7 @@ impl Edge {
                 let ctx = ctx.ok_or_else(not_working)?;
                 let pin = remote_pins::parse(&request)?;
                 let preset = CatalogPreset::parse("preset", request.preset.as_deref())?;
-                if dispatch::read_operation(&request.name).is_none() || !remote_pins::preset_serves(preset, &request.name) {
+                if dispatch::operation(&request.name).is_none() || !remote_pins::preset_serves(preset, &request.name) {
                     return Err(tool_unavailable());
                 }
                 binding.check_transport(preset)?;
@@ -394,9 +439,9 @@ impl Edge {
                 let key = ledger::Key { carrier, call_key };
                 let digest = composition_digest(&json!({"name":request.name, "schema_pin":request.schema_pin, "arguments":request.arguments}))
                     .map_err(|error| errors::invalid_request("arguments", error.to_string()))?;
-                let (read, preflight) = Read::prepare(request, scope, folder, binding.session.clone(), digest.clone(), &ctx)?;
+                let (tool, preflight) = FileTool::prepare(request, scope, folder, binding.session.clone(), digest.clone(), &ctx)?;
                 match record.claim(&key, &digest, &preflight.scope)? {
-                    ledger::Admission::New => Ok(Admission::New(key, read, preflight)),
+                    ledger::Admission::New => Ok(Admission::New(key, tool, preflight)),
                     ledger::Admission::Repeat(row) => row.frame.map(Admission::Replay).ok_or_else(|| {
                         ErrorBody::new("call_in_progress", "This remote call is already in progress.")
                     }),
@@ -405,10 +450,10 @@ impl Edge {
             }).await
         };
         match result {
-            Ok(Admission::New(key, read, consent)) => Some(Event(Progress::Preflight(
+            Ok(Admission::New(key, tool, consent)) => Some(Event(Progress::Preflight(
                 Ready {
                     call,
-                    read,
+                    tool,
                     root,
                     key,
                 },
@@ -434,7 +479,7 @@ impl Edge {
         use authorization::Authorization;
         let Ready {
             call,
-            read,
+            tool,
             root,
             key,
         } = ready;
@@ -452,28 +497,32 @@ impl Edge {
         let record = call.record.clone();
         let dispatch_key = key.clone();
         let cancel = call.cancel.clone();
+        let lifetime = call.lifetime.clone();
         let (result_tx, result_rx) = oneshot::channel();
         let request_id = format!(
-            "remote-read-{}-{}",
+            "remote-file-{}-{}",
             call.frame.header.channel, call.frame.header.corr
         );
         let rx = self.executor.submit_async(
             root,
-            Lane::PureRead,
+            tool.lane(),
             request_id.clone(),
             Box::new(move |ctx| {
                 let result = (|| {
+                    if lifetime.ended() {
+                        return Err(authorization::denied());
+                    }
                     if cancel.is_cancelled() {
                         return Err(admission_refusal());
                     }
                     record.begin(&dispatch_key, decision)?;
-                    read.run(ctx, dispatch)
+                    tool.run(ctx, dispatch)
                 })();
                 let _ = result_tx.send(result);
                 Response::success(request_id, json!({}))
             }),
         );
-        let _response = await_executor_response(rx, "remote-read".into()).await;
+        let _response = await_executor_response(rx, "remote-file".into()).await;
         let result = result_rx.await.unwrap_or_else(|_| Err(not_working()));
         let reply = match result {
             Ok(result) => {

@@ -14,6 +14,7 @@ thread_local! {
     static FENCE: RefCell<Fence> = const {
         RefCell::new(Fence {
             requests: Vec::new(),
+            remote_mutation: false,
             gate: None,
             floor_omissions: None,
             floor_filter_root: None,
@@ -29,6 +30,7 @@ thread_local! {
 #[derive(Clone, Default)]
 pub(crate) struct Fence {
     requests: Vec<String>,
+    remote_mutation: bool,
     gate: Option<Arc<ReadGate>>,
     floor_omissions: Option<Arc<parking_lot::Mutex<FloorOmissions>>>,
     floor_filter_root: Option<PathBuf>,
@@ -43,6 +45,7 @@ struct FloorOmissions {
 impl PartialEq for Fence {
     fn eq(&self, other: &Self) -> bool {
         self.requests == other.requests
+            && self.remote_mutation == other.remote_mutation
             && self.floor_filter_root == other.floor_filter_root
             && match (&self.floor_omissions, &other.floor_omissions) {
                 (Some(left), Some(right)) => Arc::ptr_eq(left, right),
@@ -162,6 +165,7 @@ mod ignore_probe_tests {
         let omissions = Arc::new(parking_lot::Mutex::new(FloorOmissions::default()));
         let original = Fence {
             requests: vec!["probe-fence".to_string()],
+            remote_mutation: false,
             gate: Some(Arc::clone(&gate)),
             floor_omissions: Some(Arc::clone(&omissions)),
             floor_filter_root: None,
@@ -251,6 +255,20 @@ pub(crate) fn ask_calls() -> usize {
 
 pub fn active() -> bool {
     FENCE.with(|fence| fence.borrow().active())
+}
+
+pub(crate) fn remote_mutation() -> bool {
+    FENCE.with(|fence| fence.borrow().remote_mutation)
+}
+
+pub(crate) fn with_remote_mutation<T>(mutation: bool, run: impl FnOnce() -> T) -> T {
+    if mutation {
+        let mut fence = capture();
+        fence.remote_mutation = true;
+        inherit(fence, run)
+    } else {
+        run()
+    }
 }
 
 pub(crate) fn for_request(id: &str) -> bool {

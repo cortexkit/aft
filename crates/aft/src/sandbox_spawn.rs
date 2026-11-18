@@ -62,6 +62,7 @@ mod requirement;
 mod settings_grants;
 #[cfg(unix)]
 mod task_temp;
+mod tool_launch_policy;
 #[cfg(unix)]
 mod worker_reads;
 pub(crate) use requirement::{resolve_command_sandbox_spawn, SandboxRequirement};
@@ -6822,11 +6823,10 @@ impl RequestToolLaunch {
 mod edit_tool_launcher;
 
 impl<'ctx> ToolLaunchPolicy<'ctx> {
-    /// The policy for a command's tools: the tool call's policy installed by
-    /// [`Self::with_current`], or else one resolved now from the current
-    /// principal and worker-jail scope.
+    /// The inherited external-tool policy, or one resolved for this request.
     pub(crate) fn for_request(ctx: &'ctx AppContext) -> Self {
         match CURRENT_TOOL_POLICY.with(|slot| slot.borrow().clone()) {
+            _ if crate::context::confinement::remote_mutation() => Self::remote_edit_refusal(),
             Some(request) => Self {
                 ctx: Some(ctx),
                 request,

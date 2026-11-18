@@ -4951,83 +4951,14 @@ async fn connect_and_authenticate_once(
     Ok(stream)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn process_route_bind_completion(
-    writer_tx: &WriterSender,
-    completion: ControlCompletion,
-    a0: &A0Egress,
-    management_routes: &mut HashMap<RouteChannel, ManagementIdentity>,
-    routes: &mut HashMap<RouteChannel, RouteIdentity>,
-    root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
-    session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
-    push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
-    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
-    pending_binds: &mut HashMap<RouteChannel, PendingBind>,
-    installed_route_epochs: &mut HashMap<u16, u32>,
-    executor: &Arc<Executor>,
-    shutdown: &Arc<Notify>,
-    metrics: &Arc<DispatchPathMetrics>,
-    lifecycle_probe: Option<&SubcTestLifecycleProbe>,
-) -> Result<(), SubcError> {
-    decrement_counted_channel(&metrics.control_completion_queued);
-    let (completion, ack_written) = match completion {
-        ControlCompletion::ConfigureReady(completion) => (completion, false),
-        ControlCompletion::AckWritten(completion) => (completion, true),
-        ControlCompletion::AckCancelled(completion) => match *completion {
-            ControlCompletion::AckWritten(completion) => (completion, false),
-            ControlCompletion::ManagementAckWritten { route, .. } => {
-                a0.retire(route);
-                remove_installed_route(installed_route_epochs, route);
-                return Ok(());
-            }
-            ControlCompletion::BindRetracted { route, .. } => {
-                a0.retire(route);
-                remove_installed_route(installed_route_epochs, route);
-                return Ok(());
-            }
-            _ => return Err(SubcError::WriterClosed),
-        },
-        ControlCompletion::ManagementAckWritten {
-            route, identity, ..
-        } => {
-            a0.retire(route);
-            if installed_route_epochs.get(&route.channel) == Some(&route.epoch) {
-                management_routes.insert(route, identity);
-            }
-            return Ok(());
-        }
-        ControlCompletion::WriteFailed => return Err(SubcError::WriterClosed),
-        ControlCompletion::BindRetracted { route, .. } => {
-            a0.retire(route);
-            remove_installed_route(installed_route_epochs, route);
-            return Ok(());
-        }
-    };
-    handle_route_bind_completion(
-        writer_tx,
-        completion,
-        ack_written,
-        a0,
-        routes,
-        root_channels,
-        session_identity,
-        push_buffer,
-        live_roots,
-        pending_binds,
-        installed_route_epochs,
-        executor,
-        shutdown,
-        metrics,
-        lifecycle_probe,
-    )
-    .await
-}
+use installed_routes::process_route_bind_completion;
 
 #[allow(clippy::too_many_arguments)]
 async fn drain_pending_route_bind_completions(
     control_completion_rx: &mut mpsc::Receiver<ControlCompletion>,
     configure_completion_rx: &mut mpsc::Receiver<ControlCompletion>,
     a0: &A0Egress,
+    remote_calls: &mut remote_calls::Service,
     management_routes: &mut HashMap<RouteChannel, ManagementIdentity>,
     writer_tx: &WriterSender,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
@@ -5051,6 +4982,7 @@ async fn drain_pending_route_bind_completions(
             writer_tx,
             completion,
             a0,
+            remote_calls,
             management_routes,
             routes,
             root_channels,
@@ -5356,6 +5288,7 @@ where
     let mut routes: HashMap<RouteChannel, RouteIdentity> = HashMap::new();
     let mut management_routes: HashMap<RouteChannel, ManagementIdentity> = HashMap::new();
     let mut remote_calls = remote_calls::Service::new(
+        control.clone(),
         writer_tx.clone(),
         dispatch_path_metrics.clone(),
         shared_app.clone(),
@@ -5500,6 +5433,7 @@ where
             &mut control_completion_rx,
             &mut configure_completion_rx,
             &a0,
+            &mut remote_calls,
             &mut management_routes,
             &writer_tx,
             &mut routes,
@@ -5732,6 +5666,7 @@ where
                     &writer_tx,
                     completion,
                     &a0,
+                    &mut remote_calls,
                     &mut management_routes,
                     &mut routes,
                     &mut root_channels,
