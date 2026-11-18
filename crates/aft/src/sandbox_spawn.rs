@@ -57,8 +57,12 @@ use crate::sandbox_profile::SandboxProfile;
 
 mod requirement;
 #[cfg(unix)]
+mod settings_grants;
+#[cfg(unix)]
 mod task_temp;
 pub(crate) use requirement::{resolve_command_sandbox_spawn, SandboxRequirement};
+#[cfg(unix)]
+use settings_grants::absolute_env_path;
 
 pub const SANDBOX_UNAVAILABLE_EXIT_CODE: i32 = 78;
 
@@ -2808,13 +2812,6 @@ const CARGO_HOME_FILES: &[&str] = &[
     ".global-cache-shm",
 ];
 
-#[cfg(unix)]
-fn absolute_env_path(name: &str) -> Option<PathBuf> {
-    crate::environment::non_empty_os_var(name)
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-}
-
 /// What a jailed worker's shell may write outside its worktree. Every entry
 /// comes from operator configuration: the AFT process environment, cargo
 /// configuration files outside the worktree, and the standard cache homes.
@@ -5155,10 +5152,11 @@ fn create_profile_candidate_dir(path: &Path) -> bool {
 
 #[cfg(target_os = "linux")]
 fn build_linux_profile(
-    profile: SandboxProfile,
+    mut profile: SandboxProfile,
     home: &Path,
     git_read_roots: &[PathBuf],
 ) -> Result<SandboxProfile, String> {
+    settings_grants::add_existing(&mut profile, home)?;
     let mut intended = Vec::new();
     for path in [
         "/usr",
