@@ -11,6 +11,7 @@ pub mod inspect;
 pub mod outline;
 pub mod read;
 pub mod search;
+pub mod trace;
 pub mod trace_data;
 pub mod trace_to;
 

@@ -1,7 +1,6 @@
 use std::path::Path;
 
-#[path = "../list_surfaces/trace.rs"]
-pub mod trace;
+pub use crate::list_surfaces::trace;
 
 use crate::commands::callgraph_store_adapter::{
     note_callgraph_served, serialized_value, store_error_response, trace_to_result,
