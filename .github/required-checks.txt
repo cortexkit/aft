@@ -35,6 +35,7 @@ E2E / E2E (Pi RPC)
 E2E / E2E (Windows native)
 E2E / E2E (macOS native)
 E2E / E2E binary (Linux x64)
+E2E / E2E binary (OpenCode 2, Linux x64)
 E2E / OpenCode 2 (Linux Docker)
 Landing policy
 search-quality-gate
