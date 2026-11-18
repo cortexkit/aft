@@ -102,10 +102,10 @@ impl Verifications {
     }
 }
 
-pub(crate) use aft_base::scope_watch_events::{changed, context_changed, Source};
-pub(super) use aft_base::scope_watch_events::{notifier, revisions};
 #[cfg(all(test, unix))]
 pub(crate) use aft_base::scope_watch_events::revision;
+pub(crate) use aft_base::scope_watch_events::{changed, context_changed, Source};
+pub(super) use aft_base::scope_watch_events::{notifier, revisions};
 
 #[derive(Default)]
 pub(super) struct Inventory {

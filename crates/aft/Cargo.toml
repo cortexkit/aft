@@ -129,9 +129,9 @@ secret-test-fake = ["aft-base/secret-test-fake"]
 semantic-chunk-census = []
 
 [dependencies]
-aft-base = { path = "../aft-base", version = "0.65.0" }
-aft-db = { path = "../aft-db", version = "0.65.0" }
-aft-parse = { path = "../aft-parse", version = "0.65.0" }
+aft-base = { path = "../aft-base", version = "0.66.0" }
+aft-db = { path = "../aft-db", version = "0.66.0" }
+aft-parse = { path = "../aft-parse", version = "0.66.0" }
 aft-store = { path = "../aft-store", version = "0.66.0" }
 log = "0.4"
 env_logger = "0.11"
@@ -328,9 +328,9 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-aft-base = { path = "../aft-base", version = "0.65.0", features = ["test-support"] }
-aft-db = { path = "../aft-db", version = "0.65.0", features = ["test-support"] }
-aft-parse = { path = "../aft-parse", version = "0.65.0", features = ["test-support"] }
+aft-base = { path = "../aft-base", version = "0.66.0", features = ["test-support"] }
+aft-db = { path = "../aft-db", version = "0.66.0", features = ["test-support"] }
+aft-parse = { path = "../aft-parse", version = "0.66.0", features = ["test-support"] }
 cortexkit-test-support = "=0.1.14"
 graphql-parser = "0.4.1"
 cortexkit-role-tool-provider-conformance = "=0.15.13"

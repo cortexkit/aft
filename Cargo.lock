@@ -19,7 +19,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "aft-base"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "aft-secret-rules",
  "aft-store",
@@ -62,8 +62,8 @@ dependencies = [
  "sha2",
  "subc-client-rs",
  "subc-os",
- "subc-protocol 0.37.0",
- "subc-transport 0.18.0",
+ "subc-protocol",
+ "subc-transport",
  "tempfile",
  "tikv-jemalloc-ctl",
  "tikv-jemalloc-sys",
@@ -83,7 +83,7 @@ dependencies = [
 
 [[package]]
 name = "aft-db"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "aft-base",
  "blake3",
@@ -95,7 +95,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "subc-protocol 0.37.0",
+ "subc-protocol",
  "tempfile",
  "tokio",
  "windows-sys 0.61.2",
@@ -103,7 +103,7 @@ dependencies = [
 
 [[package]]
 name = "aft-parse"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "aft-base",
  "aft-store",

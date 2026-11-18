@@ -2277,7 +2277,9 @@ pub fn clean_old_for_test(
     storage: &Path,
     confirm: impl FnMut(&[CleanupCandidate]) -> bool,
 ) -> CleanupReport {
-    let parent = crate::config_resolve::resolve_config(tiers).config.cache_dir;
+    let parent = crate::config_resolve::resolve_config(tiers)
+        .config
+        .cache_dir;
     let _volume = parent
         .as_ref()
         .filter(|parent| parent.is_dir())

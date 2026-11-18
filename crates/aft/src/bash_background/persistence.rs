@@ -91,8 +91,8 @@ use super::BgTaskStatus;
 
 #[path = "task_metadata_update.rs"]
 mod task_metadata_update;
-pub use task_metadata_update::update_task_at;
 pub(crate) use crate::pinned_dir::*;
+pub use task_metadata_update::update_task_at;
 
 #[cfg(test)]
 type SessionCreateGate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);

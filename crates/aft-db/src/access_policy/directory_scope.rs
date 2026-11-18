@@ -48,7 +48,10 @@ pub fn worker_read_scope(grant: &AccessGrant) -> AccessGrant {
     }
 }
 
-pub(crate) fn repository_scope_with(directory: &Path, eligible: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+pub(crate) fn repository_scope_with(
+    directory: &Path,
+    eligible: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
     for ancestor in directory.ancestors() {
         match std::fs::symlink_metadata(ancestor.join(".git")) {
             Ok(entry) if entry.is_dir() || entry.is_file() => {

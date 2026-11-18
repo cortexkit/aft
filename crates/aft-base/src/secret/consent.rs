@@ -298,7 +298,9 @@ impl Drop for Waiter {
             == 1
             && self.0.outcome.borrow().is_none()
         {
-            self.0.cancel.cancel_with_reason(CancellationReason::ClientDropped);
+            self.0
+                .cancel
+                .cancel_with_reason(CancellationReason::ClientDropped);
         }
     }
 }
@@ -443,7 +445,7 @@ mod waiter_tests {
     use std::time::Duration;
     use std::time::Instant;
 
-        #[test]
+    #[test]
     fn a_last_waiter_cannot_decrement_or_cancel_while_a_join_holds_the_cards_lock() {
         let card = Arc::new(SharedCard {
             created: Instant::now(),
@@ -486,7 +488,10 @@ mod waiter_tests {
         );
         drop(Waiter(card.clone()));
         assert!(card.cancel.is_cancelled());
-        assert_eq!(card.cancel.reason(), Some(CancellationReason::ClientDropped));
+        assert_eq!(
+            card.cancel.reason(),
+            Some(CancellationReason::ClientDropped)
+        );
     }
 }
 
