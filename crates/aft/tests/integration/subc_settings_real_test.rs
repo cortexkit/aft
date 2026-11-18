@@ -12,6 +12,33 @@ use std::{
 use subc_client_rs::{ConsumerOptions, SubcConsumer};
 use subc_protocol::manifest::ProviderRole;
 
+fn fixture_aft_binary() -> &'static Path {
+    static BINARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BINARY.get_or_init(|| {
+        let source = crate::test_helpers::aft_binary::source_binary();
+        let scratch = tempfile::tempdir().unwrap();
+        let stripped = scratch.path().join("aft");
+        // Stamp hashes the whole executable and limits it to 512 MiB. The
+        // debug test binary can be larger; keep its test hooks, not its DWARF.
+        let output = Command::new("objcopy")
+            .arg("--strip-debug")
+            .arg(source)
+            .arg(&stripped)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "objcopy: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        crate::test_helpers::executable_cache::cached_executable_named(
+            &fs::read(stripped).unwrap(),
+            "aft",
+        )
+        .unwrap()
+    })
+}
+
 struct Daemon {
     child: Child,
     home: tempfile::TempDir,
@@ -57,14 +84,14 @@ impl Daemon {
             },
         });
         fs::write(&schema_path, schema.to_string()).unwrap();
-        let module_env = json!({"PATH":"/usr/bin:/bin", "HOME":fixture.join("home"),
+        let module_env = json!({"PATH":"/usr/bin:/bin", "HOME":fixture.join("home"), "RUST_LOG":"info",
             "XDG_CONFIG_HOME":fixture.join("config"), "XDG_RUNTIME_DIR":fixture.join("runtime"),
             "XDG_DATA_HOME":fixture.join("data"), "XDG_STATE_HOME":fixture.join("state"),
             "XDG_CACHE_HOME":fixture.join("cache"), "TMPDIR":fixture.join("tmp"),
             "AFT_STORAGE_DIR":fixture.join("data/aft"), "AFT_TEST_SETTINGS_SCHEMA":schema_path});
         fs::write(fixture.join("config/cortexkit/subc.jsonc"), json!({
             "version":1,"port":0,"storage":{"backend":"sqlite","data_home":fixture.join("data")},
-            "modules":{"aft":{"program":crate::test_helpers::aft_binary::aft_binary(),"args":[],"enabled":true,"env":module_env}}
+            "modules":{"aft":{"program":fixture_aft_binary(),"args":[],"enabled":true,"env":module_env}}
         }).to_string()).unwrap();
         setup(fixture);
         let binary_env = if dev {
@@ -153,6 +180,7 @@ async fn subc_settings_real_daemon_declares_then_filters_ready_catalog_and_appli
     tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             let catalog = client.catalog_list().await.unwrap();
+            check_bootstrap_error(&client).await;
             if let Some(aft) = catalog
                 .modules
                 .iter()
@@ -216,6 +244,23 @@ async fn subc_settings_real_daemon_declares_then_filters_ready_catalog_and_appli
             daemon.log()
         )
     });
+}
+
+async fn check_bootstrap_error(client: &SubcConsumer) {
+    let Ok(report) = client.supervisor_health_probe("aft").await else {
+        return;
+    };
+    if let Some(reason) = report
+        .metrics
+        .and_then(|metrics| metrics["settings"]["reason"].as_str().map(str::to_owned))
+    {
+        if reason != "waiting_for_settings" && reason != "settings_catalog_starting" {
+            let tail = client
+                .supervisor_stderr_tail("aft", Some(30), Some(8192))
+                .await;
+            panic!("gated bootstrap failed ({reason}); module stderr: {tail:?}");
+        }
+    }
 }
 
 async fn desktop(daemon: &Daemon) -> tokio::net::UnixStream {
@@ -306,14 +351,7 @@ async fn subc_settings_real_dev_daemon_reviews_applies_and_serves_declaration_pe
     })
     .await;
     eventually(&daemon, "initial AFT readiness", || async {
-        if let Ok(report) = consumer.supervisor_health_probe("aft").await {
-            if let Some(reason) = report
-                .metrics
-                .and_then(|metrics| metrics["settings"]["reason"].as_str().map(str::to_owned))
-            {
-                assert_eq!(reason, "waiting_for_settings", "gated bootstrap failed");
-            }
-        }
+        check_bootstrap_error(&consumer).await;
         consumer
             .catalog_list()
             .await
