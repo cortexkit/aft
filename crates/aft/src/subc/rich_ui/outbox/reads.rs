@@ -1,4 +1,5 @@
 //! Process-local pull copies, independent of ownership during a push attempt.
+//! Announced records also have a protected database fallback in display::store.
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -295,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn display_read_restart_has_no_records_or_replay() {
+    fn display_read_restart_has_no_memory_records_or_replay() {
         let now = Instant::now();
         let mut outbox = Outbox::new();
         let id = admit(&mut outbox, "call:1", DisplayKind::Record, now);

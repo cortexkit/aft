@@ -3026,20 +3026,37 @@ async fn worker_jail_operator_build_slot_and_container_reads() {
     if !native_available() {
         return;
     }
-    let mut jail = Jail::start().await;
+    operator_build_slot_and_container_reads(Jail::start().await).await;
+}
+
+// Workers default to the relaxed profile, which builds its grants on a separate
+// path from the strict one; the build-slot launcher must work under both.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn worker_jail_relaxed_operator_build_slot_and_container_reads() {
+    if !native_available() {
+        return;
+    }
+    operator_build_slot_and_container_reads(Jail::relaxed(false).await).await;
+}
+
+#[cfg(target_os = "macos")]
+async fn operator_build_slot_and_container_reads(mut jail: Jail) {
     let container = jail.worktree.parent().unwrap().to_path_buf();
     let cargo_config = container.join(".cargo/config.toml");
     let budget = container.join(".cargo/alfonso-test-threads");
     let seeds = container.join(".rust-build-seeds");
-    let slots = jail.data.join("cortexkit/prefrontal-core/build-slots");
+    // Prefrontal's layout: the launcher sits beside the worktree containers
+    // and names its metadata files after itself.
+    let slots = jail.data.join("cortexkit/alfonso/worktrees/.build-slots");
     for path in [cargo_config.parent().unwrap(), &seeds, &slots] {
         std::fs::create_dir_all(path).unwrap();
     }
     std::fs::write(&budget, "2\n").unwrap();
     std::fs::write(seeds.join("seed"), "build-seed").unwrap();
     for (name, value) in [
-        (".root", "slot-root"),
-        (".cache", "slot-cache"),
+        ("prefrontal-build-slot.root", "slot-root"),
+        ("prefrontal-build-slot.cache", "slot-cache"),
         ("limit", "2\n"),
     ] {
         std::fs::write(slots.join(name), value).unwrap();
@@ -3050,8 +3067,8 @@ async fn worker_jail_operator_build_slot_and_container_reads() {
         r#"#!/usr/bin/env python3
 import fcntl, os, pathlib, sys
 base = pathlib.Path(__file__).parent
-assert (base / '.root').read_text() == 'slot-root'
-assert (base / '.cache').read_text() == 'slot-cache'
+assert (base / 'prefrontal-build-slot.root').read_text() == 'slot-root'
+assert (base / 'prefrontal-build-slot.cache').read_text() == 'slot-cache'
 assert (base / 'limit').read_text().strip() == '2'
 with (base / 'queue.lock').open('a') as queue, (base / '0.lock').open('a') as slot:
     fcntl.flock(queue, fcntl.LOCK_EX)
@@ -3095,6 +3112,26 @@ with (base / 'queue.lock').open('a') as queue, (base / '0.lock').open('a') as sl
     )).await;
     assert!(read.contains("CONTAINER_2"), "{read}");
     assert!(read.contains("build-seed"), "{read}");
+    // The worker system links sibling repositories beside every worktree. A
+    // lookup must follow such a link to a readable checkout, while a link into
+    // another worker's checkout still reads nothing.
+    std::fs::write(jail.main.join("sibling-readable.txt"), "sibling-ok").unwrap();
+    std::os::unix::fs::symlink(&jail.main, container.join("main-link")).unwrap();
+    let other_worker = container.parent().unwrap().join("fedcba9876543210/other");
+    std::fs::create_dir_all(&other_worker).unwrap();
+    std::fs::write(other_worker.join("private.txt"), "other-worker").unwrap();
+    std::os::unix::fs::symlink(&other_worker, container.join("other-link")).unwrap();
+    // Each command's sandbox profile is built when it starts, so it sees the
+    // links created above.
+    let linked = jail
+        .bash("cat ../main-link/sibling-readable.txt && echo LINK_$((1+1))")
+        .await;
+    assert!(
+        linked.contains("sibling-ok") && linked.contains("LINK_2"),
+        "{linked}"
+    );
+    let other = jail.bash("cat ../other-link/private.txt").await;
+    assert!(!other.contains("other-worker"), "{other}");
     let built = jail.bash(&cargo_build(&jail, "", "BUILD_SLOT")).await;
     eprintln!("Native build-slot output:\n{built}");
     assert!(built.contains("BUILD_SLOT_2"), "{built}");
@@ -3115,8 +3152,8 @@ with (base / 'queue.lock').open('a') as queue, (base / '0.lock').open('a') as sl
     for path in [
         &wrapper,
         &slots.join("rustc-lowprio-direct"),
-        &slots.join(".root"),
-        &slots.join(".cache"),
+        &slots.join("prefrontal-build-slot.root"),
+        &slots.join("prefrontal-build-slot.cache"),
         &slots.join("limit"),
         &cargo_config,
         &budget,

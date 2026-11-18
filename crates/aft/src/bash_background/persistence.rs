@@ -8,6 +8,14 @@ pub(crate) use scope_records::{
 };
 pub use scope_records::{read_task_at, write_task};
 
+#[cfg(target_os = "linux")]
+#[path = "linux_mount_identity.rs"]
+mod linux_mount_identity;
+#[cfg(target_os = "linux")]
+use linux_mount_identity::MountIdentity;
+#[cfg(not(target_os = "linux"))]
+type MountIdentity = (u64, Vec<u8>);
+
 #[cfg(unix)]
 use std::ffi::CString;
 use std::ffi::{OsStr, OsString};
@@ -739,9 +747,12 @@ impl PinnedDir {
         }
         result
     }
-    fn repair_mount_identity(&self) -> io::Result<(u64, Vec<u8>)> {
+    fn repair_mount_identity(&self) -> io::Result<MountIdentity> {
         #[cfg(test)]
         if let Some(mount) = REPAIR_MOUNTS.with(|ids| ids.borrow().get(self.path()).copied()) {
+            #[cfg(target_os = "linux")]
+            return Ok(MountIdentity::Statx(mount));
+            #[cfg(not(target_os = "linux"))]
             return Ok((mount, Vec::new()));
         }
         file_mount_identity(&self.file)
@@ -1683,35 +1694,10 @@ fn file_identity(file: &File) -> io::Result<(u64, u64)> {
     }
 }
 
-fn file_mount_identity(file: &File) -> io::Result<(u64, Vec<u8>)> {
+fn file_mount_identity(file: &File) -> io::Result<MountIdentity> {
     #[cfg(target_os = "linux")]
     {
-        let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
-        // Call statx through syscall(2), not glibc's wrapper: the wrapper only
-        // exists from glibc 2.28, and the Linux release binary is linked
-        // against an older glibc so it runs on older distributions. A kernel
-        // without statx fails with ENOSYS, which refuses the repair like any
-        // other unverifiable mount boundary.
-        if unsafe {
-            libc::syscall(
-                libc::SYS_statx,
-                file.as_raw_fd(),
-                c"".as_ptr(),
-                libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-                libc::STATX_MNT_ID,
-                stat.as_mut_ptr(),
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let stat = unsafe { stat.assume_init() };
-        if stat.stx_mask & libc::STATX_MNT_ID == 0 {
-            return Err(io::Error::other(
-                "kernel cannot verify repair mount boundary",
-            ));
-        }
-        Ok((stat.stx_mnt_id, Vec::new()))
+        linux_mount_identity::file_mount_identity(file)
     }
     #[cfg(target_os = "macos")]
     {
@@ -4078,7 +4064,7 @@ fn repair_errno_location() -> *mut libc::c_int {
 
 struct RepairPolicy<'a> {
     device: u64,
-    mount: (u64, Vec<u8>),
+    mount: MountIdentity,
     protected: &'a [(u64, u64)],
     /// Stop at a symlink or special file instead of unlinking it. Used when a
     /// tree is removed without a complete validation walk first.

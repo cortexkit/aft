@@ -290,10 +290,13 @@ impl BgTaskRegistry {
                             .ok()
                             .map(|state| state.metadata.clone())
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        log::warn!(
+                            "task scope kill could not read metadata for {task_id}: {error}"
+                        );
                         return Err(format!(
                             "task scope aft-task-{task_id}.scope could not be killed"
-                        ))
+                        ));
                     }
                 };
                 if let Some(metadata) = metadata {

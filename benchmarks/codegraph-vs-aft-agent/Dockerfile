@@ -24,14 +24,14 @@ RUN set -eux; \
   arch="$(uname -m)"; \
   case "$arch" in \
     x86_64|amd64) ort_arch="x64" ;; \
-    aarch64|arm64) ort_arch="aarch64" ;; \
+    aarch64|arm64) ort_arch="arm64" ;; \
     *) echo "Unsupported ONNX Runtime arch: $arch" >&2; exit 1 ;; \
   esac; \
-  url="https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-${ort_arch}-${ORT_VERSION}.tgz"; \
-  mkdir -p /opt/onnxruntime; \
-  curl -fsSL "$url" -o /tmp/onnxruntime.tgz; \
-  tar -xzf /tmp/onnxruntime.tgz -C /opt/onnxruntime --strip-components=1; \
-  rm /tmp/onnxruntime.tgz
+  url="https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/${ORT_VERSION}/microsoft.ml.onnxruntime.${ORT_VERSION}.nupkg"; \
+  mkdir -p /opt/onnxruntime/lib; \
+  curl -fsSL "$url" -o /tmp/onnxruntime.nupkg; \
+  unzip -p /tmp/onnxruntime.nupkg "runtimes/linux-${ort_arch}/native/libonnxruntime.so" > /opt/onnxruntime/lib/libonnxruntime.so; \
+  rm /tmp/onnxruntime.nupkg
 ENV ORT_DYLIB_PATH="/opt/onnxruntime/lib/libonnxruntime.so"
 ENV LD_LIBRARY_PATH="/opt/onnxruntime/lib"
 ENV PATH="/root/.bun/bin:/root/.opencode/bin:${PATH}"

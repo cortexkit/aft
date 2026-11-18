@@ -16,7 +16,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   existsSync,
-  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -32,7 +31,7 @@ const { cleanupAbandonedOnnxAttempts, ORT_VERSION, ONNX_INSTALLED_META_FILE } = 
 const {
   cleanupAbandonedStagingDirs,
   cleanupIncompleteTargetIfUnowned,
-  copyOnnxLibraries,
+  stageOnnxLibrary,
   acquireLock,
   releaseLock,
 } = __onnxTest__;
@@ -150,108 +149,23 @@ describe("cleanupAbandonedOnnxAttempts", () => {
     expect(existsSync(ortDir)).toBe(false);
   });
 
-  test("copies libraries into a target directory that does not exist yet", () => {
-    // The installer stages into a fresh `<tmp>/install` directory that nothing
-    // else creates; copying into it used to fail with ENOENT on copyfile.
-    const extractedDir = join(workDir, "extracted-fresh-target");
-    const targetDir = join(workDir, "staging", "install");
-    mkdirSync(extractedDir, { recursive: true });
-    writeFileSync(join(extractedDir, "libonnxruntime.so"), "binary");
-
-    copyOnnxLibraries(
-      { assetName: "onnxruntime-test", libName: "libonnxruntime.so", archiveType: "tgz" },
-      extractedDir,
-      targetDir,
-      ["libonnxruntime.so"],
-      [],
-    );
-
-    expect(existsSync(join(targetDir, "libonnxruntime.so"))).toBe(true);
-  });
-
-  test("required ONNX library copy failure removes partial target and throws", () => {
-    const extractedDir = join(workDir, "extracted");
-    const targetDir = join(workDir, "target");
-    mkdirSync(extractedDir, { recursive: true });
-    mkdirSync(targetDir, { recursive: true });
-    writeFileSync(join(targetDir, "leftover"), "partial install");
-
-    expect(() =>
-      copyOnnxLibraries(
-        { assetName: "onnxruntime-test", libName: "libonnxruntime.so", archiveType: "tgz" },
-        extractedDir,
-        targetDir,
-        ["libonnxruntime.so"],
-        [],
-        () => {
-          throw new Error("copy failed");
-        },
-      ),
-    ).toThrow("copy failed");
-
-    expect(existsSync(targetDir)).toBe(false);
-  });
-
-  test("missing required ONNX library after optional copies removes partial target", () => {
-    const extractedDir = join(workDir, "extracted-missing");
-    const targetDir = join(workDir, "target-missing");
-    mkdirSync(extractedDir, { recursive: true });
-    mkdirSync(targetDir, { recursive: true });
-
-    expect(() =>
-      copyOnnxLibraries(
-        { assetName: "onnxruntime-test", libName: "libonnxruntime.so", archiveType: "tgz" },
-        extractedDir,
-        targetDir,
-        [],
-        [],
-      ),
-    ).toThrow("Required ONNX Runtime library missing");
-
-    expect(existsSync(targetDir)).toBe(false);
-  });
-
-  test("rejects required symlinks that would escape the target directory after re-home", () => {
-    const extractedDir = join(workDir, "extracted-escape");
-    const targetDir = join(workDir, "target-escape");
-    mkdirSync(extractedDir, { recursive: true });
-    mkdirSync(targetDir, { recursive: true });
-    writeFileSync(join(extractedDir, "libonnxruntime.so.1.24.4"), "binary");
-
-    expect(() =>
-      copyOnnxLibraries(
-        { assetName: "onnxruntime-test", libName: "libonnxruntime.so", archiveType: "tgz" },
-        extractedDir,
-        targetDir,
-        ["libonnxruntime.so.1.24.4"],
-        [{ name: "libonnxruntime.so", target: "../.aft-onnx-installing" }],
-      ),
-    ).toThrow("points outside install dir");
-
-    expect(existsSync(targetDir)).toBe(false);
-  });
-
   test.skipIf(process.platform === "win32")(
-    "allows same-directory versioned ONNX symlinks during re-home",
-    () => {
-      const extractedDir = join(workDir, "extracted-legit-symlink");
-      const targetDir = join(workDir, "target-legit-symlink");
-      mkdirSync(extractedDir, { recursive: true });
-      mkdirSync(targetDir, { recursive: true });
-      writeFileSync(join(extractedDir, "libonnxruntime.so.1.24.4"), "binary");
+    "stages the Linux and macOS runtime under the existing library filenames",
+    async () => {
+      const linux = join(workDir, "staging", "linux");
+      const mac = join(workDir, "staging", "mac");
+      await stageOnnxLibrary(linux, "libonnxruntime.so", Buffer.from("linux runtime"));
+      await stageOnnxLibrary(mac, "libonnxruntime.dylib", Buffer.from("mac runtime"));
 
-      copyOnnxLibraries(
-        { assetName: "onnxruntime-test", libName: "libonnxruntime.so", archiveType: "tgz" },
-        extractedDir,
-        targetDir,
-        ["libonnxruntime.so.1.24.4"],
-        [{ name: "libonnxruntime.so", target: "libonnxruntime.so.1.24.4" }],
+      expect(readlinkSync(join(linux, "libonnxruntime.so"))).toBe("libonnxruntime.so.1");
+      expect(readlinkSync(join(linux, "libonnxruntime.so.1"))).toBe(
+        `libonnxruntime.so.${ORT_VERSION}`,
       );
-
-      const installedLink = join(targetDir, "libonnxruntime.so");
-      expect(lstatSync(installedLink).isSymbolicLink()).toBe(true);
-      expect(readlinkSync(installedLink)).toBe("libonnxruntime.so.1.24.4");
-      expect(existsSync(installedLink)).toBe(true);
+      expect(readFileSync(join(linux, "libonnxruntime.so"), "utf8")).toBe("linux runtime");
+      expect(readlinkSync(join(mac, "libonnxruntime.dylib"))).toBe(
+        `libonnxruntime.${ORT_VERSION}.dylib`,
+      );
+      expect(readFileSync(join(mac, "libonnxruntime.dylib"), "utf8")).toBe("mac runtime");
     },
   );
 

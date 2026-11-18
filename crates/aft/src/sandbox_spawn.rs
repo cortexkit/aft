@@ -55,6 +55,8 @@ use crate::context::AppContext;
 use crate::sandbox_profile::resolved_env_deny_paths;
 use crate::sandbox_profile::SandboxProfile;
 
+#[cfg(unix)]
+mod build_slots;
 mod requirement;
 #[cfg(unix)]
 mod settings_grants;
@@ -1971,7 +1973,7 @@ fn build_native_profile(
             policy
                 .private_stores
                 .read_allow
-                .extend(jail.read_only.iter().cloned());
+                .extend(jail.read_only.iter().chain(&jail.read_dirs).cloned());
             policy
                 .private_stores
                 .read_allow
@@ -2205,6 +2207,14 @@ fn build_relaxed_profile(
     // protecting their control files or carving out sibling checkout denies.
     policy.absolute_floor = read_deny.clone();
     policy.private_stores = stores.clone();
+    // The macOS read limit hides the worker pool outside the worker's own
+    // checkout, and the build-slot launcher sits in that pool.
+    #[cfg(target_os = "macos")]
+    if worker_jail_active() {
+        let slots = build_slots::worker_build_slot_grants(home, roots, &policy);
+        build_slots::add_build_slot_reads(&slots, &mut stores, &mut write_deny);
+        policy.private_stores = stores.clone();
+    }
     let write_grants = policy.shell_grants(crate::access_policy::AccessOperation::Write);
     let mut control_roots = roots.to_vec();
     control_roots.extend(write_grants.iter().cloned());
@@ -2840,6 +2850,11 @@ struct WorkerJailGrants {
     files: Vec<PathBuf>,
     /// Cargo configuration, .rust-build-seeds, and immutable compiler launcher files.
     read_only: Vec<PathBuf>,
+    /// Directories read recursively but left out of the shell's write-deny
+    /// list, because exact `files` grants inside them must stay writable: the
+    /// build-slot launcher's directory, whose lock files a build opens. They
+    /// sit in a private store, whose own deny already blocks other writes.
+    read_dirs: Vec<PathBuf>,
 }
 
 /// Cargo's lock and global-cache tracking files at the root of CARGO_HOME. The
@@ -2920,111 +2935,14 @@ fn worker_jail_grants(
     grants
         .roots
         .extend(worker_target_roots(home, project_roots, policy, &configs));
-    for (config_path, base) in configs {
-        grants.read_only.push(config_path.clone());
-        let Some(build) = cargo_build_settings(&config_path) else {
-            continue;
-        };
-        if let Some(wrapper) = build.rustc_wrapper {
-            let wrapper = PathBuf::from(wrapper);
-            let wrapper = if wrapper.is_absolute() {
-                Some(wrapper)
-            } else {
-                base.as_ref().map(|base| base.join(wrapper))
-            };
-            if let Some(wrapper) = wrapper {
-                add_build_slot_grants(&wrapper, project_roots, policy, &mut grants);
-            }
-        }
+    for (config_path, _) in configs {
+        grants.read_only.push(config_path);
     }
+    let slots = build_slots::worker_build_slot_grants(home, project_roots, policy);
+    grants.files.extend(slots.files);
+    grants.read_only.extend(slots.read_only);
+    grants.read_dirs.extend(slots.read_dirs);
     grants
-}
-
-/// Retain only the operator-configured `prefrontal-build-slot` launcher and its
-/// `rustc-lowprio-direct` companion: they take a slot lock and compile inside
-/// the sandbox rather than asking a shared server. The Cargo configuration and
-/// launcher files must be outside every model-writable worktree.
-#[cfg(unix)]
-fn add_build_slot_grants(
-    wrapper: &Path,
-    project_roots: &[PathBuf],
-    policy: &crate::access_policy::AccessPolicy,
-    grants: &mut WorkerJailGrants,
-) {
-    let Ok(wrapper) = canonicalize_profile_candidate(wrapper) else {
-        return;
-    };
-    if wrapper.file_name() != Some(OsStr::new("prefrontal-build-slot"))
-        || !profile_candidate_is_file(&wrapper)
-    {
-        return;
-    }
-    let Some(dir) = wrapper.parent() else {
-        return;
-    };
-    if project_roots
-        .iter()
-        .any(|root| root.starts_with(dir) || dir.starts_with(root))
-        || !policy
-            .private_stores
-            .deny
-            .iter()
-            .any(|deny| dir.starts_with(deny) && dir != deny)
-    {
-        return;
-    }
-    let paths = [
-        wrapper.clone(),
-        dir.join("rustc-lowprio-direct"),
-        dir.join(".root"),
-        dir.join(".cache"),
-        dir.join("limit"),
-    ];
-    let Ok(paths) = paths
-        .into_iter()
-        .map(|path| path.canonicalize())
-        .collect::<Result<Vec<_>, _>>()
-    else {
-        return;
-    };
-    if paths
-        .iter()
-        .any(|path| !profile_candidate_is_file(path) || !path.starts_with(dir))
-    {
-        return;
-    }
-    let Some(limit) = std::fs::read_to_string(dir.join("limit"))
-        .ok()
-        .and_then(|value| value.trim().parse::<u16>().ok())
-        .filter(|limit| (1..=256).contains(limit))
-    else {
-        return;
-    };
-    // Landlock's single-file grants require existing inodes. Provision only
-    // the configured queue and slot locks, never a writable directory grant.
-    // Include both endpoints so zero-based and one-based slot numbering work.
-    let locks = std::iter::once(dir.join("queue.lock"))
-        .chain((0..=limit).map(|slot| dir.join(format!("{slot}.lock"))));
-    let mut files = Vec::new();
-    for path in locks {
-        if std::fs::symlink_metadata(&path)
-            .is_ok_and(|metadata| !metadata.is_file() || metadata.file_type().is_symlink())
-        {
-            return;
-        }
-        if std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .is_err()
-        {
-            return;
-        }
-        files.push(path);
-    }
-    grants.files.extend(files);
-    grants.read_only.extend(paths);
 }
 
 /// A linked worktree's own Git directory and its main repository's shared
@@ -10847,80 +10765,6 @@ mod policy_tests {
         }
         cleanup_task_temp_dir(&temp).unwrap();
         assert!(bound.is_ok(), "cannot bind {}: {bound:?}", socket.display());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn worker_build_slot_grants_are_exact_and_reject_model_writable_launchers() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().canonicalize().unwrap();
-        let store = home.join(".local/share/cortexkit");
-        let project = store.join("alfonso/worktrees/container/own");
-        let slots = store.join("operator/build-slots");
-        for path in [&project, &slots] {
-            std::fs::create_dir_all(path).unwrap();
-        }
-        for name in [
-            "prefrontal-build-slot",
-            "rustc-lowprio-direct",
-            ".root",
-            ".cache",
-        ] {
-            std::fs::write(slots.join(name), "operator-owned").unwrap();
-        }
-        std::fs::write(slots.join("limit"), "2\n").unwrap();
-        let policy = crate::access_policy::AccessPolicy::from_config(
-            &crate::config::Config::default(),
-            &store.join("aft"),
-            vec![project.clone()],
-            &home,
-        );
-        let mut grants = WorkerJailGrants::default();
-        add_build_slot_grants(
-            &slots.join("prefrontal-build-slot"),
-            &[project.clone()],
-            &policy,
-            &mut grants,
-        );
-        assert_eq!(
-            grants.files,
-            ["queue.lock", "0.lock", "1.lock", "2.lock"].map(|name| slots.join(name))
-        );
-        assert_eq!(grants.read_only.len(), 5);
-        assert!(grants.roots.is_empty() && grants.caches.is_empty());
-        assert!(grants
-            .read_only
-            .iter()
-            .all(|path| path.is_file() && path.parent() == Some(slots.as_path())));
-        let mut refused = WorkerJailGrants::default();
-        add_build_slot_grants(
-            &slots.join("prefrontal-build-slot"),
-            &[slots.clone()],
-            &policy,
-            &mut refused,
-        );
-        assert_eq!(
-            refused,
-            WorkerJailGrants::default(),
-            "a model-writable launcher must never be pinned"
-        );
-        #[cfg(unix)]
-        {
-            std::fs::remove_file(slots.join(".root")).unwrap();
-            std::fs::write(home.join("secret"), "secret").unwrap();
-            std::os::unix::fs::symlink(home.join("secret"), slots.join(".root")).unwrap();
-            add_build_slot_grants(
-                &slots.join("prefrontal-build-slot"),
-                &[project],
-                &policy,
-                &mut refused,
-            );
-            assert_eq!(
-                refused,
-                WorkerJailGrants::default(),
-                "a sibling symlink must not widen the read exception"
-            );
-        }
     }
 
     fn context(project_root: PathBuf) -> AppContext {

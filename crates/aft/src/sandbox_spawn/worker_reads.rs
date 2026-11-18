@@ -142,7 +142,9 @@ pub(super) fn worker_target_roots(
 /// Adds a macOS worker's read-only exceptions above its own checkout to a data
 /// policy: the exact Cargo and container files, and the `.rust-build-seeds`
 /// directories (prebuilt dependency outputs a new worktree's build copies from)
-/// read recursively. Each path is also denied for writing.
+/// read recursively. Each path is also denied for writing. The links beside
+/// the checkout get metadata reads only, so lookups can follow them (see
+/// [`worker_container_links`]).
 #[cfg(any(target_os = "macos", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(super) fn grant_worker_pool_reads(
@@ -157,6 +159,57 @@ pub(super) fn grant_worker_pool_reads(
     let dirs = worker_pool_read_dirs(home, roots);
     stores.read_allow.extend(dirs.iter().cloned());
     write_deny.extend(dirs);
+    stores
+        .read_metadata_allow
+        .extend(worker_container_links(home, roots));
+}
+
+/// How many entries of a container folder are examined for links. A
+/// container holds one repository's worktrees and the links beside them, so
+/// this bound only stops a pathological folder from slowing every launch.
+#[cfg(any(target_os = "macos", test))]
+const CONTAINER_ENTRY_LIMIT: usize = 4096;
+
+/// The symbolic links in each checkout's container folder, such as the
+/// sibling-repository links the worker system places beside every worktree
+/// (`../subconscious`). The container is denied, so a lookup through a link
+/// stops at the link itself unless its own metadata is readable. Granting the
+/// link's metadata grants nothing else: the sandbox still checks the link's
+/// target, so a link into another worker's checkout or a protected folder
+/// stays unreadable.
+#[cfg(any(target_os = "macos", test))]
+fn worker_container_links(home: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut links = Vec::new();
+    for data in [
+        Some(home.join(".local/share")),
+        absolute_env_path("XDG_DATA_HOME"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let Ok(pool) = canonicalize_profile_candidate(&data.join("cortexkit/alfonso/worktrees"))
+        else {
+            continue;
+        };
+        for root in roots {
+            let Some(container) = root.parent().filter(|dir| dir.starts_with(&pool)) else {
+                continue;
+            };
+            let Ok(entries) = std::fs::read_dir(container) else {
+                continue;
+            };
+            links.extend(
+                entries
+                    .take(CONTAINER_ENTRY_LIMIT)
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_symlink()))
+                    .map(|entry| entry.path()),
+            );
+        }
+    }
+    links.sort_unstable();
+    links.dedup();
+    links
 }
 
 /// Every name a jailed worker may read in its checkout's container folder:
@@ -211,6 +264,30 @@ mod tests {
         std::fs::create_dir_all(roots[1].join(".rust-build-seeds")).unwrap();
         assert_eq!(worker_pool_read_dirs(&home, &roots), dirs);
         assert!(dirs.iter().all(|dir| !files.contains(dir)));
+    }
+
+    #[test]
+    fn worker_container_links_lists_only_links_beside_pool_checkouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let pool = home.join(".local/share/cortexkit/alfonso/worktrees");
+        let container = pool.join("hash-a");
+        let own = container.join("own");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir(container.join("other-worker")).unwrap();
+        std::fs::write(container.join("plain-file"), "not a link").unwrap();
+        let sibling = home.join("Work/sibling");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::os::unix::fs::symlink(&sibling, container.join("sibling")).unwrap();
+        std::os::unix::fs::symlink(home.join("missing"), container.join("dangling")).unwrap();
+        // A checkout outside the pool gets nothing, even with links beside it.
+        let outside = home.join("outside/own");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&sibling, home.join("outside/sibling")).unwrap();
+        assert_eq!(
+            worker_container_links(&home, &[own, outside]),
+            [container.join("dangling"), container.join("sibling")]
+        );
     }
 
     #[test]

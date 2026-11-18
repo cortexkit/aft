@@ -85,6 +85,8 @@ mod lifecycle_scope;
 mod scope_runtime;
 #[path = "scope_spawn.rs"]
 mod scope_spawn;
+#[path = "withdraw_liveness.rs"]
+mod withdraw_liveness;
 use scope_spawn::spawn_detached_child;
 
 struct UncommittedLayout<'a> {
@@ -8389,33 +8391,19 @@ impl BgTaskRegistry {
                 let alive = if alive && metadata.mode == BgMode::Pipes && metadata.remote.is_none()
                 {
                     let recovered = (|| -> Result<(), String> {
-                        if let Some(pid) = metadata.child_pid {
-                            let answer = if let Some(start) = metadata.child_start_time_ms {
+                        if let Some(super::task_scope::ScopeLookup::Present(scope)) =
+                            self.recover_persisted_task_scope(&metadata)?
+                        {
+                            if let Some(policy) = metadata.memory_policy.as_mut() {
+                                let monitor = super::memory_limit::Monitor::recover_task_scope(
+                                    policy.mib, &scope,
+                                );
+                                *policy = monitor.policy.clone();
                                 self.inner
-                                    .task_scopes
-                                    .adopt(&metadata.task_id, pid, start)?
-                            } else {
-                                match super::task_scope::lookup_state(&metadata.task_id)? {
-                                    super::task_scope::ScopeLookup::Present(_) => {
-                                        return Err(
-                                            "task scope replay has no exact child identity".into()
-                                        )
-                                    }
-                                    other => other,
-                                }
-                            };
-                            if let super::task_scope::ScopeLookup::Present(scope) = answer {
-                                if let Some(policy) = metadata.memory_policy.as_mut() {
-                                    let monitor = super::memory_limit::Monitor::recover_task_scope(
-                                        policy.mib, &scope,
-                                    );
-                                    *policy = monitor.policy.clone();
-                                    self.inner
-                                        .memory_monitors
-                                        .lock()
-                                        .unwrap_or_else(|error| error.into_inner())
-                                        .insert(metadata.task_id.clone(), monitor);
-                                }
+                                    .memory_monitors
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .insert(metadata.task_id.clone(), monitor);
                             }
                         }
                         Ok(())

@@ -510,6 +510,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "tool-provider protocol feed pagination uses entries, cursor and more, not an AFT ListEnvelope; the existing 256-entry limit and encoded reply-byte bound retain continuation through the shared cursor",
     },
     ExclusionEntry {
+        file: "db/display_records.rs",
+        enclosing_item: "sweep, persist",
+        location_or_primitive: "SWEEP_LIMIT, SQL LIMIT, MAX_RECORDS, MAX_BYTES",
+        reason: "Durable display pull retention bounds housekeeping pages and stored output, not a tool result list; protected capacity defers wakes without truncating or evicting promised records.",
+    },
+    ExclusionEntry {
         file: "db/access_grants.rs",
         enclosing_item: "saved_scope_batch",
         location_or_primitive: "SQL LIMIT, PER_TICK (4)",

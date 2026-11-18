@@ -203,10 +203,55 @@ pub(crate) enum AskRoute {
     /// naming the permission and the path. Allow and deny decisions are
     /// unaffected.
     Unavailable,
+    /// A fork call (tool-provider/v1 `fork_id`) to the read-only tool `tool`:
+    /// it must never ask the person, so an `ask` refuses with
+    /// `fork_call_refused {tool, reason: "approval_required"}` and no card is
+    /// raised. Allow and deny decisions are unaffected.
+    Fork { tool: String },
 }
 
 /// Refusal for a codemode call that would need a permission ask.
 pub(crate) const PERMISSION_ASK_UNAVAILABLE: &str = "permission_ask_unavailable";
+
+/// The refusal for an `ask` on a route that cannot put the question to anyone:
+/// [`AskRoute::Unavailable`] (a codemode program) or [`AskRoute::Fork`]. Any
+/// other route answers `None`.
+pub(crate) fn unasked_refusal(
+    route: &AskRoute,
+    req_id: &str,
+    original: &Path,
+    identity: &Path,
+    operation: AccessOperation,
+) -> Option<crate::protocol::Response> {
+    match route {
+        AskRoute::Unavailable => {
+            let verb = match operation {
+                AccessOperation::Read => "read",
+                AccessOperation::Write => "write",
+            };
+            Some(crate::protocol::Response::error_with_data(
+                req_id,
+                PERMISSION_ASK_UNAVAILABLE,
+                format!(
+                    "{verb} access to '{}' needs permission, and a codemode program can't ask for it",
+                    original.display()
+                ),
+                serde_json::json!({"permission": operation, "resource": identity}),
+            ))
+        }
+        AskRoute::Fork { tool } => {
+            let error =
+                cortexkit_role_tool_provider::errors::fork_call_refused(tool, "approval_required");
+            Some(crate::protocol::Response::error_with_data(
+                req_id,
+                &error.code,
+                error.message,
+                serde_json::json!({"detail": error.detail}),
+            ))
+        }
+        _ => None,
+    }
+}
 
 #[path = "access_policy_plugin.rs"]
 pub(crate) mod plugin;
@@ -374,14 +419,20 @@ pub(crate) const ACCESS_ASK_REQUIRED: &str = "access_ask_required";
 /// with, then retries) or a worker call held for consent through Cingulate
 /// (`access_ask_required`). A handler that folds errors into a phase failure
 /// or a batch entry must return such a response unchanged, or nobody can be
-/// asked and the call can never run.
+/// asked and the call can never run. A fork call's refusal in place of an ask
+/// (`fork_call_refused`) is kept whole the same way, so the caller gets the
+/// refusal rather than a partial result.
 pub(crate) fn is_access_request(response: &crate::protocol::Response) -> bool {
     matches!(
         response
             .data
             .get("code")
             .and_then(serde_json::Value::as_str),
-        Some(crate::protocol::ERROR_PERMISSION_REQUIRED | ACCESS_ASK_REQUIRED)
+        Some(
+            crate::protocol::ERROR_PERMISSION_REQUIRED
+                | ACCESS_ASK_REQUIRED
+                | cortexkit_role_tool_provider::errors::FORK_CALL_REFUSED
+        )
     )
 }
 

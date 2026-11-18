@@ -1832,6 +1832,10 @@ fn scope_project_case_034(
             assert_eq!(error["detail"]["source"], "scope_workdir");
         } else {
             assert_eq!(ack.header.ty, FrameType::Response, "{}", frame_body(&ack));
+            assert_eq!(
+                serde_json::from_slice::<ModuleControlResponse>(&ack.body).unwrap(),
+                ModuleControlResponse::RouteBindAck {},
+            );
             for (corr, body) in [
                 (20, json!({"name":"read", "preset":"head", "arguments":{"path":"marker.txt"}})),
                 (21, json!({"name":"grep", "preset":"head", "arguments":{"pattern":"scope_project_034_marker", "path":"."}})),
@@ -1945,6 +1949,50 @@ fn subc_034_project_missing_scope_workdir_uses_daemon_filled_root() {
         None,
         false,
     );
+}
+
+#[test]
+fn subc_federated_bind_metadata_does_not_change_project_admission() {
+    for (harness, peer_class) in [
+        ("fed-app:person", "app"),
+        ("fed-computer:person", "computer"),
+    ] {
+        for extended in [false, true] {
+            scope_project_case_034(
+                |_, _| {
+                    let principal = json!({"kind":"reserved", "module_id":"callosum"});
+                    let mut facts = json!({
+                        "peer_class": peer_class,
+                        "peer_fingerprint": "a".repeat(32),
+                        "pairing_id": "pairing",
+                        "peer_name": "Peer",
+                        "remote_claim": {"kind":"run", "agent_id":"agent"},
+                    });
+                    if extended {
+                        // Use the wire values from subc-protocol's federated roundtrip test.
+                        facts["origin_principal"] =
+                            json!({"kind":"reserved", "module_id":"origin-module"});
+                        facts["project"] = json!({"project_id":"project", "root_key":{"kind":"remote", "key":"owner/repo"}});
+                        facts["peer_box_id"] = json!("0123456789abcdef".repeat(2));
+                        facts["remote_claim"]["run_id"] = json!("run-1");
+                    }
+                    json!({
+                        "op": "route.bind", "route_channel": ROUTE_CHANNEL, "epoch": 1,
+                        "target": {"kind":"tool_provider", "module_id":"aft"},
+                        "identity": {"harness":harness, "session":SESSION_ID},
+                        "principal": principal,
+                        "scope": {
+                            "owner": principal, "ref": "peer", "scope_epoch": 1,
+                            "kind": "federated", "owner_authorized": false,
+                            "attributes": {"federated":facts},
+                        },
+                    })
+                },
+                None,
+                true,
+            );
+        }
+    }
 }
 
 #[test]

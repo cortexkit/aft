@@ -261,7 +261,7 @@ mod tests {
         let declared = build_facts(Some("not-a-git-sha"))
             .with_launch_nonce_source(Some(LaunchNonceSource::Fd));
         assert_eq!(declared.build_git_sha, None);
-        assert_eq!(declared.wire_crate_version.as_deref(), Some("0.37.2"));
+        assert_eq!(declared.wire_crate_version.as_deref(), Some("0.37.4"));
         assert_eq!(declared.launch_nonce_source, Some(LaunchNonceSource::Fd));
     }
 
@@ -270,7 +270,7 @@ mod tests {
         let _serial = serial();
         let _none = install_for_tests(None);
         let assert_build_facts = |declared: &ManifestProvenance| {
-            assert_eq!(declared.wire_crate_version.as_deref(), Some("0.37.2"));
+            assert_eq!(declared.wire_crate_version.as_deref(), Some("0.37.4"));
             assert_eq!(
                 declared.build_git_sha, None,
                 "the library has no binary startup revision"
@@ -299,7 +299,7 @@ mod tests {
         );
         assert_eq!(
             declaration.declared().wire_crate_version.as_deref(),
-            Some("0.37.2")
+            Some("0.37.4")
         );
         assert!(!declaration.initialize(Some(&"b".repeat(40))));
         assert_eq!(
@@ -316,7 +316,7 @@ mod tests {
         assert_eq!(declaration.declared().build_git_sha, None);
         assert_eq!(
             declaration.declared().wire_crate_version.as_deref(),
-            Some("0.37.2")
+            Some("0.37.4")
         );
     }
 

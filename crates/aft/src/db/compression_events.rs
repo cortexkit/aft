@@ -1221,6 +1221,13 @@ pub fn maybe_spawn_retention(
                 &db,
                 i64::try_from(now).unwrap_or(i64::MAX),
             );
+            if let Ok(conn) = db.try_lock() {
+                if let Err(error) = crate::db::display_records::sweep(
+                    &conn, i64::try_from(now).unwrap_or(i64::MAX),
+                ) {
+                    crate::slog_warn!("display record retention failed: {error}");
+                }
+            }
             IN_FLIGHT.store(false, Ordering::Release);
         })
     {

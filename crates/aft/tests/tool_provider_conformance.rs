@@ -2898,7 +2898,10 @@ async fn s2_withdraw_of_a_running_keyed_bash_kills_only_that_task() {
                 "killed".into(),
                 Some("withdrawn".into())
             ),
-        ]
+        ],
+        "provider stderr:\n{}",
+        std::fs::read_to_string(root.join("daemon.stderr"))
+            .unwrap_or_else(|error| format!("cannot read provider stderr: {error}"))
     );
 }
 
@@ -3594,6 +3597,43 @@ impl ToolProviderSubject for Subject {
         } else {
             ("status".into(), json!({}))
         }
+    }
+    /// The result probes cover every tool AFT marks read-only; the runner
+    /// sends only those. One more read names a file outside the project,
+    /// which a route that can ask would ask about.
+    fn fork_calls(&self) -> Vec<CallSpec> {
+        let mut probes = result_probes();
+        probes.push(("read".into(), json!({"path": "../fork-outside.txt"})));
+        probes
+    }
+    /// The project's files (each path with its length and content hash) and
+    /// the number of permission questions the stand-in has received.
+    async fn fork_observable_state(&self, handle: &Process) -> Result<Value, HarnessError> {
+        fn walk(dir: &Path, base: &Path, files: &mut BTreeMap<String, String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, base, files);
+                } else if let Ok(bytes) = std::fs::read(&path) {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    bytes.hash(&mut hasher);
+                    let relative = path.strip_prefix(base).unwrap_or(&path);
+                    files.insert(
+                        relative.display().to_string(),
+                        format!("{}:{:x}", bytes.len(), hasher.finish()),
+                    );
+                }
+            }
+        }
+        let project = handle.root.join("project");
+        let mut files = BTreeMap::new();
+        walk(&project, &project, &mut files);
+        let questions = self.stand_in.asks.lock().unwrap().len();
+        Ok(json!({"files": files, "questions": questions}))
     }
     fn tool_result_v1_calls(&self) -> Vec<CallSpec> {
         let tools = self.served_tools.lock().unwrap();

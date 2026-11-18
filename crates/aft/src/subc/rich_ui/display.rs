@@ -18,12 +18,14 @@ use subc_protocol::Principal;
 
 pub(super) mod counters;
 mod diagnostics;
+mod store;
 use counters::{count, Counter::*};
 
 struct Writer {
     outbox: Mutex<Outbox>,
     wake: tokio::sync::mpsc::Sender<()>,
     limits: Mutex<cortexkit_role_tool_display::DisplayLimits>,
+    store: store::Store,
 }
 static SENDER: OnceLock<Writer> = OnceLock::new();
 static CALLS: LazyLock<Mutex<HashMap<String, Arc<Mutex<Capture>>>>> =
@@ -709,7 +711,7 @@ pub(crate) fn reply(
     }
 }
 
-pub(crate) fn start(connection_file: PathBuf) {
+pub(crate) fn start(connection_file: &Path, app: &Arc<crate::context::App>, storage_dir: &Path) {
     if display_switch().is_err() {
         count(StartDisabled);
         return;
@@ -728,13 +730,14 @@ pub(crate) fn start(connection_file: PathBuf) {
             outbox: Mutex::new(Outbox::new()),
             wake,
             limits: Mutex::new(outbox::ceilings()),
+            store: store::Store::new(app.clone(), storage_dir.join("aft.db")),
         })
         .is_err()
     {
         count(StartExisting);
         return;
     }
-    tokio::spawn(send_loop(connection_file, receiver));
+    tokio::spawn(send_loop(connection_file.to_path_buf(), receiver));
     count(Started);
 }
 
@@ -1173,6 +1176,28 @@ pub(crate) fn with_outbox<T>(f: impl FnOnce(&mut Outbox) -> T) -> Option<T> {
     Some(f(&mut outbox))
 }
 
+pub(crate) async fn announce(
+    id: String,
+    bytes: Vec<u8>,
+    publish: impl std::future::Future<Output = Result<(), &'static str>>,
+) -> Result<(), &'static str> {
+    let writer = SENDER.get().ok_or("display_store_not_started")?;
+    announce_retained(writer, id, bytes, publish).await
+}
+
+async fn announce_retained(
+    writer: &Writer,
+    id: String,
+    bytes: Vec<u8>,
+    publish: impl std::future::Future<Output = Result<(), &'static str>>,
+) -> Result<(), &'static str> {
+    if !writer.store.persist(id.clone(), bytes).await? {
+        return Err("display_store_deferred");
+    }
+    publish.await?;
+    writer.store.acknowledged(id).await
+}
+
 pub(crate) fn check_reader(
     principal: Option<&Principal>,
     discovered: Option<&str>,
@@ -1195,27 +1220,51 @@ pub(crate) async fn read(
     if !matches!(principal, Some(Principal::Reserved { .. })) {
         return check_reader(principal, None).map(|_| Vec::new());
     }
-    if SENDER.get().is_none() {
-        return Err(cortexkit_role_tool_display::not_ready());
-    }
+    let writer = SENDER
+        .get()
+        .ok_or_else(cortexkit_role_tool_display::not_ready)?;
     let discovered = crate::late_result_bus::display_reader()?;
-    check_reader(principal, discovered.as_deref())?;
-    with_outbox(|outbox| read_retained(outbox, arguments, Instant::now()))
-        .ok_or_else(cortexkit_role_tool_display::not_ready)?
+    read_for_reader(
+        writer,
+        principal,
+        discovered.as_deref(),
+        arguments,
+        Instant::now(),
+        crate::db::display_records::now_ms(),
+    )
+    .await
 }
 
-fn read_retained(
-    outbox: &Outbox,
+async fn read_for_reader(
+    writer: &Writer,
+    principal: Option<&Principal>,
+    discovered: Option<&str>,
     arguments: Value,
     now: Instant,
+    now_ms: i64,
 ) -> Result<Vec<u8>, subc_protocol::ErrorBody> {
-    use cortexkit_role_tool_display::{DisplayRead, InvalidParams, DISPLAY_RECORD_UNKNOWN};
+    check_reader(principal, discovered)?;
+    let request = read_request(arguments)?;
+    let memory = writer
+        .outbox
+        .lock()
+        .map_err(|_| cortexkit_role_tool_display::not_ready())?
+        .reads
+        .read(&request.record_id, now);
+    if let Some(bytes) = memory {
+        return Ok(bytes);
+    }
+    writer.store.read(request.record_id, now_ms).await
+}
+
+fn read_request(
+    arguments: Value,
+) -> Result<cortexkit_role_tool_display::DisplayRead, subc_protocol::ErrorBody> {
+    use cortexkit_role_tool_display::{DisplayRead, InvalidParams};
     let request: DisplayRead =
         serde_json::from_value(arguments).map_err(|_| InvalidParams::new("record_id").refusal())?;
     request.validate().map_err(|error| error.refusal())?;
-    outbox.reads.read(&request.record_id, now).ok_or_else(|| {
-        subc_protocol::ErrorBody::new(DISPLAY_RECORD_UNKNOWN, "display record is unknown")
-    })
+    Ok(request)
 }
 
 #[cfg(test)]

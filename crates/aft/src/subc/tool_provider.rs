@@ -613,6 +613,9 @@ fn catalog_entry(
     if *restrict_replace {
         entry.result_ops = Some(vec!["prepend".into(), "append".into()]);
     }
+    if super::fork_call::READ_ONLY_TOOLS.contains(&name) {
+        entry = entry.with_read_only();
+    }
     entry
 }
 
@@ -2221,9 +2224,9 @@ fn freeze_withdraw_answer(
 
 /// Stop a withdrawn running call's task through `ctx`'s task registry (each
 /// project root has its own), then store the withdraw's answer. When that
-/// registry does not hold the task, the answer is stored only if the task's
-/// record shows it has already stopped; otherwise nothing is stored and the
-/// withdraw is refused as retryable.
+/// registry does not hold the task, its persisted process identity must prove
+/// it stopped, or its record must already be terminal. An uncheckable identity
+/// leaves the answer unfrozen so withdrawal can be retried.
 fn kill_withdrawn_call(
     ctx: &crate::context::AppContext,
     kill: &WithdrawKill,
@@ -2237,10 +2240,19 @@ fn kill_withdrawn_call(
         }
         return freeze_withdraw_answer(ctx, kill);
     }
-    let stopped = ctx.db().is_some_and(|db| {
-        db.lock().ok().is_some_and(|conn| {
-            crate::db::bash_tasks::bash_task_stopped(&conn, &kill.task).unwrap_or(false)
-        })
+    let record = ctx.db().and_then(|db| {
+        let conn = db.lock().ok()?;
+        crate::db::bash_tasks::bash_task_by_id(&conn, &kill.task)
+            .ok()
+            .flatten()
+    });
+    let stopped = record.is_some_and(|row| {
+        matches!(
+            row.status.as_str(),
+            "completed" | "failed" | "killed" | "timed_out"
+        ) || ctx.bash_background().unregistered_task_process_liveness(
+            &crate::bash_background::persistence::PersistedTask::from(row),
+        ) == crate::bash_background::process::ProcessLiveness::Gone
     });
     if stopped {
         return freeze_withdraw_answer(ctx, kill);
@@ -5206,7 +5218,7 @@ mod tests {
         use crate::subc::runner_notices::notice_templates::{self as notices, Notice, Target};
         use sha2::{Digest, Sha256};
         let mut files = BTreeMap::new();
-        files.insert("README.md".into(), "# AFT notice templates v1\n\nOpt-in `tool.catalog` replies and example `session.send` requests for each preset.\nThe examples use a fixed clock (1700000000000 ms), call key and cleared delivery\nmode; real sends use the current clock and the runner's declared modes.\nTemplate digests use llm-runner's RFC 8785 SHA-256 helper.\n\nRegenerate with `cargo test -p agent-file-tools --lib regenerate_notice_template_vectors -- --ignored`.\nThe `notice_template_vectors_match_samples` test regenerates in memory and compares every byte.\n".into());
+        files.insert("README.md".into(), "# AFT notice templates v1.1\n\nThe same opt-in `tool.catalog` replies and example `session.send` requests as\n`aft-notice-templates-v1` (see its README for the fixed clock, call key and\ndelivery mode they use), except that every catalog now carries the\ntool-provider 0.15.12 `read_only: true` mark on the tools AFT marks read-only.\nThe mark is always sent, so each catalog's `generation` and `catalog_digest`\nchange; the `*.sends.json` files are unchanged. v1 stays as published.\nRegenerate with `cargo test -p agent-file-tools --lib regenerate_notice_template_vectors -- --ignored`;\n`notice_template_vectors_match_samples` compares every byte.\n".into());
         for preset in ["head", "worker", "reader"] {
             let reply = catalog(
                 json!({"preset": preset, "notice_templates": true}),
@@ -5267,7 +5279,7 @@ mod tests {
     #[test]
     fn notice_template_vectors_match_samples() {
         let root = std::path::Path::new(crate::test_support::manifest_dir())
-            .join("../../test-vectors/aft-notice-templates-v1");
+            .join("../../test-vectors/aft-notice-templates-v1.1");
         for (path, expected) in notice_template_vectors() {
             assert_eq!(
                 std::fs::read_to_string(root.join(&path)).unwrap(),
@@ -5281,7 +5293,7 @@ mod tests {
     #[ignore = "explicit sample regeneration, not a verification gate"]
     fn regenerate_notice_template_vectors() {
         let root = std::path::Path::new(crate::test_support::manifest_dir())
-            .join("../../test-vectors/aft-notice-templates-v1");
+            .join("../../test-vectors/aft-notice-templates-v1.1");
         std::fs::create_dir_all(&root).unwrap();
         for (path, text) in notice_template_vectors() {
             std::fs::write(root.join(path), text).unwrap();
@@ -7631,6 +7643,122 @@ pub(in crate::subc) mod route_tests {
                 );
             }
         }
+    }
+
+    /// The role's published fork-call samples.
+    fn fork_call_vectors() -> Value {
+        let (_, text) = cortexkit_role_tool_provider::vectors::FILES
+            .iter()
+            .find(|(file, _)| *file == "fork-calls.json")
+            .expect("the role ships its fork-call samples");
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// A tool-provider/v1 route whose access questions go to an OpenCode
+    /// plugin prompt, so an outside read on it would normally ask the person.
+    fn plugin_prompt_v1_identity(root: &crate::path_identity::ProjectRootId) -> RouteIdentity {
+        RouteIdentity(Arc::new(RouteIdentityData {
+            output_scope: Default::default(),
+            root: root.clone(),
+            project_root: root.as_path().into(),
+            harness: "opencode".into(),
+            session: "head-session".into(),
+            role: RouteRole::ToolProviderV1,
+            trust: BindTrust::FirstParty,
+            spawn_principal: AuthenticatedPrincipal::FirstParty,
+            consumer_elicitation_capable: false,
+            held_reply: false,
+            held_update: false,
+            call_keepalive: false,
+            call_yield: false,
+            tool_result_body: false,
+            disabled_tools: Arc::new(Vec::new()),
+            scope: None,
+            run_scope: std::sync::OnceLock::new(),
+            call_mode: subc_protocol::call_mode::CallMode::Classic,
+            made_tool_call: AtomicBool::new(false),
+            run_owner: None,
+        }))
+    }
+
+    /// Records the ask route a call ran under, then answers as the access
+    /// policy answers a read outside the project: a route that cannot ask
+    /// refuses, any other route reads.
+    fn outside_read_dispatch(request: crate::protocol::RawRequest, _: &AppContext) -> Response {
+        use crate::access_policy::AskRoute;
+        let route = crate::access_policy::current_ask_route();
+        let label = match &route {
+            AskRoute::Plugin { .. } => "plugin".to_owned(),
+            AskRoute::Fork { tool } => format!("fork:{tool}"),
+            other => format!("{other:?}"),
+        };
+        *LAST_DISPATCH.lock().unwrap() = Some(json!(label));
+        let outside = std::path::Path::new("/outside/protected.txt");
+        crate::access_policy::unasked_refusal(
+            &route,
+            &request.id,
+            outside,
+            outside,
+            crate::access_policy::AccessOperation::Read,
+        )
+        .unwrap_or_else(|| Response::success(request.id, json!({"text": "found"})))
+    }
+
+    async fn fork_exchange(body: Value) -> (FrameType, Value, Option<Value>) {
+        let (_dir, root) = test_support::test_root("fork-calls");
+        *LAST_DISPATCH.lock().unwrap() = None;
+        let reply = exchange_with_actor(
+            body,
+            plugin_prompt_v1_identity(&root),
+            test_support::test_ctx(),
+            &Arc::new(DispatchPathMetrics::new()),
+            outside_read_dispatch,
+        )
+        .await;
+        let dispatched = LAST_DISPATCH.lock().unwrap().take();
+        (
+            reply.header.ty,
+            serde_json::from_slice(&reply.body).unwrap(),
+            dispatched,
+        )
+    }
+
+    /// A call without `fork_id` runs exactly as before, under its route's
+    /// own prompt. A fork call to a marked tool runs under a route that
+    /// refuses instead of asking, answered with the role's ERROR, and a fork
+    /// call to an unmarked tool or with a malformed marker never runs. The
+    /// refusals are compared with the role's published samples.
+    #[tokio::test]
+    async fn fork_calls_refuse_instead_of_asking_and_plain_calls_are_unchanged() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        let vectors = fork_call_vectors();
+        let [unmarked, needs_consent] = [&vectors["refusals"][0], &vectors["refusals"][1]];
+        assert_eq!(unmarked["name"], "unmarked");
+        assert_eq!(needs_consent["name"], "needs consent");
+
+        let plain =
+            json!({"op": "tool.call", "name": "read", "arguments": {"path": "protected.txt"}});
+        let (ty, body, dispatched) = fork_exchange(plain).await;
+        assert_eq!(ty, FrameType::Response, "{body}");
+        assert_eq!(dispatched, Some(json!("plugin")));
+
+        let (ty, body, dispatched) = fork_exchange(needs_consent["call"].clone()).await;
+        assert_eq!(ty, FrameType::Error, "{body}");
+        assert_eq!(body, needs_consent["error"]);
+        assert_eq!(dispatched, Some(json!("fork:read")));
+
+        let (ty, body, dispatched) = fork_exchange(unmarked["call"].clone()).await;
+        assert_eq!(ty, FrameType::Error, "{body}");
+        assert_eq!(body, unmarked["error"]);
+        assert_eq!(dispatched, None, "an unmarked tool must not run");
+
+        let mut malformed = vectors["call"].clone();
+        malformed["fork_id"] = json!("not valid");
+        let (ty, body, dispatched) = fork_exchange(malformed).await;
+        assert_eq!(ty, FrameType::Error, "{body}");
+        let error: ErrorBody = serde_json::from_value(body).unwrap();
+        assert_eq!(errors::invalid_request_field(&error), Some("fork_id"));
+        assert_eq!(dispatched, None, "a malformed marker must not run");
     }
 
     #[tokio::test]
@@ -10989,6 +11117,262 @@ mod ledger_terminal_tests {
     use super::*;
     use crate::db::call_ledger::Key;
     use crate::subc::{control_flags, route_key, Frame, FrameType, PersistentCancelSignal};
+
+    fn unregistered_withdraw_fixture(
+        pid: Option<u32>,
+        pgid: Option<i32>,
+    ) -> (
+        tempfile::TempDir,
+        std::sync::Arc<crate::context::AppContext>,
+        WithdrawKill,
+    ) {
+        use crate::db::call_ledger::{self as ledger, State};
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = crate::subc::test_support::test_ctx();
+        let db = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::db::open(&dir.path().join("aft.db")).unwrap(),
+        ));
+        ctx.set_db(db.clone());
+        let key = Key {
+            carrier: "carrier".into(),
+            call_key: "running".into(),
+        };
+        let task = "bash-0123456789abcdef";
+        let conn = db.lock().unwrap();
+        ledger::admit(&conn, &key, "digest", None, State::DispatchStarted).unwrap();
+        ledger::link_task(&conn, &key, task).unwrap();
+        conn.execute(
+            "INSERT INTO bash_tasks(harness,session_id,task_id,project_key,command,cwd,status,started_at,pid,pgid,metadata) VALUES('h','s',?1,'elsewhere','sleep','cwd','running',?2,?3,?4,'{}')",
+            rusqlite::params![task, ledger::now_ms(), pid, pgid],
+        )
+        .unwrap();
+        let ledger::Withdrawal::Answer {
+            body,
+            kill_task: Some(task),
+            ..
+        } = ledger::withdraw(&conn, &key, None, 100, usize::MAX).unwrap()
+        else {
+            panic!("a running linked call must name its task to kill");
+        };
+        assert!(!ctx.bash_background().holds_task(&task));
+        (dir, ctx, WithdrawKill { key, task, body })
+    }
+
+    #[cfg(unix)]
+    fn exited_withdraw_process_pid() -> u32 {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn withdraw_unregistered_gone_process_freezes_identical_answer() {
+        use crate::db::call_ledger as ledger;
+        let pid = exited_withdraw_process_pid();
+        let (_dir, ctx, kill) = unregistered_withdraw_fixture(Some(pid), None);
+        let db = ctx.db().unwrap();
+        assert_eq!(kill_withdrawn_call(&ctx, &kill).unwrap(), kill.body);
+        let conn = db.lock().unwrap();
+        let row = ledger::get(&conn, &kill.key).unwrap().unwrap();
+        assert_eq!(row.withdraw_answer.as_deref(), Some(kill.body.as_slice()));
+        // Even a later conflicting process snapshot cannot change the frozen reply.
+        conn.execute(
+            "UPDATE bash_tasks SET pid=?1 WHERE task_id=?2",
+            rusqlite::params![std::process::id(), kill.task],
+        )
+        .unwrap();
+        let ledger::Withdrawal::Answer {
+            body, kill_task, ..
+        } = ledger::withdraw(&conn, &kill.key, None, 200, usize::MAX).unwrap()
+        else {
+            panic!("a retry must return the frozen answer");
+        };
+        assert_eq!(body, kill.body);
+        assert!(kill_task.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn unregistered_scoped_withdraw_fixture(
+        events: Option<&str>,
+    ) -> (
+        tempfile::TempDir,
+        std::sync::Arc<crate::context::AppContext>,
+        WithdrawKill,
+        std::path::PathBuf,
+    ) {
+        let (dir, ctx, kill) =
+            unregistered_withdraw_fixture(Some(exited_withdraw_process_pid()), None);
+        let cgroup = dir
+            .path()
+            .join(format!("user@{}.service", unsafe { libc::geteuid() }))
+            .join("aft.slice")
+            .join(format!("aft-task-{}.scope", kill.task));
+        if let Some(events) = events {
+            std::fs::create_dir_all(&cgroup).unwrap();
+            std::fs::write(cgroup.join("cgroup.events"), events).unwrap();
+        }
+        let db = ctx.db().unwrap();
+        let conn = db.lock().unwrap();
+        let row = crate::db::bash_tasks::bash_task_by_id(&conn, &kill.task)
+            .unwrap()
+            .unwrap();
+        let mut metadata = crate::bash_background::persistence::PersistedTask::from(row);
+        metadata.memory_policy = serde_json::from_value(json!({
+            "mib": 64,
+            "kind": "Linux task scope memory.max",
+            "cgroup": cgroup,
+        }))
+        .unwrap();
+        conn.execute(
+            "UPDATE bash_tasks SET metadata=?1 WHERE task_id=?2",
+            rusqlite::params![serde_json::to_string(&metadata).unwrap(), kill.task],
+        )
+        .unwrap();
+        (dir, ctx, kill, cgroup)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_scoped_withdraw_incomplete(ctx: &crate::context::AppContext, kill: &WithdrawKill) {
+        use crate::db::call_ledger as ledger;
+        let refused = kill_withdrawn_call(ctx, kill).unwrap_err();
+        assert_eq!(refused.code, "withdraw_incomplete");
+        assert_eq!(
+            refused.detail,
+            Some(json!({"retryable": true, "task_id": kill.task}))
+        );
+        let db = ctx.db().unwrap();
+        assert!(ledger::get(&db.lock().unwrap(), &kill.key)
+            .unwrap()
+            .unwrap()
+            .withdraw_answer
+            .is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn withdraw_unregistered_recorded_scope_empty_or_absent_freezes_answer() {
+        use crate::db::call_ledger as ledger;
+        for events in [None, Some("populated 0\n")] {
+            let (_dir, ctx, kill, _cgroup) = unregistered_scoped_withdraw_fixture(events);
+            assert_eq!(kill_withdrawn_call(&ctx, &kill).unwrap(), kill.body);
+            let db = ctx.db().unwrap();
+            let conn = db.lock().unwrap();
+            let ledger::Withdrawal::Answer {
+                body, kill_task, ..
+            } = ledger::withdraw(&conn, &kill.key, None, 200, usize::MAX).unwrap()
+            else {
+                panic!("a retry must return the frozen answer");
+            };
+            assert_eq!(body, kill.body);
+            assert!(kill_task.is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn withdraw_unregistered_recorded_scope_populated_keeps_answer_unfrozen() {
+        let (_dir, ctx, kill, _cgroup) =
+            unregistered_scoped_withdraw_fixture(Some("populated 1\n"));
+        assert_scoped_withdraw_incomplete(&ctx, &kill);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn withdraw_unregistered_recorded_runtime_scope_keeps_descendants_unfrozen() {
+        let (dir, ctx, kill, _cgroup) = unregistered_scoped_withdraw_fixture(Some("populated 1\n"));
+        let db = ctx.db().unwrap();
+        {
+            let conn = db.lock().unwrap();
+            let row = crate::db::bash_tasks::bash_task_by_id(&conn, &kill.task)
+                .unwrap()
+                .unwrap();
+            let mut metadata = crate::bash_background::persistence::PersistedTask::from(row);
+            metadata.memory_policy = None;
+            metadata.task_scope_runtime_ms = Some(60_000);
+            conn.execute(
+                "UPDATE bash_tasks SET metadata=?1 WHERE task_id=?2",
+                rusqlite::params![serde_json::to_string(&metadata).unwrap(), kill.task],
+            )
+            .unwrap();
+        }
+        let current = dir.path().join(format!(
+            "user@{}.service/app.slice/module.service",
+            unsafe { libc::geteuid() }
+        ));
+        crate::bash_background::task_scope::with_local_recovery_mount_for_test(
+            current,
+            dir.path().to_path_buf(),
+            || {
+                assert_scoped_withdraw_incomplete(&ctx, &kill);
+            },
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn withdraw_unregistered_recorded_scope_lookup_error_keeps_answer_unfrozen() {
+        let (_dir, ctx, kill, cgroup) = unregistered_scoped_withdraw_fixture(Some("populated 0\n"));
+        std::fs::remove_dir_all(&cgroup).unwrap();
+        // A self-referencing link makes try_exists fail, rather than report absence.
+        std::os::unix::fs::symlink(cgroup.file_name().unwrap(), &cgroup).unwrap();
+        assert!(cgroup.try_exists().is_err());
+        assert_scoped_withdraw_incomplete(&ctx, &kill);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn withdraw_unregistered_recorded_scope_unconfirmed_population_keeps_answer_unfrozen() {
+        let (_dir, ctx, kill, _cgroup) = unregistered_scoped_withdraw_fixture(Some(""));
+        assert_scoped_withdraw_incomplete(&ctx, &kill);
+    }
+
+    #[test]
+    fn withdraw_unregistered_live_process_keeps_answer_unfrozen() {
+        use crate::db::call_ledger as ledger;
+        let (_dir, ctx, kill) = unregistered_withdraw_fixture(Some(std::process::id()), None);
+        let refused = kill_withdrawn_call(&ctx, &kill).unwrap_err();
+        assert_eq!(refused.code, "withdraw_incomplete");
+        assert_eq!(
+            refused.detail,
+            Some(json!({"retryable": true, "task_id": kill.task}))
+        );
+        assert_eq!(refused.message, format!(
+            "the withdrawn call's task {} could not be stopped: no bound project root holds the task; retry tool.withdraw",
+            kill.task
+        ));
+        assert!(crate::bash_background::process::is_process_alive(
+            std::process::id()
+        ));
+        let db = ctx.db().unwrap();
+        assert!(ledger::get(&db.lock().unwrap(), &kill.key)
+            .unwrap()
+            .unwrap()
+            .withdraw_answer
+            .is_none());
+    }
+
+    #[test]
+    fn withdraw_unregistered_unknown_identity_keeps_answer_unfrozen() {
+        use crate::db::call_ledger as ledger;
+        let (_dir, ctx, kill) = unregistered_withdraw_fixture(Some(0), None);
+        let refused = kill_withdrawn_call(&ctx, &kill).unwrap_err();
+        assert_eq!(refused.code, "withdraw_incomplete");
+        assert_eq!(
+            refused.detail,
+            Some(json!({"retryable": true, "task_id": kill.task}))
+        );
+        let db = ctx.db().unwrap();
+        assert!(ledger::get(&db.lock().unwrap(), &kill.key)
+            .unwrap()
+            .unwrap()
+            .withdraw_answer
+            .is_none());
+    }
 
     /// A withdraw whose running call could not be stopped stores no answer
     /// and is refused as retryable, so a retry tries again. Once the task's

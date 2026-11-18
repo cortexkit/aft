@@ -73,17 +73,10 @@ test.skipIf(process.platform === "win32")(
       const extracted = join(root, "migration", "extract");
       privateMkdirSync(extracted);
       execTarExtractionSync(["xf", archive, "-C", extracted], 2_000, true);
-      __onnxTest__.copyOnnxLibraries(
-        {
-          libName: "library.so",
-          assetName: "fixture",
-          archiveType: "tgz",
-          librarySha256: "fixture",
-        },
-        source,
+      await __onnxTest__.stageOnnxLibrary(
         join(root, "onnxruntime", "fixture"),
-        ["library.so"],
-        [],
+        "onnxruntime.dll",
+        Buffer.from("library"),
       );
       expect(__onnxTest__.acquireLock(join(root, "onnxruntime", "install.lock"))).toBe(true);
       const paths = [root];

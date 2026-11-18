@@ -11881,16 +11881,14 @@ impl AppContext {
         confinement::note_ask();
         use crate::access_policy::{AskRoute, GrantKind};
         let route = crate::access_policy::current_ask_route();
+        // Codemode programs and fork calls cannot put a question to anyone.
+        if let Some(refusal) =
+            crate::access_policy::unasked_refusal(&route, req_id, original, identity, operation)
+        {
+            return Err(refusal);
+        }
         match &route {
             AskRoute::Lowered => return Ok(()),
-            AskRoute::Unavailable => {
-                return Err(crate::protocol::Response::error_with_data(
-                    req_id, crate::access_policy::PERMISSION_ASK_UNAVAILABLE,
-                    format!("{} access to '{}' needs permission, and a codemode program can't ask for it",
-                        match operation { crate::access_policy::AccessOperation::Read => "read", crate::access_policy::AccessOperation::Write => "write" }, original.display()),
-                    serde_json::json!({"permission":operation,"resource":identity}),
-                ));
-            }
             AskRoute::Deny => {
                 let root = self.config().project_root.clone().unwrap_or_default();
                 return Err(path_error_response(req_id, original, &root));
