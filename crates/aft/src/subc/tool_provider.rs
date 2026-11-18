@@ -11185,9 +11185,13 @@ mod ledger_terminal_tests {
             "user@{}.service/app.slice/module.service",
             unsafe { libc::geteuid() }
         ));
-        crate::bash_background::task_scope::with_local_recovery_fixture_for_test(current, || {
-            assert_scoped_withdraw_incomplete(&ctx, &kill);
-        });
+        crate::bash_background::task_scope::with_local_recovery_mount_for_test(
+            current,
+            dir.path().to_path_buf(),
+            || {
+                assert_scoped_withdraw_incomplete(&ctx, &kill);
+            },
+        );
     }
 
     #[cfg(target_os = "linux")]
