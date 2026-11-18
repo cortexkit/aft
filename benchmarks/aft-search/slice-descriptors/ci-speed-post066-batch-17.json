@@ -6,5 +6,17 @@
     "crates/aft/src/lib.rs",
     "crates/aft/tests/integration/tool_call_parity_test.rs"
   ],
-  "note": "Batch 17's only ranking-fence change removes the module declaration for the deleted migrate-storage CLI code. No search path calls that code, and no tool-call parity fixture is changed. Every search row must remain byte-equal; no ranking, count or presentation difference is authorized."
+  "pattern_counts": {
+    "followup-census:910002": {
+      "candidate_files": {
+        "before": 3,
+        "after": 6
+      },
+      "files_examined": {
+        "before": 3,
+        "after": 6
+      }
+    }
+  },
+  "note": "Batch 17's only ranking-fence change removes the module declaration for the deleted migrate-storage CLI code. No search path calls that code, and no tool-call parity fixture is changed. Every ranked row must remain byte-equal. The one declared pattern-count transition is inherited, not caused by this batch: the committed reference still records 3 candidate files for row 910002, while main c322752a and this batch both examine 6. Earlier engine_unwired descriptors (ci-speed-landing-1, ci-speed-post064-batch-2, the Luau index-store slice) declared the same 3 -> 6 transition. A release replay on the build server found all 108 rows byte-equal between main c322752a and batch tip 701e2b29."
 }
