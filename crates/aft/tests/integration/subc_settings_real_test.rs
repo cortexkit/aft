@@ -28,7 +28,7 @@ impl Drop for Daemon {
 }
 
 impl Daemon {
-    async fn launch(setup: impl FnOnce(&Path)) -> (Self, SubcConsumer) {
+    async fn launch(dev: bool, setup: impl FnOnce(&Path)) -> (Self, SubcConsumer) {
         let home = tempfile::tempdir().unwrap();
         for name in [
             "config/cortexkit",
@@ -67,15 +67,22 @@ impl Daemon {
             "modules":{"aft":{"program":crate::test_helpers::aft_binary::aft_binary(),"args":[],"enabled":true,"env":module_env}}
         }).to_string()).unwrap();
         setup(fixture);
+        let binary_env = if dev {
+            "CK_SUBC_DEV_BIN"
+        } else {
+            "CK_SUBC_BIN"
+        };
         let binary = PathBuf::from(
-            std::env::var_os("CK_SUBC_BIN").expect("set CK_SUBC_BIN to the pinned Linux daemon"),
+            std::env::var_os(binary_env)
+                .unwrap_or_else(|| panic!("set {binary_env} to the pinned Linux daemon")),
         );
         let binary = crate::test_helpers::executable_cache::cached_executable_named(
             &fs::read(binary).unwrap(),
             "ckdev-subc",
         )
         .unwrap();
-        let child = Command::new(binary)
+        let mut command = Command::new(binary);
+        command
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", fixture.join("home"))
@@ -85,15 +92,25 @@ impl Daemon {
             .env("XDG_STATE_HOME", fixture.join("state"))
             .env("XDG_CACHE_HOME", fixture.join("cache"))
             .env("TMPDIR", fixture.join("tmp"))
+            .env("SUBC_CGROUP_PLACEMENT", "disabled")
             .env("SUBC_PORT", "0")
             .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(
                 fs::File::create(fixture.join("daemon.stderr")).unwrap(),
-            ))
-            .spawn()
-            .unwrap();
+            ));
+        if dev {
+            let script = fixture.join("operator");
+            fs::write(&script, "approve\n".repeat(16)).unwrap();
+            command
+                .arg("--config-store-root")
+                .arg(fixture.join("authority"))
+                .env("SUBC_TEST_CONFIG_GATE", "1")
+                .env("SUBC_TEST_OPERATOR_SCRIPT", script)
+                .env("SUBC_TEST_OPERATOR_EVENTS", fixture.join("operator-events"));
+        }
+        let child = command.spawn().unwrap();
         let mut daemon = Self { child, home };
         let connection = daemon.home.path().join("runtime/subc-connection.json");
         tokio::time::timeout(Duration::from_secs(30), async {
@@ -125,7 +142,7 @@ impl Daemon {
 #[tokio::test]
 #[ignore = "requires CK_SUBC_BIN with config.gate"]
 async fn subc_settings_real_daemon_declares_then_filters_ready_catalog_and_applies_changed() {
-    let (daemon, client) = Daemon::launch(|fixture| {
+    let (daemon, client) = Daemon::launch(false, |fixture| {
         fs::write(
             fixture.join("config/cortexkit/aft.jsonc"),
             r#"{"memory":"lean","disabled_tools":["aft_search"]}"#,
@@ -199,4 +216,221 @@ async fn subc_settings_real_daemon_declares_then_filters_ready_catalog_and_appli
             daemon.log()
         )
     });
+}
+
+async fn desktop(daemon: &Daemon) -> tokio::net::UnixStream {
+    let connection = subc_transport::connection_file::read_with_local_endpoint(
+        daemon.home.path().join("runtime/subc-connection.json"),
+    )
+    .unwrap();
+    let Some(subc_transport::LocalEndpoint::Unix { path }) = connection.local_endpoint else {
+        panic!("isolated desktop fixture requires the daemon's local endpoint");
+    };
+    let mut stream = tokio::net::UnixStream::connect(path).await.unwrap();
+    subc_transport::authenticate_client_with_role(
+        &mut stream,
+        &connection.info,
+        Duration::from_secs(5),
+        "desktop-app",
+    )
+    .await
+    .unwrap();
+    stream
+}
+
+async fn rpc(
+    stream: &mut tokio::net::UnixStream,
+    body: Value,
+) -> (subc_protocol::FrameType, Value) {
+    use subc_protocol::{Flags, Frame, FrameType, Priority};
+    let frame = Frame::build(
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        0,
+        0,
+        2,
+        serde_json::to_vec(&body).unwrap(),
+    )
+    .unwrap();
+    subc_transport::write_frame(stream, &frame).await.unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(20), subc_transport::read_frame(stream))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply.header.corr, 2);
+    (
+        reply.header.ty,
+        serde_json::from_slice(&reply.body).unwrap(),
+    )
+}
+
+async fn approve(stream: &mut tokio::net::UnixStream, op: &str) -> u64 {
+    let (_, plan) = rpc(stream, json!({"op":op})).await;
+    assert!(plan["view"]["digest"].is_string(), "{op}: {plan}");
+    let (_, applied) = rpc(
+        stream,
+        json!({"op":"config.apply","digest":plan["view"]["digest"]}),
+    )
+    .await;
+    applied["generation"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{op} approval: {applied}"))
+}
+
+async fn eventually<T, Fut>(daemon: &Daemon, label: &str, mut probe: impl FnMut() -> Fut) -> T
+where
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(result) = probe().await {
+                return result;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{label}: {}", daemon.log()))
+}
+
+#[tokio::test]
+#[ignore = "requires CK_SUBC_DEV_BIN with the upstream scripted Linux approval features"]
+async fn subc_settings_real_dev_daemon_reviews_applies_and_serves_declaration_pending() {
+    let (daemon, consumer) = Daemon::launch(true, |fixture| {
+        fs::write(
+            fixture.join("config/cortexkit/aft.jsonc"),
+            r#"{"memory":"lean"}"#,
+        )
+        .unwrap();
+    })
+    .await;
+    eventually(&daemon, "initial AFT readiness", || async {
+        consumer
+            .catalog_list()
+            .await
+            .ok()?
+            .modules
+            .iter()
+            .any(|row| row.module_id == "aft" && row.ready)
+            .then_some(())
+    })
+    .await;
+    let mut operator = desktop(&daemon).await;
+    let generation = approve(&mut operator, "config.stamp").await;
+    assert_eq!(generation, 1);
+    eventually(&daemon, "stamped generation activation", || async {
+        consumer
+            .config_modules()
+            .await
+            .ok()?
+            .modules
+            .iter()
+            .any(|row| row.module_id == "aft" && row.active_generation == Some(generation))
+            .then_some(())
+    })
+    .await;
+
+    // The daemon's schema accepts this integer. Only AFT enforces its upper bound.
+    fs::write(
+        daemon.user_file(),
+        r#"{"memory":"lean","formatter_timeout_secs":601}"#,
+    )
+    .unwrap();
+    let (kind, refused) = rpc(&mut operator, json!({"op":"config.plan"})).await;
+    assert_eq!(kind, subc_protocol::FrameType::Error, "{refused}");
+    assert_eq!(refused["code"], "module_review_refused", "{refused}");
+    assert!(
+        refused.to_string().contains("/formatter_timeout_secs"),
+        "{refused}"
+    );
+    assert!(!refused.to_string().contains("601"), "{refused}");
+
+    fs::write(daemon.user_file(), r#"{"memory":"balanced"}"#).unwrap();
+    let generation = approve(&mut operator, "config.plan").await;
+    eventually(&daemon, "approved live generation activation", || async {
+        consumer
+            .config_modules()
+            .await
+            .ok()?
+            .modules
+            .iter()
+            .any(|row| row.module_id == "aft" && row.active_generation == Some(generation))
+            .then_some(())
+    })
+    .await;
+
+    let path = daemon.home.path().join("aft-schema.json");
+    let mut changed: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    changed["properties"]["format_on_edit"] = json!({"type":"boolean","description":"Format after edit","default":true,"x-ck-apply":"live"});
+    fs::write(path, changed.to_string()).unwrap();
+    fs::write(daemon.user_file(), r#"{"memory":"lean"}"#).unwrap();
+    // Root-relative test inputs changed, but the approved launch command did not.
+    let (kind, reply) = rpc(
+        &mut operator,
+        json!({"op":"supervisor.restart","module_id":"aft"}),
+    )
+    .await;
+    assert_ne!(kind, subc_protocol::FrameType::Error, "{reply}");
+    eventually(
+        &daemon,
+        "new declaration uses last approved settings",
+        || async {
+            let health = consumer.supervisor_health_probe("aft").await.ok()?;
+            let metrics = health.metrics?;
+            (metrics["settings"]["declaration_pending"] == true
+                && metrics["memory_profile"]["value"] == "balanced")
+                .then_some(())
+        },
+    )
+    .await;
+    let settings = consumer.config_modules().await.unwrap();
+    assert!(settings.modules.iter().any(|row| row.module_id == "aft"
+        && row.active_generation == Some(generation)
+        && row.declaration_pending.is_some()));
+}
+
+#[tokio::test]
+#[ignore = "requires CK_SUBC_DEV_BIN with the upstream scripted Linux approval features"]
+async fn subc_settings_real_dev_daemon_no_approved_config_keeps_aft_not_ready() {
+    let (daemon, consumer) = Daemon::launch(true, |fixture| {
+        // Stamp before the supervised process declares its settings. The
+        // launch recipe is approved, but no AFT settings generation exists.
+        let path = fixture.join("config/cortexkit/subc.jsonc");
+        let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let program = config["modules"]["aft"]["program"].clone();
+        config["modules"]["aft"]["program"] = json!("/bin/sh");
+        config["modules"]["aft"]["args"] = json!([
+            "-c",
+            "while [ ! -f \"$1\" ]; do sleep 0.05; done; shift; exec \"$@\"",
+            "wait-for-stamp",
+            fixture.join("stamped"),
+            program
+        ]);
+        fs::write(path, config.to_string()).unwrap();
+        fs::write(
+            fixture.join("config/cortexkit/aft.jsonc"),
+            r#"{"memory":"lean"}"#,
+        )
+        .unwrap();
+    })
+    .await;
+    let mut operator = desktop(&daemon).await;
+    assert_eq!(approve(&mut operator, "config.stamp").await, 1);
+    fs::write(daemon.home.path().join("stamped"), b"").unwrap();
+    eventually(
+        &daemon,
+        "AFT stayed registered but not ready without an approved view",
+        || async {
+            let health = consumer.supervisor_health_probe("aft").await.ok()?;
+            let metrics = health.metrics?;
+            (metrics["settings"]["reason"] == "no_approved_config").then_some(())
+        },
+    )
+    .await;
+    let catalog = consumer.catalog_list().await.unwrap();
+    assert!(catalog
+        .modules
+        .iter()
+        .any(|row| row.module_id == "aft" && !row.ready));
 }
