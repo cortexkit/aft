@@ -432,7 +432,7 @@ fn per_call_masker_runs_before_detail_sizing_and_unavailable_masker_withholds() 
     let detail = detail.unwrap();
     let encoded = serde_json::to_string(&detail).unwrap();
     assert!(!encoded.contains("agent-opaque-value"));
-    assert!(detail["files"][0]["diff"]
+    assert!(detail["hunks"][0]["lines"][1]["text"]
         .as_str()
         .unwrap()
         .contains("REDACTED"));
@@ -650,6 +650,41 @@ fn native_edit_write_and_patch_capture_final_mutations_without_reply_fields() {
             1
         );
     }
+}
+
+#[test]
+fn batch_edit_no_match_publishes_plain_hunks_with_scalar_marks() {
+    let f = fixture("edit", "display-batch-no-match");
+    let ctx = crate::subc::test_support::test_ctx();
+    ctx.update_config(|config| {
+        config.project_root = Some(f._dir.path().into());
+        config.storage_dir = Some(f._dir.path().join("storage"));
+    });
+    let path = f._dir.path().join("a.txt");
+    let looked = "héllo 🙂 a value at the end";
+    let closest = "héllo 🙂 a value at the end!";
+    std::fs::write(&path, format!("unrelated\n{closest}\n")).unwrap();
+    f.capture.lock().unwrap().masker = Some(crate::log_redact::SecretValues::from_environment([]));
+    let request = serde_json::from_value(json!({
+        "id":"miss","command":"batch","file":path,
+        "edits":[{"oldString":looked,"newString":"new"}]
+    }))
+    .unwrap();
+    let _active = enter(Some(&f.key));
+    assert!(!crate::commands::batch::handle_batch(&request, &ctx).success);
+    handler_ready(Some(&f.key), false);
+    reply(&f.key, false, true, Some("batch_edit_failed"));
+
+    let writes = publications();
+    assert_eq!(writes[0].body["reason"], "no_match");
+    assert_eq!(writes[1].body["noMatchChange"], 1);
+    assert_eq!(
+        writes[1].body["hunks"],
+        json!([
+            {"title":"Looked for","lines":[{"kind":"plain","text":looked,"marks":[{"start":26,"end":26}]}]},
+            {"title":"Closest text in the file · line 2","lines":[{"kind":"plain","text":closest,"marks":[{"start":26,"end":27}]}]}
+        ])
+    );
 }
 
 #[test]

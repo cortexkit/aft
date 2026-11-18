@@ -10,6 +10,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use subc_protocol::ErrorBody;
 
+mod current;
+
 #[derive(Deserialize, serde::Serialize)]
 pub(crate) struct Definition {
     pub name: String,
@@ -23,10 +25,10 @@ pub(crate) struct Shipped {
 }
 
 pub(crate) static SHIPPED: LazyLock<BTreeMap<String, Shipped>> = LazyLock::new(|| {
-    let shipped: BTreeMap<String, Shipped> =
+    let mut shipped: BTreeMap<String, Shipped> =
         serde_json::from_str(include_str!("tool_views/shipped.json"))
             .expect("committed view table");
-    for (pin, entry) in &shipped {
+    for (pin, entry) in &mut shipped {
         let digest = cortexkit_role_tool_provider::catalog::schema_digest(&entry.tool.input_schema)
             .expect("shipped schema");
         assert_eq!(
@@ -39,6 +41,7 @@ pub(crate) static SHIPPED: LazyLock<BTreeMap<String, Shipped>> = LazyLock::new(|
             .expect("shipped pin"),
             *pin
         );
+        current::append(entry);
     }
     shipped
 });
@@ -123,11 +126,12 @@ mod tests {
                 "first served definition changed for {pin}"
             );
             for old in kept.history {
+                let catalog_refresh = &SHIPPED[&pin].history[0];
                 assert_ne!(
-                    fetched.template, old.template,
+                    catalog_refresh.template, old.template,
                     "catalog refresh must change the published template bytes for {pin}"
                 );
-                assert_eq!(fetched.template_revision, old.template_revision + 1);
+                assert_eq!(catalog_refresh.template_revision, old.template_revision + 1);
                 assert_eq!(
                     fetched.compare_with_kept(&old),
                     ViewChange::NewerTemplate,
@@ -136,10 +140,10 @@ mod tests {
                 let mut expected_template = old.template;
                 for slot in ["row", "page"] {
                     expected_template[slot]["catalog"]["digest"] =
-                        fetched.template[slot]["catalog"]["digest"].clone();
+                        catalog_refresh.template[slot]["catalog"]["digest"].clone();
                 }
                 assert_eq!(
-                    fetched.template, expected_template,
+                    catalog_refresh.template, expected_template,
                     "template changed: {pin}"
                 );
             }
@@ -166,10 +170,10 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_views_have_current_revision_and_null_safe_pages() {
+    fn latest_views_use_the_current_catalog_and_preserve_the_record_schema() {
         for (pin, entry) in SHIPPED.iter() {
             let view = view(pin).unwrap();
-            assert_eq!(view.template_revision, 1);
+            assert_eq!(view.template_revision, 2);
             assert_eq!(
                 view.record_schema,
                 if entry.tool.name == "bash" {
@@ -191,7 +195,7 @@ mod tests {
                     template["catalog"],
                     json!({
                         "version": "1.1",
-                        "digest": "sha256:a95693cfabc0bf2d7e7276fd1c634128d96c11605c1cdfe480da9ac2418683a4"
+                        "digest": current::CATALOG_DIGEST
                     })
                 );
                 assert_eq!(template["reads"], json!([]));
@@ -202,14 +206,12 @@ mod tests {
                         <= 131_072
                 );
             }
-            assert!(view.template["page"]["source"]
-                .as_str()
-                .unwrap()
-                .contains("view.output ??"));
-            assert!(!view.template["page"]["source"]
-                .as_str()
-                .unwrap()
-                .contains("view.detail"));
+            let page = view.template["page"]["source"].as_str().unwrap();
+            assert!(page.contains(if entry.tool.name == "edit" {
+                "view.detail.hunks"
+            } else {
+                "view.output ??"
+            }));
         }
     }
 

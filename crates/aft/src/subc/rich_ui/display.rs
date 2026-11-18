@@ -18,6 +18,7 @@ use subc_protocol::Principal;
 
 pub(super) mod counters;
 mod diagnostics;
+mod edit_hunks;
 mod store;
 use counters::{count, Counter::*};
 
@@ -342,6 +343,7 @@ fn relative(root: &Path, path: &Path) -> Option<String> {
 fn file_bodies(capture: &Capture, success: bool) -> (Value, Option<Value>) {
     let mut record = json!({"outcome": if success {"success"} else if capture.files.is_empty() {"error"} else {"partial"}, "fileCount":0,"modifiedCount":0,"createdCount":0,"deletedCount":0,"movedCount":0});
     let mut files = Vec::new();
+    let mut hunks = edit_hunks::Hunks::default();
     let (mut added, mut removed, mut known) = (0u64, 0u64, true);
     let mut changes = capture.files.clone();
     changes.sort_by(|a, b| a.path.cmp(&b.path));
@@ -394,32 +396,36 @@ fn file_bodies(capture: &Capture, success: bool) -> (Value, Option<Value>) {
                 change.before.as_deref(),
                 change.after.as_deref(),
             ) {
-                let path = entry["path"].as_str().unwrap();
-                let diff = if change.change == "moved" && before == after {
-                    format!(
-                        "rename from {}\nrename to {path}\n",
-                        entry["oldPath"].as_str().unwrap()
-                    )
+                if capture.tool == "edit" {
+                    edit_hunks::diff(&mut hunks, masker, before, after);
                 } else {
-                    let old = if change.change == "created" {
-                        "/dev/null".into()
-                    } else {
+                    let path = entry["path"].as_str().unwrap();
+                    let diff = if change.change == "moved" && before == after {
                         format!(
-                            "a/{}",
-                            entry.get("oldPath").and_then(Value::as_str).unwrap_or(path)
+                            "rename from {}\nrename to {path}\n",
+                            entry["oldPath"].as_str().unwrap()
                         )
-                    };
-                    let new = if change.change == "deleted" {
-                        "/dev/null".into()
                     } else {
-                        format!("b/{path}")
+                        let old = if change.change == "created" {
+                            "/dev/null".into()
+                        } else {
+                            format!(
+                                "a/{}",
+                                entry.get("oldPath").and_then(Value::as_str).unwrap_or(path)
+                            )
+                        };
+                        let new = if change.change == "deleted" {
+                            "/dev/null".into()
+                        } else {
+                            format!("b/{path}")
+                        };
+                        similar::TextDiff::from_lines(before, after)
+                            .unified_diff()
+                            .header(&old, &new)
+                            .to_string()
                     };
-                    similar::TextDiff::from_lines(before, after)
-                        .unified_diff()
-                        .header(&old, &new)
-                        .to_string()
-                };
-                entry["diff"] = json!(masker.redact(&diff));
+                    entry["diff"] = json!(masker.redact(&diff));
+                }
             } else {
                 // Diffs are masked with the secret values this agent has
                 // resolved (`capture.masker`). Without that list, generic
@@ -445,10 +451,18 @@ fn file_bodies(capture: &Capture, success: bool) -> (Value, Option<Value>) {
         if let Some(location) = record.get("location") {
             detail["location"] = location.clone();
         }
+        hunks.attach(&mut detail);
         detail
     });
+    let detail = if capture.tool == "edit" {
+        detail.and_then(|detail| records::cut_detail(detail, crate::edit::DIFF_RESPONSE_BUDGET))
+    } else {
+        detail
+    };
     (record, detail)
 }
+
+pub(crate) use edit_hunks::capture_no_match as edit_no_match;
 
 fn emit(capture: &Capture, kind: DisplayKind, body: Value) {
     let Some(view) = crate::subc::tool_views::view(&capture.identity.schema_pin) else {
@@ -1304,7 +1318,7 @@ pub(crate) fn handler_ready(ledger_key: Option<&crate::db::call_ledger::Key>, su
                     .processing_ms
                     .saturating_add(began.elapsed().as_millis() as u64);
             }
-            if capture.tool != "bash" {
+            if capture.tool != "bash" && capture.file_snapshot.is_none() {
                 capture.file_snapshot = Some(file_bodies(&capture, success));
             }
         }

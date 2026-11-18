@@ -553,6 +553,9 @@ fn resolve_edit_with_offsets(
         };
 
         if fuzzy_matches.is_empty() {
+            if let Some(path) = path {
+                crate::subc::rich_ui::display::edit_no_match(path, source, match_str, index);
+            }
             let message = format!(
                 "batch: edit[{}] match {} not found in file{}",
                 index,

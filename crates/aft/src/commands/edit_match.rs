@@ -1903,6 +1903,7 @@ fn handle_single_file_edit_match(
     let fuzzy_matches = crate::fuzzy_match::find_all_fuzzy(&source, match_str);
 
     if fuzzy_matches.is_empty() {
+        crate::subc::rich_ui::display::edit_no_match(path.as_path(), &source, match_str, 0);
         return Response::error(
             &req.id,
             "match_not_found",

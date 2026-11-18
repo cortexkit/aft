@@ -1720,7 +1720,10 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-fn construct_diff<'a>(before: &'a str, after: &'a str) -> similar::TextDiff<'a, 'a, 'a, str> {
+pub(crate) fn construct_diff<'a>(
+    before: &'a str,
+    after: &'a str,
+) -> similar::TextDiff<'a, 'a, 'a, str> {
     #[cfg(test)]
     if let Some(timeout) = DIFF_TIMEOUT_OVERRIDE.with(std::cell::Cell::get) {
         return construct_diff_with_timeout(before, after, timeout);

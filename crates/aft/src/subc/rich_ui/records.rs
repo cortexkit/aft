@@ -65,6 +65,19 @@ pub(crate) fn cut_detail(mut body: Value, limit: usize) -> Option<Value> {
     body["truncated"] = json!(true);
     body["omittedItems"] = json!(0);
     body["omittedBytes"] = json!(0);
+    while body.get("hunks").is_some() && size(&body) > limit {
+        let hunks = body["hunks"].as_array_mut()?;
+        let Some(last) = hunks.last_mut() else { break };
+        let lines = last["lines"].as_array_mut()?;
+        let line = lines.pop()?;
+        omitted_bytes += line["text"].as_str()?.len();
+        omitted_items += 1;
+        if lines.is_empty() {
+            hunks.pop();
+        }
+        body["omittedItems"] = json!(omitted_items);
+        body["omittedBytes"] = json!(omitted_bytes);
+    }
     if body.get("files").is_some() {
         let files = body["files"].as_array_mut()?;
         // Stable path/operation order is retained. Drop diff content before an

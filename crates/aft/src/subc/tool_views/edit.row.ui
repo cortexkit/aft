@@ -1,0 +1,12 @@
+<ToolHeader icon="edit" title={FileName(input.path)} subtitle={Folder(input.path)} truncate="middle">
+<Slot width="medium">
+{view.call.phase == "unanswered" ? <ToolText text="Not run" size="small" tone="muted" />
+ : (view.completion.reason ?? view.record.reason) == "no_match" ? <ToolText text="No match" size="small" tone="danger" />
+ : (view.completion.reason ?? view.record.reason) == "invalid_syntax" || (view.completion.reason ?? view.record.reason) == "syntax_error" ? <ToolText text="Invalid syntax" size="small" tone="danger" />
+ : (view.completion.outcome ?? view.record.outcome) == "partial" ? <ToolText text="Partly applied" size="small" tone="warning" />
+ : (view.completion.outcome ?? view.record.outcome) == "error" ? <ToolText text="Failed" size="small" tone="danger" />
+ : (view.completion.addedLines ?? view.record.addedLines) != null && (view.completion.removedLines ?? view.record.removedLines) != null
+ ? <Card appearance="clear" direction="row" gap="xs"><ToolText text={"+" + Text(view.completion.addedLines ?? view.record.addedLines)} font="mono" size="small" tone="success" /><ToolText text={"−" + Text(view.completion.removedLines ?? view.record.removedLines)} font="mono" size="small" tone="danger" /></Card>
+ : view.call.phase == "running" && view.call.startedAtMs != null ? <Elapsed start={view.call.startedAtMs ?? 0} /> : null}
+</Slot>
+</ToolHeader>
