@@ -15,6 +15,8 @@ pub mod process;
 pub mod pty_process;
 pub mod pty_runtime;
 pub mod registry;
+pub(crate) mod runner_notice_scheduler;
+pub(crate) mod scoped_tasks;
 pub(crate) mod shell_metadata;
 pub(crate) mod store_writes;
 pub(crate) mod task_scope;

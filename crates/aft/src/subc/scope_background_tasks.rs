@@ -2,12 +2,14 @@
 //! behind tool execution, so core can promptly check whether a worker is done.
 
 use super::*;
+use crate::bash_background::scoped_tasks::{running, Running, Selector};
+#[cfg(test)]
+use crate::bash_background::scoped_tasks::{Remote, COMMAND_BYTES};
 use serde::{Deserialize, Serialize};
 
 pub(super) const CAPABILITY: &str = "scope-background-tasks/v1";
 pub(super) const OPERATION: &str = "scope.background_tasks";
 const WALK_LIMIT: usize = 4096;
-const COMMAND_BYTES: usize = 2048;
 const INCOMPLETE_REASONS: [&str; 7] = [
     "registry_busy",
     "task_busy",
@@ -133,44 +135,10 @@ impl Observation {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Selector {
-    pub owner: Principal,
-    #[serde(rename = "ref")]
-    pub scope_ref: String,
-    pub epoch: u64,
-}
-
-impl Selector {
-    pub(crate) fn matches(&self, stamp: &subc_protocol::scope::ScopeStamp) -> bool {
-        self.owner == stamp.owner
-            && self.scope_ref == stamp.scope_ref
-            && self.epoch == stamp.scope_epoch
-    }
-}
-
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Params {
     scope: Selector,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct Running {
-    pub task_id: String,
-    pub title: String,
-    pub command: String,
-    pub started_at_ms: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub remote: Option<Remote>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub command_truncated: bool,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct Remote {
-    pub job_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -188,32 +156,6 @@ impl Reply {
             complete: false,
             reason: Some(reason.into()),
         }
-    }
-}
-
-pub(crate) fn running(metadata: &crate::bash_background::persistence::PersistedTask) -> Running {
-    let mut command = crate::log_redact::redact_command(&metadata.command).into_owned();
-    let command_truncated = command.len() > COMMAND_BYTES;
-    if command_truncated {
-        let mut end = COMMAND_BYTES;
-        while !command.is_char_boundary(end) {
-            end -= 1;
-        }
-        command.truncate(end);
-    }
-    Running {
-        task_id: metadata.task_id.clone(),
-        title: command.clone(),
-        command,
-        command_truncated,
-        started_at_ms: metadata.started_at,
-        remote: metadata
-            .remote
-            .as_ref()
-            .and_then(|remote| remote.job_id)
-            .map(|job_id| Remote {
-                job_id: job_id.to_string(),
-            }),
     }
 }
 

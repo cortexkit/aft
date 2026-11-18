@@ -101,7 +101,7 @@ fn status(kind: Kind, value: bool, reason: Option<&'static str>) {
         Kind::SendState => {
             SEND_ATTACHED.store(value, Ordering::Relaxed);
             if changed {
-                crate::subc::runner_notices::bus_attachment_changed(value);
+                crate::bash_background::runner_notice_scheduler::bus_attachment_changed(value);
             }
         }
     }
@@ -299,7 +299,7 @@ async fn send_wake(body: &[u8]) -> Result<(), &'static str> {
             Some("send_state_body_malformed"),
         );
     }
-    crate::subc::runner_notices::bus_wake(send_id(body).as_deref()).await?;
+    crate::bash_background::runner_notice_scheduler::bus_wake(send_id(body).as_deref()).await?;
     HEALTH.lock().sendstate.events_handled += 1;
     Ok(())
 }

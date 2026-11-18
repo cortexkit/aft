@@ -1,5 +1,5 @@
 use self::remote::RemoteOomKillText;
-use crate::bash_background::TaskIdentityAuth;
+use crate::bash_background::{runner_notice_scheduler, scoped_tasks, TaskIdentityAuth};
 #[cfg(unix)]
 use crate::posix_spawn::Child;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -4102,7 +4102,7 @@ impl BgTaskRegistry {
             .unwrap_or_else(|e| e.into_inner());
         if delivery.is_some() {
             if *delivery == Some(RecoveredDelivery::Notice) {
-                crate::subc::retry_held_notice_fallback(
+                runner_notice_scheduler::retry_held_notice_fallback(
                     self.clone(),
                     metadata.task_id.clone(),
                     crate::db::call_ledger::Key {
@@ -4219,7 +4219,7 @@ impl BgTaskRegistry {
         if let Some(error) = fallback_error {
             crate::slog_warn!("recovered bash notice fallback chosen task={} call_key={} settlement_error={error}", metadata.task_id, key.key);
             if !self.retry_held_notice_fallback(&metadata.task_id, &ledger_key) {
-                crate::subc::retry_held_notice_fallback(
+                runner_notice_scheduler::retry_held_notice_fallback(
                     self.clone(),
                     metadata.task_id.clone(),
                     ledger_key,
@@ -9323,15 +9323,9 @@ impl BgTaskRegistry {
 
     pub(crate) fn try_scope_background_tasks(
         &self,
-        scope: &crate::subc::scope_background_tasks::Selector,
+        scope: &scoped_tasks::Selector,
         remaining: &mut usize,
-    ) -> Result<
-        (
-            HashSet<String>,
-            Vec<crate::subc::scope_background_tasks::Running>,
-        ),
-        String,
-    > {
+    ) -> Result<(HashSet<String>, Vec<scoped_tasks::Running>), String> {
         let tasks = self.inner.tasks.try_lock().map_err(|_| "registry_busy")?;
         let mut known = HashSet::new();
         let mut running = Vec::new();
@@ -9348,7 +9342,7 @@ impl BgTaskRegistry {
                 .is_some_and(|stamp| scope.matches(stamp))
                 && !metadata.is_terminal()
             {
-                running.push(crate::subc::scope_background_tasks::running(metadata));
+                running.push(scoped_tasks::running(metadata));
             }
         }
         Ok((known, running))

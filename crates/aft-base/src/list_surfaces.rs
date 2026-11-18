@@ -1083,9 +1083,21 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "subc/scope_background_tasks.rs",
-        enclosing_item: "running, scan_saved, scan_sessions, next_entry, expected_roots, registry_snapshot",
-        location_or_primitive: "COMMAND_BYTES and WALK_LIMIT",
-        reason: "owner-only management snapshot, not an agent result list; command_truncated identifies the UTF-8 command ceiling and complete false with a reason discloses every bounded or failed walk",
+        enclosing_item: "scan_saved, scan_sessions, next_entry, expected_roots, registry_snapshot",
+        location_or_primitive: "WALK_LIMIT",
+        reason: "owner-only management snapshot, not an agent result list; complete false with a reason discloses every bounded or failed walk",
+    },
+    ExclusionEntry {
+        file: "bash_background/scoped_tasks.rs",
+        enclosing_item: "running",
+        location_or_primitive: "COMMAND_BYTES",
+        reason: "a command preview, not a result list; command_truncated identifies the UTF-8 byte ceiling",
+    },
+    ExclusionEntry {
+        file: "bash_background/runner_notice_scheduler.rs",
+        enclosing_item: "offer_follow",
+        location_or_primitive: "QUEUE_CAPACITY",
+        reason: "an internal delivery queue bound, not a limit on results returned to an agent",
     },
     ExclusionEntry {
         file: "subc/bash_notice_text.rs",

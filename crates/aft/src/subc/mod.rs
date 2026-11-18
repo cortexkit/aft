@@ -235,7 +235,6 @@ use installed_routes::{insert_route_channel, remove_route_channel};
 mod legacy_root;
 use legacy_root::*;
 pub(crate) mod held_task_recovery;
-pub(crate) use runner_notices::retry_held_notice_fallback;
 #[cfg(test)]
 mod idle_reap_frame_loop_tests;
 #[cfg(test)]
