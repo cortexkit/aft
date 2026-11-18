@@ -2686,10 +2686,17 @@ pub(super) mod tests {
 
     fn patch_diff_budget_fixture(large: bool) -> ToolCallResult {
         let dir = tempfile::tempdir().unwrap();
-        let deleted = dir.path().join("deleted.txt");
-        let source = dir.path().join("source.txt");
-        let moved = dir.path().join("moved.txt");
-        let edited = dir.path().join("edited.txt");
+        // macOS temp folders sit behind the /var -> /private/var link and the
+        // patch reports resolved paths, so build the fixture from the resolved
+        // folder. Elsewhere the temp path is used as is.
+        #[cfg(target_os = "macos")]
+        let root = dir.path().canonicalize().unwrap();
+        #[cfg(not(target_os = "macos"))]
+        let root = dir.path().to_path_buf();
+        let deleted = root.join("deleted.txt");
+        let source = root.join("source.txt");
+        let moved = root.join("moved.txt");
+        let edited = root.join("edited.txt");
         let original = if large {
             // A 33,608,233-byte, 380,960-line deletion must not hide later outcomes.
             let mut text = format!("{}\n", "x".repeat(33_608_233 - 380_959 * 88 - 1));
@@ -2709,8 +2716,8 @@ pub(super) mod tests {
         let ctx = crate::context::AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
-                project_root: Some(dir.path().to_owned()),
-                storage_dir: Some(dir.path().join("state")),
+                project_root: Some(root.clone()),
+                storage_dir: Some(root.join("state")),
                 format_on_edit: false,
                 diagnostics_on_edit: false,
                 disabled_tools: vec![],
@@ -2765,8 +2772,8 @@ pub(super) mod tests {
             assert!(response.data.get("diff_preview_omitted").is_none());
             let golden = [
                 (deleted, "@@ -1 +0,0 @@\n-deleted\n"),
-                (dir.path().join("moved.txt"), "@@ -1 +1 @@\n-old move\n+new move\n"),
-                (dir.path().join("edited.txt"), "@@ -1 +1 @@\n-old edit\n+new edit\n"),
+                (root.join("moved.txt"), "@@ -1 +1 @@\n-old move\n+new move\n"),
+                (root.join("edited.txt"), "@@ -1 +1 @@\n-old edit\n+new edit\n"),
             ].map(|(path, hunk)| {
                 let path = path.to_string_lossy().replace('\\', "/");
                 format!("Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n{hunk}")
