@@ -38,7 +38,7 @@ const DISCOVERY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const DISCOVERY_MAX_BACKOFF: Duration = Duration::from_secs(60);
 const STATUS_PUBLISH_TTL_MS: u64 = 7_500;
 const STATUS_MODULE: &str = "aft";
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 const STATUS_HOLDER_MODULE: &str = crate::prefrontal::LEGACY_MODULE_ID;
 const STATUS_LINE_OPERATION: &str = "status.line";
 
