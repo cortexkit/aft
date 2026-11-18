@@ -2898,7 +2898,10 @@ async fn s2_withdraw_of_a_running_keyed_bash_kills_only_that_task() {
                 "killed".into(),
                 Some("withdrawn".into())
             ),
-        ]
+        ],
+        "provider stderr:\n{}",
+        std::fs::read_to_string(root.join("daemon.stderr"))
+            .unwrap_or_else(|error| format!("cannot read provider stderr: {error}"))
     );
 }
 

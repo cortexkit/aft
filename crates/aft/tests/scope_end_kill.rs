@@ -147,6 +147,10 @@ fn startup_debug_logs(directory: &Path) -> String {
 
 impl Daemon {
     async fn spawn(root: &Path, ops: &[&str]) -> Self {
+        Self::spawn_with_scope_poll(root, ops, Some("500")).await
+    }
+
+    async fn spawn_with_scope_poll(root: &Path, ops: &[&str], poll_ms: Option<&str>) -> Self {
         let config = root.join("project/.cortexkit");
         std::fs::create_dir_all(&config).unwrap();
         std::fs::write(
@@ -194,11 +198,14 @@ impl Daemon {
             .env_remove("SUBC_LAUNCH_NONCE")
             .env_remove("AFT_STORAGE_DIR")
             .env("AFT_TEST_DISABLE_FILE_WATCHER", "1")
-            .env("AFT_TEST_SCOPE_POLL_MS", "500")
             .env("AFT_TEST_SCOPE_DESCRIBE_TIMEOUT_MS", "200")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()));
+        match poll_ms {
+            Some(ms) => command.env("AFT_TEST_SCOPE_POLL_MS", ms),
+            None => command.env_remove("AFT_TEST_SCOPE_POLL_MS"),
+        };
         for (variable, directory) in [
             ("XDG_CONFIG_HOME", "config"),
             ("XDG_DATA_HOME", "data"),
@@ -1449,8 +1456,11 @@ async fn connection_loss_detaches_without_queueing_or_killing() {
             "principal":"reserved:broca", "harness":"runner", "session":"session-1",
         })
     );
+    let is_control =
+        |frame: &Frame| frame.header.ty == FrameType::Request && frame.header.channel == 0;
+    // Already received frames cannot have been triggered by the EOF below.
+    while daemon.frames.try_recv().is_ok() {}
     daemon.writer.shutdown().await.unwrap();
-    daemon.reader.abort();
     let until = tokio::time::Instant::now() + Duration::from_secs(10);
     while daemon.child.try_wait().unwrap().is_none() {
         assert!(
@@ -1460,9 +1470,15 @@ async fn connection_loss_detaches_without_queueing_or_killing() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(daemon.controls.is_empty());
+    assert!(daemon
+        .next_matching(Duration::from_millis(700), is_control)
+        .await
+        .is_none());
     assert_eq!(task_metadata(&root)[0].1["status"], "running");
     drop(daemon);
-    let mut daemon = Daemon::spawn(&root, &["scope.describe"]).await;
+    // The fast fixture poll can query restored work before its route is bound.
+    // Use production timing so this window tests queued work, not periodic polling.
+    let mut daemon = Daemon::spawn_with_scope_poll(&root, &["scope.describe"], None).await;
     daemon
         .bind(1, 1, "broca", Some(stamp("owner", 1)), false)
         .await;
@@ -1474,9 +1490,7 @@ async fn connection_loss_detaches_without_queueing_or_killing() {
         .assert_foreign_task_is_concealed(task["task_id"].as_str().unwrap(), "session-1")
         .await;
     assert!(daemon
-        .next_matching(Duration::from_millis(700), |frame| frame.header.ty
-            == FrameType::Request
-            && frame.header.channel == 0)
+        .next_matching(Duration::from_millis(700), is_control)
         .await
         .is_none());
     daemon

@@ -4,6 +4,10 @@ pub(crate) use linux::*;
 pub(crate) use unsupported::*;
 
 #[cfg(target_os = "linux")]
+#[path = "scope_kill.rs"]
+mod scope_kill;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use super::super::HardKill;
     const TASK_SLICE: &str = "aft.slice";
@@ -166,9 +170,12 @@ mod linux {
             match lookup_local(task_id, recorded)? {
                 LocalScopeLookup::Present(handle) => Ok(Some(handle)),
                 LocalScopeLookup::Absent => Ok(None),
-                LocalScopeLookup::Unknown => Err(format!(
-                    "task scope aft-task-{task_id}.scope could not be killed"
-                )),
+                LocalScopeLookup::Unknown => {
+                    log::warn!("task scope kill could not locate the cgroup for {task_id}");
+                    Err(format!(
+                        "task scope aft-task-{task_id}.scope could not be killed"
+                    ))
+                }
             }
         }
 
@@ -1135,16 +1142,7 @@ mod linux {
                     events.lock().unwrap().push("scope-kill");
                 }
             });
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .open(self.cgroup.join("cgroup.kill"))
-            {
-                Ok(mut file) => file.write_all(b"1"),
-                Err(e) if e.kind() == io::ErrorKind::NotFound && !self.cgroup.try_exists()? => {
-                    Ok(())
-                }
-                Err(e) => Err(e),
-            }
+            super::scope_kill::kill(&self.cgroup)
         }
         pub(crate) fn stop(&self) -> Result<(), String> {
             stop_unit_with(&self.manager, &self.unit)
