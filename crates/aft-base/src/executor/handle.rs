@@ -949,7 +949,7 @@ impl<C: ExecutorContext> Executor<C> {
         self.wake_scheduler();
     }
 
-    fn maintenance_root_is_dir(&self, root_id: &ProjectRootId) -> bool {
+    pub(super) fn maintenance_root_is_dir(&self, root_id: &ProjectRootId) -> bool {
         #[cfg(any(test, feature = "test-support"))]
         {
             let hook = self.inner.maintenance_root_check_hook.lock().take();
