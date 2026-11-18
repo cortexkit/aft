@@ -1,8 +1,8 @@
 use std::fs;
 use std::sync::Arc;
 
+use aft::commands::semantic_search::exact_lane::ExactLane;
 use aft::commands::semantic_search::generation_token::GenerationToken;
-use aft::search_index::exact_lane::ExactLane;
 use aft::search_index::memo::{ExactMemoStore, MemoKey};
 
 #[derive(Debug, PartialEq, Eq)]

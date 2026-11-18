@@ -11,6 +11,7 @@ use crate::search_index::{
 };
 
 pub(crate) use crate::grep_executor::ripgrep_glob;
+pub(crate) use crate::search_index::{GREP_LINE_TRUNCATED_MARKER, GREP_MAX_LINE_CHARS};
 
 /// Matching lines the grep tool shows on a page after the first unless the
 /// caller asks for a different page size through `max_results`.
@@ -19,15 +20,9 @@ const MAX_GREP_OFFSET: usize = 100000;
 const MAX_LINE_CHARS: usize = 200;
 const MAX_MATCHES_PER_FILE: usize = 10;
 const MAX_DISPLAY_MATCHES_PER_FILE: usize = 5;
-/// Longest matching line, in characters, the grep tool prints before cutting
-/// it and appending `GREP_LINE_TRUNCATED_MARKER`.
-pub(crate) const GREP_MAX_LINE_CHARS: usize = 500;
 /// Byte budget for the match rows of one grep reply (file headers included).
 /// Rows past the budget are left for the next page instead of being printed.
 pub(crate) const GREP_MAX_OUTPUT_BYTES: usize = crate::tool_output::LIST_BODY_BYTES;
-/// Appended to a matching line cut at `GREP_MAX_LINE_CHARS`, so the reader
-/// knows the printed text is not the whole line.
-pub(crate) const GREP_LINE_TRUNCATED_MARKER: &str = "… [line truncated]";
 
 #[cfg(test)]
 mod contract_tests {

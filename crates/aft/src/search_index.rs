@@ -29,7 +29,7 @@ use crate::pattern_compile::{self, CompileOpts, CompileResult, CompiledPattern, 
 use crate::root_identity::key::{artifact_cache_key_for_build, canonicalize_or_normalize};
 use crate::search_state::request_files::{Fetched, FileStat, RequestFile, RequestFiles};
 
-pub use crate::commands::semantic_search::exact_lane;
+pub mod exact_lane;
 pub use crate::search_state::memo;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -51,8 +51,6 @@ pub struct ExactPassMatch {
 /// corpus. Files that are read are verified exactly as under [`Self::All`], so
 /// the evidence a caller keeps is the same under any scope that keeps it.
 ///
-/// Defined here rather than in the exact lane module because that module is
-/// compiled at two paths, and both must name the same type.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ExactEvidenceScope {
     /// Declarations named after a query word, verbatim phrase evidence (E1)
@@ -71,6 +69,10 @@ pub enum ExactEvidenceScope {
 }
 
 pub(crate) const DEFAULT_MAX_FILE_SIZE: u64 = 1_048_576;
+/// Longest matching line, in characters, before appending the truncation marker.
+pub(crate) const GREP_MAX_LINE_CHARS: usize = 500;
+/// Marks a matching line cut at `GREP_MAX_LINE_CHARS` characters.
+pub(crate) const GREP_LINE_TRUNCATED_MARKER: &str = "… [line truncated]";
 const EOF_SENTINEL: u8 = 0;
 #[cfg(debug_assertions)]
 thread_local! {
@@ -5073,7 +5075,6 @@ pub(crate) fn line_details_bytes_with_cr_policy(
 /// the whole line, while a match on a multi-megabyte minified line no longer
 /// decodes and copies the whole line.
 pub(crate) fn bounded_grep_line_text(line: &str) -> String {
-    use crate::commands::grep::{GREP_LINE_TRUNCATED_MARKER, GREP_MAX_LINE_CHARS};
     match line.char_indices().nth(GREP_MAX_LINE_CHARS) {
         None => line.to_string(),
         Some((cut, _)) => format!("{}{}", &line[..cut], GREP_LINE_TRUNCATED_MARKER),
@@ -5089,7 +5090,7 @@ pub(crate) fn bounded_grep_line_text(line: &str) -> String {
 /// 3 bytes, can decode differently). A line longer than that prefix therefore
 /// always has more than `GREP_MAX_LINE_CHARS` characters and is cut.
 pub(crate) fn bounded_grep_line_text_bytes(line: &[u8]) -> String {
-    const PREFIX_BYTES: usize = (crate::commands::grep::GREP_MAX_LINE_CHARS + 2) * 4;
+    const PREFIX_BYTES: usize = (GREP_MAX_LINE_CHARS + 2) * 4;
     let prefix = &line[..line.len().min(PREFIX_BYTES)];
     bounded_grep_line_text(&String::from_utf8_lossy(prefix))
 }
@@ -5152,8 +5153,8 @@ mod tests {
     fn semantic_namespaces_share_type_identity() {
         use std::any::TypeId;
         assert_eq!(
-            TypeId::of::<super::exact_lane::ExactLane>(),
-            TypeId::of::<crate::commands::semantic_search::exact_lane::ExactLane>()
+            TypeId::of::<super::exact_lane::QualifiedMember>(),
+            TypeId::of::<crate::commands::semantic_search::exact_lane::QualifiedMember>()
         );
         assert_eq!(
             TypeId::of::<super::memo::ExactMemoStore>(),

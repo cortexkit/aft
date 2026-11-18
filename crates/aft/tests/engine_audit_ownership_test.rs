@@ -119,6 +119,7 @@ fn slices() -> Vec<Slice> {
             fence: vec![
                 FenceRule::Prefix("benchmarks/aft-search/engine-fixtures/exact/"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/exact_lane.rs"),
+                FenceRule::Exact("crates/aft/src/search_index/exact_lane.rs"),
                 FenceRule::Exact("crates/aft/src/search_state/memo.rs"),
                 FenceRule::Exact("crates/aft/src/search_index.rs"),
                 FenceRule::Exact("crates/aft/src/search_state/mod.rs"),
@@ -134,6 +135,7 @@ fn slices() -> Vec<Slice> {
                 "benchmarks/aft-search/engine-fixtures/exact/fallback_bounds.json",
                 "benchmarks/aft-search/engine-fixtures/exact/uncapped_ready.json",
                 "crates/aft/src/commands/semantic_search/exact_lane.rs",
+                "crates/aft/src/search_index/exact_lane.rs",
                 "crates/aft/src/search_state/memo.rs",
                 "crates/aft/src/search_index.rs",
                 "crates/aft/src/search_state/mod.rs",
@@ -386,6 +388,7 @@ fn constraint_paths(root: &Path) -> BTreeSet<String> {
         "crates/aft/src/data_layer/external_search.rs".to_string(),
         "crates/aft/src/commands/semantic_search.rs".to_string(),
         "crates/aft/src/search_index.rs".to_string(),
+        "crates/aft/src/search_index/exact_lane.rs".to_string(),
         "crates/aft/src/subc_tool_schemas.json".to_string(),
         "packages/opencode-plugin/src/__tests__/semantic.test.ts".to_string(),
         "packages/opencode-plugin/src/tools/semantic.ts".to_string(),

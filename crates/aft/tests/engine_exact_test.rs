@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aft::commands::semantic_search::evidence_descriptor::{EvidenceKind, EvidenceTier};
+use aft::commands::semantic_search::exact_lane::{ExactLane, FallbackExactOptions};
 use aft::commands::semantic_search::generation_token::GenerationToken;
-use aft::search_index::exact_lane::{e2_window_scan_needed, ExactLane, FallbackExactOptions};
+use aft::search_index::exact_lane::e2_window_scan_needed;
 use aft::search_index::memo::ExactMemoStore;
 use aft::search_index::SearchIndex;
 
