@@ -2603,6 +2603,9 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     let base_dir = base_src_dir();
     let mut paths = collect_rs_files(&source_dir.join("commands"));
     paths.extend(collect_rs_files(&source_dir.join("search_state")));
+    paths.extend(collect_rs_files(&source_dir.join("search_index")));
+    paths.push(source_dir.join("data_layer/callgraph_store_adapter.rs"));
+    paths.push(source_dir.join("bash_background/scoped_tasks.rs"));
     paths.push(source_dir.join("bash_changed_files.rs"));
     paths.push(source_dir.join("run_tool_call.rs"));
     paths.push(source_dir.join("subc_format.rs"));

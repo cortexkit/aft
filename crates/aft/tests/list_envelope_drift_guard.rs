@@ -78,6 +78,9 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     // 1. crates/aft/src/commands/**
     files_to_scan.extend(collect_rs_files(&src_dir.join("commands")));
     files_to_scan.extend(collect_rs_files(&src_dir.join("search_state")));
+    files_to_scan.extend(collect_rs_files(&src_dir.join("search_index")));
+    files_to_scan.push(src_dir.join("data_layer/callgraph_store_adapter.rs"));
+    files_to_scan.push(src_dir.join("bash_background/scoped_tasks.rs"));
     // 2. dispatch module (run_tool_call.rs)
     files_to_scan.push(src_dir.join("run_tool_call.rs"));
     // 3. crates/aft/src/subc_format.rs
