@@ -3,7 +3,7 @@ use parking_lot::RwLock;
 use std::{fmt, sync::Arc};
 
 /// Connection-scoped user settings. A project bind or reload may take a
-/// snapshot of this tier, but must never substitute the declaration's file.
+/// snapshot of this tier, but must not read the local aft.jsonc file instead.
 #[derive(Clone)]
 pub(crate) struct ApprovedUser(Arc<RwLock<ConfigTier>>);
 

@@ -1,5 +1,6 @@
 //! Connection-local config.gate delivery. Only the legacy, non-negotiated
-//! path may read the user file; declaration paths are never input bytes.
+//! path may read the user settings file. In gated mode, its path is sent to
+//! the daemon in `config.declare`; only `config.get` supplies user settings.
 
 use super::{readiness, *};
 use crate::{
@@ -10,6 +11,8 @@ use subc_client_rs::config::*;
 
 mod review;
 mod startup;
+#[cfg(test)]
+mod tests;
 pub(super) use startup::{
     initialize_storage, initialize_task_cleanup, legacy_catalog, negotiate, wait_for_first_view,
     LegacySettings,
@@ -20,8 +23,9 @@ const WAITING_HEALTH: &str =
     "AFT is not ready because its settings are unavailable from Subconscious.";
 const PENDING_HEALTH: &str = "AFT is using its last approved settings while a settings update awaits approval in Subconscious.";
 
-// The published vocabulary cannot yet express the existing aft.jsonc grammar.
-// Keep the editor schema separate; supplying it here would strand this module.
+// subc-config 0.1.1 rejects editor constructs such as nullable fields and
+// mixed-type unions. Leave opt-in off until the daemon can admit a declaration
+// that preserves the existing aft.jsonc grammar.
 pub fn requested() -> bool {
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     if std::env::var_os("AFT_TEST_SETTINGS_SCHEMA").is_some() {

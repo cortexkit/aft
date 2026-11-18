@@ -118,7 +118,20 @@ pub(in crate::subc) async fn wait_for_first_view(
     writer: &WriterSender,
     metrics: &DispatchPathMetrics,
 ) -> Result<Result<Arc<Session>, ModuleLoopExit>, SubcError> {
-    let declaration = declaration(user_path).map(|(request, schema)| (request, Arc::new(schema)));
+    let declaration = declaration(user_path);
+    drive_first_view(control, ctx, declaration, reader, replies, writer, metrics).await
+}
+
+pub(super) async fn drive_first_view(
+    control: &readiness::DaemonControl,
+    ctx: &Arc<AppContext>,
+    declaration: Option<(ConfigDeclareRequest, Schema)>,
+    reader: &mut mpsc::Receiver<Result<DecodedFrame, SubcError>>,
+    replies: &readiness::PendingControlReplies,
+    writer: &WriterSender,
+    metrics: &DispatchPathMetrics,
+) -> Result<Result<Arc<Session>, ModuleLoopExit>, SubcError> {
+    let declaration = declaration.map(|(request, schema)| (request, Arc::new(schema)));
     let mut reason = if declaration.is_some() {
         "waiting_for_settings"
     } else {
@@ -127,27 +140,41 @@ pub(in crate::subc) async fn wait_for_first_view(
     let mut should_fetch = declaration.is_some();
     let mut declare = should_fetch;
     loop {
+        let attempt_fetch = should_fetch;
+        let attempt_declare = declare;
         let fetch = async {
-            if !should_fetch {
+            if !attempt_fetch {
                 return std::future::pending().await;
             }
             let (input, schema) = declaration
                 .as_ref()
                 .ok_or("settings_declaration_unavailable")?;
-            if declare {
+            if attempt_declare {
                 let _: ConfigDeclareReply = request(control, input).await?;
             }
-            let view = view_from_reply(request(control, &ConfigGetRequest::new()).await?)?;
+            let reply: ConfigGetReply = request(control, &ConfigGetRequest::new()).await?;
+            let recovery = reply.pending.as_ref().and_then(|_| reply.active.clone());
+            let mut view = view_from_reply(reply)?;
             let candidate = view.clone();
-            let ctx = ctx.clone();
-            let applied = tokio::task::spawn_blocking(move || apply_initial(&ctx, &candidate))
-                .await
-                .unwrap_or(Err("settings_apply_failed"));
-            if let Err(reason) = applied {
-                report(control, &view, Err(reason)).await?;
-                return Err(reason);
-            }
-            let (tier, disabled) = applied.expect("applied initial view");
+            let apply_ctx = ctx.clone();
+            let applied =
+                tokio::task::spawn_blocking(move || apply_initial(&apply_ctx, &candidate))
+                    .await
+                    .unwrap_or(Err("settings_apply_failed"));
+            let (tier, disabled) = match applied {
+                Ok(applied) => applied,
+                Err(reason) => {
+                    report(control, &view, Err(reason)).await?;
+                    view = recovery
+                        .filter(|view| view.status == ConfigStatus::Active)
+                        .ok_or(reason)?;
+                    let candidate = view.clone();
+                    let ctx = ctx.clone();
+                    tokio::task::spawn_blocking(move || apply_initial(&ctx, &candidate))
+                        .await
+                        .unwrap_or(Err("settings_apply_failed"))?
+                }
+            };
             tokio::time::timeout(
                 CONFIG_TIMEOUT,
                 control.install_settings_catalog(build_manifest_without(&disabled).provides),
@@ -200,12 +227,12 @@ fn apply_initial(
 ) -> Result<(ConfigTier, Vec<String>), &'static str> {
     let (tier, mut config) = resolve_user(view)?;
     config.storage_dir = ctx.config_unpinned().storage_dir.clone();
-    aft_store::sync::set_macos_full_sync(config.durability.macos_full_sync);
-    crate::memory::profile::publish(config.memory);
     crate::root_cache::prepare_process_cache_root(&mut config);
     if config.storage_lease.is_none() || config.cache_unavailable.is_some() {
         return Err("settings_storage_unavailable");
     }
+    aft_store::sync::set_macos_full_sync(config.durability.macos_full_sync);
+    crate::memory::profile::publish(config.memory);
     let disabled = config.disabled_tools.clone();
     ctx.set_config(config);
     Ok((tier, disabled))
@@ -262,11 +289,7 @@ pub(super) async fn pre_ready_reply(
 }
 
 pub(in crate::subc) fn initialize_storage(app: Arc<App>, storage_dir: &Path) {
-    crate::db::runner_harness_keys::start(app.clone(), storage_dir.join("aft.db"));
     crate::db::runner_harness_keys::start(app, storage_dir.join("aft.db"));
-    if crate::launch_nonce::current().is_some() {
-        crate::agent_commands::enable(storage_dir);
-    }
     crate::bash_background::note_storage_root(storage_dir);
     crate::page_collect::snapshot::SnapshotStore::for_storage(storage_dir);
 }

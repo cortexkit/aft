@@ -72,8 +72,10 @@ fn review(schema: &Schema, request: ConfigReviewRequest) -> Result<Vec<FieldChan
         }
         if let Some(bytes) = layer.bytes {
             let text = std::str::from_utf8(&bytes).map_err(|_| String::new())?;
-            let value: Value = serde_json::from_str(&crate::jsonc::strip_jsonc(text))
-                .map_err(|_| String::new())?;
+            let value: Value = serde_json::from_str(&crate::jsonc::strip_jsonc(
+                text.trim_start_matches('\u{feff}'),
+            ))
+            .map_err(|_| String::new())?;
             layers.push(LayerValue::new(Layer::User, value));
         }
     }
@@ -83,24 +85,25 @@ fn review(schema: &Schema, request: ConfigReviewRequest) -> Result<Vec<FieldChan
     validate_user(&tuple.effective)?;
     let new_values = schema.record(&tuple.effective).map_err(|_| String::new())?;
     let base = request.base;
-    let paths: std::collections::BTreeSet<_> = tuple
-        .sources
-        .keys()
-        .chain(base.iter().flat_map(|view| view.sources.keys()))
-        .collect();
+    let old_values = base
+        .as_ref()
+        .map(|view| schema.record(&view.effective))
+        .transpose()
+        .map_err(|_| String::new())?;
+    let mut paths = std::collections::BTreeSet::new();
+    leaf_paths(&tuple.effective, "", &mut paths);
+    if let Some(base) = &base {
+        leaf_paths(&base.effective, "", &mut paths);
+    }
     let mut fields = Vec::new();
     for path in paths {
-        let old = base
-            .as_ref()
-            .and_then(|view| view.effective.pointer(path))
-            .unwrap_or(&Value::Null);
-        let new = new_values.pointer(path).unwrap_or(&Value::Null);
+        let old = base.as_ref().and_then(|view| view.effective.pointer(&path));
+        let new = tuple.effective.pointer(&path);
         let old_source = base
             .as_ref()
-            .and_then(|view| view.sources.get(path))
-            .copied()
+            .and_then(|view| source(&view.sources, &path))
             .unwrap_or(Layer::Default);
-        let new_source = tuple.sources.get(path).copied().unwrap_or(Layer::Default);
+        let new_source = source(&tuple.sources, &path).unwrap_or(Layer::Default);
         if old == new && old_source == new_source {
             continue;
         }
@@ -110,7 +113,13 @@ fn review(schema: &Schema, request: ConfigReviewRequest) -> Result<Vec<FieldChan
         } else {
             ApplyKind::Live
         };
-        let mut change = FieldChange::new(AFT_MODULE, path, recorded(old), recorded(new), apply);
+        let mut change = FieldChange::new(
+            AFT_MODULE,
+            &path,
+            recorded(old_values.as_ref().and_then(|value| value.pointer(&path))),
+            recorded(new_values.pointer(&path)),
+            apply,
+        );
         change.old_source = old_source;
         change.new_source = new_source;
         fields.push(change);
@@ -118,14 +127,47 @@ fn review(schema: &Schema, request: ConfigReviewRequest) -> Result<Vec<FieldChan
     Ok(fields)
 }
 
-fn recorded(value: &Value) -> RecordedValue {
+fn recorded(value: Option<&Value>) -> RecordedValue {
     // Schema::record already replaces credential leaves with digest records.
-    if value.get("redacted") == Some(&Value::Bool(true)) {
-        let mut record = value.clone();
-        record["kind"] = json!("redacted");
-        if let Ok(record) = serde_json::from_value(record) {
+    let value = value.cloned().unwrap_or(Value::Null);
+    if value.get("kind").and_then(Value::as_str) == Some("redacted") {
+        if let Ok(record) = serde_json::from_value(value.clone()) {
             return record;
         }
     }
-    RecordedValue::new(value.clone())
+    RecordedValue::new(value)
+}
+
+fn source(sources: &std::collections::BTreeMap<String, Layer>, path: &str) -> Option<Layer> {
+    // Arrays are reported as one change; the source map can name their items.
+    if let Some((_, source)) = sources
+        .range(format!("{path}/")..)
+        .next()
+        .filter(|(key, _)| key.starts_with(&format!("{path}/")))
+    {
+        return Some(*source);
+    }
+    let mut path = path;
+    loop {
+        if let Some(source) = sources.get(path) {
+            return Some(*source);
+        }
+        path = path.rsplit_once('/')?.0;
+    }
+}
+
+fn leaf_paths(value: &Value, path: &str, paths: &mut std::collections::BTreeSet<String>) {
+    if let Some(fields) = value.as_object().filter(|fields| {
+        !fields.is_empty() && !(fields.len() == 1 && fields.contains_key("vault_ref"))
+    }) {
+        for (name, value) in fields {
+            leaf_paths(
+                value,
+                &format!("{path}/{}", name.replace('~', "~0").replace('/', "~1")),
+                paths,
+            );
+        }
+    } else if !path.is_empty() {
+        paths.insert(path.into());
+    }
 }

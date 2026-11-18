@@ -1,0 +1,46 @@
+{
+  "op": "config.review",
+  "base_generation": 3,
+  "layers": [
+    {
+      "module_id": "sample",
+      "layer": "user",
+      "path": "/config/sample.jsonc",
+      "bytes": "eyJsaW1pdCI6MjB9DQo=",
+      "digest": "sha256:86ae271c91f16ebaef71427c1c604138ca32781b416c7d5641be1daa8a67005b"
+    },
+    {
+      "module_id": "sample",
+      "project_id": "project-a",
+      "workspace_id": "workspace-a",
+      "layer": "project",
+      "path": "/projects/a/.cortexkit/sample.jsonc"
+    }
+  ],
+  "base": {
+    "generation": 3,
+    "effective": {
+      "limit": 10
+    },
+    "sources": {
+      "/limit": "user"
+    },
+    "layers": [
+      {
+        "module_id": "sample",
+        "layer": "user",
+        "path": "/config/sample.jsonc",
+        "bytes": "77u/eyJsaW1pdCI6MTB9DQo=",
+        "digest": "sha256:e03c35c4623207b271db0b0c0cd1d3355bbc3e0a12367cd9fcc0482c0928191a"
+      },
+      {
+        "module_id": "sample",
+        "project_id": "project-a",
+        "workspace_id": "workspace-a",
+        "layer": "project",
+        "path": "/projects/a/.cortexkit/sample.jsonc"
+      }
+    ],
+    "status": "active"
+  }
+}
