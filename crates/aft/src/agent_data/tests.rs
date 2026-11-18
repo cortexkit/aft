@@ -615,6 +615,112 @@ impl super::participant::SessionBarrier for FixtureBarrier {
     }
 }
 
+#[test]
+fn release_holder_box_matches_published_contract() {
+    use super::{
+        native::NativeStores,
+        participant::{Participant, ResolvedSession},
+    };
+    use cortexkit_role_agent_data::{errors::RefusalCode, request::Request, vectors};
+    use serde_json::Value;
+    use sha2::{Digest, Sha256};
+    use std::sync::Arc;
+
+    let read_vectors = |file, pinned_digest: &str| -> Value {
+        let bytes = vectors::file(file).unwrap().as_bytes();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(bytes)),
+            pinned_digest,
+            "{file}"
+        );
+        serde_json::from_slice(bytes).unwrap()
+    };
+    let requests = read_vectors(
+        "requests.json",
+        "1f09e1ce476f4db143536c9900fd7e9906460a3f839fd3928fa490cbd8a472b0",
+    );
+    let replies = read_vectors(
+        "replies.json",
+        "7431aab0a16df7b36974d0ad0499b0a524dac2496d3786bc58a2030a8488366c",
+    );
+    fn example<'a>(group: &'a Value, name: &str) -> &'a Value {
+        group
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == name)
+            .unwrap()
+    }
+    let sample = example(
+        &requests["requests"],
+        "release names the new holder with a box id",
+    );
+    let malformed = example(&requests["refused"], "release with malformed holderBox");
+    let expected = &example(&replies["replies"], "release, writes not blocked")["reply"];
+    let method = sample["method"].as_str().unwrap();
+    let decoded = Request::decode(method, &sample["params"]).unwrap();
+    assert_eq!(decoded.params(), sample["params"]);
+
+    let temp = tempfile::tempdir().unwrap();
+    let project_root = temp.path().canonicalize().unwrap();
+    let reference = "0123456789abcdef0123456789abcdef";
+    // Replace the sample's `sample.stream` reference so AFT can bind it to a Pi session.
+    let mut with_box = sample["params"].clone();
+    with_box["refs"] = json!([{"ref_kind":"pi-session","ref":reference}]);
+    let mut without_box = with_box.clone();
+    without_box.as_object_mut().unwrap().remove("holderBox");
+    let mut different_box = with_box.clone();
+    different_box["holderBox"] = json!("fedcba9876543210fedcba9876543210");
+    let cut_params = json!({"refs":with_box["refs"], "cutId":with_box["cutId"]});
+
+    for (index, (first, conflicts)) in [
+        (&with_box, vec![&without_box, &different_box]),
+        (&without_box, vec![&with_box]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let storage = temp.path().join(index.to_string());
+        let registry = Arc::new(Registry {
+            roots: vec![project_root.clone()],
+        });
+        let sender = Participant::new(
+            storage.join("agent-data"),
+            Arc::new(FixtureResolver(ResolvedSession {
+                registered_ref: reference.into(),
+                project_root: project_root.clone(),
+                harness: "pi".into(),
+                session: "session".into(),
+                storage_harness: crate::harness::Harness::Pi,
+            })),
+            Arc::new(FixtureActivity),
+            Arc::new(NativeStores {
+                storage_root: storage,
+                registry: registry.clone(),
+                database: None,
+            }),
+            registry,
+            Arc::new(super::door_tests::MemoryDoor::aft().engram()),
+        );
+        let refusal = sender
+            .handle("reserved:entorhinal", method, &malformed["params"])
+            .unwrap_err();
+        assert_eq!(refusal.code.as_str(), malformed["code"].as_str().unwrap());
+        assert!(refusal.message.contains("holderBox"));
+        for method in ["agent_data.prepare", "agent_data.export"] {
+            sender
+                .handle("reserved:entorhinal", method, &cut_params)
+                .unwrap();
+        }
+        let release = |params: &Value| sender.handle("reserved:entorhinal", method, params);
+        assert_eq!(&release(first).unwrap(), expected);
+        for changed in conflicts {
+            assert_eq!(release(changed).unwrap_err().code, RefusalCode::IdReused);
+        }
+        assert_eq!(&release(first).unwrap(), expected);
+    }
+}
+
 fn protocol_roundtrip(reference: &str, corrupt: bool) {
     use super::{
         native::NativeStores,

@@ -271,7 +271,7 @@ cortexkit-persona = "=0.3.0"
 cortexkit-role-tool-provider = "=0.15.12"
 cortexkit-role-llm-runner = "=0.8.53"
 cortexkit-role-tool-display = "=0.1.9"
-cortexkit-role-agent-data = "=0.2.4"
+cortexkit-role-agent-data = "=0.3.3"
 cortexkit-role-user-commands = "=0.1.4"
 cortexkit-project-identity = "=0.1.5"
 cortexkit-agent-identity = "=0.1.1"
@@ -326,7 +326,7 @@ cortexkit-test-support = "=0.1.14"
 graphql-parser = "0.4.1"
 cortexkit-role-tool-provider-conformance = "=0.15.13"
 cortexkit-role-tool-provider = { version = "=0.15.12", features = ["test-vectors"] }
-cortexkit-role-agent-data = { version = "=0.2.4", features = ["test-vectors"] }
+cortexkit-role-agent-data = { version = "=0.3.3", features = ["test-vectors"] }
 cortexkit-role-harness = "=0.1.0"
 async-trait = "0.1"
 tokio = { version = "1", features = ["test-util"] }
