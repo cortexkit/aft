@@ -43,11 +43,11 @@ not download the runtime. Install the public pinned x86-64 runtime:
 ```sh
 mkdir -p target/index-matrix/runtime
 cd target/index-matrix/runtime
-curl -fL --retry 3 https://github.com/microsoft/onnxruntime/releases/download/v1.24.4/onnxruntime-linux-x64-1.24.4.tgz -o runtime.tgz
-# Recorded official archive SHA-256 (Linux x86-64):
-printf '%s  %s\n' 3a211fbea252c1e66290658f1b735b772056149f28321e71c308942cdb54b747 runtime.tgz | sha256sum -c -
-tar -xzf runtime.tgz
-export ORT_DYLIB_PATH="$PWD/onnxruntime-linux-x64-1.24.4/lib/libonnxruntime.so"
+curl -fL --retry 3 https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.24.4/microsoft.ml.onnxruntime.1.24.4.nupkg -o runtime.nupkg
+unzip -p runtime.nupkg runtimes/linux-x64/native/libonnxruntime.so > libonnxruntime.so
+# Pinned SHA-256 of the Linux x86-64 library:
+printf '%s  %s\n' d132535d051344ff5c64c9c200004150559049a81ed330eb4422c1962fb6b7e4 libonnxruntime.so | sha256sum -c -
+export ORT_DYLIB_PATH="$PWD/libonnxruntime.so"
 cd ../../..
 ```
 
@@ -235,7 +235,7 @@ Example on the dedicated server, from `/root/aft`:
 systemd-run --unit=aft-index-matrix --collect \
   --property=WorkingDirectory=/root/aft --property=KillSignal=SIGINT \
   --property=TimeoutStopSec=60 \
-  --setenv=ORT_DYLIB_PATH=/root/onnx/onnxruntime-linux-x64-1.24.4/lib/libonnxruntime.so \
+  --setenv=ORT_DYLIB_PATH=/root/onnx/libonnxruntime.so \
   /usr/bin/python3 scripts/telemetry/index-matrix/matrix.py \
   --revision meaning-nine-v2.1 --results /root/aft/target/index-matrix/full-matrix -- \
   --aft-binary /root/aft-default --shape-binary /root/aft-shape \
