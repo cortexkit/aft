@@ -1064,13 +1064,13 @@ mod tests {
     /// Whether a diagnostic line names the executor's scheduler lock site as
     /// the current holder. The site is the executor's `file!()`, which the
     /// compiler spells with the host's path separator
-    /// (`crates\aft\src\executor\mod.rs` on Windows), so the separators are
+    /// (`crates\aft-base\src\executor\handle.rs` on Windows), so the separators are
     /// normalized here, at the comparison, rather than in the diagnostic.
     fn names_executor_scheduler_holder(line: &str) -> bool {
         line.split_whitespace().any(|token| {
             token.strip_prefix("holder=").is_some_and(|site| {
                 site.replace('\\', "/")
-                    .starts_with("crates/aft-base/src/executor/mod.rs:")
+                    .starts_with("crates/aft-base/src/executor/handle.rs:")
             })
         })
     }

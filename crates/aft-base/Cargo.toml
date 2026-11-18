@@ -12,7 +12,7 @@ autotests = false
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)', 'cfg(aft_fake_lsp_helper)'] }
 
 [features]
-test-support = ["dep:tempfile", "dep:filetime", "dep:crc32fast", "dep:subc-transport"]
+test-support = ["dep:tempfile", "dep:filetime", "dep:crc32fast", "dep:subc-transport", "tokio/test-util"]
 callgraph-shape-census = []
 test-hooks = []
 test-timing-hooks = []

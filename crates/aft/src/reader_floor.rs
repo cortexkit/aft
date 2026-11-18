@@ -1385,3 +1385,14 @@ pub(crate) fn prepare_cache_root_for_test(
         .map(|parent| crate::walk_boundary::simulated_volumes::simulate(parent, u64::MAX - 17));
     crate::cache_location::prepare_cache_root(config)
 }
+
+/// Register storage-format reader-version checks before testing obsolete-cache deletion.
+#[cfg(test)]
+pub(crate) fn clean_old_for_test(
+    tiers: &[crate::config_resolve::ConfigTier],
+    storage: &std::path::Path,
+    confirm: impl FnMut(&[crate::cache_location::CleanupCandidate]) -> bool,
+) -> crate::cache_location::CleanupReport {
+    register_cache_hooks();
+    crate::cache_location::clean_old_for_test(tiers, storage, confirm)
+}

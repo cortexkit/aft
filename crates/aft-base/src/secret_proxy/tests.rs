@@ -378,6 +378,14 @@ impl Server {
                             if mode == "overlap" || mode == "hold" {
                                 overlap.wait().await;
                             }
+                            if mode == "no-content" {
+                                let mut response = Response::new(full(Bytes::new()));
+                                *response.status_mut() = StatusCode::NO_CONTENT;
+                                response
+                                    .headers_mut()
+                                    .insert("x-echo", HeaderValue::from_bytes(K1).unwrap());
+                                return Ok::<_, std::convert::Infallible>(response);
+                            }
                             let mut payload = if mode.starts_with("echo-request") {
                                 [
                                     parts.uri.to_string().as_bytes(),
