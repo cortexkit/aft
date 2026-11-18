@@ -55,6 +55,8 @@ use crate::context::AppContext;
 use crate::sandbox_profile::resolved_env_deny_paths;
 use crate::sandbox_profile::SandboxProfile;
 
+#[cfg(unix)]
+mod build_slots;
 mod requirement;
 #[cfg(unix)]
 mod settings_grants;
@@ -62,10 +64,6 @@ mod settings_grants;
 mod task_temp;
 #[cfg(unix)]
 mod worker_reads;
-#[cfg(unix)]
-mod build_slots;
-#[cfg(unix)]
-use build_slots::add_build_slot_grants;
 pub(crate) use requirement::{resolve_command_sandbox_spawn, SandboxRequirement};
 #[cfg(unix)]
 use settings_grants::absolute_env_path;
@@ -2209,6 +2207,14 @@ fn build_relaxed_profile(
     // protecting their control files or carving out sibling checkout denies.
     policy.absolute_floor = read_deny.clone();
     policy.private_stores = stores.clone();
+    // The macOS read limit hides the worker pool outside the worker's own
+    // checkout, and the build-slot launcher sits in that pool.
+    #[cfg(target_os = "macos")]
+    if worker_jail_active() {
+        let slots = build_slots::worker_build_slot_grants(home, roots, &policy);
+        build_slots::add_build_slot_reads(&slots, &mut stores, &mut write_deny);
+        policy.private_stores = stores.clone();
+    }
     let write_grants = policy.shell_grants(crate::access_policy::AccessOperation::Write);
     let mut control_roots = roots.to_vec();
     control_roots.extend(write_grants.iter().cloned());
@@ -2929,23 +2935,13 @@ fn worker_jail_grants(
     grants
         .roots
         .extend(worker_target_roots(home, project_roots, policy, &configs));
-    for (config_path, base) in configs {
-        grants.read_only.push(config_path.clone());
-        let Some(build) = cargo_build_settings(&config_path) else {
-            continue;
-        };
-        if let Some(wrapper) = build.rustc_wrapper {
-            let wrapper = PathBuf::from(wrapper);
-            let wrapper = if wrapper.is_absolute() {
-                Some(wrapper)
-            } else {
-                base.as_ref().map(|base| base.join(wrapper))
-            };
-            if let Some(wrapper) = wrapper {
-                add_build_slot_grants(&wrapper, project_roots, policy, &mut grants);
-            }
-        }
+    for (config_path, _) in configs {
+        grants.read_only.push(config_path);
     }
+    let slots = build_slots::worker_build_slot_grants(home, project_roots, policy);
+    grants.files.extend(slots.files);
+    grants.read_only.extend(slots.read_only);
+    grants.read_dirs.extend(slots.read_dirs);
     grants
 }
 

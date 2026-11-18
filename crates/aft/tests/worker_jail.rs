@@ -3026,7 +3026,22 @@ async fn worker_jail_operator_build_slot_and_container_reads() {
     if !native_available() {
         return;
     }
-    let mut jail = Jail::start().await;
+    operator_build_slot_and_container_reads(Jail::start().await).await;
+}
+
+// Workers default to the relaxed profile, which builds its grants on a separate
+// path from the strict one; the build-slot launcher must work under both.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn worker_jail_relaxed_operator_build_slot_and_container_reads() {
+    if !native_available() {
+        return;
+    }
+    operator_build_slot_and_container_reads(Jail::relaxed(false).await).await;
+}
+
+#[cfg(target_os = "macos")]
+async fn operator_build_slot_and_container_reads(mut jail: Jail) {
     let container = jail.worktree.parent().unwrap().to_path_buf();
     let cargo_config = container.join(".cargo/config.toml");
     let budget = container.join(".cargo/alfonso-test-threads");
@@ -3111,7 +3126,10 @@ with (base / 'queue.lock').open('a') as queue, (base / '0.lock').open('a') as sl
     let linked = jail
         .bash("cat ../main-link/sibling-readable.txt && echo LINK_$((1+1))")
         .await;
-    assert!(linked.contains("sibling-ok") && linked.contains("LINK_2"), "{linked}");
+    assert!(
+        linked.contains("sibling-ok") && linked.contains("LINK_2"),
+        "{linked}"
+    );
     let other = jail.bash("cat ../other-link/private.txt").await;
     assert!(!other.contains("other-worker"), "{other}");
     let built = jail.bash(&cargo_build(&jail, "", "BUILD_SLOT")).await;
