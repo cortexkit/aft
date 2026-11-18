@@ -165,7 +165,10 @@ mod linux {
             }
             match lookup_local(task_id, recorded)? {
                 LocalScopeLookup::Present(handle) => Ok(Some(handle)),
-                LocalScopeLookup::Absent | LocalScopeLookup::Unknown => Ok(None),
+                LocalScopeLookup::Absent => Ok(None),
+                LocalScopeLookup::Unknown => Err(format!(
+                    "task scope aft-task-{task_id}.scope could not be killed"
+                )),
             }
         }
 
@@ -380,7 +383,34 @@ mod linux {
                 }
             }
         }
-        None
+        // A system service can launch user scopes without belonging to the
+        // user manager's cgroup. Recover only the conventional delegated
+        // directory owned by this user; a guessed foreign directory is unsafe.
+        let service = local_cgroup_mount()?
+            .join("user.slice")
+            .join(format!("user-{uid}.slice"))
+            .join(service);
+        let metadata = std::fs::symlink_metadata(&service).ok()?;
+        use std::os::unix::fs::MetadataExt;
+        (metadata.is_dir() && metadata.uid() == uid).then(|| service.join(TASK_SLICE).join(unit))
+    }
+
+    fn local_cgroup_mount() -> Option<PathBuf> {
+        #[cfg(test)]
+        if let Some(mount) = LOCAL_RECOVERY_FIXTURE.with(|fixture| {
+            fixture
+                .borrow()
+                .as_ref()
+                .and_then(|(_, mount)| mount.clone())
+        }) {
+            return Some(mount);
+        }
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        if unsafe { libc::statfs(c"/sys/fs/cgroup".as_ptr(), stat.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        (unsafe { stat.assume_init() }.f_type == libc::CGROUP2_SUPER_MAGIC)
+            .then(|| PathBuf::from("/sys/fs/cgroup"))
     }
 
     #[derive(Debug)]
@@ -864,7 +894,8 @@ mod linux {
 
     pub(crate) fn current_cgroup(pid: u32) -> Option<PathBuf> {
         #[cfg(test)]
-        if let Some(current) = LOCAL_RECOVERY_FIXTURE.with(|fixture| fixture.borrow().clone()) {
+        if let Some((current, _)) = LOCAL_RECOVERY_FIXTURE.with(|fixture| fixture.borrow().clone())
+        {
             return Some(current);
         }
         unified_cgroup_path(&std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?)
@@ -872,7 +903,7 @@ mod linux {
 
     #[cfg(test)]
     thread_local! {
-        static LOCAL_RECOVERY_FIXTURE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+        static LOCAL_RECOVERY_FIXTURE: std::cell::RefCell<Option<(PathBuf, Option<PathBuf>)>> = const { std::cell::RefCell::new(None) };
     }
 
     #[cfg(test)]
@@ -880,7 +911,16 @@ mod linux {
         current: PathBuf,
         run: impl FnOnce() -> T,
     ) -> T {
-        struct Restore(Option<PathBuf>);
+        with_local_recovery_mount_for_test(current, None, run)
+    }
+
+    #[cfg(test)]
+    fn with_local_recovery_mount_for_test<T>(
+        current: PathBuf,
+        mount: Option<PathBuf>,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Restore(Option<(PathBuf, Option<PathBuf>)>);
         impl Drop for Restore {
             fn drop(&mut self) {
                 LOCAL_RECOVERY_FIXTURE.with(|fixture| {
@@ -889,7 +929,7 @@ mod linux {
             }
         }
         let _restore =
-            Restore(LOCAL_RECOVERY_FIXTURE.with(|fixture| fixture.replace(Some(current))));
+            Restore(LOCAL_RECOVERY_FIXTURE.with(|fixture| fixture.replace(Some((current, mount)))));
         run()
     }
 
@@ -1293,12 +1333,119 @@ mod linux {
             let expected = unified_cgroup_path("0::/user.slice/user-1000.slice/user@1000.service/aft.slice/aft-task-bash-0123456789abcdef.scope\n").unwrap();
             assert_eq!(local_scope_path(&unit, &current, 1000), Some(expected));
             assert!(local_scope_path(&unit, &current, 1001).is_none());
-            assert!(local_scope_path(
-                &unit,
-                &unified_cgroup_path("0::/init.scope\n").unwrap(),
-                1000
-            )
-            .is_none());
+            let mount = tempfile::tempdir().unwrap();
+            with_local_recovery_mount_for_test(
+                mount.path().join("init.scope"),
+                Some(mount.path().into()),
+                || {
+                    assert!(local_scope_path(
+                        &unit,
+                        &unified_cgroup_path("0::/init.scope\n").unwrap(),
+                        1000
+                    )
+                    .is_none());
+                },
+            );
+        }
+
+        #[test]
+        fn task_scope_uncached_kill_from_system_service_uses_owned_fallback() {
+            let mount = tempfile::tempdir().unwrap();
+            let uid = unsafe { libc::geteuid() };
+            let id = "bash-0123456789abcdef";
+            let scope = mount.path().join(format!(
+                "user.slice/user-{uid}.slice/user@{uid}.service/aft.slice/{}",
+                scope_unit(id).unwrap()
+            ));
+            std::fs::create_dir_all(&scope).unwrap();
+            let kill_file = scope.join("cgroup.kill");
+            std::fs::write(&kill_file, "").unwrap();
+            with_local_recovery_mount_for_test(
+                mount.path().join("system.slice/actions.runner.service"),
+                Some(mount.path().into()),
+                || {
+                    let LocalScopeLookup::Present(handle) = lookup_local(id, None).unwrap() else {
+                        panic!("owned user-manager fallback was not resolved");
+                    };
+                    assert_eq!(handle.cgroup(), scope);
+                    let scopes = TaskScopes::default();
+                    assert!(scopes.get(id).is_none());
+                    scopes.kill(id, None).unwrap();
+                    assert_eq!(std::fs::read_to_string(&kill_file).unwrap(), "1");
+                    assert!(scopes.get(id).is_none());
+
+                    // A validated manager makes a different missing unit an
+                    // observed absence, not an unresolved location.
+                    assert!(matches!(
+                        lookup_local("bash-fedcba9876543210", None).unwrap(),
+                        LocalScopeLookup::Absent
+                    ));
+                    scopes.kill("bash-fedcba9876543210", None).unwrap();
+                    assert!(scopes.kill("../other", None).is_err());
+                    assert_eq!(std::fs::read_to_string(&kill_file).unwrap(), "1");
+                },
+            );
+        }
+
+        #[test]
+        fn task_scope_uncached_kill_refuses_missing_or_foreign_owned_fallback() {
+            let mount = tempfile::tempdir().unwrap();
+            let uid = unsafe { libc::geteuid() };
+            let id = "bash-0123456789abcdef";
+            let unit = scope_unit(id).unwrap();
+            let current = mount.path().join("system.slice/actions.runner.service");
+            with_local_recovery_mount_for_test(current.clone(), Some(mount.path().into()), || {
+                assert!(local_scope_path(&unit, &current, uid).is_none());
+                assert!(matches!(
+                    lookup_local(id, None).unwrap(),
+                    LocalScopeLookup::Unknown
+                ));
+                assert_eq!(
+                    TaskScopes::default().kill(id, None).unwrap_err(),
+                    format!("task scope aft-task-{id}.scope could not be killed")
+                );
+
+                // The directory exists, but its real st_uid is not the
+                // simulated caller's uid. Ownership must reject the guess.
+                let foreign_uid = uid + 1;
+                let service = mount.path().join(format!(
+                    "user.slice/user-{foreign_uid}.slice/user@{foreign_uid}.service"
+                ));
+                std::fs::create_dir_all(service).unwrap();
+                assert!(local_scope_path(&unit, &current, foreign_uid).is_none());
+            });
+        }
+
+        #[test]
+        fn task_scope_uncached_kill_never_overrides_foreign_user_ancestry() {
+            let mount = tempfile::tempdir().unwrap();
+            let uid = unsafe { libc::geteuid() };
+            let id = "bash-0123456789abcdef";
+            let unit = scope_unit(id).unwrap();
+            let own_scope = mount.path().join(format!(
+                "user.slice/user-{uid}.slice/user@{uid}.service/aft.slice/{unit}"
+            ));
+            std::fs::create_dir_all(&own_scope).unwrap();
+            let kill_file = own_scope.join("cgroup.kill");
+            std::fs::write(&kill_file, "").unwrap();
+            let foreign_uid = uid + 1;
+            with_local_recovery_mount_for_test(
+                mount
+                    .path()
+                    .join(format!("user@{foreign_uid}.service/app.slice/module.scope")),
+                Some(mount.path().into()),
+                || {
+                    assert!(matches!(
+                        lookup_local(id, None).unwrap(),
+                        LocalScopeLookup::Unknown
+                    ));
+                    assert_eq!(
+                        TaskScopes::default().kill(id, None).unwrap_err(),
+                        format!("task scope aft-task-{id}.scope could not be killed")
+                    );
+                    assert_eq!(std::fs::read_to_string(kill_file).unwrap(), "");
+                },
+            );
         }
 
         #[test]

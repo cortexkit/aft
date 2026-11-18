@@ -986,6 +986,41 @@ fn task_scope_kill_file_write_failure_is_static() {
 }
 
 #[test]
+fn task_scope_known_unscoped_launch_needs_no_cgroup_kill() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let (id, task) = tests::insert_terminal_piped_task(&registry, &root, "true", "", "", false);
+    let foreign_uid = unsafe { libc::geteuid() } + 1;
+    super::super::task_scope::with_local_recovery_fixture_for_test(
+        root.path()
+            .join(format!("user@{foreign_uid}.service/module.scope")),
+        || {
+            assert!(matches!(
+                super::super::task_scope::lookup_local(&id, None).unwrap(),
+                super::super::task_scope::LocalScopeLookup::Unknown
+            ));
+            assert!(registry.inner.task_scopes.get(&id).is_none());
+            registry.kill_task_scope(&id).unwrap();
+
+            let mut metadata = super::super::persistence::read_task(&task.paths.json).unwrap();
+            metadata.task_scope_runtime_ms = Some(60_000);
+            super::super::persistence::write_task(&task.paths.json, &metadata).unwrap();
+            assert_eq!(
+                registry.kill_task_scope(&id).unwrap_err(),
+                format!("task scope aft-task-{id}.scope could not be killed")
+            );
+
+            task.lock_state().unwrap().metadata.task_scope_runtime_ms = Some(60_000);
+            std::fs::remove_file(&task.paths.json).unwrap();
+            assert_eq!(
+                registry.kill_task_scope(&id).unwrap_err(),
+                format!("task scope aft-task-{id}.scope could not be killed")
+            );
+        },
+    );
+}
+
+#[test]
 fn task_scope_kill_outside_manager_without_identity_keeps_group_result() {
     let root = tempfile::tempdir().unwrap();
     let registry = BgTaskRegistry::default();

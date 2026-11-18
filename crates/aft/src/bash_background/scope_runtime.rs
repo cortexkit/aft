@@ -277,22 +277,38 @@ impl BgTaskRegistry {
                 return self.inner.task_scopes.kill(task_id, None);
             }
             let recorded = if let Some(task) = self.task(task_id) {
-                match resolve_task_layout(&task.paths.session_dir, task_id)
+                let metadata = match resolve_task_layout(&task.paths.session_dir, task_id)
                     .and_then(|record| read_task_at(&record))
                 {
-                    Ok(metadata) => metadata
-                        .memory_policy
-                        .filter(|policy| {
-                            policy.kind
-                                == super::super::memory_limit::MemoryPolicy::TASK_SCOPE_MEMORY_KIND
-                        })
-                        .and_then(|policy| policy.cgroup),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Ok(metadata) => Some(metadata),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        // A lost record can still have an in-memory identity.
+                        // Cleanup may already hold the state lock, so never
+                        // block while recovering that identity.
+                        task.state
+                            .try_lock()
+                            .ok()
+                            .map(|state| state.metadata.clone())
+                    }
                     Err(_) => {
                         return Err(format!(
                             "task scope aft-task-{task_id}.scope could not be killed"
                         ))
                     }
+                };
+                if let Some(metadata) = metadata {
+                    let policy = metadata.memory_policy.filter(|policy| {
+                        policy.kind
+                            == super::super::memory_limit::MemoryPolicy::TASK_SCOPE_MEMORY_KIND
+                    });
+                    // A saved unscoped launch needs only process-group
+                    // termination, not an inferred scope kill.
+                    if metadata.task_scope_runtime_ms.is_none() && policy.is_none() {
+                        return Ok(());
+                    }
+                    policy.and_then(|policy| policy.cgroup)
+                } else {
+                    None
                 }
             } else {
                 None
