@@ -682,8 +682,10 @@ impl LiveCheckout {
         next: CheckoutInputs,
         changed: &BTreeSet<String>,
     ) -> Result<UpdateStats, ManifestJoinError> {
-        self.update_with_budget(next, changed, None, None)
-            .map_err(UpdateError::unguarded)
+        let mut stats = UpdateStats::default();
+        self.update_with_budget(next, changed, None, None, &mut stats)
+            .map_err(UpdateError::unguarded)?;
+        Ok(stats)
     }
 
     /// A limit aborts before the newly invalidated pass runs. The caller must
@@ -694,11 +696,13 @@ impl LiveCheckout {
         changed: &BTreeSet<String>,
         budget: Option<&mut RefreshBudget>,
         guard: Option<&RefreshMemory>,
-    ) -> Result<UpdateStats, UpdateError> {
+        stats: &mut UpdateStats,
+    ) -> Result<(), UpdateError> {
+        stats.changed_paths = changed.len();
         let started = Instant::now();
         let pool = Arc::clone(&self.pool);
-        let mut stats = crate::alloc_trace::install(&pool, || {
-            let stats = self.update_in_pool(next, changed, budget, guard)?;
+        crate::alloc_trace::install(&pool, || {
+            self.update_in_pool(next, changed, budget, guard, stats)?;
             guard.boundary()?;
             #[cfg(feature = "test-hooks")]
             super::refresh_probe::stage("encode");
@@ -707,10 +711,10 @@ impl LiveCheckout {
             let parses = &self.inputs.parses;
             self.resolved
                 .encode_changed(|path| parses.key(path), guard)?;
-            Ok::<_, UpdateError>(stats)
+            Ok::<_, UpdateError>(())
         })?;
         stats.total_ms = started.elapsed().as_secs_f64() * 1000.0;
-        Ok(stats)
+        Ok(())
     }
 
     /// This engine moved onto `stored`, a publication of exactly what it
@@ -814,13 +818,10 @@ impl LiveCheckout {
         changed: &BTreeSet<String>,
         mut budget: Option<&mut RefreshBudget>,
         guard: Option<&RefreshMemory>,
-    ) -> Result<UpdateStats, UpdateError> {
+        stats: &mut UpdateStats,
+    ) -> Result<(), UpdateError> {
         admit(&mut budget, Stage::Changed, changed)?;
         guard.boundary()?;
-        let mut stats = UpdateStats {
-            changed_paths: changed.len(),
-            ..UpdateStats::default()
-        };
         let old = std::mem::replace(&mut self.inputs, next);
         #[cfg(feature = "test-hooks")]
         let mut profile_clock = Instant::now();
@@ -1392,7 +1393,7 @@ impl LiveCheckout {
             .chain(sites)
             .chain(removed)
             .collect();
-        Ok(stats)
+        Ok(())
     }
 
     #[cfg(feature = "test-hooks")]

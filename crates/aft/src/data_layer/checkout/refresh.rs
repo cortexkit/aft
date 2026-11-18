@@ -1,6 +1,7 @@
 use super::*;
 #[cfg(feature = "test-hooks")]
 use crate::data_layer::refresh_probe;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 #[cfg(test)]
@@ -18,6 +19,28 @@ pub(crate) struct RefreshCounts {
     pub(crate) refreshes: u64,
     pub(crate) guard_fallbacks: u64,
     pub(crate) precheck_fallbacks: u64,
+}
+
+#[derive(Default)]
+pub(super) struct RefreshWork<'a> {
+    guard: Option<&'a RefreshMemory>,
+    stats: UpdateStats,
+}
+
+impl fmt::Display for RefreshWork<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let stats = &self.stats;
+        write!(
+            formatter,
+            "changed={} rebound={} replayed={} resolved={} dispatch_replayed={} dispatch_recomputed={} site_files={} touched={} peak_growth_bytes=",
+            stats.changed_paths, stats.rebound, stats.replayed, stats.resolved,
+            stats.dispatch_replayed, stats.dispatch_recomputed, stats.sites_resolved, stats.touched.len()
+        )?;
+        match self.guard.and_then(RefreshMemory::peak_growth) {
+            Some(bytes) => write!(formatter, "{bytes}"),
+            None => formatter.write_str("unknown"),
+        }
+    }
 }
 
 impl Checkout {
@@ -132,6 +155,13 @@ impl Checkout {
             |engine| engine.live.inputs.parses.len(),
         );
         let mut budget = RefreshBudget::new(parsed, invalidated.0, invalidated.1);
+        let mut work = RefreshWork {
+            guard: Some(guard),
+            stats: UpdateStats {
+                changed_paths: changes.len(),
+                ..UpdateStats::default()
+            },
+        };
         // A damaged stored record or fragment can stop the update where it
         // expects one (every file the engine lists has a parse and a
         // resolution). Such a stop fails this refresh as damage, and the
@@ -143,12 +173,20 @@ impl Checkout {
                 &state,
                 &changes,
                 &mut budget,
-                Some(guard),
+                &mut work,
             )
         }));
         drop(budget);
         let (stats, served) = match outcome {
-            Ok(Ok(EngineUpdate::Applied(stats, served))) => (stats, served),
+            Ok(Ok(EngineUpdate::Applied(served))) => {
+                if served.is_some() {
+                    crate::slog_info!(
+                        "call-graph refresh: root={} guard_fallback=false {work}",
+                        self.root.display()
+                    );
+                }
+                (served.is_some().then_some(work.stats), served)
+            }
             Ok(Ok(fallback @ (EngineUpdate::Cold(_) | EngineUpdate::Memory(_)))) => {
                 // No incremental engine or its decoded state overlaps the cold
                 // builder. Watcher events keep recording over the publication.
@@ -165,15 +203,15 @@ impl Checkout {
                     EngineUpdate::Cold(limit) => {
                         self.refresh_counts.precheck_fallbacks.fetch_add(1, Relaxed);
                         crate::slog_info!(
-                            "data layer cold refresh: root={} {limit}",
+                            "data layer cold refresh: root={} guard_fallback=false {work}; {limit}",
                             self.root.display()
                         );
                     }
                     EngineUpdate::Memory(limit) => {
                         self.refresh_counts.guard_fallbacks.fetch_add(1, Relaxed);
                         crate::slog_info!(
-                            "call-graph refresh exceeded its memory ceiling: growth={} ceiling={} sites={} files={}; rebuilding cold",
-                            limit.growth, limit.ceiling, limit.sites, limit.files
+                            "call-graph refresh exceeded its memory ceiling: growth={} ceiling={} sites={} files={}; rebuilding cold; root={} guard_fallback=true {work}",
+                            limit.growth, limit.ceiling, limit.sites, limit.files, self.root.display()
                         );
                     }
                     EngineUpdate::Applied(..) => {
@@ -197,10 +235,18 @@ impl Checkout {
             }
             Ok(Err(error)) => {
                 self.clear_engine_slot(&mut slot);
+                crate::slog_info!(
+                    "call-graph refresh stopped: root={} guard_fallback=false {work}",
+                    self.root.display()
+                );
                 return Err(error);
             }
             Err(panic) => {
                 self.clear_engine_slot(&mut slot);
+                crate::slog_info!(
+                    "call-graph refresh stopped: root={} guard_fallback=false {work}",
+                    self.root.display()
+                );
                 let message = panic
                     .downcast_ref::<&str>()
                     .map(|message| (*message).to_string())
@@ -300,9 +346,9 @@ impl Checkout {
         state: &Arc<CheckoutState>,
         changes: &BTreeMap<Vec<u8>, Change>,
         budget: &mut RefreshBudget,
-        guard: Option<&RefreshMemory>,
+        work: &mut RefreshWork<'_>,
     ) -> Result<EngineUpdate, DataError> {
-        match self.update_engine_checked(slot, published, state, changes, budget, guard) {
+        match self.update_engine_checked(slot, published, state, changes, budget, work) {
             Ok(update) => Ok(update),
             Err(UpdateError::Limit(limit)) => Ok(EngineUpdate::Cold(limit)),
             Err(UpdateError::Stop(RefreshStop::Memory(limit))) => Ok(EngineUpdate::Memory(limit)),
@@ -319,8 +365,9 @@ impl Checkout {
         state: &Arc<CheckoutState>,
         changes: &BTreeMap<Vec<u8>, Change>,
         budget: &mut RefreshBudget,
-        guard: Option<&RefreshMemory>,
+        work: &mut RefreshWork<'_>,
     ) -> Result<EngineUpdate, UpdateError> {
+        let guard = work.guard;
         // This test needs neither extraction nor an engine start. A single
         // watcher batch can already be larger than incremental admission.
         budget
@@ -342,7 +389,6 @@ impl Checkout {
             .filter(|(path, change)| engine.applied.get(*path) != Some(&change.sequence))
             .map(|(path, _)| path.clone())
             .collect::<BTreeSet<_>>();
-        let mut stats = None;
         if !changed.is_empty() {
             guard.boundary()?;
             note_source_work(&self.root, |work| work.resolutions += 1);
@@ -375,9 +421,13 @@ impl Checkout {
                 .iter()
                 .filter_map(|path| std::str::from_utf8(path).ok().map(str::to_string))
                 .collect::<BTreeSet<_>>();
-            let update = engine
-                .live
-                .update_with_budget(next, &changed_names, Some(budget), guard);
+            let update = engine.live.update_with_budget(
+                next,
+                &changed_names,
+                Some(budget),
+                guard,
+                &mut work.stats,
+            );
             // The engine reads stored parses and resolutions as it goes; a
             // read that failed made it work from an empty one.
             let failures = published.graph.failures();
@@ -389,9 +439,8 @@ impl Checkout {
             }
             // The caller drops a partly updated engine after either error,
             // so the next refresh starts again from the publication.
-            let update = update?;
+            update?;
             guard.boundary()?;
-            log::debug!("callgraph refresh work: changed={} rebound={} replayed={} resolved={} dispatch_replayed={} dispatch_recomputed={} sites={} touched={}", update.changed_paths, update.rebound, update.replayed, update.resolved, update.dispatch_replayed, update.dispatch_recomputed, update.sites_resolved, update.touched.len());
             #[cfg(feature = "test-hooks")]
             refresh_probe::stage("slices");
             // Only the files this update touched get new slices; every file
@@ -402,7 +451,7 @@ impl Checkout {
             // next publication. The slices and encodings are made on the
             // engine's threads.
             let cached_as = CacheKey::new();
-            let files = update.touched.iter().collect::<Vec<_>>();
+            let files = work.stats.touched.iter().collect::<Vec<_>>();
             let (resolved, parses) = (&engine.live.resolved, &engine.live.inputs.parses);
             let graph = &published.graph;
             let made = engine.live.install(|| {
@@ -481,7 +530,7 @@ impl Checkout {
                     }
                 }
             }
-            stats = Some(update);
+            guard.boundary()?;
             note_source_work(&self.root, |work| {
                 let live = &engine.live;
                 work.decoded_parses = work.decoded_parses.max(live.inputs.parses.decoded_count());
@@ -505,10 +554,9 @@ impl Checkout {
         }
         // A refresh that applied nothing keeps the served graph, and with it
         // any dead-code snapshot already built for it.
-        let served = stats
-            .is_some()
-            .then(|| (engine.overlay.clone(), engine.refreshed.clone()));
+        let served =
+            (!changed.is_empty()).then(|| (engine.overlay.clone(), engine.refreshed.clone()));
         guard.boundary()?;
-        Ok(EngineUpdate::Applied(stats, served))
+        Ok(EngineUpdate::Applied(served))
     }
 }

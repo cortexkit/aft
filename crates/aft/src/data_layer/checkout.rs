@@ -393,10 +393,7 @@ struct GraphEngine {
 }
 
 enum EngineUpdate {
-    Applied(
-        Option<UpdateStats>,
-        Option<(OverlaySlices<Arc<StoredSlices>>, Refreshed)>,
-    ),
+    Applied(Option<(OverlaySlices<Arc<StoredSlices>>, Refreshed)>),
     Cold(RefreshLimit),
     Memory(MemoryLimit),
 }
@@ -7178,7 +7175,7 @@ pub fn other() { callee(); }
                     BTreeSet::new(),
                     BTreeSet::new()
                 ),
-                None,
+                &mut refresh::RefreshWork::default(),
             ),
             Err(DataError::Damaged(_))
         ));

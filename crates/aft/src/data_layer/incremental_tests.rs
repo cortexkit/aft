@@ -35,8 +35,13 @@ fn refresh_memory_guard_checks_inside_one_large_site_batch() {
     let guard = RefreshMemory::simulated(1, move |_, sites| {
         Some(if sites >= crossing { 2 } else { 0 })
     });
-    let result =
-        live.update_with_budget(next, &BTreeSet::from([path.to_owned()]), None, Some(&guard));
+    let result = live.update_with_budget(
+        next,
+        &BTreeSet::from([path.to_owned()]),
+        None,
+        Some(&guard),
+        &mut Default::default(),
+    );
     let Err(UpdateError::Stop(RefreshStop::Memory(limit))) = result else {
         panic!("the site loop must stop for memory");
     };

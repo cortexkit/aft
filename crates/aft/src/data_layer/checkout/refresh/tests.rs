@@ -42,11 +42,27 @@ fn refresh_memory_guard_publishes_the_cold_graph_byte_for_byte() {
     checkout.record_paths(&[b"run.go".to_vec()]).unwrap();
     // Let the update start, then exceed the simulated ceiling during its first file.
     let guard = RefreshMemory::simulated(1, |files, _| Some(if files > 0 { 2 } else { 0 }));
-    let stats = checkout
-        .refresh_callgraph_with(false, &guard)
-        .unwrap()
-        .unwrap();
+    let (stats, log) = crate::logging::capture_log_lines(|| {
+        checkout
+            .refresh_callgraph_with(false, &guard)
+            .unwrap()
+            .unwrap()
+    });
     assert!(stats.cold_build);
+    let work = log
+        .iter()
+        .filter(|line| line.contains("guard_fallback="))
+        .collect::<Vec<_>>();
+    assert_eq!(work.len(), 1, "{log:?}");
+    assert!(
+        work[0].contains("INFO call-graph refresh exceeded its memory ceiling: growth=2 ceiling=1"),
+        "{work:?}"
+    );
+    assert!(
+        work[0].contains("guard_fallback=true changed=1")
+            && work[0].contains("peak_growth_bytes=2"),
+        "{work:?}"
+    );
     assert!(checkout.engine.lock().unwrap().is_none());
     assert!(
         checkout.publish_changes().unwrap().is_none(),

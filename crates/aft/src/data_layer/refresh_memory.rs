@@ -3,7 +3,7 @@
 mod footprint;
 
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{mpsc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -32,6 +32,7 @@ pub(super) struct RefreshMemory {
     ceiling: u64,
     files: AtomicUsize,
     sites: AtomicUsize,
+    peak_growth: AtomicU64,
     hit: OnceLock<MemoryLimit>,
     cancellation: Option<crate::executor::JobCancellation>,
     #[cfg(test)]
@@ -54,6 +55,7 @@ impl RefreshMemory {
             ceiling,
             files: AtomicUsize::new(0),
             sites: AtomicUsize::new(0),
+            peak_growth: AtomicU64::new(0),
             hit: OnceLock::new(),
             cancellation: crate::executor::current_job_cancellation(),
             #[cfg(test)]
@@ -79,6 +81,10 @@ impl RefreshMemory {
         bytes()
     }
 
+    pub(super) fn peak_growth(&self) -> Option<u64> {
+        self.start.map(|_| self.peak_growth.load(Relaxed))
+    }
+
     fn check(&self) -> Result<(), RefreshStop> {
         if self
             .cancellation
@@ -95,6 +101,7 @@ impl RefreshMemory {
             .zip(self.sample())
             .map(|(start, now)| now.saturating_sub(start))
         {
+            self.peak_growth.fetch_max(growth, Relaxed);
             if growth > self.ceiling {
                 let limit = self.hit.get_or_init(|| MemoryLimit {
                     growth,
