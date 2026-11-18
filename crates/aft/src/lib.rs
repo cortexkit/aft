@@ -75,6 +75,7 @@ pub(crate) use aft_base::bash_env;
 pub mod bash_parse;
 pub mod bash_permissions;
 pub mod bash_rewrite;
+pub(crate) mod blocking_wait;
 pub(crate) use aft_base::bounded_io;
 pub(crate) mod bounded_io_command;
 pub mod build_breaker;

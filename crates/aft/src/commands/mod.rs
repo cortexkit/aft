@@ -31,7 +31,7 @@ pub mod bash_wait_detach;
 pub mod bash_watch;
 pub mod bash_write;
 pub mod batch;
-pub(crate) mod blocking_wait;
+pub(crate) use crate::blocking_wait;
 pub mod call_tree;
 pub mod callers;
 pub use crate::data_layer::{callgraph_roots, callgraph_store_adapter};

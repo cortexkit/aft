@@ -4,9 +4,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
-// Calls without an explicit client deadline use the catalog's default window.
-// Share its constants so enlarging the transport declaration also preserves
-// the ordinary worker wait inside the same reply-budget rule.
+// Without a client deadline, use the default worker wait plus the reply
+// margin advertised by the tool catalog.
 pub(crate) const WORKER_REPLY_MARGIN_MS: u64 = 240_000;
 const LEGACY_TRANSPORT_MS: u64 =
     crate::config::DEFAULT_BASH_WORKER_WAIT_MAX_MS + WORKER_REPLY_MARGIN_MS;
@@ -204,8 +203,8 @@ impl ReplyBudget {
         self
     }
 
-    /// Refund restoration time only to the internal startup allowance. The
-    /// caller's absolute reply deadline, including delivery margin, stays fixed.
+    /// Exclude restoration from elapsed startup time without changing the
+    /// caller's absolute reply deadline or its delivery margin.
     pub(crate) fn after_launch_restore(self, elapsed: Duration) -> Self {
         Self {
             received_at: self.received_at + elapsed,

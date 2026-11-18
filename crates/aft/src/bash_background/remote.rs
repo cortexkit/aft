@@ -4,13 +4,13 @@
 mod scope_fallback;
 #[cfg(unix)]
 use super::*;
-#[cfg(unix)]
-use crate::commands::inspect::thousands;
 use crate::exec_remote::types::*;
 #[cfg(unix)]
 use crate::exec_remote::{
     self as exec, ExecRemoteClient, OutputSink, ResumePoint, StreamProgress, Verdict,
 };
+#[cfg(unix)]
+use crate::inspect::thousands;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::ffi::OsStr;

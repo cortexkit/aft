@@ -46,3 +46,16 @@ pub use tier2_scheduler::{
 
 pub(crate) mod data_sources;
 pub mod dead_code_gate;
+
+/// Formats `2940` as `2,940`.
+pub(crate) fn thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}

@@ -4291,22 +4291,9 @@ fn excluded_test_clause(section: &Value) -> String {
     let file_label = if files == 1 { "file" } else { "files" };
     format!(
         " · excluded {} in {} test/fixture {file_label} (pass includeTests to see them)",
-        thousands(count),
-        thousands(files)
+        crate::inspect::thousands(count),
+        crate::inspect::thousands(files)
     )
-}
-
-/// `2940` as `2,940`.
-pub(crate) fn thousands(value: u64) -> String {
-    let digits = value.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(digit);
-    }
-    out
 }
 
 fn generated_count_suffix(section: &Value) -> String {

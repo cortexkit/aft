@@ -60,7 +60,7 @@ pub(crate) struct SpawnReceipt {
     changed_files_deadline: std::sync::OnceLock<crate::bash_changed_files::SharedCallDeadline>,
     state: std::sync::Mutex<SpawnReceiptState>,
     deadline: std::time::Instant,
-    reply_clock: crate::commands::blocking_wait::ReplyBudget,
+    reply_clock: crate::blocking_wait::ReplyBudget,
     startup_steps: std::sync::Mutex<StartupSteps>,
     #[cfg(feature = "test-timing-hooks")]
     startup_clock_for_test: Option<StartupClockForTest>,
@@ -244,10 +244,7 @@ pub(crate) enum StartupOutcome {
 }
 
 impl SpawnReceipt {
-    pub(crate) fn with_reply_clock(
-        mut self,
-        clock: crate::commands::blocking_wait::ReplyBudget,
-    ) -> Self {
+    pub(crate) fn with_reply_clock(mut self, clock: crate::blocking_wait::ReplyBudget) -> Self {
         self.reply_clock = clock;
         self
     }
@@ -283,7 +280,7 @@ impl SpawnReceipt {
             state: std::sync::Mutex::new(SpawnReceiptState::Pending),
             changed_files_deadline: std::sync::OnceLock::new(),
             deadline,
-            reply_clock: crate::commands::blocking_wait::ReplyBudget::new(startup_started_at, None),
+            reply_clock: crate::blocking_wait::ReplyBudget::new(startup_started_at, None),
             startup_steps: std::sync::Mutex::new(StartupSteps::new(startup_started_at)),
             #[cfg(feature = "test-timing-hooks")]
             startup_clock_for_test: match std::env::var("AFT_TEST_SUBC_BASH_STARTUP_CLOCK")
@@ -536,8 +533,7 @@ mod spawn_receipt_tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         let suspend = Box::leak(Box::new(AtomicU64::new(0)));
         let now = Instant::now();
-        let clock =
-            crate::commands::blocking_wait::ReplyBudget::new(now, None).with_suspend_clock(suspend);
+        let clock = crate::blocking_wait::ReplyBudget::new(now, None).with_suspend_clock(suspend);
         let receipt =
             SpawnReceipt::new(now + std::time::Duration::from_secs(15)).with_reply_clock(clock);
         suspend.store(60_000, Ordering::SeqCst);
