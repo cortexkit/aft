@@ -72,6 +72,12 @@ impl Fixture {
         self.command(args, bypass).output().unwrap()
     }
 
+    fn connect_daemon(&self, daemon: &SlowTestDaemon) {
+        let connection = self._root.path().join("connection.json");
+        daemon.write_connection_file(&connection);
+        write_user_config(&self.config, &connection, Some(true));
+    }
+
     fn assert_passthrough(&self, args: &[&str], bypass: bool) {
         let output = self.run(args, bypass);
         assert_eq!(output.status.code(), Some(73), "{output:?}");
@@ -265,6 +271,60 @@ fn gh_shim_manifest_unavailable_unprovisioned_passthrough_is_unchanged() {
             fixture.assert_passthrough(&["pr", "view", "1"], bypass);
         }
     }
+}
+
+#[test]
+fn gh_shim_manifest_unavailable_fresh_with_write_relay_refuses_writes_but_passes_reads() {
+    let fixture = Fixture::new();
+    let daemon = SlowTestDaemon::spawn(SlowDaemonConfig::default());
+    fixture.connect_daemon(&daemon);
+
+    for bypass in [false, true] {
+        fixture.assert_passthrough(&["issue", "view", "1"], bypass);
+    }
+    assert_eq!(daemon.catalog_requests(), 0, "reads need no catalog lookup");
+
+    for bypass in [false, true] {
+        fixture.assert_refused(
+            &["issue", "comment", "1", "--body", "offline"],
+            bypass,
+            UNAVAILABLE,
+        );
+    }
+    assert_eq!(daemon.catalog_requests(), 2);
+}
+
+#[test]
+fn gh_shim_manifest_unavailable_fresh_with_read_only_relay_passes_writes() {
+    let fixture = Fixture::new();
+    let daemon = SlowTestDaemon::spawn_with_catalog(SlowDaemonConfig::default(), None, false);
+    fixture.connect_daemon(&daemon);
+
+    for bypass in [false, true] {
+        fixture.assert_passthrough(&["issue", "comment", "1", "--body", "offline"], bypass);
+    }
+    assert_eq!(daemon.catalog_requests(), 2, "one catalog lookup per write");
+}
+
+#[test]
+fn gh_shim_manifest_unavailable_fresh_with_catalog_timeout_refuses_writes() {
+    let fixture = Fixture::new();
+    let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+        catalog_delay: Duration::from_secs(30),
+        ..SlowDaemonConfig::default()
+    });
+    fixture.connect_daemon(&daemon);
+
+    fixture.assert_refused(
+        &["issue", "comment", "1", "--body", "offline"],
+        true,
+        UNAVAILABLE,
+    );
+    assert_eq!(
+        daemon.catalog_requests(),
+        1,
+        "timeout must reach the catalog"
+    );
 }
 
 #[test]

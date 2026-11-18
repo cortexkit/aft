@@ -7,6 +7,8 @@ use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aft::config::Config;
@@ -2280,6 +2282,7 @@ fn control_flags() -> Flags {
     Flags::new(false, Priority::Passive, false)
 }
 
+#[derive(Default)]
 struct SlowDaemonConfig {
     handshake_delay: Duration,
     catalog_delay: Duration,
@@ -2296,6 +2299,7 @@ struct SlowTestDaemon {
     port: u16,
     key: Vec<u8>,
     daemon_id: [u8; DAEMON_ID_LEN],
+    catalog_requests: Arc<AtomicUsize>,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     server_task: Option<std::thread::JoinHandle<()>>,
 }
@@ -2306,6 +2310,14 @@ impl SlowTestDaemon {
     }
 
     fn spawn_with_manifest_removal(config: SlowDaemonConfig, manifest: Option<PathBuf>) -> Self {
+        Self::spawn_with_catalog(config, manifest, true)
+    }
+
+    fn spawn_with_catalog(
+        config: SlowDaemonConfig,
+        manifest: Option<PathBuf>,
+        offer_write_relay: bool,
+    ) -> Self {
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test daemon");
         std_listener.set_nonblocking(true).expect("set nonblocking");
         let port = std_listener.local_addr().expect("local addr").port();
@@ -2315,6 +2327,8 @@ impl SlowTestDaemon {
 
         let key_clone = key.clone();
         let daemon_id_clone = daemon_id;
+        let catalog_requests = Arc::new(AtomicUsize::new(0));
+        let catalog_requests_clone = Arc::clone(&catalog_requests);
 
         let server_task = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -2334,6 +2348,7 @@ impl SlowTestDaemon {
                                 let k = key_clone.clone();
                                 let d = daemon_id_clone;
                                 let manifest = manifest.clone();
+                                let catalog_requests = Arc::clone(&catalog_requests_clone);
                                 let first_connection = connection_count == 0;
                                 connection_count += 1;
                                 let hs_delay = if config.first_connection_only && !first_connection {
@@ -2407,11 +2422,16 @@ impl SlowTestDaemon {
                                                 .and_then(|v| v.get("op").and_then(Value::as_str).map(String::from));
 
                                             if op.as_deref() == Some("catalog.list") {
+                                                catalog_requests.fetch_add(1, Ordering::Relaxed);
                                                 if let Some(path) = &manifest {
                                                     fs::remove_file(path).expect("remove manifest during discovery");
                                                 }
                                                 if !cat_delay.is_zero() {
                                                     tokio::time::sleep(cat_delay).await;
+                                                }
+                                                let mut operations = vec![json!({ "name": "gh_shim.bindings_read", "kind": "query" })];
+                                                if offer_write_relay {
+                                                    operations.push(json!({ "name": "gh_shim.bot_request", "kind": "mutate" }));
                                                 }
                                                 let response_body = json!({
                                                     "op": "catalog.list",
@@ -2421,10 +2441,7 @@ impl SlowTestDaemon {
                                                         "module_version": "0.1.0",
                                                         "roles": [{
                                                             "role": "management_surface",
-                                                            "operations": [
-                                                                { "name": "gh_shim.bot_request", "kind": "mutate" },
-                                                                { "name": "gh_shim.bindings_read", "kind": "query" }
-                                                            ],
+                                                            "operations": operations,
                                                             "config_schema": {},
                                                             "observability": [],
                                                             "identity_scope": ["project"]
@@ -2540,6 +2557,7 @@ impl SlowTestDaemon {
             port,
             key,
             daemon_id,
+            catalog_requests,
             shutdown_tx: Some(shutdown_tx),
             server_task: Some(server_task),
         }
@@ -2559,6 +2577,10 @@ impl SlowTestDaemon {
             daemon_ver: FAKE_DAEMON_VERSION.to_string(),
         };
         connection_file::write_atomic(path, &conn).expect("write test daemon connection file");
+    }
+
+    fn catalog_requests(&self) -> usize {
+        self.catalog_requests.load(Ordering::Relaxed)
     }
 }
 
