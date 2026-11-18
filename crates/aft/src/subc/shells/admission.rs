@@ -38,6 +38,8 @@ pub(super) fn caller_kind(
     match harness {
         Some(harness) if harness.starts_with("fed-phone:") => "phone",
         Some(harness) if harness.starts_with("fed-sim:") => "simulator",
+        // A desktop app reaching this computer from another one.
+        Some(harness) if harness.starts_with("fed-app:") => "remote-app",
         _ => "desktop",
     }
 }
@@ -52,7 +54,8 @@ pub(in crate::subc) fn operator_refusal(body: &Value) -> ErrorBody {
     error
 }
 
-/// Federated agent routes must never inherit the phone operator's authority.
+/// Federated agent routes must never inherit the operator's authority: only
+/// the person's own paired phone, simulator or desktop app may view shells.
 /// Keep this predicate shared by route admission and request dispatch.
 pub(in crate::subc) fn operator(
     principal: Option<&Principal>,
@@ -63,8 +66,11 @@ pub(in crate::subc) fn operator(
         && (matches!(principal, Some(Principal::Direct))
             && !harness.is_some_and(crate::subc::harness_forces_untrusted)
             || matches!(principal, Some(Principal::Reserved { module_id }) if module_id == "callosum")
-                && harness
-                    .is_some_and(|h| h.starts_with("fed-phone:") || h.starts_with("fed-sim:")))
+                && harness.is_some_and(|h| {
+                    h.starts_with("fed-phone:")
+                        || h.starts_with("fed-sim:")
+                        || h.starts_with("fed-app:")
+                }))
 }
 
 pub(in crate::subc) fn operator_required() -> ErrorBody {
@@ -155,8 +161,10 @@ mod tests {
             (Some(&direct), Some("fed:facade"), false),
             (Some(&callosum), Some("fed-phone:person"), true),
             (Some(&callosum), Some("fed-sim:person"), true),
+            (Some(&callosum), Some("fed-app:person"), true),
             (Some(&callosum), Some("fed-computer:person"), false),
             (Some(&callosum), Some("fed-unknown:person"), false),
+            (Some(&callosum), Some("fed-application:person"), false),
             (Some(&callosum), Some("callosum-self"), false),
             (Some(&callosum), None, false),
             (None, Some("fed-phone:person"), false),
