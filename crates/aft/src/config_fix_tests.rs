@@ -1159,7 +1159,10 @@ fn settings_shapes_rewrite_user_with_backup_and_project_with_notice() {
     let migrated = std::fs::read_to_string(&user).unwrap();
     assert!(migrated.contains("// Keep this note."));
     let migrated: Value = serde_json::from_str(&crate::jsonc::strip_jsonc(&migrated)).unwrap();
-    assert_eq!(migrated["bash"], json!({"enabled": false}));
+    assert_eq!(
+        migrated["bash"],
+        json!({"enabled": false, "rewrite": false, "compress": false, "background": false})
+    );
     assert_eq!(
         migrated["harnesses"]["pi"]["bash"],
         json!({"enabled": true,"rewrite": true,"compress": true,"background": true})

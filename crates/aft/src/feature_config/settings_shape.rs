@@ -47,7 +47,8 @@ pub(crate) fn edits(block: &Map<String, Value>, tier: super::DocumentTier) -> Ve
             }
             enabled
         } else {
-            json!({"enabled": false})
+            // Catalog and hashline rendering read these switches even when the runtime gate is off.
+            json!({"enabled": false, "rewrite": false, "compress": false, "background": false})
         };
         let notice = if enabled && tier == super::DocumentTier::Project {
             "bash boolean → bash.rewrite, bash.compress and bash.background"

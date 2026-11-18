@@ -6717,6 +6717,9 @@ mod tests {
 
         let false_result = resolve_config(&[tier("user", r#"{ "bash": false }"#)]);
         assert!(!false_result.config.bash.enabled);
+        assert!(!false_result.config.experimental_bash_rewrite);
+        assert!(!false_result.config.experimental_bash_compress);
+        assert!(!false_result.config.experimental_bash_background);
 
         let object_default_result = resolve_config(&[tier("user", r#"{ "bash": {} }"#)]);
         assert!(object_default_result.config.experimental_bash_rewrite);
@@ -6754,9 +6757,9 @@ mod tests {
             tier("project", r#"{ "bash": { "compress": true } }"#),
         ]);
         assert!(!false_then_object_result.config.bash.enabled);
-        assert!(false_then_object_result.config.experimental_bash_rewrite);
+        assert!(!false_then_object_result.config.experimental_bash_rewrite);
         assert!(false_then_object_result.config.experimental_bash_compress);
-        assert!(false_then_object_result.config.experimental_bash_background);
+        assert!(!false_then_object_result.config.experimental_bash_background);
     }
 
     #[test]

@@ -457,8 +457,9 @@ Omit an optional setting instead of using `null`. The exception is `storage.cach
 
   // Bash runtime configuration (graduated from experimental.bash.* in v0.27.2).
   // Registration of `bash` and its companions is controlled by disabled_tools;
-  // `bash: false` or `bash.enabled: false` turns the runtime gate off, and
-  // every bash operation (including the companions) then reports bash_disabled.
+  // `bash.enabled: false` turns the runtime gate off: bash operations
+  // (including the companions) report bash_disabled. Legacy `bash: false`
+  // also turns off rewrite, compression, and background execution.
   "bash": {
     // Runtime gate. Default true.
     "enabled": true,

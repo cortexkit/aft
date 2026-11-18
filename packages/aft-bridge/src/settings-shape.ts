@@ -18,7 +18,7 @@ export function translateSettingsShape(block: ConfigObject, tier: "user" | "proj
           compress: true,
           background: true,
         }
-      : { enabled: false };
+      : { enabled: false, rewrite: false, compress: false, background: false };
     notices.push(
       projectTrue
         ? "bash boolean → bash.rewrite, bash.compress and bash.background"
