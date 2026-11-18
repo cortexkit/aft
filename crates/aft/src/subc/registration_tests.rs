@@ -42,6 +42,7 @@ fn registration_consumers_wait_bind_and_fail_closed() {
             "--nocapture",
         ])
         .env(CHILD, "1")
+        .env(subc_protocol::SUBC_MODULE_ID_ENV, "aft")
         .env(DAEMON_PID_ENV, std::process::id().to_string())
         .env(REGISTRATION_FD_ENV, format!("4:{inode}"));
     slots.install(&mut command);
@@ -142,7 +143,7 @@ async fn consumer_cases() {
         pending.clone(),
         2,
     ));
-    let mut opened = Box::pin(open());
+    let mut opened = Box::pin(super::super::consent::connect_for_registration_test(&path));
     tokio::select! {
         _ = &mut opened => panic!("consumer did not wait for the minter"),
         _ = listener.accept() => panic!("consumer dialed before the minter was installed"),

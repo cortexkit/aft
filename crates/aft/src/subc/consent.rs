@@ -482,6 +482,15 @@ impl SubcConsentTransport {
     }
 }
 
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(super) async fn connect_for_registration_test(
+    path: &Path,
+) -> Result<Arc<subc_client_rs::SubcConsumer>, ConsentError> {
+    SubcConsentTransport::new(path.to_path_buf())
+        .consumer()
+        .await
+}
+
 impl ConsentRouteIdentity {
     async fn release_route(
         &self,
