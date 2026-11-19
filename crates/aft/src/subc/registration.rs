@@ -132,11 +132,22 @@ pub(crate) fn log_claim_connect_failure(owner: &'static str, error: &ConsumerErr
 }
 
 /// Live daemon consumer connections, counted per owner label.
-#[derive(Default)]
 struct ConsumerGauge {
     counts: std::sync::Mutex<std::collections::BTreeMap<&'static str, usize>>,
     changed: AtomicBool,
     reporter: std::sync::Once,
+}
+
+// Written out because `std::sync::Once` implements `Default` only in Rust
+// releases newer than this crate's minimum supported version.
+impl Default for ConsumerGauge {
+    fn default() -> Self {
+        Self {
+            counts: std::sync::Mutex::default(),
+            changed: AtomicBool::new(false),
+            reporter: std::sync::Once::new(),
+        }
+    }
 }
 
 static CONSUMER_GAUGE: OnceLock<ConsumerGauge> = OnceLock::new();
