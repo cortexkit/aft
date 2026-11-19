@@ -257,6 +257,7 @@ pub fn unasked_refusal(
     }
 }
 
+pub mod linked_worktree;
 #[path = "access_policy_plugin.rs"]
 pub mod plugin;
 pub use aft_base::prefrontal;
@@ -583,9 +584,13 @@ pub struct AccessPolicy {
     pub standalone_owned_scratch: bool,
     /// Native host compatibility roots, not additional shell write roots.
     pub standalone_main_roots: Vec<PathBuf>,
+    linked_worktrees: Option<linked_worktree::Project>,
 }
 
 impl AccessPolicy {
+    pub fn set_linked_worktrees(&mut self, linked_worktrees: Option<linked_worktree::Project>) {
+        self.linked_worktrees = linked_worktrees;
+    }
     /// Snapshot the route configuration. Unrestricted outside access is represented
     /// as Ask and lowered to the existing behavior by the in-process caller.
     pub fn from_config(config: &Config, storage: &Path, roots: Vec<PathBuf>, home: &Path) -> Self {
@@ -712,6 +717,7 @@ impl AccessPolicy {
             standalone_managed_temp_roots: Vec::new(),
             standalone_owned_scratch: false,
             standalone_main_roots: Vec::new(),
+            linked_worktrees: None,
             mode: ApprovalMode::Ask,
             private_stores: SandboxDataPolicy {
                 deny,
@@ -778,7 +784,13 @@ impl AccessPolicy {
         path: &Path,
         owned_artifact: bool,
     ) -> AccessDecision {
-        self.decide_inner(operation, path, owned_artifact, false)
+        self.decide_inner(
+            operation,
+            path,
+            owned_artifact,
+            false,
+            self.linked_worktrees.as_ref(),
+        )
     }
 
     pub fn decide_resolved(
@@ -787,7 +799,13 @@ impl AccessPolicy {
         path: &Path,
         owned_artifact: bool,
     ) -> AccessDecision {
-        self.decide_inner(operation, path, owned_artifact, true)
+        self.decide_inner(
+            operation,
+            path,
+            owned_artifact,
+            true,
+            self.linked_worktrees.as_ref(),
+        )
     }
 
     fn decide_inner(
@@ -796,6 +814,7 @@ impl AccessPolicy {
         path: &Path,
         owned_artifact: bool,
         resolved: bool,
+        linked_worktrees: Option<&linked_worktree::Project>,
     ) -> AccessDecision {
         let floor = if resolved {
             self.floor_for_path_using(operation, path, owned_artifact, floor_contains_resolved)
@@ -866,6 +885,10 @@ impl AccessPolicy {
                     .grants
                     .iter()
                     .any(|grant| grant.covers(operation, path)))
+            || (operation == AccessOperation::Read
+                && self.outside == AccessDecision::Ask
+                && self.mode != ApprovalMode::FullAccess
+                && linked_worktrees.is_some_and(|project| project.admits(path)))
         {
             AccessDecision::Allow
         } else {
@@ -1101,6 +1124,7 @@ impl AccessPolicy {
 
     /// A subtree capability includes future descendants, not just the paths that
     /// exist today. A file grant cannot cover it, and any denied descendant wins.
+    /// Linked checkout reads do not contribute shell or delegated capabilities.
     pub fn decide_capability(
         &self,
         operation: AccessOperation,
@@ -1108,7 +1132,7 @@ impl AccessPolicy {
         path: &Path,
     ) -> AccessDecision {
         if kind == GrantKind::File {
-            return self.decide(operation, path, false);
+            return self.decide_inner(operation, path, false, false, None);
         }
         if self.capability_floor(operation, kind, path).is_some() {
             return AccessDecision::Deny(AccessDenial::Floor);
@@ -1117,7 +1141,7 @@ impl AccessPolicy {
         tree_policy
             .grants
             .retain(|grant| grant.kind == GrantKind::Subtree);
-        tree_policy.decide(operation, path, false)
+        tree_policy.decide_inner(operation, path, false, false, None)
     }
 
     pub fn head_policy(&self, grant: &AccessGrant) -> HeadPolicy {

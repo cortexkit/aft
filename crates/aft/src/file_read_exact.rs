@@ -2,7 +2,9 @@ use crate::access_policy::{AccessDecision, AccessOperation, AccessPolicy};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(windows)]
+use std::fs::OpenOptions;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
@@ -110,50 +112,10 @@ fn read_with(
     })
 }
 
-/// A file opened for an exact read. Closing any descriptor to a live SQLite
-/// file releases SQLite's process-wide POSIX locks and can crash this process,
-/// so on drop the handle is closed only when the live SQLite registry does not
-/// identify it by its device and inode; otherwise (or when the handle cannot
-/// even be identified) it is deliberately leaked. Every return after the open,
-/// refusal or success, goes through this drop.
-pub(crate) struct OpenedFile(std::mem::ManuallyDrop<File>);
+pub(crate) use aft_base::no_follow_file::OpenedFile;
 
-/// Open below a checked root without following a swapped path component. The
-/// caller must verify the handle location and policy before reading any bytes.
 pub(crate) fn open_no_follow(root: &Path, target: &Path) -> Result<OpenedFile, ReadExactRefusal> {
-    open_contents(root, target).map(OpenedFile::new)
-}
-
-impl OpenedFile {
-    fn new(file: File) -> Self {
-        Self(std::mem::ManuallyDrop::new(file))
-    }
-}
-
-impl std::ops::Deref for OpenedFile {
-    type Target = File;
-    fn deref(&self) -> &File {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for OpenedFile {
-    fn deref_mut(&mut self) -> &mut File {
-        &mut self.0
-    }
-}
-
-impl Drop for OpenedFile {
-    fn drop(&mut self) {
-        let closable = self
-            .0
-            .metadata()
-            .is_ok_and(|metadata| !crate::db::file_identity::is_live_sqlite_handle(&metadata));
-        if closable {
-            // SAFETY: the file is dropped exactly once, here, and never used after.
-            unsafe { std::mem::ManuallyDrop::drop(&mut self.0) };
-        }
-    }
+    aft_base::no_follow_file::open_no_follow(root, target).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -200,98 +162,8 @@ fn open_error(error: io::Error) -> ReadExactRefusal {
     }
 }
 
-/// Opens `target` by walking down from an opened `root` directory, one
-/// component at a time, without following a symlink at any step.
-///
-/// `target` is the canonical path the checks approved, so it has no symlink
-/// components; one found during the walk was swapped in after the checks and
-/// is refused. O_NOFOLLOW on a plain path open would protect only the final
-/// component and still follow a swapped parent directory out of the checkout.
-#[cfg(unix)]
 fn open_contents(root: &Path, target: &Path) -> Result<File, ReadExactRefusal> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::OpenOptionsExt;
-    let relative = target
-        .strip_prefix(root)
-        .map_err(|_| ReadExactRefusal::AccessDenied)?;
-    let names = relative
-        .components()
-        .map(|component| match component {
-            std::path::Component::Normal(name) => {
-                std::ffi::CString::new(name.as_bytes()).map_err(|_| ReadExactRefusal::AccessDenied)
-            }
-            _ => Err(ReadExactRefusal::AccessDenied),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    // The root and every parent are opened only to look names up in them, so
-    // they get search-only handles: a plain open of the file needs search
-    // (execute) permission on its parents, not read (list) permission, and
-    // the walk must not refuse a file under a parent like a 0711 directory
-    // owned by someone else. Nonblocking opens of the final component keep a
-    // FIFO replacement from stalling before fstat.
-    let mut handle = OpenOptions::new()
-        .read(true)
-        .custom_flags(SEARCH_DIRECTORY | libc::O_NOFOLLOW)
-        .open(root)
-        .map_err(open_error)?;
-    for (index, name) in names.iter().enumerate() {
-        let last = index + 1 == names.len();
-        let flags = libc::O_NOFOLLOW
-            | libc::O_CLOEXEC
-            | if last {
-                libc::O_RDONLY | libc::O_NONBLOCK
-            } else {
-                SEARCH_DIRECTORY
-            };
-        // SAFETY: `handle` is an open directory and `name` is NUL-terminated.
-        let fd = unsafe { libc::openat(handle.as_raw_fd(), name.as_ptr(), flags) };
-        if fd < 0 {
-            let error = io::Error::last_os_error();
-            // A parent that is no longer a real directory (a symlink gives
-            // ELOOP or ENOTDIR) was swapped in after the checks.
-            if !last && matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
-                return Err(ReadExactRefusal::AccessDenied);
-            }
-            return Err(open_error(error));
-        }
-        // SAFETY: `fd` was just returned by openat and nothing else owns it.
-        handle = unsafe { File::from_raw_fd(fd) };
-    }
-    Ok(handle)
-}
-
-/// Open flags for a directory handle used only as an `openat` base. Linux's
-/// O_PATH and Apple's O_SEARCH need search permission on the directory but
-/// not read permission. The fstat, identity and real-location checks run on
-/// the final file's handle only, which is still a plain O_RDONLY open.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-const SEARCH_DIRECTORY: libc::c_int = libc::O_PATH | libc::O_DIRECTORY;
-#[cfg(target_vendor = "apple")]
-const SEARCH_DIRECTORY: libc::c_int = libc::O_SEARCH;
-/// Other Unix systems get a read handle, so there a file whose parent grants
-/// search but not read permission (such as a 0711 directory owned by another
-/// user) is refused with an I/O error even though a plain open could read it.
-#[cfg(all(
-    unix,
-    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
-))]
-const SEARCH_DIRECTORY: libc::c_int = libc::O_RDONLY | libc::O_DIRECTORY;
-
-/// Windows has no component-relative open here, so the parent directories
-/// are resolved by path; `opened_location` then judges where the handle
-/// really points before any byte is read.
-#[cfg(windows)]
-fn open_contents(_root: &Path, target: &Path) -> Result<File, ReadExactRefusal> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    };
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-        .open(target)
-        .map_err(open_error)
+    aft_base::no_follow_file::open_contents(root, target).map_err(Into::into)
 }
 
 pub(crate) use crate::task_temp_reads::opened_location;
@@ -356,6 +228,17 @@ pub(crate) enum ReadExactRefusal {
     PolicyTimeout,
 }
 
+impl From<aft_base::no_follow_file::OpenError> for ReadExactRefusal {
+    fn from(error: aft_base::no_follow_file::OpenError) -> Self {
+        use aft_base::no_follow_file::OpenError;
+        match error {
+            OpenError::AccessDenied => Self::AccessDenied,
+            OpenError::NotFound => Self::NotFound,
+            OpenError::IoError => Self::IoError,
+        }
+    }
+}
+
 impl ReadExactRefusal {
     pub(crate) fn code(&self) -> &'static str {
         match self {
@@ -400,6 +283,15 @@ impl ReadExactRefusal {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn no_follow_errors_keep_the_exact_read_refusals() {
+        use super::ReadExactRefusal;
+        use aft_base::no_follow_file::OpenError;
+        assert_eq!(ReadExactRefusal::from(OpenError::AccessDenied), ReadExactRefusal::AccessDenied);
+        assert_eq!(ReadExactRefusal::from(OpenError::NotFound), ReadExactRefusal::NotFound);
+        assert_eq!(ReadExactRefusal::from(OpenError::IoError), ReadExactRefusal::IoError);
+    }
+
     use super::*;
 
     fn read_exact(

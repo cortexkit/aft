@@ -115,6 +115,7 @@ pub mod memory_profile;
 pub mod registration;
 
 pub mod native_stat;
+pub mod no_follow_file;
 pub mod ndjson_text;
 pub mod ort_lifecycle;
 pub mod ort_pin;

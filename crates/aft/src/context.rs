@@ -30,6 +30,7 @@ use lsp_types::FileChangeType;
 use notify::RecommendedWatcher;
 use serde::Serialize;
 
+use crate::access_policy::linked_worktree;
 use crate::alert_state::{
     AcceptedObservationBatch, AcceptedObservationResult, AlertDeltaState, ObservationError,
 };
@@ -2154,57 +2155,6 @@ fn path_error_response(
     )
 }
 
-/// The main checkout of the linked Git worktree at `worktree`, when its
-/// linkage checks out, in the policy's spelling (canonical, no Windows
-/// verbatim prefix). Otherwise `None`, and the main checkout gets no
-/// exemption.
-///
-/// A `.git` file is only a claim. The link is accepted when the worktree's
-/// `.git` file names a directory directly under `<common>/worktrees/`, that
-/// directory's `gitdir` file points back at this worktree's `.git` file, and
-/// its `commondir` file resolves to `common`, the common Git directory, whose
-/// own name is `.git`. The main checkout is the directory holding `common`.
-fn verified_linked_main_root(worktree: &Path, common: &Path) -> Option<PathBuf> {
-    let resolve = |base: &Path, spelled: &str| {
-        let spelled = Path::new(spelled.trim());
-        let path = if spelled.is_absolute() {
-            spelled.to_path_buf()
-        } else {
-            base.join(spelled)
-        };
-        std::fs::canonicalize(path).ok()
-    };
-    let common = std::fs::canonicalize(common).ok()?;
-    if common.file_name()? != ".git" {
-        return None;
-    }
-    let worktree = std::fs::canonicalize(worktree).ok()?;
-    let dot_git = worktree.join(".git");
-    if !std::fs::symlink_metadata(&dot_git).ok()?.is_file() {
-        return None;
-    }
-    let claim = std::fs::read_to_string(&dot_git).ok()?;
-    let gitdir = resolve(&worktree, claim.trim().strip_prefix("gitdir:")?)?;
-    if gitdir.parent()? != common.join("worktrees") {
-        return None;
-    }
-    let back = resolve(
-        &gitdir,
-        &std::fs::read_to_string(gitdir.join("gitdir")).ok()?,
-    )?;
-    if back != std::fs::canonicalize(&dot_git).ok()? {
-        return None;
-    }
-    let commondir = resolve(
-        &gitdir,
-        &std::fs::read_to_string(gitdir.join("commondir")).ok()?,
-    )?;
-    if commondir != common {
-        return None;
-    }
-    Some(crate::path_identity::normalize_path(common.parent()?))
-}
-
 /// Whether `location` (absolute, with at least its parent resolved) is an
 /// entry inside scratch that a task of `session` still owns.
 /// A final symlink is never owned: the registry's check resolves the whole
@@ -2915,8 +2865,9 @@ pub struct AppContext {
     git_common_dir: parking_lot::Mutex<Option<PathBuf>>,
     /// The main checkout of this linked worktree, in the policy's spelling,
     /// verified and frozen when the cache role is set (see
-    /// [`verified_linked_main_root`]).
+    /// [`linked_worktree::verified_linked_main_root`]).
     linked_main_root: parking_lot::Mutex<Option<PathBuf>>,
+    linked_worktree_projects: linked_worktree::ProjectCache,
     shared_artifacts_read_only: AtomicBool,
     /// Standalone NDJSON requests may borrow a finite CLI snapshot after the
     /// writer has exited; daemon-bound routes keep their live freshness owner.
@@ -3512,6 +3463,7 @@ impl AppContext {
             is_worktree_bridge: parking_lot::Mutex::new(false),
             git_common_dir: parking_lot::Mutex::new(None),
             linked_main_root: parking_lot::Mutex::new(None),
+            linked_worktree_projects: linked_worktree::ProjectCache::default(),
             shared_artifacts_read_only: AtomicBool::new(false),
             daemonless_query_mode: AtomicBool::new(false),
             rerank_slot: Default::default(),
@@ -7054,7 +7006,7 @@ impl AppContext {
     pub fn set_cache_role(&self, is_worktree_bridge: bool, git_common_dir: Option<PathBuf>) {
         *self.is_worktree_bridge.lock() = is_worktree_bridge;
         *self.linked_main_root.lock() = match (&git_common_dir, &self.config().project_root) {
-            (Some(common), Some(root)) => verified_linked_main_root(root, common),
+            (Some(common), Some(root)) => linked_worktree::verified_linked_main_root(root, common),
             _ => None,
         };
         *self.git_common_dir.lock() = git_common_dir;
@@ -10520,10 +10472,18 @@ impl AppContext {
         let guarded = standalone || self.missing_plugin_route();
         let temp_override = crate::access_policy::temp::roots_override();
         let scope_grants_denial = crate::access_policy::scope_grants_denial();
+        let linked_worktrees = if outside_ask && linked_worktree::in_head_scope() {
+            roots
+                .first()
+                .map(|root| self.linked_worktree_projects.for_root(root, &home))
+        } else {
+            None
+        };
         let build = move || {
             let _grants = crate::access_policy::scope_grants_guard(scope_grants_denial);
             let mut policy = AccessPolicy::from_config(&config, &storage, roots, &home);
             policy.standalone_main_roots = main_roots;
+            policy.set_linked_worktrees(linked_worktrees);
             if guarded {
                 policy.standalone_temp_guard_roots =
                     crate::access_policy::temp::guard_roots(temp_override.as_deref());

@@ -445,6 +445,12 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "access_policy/linked_worktree.rs",
+        enclosing_item: "nearest_common_dir, read_pointer",
+        location_or_primitive: "MAX_ANCESTORS, MAX_POINTER_BYTES",
+        reason: "Repository identity checks bound traversal and pointer reads; neither returns a partial tool result.",
+    },
+    ExclusionEntry {
         file: "context/checkout_suggestion.rs",
         enclosing_item: "unique_indexed_checkout_suffix",
         location_or_primitive: "MAX_PATHS, MAX_COMPONENTS",
