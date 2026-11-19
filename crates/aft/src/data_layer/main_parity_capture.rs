@@ -212,7 +212,13 @@ fn capture_case(
     config.semantic.backend = SemanticBackend::OpenAiCompatible;
     config.semantic.model = "main-parity".into();
     config.semantic.base_url = Some("http://127.0.0.1:1".into());
-    let document = json!({"indexes":config.indexes,"semantic":config.semantic,"inspect":{"categories":{"diagnostics":false}}}).to_string();
+    // Leave unset optional settings out: a user file may not hold null.
+    let mut semantic = serde_json::to_value(&config.semantic).unwrap();
+    semantic
+        .as_object_mut()
+        .unwrap()
+        .retain(|_, value| !value.is_null());
+    let document = json!({"indexes":config.indexes,"semantic":semantic,"inspect":{"categories":{"diagnostics":false}}}).to_string();
     let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
     ctx.set_canonical_cache_root(root.clone());
     crate::semantic_admission::note_opened("main-parity", &root);

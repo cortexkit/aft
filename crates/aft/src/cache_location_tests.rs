@@ -1758,11 +1758,7 @@ fn split_storage_keeps_caches_off_when_the_setting_disappears() {
     // deleting the user file must not put them back under the storage root.
     for tiers in [
         vec![user_tier(r#"{}"#)],
-        vec![user_tier(r#"{"storage":null}"#)],
         vec![user_tier(r#"{"storage":{}}"#)],
-        vec![user_tier(
-            r#"{"harnesses":{"pi":{"storage":{"cache_dir":null}}}}"#,
-        )],
         vec![],
     ] {
         let (_temp, storage, mut config) = split_then_resolve(&tiers);
@@ -1774,6 +1770,25 @@ fn split_storage_keeps_caches_off_when_the_setting_disappears() {
                 && warning.message.contains("\"cache_dir\": null"),
             "{warning:?}"
         );
+        assert!(cache_unavailable(&config).is_some());
+        assert!(crate::private_storage::create_dir_all(storage.join("index/new")).is_err());
+        assert!(!storage.join("index").exists());
+    }
+}
+
+#[test]
+fn split_storage_keeps_caches_off_when_the_user_file_has_a_refused_null() {
+    // Only a top-level `storage.cache_dir: null` means something; any other
+    // null makes the user file invalid. An invalid file must still leave the
+    // caches off the storage root, reported as an unknown configuration.
+    for doc in [
+        r#"{"storage":null}"#,
+        r#"{"harnesses":{"pi":{"storage":{"cache_dir":null}}}}"#,
+    ] {
+        let (_temp, storage, mut config) = split_then_resolve(&[user_tier(doc)]);
+        assert!(config.cache_dir.is_none());
+        let warning = prepare_cache_root(&mut config).expect("caches must stay off");
+        assert_eq!(warning.code, "cache_dir_config_unknown", "{doc}");
         assert!(cache_unavailable(&config).is_some());
         assert!(crate::private_storage::create_dir_all(storage.join("index/new")).is_err());
         assert!(!storage.join("index").exists());
