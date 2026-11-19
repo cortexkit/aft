@@ -361,6 +361,7 @@ fn terminate_piped_task(
     task_id: &str,
     pgid: Option<i32>,
     child_pid: Option<u32>,
+    reason: &str,
     #[allow(unused_mut)] mut child: Option<&mut Child>,
 ) {
     #[cfg(all(test, unix))]
@@ -375,11 +376,10 @@ fn terminate_piped_task(
         }
         return;
     }
-    let _ = task_id;
     #[cfg(unix)]
     {
-        let _ = child_pid;
         if let Some(pgid) = pgid {
+            log_bash_kill(task_id, child_pid, Some(pgid), reason);
             super::process::terminate_pgid_with(pgid, || {
                 child
                     .as_deref_mut()
@@ -390,11 +390,26 @@ fn terminate_piped_task(
     #[cfg(windows)]
     {
         let _ = pgid;
+        if let Some(pid) = child.as_ref().map(|child| child.id()).or(child_pid) {
+            log_bash_kill(task_id, Some(pid), None, reason);
+        }
         if let Some(child) = child {
             super::process::terminate_process(child);
         } else if let Some(pid) = child_pid {
             terminate_pid(pid);
         }
+    }
+}
+
+pub(super) fn log_bash_kill(task_id: &str, pid: Option<u32>, pgid: Option<i32>, reason: &str) {
+    let target = pid.or_else(|| pgid.and_then(|pgid| u32::try_from(pgid).ok()));
+    match target {
+        Some(pid) => {
+            crate::slog_info!("bash kill task={task_id} pid={pid} pgid={pgid:?} reason={reason:?}")
+        }
+        None => crate::slog_info!(
+            "bash kill task={task_id} pid=unknown pgid={pgid:?} reason={reason:?}"
+        ),
     }
 }
 
@@ -6067,6 +6082,7 @@ impl BgTaskRegistry {
                 Err(error) => {
                     drop(child.stdin.take());
                     if let Some(scope) = scope.as_ref() {
+                        log_bash_kill(&task_id, Some(child_pid), None, "spawn_memory_setup_failed");
                         let _ = scope.stop();
                     }
                     let _ = child.wait();
@@ -6077,6 +6093,12 @@ impl BgTaskRegistry {
         }
         if let Err(error) = self.arm_secret_proxy(&spawn_plan, &task_id, child_pid) {
             drop(_admission);
+            log_bash_kill(
+                &task_id,
+                Some(child_pid),
+                Some(child_pid as i32),
+                "spawn_secret_proxy_failed",
+            );
             super::process::terminate_pgid_with(child_pid as i32, || {
                 matches!(child.try_wait(), Ok(Some(_)))
             });
@@ -6090,6 +6112,12 @@ impl BgTaskRegistry {
         if let Some(mut monitor) = memory_monitor.take() {
             if let Err(error) = monitor.attach(child_pid) {
                 drop(_admission);
+                log_bash_kill(
+                    &task_id,
+                    Some(child_pid),
+                    Some(child_pid as i32),
+                    "spawn_memory_attach_failed",
+                );
                 super::process::terminate_pgid_with(child_pid as i32, || {
                     matches!(child.try_wait(), Ok(Some(_)))
                 });
@@ -6121,6 +6149,12 @@ impl BgTaskRegistry {
         if let Err(error) = self.persist_task(&paths, &metadata) {
             drop(child.stdin.take());
             if let Some(scope) = scope.as_ref() {
+                log_bash_kill(
+                    &task_id,
+                    Some(child_pid),
+                    None,
+                    "spawn_identity_persist_failed",
+                );
                 let _ = scope.stop();
             }
             let _ = child.wait();
@@ -6941,6 +6975,12 @@ impl BgTaskRegistry {
         child.declare_agent();
         if let Some(mut monitor) = memory_monitor.take() {
             if let Err(error) = monitor.attach(child_pid) {
+                log_bash_kill(
+                    &task_id,
+                    Some(child_pid),
+                    None,
+                    "spawn_memory_attach_failed",
+                );
                 let _ = child.kill();
                 let _ = child.wait();
                 self.fail_memory_spawn(&mut metadata, &paths, &error, canonical_project_root);
@@ -6955,6 +6995,7 @@ impl BgTaskRegistry {
                 crate::windows_shell::release_memory_file_gate(&paths.exit)
             };
             if let Err(error) = released {
+                log_bash_kill(&task_id, Some(child_pid), None, "spawn_memory_gate_failed");
                 monitor.terminate();
                 let _ = child.kill();
                 let _ = child.wait();
@@ -8504,10 +8545,11 @@ impl BgTaskRegistry {
                             &metadata.task_id,
                             metadata.pgid,
                             metadata.child_pid,
+                            "resume_interrupted_kill",
                             None,
                         );
                         #[cfg(target_os = "linux")]
-                        self.inner.task_scopes.kill(
+                        self.inner.task_scopes.kill_with_audit(
                             &metadata.task_id,
                             metadata
                                 .memory_policy
@@ -8517,6 +8559,9 @@ impl BgTaskRegistry {
                                         == super::memory_limit::MemoryPolicy::TASK_SCOPE_MEMORY_KIND
                                 })
                                 .and_then(|policy| policy.cgroup.as_deref()),
+                            metadata.child_pid,
+                            metadata.pgid,
+                            "resume_interrupted_kill",
                         )?;
                         settle_killed_process_group(&metadata.task_id, metadata.pgid);
                     }
@@ -14618,6 +14663,8 @@ impl BgTaskRegistry {
             terminal_status
         };
         let reason = pending_memory_reason.or(reason);
+        let audit_reason = reason.clone();
+        let kill_reason = audit_reason.as_deref().unwrap_or("kill_requested");
         let memory_kill = terminal_status == BgTaskStatus::Failed
             && reason.is_some()
             && task
@@ -14827,10 +14874,13 @@ impl BgTaskRegistry {
                     TaskRuntime::Pty(Some(pty)) => {
                         pty.was_killed.store(true, Ordering::SeqCst);
                         #[cfg(not(windows))]
-                        if let Err(error) = pty.killer.kill() {
-                            crate::slog_warn!(
-                                "[pty-kill] {task_id} ChildKiller::kill failed: {error}"
-                            );
+                        {
+                            log_bash_kill(task_id, pty.child_pid, pgid, kill_reason);
+                            if let Err(error) = pty.killer.kill() {
+                                crate::slog_warn!(
+                                    "[pty-kill] {task_id} ChildKiller::kill failed: {error}"
+                                );
+                            }
                         }
                         KillSignalPlan::Pty {
                             pid: pty.child_pid,
@@ -14860,7 +14910,8 @@ impl BgTaskRegistry {
             KillSignalPlan::TerminalSurvivors { pgid, live_count } => {
                 kill_signaled = true;
                 kill_reached = live_count;
-                self.terminate_terminal_survivors(&task, pgid)?;
+                log_bash_kill(task_id, None, Some(pgid), kill_reason);
+                self.terminate_terminal_survivors(&task, pgid, kill_reason)?;
             }
             KillSignalPlan::Piped {
                 pgid,
@@ -14897,8 +14948,8 @@ impl BgTaskRegistry {
                 if scope_diagnostic {
                     crate::slog_info!("scope diagnostic phase=signal_started task={task_id} child_pid={child_pid:?} elapsed_ms={}", diagnostic_start.elapsed().as_millis());
                 }
-                terminate_piped_task(&task.task_id, pgid, child_pid, child.as_mut());
-                let scope_result = self.kill_task_scope(&task.task_id);
+                terminate_piped_task(&task.task_id, pgid, child_pid, kill_reason, child.as_mut());
+                let scope_result = self.kill_task_scope_with_reason(&task.task_id, kill_reason);
                 scope_kill_attempted = true;
                 #[cfg(feature = "test-timing-hooks")]
                 if scope_diagnostic {
@@ -15001,6 +15052,8 @@ impl BgTaskRegistry {
                 }
             }
             KillSignalPlan::Pty { pid, master } => {
+                #[cfg(windows)]
+                log_bash_kill(task_id, pid, None, kill_reason);
                 if let Some(pid) = pid {
                     terminate_pty_group(pid);
                 }
@@ -15023,7 +15076,7 @@ impl BgTaskRegistry {
         }
 
         if !scope_kill_attempted {
-            self.kill_task_scope(&task.task_id)?;
+            self.kill_task_scope_with_reason(&task.task_id, kill_reason)?;
         }
         if terminalized {
             #[cfg(test)]
@@ -15065,9 +15118,14 @@ impl BgTaskRegistry {
     /// group, then record what is still alive. Runs without the state lock
     /// held across the signal and its grace period.
     #[cfg(unix)]
-    fn terminate_terminal_survivors(&self, task: &Arc<BgTask>, pgid: i32) -> Result<(), String> {
+    fn terminate_terminal_survivors(
+        &self,
+        task: &Arc<BgTask>,
+        pgid: i32,
+        reason: &str,
+    ) -> Result<(), String> {
         terminate_pgid(pgid, None);
-        self.kill_task_scope(&task.task_id)?;
+        self.kill_task_scope_with_reason(&task.task_id, reason)?;
         settle_killed_process_group(&task.task_id, Some(pgid));
         let sample = live_process_group_members(pgid);
         let mut db = DeferredDbWrites::new(self, task);
@@ -15083,7 +15141,12 @@ impl BgTaskRegistry {
     /// Process groups are not enumerated or signaled as a group on this
     /// platform, so a terminal task has no survivors to signal.
     #[cfg(not(unix))]
-    fn terminate_terminal_survivors(&self, _task: &Arc<BgTask>, _pgid: i32) -> Result<(), String> {
+    fn terminate_terminal_survivors(
+        &self,
+        _task: &Arc<BgTask>,
+        _pgid: i32,
+        _reason: &str,
+    ) -> Result<(), String> {
         Ok(())
     }
 

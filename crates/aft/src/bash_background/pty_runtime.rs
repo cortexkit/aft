@@ -48,6 +48,12 @@ impl PtyRuntime {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Box::new(std::io::sink());
         if !self.exit_observed.load(std::sync::atomic::Ordering::SeqCst) {
+            super::registry::log_bash_kill(
+                &self.coordinator.task_id,
+                self.child_pid,
+                None,
+                "pty_bootstrap_failed",
+            );
             let _ = self.killer.kill();
         }
     }

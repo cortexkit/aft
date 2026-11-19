@@ -302,6 +302,82 @@ fn bash_kill_of_a_finished_task_names_what_survived_it() {
     );
 }
 
+#[test]
+fn finished_foreground_nohup_child_survives_replay_and_cleanup_until_explicit_kill() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = registry();
+    let task_id = old
+        .spawn_with_shell_in_slot(
+            SpawnPlan::Unsandboxed,
+            "nohup bash -c 'touch ready; exec sleep 60' > child.log 2>&1 < /dev/null & echo $! > child.pid",
+            super::super::BashShell::Bash,
+            resolve_posix_shell(),
+            SESSION.into(),
+            dir.path().into(),
+            HashMap::new(),
+            super::super::HardKill::Default,
+            None,
+            dir.path().into(),
+            super::super::TaskSlot::Foreground,
+            false,
+            false,
+            Some(dir.path().into()),
+        )
+        .unwrap();
+    let pgid = task_pgid(&old, &task_id);
+    let _reap = ReapGroup(pgid);
+    wait_for_file(&dir.path().join("ready"), "the nohup child did not start");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let completed = loop {
+        let snapshot = old.status(&task_id, SESSION, None, None, 0).unwrap();
+        if snapshot.info.status.is_terminal() && snapshot.live_descendants.is_some() {
+            break snapshot;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the foreground task did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(completed.info.status, BgTaskStatus::Completed);
+    assert_eq!(completed.exit_code, Some(0));
+    let child_pid: u32 = fs::read_to_string(dir.path().join("child.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let child_is_in_group = || {
+        live_process_group_members(pgid)
+            .unwrap()
+            .members
+            .iter()
+            .any(|member| member.pid == child_pid)
+    };
+    assert!(child_is_in_group(), "nohup child did not outlive the task");
+
+    old.detach();
+    drop(old);
+    let restarted = registry();
+    restarted.replay_session(dir.path(), SESSION).unwrap();
+    assert!(child_is_in_group(), "replay killed the nohup child");
+    super::super::watchdog::run_cleanup([restarted.clone()]);
+    restarted.maybe_gc_persisted(dir.path()).unwrap();
+    assert!(child_is_in_group(), "periodic GC killed the nohup child");
+
+    let (killed, logs) = crate::logging::capture_log_lines(|| restarted.kill(&task_id, SESSION));
+    let killed = killed.unwrap();
+    assert_eq!(killed.info.status, BgTaskStatus::Completed);
+    assert_eq!(killed.exit_code, Some(0));
+    assert!(!child_is_in_group(), "explicit kill left the child running");
+    assert!(
+        logs.iter().any(|line| line.contains(&format!(
+            "bash kill task={task_id} pid={pgid} pgid=Some({pgid}) reason=\"kill_requested\""
+        ))),
+        "kill attempt was not logged: {logs:?}"
+    );
+}
+
 /// The control case: the group SIGKILL reaches the TERM-ignoring process, the
 /// group is empty afterwards, and the check reports an empty list, not null.
 #[test]

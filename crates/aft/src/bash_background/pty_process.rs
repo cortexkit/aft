@@ -26,6 +26,7 @@ const PTY_SETUP_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// setup fails before handing the child to its waiter thread, dropping this
 /// attempts to kill and reap the child within a deadline, logging reap failures.
 struct SpawnedPtyChild {
+    task_id: String,
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     root: Option<subc_client_rs::AgentCommandRoot>,
@@ -33,10 +34,12 @@ struct SpawnedPtyChild {
 
 impl SpawnedPtyChild {
     fn new(
+        task_id: String,
         child: Box<dyn portable_pty::Child + Send + Sync>,
         root: Option<subc_client_rs::AgentCommandRoot>,
     ) -> Self {
         Self {
+            task_id,
             child: Some(child),
             master: None,
             root,
@@ -60,6 +63,7 @@ impl Drop for SpawnedPtyChild {
         };
         // Dropping a PTY handle is not a termination guarantee: a child can
         // ignore HUP. Setup still owns this child, so kill and reap it here.
+        super::registry::log_bash_kill(&self.task_id, child.process_id(), None, "pty_setup_failed");
         #[cfg(unix)]
         if let Some(pid) = child.process_id() {
             unsafe {
@@ -440,6 +444,7 @@ fn try_spawn_pty(
     // Own the master in the child guard so every later setup error closes it
     // before cleanup waits for the session leader to exit.
     let mut child = SpawnedPtyChild {
+        task_id: task_id.to_owned(),
         child: Some(child),
         master: Some(pair.master),
         root: None,
@@ -771,7 +776,7 @@ pub(crate) fn spawn_waiter(
     coordinator: Arc<CompletionCoordinator>,
     root: Option<subc_client_rs::AgentCommandRoot>,
 ) -> io::Result<()> {
-    let mut owned_child = SpawnedPtyChild::new(child, root);
+    let mut owned_child = SpawnedPtyChild::new(coordinator.task_id.clone(), child, root);
     super::worker_thread::spawn(super::worker_thread::Worker::PtyWaiter, move || {
         let mut child = owned_child.child.take().unwrap();
         let marker = loop {
@@ -1026,6 +1031,7 @@ mod tests {
             .unwrap();
         let fd = pair.master.as_raw_fd().unwrap();
         let guard = SpawnedPtyChild {
+            task_id: "pty-setup-test".into(),
             master: Some(pair.master),
             child: Some(Box::new(MasterCloseCheckedChild(fd))),
             root: None,
