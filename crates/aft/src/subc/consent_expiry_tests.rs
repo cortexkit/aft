@@ -88,8 +88,7 @@ fn file(path: &Path) -> AccessGrant {
 
 async fn park_call(f: &Fixture) {
     let target = f.head_root.join("shared.txt");
-    let mut call = scope_probe_call(f, &target);
-    call.arguments = json!({"filePath":target});
+    let call = scope_probe_call(f, &target);
     let owner = SettlementOwner::new(&call);
     let result = hold(
         &call,
@@ -412,8 +411,10 @@ async fn consent_expiry_lost_withdrawal_reply_refiles_and_honors_the_fresh_answe
     let endpoint = Arc::new(Endpoint(Arc::clone(&f.fake), Arc::clone(&pause)));
     install_test_transport(Some(endpoint));
     let pause = pause.wait.as_ref().unwrap();
+    let target = f.head_root.join("shared.txt");
+    let arguments = scope_probe_call(&f, &target).arguments;
     let mut replies = f
-        .send_read(&f.worker, &f.head_root.join("shared.txt"), 1)
+        .send_tool(&f.worker, "read", arguments, 1, read_dispatch)
         .await;
     tokio::time::timeout(BUDGET, pause.entered.notified())
         .await
