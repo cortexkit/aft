@@ -2037,7 +2037,7 @@ pub fn shutdown_idle_lsp(ctx: &AppContext) {
 }
 
 pub fn shutdown_idle_lsp_at(ctx: &AppContext, now: Instant, last_activity: Instant) {
-    let Some(ttl) = ctx.config().lsp_idle_minutes.ttl() else {
+    let Some(ttl) = ctx.config().lsp_idle_ttl() else {
         return;
     };
     let idle = now.saturating_duration_since(last_activity);
@@ -4525,7 +4525,7 @@ mod idle_lsp_tests {
     fn idle_lsp_ttl_shuts_down_stale_client_and_keeps_recent() {
         let tmp = tempfile::tempdir().unwrap();
         let mut stale_config = Config::default();
-        stale_config.lsp_idle_minutes = crate::config::LspIdleMinutes::Minutes(5);
+        stale_config.lsp_idle_minutes = 5;
         let stale = AppContext::new(
             crate::context::default_language_provider_factory(),
             stale_config,
@@ -4552,7 +4552,7 @@ mod idle_lsp_tests {
         );
 
         let mut fresh_config = Config::default();
-        fresh_config.lsp_idle_minutes = crate::config::LspIdleMinutes::Minutes(5);
+        fresh_config.lsp_idle_minutes = 5;
         let fresh = AppContext::new(
             crate::context::default_language_provider_factory(),
             fresh_config,
@@ -4572,7 +4572,7 @@ mod idle_lsp_tests {
     fn lsp_idle_never_keeps_server_past_any_idle_window() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = Config::default();
-        config.lsp_idle_minutes = crate::config::LspIdleMinutes::Never;
+        config.lsp_idle_shutdown = false;
         let ctx = AppContext::new(crate::context::default_language_provider_factory(), config);
         let pid = spawn_sleep_client(&ctx, tmp.path().to_path_buf());
         let last_activity = Instant::now();

@@ -2053,14 +2053,14 @@ fn run_row_with_options(
     let home = temp.path().join("home");
     fs::create_dir_all(&home).expect("create HOME");
     let project = write_project_repo(temp.path());
-    let connection_file = temp.path().join("subc-connection.json");
-    holder.write_connection_file(&connection_file);
-    write_user_config(&config_home, &connection_file);
     let upstream_bin = temp.path().join("upstream-bin");
     let recorder = temp.path().join("upstream-invocations.txt");
     write_upstream_gh(&upstream_bin);
     let now = unix_seconds();
     if provisioned {
+        let connection_file = temp.path().join("subc-connection.json");
+        holder.write_connection_file(&connection_file);
+        write_user_config(&config_home, &connection_file);
         write_signed_manifest_bytes(&state_dir, manifest_bytes, now);
     }
 
@@ -2741,13 +2741,13 @@ fn queue_actions_never_route_under_v22_even_with_v23_rows_signed() {
 }
 
 #[test]
-fn unprovisioned_head_shell_keeps_unknown_dequeue_and_merge_passthrough() {
+fn standalone_head_shell_keeps_unknown_dequeue_and_merge_passthrough() {
     for argv in [
         vec!["pr", "dequeue", "7"],
         vec!["pr", "merge", "7", "--auto"],
     ] {
         let row = V22Row {
-            name: "unprovisioned queue",
+            name: "standalone queue",
             argv,
             expect: V22Expect::Refused("unused"),
         };

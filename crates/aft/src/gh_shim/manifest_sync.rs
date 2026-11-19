@@ -472,7 +472,11 @@ pub(crate) struct Worker {
 
 /// Called only by subc startup after registration, never by a standalone shim.
 pub(crate) fn start(connection_file: PathBuf) -> Option<Worker> {
-    crate::launch_nonce::consumer_identity().filter(|identity| identity.module_id == "aft")?;
+    if !crate::subc::registration::module_consumer_allowed()
+        || crate::subc::registration::module_id().as_deref() != Some("aft")
+    {
+        return None;
+    }
     let (stop, stopped) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
         if gh_shim_enabled_from_config_doc(&read_user_config_doc().unwrap_or_default())

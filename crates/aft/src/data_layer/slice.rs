@@ -30,6 +30,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
+mod edge_assembly;
+use edge_assembly::{EdgeKey, EdgeRow};
+
 use super::callgraph::FileResolution;
 use super::graph_rows::{macro_body_call, references_by_key};
 use crate::callgraph_store::join::{BlobRefKind, BlobSymbol, ParseBlob, ResolutionStatus};
@@ -1005,18 +1008,6 @@ impl<'p> RefRow<'p> {
     }
 }
 
-/// An edge as assembly collects it, before the slice is packed.
-struct EdgeRow {
-    ref_id: String,
-    source: NodeId,
-    target_file: String,
-    target_symbol: String,
-    kind: u64,
-    line: u32,
-    provenance: u64,
-    lookup: TargetLookup,
-}
-
 const fn ref_kind_code(kind: BlobRefKind) -> u64 {
     match kind {
         BlobRefKind::Call => 0,
@@ -1054,6 +1045,19 @@ impl FileSlice {
         parse: &ParseBlob,
         resolution: &FileResolution,
     ) -> Self {
+        Self::build_checked(path, record_key, parse, resolution, None)
+            .expect("an unguarded slice cannot stop")
+    }
+
+    pub(super) fn build_checked(
+        path: &str,
+        record_key: &str,
+        parse: &ParseBlob,
+        resolution: &FileResolution,
+        guard: Option<&super::refresh_memory::RefreshMemory>,
+    ) -> Result<Self, super::refresh_memory::RefreshStop> {
+        use super::refresh_memory::RefreshChecks;
+
         let mut ordinary = HashMap::<&str, NodeId>::new();
         let surviving = surviving_nodes(path, parse, &mut ordinary);
         let mut scoped = HashMap::<&str, NodeId>::new();
@@ -1066,7 +1070,7 @@ impl FileSlice {
         // reference replaces the earlier one.
         let references = references_by_key(parse);
         let mut refs = BTreeMap::<String, RefRow<'_>>::new();
-        let mut edges = BTreeMap::<String, EdgeRow>::new();
+        let mut edges = BTreeMap::<EdgeKey<'_>, EdgeRow<'_>>::new();
         let mut rows = resolution.rows.iter().collect::<Vec<_>>();
         rows.sort();
         for row in rows {
@@ -1082,21 +1086,23 @@ impl FileSlice {
                 .copied();
             let target = row
                 .target_path
-                .as_ref()
-                .and_then(|target| String::from_utf8(target.clone()).ok())
-                .zip(row.target_symbol.clone());
+                .as_deref()
+                .and_then(|target| std::str::from_utf8(target).ok())
+                .zip(row.target_symbol.as_deref());
             if let (Some(source), Some((target_file, target_symbol)), true) = (
                 caller,
-                target.clone(),
+                target,
                 matches!(
                     row.kind,
                     BlobRefKind::Call | BlobRefKind::Construction | BlobRefKind::CallbackRef
                 ),
             ) {
                 edges.insert(
-                    format!("edge:{ref_id}"),
+                    EdgeKey::Edge {
+                        ordinal: row.ref_ordinal,
+                    },
                     EdgeRow {
-                        ref_id: ref_id.clone(),
+                        ref_ordinal: row.ref_ordinal,
                         source,
                         target_file,
                         target_symbol,
@@ -1133,17 +1139,20 @@ impl FileSlice {
                     byte_start: reference.byte_start as u64,
                     byte_end: reference.byte_end as u64,
                     resolved: row.status == ResolutionStatus::Resolved,
-                    target,
+                    target: target.map(|(file, symbol)| (file.to_owned(), symbol.to_owned())),
                 },
             );
         }
         // Method-call sites replace their reference's ordinary edge and
         // target with the dispatch pass's.
         for kept in &resolution.sites {
+            guard.site()?;
             let site = &kept.site;
             let resolution = &kept.resolution;
             let ref_id = format!("view:{path}:{}", site.ordinal);
-            edges.remove(&format!("edge:{ref_id}"));
+            edges.remove(&EdgeKey::Edge {
+                ordinal: site.ordinal,
+            });
             if let Some(reference) = refs.get_mut(&ref_id) {
                 reference.resolved = !resolution.targets.is_empty();
                 reference.target = None;
@@ -1158,15 +1167,16 @@ impl FileSlice {
             };
             for target in &resolution.targets {
                 edges.insert(
-                    format!(
-                        "dispatch:{path}:{}:{}:{}",
-                        site.ordinal, target.file, target.symbol
-                    ),
+                    EdgeKey::Dispatch {
+                        ordinal: site.ordinal,
+                        file: &target.file,
+                        symbol: &target.symbol,
+                    },
                     EdgeRow {
-                        ref_id: ref_id.clone(),
+                        ref_ordinal: site.ordinal,
                         source: caller,
-                        target_file: target.file.clone(),
-                        target_symbol: target.symbol.clone(),
+                        target_file: &target.file,
+                        target_symbol: &target.symbol,
                         kind: 0,
                         line: site.line,
                         provenance: code_of(&PROVENANCES, target.provenance),
@@ -1175,7 +1185,7 @@ impl FileSlice {
                 );
             }
         }
-        Self::pack(
+        Ok(Self::pack(
             path,
             record_key,
             &parse.language,
@@ -1185,7 +1195,7 @@ impl FileSlice {
             scoped,
             &refs,
             &edges,
-        )
+        ))
     }
 
     /// Packs assembled rows into columns over one sorted string table.
@@ -1199,7 +1209,7 @@ impl FileSlice {
         ordinary: HashMap<&str, NodeId>,
         scoped: HashMap<&str, NodeId>,
         refs: &BTreeMap<String, RefRow<'_>>,
-        edges: &BTreeMap<String, EdgeRow>,
+        edges: &BTreeMap<EdgeKey<'_>, EdgeRow<'_>>,
     ) -> Self {
         let mut ordinary = ordinary.into_iter().collect::<Vec<_>>();
         ordinary.sort_unstable_by_key(|(name, _)| *name);
@@ -1248,7 +1258,7 @@ impl FileSlice {
             }
         }
         for edge in edges.values() {
-            strings.extend([edge.target_file.as_str(), edge.target_symbol.as_str()]);
+            strings.extend([edge.target_file, edge.target_symbol]);
         }
         strings.extend(ordinary.iter().map(|(name, _)| *name));
         let sorted = strings.into_iter().collect::<Vec<_>>();
@@ -1327,12 +1337,12 @@ impl FileSlice {
             ),
         };
 
-        let positions = refs
-            .keys()
-            .enumerate()
-            .map(|(position, id)| (id.as_str(), position as u64))
-            .collect::<HashMap<_, _>>();
         let rows = refs.values().collect::<Vec<_>>();
+        let positions = rows
+            .iter()
+            .enumerate()
+            .map(|(position, reference)| (reference.ordinal, position as u64))
+            .collect::<HashMap<_, _>>();
         let (mut full_at, mut full_name) = (Vec::new(), Vec::new());
         let (mut local_at, mut local_name) = (Vec::new(), Vec::new());
         let (mut target_at, mut target_file, mut target_symbol) =
@@ -1387,12 +1397,12 @@ impl FileSlice {
         let edges = Edges {
             reference: column(
                 rows.iter()
-                    .map(|e| positions.get(e.ref_id.as_str()).map_or(0, |at| at + 1))
+                    .map(|e| positions.get(&e.ref_ordinal).map_or(0, |at| at + 1))
                     .collect(),
             ),
             source: column(rows.iter().map(|e| u64::from(handle(&e.source))).collect()),
-            target_file: column(rows.iter().map(|e| at(&e.target_file)).collect()),
-            target_symbol: column(rows.iter().map(|e| at(&e.target_symbol)).collect()),
+            target_file: column(rows.iter().map(|e| at(e.target_file)).collect()),
+            target_symbol: column(rows.iter().map(|e| at(e.target_symbol)).collect()),
             line: column(rows.iter().map(|e| u64::from(e.line)).collect()),
             code: column(
                 rows.iter()

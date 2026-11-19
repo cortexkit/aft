@@ -244,6 +244,8 @@ mod ledger_lane_tests;
 mod perf_sweep;
 mod route_census;
 mod secret_consent;
+mod settings;
+pub use settings::requested as settings_gate_requested;
 #[cfg(test)]
 mod views_idle_checkout_tests;
 #[cfg(all(test, unix))]
@@ -4456,86 +4458,8 @@ pub fn run_subc_mode_for_test_with_health_rollup_probe(
         dispatch,
         user_config_path,
         Some(probe),
+        None,
     )
-}
-
-fn run_subc_mode_with_probe(
-    connection_file_path: &Path,
-    ctx: Arc<AppContext>,
-    executor: Arc<Executor>,
-    dispatch: DispatchFn,
-    user_config_path: Option<PathBuf>,
-    lifecycle_probe: Option<SubcTestLifecycleProbe>,
-) -> Result<(), SubcError> {
-    // One watch on the user config file serves every root in this process:
-    // an edit asks each live root to reload its config.
-    let _user_config_watch = user_config_path.clone().map(|path| {
-        let executor = Arc::downgrade(&executor);
-        crate::config_live::start_process_user_config_watch(path, move || {
-            executor
-                .upgrade()
-                .map(|executor| executor.actor_contexts())
-                .unwrap_or_default()
-        })
-    });
-    // Production NEVER allows non-manifest tool names on route channels: AFT
-    // fails closed and does not trust subc to enforce the manifest. The
-    // test-only harness sets this through `run_subc_mode_for_test`.
-    run_subc_mode_inner(
-        connection_file_path,
-        ctx,
-        executor,
-        dispatch,
-        user_config_path,
-        false,
-        MAX_FRAME_BODY_LEN as usize,
-        lifecycle_probe,
-    )
-}
-
-// A current-thread runtime polls its root future on the thread calling
-// block_on. Windows gives the process main thread only a 1 MiB stack; the
-// module loop and its callees need headroom even with their futures boxed.
-const MODULE_RUNTIME_STACK_BYTES: usize = 16 * 1024 * 1024;
-
-fn with_module_runtime_stack<T: Send>(run: impl FnOnce() -> T + Send) -> io::Result<T> {
-    std::thread::scope(|scope| {
-        let worker = std::thread::Builder::new()
-            .name("aft-subc-runtime".to_string())
-            .stack_size(MODULE_RUNTIME_STACK_BYTES)
-            .spawn_scoped(scope, run)?;
-        match worker.join() {
-            Ok(result) => Ok(result),
-            // Keep the original panic payload and unwind the caller, rather
-            // than turning a module panic into a clean stop or a new panic.
-            Err(panic) => std::panic::resume_unwind(panic),
-        }
-    })
-}
-
-fn run_subc_mode_inner(
-    connection_file_path: &Path,
-    ctx: Arc<AppContext>,
-    executor: Arc<Executor>,
-    dispatch: DispatchFn,
-    user_config_path: Option<PathBuf>,
-    allow_native_passthrough: bool,
-    tool_response_body_limit: usize,
-    lifecycle_probe: Option<SubcTestLifecycleProbe>,
-) -> Result<(), SubcError> {
-    with_module_runtime_stack(move || {
-        run_subc_mode_on_runtime_thread(
-            connection_file_path,
-            ctx,
-            executor,
-            dispatch,
-            user_config_path,
-            allow_native_passthrough,
-            tool_response_body_limit,
-            lifecycle_probe,
-        )
-    })
-    .map_err(SubcError::RuntimeThread)?
 }
 
 fn run_subc_mode_on_runtime_thread(
@@ -4547,40 +4471,43 @@ fn run_subc_mode_on_runtime_thread(
     allow_native_passthrough: bool,
     tool_response_body_limit: usize,
     lifecycle_probe: Option<SubcTestLifecycleProbe>,
+    registration: Option<AdoptedRegistration>,
 ) -> Result<(), SubcError> {
     // Before any database opens: this process admits keyed calls, so it is
     // the one that recovers the call ledger after a restart.
     crate::db::call_ledger::mark_provider_process();
-    let _daemon_storage_lease = crate::root_cache::acquire_daemon_storage_lease(&ctx.storage_dir())
+    let opt_in = settings::requested();
+    let _daemon_storage_lease = (!opt_in)
+        .then(|| crate::root_cache::acquire_daemon_storage_lease(&ctx.storage_dir()))
+        .transpose()
         .map_err(SubcError::StorageLease)?;
-    crate::db::runner_harness_keys::start(ctx.app(), ctx.storage_dir().join("aft.db"));
-    let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
-    let runtime = dispatch_path_metrics
-        .frame_loop_runtime()
-        .map_err(SubcError::Runtime)?;
+    let (runtime, dispatch_path_metrics, adopted) = match registration {
+        Some(channel) => (channel.runtime, channel.metrics, Some(channel.stream)),
+        None => {
+            let metrics = Arc::new(DispatchPathMetrics::new());
+            let runtime = metrics.frame_loop_runtime().map_err(SubcError::Runtime)?;
+            (runtime, metrics, None)
+        }
+    };
 
     let executor_for_loop = Arc::clone(&executor);
     let loop_result = runtime.block_on(async move {
         let shared_app = ctx.app();
         // Stall captures land under `<storage>/diagnostics`.
         let storage_dir = ctx.storage_dir();
-        if crate::launch_nonce::current().is_some() {
+        if registration::identity_ready() {
             crate::agent_commands::enable(&storage_dir);
         }
-        let base_task_scope_runtime = Some((
-            ctx.bash_background().clone(),
-            Duration::from_secs(ctx.config().bash.linux_scope_max_runtime_secs),
-            ctx.storage_dir(),
-        ));
-        drop(ctx);
-        // Saved paused tasks may still owe their runner a cancel; send those
-        // now rather than when (if ever) their projects bind again.
-        crate::bash_background::note_storage_root(&storage_dir);
-        // Initialize the page snapshot store. The shared storage-use lease
-        // excludes cache cleanup, not other AFT daemons.
-        crate::page_collect::snapshot::SnapshotStore::for_storage(&storage_dir);
-        let stream =
-            connect_and_authenticate(connection_file_path, lifecycle_probe.as_ref()).await?;
+        if !opt_in {
+            settings::initialize_storage(shared_app.clone(), &storage_dir);
+        }
+        let using_registration = adopted.is_some();
+        let stream: Box<dyn subc_client_rs::ModuleStream> = match adopted {
+            Some(stream) => registration::authenticate(stream, connection_file_path).await?,
+            None => Box::new(
+                connect_and_authenticate(connection_file_path, lifecycle_probe.as_ref()).await?,
+            ),
+        };
         log::info!(
             "subc attach: authenticated to daemon via {}",
             connection_file_path.display()
@@ -4599,10 +4526,11 @@ fn run_subc_mode_on_runtime_thread(
                 tool_response_body_limit,
                 lifecycle_probe,
                 &storage_dir,
-                base_task_scope_runtime,
+                Some(ctx),
                 // The exit phase below takes and shuts down every root's servers.
                 QuiescedLsp::LeaveForExitSweep,
                 Some(dispatch_path_metrics),
+                using_registration,
                 #[cfg(test)]
                 None,
                 #[cfg(test)]
@@ -4718,6 +4646,7 @@ fn spawn_readiness(
     control: Arc<readiness::DaemonControl>,
     spawn_role: readiness::SpawnRole,
     hello_at: tokio::time::Instant,
+    settings: Option<Arc<settings::Session>>,
 ) -> Option<JoinHandle<()>> {
     if !control.supports_ready_flip() {
         log::info!("readiness: daemon does not advertise catalog.update; no flip is sent");
@@ -4727,6 +4656,9 @@ fn spawn_readiness(
         let report =
             readiness::run_readiness(control.as_ref(), &readiness::NoWarmer, spawn_role, hello_at)
                 .await;
+        if let Some(settings) = settings {
+            settings.mark_ready();
+        }
         log::info!("{report}");
     }))
 }
@@ -4804,6 +4736,7 @@ pub fn run_subc_mode_for_test(
         true,
         MAX_FRAME_BODY_LEN as usize,
         None,
+        None,
     )
 }
 
@@ -4826,6 +4759,7 @@ pub fn run_subc_mode_for_test_with_lifecycle_probe(
         true,
         MAX_FRAME_BODY_LEN as usize,
         Some(lifecycle_probe),
+        None,
     )
 }
 
@@ -4849,6 +4783,7 @@ pub fn run_subc_mode_for_test_with_response_body_limit(
         user_config_path,
         true,
         tool_response_body_limit,
+        None,
         None,
     )
 }
@@ -5188,10 +5123,12 @@ async fn drain_pending_route_bind_completions(
 
 #[path = "task_scope_runtime.rs"]
 mod task_scope_runtime;
-use task_scope_runtime::heap_module_future;
+use task_scope_runtime::{heap_module_future, run_subc_mode_inner, run_subc_mode_with_probe};
 #[cfg(test)]
-use task_scope_runtime::run_module_loop;
-pub use task_scope_runtime::run_subc_mode;
+use task_scope_runtime::{run_module_loop, with_module_runtime_stack, MODULE_RUNTIME_STACK_BYTES};
+pub use task_scope_runtime::{run_subc_mode, run_subc_mode_with_registration};
+pub(crate) mod registration;
+pub use registration::AdoptedRegistration;
 
 /// Runs the `ModuleHello` → `HelloAck` sequence and the control/route loop.
 /// Stops on connection EOF, channel-0 Goodbye, or an executor response that requests whole-connection teardown.
@@ -5207,9 +5144,10 @@ async fn run_module_loop_with_task_scopes<R, W>(
     tool_response_body_limit: usize,
     lifecycle_probe: Option<SubcTestLifecycleProbe>,
     storage_dir: &Path,
-    base_task_scope_runtime: Option<(crate::bash_background::BgTaskRegistry, Duration, PathBuf)>,
+    startup_ctx: Option<Arc<AppContext>>,
     connection_end_lsp: QuiescedLsp,
     runtime_metrics: Option<Arc<DispatchPathMetrics>>,
+    using_registration: bool,
     #[cfg(test)] standing_actor_override: Option<Arc<standing::StandingActor>>,
     #[cfg(test)] mut watchdog_test: Option<stall_watchdog::FrameLoopTestHooks>,
 ) -> Result<ModuleLoopExit, SubcError>
@@ -5217,63 +5155,19 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    // ModuleHello registers the tool and management providers and advertises
-    // the separate channel-0 control operations.
-    // The spawn role is read once, before HELLO: it selects the warm-up budget
-    // and nothing else.
     let spawn_role = readiness::SpawnRole::from_process_env();
-    // The catalog is module-wide and sent once, before any route binds, so it
-    // can only reflect the user config file: project and per-harness disables
-    // are enforced per route at dispatch.
-    let catalog_disabled = crate::subc_config::catalog_disabled_tools(user_config_path.as_deref());
-    // Echo the launch nonce the daemon handed over at spawn (captured once at
-    // startup, see `crate::launch_nonce`) so a reserved module_id's HELLO is
-    // accepted; absent for non-reserved/self-connect.
-    let launch_nonce = crate::launch_nonce::current();
-    // Compile immutable call validators before HELLO makes this module available.
-    // Discovery only needs catalog entries and must not pay this first-use cost.
-    tool_provider::prepare_admission();
-    let mut manifest = build_manifest_without(&catalog_disabled);
-    manifest::declare_provenance(&mut manifest, crate::launch_nonce::provenance());
-    let rich_ui_proofs = rich_ui::session::ProofCapabilities::from_manifest(&manifest);
-    let manifest_provides = manifest.provides.clone();
-    let hello_at = tokio::time::Instant::now();
-    let hello = ModuleHelloBody {
-        manifest,
-        protocol_ver: PROTOCOL_VERSION,
-        control_ops: control_ops(),
-        launch_nonce: launch_nonce.map(|nonce| nonce.value().to_string()),
-    };
-    let hello_frame = Frame::build(
-        FrameType::Hello,
-        control_flags(),
-        0,
-        0,
-        HELLO_CORR,
-        serde_json::to_vec(&hello).map_err(SubcError::Json)?,
+    let opt_in = startup_ctx.is_some() && settings::requested();
+    let hello = settings::negotiate(
+        &mut read,
+        &mut write,
+        user_config_path.as_deref(),
+        opt_in,
+        using_registration,
     )
-    .map_err(SubcError::FrameBuild)?;
-    write_frame(&mut write, &hello_frame)
-        .await
-        .map_err(SubcError::FrameIo)?;
-
-    // Expect HelloAck (registered) or a channel-0 Error (manifest/version reject).
-    let hello_ack = match read_frame(&mut read).await.map_err(SubcError::FrameIo)? {
-        None => return Err(SubcError::ClosedBeforeHelloAck),
-        Some(frame) => match frame.header.ty {
-            FrameType::HelloAck => {
-                log::info!("subc attach: registered (HelloAck received)");
-                // The advertised ops decide which readiness requests the daemon
-                // can serve. An unreadable body advertises nothing.
-                serde_json::from_slice::<ModuleHelloAckBody>(&frame.body).ok()
-            }
-            FrameType::Error => {
-                let body = serde_json::from_slice::<ErrorBody>(&frame.body).ok();
-                return Err(SubcError::HelloRejected { body });
-            }
-            other => return Err(SubcError::UnexpectedFrame { ty: other }),
-        },
-    };
+    .await?;
+    let gated = opt_in && hello.gated();
+    let rich_ui_proofs = hello.rich_ui;
+    let hello_at = hello.at;
 
     let dispatch_path_metrics =
         runtime_metrics.unwrap_or_else(|| Arc::new(DispatchPathMetrics::new()));
@@ -5285,13 +5179,7 @@ where
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(probe);
     }
     shared_app.set_subc_connection_file(connection_file_path.to_path_buf());
-    if let Some((registry, max_runtime, storage_dir)) = base_task_scope_runtime.as_ref() {
-        registry.configure_task_scope_runtime(
-            shared_app.subc_connection_file().is_some(),
-            *max_runtime,
-        );
-        registry.start_task_scope_cleanup(storage_dir);
-    }
+
     #[cfg(test)]
     let dispatch_path_metrics = watchdog_test
         .as_ref()
@@ -5333,7 +5221,7 @@ where
         observer(writer_tx.clone());
     }
     let control_replies = readiness::PendingControlReplies::default();
-    let (negotiated_ver, advertised_ops) = hello_ack.map_or((PROTOCOL_VERSION, vec![]), |ack| {
+    let (negotiated_ver, advertised_ops) = hello.ack.map_or((PROTOCOL_VERSION, vec![]), |ack| {
         (ack.negotiated_ver, ack.subc_ops)
     });
     let control = Arc::new(readiness::DaemonControl::new(
@@ -5341,12 +5229,61 @@ where
         Arc::clone(&dispatch_path_metrics),
         negotiated_ver,
         advertised_ops,
-        manifest_provides,
+        hello.provides,
         control_replies.clone(),
         HELLO_CORR + 1,
     ));
+    let claim_lifetime = if using_registration {
+        let minter = registration::install_minter(&control)?;
+        crate::agent_commands::enable(storage_dir);
+        Some(minter)
+    } else {
+        None
+    };
+    // A dedicated reader keeps frame reads intact across a settings timeout.
+    let (reader_tx, mut reader_rx) = mpsc::channel::<Result<DecodedFrame, SubcError>>(256);
+    let reader_task = spawn_reader_task(read, reader_tx);
+    let session = if gated {
+        match settings::wait_for_first_view(
+            &control,
+            startup_ctx.as_ref().expect("gated startup context"),
+            user_config_path.as_deref(),
+            &mut reader_rx,
+            &control_replies,
+            &writer_tx,
+            &dispatch_path_metrics,
+        )
+        .await?
+        {
+            Ok(session) => Some(session),
+            Err(exit) => return Ok(exit),
+        }
+    } else {
+        None
+    };
+    let _legacy_settings = (!gated && startup_ctx.is_some())
+        .then(|| settings::LegacySettings::watch(user_config_path.as_deref(), &executor));
+    let _approved_config = startup_ctx
+        .as_ref()
+        .filter(|_| gated)
+        .map(|ctx| ctx.config_unpinned());
+    if let Some(ctx) = startup_ctx.as_ref() {
+        if opt_in {
+            settings::initialize_storage(shared_app.clone(), storage_dir);
+            crate::engram_catalog::refresh_catalog(storage_dir);
+        }
+        if opt_in && !gated {
+            settings::legacy_catalog(&control, user_config_path.as_deref());
+        }
+        settings::initialize_task_cleanup(ctx, storage_dir);
+    }
+    let settings_worker = session.clone().map(|session| {
+        let control = control.clone();
+        let executor = executor.clone();
+        tokio::spawn(async move { session.run(control, executor).await })
+    });
     let run_scopes = Arc::new(run_scope::RunScopes::new(control.clone()));
-    let agent_commands = crate::launch_nonce::current().map(|_| {
+    let agent_commands = registration::identity_ready().then(|| {
         let control = control.clone();
         crate::agent_commands::connect(move |batch| {
             let control = control.clone();
@@ -5379,15 +5316,8 @@ where
             Arc::clone(&speech),
         );
     let (run_ready_tx, mut run_ready_rx) = mpsc::unbounded_channel::<DecodedFrame>();
-    let readiness_task = spawn_readiness(control.clone(), spawn_role, hello_at);
-    // `read_frame` is NOT cancellation-safe, so it must never sit directly inside
-    // the `select!` below: a drain-interval tick (or shutdown) firing while a
-    // frame is mid-transit would drop the partially-consumed bytes and desync the
-    // stream (the next read would parse a body byte as a frame header). A
-    // dedicated reader task owns the socket, reads whole frames sequentially, and
-    // forwards them over a channel; the loop selects on the cancel-safe `recv()`.
-    let (reader_tx, mut reader_rx) = mpsc::channel::<Result<DecodedFrame, SubcError>>(256);
-    let reader_task = spawn_reader_task(read, reader_tx);
+    let readiness_task = spawn_readiness(control.clone(), spawn_role, hello_at, session.clone());
+
     let shutdown = Arc::new(Notify::new());
     // Drain-tick deadline is tracked manually and checked at the TOP of every
     // loop turn rather than as an Interval select arm: the select below is
@@ -5919,6 +5849,13 @@ where
                     Some(Err(error)) => break Err(error),
                     Some(Ok(frame)) => frame,
                 };
+                if let Some(session) = session.as_ref() {
+                    match session.intercept(&frame.frame, &writer_tx, &dispatch_path_metrics).await {
+                        Ok(true) => continue,
+                        Ok(false) => {},
+                        Err(error) => break Err(error),
+                    }
+                }
                 dispatch_path_metrics.mark_frame_loop_frame(&frame.frame);
                 #[cfg(test)]
                 if let Some(hooks) = watchdog_test.as_ref() {
@@ -6086,6 +6023,7 @@ where
                             &push_senders,
                             dispatch,
                             user_config_path.as_deref(),
+                            session.as_deref(),
                             tool_response_body_limit,
                             Some(&run_scopes),
                             storage_dir,
@@ -7036,6 +6974,7 @@ where
         }
     };
 
+    drop(claim_lifetime);
     shells_service.drain().await;
     shells_service.stop();
     dispatch_path_metrics.held_bash_calls.clear_all_progress();
@@ -7088,6 +7027,9 @@ where
         speech_runtime.retain_until_process_exit();
     }
     ledger_edge.detach_shells(&executor, None).await;
+    if let Some(task) = settings_worker {
+        task.abort();
+    }
     if let Some(task) = readiness_task {
         task.abort();
         let _ = task.await;
@@ -8191,6 +8133,7 @@ async fn send_cached_health_response(
     metrics: &DispatchPathMetrics,
     health_rollup_cache: &HealthRollupCache,
     ownership_summary: Value,
+    settings: Option<&settings::Session>,
 ) -> Result<(), SubcError> {
     let mut report = build_health_report(
         health_rollup_cache,
@@ -8199,6 +8142,7 @@ async fn send_cached_health_response(
         metrics,
         shared_app,
     );
+    settings::note_health(&mut report, settings);
     health::with_route_ownership_summary(&mut report, ownership_summary);
     let body = serde_json::to_vec(&ModuleControlResponse::from(report)).map_err(SubcError::Json)?;
     let response = Frame::build_with_version(
@@ -8249,6 +8193,7 @@ async fn handle_control_request(
     push_senders: &PushSenders,
     dispatch: DispatchFn,
     user_config_path: Option<&Path>,
+    settings_session: Option<&settings::Session>,
     tool_response_body_limit: usize,
     run_scopes: Option<&run_scope::RunScopes>,
     storage_dir: &Path,
@@ -8714,8 +8659,9 @@ async fn handle_control_request(
             // Invalid harnesses still reach configure's existing typed refusal.
             let active_harness = bind_harness.parse::<crate::harness::Harness>().ok();
             let prepared_config = match active_harness.as_ref() {
-                Some(harness) => match crate::subc_config::PreparedBindConfig::read(
+                Some(harness) => match crate::subc_config::PreparedBindConfig::read_with_approved(
                     user_config_path,
+                    settings_session.map(settings::Session::user),
                     Path::new(&bind_project_root),
                     harness,
                 ) {
@@ -8982,6 +8928,7 @@ async fn handle_control_request(
                     Instant::now(),
                 )
                 .summary(),
+                settings_session,
             )
             .await
         }
@@ -9490,7 +9437,7 @@ fn with_census_route_rows(
                     "lsp_idle_ttl_ms".to_string(),
                     json!(executor
                         .actor_context(root_id)
-                        .and_then(|ctx| ctx.config().lsp_idle_minutes.ttl())
+                        .and_then(|ctx| ctx.config().lsp_idle_ttl())
                         .map(|ttl| ttl.as_millis().min(u128::from(u64::MAX)) as u64)),
                 );
                 row.insert(
@@ -10802,7 +10749,7 @@ impl PlainToolRun {
                                 &result.response,
                             );
                             let response = result.response;
-                            rich_ui::display::handler_ready(ledger_key.as_ref(), response.success);
+                            rich_ui::display::handler_ready(ledger_key.as_ref(), &response);
                             let _ = done.send(ToolCallCompletion {
                                 text: result.text,
                                 phase_trace: phase_trace
@@ -16307,6 +16254,7 @@ mod tests {
                 &metrics,
                 &health_rollup_cache,
                 json!({}),
+                None,
             ));
             done_tx.send(result).expect("report health result");
         });

@@ -356,7 +356,7 @@ echo ""
 # Regenerate the JSON Schema asset so editor `$schema` URLs always resolve
 # to a schema that matches the shipped config surface for this release.
 echo "→ Rebuilding aft.schema.json..."
-bun packages/opencode-plugin/scripts/build-schema.ts
+cargo run --locked --quiet -p agent-file-tools --example aft-settings-schema > assets/aft.schema.json
 echo ""
 
 # Refresh bun.lock so workspace package versions match the bumped

@@ -94,9 +94,8 @@ test("published schema advertises the same MiB ceiling in base and harness block
     readFileSync(new URL("../../../../assets/aft.schema.json", import.meta.url), "utf8"),
   );
   const cap = { type: "integer", minimum: 1, maximum: 4294967295 };
-  expect(schema.properties.bash.oneOf[1].properties.memory_limit_mib).toMatchObject(cap);
+  expect(schema.properties.bash.properties.memory_limit_mib).toMatchObject(cap);
   expect(
-    schema.properties.harnesses.additionalProperties.properties.bash.oneOf[1].properties
-      .memory_limit_mib,
+    schema.properties.harnesses.additionalProperties.properties.bash.properties.memory_limit_mib,
   ).toMatchObject(cap);
 });

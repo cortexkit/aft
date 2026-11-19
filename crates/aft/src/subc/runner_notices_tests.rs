@@ -2611,6 +2611,7 @@ fn runner_notices_final_refusals_stop_without_retry() {
         "send_id_reuse",
         "delivery_unsupported",
         "invalid_params",
+        "session_held_elsewhere",
     ] {
         let request = request("aft:bash:bash-7".into(), "completion".into(), true, false);
         let mut runner = FakeRunner {

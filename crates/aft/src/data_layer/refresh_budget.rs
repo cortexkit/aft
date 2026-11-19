@@ -1,5 +1,5 @@
 //! Decides whether an incremental update is cheaper than a cold build, by
-//! the files it has to work on since the publication: past a quarter of the
+//! the files it has to work on since the call graph was published: past a tenth of the
 //! parsed files (and at least 1,024) the update gives way to a cold build.
 //!
 //! Files are counted in two classes, which the limit counts together and
@@ -175,7 +175,8 @@ impl RefreshBudget {
 
     /// Checks the files admitted so far, or `count` instead when given.
     fn check(&self, stage: Stage, count: Option<usize>) -> Result<(), RefreshLimit> {
-        let threshold = self.parsed.div_ceil(4).max(1024);
+        // Small checkouts rely on the memory guard rather than rebuilding on routine edits.
+        let threshold = self.parsed.div_ceil(10).max(1024);
         let sites_only = self.sites_only();
         let count = count.unwrap_or(self.files.len() + sites_only);
         #[cfg(test)]
@@ -318,5 +319,13 @@ mod tests {
         budget.check_changed(30).unwrap();
         let limit = budget.check_changed(1_025).unwrap_err();
         assert_eq!((limit.stage, limit.invalidated), (Stage::Changed, 1_025));
+    }
+
+    #[test]
+    fn large_checkouts_admit_one_tenth_of_the_parsed_files() {
+        let mut budget = RefreshBudget::new(20_000, BTreeSet::new(), BTreeSet::new());
+        budget.check_changed(2_000).unwrap();
+        let limit = budget.check_changed(2_001).unwrap_err();
+        assert_eq!(limit.threshold, 2_000);
     }
 }

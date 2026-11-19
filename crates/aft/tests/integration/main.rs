@@ -169,6 +169,12 @@ mod subc_format_test;
 #[cfg(unix)]
 mod subc_launch_nonce_test;
 mod subc_plumbing_drift_test;
+#[cfg(target_os = "linux")]
+mod subc_registration_real_test;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod subc_registration_test;
+#[cfg(target_os = "linux")]
+mod subc_settings_real_test;
 mod subc_storm_test;
 mod subc_translate_test;
 mod symbol_cache_persist_test;

@@ -476,8 +476,14 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
         file: "subc/rich_ui/records.rs",
         enclosing_item: "cut_detail",
-        location_or_primitive: "canonical byte limit, files.pop, UTF-8 stream prefix",
+        location_or_primitive: "canonical byte limit, files.pop, UTF-8 stream prefix, hunks.pop, lines.pop",
         reason: "tool-display/v1 details use their own truncated/omittedItems/omittedBytes envelope, measured on RFC 8785 bytes, rather than the model-facing ListEnvelope.",
+    },
+    ExclusionEntry {
+        file: "subc/rich_ui/display/edit_hunks.rs",
+        enclosing_item: "Hunks::push, Hunks::charge, line_prefix",
+        location_or_primitive: "MAX_HUNKS, MAX_LINES, MAX_LINE_BYTES, DIFF_RESPONSE_BUDGET",
+        reason: "Edit detail uses the tool-display truncation flag and serves the prefix retained for the Diff component; this does not limit the edit result.",
     },
     ExclusionEntry {
         file: "subc/rich_ui/outbox.rs",

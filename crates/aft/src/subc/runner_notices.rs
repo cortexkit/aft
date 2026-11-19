@@ -820,7 +820,7 @@ impl CapabilityConsumer {
         if let Some(probe) = test_endpoint::probe(_address) {
             return Ok(Self::Endpoint(probe));
         }
-        SubcConsumer::connect(path, ConsumerOptions::default())
+        super::registration::connect_consumer(path, ConsumerOptions::default())
             .await
             .map(Self::Runner)
             .map_err(|_| ("connect", None))
@@ -1412,11 +1412,14 @@ fn retry(class: FailureClass, detail: impl ToString) -> Outcome {
 }
 
 fn refusal(code: &str) -> Outcome {
+    // `session_held_elsewhere`: the session moved to another computer, whose
+    // own AFT serves it now, so a resend from here can never land.
     match code {
         "scope_owner_mismatch"
         | "expired"
         | "session_released"
         | "session_unconverted"
+        | "session_held_elsewhere"
         | "send_id_reuse"
         | "delivery_unsupported"
         | "invalid_params" => Outcome::Final(Failure::coded(FailureClass::PeerRefusal, code, code)),
@@ -1802,16 +1805,17 @@ async fn call(path: &Path, address: &Address, body: Vec<u8>) -> Result<Vec<u8>, 
     if let Some(result) = test_endpoint::call(address, &body).await {
         return result;
     }
-    let Some(_) = crate::launch_nonce::consumer_identity() else {
+    if !super::registration::module_consumer_allowed() {
         return Err(retry(
             FailureClass::ConsumerIdentity,
             "AFT launch has no consumer identity",
         ));
-    };
-    let consumer = match SubcConsumer::connect(path, ConsumerOptions::default()).await {
-        Ok(consumer) => consumer,
-        Err(error) => return Err(retry(FailureClass::Connect, error)),
-    };
+    }
+    let consumer =
+        match super::registration::connect_consumer(path, ConsumerOptions::default()).await {
+            Ok(consumer) => consumer,
+            Err(error) => return Err(retry(FailureClass::Connect, error)),
+        };
     let route = open_notice_route(&consumer, address).await;
     let result = match route {
         Ok(route) => {
@@ -1843,12 +1847,12 @@ async fn open_notice_route(
     consumer: &SubcConsumer,
     address: &Address,
 ) -> Result<subc_client_rs::RouteHandle, Outcome> {
-    let Some(_) = crate::launch_nonce::consumer_identity() else {
+    if !super::registration::module_consumer_allowed() {
         return Err(retry(
             FailureClass::ConsumerIdentity,
             "AFT launch has no consumer identity",
         ));
-    };
+    }
     let target = target(address);
     let options = CallOptions {
         timeout: Duration::from_secs(5),

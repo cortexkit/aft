@@ -1,0 +1,5 @@
+{
+  "rejected": [
+    "invalid_config_null:lsp.servers.rust.initialization_options"
+  ]
+}

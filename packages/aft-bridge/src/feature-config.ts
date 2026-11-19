@@ -14,6 +14,9 @@
 
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
+import { translateSettingsShape } from "./settings-shape.js";
+
+export { nullSettingPath } from "./settings-shape.js";
 
 /** Every agent-visible tool name a registration adapter may publish (sorted). */
 export const CANONICAL_TOOLS = [
@@ -1027,11 +1030,15 @@ export function translateConfigDocument(
   };
   translateRunonEnabled(map, tier, "", out);
   translateBlock(map, tier === "user", "base", out);
+  for (const notice of translateSettingsShape(map, tier)) recordRetired(out, "", notice);
   if (isRecord(map.harnesses)) {
     for (const [name, block] of Object.entries(map.harnesses)) {
       if (isRecord(block)) {
         translateRunonEnabled(block, tier, `harnesses.${name}.`, out);
         translateBlock(block, false, `harnesses.${name}`, out);
+        for (const notice of translateSettingsShape(block, tier)) {
+          recordRetired(out, `harnesses.${name}.`, notice);
+        }
       }
     }
   }
@@ -1161,9 +1168,15 @@ function projectBlock(block: JsonRecord): JsonRecord {
     }
     indexes[leaf] = inputs;
   }
+  const shapes = sortedUnique(
+    translateSettingsShape(structuredClone(block), "project").filter(
+      (notice) => !notice.startsWith("bash "),
+    ),
+  );
   return {
     legacy_paths: legacyPaths,
     runtime_gates: gates,
+    ...(shapes.length === 0 ? {} : { legacy_shapes: shapes }),
     legacy_disabled_entries: aliases,
     disabled_tools: disabled,
     github,

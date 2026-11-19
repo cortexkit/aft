@@ -113,7 +113,12 @@ pub struct UrlFetchOptions {
     /// verifier, so a test can trust a local HTTPS server's certificate.
     #[doc(hidden)]
     pub tls_config: Option<rustls::ClientConfig>,
+    #[cfg(all(test, unix))]
+    pub(crate) reply_clock_for_test: Option<ReplyClock>,
 }
+
+#[cfg(all(test, unix))]
+type ReplyClock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 /// A host name lookup: the host's addresses, or the lookup's error.
 pub type HostLookup = Arc<dyn Fn(&str) -> io::Result<Vec<IpAddr>> + Send + Sync>;
@@ -841,13 +846,24 @@ pub struct SecretFetch {
 pub struct SecretFetchCancellation {
     job: Option<crate::executor::JobCancellation>,
     deadline: Option<Instant>,
+    #[cfg(all(test, unix))]
+    clock: Option<ReplyClock>,
 }
 impl SecretFetchCancellation {
-    pub(crate) fn for_current_call() -> Self {
+    pub(crate) fn for_current_call(_options: &UrlFetchOptions) -> Self {
         Self {
             job: crate::executor::current_job_cancellation(),
             deadline: crate::subc::current_fetch_reply_deadline(),
+            #[cfg(all(test, unix))]
+            clock: _options.reply_clock_for_test.clone(),
         }
+    }
+    fn now(&self) -> Instant {
+        #[cfg(all(test, unix))]
+        if let Some(clock) = &self.clock {
+            return clock();
+        }
+        Instant::now()
     }
     pub(crate) fn is_cancelled(&self) -> bool {
         self.reason().is_some()
@@ -859,17 +875,14 @@ impl SecretFetchCancellation {
             .then_some(crate::secret::requests::UseError::Cancelled)
             .or_else(|| {
                 self.deadline
-                    .is_some_and(|at| Instant::now() >= at)
+                    .is_some_and(|at| self.now() >= at)
                     .then_some(crate::secret::requests::UseError::Expired)
             })
     }
     pub(crate) fn expires_at_ms(&self) -> Option<u64> {
         self.deadline.map(|deadline| {
-            now_ms().saturating_add(
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .as_millis() as u64,
-            )
+            now_ms()
+                .saturating_add(deadline.saturating_duration_since(self.now()).as_millis() as u64)
         })
     }
     pub(crate) async fn cancelled(&self) {
@@ -879,7 +892,7 @@ impl SecretFetchCancellation {
             }
             let delay = self.deadline.map_or(Duration::from_millis(25), |deadline| {
                 deadline
-                    .saturating_duration_since(Instant::now())
+                    .saturating_duration_since(self.now())
                     .min(Duration::from_millis(25))
             });
             tokio::time::sleep(delay).await;

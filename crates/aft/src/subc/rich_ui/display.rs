@@ -18,6 +18,7 @@ use subc_protocol::Principal;
 
 pub(super) mod counters;
 mod diagnostics;
+mod edit_hunks;
 mod store;
 use counters::{count, Counter::*};
 
@@ -106,7 +107,7 @@ pub(crate) fn health() -> Value {
         Some(reason)
     } else if std::env::var("SUBC_MODULE_ID").as_deref() != Ok("aft") {
         Some("not_module")
-    } else if crate::launch_nonce::consumer_identity().is_none() {
+    } else if !crate::subc::registration::identity_ready() {
         Some("consumer_identity_missing")
     } else {
         Some("not_started")
@@ -342,6 +343,7 @@ fn relative(root: &Path, path: &Path) -> Option<String> {
 fn file_bodies(capture: &Capture, success: bool) -> (Value, Option<Value>) {
     let mut record = json!({"outcome": if success {"success"} else if capture.files.is_empty() {"error"} else {"partial"}, "fileCount":0,"modifiedCount":0,"createdCount":0,"deletedCount":0,"movedCount":0});
     let mut files = Vec::new();
+    let mut hunks = edit_hunks::Hunks::default();
     let (mut added, mut removed, mut known) = (0u64, 0u64, true);
     let mut changes = capture.files.clone();
     changes.sort_by(|a, b| a.path.cmp(&b.path));
@@ -394,32 +396,36 @@ fn file_bodies(capture: &Capture, success: bool) -> (Value, Option<Value>) {
                 change.before.as_deref(),
                 change.after.as_deref(),
             ) {
-                let path = entry["path"].as_str().unwrap();
-                let diff = if change.change == "moved" && before == after {
-                    format!(
-                        "rename from {}\nrename to {path}\n",
-                        entry["oldPath"].as_str().unwrap()
-                    )
+                if capture.tool == "edit" {
+                    edit_hunks::diff(&mut hunks, masker, before, after);
                 } else {
-                    let old = if change.change == "created" {
-                        "/dev/null".into()
-                    } else {
+                    let path = entry["path"].as_str().unwrap();
+                    let diff = if change.change == "moved" && before == after {
                         format!(
-                            "a/{}",
-                            entry.get("oldPath").and_then(Value::as_str).unwrap_or(path)
+                            "rename from {}\nrename to {path}\n",
+                            entry["oldPath"].as_str().unwrap()
                         )
-                    };
-                    let new = if change.change == "deleted" {
-                        "/dev/null".into()
                     } else {
-                        format!("b/{path}")
+                        let old = if change.change == "created" {
+                            "/dev/null".into()
+                        } else {
+                            format!(
+                                "a/{}",
+                                entry.get("oldPath").and_then(Value::as_str).unwrap_or(path)
+                            )
+                        };
+                        let new = if change.change == "deleted" {
+                            "/dev/null".into()
+                        } else {
+                            format!("b/{path}")
+                        };
+                        similar::TextDiff::from_lines(before, after)
+                            .unified_diff()
+                            .header(&old, &new)
+                            .to_string()
                     };
-                    similar::TextDiff::from_lines(before, after)
-                        .unified_diff()
-                        .header(&old, &new)
-                        .to_string()
-                };
-                entry["diff"] = json!(masker.redact(&diff));
+                    entry["diff"] = json!(masker.redact(&diff));
+                }
             } else {
                 // Diffs are masked with the secret values this agent has
                 // resolved (`capture.masker`). Without that list, generic
@@ -445,10 +451,18 @@ fn file_bodies(capture: &Capture, success: bool) -> (Value, Option<Value>) {
         if let Some(location) = record.get("location") {
             detail["location"] = location.clone();
         }
+        hunks.attach(&mut detail);
         detail
     });
+    let detail = if capture.tool == "edit" {
+        detail.and_then(|detail| records::cut_detail(detail, crate::edit::DIFF_RESPONSE_BUDGET))
+    } else {
+        detail
+    };
     (record, detail)
 }
+
+pub(crate) use edit_hunks::capture_no_match as edit_no_match;
 
 fn emit(capture: &Capture, kind: DisplayKind, body: Value) {
     let Some(view) = crate::subc::tool_views::view(&capture.identity.schema_pin) else {
@@ -720,7 +734,7 @@ pub(crate) fn start(connection_file: &Path, app: &Arc<crate::context::App>, stor
         count(StartNotModule);
         return;
     }
-    if crate::launch_nonce::consumer_identity().is_none() {
+    if !crate::subc::registration::module_consumer_allowed() {
         count(StartNoIdentity);
         return;
     }
@@ -742,7 +756,7 @@ pub(crate) fn start(connection_file: &Path, app: &Arc<crate::context::App>, stor
 }
 
 async fn send_loop(connection_file: PathBuf, mut receiver: tokio::sync::mpsc::Receiver<()>) {
-    use subc_client_rs::{CallOptions, CloseRouteOptions, ConsumerOptions, SubcConsumer};
+    use subc_client_rs::{CallOptions, CloseRouteOptions, ConsumerOptions};
     use subc_protocol::BindIdentity;
     let writer = SENDER.get().expect("display writer started");
     let mut consumer = None;
@@ -771,7 +785,7 @@ async fn send_loop(connection_file: PathBuf, mut receiver: tokio::sync::mpsc::Re
                 call_timeout: std::time::Duration::from_secs(5),
                 ..Default::default()
             };
-            match SubcConsumer::connect(&connection_file, options).await {
+            match crate::subc::registration::connect_consumer(&connection_file, options).await {
                 Ok(client) => consumer = Some(client),
                 Err(_) => count(WriterConnect),
             }
@@ -1294,7 +1308,10 @@ pub(crate) fn person_answered(ledger_key: &crate::db::call_ledger::Key) {
     }
 }
 
-pub(crate) fn handler_ready(ledger_key: Option<&crate::db::call_ledger::Key>, success: bool) {
+pub(crate) fn handler_ready(
+    ledger_key: Option<&crate::db::call_ledger::Key>,
+    response: &crate::protocol::Response,
+) {
     let capture =
         ledger_key.and_then(|ledger_key| CALLS.lock().ok()?.get(&key(ledger_key)).cloned());
     if let Some(capture) = capture {
@@ -1304,8 +1321,13 @@ pub(crate) fn handler_ready(ledger_key: Option<&crate::db::call_ledger::Key>, su
                     .processing_ms
                     .saturating_add(began.elapsed().as_millis() as u64);
             }
-            if capture.tool != "bash" {
-                capture.file_snapshot = Some(file_bodies(&capture, success));
+            if capture.tool != "bash" && capture.file_snapshot.is_none() {
+                let (mut record, detail) = file_bodies(&capture, response.success);
+                if capture.tool == "edit" && response.data["syntax_valid"].as_bool() == Some(false)
+                {
+                    record["reason"] = json!("invalid_syntax");
+                }
+                capture.file_snapshot = Some((record, detail));
             }
         }
     }

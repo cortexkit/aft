@@ -130,6 +130,7 @@ export function aftLiveConfigKeys<C>(
     pathKey<C>("durability.macos_full_sync"),
     pathKey<C>("inspect.diagnostics_timeout_ms"),
     pathKey<C>("lsp.idle_minutes"),
+    pathKey<C>("lsp.idle_shutdown"),
     pathKey<C>("lsp.max_servers"),
     ...[
       "diagnostics",
@@ -580,10 +581,13 @@ export function aftLiveSecurityKeys<C>(keys: readonly LiveConfigKey<C>[]): LiveS
     {
       key: pick("lsp.idle_minutes"),
       loosens: (current, next) => {
-        const minutes = (value: unknown) =>
-          value === "never" ? Infinity : typeof value === "number" ? value : 60;
+        const minutes = (value: unknown) => (typeof value === "number" ? value : 60);
         return minutes(next) > minutes(current);
       },
+    },
+    {
+      key: pick("lsp.idle_shutdown"),
+      loosens: (current, next) => current !== false && next === false,
     },
     {
       key: pick("lsp.max_servers"),

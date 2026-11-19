@@ -16,7 +16,7 @@ impl IdleLspFixture {
         let tmp = tempfile::tempdir().unwrap();
         let config = Config {
             project_root: Some(tmp.path().to_path_buf()),
-            lsp_idle_minutes: crate::config::LspIdleMinutes::Minutes(5),
+            lsp_idle_minutes: 5,
             ..Config::default()
         };
         let ctx = std::sync::Arc::new(crate::context::AppContext::new(

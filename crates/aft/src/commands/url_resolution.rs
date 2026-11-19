@@ -188,7 +188,7 @@ fn resolve_secret_fetch(
         #[cfg(test)]
         test_https_port: url::Url::parse(file).ok().and_then(|url| url.port()),
         call_id: req.id.clone(),
-        cancellation: crate::url_fetch::SecretFetchCancellation::for_current_call(),
+        cancellation: crate::url_fetch::SecretFetchCancellation::for_current_call(&options),
     };
     let document = crate::url_fetch::fetch_url_with_secrets(file, &document_dir, options, &secrets)
         .map_err(|error| url_fetch_error_response(&req.id, &error))?;

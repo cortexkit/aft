@@ -44,11 +44,12 @@ fn is_config_named(path: &str, name: &str) -> bool {
 use aft_store::graph::TermKind;
 
 use super::callgraph::{
-    bind_all, dispatch_targets, resolve_files, resolver_index, BindCache, CheckoutFacts,
-    CheckoutInputs, FileResolution, MethodCallInputs, Resolutions,
+    bind_all_checked, dispatch_targets, resolve_files, resolve_files_checked, resolver_index,
+    BindCache, CheckoutFacts, CheckoutInputs, FileResolution, MethodCallInputs, Resolutions,
 };
 use super::graph_store::StoredSlices;
 use super::refresh_budget::{RefreshBudget, RefreshLimit, Stage};
+use super::refresh_memory::{RefreshChecks, RefreshMemory, RefreshStop};
 use super::subjects::{affected_by, subjects, Subject};
 
 /// What one update did, for measurement.
@@ -90,9 +91,26 @@ pub struct UpdateStats {
     pub touched: BTreeSet<String>,
 }
 
-pub(crate) enum UpdateError {
+pub(super) enum UpdateError {
     Resolve(ManifestJoinError),
     Limit(RefreshLimit),
+    Stop(RefreshStop),
+    Data(super::checkout::DataError),
+}
+
+impl UpdateError {
+    pub(super) fn unguarded(self) -> ManifestJoinError {
+        match self {
+            Self::Resolve(error) => error,
+            _ => unreachable!("an unguarded update can only fail resolution"),
+        }
+    }
+}
+
+impl From<RefreshStop> for UpdateError {
+    fn from(stop: RefreshStop) -> Self {
+        Self::Stop(stop)
+    }
 }
 
 impl From<ManifestJoinError> for UpdateError {
@@ -173,22 +191,26 @@ impl Readers {
         &self,
         keys: impl IntoIterator<Item = &'k String>,
         stored: Option<&StoredSlices>,
-    ) -> BTreeSet<String> {
+        guard: Option<&RefreshMemory>,
+    ) -> Result<BTreeSet<String>, RefreshStop> {
         let mut files = BTreeSet::new();
         for key in keys {
             if let Some(found) = self.by_key.get(key) {
-                files.extend(found.iter().cloned());
+                for file in found {
+                    guard.file()?;
+                    files.insert(file.clone());
+                }
             }
             if let Some(stored) = stored {
-                files.extend(
-                    stored
-                        .files_recording(self.kind, key.as_bytes())
-                        .into_iter()
-                        .filter(|file| !self.replaced.contains(file)),
-                );
+                for file in stored.files_recording(self.kind, key.as_bytes()) {
+                    guard.file()?;
+                    if !self.replaced.contains(&file) {
+                        files.insert(file);
+                    }
+                }
             }
         }
-        files
+        Ok(files)
     }
 }
 
@@ -233,24 +255,44 @@ impl ReverseInputs {
         }
     }
 
-    fn binding_of<'k>(&self, keys: impl IntoIterator<Item = &'k String>) -> BTreeSet<String> {
-        self.binding.of(keys, self.stored.as_deref())
+    fn binding_of<'k>(
+        &self,
+        keys: impl IntoIterator<Item = &'k String>,
+        guard: Option<&RefreshMemory>,
+    ) -> Result<BTreeSet<String>, RefreshStop> {
+        self.binding.of(keys, self.stored.as_deref(), guard)
     }
 
-    fn resolution_of<'k>(&self, keys: impl IntoIterator<Item = &'k String>) -> BTreeSet<String> {
-        self.resolution.of(keys, self.stored.as_deref())
+    fn resolution_of<'k>(
+        &self,
+        keys: impl IntoIterator<Item = &'k String>,
+        guard: Option<&RefreshMemory>,
+    ) -> Result<BTreeSet<String>, RefreshStop> {
+        self.resolution.of(keys, self.stored.as_deref(), guard)
     }
 
-    fn dispatch_of<'k>(&self, keys: impl IntoIterator<Item = &'k String>) -> BTreeSet<String> {
-        self.dispatch.of(keys, self.stored.as_deref())
+    fn dispatch_of<'k>(
+        &self,
+        keys: impl IntoIterator<Item = &'k String>,
+        guard: Option<&RefreshMemory>,
+    ) -> Result<BTreeSet<String>, RefreshStop> {
+        self.dispatch.of(keys, self.stored.as_deref(), guard)
     }
 
-    fn sites_of<'k>(&self, keys: impl IntoIterator<Item = &'k String>) -> BTreeSet<String> {
-        self.sites.of(keys, self.stored.as_deref())
+    fn sites_of<'k>(
+        &self,
+        keys: impl IntoIterator<Item = &'k String>,
+        guard: Option<&RefreshMemory>,
+    ) -> Result<BTreeSet<String>, RefreshStop> {
+        self.sites.of(keys, self.stored.as_deref(), guard)
     }
 
-    fn subjects_of<'k>(&self, keys: impl IntoIterator<Item = &'k String>) -> BTreeSet<String> {
-        self.subjects.of(keys, self.stored.as_deref())
+    fn subjects_of<'k>(
+        &self,
+        keys: impl IntoIterator<Item = &'k String>,
+        guard: Option<&RefreshMemory>,
+    ) -> Result<BTreeSet<String>, RefreshStop> {
+        self.subjects.of(keys, self.stored.as_deref(), guard)
     }
 
     fn note_prebound(&mut self, file: &str, binding: &ViewBindingDependencies) {
@@ -476,7 +518,8 @@ impl LiveCheckout {
         old: &CheckoutInputs,
         changed: &BTreeSet<String>,
         configs_changed: bool,
-    ) -> StaleAnswers {
+        guard: Option<&RefreshMemory>,
+    ) -> Result<StaleAnswers, RefreshStop> {
         /// Whether any of `answers` differs now; each distinct read is asked
         /// once and kept in `now`.
         fn differs(
@@ -499,6 +542,7 @@ impl LiveCheckout {
             inputs: &self.inputs,
         };
         for path in changed {
+            guard.file()?;
             for subject in affected_by(path.as_bytes(), &before, &after) {
                 keys.insert(subject_key(&subject));
             }
@@ -506,13 +550,14 @@ impl LiveCheckout {
         if configs_changed {
             keys.insert(String::from_utf8_lossy(UNATTRIBUTED_TERM).into_owned());
         }
-        let files = self.reverse.subjects_of(&keys);
+        let files = self.reverse.subjects_of(&keys, guard)?;
         let inputs = &self.inputs;
         let facts = CheckoutFacts { inputs };
         let mut now = HashMap::<FactQuestion, FactAnswer>::new();
         let mut stale = StaleAnswers::default();
         let mut changed_reads = BTreeSet::new();
         for path in &files {
+            guard.file()?;
             // Most of these files keep their resolution, so each is read
             // without keeping it decoded ([`Resolutions::read`]).
             let Some(file) = self.resolved.read(path) else {
@@ -554,7 +599,7 @@ impl LiveCheckout {
         }
         stale.checked = now.len();
         stale.changed = changed_reads.len();
-        stale
+        Ok(stale)
     }
 
     /// Resolves every file of `inputs` cold.
@@ -637,37 +682,39 @@ impl LiveCheckout {
         next: CheckoutInputs,
         changed: &BTreeSet<String>,
     ) -> Result<UpdateStats, ManifestJoinError> {
-        self.update_with_budget(next, changed, None)
-            .map_err(|error| match error {
-                UpdateError::Resolve(error) => error,
-                UpdateError::Limit(_) => {
-                    unreachable!("an unbounded update cannot hit a refresh limit")
-                }
-            })
+        let mut stats = UpdateStats::default();
+        self.update_with_budget(next, changed, None, None, &mut stats)
+            .map_err(UpdateError::unguarded)?;
+        Ok(stats)
     }
 
     /// A limit aborts before the newly invalidated pass runs. The caller must
     /// drop this partly updated engine before rebuilding the checkout.
-    pub(crate) fn update_with_budget(
+    pub(super) fn update_with_budget(
         &mut self,
         next: CheckoutInputs,
         changed: &BTreeSet<String>,
         budget: Option<&mut RefreshBudget>,
-    ) -> Result<UpdateStats, UpdateError> {
+        guard: Option<&RefreshMemory>,
+        stats: &mut UpdateStats,
+    ) -> Result<(), UpdateError> {
+        stats.changed_paths = changed.len();
         let started = Instant::now();
         let pool = Arc::clone(&self.pool);
-        let mut stats = crate::alloc_trace::install(&pool, || {
-            let stats = self.update_in_pool(next, changed, budget)?;
+        crate::alloc_trace::install(&pool, || {
+            self.update_in_pool(next, changed, budget, guard, stats)?;
+            guard.boundary()?;
             #[cfg(feature = "test-hooks")]
             super::refresh_probe::stage("encode");
             // Every resolution the update made or changed is encoded, so
             // that it can be let go between updates like a stored one.
             let parses = &self.inputs.parses;
-            self.resolved.encode_changed(|path| parses.key(path));
-            Ok::<_, UpdateError>(stats)
+            self.resolved
+                .encode_changed(|path| parses.key(path), guard)?;
+            Ok::<_, UpdateError>(())
         })?;
         stats.total_ms = started.elapsed().as_secs_f64() * 1000.0;
-        Ok(stats)
+        Ok(())
     }
 
     /// This engine moved onto `stored`, a publication of exactly what it
@@ -751,11 +798,14 @@ impl LiveCheckout {
     /// what a change to a declaration of it admits. For measurement.
     #[cfg(all(test, unix))]
     pub(crate) fn method_site_readers(&self, name: &str) -> BTreeSet<String> {
-        self.reverse.sites_of(
-            &[crate::callgraph_store::join::dispatch::dependency::method(
-                name,
-            )],
-        )
+        self.reverse
+            .sites_of(
+                &[crate::callgraph_store::join::dispatch::dependency::method(
+                    name,
+                )],
+                None,
+            )
+            .expect("unguarded reader lookup cannot stop")
     }
 
     #[expect(
@@ -767,12 +817,11 @@ impl LiveCheckout {
         next: CheckoutInputs,
         changed: &BTreeSet<String>,
         mut budget: Option<&mut RefreshBudget>,
-    ) -> Result<UpdateStats, UpdateError> {
+        guard: Option<&RefreshMemory>,
+        stats: &mut UpdateStats,
+    ) -> Result<(), UpdateError> {
         admit(&mut budget, Stage::Changed, changed)?;
-        let mut stats = UpdateStats {
-            changed_paths: changed.len(),
-            ..UpdateStats::default()
-        };
+        guard.boundary()?;
         let old = std::mem::replace(&mut self.inputs, next);
         #[cfg(feature = "test-hooks")]
         let mut profile_clock = Instant::now();
@@ -828,8 +877,8 @@ impl LiveCheckout {
             // when few paths changed. Admit those declaration readers before
             // binding or resolving other files, rather than waiting until
             // method-call sites are processed.
-            let keys = MethodCallInputs::changed_parse_method_keys(&old, inputs, &contents);
-            let readers = self.reverse.sites_of(&keys);
+            let keys = MethodCallInputs::changed_parse_method_keys(&old, inputs, &contents, guard)?;
+            let readers = self.reverse.sites_of(&keys, guard)?;
             admit(&mut budget, Stage::MethodReaders, &readers)?;
         }
         // Configuration files added or removed. A content change of an
@@ -929,11 +978,12 @@ impl LiveCheckout {
         // affect which read.
         #[cfg(feature = "test-hooks")]
         super::refresh_probe::stage("facts");
+        guard.boundary()?;
         let started = Instant::now();
         let stale = if membership.is_empty() && links.is_empty() && configs.is_empty() {
             StaleAnswers::default()
         } else {
-            self.stale_answers(&old, changed, !configs.is_empty())
+            self.stale_answers(&old, changed, !configs.is_empty(), guard)?
         };
         let inputs = &self.inputs;
         stats.answers_checked = stale.checked;
@@ -953,18 +1003,17 @@ impl LiveCheckout {
             binding_keys.insert(VIEW_GO_MODULES_DOMAIN.to_string());
         }
         binding_keys.extend(changed_crates.iter().cloned());
-        let mut rebind = self.reverse.binding_of(&binding_keys);
+        let mut rebind = self.reverse.binding_of(&binding_keys, guard)?;
         stats.rebound_by_keys = rebind.len();
         stats.rebound_by_answers = stale.binding.len();
         if rebind.len() > 100 {
-            let mut by_key = binding_keys
-                .iter()
-                .map(|key| {
-                    let reached = self.reverse.binding_of(&BTreeSet::from([key.clone()]));
-                    (key.replace('\0', "\\0"), reached.len())
-                })
-                .filter(|(_, reached)| *reached > 0)
-                .collect::<Vec<_>>();
+            let mut by_key = Vec::new();
+            for key in &binding_keys {
+                let reached = self.reverse.binding_of([key], guard)?;
+                if !reached.is_empty() {
+                    by_key.push((key.replace('\0', "\\0"), reached.len()));
+                }
+            }
             by_key.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             by_key.truncate(5);
             stats.rebound_top_keys = by_key;
@@ -977,9 +1026,10 @@ impl LiveCheckout {
             Stage::Rebind,
             rebind.iter().chain(&removed_parses),
         )?;
+        guard.boundary()?;
         let rebind = rebind.into_iter().collect::<Vec<_>>();
         let rebind_refs = rebind.iter().collect::<Vec<_>>();
-        let new_bound = bind_all(inputs, &rebind_refs)?;
+        let new_bound = bind_all_checked(inputs, &rebind_refs, guard)?;
         stats.rebound = rebind.len();
         // What each rebound file was bound to before: its cached binding,
         // which holds for the old inputs, or for a file never bound since
@@ -989,11 +1039,12 @@ impl LiveCheckout {
             .chain(&removed_parses)
             .filter(|path| self.bound.get(path).is_none() && old.parses.contains_key(path))
             .collect::<Vec<_>>();
-        let mut old_bound = bind_all(&old, &unbound)?
+        let mut old_bound = bind_all_checked(&old, &unbound, guard)?
             .into_iter()
             .map(|(path, bound)| (path, Arc::new(bound)))
             .collect::<HashMap<_, _>>();
         for path in rebind.iter().chain(&removed_parses) {
+            guard.file()?;
             if let Some(bound) = self.bound.get(path) {
                 old_bound.insert(path.clone(), bound);
             }
@@ -1006,6 +1057,7 @@ impl LiveCheckout {
         // or rename, even if another declaration still names the target.
         let mut changed_parents = BTreeSet::new();
         for path in rebind.iter().chain(&removed_parses) {
+            guard.file()?;
             let before = old_bound
                 .get(path)
                 .map(|bound| bound.surface.declared_module_targets());
@@ -1028,6 +1080,7 @@ impl LiveCheckout {
         let mut surface_keys = BTreeSet::new();
         let mut references_changed = BTreeSet::new();
         for path in &rebind {
+            guard.file()?;
             let new = &new_bound[path.as_str()].binding;
             match old_bound.get(path) {
                 Some(old) => {
@@ -1049,6 +1102,7 @@ impl LiveCheckout {
         drop(old_bound);
         let removed = removed_parses;
         for path in &removed {
+            guard.file()?;
             surfaces_changed.insert(path.clone());
             surface_keys.insert(path.clone());
             self.bound.remove(path);
@@ -1066,6 +1120,7 @@ impl LiveCheckout {
         self.bound
             .update_lists(&self.inputs, contents.iter().chain(&membership));
         for (path, bound) in new_bound {
+            guard.file()?;
             self.reverse.note_prebound(&path, &bound.binding);
             self.bound.set(path, bound);
         }
@@ -1095,6 +1150,7 @@ impl LiveCheckout {
         // Pass 2.
         #[cfg(feature = "test-hooks")]
         super::refresh_probe::stage("replay");
+        guard.boundary()?;
         let started = Instant::now();
         let facts = Rc::new(ViewBindingFacts::typed(Rc::new(CheckoutFacts { inputs })));
         let (index, files) = resolver_index(inputs, &self.bound, &facts);
@@ -1104,6 +1160,7 @@ impl LiveCheckout {
         resolve.extend(stale.resolution.iter().cloned());
         resolve.retain(|path| inputs.parses.contains_key(path));
         for path in inputs.parses.keys() {
+            guard.file()?;
             if !self.resolved.contains_key(path) {
                 resolve.insert(path.clone());
             }
@@ -1117,7 +1174,7 @@ impl LiveCheckout {
             .chain(changed)
             .any(|path| path.ends_with(".rs"))
         {
-            self.bound.bind_module_declaring(inputs)?;
+            self.bound.bind_module_declaring_checked(inputs, guard)?;
         }
         // Most files a change reaches here keep their resolution: each file
         // whose surface answers (pass 2) or dispatch trace (pass 3) depend on
@@ -1132,13 +1189,13 @@ impl LiveCheckout {
         trace_keys.extend(membership.iter().cloned());
         let replaying = self
             .reverse
-            .resolution_of(&changed_keys)
+            .resolution_of(&changed_keys, guard)?
             .into_iter()
             .filter(|path| !resolve.contains(path))
             .collect::<BTreeSet<_>>();
         let tracing = self
             .reverse
-            .dispatch_of(&trace_keys)
+            .dispatch_of(&trace_keys, guard)?
             .into_iter()
             .filter(|path| !resolve.contains(path))
             .collect::<BTreeSet<_>>();
@@ -1146,6 +1203,7 @@ impl LiveCheckout {
         let mut trace_answers = BTreeMap::new();
         let mut traces_changed = BTreeSet::new();
         for path in replaying.union(&tracing) {
+            guard.file()?;
             let Some(file) = self.resolved.read(path) else {
                 continue;
             };
@@ -1179,6 +1237,7 @@ impl LiveCheckout {
                 traces_changed.insert(path.clone());
             }
         }
+        guard.boundary()?;
         drop(answers);
         drop(trace_answers);
         admit(&mut budget, Stage::Resolve, &resolve)?;
@@ -1188,6 +1247,7 @@ impl LiveCheckout {
         super::refresh_probe::stage("resolution");
         // Files kept whose binding was redone carry their resolution over.
         for path in &rebind {
+            guard.file()?;
             if resolve.contains(path) {
                 continue;
             }
@@ -1208,9 +1268,10 @@ impl LiveCheckout {
             }
         }
         let paths = resolve.iter().collect::<Vec<_>>();
-        let fresh = resolve_files(inputs, &self.bound, &paths)?;
+        let fresh = resolve_files_checked(inputs, &self.bound, &paths, guard)?;
         stats.resolved = fresh.len();
         for (path, mut file) in fresh {
+            guard.file()?;
             self.calls.remember(
                 &path,
                 old.parses.get(&path).map(|(_, parse)| &**parse),
@@ -1235,11 +1296,13 @@ impl LiveCheckout {
         // could change was bound again in pass 1.
         #[cfg(feature = "test-hooks")]
         super::refresh_probe::stage("dispatch");
+        guard.boundary()?;
         let started = Instant::now();
         let mut recompute = Vec::new();
         // Stale answers were asked before this update removed files; a
         // removed file has nothing left to recompute.
         for path in &stale.dispatch {
+            guard.file()?;
             if !resolve.contains(path)
                 && !recompute.contains(path)
                 && self.resolved.contains_key(path)
@@ -1250,6 +1313,7 @@ impl LiveCheckout {
         recompute.extend(traces_changed);
         admit(&mut budget, Stage::Dispatch, &recompute)?;
         for path in &recompute {
+            guard.file()?;
             let (_, parse) = &inputs.parses[path.as_str()];
             let dispatch = dispatch_targets(path, parse, &index, &facts)?;
             self.calls.remember(
@@ -1279,6 +1343,7 @@ impl LiveCheckout {
         // Pass 4.
         #[cfg(feature = "test-hooks")]
         super::refresh_probe::stage("sites");
+        guard.boundary()?;
         let started = Instant::now();
         let mut site_keys = BTreeSet::new();
         let mut sites = contents.clone();
@@ -1289,6 +1354,7 @@ impl LiveCheckout {
             .cloned()
             .collect::<BTreeSet<_>>();
         for path in &touched {
+            guard.file()?;
             let (keys, own) = self.calls.update(inputs, path, self.resolved.get(path));
             if !keys.is_empty() {
                 stats.facts_changed += 1;
@@ -1298,13 +1364,15 @@ impl LiveCheckout {
                 sites.insert(path.clone());
             }
         }
-        sites.extend(self.reverse.sites_of(&site_keys));
+        sites.extend(self.reverse.sites_of(&site_keys, guard)?);
         sites.retain(|path| inputs.parses.contains_key(path));
         admit(&mut budget, Stage::Sites, &sites)?;
         let paths = sites.iter().collect::<Vec<_>>();
         for (path, kept, dependencies) in
-            self.calls.resolve_sites(inputs, &self.resolved, &paths)?
+            self.calls
+                .resolve_sites_checked(inputs, &self.resolved, &paths, guard)?
         {
+            guard.file()?;
             let file = self.resolved.get_mut(&path).ok_or_else(|| {
                 ManifestJoinError::Parse(format!("stored resolution of {path} could not be read"))
             })?;
@@ -1325,7 +1393,7 @@ impl LiveCheckout {
             .chain(sites)
             .chain(removed)
             .collect();
-        Ok(stats)
+        Ok(())
     }
 
     #[cfg(feature = "test-hooks")]

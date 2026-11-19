@@ -393,7 +393,7 @@ describe("feature-config policy", () => {
     expect(translateConfigDocument(canonical, "user").warnings[0]?.code).toBe(
       "superseded_legacy_config",
     );
-    expect(canonical).toEqual({ lsp: { idle_minutes: "never" } });
+    expect(canonical).toEqual({ lsp: { idle_shutdown: false } });
   });
 
   test("a false runtime gate never generates disables and says so", () => {
@@ -407,7 +407,7 @@ describe("feature-config policy", () => {
         const doc: Record<string, unknown> = structuredClone(gate);
         const out = translateConfigDocument(doc, tier);
         expect(doc.disabled_tools).toBeUndefined();
-        expect(out.legacyInput).toBe(false);
+        expect(out.legacyInput).toBe(gate.bash === false);
         expect(out.warnings.map((warning) => warning.code)).toContain(
           "legacy_runtime_gate_runtime_only",
         );

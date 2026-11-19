@@ -2002,7 +2002,7 @@ impl SubcRelayTransport {
     }
 
     fn identity_available() -> bool {
-        crate::launch_nonce::consumer_identity().is_some()
+        crate::subc::registration::module_consumer_allowed()
     }
 
     async fn consumer(&self) -> Result<Arc<subc_client_rs::SubcConsumer>, TransportError> {

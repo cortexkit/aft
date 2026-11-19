@@ -20,10 +20,11 @@ Memory may retain a record longer while its push remains live. Expired or
 never-retained identifiers return `display_record_unknown`; no wakes are replayed
 from the cache after restart.
 
-The durable cache holds at most 192 records and 16 MiB of pull bytes. AFT reclaims
+The durable cache holds at most 4,096 records and 16 MiB of pull bytes. AFT reclaims
 expired rows first and never evicts protected rows. When protected records fill
-the cache, AFT defers new wake announcements and logs the deferred count and byte
-usage; existing `display.write` pushes continue independently. Bounded expiry
+the cache, AFT defers new wake announcements. It logs the first deferral with the
+cache's count and byte usage, and how many wakes it deferred once it admits a
+record again; existing `display.write` pushes continue independently. Bounded expiry
 sweeps run on writable database opens and the regular retention tick. Read-only
 or older databases without the optional cache use memory only.
 

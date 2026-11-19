@@ -53,63 +53,6 @@ pub const DEFAULT_LSP_IDLE_MINUTES: u32 = 60;
 pub const MIN_LSP_IDLE_MINUTES: u32 = 5;
 pub const MAX_LSP_IDLE_MINUTES: u32 = 1440;
 
-/// Minutes since the last AFT tool call on that repository. `Never` disables
-/// only idle reaping, not unbind, eviction or shutdown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "serde_json::Value", into = "serde_json::Value")]
-pub enum LspIdleMinutes {
-    Minutes(u32),
-    Never,
-}
-
-impl Default for LspIdleMinutes {
-    fn default() -> Self {
-        Self::Minutes(DEFAULT_LSP_IDLE_MINUTES)
-    }
-}
-
-impl TryFrom<serde_json::Value> for LspIdleMinutes {
-    type Error = &'static str;
-    fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
-        if value.as_str() == Some("never") {
-            return Ok(Self::Never);
-        }
-        let minutes = value
-            .as_i64()
-            .ok_or("lsp.idle_minutes must be an integer or \"never\"")?;
-        Ok(Self::Minutes(minutes.clamp(
-            i64::from(MIN_LSP_IDLE_MINUTES),
-            i64::from(MAX_LSP_IDLE_MINUTES),
-        ) as u32))
-    }
-}
-
-impl From<LspIdleMinutes> for serde_json::Value {
-    fn from(value: LspIdleMinutes) -> Self {
-        match value {
-            LspIdleMinutes::Minutes(minutes) => Self::from(minutes),
-            LspIdleMinutes::Never => Self::from("never"),
-        }
-    }
-}
-
-impl LspIdleMinutes {
-    pub fn ttl(self) -> Option<std::time::Duration> {
-        match self {
-            Self::Minutes(minutes) => Some(std::time::Duration::from_secs(u64::from(minutes) * 60)),
-            Self::Never => None,
-        }
-    }
-
-    pub fn tightens(self, floor: Self) -> bool {
-        match (self, floor) {
-            (_, Self::Never) => true,
-            (Self::Minutes(next), Self::Minutes(before)) => next <= before,
-            (Self::Never, _) => false,
-        }
-    }
-}
-
 const fn default_semantic_query_timeout_ms() -> u64 {
     DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS
 }
@@ -280,7 +223,7 @@ fn expand_configured_absolute_path(
 }
 
 /// Semantic backend selected by the currently resolved runtime configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticBackend {
     Fastembed,
@@ -428,7 +371,7 @@ pub struct InspectDuplicatesConfig {
     pub expected_mirrors: Vec<[String; 2]>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct InspectCategories {
     pub diagnostics: bool,
@@ -621,7 +564,7 @@ pub fn normalize_git_co_author(value: &str) -> Option<String> {
 pub const DEFAULT_SEMANTIC_MODEL: &str = "all-MiniLM-L6-v2";
 
 /// Which reranker, if any, reorders the head of `aft_search` results.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RerankBackendKind {
     Off,
@@ -682,7 +625,9 @@ impl Config {
 }
 
 /// Ordered from least to most restrictive for project-tier hardening.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxMode {
     Off,
@@ -757,7 +702,9 @@ pub struct RemoteExecConfig {
     pub project_off: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum BashChangedFiles {
     #[default]
@@ -829,14 +776,17 @@ pub struct BashConfig {
 }
 
 /// User-only project environment selection, separate from shell tool switches.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ShellConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "Opt-in per-project environment export, run in the command workdir under its sandbox. Omit to preserve AFT's default environment. direnv is unsupported on Windows."
+    )]
     pub env_provider: Option<ShellEnvProvider>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ShellEnvProviderKind {
     Mise,
@@ -844,15 +794,21 @@ pub enum ShellEnvProviderKind {
     Custom,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ShellEnvProvider {
     pub kind: ShellEnvProviderKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "Provider argv. Defaults to mise env --json or direnv export json; required for custom."
+    )]
     pub command: Option<Vec<String>>,
     #[serde(default = "default_env_provider_timeout_ms")]
     pub timeout_ms: u64,
     #[serde(default)]
+    #[schemars(
+        description = "Custom provider watch files, checked at every ancestor. A custom provider with no watches runs on every call."
+    )]
     pub watch: Vec<String>,
 }
 
@@ -1103,12 +1059,16 @@ pub struct Config {
     pub experimental_lsp_ty: bool,
     /// User-defined LSP servers registered by the OpenCode plugin.
     pub lsp_servers: Vec<UserServerDef>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub invalid_lsp_initialization_options: Vec<String>,
     /// Lowercase LSP server IDs disabled by user config.
     pub disabled_lsp: HashSet<String>,
     /// Whether the system should request inline diagnostics after a tool call edits or writes a file.
     #[serde(skip)]
     pub diagnostics_on_edit: bool,
-    pub lsp_idle_minutes: LspIdleMinutes,
+    pub lsp_idle_minutes: u32,
+    pub lsp_idle_shutdown: bool,
     /// Maximum live language servers, including reserved starts.
     pub lsp_max_servers: usize,
     /// Trusted user ceiling before project tightening; not a configure input.
@@ -1215,9 +1175,11 @@ impl Default for Config {
             git: GitConfig::default(),
             experimental_lsp_ty: false,
             lsp_servers: Vec::new(),
+            invalid_lsp_initialization_options: Vec::new(),
             disabled_lsp: HashSet::new(),
             diagnostics_on_edit: false,
-            lsp_idle_minutes: LspIdleMinutes::default(),
+            lsp_idle_minutes: DEFAULT_LSP_IDLE_MINUTES,
+            lsp_idle_shutdown: true,
             lsp_max_servers: 8,
             lsp_user_max_servers: None,
             lsp_paths_extra: Vec::new(),
@@ -1237,6 +1199,26 @@ impl Default for Config {
 }
 
 impl Config {
+    pub(crate) fn lsp_idle_ttl(&self) -> Option<std::time::Duration> {
+        self.lsp_idle_shutdown
+            .then(|| std::time::Duration::from_secs(u64::from(self.lsp_idle_minutes) * 60))
+    }
+
+    pub(crate) fn check_lsp_initialization_options(
+        &self,
+        id: &str,
+    ) -> Result<(), crate::lsp::LspError> {
+        if self
+            .invalid_lsp_initialization_options
+            .iter()
+            .any(|name| name == id)
+        {
+            return Err(crate::lsp::LspError::ServerNotReady(format!(
+                "lsp.servers.{id}.initialization_options must contain valid JSON text"
+            )));
+        }
+        Ok(())
+    }
     /// Whether the host's tagged `read` slot is registered, i.e. `read` is not
     /// in the resolved disabled list.
     ///

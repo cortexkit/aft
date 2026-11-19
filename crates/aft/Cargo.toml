@@ -271,7 +271,7 @@ cortexkit-persona = "=0.3.0"
 cortexkit-role-tool-provider = "=0.15.12"
 cortexkit-role-llm-runner = "=0.8.53"
 cortexkit-role-tool-display = "=0.1.9"
-cortexkit-role-agent-data = "=0.2.4"
+cortexkit-role-agent-data = "=0.3.3"
 cortexkit-role-user-commands = "=0.1.4"
 cortexkit-project-identity = "=0.1.5"
 cortexkit-agent-identity = "=0.1.1"
@@ -279,14 +279,17 @@ cortexkit-bus-client = "=0.1.2"
 cortexkit-bus-naming = "=0.4.6"
 async-nats = { version = "0.50", default-features = false, features = ["jetstream", "ring"] }
 jsonschema = { version = "0.33", default-features = false }
+schemars = "1"
+serde_path_to_error = "0.1"
 subc-protocol = "=0.37.4"
-subc-control = "=0.41.0"
+subc-control = "=0.42.2"
 subc-transport = "=0.18.0"
-subc-client-rs = "=0.41.0"
+subc-client-rs = "=0.41.4"
+subc-config = "=0.1.1"
 # The one reader of the daemon's launch nonce (pipe first, environment copy
 # second). subc-client-rs reads through the same cached accessor, so this pin
 # must match the version subc-client-rs depends on.
-subc-os = { version = "=0.1.40", features = ["tokio"] }
+subc-os = { version = "=0.1.42", features = ["tokio"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 vt100 = "0.16"
 jsonc-parser = { version = "0.33", features = ["cst"] }
@@ -303,6 +306,7 @@ landlock = "=0.4.5"
 [target.'cfg(target_os = "macos")'.dependencies]
 fsevent-sys = "4.1"
 libproc = "0.14"
+mach2 = "0.4.3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
@@ -316,6 +320,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
     "Win32_System_JobObjects",
+    "Win32_System_ProcessStatus",
     "Win32_UI_Shell",
 ] }
 
@@ -324,7 +329,7 @@ cortexkit-test-support = "=0.1.14"
 graphql-parser = "0.4.1"
 cortexkit-role-tool-provider-conformance = "=0.15.13"
 cortexkit-role-tool-provider = { version = "=0.15.12", features = ["test-vectors"] }
-cortexkit-role-agent-data = { version = "=0.2.4", features = ["test-vectors"] }
+cortexkit-role-agent-data = { version = "=0.3.3", features = ["test-vectors"] }
 cortexkit-role-harness = "=0.1.0"
 async-trait = "0.1"
 tokio = { version = "1", features = ["test-util"] }

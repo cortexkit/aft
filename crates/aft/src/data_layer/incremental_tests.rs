@@ -14,6 +14,44 @@ use super::content::{blob_from_record, extract, language_for};
 use super::incremental::LiveCheckout;
 use crate::callgraph_store::join::{CallgraphBlob, ResolutionStatus};
 
+#[test]
+fn refresh_memory_guard_checks_inside_one_large_site_batch() {
+    use super::incremental::UpdateError;
+    use super::refresh_memory::{RefreshMemory, RefreshStop};
+
+    let path = "p.go";
+    let initial = format!(
+        "package p\ntype T struct{{}}\nfunc (T) Run() {{}}\nfunc Use(t T) {{\n{}}}\n",
+        "t.Run()\n".repeat(4096)
+    );
+    let edited = format!("{initial}\n// changed\n");
+    let mut live = LiveCheckout::cold(checkout(&[(path, &initial)], &[])).unwrap();
+    let next = checkout(&[(path, &edited)], &[]);
+    let (_, parse) = next.parses.get(path).unwrap();
+    let sites = parse.iter_bound_dispatch_sites().count();
+    assert!(sites > 1024, "the fixture must populate one large batch");
+    // Cross after the small-batch declarer scan, during actual resolution.
+    let crossing = sites + 257;
+    let guard = RefreshMemory::simulated(1, move |_, sites| {
+        Some(if sites >= crossing { 2 } else { 0 })
+    });
+    let result = live.update_with_budget(
+        next,
+        &BTreeSet::from([path.to_owned()]),
+        None,
+        Some(&guard),
+        &mut Default::default(),
+    );
+    let Err(UpdateError::Stop(RefreshStop::Memory(limit))) = result else {
+        panic!("the site loop must stop for memory");
+    };
+    assert!(
+        (crossing..crossing + 256).contains(&limit.sites),
+        "stopped at {} sites after crossing at {crossing}",
+        limit.sites
+    );
+}
+
 /// A checkout of text `files` and symlinks `links` (path, target).
 pub(super) fn checkout(files: &[(&str, &str)], links: &[(&str, &str)]) -> CheckoutInputs {
     let mut records = Vec::new();

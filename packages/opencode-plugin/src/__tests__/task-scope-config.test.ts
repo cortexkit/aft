@@ -24,8 +24,8 @@ test("published task scope defaults agree in base and harness blocks", () => {
     readFileSync(new URL("../../../../assets/aft.schema.json", import.meta.url), "utf8"),
   );
   for (const properties of [
-    schema.properties.bash.oneOf[1].properties,
-    schema.properties.harnesses.additionalProperties.properties.bash.oneOf[1].properties,
+    schema.properties.bash.properties,
+    schema.properties.harnesses.additionalProperties.properties.bash.properties,
   ]) {
     expect(properties.linux_scope.default).toBe(true);
     expect(properties.linux_scope_max_runtime_secs).toMatchObject({

@@ -1,0 +1,7 @@
+{
+  "op": "config.applied",
+  "generation": 4,
+  "attempt": 8,
+  "result": "ack",
+  "reasons": []
+}

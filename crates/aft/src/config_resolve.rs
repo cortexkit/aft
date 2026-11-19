@@ -15,17 +15,19 @@ use serde_json::{Map, Value};
 use crate::config::{
     expand_index_root_path, normalize_git_co_author, BackupConfig, Config, GhShimConfig, GitConfig,
     GithubConfig, IdleConfig, IndexConfig, IndexKind, IndexRootConfig, IndexesConfig,
-    InspectCategories, InspectConfig, LspIdleMinutes, RemoteExecConfig, RerankBackendKind,
-    RerankConfig, SandboxConfig, SearchConfig, SemanticBackend, SemanticBackendConfig,
-    UserServerDef, DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_BASH_WORKER_WAIT_MAX_MS,
-    DEFAULT_IDLE_ROOT_TTL_MINUTES, DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
-    MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_ROOT_TTL_MINUTES, MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
-    MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_BASH_WATCH_SYNC_MAX_MS, MIN_BASH_WORKER_WAIT_MAX_MS,
-    MIN_IDLE_ROOT_TTL_MINUTES, MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
+    InspectCategories, InspectConfig, RemoteExecConfig, RerankBackendKind, RerankConfig,
+    SandboxConfig, SearchConfig, SemanticBackend, SemanticBackendConfig, UserServerDef,
+    DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_BASH_WORKER_WAIT_MAX_MS, DEFAULT_IDLE_ROOT_TTL_MINUTES,
+    DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_ROOT_TTL_MINUTES,
+    MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_BASH_WATCH_SYNC_MAX_MS,
+    MIN_BASH_WORKER_WAIT_MAX_MS, MIN_IDLE_ROOT_TTL_MINUTES, MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+    MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
 use crate::feature_config;
 use crate::harness::Harness;
 use crate::jsonc::strip_jsonc;
+
+pub mod schema;
 
 const FOREGROUND_WAIT_WINDOW_DEFAULT_MS: u64 = 15_000;
 const FOREGROUND_WAIT_WINDOW_MIN_MS: u64 = 5_000;
@@ -104,50 +106,149 @@ pub struct ResolveResult {
 /// Strict raw shape for aft.jsonc. This mirrors the TypeScript Zod schema, not
 /// the flat runtime [`Config`]. Privileged process-state fields are deliberately
 /// absent and therefore rejected by `deny_unknown_fields`.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default, deny_unknown_fields)]
+#[schemars(
+    description = "Configuration schema for the @cortexkit/aft-opencode and @cortexkit/aft-pi plugins. Place as aft.jsonc in ~/.config/opencode/, <project>/.opencode/, ~/.pi/agent/, or <project>/.pi/."
+)]
 pub struct RawAftConfig {
+    #[schemars(
+        description = "Machine-local resource profile, user config base only. lean uses less memory and can build more slowly: it uses a smaller shared block cache, four call-graph resolver threads on Linux and macOS, and immediate freed-memory return on Linux. Windows keeps all CPUs. balanced keeps the previous limits. When unset, total physical RAM selects lean below 8 GiB, otherwise balanced; unreadable RAM selects balanced. Changes apply to subsequent builds and shared block cache sizing without a restart. Other limits and meaning-search settings stay unchanged."
+    )]
     pub memory: Option<crate::memory::profile::MemoryMode>,
+    #[schemars(
+        description = "Process-wide file flush policy from the user config base only. Project values and all harness overrides have no effect."
+    )]
     pub durability: Option<RawDurability>,
+    #[schemars(
+        description = "Storage-wide settings from the user config base only. Project values and every harness override are ignored."
+    )]
     pub storage: Option<RawStorage>,
     #[serde(rename = "$schema")]
     pub schema: Option<String>,
+    #[schemars(
+        description = "Select the edit/read surface. Hashline mode renders tagged reads and changes edit arguments to exactly { patch }."
+    )]
     pub edit_mode: Option<RawEditMode>,
+    #[schemars(
+        description = "Auto-format files after edits with the language's configured formatter. Default false: formatting can reflow the file under the agent and stale the next edit's context."
+    )]
     pub format_on_edit: Option<bool>,
+    #[schemars(
+        description = "Let read, aft_outline and aft_zoom take a `ref` argument that reads a file as it is at a git revision (branch, tag, SHA, or forms like HEAD~2) from the repository's object store, without touching the working tree. Default false: the argument is not offered and a call that passes it is refused."
+    )]
     pub revision_reads: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_timeout_secs")]
+    #[schemars(range(min = 1, max = 600))]
+    #[schemars(
+        description = "Maximum seconds an external formatter is allowed to run before AFT kills it and reports `format_skipped_reason: \"timeout\"`. Raise for slow formatters in large projects."
+    )]
     pub formatter_timeout_secs: Option<u32>,
     #[serde(deserialize_with = "deserialize_opt_timeout_secs")]
+    #[schemars(range(min = 1, max = 600))]
+    #[schemars(
+        description = "Maximum time in seconds for an external type checker to run. The default is 30 seconds."
+    )]
     pub type_checker_timeout_secs: Option<u32>,
+    #[schemars(
+        description = "Auto-validate after edits: 'syntax' (tree-sitter parse check) or 'full' (also runs type checker)."
+    )]
     pub validate_on_edit: Option<RawValidateOnEdit>,
+    #[schemars(
+        description = "Per-language formatter overrides keyed by language (e.g. 'typescript', 'python', 'rust', 'go')."
+    )]
     pub formatter: Option<HashMap<String, RawFormatter>>,
+    #[schemars(
+        description = "Per-language type checker overrides keyed by language (e.g. 'typescript', 'python', 'rust', 'go')."
+    )]
     pub checker: Option<HashMap<String, RawChecker>>,
+    #[schemars(
+        description = "How missing formatter/checker/LSP binary warnings are shown after configure. 'toast' (default) uses a 10s TUI or HTTP toast without adding session chat messages. 'log' writes to the plugin log only. 'chat' uses legacy ignored user messages in the session transcript. Warnings for formatters/checkers are only emitted when format_on_edit is true or a per-language formatter is set; checker warnings require validate_on_edit 'syntax' or 'full' or an explicit checker. There is no top-level 'formatters' key — use format_on_edit, formatter, and checker instead."
+    )]
     pub configure_warnings_delivery: Option<RawConfigureWarningsDelivery>,
     /// Raw presence is preserved: `None` (absent) and `Some([])` (explicit
     /// empty choice) mean different things until user-base resolution.
+    #[schemars(
+        description = "Tool names that are not registered; every other AFT tool is registered. When absent from the user config it defaults to [\"aft_move\", \"aft_delete\"]; an explicit list (including []) replaces that default. Host tool names ('read', 'grep', 'bash', ...) leave the host's own tool in place. Project config may only add names and cannot disable aft_safety or a host tool slot."
+    )]
     pub disabled_tools: Option<Vec<String>>,
+    #[schemars(
+        description = "Restrict file operations to within project root. When true, write-capable commands reject paths outside project_root. Default: false (matches OpenCode built-in behavior)."
+    )]
     pub restrict_to_project_root: Option<bool>,
+    #[schemars(
+        description = "Background indexes. Each defaults on and builds independently of which tools are registered. Project config can only turn an index off."
+    )]
     pub indexes: Option<RawIndexes>,
+    #[schemars(
+        description = "Configure indexes for folders even when no session is open in them. By default, no folders are configured for standing indexing."
+    )]
     pub index: Option<RawIndex>,
+    #[schemars(
+        description = "Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect."
+    )]
     pub inspect: Option<RawInspect>,
+    #[schemars(
+        description = "Idle windows: when an unbound root's indexes are evicted, and when an unused checkout drops its in-memory index state."
+    )]
     pub idle: Option<RawIdle>,
     pub backup: Option<RawBackup>,
+    #[schemars(
+        description = "User-scoped GitHub integration gates. Project config cannot change capabilities or host-wide tool descriptions."
+    )]
     pub github: Option<RawGithub>,
+    #[schemars(
+        description = "Managed gh shim binary override. Whether the shim is used is github.shim; binary_path is the advanced AFT-image override."
+    )]
     pub gh_shim: Option<RawGhShim>,
+    #[schemars(
+        description = "Agent-child Git attribution injected through environment-scoped core.hooksPath configuration."
+    )]
     pub git: Option<RawGit>,
+    #[schemars(description = "Pi and OMP harness-specific configuration.")]
     pub pi: Option<RawPi>,
+    #[schemars(
+        description = "Shell sandbox profiles: stamped workers default to relaxed, all other sessions to off; untrusted routes always use strict."
+    )]
     pub sandbox: Option<RawSandbox>,
-    pub bash: Option<RawBash>,
+    #[schemars(
+        description = "Bash runtime configuration (runtime gate + rewrite + compress + background execution and user-only environment defaults). Registration of bash and its companions is controlled by disabled_tools. Replaces `experimental.bash.*`."
+    )]
+    pub bash: Option<RawBashFeatures>,
+    #[schemars(
+        description = "User-only shell environment settings. Project configuration cannot select an environment provider."
+    )]
     pub shell: Option<crate::config::ShellConfig>,
+    #[schemars(description = "Experimental opt-in features. May change between releases.")]
     pub experimental: Option<RawExperimental>,
+    #[schemars(description = "User-defined and built-in LSP server configuration.")]
     pub lsp: Option<RawLsp>,
+    #[schemars(
+        description = "Allow `aft_outline`/`aft_zoom` URL fetches to request private/link-local hosts. Default: false (rejects RFC1918, loopback, and link-local)."
+    )]
     pub url_fetch_allow_private: Option<bool>,
+    #[schemars(
+        description = "External semantic backend configuration for embedding and retrieval."
+    )]
     pub semantic: Option<RawSemantic>,
+    #[schemars(description = "aft_search settings.")]
     pub search: Option<RawSearch>,
+    #[schemars(
+        description = "OpenCode only: auto-refresh the cached @cortexkit/aft-opencode package when a newer channel version is published. User-scoped only — project configs cannot disable updates silently."
+    )]
     pub auto_update: Option<bool>,
+    #[schemars(
+        description = "Shared NDJSON bridge transport tuning (OpenCode and Pi). User-scoped only — project configs cannot set this block (bridge safety and per-machine transport budget)."
+    )]
     pub bridge: Option<RawBridge>,
+    #[schemars(
+        description = "Subconscious (subc) daemon transport selection. User-scoped only — a project config cannot redirect transport. Presence of connection_file switches AFT from a spawned child process to a daemon-supervised module."
+    )]
     pub subc: Option<RawSubc>,
 
+    #[schemars(
+        description = "Remote runs requested per bash call with runon. See docs/tools.md (bash: running on the remote build server)."
+    )]
     pub remote_exec: Option<RawRemoteExec>,
     /// Set by the resolver, never read from a file: a project tier turned
     /// `remote_exec.enabled` off.
@@ -155,12 +256,18 @@ pub struct RawAftConfig {
     pub remote_exec_project_off: bool,
     /// Raw per-harness objects stay opaque until the resolver knows the active
     /// configure harness. Unknown harness names are intentionally ignored.
+    #[schemars(
+        description = "Per-harness overrides. The active harness applies its override after the base config within each tier: user base, user override, project base, project override. storage.cache_dir, durability.macos_full_sync and memory apply to the whole process; none can be overridden here. Nested harnesses are ignored; unknown harness names are reserved for forward compatibility."
+    )]
     pub harnesses: Option<BTreeMap<String, Value>>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct RawDurability {
+    #[schemars(
+        description = "On macOS, restore F_FULLFSYNC drive-cache flushes instead of faster plain fsync. Plain fsync can lose recent writes on power loss, but adds no loss on daemon kill or OS crash. Applies to AFT files and directories, not SQLite; ignored on Linux and Windows. Takes effect on the next sync."
+    )]
     pub macos_full_sync: Option<bool>,
 }
 
@@ -185,7 +292,7 @@ impl<'de> Deserialize<'de> for RawEditMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RawValidateOnEdit {
     Syntax,
@@ -201,7 +308,7 @@ impl RawValidateOnEdit {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RawFormatter {
     Biome,
@@ -233,7 +340,7 @@ impl RawFormatter {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RawChecker {
     Tsc,
@@ -263,7 +370,7 @@ impl RawChecker {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RawConfigureWarningsDelivery {
     Toast,
@@ -272,46 +379,82 @@ pub enum RawConfigureWarningsDelivery {
 }
 
 /// Raw `indexes` block; each switch keeps its presence until resolution.
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawIndexes {
+    #[schemars(
+        description = "Trigram index for indexed grep/glob and the lexical aft_search lane. With false, no text index is built, and grep and glob walk the folder."
+    )]
     pub trigram: Option<bool>,
+    #[schemars(
+        description = "Semantic (embedding) index for the semantic aft_search lane. The default local backend may download an ONNX runtime and model and use CPU."
+    )]
     pub semantic: Option<bool>,
+    #[schemars(description = "Persisted call-graph store used by aft_callgraph and enrichment.")]
     pub callgraph: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawStorage {
+    #[schemars(
+        description = "Existing absolute cache parent (~ is expanded); AFT creates only its marked aft/ namespace. A path through symlinks is resolved once when first used and pinned by device and inode; if it later names a different directory, or is missing, unwritable or identity-changed, all disk caches turn off with cache_dir_unavailable and never fall back to storage. Rechecked on binds and at most once a minute. First enrollment requires a different device from durable storage; cache_dir_on_storage_device refuses main-disk mount stubs on every platform. Once a storage root has used a cache directory, removing this key keeps caches off; set it to null to move caches back to the storage root. Only the user config base may set this; harness/project overrides are dropped. Old caches are not migrated; doctor --fix reclaims only identity- and ownership-verified inactive cache domains."
+    )]
     pub cache_dir: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, schemars::JsonSchema)]
 // Nested objects mirror TS sub-schemas, which are non-strict z.object (unknown
 // keys are silently stripped, the object survives). Only the TOP-LEVEL
 // RawAftConfig is strict (matches AftConfigSchema.strict()). Privileged denylist
 // fields are all top-level, so nested unknowns are harmlessly ignored.
 pub struct RawSemantic {
+    #[schemars(
+        description = "Embedding backend. 'fastembed' uses local ONNX runtime, 'openai_compatible' calls a configured OpenAI-style API, 'ollama' calls a local Ollama embedding endpoint, and 'synapse' dials CortexKit Synapse over SubC."
+    )]
     pub backend: Option<SemanticBackend>,
     #[serde(default, deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    #[schemars(
+        description = "Model identifier passed to the backend. Required for synapse; fastembed defaults to all-MiniLM-L6-v2."
+    )]
     pub model: Option<String>,
     #[serde(default, deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    #[schemars(
+        description = "Base URL of the backend API endpoint. Required for openai_compatible. Default for ollama: http://localhost:11434."
+    )]
     pub base_url: Option<String>,
     #[serde(default, deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    #[schemars(
+        description = "Environment variable name containing the API key (e.g. 'OPENAI_API_KEY'). Project-scoped configs cannot set this field — only user-scoped configs can."
+    )]
     pub api_key_env: Option<String>,
     /// Background embedding request floor in milliseconds. HTTP batch deadlines
     /// scale above it using measured per-item latency.
     #[serde(default, deserialize_with = "deserialize_opt_positive_u64")]
+    #[schemars(description = "Background build embedding request timeout in milliseconds.")]
     pub timeout_ms: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_u64")]
+    #[schemars(
+        description = "Interactive query embedding deadline in milliseconds. Project-scoped configs cannot set this field; values are clamped to 500..30000."
+    )]
     pub query_timeout_ms: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    #[schemars(
+        description = "Query-only task instruction sent to the embedding backend: \"auto\" applies the model family's documented recipe (Qwen3-Embedding: the model-card retrieval task; fastembed and other families stay bare), \"off\" sends bare queries, any other value is used as literal task text. Never changes document vectors or the index fingerprint."
+    )]
     pub query_instruction: Option<String>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_usize")]
+    #[schemars(description = "Maximum batch size used by the semantic embedding pipeline.")]
     pub max_batch_size: Option<usize>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_usize")]
+    #[schemars(
+        description = "Whole-row input token budget for remote embedding backends. Absent keeps the MiniLM-era chunk caps. Fingerprinted: changing it rebuilds the semantic index."
+    )]
     pub max_input_tokens: Option<usize>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_usize")]
+    #[schemars(
+        description = "Most project files to embed for semantic search (default 20000): a limit on embedding cost and time; files past it are not embedded. Raise it for remote backends that embed server-side."
+    )]
     pub max_files: Option<usize>,
 }
 
@@ -330,53 +473,106 @@ impl RawSemantic {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawSearch {
+    #[schemars(
+        description = "Optional cross-encoder reranking of aft_search results. Default off."
+    )]
     pub rerank: Option<RawRerank>,
 }
 
 /// Raw `search.rerank`. Parsing only: defaults and clamps belong to the search
 /// engine, which owns every setting that can change result order.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawRerank {
+    #[schemars(
+        description = "Cross-encoder reranker for the head of aft_search results. Only prose questions are reranked, and exact matches keep their order. 'off' keeps fused order, 'onnx' runs a local model through ONNX Runtime (downloaded in the background on first use), 'remote' calls a Cohere-style /rerank endpoint, 'synapse' uses CortexKit Synapse. A project config may only set 'off'."
+    )]
     pub backend: Option<RerankBackendKind>,
     #[serde(deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    #[schemars(
+        description = "Reranker model. For onnx: bge-reranker-base (default), bge-reranker-v2-m3, jina-reranker-v1-turbo or gte-reranker-modernbert-base. Required for remote and synapse. User config only."
+    )]
     pub model: Option<String>,
     #[serde(deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    #[schemars(
+        description = "Base URL of the remote rerank endpoint; AFT appends /rerank. Prefix with tei+ for a TEI server. User config only."
+    )]
     pub endpoint: Option<String>,
     #[serde(deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    #[schemars(
+        description = "Environment variable holding the remote rerank endpoint's API key. User config only."
+    )]
     pub api_key_env: Option<String>,
     #[serde(deserialize_with = "deserialize_opt_positive_u64")]
+    #[schemars(
+        description = "How many leading results are reranked (default 20, at most 200). User config only."
+    )]
     pub top_n: Option<u64>,
     #[serde(deserialize_with = "deserialize_opt_positive_u64")]
+    #[schemars(
+        description = "Reranking budget per search in milliseconds (default 1500, clamped to 50..15000). On timeout the fused order is kept. User config only."
+    )]
     pub timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 pub struct RawLsp {
-    pub idle_minutes: Option<LspIdleMinutes>,
+    #[schemars(
+        description = "Minutes since the last AFT tool call on that repository. Default 60; integers are clamped to 5..=1440. Project config may only lower the user value. Applies live."
+    )]
+    pub idle_minutes: Option<i64>,
+    #[schemars(
+        description = "Shut down idle language servers (default true). When false, servers still stop on unbind, eviction and shutdown. A project may turn idle shutdown on, never off. Applies live."
+    )]
+    pub idle_shutdown: Option<bool>,
+    #[schemars(
+        description = "Maximum live language servers process-wide, including starts in progress. Evicts the least recently used client with no pending requests before refusing a start. Project config may only lower the user value. Zero prevents new starts."
+    )]
     pub max_servers: Option<usize>,
     #[serde(default, deserialize_with = "deserialize_opt_lsp_servers")]
+    #[schemars(
+        description = "User-defined LSP server map keyed by server id (e.g. { 'terraform-ls': { ... } })."
+    )]
     pub servers: Option<BTreeMap<String, RawLspServerEntry>>,
     #[serde(
         default,
         deserialize_with = "deserialize_opt_trimmed_non_empty_string_vec"
     )]
+    #[schemars(
+        description = "Built-in LSP server ids to disable (e.g. ['python', 'biome']). See README for the full list."
+    )]
     pub disabled: Option<Vec<String>>,
+    #[schemars(
+        description = "Which Python LSP to use. 'auto' stays on Pyright while ty is experimental; select 'ty' explicitly to opt in without fallback."
+    )]
     pub python: Option<RawPythonLsp>,
+    #[schemars(
+        description = "Wait for inline LSP diagnostics on every edit/write/apply_patch call. Default: false."
+    )]
     pub diagnostics_on_edit: Option<bool>,
+    #[schemars(
+        description = "Auto-install npm-distributed and GitHub-release LSP servers when the project needs them. Set false to require manual install on PATH."
+    )]
     pub auto_install: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_u64")]
+    #[schemars(
+        description = "Supply-chain grace window. AFT only installs versions that have been on the registry / GitHub releases for at least this many days. User pins via `lsp.versions` bypass this."
+    )]
     pub grace_days: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_opt_versions_map")]
+    #[schemars(
+        description = "Per-package version pin map keyed by npm package or GitHub repo. Pins bypass the grace filter and any weekly version recheck (e.g. { 'typescript-language-server': '5.0.0', 'clangd/clangd': '21.1.0' })."
+    )]
     pub versions: Option<HashMap<String, String>>,
 }
 
 impl RawLsp {
     fn is_empty(&self) -> bool {
         self.idle_minutes.is_none()
+            && self.idle_shutdown.is_none()
             && self.max_servers.is_none()
             && self.servers.is_none()
             && self.disabled.is_none()
@@ -388,7 +584,7 @@ impl RawLsp {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RawPythonLsp {
     Pyright,
@@ -396,89 +592,147 @@ pub enum RawPythonLsp {
     Auto,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawLspServerEntry {
     #[serde(deserialize_with = "deserialize_opt_lsp_extensions")]
+    #[schemars(
+        description = "File extensions this server handles (e.g. ['.tf', '.tfvars']). Optional when overriding a built-in server — the built-in's extensions are inherited."
+    )]
     pub extensions: Option<Vec<String>>,
     #[serde(deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    #[schemars(
+        description = "LSP binary command (must be on PATH or absolute path). Optional when overriding a built-in server — the built-in's binary is inherited."
+    )]
     pub binary: Option<String>,
+    #[schemars(description = "Extra command-line arguments passed to the LSP binary.")]
     pub args: Option<Vec<String>>,
     #[serde(deserialize_with = "deserialize_opt_trimmed_non_empty_string_vec")]
+    #[schemars(
+        description = "Workspace root marker files. AFT walks up from each opened file looking for any of these."
+    )]
     pub root_markers: Option<Vec<String>>,
+    #[schemars(description = "Disable this server entirely without removing the config block.")]
     pub disabled: Option<bool>,
+    #[schemars(
+        description = "Extra environment variables passed to the LSP server child process."
+    )]
     pub env: Option<HashMap<String, String>>,
-    pub initialization_options: Option<Value>,
+    #[schemars(
+        description = "JSON text passed as `initializationOptions` in the LSP `initialize` request. Invalid JSON prevents this server from starting."
+    )]
+    pub initialization_options: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum RawBash {
-    Bool(bool),
-    Features(RawBashFeatures),
-}
-
-/// `bash` is a boolean or an object. Written by hand rather than as an
-/// untagged enum, which would replace every error inside the object with "did
-/// not match any variant": a value below a minimum must be reported with the
-/// key it is about.
-impl<'de> Deserialize<'de> for RawBash {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        match Value::deserialize(deserializer)? {
-            Value::Bool(enabled) => Ok(Self::Bool(enabled)),
-            Value::Object(map) => serde_json::from_value::<RawBashFeatures>(Value::Object(map))
-                .map(Self::Features)
-                .map_err(de::Error::custom),
-            other => Err(de::Error::custom(format!(
-                "bash must be a boolean or an object, not {other}"
-            ))),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawBashFeatures {
+    #[schemars(
+        description = "Report watcher-observed project changes after bash commands. User opt-in; projects may only set off. Diff mode uses clean git before-images and bounded output."
+    )]
     pub changed_files: Option<crate::config::BashChangedFiles>,
     /// Runtime gate for bash execution. Absent means on.
+    #[schemars(
+        description = "Runtime gate for every bash operation, including bash_status/bash_write/bash_watch/bash_kill. When false they report bash_disabled; registration is controlled by disabled_tools."
+    )]
     pub enabled: Option<bool>,
+    #[schemars(
+        description = "Rewrite common bash commands (cat, grep, find, sed, ls) into AFT tool calls for faster, formatted output."
+    )]
     pub rewrite: Option<bool>,
+    #[schemars(
+        description = "Compress bash output via per-tool compressors (git, cargo, npm, bun, pnpm, pytest, tsc, eslint, biome, vitest, prettier, ruff, mypy, go, golangci-lint, playwright, next) plus TOML filter pipeline. Adds `[cmpaft]` marker."
+    )]
     pub compress: Option<bool>,
+    #[schemars(
+        description = "Allow agents to launch bash with `{ background: true }` for long-running tasks. Foreground bash always auto-promotes to background after the foreground wait window (default 8s) regardless of this flag."
+    )]
     pub background: Option<bool>,
+    #[schemars(
+        description = "Break-glass host execution when AFT's module transport is unavailable. Project-settable. Every fallback command requires a fresh host permission prompt and runs without AFT rewrites, compression, or background support."
+    )]
     pub host_fallback: Option<bool>,
+    #[schemars(
+        description = "Allow subagents to run background bash. Default true because workers are multi-turn and wait with bash_watch; when false, subagent `background: true` requests are converted to foreground calls that block up to the hard cap."
+    )]
     pub subagent_background: Option<bool>,
+    #[schemars(
+        description = "Detach a `wait: true` bash call when a new user message arrives. Default true. Set false to keep the wait blocking; a message containing the literal `&detach` still forces detachment, the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Project-safe."
+    )]
     pub detach_on_user_message: Option<bool>,
+    #[schemars(
+        description = "Append AFT read-only database schema hints after missing-table or missing-column errors. SQLite on Unix only; supported literal database paths only. Project-safe."
+    )]
     pub db_schema_hints: Option<bool>,
+    #[schemars(
+        description = "Periodically remind the agent that a background bash task is still running. When false, completion is delivered but mid-flight reminders are suppressed."
+    )]
     pub long_running_reminder_enabled: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_positive_u64")]
+    #[schemars(
+        description = "Interval in milliseconds between mid-flight reminders for a still-running background bash task."
+    )]
     pub long_running_reminder_interval_ms: Option<u64>,
     #[serde(deserialize_with = "deserialize_opt_positive_u64")]
+    #[schemars(
+        description = "How long foreground bash blocks before auto-promoting the task to background, in milliseconds. Minimum 5000; values below the floor are clamped up."
+    )]
     pub foreground_wait_window_ms: Option<u64>,
     #[serde(deserialize_with = "deserialize_opt_positive_u64")]
+    #[schemars(
+        description = "Maximum synchronous bash_watch wait in milliseconds. Defaults to 120 seconds for short remaining waits; set to 1800000 to restore the old 30-minute cap."
+    )]
     pub watch_sync_max_ms: Option<u64>,
     #[serde(deserialize_with = "deserialize_opt_worker_wait_max_ms")]
+    #[schemars(
+        description = "Longest a delegated worker (subagent) waits on one command before control returns to it, in milliseconds: a bash_watch without a timeout, or a bash call that blocks until the command finishes (wait: true, or every foreground call when subagent_background is false). The command keeps running in the background; the worker is told it is still running and can wait again or kill it. While a worker keeps waiting, the command's default 30-minute hard kill is pushed back by this much. Default 1800000 (30 minutes); values below 60000 are a config error. Project-safe."
+    )]
     pub worker_wait_max_ms: Option<u64>,
+    #[schemars(
+        description = "Linux daemon scopes are on by default (user config only). User config can disable them. Standalone mode, PTY tasks, and native-sandbox launches use the usual spawn path. If systemd-run, the user manager, or cgroup access is unavailable, AFT uses the usual path."
+    )]
     pub linux_scope: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_linux_scope_max_runtime_secs")]
+    #[schemars(range(min = 1, max = 4294967295_u64))]
+    #[schemars(
+        description = "User-only Linux daemon scope ceiling in seconds. Worker waits do not extend it. An explicit timeout uses its own limit plus 60 seconds."
+    )]
     pub linux_scope_max_runtime_secs: Option<u64>,
     #[serde(deserialize_with = "deserialize_opt_memory_limit_mib")]
+    #[schemars(range(min = 1, max = 4294967295_u64))]
+    #[schemars(
+        description = "Optional aggregate local-command memory cap in MiB. Off by default; projects may only lower a user cap. Remote runon jobs use server limits."
+    )]
     pub memory_limit_mib: Option<u64>,
+    #[schemars(
+        description = "On macOS, agent shells and governed gh commands do not inherit the supervisor's privacy grants. Default false. Live for future commands; user tier controls it and projects may only enable it. Protected folders such as ~/Downloads should be read with AFT's read tool. Accepted but inert on other platforms; unavailable spawn attributes refuse the command instead of inheriting grants."
+    )]
     pub disclaim_privacy: Option<bool>,
+    #[schemars(
+        description = "Pi-only fallback for manually mirroring Pi's optional PowerShell default tool when the host does not expose its enabled-tool registry. OpenCode never registers this tool."
+    )]
     pub powershell_tool: Option<bool>,
+    #[schemars(
+        description = "Fixed environment variables for local shell commands, at either tier. A project's names apply only while the project is trusted (aft doctor filters trust; a linked worktree inherits its main checkout); a user value wins when both tiers set the same name, and the first bash reply in a session names each applied variable with its tier, never its value. Per-call env values and the command's own export both override these. Names that hijack startup, redirect lookup roots, inject into interpreters or Git, or drive AFT, the sandbox, or a build worker are rejected at every tier; credentials, identity, proxy, and TLS-trust names are rejected at the project tier. These values never reach a runon build-server job unless a user name is listed in bash.runon_env."
+    )]
     pub env: Option<BTreeMap<String, String>>,
     /// Project-tier `bash.env` values, carried separately so the user-tier map
     /// stays user-only. Only `project_safe_bash` fills this field.
     #[serde(skip)]
     pub project_env: Option<BTreeMap<String, String>>,
     /// User-only: `bash.env` names that are also sent to a `runon` job.
+    #[schemars(
+        description = "User-only list of bash.env names that are also sent to a runon build-server job. Every other bash.env value applies to local commands only; a project's values are never sent, even when their name is listed. Unlisted names appear in the job's \"does not receive\" disclosure."
+    )]
     pub runon_env: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawExperimental {
+    #[schemars(
+        description = "Run the experimental Python `ty` type checker alongside Pyright. Use lsp.python = 'ty' to select ty exclusively."
+    )]
     pub lsp_ty: Option<bool>,
 }
 
@@ -488,16 +742,30 @@ impl RawExperimental {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawInspect {
+    #[schemars(
+        description = "Runtime switch for aft_inspect. Defaults to true. When false the registered tool reports inspect_disabled; use disabled_tools to unregister it."
+    )]
     pub enabled: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_u64")]
+    #[schemars(
+        description = "Blocking LSP diagnostics deadline in milliseconds. Values are clamped to 10000..600000. User config sets the baseline; project config may only raise the effective deadline so a repository cannot silently reduce diagnostic completeness for another consumer."
+    )]
     pub diagnostics_timeout_ms: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_u64")]
+    #[schemars(
+        description = "Hard deadline for one Tier-2 pass, including projection and scanning. On expiry AFT cooperatively cancels the pass and releases its cold-build slot."
+    )]
     pub tier2_pass_timeout_ms: Option<u64>,
     #[serde(deserialize_with = "deserialize_opt_inspect_categories")]
+    #[schemars(with = "Option<InspectCategories>")]
+    #[schemars(
+        description = "Per-category computation switches, all true by default. Off categories run no scans or refreshes and render as off, never incomplete. Project config may only turn a category off."
+    )]
     pub categories: Option<BTreeMap<String, bool>>,
+    #[schemars(description = "Duplicate suppression config for the duplicates inspect category.")]
     pub duplicates: Option<RawInspectDuplicates>,
 }
 
@@ -515,10 +783,20 @@ impl RawInspect {
 /// `anonymize` were accepted-but-never-read knobs (the scanner hardcodes its
 /// cost bounds and anonymization rules), so they were removed from the schema
 /// rather than wired up.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawInspectDuplicates {
-    pub expected_mirrors: Option<Vec<[String; 2]>>,
+    #[schemars(
+        description = "Intentional mirror paths for duplicate suppression. Each source and mirror glob matches project-root-relative forward-slash paths; groups fully straddling the pair are counted as suppressed instead of reported."
+    )]
+    pub expected_mirrors: Option<Vec<RawExpectedMirror>>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RawExpectedMirror {
+    pub source: String,
+    pub mirror: String,
 }
 
 impl RawInspectDuplicates {
@@ -527,10 +805,16 @@ impl RawInspectDuplicates {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawIdle {
+    #[schemars(
+        description = "Minutes without tool traffic before an unbound root's indexes are evicted. Default 30; values outside 5..=30 are clamped. Reclaimed state rebuilds on the next request. User and project tiers."
+    )]
     pub root_ttl_minutes: Option<Value>,
+    #[schemars(
+        description = "Hours without use after which a checkout counts as idle and drops its in-memory index state; its state on disk stays. Default 168 (one week); values outside 1..=8760 are clamped. Replaces views.idle_checkout_hours. User and project tiers. Applies live."
+    )]
     pub checkout_hours: Option<Value>,
 }
 
@@ -540,48 +824,76 @@ impl RawIdle {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawBridge {
     #[serde(deserialize_with = "deserialize_opt_bridge_request_timeout_ms")]
+    #[schemars(
+        description = "Per-request bridge transport timeout in milliseconds. Default 30000. Raise on slow filesystems (WSL/DrvFs/NFS) where cold aft operations exceed the default."
+    )]
     pub request_timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawSubc {
+    #[schemars(
+        description = "Absolute path to the Subconscious (subc) daemon connection file. When present (non-empty), the plugin talks to AFT as a daemon-supervised module over subc instead of spawning the aft binary; absent/empty means standalone NDJSON (the default). macOS default: ~/.local/share/cortexkit/run/subc-connection.json."
+    )]
     pub connection_file: Option<String>,
+    #[schemars(
+        description = "Close the plugin's Subconscious routes to a checkout after two consecutive checks find the folder missing. Off by default."
+    )]
     pub client_reaper: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawGithub {
+    #[schemars(description = "Interpose the governed gh shim in agent child PATHs.")]
     pub shim: Option<bool>,
+    #[schemars(
+        description = "Enable structured issue:// and pr:// reads. github.write=true also enables this to keep comment ordinals visible."
+    )]
     pub read: Option<bool>,
+    #[schemars(
+        description = "Enable creating and editing issue and pull-request conversation comments. Implies github.read."
+    )]
     pub write: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawGhShim {
     #[serde(deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    #[schemars(
+        description = "Absolute deployed or development AFT binary used by the managed gh entry. Defaults to the running AFT image. User-scoped only."
+    )]
     pub binary_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawGit {
     #[serde(deserialize_with = "deserialize_opt_git_co_author")]
+    #[schemars(
+        description = "Git co-author attribution for AFT-spawned agent children: 'off', 'auto', or an explicit 'Name <email>' identity. User and project tiers are accepted with project precedence."
+    )]
     pub co_author: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawPi {
+    #[schemars(
+        description = "Pi and OMP tool presentation mode. 'top_level' registers tools with loadMode: essential on OMP so they appear at top level (default). 'host_default' uses host default loadMode (mounting tools under xd:// on OMP). User and project tiers are accepted with project precedence."
+    )]
     pub tool_presentation: Option<RawPiToolPresentation>,
     /// Plain Pi asks before outside-project access (default on). A project
     /// tier may turn it on, never off; see `merge_pi_config`.
+    #[schemars(
+        description = "Plain Pi only: ask before an AFT tool reaches a path outside the project. On (default), Pi's own terminal UI asks; print, JSON and RPC sessions have no screen to ask on and allow it without asking. Off, outside access is allowed without asking. Credentials, AFT's data folder, sandbox.read_deny and restrict_to_project_root: true refuse either way. Does not apply on OMP, where OMP's approval mode (tools.approvalMode) decides through the tools' declared approval tiers. A project config may turn it on, never off."
+    )]
     pub external_access_ask: Option<bool>,
 }
 
@@ -612,33 +924,55 @@ impl<'de> Deserialize<'de> for RawPiToolPresentation {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawBackup {
+    #[schemars(
+        description = "Master switch for agent-facing undo backups. When false aft_safety stays registered and reports that backups are disabled. User-only; project config is ignored."
+    )]
     pub enabled: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_usize")]
+    #[schemars(description = "Per-file undo stack depth. User-only; project config is ignored.")]
     pub max_depth: Option<usize>,
+    #[schemars(
+        description = "Maximum existing-file size captured for undo, in bytes. Defaults to 64 MiB. User and project tiers may set it; explicit larger values are honored. Zero disables automatic snapshots. Mutations still proceed when capture is skipped."
+    )]
     pub max_file_size: Option<u64>,
 }
 
 /// `remote_exec`: whether bash calls may ask to run on the remote build server
 /// with `runon`. User tier only, except that a project may turn it off.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawRemoteExec {
+    #[schemars(
+        description = "Offer bash's runon argument, which runs a command line on the remote Linux build server (subc mode only). User-scoped: a project config may set false to turn remote runs off for itself, never true."
+    )]
     pub enabled: Option<bool>,
+    #[schemars(
+        description = "The runner demand a runon call without specifics runs under (today only \"linux\"). Never makes a call remote by itself. User-scoped only."
+    )]
     pub default_demand: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawSandbox {
+    #[schemars(
+        description = "User-selected sandbox profiles by role. Projects may only select a stricter profile (off < relaxed < strict)."
+    )]
     pub profile: Option<RawSandboxRoles>,
+    #[schemars(
+        description = "Additional absolute writable directories. User-scoped only; project config cannot add write access."
+    )]
     pub write_allow: Option<Vec<PathBuf>>,
+    #[schemars(
+        description = "Additional absolute paths sandboxed commands may not read. Project config may add deny entries but cannot remove user or built-in entries."
+    )]
     pub read_deny: Option<Vec<PathBuf>>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawSandboxRoles {
     pub worker: Option<crate::config::SandboxMode>,
@@ -648,13 +982,16 @@ pub struct RawSandboxRoles {
 /// Raw user-tier standing index configuration. Unlike normally stripped nested
 /// fields, unknown entry fields are retained only long enough to emit an
 /// explicit warn-and-ignore notice.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawIndex {
+    #[schemars(
+        description = "List the folders to index, with a path and a list of indexes to build for each folder. The default is an empty list."
+    )]
     pub roots: Option<Vec<RawIndexRoot>>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RawIndexRoot {
     pub path: Option<String>,
@@ -1129,6 +1466,9 @@ fn parse_tier(
     if !security_errors.is_empty() {
         return Err(security_errors);
     }
+    if let Some(path) = feature_config::settings_shape::null_path(&map) {
+        return Err(vec![format!("invalid_config_null:{path}")]);
+    }
 
     let raw = match serde_json::from_value::<RawAftConfig>(Value::Object(map.clone())) {
         Ok(config) => config,
@@ -1436,6 +1776,9 @@ pub fn strict_tier_error(tier: &ConfigTier, harness: Option<&Harness>) -> Option
     };
     feature_config::translate_document(&mut map, document_tier);
     normalize_config_for_harness(&mut map, harness);
+    if let Some(path) = feature_config::settings_shape::null_path(&map) {
+        return Some(format!("invalid_config_null:{path}"));
+    }
     let raw = match serde_json::from_value::<RawAftConfig>(Value::Object(map)) {
         Ok(raw) => raw,
         Err(error) => {
@@ -1516,7 +1859,7 @@ fn raw_bash_env_refusal(
     harness_label: Option<&str>,
 ) -> Option<String> {
     let env = match raw.bash.as_ref() {
-        Some(RawBash::Features(features)) => features.env.as_ref(),
+        Some(features) => features.env.as_ref(),
         _ => None,
     };
     let found = crate::bash_env::first_refused_env_key(env?, tier_kind);
@@ -1832,12 +2175,9 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     base.search = merge_project_search(base.search.take(), project.search);
     base.lsp = merge_lsp_config(base.lsp.take(), project.lsp);
     base.experimental = merge_experimental_config(base.experimental.take(), project.experimental);
-    let ceiling = base
-        .bash
-        .as_ref()
-        .and_then(|bash| expand_bash_for_merge(bash).memory_limit_mib);
+    let ceiling = base.bash.as_ref().and_then(|bash| bash.memory_limit_mib);
     let mut project_bash = project_safe_bash(project.bash);
-    if let Some(RawBash::Features(features)) = &mut project_bash {
+    if let Some(features) = &mut project_bash {
         features.memory_limit_mib = match (ceiling, features.memory_limit_mib) {
             (Some(user), Some(project)) => Some(user.min(project)),
             (_, value) => value,
@@ -2055,17 +2395,7 @@ fn merge_semantic_config(
 }
 
 fn merge_lsp_config(base: Option<RawLsp>, override_lsp: Option<RawLsp>) -> Option<RawLsp> {
-    let mut lsp = base.unwrap_or(RawLsp {
-        idle_minutes: None,
-        max_servers: None,
-        servers: None,
-        disabled: None,
-        python: None,
-        diagnostics_on_edit: None,
-        auto_install: None,
-        grace_days: None,
-        versions: None,
-    });
+    let mut lsp = base.unwrap_or_default();
 
     if let Some(project) = override_lsp {
         if let Some(max_servers) = project.max_servers {
@@ -2074,9 +2404,12 @@ fn merge_lsp_config(base: Option<RawLsp>, override_lsp: Option<RawLsp>) -> Optio
             }
         }
         if let Some(idle) = project.idle_minutes {
-            if idle.tightens(lsp.idle_minutes.unwrap_or_default()) {
+            if lsp_idle_minutes(Some(idle)) <= lsp_idle_minutes(lsp.idle_minutes) {
                 lsp.idle_minutes = Some(idle);
             }
+        }
+        if project.idle_shutdown == Some(true) {
+            lsp.idle_shutdown = Some(true);
         }
         if project.python.is_some() {
             lsp.python = project.python;
@@ -2103,23 +2436,18 @@ fn merge_experimental_config(
     (!experimental.is_empty()).then_some(experimental)
 }
 
-fn project_safe_bash(project: Option<RawBash>) -> Option<RawBash> {
-    project.map(|bash| match bash {
-        RawBash::Bool(enabled) => RawBash::Bool(enabled),
-        RawBash::Features(mut features) => {
-            features.changed_files = features
-                .changed_files
-                .filter(|mode| *mode == crate::config::BashChangedFiles::Off);
-            features.linux_scope = None;
-            features.linux_scope_max_runtime_secs = None;
-            // `project_env` is carried separately: the resolver never applies a
-            // project's environment, so it must not reach the user-tier map.
-            features.project_env = features.env.take();
-            features.runon_env = None;
-            // A repository may tighten privacy, never restore inherited grants.
-            features.disclaim_privacy = features.disclaim_privacy.filter(|value| *value);
-            RawBash::Features(features)
-        }
+fn project_safe_bash(project: Option<RawBashFeatures>) -> Option<RawBashFeatures> {
+    project.map(|mut features| {
+        features.changed_files = features
+            .changed_files
+            .filter(|mode| *mode == crate::config::BashChangedFiles::Off);
+        features.linux_scope = None;
+        features.linux_scope_max_runtime_secs = None;
+        // Project environment entries retain their own tier through resolution.
+        features.project_env = features.env.take();
+        features.runon_env = None;
+        features.disclaim_privacy = features.disclaim_privacy.filter(|value| *value);
+        features
     })
 }
 
@@ -2265,12 +2593,10 @@ fn bash_memory_limit_parses_and_project_cannot_raise_it() {
         ),
         serde_json::json!(32)
     );
-    for project in [r#"{"bash":false}"#, r#"{"bash":{"memory_limit_mib":null}}"#] {
-        assert_eq!(
-            resolve(r#"{"bash":{"memory_limit_mib":64}}"#, project),
-            serde_json::json!(64)
-        );
-    }
+    assert_eq!(
+        resolve(r#"{"bash":{"memory_limit_mib":64}}"#, r#"{"bash":false}"#),
+        serde_json::json!(64)
+    );
 }
 
 #[cfg(test)]
@@ -2283,15 +2609,17 @@ fn bash_memory_limit_rejects_invalid_values() {
     }
 }
 
-fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> Option<RawBash> {
+fn merge_bash_config(
+    base: Option<RawBashFeatures>,
+    override_bash: Option<RawBashFeatures>,
+) -> Option<RawBashFeatures> {
     match (base, override_bash) {
         (None, None) => None,
         (None, Some(override_bash)) => Some(override_bash),
         (Some(base), None) => Some(base),
         (Some(base), Some(override_bash)) => {
-            let base = expand_bash_for_merge(&base);
-            let override_features = expand_bash_for_merge(&override_bash);
-            Some(RawBash::Features(RawBashFeatures {
+            let override_features = override_bash;
+            Some(RawBashFeatures {
                 changed_files: override_features.changed_files.or(base.changed_files),
                 enabled: override_features.enabled.or(base.enabled),
                 rewrite: override_features.rewrite.or(base.rewrite),
@@ -2330,7 +2658,7 @@ fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> O
                 env: merge_env_maps(base.env, override_features.env),
                 project_env: merge_env_maps(base.project_env, override_features.project_env),
                 runon_env: override_features.runon_env.or(base.runon_env),
-            }))
+            })
         }
     }
 }
@@ -2349,38 +2677,6 @@ fn merge_env_maps(
             base.extend(override_map);
             Some(base)
         }
-    }
-}
-
-fn expand_bash_for_merge(value: &RawBash) -> RawBashFeatures {
-    match value {
-        // A boolean expands to its sub-features only. The runtime gate is left
-        // unset so a later object tier decides it, matching the TypeScript merge.
-        RawBash::Bool(enabled) => RawBashFeatures {
-            changed_files: None,
-            enabled: None,
-            rewrite: Some(*enabled),
-            compress: Some(*enabled),
-            background: Some(*enabled),
-            host_fallback: None,
-            subagent_background: None,
-            detach_on_user_message: None,
-            db_schema_hints: None,
-            long_running_reminder_enabled: None,
-            long_running_reminder_interval_ms: None,
-            foreground_wait_window_ms: None,
-            watch_sync_max_ms: None,
-            worker_wait_max_ms: None,
-            linux_scope: None,
-            linux_scope_max_runtime_secs: None,
-            memory_limit_mib: None,
-            disclaim_privacy: None,
-            powershell_tool: None,
-            env: None,
-            project_env: None,
-            runon_env: None,
-        },
-        RawBash::Features(features) => features.clone(),
     }
 }
 
@@ -2507,25 +2803,22 @@ fn record_resource_loosening(
             push_drop(dropped, "lsp.max_servers", tier, REASON);
         }
     }
-    let cap = |raw: &RawAftConfig| {
-        raw.bash
-            .as_ref()
-            .and_then(|bash| expand_bash_for_merge(bash).memory_limit_mib)
-    };
+    let cap = |raw: &RawAftConfig| raw.bash.as_ref().and_then(|bash| bash.memory_limit_mib);
     if let (Some(user), Some(project)) = (cap(base), cap(project)) {
         if project > user {
             push_drop(dropped, "bash.memory_limit_mib", tier, REASON);
         }
     }
     if let Some(next) = project.lsp.as_ref().and_then(|lsp| lsp.idle_minutes) {
-        let floor = base
-            .lsp
-            .as_ref()
-            .and_then(|lsp| lsp.idle_minutes)
-            .unwrap_or_default();
-        if !next.tightens(floor) {
+        let floor = base.lsp.as_ref().and_then(|lsp| lsp.idle_minutes);
+        if lsp_idle_minutes(Some(next)) > lsp_idle_minutes(floor) {
             push_drop(dropped, "lsp.idle_minutes", tier, REASON);
         }
+    }
+    if project.lsp.as_ref().and_then(|lsp| lsp.idle_shutdown) == Some(false)
+        && base.lsp.as_ref().and_then(|lsp| lsp.idle_shutdown) != Some(false)
+    {
+        push_drop(dropped, "lsp.idle_shutdown", tier, REASON);
     }
     if let Some(categories) = project
         .inspect
@@ -2574,8 +2867,7 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     {
         push_drop(dropped, "storage.cache_dir", tier, USER_ONLY_REASON);
     }
-    if matches!(&raw.bash, Some(RawBash::Features(features)) if features.disclaim_privacy == Some(false))
-    {
+    if matches!(&raw.bash, Some(features) if features.disclaim_privacy == Some(false)) {
         push_drop(
             dropped,
             "bash.disclaim_privacy",
@@ -2585,7 +2877,7 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     }
     // A project's own `bash.env` is not dropped: it is validated and carried in
     // `project_env`, then applied only while the project is trusted.
-    if matches!(&raw.bash, Some(RawBash::Features(features)) if features.runon_env.is_some()) {
+    if matches!(&raw.bash, Some(features) if features.runon_env.is_some()) {
         push_drop(dropped, "bash.runon_env", tier, USER_ONLY_REASON);
     }
     if raw.restrict_to_project_root.is_some() {
@@ -2667,19 +2959,26 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
         }
     }
     if raw.bash.as_ref().is_some_and(
-        |bash| matches!(bash, RawBash::Features(features) if features.changed_files.is_some_and(|mode| mode != crate::config::BashChangedFiles::Off)),
+        |bash| matches!(bash, features if features.changed_files.is_some_and(|mode| mode != crate::config::BashChangedFiles::Off)),
     ) {
         push_drop(dropped, "bash.changed_files", tier, "a project config may only turn changed-file reporting off");
     }
-    if raw.bash.as_ref().is_some_and(
-        |bash| matches!(bash, RawBash::Features(features) if features.linux_scope.is_some()),
-    ) {
+    if raw
+        .bash
+        .as_ref()
+        .is_some_and(|bash| matches!(bash, features if features.linux_scope.is_some()))
+    {
         push_drop(dropped, "bash.linux_scope", tier, USER_ONLY_REASON);
     }
     if raw.bash.as_ref().is_some_and(
-        |bash| matches!(bash, RawBash::Features(features) if features.linux_scope_max_runtime_secs.is_some()),
+        |bash| matches!(bash, features if features.linux_scope_max_runtime_secs.is_some()),
     ) {
-        push_drop(dropped, "bash.linux_scope_max_runtime_secs", tier, USER_ONLY_REASON);
+        push_drop(
+            dropped,
+            "bash.linux_scope_max_runtime_secs",
+            tier,
+            USER_ONLY_REASON,
+        );
     }
     for tool in feature_config::normalize_tool_list(
         raw.disabled_tools
@@ -3125,7 +3424,10 @@ fn resolve_inspect_config(raw: Option<&RawInspect>) -> InspectConfig {
         .as_ref()
         .and_then(|duplicates| duplicates.expected_mirrors.clone())
     {
-        inspect.duplicates.expected_mirrors = expected_mirrors;
+        inspect.duplicates.expected_mirrors = expected_mirrors
+            .into_iter()
+            .map(|pair| [pair.source, pair.mirror])
+            .collect();
     }
     inspect
 }
@@ -3227,7 +3529,8 @@ fn resolve_remote_exec_config(raw: &RawAftConfig) -> RemoteExecConfig {
 
 fn resolve_lsp_config(raw: &RawAftConfig, config: &mut Config) {
     let lsp = raw.lsp.as_ref();
-    config.lsp_idle_minutes = lsp.and_then(|lsp| lsp.idle_minutes).unwrap_or_default();
+    config.lsp_idle_minutes = lsp_idle_minutes(lsp.and_then(|lsp| lsp.idle_minutes));
+    config.lsp_idle_shutdown = lsp.and_then(|lsp| lsp.idle_shutdown).unwrap_or(true);
     config.lsp_max_servers = lsp.and_then(|lsp| lsp.max_servers).unwrap_or(8);
     let mut disabled: HashSet<String> = lsp
         .and_then(|lsp| lsp.disabled.as_ref())
@@ -3261,6 +3564,7 @@ fn resolve_lsp_config(raw: &RawAftConfig, config: &mut Config) {
     }
 
     if let Some(servers) = lsp.and_then(|lsp| lsp.servers.as_ref()) {
+        let invalid = &mut config.invalid_lsp_initialization_options;
         config.lsp_servers = servers
             .iter()
             .map(|(id, server)| UserServerDef {
@@ -3279,7 +3583,15 @@ fn resolve_lsp_config(raw: &RawAftConfig, config: &mut Config) {
                     .clone()
                     .unwrap_or_else(|| vec![".git".to_string()]),
                 env: server.env.clone().unwrap_or_default(),
-                initialization_options: server.initialization_options.clone(),
+                initialization_options: server.initialization_options.as_deref().and_then(|text| {
+                    match serde_json::from_str(text) {
+                        Ok(options) => Some(options),
+                        Err(_) => {
+                            invalid.push(id.clone());
+                            None
+                        }
+                    }
+                }),
                 disabled: server.disabled.unwrap_or(false),
             })
             .collect();
@@ -3288,6 +3600,14 @@ fn resolve_lsp_config(raw: &RawAftConfig, config: &mut Config) {
     if !disabled.is_empty() {
         config.disabled_lsp = disabled;
     }
+}
+
+fn lsp_idle_minutes(value: Option<i64>) -> u32 {
+    use crate::config::{DEFAULT_LSP_IDLE_MINUTES, MAX_LSP_IDLE_MINUTES, MIN_LSP_IDLE_MINUTES};
+    value.unwrap_or(i64::from(DEFAULT_LSP_IDLE_MINUTES)).clamp(
+        i64::from(MIN_LSP_IDLE_MINUTES),
+        i64::from(MAX_LSP_IDLE_MINUTES),
+    ) as u32
 }
 
 /// A validated `bash.env` map together with the tier it was written at.
@@ -3361,10 +3681,7 @@ fn resolve_bash_config(
 ) -> ResolvedBashConfig {
     let top = raw.bash.as_ref();
 
-    let top_features = match top {
-        Some(RawBash::Features(features)) => Some(features),
-        _ => None,
-    };
+    let top_features = top;
     let reminder_enabled = top_features.and_then(|features| features.long_running_reminder_enabled);
     let reminder_interval =
         top_features.and_then(|features| features.long_running_reminder_interval_ms);
@@ -3429,15 +3746,7 @@ fn resolve_bash_config(
     };
 
     match top {
-        Some(RawBash::Bool(false)) => base,
-        Some(RawBash::Bool(true)) => ResolvedBashConfig {
-            enabled: true,
-            rewrite: true,
-            compress: true,
-            background: true,
-            ..base
-        },
-        Some(RawBash::Features(features)) => ResolvedBashConfig {
+        Some(features) => ResolvedBashConfig {
             enabled: features.enabled.unwrap_or(true),
             rewrite: features.rewrite.unwrap_or(true),
             compress: features.compress.unwrap_or(true),
@@ -4201,33 +4510,107 @@ mod tests {
     }
 
     #[test]
-    fn lsp_idle_default_never_and_project_tightening() {
-        let default = serde_json::to_value(resolve_config(&[]).config).unwrap();
-        assert_eq!(default["lsp_idle_minutes"], 60);
-        for (user, project, expected, refused) in [
-            ("60", "30", serde_json::json!(30), false),
-            ("30", "60", serde_json::json!(30), true),
-            ("30", "\"never\"", serde_json::json!(30), true),
-            ("\"never\"", "1440", serde_json::json!(1440), false),
-            ("\"never\"", "\"never\"", serde_json::json!("never"), false),
+    fn lsp_idle_default_and_project_tightening() {
+        let default = resolve_config(&[]).config;
+        assert_eq!(default.lsp_idle_minutes, 60);
+        assert!(default.lsp_idle_shutdown);
+        for (user, project, minutes, shutdown, refused) in [
+            (
+                r#"{"idle_minutes":60}"#,
+                r#"{"idle_minutes":30}"#,
+                30,
+                true,
+                None,
+            ),
+            (
+                r#"{"idle_minutes":30}"#,
+                r#"{"idle_minutes":60}"#,
+                30,
+                true,
+                Some("lsp.idle_minutes"),
+            ),
+            (
+                r#"{"idle_shutdown":true}"#,
+                r#"{"idle_minutes":"never"}"#,
+                60,
+                true,
+                Some("lsp.idle_shutdown"),
+            ),
+            (
+                r#"{"idle_minutes":30,"idle_shutdown":false}"#,
+                r#"{"idle_shutdown":true}"#,
+                30,
+                true,
+                None,
+            ),
+            (
+                r#"{"idle_minutes":"never"}"#,
+                r#"{"idle_minutes":30,"idle_shutdown":false}"#,
+                30,
+                false,
+                None,
+            ),
         ] {
             let result = resolve_config(&[
-                tier("user", &format!(r#"{{"lsp":{{"idle_minutes":{user}}}}}"#)),
-                tier(
-                    "project",
-                    &format!(r#"{{"lsp":{{"idle_minutes":{project}}}}}"#),
-                ),
+                tier("user", &format!(r#"{{"lsp":{user}}}"#)),
+                tier("project", &format!(r#"{{"lsp":{project}}}"#)),
             ]);
             assert!(result.errors.is_empty(), "{:?}", result.errors);
+            assert_eq!(result.config.lsp_idle_minutes, minutes);
+            assert_eq!(result.config.lsp_idle_shutdown, shutdown);
+            assert_eq!(drop_keys(&result).first().map(String::as_str), refused);
+        }
+    }
+
+    #[test]
+    fn settings_shapes_preserve_legacy_true_in_harness_and_reject_explicit_null() {
+        let harness = resolve_config_for_harness(
+            &[tier(
+                "user",
+                r#"{"bash":{"enabled":false,"rewrite":false,"compress":false,"background":false},"harnesses":{"pi":{"bash":true}}}"#,
+            )],
+            Some(&Harness::Pi),
+        );
+        assert!(harness.errors.is_empty());
+        assert!(harness.config.bash.enabled);
+        assert!(harness.config.experimental_bash_rewrite);
+        assert!(harness.config.experimental_bash_compress);
+        assert!(harness.config.experimental_bash_background);
+
+        for (document, path) in [
+            (r#"{"lsp":{"idle_minutes":null}}"#, "lsp.idle_minutes"),
+            (r#"{"lsp":{"idle_shutdown":null}}"#, "lsp.idle_shutdown"),
+            (
+                r#"{"bash":{"memory_limit_mib":null}}"#,
+                "bash.memory_limit_mib",
+            ),
+            (
+                r#"{"lsp":{"servers":{"rust":{"initialization_options":null}}}}"#,
+                "lsp.servers.rust.initialization_options",
+            ),
+            (
+                r#"{"inspect":{"duplicates":{"expected_mirrors":null}}}"#,
+                "inspect.duplicates.expected_mirrors",
+            ),
+            (
+                r#"{"harnesses":{"pi":{"format_on_edit":null}}}"#,
+                "harnesses.pi.format_on_edit",
+            ),
+        ] {
+            let candidate = tier("user", document);
+            let expected = format!("invalid_config_null:{path}");
             assert_eq!(
-                serde_json::to_value(&result.config).unwrap()["lsp_idle_minutes"],
-                expected
+                strict_tier_error(&candidate, Some(&Harness::Pi)),
+                Some(expected.clone())
             );
             assert_eq!(
-                drop_keys(&result).contains(&"lsp.idle_minutes".to_string()),
-                refused
+                resolve_config_for_harness(&[candidate], Some(&Harness::Pi)).errors,
+                [expected]
             );
         }
+        let opt_out = resolve_config(&[tier("user", r#"{"storage":{"cache_dir":null}}"#)]);
+        assert!(opt_out.errors.is_empty());
+        assert!(opt_out.config.cache_dir_opt_out);
     }
 
     #[test]
@@ -4957,7 +5340,7 @@ mod tests {
         let result = resolve_config(std::slice::from_ref(&project));
         assert_eq!(result.errors, ["invalid_security_config:bash"]);
         let strict = strict_tier_error(&project, None).unwrap_or_default();
-        assert!(strict.contains("invalid type: null"), "{strict}");
+        assert_eq!(strict, "invalid_config_null:bash.env.TZ");
     }
 
     /// One representative name per refused group, at each tier and each place
@@ -5818,10 +6201,7 @@ mod tests {
                 &format!(r#"{{"lsp":{{"idle_minutes":{raw}}}}}"#),
             )]);
             assert!(result.errors.is_empty());
-            assert_eq!(
-                result.config.lsp_idle_minutes,
-                LspIdleMinutes::Minutes(expected)
-            );
+            assert_eq!(result.config.lsp_idle_minutes, expected);
         }
     }
 
@@ -6336,6 +6716,7 @@ mod tests {
         assert!(true_result.config.experimental_bash_background);
 
         let false_result = resolve_config(&[tier("user", r#"{ "bash": false }"#)]);
+        assert!(!false_result.config.bash.enabled);
         assert!(!false_result.config.experimental_bash_rewrite);
         assert!(!false_result.config.experimental_bash_compress);
         assert!(!false_result.config.experimental_bash_background);
@@ -6361,6 +6742,7 @@ mod tests {
         let explicit_off = resolve_config(&[tier("user", r#"{ "bash": { "enabled": false } }"#)]);
         assert!(!explicit_off.config.bash.enabled);
         assert!(explicit_off.config.experimental_bash_rewrite);
+        assert_eq!(false_result.config.bash, explicit_off.config.bash);
 
         let merged_result = resolve_config(&[
             tier("user", r#"{ "bash": true }"#),
@@ -6374,9 +6756,26 @@ mod tests {
             tier("user", r#"{ "bash": false }"#),
             tier("project", r#"{ "bash": { "compress": true } }"#),
         ]);
+        assert!(!false_then_object_result.config.bash.enabled);
         assert!(!false_then_object_result.config.experimental_bash_rewrite);
         assert!(false_then_object_result.config.experimental_bash_compress);
         assert!(!false_then_object_result.config.experimental_bash_background);
+    }
+
+    #[test]
+    fn settings_shapes_project_bash_true_cannot_reenable_user_gate() {
+        let result = resolve_config(&[
+            tier(
+                "user",
+                r#"{"bash":{"enabled":false,"rewrite":false,"compress":false,"background":false}}"#,
+            ),
+            tier("project", r#"{"bash":true}"#),
+        ]);
+        assert!(result.errors.is_empty());
+        assert!(!result.config.bash.enabled);
+        assert!(result.config.experimental_bash_rewrite);
+        assert!(result.config.experimental_bash_compress);
+        assert!(result.config.experimental_bash_background);
     }
 
     #[test]

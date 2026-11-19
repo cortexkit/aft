@@ -75,7 +75,11 @@ fn inspect_cleanup_doctor_maps_idle_and_drops_inert_keys() {
     )
     .unwrap();
     let value: Value = serde_json::from_str(&migrated.text).unwrap();
-    assert_eq!(value["lsp"]["idle_minutes"], "never", "canonical key wins");
+    assert_eq!(
+        value["lsp"],
+        json!({"idle_shutdown": false}),
+        "the old canonical `never` beats the older TTL alias"
+    );
     // A whole number written as a float migrates as that number, matching
     // the load-time translation in both languages.
     let migrated =
@@ -241,7 +245,7 @@ fn files_without_legacy_input_are_left_byte_identical() {
         // A false runtime gate is a current key that only switches its
         // behaviour off, so there is no registration choice to record.
         r#"{"backup": {"enabled": false}}"#,
-        r#"{"bash": false, "inspect": {"enabled": false}}"#,
+        r#"{"bash": {"enabled": false}, "inspect": {"enabled": false}}"#,
     ] {
         let migration = migrate_config_text(doc, FixTier::User).unwrap();
         assert!(!migration.changed, "{doc}");
@@ -814,7 +818,7 @@ fn auto_migration_ignores_current_missing_and_unparsable_files() {
     let path = dir.path().join("aft.jsonc");
     assert_eq!(auto_migrate_user_config(&path), None);
     for text in [
-        "{\n  \"indexes\": {\"semantic\": false},\n  \"bash\": false\n}\n",
+        "{\n  \"indexes\": {\"semantic\": false},\n  \"bash\": {\"enabled\": false}\n}\n",
         "{ \"search_index\": false",
     ] {
         std::fs::write(&path, text).unwrap();
@@ -1130,4 +1134,80 @@ fn automatic_user_rewrite_moves_idle_checkout_hours_but_keeps_removed_keys() {
     assert_eq!(auto_migrate_user_config(&removed_only), None);
     assert_eq!(std::fs::read_to_string(&removed_only).unwrap(), input);
     assert!(backups(dir.path()).len() == 1, "{:?}", backups(dir.path()));
+}
+
+#[test]
+fn settings_shapes_rewrite_user_with_backup_and_project_with_notice() {
+    use serde_json::json;
+
+    let temp = tempfile::tempdir().unwrap();
+    let user = temp.path().join("aft.jsonc");
+    let legacy = r#"{
+        // Keep this note.
+        "bash": false,
+        "lsp": {"idle_minutes": "never", "servers": {"rust": {"initialization_options": {"checkOnSave": true, "other": null}}}},
+        "inspect": {"duplicates": {"expected_mirrors": [["src/**", "mirror/**"]]}},
+        "harnesses": {"pi": {"bash": true}}
+    }"#;
+    std::fs::write(&user, legacy).unwrap();
+    let Some(UserConfigMigration::Migrated { backup, notice, .. }) =
+        auto_migrate_user_config(&user)
+    else {
+        panic!("the user file should be rewritten");
+    };
+    assert_eq!(std::fs::read_to_string(backup).unwrap(), legacy);
+    let migrated = std::fs::read_to_string(&user).unwrap();
+    assert!(migrated.contains("// Keep this note."));
+    let migrated: Value = serde_json::from_str(&crate::jsonc::strip_jsonc(&migrated)).unwrap();
+    assert_eq!(
+        migrated["bash"],
+        json!({"enabled": false, "rewrite": false, "compress": false, "background": false})
+    );
+    assert_eq!(
+        migrated["harnesses"]["pi"]["bash"],
+        json!({"enabled": true,"rewrite": true,"compress": true,"background": true})
+    );
+    assert_eq!(migrated["lsp"]["idle_shutdown"], false);
+    assert!(!migrated["lsp"]
+        .as_object()
+        .unwrap()
+        .contains_key("idle_minutes"));
+    assert_eq!(
+        migrated["inspect"]["duplicates"]["expected_mirrors"],
+        json!([{"source":"src/**","mirror":"mirror/**"}])
+    );
+    let options: Value = serde_json::from_str(
+        migrated["lsp"]["servers"]["rust"]["initialization_options"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(options, json!({"checkOnSave": true, "other": null}));
+    assert!(auto_migrate_user_config(&user).is_none());
+
+    let mut project: Value = serde_json::from_str(&crate::jsonc::strip_jsonc(legacy)).unwrap();
+    let translated = feature_config::translate_document(
+        project.as_object_mut().unwrap(),
+        feature_config::DocumentTier::Project,
+    );
+    let mut expected_project = migrated.clone();
+    expected_project["harnesses"]["pi"]["bash"]
+        .as_object_mut()
+        .unwrap()
+        .remove("enabled");
+    assert_eq!(project, expected_project);
+    let project_notice =
+        feature_config::project_retired_keys_notice("/project/.cortexkit/aft.jsonc", &translated);
+    for replacement in [
+        "bash.enabled",
+        "lsp.idle_shutdown",
+        "source and mirror objects",
+        "initialization_options → JSON text",
+    ] {
+        assert!(notice.contains(replacement), "user: {notice}");
+        assert!(
+            project_notice.contains(replacement),
+            "project: {project_notice}"
+        );
+    }
 }

@@ -1,0 +1,37 @@
+{
+  "op": "config.review",
+  "fields": [
+    {
+      "module_id": "sample",
+      "project_id": null,
+      "path": "/limit",
+      "old": {
+        "kind": "value",
+        "value": 10
+      },
+      "new": {
+        "kind": "value",
+        "value": 20
+      },
+      "old_source": "user",
+      "new_source": "project",
+      "apply": "live",
+      "reasons": [
+        "Project limit raised"
+      ]
+    }
+  ],
+  "refusals": [
+    {
+      "code": "bound_violated",
+      "paths": [
+        "/limit",
+        "/ceiling"
+      ],
+      "project_id": "project-a",
+      "reasons": [
+        "Limit exceeds ceiling"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "bash": {
+    "enabled": false,
+    "rewrite": false,
+    "compress": false,
+    "background": false
+  }
+}

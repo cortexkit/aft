@@ -5,6 +5,7 @@
 //! agents see from `read`, but only the conflict areas.
 
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::context::AppContext;
@@ -71,14 +72,48 @@ fn path_from_git_bytes(bytes: &[u8]) -> PathBuf {
     }
 }
 
+/// Find the part of the worktree this request can sweep. An explicit path can
+/// select another repository, but approval for that path doesn't cover its siblings.
+fn sweep_scope(toplevel: &Path, base_path: &Path, project_root: &Path) -> Result<PathBuf, String> {
+    let canonicalize = |path: &Path| {
+        crate::bounded_io::canonicalize(path).map_err(|error| format!("failed to run git: {error}"))
+    };
+    let toplevel = canonicalize(toplevel)?;
+    let project_root = canonicalize(project_root)?;
+    if let Ok(relative) = project_root.strip_prefix(&toplevel) {
+        return Ok(relative.to_path_buf());
+    }
+    if toplevel.starts_with(&project_root) {
+        return Ok(PathBuf::new());
+    }
+    canonicalize(base_path)?
+        .strip_prefix(&toplevel)
+        .map(Path::to_path_buf)
+        .map_err(|_| "not a git repository".to_string())
+}
+
+fn literal_git_pathspec(relative: &Path) -> OsString {
+    let mut pathspec = OsString::from(":(top,literal)");
+    for (i, component) in relative.iter().enumerate() {
+        // Git uses forward slashes in pathspecs even on Windows.
+        if i != 0 {
+            pathspec.push("/");
+        }
+        pathspec.push(component);
+    }
+    pathspec
+}
+
 /// Find all conflicted files using index-unmerged state plus tracked working-tree markers.
 /// Returns the Git toplevel, unique file paths relative to that toplevel, the
 /// subset reported by Git as index-unmerged paths, and an error when scanning
 /// tracked files for additional conflict markers was incomplete.
 fn discover_conflicted_files(
-    base_dir: &Path,
+    base_path: &Path,
+    project_root: &Path,
 ) -> Result<(PathBuf, Vec<PathBuf>, HashSet<PathBuf>, Option<String>), String> {
-    let toplevel = git_toplevel(base_dir)?;
+    let toplevel = git_toplevel(base_path)?;
+    let scope = sweep_scope(&toplevel, base_path, project_root)?;
     let mut files: Vec<PathBuf> = Vec::new();
     let mut seen = HashSet::new();
     let mut unmerged_files = HashSet::new();
@@ -102,6 +137,9 @@ fn discover_conflicted_files(
         // Format: "<mode> <hash> <stage>\t<filename>\0"
         if let Some(tab_pos) = record.iter().position(|byte| *byte == b'\t') {
             let path = path_from_git_bytes(&record[tab_pos + 1..]);
+            if !path.starts_with(&scope) {
+                continue;
+            }
             unmerged_files.insert(path.clone());
             if seen.insert(path.clone()) {
                 files.push(path);
@@ -109,12 +147,15 @@ fn discover_conflicted_files(
         }
     }
 
+    let mut grep = crate::git_probe::command();
+    grep.args(["grep", "-z", "-lE", r"^(<<<<<<< |>>>>>>> )"])
+        .current_dir(&toplevel);
+    if !scope.as_os_str().is_empty() {
+        // Filter before Git opens any worktree files, not just its returned names.
+        grep.arg("--").arg(literal_git_pathspec(&scope));
+    }
     let mut sweep_error = None;
-    match crate::git_probe::supervised_output(
-        crate::git_probe::command()
-            .args(["grep", "-z", "-lE", r"^(<<<<<<< |>>>>>>> )"])
-            .current_dir(&toplevel),
-    ) {
+    match crate::git_probe::supervised_output(&mut grep) {
         Ok(grep_output) => {
             let status = grep_output.status.code();
             if status == Some(0) {
@@ -266,12 +307,12 @@ pub fn handle_git_conflicts(ctx: &AppContext, req: &RawRequest) -> Response {
             Err(resp) => return resp,
         }
     } else {
-        project_root
+        project_root.clone()
     };
 
     // Discover conflicted files
     let (git_toplevel, files, unmerged_files, sweep_error) =
-        match discover_conflicted_files(&discovery_base) {
+        match discover_conflicted_files(&discovery_base, &project_root) {
             Ok(result) => result,
             Err(e) => {
                 if requested_path.is_some() && e == "not a git repository" {

@@ -214,13 +214,8 @@ fn main() {
     aft::memory::profile::publish(None);
     #[cfg(feature = "test-hooks")]
     aft::grammar::initialize_test_identity();
-    // The subc daemon hands a supervised module its launch nonce through an
-    // inherited pipe (and, for now, an environment copy). Take it before
-    // anything else can run: this is the only moment the process has one
-    // thread and no children, so the pipe is read and closed and both
-    // variables are removed before any child (the login-shell PATH probe
-    // below included) could inherit them. Standalone mode has no nonce and
-    // never touches the descriptor.
+    // Take the daemon handoff before any threads or children start. Standalone
+    // mode never touches the inherited descriptors.
     let subc_connection_file = parse_subc_arg(std::env::args_os().skip(1));
     // Startup can stop before the logger exists. Opt-in test diagnostics go
     // straight to stderr so the supervisor fixture can retain the last phase.
@@ -238,11 +233,23 @@ fn main() {
             );
         }
     };
-    if subc_connection_file.is_some() {
+    let registration = if subc_connection_file.is_some() {
         startup_phase("nonce_capture_start");
-        aft::launch_nonce::capture_at_startup();
+        let registration = match aft::subc::AdoptedRegistration::adopt() {
+            Ok(registration) => registration,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        };
+        if registration.is_none() {
+            aft::launch_nonce::capture_at_startup();
+        }
         startup_phase("nonce_capture_done");
-    }
+        registration
+    } else {
+        None
+    };
     // Only the binary embeds the per-commit revision. Declare it before CLI
     // dispatch or the subc HELLO can request the library's build provenance.
     assert!(
@@ -472,10 +479,10 @@ fn main() {
     aft::alloc_trace::start_logger();
 
     // subc daemon attach: `aft --subc <connection-file>` swaps the
-    // standalone NDJSON-over-stdin transport for the subc loopback-TCP client.
+    // standalone NDJSON-over-stdin transport for the subc module connection.
     // Presence of --subc => subc mode; absence => standalone (the dormancy gate).
     // Fail-loud on connect/auth failure — never silently downgrade to standalone
-    // (split-brain index state). tokio runs ONLY inside run_subc_mode.
+    // (split-brain index state).
     if let Some(connection_file) = subc_connection_file {
         aft::slog_info!("subc mode, pid {}", std::process::id());
         aft::launch_nonce::log_capture_outcome();
@@ -492,8 +499,11 @@ fn main() {
         let ctx = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
         startup_phase("context_done");
         // Tell the fleet backup service what this storage root holds; a
-        // failure is logged and never stops the module from attaching.
-        aft::engram_catalog::refresh_catalog(&ctx.storage_dir());
+        // failure is logged and never stops the module from attaching. A
+        // settings-gated start refreshes only once it has applied the view.
+        if !aft::subc::settings_gate_requested() {
+            aft::engram_catalog::refresh_catalog(&ctx.storage_dir());
+        }
         let executor = Arc::new(aft::executor::Executor::new());
         install_subc_signal_handler(
             Arc::clone(&executor),
@@ -512,8 +522,14 @@ fn main() {
         let _held_ort =
             std::env::var_os("AFT_TEST_HOLD_ORT_SECTION").and_then(|_| aft::ort_lifecycle::enter());
         startup_phase("module_runtime_start");
-        match aft::subc::run_subc_mode(&connection_file, ctx, executor, dispatch, user_config_path)
-        {
+        match aft::subc::run_subc_mode_with_registration(
+            &connection_file,
+            ctx,
+            executor,
+            dispatch,
+            user_config_path,
+            registration,
+        ) {
             Ok(()) => {
                 aft::slog_info!("subc module stopped at the daemon's request; exiting 0");
                 // ORT work persists nothing needed by the next module. Close the

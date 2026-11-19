@@ -25,6 +25,8 @@ use allocator::CachedAllocatorObservation;
 mod demand;
 #[path = "health/legacy_root.rs"]
 mod legacy_root;
+mod root_evidence;
+use root_evidence::{health_failure_evidence, health_failure_field, health_nondefault};
 
 const EXECUTOR_SCHEDULER_CONTENTION_DETAIL: &str =
     "executor scheduler state could not be snapshotted without contention";
@@ -2053,24 +2055,6 @@ fn settled_health_root(root: &Value) -> bool {
         })
 }
 
-fn health_failure_evidence(value: &Value) -> bool {
-    match value {
-        Value::Object(fields) => fields.iter().any(|(key, value)| {
-            (health_failure_field(key) && health_nondefault(value))
-                || health_failure_evidence(value)
-        }),
-        Value::Array(rows) => rows.iter().any(health_failure_evidence),
-        _ => false,
-    }
-}
-
-fn health_failure_field(key: &str) -> bool {
-    key.contains("fail")
-        || key.contains("error")
-        || key.contains("refusal")
-        || matches!(key, "loss_unrecovered" | "watch_lost_races_total")
-}
-
 fn reduce_health_root_details(root: &mut Value) -> bool {
     fn retain_abnormal_fields(value: &mut Value, path: &str) {
         let Value::Object(fields) = value else { return };
@@ -2101,6 +2085,7 @@ fn reduce_health_root_details(root: &mut Value) -> bool {
                         | "/callgraph_store/since_ms"
                         | "/callgraph_store/last_progress_at_ms"
                         | "/callgraph_store/stalled"
+                        | "/callgraph_refresh"
                         | "/watcher/directory_arrivals_total"
                         | "/watcher/overflows_total"
                 )
@@ -2132,17 +2117,6 @@ fn reduce_health_root_details(root: &mut Value) -> bool {
     *root != before
 }
 
-fn health_nondefault(value: &Value) -> bool {
-    match value {
-        Value::Null | Value::Bool(false) => false,
-        Value::Number(number) => number.as_f64() != Some(0.0),
-        Value::Array(rows) => rows.iter().any(health_nondefault),
-        Value::Object(fields) => fields.values().any(health_nondefault),
-        Value::String(text) => !text.is_empty(),
-        Value::Bool(true) => true,
-    }
-}
-
 fn compact_health_root(value: &mut Value) {
     compact_health_root_fields(value, "");
 }
@@ -2161,6 +2135,7 @@ fn compact_health_root_fields(value: &mut Value, path: &str) {
                 | "/search_index/status"
                 | "/semantic_index/status"
                 | "/callgraph_store/status"
+                | "/callgraph_refresh"
                 | "/tier2/status"
                 | "/bash/running"
                 | "/bash/pending_completions"
@@ -4282,6 +4257,7 @@ fn build_health_diagnostic_rollup_from_actors(
         disclaim_privacy: Option<bool>,
         standing: Option<StandingHealthEntry>,
         diagnostics_evidence: Value,
+        refresh_counts: Option<crate::data_layer::checkout::RefreshCounts>,
     }
 
     let lifecycle_contexts = actor_entries
@@ -4420,6 +4396,7 @@ fn build_health_diagnostic_rollup_from_actors(
         let busy = health_summary.is_busy();
         let fully_ready = health_summary.is_fully_ready();
         candidates.push(RootCandidate {
+            refresh_counts: root_evidence::refresh_counts(&ctx),
             root_label,
             health: health_summary.into_snapshot(root_id.as_path()),
             busy,
@@ -4445,6 +4422,7 @@ fn build_health_diagnostic_rollup_from_actors(
         }
         let health = unhosted_standing_health_snapshot(&standing);
         candidates.push(RootCandidate {
+            refresh_counts: None,
             root_label: health.project_root.clone(),
             disclaim_privacy: None,
             health,
@@ -4604,6 +4582,9 @@ fn build_health_diagnostic_rollup_from_actors(
                 );
             }
             if let Some(object) = value.as_object_mut() {
+                if let Some(counts) = candidate.refresh_counts {
+                    object.insert("callgraph_refresh".to_owned(), json!(counts));
+                }
                 object.insert(
                     "diagnostics_evidence".to_owned(),
                     candidate.diagnostics_evidence,

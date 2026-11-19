@@ -1772,6 +1772,21 @@ pub fn relieve_allocator_pressure() -> AllocatorPressureRelief {
     relieve_allocator_pressure_from_snapshot(allocator_memory_snapshot())
 }
 
+/// Hands the allocator's free pages back to the system without measuring
+/// anything, for callers that would throw the measurement away. On macOS the
+/// measured `relieve_allocator_pressure` reads zone statistics before and after
+/// the relief, which takes every allocator-zone lock and stalls every thread
+/// that allocates meanwhile; a call-graph build calls this between stages.
+#[cfg(target_os = "macos")]
+pub fn return_free_pages() {
+    unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+}
+
+#[cfg(target_os = "linux")]
+pub fn return_free_pages() {
+    let _ = purge_allocator();
+}
+
 #[cfg(target_os = "linux")]
 fn relieve_allocator_pressure_from_snapshot(
     allocator_before: AllocatorMemorySnapshot,
@@ -1815,7 +1830,7 @@ fn process_rss_bytes() -> Option<u64> {
 /// Kernel physical footprint via `proc_pid_rusage` (`ri_phys_footprint`).
 /// See `phys_footprint_bytes` for why this, not RSS, is the headline number.
 #[cfg(target_os = "macos")]
-fn process_phys_footprint_bytes() -> Option<u64> {
+pub(crate) fn process_phys_footprint_bytes() -> Option<u64> {
     let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
     let rc = unsafe {
         libc::proc_pid_rusage(

@@ -57,16 +57,28 @@ fn kind_code(kind: BlobRefKind) -> u8 {
 /// [`PROVENANCES`], which a resolver change must add.
 #[must_use]
 pub(crate) fn encode(file: &FileResolution) -> Vec<u8> {
-    strings::encode(&encode_expanded(file))
+    encode_checked(file, None).expect("an unguarded fragment cannot stop")
+}
+
+pub(super) fn encode_checked(
+    file: &FileResolution,
+    guard: Option<&super::refresh_memory::RefreshMemory>,
+) -> Result<Vec<u8>, super::refresh_memory::RefreshStop> {
+    Ok(strings::encode(&encode_expanded(file, guard)?))
 }
 
 /// The string table in the format used by older builds, without a magic header.
 #[cfg(test)]
 pub(crate) fn encode_legacy(file: &FileResolution) -> Vec<u8> {
-    encode_expanded(file)
+    encode_expanded(file, None).expect("an unguarded fragment cannot stop")
 }
 
-fn encode_expanded(file: &FileResolution) -> Vec<u8> {
+fn encode_expanded(
+    file: &FileResolution,
+    guard: Option<&super::refresh_memory::RefreshMemory>,
+) -> Result<Vec<u8>, super::refresh_memory::RefreshStop> {
+    use super::refresh_memory::RefreshChecks;
+
     let mut out = Encoder::default();
     out.byte(FORMAT);
     out.usize(file.rows.len());
@@ -91,6 +103,7 @@ fn encode_expanded(file: &FileResolution) -> Vec<u8> {
     }
     out.usize(file.sites.len());
     for kept in &file.sites {
+        guard.site()?;
         let site = &kept.site;
         out.u32(site.ordinal);
         out.opt_str(site.caller.as_deref());
@@ -124,7 +137,7 @@ fn encode_expanded(file: &FileResolution) -> Vec<u8> {
     for key in &file.site_dependencies {
         out.str(key);
     }
-    out.finish()
+    Ok(out.finish())
 }
 
 /// Decodes a fragment of the file at `path` whose content record has the

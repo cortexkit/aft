@@ -30,7 +30,7 @@
     "test:e2e": "bun test src/__tests__/e2e/",
     "test:load-matrix": "bun test ./test/load-matrix/load-matrix.ts",
     "lint": "biome check src",
-    "schema": "bun scripts/build-schema.ts",
+    "schema": "cd ../.. && cargo run --locked --quiet -p agent-file-tools --example aft-settings-schema > assets/aft.schema.json",
     "build:tool-schemas": "bun run scripts/build-tool-schemas.ts",
     "prepublishOnly": "bun run build",
     "pretest:unit": "bun run build:tui",

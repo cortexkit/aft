@@ -446,9 +446,9 @@ pub enum SpawnPlan {
 
 #[cfg(unix)]
 #[path = "sandbox_spawn/local_launch.rs"]
-mod local_launch;
+pub(crate) mod local_launch;
 #[cfg(unix)]
-pub(crate) use local_launch::{restore_local_launch, save_local_launch, REMOTE_LOCAL_LAUNCH};
+pub(crate) use local_launch::{restore_local_launch, save_local_launch};
 
 impl SpawnPlan {
     fn policy(&self) -> &Self {

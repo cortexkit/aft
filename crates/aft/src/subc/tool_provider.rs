@@ -23,6 +23,8 @@ use crate::hashline::integration::RegistrationRequest;
 mod guidance;
 #[cfg(test)]
 mod guidance_text_tests;
+#[cfg(test)]
+mod late_results_tests;
 
 #[cfg(test)]
 thread_local! {
@@ -5436,6 +5438,53 @@ mod tests {
             .map(|preset| preset.name().to_string())
             .collect();
         assert_eq!(presets_seen, every, "every preset has a golden");
+    }
+
+    #[test]
+    fn legacy_bash_false_catalog_matches_pre_migration_bytes() {
+        use crate::config_resolve::{resolve_config, ConfigTier};
+
+        // Captured from the pre-migration resolver and renderer at 4d0a522e.
+        // In hashline edit mode the description names shell reads that mint
+        // line tags only when Bash rewriting is enabled. Pin that wording and
+        // the background tool list in the same catalog.
+        let expected = include_bytes!("../../tests/fixtures/tool_provider_bash_false_catalog.json");
+        let legacy = r#"{"bash":false,"edit_mode":"hashline"}"#;
+        let rewritten = crate::config_fix::migrate_user_config_text(legacy).unwrap();
+        assert!(rewritten.changed);
+        for (source, doc) in [("legacy", legacy), ("rewritten", rewritten.text.as_str())] {
+            let result = resolve_config(&[ConfigTier {
+                tier: "user".into(),
+                source: "aft.jsonc".into(),
+                doc: doc.into(),
+            }]);
+            assert!(result.errors.is_empty(), "{source}: {:?}", result.errors);
+            let config = result.config;
+            assert!(!config.bash.enabled);
+            let reply = catalog_for_session_with(
+                json!({
+                    "preset": "head",
+                    "params": {"model": {"provider": "example", "model": "claude-opus-5-5"}},
+                    "system_text": {"preset": "head"}
+                }),
+                &config.disabled_tools,
+                false,
+                false,
+                config.bash.worker_wait_max_ms,
+                HeadSettings::from_config(&config),
+            )
+            .unwrap();
+            let actual = serde_json::to_vec(&reply).unwrap();
+            assert!(
+                actual.as_slice() == expected,
+                "{source}: catalog bytes differ: {}",
+                catalog_golden_difference(
+                    &serde_json::from_slice(expected).unwrap(),
+                    &reply,
+                    "reply"
+                )
+            );
+        }
     }
 
     /// Whether a golden is for a session that may run commands remotely

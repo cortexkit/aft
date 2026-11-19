@@ -32,6 +32,7 @@ use subc_protocol::manifest::ProviderRole;
 use crate::db::github_read_cache::{invalidate_github_read_cache_resource, GithubReadResourceKind};
 use subc_protocol::{BindIdentity, RouteTarget};
 
+mod manifest_guard;
 pub(crate) mod manifest_sync;
 mod manifest_wire;
 mod native_guard;
@@ -773,10 +774,10 @@ fn run_with(
     ) -> Result<Option<bool>, String>,
 ) -> i32 {
     let paths = StatePaths::from_process();
+    let manifest_guard = manifest_guard::ManifestGuard::new(&paths);
     // The manifest can disappear after authority and audit checks finish.
     // Recheck it before calling upstream gh, including audited operator writes.
-    let mut delegate =
-        |args: &[OsString]| delegate_with_manifest_guard(args, &paths, &mut native_delegate);
+    let mut delegate = |args: &[OsString]| manifest_guard.delegate(args, &mut native_delegate);
     if args.first().and_then(|arg| arg.to_str()) == Some(CO_AUTHOR_LINE_REPORT) {
         if let Some(line) = co_author_line(&paths) {
             println!("{line}");
@@ -852,6 +853,7 @@ fn run_with(
         return run_captured_protected(
             args,
             &paths,
+            &manifest_guard,
             &TargetRepository::from_invocation(args),
             &cwd,
             now,
@@ -887,15 +889,15 @@ fn run_with(
     // every later passthrough boundary without changing unprovisioned fallback.
     let captured_now = || {
         (!operator_bypass_requested() && crate::gh_shim_speech::start_view::protected(args))
-            .then(|| run_captured_protected(args, &paths, &target, &cwd, now))
+            .then(|| run_captured_protected(args, &paths, &manifest_guard, &target, &cwd, now))
     };
     // A write aimed at a repository no signed binding covers cannot be spoken
     // by any bot, and upstream `gh` would run it under the operator's own
     // login. Decide that before the rung probe: the answer does not depend on
     // the governance daemon, and a bound target falls through to the governed
     // path below unchanged. Without a signed manifest there are no bindings to
-    // compare against; the fallback below separately checks whether this machine
-    // was previously provisioned before allowing upstream execution.
+    // compare against; the fallback checks manifest history and daemon routing
+    // before allowing upstream execution.
     if let ManifestResolution::Active(manifest) = &initial_manifest {
         if let Some(status) =
             worker_reads::dispatch(args, manifest, &cwd, &paths, &mut read_identity)
@@ -975,9 +977,8 @@ fn run_with(
                 if let Some(status) = captured_now() {
                     return status;
                 }
-                return dispatch_without_valid_manifest(
+                return manifest_guard.dispatch_without_valid_manifest(
                     args,
-                    &paths,
                     invalid_manifest_problem.as_ref(),
                     delegate,
                 );
@@ -1033,13 +1034,13 @@ fn run_with(
             if let Some(status) = captured_now() {
                 return status;
             }
-            return dispatch_without_valid_manifest(args, &paths, Some(&problem), delegate);
+            return manifest_guard.dispatch_without_valid_manifest(args, Some(&problem), delegate);
         }
         ManifestResolution::Dormant => {
             if let Some(status) = captured_now() {
                 return status;
             }
-            return dispatch_without_valid_manifest(args, &paths, None, delegate);
+            return manifest_guard.dispatch_without_valid_manifest(args, None, delegate);
         }
     };
     let classification = classify(args, &manifest, current_platform());
@@ -4518,10 +4519,9 @@ enum ManifestResolution {
         manifest: Manifest,
         problem: ManifestProblem,
     },
-    /// An artifact is installed but failed validation before this machine ever
-    /// accepted one, so the invocation passes through with an identity notice.
+    /// An installed artifact failed validation without a last-valid cache.
     Invalid(ManifestProblem),
-    /// No manifest artifact is present, so delegate without manifest-based routing.
+    /// No manifest artifact is present.
     Dormant,
 }
 
@@ -4560,80 +4560,6 @@ fn resolve_manifest(paths: &StatePaths, now: u64) -> ManifestResolution {
             None => ManifestResolution::Invalid(problem),
         },
     }
-}
-
-fn manifest_state_was_provisioned(root: &Path) -> bool {
-    [
-        "last-valid-manifest.json",
-        "manifest-version-high-water.json",
-    ]
-    .iter()
-    .any(|name| match fs::symlink_metadata(root.join(name)) {
-        Ok(_) => true,
-        // An unreadable record cannot establish that this is a public,
-        // never-provisioned installation. Only absence permits that fallback.
-        Err(error) => error.kind() != io::ErrorKind::NotFound,
-    })
-}
-
-fn dispatch_without_valid_manifest(
-    args: &[OsString],
-    paths: &StatePaths,
-    problem: Option<&ManifestProblem>,
-    delegate: impl FnOnce(&[OsString]) -> i32,
-) -> i32 {
-    if let Some(status) = unavailable_manifest_refusal(args, paths) {
-        return status;
-    }
-    match problem {
-        Some(problem) => delegate_after_invalid_manifest_notice(args, problem, delegate),
-        None => delegate(args),
-    }
-}
-
-fn unavailable_manifest_refusal(args: &[OsString], paths: &StatePaths) -> Option<i32> {
-    // The agent may select an empty override. Check the default location too,
-    // without constructing StatePaths there: that constructor tightens permissions.
-    let default_root = gh_shim_state_dir_from(
-        None,
-        crate::environment::non_empty_os_var("XDG_STATE_HOME").as_deref(),
-        crate::environment::non_empty_os_var("HOME").as_deref(),
-    );
-    if (manifest_state_was_provisioned(&paths.root)
-        || manifest_state_was_provisioned(&default_root))
-        && !is_unbound_safe(args)
-    {
-        return Some(refuse(
-            RefusalCode::ManifestUnavailable,
-            "GitHub writes are refused because this machine's signed routing manifest is missing or invalid; without it the write would run as the operator's own account. Ask the operator to repair the manifest. Reads still work.",
-        ));
-    }
-    None
-}
-
-fn delegate_with_manifest_guard(
-    args: &[OsString],
-    paths: &StatePaths,
-    delegate: impl FnOnce(&[OsString]) -> i32,
-) -> i32 {
-    if !is_unbound_safe(args) {
-        match resolve_manifest(paths, unix_seconds()) {
-            ManifestResolution::Invalid(_) | ManifestResolution::Dormant => {
-                if let Some(status) = unavailable_manifest_refusal(args, paths) {
-                    return status;
-                }
-            }
-            ManifestResolution::Regressed { manifest, problem } => {
-                if let RegressedDisposition::Refuse { code, text } =
-                    regressed_disposition(args, &manifest, current_platform(), &problem)
-                {
-                    return refuse(code, &text);
-                }
-            }
-            ManifestResolution::Active(_) => {}
-        }
-    }
-    delegate(args)
 }
 
 fn delegate_after_invalid_manifest_notice(
@@ -8904,30 +8830,23 @@ mod tests {
         let _home = ScopedTestEnvVar::set("HOME", paths.root.to_str());
         let _xdg = ScopedTestEnvVar::set("XDG_STATE_HOME", paths.root.to_str());
         write_version_high_water(&paths, 1);
+        let guard = manifest_guard::ManifestGuard::new(&paths);
         let mut calls = 0;
         for bypass in [None, Some("operator")] {
             let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", bypass);
-            let status = delegate_with_manifest_guard(
-                &os_args(&["pr", "merge", "1", "--squash"]),
-                &paths,
-                |_| {
-                    calls += 1;
-                    73
-                },
-            );
+            let status = guard.delegate(&os_args(&["pr", "merge", "1", "--squash"]), |_| {
+                calls += 1;
+                73
+            });
             assert_eq!(status, 86);
         }
         assert_eq!(calls, 0);
 
         write_signed_manifest(&paths, fixture_manifest(), unix_seconds());
-        let status = delegate_with_manifest_guard(
-            &os_args(&["pr", "merge", "1", "--squash"]),
-            &paths,
-            |_| {
-                calls += 1;
-                73
-            },
-        );
+        let status = guard.delegate(&os_args(&["pr", "merge", "1", "--squash"]), |_| {
+            calls += 1;
+            73
+        });
         assert_eq!(status, 73);
         assert_eq!(calls, 1);
     }
@@ -17001,6 +16920,7 @@ mod github_read_mutation_tests {
 fn run_captured_protected(
     args: &[OsString],
     paths: &StatePaths,
+    manifest_guard: &manifest_guard::ManifestGuard<'_>,
     target: &TargetRepository,
     cwd: &Path,
     now: u64,
@@ -17012,7 +16932,7 @@ fn run_captured_protected(
         resolve_manifest(paths, now),
         ManifestResolution::Invalid(_) | ManifestResolution::Dormant
     ) {
-        if let Some(status) = unavailable_manifest_refusal(args, paths) {
+        if let Some(status) = manifest_guard.unavailable_refusal(args) {
             return status;
         }
     }

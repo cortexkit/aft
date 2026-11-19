@@ -1,7 +1,8 @@
 {
   "aft_search_registered": true,
   "bash": {
-    "disclaim_privacy": true
+    "disclaim_privacy": true,
+    "enabled": false
   },
   "disabled_tools": [
     "aft_delete",

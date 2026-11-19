@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 const GIB: u64 = 1024 * 1024 * 1024;
 const MIB: usize = 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum MemoryMode {
     Lean,
@@ -21,6 +21,9 @@ pub struct MemoryProfile {
     /// None restores the allocator's startup defaults.
     pub decay_ms: Option<isize>,
     pub block_cache_bytes: usize,
+    /// Estimated bytes of decoded parses and new bound surfaces in a cold batch.
+    pub(crate) bind_batch_bytes: usize,
+    pub refresh_floor_bytes: u64,
 }
 
 impl MemoryMode {
@@ -34,11 +37,15 @@ impl MemoryMode {
                 resolver_threads: if windows { None } else { Some(4) },
                 decay_ms: if linux { Some(0) } else { None },
                 block_cache_bytes: 128 * MIB,
+                bind_batch_bytes: 384 * MIB,
+                refresh_floor_bytes: GIB / 2,
             },
             Self::Balanced => MemoryProfile {
                 resolver_threads: None,
                 decay_ms: None,
                 block_cache_bytes: 256 * MIB,
+                bind_batch_bytes: 768 * MIB,
+                refresh_floor_bytes: GIB,
             },
         }
     }
@@ -241,6 +248,8 @@ mod tests {
                     resolver_threads: threads,
                     decay_ms: decay,
                     block_cache_bytes: 128 * MIB,
+                    bind_batch_bytes: 384 * MIB,
+                    refresh_floor_bytes: 512 * 1024 * 1024,
                 },
                 "{platform} lean",
             );
@@ -249,7 +258,9 @@ mod tests {
                 MemoryProfile {
                     resolver_threads: None,
                     decay_ms: None,
-                    block_cache_bytes: 256 * MIB
+                    block_cache_bytes: 256 * MIB,
+                    bind_batch_bytes: 768 * MIB,
+                    refresh_floor_bytes: 1024 * 1024 * 1024,
                 },
                 "{platform} balanced",
             );

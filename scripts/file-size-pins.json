@@ -12,7 +12,7 @@
     "reason": "Split bridge integration tests by tool family pending; AFT crate split lane."
   },
   "crates/aft/src/subc/mod.rs": {
-    "lines": 13376,
+    "lines": 13323,
     "reason": "Split daemon orchestration by area pending; AFT crate split lane."
   },
   "crates/aft/src/context.rs": {
@@ -40,7 +40,7 @@
     "reason": "Split parser support by language pending; AFT crate split lane."
   },
   "crates/aft/src/gh_shim.rs": {
-    "lines": 8611,
+    "lines": 8538,
     "reason": "Split GitHub shim policy and commands pending; AFT crate split lane."
   },
   "crates/aft/src/subc/consent_tests.rs": {
@@ -60,7 +60,7 @@
     "reason": "Split backup storage and recovery pending; AFT crate split lane."
   },
   "crates/aft/src/data_layer/checkout.rs": {
-    "lines": 6927,
+    "lines": 6535,
     "reason": "Split checkout lifecycle and storage pending; AFT crate split lane."
   },
   "crates/aft/src/bash_background/persistence.rs": {
@@ -88,7 +88,7 @@
     "reason": "Split executor tests by command family pending; AFT crate split lane."
   },
   "crates/aft/src/subc/health.rs": {
-    "lines": 5587,
+    "lines": 5568,
     "reason": "Split daemon health monitoring responsibilities pending; AFT crate split lane."
   },
   "crates/aft/src/search_index.rs": {

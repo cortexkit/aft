@@ -1,0 +1,11 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "note": "Post-0.66 batch 19 is non-ranking: its diff against main changes no RANKING_FENCE_PREFIXES path. It carries settings read through Subconscious, registration-channel adoption, call-graph build memory fixes (#1441), conflicts sweep confinement, late-result cleanup, display views and test fixes. No ranking or count difference is authorized."
+}

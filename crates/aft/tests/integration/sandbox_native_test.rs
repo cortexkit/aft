@@ -165,7 +165,11 @@ impl CortexkitFloorFixture {
                     "sandbox": { "profile": { "worker": "strict", "head": "strict" } },
                     "subc": { "connection_file": "~/daemon/connection.json" },
                 "github": { "shim": true },
-                "gh_shim": { "binary_path": shim_image },
+                // Without a private image, leave the path unset (a user file
+                // may not hold null) so AFT uses its own binary.
+                "gh_shim": shim_image
+                    .as_ref()
+                    .map_or_else(|| json!({}), |image| json!({ "binary_path": image })),
                     "git": { "co_author": "Sandbox Test <sandbox@example.invalid>" },
                 })),
             })

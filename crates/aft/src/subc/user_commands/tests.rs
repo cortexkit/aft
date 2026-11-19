@@ -969,7 +969,11 @@ async fn user_commands_real_management_routes_admit_only_occipital_and_keep_bodi
                 Some("tool.views") => {
                     assert_eq!(answer["views"].as_object().unwrap().len(), pins.len());
                     for pin in &pins {
-                        assert_eq!(answer["views"][pin]["template_revision"], 1);
+                        let current = tool_views::SHIPPED[pin].history.last().unwrap();
+                        assert_eq!(
+                            answer["views"][pin]["template_revision"],
+                            current.template_revision
+                        );
                     }
                 }
                 Some("tool.catalog") => assert!(answer["tools"].is_array()),

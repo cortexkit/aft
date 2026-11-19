@@ -1,0 +1,6 @@
+{
+  "lsp": {
+    "idle_minutes": 30,
+    "idle_shutdown": true
+  }
+}

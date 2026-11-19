@@ -1,0 +1,23 @@
+{
+  "op": "config.declare",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "limit": {
+        "type": "integer",
+        "description": "Work limit",
+        "default": 5,
+        "x-ck-apply": "live",
+        "x-ck-layers": [
+          "user",
+          "project"
+        ]
+      }
+    },
+    "unevaluatedProperties": false
+  },
+  "user_file": "/config/sample.jsonc",
+  "project_dirs": [
+    "/projects/a"
+  ]
+}

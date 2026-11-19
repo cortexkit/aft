@@ -18,7 +18,9 @@ use crate::harness::Harness;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+mod approved;
 mod prepared;
+pub(crate) use approved::ApprovedUser;
 pub(crate) use prepared::{
     current_prepared_bind_config, read_bounded_config, with_prepared_bind_config,
     PreparedBindConfig,

@@ -178,6 +178,7 @@ async fn real_bind_dispatch_scope_survives_config_edits_before_executor_admissio
         &senders,
         |request, ctx| crate::commands::configure::handle_configure(&request, ctx),
         Some(&user),
+        None,
         usize::MAX,
         None,
         &dir.path().join("storage"),

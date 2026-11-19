@@ -83,6 +83,12 @@ impl StagedUnit {
     /// The bytes [`Self::to_bytes`] writes.
     pub const BYTES: usize = 21;
 
+    /// Size of the uncompressed record payload, without reading the segment.
+    #[must_use]
+    pub fn uncompressed_bytes(self) -> usize {
+        (self.surface as usize).saturating_add(self.unpacked as usize)
+    }
+
     /// The unit as fixed-width little-endian bytes, for a table kept on
     /// disk beside its staging segment so a later build can find each
     /// record again.

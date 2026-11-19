@@ -1,0 +1,22 @@
+<CardHeader title={input.description ?? input.command} />
+
+<ToolText text="Command" />
+
+<CodeBlock codeString={input.command} />
+
+{(view.completion.endReason ?? view.record.endReason) == "timed_out" ? <ToolText text="Timed out" tone="danger" />
+ : (view.completion.endReason ?? view.record.endReason) == "killed" ? <ToolText text="Stopped" tone="danger" />
+ : (view.completion.exitCode ?? view.record.exitCode) != null ? <ToolText text={"Exit " + Text(view.completion.exitCode ?? view.record.exitCode)} tone={(view.completion.exitCode ?? view.record.exitCode) == 0 ? "muted" : "danger"} />
+ : view.record.phase == "background_started" && view.completion == null ? <ToolText text="In background" tone="muted" />
+ : view.call.phase == "unanswered" ? <ToolText text="Not run" tone="muted" />
+ : view.call.isError == true ? <ToolText text="Failed" tone="danger" /> : null}
+
+{view.record.phase == "background_started" && view.completion == null
+ ? <ToolText text="Running in the background." tone="muted" />
+ : view.call.phase == "running" ? <ToolText text="Waiting for output…" tone="muted" /> : null}
+
+{view.call.phase == "running" || (view.record.phase == "background_started" && view.completion == null)
+ ? null : <ToolText text={view.output == null ? "Output" : "Output · " + Text(Count(Lines(view.output ?? ""))) + " lines"} />}
+
+{view.call.phase == "running" || (view.record.phase == "background_started" && view.completion == null)
+ ? null : view.output == null ? <ToolText text="No output was kept." tone="muted" /> : <CodeBlock codeString={view.output ?? ""} maxLines={40} />}
