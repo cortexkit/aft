@@ -2658,7 +2658,6 @@ fn legacy_daemon_present(processes: &str, current_pid: u32) -> io::Result<bool> 
 }
 
 /// List every process in the snapshot format `legacy_daemon_present` reads.
-#[cfg(not(test))]
 fn legacy_process_query(label: &str, timeout: Duration) -> io::Result<String> {
     #[cfg(windows)]
     {

@@ -68,4 +68,12 @@ mod tests {
     fn test_database_open_rejects_default_before_creating_files() {
         let _ = crate::db::open(&live_storage_roots()[0].join("aft.db"));
     }
+
+    #[test]
+    #[should_panic(expected = "test context cannot use the live default AFT storage root")]
+    fn test_database_single_attempt_rejects_live_storage_before_open() {
+        let live = live_storage_roots();
+        let _ =
+            crate::db::open_with_mode(&live[0].join("aft.db"), crate::db::OpenMode::SingleAttempt);
+    }
 }

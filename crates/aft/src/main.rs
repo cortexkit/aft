@@ -210,6 +210,27 @@ mod rayon_thread_tests {
     }
 }
 
+#[cfg(test)]
+mod db_unit_test_fence {
+    extern "C" fn enable() {
+        aft::db::enable_binary_unit_test_fence();
+    }
+
+    // The bin unit harness replaces main and links the library without cfg(test).
+    #[used]
+    #[cfg_attr(target_os = "linux", link_section = ".init_array")]
+    #[cfg_attr(target_os = "macos", link_section = "__DATA,__mod_init_func")]
+    #[cfg_attr(windows, link_section = ".CRT$XCU")]
+    static ENABLE_DB_FENCE: extern "C" fn() = enable;
+
+    #[test]
+    #[should_panic(expected = "test context cannot use the live default AFT storage root")]
+    fn bin_database_test_fence_rejects_live_storage_before_open() {
+        let live = aft_base::test_storage::live_storage_roots();
+        let _ = aft::db::open(&live[0].join("aft.db"));
+    }
+}
+
 fn main() {
     aft::memory::profile::publish(None);
     #[cfg(feature = "test-hooks")]
@@ -235,6 +256,12 @@ fn main() {
             );
         }
     };
+    #[cfg(feature = "test-hooks")]
+    startup_phase(if aft::db::binary_unit_test_fence_enabled() {
+        "unit_test_db_fence_enabled"
+    } else {
+        "unit_test_db_fence_disabled"
+    });
     let registration = if subc_connection_file.is_some() {
         startup_phase("nonce_capture_start");
         let registration = match aft::subc::AdoptedRegistration::adopt() {

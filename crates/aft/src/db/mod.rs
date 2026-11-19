@@ -2,6 +2,17 @@
 pub use aft_db::db::*;
 
 #[cfg(test)]
+pub fn open(path: &Path) -> Result<TrackedConnection, OpenError> {
+    open_with_mode(path, OpenMode::Deferred)
+}
+
+#[cfg(test)]
+pub fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConnection, OpenError> {
+    crate::test_storage::assert_database(path);
+    aft_db::db::open_with_mode(path, mode)
+}
+
+#[cfg(test)]
 pub(crate) use display_records::test_support::{current_schema_version, run_migrations_supported};
 #[cfg(test)]
 mod display_records_tests;

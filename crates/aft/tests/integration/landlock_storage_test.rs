@@ -217,6 +217,10 @@ async fn storage_lease_starts_without_reading_root_under_landlock() {
         for phase in ["storage_lease_done", "executable_pin_done", "logging_done"] {
             assert!(stderr.contains(phase), "missing {phase}: {stderr}");
         }
+        assert!(
+            stderr.contains("phase=unit_test_db_fence_disabled"),
+            "{stderr}"
+        );
         let lock = OpenOptions::new()
             .read(true)
             .write(true)

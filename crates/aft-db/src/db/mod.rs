@@ -653,9 +653,30 @@ pub enum OpenMode {
     SingleAttempt,
 }
 
+#[cfg(feature = "test-support")]
+static BINARY_UNIT_TEST_FENCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The binary unit-test harness links this crate without `cfg(test)`.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn enable_binary_unit_test_fence() {
+    BINARY_UNIT_TEST_FENCE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn binary_unit_test_fence_enabled() -> bool {
+    BINARY_UNIT_TEST_FENCE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConnection, OpenError> {
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     crate::test_storage::assert_database(path);
+    #[cfg(all(not(test), feature = "test-support"))]
+    if binary_unit_test_fence_enabled() {
+        crate::test_storage::assert_database(path);
+    }
     // Decide before mkdir, journal PRAGMAs, or a writable SQLite open. A dev
     // reader can inspect a matching schema, but cannot create even one record.
     if crate::production_storage::protected(path) {
