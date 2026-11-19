@@ -139,6 +139,39 @@ fn session_stops_when_its_context_is_dropped() {
 }
 
 #[test]
+fn discovery_limits_stop_the_directory_iterator_before_sorting() {
+    use std::cell::Cell;
+
+    let visits = Cell::new(0);
+    let entries = || {
+        (0..10).map(|i| {
+            visits.set(visits.get() + 1);
+            if i == 0 {
+                Err(())
+            } else {
+                Ok(i)
+            }
+        })
+    };
+    let mut remaining = 3;
+    assert_eq!(
+        read_discovery_entries(entries(), &mut remaining, || false),
+        [1, 2]
+    );
+    assert_eq!(visits.get(), 3);
+    assert_eq!(remaining, 0);
+
+    visits.set(0);
+    let mut remaining = 10;
+    assert_eq!(
+        read_discovery_entries(entries(), &mut remaining, || visits.get() >= 2),
+        [1]
+    );
+    assert_eq!(visits.get(), 2);
+    assert_eq!(remaining, 8);
+}
+
+#[test]
 fn configure_probe_is_bounded_by_wall_clock_time() {
     let temp = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(temp.path()).unwrap();

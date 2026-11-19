@@ -207,8 +207,27 @@ struct Walk {
     outside: Vec<PathBuf>,
 }
 
-/// Walks `root` for repositories. `stop` is asked after each entry; when it
-/// answers true the walk ends with what it found so far.
+/// Reads at most the remaining visit budget. The stop check also runs while
+/// collecting entries, so a slow directory cannot hide behind the sort.
+fn read_discovery_entries<T, E>(
+    entries: impl Iterator<Item = Result<T, E>>,
+    remaining: &mut usize,
+    stop: impl Fn() -> bool,
+) -> Vec<T> {
+    let mut read = Vec::new();
+    let mut entries = entries;
+    while *remaining > 0 && !stop() {
+        let Some(entry) = entries.next() else {
+            break;
+        };
+        *remaining -= 1;
+        read.extend(entry.ok());
+    }
+    read
+}
+
+/// Walks `root` for repositories. When `stop` answers true the walk ends
+/// with what it found so far.
 fn walk(root: &Path, stop: &dyn Fn(&Walk) -> bool) -> Walk {
     let delay = lock(discovery_delays()).get(root).copied();
     let mut found = Walk {
@@ -218,21 +237,26 @@ fn walk(root: &Path, stop: &dyn Fn(&Walk) -> bool) -> Walk {
     let Some(boundary) = crate::watcher_filter::WatcherWalkBoundary::for_root(root) else {
         return found;
     };
-    let mut examined = 0usize;
+    let mut remaining = MAX_DISCOVERY_ENTRIES;
     let mut pending = vec![(root.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = pending.pop() {
+        if remaining == 0 || stop(&found) {
+            break;
+        }
         if !boundary.allows_directory(&dir) {
             continue;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        let mut entries = entries.flatten().collect::<Vec<_>>();
+        let mut entries = read_discovery_entries(entries, &mut remaining, || stop(&found));
+        if stop(&found) {
+            return found;
+        }
         entries.sort_by_key(|entry| entry.file_name());
         let mut subdirectories = Vec::new();
         for entry in entries {
-            examined += 1;
-            if examined > MAX_DISCOVERY_ENTRIES || stop(&found) {
+            if stop(&found) {
                 return found;
             }
             if let Some(delay) = delay {
