@@ -17,17 +17,22 @@ the streaming dead-code check. It lets the gate discard each caller's decoded
 symbols after comparison without replacing the archived resolver or dead-code
 rules. Each archive has a separate Cargo target directory.
 
+The oldest supported reference is `ac1428808ea80db6a35860c5434d729210ddc9a8`.
+The previous example reference, `cb3a5ae1badbb30716ad1de187b903ab47e90638`,
+lacks `content::record_key`, which the probe uses to record the archive's
+content identities. The builder rejects revisions without that helper.
+
 ```sh
 git log -1
 python3 scripts/telemetry/callgraph-exactness/build.py \
-  cb3a5ae1badbb30716ad1de187b903ab47e90638 \
+  ac1428808ea80db6a35860c5434d729210ddc9a8 \
   target/measurements/exactness/reference-build
 python3 scripts/telemetry/callgraph-exactness/build.py \
   HEAD target/measurements/exactness/candidate-build
 python3 scripts/telemetry/callgraph-exactness/run.py \
   --reference target/measurements/exactness/reference-build/probe \
   --candidate target/measurements/exactness/candidate-build/probe \
-  --reference-source cb3a5ae1badbb30716ad1de187b903ab47e90638 \
+  --reference-source ac1428808ea80db6a35860c5434d729210ddc9a8 \
   --candidate-source "$(git rev-parse HEAD)" \
   --repository neovim/neovim \
   --repository apache/superset \

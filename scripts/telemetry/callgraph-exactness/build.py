@@ -36,6 +36,10 @@ def overlay_dead_code(source, sha):
         path = source / layer / filename
         needs(path.read_text() if path.is_file() else "", method, f"per-file read in {filename}")
 
+    content = source / layer / "content.rs"
+    needs(content.read_text() if content.is_file() else "", "fn record_key(",
+          "content::record_key for the exactness artifact's recorded identities")
+
     for name in ("dead_code/stream.rs", "dead_code/stream", "dead_code_graph/stream.rs"):
         local = REPO / layer / name
         dest = source / layer / name
