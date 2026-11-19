@@ -16,7 +16,12 @@ import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { translateSettingsShape } from "./settings-shape.js";
 
-export { nullSettingPath } from "./settings-shape.js";
+export {
+  type CacheDirChoice,
+  hasMalformedCacheDirChoice,
+  isCacheDirChoice,
+  nullSettingPath,
+} from "./settings-shape.js";
 
 /** Every agent-visible tool name a registration adapter may publish (sorted). */
 export const CANONICAL_TOOLS = [
@@ -1030,13 +1035,13 @@ export function translateConfigDocument(
   };
   translateRunonEnabled(map, tier, "", out);
   translateBlock(map, tier === "user", "base", out);
-  for (const notice of translateSettingsShape(map, tier)) recordRetired(out, "", notice);
+  for (const notice of translateSettingsShape(map, tier, true)) recordRetired(out, "", notice);
   if (isRecord(map.harnesses)) {
     for (const [name, block] of Object.entries(map.harnesses)) {
       if (isRecord(block)) {
         translateRunonEnabled(block, tier, `harnesses.${name}.`, out);
         translateBlock(block, false, `harnesses.${name}`, out);
-        for (const notice of translateSettingsShape(block, tier)) {
+        for (const notice of translateSettingsShape(block, tier, false)) {
           recordRetired(out, `harnesses.${name}.`, notice);
         }
       }
@@ -1169,7 +1174,7 @@ function projectBlock(block: JsonRecord): JsonRecord {
     indexes[leaf] = inputs;
   }
   const shapes = sortedUnique(
-    translateSettingsShape(structuredClone(block), "project").filter(
+    translateSettingsShape(structuredClone(block), "project", true).filter(
       (notice) => !notice.startsWith("bash "),
     ),
   );
@@ -1328,8 +1333,7 @@ export class ConfigRejectedError extends Error {
 }
 
 /** Sections whose schema failure must not replace explicit security settings with defaults. */
-// `storage` is deliberately not listed: a malformed `storage.cache_dir` weakens
-// no protection; it turns caches off (cache_dir_config_unknown) and warns.
+// Storage validation has its own diagnostics and does not belong to the security sections.
 const SECURITY_CONFIG_SECTIONS = new Set([
   "restrict_to_project_root",
   "url_fetch_allow_private",

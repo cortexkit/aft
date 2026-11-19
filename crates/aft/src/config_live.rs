@@ -951,7 +951,7 @@ macro_rules! restart_settings {
         $field!("bash.detach_on_user_message", bash.detach_on_user_message);
         $field!("bash.powershell_tool", bash.powershell_tool);
         $field!("storage.cache_dir", cache_dir);
-        $field!("storage.cache_dir: null", cache_dir_opt_out);
+        $field!("storage.cache_dir", cache_dir_opt_out);
         $field!("lsp.servers", lsp_servers);
         $field!("lsp.servers", invalid_lsp_initialization_options);
         $field!("lsp.disabled", disabled_lsp);

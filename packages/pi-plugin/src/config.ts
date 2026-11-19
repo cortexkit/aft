@@ -4,15 +4,18 @@ import { isAbsolute } from "node:path";
 import {
   type AftConfigFileMigrationResult,
   CALLGRAPH_CHUNK_KEY,
+  type CacheDirChoice,
   ConfigRejectedError,
   type ConfigTier,
   DATA_LAYER_RETIRED_PATHS,
   DEFAULT_DISABLED_TOOLS,
   DEFAULT_WORKER_WAIT_MAX_MS,
   deliverMigrationNoticeOnce,
+  hasMalformedCacheDirChoice,
   IDLE_CHECKOUT_HOURS_MAX,
   IDLE_CHECKOUT_HOURS_MIN,
   isBlockedBashEnvKey,
+  isCacheDirChoice,
   isProjectBlockedBashEnvKey,
   legacyConfigNoticeMessage,
   legacyProjectConfigLocationNotice,
@@ -1127,7 +1130,9 @@ const AftConfigFieldsSchema = z.object({
   indexes: IndexesConfigSchema.optional(),
   /** User-configured filesystem roots for indexed search; project config cannot change them. */
   index: IndexConfigSchema.optional(),
-  storage: z.object({ cache_dir: z.string().nullable().optional() }).optional(),
+  storage: z
+    .object({ cache_dir: z.custom<CacheDirChoice>(isCacheDirChoice).optional() })
+    .optional(),
   durability: z.object({ macos_full_sync: z.boolean().optional() }).strict().optional(),
   memory: z.enum(["lean", "balanced"]).optional(),
   inspect: InspectConfigSchema.optional(),
@@ -1693,6 +1698,8 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   }
   if (invalidNull !== undefined)
     throw new ConfigRejectedError([`invalid_config_null:${invalidNull}`], configPath);
+  if (tier === "user" && hasMalformedCacheDirChoice(normalized))
+    throw new ConfigRejectedError(["invalid_cache_config: storage.cache_dir"], configPath);
   let parsed: AftConfig;
   if (result.success) {
     log(`Config loaded from ${configPath}`);

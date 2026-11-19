@@ -6,8 +6,47 @@ function object(value: unknown): ConfigObject | undefined {
     : undefined;
 }
 
+export type CacheDirChoice =
+  | { kind: "default" }
+  | { kind: "main_disk" }
+  | { kind: "dir"; path: string };
+
+export function isCacheDirChoice(value: unknown): value is CacheDirChoice {
+  const choice = object(value);
+  if (!choice) return false;
+  const keys = Object.keys(choice);
+  if (choice.kind === "dir") {
+    return (
+      keys.length === 2 &&
+      Object.hasOwn(choice, "kind") &&
+      Object.hasOwn(choice, "path") &&
+      typeof choice.path === "string"
+    );
+  }
+  return (
+    (choice.kind === "default" || choice.kind === "main_disk") &&
+    keys.length === 1 &&
+    Object.hasOwn(choice, "kind")
+  );
+}
+
+export function hasMalformedCacheDirChoice(config: ConfigObject): boolean {
+  const malformed = (block: ConfigObject | undefined) => {
+    const choice = object(block?.storage)?.cache_dir;
+    return object(choice) !== undefined && !isCacheDirChoice(choice);
+  };
+  return (
+    malformed(config) ||
+    Object.values(object(config.harnesses) ?? {}).some((block) => malformed(object(block)))
+  );
+}
+
 // Keep the compatibility translation in step with Rust's feature_config/settings_shape.rs.
-export function translateSettingsShape(block: ConfigObject, tier: "user" | "project"): string[] {
+export function translateSettingsShape(
+  block: ConfigObject,
+  tier: "user" | "project",
+  isBase: boolean,
+): string[] {
   const notices: string[] = [];
   if (typeof block.bash === "boolean") {
     const projectTrue = block.bash && tier === "project";
@@ -40,6 +79,14 @@ export function translateSettingsShape(block: ConfigObject, tier: "user" | "proj
       notices.push("lsp.servers.<name>.initialization_options → JSON text");
     }
   }
+  const storage = object(block.storage);
+  if (storage?.cache_dir === null && isBase && tier === "user") {
+    storage.cache_dir = { kind: "main_disk" };
+    notices.push("storage.cache_dir null → storage.cache_dir main_disk");
+  } else if (typeof storage?.cache_dir === "string") {
+    storage.cache_dir = { kind: "dir", path: storage.cache_dir };
+    notices.push("storage.cache_dir string → storage.cache_dir dir");
+  }
   const duplicates = object(object(block.inspect)?.duplicates);
   if (duplicates && Array.isArray(duplicates.expected_mirrors)) {
     let changed = false;
@@ -63,6 +110,7 @@ export function translateSettingsShape(block: ConfigObject, tier: "user" | "proj
 
 export function nullSettingPath(value: unknown, path: string[] = []): string | undefined {
   if (value === null) {
+    // The project-base legacy opt-out was accepted but ignored.
     return path.length === 2 && path[0] === "storage" && path[1] === "cache_dir"
       ? undefined
       : path.join(".");

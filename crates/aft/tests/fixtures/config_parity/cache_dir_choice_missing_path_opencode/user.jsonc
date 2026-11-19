@@ -1,0 +1,7 @@
+{
+  "storage": {
+    "cache_dir": {
+      "kind": "dir"
+    }
+  }
+}

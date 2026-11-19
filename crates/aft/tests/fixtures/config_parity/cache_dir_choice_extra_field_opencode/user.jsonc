@@ -1,0 +1,8 @@
+{
+  "storage": {
+    "cache_dir": {
+      "kind": "main_disk",
+      "path": "ignored"
+    }
+  }
+}

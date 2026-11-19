@@ -1138,7 +1138,7 @@ fn translate_shapes(
     prefix: &str,
     out: &mut DocumentTranslation,
 ) {
-    for edit in settings_shape::edits(map, tier) {
+    for edit in settings_shape::edits(map, tier, prefix.is_empty()) {
         record_retired(out, prefix, edit.notice);
         edit.apply(map);
     }
@@ -1462,11 +1462,12 @@ fn project_block(block: &Map<String, Value>) -> Value {
     projected.insert("runtime_gates".to_string(), Value::Object(gates));
     // The notice identity records which shapes changed, not the potentially
     // sensitive initialization options. Bash booleans are projected above.
-    let shapes: std::collections::BTreeSet<_> = settings_shape::edits(block, DocumentTier::Project)
-        .into_iter()
-        .filter(|edit| edit.path[0] != "bash")
-        .map(|edit| edit.notice)
-        .collect();
+    let shapes: std::collections::BTreeSet<_> =
+        settings_shape::edits(block, DocumentTier::Project, false)
+            .into_iter()
+            .filter(|edit| edit.path[0] != "bash")
+            .map(|edit| edit.notice)
+            .collect();
     if !shapes.is_empty() {
         projected.insert("legacy_shapes".into(), serde_json::json!(shapes));
     }

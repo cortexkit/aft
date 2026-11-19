@@ -219,6 +219,16 @@ fn assert_case(dir: &Path) -> Option<String> {
         .as_object_mut()
         .map(|object| object.remove("project_env"));
     fill_server_defaults(&mut golden);
+    // The opt-out is process state and is not serialized with the resolved path.
+    let cache_opt_out = golden
+        .as_object_mut()
+        .and_then(|object| object.remove("cache_dir_opt_out"))
+        == Some(Value::Bool(true));
+    if resolved.cache_dir_opt_out != cache_opt_out {
+        return Some(format!(
+            "case `{case}`: cache_dir_opt_out expected {cache_opt_out}"
+        ));
+    }
     let mut want_json = serde_json::to_value(Config::default()).expect("serialize default config");
     overlay(&mut want_json, &golden);
 
