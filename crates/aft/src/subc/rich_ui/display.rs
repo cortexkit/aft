@@ -785,7 +785,9 @@ async fn send_loop(connection_file: PathBuf, mut receiver: tokio::sync::mpsc::Re
                 call_timeout: std::time::Duration::from_secs(5),
                 ..Default::default()
             };
-            match crate::subc::registration::connect_consumer(&connection_file, options).await {
+            match crate::subc::registration::connect_consumer("display", &connection_file, options)
+                .await
+            {
                 Ok(client) => consumer = Some(client),
                 Err(_) => count(WriterConnect),
             }

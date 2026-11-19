@@ -15,6 +15,8 @@ pub(crate) struct Counts {
     pub active: usize,
     pub queries: usize,
     pub connections: usize,
+    /// Connections the fake has accepted and not yet seen close.
+    pub live: usize,
 }
 
 pub(crate) struct Daemon {
@@ -91,6 +93,7 @@ impl Daemon {
                                 let connection = {
                                     let mut count = counts.0.lock().unwrap();
                                     count.connections += 1;
+                                    count.live += 1;
                                     count.connections
                                 };
                                 let mut active = 0;
@@ -175,6 +178,10 @@ impl Daemon {
                                                     subc_transport::write_frame(&mut stream, &frame).await.unwrap();
                                                     continue;
                                                 },
+                                                Some("lane-paused") => {
+                                                    respond(&mut stream, &request, pause_test_support::pause_reply(json!(1_000)), false).await;
+                                                    continue;
+                                                },
                                                 Some("application-error") => {
                                                     respond(&mut stream, &request, json!({"error":{"code":"test_rejected","message":"application rejected"}}), false).await;
                                                     continue;
@@ -216,7 +223,11 @@ impl Daemon {
                                     };
                                     respond(&mut stream, &request, reply, false).await;
                                 }
-                                counts.0.lock().unwrap().active -= active;
+                                {
+                                    let mut count = counts.0.lock().unwrap();
+                                    count.active -= active;
+                                    count.live -= 1;
+                                }
                                 counts.1.notify_all();
                             });
                         }
@@ -272,6 +283,20 @@ impl Daemon {
             )
             .unwrap();
         assert_eq!(count.active, 0, "completed clients left routes open");
+    }
+
+    /// Wait until the fake holds exactly `live` open connections.
+    fn wait_live(&self, live: usize) {
+        let (count, _) = self
+            .counts
+            .1
+            .wait_timeout_while(
+                self.counts.0.lock().unwrap(),
+                Duration::from_secs(5),
+                |count| count.live != live,
+            )
+            .unwrap();
+        assert_eq!(count.live, live, "unexpected open daemon connections");
     }
 
     fn wait_queries(&self, queries: usize) {
@@ -939,4 +964,146 @@ fn synapse_untyped_not_sent_and_unknown_outcomes_do_not_imply_a_dead_route() {
     assert!(connection_is_gone(&CallError::StaleRouteHandle(
         RouteHandle::detached(7, 1)
     )));
+}
+
+/// Each project context builds its own reranker and keeps it while the context
+/// lives. They must all share one daemon connection and one route, or AFT's
+/// connections grow with every root it serves.
+#[test]
+fn synapse_rerankers_across_roots_share_one_connection_and_route() {
+    const ROOTS: usize = 6;
+    let daemon = Daemon::start(1, false);
+    let mut transports = (0..ROOTS)
+        .map(|root| SynapseRerankTransport::new(&daemon.config(root)).unwrap())
+        .collect::<Vec<_>>();
+    for transport in &mut transports {
+        transport
+            .call(
+                "rerank.score",
+                json!({"text":"healthy"}),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+    }
+    {
+        let counts = daemon.counts.0.lock().unwrap();
+        assert_eq!(counts.queries, ROOTS);
+        assert_eq!(counts.connections, 1, "rerankers opened a connection each");
+        assert_eq!(counts.live, 1);
+        assert_eq!(counts.opens, 1, "rerankers opened a route each");
+        assert_eq!(counts.active, 1);
+    }
+    drop(transports);
+    daemon.wait_closed();
+    daemon.wait_live(0);
+    daemon.finish();
+}
+
+/// Lane pauses and a lost connection must leave exactly one connection and
+/// one route: a pause keeps the route, and a reconnect replaces the old
+/// connection instead of adding to it.
+#[test]
+fn synapse_embed_calls_with_lane_pauses_and_a_lost_connection_keep_one_connection() {
+    const ROOTS: usize = 4;
+    let daemon = Daemon::start(1, false);
+    let mut clients = (0..ROOTS)
+        .map(|root| SynapseEmbeddingClient::from_config(&daemon.config(root)).unwrap())
+        .collect::<Vec<_>>();
+    for client in &mut clients {
+        assert!(matches!(
+            client.embed_query("lane-paused", Duration::from_secs(5)),
+            Err(SynapseEmbeddingError::LanePaused(_))
+        ));
+        assert_eq!(
+            client
+                .embed_query("healthy", Duration::from_secs(5))
+                .unwrap(),
+            vec![1.0, 0.0]
+        );
+    }
+    {
+        let counts = daemon.counts.0.lock().unwrap();
+        assert_eq!((counts.connections, counts.live), (1, 1));
+        assert_eq!((counts.opens, counts.active), (1, 1));
+    }
+    let shared = Arc::clone(&clients[0].state.connection);
+    let old = shared
+        .runtime
+        .block_on(clients[0].state.ensure_route())
+        .unwrap();
+    let (dropped, observed_drop) = std::sync::mpsc::channel();
+    old.consumer.on_connection_state(move |state| {
+        if matches!(state, subc_client_rs::ConnectionState::Dropped) {
+            let _ = dropped.send(());
+        }
+    });
+    drop(old);
+    daemon.disconnect_first_connection();
+    observed_drop.recv_timeout(Duration::from_secs(5)).unwrap();
+    daemon.wait_live(0);
+    for client in &mut clients {
+        assert!(matches!(
+            client.embed_query("lane-paused", Duration::from_secs(5)),
+            Err(SynapseEmbeddingError::LanePaused(_))
+        ));
+        assert_eq!(
+            client
+                .embed_query("after-disconnect", Duration::from_secs(5))
+                .unwrap(),
+            vec![1.0, 0.0]
+        );
+    }
+    {
+        let counts = daemon.counts.0.lock().unwrap();
+        assert_eq!(
+            counts.connections, 2,
+            "only the lost connection is replaced"
+        );
+        assert_eq!((counts.live, counts.active), (1, 1));
+        assert_eq!(counts.opens, 2);
+    }
+    drop(clients);
+    drop(shared);
+    daemon.wait_closed();
+    daemon.wait_live(0);
+    daemon.finish();
+}
+
+/// The per-owner gauge counts a tracked consumer while it is open and drops
+/// the count once the consumer is released.
+#[test]
+fn consumer_gauge_returns_to_zero_after_the_consumer_is_dropped() {
+    const OWNER: &str = "gauge_test";
+    let daemon = Daemon::start(1, false);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let consumer = runtime
+        .block_on(crate::subc::registration::connect_consumer(
+            OWNER,
+            &daemon.path,
+            subc_client_rs::ConsumerOptions::default(),
+        ))
+        .unwrap();
+    assert_eq!(
+        crate::subc::registration::live_consumers().get(OWNER),
+        Some(&1)
+    );
+    drop(consumer);
+    // The SDK releases the connection's shared state once its aborted
+    // transport tasks have been dropped, which needs the runtime to run.
+    runtime.block_on(async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while crate::subc::registration::live_consumers().get(OWNER) != Some(&0) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the gauge still counts a dropped consumer"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+    daemon.wait_live(0);
+    drop(runtime);
+    daemon.finish();
 }

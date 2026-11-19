@@ -176,7 +176,7 @@ async fn run(app: Arc<App>, path: PathBuf, database: PathBuf, mut stopped: onesh
     let consumer = loop {
         let result = tokio::select! {
             _ = &mut stopped => return,
-            result = tokio::time::timeout(IO_TIMEOUT, crate::subc::registration::connect_consumer(&path, ConsumerOptions::default())) => result,
+            result = tokio::time::timeout(IO_TIMEOUT, crate::subc::registration::connect_consumer("late_result_bus", &path, ConsumerOptions::default())) => result,
         };
         if let Ok(Ok(consumer)) = result {
             HEALTH.lock().connects += 1;

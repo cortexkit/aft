@@ -372,6 +372,7 @@ impl StoreOwner for DaemonOwner {
 
 async fn purge_via_daemon(connection_file: PathBuf, request: &PurgeRequest) -> OwnerReply {
     let consumer = match aft::fleet_status::connect_subc_consumer(
+        "cli_backups",
         &connection_file,
         ConsumerOptions::default(),
     )

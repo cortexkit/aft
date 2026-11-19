@@ -262,10 +262,13 @@ fn fetch_management_census(
         .build()
         .map_err(|error| format!("could not start daemon client: {error}"))?;
     runtime.block_on(async move {
-        let consumer =
-            aft::fleet_status::connect_subc_consumer(&connection_file, ConsumerOptions::default())
-                .await
-                .map_err(|error| format!("daemon connection failed: {error}"))?;
+        let consumer = aft::fleet_status::connect_subc_consumer(
+            "cli_profile",
+            &connection_file,
+            ConsumerOptions::default(),
+        )
+        .await
+        .map_err(|error| format!("daemon connection failed: {error}"))?;
         let catalog = consumer
             .catalog_list()
             .await

@@ -254,6 +254,7 @@ fn raw_call(daemon: &FakeClaustrum, identity: Option<ConsumerIdentity>, params: 
         .unwrap()
         .block_on(async {
             let consumer = crate::fleet_status::connect_subc_consumer(
+                "secret_transport_test",
                 &daemon.path,
                 ConsumerOptions::default(),
             )

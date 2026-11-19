@@ -2021,9 +2021,13 @@ impl SubcRelayTransport {
             call_timeout: RELAY_CALL_TIMEOUT,
             ..subc_client_rs::ConsumerOptions::default()
         };
-        let consumer = crate::fleet_status::connect_subc_consumer(&self.connection_file, options)
-            .await
-            .map_err(|error| TransportError::Unavailable(error.to_string()))?;
+        let consumer = crate::fleet_status::connect_subc_consumer(
+            "gh_shim_relay",
+            &self.connection_file,
+            options,
+        )
+        .await
+        .map_err(|error| TransportError::Unavailable(error.to_string()))?;
         let consumer = Arc::new(consumer);
         *slot = Some(Arc::clone(&consumer));
         Ok(consumer)

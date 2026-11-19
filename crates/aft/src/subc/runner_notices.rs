@@ -820,10 +820,14 @@ impl CapabilityConsumer {
         if let Some(probe) = test_endpoint::probe(_address) {
             return Ok(Self::Endpoint(probe));
         }
-        super::registration::connect_consumer(path, ConsumerOptions::default())
-            .await
-            .map(Self::Runner)
-            .map_err(|_| ("connect", None))
+        super::registration::connect_consumer(
+            "runner_notice_probe",
+            path,
+            ConsumerOptions::default(),
+        )
+        .await
+        .map(Self::Runner)
+        .map_err(|_| ("connect", None))
     }
 
     async fn incarnation(&self, module: &str) -> Result<RunnerIncarnation, ProbeFailure> {
@@ -1811,11 +1815,16 @@ async fn call(path: &Path, address: &Address, body: Vec<u8>) -> Result<Vec<u8>, 
             "AFT launch has no consumer identity",
         ));
     }
-    let consumer =
-        match super::registration::connect_consumer(path, ConsumerOptions::default()).await {
-            Ok(consumer) => consumer,
-            Err(error) => return Err(retry(FailureClass::Connect, error)),
-        };
+    let consumer = match super::registration::connect_consumer(
+        "runner_notice_send",
+        path,
+        ConsumerOptions::default(),
+    )
+    .await
+    {
+        Ok(consumer) => consumer,
+        Err(error) => return Err(retry(FailureClass::Connect, error)),
+    };
     let route = open_notice_route(&consumer, address).await;
     let result = match route {
         Ok(route) => {
