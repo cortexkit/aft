@@ -79,15 +79,26 @@ impl Edge {
         let record = call.record.clone();
         let begin_key = key.clone();
         let ctx = self.executor.actor_context(&root);
+        #[cfg(all(test, target_os = "linux"))]
+        let test_launcher = self.test_launcher.clone();
         let prepared = blocking(move || {
             let ctx = ctx.ok_or_else(not_working)?;
             let workdir = shell.check(&ctx)?;
-            let launch =
-                crate::sandbox_spawn::remote::prepare(&ctx, &shell.folder, workdir, shell.command)
-                    .map_err(|error| {
-                        log::warn!("remote shell setup: {error}");
-                        remote_bash::unavailable()
-                    })?;
+            use crate::sandbox_spawn::remote::prepare;
+            #[cfg(all(test, target_os = "linux"))]
+            let prepare = |ctx: &AppContext, folder: &Path, workdir, command| {
+                if let Some(launcher) = test_launcher {
+                    crate::sandbox_spawn::remote::prepare_with_launcher(
+                        ctx, folder, workdir, command, launcher,
+                    )
+                } else {
+                    prepare(ctx, folder, workdir, command)
+                }
+            };
+            let launch = prepare(&ctx, &shell.folder, workdir, shell.command).map_err(|error| {
+                log::warn!("remote shell setup: {error}");
+                remote_bash::unavailable()
+            })?;
             record.begin_with_grant(&begin_key, decision, grant.as_deref())?;
             Ok((launch, shell.timeout))
         })
@@ -172,31 +183,26 @@ impl Edge {
         if let Ok(request) = job.yield_rx.try_recv() {
             self.yield_answer(&request, YieldAnswer::UnknownCall).await;
         }
-        let (result, reason) = match output {
+        let result = match output {
             Ok(output) => {
-                let reason = if denied || cancelled {
-                    Some("denied")
-                } else if output.timed_out {
-                    Some("timeout")
+                let line = if denied || cancelled {
+                    Some(authorization::denied().message)
+                } else if output.timed_out && timeout == remote_bash::MAX_RUNTIME {
+                    Some(remote_bash::TIME_LIMIT.to_owned())
                 } else {
                     None
                 };
-                let line = match reason {
-                    Some("denied") => Some(authorization::denied().message),
-                    Some("timeout") if timeout == Duration::from_secs(600) => {
-                        Some(remote_bash::TIME_LIMIT.to_owned())
-                    }
-                    _ => None,
-                };
-                (Ok(output.result(&key.call_key, line)), reason)
+                Ok(output.result(&key.call_key, line))
             }
             Err(error) => {
                 log::warn!("remote shell did not run to completion: {error}");
-                (Err(remote_bash::unavailable()), Some("refused"))
+                Err(remote_bash::unavailable())
             }
         };
         let reply = self.tool_reply(&call, result);
-        self.settle(frame, call.record, Some(key), reply, decision, reason, held)
+        // The call ran, even on timeout or cancellation. A not-started reason
+        // would make the ledger omit its output from the late-results feed.
+        self.settle(frame, call.record, Some(key), reply, decision, None, held)
             .await;
     }
 }

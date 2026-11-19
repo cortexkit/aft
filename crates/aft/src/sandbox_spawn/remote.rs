@@ -15,7 +15,10 @@ pub(crate) struct Output {
 
 impl Output {
     pub(crate) fn result(self, id: &str, line: Option<String>) -> ToolCallResult {
-        let text = match line.as_deref() {
+        let line = line
+            .as_deref()
+            .or(self.timed_out.then_some("[command timed out]"));
+        let text = match line {
             Some(line) if self.text.is_empty() => line.to_owned(),
             Some(line) => format!("{}\n{line}", self.text),
             None => self.text,
@@ -25,7 +28,7 @@ impl Output {
         let response = if self.code == 0 && !self.timed_out && line.is_none() {
             crate::protocol::Response::success(id, data)
         } else {
-            let (code, message) = match line.as_deref() {
+            let (code, message) = match line {
                 Some(message) if self.timed_out => ("timeout", message),
                 Some(message) => ("permission_denied", message),
                 None if self.timed_out => ("timeout", "Command timed out."),
@@ -42,6 +45,8 @@ impl Output {
 mod unix;
 #[cfg(target_os = "linux")]
 pub(crate) use unix::prepare;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use unix::prepare_with_launcher;
 
 #[cfg(all(target_os = "linux", feature = "test-hooks"))]
 pub async fn run_for_test(

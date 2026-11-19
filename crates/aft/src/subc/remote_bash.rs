@@ -8,7 +8,12 @@ use tokio_util::sync::CancellationToken;
 
 pub(super) const BACKGROUND: &str = "Remote shells can't run in the background.";
 pub(super) const TIME_LIMIT: &str = "The command was stopped at the remote time limit.";
-const MAX_RUNTIME: Duration = Duration::from_secs(600);
+pub(super) const MAX_RUNTIME: Duration = Duration::from_secs(600);
+
+#[cfg(all(test, target_os = "linux"))]
+tokio::task_local! {
+    pub(super) static TEST_LAUNCHER: PathBuf;
+}
 
 pub(super) struct Shell {
     pub(super) command: String,
