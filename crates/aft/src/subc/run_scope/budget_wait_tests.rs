@@ -108,3 +108,49 @@ async fn cancelled_run_budget_wait_never_resumes_after_live_describe() {
         "lookup sent a duplicate terminal"
     );
 }
+
+#[test]
+fn idle_runs_release_records_but_confirmed_end_blocks_rebind() {
+    let (_dir, root) = test_support::test_root("idle-run-records");
+    let (writer, _) = mpsc::channel(1);
+    let runs = RunScopes::new(Arc::new(readiness::DaemonControl::new(
+        writer,
+        Arc::new(DispatchPathMetrics::new()),
+        PROTOCOL_VERSION,
+        vec![],
+        vec![],
+        Default::default(),
+        200,
+    )));
+    let route = |epoch| {
+        let mut route = test_support::route_identity(&root, "same-run");
+        let data = Arc::get_mut(&mut route.0).unwrap();
+        data.call_mode = subc_protocol::call_mode::CallMode::Codemode;
+        data.scope = Some(serde_json::from_value(json!({
+            "owner":{"kind":"reserved","module_id":"broca"}, "ref":"idle-run", "scope_epoch":epoch, "kind":"ephemeral",
+            "owner_authorized":true, "attributes":{"run_id":"same-run"}
+        })).unwrap());
+        route
+    };
+    for epoch in 1..=32 {
+        let identity = route(epoch);
+        let stamp = identity.scope.clone().unwrap();
+        let call = runs.bind(&identity).unwrap();
+        drop(identity);
+        assert_eq!(
+            runs.scopes.counts().0,
+            1,
+            "an in-flight call still owns its run"
+        );
+        drop(call);
+        assert_eq!(runs.scopes.counts().0, 0, "idle run state must be evicted");
+        runs.revoke(&stamp);
+        let rebound = route(epoch);
+        assert!(
+            runs.bind(&rebound).unwrap().revoked(),
+            "close then confirmed end must fence an old bind"
+        );
+        drop(rebound);
+        assert_eq!(runs.scopes.counts(), (0, epoch as usize));
+    }
+}
