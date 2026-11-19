@@ -1164,6 +1164,7 @@ pub struct VectorPlane {
     old: Option<OldIndex>,
     /// When a fill round merges the family's vector segments.
     merge: MergeLimits,
+    merge_due: Mutex<Option<(Generation, u64)>>,
 }
 
 fn elapsed_ms(started: Instant) -> f64 {
@@ -1183,6 +1184,7 @@ impl VectorPlane {
             members: Mutex::new(None),
             old: None,
             merge: MergeLimits::default(),
+            merge_due: Mutex::default(),
         }
     }
 
@@ -1504,6 +1506,9 @@ impl VectorPlane {
         let mut queue = queue.into_iter().peekable();
         let mut files_done = 0;
         let mut rounds_run = 0;
+        if rounds > 0 && queue.peek().is_none() {
+            self.maybe_merge(&mut loaded, None, &mut report)?;
+        }
         while queue.peek().is_some() {
             if rounds_run == rounds {
                 report.files_left += queue.count();
@@ -1764,31 +1769,7 @@ impl VectorPlane {
                 report.segments_published += 1;
                 report.files_filled += filled;
                 loaded = self.load()?;
-                // Each round adds a vector segment and nothing else folds
-                // them, so past `MERGE_AT` this round merges them: once at
-                // most, under the round's fill lock, or one taken now when
-                // no other fill holds it (that fill merges after its round).
-                if loaded.open.len() > self.merge.merge_at {
-                    let taken = match round_lock {
-                        Some(_) => None,
-                        None => FillLock::try_take(self.checkout.family_dir())?,
-                    };
-                    if round_lock.is_some() || taken.is_some() {
-                        match self.merge_segments() {
-                            Ok(Some(merged)) => {
-                                report.merges += 1;
-                                report.merged_segments += merged.merged;
-                                report.merge_ms += merged.ms;
-                                loaded = self.load()?;
-                            }
-                            Ok(None) => {}
-                            Err(error) => crate::slog_warn!(
-                                "data layer could not merge the vector segments of {}: {error}",
-                                parts.root.display()
-                            ),
-                        }
-                    }
-                }
+                self.maybe_merge(&mut loaded, round_lock.as_ref(), &mut report)?;
             }
             progress(FillProgress {
                 files_done,
@@ -1804,6 +1785,66 @@ impl VectorPlane {
             }
         }
         Ok(report)
+    }
+
+    fn maybe_merge(
+        &self,
+        loaded: &mut Arc<Loaded>,
+        round_lock: Option<&FillLock>,
+        report: &mut FillReport,
+    ) -> Result<(), DataError> {
+        if !self.merge_ready(loaded) {
+            return Ok(());
+        }
+        let taken = if round_lock.is_none() {
+            FillLock::try_take(self.checkout.family_dir())?
+        } else {
+            None
+        };
+        if round_lock.is_some() || taken.is_some() {
+            match self.merge_segments() {
+                Ok(Some(merged)) => {
+                    report.merges += 1;
+                    report.merged_segments += merged.merged;
+                    report.merge_ms += merged.ms;
+                    *loaded = self.load()?;
+                }
+                Ok(None) => {}
+                Err(error) => crate::slog_warn!(
+                    "data layer could not merge the vector segments of {}: {error}",
+                    self.checkout.root().display(),
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// Memoize when a second segment ages into eligibility. No timer is
+    /// scheduled: another fill or publication checks again, so an idle
+    /// checkout can keep some young segments unmerged.
+    fn merge_ready(&self, loaded: &Loaded) -> bool {
+        if loaded.open.len() <= self.merge.merge_at {
+            return false;
+        }
+        let mut memo = self.merge_due.lock().expect("no panics while holding it");
+        let due = match *memo {
+            Some((generation, due)) if generation == loaded.generation => due,
+            _ => {
+                let mut oldest = [u64::MAX; 2];
+                for segment in loaded.open.values().filter(|segment| vector_only(segment)) {
+                    let created = segment.created_unix_ms();
+                    if created < oldest[0] {
+                        oldest = [created, oldest[0]];
+                    } else if created < oldest[1] {
+                        oldest[1] = created;
+                    }
+                }
+                let due = oldest[1].saturating_add(self.merge.grace_ms());
+                *memo = Some((loaded.generation, due));
+                due
+            }
+        };
+        unix_ms() >= due
     }
 
     /// Publishes `builder` as one new segment, in a generation that
@@ -1881,6 +1922,20 @@ impl Default for MergeLimits {
     }
 }
 
+impl MergeLimits {
+    fn grace_ms(self) -> u64 {
+        u64::try_from(self.grace.as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+fn vector_only(segment: &Segment) -> bool {
+    segment.sections().all(|(_, section)| {
+        aft_store::vector::KNOWN
+            .iter()
+            .any(|known| known.kind == section.id.kind)
+    })
+}
+
 /// Merges vector segments of `model` into one new segment, when the
 /// newest generation holds more than `limits.merge_at` of them.
 ///
@@ -1910,6 +1965,8 @@ pub(crate) fn merge_vector_segments(
     bound: &[CheckoutState],
     limits: MergeLimits,
 ) -> Result<Option<MergeReport>, DataError> {
+    #[cfg(test)]
+    MERGE_WRITER_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
     let started = Instant::now();
     let mut session = writer(parts.family)?;
     // With the writer held, this is the generation the merge changes.
@@ -1941,6 +1998,19 @@ pub(crate) fn merge_vector_segments(
         ..MergeReport::default()
     };
     if ours.len() <= limits.merge_at {
+        return Ok(None);
+    }
+    let now = unix_ms();
+    let eligible = ours
+        .iter()
+        .copied()
+        .filter(|&place| {
+            let segment = &opened[place];
+            vector_only(segment)
+                && now.saturating_sub(segment.created_unix_ms()) >= limits.grace_ms()
+        })
+        .collect::<Vec<_>>();
+    if eligible.len() < 2 {
         return Ok(None);
     }
     let ours_at = |place: usize| vectors[place].as_ref().expect("a segment of the model");
@@ -2003,24 +2073,10 @@ pub(crate) fn merge_vector_segments(
     // The segments to merge: vector-only and old enough, fewest reached
     // vector bytes first, cut where the copied bytes would pass the budget.
     let per_vector = VectorSectionsBuilder::bytes_per_vector(model.dimensions as usize);
-    let now = unix_ms();
-    let grace = u64::try_from(limits.grace.as_millis()).unwrap_or(u64::MAX);
     let mut candidates = Vec::new();
-    for &place in &ours {
-        let segment = &opened[place];
-        let vector_only = aft_store::text::TextSegment::open(segment)
-            .map_err(store_error)?
-            .is_none()
-            && aft_store::content::ContentSegment::open(segment)
-                .map_err(store_error)?
-                .is_none()
-            && aft_store::graph::GraphSegment::open(segment)
-                .map_err(store_error)?
-                .is_none();
-        if vector_only && now.saturating_sub(segment.created_unix_ms()) >= grace {
-            let bytes = reached_texts.get(&place).map_or(0, HashSet::len) * per_vector;
-            candidates.push((bytes, place));
-        }
+    for place in eligible {
+        let bytes = reached_texts.get(&place).map_or(0, HashSet::len) * per_vector;
+        candidates.push((bytes, place));
     }
     candidates.sort_unstable();
     let mut taken = Vec::new();
@@ -2096,6 +2152,11 @@ pub(crate) fn merge_vector_segments(
     }
     report.ms = elapsed_ms(started);
     Ok(Some(report))
+}
+
+#[cfg(test)]
+thread_local! {
+    static MERGE_WRITER_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Which of `segments` (one generation's, in manifest order) hold vector
@@ -2253,6 +2314,7 @@ impl VectorPlane {
             members,
             old,
             merge: _,
+            merge_due: _,
         } = self;
         model.heap_bytes(seen)
             + loaded.heap_bytes(seen)
@@ -2874,9 +2936,11 @@ mod tests {
         // Two files a round, so the segment holding the first extra file's
         // vectors holds another file's too, and stays after the first one
         // changes.
+        MERGE_WRITER_ATTEMPTS.with(|attempts| attempts.set(0));
         let report = fill(&first_plane, &mut Recorder::default(), 2);
         assert!(report.segments_published > MERGE_AT, "{report:?}");
         assert_eq!(report.merges, 0, "every segment is younger than the grace");
+        assert_eq!(MERGE_WRITER_ATTEMPTS.with(std::cell::Cell::get), 0);
 
         // A second checkout: one function edited, a file added, and the
         // first extra file gone.
