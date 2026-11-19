@@ -426,7 +426,11 @@ async fn consent_expiry_lost_withdrawal_reply_refiles_and_honors_the_fresh_answe
     tokio::time::timeout(BUDGET, pause.entered.notified())
         .await
         .unwrap();
-    let new = f.asks().pop().expect("retry published a replacement");
+    let [new]: [asks::AskRecord; 1] = f
+        .asks()
+        .try_into()
+        .expect("only the replacement card remains");
+    assert_eq!(new.key, old.key);
     assert_ne!(new.call_key, old.call_key);
     assert_ne!(new.elicitation_id, old.elicitation_id);
     f.fake.answer(
@@ -439,5 +443,16 @@ async fn consent_expiry_lost_withdrawal_reply_refiles_and_honors_the_fresh_answe
         .unwrap()
         .unwrap();
     assert!(text(&serde_json::from_slice(&reply.body).unwrap()).contains("head-owned contents"));
-    assert!(f.asks().is_empty());
+    assert_eq!(
+        f.fake
+            .calls("consent.request")
+            .iter()
+            .map(|request| request["call_key"].clone())
+            .collect::<Vec<_>>(),
+        [
+            json!(old.call_key),
+            json!(old.call_key),
+            json!(new.call_key)
+        ]
+    );
 }
