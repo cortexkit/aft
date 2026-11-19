@@ -1383,10 +1383,18 @@ struct RoundFile {
     chunks: Result<Vec<(TextDigest, CutChunk)>, String>,
 }
 
+fn check_cancelled() -> Result<(), DataError> {
+    if crate::executor::current_job_cancelled() {
+        return Err(DataError::Cancelled);
+    }
+    Ok(())
+}
+
 /// Waits up to [`WRITER_WAIT`] for the family's writer.
 fn writer(family: &Family) -> Result<WriteSession<'_>, DataError> {
     let deadline = Instant::now() + WRITER_WAIT;
     loop {
+        check_cancelled()?;
         if let Some(session) = family.try_write().map_err(store_error)? {
             return Ok(session);
         }
@@ -1445,6 +1453,7 @@ impl VectorPlane {
         rounds: usize,
         progress: &mut dyn FnMut(FillProgress),
     ) -> Result<FillReport, DataError> {
+        check_cancelled()?;
         let mut report = FillReport::default();
         let Some(view) = self.checkout.view() else {
             return Ok(report);
@@ -1519,6 +1528,7 @@ impl VectorPlane {
                 while round.len() < budget.files_per_round.max(1)
                     && (wanted.len() + imported.len()).saturating_mul(per_vector) < ROUND_BYTES
                 {
+                    check_cancelled()?;
                     let Some((path, content)) = queue.next() else {
                         break;
                     };
@@ -1651,6 +1661,7 @@ impl VectorPlane {
             let mut refused: HashMap<TextDigest, String> = HashMap::new();
             let started = Instant::now();
             for batch in wanted.chunks(budget.max_batch.max(1)) {
+                check_cancelled()?;
                 report.embed_calls += 1;
                 let texts = batch.iter().map(|(_, text)| text.clone()).collect();
                 let rows = match execute_build_embedding_batch(texts, &mut embed_rows) {
@@ -1802,6 +1813,7 @@ impl VectorPlane {
         let mut pending = session.create_segment().map_err(store_error)?;
         builder.write(pending.writer()).map_err(store_error)?;
         let id = session.finish_segment(pending).map_err(store_error)?;
+        check_cancelled()?;
         session
             .publish(&Publication {
                 add_segments: vec![id],
@@ -2065,6 +2077,7 @@ pub(crate) fn merge_vector_segments(
     let mut pending = session.create_segment().map_err(store_error)?;
     builder.write(pending.writer()).map_err(store_error)?;
     let id = session.finish_segment(pending).map_err(store_error)?;
+    check_cancelled()?;
     session
         .publish(&Publication {
             add_segments: vec![id],
@@ -2304,6 +2317,38 @@ mod tests {
                 &mut |_| {},
             )
             .unwrap()
+    }
+
+    #[test]
+    fn cancelled_fill_neither_dispatches_another_batch_nor_publishes() {
+        let store = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        project(dir.path());
+        let checkout = bind(store.path(), dir.path());
+        let family = checkout.vector_parts().family;
+        let initial = family.newest_generation().unwrap();
+        let plane = VectorPlane::new(Arc::clone(&checkout), producer(), 100);
+        for max_batch in [1, usize::MAX] {
+            let token = crate::executor::JobCancellation::new();
+            let _context = crate::executor::install_job_cancellation(token.clone());
+            let mut calls = 0;
+            let result = plane.fill_rounds(
+                &mut |texts| {
+                    calls += 1;
+                    token.request_cancel();
+                    Ok(texts.iter().map(|text| vector_of(text)).collect())
+                },
+                FillBudget {
+                    max_batch,
+                    files_per_round: 100,
+                },
+                1,
+                &mut |_| {},
+            );
+            assert!(matches!(result, Err(DataError::Cancelled)));
+            assert_eq!(calls, 1);
+            assert_eq!(family.newest_generation().unwrap(), initial);
+        }
     }
 
     /// A small project in four languages, with exported and private
