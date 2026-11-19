@@ -824,6 +824,8 @@ The setting is honored only in user config; a project config can't select a prov
 
 When an agent's tool reaches a folder outside what its session may use, AFT asks you through a folder-access card in the CortexKit apps. An answer you save there is kept for that agent or worker until its session ends. Under the daemon, the apps' Permissions pages list these saved answers (one row per folder per agent or worker) and can revoke them. A revoke takes effect at once: the next tool call asks again, and shell commands still running with that folder in their sandbox are stopped and end as `killed (folder access revoked)`. Commands running on a build server (`runon`) work on a copy of the checkout outside this machine's sandbox and are not stopped. Grants saved before AFT recorded grant times show the time of the upgrade instead.
 
+Head agents can use AFT's read-only tools in the main checkout and linked worktrees of their own Git repository without a folder-access card. Protected paths and `restrict_to_project_root: true` still take precedence; writes, shell commands, and other session roles are unchanged.
+
 ## Native command sandbox
 
 `sandbox.profile` selects a shell profile by authenticated session role. Put user choices in `~/.config/cortexkit/aft.jsonc` (or the absolute XDG config location):

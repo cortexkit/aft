@@ -35,6 +35,11 @@ pub(super) fn with_tool_call_policy<T, R>(
     let _ask_route = crate::access_policy::ask_route_guard(Some(ask_route));
     let _grants =
         crate::access_policy::scope_grants_guard(access_grants::scope_grants_denial(identity));
+    let _linked = crate::access_policy::linked_worktree::head_scope_guard(
+        matches!(trust, BindTrust::FirstParty)
+            && crate::access_policy::scope_grants_denial().is_none()
+            && is_head(identity),
+    );
     crate::access_policy::with_scope(Some(access_grants::policy_scope_key(identity)), || {
         let run = || {
             finish(remote_policy::with_call_policy(
@@ -47,4 +52,20 @@ pub(super) fn with_tool_call_policy<T, R>(
             run()
         }
     })
+}
+
+fn is_head(identity: &RouteIdentity) -> bool {
+    use subc_protocol::scope::ScopeKind;
+    let session = match &identity.run_owner {
+        Some(owner) if owner.is_worker_run() => return false,
+        Some(owner) => &owner.owner_route,
+        None => identity,
+    };
+    matches!(session.trust, BindTrust::FirstParty)
+        && !carrier_read_only::restricted(session)
+        && session
+            .scope
+            .as_ref()
+            .is_some_and(|stamp| stamp.kind == ScopeKind::Head)
+        && access_grants::scope_grants_denial(session).is_none()
 }

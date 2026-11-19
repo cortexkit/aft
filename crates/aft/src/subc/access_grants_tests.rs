@@ -420,6 +420,184 @@ fn basal_session_run(parent: &RouteIdentity, worker: bool) -> RouteIdentity {
 }
 
 #[test]
+fn linked_worktree_reads_follow_only_the_authenticated_heads_repository() {
+    use crate::access_policy::ApprovalMode;
+    use std::{fs, process::Command};
+
+    let _storage = crate::test_env::without_storage_override();
+    let dir = tempfile::tempdir().unwrap();
+    let base = policy_path(dir.path());
+    let main = base.join("main");
+    let linked = base.join("linked");
+    let other = linked.join("other-repo");
+    let malformed = linked.join("malformed");
+    let impostor = base.join("impostor");
+    for folder in [&main, &impostor] {
+        fs::create_dir(folder).unwrap();
+    }
+    let git = |dir: &Path, args: &[&str]| {
+        let output = Command::new("git")
+            .args([
+                "-c",
+                "user.name=AFT test",
+                "-c",
+                "user.email=test@example.invalid",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", base.join("no-global-config"))
+            .env("GIT_CONFIG_COUNT", "0")
+            .output()
+            .expect("git runs");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    };
+    git(&main, &["init", "-q"]);
+    fs::write(main.join("file.txt"), "inside both checkouts").unwrap();
+    git(&main, &["add", "file.txt"]);
+    git(&main, &["commit", "-qm", "fixture"]);
+    git(&main, &["worktree", "add", "-q", "--detach", "../linked"]);
+    for folder in [&other, &malformed] {
+        fs::create_dir(folder).unwrap();
+    }
+    git(&other, &["init", "-q"]);
+    fs::write(malformed.join(".git"), "not a gitdir pointer\n").unwrap();
+    fs::write(impostor.join(".git"), "gitdir: ../main/.git\n").unwrap();
+    for folder in [&other, &malformed, &impostor] {
+        fs::write(folder.join("file.txt"), "outside").unwrap();
+    }
+
+    let ctx = context(&main, &base.join("store"));
+    let head = identity(&main, "head", "head", None);
+    let reverse = identity(&linked, "reverse", "head", None);
+    let worker = identity(&main, "worker", "worker", Some("head"));
+    for route in [&head, &reverse, &worker] {
+        register(route, &ctx).unwrap();
+    }
+    let db = ctx.db().unwrap();
+    for route in [&head, &reverse] {
+        store::set_mode(&db.lock().unwrap(), &scope_key(route), ApprovalMode::Ask).unwrap();
+    }
+    let protected = linked.join("protected.txt");
+    let connection = linked.join("connection.json");
+    for path in [&protected, &connection] {
+        fs::write(path, "not readable").unwrap();
+    }
+    ctx.update_config(|config| {
+        config.restrict_to_project_root = false;
+        config.sandbox.read_deny = vec![protected.clone()];
+        config.semantic.subc_connection_file = Some(connection.clone());
+    });
+
+    let check = |route: &RouteIdentity, trust, path: &Path, operation, expected: Option<&str>| {
+        let req = "linked-worktree-read";
+        let read = operation == AccessOperation::Read;
+        #[cfg(unix)]
+        let asks = crate::context::confinement::ask_calls();
+        let result = call_policy::with_tool_call_policy(
+            &ctx,
+            route,
+            req,
+            ask_route(route),
+            trust,
+            if read { "read" } else { "write" },
+            json!({}),
+            |_| {
+                if read {
+                    ctx.validate_read_path(req, &route.session, path)
+                } else {
+                    ctx.validate_path(req, path)
+                }
+            },
+            |outer| outer.and_then(|inner| inner),
+        );
+        match (result, expected) {
+            (Ok(_), None) => {
+                #[cfg(unix)]
+                assert_eq!(asks, crate::context::confinement::ask_calls());
+            }
+            (Err(error), Some(code)) => {
+                assert_eq!(
+                    error.data["code"],
+                    code,
+                    "{}: {}: {error:?}",
+                    route.session,
+                    path.display()
+                );
+            }
+            (result, _) => panic!(
+                "{}: {}: expected {expected:?}, got {result:?}",
+                route.session,
+                path.display()
+            ),
+        }
+    };
+    let read = |route: &RouteIdentity, path: &Path, expected| {
+        check(
+            route,
+            BindTrust::FirstParty,
+            path,
+            AccessOperation::Read,
+            expected,
+        )
+    };
+    let ask = Some(crate::access_policy::ACCESS_ASK_REQUIRED);
+    let linked_file = linked.join("file.txt");
+    read(&head, &linked_file, None);
+    read(&basal_session_run(&head, false), &linked_file, None);
+    read(&worker, &linked_file, ask);
+    read(
+        &basal_session_run(&worker, true),
+        &linked_file,
+        Some(crate::access_policy::PERMISSION_ASK_UNAVAILABLE),
+    );
+    let mut flow = copied_identity(&head);
+    flow.scope.as_mut().unwrap().attributes.flow_id = Some("flow".into());
+    read(&RouteIdentity(Arc::new(flow)), &linked_file, ask);
+    check(
+        &head,
+        BindTrust::Untrusted,
+        &linked_file,
+        AccessOperation::Read,
+        Some("path_outside_root"),
+    );
+    check(
+        &head,
+        BindTrust::FirstParty,
+        &linked_file,
+        AccessOperation::Write,
+        ask,
+    );
+    for path in [&protected, &connection] {
+        read(&head, path, Some("denied_floor"));
+    }
+    for folder in [&other, &malformed, &impostor] {
+        read(&head, &folder.join("file.txt"), ask);
+    }
+    // Even a valid worktree's registration does not cover a copy of its pointer.
+    fs::copy(linked.join(".git"), impostor.join(".git")).unwrap();
+    read(&head, &impostor.join("file.txt"), ask);
+    #[cfg(unix)]
+    {
+        let link = linked.join("escape.txt");
+        std::os::unix::fs::symlink(impostor.join("file.txt"), &link).unwrap();
+        read(&head, &link, ask);
+    }
+    ctx.update_config(|config| config.restrict_to_project_root = true);
+    read(&head, &linked_file, Some("path_outside_root"));
+    ctx.update_config(|config| {
+        config.project_root = Some(linked.clone());
+        config.restrict_to_project_root = false;
+    });
+    read(&reverse, &main.join("file.txt"), None);
+
+    let conn = db.lock().unwrap();
+    for route in [&head, &reverse] {
+        assert!(store::list(&conn, &scope_key(route)).unwrap().is_empty());
+    }
+}
+
+#[test]
 fn saved_scope_grants_basal_codemode_keeps_grants_but_flow_id_loses_them() {
     let (dir, ctx, head, worker) = fixture();
     let outside = dir.path().join("outside.txt");
