@@ -554,12 +554,11 @@ fn build_tools(preset: CatalogPreset) -> Vec<ServedVariants> {
     served
         .into_iter()
         .map(|(name, schema, description)| {
-            let semantics =
-                if name == "bash" || (preset == CatalogPreset::Worker && name == "bash_watch") {
-                    2
-                } else {
-                    1
-                };
+            let semantics = match name.as_str() {
+                "bash" => super::tool_views::BASH_SEMANTICS,
+                "bash_watch" if preset == CatalogPreset::Worker => 2,
+                _ => 1,
+            };
             let entry = |schema: Value, description: Option<String>| {
                 let mut entry = catalog_entry(&name, semantics, schema, description);
                 // A head's waiting `bash` call can be handed back with
@@ -5077,7 +5076,7 @@ mod tests {
             assert_eq!(inventory.len(), if available { 24 } else { 23 });
             for tool in &inventory {
                 assert!(expected.contains(tool.name.as_str()));
-                assert_eq!(tool.semantics, if tool.name == "bash" { 2 } else { 1 });
+                assert_eq!(tool.semantics, if tool.name == "bash" { 3 } else { 1 });
                 assert_eq!(tool.capabilities.is_empty(), tool.name == "status");
                 assert_eq!(
                     tool.result_ops,
@@ -5149,7 +5148,7 @@ mod tests {
         let mut request = call("bash", json!({"command":"echo"}));
         request.preset = Some("head".into());
         request.schema_pin = Some(
-            SchemaPin::new("bash", &tool.schema_digest, 1)
+            SchemaPin::new("bash", &tool.schema_digest, 2)
                 .encode()
                 .unwrap(),
         );
@@ -5157,10 +5156,10 @@ mod tests {
         assert_eq!(refusal.code, "tool_semantics_changed");
         assert_eq!(
             refusal.detail.unwrap(),
-            json!({"tool":"bash","expected":1,"current":2})
+            json!({"tool":"bash","expected":2,"current":3})
         );
         request.schema_pin = Some(
-            SchemaPin::new("bash", &tool.schema_digest, 2)
+            SchemaPin::new("bash", &tool.schema_digest, 3)
                 .encode()
                 .unwrap(),
         );
@@ -5178,6 +5177,7 @@ mod tests {
     #[test]
     fn worker_shell_calls_with_old_semantics_pins_are_refused() {
         for name in ["bash", "bash_watch"] {
+            let (old, current) = if name == "bash" { (2, 3) } else { (1, 2) };
             let tool = tools_for_session(CatalogPreset::Worker, &[], true, false, false)
                 .into_iter()
                 .find(|tool| tool.name == name)
@@ -5190,7 +5190,7 @@ mod tests {
             let mut request = call(name, arguments);
             request.preset = Some("worker".into());
             request.schema_pin = Some(
-                SchemaPin::new(name, &tool.schema_digest, 1)
+                SchemaPin::new(name, &tool.schema_digest, old)
                     .encode()
                     .unwrap(),
             );
@@ -5198,10 +5198,10 @@ mod tests {
             assert_eq!(refusal.code, "tool_semantics_changed");
             assert_eq!(
                 refusal.detail.unwrap(),
-                json!({"tool":name,"expected":1,"current":2})
+                json!({"tool":name,"expected":old,"current":current})
             );
             request.schema_pin = Some(
-                SchemaPin::new(name, &tool.schema_digest, 2)
+                SchemaPin::new(name, &tool.schema_digest, current)
                     .encode()
                     .unwrap(),
             );
@@ -7242,15 +7242,15 @@ mod tests {
             .find(|tool| tool.name == "bash")
             .unwrap();
         for (digest, semantics, expected) in [
-            (schema.schema_digest.as_str(), 2, None),
+            (schema.schema_digest.as_str(), 3, None),
             (
                 "0000000000000000000000000000000000000000000000000000000000000000",
-                2,
+                3,
                 Some("tool_schema_changed"),
             ),
             (
                 schema.schema_digest.as_str(),
-                1,
+                2,
                 Some("tool_semantics_changed"),
             ),
         ] {

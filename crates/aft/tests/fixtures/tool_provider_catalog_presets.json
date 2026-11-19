@@ -10,8 +10,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "a91a426d38746f509bc621c2ab504f0ea480be13f87ee42b52f002f09205b09e",
-      "catalog_digest": "a91a426d38746f509bc621c2ab504f0ea480be13f87ee42b52f002f09205b09e",
+      "generation": "1a1f91d9ef9329a9483514e44440e6e4cb9b4a1abb61850ff545943559505a18",
+      "catalog_digest": "1a1f91d9ef9329a9483514e44440e6e4cb9b4a1abb61850ff545943559505a18",
       "tools": [
         {
           "name": "status",
@@ -33,7 +33,7 @@
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"
@@ -1288,8 +1288,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "54abe96577ce8c0d5ccf626d25aad4839fefab7b9d22d8851ef91ebc33e08d0d",
-      "catalog_digest": "54abe96577ce8c0d5ccf626d25aad4839fefab7b9d22d8851ef91ebc33e08d0d",
+      "generation": "cbfdfca755c28bf6dcc408e28007094df90a819c311dca32845dc304cc67f42f",
+      "catalog_digest": "cbfdfca755c28bf6dcc408e28007094df90a819c311dca32845dc304cc67f42f",
       "tools": [
         {
           "name": "status",
@@ -1311,7 +1311,7 @@
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"
@@ -3562,8 +3562,8 @@
     "powershell_available": false,
     "remote_runs": true,
     "reply": {
-      "generation": "15c017b29b8bdb0f77ebda55a775d5a345f30f452a3bfdf7556125006874fce8",
-      "catalog_digest": "15c017b29b8bdb0f77ebda55a775d5a345f30f452a3bfdf7556125006874fce8",
+      "generation": "adaf1a2f05f47e2af785618ba9a30340f7ba89479bf83160cd7cad774f1da1d4",
+      "catalog_digest": "adaf1a2f05f47e2af785618ba9a30340f7ba89479bf83160cd7cad774f1da1d4",
       "tools": [
         {
           "name": "status",
@@ -3585,7 +3585,7 @@
         {
           "name": "bash",
           "schema_digest": "019128a28f9f2724d2c086f93a1c74222b294ad95fee8b255fa799b257397a4f",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"
@@ -4853,8 +4853,8 @@
     "powershell_available": true,
     "remote_runs": true,
     "reply": {
-      "generation": "70986d8c7bab9d7ddcdcfbf84813a14195ffdb56034302e7f45886113da83e8c",
-      "catalog_digest": "70986d8c7bab9d7ddcdcfbf84813a14195ffdb56034302e7f45886113da83e8c",
+      "generation": "486a1f6fd39dd7439a3c13af4a17df40bcfe206cc615efde4effa37a71a03588",
+      "catalog_digest": "486a1f6fd39dd7439a3c13af4a17df40bcfe206cc615efde4effa37a71a03588",
       "tools": [
         {
           "name": "status",
@@ -4876,7 +4876,7 @@
         {
           "name": "bash",
           "schema_digest": "019128a28f9f2724d2c086f93a1c74222b294ad95fee8b255fa799b257397a4f",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"
@@ -6218,8 +6218,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "5fe0c8895ecaf0a6469b94732f2db6cda45f3106210775a5207a15f71cf266d9",
-      "catalog_digest": "5fe0c8895ecaf0a6469b94732f2db6cda45f3106210775a5207a15f71cf266d9",
+      "generation": "1f4117191dce93e591a3f464ba18b852cd040b6fa014c483f04ec133f69ed5b9",
+      "catalog_digest": "1f4117191dce93e591a3f464ba18b852cd040b6fa014c483f04ec133f69ed5b9",
       "tools": [
         {
           "name": "status",
@@ -6241,7 +6241,7 @@
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"
@@ -7430,8 +7430,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "7ddde2e17017d03560285880c724f1a067698382ec4507674ecbced6b62f1213",
-      "catalog_digest": "7ddde2e17017d03560285880c724f1a067698382ec4507674ecbced6b62f1213",
+      "generation": "a91ae13cba6cc7c57c313a4b0ee9b7b739e2b1edc0d9a4c499e140a07d1a756b",
+      "catalog_digest": "a91ae13cba6cc7c57c313a4b0ee9b7b739e2b1edc0d9a4c499e140a07d1a756b",
       "tools": [
         {
           "name": "status",
@@ -7453,7 +7453,7 @@
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"
@@ -8723,13 +8723,13 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "5cc075df495707259abe0bc542b47f340e3d1fb53bc1a223fd01bde2844ce236",
-      "catalog_digest": "5cc075df495707259abe0bc542b47f340e3d1fb53bc1a223fd01bde2844ce236",
+      "generation": "7b55ca9f7252399ab1ffe6d7da9529939af5c936e22f904edd531d35a723f237",
+      "catalog_digest": "7b55ca9f7252399ab1ffe6d7da9529939af5c936e22f904edd531d35a723f237",
       "tools": [
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"
@@ -9859,13 +9859,13 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "a47a88a9232f0a0452f502095bc8fd7d9703d105e932b7c0cc40e592872f95fc",
-      "catalog_digest": "a47a88a9232f0a0452f502095bc8fd7d9703d105e932b7c0cc40e592872f95fc",
+      "generation": "f2b3dd280a517810d1429863899eeb7ec4f5ae2ded764c1458c9587766f677b5",
+      "catalog_digest": "f2b3dd280a517810d1429863899eeb7ec4f5ae2ded764c1458c9587766f677b5",
       "tools": [
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"
@@ -11087,13 +11087,13 @@
       "hashline": true
     },
     "reply": {
-      "generation": "f2c857219f222c7f358036bc1337a0d84272a108334f5ce929b9bf546a61fd14",
-      "catalog_digest": "f2c857219f222c7f358036bc1337a0d84272a108334f5ce929b9bf546a61fd14",
+      "generation": "91a936147272e86f6186e11aac74d955b5b939cf4659daaa4e4ccf0ef3fd6af4",
+      "catalog_digest": "91a936147272e86f6186e11aac74d955b5b939cf4659daaa4e4ccf0ef3fd6af4",
       "tools": [
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"

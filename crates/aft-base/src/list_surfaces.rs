@@ -463,6 +463,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "An ambiguous batch edit is a refusal, not a result list: its structured occurrence rows stop at the same eight the error message lists, and the message states the exact match count and how many more were not listed.",
     },
     ExclusionEntry {
+        file: "subc/rich_ui/display/bash_tail.rs",
+        enclosing_item: "from_streams",
+        location_or_primitive: "MAX_LINES, MAX_CHARS, .take(MAX_LINES)",
+        reason: "The optional tool-display completion preview uses the shared text_lines limits; the command output and its list envelope are unchanged.",
+    },
+    ExclusionEntry {
         file: "context/checkout_suggestion.rs",
         enclosing_item: "unique_indexed_checkout_suffix",
         location_or_primitive: "MAX_PATHS, MAX_COMPONENTS",

@@ -273,7 +273,7 @@ markup5ever_rcdom = "0.38"
 cortexkit-persona = "=0.3.0"
 cortexkit-role-tool-provider = "=0.15.12"
 cortexkit-role-llm-runner = "=0.8.53"
-cortexkit-role-tool-display = "=0.1.9"
+cortexkit-role-tool-display = "=0.1.12"
 cortexkit-role-agent-data = "=0.3.3"
 cortexkit-role-user-commands = "=0.1.4"
 cortexkit-project-identity = "=0.1.5"
@@ -295,6 +295,7 @@ subc-config = "=0.1.1"
 subc-os = { version = "=0.1.42", features = ["tokio"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 vt100 = "0.16"
+vte = "0.15"
 jsonc-parser = { version = "0.33", features = ["cst"] }
 
 [target.'cfg(unix)'.dependencies]

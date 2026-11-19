@@ -366,6 +366,7 @@ dependencies = [
  "unicode-normalization",
  "url",
  "vt100",
+ "vte",
  "wasmtime",
  "wasmtime-c-api-impl",
  "which",
@@ -1350,9 +1351,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-display"
-version = "0.1.9"
+version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f85b7e6c09e45bff8fe81d698a75c477d960fe0bb1cea36b55aba8adc78d25e0"
+checksum = "6100169f0f49cb0f8e0c7346530550a17383c636d2d44c19f1ae68dfa8ca5819"
 dependencies = [
  "serde",
  "serde_jcs",

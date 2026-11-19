@@ -1,6 +1,6 @@
 {
-  "generation": "42b9517ae66d286a8307266b16140e59a8055b4673cd2647914386bebef7e279",
-  "catalog_digest": "42b9517ae66d286a8307266b16140e59a8055b4673cd2647914386bebef7e279",
+  "generation": "3cae7cf86828aa476300d122e91f6c74a8523ce783fe971b2e05a490ec827d18",
+  "catalog_digest": "3cae7cf86828aa476300d122e91f6c74a8523ce783fe971b2e05a490ec827d18",
   "tools": [
     {
       "name": "status",
@@ -22,7 +22,7 @@
     {
       "name": "bash",
       "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-      "semantics": 2,
+      "semantics": 3,
       "modes": [
         "classic",
         "codemode"

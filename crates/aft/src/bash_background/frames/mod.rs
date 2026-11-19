@@ -21,13 +21,20 @@ pub(crate) struct TaskDisplay {
     pub attempted: bool,
 }
 
-/// Build only scalar facts from execution metadata. Unknown fate never implies
+#[derive(Clone)]
+pub(crate) struct BashBodies {
+    pub facts: Value,
+    pub detail: Value,
+    pub tail: Option<Value>,
+}
+
+/// Build scalar facts from execution metadata. Unknown fate never implies
 /// an exit code; a kill AFT performed is distinguished from an ordinary exit.
 pub(crate) fn bash_bodies(
     metadata: &crate::bash_background::persistence::PersistedTask,
     output_bytes: Option<u64>,
     streams: Option<(String, String)>,
-) -> (Value, Value) {
+) -> BashBodies {
     use crate::protocol::BgTaskStatus;
     let remote = metadata
         .remote
@@ -93,8 +100,17 @@ pub(crate) fn bash_bodies(
     } else {
         detail["outputUnavailable"] = json!("not_retained");
     }
-    (record, detail)
+    BashBodies {
+        facts: record,
+        detail,
+        tail: None,
+    }
 }
+
+use super::persistence::PersistedTask;
+
+type Redact<'a> = dyn Fn(&str) -> Option<String> + 'a;
+type BashTail = fn(&PersistedTask, &str, &str, &Redact<'_>) -> Option<Value>;
 
 pub(crate) type RecoveredFrame = (
     crate::db::call_ledger::RecordedFrame,
@@ -105,8 +121,9 @@ pub(crate) type RecoveredFrame = (
 pub(crate) struct Hooks {
     pub enabled: fn() -> bool,
     pub current_task: fn() -> Option<TaskDisplay>,
-    pub bash_reply: fn(&mut TaskDisplay, (Value, Value), bool),
-    pub bash_terminal: fn(&TaskDisplay, (Value, Value), &str, Option<u64>),
+    pub bash_reply: fn(&mut TaskDisplay, BashBodies, bool),
+    pub bash_terminal: fn(&TaskDisplay, BashBodies, &str, Option<u64>),
+    pub bash_tail: BashTail,
     pub recovered_bash_frame: fn(
         super::registry::BgTaskSnapshot,
         &crate::db::call_ledger::Key,
@@ -130,20 +147,30 @@ pub(crate) fn enabled() -> bool {
 pub(crate) fn current_task() -> Option<TaskDisplay> {
     HOOKS.get().and_then(|hooks| (hooks.current_task)())
 }
-pub(crate) fn bash_reply(display: &mut TaskDisplay, body: (Value, Value), deferred: bool) {
+pub(crate) fn bash_reply(display: &mut TaskDisplay, body: BashBodies, deferred: bool) {
     if let Some(hooks) = HOOKS.get() {
         (hooks.bash_reply)(display, body, deferred);
     }
 }
 pub(crate) fn bash_terminal(
     display: &TaskDisplay,
-    body: (Value, Value),
+    body: BashBodies,
     task_id: &str,
     duration_ms: Option<u64>,
 ) {
     if let Some(hooks) = HOOKS.get() {
         (hooks.bash_terminal)(display, body, task_id, duration_ms);
     }
+}
+pub(crate) fn bash_tail(
+    metadata: &PersistedTask,
+    stdout: &str,
+    stderr: &str,
+    redact: &Redact<'_>,
+) -> Option<Value> {
+    HOOKS
+        .get()
+        .and_then(|hooks| (hooks.bash_tail)(metadata, stdout, stderr, redact))
 }
 pub(crate) fn recovered_bash_frame(
     snapshot: super::registry::BgTaskSnapshot,

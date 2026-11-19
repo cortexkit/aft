@@ -20,7 +20,7 @@ use super::subc_detach_test::{
 };
 
 const BASH_PIN: &str =
-    "tp1:bash:019128a28f9f2724d2c086f93a1c74222b294ad95fee8b255fa799b257397a4f:2";
+    "tp1:bash:019128a28f9f2724d2c086f93a1c74222b294ad95fee8b255fa799b257397a4f:3";
 
 async fn respond(stream: &mut TcpStream, request: &Frame, value: Value) {
     send_frame(
@@ -348,6 +348,18 @@ async fn run_display_case(switch: Option<&str>) {
                 }
             );
             assert_eq!(write.schema_pin, BASH_PIN);
+            assert!(write.body.get("tail").is_none());
+            let completion = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let write = writes.recv().await.expect("fake display alive");
+                    if write.kind == DisplayKind::Completion && write.call_key == call_key {
+                        break write;
+                    }
+                }
+            })
+            .await
+            .expect("bash reply never reached the display as a completion");
+            assert_eq!(completion.body["tail"], json!([{"text":"display-ok"}]));
         }
     }
     let report = request(

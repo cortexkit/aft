@@ -13,9 +13,11 @@ use cortexkit_role_tool_display::{
     schema::{validate_completion, validate_record},
     DisplayKind,
 };
+use crate::bash_background::frames::BashBodies;
 use serde_json::{json, Value};
 use subc_protocol::Principal;
 
+pub(crate) mod bash_tail;
 pub(super) mod counters;
 mod diagnostics;
 mod edit_hunks;
@@ -51,8 +53,8 @@ pub(crate) struct Capture {
     files: Vec<FileChange>,
     file_snapshot: Option<(Value, Option<Value>)>,
     masker: Option<crate::log_redact::SecretValues>,
-    bash: Option<(Value, Value)>,
-    terminal_bash: Option<(Value, Value)>,
+    bash: Option<BashBodies>,
+    terminal_bash: Option<BashBodies>,
     deferred: bool,
     terminal: bool,
     // A bash task can exit before its launch reply is sent. The cached exit
@@ -582,7 +584,7 @@ pub(crate) fn reply(
                 capture
                     .bash
                     .as_ref()
-                    .map(|(body, _)| body.clone())
+                    .map(|bodies| bodies.facts.clone())
                     .unwrap_or_else(|| json!({}))
             } else {
                 json!({})
@@ -623,23 +625,21 @@ pub(crate) fn reply(
     }
     end_person_wait(&mut capture);
     let completion = capture.record_sent;
+    let mut tail = None;
     let (mut body, detail) = if capture.tool == "bash" {
         capture
             .bash
             .as_ref()
             .or(capture.terminal_bash.as_ref())
             .cloned()
-            .map(|(body, detail)| {
-                (
-                    body,
-                    Some(
-                        capture
-                            .terminal_bash
-                            .as_ref()
-                            .map(|(_, terminal)| terminal.clone())
-                            .unwrap_or(detail),
-                    ),
-                )
+            .map(|bodies| {
+                let (detail, output_tail) = capture
+                    .terminal_bash
+                    .as_ref()
+                    .map(|terminal| (terminal.detail.clone(), terminal.tail.clone()))
+                    .unwrap_or((bodies.detail, bodies.tail));
+                tail = output_tail;
+                (bodies.facts, Some(detail))
             })
             .unwrap_or_else(|| {
                 (
@@ -698,6 +698,18 @@ pub(crate) fn reply(
             "failed"
         });
     }
+    let mut foreground_completion = None;
+    if !capture.deferred {
+        if let Some(tail) = tail {
+            if completion {
+                body["tail"] = tail;
+            } else {
+                let mut body = body.clone();
+                body["tail"] = tail;
+                foreground_completion = Some(body);
+            }
+        }
+    }
     emit(
         &capture,
         if completion {
@@ -717,6 +729,9 @@ pub(crate) fn reply(
                 detail.as_object_mut().unwrap().remove("taskId");
             }
             emit(&capture, DisplayKind::Detail, detail);
+        }
+        if let Some(body) = foreground_completion {
+            emit(&capture, DisplayKind::Completion, body);
         }
         capture.finished = true;
         drop(capture);
@@ -978,7 +993,24 @@ pub(crate) fn current_task() -> Option<TaskDisplay> {
 #[cfg(test)]
 pub(crate) use crate::bash_background::frames::bash_bodies;
 
-pub(crate) fn bash_reply(display: &mut TaskDisplay, body: (Value, Value), deferred: bool) {
+pub(in crate::subc) fn bash_tail(
+    metadata: &crate::bash_background::persistence::PersistedTask,
+    stdout: &str,
+    stderr: &str,
+    remask: &dyn Fn(&str) -> Option<String>,
+) -> Option<Value> {
+    if metadata.is_terminal()
+        && metadata.display.as_ref().is_some_and(|display| {
+            crate::subc::tool_views::has_bash_tail(&display.identity.schema_pin)
+        })
+    {
+        bash_tail::from_streams(metadata, stdout, stderr, remask)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn bash_reply(display: &mut TaskDisplay, body: BashBodies, deferred: bool) {
     let capture = CALLS
         .lock()
         .ok()
@@ -1009,7 +1041,12 @@ fn emit_bash_completion(capture: &mut Capture) {
     if capture.finished || !capture.completion_claimed {
         return;
     }
-    let Some((mut record, mut detail)) = capture.terminal_bash.clone() else {
+    let Some(BashBodies {
+        facts: mut record,
+        mut detail,
+        tail,
+    }) = capture.terminal_bash.clone()
+    else {
         return;
     };
     record["taskId"] = detail.get("taskId").cloned().unwrap_or(Value::Null);
@@ -1018,6 +1055,9 @@ fn emit_bash_completion(capture: &mut Capture) {
     if let Some(held_ms) = capture.held_ms {
         record["heldMs"] = json!(held_ms);
     }
+    if let Some(tail) = tail {
+        record["tail"] = tail;
+    }
     emit(capture, DisplayKind::Detail, detail);
     emit(capture, DisplayKind::Completion, record);
     capture.finished = true;
@@ -1025,13 +1065,13 @@ fn emit_bash_completion(capture: &mut Capture) {
 
 pub(crate) fn bash_terminal(
     display: &TaskDisplay,
-    mut bodies: (Value, Value),
+    mut bodies: BashBodies,
     task_id: &str,
     duration_ms: Option<u64>,
 ) {
     // Losing track of deferred work is not proof that it ended. The initial
     // record stays, but neither a completion nor a terminal detail is written.
-    if bodies.0["reason"] == "fate_unknown" {
+    if bodies.facts["reason"] == "fate_unknown" {
         if let Some(capture) = CALLS
             .lock()
             .ok()
@@ -1043,10 +1083,10 @@ pub(crate) fn bash_terminal(
         }
         return;
     }
-    bodies.0["taskId"] = json!(task_id);
-    bodies.1["taskId"] = json!(task_id);
+    bodies.facts["taskId"] = json!(task_id);
+    bodies.detail["taskId"] = json!(task_id);
     if let Some(duration) = duration_ms {
-        bodies.0["runDurationMs"] = json!(duration);
+        bodies.facts["runDurationMs"] = json!(duration);
     }
     let capture = CALLS
         .lock()

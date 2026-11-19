@@ -83,6 +83,8 @@ use crate::db::bash_watches::BashPatternWatchRow;
 mod saved_delivery;
 use saved_delivery::list_delivery_gaps;
 
+#[path = "display_bodies.rs"]
+mod display_bodies;
 #[path = "lifecycle_scope.rs"]
 mod lifecycle_scope;
 #[path = "scope_runtime.rs"]
@@ -3653,114 +3655,6 @@ impl BgTaskRegistry {
         release_terminal_io_handles(task);
         self.cleanup_terminal_task_image(task).report();
         Ok(())
-    }
-
-    fn display_bodies(
-        &self,
-        task: &Arc<BgTask>,
-        metadata: &PersistedTask,
-        buffer: &BgBuffer,
-    ) -> (serde_json::Value, serde_json::Value) {
-        use super::buffer::StreamKind;
-        let bytes = metadata
-            .remote
-            .as_ref()
-            .filter(|_| !metadata.local_fallback_started)
-            .map(|remote| {
-                remote
-                    .stdout_len
-                    .saturating_add(remote.stderr_len)
-                    .saturating_add(remote.unknown_len)
-            })
-            .unwrap_or_else(|| {
-                let stdout = buffer.stream_len(StreamKind::Stdout);
-                if metadata.mode == BgMode::Pty {
-                    stdout
-                } else {
-                    stdout.saturating_add(buffer.stream_len(StreamKind::Stderr))
-                }
-            });
-        let secrets = task.completion_secrets.lock().ok();
-        let masker = secrets.as_deref().and_then(Option::as_ref);
-        let safe = masker.is_some() || metadata.has_safe_completion_redaction_after_restart();
-        let streams = safe
-            .then(|| buffer.read_complete_for_notice())
-            .flatten()
-            .and_then(|(stdout, stderr)| {
-                let mask = |text: &str| -> Option<String> {
-                    let masked = masker.map_or_else(
-                        || crate::log_redact::aft_redactor(text),
-                        |masker| masker.redact(text),
-                    );
-                    crate::log_redact::redact_ticket_digest(
-                        &masked,
-                        metadata.completion_ticket_digest.as_deref(),
-                    )
-                    .ok()
-                    .map(|text| text.into_owned())
-                };
-                Some((mask(&stdout)?, mask(&stderr)?))
-            });
-        let mut bodies =
-            crate::bash_background::frames::bash_bodies(metadata, Some(bytes), streams);
-        if let Some(refusal) = (!metadata.local_fallback_started)
-            .then(|| remote::remote_refusal(metadata))
-            .flatten()
-        {
-            bodies.0["reason"] = serde_json::json!(refusal.code);
-            bodies.0.as_object_mut().unwrap().remove("endReason");
-            bodies.0.as_object_mut().unwrap().remove("exitCode");
-        }
-        bodies
-    }
-
-    fn capture_display_terminal(
-        &self,
-        task: &Arc<BgTask>,
-        metadata: &PersistedTask,
-        buffer: &BgBuffer,
-    ) {
-        if metadata
-            .display
-            .as_ref()
-            .is_none_or(|display| display.attempted)
-        {
-            return;
-        }
-        let bodies = self.display_bodies(task, metadata, buffer);
-        // The handler can release its reply while the terminal snapshot is
-        // being built. Claim from live task metadata, not that older snapshot.
-        let display = {
-            let mut db = DeferredDbWrites::new(self, task);
-            let Ok(mut state) = task.lock_state() else {
-                return;
-            };
-            let Some(display) = state
-                .metadata
-                .display
-                .as_ref()
-                .filter(|display| !display.attempted)
-                .cloned()
-            else {
-                return;
-            };
-            if display.reply_produced && display.deferred {
-                state.metadata.display.as_mut().unwrap().attempted = true;
-                if self
-                    .persist_task_locked(task, &state.metadata, &mut db)
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            display
-        };
-        crate::bash_background::frames::bash_terminal(
-            &display,
-            bodies,
-            &metadata.task_id,
-            metadata.duration_ms,
-        );
     }
 
     /// Records which task this `bash` call's reply started, so the call's
@@ -31923,13 +31817,13 @@ mod a02_tests {
         metadata.completion_has_non_ticket_env_secrets = Some(false);
         std::fs::write(&task.paths.pty, "ok\n").unwrap();
         let buffer = BgBuffer::registered(&task.paths, BgMode::Pty);
-        let (record, detail) = ctx
+        let bodies = ctx
             .bash_background()
             .display_bodies(&task, &metadata, &buffer);
-        assert_eq!(record["outputBytes"], 3);
-        assert_eq!(detail["pty"], "ok\n");
-        assert!(detail.get("stdout").is_none());
-        assert!(detail.get("stderr").is_none());
+        assert_eq!(bodies.facts["outputBytes"], 3);
+        assert_eq!(bodies.detail["pty"], "ok\n");
+        assert!(bodies.detail.get("stdout").is_none());
+        assert!(bodies.detail.get("stderr").is_none());
     }
 
     #[test]
@@ -31945,9 +31839,10 @@ mod a02_tests {
             "pre_start_refusal":{"code":"runon_cd_outside_checkout","message":"private external path","ran":"none"}
         })).unwrap());
         let buffer = task.state.lock().unwrap().buffer.clone();
-        let (record, _) = ctx
+        let record = ctx
             .bash_background()
-            .display_bodies(&task, &metadata, &buffer);
+            .display_bodies(&task, &metadata, &buffer)
+            .facts;
         assert_eq!(record["outcome"], "error");
         assert_eq!(record["reason"], "runon_cd_outside_checkout");
         assert!(record.get("exitCode").is_none());
@@ -31957,28 +31852,81 @@ mod a02_tests {
             .contains("private external path"));
     }
 
-    #[test]
-    fn display_terminal_claim_uses_current_reply_state_not_a_stale_snapshot() {
-        let (_dir, ctx, task) = terminal_fixture();
-        let pin = crate::subc::tool_views::SHIPPED
-            .keys()
-            .find(|pin| pin.starts_with("tp1:bash:"))
-            .unwrap()
-            .clone();
-        let display = crate::bash_background::frames::TaskDisplay {
+    fn task_display(pin: &str) -> crate::bash_background::frames::TaskDisplay {
+        crate::bash_background::frames::TaskDisplay {
             identity: crate::bash_background::frames::Identity {
                 runner: subc_protocol::Principal::Reserved {
                     module_id: "broca".into(),
                 },
                 call_key: "display-terminal-race".into(),
-                schema_pin: pin,
+                schema_pin: pin.into(),
             },
             capture_key: "display-terminal-race".into(),
             reply_produced: false,
             deferred: false,
             held_ms: None,
             attempted: false,
+        }
+    }
+
+    #[test]
+    fn bash_tail_masks_secrets_and_tickets_before_and_after_removing_escapes() {
+        crate::subc::lower_hooks::register();
+        use crate::log_redact::{SecretValues, SECRET_PLACEHOLDER};
+        use std::ffi::OsStr;
+        const SECRET: &str = "unpredictable-long-credential-value";
+        const TICKET: &str = "d34db33f89ab01cd7654ef2098ac1357";
+        let (_dir, ctx, task) = terminal_fixture();
+        let (mut metadata, buffer) = {
+            let state = task.state.lock().unwrap();
+            (state.metadata.clone(), state.buffer.clone())
         };
+        *task.completion_secrets.lock().unwrap() = Some(SecretValues::from_environment([(
+            OsStr::new("CUSTOM_TOKEN"),
+            OsStr::new(SECRET),
+        )]));
+        metadata.completion_ticket_digest =
+            Some(blake3::hash(TICKET.as_bytes()).to_hex().to_string());
+        let pin = crate::subc::tool_views::SHIPPED
+            .keys()
+            .find(|pin| crate::subc::tool_views::has_bash_tail(pin))
+            .unwrap();
+        metadata.display = Some(task_display(pin));
+        std::fs::write(
+            &task.paths.stdout,
+            format!("plain {SECRET}\ncolored unpredictable-\x1b[31mlong-credential-value\x1b[0m\n"),
+        )
+        .unwrap();
+        std::fs::write(&task.paths.stderr, format!("ticket {TICKET}\n")).unwrap();
+        let bodies = ctx
+            .bash_background()
+            .display_bodies(&task, &metadata, &buffer);
+        assert_eq!(
+            bodies.tail,
+            Some(serde_json::json!([
+                {"text":format!("plain {SECRET_PLACEHOLDER}")},
+                {"text":format!("colored {SECRET_PLACEHOLDER}")},
+                {"text":format!("ticket {SECRET_PLACEHOLDER}"),"tone":"muted"},
+            ]))
+        );
+
+        let old = pin.strip_suffix(":3").unwrap().to_string() + ":2";
+        metadata.display = Some(task_display(&old));
+        let legacy = ctx
+            .bash_background()
+            .display_bodies(&task, &metadata, &buffer);
+        assert_eq!(legacy.detail, bodies.detail);
+        assert!(legacy.tail.is_none());
+    }
+
+    #[test]
+    fn display_terminal_claim_uses_current_reply_state_not_a_stale_snapshot() {
+        let (_dir, ctx, task) = terminal_fixture();
+        let pin = crate::subc::tool_views::SHIPPED
+            .keys()
+            .find(|pin| pin.starts_with("tp1:bash:"))
+            .unwrap();
+        let display = task_display(pin);
         let (stale, buffer) = {
             let mut state = task.state.lock().unwrap();
             state.metadata.display = Some(display);
