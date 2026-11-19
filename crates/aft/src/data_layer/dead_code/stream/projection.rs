@@ -110,14 +110,21 @@ impl Outbound<'_> {
             .or_else(|| self.edge.map(|edge| edge.target_file.as_str()))
     }
 
-    fn target_symbol<'n>(&'n self, nodes: &'n impl TargetNodes) -> Option<&'n str> {
+    fn target_symbol(&self, nodes: &impl TargetNodes) -> Option<std::borrow::Cow<'_, str>> {
         // `COALESCE(tn.name, r.target_symbol, e.target_symbol)`: the edge's
         // target node's plain name first.
         self.edge
-            .and_then(|edge| nodes.node(&edge.target_file, edge.target_node.as_deref()?))
-            .map(|(name, _)| name)
-            .or(self.reference.target_symbol.as_deref())
-            .or_else(|| self.edge.map(|edge| edge.target_symbol.as_str()))
+            .and_then(|edge| nodes.name(&edge.target_file, edge.target_node.as_deref()?))
+            .map(std::borrow::Cow::Owned)
+            .or(self
+                .reference
+                .target_symbol
+                .as_deref()
+                .map(std::borrow::Cow::Borrowed))
+            .or_else(|| {
+                self.edge
+                    .map(|edge| std::borrow::Cow::Borrowed(edge.target_symbol.as_str()))
+            })
     }
 
     fn provenance(&self) -> &str {

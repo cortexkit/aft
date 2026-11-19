@@ -416,6 +416,7 @@ pub(crate) struct DeadCodeGraph<'f> {
     /// Whether a file only called into is read into its [`TargetIndex`]
     /// alone (see [`Self::compact_targets`]).
     compact_targets: std::sync::atomic::AtomicBool,
+    stream_targets: std::sync::OnceLock<parking_lot::Mutex<stream::Targets>>,
     /// Go package directories to their files, in path order, once worked
     /// out (it reads every file's language).
     go_packages: std::sync::OnceLock<BTreeMap<PathBuf, Vec<String>>>,
@@ -594,6 +595,7 @@ impl<'f> DeadCodeGraph<'f> {
                 .map(|path| (path, FileCell::default()))
                 .collect(),
             compact_targets: std::sync::atomic::AtomicBool::new(false),
+            stream_targets: std::sync::OnceLock::new(),
             go_packages: std::sync::OnceLock::new(),
             failure: parking_lot::Mutex::new(None),
             paths: parking_lot::Mutex::new(HashMap::new()),
@@ -937,8 +939,7 @@ impl<'f> DeadCodeGraph<'f> {
             let target_node = target_path
                 .as_deref()
                 .zip(row.target_symbol.as_deref())
-                .and_then(|(path, symbol)| self.target(path)?.lookup(symbol))
-                .map(str::to_string);
+                .and_then(|(path, symbol)| self.target_lookup(path, symbol));
             let ref_id = format!("view:{caller_path}:{}", row.ref_ordinal);
             let macro_body = macro_body_call(row.kind, reference);
             if let (Some(source_node), Some(target_file), Some(target_symbol), true) = (
@@ -956,8 +957,7 @@ impl<'f> DeadCodeGraph<'f> {
                     BlobRefKind::Construction
                         if !target_node
                             .as_deref()
-                            .and_then(|id| self.target(&target_file)?.node(id))
-                            .is_some_and(|(_, kind)| matches!(kind, "function" | "method")) =>
+                            .is_some_and(|id| self.target_is_constructor(&target_file, id)) =>
                     {
                         "value_ref"
                     }
@@ -1072,10 +1072,7 @@ impl<'f> DeadCodeGraph<'f> {
                     "dispatch:{path}:{}:{}:{}",
                     site.ordinal, target.file, target.symbol
                 );
-                let target_node = self
-                    .target(&target.file)
-                    .and_then(|file| file.scoped(target.symbol.as_str()))
-                    .map(str::to_string);
+                let target_node = self.target_scoped(&target.file, &target.symbol);
                 rows.insert_edge(EdgeRow {
                     edge_id,
                     ref_id: ref_id.clone(),
@@ -1172,11 +1169,13 @@ impl<'f> DeadCodeGraph<'f> {
         let target_symbol = edge
             .and_then(|edge| {
                 let id = edge.target_node.as_deref()?;
-                self.target(&edge.target_file)?.node(id)
+                self.target_name(&edge.target_file, id)
             })
-            .map(|(name, _)| name)
-            .or(reference.target_symbol.as_deref())
-            .or_else(|| edge.map(|edge| edge.target_symbol.as_str()));
+            .or(reference
+                .target_symbol
+                .as_deref()
+                .map(std::borrow::Cow::Borrowed))
+            .or_else(|| edge.map(|edge| std::borrow::Cow::Borrowed(edge.target_symbol.as_str())));
         let mut target = if is_resolved_edge(status, Some(provenance)) {
             match (target_file, target_symbol) {
                 (Some(target_file), Some(target_symbol)) => {

@@ -111,6 +111,34 @@ def overlay_dead_code(source, sha):
                     };""", "rollup Go symbol interning")
     graft("        Some(GoInitializerGroup {", "        Ok(Some(GoInitializerGroup {", "rollup Go projection result")
     graft("            targets,\n        })", "            targets,\n        }))", "rollup Go projection result end")
+    graft("    compact_targets: std::sync::atomic::AtomicBool,",
+          "    compact_targets: std::sync::atomic::AtomicBool,\n"
+          "    stream_targets: std::sync::OnceLock<parking_lot::Mutex<stream::Targets>>,",
+          "rollup target cache declaration")
+    graft("            compact_targets: std::sync::atomic::AtomicBool::new(false),",
+          "            compact_targets: std::sync::atomic::AtomicBool::new(false),\n"
+          "            stream_targets: std::sync::OnceLock::new(),", "rollup target cache initialization")
+    graft(""".and_then(|(path, symbol)| self.target(path)?.lookup(symbol))
+                .map(str::to_string);""", ".and_then(|(path, symbol)| self.target_lookup(path, symbol));",
+          "rollup ordinary target lookup")
+    graft(""".and_then(|id| self.target(&target_file)?.node(id))
+                            .is_some_and(|(_, kind)| matches!(kind, "function" | "method")) =>""",
+          ".is_some_and(|id| self.target_is_constructor(&target_file, id)) =>", "rollup construction target lookup")
+    graft("""let target_node = self
+                    .target(&target.file)
+                    .and_then(|file| file.scoped(target.symbol.as_str()))
+                    .map(str::to_string);""", "let target_node = self.target_scoped(&target.file, &target.symbol);",
+          "rollup dispatch target lookup")
+    graft("""self.target(&edge.target_file)?.node(id)
+            })
+            .map(|(name, _)| name)
+            .or(reference.target_symbol.as_deref())
+            .or_else(|| edge.map(|edge| edge.target_symbol.as_str()));""",
+          """self.target_name(&edge.target_file, id)
+            })
+            .or(reference.target_symbol.as_deref().map(std::borrow::Cow::Borrowed))
+            .or_else(|| edge.map(|edge| std::borrow::Cow::Borrowed(edge.target_symbol.as_str())));""",
+          "rollup outbound target lookup")
     graph.write_text(text)
 
 

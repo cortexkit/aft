@@ -67,9 +67,10 @@ pub(crate) fn file_nodes(path: &str, parse: &ParseBlob) -> (Nodes, HashMap<Strin
 
 /// Symbol facts that survive across files; reference and edge rows never do.
 pub(crate) trait TargetNodes {
-    fn lookup(&self, file: &str, symbol: &str) -> Option<&str>;
-    fn scoped(&self, file: &str, symbol: &str) -> Option<&str>;
-    fn node(&self, file: &str, id: &str) -> Option<(&str, &str)>;
+    fn lookup(&self, file: &str, symbol: &str) -> Option<String>;
+    fn scoped(&self, file: &str, symbol: &str) -> Option<String>;
+    fn name(&self, file: &str, id: &str) -> Option<String>;
+    fn is_constructor(&self, file: &str, id: &str) -> bool;
 }
 
 /// Assembles one caller's rows with the same join and ordering as the
@@ -110,8 +111,7 @@ pub(crate) fn assemble(
         let target_node = target_path
             .as_deref()
             .zip(row.target_symbol.as_deref())
-            .and_then(|(path, symbol)| targets.lookup(path, symbol))
-            .map(str::to_owned);
+            .and_then(|(path, symbol)| targets.lookup(path, symbol));
         let ref_id = format!("view:{caller_path}:{}", row.ref_ordinal);
         let macro_body = macro_body_call(row.kind, reference);
         let edge_ends = (
@@ -134,8 +134,7 @@ pub(crate) fn assemble(
                 BlobRefKind::Construction
                     if !target_node
                         .as_deref()
-                        .and_then(|id| targets.node(&target_file, id).map(|(_, kind)| kind))
-                        .is_some_and(|kind| matches!(kind, "function" | "method")) =>
+                        .is_some_and(|id| targets.is_constructor(&target_file, id)) =>
                 {
                     "value_ref"
                 }
@@ -253,9 +252,7 @@ pub(crate) fn assemble(
                     edge_id,
                     ref_id: ref_id.clone(),
                     source_node: (*caller).to_string(),
-                    target_node: targets
-                        .scoped(&target.file, &target.symbol)
-                        .map(str::to_owned),
+                    target_node: targets.scoped(&target.file, &target.symbol),
                     target_file: target.file.clone(),
                     target_symbol: target.symbol.clone(),
                     kind: "call",

@@ -14,6 +14,7 @@ use crate::data_layer::dead_code_snapshot::{
 };
 use crate::data_layer::graph_rows::Nodes;
 
+pub(crate) mod cache;
 mod projection;
 mod rows;
 mod targets;
@@ -35,7 +36,7 @@ pub(crate) struct Rows<'a> {
     root: &'a Path,
     source: ViewGraphFiles<'a>,
     entry_points: BTreeSet<PathBuf>,
-    targets: Targets,
+    targets: Targets<'a>,
     packages: GoPackages,
     paths: parking_lot::Mutex<Paths<'a>>,
     /// Paths ordered by canonical file, then by the stored path string.
@@ -61,19 +62,22 @@ impl<'a> Rows<'a> {
             root,
             cache: HashMap::new(),
         };
-        let mut targets = Targets::default();
+        let targets = Targets::new(view.dead_code_files());
         let mut packages = GoPackages::new();
         let mut canonical = Vec::new();
+        let progress = progress_enabled();
+        if progress {
+            report_progress("before check", 0, (0, 0), (0, 0));
+        }
         for path in source.paths() {
             let parse = source.parse(&path)?;
-            let (nodes, lookup) = file_nodes(&path, &parse);
             if parse.language == "go" {
+                let (nodes, _) = file_nodes(&path, &parse);
                 packages
                     .entry(parent(&path).to_path_buf())
                     .or_default()
                     .push((path.clone(), initializer_symbols(&nodes)));
             }
-            targets.insert(path.clone(), nodes, lookup);
             canonical.push((paths.resolve(&path), path));
         }
         canonical
@@ -82,6 +86,14 @@ impl<'a> Rows<'a> {
             .iter()
             .map(|(file, _)| file.clone())
             .collect::<Vec<_>>();
+        if progress {
+            report_progress(
+                "file list and Go index",
+                canonical.len(),
+                targets.held(),
+                (0, 0),
+            );
+        }
         Ok(Self {
             root,
             source,
@@ -119,12 +131,14 @@ impl<'a> Rows<'a> {
         let resolution = self.source.resolution(path)?;
         let rows = assemble(path, &parse, &resolution, &self.targets);
         let mut paths = self.paths.lock();
-        Ok(File {
+        let file = File {
             calls: outbound_calls(&rows, &mut paths, &self.targets),
             exports: exported_symbols(&rows, &mut paths),
             roots: entry_point_symbols(&rows),
             go: go_initializers(path, &rows, &mut paths, &self.packages),
-        })
+        };
+        self.targets.check()?;
+        Ok(file)
     }
 
     #[cfg(feature = "test-hooks")]
@@ -197,7 +211,8 @@ impl<'a> Rows<'a> {
         }
         let mut graph = DeadCodeGraph::open_lazy(self.root, &self.source);
         graph.prepare_stream().map_err(E::from)?;
-        for (absolute, path) in &self.canonical {
+        let progress = progress_enabled();
+        for (index, (absolute, path)) in self.canonical.iter().enumerate() {
             let file = self.file(path).map_err(E::from)?;
             let (rollup, exports, roots) = graph.stream_file(path).map_err(E::from)?;
             compare_file(path, &file, rollup, exports, roots).map_err(E::from)?;
@@ -208,9 +223,36 @@ impl<'a> Rows<'a> {
                 "full symbols retained after {path}"
             );
             visit(absolute, file)?;
+            if progress && ((index + 1) % 256 == 0 || index + 1 == self.canonical.len()) {
+                report_progress(
+                    "compared",
+                    index + 1,
+                    self.targets.held(),
+                    graph.held_stream_targets(),
+                );
+            }
         }
         Ok(())
     }
+}
+
+fn progress_enabled() -> bool {
+    cfg!(all(feature = "test-hooks", target_os = "linux"))
+        && std::env::var_os("EXACTNESS_DEAD_CODE_PROGRESS").is_some()
+}
+
+fn report_progress(phase: &str, files: usize, rows: (usize, usize), rollup: (usize, usize)) {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let memory = status
+        .lines()
+        .filter(|line| {
+            ["VmHWM:", "VmRSS:", "RssAnon:", "RssFile:"]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!("DEAD_CODE_STREAM {phase} files={files} row_targets={rows:?} rollup_targets={rollup:?} {memory}");
 }
 
 fn initializer_symbols(nodes: &Nodes) -> Vec<Arc<str>> {
