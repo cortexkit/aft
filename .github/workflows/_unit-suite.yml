@@ -419,7 +419,9 @@ jobs:
         with:
           node-version: "24"
       - name: Install search parity dependency
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+        # Retry package downloads: an Ubuntu mirror outage once failed both
+        # plugin e2e jobs here before any AFT code ran.
+        run: sudo apt-get update && sudo apt-get install -y -o Acquire::Retries=5 ripgrep
       - name: Install workspace deps
         run: bun install --frozen-lockfile
       - name: Build aft-bridge dist

@@ -10,10 +10,11 @@
 //! their run scope, without `head_policy`. A worker's scripted calls still
 //! refuse permission asks with `permission_ask_unavailable`.
 //!
-//! A direct ask never expires. Its call is held for at most the route's reply budget
+//! A direct call is held for at most the route's reply budget
 //! (never more than 100 s); an ask still open then ends the call with
 //! `access_pending`, and the persisted ask (see [`crate::db::access_asks`]) lets
-//! the retried call pick up the same Cingulate ask by its original call key.
+//! the retried call pick up the same Cingulate ask by its original call key
+//! until the file-access card has been idle for 30 minutes.
 //! Once an answer arrives, local application gets a separate bounded wait;
 //! exhausting that wait asks for an immediate retry, not another notification
 //! from Cingulate.
@@ -46,6 +47,9 @@ use crate::db::access_asks::{self as asks, AskKey, Permission};
 use std::future::Future;
 use std::pin::Pin;
 use subc_protocol::scope::ScopeSelector;
+
+#[path = "consent_expiry.rs"]
+pub(super) mod expiry;
 
 pub(super) const CINGULATE_MODULE_ID: &str = "cingulate";
 
@@ -256,6 +260,14 @@ pub(super) trait ConsentTransport: Send + Sync {
     fn call_with_receipt(&self, call: ConsentCall, receipt: ConsentReceipt) -> ConsentFuture {
         let reply = self.call(call);
         Box::pin(async move { receipt(reply.await?).await })
+    }
+
+    fn withdraw_idle(&self, _id: String, _timeout: Duration) -> ConsentFuture {
+        Box::pin(async {
+            Err(ConsentError::Unavailable(
+                "no idle withdrawal transport".into(),
+            ))
+        })
     }
 }
 
@@ -701,6 +713,14 @@ impl ConsentTransport for SharedSubcConsent {
 
     fn call_with_receipt(&self, call: ConsentCall, receipt: ConsentReceipt) -> ConsentFuture {
         Box::pin(Arc::clone(&self.0).send_with_receipt(call, Some(receipt)))
+    }
+
+    fn withdraw_idle(&self, id: String, timeout: Duration) -> ConsentFuture {
+        Box::pin(expiry::withdraw_on_own_route(
+            Arc::clone(&self.0),
+            id,
+            timeout,
+        ))
     }
 }
 
@@ -1199,6 +1219,8 @@ enum Hold {
     Answer(Response),
     /// An overlapping call owns the one-time approval; reuse its result only.
     Shared((Response, Option<String>)),
+    /// A reused file-access approval was withdrawn; ask again with a fresh key.
+    Refile(Permission),
     /// Nobody waits for this call any more (cancelled, route closed, transport
     /// gone); the caller sends nothing.
     Abandoned,
@@ -1633,6 +1655,17 @@ where
                     }
                 }
             }
+            Hold::Refile(next) => {
+                match stop_signal(call, &route_hold) {
+                    Some(Stop::Detach | Stop::Withdraw) => return None,
+                    Some(Stop::RunEnded) => {
+                        return Some((refused_answer(call, &next, "access_withdrawn", None), None));
+                    }
+                    None => {}
+                }
+                flight.group.settled.store(false, Ordering::SeqCst);
+                grant = next;
+            }
             Hold::Answer(response) => return Some((response, None)),
             Hold::Shared(result) => return Some(result),
             Hold::Abandoned => return None,
@@ -1687,6 +1720,7 @@ async fn with_db_handle<T: Send + 'static>(
 struct Prepared {
     key: AskKey,
     call_key: String,
+    reused_file_card: bool,
     request: Value,
     selector: ScopeSelector,
     grant: Permission,
@@ -1831,9 +1865,11 @@ fn prepare_locked(
         ) {
             // Re-send the ask under the call key it was first sent with, so
             // Cingulate returns the same ask rather than a second one.
+            expiry::touch(conn, &key, &call_key, expiry::wall_now())?;
             return Ok(Prep::Ask(Prepared {
                 key,
                 call_key,
+                reused_file_card: true,
                 request,
                 selector,
                 grant: pending,
@@ -1886,11 +1922,12 @@ fn prepare_locked(
         &serde_json::to_value(&selector).expect("scope selector is JSON"),
         &request,
         grant,
-        crate::db::call_ledger::now_ms(),
+        expiry::wall_now(),
     )?;
     Ok(Prep::Ask(Prepared {
         key,
         call_key,
+        reused_file_card: false,
         request,
         selector,
         grant: Permission::File(grant.clone()),
@@ -1920,6 +1957,7 @@ fn prepare_shell(
             return Ok(Prep::Ask(Prepared {
                 key,
                 call_key,
+                reused_file_card: false,
                 request,
                 selector,
                 grant,
@@ -1959,6 +1997,7 @@ fn prepare_shell(
     Ok(Prep::Ask(Prepared {
         key,
         call_key,
+        reused_file_card: false,
         request,
         selector,
         grant: permission.clone(),
@@ -2871,7 +2910,9 @@ async fn hold(
         response.data["reason"] = json!("consent_path_unrepresentable");
         return Hold::Answer(response);
     }
+    let mut waiting = None;
     if let Some(file) = grant.file() {
+        waiting = Some(expiry::watch(flight.key.clone()).await);
         if let Some(approval_key) = reconcile_covering_asks(call, file).await {
             return Hold::Run {
                 once: vec![grant],
@@ -2937,6 +2978,9 @@ async fn hold(
         }
         Err(error) => return Hold::Answer(unavailable_answer(call, &grant, &error)),
     };
+    if let Some(waiting) = waiting.as_mut() {
+        waiting.remember(call, &prep);
+    }
     let Some(transport) = transport() else {
         return Hold::Answer(unavailable_answer(
             call,
@@ -2992,6 +3036,9 @@ async fn hold(
         }
         if now >= deadline && !first {
             park(call, &prep, &elicitation);
+            if let Some(waiting) = waiting.take() {
+                waiting.finish().await;
+            }
             return Hold::Answer(pending_answer(call, &prep.grant));
         }
         first = false;
@@ -3194,14 +3241,16 @@ async fn finish(
             ))
         }
         Settlement::Refused(code) => {
-            // A card withdrawn because a folder grant now covers its path runs
-            // under that covering authority instead of ending withdrawn. Any
-            // other withdrawn card keeps its recorded refusal.
+            // A covering folder grant can have withdrawn the card while the
+            // call waited. Apply the covering grant before considering refile.
             if code == "access_withdrawn" {
                 if let Some(run) =
                     try_apply_covering_grant(call, prep, retry_after_deadline, elicitation).await
                 {
                     return run;
+                }
+                if prep.reused_file_card {
+                    return expiry::refile_withdrawn(call, prep).await;
                 }
             }
             discard(call, prep).await;
@@ -3464,6 +3513,7 @@ fn park(call: &HeldCall, prep: &Prepared, elicitation: &str) {
             UNARY_TIMEOUT,
         ),
         key: prep.key.clone(),
+        file_call_key: prep.grant.file().map(|_| prep.call_key.clone()),
         db,
     });
 }
@@ -3472,12 +3522,21 @@ fn park(call: &HeldCall, prep: &Prepared, elicitation: &str) {
 pub(super) struct ParkedAsk {
     call: ConsentCall,
     key: AskKey,
+    file_call_key: Option<String>,
     db: Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
 }
 
 /// Withdraw the asks a codemode run left open, once its scope has ended.
 pub(super) async fn withdraw_parked(parked: Vec<ParkedAsk>) {
     for ask in parked {
+        let _waiting = if let Some(call_key) = ask.file_call_key.as_ref() {
+            let Some(waiting) = expiry::watch_parked(&ask.db, &ask.key, call_key).await else {
+                continue;
+            };
+            Some(waiting)
+        } else {
+            None
+        };
         if let Some(transport) = transport() {
             if let Err(error) = transport.call(ask.call.clone()).await {
                 log::warn!("consent.withdraw for an ended run failed: {error:?}");
@@ -3487,7 +3546,11 @@ pub(super) async fn withdraw_parked(parked: Vec<ParkedAsk>) {
         let key = ask.key.clone();
         let _ = tokio::task::spawn_blocking(move || {
             if let Ok(conn) = db.lock() {
-                let _ = asks::discard(&conn, &key);
+                if let Some(call_key) = ask.file_call_key {
+                    let _ = expiry::discard_card(&conn, &key, &call_key);
+                } else {
+                    let _ = asks::discard(&conn, &key);
+                }
             }
         })
         .await;
@@ -3502,6 +3565,7 @@ fn open_prepared(record: asks::AskRecord) -> Option<(Prepared, Option<String>)> 
         Prepared {
             key: record.key,
             call_key: record.call_key?,
+            reused_file_card: false,
             request: record.request?,
             selector: serde_json::from_value(record.selector).ok()?,
             grant: record.pending?,
@@ -3524,6 +3588,11 @@ async fn reconcile_scope_answer(
         return None;
     }
     let db = ctx.db()?;
+    let _recovery = if prep.grant.file().is_some() {
+        Some(expiry::watch_reconciliation(&db, &prep).await?)
+    } else {
+        None
+    };
     let transport = transport()?;
     let method_call = |method, params| ConsentCall {
         scope: prep.selector.clone(),

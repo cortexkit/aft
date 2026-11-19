@@ -103,7 +103,7 @@ async fn a_cancelled_proxy_card_uses_the_exact_approved_line_and_never_sends() {
     assert_eq!(reply["status"], 403);
     assert_eq!(
         reply["body"],
-        "secret test: the request for localhost was cancelled; the request was not sent"
+        "AFT's secret proxy refused the request: test (localhost). The approval request was withdrawn."
     );
     assert_eq!(daemon.state.lock().unwrap().calls, 1);
     assert!(server.seen.lock().is_empty());
@@ -127,7 +127,10 @@ async fn an_unfiled_proxy_card_uses_the_exact_approved_line_and_never_sends() {
         "",
     );
     assert_eq!(reply["status"], 403);
-    assert_eq!(reply["body"], "secret test: the approval request for localhost could not be filed; the request was not sent");
+    assert_eq!(
+        reply["body"],
+        "AFT's secret proxy refused the request: test (localhost). The approval was not granted."
+    );
     assert!(phone.phone.state.lock().unwrap().requests.is_empty());
     assert_eq!(daemon.state.lock().unwrap().calls, 1);
     assert!(server.seen.lock().is_empty());
@@ -467,7 +470,7 @@ async fn approval_log_declined() {
         ConsentOutcome::Declined,
         None,
         "approval_declined",
-        "secret test: approval was declined for localhost; the request was not sent",
+        "AFT's secret proxy refused the request: test (localhost). The approval was declined.",
         None,
     )
     .await;
@@ -478,7 +481,7 @@ async fn approval_log_expired() {
         ConsentOutcome::Expired,
         None,
         "approval_expired",
-        "secret test: approval expired for localhost; the request was not sent",
+        "AFT's secret proxy refused the request: test (localhost). The approval request expired.",
         None,
     )
     .await;
@@ -489,7 +492,7 @@ async fn approval_log_withdrawn() {
         ConsentOutcome::Cancelled,
         None,
         "approval_withdrawn",
-        "secret test: the request for localhost was cancelled; the request was not sent",
+        "AFT's secret proxy refused the request: test (localhost). The approval request was withdrawn.",
         None,
     )
     .await;
@@ -500,7 +503,7 @@ async fn approval_log_unknown_allowlisted() {
         ConsentOutcome::Indeterminate,
         Some("transient"),
         "approval_not_granted",
-        "Secret proxy refused the request: test (localhost)\n",
+        "AFT's secret proxy refused the request: test (localhost). The approval was not granted.",
         Some("transient"),
     )
     .await;
@@ -512,7 +515,7 @@ async fn approval_log_unknown_secret_shaped() {
         ConsentOutcome::Indeterminate,
         Some(secret_code),
         "approval_not_granted",
-        "Secret proxy refused the request: test (localhost)\n",
+        "AFT's secret proxy refused the request: test (localhost). The approval was not granted.",
         Some("unlisted"),
     )
     .await;
@@ -523,11 +526,11 @@ async fn live_vault_decline_and_expiry_answer_403_without_sending_or_retrying() 
     for (decision, expected) in [
         (
             ConsentOutcome::Declined,
-            "secret test: approval was declined for localhost; the request was not sent",
+            "AFT's secret proxy refused the request: test (localhost). The approval was declined.",
         ),
         (
             ConsentOutcome::Expired,
-            "secret test: approval expired for localhost; the request was not sent",
+            "AFT's secret proxy refused the request: test (localhost). The approval request expired.",
         ),
     ] {
         let daemon = FakeClaustrum::start();
@@ -579,22 +582,22 @@ async fn live_vault_negotiated_h2_client_holds_then_returns_clean_responses() {
         (
             "echo-request",
             Some(ConsentOutcome::Declined),
-            "secret test: approval was declined for localhost; the request was not sent",
+            "AFT's secret proxy refused the request: test (localhost). The approval was declined.",
         ),
         (
             "echo-request",
             Some(ConsentOutcome::Expired),
-            "secret test: approval expired for localhost; the request was not sent",
+            "AFT's secret proxy refused the request: test (localhost). The approval request expired.",
         ),
         (
             "echo-request",
             Some(ConsentOutcome::Cancelled),
-            "secret test: the request for localhost was cancelled; the request was not sent",
+            "AFT's secret proxy refused the request: test (localhost). The approval request was withdrawn.",
         ),
         (
             "echo-request",
             None,
-            "secret test: approval expired for localhost; the request was not sent",
+            "AFT's secret proxy refused the request: test (localhost). No answer to the approval arrived in time.",
         ),
     ] {
         let daemon = FakeClaustrum::start();
@@ -727,7 +730,7 @@ async fn live_vault_injected_ten_minute_deadline_answers_403_locally() {
     assert_eq!(reply["status"], 403);
     assert_eq!(
         reply["body"],
-        "secret test: approval expired for localhost; the request was not sent"
+        "AFT's secret proxy refused the request: test (localhost). No answer to the approval arrived in time."
     );
     assert!(server.seen.lock().is_empty());
     assert!(proxy.approval_status().is_empty());

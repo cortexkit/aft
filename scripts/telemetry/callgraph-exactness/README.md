@@ -79,8 +79,10 @@ requires a failing comparison naming that file and a log confirming the flip.
   canonical; array order is preserved. Both test inclusion settings run. The
   reference chooses busiest symbols by incoming edge count, middle-ranked
   symbols and leaves, with deterministic path/name ties. Its query plan is
-  reused verbatim by the candidate. Trace pairs derived from real edges and a
-  known inter-file witness must have paths, not merely equal negative results.
+  reused verbatim by the candidate. Trace pairs derived from traversable calls
+  and a known inter-file witness must have paths when tests are included, and
+  also when tests are hidden if neither endpoint is a test file. Both modes
+  still compare the reference and candidate answers byte for byte.
   A data-flow witness must have nonempty hops. Full dead-code input rows and
   actual uncached dead-code finding JSON are compared too; timestamps and phase
   measurements are outside the compared JSON.

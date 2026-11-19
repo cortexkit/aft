@@ -171,7 +171,7 @@ fn migrate_block(
     } else {
         feature_config::DocumentTier::Project
     };
-    for edit in feature_config::settings_shape::edits(raw, document_tier) {
+    for edit in feature_config::settings_shape::edits(raw, document_tier, prefix.is_empty()) {
         let path: Vec<_> = prefix
             .iter()
             .chain(&edit.path)

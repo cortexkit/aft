@@ -263,7 +263,7 @@ async fn exercise_bootstrap() {
             incoming(&incoming_tx, frame(FrameType::Push, 0, changed)).await;
             let (corr, _) = next(&mut written).await;
             let mut active = json_as::<Value>(golden!("config_get_reply_declaration_pending"));
-            active["active"]["effective"] = json!({"format_on_edit":false,"disabled_tools":["aft_search"],"storage":{"cache_dir":cache_path}});
+            active["active"]["effective"] = json!({"format_on_edit":false,"disabled_tools":["aft_search"],"storage":{"cache_dir":{"kind":"dir","path":cache_path}}});
             active["active"]["sources"] = json!({"/format_on_edit":"user","/disabled_tools":"user","/storage/cache_dir":"user"});
             active["active"]["layers"] = json!([]);
             active["active"]["attempt"] = json!(39);

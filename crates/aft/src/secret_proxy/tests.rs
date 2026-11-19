@@ -277,11 +277,16 @@ impl Server {
                                     )
                                 })
                                 .collect();
-                            recorded
-                                .lock()
-                                .push(json!({"target":parts.uri.to_string(),"headers":fields,
-                                "body":String::from_utf8_lossy(&data)}));
-                            if mode == "no-content" {
+                            let mut received =
+                                json!({"target":parts.uri.to_string(),"headers":fields});
+                            if mode == "binary-request" {
+                                received["body_base64"] =
+                                    json!(base64::engine::general_purpose::STANDARD.encode(&data));
+                            } else {
+                                received["body"] = json!(String::from_utf8_lossy(&data));
+                            }
+                            recorded.lock().push(received);
+                            if mode == "no-content" || mode == "binary-request" {
                                 let mut response = Response::new(full(Bytes::new()));
                                 *response.status_mut() = StatusCode::NO_CONTENT;
                                 response
@@ -575,6 +580,18 @@ impl Client {
     fn request(&mut self, path: &str, headers: Value, body: &str) -> Value {
         self.command(json!({"op":"request","path":path,"headers":headers,"body":body}))
     }
+
+    fn put_gzip_json(&mut self, body: &[u8]) -> Value {
+        self.command(json!({
+            "op": "request", "method": "PUT", "path": "/approved",
+            "headers": {
+                "authorization": format!("Bearer {MARKER}"),
+                "content-type": "application/json",
+                "content-encoding": "gzip",
+            },
+            "body_base64": base64::engine::general_purpose::STANDARD.encode(body),
+        }))
+    }
 }
 
 impl Drop for Client {
@@ -720,7 +737,12 @@ fn client_child() {
                 if let Some(headers) = value["headers"].as_object() {
                     for (key, val) in headers { request = request.header(key, val.as_str().unwrap()); }
                 }
-                let request = request.body(Full::new(Bytes::copy_from_slice(value["body"].as_str().unwrap_or("").as_bytes()))).unwrap();
+                let body = if let Some(encoded) = value["body_base64"].as_str() {
+                    Bytes::from(base64::engine::general_purpose::STANDARD.decode(encoded).map_err(|_| ())?)
+                } else {
+                    Bytes::copy_from_slice(value["body"].as_str().unwrap_or("").as_bytes())
+                };
+                let request = request.body(Full::new(body)).unwrap();
                 let mut response = match sender {
                     Sender::H1(sender) => sender.send_request(request).await.map_err(|_| ())?,
                     Sender::H2(sender) => sender.send_request(request).await.map_err(|_| ())?,
@@ -839,6 +861,102 @@ async fn proxy_h1_h2_locations_keepalive_authority_and_scanned_set() {
     );
     proxy.stop();
     assert!(proxy.state.patterns.lock().is_empty());
+}
+
+fn gzip_json(padding: usize) -> Vec<u8> {
+    // Stored blocks keep the placeholders visible to any accidental scan of
+    // the wire bytes, and keep the large fixture above the JSON buffer limit.
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::none());
+    encoder
+        .write_all(
+            br#"{"key":"{{ck-secret:test}}","body-only":"{{ck-secret:body-only}}","padding":""#,
+        )
+        .unwrap();
+    encoder.write_all(&vec![b'x'; padding]).unwrap();
+    encoder.write_all(br#""}"#).unwrap();
+    encoder.finish().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_streams_small_and_large_gzip_json_with_a_bearer_secret() {
+    let server = Server::new("binary-request").await;
+    let vault = Vault::new();
+    let proxy = SecretProxy::start_with_tls(
+        config(
+            vault.clone(),
+            server.address.port(),
+            &[
+                ("test", Location::Bearer),
+                ("body-only", Location::Json("/body-only".into())),
+            ],
+        ),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    let large = 2 * 1024 * 1024;
+    let bodies = [gzip_json(0), gzip_json(large)];
+    assert!(bodies[1].len() >= large);
+    for body in &bodies {
+        let reply = client.put_gzip_json(body);
+        assert_eq!(reply["status"], 204, "{} bytes: {reply}", body.len());
+    }
+    let seen = server.seen.lock();
+    assert_eq!(seen.len(), bodies.len());
+    let target = format!("https://localhost:{}/approved", server.address.port());
+    for (request, expected) in seen.iter().zip(&bodies) {
+        assert_eq!(request["target"], target);
+        assert_eq!(
+            request["headers"]["authorization"],
+            "Bearer test-key-12345678"
+        );
+        assert_eq!(request["headers"]["content-encoding"], "gzip");
+        assert_eq!(request["headers"]["content-type"], "application/json");
+        let received = base64::engine::general_purpose::STANDARD
+            .decode(request["body_base64"].as_str().unwrap())
+            .unwrap();
+        assert!(
+            received == *expected,
+            "gzip body changed in transit (sent {}, received {} bytes)",
+            expected.len(),
+            received.len()
+        );
+    }
+    assert_eq!(
+        vault.calls.load(Ordering::SeqCst),
+        2,
+        "only the header label should reach the vault"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_refuses_a_json_body_location_for_gzip_without_sending_upstream() {
+    let server = Server::new("binary-request").await;
+    let vault = Vault::new();
+    let proxy = SecretProxy::start_with_tls(
+        config(
+            vault.clone(),
+            server.address.port(),
+            &[("test", Location::Json("/key".into()))],
+        ),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    // The header discovers the label without reading the opaque body. The
+    // vault then reveals that the secret may only be placed in the body.
+    let reply = client.put_gzip_json(&gzip_json(0));
+    assert_eq!(reply["status"], 403, "{reply}");
+    assert_eq!(reply["body"], "AFT's secret proxy refused the request: test (localhost). The placeholder is not in a place where this secret may go.");
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 1);
+    let lines = proxy.state.test_refusals.lock();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("reason=location_mismatch "), "{lines:?}");
+    assert!(server.seen.lock().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -973,7 +1091,7 @@ async fn proxy_atomic_json_and_material_refusals_send_nothing_upstream() {
     assert_eq!(refused["status"], 403);
     assert_eq!(
         refused["body"],
-        "Secret proxy refused the request: json (localhost)\n"
+        "AFT's secret proxy refused the request: json (localhost). The vault did not release the secret."
     );
     assert_eq!(vault.calls.load(Ordering::SeqCst), 4);
     assert!(server.seen.lock().is_empty());

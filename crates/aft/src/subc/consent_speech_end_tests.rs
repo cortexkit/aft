@@ -217,6 +217,7 @@ async fn audit_failed_speech_end_write_fences_received_approval_before_actor_adm
         .pop()
         .unwrap();
     run.run_scope.get().unwrap().park_ask(ParkedAsk {
+        file_call_key: None,
         call: ConsentCall {
             scope: serde_json::from_value(ask.selector).unwrap(),
             project_root: run.project_root.clone(),

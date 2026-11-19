@@ -88,9 +88,9 @@ function goldenParamsFromMerged(
   if (merged.gh_shim !== undefined) {
     params.gh_shim = merged.gh_shim;
   }
-  if (merged.storage?.cache_dir !== undefined) {
-    params.cache_dir = merged.storage.cache_dir;
-  }
+  const cache = merged.storage?.cache_dir;
+  if (cache?.kind === "dir") params.cache_dir = cache.path;
+  if (cache?.kind === "main_disk") params.cache_dir_opt_out = true;
   if (merged.memory !== undefined) params.memory = merged.memory;
   // The OpenCode prompt server is read by the plugin itself and is not a
   // configure param either; it is carried here so the Rust resolver's user-only
@@ -209,8 +209,8 @@ const CASES: ParityCase[] = [
   { name: "malformed_nonsecurity_inspect_partial", user: { inspect: { categories: { diagnostics: "off" } }, format_on_edit: true } },
   { name: "malformed_config_document", user: "{" },
   { name: "pi_malformed_config_document", harness: "pi", user: "{" },
-  // storage.cache_dir is not a security section: a malformed value turns caches
-  // off with a warning while the rest of the candidate applies.
+  // A malformed scalar still turns caches off while the rest of the candidate
+  // applies. Malformed choice objects are refused.
   { name: "malformed_storage_cache_dir_number", user: { storage: { cache_dir: 5 }, format_on_edit: true } },
   { name: "malformed_storage_cache_dir_object", user: { storage: { cache_dir: { path: "/aft-cache" } }, format_on_edit: true } },
   { name: "pi_malformed_storage_cache_dir_number", harness: "pi", user: { storage: { cache_dir: 5 }, format_on_edit: true } },
@@ -252,6 +252,15 @@ const CASES: ParityCase[] = [
     { name: `cache_dir_typo_harness_storage_${harness}`, harness, user: { harnesses: { future: { storage: { cachedir: "/aft-cache" } } } } },
   ]),
   { name: "cache_dir_user", user: { storage: { cache_dir: USER_CACHE_DIR } } },
+  ...(["opencode", "pi"] as const).flatMap((harness) => [
+    { name: `cache_dir_legacy_main_disk_${harness}`, harness, user: { storage: { cache_dir: null } } },
+    { name: `cache_dir_choice_dir_${harness}`, harness, user: { storage: { cache_dir: { kind: "dir", path: USER_CACHE_DIR } } } },
+    { name: `cache_dir_choice_main_disk_${harness}`, harness, user: { storage: { cache_dir: { kind: "main_disk" } } } },
+    { name: `cache_dir_choice_default_${harness}`, harness, user: { storage: { cache_dir: { kind: "default" } } }, project: { storage: { cache_dir: { kind: "dir", path: USER_CACHE_DIR } } } },
+    { name: `cache_dir_choice_unknown_kind_${harness}`, harness, user: { storage: { cache_dir: { kind: "unknown" } } } },
+    { name: `cache_dir_choice_missing_path_${harness}`, harness, user: { storage: { cache_dir: { kind: "dir" } } } },
+    { name: `cache_dir_choice_extra_field_${harness}`, harness, user: { storage: { cache_dir: { kind: "main_disk", path: "ignored" } } } },
+  ]),
   { name: "cache_dir_project_dropped", user: { storage: { cache_dir: USER_CACHE_DIR } }, project: { storage: { cache_dir: "/evil" } } },
   { name: "cache_dir_project_only_dropped", project: { storage: { cache_dir: "/evil" } } },
   { name: "cache_dir_harness_attempts_dropped", user: { storage: { cache_dir: USER_CACHE_DIR }, harnesses: { pi: { storage: { cache_dir: "/pi-cache" } } } }, project: { harnesses: { pi: { storage: { cache_dir: "/evil" } } } }, harness: "pi" },

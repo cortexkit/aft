@@ -120,6 +120,7 @@ async fn audit_confirm_scope_end(f: &Fixture, run: &RouteIdentity) {
         rows.pop().unwrap()
     };
     watched_scope.park_ask(ParkedAsk {
+        file_call_key: None,
         call: ConsentCall {
             scope: serde_json::from_value(ask.selector).unwrap(),
             project_root: run.project_root.clone(),

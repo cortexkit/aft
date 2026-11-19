@@ -2,6 +2,7 @@
 //! Route closure and module drain alone do not establish scope end.
 
 use super::*;
+use crate::access_policy::prefrontal::{self, Continuation, CounterpartReply};
 use subc_protocol::{scope::ScopeStamp, session::ModuleControlResponseToModule};
 
 pub(super) fn describe_timeout() -> Duration {
@@ -28,14 +29,17 @@ fn timing(_name: &str, production: Duration) -> Duration {
 /// A changed epoch for the same scope reference identifies a rebind of the
 /// same agent, not its termination. Ended means the daemon remembers an end;
 /// synced NotLive means the owner published its scope set without this scope.
+/// An unconfigured owner is not evidence of scope end.
 pub(super) fn describe_answer_ends_scope(reply: &ModuleControlResponseToModule) -> bool {
     matches!(
         reply,
         ModuleControlResponseToModule::ScopeDescribe {
             status: subc_protocol::scope::ScopeStatus::Ended,
+            owner_configured: true,
             ..
         } | ModuleControlResponseToModule::ScopeDescribe {
             status: subc_protocol::scope::ScopeStatus::NotLive,
+            owner_configured: true,
             owner_synced: true,
             ..
         }
@@ -294,6 +298,7 @@ where
         let mut confirmed = HashSet::new();
         let mut speech_pending = HashSet::new();
         let mut cleanup_keys = HashSet::new();
+        let mut continuity_holds = HashSet::new();
         let mut next_poll: HashMap<_, tokio::time::Instant> = HashMap::new();
         // Only unix refreshes the set from secret proxy authorizations.
         #[cfg_attr(not(unix), allow(unused_mut))]
@@ -362,6 +367,8 @@ where
             });
             next_poll.retain(|key, _| held_scopes.contains_key(key) && !confirmed.contains(key));
             retry.retain(|key, _| held_scopes.contains_key(key) && !confirmed.contains(key));
+            continuity_holds
+                .retain(|key| held_scopes.contains_key(key) && !confirmed.contains(key));
             retrigger.retain(|key| held_scopes.contains_key(key) && !confirmed.contains(key));
             verification_keys
                 .retain(|key| held_scopes.contains_key(key) && !confirmed.contains(key));
@@ -392,6 +399,7 @@ where
             watches.health.skipped_held_rows = inventory.skipped[1];
             watches.health.poll_keys = next_poll.len();
             watches.health.confirmed_cleanup = confirmed.len();
+            watches.health.prefrontal_continuity_holds = continuity_holds.len();
             coverage.send_replace(protected.clone());
             control
                 .metrics
@@ -506,12 +514,14 @@ where
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
+            // A reopened watch can report a retired owner's stale scope as
+            // live. Keep describing held scopes even after watch coverage resumes.
             let wake_at = next_poll
                 .iter()
                 .filter(|(key, _)| {
                     !confirmed.contains(*key)
                         && !pending.contains(*key)
-                        && !protected_keys.contains(*key)
+                        && (!protected_keys.contains(*key) || continuity_holds.contains(*key))
                         && (!routed_now.contains(*key)
                             || secret_authorizations.contains(*key)
                             || retry.contains_key(*key))
@@ -519,7 +529,7 @@ where
                 .map(|(_, due)| *due)
                 .min()
                 .map_or(next_scan, |due| due.min(next_scan));
-            let wake_at = if protected.all {
+            let wake_at = if protected.all && continuity_holds.is_empty() {
                 next_backstop
             } else {
                 wake_at.min(next_backstop)
@@ -639,7 +649,7 @@ where
                     let routed = routed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
                     for stamp in scopes {
                         let key = stamp_key(&stamp);
-                        if !protected_keys.contains(&key) && !confirmed.contains(&key) && !pending.contains(&key) && (!routed.contains(&key) || secret_authorizations.contains(&key) || retry.contains_key(&key))
+                        if (!protected_keys.contains(&key) || continuity_holds.contains(&key)) && !confirmed.contains(&key) && !pending.contains(&key) && (!routed.contains(&key) || secret_authorizations.contains(&key) || retry.contains_key(&key))
                             && next_poll.get(&key).map_or(scan_due, |due| tokio::time::Instant::now() >= *due) {
                             // A per-scope deadline can precede the next inventory
                             // scan. Consume it when queuing the probe so no past
@@ -668,20 +678,21 @@ where
                         // periodic tick. Wait a full interval after its answer
                         // before rechecking shell tasks with that owner/ref/epoch.
                         next_poll.insert(key.clone(), tokio::time::Instant::now() + interval);
-                        let ends = reply.as_ref().is_ok_and(|reply| describe_answer_ends_scope(reply) || crate::access_policy::prefrontal::retired(&stamp, reply));
-                        if ends {
-                            if let Some(other) = crate::access_policy::prefrontal::counterpart(&stamp) {
-                                let decision = match counterpart_reply.as_ref() {
-                                    Some(reply) => crate::access_policy::prefrontal::continuation(&other, reply.as_ref().ok()),
-                                    // No RPC was needed because the counterpart
-                                    // module was absent; an RPC error is Some(Err).
-                                    None => crate::access_policy::prefrontal::Continuation::Absent,
+                        let source_ended = reply.as_ref().is_ok_and(describe_answer_ends_scope);
+                        let mut ends = source_ended;
+                        if source_ended || reply.as_ref().is_ok_and(|reply| prefrontal::retired(&stamp, reply)) {
+                            if let Some(other) = prefrontal::counterpart(&stamp) {
+                                let answer = match counterpart_reply.as_ref() {
+                                    Some(reply) => CounterpartReply::Describe(reply.as_ref().ok()),
+                                    None => CounterpartReply::NotInCatalog,
                                 };
+                                let decision = prefrontal::continuation(&other, answer, source_ended);
                                 match decision {
-                                    crate::access_policy::prefrontal::Continuation::Live(live) => {
+                                    Continuation::Live(live) => {
                                         match rehome_shell_scopes(executor.clone(), stamp.clone(), live.clone()).await {
                                             Ok(_) => {
                                                 crate::access_policy::prefrontal::log_continuation(&stamp, &live, "continuation");
+                                                continuity_holds.remove(&key);
                                                 retry.remove(&key);
                                                 retrigger.remove(&key);
                                             }
@@ -696,18 +707,22 @@ where
                                         refresh.immediate();
                                         continue;
                                     }
-                                    crate::access_policy::prefrontal::Continuation::Hold => {
-                                        crate::access_policy::prefrontal::log_continuation(&stamp, &other, "hold");
+                                    Continuation::Hold(outcome) => {
+                                        prefrontal::log_continuation(&stamp, &other, outcome);
+                                        continuity_holds.insert(key.clone());
                                         retry.insert(key.clone(), stamp.clone());
                                         watches.fallback(&key, interval);
                                         pending.remove(&key);
                                         continue;
                                     }
-                                    crate::access_policy::prefrontal::Continuation::Absent => crate::access_policy::prefrontal::log_continuation(&stamp, &other, if counterpart_reply.is_none() { "absent_from_catalog" } else { "absent_end" }),
+                                    Continuation::End(outcome) => {
+                                        prefrontal::log_continuation(&stamp, &other, outcome);
+                                        ends = true;
+                                    }
                                 }
                             }
-                        } else if let Some(other) = crate::access_policy::prefrontal::counterpart(&stamp) {
-                            crate::access_policy::prefrontal::log_continuation(&stamp, &other, crate::access_policy::prefrontal::retained_outcome(reply.as_ref().ok()));
+                        } else if let Some(other) = prefrontal::counterpart(&stamp) {
+                            prefrontal::log_continuation(&stamp, &other, prefrontal::retained_outcome(reply.as_ref().ok()));
                         }
                         #[cfg(unix)]
                         if reply.as_ref().is_ok_and(|answer| secret_authorization_rebound(&stamp, answer)) {
@@ -717,7 +732,7 @@ where
                                 for ctx in executor.actor_contexts() { ctx.bash_background().revoke_secret_authorization(&described); }
                             }).await;
                         }
-                        let strict_end = speech.as_ref().filter(|_| full_stamp).and_then(|service| {
+                        let strict_end = speech.as_ref().filter(|_| full_stamp && source_ended).and_then(|service| {
                             let role=if stamp.attributes.run_id.is_some(){crate::gh_shim_speech::ScopeRole::Run}else{crate::gh_shim_speech::ScopeRole::Authority};
                             reply.as_ref().ok().and_then(|reply| match crate::gh_shim_speech::scope::validate_scope_identity(&stamp,role,reply,&service.generation(),&generation,crate::db::call_ledger::now_ms() as u64) {
                                 Ok(crate::gh_shim_speech::scope::Answer::Ended(proof)) => Some((service.clone(), proof)),
@@ -746,6 +761,7 @@ where
                             retry.insert(key.clone(), stamp.clone());
                         } else {
                             retry.remove(&key);
+                            continuity_holds.remove(&key);
                         }
                         // Exact speech proofs retain persistence-before-ledger
                         // cleanup ordering. If a ref moved to a newer live

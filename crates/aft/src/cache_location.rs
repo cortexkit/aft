@@ -924,15 +924,15 @@ pub fn prepare_cache_root(
         // A storage root that once kept its caches on another volume must not
         // quietly start writing them to its own volume again because the
         // setting went missing (a typo, a deleted user file). Only an
-        // explicit `"cache_dir": null` moves caches back.
+        // explicit `main_disk` choice moves caches back.
         let message = match previous_cache_parent(&storage) {
             Ok(None) => None,
             Ok(Some(parent)) => Some(format!(
-                "storage.cache_dir is not set, but this storage root's caches live on {}; set it again, or set \"cache_dir\": null to move caches back to the primary disk.",
+                "storage.cache_dir is not set, but this storage root's caches live on {}; set it again, or set \"cache_dir\": {{\"kind\": \"main_disk\"}} to move caches back to the primary disk.",
                 parent.display()
             )),
             Err(error) => Some(format!(
-                "storage.cache_dir is not set, and this storage root's cache records cannot be read ({error}); set it again, or set \"cache_dir\": null to move caches back to the primary disk."
+                "storage.cache_dir is not set, and this storage root's cache records cannot be read ({error}); set it again, or set \"cache_dir\": {{\"kind\": \"main_disk\"}} to move caches back to the primary disk."
             )),
         };
         if let Some(message) = message {

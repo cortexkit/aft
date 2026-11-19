@@ -1,5 +1,6 @@
 use super::*;
 use crate::bash_background::{persistence, BgTaskStatus};
+use crate::db::{access_grants as grants, remote_exec};
 use subc_protocol::scope::{ScopeKind, ScopeStatus};
 
 fn named(module: &str) -> ScopeStamp {
@@ -35,6 +36,7 @@ struct Fixture {
     ended: mpsc::UnboundedReceiver<EndedScope>,
     worker: JoinHandle<()>,
     catalog: tokio::sync::watch::Sender<Vec<String>>,
+    metrics: Arc<DispatchPathMetrics>,
     task: String,
 }
 
@@ -59,6 +61,7 @@ impl Fixture {
         let executor = Arc::new(Executor::new());
         assert!(executor.register_actor(root.clone(), ctx.clone()));
         let (control, pending, frames) = control(&["scope.describe", "scope.watch"]);
+        let metrics = control.metrics.clone();
         let runs = Arc::new(run_scope::RunScopes::new(control.clone()));
         let watched_runs = runs.clone();
         let source_executor = executor.clone();
@@ -91,15 +94,20 @@ impl Fixture {
             ended,
             worker,
             catalog,
+            metrics,
             task,
         }
     }
 
     fn status(&self) -> BgTaskStatus {
+        self.task_status(&self.task)
+    }
+
+    fn task_status(&self, task: &str) -> BgTaskStatus {
         self.ctx
             .bash_background()
             .status(
-                &self.task,
+                task,
                 "watch-session",
                 Some(self.root.as_path()),
                 Some(&self.ctx.storage_dir()),
@@ -134,13 +142,61 @@ impl Fixture {
 
     async fn reply(&mut self, expected: &ScopeStamp, reply: ModuleControlResponseToModule) {
         let query = request(&mut self.frames, "scope.describe").await;
+        self.respond_to_describe(&query, expected, reply);
+    }
+
+    fn respond_to_describe(
+        &self,
+        query: &WriterFrame,
+        expected: &ScopeStamp,
+        reply: ModuleControlResponseToModule,
+    ) {
         let body: Value = serde_json::from_slice(&query.body).unwrap();
         assert_eq!(
             body["owner"],
             serde_json::to_value(&expected.owner).unwrap()
         );
         assert_eq!(body["ref"], expected.scope_ref);
-        response(&self.pending, &query, reply);
+        response(&self.pending, query, reply);
+    }
+
+    async fn reply_through_watch_reopen(
+        &mut self,
+        stage: &str,
+        expected: &ScopeStamp,
+        reply: ModuleControlResponseToModule,
+    ) -> Option<WriterFrame> {
+        let mut reopened = None;
+        let query = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = self.frames.recv().await.unwrap();
+                if frame.header.ty == FrameType::Cancel {
+                    continue;
+                }
+                let body: Value = serde_json::from_slice(&frame.body).unwrap();
+                if body["op"] == "scope.watch" {
+                    snapshot(&self.pending, &frame);
+                    reopened = Some(frame);
+                    continue;
+                }
+                assert_eq!(body["op"], "scope.describe");
+                break frame;
+            }
+        })
+        .await
+        .unwrap_or_else(|error| panic!("missing scope.describe {stage}: {error}"));
+        self.respond_to_describe(&query, expected, reply);
+        turns().await;
+        reopened
+    }
+
+    fn continuity_holds(&self) -> Value {
+        self.metrics
+            .scope_descriptions
+            .lock()
+            .unwrap()
+            .scope_watch_health()["prefrontal_continuity_holds"]
+            .clone()
     }
 
     async fn rehomed(&mut self, live: &ScopeStamp) -> WriterFrame {
@@ -168,6 +224,147 @@ impl Fixture {
             Some("scope_revoked")
         );
     }
+}
+
+#[tokio::test]
+async fn prefrontal_scope_watch_holds_rename_gap_through_rollback_until_confirmed_end() {
+    let old = named("prefrontal-core");
+    let new = named("prefrontal");
+    let mut f = Fixture::new(&old).await;
+    f.catalog.send_replace(vec!["prefrontal-core".into()]);
+    let watch = f.opened(&old).await;
+    let db = f.ctx.db().unwrap();
+    let scope_key = grants::ScopeKey::for_grants(&old);
+    let policy_key = remote_exec::PolicyKey {
+        project_root: f.root.as_path().display().to_string(),
+        harness: "broca".into(),
+        session: "watch-session".into(),
+        principal: "reserved:broca".into(),
+        owner: scope_key.owner.clone(),
+        scope_ref: old.scope_ref.clone(),
+        epoch: old.scope_epoch,
+        preset: "worker".into(),
+    };
+    let grant = crate::access_policy::AccessGrant {
+        path: crate::access_policy::policy_path(f.root.as_path()),
+        kind: crate::access_policy::GrantKind::Subtree,
+        operation: crate::access_policy::AccessOperation::Read,
+    };
+    let launch = json!([{"path": grant.path, "mode": "read"}]);
+    {
+        let conn = db.lock().unwrap();
+        grants::register_scope(&conn, &scope_key, None, &crate::config::Config::default()).unwrap();
+        grants::materialize(&conn, &policy_key, &launch, &[(grant.clone(), None)]).unwrap();
+        remote_exec::freeze(
+            &conn,
+            &policy_key,
+            &crate::exec_remote::FrozenParams {
+                remote_exec: Some(crate::exec_remote::policy::RemoteExecPolicy {
+                    enabled: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            100,
+            || {},
+        )
+        .unwrap();
+    }
+    let assert_survives = |f: &Fixture| {
+        assert_eq!(
+            f.ctx.bash_background().with_live_scope(&old, || ()),
+            Some(()),
+            "the rename gap must never fence the old scope"
+        );
+        assert_eq!(f.status(), BgTaskStatus::Running);
+        assert_eq!(f.metadata().lifecycle_scope(), Some(&old));
+        let conn = db.lock().unwrap();
+        assert!(!grants::scope_ended(&conn, &scope_key).unwrap());
+        assert_eq!(grants::list(&conn, &scope_key).unwrap(), [grant.clone()]);
+        assert_eq!(
+            grants::launch_params(&conn, &policy_key).unwrap().as_ref(),
+            Some(&launch)
+        );
+        assert!(
+            remote_exec::lookup(&conn, &policy_key, 100)
+                .unwrap()
+                .unwrap()
+                .remote_exec
+                .unwrap()
+                .enabled
+        );
+    };
+    assert_survives(&f);
+
+    f.catalog.send_replace(vec![]);
+    push(&f.pending, &watch, &old, ScopeWatchEvent::Ended);
+    f.reply(&old, described(ScopeStatus::Live, false, true))
+        .await;
+    turns().await;
+    assert_survives(&f);
+    assert_eq!(f.continuity_holds(), 1);
+    assert!(f.ended.try_recv().is_err());
+    let second = spawn_scoped(&f.ctx, &f.root, &old, "sleep 30");
+    assert_eq!(f.task_status(&second), BgTaskStatus::Running);
+
+    f.reply_through_watch_reopen(
+        "during the catalog gap",
+        &old,
+        described(ScopeStatus::Live, false, true),
+    )
+    .await;
+    assert_survives(&f);
+
+    f.catalog.send_replace(vec!["prefrontal".into()]);
+    f.reply_through_watch_reopen(
+        "after the counterpart appears",
+        &old,
+        described(ScopeStatus::Live, false, true),
+    )
+    .await;
+    f.reply_through_watch_reopen(
+        "against the unsynced counterpart",
+        &new,
+        described(ScopeStatus::NotLive, true, false),
+    )
+    .await;
+    assert_survives(&f);
+    assert_eq!(f.continuity_holds(), 1);
+    assert!(f.ended.try_recv().is_err());
+
+    f.catalog.send_replace(vec!["prefrontal-core".into()]);
+    let reopened = f
+        .reply_through_watch_reopen(
+            "after rollback",
+            &old,
+            described(ScopeStatus::Live, true, true),
+        )
+        .await;
+    assert_survives(&f);
+    assert_eq!(f.continuity_holds(), 0);
+    assert!(f.ended.try_recv().is_err());
+
+    let watch = match reopened {
+        Some(watch) => watch,
+        None => f.opened(&old).await,
+    };
+    push(&f.pending, &watch, &old, ScopeWatchEvent::Ended);
+    f.reply_through_watch_reopen(
+        "after the real scope end",
+        &old,
+        described(ScopeStatus::Ended, true, true),
+    )
+    .await;
+    f.killed().await;
+    assert_eq!(f.task_status(&second), BgTaskStatus::Killed);
+    assert_eq!(f.ctx.bash_background().with_live_scope(&old, || ()), None);
+    let conn = db.lock().unwrap();
+    assert!(grants::scope_ended(&conn, &scope_key).unwrap());
+    assert!(grants::list(&conn, &scope_key).unwrap().is_empty());
+    assert!(grants::launch_params(&conn, &policy_key).unwrap().is_none());
+    assert!(remote_exec::lookup(&conn, &policy_key, 100)
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]

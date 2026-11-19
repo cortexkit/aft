@@ -13,7 +13,9 @@ use secret_rules::material::{check_admissible, encode_for_location};
 use secret_rules::target::{authority_matches_connect, normalize_request_target, ConnectAuthority};
 use zeroize::Zeroizing;
 
-use super::diagnostics::{log_approval_refusal, log_refusal, Reason, Refusal};
+use super::diagnostics::{
+    log_approval_refusal, log_refusal, refusal_line, scrubbed_refusal_body, Reason, Refusal,
+};
 use super::{full, refusal, Body, State};
 
 pub(super) async fn forward(
@@ -75,16 +77,10 @@ pub(super) async fn forward(
         } else {
             &error.label
         };
-        let bytes = Zeroizing::new(format!(
-            "{}: {label} ({})\n",
-            super::PROXY_REFUSAL,
-            authority.host
-        ));
-        let mut response = refusal("", "");
-        *response.body_mut() =
-            full(Bytes::from(state.scrub(bytes.as_bytes()).unwrap_or_else(
-                |_| super::PROXY_REFUSAL.as_bytes().to_vec(),
-            )));
+        // A label or host can spell an installed key; omit them if scrubbing fails.
+        let bytes = scrubbed_refusal_body(&state, error.reason, label, &authority.host)
+            .unwrap_or_else(|_| Bytes::from(refusal_line(error.reason, "", "")));
+        let mut response = refusal(bytes);
         if websocket {
             response.headers_mut().insert(
                 "connection",
@@ -176,13 +172,19 @@ async fn prepare_and_send(
             }
         }
     }
-    // The vault names the substitution location only when it releases a key.
-    // Buffer bounded JSON bodies to discover placeholders before asking it.
-    let has_json = parts
-        .headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(secret_rules::location::is_json_content_type);
+    // Only inspect JSON we can read as sent. Other content codings stay on the
+    // streaming path, including when a header or query carries a placeholder.
+    let opaque_body = parts.headers.get_all("content-encoding").iter().any(|v| {
+        v.to_str().map_or(true, |encoding| {
+            !encoding.trim().eq_ignore_ascii_case("identity")
+        })
+    });
+    let has_json = !opaque_body
+        && parts
+            .headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(secret_rules::location::is_json_content_type);
     let mut body = body_buffer(has_json);
     if has_json {
         while let Some(frame) = incoming.frame().await {
@@ -223,7 +225,7 @@ async fn prepare_and_send(
                     .headers
                     .values()
                     .any(|value| super::audit::mentions(value.as_bytes(), label))
-                || super::audit::mentions(&body, label)
+                || (has_json && super::audit::mentions(&body, label))
         })
         .cloned()
         .collect();
@@ -258,7 +260,11 @@ async fn prepare_and_send(
         let reconnected = &reconnected;
         let approval_metadata = &approval_metadata;
         let expires = budget.expires_at_ms;
-        let (target, headers, body) = (&target, &parts.headers, &body);
+        let (target, headers, body) = (
+            &target,
+            &parts.headers,
+            (!opaque_body).then_some(body.as_slice()),
+        );
         pending.push(async move {
             let answer = if state.is_https_port(authority.port) {
                 state
@@ -271,7 +277,6 @@ async fn prepare_and_send(
                             plan_location(
                                 label, location, addressed, authority, target, headers, body,
                             )
-                            .map_err(|_| crate::secret::requests::UseError::Unavailable)
                         },
                         |key| {
                             state
@@ -313,7 +318,7 @@ async fn prepare_and_send(
             () = budget.expired() => {
                 let metadata = approval_metadata.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let label = unsettled.first().map(String::as_str).unwrap_or("");
-                return Ok(not_approved(label, &authority.host, state, crate::secret::requests::UseError::Expired, Reason::ApprovalPendingAtDeadline, "pending_at_deadline", metadata.get(label)));
+                return Ok(not_approved(label, &authority.host, state, Reason::ApprovalPendingAtDeadline, "pending_at_deadline", metadata.get(label)));
             },
             result = pending.next() => result.ok_or_else(fail)?,
         };
@@ -345,7 +350,6 @@ async fn prepare_and_send(
                     label,
                     &authority.host,
                     state,
-                    reason,
                     log_reason,
                     outcome,
                     metadata.get(label),
@@ -580,27 +584,23 @@ fn not_approved(
     label: &str,
     host: &str,
     state: &State,
-    reason: crate::secret::requests::UseError,
-    log_reason: Reason,
+    reason: Reason,
     outcome: &'static str,
     approval: Option<&crate::secret::requests::ApprovalMetadata>,
 ) -> Response<Body> {
-    let body = Zeroizing::new(crate::secret::requests::consent_failure_message(
-        label, host, reason,
-    ));
-    let (bytes, refusal) = match state.scrub(body.as_bytes()) {
+    let (bytes, refusal) = match scrubbed_refusal_body(state, reason, label, host) {
         Ok(bytes) => {
-            let mut refusal = Refusal::for_label(log_reason, label);
+            let mut refusal = Refusal::for_label(reason, label);
             refusal.approval = approval.cloned();
             refusal.outcome = Some(outcome);
             (bytes, refusal)
         }
         Err(_) => (
-            super::PROXY_REFUSAL.as_bytes().to_vec(),
+            Bytes::from(refusal_line(Reason::ScrubFailed, "", "")),
             Refusal::for_label(Reason::ScrubFailed, label),
         ),
     };
-    let mut response = Response::new(full(Bytes::from(bytes)));
+    let mut response = Response::new(full(bytes));
     response.extensions_mut().insert(refusal);
     *response.status_mut() = hyper::StatusCode::FORBIDDEN;
     response
@@ -613,16 +613,21 @@ fn plan_location(
     authority: &ConnectAuthority,
     target: &str,
     headers: &hyper::HeaderMap,
-    body: &[u8],
-) -> Result<(), ()> {
-    let location = secret_rules::location::parse_vault_location(token).ok_or(())?;
+    body: Option<&[u8]>,
+) -> Result<(), crate::secret::requests::UseError> {
+    use crate::secret::requests::UseError;
+
+    let location =
+        secret_rules::location::parse_vault_location(token).ok_or(UseError::Unavailable)?;
     if let Location::Json(pointer) = &location {
-        let value: serde_json::Value = serde_json::from_slice(body).map_err(|_| ())?;
+        let body = body.ok_or(UseError::InvalidPlan("opaque request body"))?;
+        let value: serde_json::Value =
+            serde_json::from_slice(body).map_err(|_| UseError::Unavailable)?;
         if value
             .pointer(pointer)
             .is_some_and(|value| !value.is_string())
         {
-            return Err(());
+            return Err(UseError::Unavailable);
         }
     }
     let rule = secret_rules::location::LabelRule {
@@ -636,13 +641,13 @@ fn plan_location(
         .iter()
         .map(|(n, v)| HeaderField::value(n.as_str(), v.as_bytes()))
         .collect();
-    let view = RequestView::new(target, headers).with_body(body);
+    let view = RequestView::new(target, headers).with_body(body.unwrap_or_default());
     let dummy = [(label.to_owned(), b"proxy-planning-value-0000".to_vec())];
     if evaluate_request_with_connect(&view, authority, &[rule], &dummy)
         .refusal
         .is_some()
     {
-        Err(())
+        Err(UseError::Unavailable)
     } else {
         Ok(())
     }

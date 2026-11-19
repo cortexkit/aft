@@ -246,6 +246,20 @@ pub(super) fn run_kind(
     })
 }
 
+/// Whether a head route's scope owner is the run parent's owner. A runner that
+/// adopted its head before the prefrontal module rename keeps binding that
+/// head's routes under the old owner name, with the same scope ref and epoch
+/// the new owner registered. Both names are the same module, so either one
+/// owns the head.
+fn same_owner(
+    route_owner: &subc_protocol::Principal,
+    parent_owner: &subc_protocol::Principal,
+) -> bool {
+    route_owner == parent_owner
+        || crate::access_policy::prefrontal::counterpart_owner(route_owner).as_ref()
+            == Some(parent_owner)
+}
+
 fn resolve_owner(
     routes: &HashMap<RouteChannel, RouteIdentity>,
     route: RouteChannel,
@@ -329,7 +343,7 @@ fn resolve_owner(
             && identity.call_mode == subc_protocol::call_mode::CallMode::Classic
             && identity.scope.as_ref().is_some_and(|scope| {
                 scope.owner_authorized
-                    && scope.owner == parent.owner
+                    && same_owner(&scope.owner, &parent.owner)
                     && scope.scope_ref == parent.scope_ref
                     && scope.scope_epoch == parent.scope_epoch
             })

@@ -6,6 +6,7 @@ import {
   formatConfigErrorMessage,
   formatConfigParseErrorMessage,
   formatSubcConnectionMissingMessage,
+  isCacheDirChoice,
   mergeIndexes,
   type RawIndexesConfig,
   resolveCortexKitProjectConfigPath,
@@ -170,7 +171,8 @@ export function evaluatePluginLoad(input: PluginLoadInput): PluginLoadEvaluation
       ? userSemantic.backend
       : "fastembed";
   const storage = loaded.user && isRecord(loaded.user.storage) ? loaded.user.storage : null;
-  const requested = typeof storage?.cache_dir === "string" ? storage.cache_dir : "";
+  const choice = storage?.cache_dir;
+  const requested = isCacheDirChoice(choice) && choice.kind === "dir" ? choice.path : "";
   const home = input.home ?? homedir();
   const expanded =
     requested === "~"

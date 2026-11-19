@@ -1,9 +1,9 @@
 use super::*;
-
+#[path = "consent_expiry_tests.rs"]
+mod expiry_tests;
 #[path = "consent_label_tests.rs"]
 mod labels;
 use labels::assert_read_tree_scope_label;
-
 #[cfg(unix)]
 mod program_approvals {
     use super::*;

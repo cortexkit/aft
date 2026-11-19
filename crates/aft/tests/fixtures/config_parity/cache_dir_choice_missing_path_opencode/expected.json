@@ -1,0 +1,5 @@
+{
+  "rejected": [
+    "invalid_cache_config: storage.cache_dir"
+  ]
+}

@@ -1759,6 +1759,7 @@ fn split_storage_keeps_caches_off_when_the_setting_disappears() {
     for tiers in [
         vec![user_tier(r#"{}"#)],
         vec![user_tier(r#"{"storage":{}}"#)],
+        vec![user_tier(r#"{"storage":{"cache_dir":{"kind":"default"}}}"#)],
         vec![],
     ] {
         let (_temp, storage, mut config) = split_then_resolve(&tiers);
@@ -1767,7 +1768,9 @@ fn split_storage_keeps_caches_off_when_the_setting_disappears() {
         assert_eq!(warning.code, CACHE_DIR_UNAVAILABLE);
         assert!(
             warning.message.contains("caches live on")
-                && warning.message.contains("\"cache_dir\": null"),
+                && warning
+                    .message
+                    .contains(r#""cache_dir": {"kind": "main_disk"}"#),
             "{warning:?}"
         );
         assert!(cache_unavailable(&config).is_some());

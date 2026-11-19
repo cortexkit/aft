@@ -398,9 +398,18 @@ pub struct RawIndexes {
 #[serde(default)]
 pub struct RawStorage {
     #[schemars(
-        description = "Existing absolute cache parent (~ is expanded); AFT creates only its marked aft/ namespace. A path through symlinks is resolved once when first used and pinned by device and inode; if it later names a different directory, or is missing, unwritable or identity-changed, all disk caches turn off with cache_dir_unavailable and never fall back to storage. Rechecked on binds and at most once a minute. First enrollment requires a different device from durable storage; cache_dir_on_storage_device refuses main-disk mount stubs on every platform. Once a storage root has used a cache directory, removing this key keeps caches off; set it to null to move caches back to the storage root. Only the user config base may set this; harness/project overrides are dropped. Old caches are not migrated; doctor --fix reclaims only identity- and ownership-verified inactive cache domains."
+        description = "Existing absolute cache parent (~ is expanded); AFT creates only its marked aft/ namespace. A path through symlinks is resolved once when first used and pinned by device and inode; if it later names a different directory, or is missing, unwritable or identity-changed, all disk caches turn off with cache_dir_unavailable and never fall back to storage. Rechecked on binds and at most once a minute. First enrollment requires a different device from durable storage; cache_dir_on_storage_device refuses main-disk mount stubs on every platform. Once a storage root has used a cache directory, removing this key keeps caches off; set it to null to move caches back to the storage root. Only the user config base may set this; harness/project overrides are dropped. Old caches are not migrated; doctor --fix reclaims only identity- and ownership-verified inactive cache domains. Choose default for the same behavior as omitting the setting; choose main_disk to return caches to the storage root (the old null spelling); choose dir with path to use a cache parent.",
+        with = "RawCacheDir"
     )]
-    pub cache_dir: Option<String>,
+    pub cache_dir: Option<RawCacheDir>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RawCacheDir {
+    Default {},
+    MainDisk {},
+    Dir { path: String },
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, schemars::JsonSchema)]
@@ -1168,11 +1177,8 @@ pub fn resolve_config_for_harness(
     }
     config.index = resolve_index_config(merged.index.as_ref(), &mut warnings);
     config.lsp_user_max_servers = Some(lsp_user_max_servers);
-    if let Some(raw) = merged
-        .storage
-        .as_ref()
-        .and_then(|storage| storage.cache_dir.as_ref())
-    {
+    let cache_dir = merged.storage.and_then(|storage| storage.cache_dir);
+    if let Some(RawCacheDir::Dir { path: raw }) = cache_dir.as_ref() {
         let home = std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
             .map(std::path::PathBuf::from);
@@ -1186,11 +1192,7 @@ pub fn resolve_config_for_harness(
             }
         }
     }
-    config.cache_dir_opt_out = config.cache_dir.is_none()
-        && tiers
-            .iter()
-            .filter(|tier| tier.tier == "user")
-            .any(explicit_null_cache_dir);
+    config.cache_dir_opt_out = matches!(cache_dir, Some(RawCacheDir::MainDisk {}));
     config.idle = resolve_idle_config(merged.idle.as_ref(), &mut warnings);
     let resolved = serde_json::to_value(&config).unwrap_or(Value::Null);
     if let Err(invalid) = feature_config::validate_resolved_config(&resolved) {
@@ -1248,33 +1250,31 @@ fn rejected_cache_config(tiers: &[ConfigTier], mut config: Config, errors: &[Str
         // Read only `storage.cache_dir` from the user document itself: the
         // candidate was rejected, possibly for another section, so the tier
         // as a whole may not parse.
-        if let Some(raw) = tiers
-            .iter()
-            .filter(|tier| tier.tier == "user")
-            .filter_map(|tier| {
-                serde_json::from_str::<Value>(&strip_jsonc(&tier.doc))
-                    .ok()?
-                    .get("storage")?
-                    .get("cache_dir")?
-                    .as_str()
-                    .map(str::to_owned)
-            })
-            .last()
-        {
-            let home = std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .map(std::path::PathBuf::from);
-            config.cache_dir = Some(
-                crate::config::expand_cache_dir_path(&raw, home.as_deref())
-                    .unwrap_or_else(|_| std::path::PathBuf::from(raw)),
-            );
+        let mut choice = None;
+        for tier in tiers.iter().filter(|tier| tier.tier == "user") {
+            if let Some(next) = serde_json::from_str::<Value>(&strip_jsonc(&tier.doc))
+                .ok()
+                .and_then(|doc| {
+                    parse_cache_dir(doc.get("storage")?.get("cache_dir").cloned()?).ok()
+                })
+            {
+                merge_cache_dir(&mut choice, next);
+            }
+        }
+        match choice {
+            Some(RawCacheDir::Dir { path: raw }) => {
+                let home = std::env::var_os("HOME")
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .map(std::path::PathBuf::from);
+                config.cache_dir = Some(
+                    crate::config::expand_cache_dir_path(&raw, home.as_deref())
+                        .unwrap_or_else(|_| std::path::PathBuf::from(raw)),
+                );
+            }
+            Some(RawCacheDir::MainDisk {}) => config.cache_dir_opt_out = true,
+            Some(RawCacheDir::Default {}) | None => {}
         }
     }
-    config.cache_dir_opt_out = config.cache_dir.is_none()
-        && tiers
-            .iter()
-            .filter(|tier| tier.tier == "user")
-            .any(explicit_null_cache_dir);
     config
         .cache_config_unknown
         .get_or_insert_with(|| format!("configuration rejected: {}", errors.join(", ")));
@@ -1469,6 +1469,30 @@ fn parse_tier(
     if let Some(path) = feature_config::settings_shape::null_path(&map) {
         return Err(vec![format!("invalid_config_null:{path}")]);
     }
+    if tier.tier == "user" {
+        let malformed_choice = |block: &Map<String, Value>| {
+            block
+                .get("storage")
+                .and_then(|storage| storage.get("cache_dir"))
+                .filter(|choice| choice.is_object())
+                .is_some_and(|choice| {
+                    serde_json::from_value::<RawCacheDir>(choice.clone()).is_err()
+                })
+        };
+        if malformed_choice(&map)
+            || map
+                .get("harnesses")
+                .and_then(Value::as_object)
+                .is_some_and(|blocks| {
+                    blocks
+                        .values()
+                        .filter_map(Value::as_object)
+                        .any(malformed_choice)
+                })
+        {
+            return Err(vec!["invalid_cache_config: storage.cache_dir".into()]);
+        }
+    }
 
     let raw = match serde_json::from_value::<RawAftConfig>(Value::Object(map.clone())) {
         Ok(config) => config,
@@ -1607,15 +1631,22 @@ fn malformed_security_config_errors(
     errors
 }
 
-/// Whether a user tier sets `storage.cache_dir` to null, the explicit way to
-/// move caches back to the storage root after it used a cache directory.
-fn explicit_null_cache_dir(tier: &ConfigTier) -> bool {
-    serde_json::from_str::<Value>(&strip_jsonc(&tier.doc)).is_ok_and(|value| {
-        value
-            .get("storage")
-            .and_then(|storage| storage.get("cache_dir"))
-            .is_some_and(Value::is_null)
-    })
+fn parse_cache_dir(value: Value) -> serde_json::Result<RawCacheDir> {
+    let canonical = feature_config::settings_shape::cache_dir_replacement(&value)
+        .map_or(value, |(replacement, _)| replacement);
+    serde_json::from_value(canonical)
+}
+
+fn merge_cache_dir(base: &mut Option<RawCacheDir>, next: RawCacheDir) {
+    // When multiple user tiers are supplied, a path used to take precedence
+    // over a null opt-out, and an omitted setting never hid either choice.
+    if base.is_none()
+        || matches!(next, RawCacheDir::Dir { .. })
+        || (matches!(next, RawCacheDir::MainDisk {})
+            && !matches!(base, Some(RawCacheDir::Dir { .. })))
+    {
+        *base = Some(next);
+    }
 }
 
 /// Recognize storage-section typos without making unrelated user keys strict.
@@ -1703,7 +1734,7 @@ pub fn cache_location_config_error(tier: &ConfigTier) -> Option<String> {
     #[serde(deny_unknown_fields)]
     #[allow(dead_code)]
     struct StrictStorage {
-        cache_dir: Option<String>,
+        cache_dir: Option<RawCacheDir>,
     }
     let invalid_storage = |section: &Value| -> Option<String> {
         if section.is_null() {
@@ -1715,7 +1746,15 @@ pub fn cache_location_config_error(tier: &ConfigTier) -> Option<String> {
         {
             return Some(format!("unknown field `{key}`, expected `cache_dir`"));
         }
-        serde_json::from_value::<StrictStorage>(section.clone())
+        let mut section = section.clone();
+        if let Some(cache_dir) = section.get_mut("cache_dir") {
+            if let Some((replacement, _)) =
+                feature_config::settings_shape::cache_dir_replacement(cache_dir)
+            {
+                *cache_dir = replacement;
+            }
+        }
+        serde_json::from_value::<StrictStorage>(section)
             .err()
             .map(|error| error.to_string())
     };
@@ -2006,12 +2045,17 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
             .get_or_insert_with(RawDurability::default)
             .macos_full_sync = Some(value);
     }
-    if override_config
+    if let Some(choice) = override_config
         .storage
-        .as_ref()
-        .is_some_and(|storage| storage.cache_dir.is_some())
+        .and_then(|storage| storage.cache_dir)
     {
-        base.storage = override_config.storage;
+        merge_cache_dir(
+            &mut base
+                .storage
+                .get_or_insert_with(RawStorage::default)
+                .cache_dir,
+            choice,
+        );
     }
     if override_config.harnesses.is_some() {
         base.harnesses = override_config.harnesses.clone();
@@ -4028,9 +4072,62 @@ mod tests {
     #[test]
     fn storage_cache_dir_is_a_recognized_user_setting() {
         let raw = serde_json::from_str::<super::RawAftConfig>(
-            r#"{"storage":{"cache_dir":"/cache/aft"}}"#,
+            r#"{"storage":{"cache_dir":{"kind":"dir","path":"/cache/aft"}}}"#,
         );
         assert!(raw.is_ok(), "storage.cache_dir must be recognized: {raw:?}");
+    }
+
+    #[test]
+    fn storage_cache_dir_rejects_malformed_choices() {
+        for choice in [
+            r#"{"kind":"other"}"#,
+            r#"{"kind":"dir"}"#,
+            r#"{"kind":"main_disk","path":"/unexpected"}"#,
+        ] {
+            let candidate = tier(
+                "user",
+                &format!(r#"{{"storage":{{"cache_dir":{choice}}}}}"#),
+            );
+            assert!(strict_tier_error(&candidate, None).is_some(), "{choice}");
+            let result = resolve_config(&[candidate]);
+            assert_eq!(
+                result.errors,
+                ["invalid_cache_config: storage.cache_dir"],
+                "{choice}"
+            );
+            assert!(result.config.cache_config_unknown.is_some(), "{choice}");
+            assert!(!result.config.cache_dir_opt_out, "{choice}");
+        }
+    }
+
+    #[test]
+    fn storage_cache_dir_project_and_harness_choices_are_dropped() {
+        for choice in [
+            r#"{"kind":"default"}"#,
+            r#"{"kind":"main_disk"}"#,
+            r#"{"kind":"dir","path":"~/do-not-use"}"#,
+        ] {
+            let storage = format!(r#""storage":{{"cache_dir":{choice}}}"#);
+            let result = resolve_config_for_harness(
+                &[
+                    tier(
+                        "user",
+                        &format!(r#"{{"harnesses":{{"pi":{{{storage}}}}}}}"#),
+                    ),
+                    tier("project", &format!(r#"{{{storage}}}"#)),
+                ],
+                Some(&Harness::Pi),
+            );
+            assert!(result.errors.is_empty(), "{choice}: {:?}", result.errors);
+            assert!(result.config.cache_dir.is_none());
+            assert!(!result.config.cache_dir_opt_out);
+            for tier in ["user", "project"] {
+                assert!(result
+                    .dropped
+                    .iter()
+                    .any(|drop| drop.tier == tier && drop.key == "storage.cache_dir"));
+            }
+        }
     }
 
     #[test]
@@ -4186,7 +4283,7 @@ mod tests {
         let result = super::resolve_config(&[super::ConfigTier {
             tier: "user".into(),
             source: "user".into(),
-            doc: r#"{"storage":{"cache_dir":"relative"}}"#.into(),
+            doc: r#"{"storage":{"cache_dir":{"kind":"dir","path":"relative"}}}"#.into(),
         }]);
         assert_eq!(
             result.config.cache_dir,

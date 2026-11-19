@@ -322,7 +322,7 @@ async fn audit_unscanned_header_refusal() {
     assert_eq!(reply["status"], 403);
     assert_eq!(
         reply["body"],
-        "Secret proxy refused the request: new (localhost)\n"
+        "AFT's secret proxy refused the request: new (localhost). This secret was not named in the command when it started."
     );
     assert_eq!(vault.calls.load(Ordering::SeqCst), 0);
     assert!(server.seen.lock().is_empty());

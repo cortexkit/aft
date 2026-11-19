@@ -4,15 +4,18 @@ import { isAbsolute } from "node:path";
 import {
   type AftConfigFileMigrationResult,
   CALLGRAPH_CHUNK_KEY,
+  type CacheDirChoice,
   ConfigRejectedError,
   type ConfigTier,
   DATA_LAYER_RETIRED_PATHS,
   DEFAULT_DISABLED_TOOLS,
   DEFAULT_WORKER_WAIT_MAX_MS,
   deliverMigrationNoticeOnce,
+  hasMalformedCacheDirChoice,
   IDLE_CHECKOUT_HOURS_MAX,
   IDLE_CHECKOUT_HOURS_MIN,
   isBlockedBashEnvKey,
+  isCacheDirChoice,
   isProjectBlockedBashEnvKey,
   legacyConfigNoticeMessage,
   legacyProjectConfigLocationNotice,
@@ -488,7 +491,7 @@ export interface AftConfig {
   /** User-tier standing roots; project config cannot configure this machine state. */
   index?: IndexConfig;
   /** Only the user config's top level may select this existing directory. Caches live in its `aft` child; an unavailable directory disables caches instead of writing them under the storage root. */
-  storage?: { cache_dir?: string | null };
+  storage?: { cache_dir?: CacheDirChoice };
   /** User-base-only macOS file flush policy. Full drive-cache flushes default off. */
   durability?: { macos_full_sync?: boolean };
   /** Machine-local limits; only the user config base may select a profile. */
@@ -1127,7 +1130,9 @@ const AftConfigFieldsSchema = z.object({
   indexes: IndexesConfigSchema.optional(),
   /** User-configured filesystem roots for indexed search; project config cannot change them. */
   index: IndexConfigSchema.optional(),
-  storage: z.object({ cache_dir: z.string().nullable().optional() }).optional(),
+  storage: z
+    .object({ cache_dir: z.custom<CacheDirChoice>(isCacheDirChoice).optional() })
+    .optional(),
   durability: z.object({ macos_full_sync: z.boolean().optional() }).strict().optional(),
   memory: z.enum(["lean", "balanced"]).optional(),
   inspect: InspectConfigSchema.optional(),
@@ -1693,6 +1698,8 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   }
   if (invalidNull !== undefined)
     throw new ConfigRejectedError([`invalid_config_null:${invalidNull}`], configPath);
+  if (tier === "user" && hasMalformedCacheDirChoice(normalized))
+    throw new ConfigRejectedError(["invalid_cache_config: storage.cache_dir"], configPath);
   let parsed: AftConfig;
   if (result.success) {
     log(`Config loaded from ${configPath}`);
