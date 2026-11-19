@@ -1503,14 +1503,15 @@ impl DataCheckout {
         let bound = family_of(root).and_then(|family| {
             let family_dir = storage.join("data").join(family.digest().to_string());
             Checkout::bind_planes(shared, &family_dir, family, root, planes)
+                .map(|checkout| (checkout, family))
         });
-        let checkout = match bound {
-            Ok(checkout) => {
+        let (checkout, family) = match bound {
+            Ok((checkout, family)) => {
                 bind_failures()
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(root);
-                Arc::new(checkout)
+                (Arc::new(checkout), family)
             }
             Err(error) => {
                 let mut failures = bind_failures()
@@ -1597,6 +1598,7 @@ impl DataCheckout {
         let checkout = Arc::new(Self {
             disk_measurement: super::surfaces::DiskMeasurement::for_family(
                 work.checkout.family_dir(),
+                family,
             ),
             work,
             quiet,

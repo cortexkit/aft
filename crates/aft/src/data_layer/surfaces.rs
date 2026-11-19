@@ -978,28 +978,17 @@ fn report_from(
     }
 }
 
-/// The bytes of every file under `dir`; zero when it cannot be read.
-fn dir_bytes(dir: &Path) -> u64 {
-    #[cfg(test)]
-    STATUS_DISK_WALKS.with(|count| count.set(count.get() + 1));
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .map(|entry| match entry.file_type() {
-            Ok(kind) if kind.is_dir() => dir_bytes(&entry.path()),
-            Ok(kind) if kind.is_file() => entry.metadata().map_or(0, |meta| meta.len()),
-            _ => 0,
-        })
-        .fold(0, u64::saturating_add)
-}
+const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const DISK_ENTRY_CAP: usize = 4096;
+const DISK_WALK_BUDGET: Duration = Duration::from_millis(50);
 
-const DISK_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+fn complete_disk_bytes(usage: aft_store::family::DiskUsage) -> Option<u64> {
+    usage.stop.is_none().then_some(usage.bytes)
+}
 
 #[derive(Debug, Default)]
 struct DiskSample {
-    bytes: Option<u64>,
+    usage: Option<aft_store::family::DiskUsage>,
     completed: Option<std::time::Instant>,
     started: Option<std::time::Instant>,
     running: bool,
@@ -1011,8 +1000,8 @@ struct DiskSample {
 /// temporary files can grow without publishing a generation. All checkouts of
 /// a family share one coalesced sampler; push and operator reads never walk the
 /// family directory on the caller's thread.
-#[derive(Default)]
 pub(crate) struct DiskMeasurement {
+    family: aft_store::ids::FamilyId,
     sample: std::sync::Mutex<DiskSample>,
     listeners: std::sync::Mutex<Vec<std::sync::Weak<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
@@ -1033,7 +1022,7 @@ impl DiskMeasurement {
         sample.started = None;
         sample.completed = None;
     }
-    pub(crate) fn for_family(dir: &Path) -> Arc<Self> {
+    pub(crate) fn for_family(dir: &Path, family: aft_store::ids::FamilyId) -> Arc<Self> {
         let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         static FAMILIES: std::sync::LazyLock<
             std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Weak<DiskMeasurement>>>,
@@ -1045,7 +1034,13 @@ impl DiskMeasurement {
         if let Some(sample) = families.get(&dir).and_then(std::sync::Weak::upgrade) {
             return sample;
         }
-        let sample = Arc::new(Self::default());
+        let sample = Arc::new(Self {
+            family,
+            sample: Default::default(),
+            listeners: Default::default(),
+            #[cfg(test)]
+            gate: Default::default(),
+        });
         families.insert(dir, Arc::downgrade(&sample));
         sample
     }
@@ -1073,6 +1068,7 @@ impl DiskMeasurement {
             sample.started = Some(std::time::Instant::now());
             let own = Arc::clone(self);
             let dir = dir.to_path_buf();
+            let previous = sample.usage;
             if std::thread::Builder::new()
                 .name("aft-status-disk".into())
                 .spawn(move || {
@@ -1084,19 +1080,21 @@ impl DiskMeasurement {
                             held = changed.wait(held).unwrap();
                         }
                     }
-                    let bytes = dir_bytes(&dir);
+                    let usage = own.measure(&dir, previous);
                     {
                         let mut sample = own
                             .sample
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        sample.bytes = Some(bytes);
+                        if let Some(usage) = usage {
+                            sample.usage = Some(usage);
+                            #[cfg(test)]
+                            {
+                                sample.walks += 1;
+                            }
+                        }
                         sample.completed = Some(std::time::Instant::now());
                         sample.running = false;
-                        #[cfg(test)]
-                        {
-                            sample.walks += 1;
-                        }
                     }
                     let listeners = own
                         .listeners
@@ -1114,13 +1112,41 @@ impl DiskMeasurement {
                 sample.running = false;
             }
         }
+        let bytes = sample.usage.and_then(complete_disk_bytes);
         (
-            sample.bytes,
+            bytes,
             sample.running
+                || bytes.is_none()
                 || sample
                     .completed
                     .is_none_or(|at| at.elapsed() >= DISK_REFRESH_INTERVAL),
         )
+    }
+
+    fn measure(
+        &self,
+        dir: &Path,
+        previous: Option<aft_store::family::DiskUsage>,
+    ) -> Option<aft_store::family::DiskUsage> {
+        let usage = aft_store::family::measure_disk_usage(
+            dir,
+            self.family,
+            previous,
+            DISK_ENTRY_CAP,
+            std::time::Instant::now() + DISK_WALK_BUDGET,
+        )?;
+        #[cfg(test)]
+        STATUS_DISK_WALKS.with(|count| count.set(count.get() + 1));
+        if let Some(reason) = usage.stop {
+            log::warn!(
+                "index store disk sample partial: family={} path={} bytes={} examined={} reason={reason:?}",
+                self.family,
+                dir.display(),
+                usage.bytes,
+                usage.examined,
+            );
+        }
+        Some(usage)
     }
 }
 
@@ -1489,7 +1515,12 @@ fn apply_to_status_inner(payload: &mut Value, report: &DataStoreReport, push: bo
             disk.insert("data_store_bytes".into(), json!(bytes));
             disk.insert("data_store_bytes_stale".into(), json!(stale));
         } else {
-            disk.insert("data_store_bytes".into(), json!(dir_bytes(dir)));
+            let bytes = report
+                .disk_measurement
+                .as_ref()
+                .and_then(|measurement| measurement.measure(dir, None))
+                .and_then(complete_disk_bytes);
+            disk.insert("data_store_bytes".into(), json!(bytes));
         }
     }
     if let Some(object) = payload.as_object_mut() {
@@ -1503,7 +1534,7 @@ fn apply_to_status_inner(payload: &mut Value, report: &DataStoreReport, push: bo
 fn user_commands_operator_projection_returns_without_waiting_and_coalesces_disk_measurements() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("store"), b"first").unwrap();
-    let measurement = Arc::new(DiskMeasurement::default());
+    let measurement = DiskMeasurement::for_family(dir.path(), status_disk_tests::family_id());
     let gate = Arc::new((std::sync::Mutex::new(true), std::sync::Condvar::new()));
     *measurement.gate.lock().unwrap() = Some(gate.clone());
     let (completed_tx, completed_rx) = std::sync::mpsc::channel();
@@ -3218,16 +3249,59 @@ pub(crate) fn status_disk_walks_for_test() -> usize {
 #[cfg(test)]
 mod status_disk_tests {
     use super::*;
+    use aft_store::family::{measure_disk_usage, DiskUsageStop};
+    use aft_store::ids::{Digest128, FamilyId};
+
+    pub(super) fn family_id() -> FamilyId {
+        FamilyId::from_digest(Digest128::of(b"status test family"))
+    }
+
+    #[test]
+    fn status_disk_measurement_marks_a_capped_scratch_scan_as_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let builds = dir.path().join("builds");
+        std::fs::create_dir(&builds).unwrap();
+        for n in 0..64 {
+            std::fs::write(builds.join(n.to_string()), b"scratch").unwrap();
+        }
+        let usage = measure_disk_usage(
+            dir.path(),
+            family_id(),
+            None,
+            16,
+            std::time::Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap();
+        assert_eq!(usage.stop, Some(DiskUsageStop::EntryCap));
+        assert_eq!(usage.examined, 16);
+        assert_eq!(usage.bytes, 15 * 7);
+
+        let measurement = DiskMeasurement::for_family(dir.path(), family_id());
+        let now = std::time::Instant::now();
+        *measurement.sample.lock().unwrap() = DiskSample {
+            usage: Some(usage),
+            started: Some(now),
+            completed: Some(now),
+            ..DiskSample::default()
+        };
+        let mut report = DataStoreReport::both(PlaneReport::of(READY));
+        report.family_dir = Some(dir.path().to_path_buf());
+        report.disk_measurement = Some(measurement);
+        let mut payload = json!({"disk":{}});
+        apply_to_status_operator(&mut payload, &report);
+        assert_eq!(payload["disk"]["data_store_bytes"], Value::Null);
+        assert_eq!(payload["disk"]["data_store_bytes_stale"], true);
+    }
 
     #[test]
     fn status_disk_measurement_coalesces_bursts_and_marks_inflight_and_expired_samples() {
         let dir = tempfile::tempdir().unwrap();
         let temp = dir.path().join("growing.tmp");
         std::fs::write(&temp, b"first").unwrap();
-        let sample = DiskMeasurement::for_family(dir.path());
+        let sample = DiskMeasurement::for_family(dir.path(), family_id());
         assert!(Arc::ptr_eq(
             &sample,
-            &DiskMeasurement::for_family(dir.path())
+            &DiskMeasurement::for_family(dir.path(), family_id())
         ));
         let gate = Arc::new((std::sync::Mutex::new(true), std::sync::Condvar::new()));
         *sample.gate.lock().unwrap() = Some(Arc::clone(&gate));
@@ -3257,9 +3331,18 @@ mod status_disk_tests {
         *gate.0.lock().unwrap() = false;
         gate.1.notify_all();
         rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap();
+        assert_eq!(sample.observe(dir.path()), (Some(5), false));
+        assert_eq!(sample.sample.lock().unwrap().walks, 1, "unchanged family");
+
+        let builds = dir.path().join("builds");
+        std::fs::create_dir(&builds).unwrap();
+        std::fs::write(builds.join("new"), b"scratch").unwrap();
+        sample.expire_for_test();
+        assert_eq!(sample.observe(dir.path()), (Some(5), true));
+        rx.recv_timeout(Duration::from_secs(60)).unwrap();
         assert_eq!(
             sample.observe(dir.path()),
-            (Some(dir_bytes(dir.path())), false)
+            (Some(std::fs::metadata(temp).unwrap().len() + 7), false)
         );
         assert_eq!(sample.sample.lock().unwrap().walks, 2);
     }

@@ -1208,6 +1208,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal cache repair and retention walks, not result lists; an incomplete identity census or inventory refuses deletion and interrupted removal reports partial progress",
     },
     ExclusionEntry {
+        file: "crates/aft-store/src/family/disk.rs",
+        enclosing_item: "Scan::open_dir, Scan::next_entry",
+        location_or_primitive: "shared entry cap and deadline across manifest discovery and leftover file measurement",
+        reason: "internal index store disk accounting, not a result list; a stopped scan keeps bytes, examined entries and the stop reason and withholds the total from status",
+    },
+    ExclusionEntry {
         file: "views/callgraph_copies.rs",
         enclosing_item: "evict_for",
         location_or_primitive: "EVICTION_CANDIDATES and five-second deadline",

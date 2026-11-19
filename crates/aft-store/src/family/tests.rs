@@ -71,6 +71,105 @@ fn publish(family: &Family, bytes: &[u8], state: &[u8]) -> Generation {
         .unwrap()
 }
 
+#[test]
+fn disk_usage_counts_published_segments_at_their_actual_file_lengths() {
+    fn physical_bytes(dir: &Path) -> u64 {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    physical_bytes(&entry.path())
+                } else {
+                    entry.metadata().unwrap().len()
+                }
+            })
+            .sum()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let family = open(dir.path());
+    publish(&family, b"retained segment", b"previous state");
+    let generation = publish(&family, b"published segment", b"current state");
+    let (manifest, manifest_bytes) = super::disk::read_manifest(
+        &family.layout.manifest(generation),
+        family.id(),
+        generation.get(),
+    )
+    .unwrap();
+    let actual_segments = manifest
+        .segments()
+        .iter()
+        .map(|segment| {
+            std::fs::metadata(family.layout.segment(segment.id))
+                .unwrap()
+                .len()
+        })
+        .sum::<u64>();
+    assert!(actual_segments > 0);
+    assert_eq!(
+        manifest
+            .segments()
+            .iter()
+            .map(|segment| segment.len)
+            .sum::<u64>(),
+        actual_segments
+    );
+    assert_eq!(
+        manifest_bytes,
+        std::fs::metadata(family.layout.manifest(generation))
+            .unwrap()
+            .len()
+    );
+
+    std::fs::write(
+        family.layout.tmp_dir().join("staging"),
+        b"temporary build bytes",
+    )
+    .unwrap();
+    let expected = physical_bytes(dir.path());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let usage = measure_disk_usage(dir.path(), family.id(), None, 256, deadline).unwrap();
+    assert_eq!(usage.stop, None);
+    assert_eq!(
+        usage.bytes, expected,
+        "must also count retained and staging files"
+    );
+    assert_eq!(
+        physical_bytes(dir.path()),
+        expected,
+        "must not create a lease"
+    );
+    assert!(measure_disk_usage(dir.path(), family.id(), Some(usage), 256, deadline).is_none());
+    publish(&family, b"another published segment", b"a state");
+    let next = measure_disk_usage(dir.path(), family.id(), Some(usage), 256, deadline).unwrap();
+    assert_eq!(next.stop, None);
+    assert_eq!(next.bytes, physical_bytes(dir.path()));
+}
+
+#[test]
+fn disk_usage_bounds_manifest_discovery_by_entries_and_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let family = open(dir.path());
+    for number in 1..=16 {
+        std::fs::write(family.layout.manifest(Generation::new(number)), b"torn").unwrap();
+    }
+    let now = std::time::Instant::now();
+    let expired = measure_disk_usage(dir.path(), family.id(), None, 32, now).unwrap();
+    assert_eq!(expired.stop, Some(DiskUsageStop::Deadline));
+    assert_eq!(expired.examined, 0);
+    let capped = measure_disk_usage(
+        dir.path(),
+        family.id(),
+        None,
+        8,
+        now + std::time::Duration::from_secs(60),
+    )
+    .unwrap();
+    assert_eq!(capped.stop, Some(DiskUsageStop::EntryCap));
+    assert_eq!(capped.examined, 8);
+}
+
 fn read_section(snapshot: &Snapshot) -> Vec<u8> {
     let id = snapshot.manifest().segments()[0].id;
     let segment = snapshot.open_segment(id, &known(), cache()).unwrap();

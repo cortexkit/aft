@@ -40,6 +40,7 @@
 //! ends, so a lease never outlives its process, and a reused process id
 //! means nothing.
 
+mod disk;
 mod lease;
 mod manifest;
 pub(crate) mod record;
@@ -57,6 +58,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+pub use disk::{DiskUsage, DiskUsageStop, measure_disk_usage};
 pub use manifest::{Manifest, SegmentEntry, StateRef};
 pub use snapshot::Snapshot;
 pub use writer::{
