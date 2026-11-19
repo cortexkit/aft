@@ -1374,13 +1374,18 @@ mod tests {
         let rows = view
             .rows_dead_code_snapshot(&super::super::InspectEntryPoints)
             .unwrap();
+        let files = crate::inspect::tier2_scope_files(
+            &fixture.root,
+            &JobScope::for_project(fixture.root.clone()),
+        );
         let facts = scan(
             &job(&fixture.root, fixture.storage.path()),
             rows.entry_points.iter().cloned().collect(),
-            &rows.files,
+            &files,
             &rows.exported_symbols,
         );
         let reference = aggregate(&fixture.root, &rows, &facts, &mut Vec::new()).unwrap();
+        assert_eq!(reference["items"][0]["symbol"], "orphan");
         assert_eq!(fixture.rollup().0.unwrap(), reference);
     }
 
