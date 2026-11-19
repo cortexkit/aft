@@ -550,6 +550,47 @@ fn apply_patch_move_onto_symlink_is_refused_so_its_target_is_never_lost() {
     assert!(aft.shutdown().success());
 }
 
+/// A move reads its source through an in-root symlink, while the root check
+/// judged only the link's location: a target outside the root was copied
+/// into the project although a direct read of the link is refused.
+#[cfg(unix)]
+#[test]
+fn restricted_apply_patch_move_from_symlink_to_outside_file_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let secret = write_file(outside.path(), "secret.txt", "outside secret\n");
+    let link = root.join("link.txt");
+    std::os::unix::fs::symlink(&secret, &link).unwrap();
+    let mut aft = configured_restricted_aft(root);
+
+    let patch = r#"*** Begin Patch
+*** Update File: link.txt
+*** Move to: copied.txt
+@@
++appended
+*** End Patch"#;
+    for response in [
+        preview(&mut aft, "preview-move-from-outside-link", patch),
+        apply(&mut aft, "apply-move-from-outside-link", patch),
+    ] {
+        assert_eq!(response["success"], false, "move should fail: {response:?}");
+        assert_eq!(response["code"], "path_outside_root", "{response:?}");
+    }
+
+    assert!(
+        !root.join("copied.txt").exists(),
+        "outside content copied in"
+    );
+    assert!(fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read_to_string(&secret).unwrap(), "outside secret\n");
+
+    assert!(aft.shutdown().success());
+}
+
 #[cfg(unix)]
 #[test]
 fn restricted_apply_patch_symlink_delete_rejection_rolls_back_prior_hunks() {

@@ -271,6 +271,10 @@ fn reject_symlink_leaf(
     Ok(())
 }
 
+fn is_symlink_leaf(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
 fn remember_path(
     abs: &Path,
     rel: &str,
@@ -306,6 +310,12 @@ fn resolve_hunks(
         let source = resolve_path(req, ctx, source_path, preserve_source_entry)?;
         if matches!(&hunk, Hunk::Delete { .. }) {
             reject_symlink_delete(req, source_path, &source)?;
+        }
+        if move_path.is_some() && is_symlink_leaf(&source.abs) {
+            // A move keeps the source's own entry so it can remove a link
+            // rather than its target, but it still reads the content through
+            // the link: authorize that target exactly as a direct read would.
+            resolve_path(req, ctx, source_path, false)?;
         }
         remember_path(
             &source.abs,
