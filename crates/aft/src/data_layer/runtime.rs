@@ -2917,9 +2917,12 @@ mod tests {
 
     #[test]
     fn quiet_changes_still_refresh_and_publish_below_the_threshold() {
-        let fixture = PublicationFixture::new(Duration::from_secs(60), Duration::from_millis(200));
+        let quiet = Duration::from_millis(200);
+        let fixture = PublicationFixture::new(Duration::from_secs(60), quiet);
+        fixture.handle.quiet.use_manual_clock_for_test();
         fixture.add("quiet_edit", 1);
         assert_eq!(fixture.publications(), 0);
+        fixture.handle.quiet.advance_for_test(quiet);
         wait_until(|| fixture.handle.checkout().changed_paths() == 0);
         assert_eq!(fixture.publications(), 1);
         assert!(matches!(
@@ -2974,10 +2977,12 @@ mod tests {
     fn a_head_joining_worker_only_routes_arms_pending_changes_and_leaving_cancels_them() {
         let quiet = Duration::from_millis(100);
         let fixture = PublicationFixture::new(quiet, quiet);
+        fixture.handle.quiet.use_manual_clock_for_test();
         let ctx = fixture.context();
         ctx.set_worker_only_routes(true);
         fixture.add("worker_pending", 1);
         ctx.set_worker_only_routes(false);
+        fixture.handle.quiet.advance_for_test(quiet);
         wait_until(|| fixture.handle.checkout().changed_paths() == 0);
         wait_until(|| !fixture.handle.work.running());
         let before = fixture.refreshes();
@@ -2985,7 +2990,8 @@ mod tests {
         fixture.add("mixed_pending", 1);
         assert!(fixture.handle.quiet.armed.load(Ordering::Acquire));
         ctx.set_worker_only_routes(true);
-        std::thread::sleep(quiet * 3);
+        fixture.handle.quiet.advance_for_test(quiet);
+        wait_until(|| !fixture.handle.work.running());
         assert_eq!(fixture.refreshes(), before);
         assert!(pending(fixture.handle.checkout()));
         assert!(!fixture.handle.quiet.armed.load(Ordering::Acquire));
@@ -3218,27 +3224,25 @@ mod tests {
 
     #[test]
     fn a_new_edit_postpones_a_settled_request_already_waiting_for_refresh() {
-        let fixture = PublicationFixture::new(Duration::from_millis(400), QUIET);
+        let settle = Duration::from_millis(400);
+        let fixture = PublicationFixture::new(settle, QUIET);
+        let work = &fixture.handle.work;
+        work.settle.use_manual_clock_for_test();
+        fixture.handle.quiet.use_manual_clock_for_test();
         fixture.add("threshold", PUBLISH_AT);
-        fixture
-            .handle
-            .work
-            .refreshing
-            .store(true, Ordering::Release);
-        fixture.handle.work.settle.arm();
-        wait_until(|| *fixture.handle.work.publish_requested.lock() == Publish::Settled);
+        work.refreshing.store(true, Ordering::Release);
+        work.settle.arm();
+        work.settle.advance_for_test(settle);
+        assert!(*work.publish_requested.lock() == Publish::Settled);
         fixture.add("after_timer", 1);
-        fixture
-            .handle
-            .work
-            .refreshing
-            .store(false, Ordering::Release);
+        work.refreshing.store(false, Ordering::Release);
         fixture.refresh();
         assert_eq!(
             fixture.publications(),
             0,
             "a stale settle request published a new edit"
         );
+        work.settle.advance_for_test(settle);
         wait_until(|| fixture.handle.checkout().changed_paths() == 0);
         assert_eq!(fixture.publications(), 1);
     }
