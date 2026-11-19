@@ -3,10 +3,14 @@
 use super::{dispatch::FileTool, record::Record, *};
 use crate::db::call_ledger::{self as ledger, RecordedFrame};
 use cortexkit_role_tool_provider::{call::ToolCallRequest, catalog::composition_digest, errors};
+use dispatch::bash::{Running, Shell};
 use scope_describe::remote::{self as scope_lifetime, Lifetime};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tool_provider::{remote_pins, CatalogPreset};
+
+#[path = "remote_bash_service.rs"]
+mod bash_service;
 
 #[derive(PartialEq, Eq)]
 pub(in crate::subc) struct Binding {
@@ -74,6 +78,7 @@ pub(in crate::subc) struct Service {
     jobs: JoinSet<Option<Event>>,
     authorizer: authorization::Authorizer,
     scopes: scope_lifetime::Tracker,
+    pub(in crate::subc) bash: Running,
 }
 
 pub(in crate::subc) struct Event(Progress);
@@ -98,9 +103,14 @@ struct Call {
 
 struct Ready {
     call: Call,
-    tool: FileTool,
+    tool: Tool,
     root: ProjectRootId,
     key: ledger::Key,
+}
+
+enum Tool {
+    File(FileTool),
+    Shell(Shell),
 }
 
 impl Service {
@@ -130,6 +140,7 @@ impl Service {
             jobs: JoinSet::new(),
             authorizer: authorization::Authorizer::new(None, connection_file.to_path_buf()),
             scopes: scope_lifetime::Tracker::new(control),
+            bash: Running::default(),
         }
     }
 
@@ -153,6 +164,13 @@ impl Service {
         binding: &Arc<Binding>,
     ) {
         let edge = self.edge.clone();
+        if let Some(body) = body
+            .as_ref()
+            .filter(|body| body["name"] == call_yield::TOOL_YIELD)
+        {
+            self.yield_shell(frame, body, binding);
+            return;
+        }
         let operation = body
             .as_ref()
             .and_then(|body| body.get("op").or_else(|| body.get("name")))
@@ -387,8 +405,9 @@ impl Service {
                     locally_bound_root(&consent.folder, root_channels, routes)?;
                     Ok(authorization)
                 });
+                let bash = self.bash.clone();
                 self.jobs.spawn(async move {
-                    edge.execute(ready, decision).await;
+                    edge.execute(ready, decision, bash).await;
                     None
                 });
             }
@@ -397,7 +416,7 @@ impl Service {
 }
 
 enum Admission {
-    New(ledger::Key, FileTool, Preflight),
+    New(ledger::Key, Tool, Preflight),
     Replay(RecordedFrame),
 }
 
@@ -424,6 +443,7 @@ impl Edge {
                 call.carrier.clone(),
                 call.record.clone(),
             );
+            let trackable = call.lifetime.can_ask();
             blocking(move || {
                 let ctx = ctx.ok_or_else(not_working)?;
                 let pin = remote_pins::parse(&request)?;
@@ -439,7 +459,16 @@ impl Edge {
                 let key = ledger::Key { carrier, call_key };
                 let digest = composition_digest(&json!({"name":request.name, "schema_pin":request.schema_pin, "arguments":request.arguments}))
                     .map_err(|error| errors::invalid_request("arguments", error.to_string()))?;
-                let (tool, preflight) = FileTool::prepare(request, scope, folder, binding.session.clone(), digest.clone(), &ctx)?;
+                let (tool, preflight) = if dispatch::operation(&request.name).is_some_and(|(op, _)| op == "bash") {
+                    if !trackable {
+                        return Err(admission_refusal());
+                    }
+                    let (shell, preflight) = Shell::prepare(request, scope, folder, binding.session.clone(), digest.clone(), &ctx)?;
+                    (Tool::Shell(shell), preflight)
+                } else {
+                    let (file, preflight) = FileTool::prepare(request, scope, folder, binding.session.clone(), digest.clone(), &ctx)?;
+                    (Tool::File(file), preflight)
+                };
                 match record.claim(&key, &digest, &preflight.scope)? {
                     ledger::Admission::New => Ok(Admission::New(key, tool, preflight)),
                     ledger::Admission::Repeat(row) => row.frame.map(Admission::Replay).ok_or_else(|| {
@@ -475,6 +504,7 @@ impl Edge {
         &self,
         ready: Ready,
         authorization: Result<authorization::Authorization, ErrorBody>,
+        bash: Running,
     ) {
         use authorization::Authorization;
         let Ready {
@@ -483,12 +513,20 @@ impl Edge {
             root,
             key,
         } = ready;
-        let decision = match authorization {
-            Ok(Authorization::Once) => "allow_once",
-            Ok(Authorization::Saved(_)) => "saved_grant",
-            Ok(Authorization::WorkerRun) => "worker_run",
+        let (decision, grant) = match authorization {
+            Ok(Authorization::Once) => ("allow_once", None),
+            Ok(Authorization::Saved(id)) => ("saved_grant", Some(id)),
+            Ok(Authorization::WorkerRun) => ("worker_run", None),
             Err(error) => {
                 self.refuse(&call.frame, call.record, Some(key), error)
+                    .await;
+                return;
+            }
+        };
+        let tool = match tool {
+            Tool::File(tool) => tool,
+            Tool::Shell(shell) => {
+                self.execute_shell(call, root, key, shell, decision, grant, bash)
                     .await;
                 return;
             }
@@ -524,7 +562,13 @@ impl Edge {
         );
         let _response = await_executor_response(rx, "remote-file".into()).await;
         let result = result_rx.await.unwrap_or_else(|_| Err(not_working()));
-        let reply = match result {
+        let reply = self.tool_reply(&call, result);
+        self.finish(&call.frame, call.record, Some(key), reply, decision, None)
+            .await;
+    }
+
+    fn tool_reply(&self, call: &Call, result: Result<ToolCallResult, ErrorBody>) -> RecordedFrame {
+        match result {
             Ok(result) => {
                 let build = || {
                     let frame = &call.frame;
@@ -554,9 +598,7 @@ impl Edge {
                 })
             }
             Err(error) => error_reply(error),
-        };
-        self.finish(&call.frame, call.record, Some(key), reply, decision, None)
-            .await;
+        }
     }
 
     async fn refuse(
@@ -591,12 +633,28 @@ impl Edge {
         decision: &'static str,
         reason: Option<&'static str>,
     ) {
+        self.settle(frame, record, key, reply, decision, reason, false)
+            .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn settle(
+        &self,
+        frame: &Frame,
+        record: Record,
+        key: Option<ledger::Key>,
+        reply: RecordedFrame,
+        decision: &'static str,
+        reason: Option<&'static str>,
+        held: bool,
+    ) {
         let settled = blocking(move || {
             record.finish(key.as_ref(), &reply, decision, reason)?;
             Ok(reply)
         })
         .await;
         match settled {
+            Ok(_) if held => {}
             Ok(reply) => {
                 if let Ok(response) = Frame::build_with_version(
                     frame.header.ver,
@@ -616,7 +674,8 @@ impl Edge {
                     .await;
                 }
             }
-            Err(error) => self.error(frame, error).await,
+            Err(error) if !held => self.error(frame, error).await,
+            Err(_) => {}
         }
     }
 

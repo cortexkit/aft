@@ -16,12 +16,83 @@
 //! so its rows leave the member out. `scope` takes one of AFT's four tokens:
 //! `read` and `read_write` for a folder, `file_read` and `file_read_write`
 //! for a single file. `scope_label` is the sentence the page shows as given.
+use super::{
+    remote_calls, send_provider_error, send_reliable_writer_frame, App, DispatchPathMetrics,
+    Executor, ResponseTaskGuard, SubcError, WriterSender,
+};
 use crate::access_policy::{AccessOperation, GrantKind};
 use crate::db::access_grant_rows::{GrantHolder, GrantRow};
 use crate::db::remote_grant_rows;
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
-use subc_protocol::{ErrorBody, Principal};
+use std::sync::Arc;
+use subc_protocol::{ErrorBody, Frame, FrameType, Principal};
+
+/// Answer a `permissions/v1` request off the frame loop: listing reads
+/// aft.db, and a revoke may stop running commands.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn spawn_request(
+    tx: &WriterSender,
+    metrics: &Arc<DispatchPathMetrics>,
+    frame: &Frame,
+    principal: Option<&Principal>,
+    body: &Value,
+    shared_app: &Arc<App>,
+    executor: &Arc<Executor>,
+    bash: &remote_calls::RunningBash,
+) {
+    let admitted = admit(principal, body);
+    let tx = tx.clone();
+    let frame = frame.clone();
+    let metrics = Arc::clone(metrics);
+    let db = shared_app.db();
+    let executor = Arc::clone(executor);
+    let bash = bash.clone();
+    tokio::spawn(async move {
+        let _response_task = ResponseTaskGuard::new(&metrics);
+        let result = match admitted {
+            Err(error) => Err(error),
+            Ok(request) => tokio::task::spawn_blocking(move || {
+                let registries = executor
+                    .actor_contexts()
+                    .iter()
+                    .map(|ctx| ctx.bash_background().clone())
+                    .collect::<Vec<_>>();
+                answer(db.as_deref(), &request, |grant| match grant {
+                    RevokedGrant::Remote(id) => bash.revoke(id),
+                    grant => stop_tasks(&registries, grant),
+                })
+            })
+            .await
+            .unwrap_or_else(|error| Err(ErrorBody::new("internal_error", error.to_string()))),
+        };
+        let sent = match result {
+            Err(error) => send_provider_error(&tx, &metrics, &frame, error).await,
+            Ok(answer) => match serde_json::to_vec(&json!({ "result": answer }))
+                .map_err(SubcError::Json)
+                .and_then(|body| {
+                    Frame::build_with_version(
+                        frame.header.ver,
+                        FrameType::Response,
+                        frame.header.flags,
+                        frame.header.channel,
+                        frame.header.epoch,
+                        frame.header.corr,
+                        body,
+                    )
+                    .map_err(SubcError::FrameBuild)
+                }) {
+                Ok(response) => {
+                    send_reliable_writer_frame(&tx, &metrics, response, "permissions reply").await
+                }
+                Err(error) => Err(error),
+            },
+        };
+        if let Err(error) = sent {
+            log::warn!("permissions/v1: could not queue the reply: {error}");
+        }
+    });
+}
 
 pub(super) const CAPABILITY: &str = "permissions/v1";
 pub(super) const LIST_OPERATION: &str = "permissions.list";
@@ -333,8 +404,7 @@ pub(super) fn stop_tasks(
 
 pub(super) enum RevokedGrant<'a> {
     Local(&'a GrantRow),
-    // The remote shell executor will stop jobs indexed by this id.
-    Remote(#[allow(dead_code)] &'a str),
+    Remote(&'a str),
 }
 
 /// Delete before stopping commands, so later calls cannot get the revoked grant.

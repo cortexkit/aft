@@ -236,6 +236,8 @@ pub mod write_ledger;
 // `commands::bash::try_spawn_with_fallback` can exercise the retry
 // decision logic without a real Windows runtime. The module itself only
 // uses portable APIs; only its callers are Windows-gated.
+#[doc(hidden)]
+pub mod remote_shell_guard;
 pub(crate) mod windows_command;
 pub mod windows_path;
 pub mod windows_shell;

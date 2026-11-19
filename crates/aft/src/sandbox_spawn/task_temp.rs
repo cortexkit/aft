@@ -26,7 +26,7 @@ fn provider_root() -> PathBuf {
 
 /// Provider preflights have their own namespace so restart cleanup can inspect
 /// process identities without changing ordinary task scratch retention.
-pub(super) fn create_provider_layout() -> io::Result<PathBuf> {
+pub(crate) fn create_provider_layout() -> io::Result<PathBuf> {
     Parent::open(root())?;
     let parent = Parent::open(&provider_root())?;
     let identity = crate::bash_background::process::ProcessIdentity::of(std::process::id())
@@ -49,7 +49,7 @@ pub(super) fn create_provider_layout() -> io::Result<PathBuf> {
     Ok(path)
 }
 
-pub(super) fn remove_provider_layout(path: &Path) -> io::Result<()> {
+pub(crate) fn remove_provider_layout(path: &Path) -> io::Result<()> {
     if path.parent() == Some(provider_root().as_path())
         && path
             .file_name()
@@ -61,7 +61,7 @@ pub(super) fn remove_provider_layout(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn sweep_provider_layouts() -> io::Result<()> {
+pub(crate) fn sweep_provider_layouts() -> io::Result<()> {
     if !provider_root().exists() {
         return Ok(());
     }

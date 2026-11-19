@@ -41,6 +41,13 @@ impl Lifetime {
     pub(in crate::subc) fn ended(&self) -> bool {
         self.0.as_ref().is_some_and(CancellationToken::is_cancelled)
     }
+
+    pub(in crate::subc) async fn cancelled(&self) {
+        match &self.0 {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending().await,
+        }
+    }
 }
 
 pub(in crate::subc) struct Tracker {

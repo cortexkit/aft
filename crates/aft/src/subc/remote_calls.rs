@@ -15,6 +15,7 @@ mod dispatch;
 mod record;
 #[path = "remote_call_service.rs"]
 mod service;
+pub(super) use dispatch::bash::Running as RunningBash;
 pub(super) use service::{Binding, Service};
 
 /// Success of the remote dispatch preflight, minted only after admission,

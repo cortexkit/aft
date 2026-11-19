@@ -772,6 +772,12 @@ fn run_with(
         &RelayContext,
     ) -> Result<Option<bool>, String>,
 ) -> i32 {
+    if crate::remote_shell_guard::active() {
+        return refuse(
+            RefusalCode::WorkerWriteRefused,
+            "GitHub commands are not available in remote shells.",
+        );
+    }
     let paths = StatePaths::from_process();
     // The manifest can disappear after authority and audit checks finish.
     // Recheck it before calling upstream gh, including audited operator writes.
@@ -1267,22 +1273,7 @@ where
     }
 }
 
-/// True when the operator asked to run administration under their own `gh`.
-fn operator_bypass_requested() -> bool {
-    std::env::var_os("GH_SHIM_BYPASS").as_deref() == Some(OsStr::new("operator"))
-}
-
-fn refuse_bypass_bot_credentials(detectors: &Detectors) -> Option<i32> {
-    find_ambient_agent_credential(detectors).map(|credential| {
-        refuse(
-            RefusalCode::BypassBotCredentials,
-            &format!(
-                "{}; operator commands must run from a shell without bot credentials",
-                credential.presence()
-            ),
-        )
-    })
-}
+use native_guard::{operator_bypass_requested, refuse_bypass_bot_credentials};
 
 /// Run an admin-tier operator row (`pr edit`, `label create`).
 ///

@@ -6157,9 +6157,9 @@ where
                                 continue;
                             }
                             if permissions::is_request(body) {
-                                spawn_permissions_request(
+                                permissions::spawn_request(
                                     &writer_tx, &dispatch_path_metrics, &decoded.frame,
-                                    identity.principal.as_ref(), body, &shared_app, &executor,
+                                    identity.principal.as_ref(), body, &shared_app, &executor, &remote_calls.bash,
                                 );
                                 continue;
                             }
@@ -9488,69 +9488,6 @@ fn spawn_gh_relay(
 /// Bit 0 of a frame's flags byte: the body is raw bytes, not JSON
 /// (`Flags::is_binary`). subc-protocol does not export the constant.
 const FRAME_FLAG_BINARY: u8 = 0b0000_0001;
-
-/// Answer a `permissions/v1` request off the frame loop: listing reads
-/// aft.db, and a revoke may stop running commands.
-#[allow(clippy::too_many_arguments)]
-fn spawn_permissions_request(
-    tx: &WriterSender,
-    metrics: &Arc<DispatchPathMetrics>,
-    frame: &Frame,
-    principal: Option<&Principal>,
-    body: &Value,
-    shared_app: &Arc<App>,
-    executor: &Arc<Executor>,
-) {
-    let admitted = permissions::admit(principal, body);
-    let tx = tx.clone();
-    let frame = frame.clone();
-    let metrics = Arc::clone(metrics);
-    let db = shared_app.db();
-    let executor = Arc::clone(executor);
-    tokio::spawn(async move {
-        let _response_task = ResponseTaskGuard::new(&metrics);
-        let result = match admitted {
-            Err(error) => Err(error),
-            Ok(request) => tokio::task::spawn_blocking(move || {
-                let registries = executor
-                    .actor_contexts()
-                    .iter()
-                    .map(|ctx| ctx.bash_background().clone())
-                    .collect::<Vec<_>>();
-                permissions::answer(db.as_deref(), &request, |grant| {
-                    permissions::stop_tasks(&registries, grant)
-                })
-            })
-            .await
-            .unwrap_or_else(|error| Err(ErrorBody::new("internal_error", error.to_string()))),
-        };
-        let sent = match result {
-            Err(error) => send_provider_error(&tx, &metrics, &frame, error).await,
-            Ok(answer) => match serde_json::to_vec(&json!({ "result": answer }))
-                .map_err(SubcError::Json)
-                .and_then(|body| {
-                    Frame::build_with_version(
-                        frame.header.ver,
-                        FrameType::Response,
-                        frame.header.flags,
-                        frame.header.channel,
-                        frame.header.epoch,
-                        frame.header.corr,
-                        body,
-                    )
-                    .map_err(SubcError::FrameBuild)
-                }) {
-                Ok(response) => {
-                    send_reliable_writer_frame(&tx, &metrics, response, "permissions reply").await
-                }
-                Err(error) => Err(error),
-            },
-        };
-        if let Err(error) = sent {
-            log::warn!("permissions/v1: could not queue the reply: {error}");
-        }
-    });
-}
 
 /// Run a page-bundle operation off the frame loop: a collection reads files
 /// and checks policy, and every operation touches the snapshot folder.
