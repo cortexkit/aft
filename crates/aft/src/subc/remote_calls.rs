@@ -13,9 +13,11 @@ pub(super) mod authorization;
 mod dispatch;
 #[path = "remote_call_record.rs"]
 mod record;
+#[path = "remote_bash.rs"]
+mod remote_bash;
 #[path = "remote_call_service.rs"]
 mod service;
-pub(super) use dispatch::bash::Running as RunningBash;
+pub(super) use remote_bash::Running as RunningBash;
 pub(super) use service::{Binding, Service};
 
 /// Success of the remote dispatch preflight, minted only after admission,

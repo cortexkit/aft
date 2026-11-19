@@ -3,7 +3,7 @@
 use super::{dispatch::FileTool, record::Record, *};
 use crate::db::call_ledger::{self as ledger, RecordedFrame};
 use cortexkit_role_tool_provider::{call::ToolCallRequest, catalog::composition_digest, errors};
-use dispatch::bash::{Running, Shell};
+use remote_bash::{Running, Shell};
 use scope_describe::remote::{self as scope_lifetime, Lifetime};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;

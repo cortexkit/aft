@@ -380,6 +380,63 @@ async fn remote_edit_and_scope_end_enforce_attributed_authority() {
         );
         peer.saw_probe("remote-session").await;
         peer.saw_probe("run-session").await;
+        for (corr, args, code) in [
+            (
+                780,
+                json!({"command":"exit 9", "background":true}),
+                "invalid_request",
+            ),
+            (
+                781,
+                json!({"command":"exit 9", "pty":true}),
+                "invalid_request",
+            ),
+            (
+                782,
+                json!({"command":"exit 9", "sandbox":"host"}),
+                "remote_tool_not_available",
+            ),
+        ] {
+            refusal(peer.call(4, corr, tool("bash", args, corr)).await, code);
+        }
+        let runon = request(
+            "bash",
+            "head",
+            json!({"command":"exit 9", "runon":"linux"}),
+            "forbidden-runon",
+            pin("bash", CatalogPreset::Head, true, false, None),
+        );
+        refusal(peer.call(4, 783, runon).await, "remote_tool_not_available");
+        #[cfg(target_os = "linux")]
+        {
+            std::os::unix::fs::symlink(storage.path(), root.as_path().join("outside-link"))
+                .unwrap();
+            refusal(
+                peer.call(
+                    4,
+                    784,
+                    tool(
+                        "bash",
+                        json!({"command":"exit 9", "workdir":"outside-link"}),
+                        784,
+                    ),
+                )
+                .await,
+                "path_outside_root",
+            );
+        }
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            let marker = root.as_path().join("must-not-run");
+            let args = json!({"command":"touch must-not-run", "background":false, "pty":false});
+            let error = refusal(
+                peer.call(4, 784, tool("bash", args, 784)).await,
+                "sandbox_unavailable",
+            );
+            assert_eq!(error.message, remote_bash::unavailable().message);
+            assert!(!marker.exists());
+        }
+        assert!(cards.try_recv().is_err(), "a refusal opened a consent card");
         let read = |corr| tool("read", json!({"path":"in.txt"}), corr);
         let edit = |corr| {
             tool(

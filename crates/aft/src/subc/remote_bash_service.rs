@@ -86,7 +86,7 @@ impl Edge {
                 crate::sandbox_spawn::remote::prepare(&ctx, &shell.folder, workdir, shell.command)
                     .map_err(|error| {
                         log::warn!("remote shell setup: {error}");
-                        dispatch::bash::unavailable()
+                        remote_bash::unavailable()
                     })?;
             record.begin_with_grant(&begin_key, decision, grant.as_deref())?;
             Ok((launch, shell.timeout))
@@ -100,11 +100,11 @@ impl Edge {
                 return Err(admission_refusal());
             }
             launch
-                .start()
+                .start(timeout)
                 .map(|child| (child, timeout))
                 .map_err(|error| {
                     log::warn!("remote shell launch: {error}");
-                    dispatch::bash::unavailable()
+                    remote_bash::unavailable()
                 })
         });
         let (child, timeout) = match started {
@@ -118,21 +118,30 @@ impl Edge {
         let stop = CancellationToken::new();
         let _stop_on_drop = stop.clone().drop_guard();
         let stop_child = stop.clone();
-        let mut wait = tokio::spawn(async move { child.wait(timeout, stop_child).await });
+        let lifetime = call.lifetime.clone();
+        let revoked = job.revoked.clone();
+        let mut wait = tokio::spawn(async move {
+            let child_wait = child.wait(stop_child.clone());
+            tokio::pin!(child_wait);
+            tokio::select! {
+                biased;
+                _ = lifetime.cancelled() => {
+                    stop_child.cancel();
+                    (child_wait.await, true)
+                }
+                _ = revoked.cancelled() => {
+                    stop_child.cancel();
+                    (child_wait.await, true)
+                }
+                result = &mut child_wait => (result, false),
+            }
+        });
         let mut held = false;
         let mut yielded = false;
         let mut cancelled = false;
-        let output = loop {
+        let (output, denied) = loop {
             tokio::select! {
                 biased;
-                _ = call.lifetime.cancelled(), if !cancelled => {
-                    cancelled = true;
-                    stop.cancel();
-                }
-                _ = job.revoked.cancelled(), if !cancelled => {
-                    cancelled = true;
-                    stop.cancel();
-                }
                 pending = &mut job.yield_rx, if !yielded => {
                     yielded = true;
                     if let Ok(request) = pending {
@@ -155,7 +164,7 @@ impl Edge {
                     cancelled = true;
                     stop.cancel();
                 }
-                output = &mut wait => break output.unwrap_or_else(|error| Err(error.to_string())),
+                output = &mut wait => break output.unwrap_or_else(|error| (Err(error.to_string()), false)),
             }
         };
         // Do not accept a yield once the terminal result has been selected.
@@ -165,7 +174,7 @@ impl Edge {
         }
         let (result, reason) = match output {
             Ok(output) => {
-                let reason = if cancelled {
+                let reason = if denied || cancelled {
                     Some("denied")
                 } else if output.timed_out {
                     Some("timeout")
@@ -175,7 +184,7 @@ impl Edge {
                 let line = match reason {
                     Some("denied") => Some(authorization::denied().message),
                     Some("timeout") if timeout == Duration::from_secs(600) => {
-                        Some(dispatch::bash::TIME_LIMIT.to_owned())
+                        Some(remote_bash::TIME_LIMIT.to_owned())
                     }
                     _ => None,
                 };
@@ -183,7 +192,7 @@ impl Edge {
             }
             Err(error) => {
                 log::warn!("remote shell did not run to completion: {error}");
-                (Err(dispatch::bash::unavailable()), Some("refused"))
+                (Err(remote_bash::unavailable()), Some("refused"))
             }
         };
         let reply = self.tool_reply(&call, result);
