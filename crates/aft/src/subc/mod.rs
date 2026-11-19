@@ -227,6 +227,8 @@ mod diagnostics_findings;
 // The secret vault seam and its consent adapter. They read ragged route
 // fields, so they live under `subc` rather than the public `secret` types.
 mod drain;
+#[cfg(test)]
+mod edge_lifecycle_tests;
 mod flow_read;
 mod fork_call;
 mod health;
@@ -265,6 +267,7 @@ mod persistence;
 mod prepared_bind_tests;
 mod push;
 mod queued_call;
+use queued_call::AdmissionWait;
 mod readiness;
 mod remote_policy;
 pub(crate) mod result_body;
@@ -607,52 +610,6 @@ struct RequestFrameMeta {
     ver: u8,
     flags: Flags,
     deadline: Option<queued_call::Deadline>,
-}
-
-#[derive(Clone)]
-struct AdmissionWait {
-    route: RouteChannel,
-    corr: u64,
-    meta: RequestFrameMeta,
-    bare_name: String,
-    held_since: Instant,
-}
-
-impl AdmissionWait {
-    fn from_decoded(decoded: &DecodedFrame, bare_name: &str) -> Self {
-        Self {
-            route: route_key(decoded.frame.header.channel, decoded.frame.header.epoch),
-            corr: decoded.frame.header.corr,
-            meta: RequestFrameMeta {
-                ver: decoded.frame.header.ver,
-                flags: decoded.frame.header.flags,
-                deadline: None,
-            },
-            bare_name: bare_name.to_owned(),
-            held_since: decoded.phase_trace.received_at(),
-        }
-    }
-
-    fn draining_frame(&self) -> Result<Frame, SubcError> {
-        let response = drain::module_draining_response("admission", &self.bare_name);
-        let error = ErrorBody::new(
-            drain::MODULE_DRAINING_ERROR_CODE,
-            response.data["message"]
-                .as_str()
-                .expect("drain response has a message"),
-        )
-        .with_detail(json!({"retryable": true}));
-        Frame::build_with_version(
-            self.meta.ver,
-            FrameType::Error,
-            self.meta.flags,
-            self.route.channel,
-            self.route.epoch,
-            self.corr,
-            serde_json::to_vec(&error).map_err(SubcError::Json)?,
-        )
-        .map_err(SubcError::FrameBuild)
-    }
 }
 
 #[derive(Clone)]
@@ -4132,6 +4089,7 @@ async fn end_bg_subscriptions_for_drain(
 #[allow(clippy::too_many_arguments)]
 async fn teardown_installed_route(
     tx: &WriterSender,
+    ledger: Option<&tool_provider::LedgerEdge>,
     metrics: &DispatchPathMetrics,
     executor: &Arc<Executor>,
     channel: RouteChannel,
@@ -4156,6 +4114,9 @@ async fn teardown_installed_route(
     tool_response_body_limit: usize,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
+    if let Some(ledger) = ledger {
+        ledger.close_route(channel, tx, metrics).await?;
+    }
     // A replacement project route keeps replayable calls, even those still
     // waiting in the executor. Release queued calls only when no project route
     // replaces the old handle; already-running mutations keep their result.
@@ -4163,15 +4124,7 @@ async fn teardown_installed_route(
         let queued =
             queued_call::release_route(active_tool_calls, executor, channel, pending_responses);
         for (corr, request) in queued {
-            let terminal = build_error_frame(
-                request.ver,
-                channel.channel,
-                channel.epoch,
-                corr,
-                request.flags,
-                "route_released",
-                "route released before execution; the tool did not run",
-            )?;
+            let terminal = queued_call::released_frame(channel, corr, request)?;
             send_reliable_writer_frame(tx, metrics, terminal, "released queued call").await?;
         }
     }
@@ -5889,6 +5842,7 @@ where
                         }
                         if let Err(error) = teardown_installed_route(
                             &writer_tx,
+                            Some(&ledger_edge),
                             &dispatch_path_metrics,
                             &executor,
                             channel,
@@ -5967,6 +5921,7 @@ where
                             &a0.writer,
                             &writer_tx,
                             &a0,
+                            Some(&ledger_edge),
                             &frame,
                             &shared_app,
                             &executor,
@@ -6882,6 +6837,12 @@ where
                         &dispatch_path_metrics,
                     );
                     for frame in reclaim_frames {
+                        if frame.header.ty == FrameType::Goodbye {
+                            let route = route_key(frame.header.channel, frame.header.epoch);
+                            if let Err(error) = ledger_edge.close_route(route, &writer_tx, &dispatch_path_metrics).await {
+                                break 'module_loop Err(error);
+                            }
+                        }
                         if let Err(error) = send_reliable_writer_frame(
                             &writer_tx,
                             &dispatch_path_metrics,
@@ -8138,6 +8099,7 @@ async fn handle_control_request(
     tx: &WriterSender,
     legacy_tx: &WriterSender,
     a0: &A0Egress,
+    ledger: Option<&tool_provider::LedgerEdge>,
     frame: &Frame,
     shared_app: &Arc<App>,
     executor: &Arc<Executor>,
@@ -8394,6 +8356,7 @@ async fn handle_control_request(
                     a0.supersede(route_key(route_channel, installed_epoch));
                     teardown_installed_route(
                         legacy_tx,
+                        ledger,
                         metrics,
                         executor,
                         route_key(route_channel, installed_epoch),
@@ -8525,6 +8488,7 @@ async fn handle_control_request(
                 a0.supersede(route_key(route_channel, installed_epoch));
                 teardown_installed_route(
                     legacy_tx,
+                    ledger,
                     metrics,
                     executor,
                     route_key(route_channel, installed_epoch),
@@ -22757,6 +22721,7 @@ mod terminal_lifecycle_tests {
                 } else {
                     teardown_installed_route(
                         &tx,
+                        None,
                         &metrics,
                         &executor,
                         route,

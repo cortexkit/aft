@@ -23,6 +23,7 @@ use subc_protocol::ErrorBody;
 use super::manifest;
 use crate::hashline::integration::RegistrationRequest;
 
+mod admission_close;
 mod guidance;
 #[cfg(test)]
 mod guidance_text_tests;
@@ -1925,6 +1926,7 @@ struct LedgerWait {
     admission: super::AdmissionWait,
     cancel: super::PersistentCancelSignal,
     terminal_claim: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    undispatched: Option<admission_close::Undispatched>,
 }
 
 struct LedgerCall {
@@ -2724,6 +2726,7 @@ impl LedgerEdge {
                 admission,
                 cancel: cancel.clone(),
                 terminal_claim: terminal_claim.clone(),
+                undispatched: None,
             },
         );
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
@@ -2769,7 +2772,7 @@ impl LedgerEdge {
                     }
                     ledger::reduce_expired(&conn, &key, now)
                         .and_then(|_| {
-                            ledger::admit_with_tool_result_source(
+                            ledger::admit_with_event_id(
                                 &conn,
                                 &key,
                                 &digest,
@@ -2780,6 +2783,16 @@ impl LedgerEdge {
                                     State::DispatchStarted
                                 },
                                 include_tool_result_body,
+                            )
+                        })
+                        .map(|(admission, event_id)| {
+                            (
+                                admission,
+                                event_id.map(|event_id| admission_close::Undispatched {
+                                    db: db.clone(),
+                                    key,
+                                    event_id,
+                                }),
                             )
                         })
                         .map_err(|error| {
@@ -2799,12 +2812,13 @@ impl LedgerEdge {
             let response = await_executor_response(rx, "ledger-admission".into()).await;
             let result = result_rx.await.unwrap_or(Err(response));
             match result {
-                Ok(Admission::New) => {
-                    super::rich_ui::display::register(&response_key, &identity, &call);
+                Ok((Admission::New, mut undispatched)) => {
                     let admitted = {
-                        let waiting = edge.waiting.lock().unwrap();
-                        let admitted = waiting.contains_key(&(route, decoded.frame.header.corr));
-                        if admitted {
+                        let mut waiting = edge.waiting.lock().unwrap();
+                        let wait = waiting.get_mut(&(route, decoded.frame.header.corr));
+                        if let Some(wait) = wait {
+                            super::rich_ui::display::register(&response_key, &identity, &call);
+                            wait.undispatched = undispatched.take();
                             edge.calls.lock().unwrap().insert(
                                 (route, decoded.frame.header.corr),
                                 LedgerCall {
@@ -2827,23 +2841,15 @@ impl LedgerEdge {
                             {
                                 let _ = received.live.send_replace(true);
                             }
+                            true
+                        } else {
+                            false
                         }
-                        admitted
                     };
                     if !admitted {
-                        // Drain answered before admission completed. No tool was
-                        // dispatched, so leave a durable not-started result for repeats.
-                        drop(repeat_executor.submit_async(root, Lane::CallLedger, "ledger-drained-admission".into(), Box::new(move |ctx| {
-                            if let Some(db) = ctx.db() {
-                                if let Ok(conn) = db.lock() {
-                                    let recorded = ledger::not_started(&response_key, "cancelled");
-                                    if let Err(error) = ledger::settle(&conn, &response_key, &recorded, "not_started", Some("cancelled"), ledger::now_ms()) {
-                                        log::warn!("call ledger drained admission settlement failed: {error}");
-                                    }
-                                }
-                            }
-                            Response::success("ledger-drained-admission", json!({}))
-                        })));
+                        if let Some(new) = undispatched {
+                            new.settle();
+                        }
                         return;
                     }
                     // Without `test-timing-hooks` the gate is an empty async fn:
@@ -2853,7 +2859,7 @@ impl LedgerEdge {
                     admission_gate().await;
                     let _ = edge.ready.send(decoded);
                 }
-                Ok(Admission::Repeat(row)) if row.state != State::Settled => {
+                Ok((Admission::Repeat(row), _)) if row.state != State::Settled => {
                     // Repeats observe the same durable execution, including a
                     // shell recovered after restart. They never dispatch again.
                     loop {
@@ -2954,7 +2960,7 @@ impl LedgerEdge {
                         }
                     }
                 }
-                Ok(Admission::Repeat(row)) => {
+                Ok((Admission::Repeat(row), _)) => {
                     if terminal_claim.swap(true, Ordering::SeqCst) {
                         return;
                     }
@@ -2981,7 +2987,7 @@ impl LedgerEdge {
                         .await;
                     }
                 }
-                Ok(Admission::Conflict) => {
+                Ok((Admission::Conflict, _)) => {
                     if terminal_claim.swap(true, Ordering::SeqCst) {
                         return;
                     }
@@ -3595,12 +3601,8 @@ impl LedgerEdge {
         &self,
     ) -> Result<Vec<subc_protocol::Frame>, super::SubcError> {
         let mut frames = Vec::new();
-        for (_, wait) in self.waiting.lock().unwrap().drain() {
-            if !wait
-                .terminal_claim
-                .swap(true, std::sync::atomic::Ordering::SeqCst)
-            {
-                wait.cancel.cancel();
+        for (key, mut wait) in self.waiting.lock().unwrap().drain() {
+            if self.retire_wait(key, &mut wait) {
                 frames.push(wait.admission.draining_frame()?);
             }
         }
@@ -3608,18 +3610,22 @@ impl LedgerEdge {
     }
 
     pub(super) fn finish_waiting(&self, request: &subc_protocol::Frame) -> bool {
-        self.received.lock().unwrap().remove(&(
+        let key = (
             super::route_key(request.header.channel, request.header.epoch),
             request.header.corr,
-        ));
+        );
+        self.received.lock().unwrap().remove(&key);
         self.waiting
             .lock()
             .unwrap()
-            .remove(&(
-                super::route_key(request.header.channel, request.header.epoch),
-                request.header.corr,
-            ))
-            .is_some_and(|waiting| waiting.cancel.is_cancelled())
+            .remove(&key)
+            .is_some_and(|mut wait| {
+                let cancelled = wait.cancel.is_cancelled();
+                if cancelled {
+                    self.retire_wait(key, &mut wait);
+                }
+                cancelled
+            })
     }
 
     fn cancelled_frame(
@@ -12112,6 +12118,7 @@ mod ledger_terminal_tests {
                 ),
                 cancel: cancel.clone(),
                 terminal_claim: terminal_claim.clone(),
+                undispatched: None,
             },
         );
         let census = crate::subc::drain::held_request_census(
@@ -12156,6 +12163,7 @@ mod ledger_terminal_tests {
                 ),
                 cancel: PersistentCancelSignal::new(),
                 terminal_claim: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                undispatched: None,
             },
         );
         let frame = edge

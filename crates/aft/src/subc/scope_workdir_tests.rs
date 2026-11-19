@@ -145,6 +145,7 @@ fn bind_observed(
                 &writer_tx,
                 &writer_tx,
                 &a0,
+                None,
                 &frame,
                 &app,
                 &executor,

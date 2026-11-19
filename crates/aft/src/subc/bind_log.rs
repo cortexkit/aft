@@ -80,6 +80,7 @@ mod tests {
                 &writer,
                 &writer,
                 &a0,
+                None,
                 &frame,
                 &app,
                 &executor,
