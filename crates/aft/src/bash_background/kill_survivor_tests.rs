@@ -348,7 +348,12 @@ while [ ! -f ready ] && kill -0 "$pid" 2>/dev/null; do /bin/sleep 0.02; done
         );
         std::thread::sleep(Duration::from_millis(20));
     };
-    assert_eq!(completed.info.status, BgTaskStatus::Completed);
+    assert_eq!(
+        completed.info.status,
+        BgTaskStatus::Completed,
+        "foreground snapshot: {completed:?}; nohup output: {:?}",
+        fs::read_to_string(dir.path().join("child.log"))
+    );
     assert_eq!(
         completed.exit_code,
         Some(0),
