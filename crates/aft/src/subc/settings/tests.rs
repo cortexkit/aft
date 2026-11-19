@@ -273,10 +273,17 @@ async fn exercise_bootstrap() {
             assert_eq!(catalog["ready"], false);
             assert!(!catalog["provides"].to_string().contains("\"aft_search\""));
             assert!(!ctx.config_unpinned().format_on_edit);
-            assert_eq!(
-                ctx.config_unpinned().cache_dir.as_deref(),
-                Some(cache_path.as_path())
+            // Windows canonicalization adds a verbatim prefix the stored
+            // setting doesn't carry; compare the normalized forms there.
+            let stored = ctx.config_unpinned().cache_dir.clone().expect("cache dir");
+            #[cfg(windows)]
+            let (stored, expected) = (
+                crate::windows_path::normalize_windows_path(&stored),
+                crate::windows_path::normalize_windows_path(&cache_path),
             );
+            #[cfg(not(windows))]
+            let expected = cache_path.clone();
+            assert_eq!(stored, expected);
             incoming(
                 &incoming_tx,
                 frame(FrameType::Response, corr, json!({"op":"catalog.update"})),
