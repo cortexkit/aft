@@ -28,7 +28,7 @@ use subc_transport::connection_file::SCHEMA_VERSION;
 use super::super::wire::Coverage;
 use super::super::wire::Target;
 
-const GOLDENS: &str = include_str!("../../../aft/tests/fixtures/secret/secret-use-v1.jsonl");
+const GOLDENS: &str = include_str!("../../tests/fixtures/secret/secret-use-v1.jsonl");
 pub const NONCE: &str = "fake-aft-launch-nonce";
 
 type PendingKey = (String, String, String, String, String);

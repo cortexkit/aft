@@ -730,6 +730,40 @@ class EngineUnwiredGateTests(unittest.TestCase):
         # symbols.rs only defines the Symbol and Range types, so it stays out.
         self.assertEqual(derive_slice_class(["crates/aft/src/symbols.rs"]), "non_ranking")
 
+    def test_split_preserves_ranking_fence_at_each_moved_owner(self) -> None:
+        source = "crates/aft/src/"
+        semantic = source + "commands/semantic_search/"
+        state = source + "search_state/"
+        moves = [
+            (semantic + "comparator.rs", state + "candidate.rs"),
+            (semantic + "mod.rs", state + "mod.rs"),
+            (semantic + "exact_lane.rs", source + "search_index/exact_lane.rs"),
+            (semantic + "plan_table.rs", source + "search_b2/plan_table.rs"),
+            (source + "query_shape.rs", "crates/aft-base/src/query_shape.rs"),
+            (source + "semantic_index.rs", "crates/aft-base/src/ort_pin.rs"),
+            (source + "parser.rs", "crates/aft-parse/src/parser.rs"),
+            (source + "parser.rs", "crates/aft-parse/src/parser/file_language.rs"),
+            (source + "parser.rs", "crates/aft-base/src/lang_id.rs"),
+        ]
+        moves += [(source + "lib.rs", f"crates/{crate}/src/lib.rs") for crate in ("aft-base", "aft-db", "aft-parse")]
+        moves += [
+            (source + "search_b2/" + file, semantic + "planner/" + file)
+            for file in ("lane_plan.rs", "readiness.rs")
+        ]
+        moves += [
+            (semantic + file, state + file)
+            for file in (
+                "evidence_descriptor.rs", "generation_token.rs", "memo.rs", "request_files.rs", "waits.rs",
+                "rerank/fixture.rs", "rerank/mod.rs", "rerank/onnx.rs", "rerank/remote.rs", "rerank/slot.rs", "rerank/synapse.rs",
+            )
+        ]
+        root = Path(__file__).resolve().parents[2]
+        for old, new in moves:
+            with self.subTest(old=old, new=new):
+                self.assertTrue((root / new).is_file(), "update the fence when its owner moves")
+                self.assertEqual(derive_slice_class([old]), "ranking")
+                self.assertEqual(derive_slice_class([new]), derive_slice_class([old]))
+
     def test_engine_unwired_rejects_a_non_ranking_diff_class(self) -> None:
         result = self.gate(self.score, ["scripts/telemetry/cost-gate.sh"])
         self.assertEqual(result.exit_code, 2)

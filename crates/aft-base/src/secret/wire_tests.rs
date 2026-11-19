@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! The `secret.use` seam against the contract's golden examples and the pinned
 //! approval vectors.
 //!
@@ -23,7 +25,7 @@ const VECTORS_SHA256: &str = "efd4ba60641586e143bce81087e4f9f5aaf8a99ffede741903
 // docs/wire-contract-v1.md, §15 "secret.use: the sender contract", in document
 // order. Keep their literal JSON bytes, including statement bytes.
 pub(super) const USE_GOLDENS: &str =
-    include_str!("../../../aft/tests/fixtures/secret/secret-use-v1.jsonl");
+    include_str!("../../tests/fixtures/secret/secret-use-v1.jsonl");
 
 #[test]
 fn every_sender_golden_round_trips_through_the_wire_types() {

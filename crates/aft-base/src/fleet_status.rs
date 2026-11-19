@@ -1167,12 +1167,16 @@ fn next_discovery_backoff(current: Duration) -> Duration {
 #[allow(dead_code, unused_imports)]
 pub mod tests {
     use super::*;
+    #[cfg(test)]
     use serde_json::Map;
+    #[cfg(test)]
     use std::collections::HashSet;
     use subc_protocol::manifest::{ManagementOperation, ManagementOperationKind};
 
+    #[cfg(test)]
     const FIXTURES: &str =
         include_str!("../../aft/tests/fixtures/status_line/status-line-fixtures-2026-08-14.json");
+    #[cfg(test)]
     const PUBLISH_ACK_FIXTURES: [&str; 9] = [
         "publish_aft",
         "supersede_r3",
@@ -1184,6 +1188,7 @@ pub mod tests {
         "epoch_bump_republish_r1_new_conn",
         "publish_aft_project",
     ];
+    #[cfg(test)]
     const LINE_REPLY_FIXTURES: [&str; 9] = [
         "line_foreign_present",
         "supersede_line_after_r3",
@@ -1196,6 +1201,7 @@ pub mod tests {
         "line_aft_solo_scope",
     ];
 
+    #[cfg(test)]
     fn fixtures() -> Map<String, Value> {
         serde_json::from_str::<Value>(FIXTURES)
             .expect("producer fixture JSON")
@@ -1204,11 +1210,13 @@ pub mod tests {
             .clone()
     }
 
+    #[cfg(test)]
     fn parse_line(value: &Value) -> StatusLineSnapshot {
         StatusLineSnapshot::parse(&serde_json::to_vec(value).expect("fixture bytes"))
             .expect("status.line fixture")
     }
 
+    #[cfg(test)]
     fn parse_ack(value: &Value) -> StatusPublishAck {
         StatusPublishAck::parse(&serde_json::to_vec(value).expect("fixture bytes"))
             .expect("status.publish fixture")
