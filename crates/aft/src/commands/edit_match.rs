@@ -1775,9 +1775,13 @@ pub(crate) fn push_fuzzy_replacement(
     let end = matched.byte_start + matched.byte_len;
     // When the match leaves the source line separator outside its span, a
     // replacement ending in a newline must not introduce a second separator.
+    // A match that already ends with its line's separator replaces it, so the
+    // text after it (such as a following blank line) is not a separator to
+    // drop.
     let remaining = source[end..].trim_start_matches([' ', '\t']);
-    let separator_is_outside =
-        matched.pass > 1 && (remaining.starts_with('\n') || remaining.starts_with("\r\n"));
+    let separator_is_outside = matched.pass > 1
+        && !source[..end].ends_with('\n')
+        && (remaining.starts_with('\n') || remaining.starts_with("\r\n"));
     if separator_is_outside && replacement.ends_with('\n') {
         output.push_str(
             replacement
@@ -2636,6 +2640,73 @@ mod audit_regressions {
         let reply_bytes = serde_json::to_vec(&response.data).unwrap().len();
         assert!(reply_bytes < 8 * 1024, "reply is {reply_bytes} bytes");
         assert_eq!(std::fs::read_to_string(&path).unwrap().len(), length);
+    }
+
+    fn edit_file(dir: &Path, name: &str, source: &str, needle: &str, replacement: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, source).unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::language::StubProvider),
+            crate::config::Config {
+                storage_dir: Some(dir.join(format!("state-{name}"))),
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        let req: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "loose", "command": "edit_match", "file": path,
+            "match": needle, "replacement": replacement,
+        }))
+        .unwrap();
+        let response = super::handle_edit_match(&req, &ctx);
+        assert!(response.success, "{response:?}");
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    /// A loose match (here trailing whitespace on `foo `) whose oldString
+    /// ends with a newline already covers its last line's separator. The
+    /// blank or whitespace-only line after it used to be taken for that
+    /// separator and removed along with the replacement's final newline.
+    #[test]
+    fn loose_match_ending_in_newline_keeps_the_following_blank_line() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            edit_file(
+                dir.path(),
+                "blank.txt",
+                "foo \nbar\n\nbaz\n",
+                "foo\nbar\n",
+                "FOO\nBAR\n"
+            ),
+            "FOO\nBAR\n\nbaz\n"
+        );
+        assert_eq!(
+            edit_file(
+                dir.path(),
+                "spaces.txt",
+                "foo \nbar\n    \nbaz\n",
+                "foo\nbar\n",
+                "FOO\nBAR\n"
+            ),
+            "FOO\nBAR\n    \nbaz\n"
+        );
+    }
+
+    /// The exact pass never took that path: the same edit spelled exactly
+    /// keeps the blank line, before and after the fix.
+    #[test]
+    fn exact_match_ending_in_newline_keeps_the_following_blank_line() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            edit_file(
+                dir.path(),
+                "exact.txt",
+                "foo \nbar\n\nbaz\n",
+                "foo \nbar\n",
+                "FOO\nBAR\n"
+            ),
+            "FOO\nBAR\n\nbaz\n"
+        );
     }
 
     /// The 1-based selector still reaches a match past the listed eight.
