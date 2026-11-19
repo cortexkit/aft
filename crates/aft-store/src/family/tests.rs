@@ -10,6 +10,11 @@ use crate::segment::{
 
 const KIND: SectionKind = SectionKind::new(1);
 
+thread_local! {
+    pub(super) static AFTER_MANIFEST_LIST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn family_id() -> FamilyId {
     FamilyId::from_digest(Digest128::of(b"repo"))
 }
@@ -240,6 +245,35 @@ fn an_empty_family_reads_as_the_empty_generation() {
     assert_eq!(snapshot.generation(), Generation::EMPTY);
     assert!(snapshot.manifest().segments().is_empty());
     assert_eq!(snapshot.read_state(checkout("main")).unwrap(), None);
+}
+
+#[test]
+fn readers_retry_when_reclaim_removes_the_listed_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let family = open(dir.path());
+    publish(&family, b"first", b"state one");
+
+    let reuse_listing_after = |number| {
+        let writer = open(dir.path());
+        AFTER_MANIFEST_LIST.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                assert_eq!(
+                    publish(&writer, b"new", b"new state"),
+                    Generation::new(number)
+                );
+                let mut session = writer.try_write().unwrap().unwrap();
+                assert_eq!(session.reclaim().unwrap().removed_manifests, 1);
+            }));
+        });
+    };
+    reuse_listing_after(2);
+    {
+        let snapshot = family.snapshot().unwrap();
+        assert_eq!(snapshot.generation(), Generation::new(2));
+        assert_eq!(read_section(&snapshot), b"new");
+    }
+    reuse_listing_after(3);
+    assert_eq!(family.newest_generation().unwrap(), Generation::new(3));
 }
 
 #[test]
