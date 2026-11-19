@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use aft_store::cache::BlockCache;
 use aft_store::checkout::{CheckoutState, PathKind};
 use aft_store::family::{Family, Publication, Snapshot, WriteSession};
-use aft_store::ids::{ContentKey, Generation, SegmentId};
+use aft_store::ids::{ContentKey, Digest128, Generation, SegmentId};
 use aft_store::segment::{KnownSection, Segment};
 use aft_store::vector::{
     Chunk, ChunkDetail, ChunkMapKey, FileDetails, Member, MemberSet, ModelId, ModelIdentity,
@@ -1160,6 +1160,7 @@ pub struct VectorPlane {
     max_files: usize,
     loaded: Mutex<Arc<Loaded>>,
     members: Mutex<Option<Arc<Members>>>,
+    fill_queue: Mutex<Option<FillQueue>>,
     /// The old meaning index whose vectors fills take where they match.
     old: Option<OldIndex>,
     /// When a fill round merges the family's vector segments.
@@ -1182,6 +1183,7 @@ impl VectorPlane {
             max_files,
             loaded: Mutex::new(Arc::new(Loaded::empty())),
             members: Mutex::new(None),
+            fill_queue: Mutex::new(None),
             old: None,
             merge: MergeLimits::default(),
             merge_due: Mutex::default(),
@@ -1385,6 +1387,84 @@ struct RoundFile {
     chunks: Result<Vec<(TextDigest, CutChunk)>, String>,
 }
 
+/// Pending work across background jobs, each of which normally publishes
+/// one batch. Keeping just path and content keys does not keep an older
+/// checkout view or vector snapshot alive.
+struct FillQueue {
+    text: String,
+    parse_gaps: Digest128,
+    segments: Vec<SegmentId>,
+    files: usize,
+    admitted: usize,
+    embedded: usize,
+    awaiting_publication: usize,
+    /// Reverse path order, so consuming the next path does not shift the rest.
+    pending: Vec<(Vec<u8>, ContentKey)>,
+}
+
+aft_store::heap_bytes_of_fields!(FillQueue {
+    text,
+    parse_gaps,
+    segments,
+    files,
+    admitted,
+    embedded,
+    awaiting_publication,
+    pending
+});
+
+fn vector_membership(loaded: &Loaded) -> Vec<SegmentId> {
+    loaded
+        .shared
+        .iter()
+        .flat_map(|shared| shared.segments().map(|segment| segment.id()))
+        .collect()
+}
+
+impl FillQueue {
+    fn survey(view: &CheckoutView, loaded: &Loaded, max_files: usize) -> Result<Self, DataError> {
+        #[cfg(test)]
+        FILL_SURVEYS.with(|surveys| surveys.set(surveys.get() + 1));
+        let index = loaded.shared.as_ref().map(SharedVectorIndex::index);
+        let surveyed = survey(view, loaded, index.as_ref(), max_files)?;
+        let mut queue = Self {
+            text: view.text_generation(),
+            parse_gaps: view.parse_gaps_identity(),
+            segments: vector_membership(loaded),
+            files: surveyed.len(),
+            admitted: 0,
+            embedded: 0,
+            awaiting_publication: 0,
+            pending: Vec::new(),
+        };
+        for file in surveyed {
+            if file.gap.is_some() || !file.admitted {
+                continue;
+            }
+            queue.admitted += 1;
+            if !file.kind.has_content() {
+                continue;
+            }
+            if file.done(index.as_ref()) {
+                queue.embedded += 1;
+            } else if native_path(&file.path).is_some_and(|path| is_luau(&path))
+                && view.awaits_parse_publication(&file.path)
+            {
+                queue.awaiting_publication += 1;
+            } else {
+                queue.pending.push((file.path, file.content));
+            }
+        }
+        queue.pending.reverse();
+        Ok(queue)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FILL_SURVEYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn check_cancelled() -> Result<(), DataError> {
     if crate::executor::current_job_cancelled() {
         return Err(DataError::Cancelled);
@@ -1464,36 +1544,26 @@ impl VectorPlane {
         let model = &self.producer.model;
         let dimensions = model.dimensions as usize;
         let mut loaded = self.load()?;
-        let queue = {
-            let index = loaded.shared.as_ref().map(SharedVectorIndex::index);
-            let surveyed = survey(&view, &loaded, index.as_ref(), self.max_files)?;
-            report.files = surveyed.len();
-            let mut queue = Vec::new();
-            for file in surveyed {
-                if file.gap.is_some() {
-                    continue;
-                }
-                if !file.admitted {
-                    continue;
-                }
-                report.files_admitted += 1;
-                // Too large or unreadable: nothing to embed.
-                if !file.kind.has_content() {
-                    continue;
-                }
-                if file.done(index.as_ref()) {
-                    report.files_already_embedded += 1;
-                } else if native_path(&file.path).is_some_and(|path| is_luau(&path))
-                    && view.awaits_parse_publication(&file.path)
-                {
-                    report.files_awaiting_publication += 1;
-                } else {
-                    queue.push((file.path, file.content));
-                }
+        let previous = self
+            .fill_queue
+            .lock()
+            .expect("no panics while holding it")
+            .take();
+        let mut queue = match previous {
+            Some(queue)
+                if queue.text == view.text_generation()
+                    && queue.parse_gaps == view.parse_gaps_identity()
+                    && queue.segments == vector_membership(&loaded) =>
+            {
+                queue
             }
-            queue
+            _ => FillQueue::survey(&view, &loaded, self.max_files)?,
         };
-        report.files_queued = queue.len();
+        report.files = queue.files;
+        report.files_admitted = queue.admitted;
+        report.files_already_embedded = queue.embedded;
+        report.files_awaiting_publication = queue.awaiting_publication;
+        report.files_queued = queue.pending.len();
         #[cfg(all(
             test,
             feature = "wasm-grammars",
@@ -1503,15 +1573,16 @@ impl VectorPlane {
         super::test_gates::arrive(view.root(), super::test_gates::Point::FillSurvey);
         let per_vector = VectorSectionsBuilder::bytes_per_vector(dimensions);
         let mut embed_rows = |texts: Vec<String>| embed(texts);
-        let mut queue = queue.into_iter().peekable();
         let mut files_done = 0;
         let mut rounds_run = 0;
-        if rounds > 0 && queue.peek().is_none() {
+        let mut reusable = rounds == 1;
+        if rounds > 0 && queue.pending.is_empty() {
             self.maybe_merge(&mut loaded, None, &mut report)?;
+            reusable &= report.merges == 0;
         }
-        while queue.peek().is_some() {
+        while !queue.pending.is_empty() {
             if rounds_run == rounds {
-                report.files_left += queue.count();
+                report.files_left += queue.pending.len();
                 break;
             }
             rounds_run += 1;
@@ -1534,7 +1605,7 @@ impl VectorPlane {
                     && (wanted.len() + imported.len()).saturating_mul(per_vector) < ROUND_BYTES
                 {
                     check_cancelled()?;
-                    let Some((path, content)) = queue.next() else {
+                    let Some((path, content)) = queue.pending.pop() else {
                         break;
                     };
                     let started = Instant::now();
@@ -1620,6 +1691,7 @@ impl VectorPlane {
                 let lock = FillLock::take(self.checkout.family_dir(), &mut || progress(waiting))?;
                 report.wait_ms += elapsed_ms(started);
                 loaded = self.load()?;
+                reusable &= queue.segments == vector_membership(&loaded);
                 progress(FillProgress {
                     waiting: false,
                     ..waiting
@@ -1763,13 +1835,19 @@ impl VectorPlane {
             let mut stored_at_ms = None;
             if builder.chunk_maps() > 0 || builder.vectors() > 0 {
                 let started = Instant::now();
-                report.segment_bytes += Self::publish(&parts, builder)?;
+                let (base, generation, bytes) = Self::publish(&parts, builder)?;
+                report.segment_bytes += bytes;
                 stored_at_ms = Some(unix_ms());
                 report.publish_ms += elapsed_ms(started);
                 report.segments_published += 1;
                 report.files_filled += filled;
+                // Advance over our own publication only, not a publication
+                // that might also have changed maps for other queued files.
+                reusable &= base == loaded.generation;
                 loaded = self.load()?;
+                reusable &= loaded.generation == generation;
                 self.maybe_merge(&mut loaded, round_lock.as_ref(), &mut report)?;
+                reusable &= report.merges == 0;
             }
             progress(FillProgress {
                 files_done,
@@ -1780,9 +1858,19 @@ impl VectorPlane {
                 stored_at_ms,
             });
             if report.error.is_some() {
-                report.files_left += queue.count();
+                report.files_left += queue.pending.len();
                 break;
             }
+        }
+        if reusable
+            && report.error.is_none()
+            && report.files_changed == 0
+            && report.files_left == queue.pending.len()
+        {
+            queue.embedded += report.files_filled + report.files_filled_elsewhere;
+            queue.segments = vector_membership(&loaded);
+            *self.fill_queue.lock().expect("no panics while holding it") = Some(queue);
+            self.checkout.touch_memory();
         }
         Ok(report)
     }
@@ -1848,20 +1936,29 @@ impl VectorPlane {
     }
 
     /// Publishes `builder` as one new segment, in a generation that
-    /// changes no checkout's state. Returns the segment's length.
-    fn publish(parts: &VectorParts<'_>, builder: VectorSectionsBuilder) -> Result<u64, DataError> {
+    /// changes no checkout's state. Returns the before and after generations
+    /// and the segment's length.
+    fn publish(
+        parts: &VectorParts<'_>,
+        builder: VectorSectionsBuilder,
+    ) -> Result<(Generation, Generation, u64), DataError> {
         let mut session = writer(parts.family)?;
+        let base = session.base().generation();
         let mut pending = session.create_segment().map_err(store_error)?;
         builder.write(pending.writer()).map_err(store_error)?;
         let id = session.finish_segment(pending).map_err(store_error)?;
         check_cancelled()?;
-        session
+        let generation = session
             .publish(&Publication {
                 add_segments: vec![id],
                 ..Publication::default()
             })
             .map_err(store_error)?;
-        Ok(session.base().segment(id).map_or(0, |entry| entry.len))
+        Ok((
+            base,
+            generation,
+            session.base().segment(id).map_or(0, |entry| entry.len),
+        ))
     }
 
     /// Merges vector segments of this plane's model into one, when the
@@ -2312,6 +2409,7 @@ impl VectorPlane {
             max_files: _,
             loaded,
             members,
+            fill_queue,
             old,
             merge: _,
             merge_due: _,
@@ -2319,6 +2417,7 @@ impl VectorPlane {
         model.heap_bytes(seen)
             + loaded.heap_bytes(seen)
             + members.heap_bytes(seen)
+            + fill_queue.heap_bytes(seen)
             + old.heap_bytes(seen)
     }
 }
@@ -2399,6 +2498,48 @@ mod tests {
                 &mut |_| {},
             )
             .unwrap()
+    }
+
+    #[test]
+    fn one_round_jobs_reuse_the_queue_until_the_view_or_shared_vectors_change() {
+        let store = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        project(dir.path());
+        let checkout = bind(store.path(), dir.path());
+        let plane = VectorPlane::new(Arc::clone(&checkout), producer(), 100);
+        let round = || {
+            plane
+                .fill_rounds(
+                    &mut |texts| Ok(texts.iter().map(|text| vector_of(text)).collect()),
+                    FillBudget {
+                        max_batch: 5,
+                        files_per_round: 1,
+                    },
+                    1,
+                    &mut |_| {},
+                )
+                .unwrap()
+        };
+        FILL_SURVEYS.with(|surveys| surveys.set(0));
+        let first = round();
+        let second = round();
+        assert_eq!(first.files_filled, 1);
+        assert_eq!(second.files_filled, 1);
+        assert_eq!(second.files_queued + 1, first.files_queued);
+        assert_eq!(FILL_SURVEYS.with(std::cell::Cell::get), 1);
+
+        write(dir.path(), "src/lib.rs", "pub fn edited() {}\n");
+        checkout.record_paths(&[b"src/lib.rs".to_vec()]).unwrap();
+        round();
+        assert_eq!(FILL_SURVEYS.with(std::cell::Cell::get), 2);
+
+        let mut external = VectorSectionsBuilder::new(producer().model).unwrap();
+        external
+            .add_vector(TextDigest::of(b"external"), &vector_of("external"))
+            .unwrap();
+        VectorPlane::publish(&checkout.vector_parts(), external).unwrap();
+        round();
+        assert_eq!(FILL_SURVEYS.with(std::cell::Cell::get), 3);
     }
 
     #[test]
