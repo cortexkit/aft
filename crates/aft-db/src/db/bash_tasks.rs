@@ -488,10 +488,7 @@ pub fn find_bash_task_session(
 }
 
 /// Task IDs remain unique across the harnesses and sessions of a project root.
-pub fn bash_task_by_id(
-    conn: &Connection,
-    task_id: &str,
-) -> rusqlite::Result<Option<BashTaskRow>> {
+pub fn bash_task_by_id(conn: &Connection, task_id: &str) -> rusqlite::Result<Option<BashTaskRow>> {
     conn.query_row(
         "SELECT harness, session_id, task_id, project_key, command, cwd, status,
                 exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,

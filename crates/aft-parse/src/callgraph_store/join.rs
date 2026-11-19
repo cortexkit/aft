@@ -881,9 +881,7 @@ impl ParseBlob {
     /// Bind Python dispatch hints to the same keys as their call references.
     /// Nested bodies retain each enclosing caller, so their hints must use
     /// caller-specific keys rather than the shared syntax ordinal.
-    pub fn iter_bound_dispatch_sites(
-        &self,
-    ) -> impl Iterator<Item = dispatch::SiteHint> + '_ {
+    pub fn iter_bound_dispatch_sites(&self) -> impl Iterator<Item = dispatch::SiteHint> + '_ {
         let keys = (self.language == "python").then(|| {
             self.refs
                 .iter()

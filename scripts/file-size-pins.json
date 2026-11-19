@@ -1,6 +1,6 @@
 {
   "crates/aft/src/bash_background/registry.rs": {
-    "lines": 19058,
+    "lines": 19052,
     "reason": "Split registry lifecycle and persistence by area pending; AFT crate split lane."
   },
   "crates/aft/src/bash_background/remote_tests.rs": {
@@ -12,11 +12,11 @@
     "reason": "Split bridge integration tests by tool family pending; AFT crate split lane."
   },
   "crates/aft/src/subc/mod.rs": {
-    "lines": 13323,
+    "lines": 13315,
     "reason": "Split daemon orchestration by area pending; AFT crate split lane."
   },
   "crates/aft/src/context.rs": {
-    "lines": 11464,
+    "lines": 11462,
     "reason": "Split workspace context responsibilities pending; AFT crate split lane."
   },
   "crates/aft/src/lsp/manager.rs": {
@@ -24,7 +24,7 @@
     "reason": "Split language-server lifecycle and requests pending; AFT crate split lane."
   },
   "crates/aft/src/sandbox_spawn.rs": {
-    "lines": 10715,
+    "lines": 10689,
     "reason": "Split sandbox spawning by platform pending; AFT crate split lane."
   },
   "crates/aft/src/commands/semantic_search/mod.rs": {
@@ -32,7 +32,7 @@
     "reason": "Split semantic search command responsibilities pending; AFT crate split lane."
   },
   "crates/aft/src/semantic_index.rs": {
-    "lines": 10574,
+    "lines": 10567,
     "reason": "Split semantic indexing by area pending; AFT crate split lane."
   },
   "crates/aft-parse/src/parser.rs": {
@@ -40,7 +40,7 @@
     "reason": "Split parser support by language pending; AFT crate split lane."
   },
   "crates/aft/src/gh_shim.rs": {
-    "lines": 8538,
+    "lines": 8536,
     "reason": "Split GitHub shim policy and commands pending; AFT crate split lane."
   },
   "crates/aft/src/subc/consent_tests.rs": {
@@ -60,7 +60,7 @@
     "reason": "Split backup storage and recovery pending; AFT crate split lane."
   },
   "crates/aft/src/data_layer/checkout.rs": {
-    "lines": 6535,
+    "lines": 6520,
     "reason": "Split checkout lifecycle and storage pending; AFT crate split lane."
   },
   "crates/aft/src/bash_background/remote.rs": {

@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use subc_client_rs::registration::{self, ClaimError, ClaimMinter};
+use subc_client_rs::ModuleStream;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 use subc_client_rs::{ConsumerError, ConsumerOptions, SubcConsumer};
-use subc_client_rs::ModuleStream;
 use subc_protocol::claim::{ClaimMintReply, ClaimMintRequest, ClaimRateLimitedDetail};
 use subc_protocol::{error_codes, ErrorBody, FrameType};
 use subc_transport::{authenticate_client, connection_file};

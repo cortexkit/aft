@@ -103,7 +103,6 @@ pub mod large_read_counts;
 #[doc(hidden)]
 pub mod launch_fds;
 pub mod launch_nonce;
-pub mod registration;
 pub mod list_envelope;
 pub mod list_surfaces;
 pub mod live_db_files;
@@ -113,6 +112,7 @@ pub mod log_redact;
 pub mod logging;
 pub mod memory;
 pub mod memory_profile;
+pub mod registration;
 
 pub mod native_stat;
 pub mod ndjson_text;

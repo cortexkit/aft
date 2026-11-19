@@ -54,7 +54,7 @@ pub fn module_id() -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
-/// Can use module identity now, or wait for the minter on the consumer path.
+/// Can use module identity now, or wait until the daemon can issue claims for consumers.
 /// Preserve the legacy gate for processes not launched with module identity.
 pub fn module_consumer_allowed() -> bool {
     module_id().is_some() && (REGISTRATION.get().is_some() || identity_ready())
@@ -77,12 +77,12 @@ pub async fn connect_consumer(
     SubcConsumer::connect(path, options).await
 }
 
-/// A daemon registration channel was adopted; consumers must wait for its minter.
+/// The channel was adopted; consumers must wait until it can issue identity claims.
 pub fn channel_adopted() {
     REGISTRATION.get_or_init(IdentityReady::default);
 }
 
-/// The daemon-backed claim minter is ready to serve waiting consumers.
+/// The daemon-backed minter can now issue identity claims to waiting consumers.
 pub fn minter_installed() {
     REGISTRATION.get_or_init(IdentityReady::default).install();
 }

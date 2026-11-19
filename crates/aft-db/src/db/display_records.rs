@@ -87,12 +87,7 @@ pub(crate) fn sweep(conn: &Connection, now_ms: i64) -> rusqlite::Result<usize> {
 
 /// False means protected capacity is full: the caller must defer the wake,
 /// without interfering with the independent display.write push.
-pub fn persist(
-    conn: &Connection,
-    id: &str,
-    bytes: &[u8],
-    now_ms: i64,
-) -> rusqlite::Result<bool> {
+pub fn persist(conn: &Connection, id: &str, bytes: &[u8], now_ms: i64) -> rusqlite::Result<bool> {
     if !available(conn)? {
         log::warn!(
             "display store deferral: reason=unavailable count=1 bytes={}",

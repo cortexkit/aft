@@ -64,11 +64,12 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rustls-platform-verifier = "0.6"
 htmd = "0.5.4"
 markup5ever_rcdom = "0.38"
-cortexkit-role-tool-provider = "=0.15.10"
-subc-protocol = "=0.37.2"
+cortexkit-role-tool-provider = "=0.15.12"
+schemars = "1"
+subc-protocol = "=0.37.4"
 subc-transport = { version = "=0.18.0", optional = true }
-subc-client-rs = "=0.41.0"
-subc-os = { version = "=0.1.40", features = ["tokio"] }
+subc-client-rs = "=0.41.4"
+subc-os = { version = "=0.1.42", features = ["tokio"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 vt100 = "0.16"
 jsonc-parser = { version = "0.33", features = ["cst"] }

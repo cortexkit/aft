@@ -1,5 +1,4 @@
 use super::super::process::recorded_process_liveness;
-use crate::process_identity::ProcessLiveness;
 #[cfg(target_os = "linux")]
 use super::super::{
     memory_limit::MemoryPolicy,
@@ -8,6 +7,7 @@ use super::super::{
 #[cfg(target_os = "linux")]
 use super::BgMode;
 use super::{BgTaskRegistry, PersistedTask};
+use crate::process_identity::ProcessLiveness;
 #[cfg(target_os = "linux")]
 use std::fs;
 

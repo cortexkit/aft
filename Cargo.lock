@@ -57,6 +57,7 @@ dependencies = [
  "rustc-demangle",
  "rustls",
  "rustls-platform-verifier",
+ "schemars",
  "serde",
  "serde_json",
  "sha2",
