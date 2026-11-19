@@ -382,7 +382,8 @@ pub(super) async fn withdraw_on_own_route(
     id: String,
     timeout: Duration,
 ) -> Result<serde_json::Value, ConsentError> {
-    use subc_client_rs::{CallError, CallOptions, RouteTarget};
+    use subc_client_rs::{CallError, CallOptions};
+    use subc_protocol::RouteTarget;
     let body = super::encode("consent.withdraw", &json!({"elicitation_id": id}))?;
     let consumer = transport.consumer().await?;
     // The authenticated AFT principal owns the card. Unlike a new request,
