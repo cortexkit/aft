@@ -1,87 +1,117 @@
 #!/usr/bin/env bash
-# A release build must never compile the test-only secret vault or fixture hooks.
-#
-# The feature `secret-test-fake` compiles a vault that hands out key material on
-# request. If a shipped build enabled it, a released binary could substitute
-# fake keys. The fixture hooks allow test inputs and executable overrides.
-# Cargo profiles cannot enable crate features, so this guard checks default
-# feature sets and dependency edges that could enable either test-only feature.
-#
-# It reads the workspace manifests directly. `cargo metadata` would need the
-# network on a clean runner, and this check must run before any build artifact
-# exists.
+# Test-only vaults, hooks and shared fixtures must not be enabled by a release.
 set -euo pipefail
 
-repo_root="$(git rev-parse --show-toplevel)"
-cd "$repo_root"
+cd "$(git rev-parse --show-toplevel)"
 
-status=0
-
-fail() {
-  printf 'secret-test-fake guard: %s\n' "$1" >&2
-  status=1
-}
-
-# `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]` and their
-# `[target.'cfg(...)'.dependencies]` forms are where an edge can request the
-# feature for the whole graph.
-dependency_lines() {
-  local manifest="$1"
-  awk '
-    /^[[:space:]]*\[/ { section = $0; next }
-    section ~ /dependencies/ { print }
-  ' "$manifest"
-}
-
-# Both test-only features must stay standalone opt-in switches, with no default
-# or dependency edge enabling them in a production build.
-for feature in secret-test-fake test-hooks; do
-fake_owner="./crates/aft/Cargo.toml"
-if [[ ! -f "$fake_owner" ]]; then
-  fail "$fake_owner is missing, so $feature cannot be checked"
-else
-  if ! grep -Eq "^[[:space:]]*$feature[[:space:]]*=[[:space:]]*\[[[:space:]]*\][[:space:]]*$" "$fake_owner"; then
-    fail "$fake_owner must declare $feature = [] as a standalone opt-in feature"
+# Some macOS installations still put Python 3.9 first on PATH.
+for python in python3 python3.14 python3.13 python3.12 python3.11; do
+  if "$python" -c 'import tomllib' 2>/dev/null; then
+    break
   fi
-  # A `default` line that names the fake turns it on for every ordinary build.
-  while IFS= read -r default_line; do
-    [ -n "$default_line" ] || continue
-    if grep -q "$feature" <<<"$default_line"; then
-      fail "$fake_owner enables $feature from a default feature set: $default_line"
-    fi
-  done < <(grep -E '^[[:space:]]*default[[:space:]]*=' "$fake_owner" || true)
-fi
-
-# No other crate may declare the feature (an impostor with its own meaning), and
-# no dependency edge may request it from `agent-file-tools`.
-checked=0
-while IFS= read -r manifest; do
-  checked=$((checked + 1))
-  if [[ "$manifest" != "$fake_owner" ]]; then
-    while IFS= read -r line; do
-      [ -n "$line" ] || continue
-      case "$line" in
-        \#*) continue ;;
-      esac
-      if [[ "$line" =~ ^[[:space:]]*$feature[[:space:]]*= ]]; then
-        fail "$manifest declares its own $feature feature"
-      fi
-    done < <(grep -E "^[[:space:]]*$feature[[:space:]]*=" "$manifest" || true)
-  fi
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    case "$line" in
-      \#*) continue ;;
-    esac
-    if grep -q "\"$feature\"" <<<"$line"; then
-      fail "$manifest requests $feature from a dependency: $line"
-    fi
-  done < <(dependency_lines "$manifest" | grep -E 'agent-file-tools' || true)
-done < <(find . -name Cargo.toml -not -path './target/*' -not -path './node_modules/*' | sort)
+  python=
 done
-
-if [[ "$status" -ne 0 ]]; then
-  printf 'secret-test-fake guard: FAILED\n' >&2
+if [[ -z "$python" ]]; then
+  printf 'secret-test-fake guard: Python 3.11+ with tomllib is required\n' >&2
   exit 1
 fi
-printf 'secret-test-fake guard: ok (%d manifests, secret-test-fake and test-hooks stay opt-in)\n' "$checked"
+
+"$python" - <<'PY'
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tomllib
+
+PROTECTED = {"secret-test-fake", "test-hooks", "test-support"}
+STRICT = PROTECTED - {"test-support"}
+ROOT = Path.cwd()
+errors = []
+
+
+def fail(manifest, message):
+    errors.append(f"{manifest.relative_to(ROOT)}: {message}")
+
+
+def manifests():
+    for directory, children, files in os.walk(ROOT):
+        if Path(directory) == ROOT:
+            children[:] = [child for child in children if child not in {".git", "target", "node_modules"}]
+        if "Cargo.toml" in files:
+            yield Path(directory) / "Cargo.toml"
+
+
+def inspect_features(manifest, features, siblings):
+    # Any indirect activation from a default or ordinary feature must cross
+    # into the protected set somewhere; reject the edge where it crosses.
+    for source, entries in features.items():
+        if source in PROTECTED and siblings is None:
+            fail(manifest, f"non-workspace crate declares protected feature {source}")
+        for entry in entries:
+            dependency, slash, target = entry.partition("/")
+            if (target if slash else entry) not in PROTECTED:
+                if source in STRICT:
+                    fail(manifest, f"{source} may only forward to a protected workspace feature: {entry}")
+                continue
+            if source == "default":
+                fail(manifest, f"default enables a protected feature: {entry}")
+            elif source not in PROTECTED:
+                fail(manifest, f"ordinary feature {source} enables a protected feature: {entry}")
+            elif slash != "/" or target not in (siblings or {}).get(dependency.removesuffix("?"), ()):
+                fail(manifest, f"{source} must forward {entry} to a declared protected feature of a workspace sibling")
+
+
+def inspect_dependency(manifest, name, features):
+    for feature in sorted(PROTECTED.intersection(features)):
+        fail(manifest, f"non-dev dependency {name} requests protected feature {feature}")
+
+
+def inspect_other_manifest(manifest, document):
+    inspect_features(manifest, document.get("features", {}), None)
+    for table in (document, *document.get("target", {}).values()):
+        for kind in ("dependencies", "build-dependencies", "build_dependencies"):
+            for name, dependency in table.get(kind, {}).items():
+                if isinstance(dependency, dict):
+                    inspect_dependency(manifest, name, dependency.get("features", ()))
+
+
+try:
+    # No dependency resolution or network is needed. Cargo reports actual
+    # members and expands renamed, target-specific and inherited dependencies.
+    metadata = json.loads(subprocess.check_output([
+        "cargo", "metadata", "--offline", "--no-deps", "--format-version", "1"
+    ]))
+    member_ids = set(metadata["workspace_members"])
+    members = {
+        Path(package["manifest_path"]).resolve(): package
+        for package in metadata["packages"] if package["id"] in member_ids
+    }
+    others = sorted({manifest for manifest in manifests() if manifest.resolve() not in members})
+    for manifest in others:
+        with manifest.open("rb") as source:
+            inspect_other_manifest(manifest, tomllib.load(source))
+    for manifest, member in sorted(members.items()):
+        siblings = {}
+        for dependency in member["dependencies"]:
+            alias = dependency["rename"] or dependency["name"]
+            if dependency["kind"] != "dev":
+                inspect_dependency(manifest, alias, dependency["features"])
+            targets = set()
+            if local_path := dependency.get("path"):
+                other_manifest = (Path(local_path) / "Cargo.toml").resolve()
+                sibling = members.get(other_manifest)
+                if sibling is not None and sibling["id"] != member["id"] and sibling["name"] == dependency["name"]:
+                    targets.update(sibling["features"])
+            # A forward must be safe for every target-specific spelling of the alias.
+            siblings.setdefault(alias, targets).intersection_update(targets)
+        inspect_features(manifest, member["features"], siblings)
+except (OSError, ValueError, subprocess.CalledProcessError) as error:
+    sys.exit(f"secret-test-fake guard: cannot inspect workspace manifests: {error}")
+
+if errors:
+    for error in errors:
+        print(f"secret-test-fake guard: {error}", file=sys.stderr)
+    sys.exit("secret-test-fake guard: FAILED")
+print(f"secret-test-fake guard: ok ({len(members) + len(others)} manifests, all three test-only features stay opt-in)")
+PY

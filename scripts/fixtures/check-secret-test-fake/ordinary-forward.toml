@@ -1,0 +1,11 @@
+[package]
+name = "candidate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aft-base = { path = "../aft-base", optional = true }
+
+[features]
+default = ["release-ready"]
+release-ready = ["aft-base?/test-support"]
