@@ -6,8 +6,6 @@ use crate::db::remote_grant_rows::Mode;
 use cortexkit_role_tool_provider::call::ToolCallRequest;
 use cortexkit_role_tool_provider::errors;
 
-#[path = "remote_bash.rs"]
-pub(super) mod bash;
 #[path = "remote_edit_paths.rs"]
 mod edit_paths;
 

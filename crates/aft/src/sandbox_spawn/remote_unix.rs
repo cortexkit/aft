@@ -3,11 +3,14 @@ use crate::{bash_background::output::FINAL_OUTPUT_CAP_BYTES, sandbox_profile::Sa
 use std::{
     ffi::OsString,
     io,
-    os::{fd::AsRawFd, unix::net::UnixStream},
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::net::UnixStream,
+    },
     process::{ExitStatus, Stdio},
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt},
+    io::{unix::AsyncFd, AsyncRead, AsyncReadExt},
     process::{Child, Command},
 };
 
@@ -153,10 +156,11 @@ pub(crate) struct Running {
     scratch: Scratch,
     group: i32,
     failure: tokio::net::UnixStream,
+    deadline: AsyncFd<OwnedFd>,
 }
 
 impl Start {
-    pub(crate) fn start(self) -> Result<Running, String> {
+    pub(crate) fn start(self, timeout: Duration) -> Result<Running, String> {
         let result = (|| -> io::Result<Running> {
             let (reader, writer) = UnixStream::pair()?;
             reader.set_nonblocking(true)?;
@@ -192,6 +196,7 @@ impl Start {
                     Ok(())
                 });
             }
+            let deadline = deadline(timeout)?;
             let child = command.spawn()?;
             let group = child.id().expect("newly spawned child has a PID") as i32;
             Ok(Running {
@@ -199,6 +204,7 @@ impl Start {
                 scratch: self.scratch,
                 group,
                 failure,
+                deadline,
             })
         })();
         result.map_err(|error| error.to_string())
@@ -211,11 +217,7 @@ impl Running {
         unsafe { libc::kill(-self.group, libc::SIGKILL) };
     }
 
-    pub(crate) async fn wait(
-        mut self,
-        timeout: Duration,
-        cancel: CancellationToken,
-    ) -> Result<Output, String> {
+    pub(crate) async fn wait(mut self, cancel: CancellationToken) -> Result<Output, String> {
         let stdout = self.child.stdout.take().expect("piped stdout");
         let stderr = self.child.stderr.take().expect("piped stderr");
         let mut out = Captured::default();
@@ -224,13 +226,15 @@ impl Running {
             let drain =
                 async { tokio::try_join!(out.drain(stdout), err.drain(stderr)).map(|_| ()) };
             tokio::pin!(drain);
-            let deadline = tokio::time::Instant::now() + timeout;
             let mut drained = false;
             let (status, timed_out) = loop {
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => break (None, false),
-                    _ = tokio::time::sleep_until(deadline) => break (None, true),
+                    expiry = self.deadline.readable() => {
+                        expiry.map_err(|error| error.to_string())?;
+                        break (None, true);
+                    },
                     status = self.child.wait() => break (Some(status), false),
                     result = &mut drain, if !drained => {
                         result.map_err(|error| error.to_string())?;
@@ -290,6 +294,32 @@ impl Running {
             timed_out,
         }
     }
+}
+
+fn deadline(timeout: Duration) -> io::Result<AsyncFd<OwnedFd>> {
+    // BOOTTIME advances while suspended, unlike the default Tokio clock on Linux.
+    let raw = unsafe {
+        libc::timerfd_create(libc::CLOCK_BOOTTIME, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK)
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a successful timerfd_create returned a new owned descriptor.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let timer = libc::itimerspec {
+        it_interval: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        it_value: libc::timespec {
+            tv_sec: timeout.as_secs() as libc::time_t,
+            tv_nsec: timeout.subsec_nanos().into(),
+        },
+    };
+    if unsafe { libc::timerfd_settime(raw, 0, &timer, std::ptr::null_mut()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    AsyncFd::new(fd)
 }
 
 fn session_is_clean(session: i32) -> io::Result<bool> {

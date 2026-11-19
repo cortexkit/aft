@@ -58,8 +58,8 @@ pub async fn run_for_test(
         command,
         launcher.to_path_buf(),
     )?
-    .start()?
-    .wait(timeout, CancellationToken::new())
+    .start(timeout)?
+    .wait(CancellationToken::new())
     .await
     .map(|output| output.result("test", None))
 }
@@ -73,7 +73,7 @@ pub(crate) fn prepare(_: &AppContext, _: &Path, _: PathBuf, _: String) -> Result
 pub(crate) struct Start;
 #[cfg(not(target_os = "linux"))]
 impl Start {
-    pub(crate) fn start(self) -> Result<Running, String> {
+    pub(crate) fn start(self, _: Duration) -> Result<Running, String> {
         Err("no remote shell sandbox backend".into())
     }
 }
@@ -81,7 +81,7 @@ impl Start {
 pub(crate) struct Running;
 #[cfg(not(target_os = "linux"))]
 impl Running {
-    pub(crate) async fn wait(self, _: Duration, _: CancellationToken) -> Result<Output, String> {
+    pub(crate) async fn wait(self, _: CancellationToken) -> Result<Output, String> {
         Err("no remote shell sandbox backend".into())
     }
 }

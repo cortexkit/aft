@@ -1,6 +1,7 @@
 //! A federated shell is not a local background task and has no task ID.
 
 use super::*;
+use crate::context::confinement;
 use crate::db::remote_grant_rows::Mode;
 use cortexkit_role_tool_provider::{call::ToolCallRequest, errors};
 use tokio_util::sync::CancellationToken;
@@ -74,22 +75,18 @@ impl Shell {
         {
             return Err(tool_unavailable());
         }
-        let workdir = self.workdir.canonicalize().map_err(|_| {
-            dispatch::error(&crate::confinement::refusal("remote-bash", &self.workdir))
-        })?;
+        let workdir = self
+            .workdir
+            .canonicalize()
+            .map_err(|_| dispatch::error(&confinement::refusal("remote-bash", &self.workdir)))?;
         if !workdir.starts_with(&self.folder) || !workdir.is_dir() {
-            return Err(dispatch::error(&crate::confinement::refusal(
+            return Err(dispatch::error(&confinement::refusal(
                 "remote-bash",
                 &self.workdir,
             )));
         }
-        crate::confinement::with_root(ctx, "remote-bash", || {
-            crate::confinement::preflight(
-                ctx,
-                "remote-bash",
-                "remote-bash",
-                &json!({"path":workdir}),
-            )
+        confinement::with_root(ctx, "remote-bash", || {
+            confinement::preflight(ctx, "remote-bash", "remote-bash", &json!({"path":workdir}))
         })
         .map_err(|error| dispatch::error(&error))?;
         Ok(workdir)
