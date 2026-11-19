@@ -15,8 +15,6 @@
  ? <ToolText text="Running in the background." tone="muted" />
  : view.call.phase == "running" ? <ToolText text="Waiting for output…" tone="muted" /> : null}
 
-{Each(view.completion.tail ?? [], "line", <ToolText font="mono" maxLines={1} tone={line.tone ?? "neutral"} text={line.text} />)}
-
 {view.call.phase == "running" || (view.record.phase == "background_started" && view.completion == null)
  ? null : <ToolText text={view.output == null ? "Output" : "Output · " + Text(Count(Lines(view.output ?? ""))) + " lines"} />}
 

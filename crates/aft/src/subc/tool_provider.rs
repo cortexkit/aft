@@ -5218,12 +5218,25 @@ mod tests {
     }
 
     const REGENERATE_CATALOG: &str = "cargo test -p agent-file-tools --lib regenerate_tool_provider_catalog --locked -- --ignored";
+    const NOTICE_TEMPLATE_VECTORS: &str = "../../test-vectors/aft-notice-templates-v1.2";
 
     fn notice_template_vectors() -> BTreeMap<String, String> {
         use crate::subc::runner_notices::notice_templates::{self as notices, Notice, Target};
         use sha2::{Digest, Sha256};
         let mut files = BTreeMap::new();
-        files.insert("README.md".into(), "# AFT notice templates v1.1\n\nThe same opt-in `tool.catalog` replies and example `session.send` requests as\n`aft-notice-templates-v1` (see its README for the fixed clock, call key and\ndelivery mode they use), except that every catalog now carries the\ntool-provider 0.15.12 `read_only: true` mark on the tools AFT marks read-only.\nThe mark is always sent, so each catalog's `generation` and `catalog_digest`\nchange; the `*.sends.json` files are unchanged. v1 stays as published.\nRegenerate with `cargo test -p agent-file-tools --lib regenerate_notice_template_vectors -- --ignored`;\n`notice_template_vectors_match_samples` compares every byte.\n".into());
+        files.insert(
+            "README.md".into(),
+            concat!(
+                "# AFT notice templates v1.2\n\n",
+                "These opt-in `tool.catalog` replies and example `session.send` requests follow\n",
+                "`aft-notice-templates-v1.1`. The head and worker catalogs have a new bash pin\n",
+                "for completion output tails, which also changes their `generation` and\n",
+                "`catalog_digest`. The reader catalog and `*.sends.json` files are unchanged.\n",
+                "Versions 1 and 1.1 remain as published.\n\n",
+                "Regenerate with `cargo test -p agent-file-tools --lib regenerate_notice_template_vectors -- --ignored`;\n",
+                "`notice_template_vectors_match_samples` compares every byte.\n",
+            ).into(),
+        );
         for preset in ["head", "worker", "reader"] {
             let reply = catalog(
                 json!({"preset": preset, "notice_templates": true}),
@@ -5283,8 +5296,8 @@ mod tests {
 
     #[test]
     fn notice_template_vectors_match_samples() {
-        let root = std::path::Path::new(crate::test_support::manifest_dir())
-            .join("../../test-vectors/aft-notice-templates-v1.1");
+        let root =
+            std::path::Path::new(crate::test_support::manifest_dir()).join(NOTICE_TEMPLATE_VECTORS);
         for (path, expected) in notice_template_vectors() {
             assert_eq!(
                 std::fs::read_to_string(root.join(&path)).unwrap(),
@@ -5297,8 +5310,8 @@ mod tests {
     #[test]
     #[ignore = "explicit sample regeneration, not a verification gate"]
     fn regenerate_notice_template_vectors() {
-        let root = std::path::Path::new(crate::test_support::manifest_dir())
-            .join("../../test-vectors/aft-notice-templates-v1.1");
+        let root =
+            std::path::Path::new(crate::test_support::manifest_dir()).join(NOTICE_TEMPLATE_VECTORS);
         std::fs::create_dir_all(&root).unwrap();
         for (path, text) in notice_template_vectors() {
             std::fs::write(root.join(path), text).unwrap();

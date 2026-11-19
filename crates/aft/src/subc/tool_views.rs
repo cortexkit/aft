@@ -238,6 +238,19 @@ mod tests {
     #[test]
     fn bash_catalog_serves_a_new_tail_pin_without_changing_the_old_record_schema() {
         use crate::subc::tool_provider::{tools_for_session, CatalogPreset};
+        use sha2::{Digest, Sha256};
+
+        // These source digests were served before the completion schema had a tail.
+        let legacy_template_digests = [
+            (
+                "row",
+                "f735ae10c6e774181736e0f126c6250a37ac37c7a80ef77d7cef0ed89f6b553a",
+            ),
+            (
+                "page",
+                "ec82b0c56449e389316211a1a5da560e2fb9c680ad36bd901762e8d22b80623b",
+            ),
+        ];
 
         let base: BTreeMap<String, Shipped> = serde_json::from_str(include_str!(
             "../../tests/fixtures/tool_views/shipped-v1.json"
@@ -279,7 +292,14 @@ mod tests {
                 schema["fields"],
                 reply["views"][&old]["record_schema"]["fields"]
             );
-            for slot in ["row", "page"] {
+            for (slot, legacy_digest) in legacy_template_digests {
+                let legacy_source = reply["views"][&old]["template"][slot]["source"]
+                    .as_str()
+                    .unwrap();
+                assert_eq!(
+                    format!("{:x}", Sha256::digest(legacy_source.as_bytes())),
+                    legacy_digest
+                );
                 assert!(reply["views"][&pin]["template"][slot]["source"]
                     .as_str()
                     .unwrap()

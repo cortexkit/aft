@@ -13,9 +13,7 @@
 <ToolText font="mono" maxLines={2} text={input.command} />
 
 <Slot width="fill" lines={3} box="code">
-{view.completion.tail != null
- ? Each(view.completion.tail ?? [], "line", <ToolText font="mono" size="small" maxLines={1} tone={line.tone ?? "neutral"} text={line.text} />)
- : view.record.phase == "background_started" && view.completion == null
+{view.record.phase == "background_started" && view.completion == null
  ? <ToolText font="mono" size="small" tone="muted" text="Running in the background." />
  : view.call.phase == "running" ? <ToolText font="mono" size="small" tone="muted" text="Waiting for output…" /> : null}
 </Slot>
