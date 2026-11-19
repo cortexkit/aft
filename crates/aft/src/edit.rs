@@ -1302,13 +1302,22 @@ impl<'a> SourceLineIndex<'a> {
             .saturating_sub(1)
     }
 
+    /// The lines from `margin` before `line` to `margin` after it, joined
+    /// with LF. Each line longer than
+    /// [`crate::fuzzy_match::NEAREST_MISS_LINE_CHARS`] characters is shortened
+    /// around a middle `…`, so one context row stays small even on a long
+    /// generated or minified line that many matches share.
     pub(crate) fn context(&self, line: usize, margin: usize) -> String {
         let start = line.saturating_sub(margin).min(self.lines.len());
         let end = line
             .saturating_add(margin)
             .saturating_add(1)
             .min(self.lines.len());
-        self.lines[start..end].join("\n")
+        self.lines[start..end]
+            .iter()
+            .map(|line| crate::fuzzy_match::shorten_diagnostic_line(line))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 

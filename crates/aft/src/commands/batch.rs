@@ -641,8 +641,11 @@ fn resolve_edit_with_offsets(
 
         if fuzzy_matches.len() > 1 {
             let line_index = edit::SourceLineIndex::new(source);
+            // Structured rows stop where the message's listing stops; the
+            // message keeps the exact count (see `render_occurrence_listing`).
             let occurrences: Vec<serde_json::Value> = fuzzy_matches
                 .iter()
+                .take(crate::fuzzy_match::AMBIGUOUS_OCCURRENCE_LIST_LIMIT)
                 .enumerate()
                 .map(|(occurrence_index, matched)| {
                     let line = line_index.line_at(matched.byte_start);
@@ -977,11 +980,21 @@ mod a03_tests {
             .unwrap();
             let occurrences = &response.data["occurrences"];
             let lines: Vec<_> = source.lines().collect();
-            let expected: Vec<_> = (0..count).map(|line| serde_json::json!({
+            // Rows stop at the eight the message lists; the message keeps the count.
+            let shown = count.min(crate::fuzzy_match::AMBIGUOUS_OCCURRENCE_LIST_LIMIT);
+            let expected: Vec<_> = (0..shown).map(|line| serde_json::json!({
                 "occurrence": line + 1, "line": line + 1,
                 "context": lines[line.saturating_sub(2)..(line+3).min(lines.len())].join("\n")
             })).collect();
             assert_eq!(occurrences, &serde_json::json!(expected));
+            assert!(
+                response.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("({count} occurrences, expected 1)")),
+                "{:?}",
+                response
+            );
             let passes = edit::A03_LINE_INDEX_PASSES.with(|counter| counter.get());
             eprintln!("A03 ambiguity matches={count}: index passes={passes}");
             observed.push(passes);
@@ -1074,10 +1087,14 @@ mod a03_tests {
         edit::A03_LINE_INDEX_PASSES.with(|count| count.set(0));
         let response = crate::commands::edit_match::handle_edit_match(&req, &ctx);
         assert!(!response.success);
+        // The 10,006-character line is shortened to its first and last 120
+        // characters around an ellipsis in every row that shows it.
+        let long_line = format!("TARGET{}…{}", "中".repeat(114), "中".repeat(120));
+        let context = format!("α\n{long_line}\nTARGET TARGET\nlast");
         let expected = vec![
-            serde_json::json!({"occurrence": 1, "line": 2, "context": source.lines().collect::<Vec<_>>().join("\n")}),
-            serde_json::json!({"occurrence": 2, "line": 3, "context": source.lines().collect::<Vec<_>>().join("\n")}),
-            serde_json::json!({"occurrence": 3, "line": 3, "context": source.lines().collect::<Vec<_>>().join("\n")}),
+            serde_json::json!({"occurrence": 1, "line": 2, "context": context}),
+            serde_json::json!({"occurrence": 2, "line": 3, "context": context}),
+            serde_json::json!({"occurrence": 3, "line": 3, "context": context}),
         ];
         assert_eq!(response.data["occurrences"], serde_json::json!(expected));
         assert_eq!(edit::A03_LINE_INDEX_PASSES.with(|count| count.get()), 1);
