@@ -4837,9 +4837,24 @@ mod policy_environment_startup_tests {
     #[test]
     fn both_entry_modes_register_policy_environment_before_config_or_context() {
         let source = include_str!("main.rs");
-        let main = source.split_once("fn main() {").unwrap().1;
-        let first_statement = main.trim_start().lines().next().unwrap();
-        assert_eq!(first_statement, "aft::commands::policy_environment::register();",
-            "both NDJSON and subc enter through main: register before parsing the mode or resolving config");
+        let (_, main) = source.split_once("\nfn main() {\n").unwrap();
+        let (main, _) = main.split_once("\n}\n").unwrap();
+        let registration = main
+            .find("aft::commands::policy_environment::register();")
+            .expect("main registers worker policy");
+        for (call, expected_count) in [
+            ("parse_subc_arg(", 1),
+            ("cli::fix_config::run(", 1),
+            ("aft::subc_config::cortexkit_user_config_path(", 1),
+            ("AppContext::from_app(", 2),
+            ("Config::default(", 2),
+        ] {
+            let sites: Vec<_> = main.match_indices(call).collect();
+            assert_eq!(sites.len(), expected_count, "startup sites for {call}");
+            assert!(
+                sites.iter().all(|(site, _)| registration < *site),
+                "worker policy must be registered before {call}"
+            );
+        }
     }
 }
