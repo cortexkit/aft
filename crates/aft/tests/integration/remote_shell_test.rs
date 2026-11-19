@@ -71,7 +71,7 @@ async fn native() {
         cfg.project_root = Some(other.clone());
         cfg.github.shim = true;
     });
-    let executable = Path::new(env!("CARGO_BIN_EXE_aft"));
+    let executable = &crate::test_helpers::aft_binary::source_binary();
     let shims = ctx.storage_dir().join("shims");
     fs::create_dir_all(&shims).unwrap();
     symlink(executable, shims.join("gh")).unwrap();

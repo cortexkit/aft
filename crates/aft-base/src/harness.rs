@@ -47,6 +47,8 @@ const MCP_SLUG_READABLE_MAX: usize = 40;
 const MCP_SLUG_HASH_HEX_LEN: usize = 32;
 const FED_FINGERPRINT_MIN_HEX_LEN: usize = 32;
 const FED_FINGERPRINT_MAX_HEX_LEN: usize = 64;
+pub const BAD_FED_FINGERPRINT: &str =
+    "configure payload invalid field 'harness'; fed fingerprint must be 32-64 lowercase hex characters";
 const FED_SLUG_READABLE_HEX_LEN: usize = 16;
 const FED_SLUG_HASH_HEX_LEN: usize = 8;
 

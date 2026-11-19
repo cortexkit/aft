@@ -150,11 +150,7 @@ impl Service {
 
     pub(in crate::subc) fn enroll(&mut self, identity: &ManagementIdentity) {
         if let ManagementAdmission::RemoteTools(_) = &identity.admission {
-            if let Some(stamp) = identity
-                .scope
-                .as_ref()
-                .filter(|stamp| admit(Some(stamp)).is_ok())
-            {
+            if let Some(stamp) = admitted_scope(identity) {
                 self.scopes.enroll(stamp);
             }
         }
@@ -168,11 +164,19 @@ impl Service {
         binding: &Arc<Binding>,
     ) {
         let edge = self.edge.clone();
+        let admitted_scope = admitted_scope(identity);
         if let Some(body) = body
             .as_ref()
             .filter(|body| body["name"] == call_yield::TOOL_YIELD)
         {
-            self.yield_shell(frame, body, binding);
+            if admitted_scope.is_some() {
+                self.yield_shell(frame, body, binding);
+            } else {
+                self.jobs.spawn(async move {
+                    edge.error(&frame, admission_refusal()).await;
+                    None
+                });
+            }
             return;
         }
         let operation = body
@@ -185,11 +189,7 @@ impl Service {
                 _ => None,
             });
         if let Some(op) = operation {
-            let Some(scope) = identity
-                .scope
-                .as_ref()
-                .filter(|scope| admit(Some(scope)).is_ok())
-            else {
+            let Some(scope) = admitted_scope else {
                 self.jobs.spawn(async move {
                     edge.error(&frame, admission_refusal()).await;
                     None
@@ -236,9 +236,8 @@ impl Service {
             return;
         };
         let scope = identity.scope.clone();
-        let lifetime = scope
-            .as_ref()
-            .filter(|stamp| admit(Some(stamp)).is_ok())
+        let is_admitted = admitted_scope.is_some();
+        let lifetime = admitted_scope
             .map(|stamp| self.scopes.lifetime(stamp))
             .unwrap_or_default();
         let principal = principal_label(&identity.principal);
@@ -280,10 +279,10 @@ impl Service {
                 }
             };
             let folder = async {
-                let (project, _) = admit(scope.as_ref())?;
-                if !capacity || cancel.is_cancelled() {
+                if !is_admitted || !capacity || cancel.is_cancelled() {
                     return Err(admission_refusal());
                 }
+                let (project, _) = admit_scope(scope.as_ref())?;
                 if lifetime.ended() {
                     return Err(authorization::denied());
                 }

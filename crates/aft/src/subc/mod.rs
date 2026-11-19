@@ -8082,7 +8082,7 @@ async fn handle_control_request(
     storage_dir: &Path,
 ) -> Result<(), SubcError> {
     metrics.mark_frame_loop_entry("handle_control_request", frame);
-    let request = match remote_calls::decode_control(&frame.body) {
+    let (request, undecodable_remote_scope) = match remote_calls::decode_control(&frame.body) {
         Ok(request) => request,
         Err(error) => return refuse_undecodable_control_request(tx, frame, &error, metrics).await,
     };
@@ -8101,7 +8101,24 @@ async fn handle_control_request(
             call_mode,
         } => {
             let route_id = route_key(route_channel, epoch);
-            let remote = harness_forces_untrusted(&identity.harness);
+            let tool_provider = matches!(target, RouteTarget::ToolProvider { .. });
+            let remote = if tool_provider {
+                match remote_calls::classify_tool_bind(
+                    &identity.harness,
+                    principal.as_ref(),
+                    scope.as_ref(),
+                    undecodable_remote_scope,
+                    route_id,
+                    frame.header.corr,
+                ) {
+                    Ok(remote) => remote,
+                    Err(error) => {
+                        return send_route_bind_error_body(tx, frame, &error, metrics).await
+                    }
+                }
+            } else {
+                harness_forces_untrusted(&identity.harness)
+            };
             bind_log::consumer_capabilities(
                 &principal,
                 &identity.harness,
@@ -8120,12 +8137,6 @@ async fn handle_control_request(
                 ),
                 if role_versions.is_some() { "declared" } else { "none" }
             );
-            // Protocol 0.34 drops project fields from BindIdentity. Read the
-            // legacy claim separately for compatibility clients and mismatch
-            // logging; it must never override an explicit stamped workdir.
-            let legacy_root = (!remote)
-                .then(|| legacy_route_project_root(frame))
-                .flatten();
             if epoch == 0 {
                 return send_route_bind_error(
                     tx,
@@ -8174,33 +8185,17 @@ async fn handle_control_request(
                 }
             };
             // Refuse an exhausted bind budget before probing project folders.
-            let bind_project_root = if !remote && matches!(target, RouteTarget::ToolProvider { .. })
-            {
-                match resolve_route_project_root(legacy_root.as_deref(), scope.as_ref()) {
-                    Ok(root) => root,
-                    Err(_) => {
-                        let refusal = project_folder_refusal(
-                            "invalid_workdir",
-                            scope.as_ref().and_then(|stamp| stamp.workdir.as_deref()),
-                            legacy_root.as_deref(),
-                            route_id,
-                            frame.header.corr,
-                        );
-                        return send_route_bind_error_body(tx, frame, &refusal, metrics).await;
+            let (legacy_root, bind_project_root) = if remote {
+                (None, None)
+            } else {
+                match bind_folders(&identity, scope.as_ref(), frame, route_id, tool_provider) {
+                    Ok(folders) => folders,
+                    Err(error) => {
+                        return send_route_bind_error_body(tx, frame, &error, metrics).await
                     }
                 }
-            } else {
-                None
             };
-            let project_free =
-                matches!(target, RouteTarget::ToolProvider { .. }) && bind_project_root.is_none();
-            if !remote {
-                schedule_scope_workdir_comparison(
-                    &identity,
-                    legacy_root.as_deref(),
-                    scope.as_ref(),
-                );
-            }
+            let project_free = tool_provider && bind_project_root.is_none();
             if matches!(target, RouteTarget::ManagementSurface { .. }) || project_free {
                 let display_reader = crate::late_result_bus::display_reader().ok().flatten();
                 let display_admitted =

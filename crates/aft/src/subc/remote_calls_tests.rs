@@ -224,7 +224,7 @@ async fn real_binds_enforce_admission_without_opening_a_workdir() {
         for (index, (scope, admissible)) in cases.into_iter().enumerate() {
             if admissible {
                 assert_eq!(
-                    admit(Some(&serde_json::from_value(scope.clone()).unwrap()))
+                    admit_scope(Some(&serde_json::from_value(scope.clone()).unwrap()))
                         .unwrap()
                         .1,
                     "remote-agent"
@@ -253,6 +253,64 @@ async fn real_binds_enforce_admission_without_opening_a_workdir() {
                 }
             );
         }
+        // Neither a valid scope under a different principal nor one with no
+        // principal may dispatch remotely or fall through to a local bind.
+        let mut undecodable = agent.clone();
+        undecodable["scope_epoch"] = json!("not an epoch");
+        for (index, (principal, scope)) in [
+            (
+                Some(json!({"kind":"reserved", "module_id":"subc-mcp"})),
+                agent.clone(),
+            ),
+            (None, agent.clone()),
+            (Some(json!({"kind":"direct"})), undecodable),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let channel = 40 + index as u16;
+            let corr = u64::from(channel) * 2;
+            let mut bind = bind(channel, REMOTE, scope, root.as_path(), "tool_provider");
+            if let Some(principal) = principal {
+                bind["principal"] = principal;
+            } else {
+                bind.as_object_mut().unwrap().remove("principal");
+            }
+            let ack = rpc(&mut daemon, 0, corr, bind).await;
+            assert_eq!(ack.header.ty, FrameType::Response);
+            assert_eq!(
+                call(&mut daemon, channel, corr + 1, "read").await.code,
+                "remote_call_not_admitted"
+            );
+            let late_results = rpc(
+                &mut daemon,
+                channel,
+                corr + 100,
+                json!({"op":"late_results"}),
+            )
+            .await;
+            assert_eq!(late_results.header.ty, FrameType::Error);
+            assert_eq!(
+                serde_json::from_slice::<ErrorBody>(&late_results.body)
+                    .unwrap()
+                    .code,
+                "remote_call_not_admitted"
+            );
+        }
+        let malformed = rpc(
+            &mut daemon,
+            0,
+            87,
+            bind(44, "fed:", agent.clone(), root.as_path(), "tool_provider"),
+        )
+        .await;
+        assert_eq!(malformed.header.ty, FrameType::Error);
+        assert_eq!(
+            serde_json::from_slice::<ErrorBody>(&malformed.body)
+                .unwrap()
+                .code,
+            "bad_harness_fingerprint"
+        );
         assert_eq!(lookups.load(Ordering::Relaxed), 3);
         assert_eq!(executor.actor_count(), 0);
         assert_eq!(app.watcher_count(), 0);
@@ -354,7 +412,7 @@ async fn real_binds_enforce_admission_without_opening_a_workdir() {
 fn registry_selection_counts_only_usable_records_matching_both_keys() {
     let scope: ScopeStamp =
         serde_json::from_value(stamp(json!({"kind":"agent","agent_id":"agent"}))).unwrap();
-    let (project, _) = admit(Some(&scope)).unwrap();
+    let (project, _) = admit_scope(Some(&scope)).unwrap();
     let mut entries = registry(Path::new("registered"));
     let record = entries.projects[0].root_records.as_ref().unwrap()[0].clone();
     for unusable in [

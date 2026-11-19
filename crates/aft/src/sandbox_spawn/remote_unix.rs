@@ -1,5 +1,8 @@
-use super::{super as native, *};
-use crate::{bash_background::output::FINAL_OUTPUT_CAP_BYTES, sandbox_profile::SandboxProfile};
+use super::*;
+use crate::{
+    bash_background::output::FINAL_OUTPUT_CAP_BYTES, sandbox_profile::SandboxProfile,
+    sandbox_spawn as native,
+};
 use std::{
     ffi::OsString,
     io,

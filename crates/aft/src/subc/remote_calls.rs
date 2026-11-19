@@ -68,30 +68,76 @@ fn tool_unavailable() -> ErrorBody {
     )
 }
 
-pub(super) fn decode_control(body: &[u8]) -> serde_json::Result<ModuleControlRequest> {
-    serde_json::from_slice(body).or_else(|error| {
-        // An undecodable daemon scope stamp must still reach call-time refusal
-        // on a `fed:` tool route. Other binds keep their original decode error.
-        without_undecodable_scope(body).ok_or(error)
-    })
+fn is_callosum(principal: Option<&Principal>) -> bool {
+    matches!(principal, Some(Principal::Reserved { module_id }) if module_id == "callosum")
 }
 
-fn without_undecodable_scope(body: &[u8]) -> Option<ModuleControlRequest> {
+pub(super) fn classify_tool_bind(
+    harness: &str,
+    principal: Option<&Principal>,
+    scope: Option<&ScopeStamp>,
+    undecodable_remote_scope: bool,
+    route: RouteChannel,
+    corr: u64,
+) -> Result<bool, ErrorBody> {
+    // Local bridge clients can also use `fed:` harness labels, which make
+    // their routes untrusted. A Callosum principal or a federated scope stamp
+    // marks a route as remote even when the stamp cannot be decoded.
+    let remote = undecodable_remote_scope
+        || is_callosum(principal)
+        || scope.is_some_and(|stamp| {
+            stamp.kind == ScopeKind::Federated || stamp.attributes.federated.is_some()
+        });
+    if harness_forces_untrusted(harness) {
+        // Project-free routes do not call configure, which also checks this.
+        if harness.parse::<crate::harness::Harness>().is_err() {
+            return Err(ErrorBody::new(
+                "bad_harness_fingerprint",
+                crate::harness::BAD_FED_FINGERPRINT,
+            ));
+        }
+    } else if remote {
+        return Err(project_folder_refusal(
+            "invalid_workdir",
+            None,
+            None,
+            route,
+            corr,
+        ));
+    }
+    Ok(remote)
+}
+
+pub(super) fn decode_control(body: &[u8]) -> serde_json::Result<(ModuleControlRequest, bool)> {
+    serde_json::from_slice(body)
+        .map(|request| (request, false))
+        .or_else(|error| {
+            // Keep the remote origin even if the scope cannot be decoded, so
+            // dropping the malformed stamp cannot turn it into a local bind.
+            without_undecodable_remote_scope(body)
+                .map(|bind| (bind, true))
+                .ok_or(error)
+        })
+}
+
+fn without_undecodable_remote_scope(body: &[u8]) -> Option<ModuleControlRequest> {
     let mut envelope: Value = serde_json::from_slice(body).ok()?;
-    if envelope.get("op")?.as_str()? != "route.bind"
-        || !harness_forces_untrusted(envelope.pointer("/identity/harness")?.as_str()?)
-    {
+    if envelope.get("op")?.as_str()? != "route.bind" {
         return None;
     }
     let stamp = envelope.as_object_mut()?.remove("scope")?;
+    let stamped_remote =
+        stamp["kind"] == "federated" || !stamp["attributes"]["federated"].is_null();
     if serde_json::from_value::<Option<ScopeStamp>>(stamp).is_ok() {
         return None;
     }
-    match serde_json::from_value(envelope).ok()? {
-        bind @ ModuleControlRequest::RouteBind {
+    let bind = serde_json::from_value(envelope).ok()?;
+    match &bind {
+        ModuleControlRequest::RouteBind {
             target: RouteTarget::ToolProvider { .. },
+            principal,
             ..
-        } => Some(bind),
+        } if stamped_remote || is_callosum(principal.as_ref()) => Some(bind),
         _ => None,
     }
 }
@@ -104,7 +150,17 @@ fn caller(facts: &subc_protocol::scope::FederatedAttributes) -> Option<&str> {
     }
 }
 
-fn admit(scope: Option<&ScopeStamp>) -> Result<(&FederatedProject, &str), ErrorBody> {
+fn admitted_scope(identity: &ManagementIdentity) -> Option<&ScopeStamp> {
+    if !is_callosum(identity.principal.as_ref()) {
+        return None;
+    }
+    identity
+        .scope
+        .as_ref()
+        .filter(|stamp| admit_scope(Some(stamp)).is_ok())
+}
+
+fn admit_scope(scope: Option<&ScopeStamp>) -> Result<(&FederatedProject, &str), ErrorBody> {
     let facts = scope
         .filter(|stamp| stamp.kind == ScopeKind::Federated)
         .and_then(|stamp| stamp.attributes.federated.as_ref())

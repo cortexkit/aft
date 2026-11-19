@@ -91,7 +91,8 @@ struct Card {
 
 impl Card {
     fn prepare(call: &Preflight, can_ask: bool) -> (Group, Self) {
-        let (project, caller) = admit(Some(&call.scope)).expect("preflight admitted the scope");
+        let (project, caller) =
+            admit_scope(Some(&call.scope)).expect("preflight admitted the scope");
         let facts = call
             .scope
             .attributes

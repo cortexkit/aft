@@ -63,6 +63,34 @@ pub(super) const PROJECT_REQUIRED: &str =
     "This connection has no project folder, so AFT cannot run project tools on it.";
 pub(super) const PROJECT_REQUIRED_CODE: &str = "project_required";
 
+pub(super) fn bind_folders(
+    identity: &subc_protocol::BindIdentity,
+    scope: Option<&subc_protocol::scope::ScopeStamp>,
+    frame: &Frame,
+    route: RouteChannel,
+    tool_provider: bool,
+) -> Result<(Option<PathBuf>, Option<PathBuf>), ErrorBody> {
+    // Protocol 0.34 drops project fields from BindIdentity. Read the legacy
+    // claim separately for compatibility and mismatch logging. It must never
+    // override an explicit stamped workdir.
+    let legacy_root = legacy_route_project_root(frame);
+    let project_root = if tool_provider {
+        resolve_route_project_root(legacy_root.as_deref(), scope).map_err(|_| {
+            project_folder_refusal(
+                "invalid_workdir",
+                scope.and_then(|stamp| stamp.workdir.as_deref()),
+                legacy_root.as_deref(),
+                route,
+                frame.header.corr,
+            )
+        })?
+    } else {
+        None
+    };
+    schedule_scope_workdir_comparison(identity, legacy_root.as_deref(), scope);
+    Ok((legacy_root, project_root))
+}
+
 pub(super) fn project_folder_refusal(
     code: &str,
     workdir: Option<&str>,

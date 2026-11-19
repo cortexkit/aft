@@ -2337,7 +2337,7 @@ fn handle_configure_inner(
                     return Response::error(
                         &req.id,
                         "bad_harness_fingerprint",
-                        "configure payload invalid field 'harness'; fed fingerprint must be 32-64 lowercase hex characters",
+                        crate::harness::BAD_FED_FINGERPRINT,
                     );
                 }
                 return Response::error(
