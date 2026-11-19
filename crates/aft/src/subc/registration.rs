@@ -17,8 +17,8 @@ use super::{SubcError, AUTH_DEADLINE};
 
 use aft_base::registration::claim_cause;
 pub(crate) use aft_base::registration::{
-    connect_consumer, identity_ready, log_claim_connect_failure, module_consumer_allowed, module_id,
-    track_consumer,
+    connect_consumer, count_live, identity_ready, log_claim_connect_failure, module_consumer_allowed,
+    module_id, track_consumer,
 };
 #[cfg(test)]
 pub(crate) use aft_base::registration::live_consumers;

@@ -187,15 +187,26 @@ impl ConsumerGauge {
     }
 }
 
-/// Counts one live connection for its owner and uncounts it when dropped.
-struct LiveConsumer {
+/// Counts one live item (a connection or a worker thread) for its label and
+/// uncounts it when dropped.
+pub struct LiveCount {
     owner: &'static str,
 }
 
-impl Drop for LiveConsumer {
+impl Drop for LiveCount {
     fn drop(&mut self) {
         consumer_gauge().adjust(self.owner, false);
     }
+}
+
+/// Count one live item under `label` in the per-owner gauge line until the
+/// returned guard drops. Used for daemon connections and for the remote-job
+/// worker threads that hold them.
+pub fn count_live(label: &'static str) -> LiveCount {
+    let gauge = consumer_gauge();
+    gauge.start_reporter();
+    gauge.adjust(label, true);
+    LiveCount { owner: label }
 }
 
 /// Count `consumer` as a live connection held by `owner` until the SDK
@@ -204,10 +215,7 @@ impl Drop for LiveConsumer {
 /// `SubcConsumer` handle, its subscriptions and its background tasks are gone.
 /// A consumer that is kept alive therefore stays counted.
 pub fn track_consumer(owner: &'static str, consumer: &SubcConsumer) {
-    let gauge = consumer_gauge();
-    gauge.start_reporter();
-    gauge.adjust(owner, true);
-    let live = LiveConsumer { owner };
+    let live = count_live(owner);
     consumer.on_connection_state(move |_| {
         let _ = &live;
     });
