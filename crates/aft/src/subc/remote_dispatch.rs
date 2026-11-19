@@ -105,29 +105,31 @@ impl FileTool {
             context,
         };
         let _config = ctx.pin_config();
-        let write_paths = confinement::with_root(ctx, &tool.context.request_id, || {
-            tool.check(ctx)?;
-            let format = tool.format();
-            let prepared = prepare_tool_call(
-                tool.operation,
-                tool.arguments.clone(),
-                &format,
-                &tool.context,
-                ctx,
-                None,
-            )
-            .map_err(|failed| failed.response)?;
-            if tool.arguments.get("ref").is_some() {
-                // Git revision reads can open an ancestor or linked worktree's
-                // object store outside the registered folder.
-                return Err(crate::revision_read::disabled(&prepared.request));
-            }
-            if mode == Mode::ReadWrite {
-                let paths = edit_paths::operands(&prepared.request)?;
-                tool.check_writes(ctx, &paths)?;
-                return Ok(paths);
-            }
-            Ok(Vec::new())
+        let write_paths = confinement::with_remote_mutation(mode == Mode::ReadWrite, || {
+            confinement::with_root(ctx, &tool.context.request_id, || {
+                tool.check(ctx)?;
+                let format = tool.format();
+                let prepared = prepare_tool_call(
+                    tool.operation,
+                    tool.arguments.clone(),
+                    &format,
+                    &tool.context,
+                    ctx,
+                    None,
+                )
+                .map_err(|failed| failed.response)?;
+                if tool.arguments.get("ref").is_some() {
+                    // Git revision reads can open an ancestor or linked worktree's
+                    // object store outside the registered folder.
+                    return Err(crate::revision_read::disabled(&prepared.request));
+                }
+                if mode == Mode::ReadWrite {
+                    let paths = edit_paths::operands(&prepared.request)?;
+                    tool.check_writes(ctx, &paths)?;
+                    return Ok(paths);
+                }
+                Ok(Vec::new())
+            })
         })
         .map_err(|refusal| error(&refusal))?;
         let consent = Preflight {
@@ -206,34 +208,33 @@ impl FileTool {
         let _config = ctx.pin_config();
         let format = self.format();
         let id = self.context.request_id.clone();
-        confinement::with_root(ctx, &id, || {
-            // Consent and scheduling may have delayed this call. Recheck the
-            // current path and tool policy immediately before dispatch.
-            self.check(ctx)?;
-            self.check_writes(ctx, &self.write_paths)?;
-            let mutation = self.mode == Mode::ReadWrite;
-            let dispatch = |mut request: RawRequest, ctx: &AppContext| {
-                if mutation {
-                    // Keep normal file-change notifications, but never ask a
-                    // language server to start for post-write diagnostics.
-                    request.params["diagnostics"] = Value::Bool(false);
-                }
-                dispatch(request, ctx)
-            };
-            let crate::run_tool_call::ToolCallOutcome::Unary(result) =
-                confinement::with_remote_mutation(mutation, || {
-                    run_tool_call(
-                        self.operation,
-                        self.arguments,
-                        &format,
-                        &self.context,
-                        ctx,
-                        &dispatch,
-                        None,
-                        None,
-                    )
-                });
-            Ok(result)
+        let mutation = self.mode == Mode::ReadWrite;
+        confinement::with_remote_mutation(mutation, || {
+            confinement::with_root(ctx, &id, || {
+                // Consent and scheduling may have delayed this call. Recheck the
+                // current path and tool policy immediately before dispatch.
+                self.check(ctx)?;
+                self.check_writes(ctx, &self.write_paths)?;
+                let dispatch = |mut request: RawRequest, ctx: &AppContext| {
+                    if mutation {
+                        // Keep normal file-change notifications, but never ask a
+                        // language server to start for post-write diagnostics.
+                        request.params["diagnostics"] = Value::Bool(false);
+                    }
+                    dispatch(request, ctx)
+                };
+                let crate::run_tool_call::ToolCallOutcome::Unary(result) = run_tool_call(
+                    self.operation,
+                    self.arguments,
+                    &format,
+                    &self.context,
+                    ctx,
+                    &dispatch,
+                    None,
+                    None,
+                );
+                Ok(result)
+            })
         })
         .map_err(|refusal| error(&refusal))
     }

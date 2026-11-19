@@ -261,6 +261,15 @@ pub(crate) fn remote_mutation() -> bool {
     FENCE.with(|fence| fence.borrow().remote_mutation)
 }
 
+pub(crate) fn admits_path_metadata(identity: &Path) -> bool {
+    match crate::bounded_io::metadata(identity) {
+        Ok(_) => true,
+        // Remote edit tools can create files after the root and access checks.
+        // For those calls, only a missing location is not an I/O refusal.
+        Err(error) => remote_mutation() && error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
 pub(crate) fn with_remote_mutation<T>(mutation: bool, run: impl FnOnce() -> T) -> T {
     if mutation {
         let mut fence = capture();

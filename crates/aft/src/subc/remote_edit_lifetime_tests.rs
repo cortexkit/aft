@@ -428,6 +428,26 @@ async fn remote_edit_and_scope_end_enforce_attributed_authority() {
         }
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "outside\n");
         assert!(!root.as_path().join("inside.txt").exists());
+        #[cfg(unix)]
+        {
+            let absent_outside = storage.path().join("must-not-create.txt");
+            std::os::unix::fs::symlink(&absent_outside, root.as_path().join("dangling.txt"))
+                .unwrap();
+            refusal(
+                peer.call(
+                    1,
+                    719,
+                    tool(
+                        "write",
+                        json!({"path":"dangling.txt", "content":"escaped"}),
+                        719,
+                    ),
+                )
+                .await,
+                "path_outside_root",
+            );
+            assert!(!absent_outside.exists());
+        }
         ctx.update_config(|config| config.disabled_tools.push("edit".into()));
         refusal(
             peer.call(1, 717, edit(717)).await,
@@ -504,6 +524,23 @@ async fn remote_edit_and_scope_end_enforce_attributed_authority() {
         reply(peer.call(3, 728, tool("apply_patch", json!({"patchText":"*** Begin Patch\n*** Add File: inside.txt\n+inside\n*** End Patch"}), 728)).await);
         assert_eq!(
             std::fs::read_to_string(root.as_path().join("inside.txt")).unwrap(),
+            "inside\n"
+        );
+        reply(
+            peer.call(
+                3,
+                730,
+                tool(
+                    "move",
+                    json!({"path":"inside.txt", "destination":"new-dir/moved.txt"}),
+                    730,
+                ),
+            )
+            .await,
+        );
+        assert!(!root.as_path().join("inside.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.as_path().join("new-dir/moved.txt")).unwrap(),
             "inside\n"
         );
         #[cfg(unix)]
