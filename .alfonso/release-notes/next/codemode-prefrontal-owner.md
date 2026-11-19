@@ -1,0 +1,1 @@
+- Programs run from a head that a runner adopted before the prefrontal rename are accepted again; the head's two module names count as one owner.
