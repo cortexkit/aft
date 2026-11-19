@@ -149,7 +149,12 @@ async fn thalamus_fork_samples_decode_and_obey_fork_admission() {
     // The published Pi call names an AFT tool but was pinned to a stand-in
     // schema. Use a live pin and an actual input only in the controls.
     let mut control: Value = serde_json::from_str(request_body(PI).get()).unwrap();
-    control["schema_pin"] = json!(read_tool(false).schema_pin().unwrap());
+    let tool = read_tool(false);
+    control["schema_pin"] = json!(
+        SchemaPin::new(&tool.name, &tool.schema_digest, tool.semantics)
+            .encode()
+            .unwrap()
+    );
     control["arguments"] = json!({"path": "inside.txt"});
     let (ty, reply) = exchange_sample(
         "Pi control, in-root read",
