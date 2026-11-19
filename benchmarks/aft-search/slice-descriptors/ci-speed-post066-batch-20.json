@@ -1,0 +1,11 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "note": "Post-0.66 batch 20 is non-ranking: its diff against main changes no RANKING_FENCE_PREFIXES path. It carries the prefrontal rename-gap hold, linked-worktree reads, secret-proxy compressed bodies, the codemode owner match across prefrontal names, bus-client 0.1.9, cache_dir named choices, idle approval-card withdrawal, an exactness gate fix and an apt retry in CI. No ranking or count difference is authorized."
+}
