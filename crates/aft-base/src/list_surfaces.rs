@@ -614,6 +614,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "Keyset pagination bounds background lifecycle probes, not permissions.list; every live grant remains listed and later maintenance ticks continue after the saved cursor.",
     },
     ExclusionEntry {
+        file: "subc/consent_expiry.rs",
+        enclosing_item: "candidates, Sweep::run",
+        location_or_primitive: "SQL LIMIT, ROW_LIMIT (32)",
+        reason: "Pagination bounds background withdrawal of idle file approvals. Later sweeps continue at the saved cursor; no tool returns this list.",
+    },
+    ExclusionEntry {
         file: "subc/scope_watch.rs",
         enclosing_item: "reconcile",
         location_or_primitive: "SELECTORS_PER_WATCH (256), WATCHES_PER_CONNECTION (16)",
