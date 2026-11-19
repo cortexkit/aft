@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 pub(super) const BACKGROUND: &str = "Remote shells can't run in the background.";
 pub(super) const TIME_LIMIT: &str = "The command was stopped at the remote time limit.";
 pub(super) const MAX_RUNTIME: Duration = Duration::from_secs(600);
+const NON_LINUX_REFUSAL: &str = "Remote shells run only on Linux computers for now.";
 
 #[cfg(all(test, target_os = "linux"))]
 tokio::task_local! {
@@ -99,10 +100,15 @@ impl Shell {
 }
 
 pub(super) fn unavailable() -> ErrorBody {
-    #[cfg(target_os = "macos")]
-    return ErrorBody::new("sandbox_unavailable", "Remote shells aren't available on macOS because AFT can't confine the entire process tree there.");
-    #[cfg(not(target_os = "macos"))]
-    ErrorBody::new("sandbox_unavailable", tool_unavailable().message)
+    if cfg!(target_os = "linux") {
+        ErrorBody::new("sandbox_unavailable", tool_unavailable().message)
+    } else {
+        non_linux_refusal()
+    }
+}
+
+fn non_linux_refusal() -> ErrorBody {
+    ErrorBody::new("sandbox_unavailable", NON_LINUX_REFUSAL)
 }
 
 #[derive(Clone, Default)]
@@ -193,5 +199,22 @@ impl Running {
 impl Drop for Job {
     fn drop(&mut self) {
         self.jobs.0.lock().unwrap().remove(&self.key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn pins_non_linux_shell_refusal() {
+        let refusal = if cfg!(target_os = "linux") {
+            super::non_linux_refusal()
+        } else {
+            super::unavailable()
+        };
+        assert_eq!(refusal.code, "sandbox_unavailable");
+        assert_eq!(
+            refusal.message.as_bytes(),
+            b"Remote shells run only on Linux computers for now."
+        );
     }
 }
