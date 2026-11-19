@@ -4090,6 +4090,7 @@ async fn end_bg_subscriptions_for_drain(
 async fn teardown_installed_route(
     tx: &WriterSender,
     ledger: Option<&tool_provider::LedgerEdge>,
+    run_scopes: Option<&run_scope::RunScopes>,
     metrics: &DispatchPathMetrics,
     executor: &Arc<Executor>,
     channel: RouteChannel,
@@ -4114,9 +4115,7 @@ async fn teardown_installed_route(
     tool_response_body_limit: usize,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
-    if let Some(ledger) = ledger {
-        ledger.close_route(channel, tx, metrics).await?;
-    }
+    queued_call::close_admissions(channel, tx, metrics, ledger, run_scopes).await?;
     // A replacement project route keeps replayable calls, even those still
     // waiting in the executor. Release queued calls only when no project route
     // replaces the old handle; already-running mutations keep their result.
@@ -5260,7 +5259,7 @@ where
             run_scopes.clone(),
             Arc::clone(&speech),
         );
-    let (run_ready_tx, mut run_ready_rx) = mpsc::unbounded_channel::<DecodedFrame>();
+    let (run_ready_tx, mut run_ready_rx) = mpsc::unbounded_channel();
     let readiness_task = spawn_readiness(control.clone(), spawn_role, hello_at, session.clone());
 
     let shutdown = Arc::new(Notify::new());
@@ -5758,7 +5757,7 @@ where
                 }
                 tokio::select! {
                     frame = reader_rx.recv() => (frame, false, false),
-                    frame = run_ready_rx.recv() => (frame.map(Ok), false, false),
+                    frame = run_scopes.next_ready(&mut run_ready_rx) => (frame.map(Ok), false, false),
                     frame = database_waits.next(), if !database_waits.is_empty() => (Some(Ok(frame)), true, false),
                     frame = ledger_ready_rx.recv() => (frame.map(Ok), true, true),
                 }
@@ -5843,6 +5842,7 @@ where
                         if let Err(error) = teardown_installed_route(
                             &writer_tx,
                             Some(&ledger_edge),
+                            Some(&run_scopes),
                             &dispatch_path_metrics,
                             &executor,
                             channel,
@@ -6323,7 +6323,7 @@ where
                             channel,
                             corr,
                             "Cancel frame",
-                        ).or_else(|| database_waits.cancel(channel, corr));
+                        ).or_else(|| database_waits.cancel(channel, corr)).or_else(|| run_scopes.cancel(channel, corr));
                         let cancelled_deferred = pending_responses.cancel_request(channel, corr);
                         if cancelled_call.is_some() || cancelled_deferred {
                             let request = cancelled_call.unwrap_or(RequestFrameMeta {
@@ -6331,15 +6331,7 @@ where
                                 ver: frame.header.ver,
                                 flags: frame.header.flags,
                             });
-                            let sent = match build_error_frame(
-                                request.ver,
-                                channel.channel,
-                                channel.epoch,
-                                corr,
-                                request.flags,
-                                "cancelled",
-                                "request cancelled",
-                            ) {
+                             let sent = match queued_call::cancelled_frame(channel, corr, request) {
                                 Ok(error_frame) => {
                                     send_reliable_writer_frame(
                                         &writer_tx,
@@ -6441,6 +6433,7 @@ where
                                  let admission_frames = match database_waits.drain_for_module_drain()
                                      .and_then(|mut frames| {
                                          frames.extend(ledger_edge.drain_for_module_drain()?);
+                                         frames.extend(run_scopes.drain()?);
                                          Ok(frames)
                                      }) {
                                      Ok(frames) => frames,
@@ -6839,7 +6832,7 @@ where
                     for frame in reclaim_frames {
                         if frame.header.ty == FrameType::Goodbye {
                             let route = route_key(frame.header.channel, frame.header.epoch);
-                            if let Err(error) = ledger_edge.close_route(route, &writer_tx, &dispatch_path_metrics).await {
+                            if let Err(error) = queued_call::close_admissions(route, &writer_tx, &dispatch_path_metrics, Some(&ledger_edge), Some(&run_scopes)).await {
                                 break 'module_loop Err(error);
                             }
                         }
@@ -8357,6 +8350,7 @@ async fn handle_control_request(
                     teardown_installed_route(
                         legacy_tx,
                         ledger,
+                        run_scopes,
                         metrics,
                         executor,
                         route_key(route_channel, installed_epoch),
@@ -8489,6 +8483,7 @@ async fn handle_control_request(
                 teardown_installed_route(
                     legacy_tx,
                     ledger,
+                    run_scopes,
                     metrics,
                     executor,
                     route_key(route_channel, installed_epoch),
@@ -22721,6 +22716,7 @@ mod terminal_lifecycle_tests {
                 } else {
                     teardown_installed_route(
                         &tx,
+                        None,
                         None,
                         &metrics,
                         &executor,

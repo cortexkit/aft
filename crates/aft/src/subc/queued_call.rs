@@ -52,6 +52,22 @@ impl AdmissionWait {
     }
 }
 
+pub(super) fn cancelled_frame(
+    route: RouteChannel,
+    corr: u64,
+    request: RequestFrameMeta,
+) -> Result<Frame, SubcError> {
+    build_error_frame(
+        request.ver,
+        route.channel,
+        route.epoch,
+        corr,
+        request.flags,
+        "cancelled",
+        "request cancelled",
+    )
+}
+
 pub(super) fn released_frame(
     route: RouteChannel,
     corr: u64,
@@ -66,6 +82,22 @@ pub(super) fn released_frame(
         "route_released",
         "route released before execution; the tool did not run",
     )
+}
+
+pub(super) async fn close_admissions(
+    route: RouteChannel,
+    writer: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    ledger: Option<&tool_provider::LedgerEdge>,
+    runs: Option<&run_scope::RunScopes>,
+) -> Result<(), SubcError> {
+    if let Some(ledger) = ledger {
+        ledger.close_route(route, writer, metrics).await?;
+    }
+    if let Some(runs) = runs {
+        runs.close_route(route, writer, metrics).await?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -347,6 +379,7 @@ mod tests {
             HashMap::from([(route, test_support::route_identity(&root, "release-test"))]);
         teardown_installed_route(
             &writer,
+            None,
             None,
             &DispatchPathMetrics::new(),
             &executor,

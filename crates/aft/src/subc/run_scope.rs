@@ -301,14 +301,57 @@ impl RunScope {
 pub(super) struct RunScopes {
     control: Arc<readiness::DaemonControl>,
     scopes: StdMutex<HashMap<(String, String, u64), Arc<RunScope>>>,
+    waits: budget_waits::BudgetWaits,
 }
+
+mod budget_waits;
+pub(super) use budget_waits::Ready;
+#[cfg(test)]
+mod budget_wait_tests;
 
 impl RunScopes {
     pub(super) fn new(control: Arc<readiness::DaemonControl>) -> Self {
         Self {
             control,
             scopes: StdMutex::new(HashMap::new()),
+            waits: Default::default(),
         }
+    }
+
+    pub(super) fn cancel(&self, route: RouteChannel, corr: u64) -> Option<RequestFrameMeta> {
+        self.waits.cancel(route, corr)
+    }
+
+    pub(super) fn resume(&self, ready: Ready) -> Option<DecodedFrame> {
+        self.waits.resume(ready)
+    }
+
+    pub(super) async fn next_ready(
+        &self,
+        receiver: &mut mpsc::UnboundedReceiver<Ready>,
+    ) -> Option<DecodedFrame> {
+        while let Some(ready) = receiver.recv().await {
+            if let Some(decoded) = self.resume(ready) {
+                return Some(decoded);
+            }
+        }
+        None
+    }
+
+    pub(super) fn drain(&self) -> Result<Vec<Frame>, SubcError> {
+        self.waits.drain()
+    }
+
+    pub(super) async fn close_route(
+        &self,
+        route: RouteChannel,
+        writer: &WriterSender,
+        metrics: &DispatchPathMetrics,
+    ) -> Result<(), SubcError> {
+        for frame in self.waits.release(route)? {
+            send_reliable_writer_frame(writer, metrics, frame, "released queued call").await?;
+        }
+        Ok(())
     }
 
     pub(super) fn revoke(&self, stamp: &subc_protocol::scope::ScopeStamp) {
@@ -381,7 +424,7 @@ impl RunScopes {
         &self,
         decoded: DecodedFrame,
         identity: &RouteIdentity,
-        ready: &mpsc::UnboundedSender<DecodedFrame>,
+        ready: &mpsc::UnboundedSender<Ready>,
     ) -> Result<(), DecodedFrame> {
         let body = serde_json::from_slice::<Value>(&decoded.frame.body).unwrap_or(Value::Null);
         let name = body.get("name").and_then(Value::as_str).unwrap_or("");
@@ -455,39 +498,14 @@ impl RunScopes {
         if background_error.is_none() && scope.cached_budget().is_ok() {
             return Err(decoded);
         }
-        let control = Arc::clone(&self.control);
-        let ready = ready.clone();
-        tokio::spawn(async move {
-            let result = match background_error {
-                Some(error) => Err(error),
-                None => scope.read_budget().await,
-            };
-            match result {
-                Ok(_) => {
-                    let _ = ready.send(decoded);
-                }
-                Err(error) => {
-                    let frame = &decoded.frame;
-                    if let Ok(refusal) = build_error_frame(
-                        frame.header.ver,
-                        frame.header.channel,
-                        frame.header.epoch,
-                        frame.header.corr,
-                        frame.header.flags,
-                        &error.code,
-                        &error.message,
-                    ) {
-                        let _ = send_reliable_writer_frame(
-                            &control.writer,
-                            &control.metrics,
-                            refusal,
-                            "run scope refusal",
-                        )
-                        .await;
-                    }
-                }
-            }
-        });
+        self.waits.start(
+            decoded,
+            name,
+            scope,
+            background_error,
+            self.control.clone(),
+            ready.clone(),
+        );
         Ok(())
     }
 }
