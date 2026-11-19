@@ -1,7 +1,7 @@
 //! Project dead-code inputs from one caller’s rows.
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use super::super::OUTBOUND_KINDS;

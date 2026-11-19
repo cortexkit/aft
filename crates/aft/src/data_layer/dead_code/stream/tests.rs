@@ -1,6 +1,5 @@
 use super::*;
-use crate::data_layer::checkout::Checkout;
-use crate::data_layer::DataLayer;
+use crate::data_layer::checkout::{Checkout, DataLayer};
 use crate::inspect::InspectEntryPoints;
 use aft_store::ids::{Digest128, FamilyId};
 

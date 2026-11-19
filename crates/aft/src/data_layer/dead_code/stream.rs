@@ -156,7 +156,7 @@ impl<'a> Rows<'a> {
 
     #[cfg(test)]
     pub(crate) fn fixture_snapshot(
-        view: &CheckoutView,
+        view: &'a CheckoutView,
         entry_points: &dyn EntryPoints,
     ) -> Result<CallgraphSnapshot, String> {
         let rows = Self::new(view, entry_points)?;
