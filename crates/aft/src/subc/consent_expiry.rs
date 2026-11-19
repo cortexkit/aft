@@ -1,5 +1,5 @@
 //! Expire unattended file-access asks without racing a retry of the same call.
-use super::{ConsentError, ConsentTransport, HeldCall, Prepared, SubcConsentTransport};
+use super::{ConsentError, ConsentTransport, HeldCall, Hold, Prepared, SubcConsentTransport};
 use crate::context::App;
 use crate::db::access_asks::AskKey;
 use crate::db::access_grants::ScopeKey;
@@ -134,6 +134,21 @@ pub(super) async fn watch_reconciliation(db: &Db, prep: &Prepared) -> Option<Gua
     .then_some(guard)
 }
 
+pub(super) async fn watch_parked(db: &Db, key: &AskKey, call_key: &str) -> Option<CallUse> {
+    let waiting = watch(key.clone()).await;
+    let key = key.clone();
+    let call_key = call_key.to_owned();
+    // The sweep may already have withdrawn the parked card. In that case the
+    // run must not withdraw it again or remove a fresh row for these arguments.
+    blocking(db, move |conn| {
+        let row = crate::db::access_asks::get(conn, &key)?;
+        Ok(row.is_some_and(|row| row.call_key.as_ref() == Some(&call_key)))
+    })
+    .await
+    .ok()?
+    .then_some(waiting)
+}
+
 fn begin_withdrawal(key: &AskKey) -> Option<Guard> {
     let mut leases = LEASES.lock().unwrap();
     if leases.contains_key(key) {
@@ -188,7 +203,7 @@ fn candidates(
     let mut stmt = conn.prepare(
         "SELECT rowid,owner,scope_ref,epoch,args_hash,call_key,elicitation_id,created_at
          FROM access_asks WHERE rowid>?1 AND created_at<?2 AND call_key IS NOT NULL
-         AND json_extract(pending,'$.operation') IN ('read','write') ORDER BY rowid LIMIT ?3",
+         AND json_extract(pending,'$.mode') IN ('read','write') ORDER BY rowid LIMIT ?3",
     )?;
     let rows = stmt.query_map(params![cursor, cutoff, limit], |row| {
         let epoch: String = row.get(3)?;
@@ -226,12 +241,30 @@ impl Candidate {
             |row| row.get(0),
         )
     }
+}
 
-    fn discard(&self, conn: &Connection) -> rusqlite::Result<usize> {
-        conn.execute(
-            "DELETE FROM access_asks WHERE rowid=?1 AND call_key=?2",
-            params![self.rowid, self.call_key],
-        )
+/// Remove only this card, not a replacement another dispatch already opened.
+pub(super) fn discard_card(
+    conn: &Connection,
+    key: &AskKey,
+    call_key: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM access_asks WHERE owner=?1 AND scope_ref=?2 AND epoch=?3 AND args_hash=?4 AND call_key=?5",
+        params![key.scope.owner, key.scope.scope_ref, key.scope.epoch.to_string(), key.args_hash, call_key],
+    )?;
+    Ok(())
+}
+
+pub(super) async fn refile_withdrawn(call: &HeldCall, prep: &Prepared) -> Hold {
+    // Cingulate can close the card without AFT receiving the reply, or AFT can
+    // exit before deleting the row. A replay must ask again rather than treat
+    // that withdrawal as the person's answer.
+    let key = prep.key.clone();
+    let call_key = prep.call_key.clone();
+    match super::with_db(call, move |conn, _| discard_card(conn, &key, &call_key)).await {
+        Ok(()) => Hold::Refile(prep.grant.clone()),
+        Err(error) => Hold::Answer(super::unavailable_answer(call, &prep.grant, &error)),
     }
 }
 
@@ -318,7 +351,7 @@ impl Sweep {
                 }
             }
             self.failed.remove(&row.call_key);
-            blocking(db, move |conn| row.discard(conn)).await?;
+            blocking(db, move |conn| discard_card(conn, &row.key, &row.call_key)).await?;
         }
         if end {
             self.cursor = 0;
