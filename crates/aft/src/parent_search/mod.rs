@@ -205,6 +205,7 @@ fn candidate_root(root: &Path) -> Option<PathBuf> {
 struct Walk {
     repositories: Vec<PathBuf>,
     outside: Vec<PathBuf>,
+    entry_limit_reached: bool,
 }
 
 /// Reads at most the remaining visit budget. The stop check also runs while
@@ -228,16 +229,16 @@ fn read_discovery_entries<T, E>(
 
 /// Walks `root` for repositories. When `stop` answers true the walk ends
 /// with what it found so far.
-fn walk(root: &Path, stop: &dyn Fn(&Walk) -> bool) -> Walk {
+fn walk(root: &Path, mut remaining: usize, stop: &dyn Fn(&Walk) -> bool) -> Walk {
     let delay = lock(discovery_delays()).get(root).copied();
     let mut found = Walk {
         repositories: Vec::new(),
         outside: Vec::new(),
+        entry_limit_reached: false,
     };
     let Some(boundary) = crate::watcher_filter::WatcherWalkBoundary::for_root(root) else {
         return found;
     };
-    let mut remaining = MAX_DISCOVERY_ENTRIES;
     let mut pending = vec![(root.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = pending.pop() {
         if remaining == 0 || stop(&found) {
@@ -250,6 +251,7 @@ fn walk(root: &Path, stop: &dyn Fn(&Walk) -> bool) -> Walk {
             continue;
         };
         let mut entries = read_discovery_entries(entries, &mut remaining, || stop(&found));
+        found.entry_limit_reached = remaining == 0;
         if stop(&found) {
             return found;
         }
@@ -325,9 +327,13 @@ fn note_outside(found: &mut Walk, root: &Path, path: &Path) {
 /// it is the home folder, or it holds no repository within
 /// [`MAX_DISCOVERY_DEPTH`].
 pub fn discover(root: &Path, cap: usize) -> Option<Discovery> {
+    discover_with_limit(root, cap, MAX_DISCOVERY_ENTRIES)
+}
+
+fn discover_with_limit(root: &Path, cap: usize, entry_limit: usize) -> Option<Discovery> {
     let root = candidate_root(root)?;
-    let found = walk(&root, &|_| false);
-    if found.repositories.is_empty() {
+    let found = walk(&root, entry_limit, &|_| false);
+    if found.repositories.is_empty() && !found.entry_limit_reached {
         return None;
     }
     let mut repositories = found
@@ -345,6 +351,7 @@ pub fn discover(root: &Path, cap: usize) -> Option<Discovery> {
         children: repositories,
         skipped,
         outside,
+        entry_limit_reached: found.entry_limit_reached,
     })
 }
 
@@ -354,7 +361,7 @@ pub fn discover(root: &Path, cap: usize) -> Option<Discovery> {
 fn probe(root: &Path, budget: Duration) -> Option<PathBuf> {
     let root = candidate_root(root)?;
     let deadline = Instant::now() + budget;
-    let found = walk(&root, &|found| {
+    let found = walk(&root, MAX_DISCOVERY_ENTRIES, &|found| {
         !found.repositories.is_empty() || Instant::now() >= deadline
     });
     (!found.repositories.is_empty()).then_some(root)

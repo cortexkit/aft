@@ -16,7 +16,9 @@ use crate::grep_executor::{GrepExecutionPhaseTimings, GrepParams, GrepScope};
 use crate::pattern_compile::CompiledPattern;
 use crate::search_index::{GrepResult, IndexStatus, PathFilters, SearchIndexSnapshot};
 
-use super::parent_session::{display_relative, Child, ParentView, Plane};
+use super::parent_session::{display_relative, Child, Discovery, ParentView, Plane};
+
+const DISCOVERY_ENTRY_LIMIT_REASON: &str = "AFT stopped looking for repositories here after 20,000 entries, so some repositories in this folder were not searched.";
 
 /// Named gaps collected while answering one request, deduplicated.
 #[derive(Default)]
@@ -42,6 +44,23 @@ impl Gaps {
             self.discovering();
             return;
         };
+        self.discovery_scope(&discovery, scope);
+    }
+
+    pub(super) fn discovery_scope(&mut self, discovery: &Discovery, scope: &Path) {
+        if discovery.entry_limit_reached
+            && !discovery
+                .children
+                .iter()
+                .chain(&discovery.skipped)
+                .any(|child| scope.starts_with(child))
+        {
+            self.push(
+                "parent_discovery_entry_limit",
+                display_relative(&discovery.root, scope),
+                DISCOVERY_ENTRY_LIMIT_REASON.to_string(),
+            );
+        }
         let in_scope = |path: &Path| path.starts_with(scope) || scope.starts_with(path);
         let skipped = discovery
             .skipped

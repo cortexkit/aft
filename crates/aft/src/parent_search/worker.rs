@@ -78,6 +78,7 @@ fn discover(session: &Arc<ParentSession>) -> bool {
         children: Vec::new(),
         skipped: Vec::new(),
         outside: Vec::new(),
+        entry_limit_reached: false,
     });
     if session.stopped() {
         return false;
