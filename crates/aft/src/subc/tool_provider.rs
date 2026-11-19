@@ -2257,7 +2257,7 @@ fn kill_withdrawn_call(
             "completed" | "failed" | "killed" | "timed_out"
         ) || ctx.bash_background().unregistered_task_process_liveness(
             &crate::bash_background::persistence::PersistedTask::from(row),
-        ) == crate::bash_background::process::ProcessLiveness::Gone
+        ) == crate::process_identity::ProcessLiveness::Gone
     });
     if stopped {
         return freeze_withdraw_answer(ctx, kill);

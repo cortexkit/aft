@@ -2,7 +2,7 @@
 pub use aft_db::db::*;
 
 #[cfg(test)]
-pub(crate) use display_records::test_support::run_migrations_supported;
+pub(crate) use display_records::test_support::{current_schema_version, run_migrations_supported};
 #[cfg(test)]
 mod display_records_tests;
 

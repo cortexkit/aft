@@ -8379,7 +8379,7 @@ fn initialization_options_for_spawn(
     server_root: &Path,
     config: &Config,
 ) -> Result<Option<serde_json::Value>, LspError> {
-    config.check_lsp_initialization_options(def.kind.id_str())?;
+    super::check_lsp_initialization_options(config, def.kind.id_str())?;
     if def.kind == ServerKind::Rust {
         // Cargo holds its target directory lock throughout a check, including
         // time spent waiting for compiler resources. Isolate analyzer checks

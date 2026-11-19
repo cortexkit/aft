@@ -185,6 +185,10 @@ mod tests;
 pub mod test_support {
     pub const MAX_RECORDS: usize = super::MAX_RECORDS;
 
+    pub fn current_schema_version(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
+        super::super::current_schema_version(conn)
+    }
+
     pub fn available(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
         super::available(conn)
     }

@@ -10,8 +10,8 @@ use super::super::{
     DispatchPathMetrics, PhaseTrace, ProjectRootId, PROTOCOL_VERSION,
 };
 use super::{LedgerEdge, RouteRole};
+use crate::context::Executor;
 use crate::db::call_ledger::{self as ledger, Key, RecordedFrame, ScopeIdentity, State};
-use crate::executor::Executor;
 
 const THALAMUS: &str = "reserved:thalamus-harness";
 const HEAD_OWNER: &str = "reserved:prefrontal-core";

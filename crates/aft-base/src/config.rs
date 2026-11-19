@@ -817,7 +817,7 @@ fn default_env_provider_timeout_ms() -> u64 {
 }
 
 impl ShellEnvProvider {
-    pub(crate) fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), String> {
         if self.kind != ShellEnvProviderKind::Custom && !self.watch.is_empty() {
             return Err("invalid_security_config:shell.env_provider.watch".into());
         }
@@ -1199,26 +1199,11 @@ impl Default for Config {
 }
 
 impl Config {
-    pub(crate) fn lsp_idle_ttl(&self) -> Option<std::time::Duration> {
+    pub fn lsp_idle_ttl(&self) -> Option<std::time::Duration> {
         self.lsp_idle_shutdown
             .then(|| std::time::Duration::from_secs(u64::from(self.lsp_idle_minutes) * 60))
     }
 
-    pub(crate) fn check_lsp_initialization_options(
-        &self,
-        id: &str,
-    ) -> Result<(), crate::lsp::LspError> {
-        if self
-            .invalid_lsp_initialization_options
-            .iter()
-            .any(|name| name == id)
-        {
-            return Err(crate::lsp::LspError::ServerNotReady(format!(
-                "lsp.servers.{id}.initialization_options must contain valid JSON text"
-            )));
-        }
-        Ok(())
-    }
     /// Whether the host's tagged `read` slot is registered, i.e. `read` is not
     /// in the resolved disabled list.
     ///

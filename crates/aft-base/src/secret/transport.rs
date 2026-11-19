@@ -312,7 +312,7 @@ impl SubcSecretUseTransport {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn dispatch(
         &self,
         params: Value,

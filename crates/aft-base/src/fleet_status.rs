@@ -546,14 +546,14 @@ pub async fn connect_subc_consumer(
     connection_file: &Path,
     options: ConsumerOptions,
 ) -> Result<SubcConsumer, subc_client_rs::ConsumerError> {
-    crate::subc::registration::connect_consumer(connection_file, options).await
+    crate::registration::connect_consumer(connection_file, options).await
 }
 
 pub fn spawn_fleet_status_dial(
     connection_file: &Path,
     capacity: usize,
 ) -> (FleetStatusClient, JoinHandle<()>) {
-    if !crate::subc::registration::module_consumer_allowed() {
+    if !crate::registration::module_consumer_allowed() {
         return (FleetStatusClient::dormant(), tokio::spawn(async {}));
     }
     let (client, wire_rx) = FleetStatusClient::dial_channel(capacity);
