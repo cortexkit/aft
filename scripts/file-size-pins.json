@@ -36,7 +36,7 @@
     "reason": "Split semantic indexing by area pending; AFT crate split lane."
   },
   "crates/aft-parse/src/parser.rs": {
-    "lines": 9906,
+    "lines": 9905,
     "reason": "Split parser support by language pending; AFT crate split lane."
   },
   "crates/aft/src/gh_shim.rs": {

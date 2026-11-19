@@ -26,6 +26,7 @@ fn grammar_registries_download_fail_and_retry_independently() {
         .args(["--exact", "data_layer::grammar_tests::multiple::grammar_registries_download_fail_and_retry_independently", "--nocapture"])
         .env("AFT_TEST_MULTI_GRAMMAR_ROOT", dir.path())
         .env("AFT_TEST_GRAMMAR_MANIFEST", manifest_path)
+        .env("AFT_TEST_GRAMMAR_PARSE_DEADLINE_MS", "30000")
         .env("AFT_TEST_GRAMMAR_TRANSPORT_DIR", dir.path().join("transport"))
         .env("AFT_TEST_GRAMMAR_CLOCK_FILE", write(dir.path(), "clock", "0"))
         .output()

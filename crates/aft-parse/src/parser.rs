@@ -18,7 +18,6 @@ use crate::error::AftError;
 use crate::symbols::{Range, Symbol, SymbolKind, SymbolMatch};
 
 mod file_language;
-use file_language::dynamic_language_for_extension;
 pub use file_language::dynamic_language_for_extension;
 mod grammar_selection;
 pub use grammar_selection::grammar_for;
