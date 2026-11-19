@@ -60,7 +60,13 @@ async fn native() {
     for dir in [&project, &other, &data] {
         fs::create_dir(dir).unwrap();
     }
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), data.clone());
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        aft::config::Config {
+            storage_dir: Some(data.clone()),
+            ..Default::default()
+        },
+    );
     ctx.update_config(|cfg| {
         cfg.project_root = Some(other.clone());
         cfg.github.shim = true;
