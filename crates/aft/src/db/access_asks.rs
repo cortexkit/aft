@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS access_asks (
 "#;
 
 /// Identity of one ask: the asking scope at its epoch plus the call's args hash.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AskKey {
     pub scope: ScopeKey,
     pub args_hash: String,
@@ -206,7 +206,7 @@ pub(crate) fn open_permission(
          VALUES (?1,?2,?3,?4,?5,NULL,?6,?7,?8,'[]',NULL,?9)
          ON CONFLICT(owner,scope_ref,epoch,args_hash) DO UPDATE SET call_key=excluded.call_key,
            elicitation_id=NULL, selector=excluded.selector, request=excluded.request,
-           pending=excluded.pending, holder=NULL",
+           pending=excluded.pending, holder=NULL, created_at=excluded.created_at",
         params![
             key.scope.owner,
             key.scope.scope_ref,

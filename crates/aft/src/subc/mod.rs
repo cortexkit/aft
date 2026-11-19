@@ -5383,8 +5383,8 @@ where
     // prefrontal and plexus over its own connection, off the frame loop.
     let (_worker_read_service, mut worker_read_scopes) =
         crate::gh_shim_worker_broker::install(Arc::clone(&gh_relay));
-    // Stamped workers' permission asks go to Cingulate over this daemon.
     consent::install_subc_transport(connection_file_path);
+    let _expiry = consent::expiry::start(shared_app.clone(), storage_dir.join("aft.db"));
     let _manifest_sync = crate::gh_shim::manifest_sync::start(connection_file_path.to_path_buf());
     let bus_worker = crate::late_result_bus::start(
         Arc::clone(&shared_app),
