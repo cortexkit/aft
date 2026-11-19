@@ -509,7 +509,7 @@ fn queries(
     // protected roots. The timestamp is deliberately outside the comparison.
     let dead =
         super::super::dead_code::stream::Rows::new(&view, &crate::inspect::InspectEntryPoints)?;
-    let snapshot = view.dead_code_snapshot_shared(&crate::inspect::InspectEntryPoints)?;
+    let snapshot = view.dead_code_snapshot_in(None, &crate::inspect::InspectEntryPoints)?;
     super::super::dead_code::stream::artifact::write(
         &out.join("dead-code.json"),
         &dead,
