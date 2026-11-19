@@ -377,9 +377,8 @@ fn parity_waits_for_actual_reply_after_a_clear_watcher_probe() {
 #[cfg(feature = "test-timing-hooks")]
 #[test]
 fn parity_waits_for_real_maintenance_drain_between_calls() {
-    use aft::context::Executor;
     use aft::context::{default_language_provider_factory, AppContext};
-    use aft::executor::Lane;
+    use aft::executor::{Executor, Lane};
     use aft::path_identity::ProjectRootId;
     use aft::run_tool_call::{run_tool_call, ToolCallContext, ToolCallOutcome};
     use aft::runtime_drain::{

@@ -439,6 +439,7 @@ fn native_doctor_fixes_only_marked_roots_and_old_cache_cleanup_is_explicit() {
 #[test]
 #[ignore = "real-volume scenario supervised by the cache-root doctor test"]
 fn cache_root_doctor_body_child() {
+    aft::reader_floor::register_cache_hooks();
     let temp = tempfile::tempdir().unwrap();
     #[cfg(unix)]
     let process_path = process_snapshot_fixture(temp.path(), "");

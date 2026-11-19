@@ -298,28 +298,40 @@ pub fn capture_active() -> bool {
     false
 }
 
+// Keep the session-log filters people set against AFT working across crate boundaries.
+fn canonical_slog_target(target: &str) -> std::borrow::Cow<'_, str> {
+    match target.split_once("::") {
+        Some(("aft_base" | "aft_db" | "aft_parse", module)) => format!("aft::{module}").into(),
+        _ => target.into(),
+    }
+}
+
 #[doc(hidden)]
 #[inline]
 pub fn slog_info_enabled(target: &'static str) -> bool {
-    log::log_enabled!(target: target, log::Level::Info) || capture_active()
+    log::log_enabled!(target: canonical_slog_target(target).as_ref(), log::Level::Info)
+        || capture_active()
 }
 
 #[doc(hidden)]
 #[inline]
 pub fn slog_warn_enabled(target: &'static str) -> bool {
-    log::log_enabled!(target: target, log::Level::Warn) || capture_active()
+    log::log_enabled!(target: canonical_slog_target(target).as_ref(), log::Level::Warn)
+        || capture_active()
 }
 
 #[doc(hidden)]
 #[inline]
 pub fn slog_error_enabled(target: &'static str) -> bool {
-    log::log_enabled!(target: target, log::Level::Error) || capture_active()
+    log::log_enabled!(target: canonical_slog_target(target).as_ref(), log::Level::Error)
+        || capture_active()
 }
 
 #[doc(hidden)]
 #[inline]
 pub fn slog_debug_enabled(target: &'static str) -> bool {
-    log::log_enabled!(target: target, log::Level::Debug) || capture_active()
+    log::log_enabled!(target: canonical_slog_target(target).as_ref(), log::Level::Debug)
+        || capture_active()
 }
 
 // Exported slog macros expand outside this module, so their entry points must
@@ -347,7 +359,7 @@ pub fn emit_slog_debug(target: &'static str, message: String) {
 fn emit_slog(target: &'static str, level: log::Level, message: String) {
     #[cfg(any(test, feature = "test-support"))]
     capture_log_line(level, &message);
-    log::log!(target: target, level, "{message}");
+    log::log!(target: canonical_slog_target(target).as_ref(), level, "{message}");
 }
 
 /// Mint a stable per-attempt id (`b-<pid>-<n>`) at `build_started`.
@@ -3504,6 +3516,35 @@ pub mod tests {
             render_log_line(log::Level::Debug, "aft_lsp", "x"),
             "2026-09-26T10:00:00Z [aft-lsp] DEBUG x\n"
         );
+    }
+
+    #[test]
+    fn split_session_log_targets_preserve_legacy_filters() {
+        let filter = env_logger::Builder::new()
+            .parse_filters("info,aft::db=debug")
+            .build();
+        for (target, canonical) in [
+            ("aft_base::cache_location", "aft::cache_location"),
+            ("aft_db::db::write_ledger", "aft::db::write_ledger"),
+            ("aft_parse::parser", "aft::parser"),
+            ("aft::subc", "aft::subc"),
+            ("aft_db_probe::db", "aft_db_probe::db"),
+        ] {
+            assert_eq!(canonical_slog_target(target), canonical);
+        }
+        let matches = |target| {
+            log::Log::enabled(
+                &filter,
+                &log::Metadata::builder()
+                    .target(target)
+                    .level(log::Level::Debug)
+                    .build(),
+            )
+        };
+        assert!(!matches("aft_db::db::write_ledger"));
+        assert!(matches(
+            canonical_slog_target("aft_db::db::write_ledger").as_ref()
+        ));
     }
 
     fn slow_phases() -> ToolCallPhaseDurations {

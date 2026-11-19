@@ -2284,7 +2284,9 @@ pub fn clean_old_for_test(
         .as_ref()
         .filter(|parent| parent.is_dir())
         .map(|parent| crate::walk_boundary::simulated_volumes::simulate(parent, u64::MAX - 17));
-    clean_old_resolved(tiers, storage, storage, confirm)
+    with_legacy_daemon_processes_for_test_if_unset(|| {
+        clean_old_resolved(tiers, storage, storage, confirm)
+    })
 }
 
 /// Whether `storage` holds AFT's database (`aft.db`) or an owner marker that
@@ -2503,10 +2505,30 @@ fn storage_lock_error(error: std::fs::TryLockError) -> io::Error {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-// Unit tests supply process snapshots instead of inspecting unrelated daemons
-// on the operator's machine; the same classifier and cleanup refusal still run.
-// An empty snapshot means the test supplied none, and the scan is skipped.
-thread_local! { pub static LEGACY_DAEMON_PROCESSES: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) }; }
+thread_local! { static LEGACY_DAEMON_PROCESSES: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) }; }
+
+/// Supply a synthetic process snapshot for this thread. An empty snapshot
+/// skips the scan so unit tests do not inspect unrelated operator daemons.
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_legacy_daemon_processes_for_test<R>(processes: String, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LEGACY_DAEMON_PROCESSES.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+    let _restore = Restore(LEGACY_DAEMON_PROCESSES.with(|slot| slot.replace(Some(processes))));
+    run()
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn with_legacy_daemon_processes_for_test_if_unset<R>(run: impl FnOnce() -> R) -> R {
+    if LEGACY_DAEMON_PROCESSES.with(|slot| slot.borrow().is_some()) {
+        run()
+    } else {
+        with_legacy_daemon_processes_for_test(String::new(), run)
+    }
+}
 
 /// A process snapshot has one process per line:
 /// `pid<TAB>executable<TAB>arguments`.
@@ -2636,7 +2658,7 @@ fn legacy_daemon_present(processes: &str, current_pid: u32) -> io::Result<bool> 
 }
 
 /// List every process in the snapshot format `legacy_daemon_present` reads.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(not(test))]
 fn legacy_process_query(label: &str, timeout: Duration) -> io::Result<String> {
     #[cfg(windows)]
     {
@@ -2667,7 +2689,6 @@ fn legacy_process_query(label: &str, timeout: Duration) -> io::Result<String> {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn legacy_process_snapshot(
     command: &mut std::process::Command,
     label: &str,
@@ -2754,14 +2775,24 @@ fn ensure_no_legacy_daemon() -> io::Result<()> {
     // Upgrade-window protection: older daemons do not hold the durable-root
     // lock and cannot be excluded by it. Keep this host-wide refusal for this release.
     #[cfg(any(test, feature = "test-support"))]
-    let processes = LEGACY_DAEMON_PROCESSES.with(|processes| processes.borrow().clone());
-    #[cfg(any(test, feature = "test-support"))]
-    if processes.is_empty() {
-        return Ok(());
+    if let Some(processes) = LEGACY_DAEMON_PROCESSES.with(|slot| slot.borrow().clone()) {
+        return if processes.is_empty() {
+            Ok(())
+        } else {
+            refuse_legacy_daemon(&processes)
+        };
     }
-    #[cfg(not(any(test, feature = "test-support")))]
-    let processes = legacy_process_query("legacy-daemon process scan", Duration::from_secs(10))?;
-    if legacy_daemon_present(&processes, std::process::id())? {
+    #[cfg(test)]
+    return Ok(());
+    #[cfg(not(test))]
+    refuse_legacy_daemon(&legacy_process_query(
+        "legacy-daemon process scan",
+        Duration::from_secs(10),
+    )?)
+}
+
+fn refuse_legacy_daemon(processes: &str) -> io::Result<()> {
+    if legacy_daemon_present(processes, std::process::id())? {
         return Err(io::Error::other(
             "legacy_daemon_upgrade_window: stop the running subc daemon before cache cleanup",
         ));

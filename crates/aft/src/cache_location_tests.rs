@@ -6,6 +6,10 @@ use crate::config::Config;
 #[allow(unused_imports)]
 pub(crate) use aft_base::cache_location::tests::*;
 
+fn without_host_process_scan<R>(run: impl FnOnce() -> R) -> R {
+    with_legacy_daemon_processes_for_test(String::new(), run)
+}
+
 #[test]
 fn registered_floor_hook_preserves_newer_reader_refusal() {
     let dir = tempfile::tempdir().unwrap();
@@ -50,7 +54,7 @@ fn legacy_cleanup_refuses_a_non_resolved_storage_root() {
         source: "test".into(),
         doc: serde_json::json!({"storage":{"cache_dir":parent}}).to_string(),
     }];
-    let report = super::clean_old(&tiers, &storage, |_| true);
+    let report = without_host_process_scan(|| super::clean_old(&tiers, &storage, |_| true));
     assert_eq!(
         report.reason,
         Some("old_cache_storage_root_mismatch"),
@@ -111,8 +115,10 @@ fn legacy_cleanup_requires_the_active_namespace_on_its_own_device() {
     }];
     // No simulated volume here: this deliberately models an old enrollment on
     // the primary device, which is not sufficient to authorize legacy cleanup.
-    let report = super::clean_old_resolved(&tiers, &storage, &storage, |_| {
-        panic!("same-device namespace must be refused before confirmation")
+    let report = without_host_process_scan(|| {
+        super::clean_old_resolved(&tiers, &storage, &storage, |_| {
+            panic!("same-device namespace must be refused before confirmation")
+        })
     });
     assert_eq!(
         report.reason,
@@ -1043,14 +1049,15 @@ fn cache_cleanup_upgrade_window_refuses_a_prelease_daemon() {
         std::process::id(),
         std::process::id() ^ 1
     );
-    LEGACY_DAEMON_PROCESSES.with(|text| *text.borrow_mut() = processes);
-    let doctor = reclaim_configured_inactive_caches(&tiers, &storage);
     let mut confirmed = false;
-    let report = clean_old(&tiers, &storage, |_| {
-        confirmed = true;
-        true
+    let (doctor, report) = with_legacy_daemon_processes_for_test(processes, || {
+        let doctor = reclaim_configured_inactive_caches(&tiers, &storage);
+        let report = clean_old(&tiers, &storage, |_| {
+            confirmed = true;
+            true
+        });
+        (doctor, report)
     });
-    LEGACY_DAEMON_PROCESSES.with(|text| text.borrow_mut().clear());
     assert!(
         doctor
             .error
@@ -1118,7 +1125,9 @@ fn cache_cleanup_allows_a_daemon_using_a_different_storage_root() {
     let other_canary = canary(&other, "logs/keep");
     let _daemon = acquire_daemon_storage_lease(&other).unwrap();
     assert_eq!(
-        acquire_cache_cleanup_lease(&other).unwrap_err().kind(),
+        without_host_process_scan(|| acquire_cache_cleanup_lease(&other))
+            .unwrap_err()
+            .kind(),
         io::ErrorKind::WouldBlock
     );
     let report = clean_old(&tiers, &storage, |inventory| {
@@ -2055,7 +2064,7 @@ fn cache_location_unavailable_root_refuses_all_cleanup() {
         source: "file".into(),
         doc: serde_json::json!({"storage":{"cache_dir":parent}}).to_string(),
     }];
-    let report = reclaim_configured_inactive_caches(&tiers, &storage);
+    let report = without_host_process_scan(|| reclaim_configured_inactive_caches(&tiers, &storage));
     assert!(
         report
             .error

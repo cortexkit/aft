@@ -666,7 +666,7 @@ async function surfaceRequirement(repoRoot: string, body: string): Promise<strin
 }
 
 export async function deriveListSurfaces(repoRoot: string): Promise<ListSurface[]> {
-  const path = join(repoRoot, "crates", "aft", "src", "list_surfaces.rs");
+  const path = join(repoRoot, "crates", "aft-base", "src", "list_surfaces.rs");
   const source = await readFile(path, "utf8");
   const registry = source.match(/pub static LIST_SURFACES[^=]*=\s*&\[(?<body>[\s\S]*?)\n\];/)
     ?.groups?.body;

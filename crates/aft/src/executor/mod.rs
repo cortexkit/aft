@@ -1,5 +1,8 @@
 pub use aft_base::executor::*;
 
+/// Stable AFT executor path used by application callers and parity fixtures.
+pub type Executor<C = crate::context::AppContext> = aft_base::executor::Executor<C>;
+
 #[cfg(test)]
 #[allow(unused_imports)]
 use crate::path_identity::ProjectRootId;

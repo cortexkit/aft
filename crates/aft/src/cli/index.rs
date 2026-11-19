@@ -193,6 +193,7 @@ fn run_snapshot(
 
     config.storage_dir = Some(paths.storage_dir);
     let notices = index_notices(&warnings);
+    aft::reader_floor::register_cache_hooks();
     if let Some(warning) = aft::root_cache::prepare_cache_root(&mut config) {
         return Err(IndexError::validation(format!(
             "cache_dir_unavailable: {}",

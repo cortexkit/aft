@@ -234,7 +234,12 @@ async fn storage_lease_starts_without_reading_root_under_landlock() {
         );
         assert!(fs::read_dir(storage.join("logs")).unwrap().next().is_some());
         send_connection_goodbye(&mut stream).await;
-        assert!(module.wait_for_exit("Landlock daemon clean exit").success());
+        let status = module.wait_for_exit("Landlock daemon clean exit");
+        assert!(
+            status.success(),
+            "{status}: {}",
+            fs::read_to_string(&stderr_path).unwrap()
+        );
         lock.try_lock()
             .expect("daemon must release its lease on exit");
     }
