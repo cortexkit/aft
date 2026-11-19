@@ -1,4 +1,4 @@
-use std::sync::LazyLock;
+use std::{collections::HashMap, path::Path, sync::LazyLock};
 
 use serde::Deserialize;
 
@@ -15,42 +15,83 @@ pub struct GrammarManifest {
     pub url: String,
 }
 
-pub static PRODUCTION_MANIFEST: LazyLock<GrammarManifest> = LazyLock::new(|| {
-    serde_json::from_str(include_str!("manifest.json")).expect("compiled grammar manifest")
+#[derive(Deserialize)]
+struct ManifestList {
+    grammars: Vec<GrammarManifest>,
+}
+
+impl ManifestList {
+    fn load(json: &[u8], production: bool) -> Result<Self, String> {
+        let list: Self = serde_json::from_slice(json).map_err(|error| error.to_string())?;
+        list.validate(production)?;
+        Ok(list)
+    }
+
+    fn validate(&self, production: bool) -> Result<(), String> {
+        let mut languages = std::collections::HashSet::new();
+        let mut extensions = HashMap::new();
+        for grammar in &self.grammars {
+            let language = grammar.language.as_str();
+            if !languages.insert(language) {
+                return Err(format!("duplicate grammar language: {language}"));
+            }
+            if production && super::extractor_language(language).is_none() {
+                return Err(format!("no extractor for grammar: {language}"));
+            }
+            for extension in &grammar.extensions {
+                if crate::lang_id::native_language_by_extension(extension).is_some() {
+                    return Err(format!("grammar extension is already linked: {extension}"));
+                }
+                if let Some(other) = extensions.insert(extension, language) {
+                    if other != language {
+                        return Err(format!("duplicate grammar extension: {extension}"));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+static PRODUCTION_MANIFEST: LazyLock<ManifestList> = LazyLock::new(|| {
+    ManifestList::load(include_bytes!("manifest.json"), true).expect("compiled grammar manifest")
 });
 
-pub const LUAU_EXTRACTOR_VERSION: u32 = 3;
-
-pub fn manifest() -> &'static GrammarManifest {
+pub fn manifests() -> &'static [GrammarManifest] {
     #[cfg(feature = "test-hooks")]
     {
-        static OVERRIDE: LazyLock<Option<GrammarManifest>> = LazyLock::new(|| {
+        static OVERRIDE: LazyLock<Option<ManifestList>> = LazyLock::new(|| {
             let path = std::env::var_os("AFT_TEST_GRAMMAR_MANIFEST")?;
             Some(
-                serde_json::from_slice(&std::fs::read(path).expect("test grammar manifest"))
-                    .expect("test grammar manifest JSON"),
+                ManifestList::load(&std::fs::read(path).expect("test grammar manifest"), false)
+                    .expect("valid test grammar manifest"),
             )
         });
         if let Some(value) = OVERRIDE.as_ref() {
-            return value;
+            return &value.grammars;
         }
     }
-    &PRODUCTION_MANIFEST
+    &PRODUCTION_MANIFEST.grammars
 }
 
-pub fn extractor_version() -> u32 {
-    #[cfg(feature = "test-hooks")]
-    {
-        static VERSION: LazyLock<u32> = LazyLock::new(|| {
-            std::env::var("AFT_TEST_GRAMMAR_EXTRACTOR_VERSION")
-                .ok()
-                .map(|v| v.parse().expect("test extractor version"))
-                .unwrap_or(LUAU_EXTRACTOR_VERSION)
-        });
-        return *VERSION;
-    }
-    #[cfg(not(feature = "test-hooks"))]
-    LUAU_EXTRACTOR_VERSION
+pub fn manifest(language: &str) -> Option<&'static GrammarManifest> {
+    manifests().iter().find(|entry| entry.language == language)
+}
+
+#[cfg(feature = "test-support")]
+pub fn production_manifest(language: &str) -> Option<&'static GrammarManifest> {
+    PRODUCTION_MANIFEST
+        .grammars
+        .iter()
+        .find(|entry| entry.language == language)
+}
+
+/// Resolve a downloaded grammar from the file name without opening the file.
+pub fn manifest_for_path(path: &Path) -> Option<&'static GrammarManifest> {
+    let extension = path.extension()?.to_str()?;
+    manifests()
+        .iter()
+        .find(|entry| entry.extensions.iter().any(|ext| ext == extension))
 }
 
 /// Initialize the test manifest's hash/URL and the Luau extractor version in
@@ -59,6 +100,10 @@ pub fn extractor_version() -> u32 {
 /// Production has no environment-controlled manifest or extractor version.
 #[cfg(feature = "test-hooks")]
 pub fn initialize_test_identity() {
-    let _ = manifest();
-    let _ = extractor_version();
+    for entry in manifests() {
+        let _ = super::extractor_version(&entry.language);
+    }
 }
+
+#[cfg(test)]
+mod tests;

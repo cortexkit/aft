@@ -114,11 +114,33 @@ class BuildTests(unittest.TestCase):
             build.require_equal("<chunk><function/></chunk>", "<chunk/>", "parse tree")
 
     def test_pin_uses_only_reviewed_c_inputs(self):
-        pin = json.loads(build.PIN.read_text())
+        entry = next(entry for entry in build.manifest_entries() if entry["language"] == "luau")
+        _, pin = build.pin_for(entry)
         self.assertEqual(pin["build"]["sources"], ["src/parser.c", "src/scanner.c"])
         self.assertEqual(pin["extensions"], ["luau"])
         self.assertRegex(pin["grammar"]["commit"], r"^[0-9a-f]{40}$")
         self.assertTrue(pin["zed"]["exemption"])
+
+    def test_verifies_both_artifact_hash_and_size_against_the_manifest(self):
+        data = b"pinned grammar"
+        entry = {"language": "fake", "sha256": build.digest(data), "size": len(data)}
+        build.verify_artifact(entry, data)
+        with self.assertRaisesRegex(ValueError, "manifest SHA-256"):
+            build.verify_artifact(entry, b"wrong grammar!")
+        with self.assertRaisesRegex(ValueError, "manifest size"):
+            build.verify_artifact(dict(entry, size=len(data) + 1), data)
+
+    def test_build_rebuilds_each_manifest_entry(self):
+        entries = [{"language": name, "sha256": build.digest(name.encode()), "size": len(name)}
+                   for name in ("first", "second")]
+        with patch.object(build, "manifest_entries", return_value=entries), \
+             patch.object(build, "pin_for", return_value=(None, {})), \
+             patch.object(build, "compile_pinned", side_effect=lambda entry, *_: (entry["language"].encode(), "clang")) as compile:
+            build.build(self.work)
+        self.assertEqual([call.args[0] for call in compile.call_args_list], entries)
+        for entry in entries:
+            self.assertEqual((self.work / "artifacts" / f"{entry['sha256']}.wasm").read_bytes(),
+                             entry["language"].encode())
 
 
 class PublicationTests(unittest.TestCase):
@@ -192,6 +214,19 @@ class PublicationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "network error"):
                 publish.publish(self.artifact, self.entry, "cortexkit/aft", "grammars-1", self.work)
         self.assertEqual(gh.call_count, 1)
+
+    def test_publish_uses_only_the_production_manifest_assets(self):
+        entries = [self.entry, {"sha256": "b" * 64, "size": 123}]
+        pin = {"publication": {"repository": "cortexkit/aft", "tag": "grammars-1"}}
+        (self.work / "test-only.wasm").write_bytes(b"not a production artifact")
+        with patch.object(publish, "manifest_entries", return_value=entries), \
+             patch.object(publish, "pin_for", return_value=(None, pin)), \
+             patch.object(publish, "publish") as upload:
+            publish.publish_manifest(self.work)
+        self.assertEqual([call.args[:4] for call in upload.call_args_list], [
+            (self.work / f"{entry['sha256']}.wasm", entry, "cortexkit/aft", "grammars-1")
+            for entry in entries
+        ])
 
 
 if __name__ == "__main__":

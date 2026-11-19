@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build only pinned generated C; verify repeatability and Zed parse parity."""
+"""Rebuild the pinned grammar manifest from verified generated C sources."""
 
 import argparse
 import gzip
@@ -17,7 +17,7 @@ import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "crates/aft/tests/fixtures/grammars"
-PIN = ROOT / "grammars/luau.pin.json"
+MANIFEST = ROOT / "crates/aft-parse/src/grammar/manifest.json"
 
 
 def digest(data):
@@ -133,24 +133,64 @@ def json_write(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
 
-def build(output, write_fixtures=False):
-    pin = json.loads(PIN.read_text())
+def manifest_entries():
+    entries = json.loads(MANIFEST.read_text())["grammars"]
+    if not entries or len({entry["language"] for entry in entries}) != len(entries):
+        raise ValueError("expected a nonempty manifest with unique languages")
+    return entries
+
+
+def pin_for(entry):
+    language = entry["language"]
+    if not re.fullmatch(r"[a-z0-9_]+", language):
+        raise ValueError("invalid grammar language name")
+    path = ROOT / "grammars" / f"{language}.pin.json"
+    pin = json.loads(path.read_text())
     grammar = pin["grammar"]
-    if not re.fullmatch(r"[0-9a-f]{40}", grammar["commit"]):
+    for key in ("language", "extensions"):
+        require_equal(pin[key], entry[key], f"{language} {key}")
+    for key in ("repository", "commit", "abi", "license"):
+        field = f"grammar_{key}" if key in ("repository", "commit") else key
+        require_equal(grammar[key], entry[field], f"{language} {key}")
+    repository, tag = pin["publication"]["repository"], pin["publication"]["tag"]
+    require_equal(entry["url"],
+                  f"https://github.com/{repository}/releases/download/{tag}/{entry['sha256']}.wasm",
+                  f"{language} release URL")
+    return path, pin
+
+
+def verify_artifact(entry, data):
+    require_equal(digest(data), entry["sha256"], f"{entry['language']} manifest SHA-256")
+    require_equal(len(data), entry["size"], f"{entry['language']} manifest size")
+
+
+def compile_pinned(entry, pin, work):
+    grammar = pin["grammar"]
+    commit = entry["grammar_commit"]
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("grammar revision must be a full commit")
-    work = output / "work"
     work.mkdir(parents=True, exist_ok=True)
     env = clean_environment(work)
     downloads = work / "downloads"
     source = work / "source"
-    repo = grammar["repository"].removeprefix("https://github.com/")
+    repository = re.fullmatch(r"https://github\.com/([\w.-]+/[\w.-]+)", entry["grammar_repository"])
+    if repository is None:
+        raise ValueError("expected a GitHub grammar repository")
+    repo = repository[1]
     for name, sha in grammar["files"].items():
-        fetch(f"https://raw.githubusercontent.com/{repo}/{grammar['commit']}/{name}",
+        if Path(name).is_absolute() or ".." in Path(name).parts:
+            raise ValueError(f"invalid pinned source path: {name}")
+        fetch(f"https://raw.githubusercontent.com/{repo}/{commit}/{name}",
               sha, source / name, limit=8 * 1024 * 1024)
     parser = (source / "src/parser.c").read_text()
     abi = int(re.search(r"#define LANGUAGE_VERSION (\d+)", parser)[1])
-    require_equal(abi, grammar["abi"], "grammar ABI")
-    require_equal(pin["build"]["sources"], ["src/parser.c", "src/scanner.c"], "C input allowlist")
+    require_equal(abi, entry["abi"], "grammar ABI")
+    allowed_sources = ["src/parser.c"]
+    if "src/scanner.c" in grammar["files"]:
+        allowed_sources.append("src/scanner.c")
+    require_equal(pin["build"]["sources"], allowed_sources, "C input allowlist")
+    if not all(name in grammar["files"] for name in allowed_sources):
+        raise ValueError("all C sources must be checksum-pinned")
     sdk_pin = pin["wasi_sdk"]
     sdk_archive = fetch(sdk_pin["url"], sdk_pin["sha256"], downloads / "wasi-sdk.tar.gz")
     sdk_dir = work / "sdk"
@@ -168,20 +208,29 @@ def build(output, write_fixtures=False):
         if directory.exists():
             shutil.rmtree(directory)
         shutil.copytree(source, directory)
-        run([clang, *pin["build"]["flags"], "-o", "luau.wasm", "-I", pin["build"]["include"],
-             *pin["build"]["sources"]], cwd=directory, env=env)
-        modules.append((directory / "luau.wasm").read_bytes())
+        filename = f"{entry['language']}.wasm"
+        run([clang, *pin["build"]["flags"], "-o", filename, "-I", pin["build"]["include"],
+              *pin["build"]["sources"]], cwd=directory, env=env)
+        modules.append((directory / filename).read_bytes())
     require_equal(modules[0], modules[1], "independent C builds")
-    a = modules[0]
+    verify_artifact(entry, modules[0])
+    return modules[0], compiler_version
+
+
+def verify_luau(a, compiler_version, pin_path, pin, work, artifacts, write_fixtures):
+    grammar = pin["grammar"]
+    source = work / "source"
+    downloads = work / "downloads"
+    env = clean_environment(work)
     b = variant(a)
-    artifacts = output / "artifacts"
-    if artifacts.exists():
-        shutil.rmtree(artifacts)
-    artifacts.mkdir()
     manifests = [manifest(pin, a, "A"), manifest(pin, b, "B")]
+    fixtures = []
     for item, data in zip(manifests, (a, b)):
-        (artifacts / item["file"]).write_bytes(data)
-        json_write(artifacts / f"manifest-{item['role'].lower()}.json", item)
+        module_path = artifacts / item["file"]
+        module_path.write_bytes(data)
+        manifest_path = artifacts / f"manifest-{item['role'].lower()}.json"
+        json_write(manifest_path, {"grammars": [item]})
+        fixtures.extend((module_path, manifest_path))
 
     zed = pin["zed"]
     archive = fetch(zed["url"], zed["sha256"], downloads / "zed.tar.gz", limit=16 * 1024 * 1024)
@@ -234,19 +283,36 @@ def build(output, write_fixtures=False):
             require_equal(trees[0], oracle.read_text(), f"checked-in tree: {entry['file']}")
     if write_fixtures:
         FIXTURES.mkdir(parents=True, exist_ok=True)
-        for path in artifacts.iterdir():
+        for path in fixtures:
             shutil.copyfile(path, FIXTURES / path.name)
         shutil.copyfile(source / "LICENSE", FIXTURES / "LICENSE.luau")
     else:
-        for path in artifacts.iterdir():
+        for path in fixtures:
             require_equal(path.read_bytes(), (FIXTURES / path.name).read_bytes(), f"fixture {path.name}")
-    report = {"pin_sha256": digest(PIN.read_bytes()), "compiler": compiler_version,
+    report = {"pin_sha256": digest(pin_path.read_bytes()), "compiler": compiler_version,
               "verifier": verifier_version, "builds_equal": True,
               "zed_comparison": zed["comparison"], "corpus_files": len(corpus["files"]),
               "parse_trees_equal": True, "artifacts": manifests,
               "provenance_notes": pin["provenance_notes"]}
     json_write(artifacts / "verification.json", report)
     print(json.dumps(report, indent=2))
+
+
+def build(output, write_fixtures=False):
+    artifacts = output / "artifacts"
+    if artifacts.exists():
+        shutil.rmtree(artifacts)
+    artifacts.mkdir(parents=True)
+    for entry in manifest_entries():
+        pin_path, pin = pin_for(entry)
+        language = entry["language"]
+        work = output / "work" / language
+        module, compiler = compile_pinned(entry, pin, work)
+        if language == "luau":
+            verify_luau(module, compiler, pin_path, pin, work, artifacts, write_fixtures)
+        else:
+            (artifacts / f"{entry['sha256']}.wasm").write_bytes(module)
+            print(f"verified {language}: {entry['sha256']}.wasm ({entry['size']} bytes)")
 
 
 if __name__ == "__main__":

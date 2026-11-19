@@ -8,7 +8,7 @@ ck_aft_smoke_grammar() (
   mkdir -p "$repo/target/scratch" || return 1
   work="$(mktemp -d "$repo/target/scratch/grammar-smoke.XXXXXX")" || return 1
   trap 'rm -rf "$work"' EXIT
-  hash="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha256"])' "$repo/crates/aft-parse/src/grammar/manifest.json")" || return 1
+  hash="$(python3 -c 'import json,sys; print(next(e["sha256"] for e in json.load(open(sys.argv[1]))["grammars"] if e["language"] == "luau"))' "$repo/crates/aft-parse/src/grammar/manifest.json")" || return 1
   mkdir -p "$work/storage/grammars" "$work/home" "$work/config" "$work/cache" "$work/state" "$work/data" "$work/tmp" || return 1
   cp "$repo/crates/aft/tests/fixtures/grammars/$hash.wasm" "$work/storage/grammars/$hash.wasm" || return 1
 

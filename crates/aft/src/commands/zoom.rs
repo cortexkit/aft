@@ -156,8 +156,7 @@ fn zoom_parse_source(
     }
     let lang = crate::parser::detect_language_from_source(path, source)
         .or_else(|| {
-            crate::parser::detect_language_any(path, cfg!(feature = "wasm-grammars"))
-                .filter(|language| *language == LangId::Luau)
+            crate::parser::dynamic_language_for_extension(path, cfg!(feature = "wasm-grammars"))
         })
         .ok_or_else(|| crate::error::AftError::InvalidRequest {
             message: format!("unsupported file extension: {}", path.display()),
@@ -2093,9 +2092,7 @@ fn resolve_zoom_symbol(
     let (name, anchor_line) = split_zoom_line_anchor(query);
     let matches = if is_heading {
         resolve_heading_symbols(provider, path, name)?
-    } else if crate::parser::detect_language_any(path, cfg!(feature = "wasm-grammars"))
-        == Some(LangId::Luau)
-    {
+    } else if crate::data_layer::grammar::downloaded_language(path).is_some() {
         crate::parser::list_symbols_shared(provider, path, true)?
             .iter()
             .filter(|symbol| {

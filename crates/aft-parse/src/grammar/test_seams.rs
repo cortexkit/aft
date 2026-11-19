@@ -48,7 +48,9 @@ pub fn from_environment(mut registry: Arc<GrammarRegistry>) -> Arc<GrammarRegist
         }
         inner.clock = Arc::new(FileClock(path.into()));
     }
-    if let Some(path) = std::env::var_os("AFT_TEST_GRAMMAR_TRANSPORT_FILE") {
+    if let Some(path) = std::env::var_os("AFT_TEST_GRAMMAR_TRANSPORT_DIR").map(|dir| {
+        std::path::PathBuf::from(dir).join(format!("{}.wasm", inner.manifest.sha256))
+    }).or_else(|| std::env::var_os("AFT_TEST_GRAMMAR_TRANSPORT_FILE").map(Into::into)) {
         struct FileTransport(std::path::PathBuf);
         impl Transport for FileTransport {
             fn get(
@@ -66,7 +68,7 @@ pub fn from_environment(mut registry: Arc<GrammarRegistry>) -> Arc<GrammarRegist
         }
         let _ = inner
             .transport
-            .set(Ok(Arc::new(FileTransport(path.into()))));
+            .set(Ok(Arc::new(FileTransport(path))));
     }
     if let Ok(queries) = std::env::var("AFT_TEST_GRAMMAR_QUERIES") {
         inner.queries = serde_json::from_str(&queries).expect("test grammar queries");
@@ -97,7 +99,7 @@ impl GrammarRegistry {
                 *self.0.forced_unavailable.lock() = None;
             }
         }
-        *self.forced_unavailable.lock() = Some(GrammarUnavailable::new("luau", state));
+        *self.forced_unavailable.lock() = Some(GrammarUnavailable::new(&self.manifest.language, state));
         Guard(self)
     }
 

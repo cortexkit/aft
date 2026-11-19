@@ -28,6 +28,10 @@ pub fn verified(manifest: &GrammarManifest, bytes: &[u8]) -> bool {
     bytes.len() as u64 == manifest.size && format!("{:x}", Sha256::digest(bytes)) == manifest.sha256
 }
 
+fn artifact_name(manifest: &GrammarManifest) -> String {
+    format!("{}.wasm", manifest.sha256)
+}
+
 impl Storage {
     pub fn folder(&self) -> PathBuf {
         self.root.join("grammars")
@@ -64,7 +68,7 @@ impl Storage {
                 "injected transient grammar open error",
             ));
         }
-        let name = format!("{}.wasm", manifest.sha256);
+        let name = artifact_name(manifest);
         let mut file = match dir.repair_read_file(OsStr::new(&name)) {
             Ok(file) => file,
             Err(error) => {
@@ -125,7 +129,7 @@ impl Storage {
         getrandom::fill(&mut nonce).map_err(io::Error::other)?;
         let nonce: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
         let temp = format!(".{}.{}.{nonce}.tmp", manifest.sha256, std::process::id());
-        let dest = format!("{}.wasm", manifest.sha256);
+        let dest = artifact_name(manifest);
         let result = (|| {
             let mut file = dir.repair_new_file(OsStr::new(&temp))?;
             if self.fault == StorageFault::Write {
@@ -172,5 +176,5 @@ impl Storage {
 #[cfg(any(any(test, feature = "test-support"), feature = "test-hooks"))]
 pub fn stored_path(root: &std::path::Path, manifest: &GrammarManifest) -> PathBuf {
     root.join("grammars")
-        .join(format!("{}.wasm", manifest.sha256))
+        .join(artifact_name(manifest))
 }

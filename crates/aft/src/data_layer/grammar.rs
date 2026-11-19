@@ -3,18 +3,21 @@
 use crate::callgraph_store::join::ManifestJoinError;
 use crate::error::AftError;
 
-const CALLGRAPH_OFF_MEANING: &str = "Luau files are skipped by meaning search because the call-graph index is off (indexes.callgraph: false).";
-
-pub(crate) fn meaning_callgraph_off_reason() -> String {
-    serde_json::json!({"code": "callgraph_off", "language": "luau", "state": "callgraph_off", "message": CALLGRAPH_OFF_MEANING}).to_string()
+pub(crate) fn meaning_callgraph_off_reason(language: &str) -> String {
+    let name = crate::grammar_state::display_name(language);
+    let message = format!("{name} files are skipped by meaning search because the call-graph index is off (indexes.callgraph: false).");
+    serde_json::json!({"code": "callgraph_off", "language": language, "state": "callgraph_off", "message": message}).to_string()
 }
 
 pub(crate) fn prepare(
     ctx: &crate::context::AppContext,
     path: &std::path::Path,
 ) -> Result<(), AftError> {
-    if crate::parser::detect_language_any(path, true) == Some(crate::parser::LangId::Luau) {
-        crate::grammar::configure(&ctx.config()).request()?;
+    if let Some(entry) = crate::grammar::manifest_for_path(path) {
+        crate::grammar::configure(&ctx.config());
+        if let Some(registry) = crate::grammar::registry(&entry.language) {
+            registry.request()?;
+        }
     }
     Ok(())
 }
@@ -47,11 +50,18 @@ pub(crate) fn is_grammar_error(error: &AftError) -> bool {
     )
 }
 
-/// Starting a scan's Luau extraction is the download trigger. The parser
+pub(crate) fn downloaded_language(path: &std::path::Path) -> Option<&'static str> {
+    if !cfg!(feature = "wasm-grammars") {
+        return None;
+    }
+    Some(&crate::grammar::manifest_for_path(path)?.language)
+}
+
+/// Starting a scan's extraction is the download trigger. The parser
 /// itself remains stored-only, so unrelated parser users cannot download.
 pub(super) fn request(language: &str) -> Result<(), ManifestJoinError> {
-    if language == "luau" {
-        crate::grammar::registry()
+    if let Some(registry) = crate::grammar::registry(language) {
+        registry
             .request()
             .map_err(ManifestJoinError::GrammarUnavailable)?;
     }
@@ -78,38 +88,52 @@ pub(super) fn reason(error: &ManifestJoinError) -> Option<String> {
     Some(reason)
 }
 
-/// One non-blocking registry observation shared by every gap in a reply.
+/// One non-blocking observation per grammar, shared by its gaps in a reply.
 #[derive(Default)]
 pub(crate) struct GapReply {
-    unavailable: Option<crate::grammar::GrammarUnavailable>,
+    unavailable: std::collections::BTreeMap<&'static str, crate::grammar::GrammarUnavailable>,
 }
 
 impl GapReply {
     pub(crate) fn capture() -> Self {
         #[cfg(feature = "wasm-grammars")]
-        let unavailable = crate::grammar::registry().status_snapshot();
+        let unavailable = crate::grammar::manifests()
+            .iter()
+            .filter_map(|entry| {
+                let language = entry.language.as_str();
+                Some((
+                    language,
+                    crate::grammar::registry(language)?.status_snapshot()?,
+                ))
+            })
+            .collect();
         #[cfg(not(feature = "wasm-grammars"))]
-        let unavailable = None;
+        let unavailable = Default::default();
         Self { unavailable }
     }
 
     pub(crate) fn value(&self, stored: &str, path: &std::path::Path) -> Option<serde_json::Value> {
         let saved: serde_json::Value = serde_json::from_str(stored).ok()?;
         let mut value = match saved["code"].as_str()? {
-            "grammar_parse_timeout" => AftError::GrammarParseTimeout {
-                path: path.display().to_string(),
-                language: "luau".into(),
-                timeout_ms: crate::parser::luau_parse_deadline()
-                    .as_millis()
-                    .min(u64::MAX as u128) as u64,
+            "grammar_parse_timeout" => {
+                let language = &crate::grammar::manifest_for_path(path)?.language;
+                AftError::GrammarParseTimeout {
+                    path: path.display().to_string(),
+                    language: language.clone(),
+                    timeout_ms: crate::grammar::parse_deadline(language)?
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64,
+                }
+                .to_error_json()
             }
-            .to_error_json(),
             "grammar_unavailable" => {
+                let language = &crate::grammar::manifest_for_path(path)?.language;
                 let state = serde_json::from_value(saved["state"].clone()).ok()?;
                 let error = self
                     .unavailable
-                    .clone()
-                    .unwrap_or_else(|| crate::grammar::GrammarUnavailable::new("luau", state));
+                    .get(language.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| crate::grammar::GrammarUnavailable::new(language, state));
                 AftError::from(error).to_error_json()
             }
             "callgraph_off" => saved,

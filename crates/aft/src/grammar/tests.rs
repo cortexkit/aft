@@ -5,9 +5,43 @@ use std::time::Duration;
 
 use super::test_seams::*;
 use super::*;
-use crate::grammar::PRODUCTION_MANIFEST;
+
+fn luau_manifest() -> &'static GrammarManifest {
+    crate::grammar::production_manifest("luau").unwrap()
+}
 
 const WASM: &[u8] = include_bytes!("../../tests/fixtures/grammars/56b2a562244e6f35f7b320bce59099126185389df1277a93e450ba4156c0e039.wasm");
+
+#[test]
+fn grammar_luau_identity_and_storage_path_match_the_single_grammar_release() {
+    use crate::data_layer::content::{keyed_language, record_key};
+    use aft_store::{content::RecordKey, ids::ContentKey};
+    use std::path::Path;
+
+    const IDENTITY: &str =
+        "luau@56b2a562244e6f35f7b320bce59099126185389df1277a93e450ba4156c0e039:3";
+    let registry = crate::grammar::registry("luau").unwrap();
+    assert_eq!(
+        registry.identity(),
+        "56b2a562244e6f35f7b320bce59099126185389df1277a93e450ba4156c0e039"
+    );
+    assert_eq!(keyed_language("luau"), IDENTITY);
+    assert_eq!(
+        stored_path(Path::new("cache"), luau_manifest()),
+        Path::new(
+            "cache/grammars/56b2a562244e6f35f7b320bce59099126185389df1277a93e450ba4156c0e039.wasm"
+        )
+    );
+    let content = ContentKey::of(b"local value = 1\n");
+    assert_eq!(
+        record_key(content, "luau"),
+        RecordKey::new(
+            content,
+            IDENTITY,
+            "ruled-callgraph-v14-resolver-precision+record-14"
+        )
+    );
+}
 
 #[test]
 fn luau_s4_same_storage_root_preserves_retry_budget() {
@@ -142,7 +176,7 @@ fn setup(
     let clock = Arc::new(FakeClock::default());
     let transport = Script::new(hops);
     let registry = GrammarRegistry::with_test_options(TestOptions {
-        manifest: PRODUCTION_MANIFEST.clone(),
+        manifest: luau_manifest().clone(),
         storage_root: directory.path().into(),
         clock: clock.clone(),
         transport: transport.clone(),
@@ -154,7 +188,7 @@ fn setup(
 
 fn stored(directory: &std::path::Path) {
     crate::private_storage::create_dir_all(directory.join("grammars")).unwrap();
-    crate::private_storage::write(stored_path(directory, &PRODUCTION_MANIFEST), WASM).unwrap();
+    crate::private_storage::write(stored_path(directory, luau_manifest()), WASM).unwrap();
 }
 
 fn settled(registry: &GrammarRegistry) {
@@ -280,7 +314,7 @@ fn grammar_detection_golden_builtins_and_opt_in() {
             (extension == "luau").then_some(Luau)
         );
     }
-    // The read-free Luau test agrees with full detection for every name above,
+    // The read-free manifest lookup agrees with full detection for every name above,
     // including headers that would otherwise be read and parsed.
     let mut names: Vec<String> = mappings
         .iter()
@@ -301,7 +335,7 @@ fn grammar_detection_golden_builtins_and_opt_in() {
         let path = std::path::Path::new(name);
         for dynamic in [false, true] {
             assert_eq!(
-                crate::parser::is_luau_path(path, dynamic),
+                crate::grammar::manifest_for_path(path).is_some() && dynamic,
                 detect_language_any(path, dynamic) == Some(Luau),
                 "{name} dynamic={dynamic}"
             );
@@ -325,7 +359,7 @@ fn grammar_stored_first_single_compile_rayon_and_lifetime() {
                 .map(|_| {
                     let language = registry.stored().unwrap();
                     let mut parser = tree_sitter::Parser::new();
-                    prepare_parser(&mut parser).unwrap();
+                    prepare_parser(&mut parser, "luau").unwrap();
                     parser.set_language(&language).unwrap();
                     let tree = parser
                         .parse("local function f() return 1 end", None)
@@ -342,10 +376,10 @@ fn grammar_stored_first_single_compile_rayon_and_lifetime() {
         ready.recv_timeout(Duration::from_secs(1)).unwrap(),
         registry.identity()
     );
-    std::fs::remove_file(stored_path(directory.path(), &PRODUCTION_MANIFEST)).unwrap();
+    std::fs::remove_file(stored_path(directory.path(), luau_manifest())).unwrap();
     let language = registry.request().unwrap();
     let mut parser = tree_sitter::Parser::new();
-    prepare_parser(&mut parser).unwrap();
+    prepare_parser(&mut parser, "luau").unwrap();
     parser.set_language(&language).unwrap();
     let after_delete = parser
         .parse("local function f() return 1 end", None)
@@ -451,7 +485,7 @@ fn grammar_download_redirect_status_and_verification_table() {
         settled(&registry);
         assert_eq!(registry.stored().unwrap_err().state, expected);
         assert_eq!(registry.compile_count(), 0);
-        assert!(!stored_path(directory.path(), &PRODUCTION_MANIFEST).exists());
+        assert!(!stored_path(directory.path(), luau_manifest()).exists());
         if expected == GrammarState::VerificationFailed {
             clock.advance(1_000_000);
             assert_eq!(registry.request().unwrap_err().state, expected);
@@ -516,7 +550,7 @@ fn grammar_storage_faults_discard_bytes_then_retry() {
 fn grammar_altered_stored_file_is_replaced_without_deleting_it_first() {
     let (directory, registry, _, transport) = setup([success()]);
     stored(directory.path());
-    let path = stored_path(directory.path(), &PRODUCTION_MANIFEST);
+    let path = stored_path(directory.path(), luau_manifest());
     let bad = vec![0; WASM.len()];
     std::fs::write(&path, &bad).unwrap();
     assert_eq!(
@@ -541,7 +575,7 @@ fn grammar_transient_stored_open_error_preserves_the_file() {
         GrammarState::StorageRetry
     );
     assert_eq!(
-        std::fs::read(stored_path(directory.path(), &PRODUCTION_MANIFEST)).unwrap(),
+        std::fs::read(stored_path(directory.path(), luau_manifest())).unwrap(),
         WASM
     );
 }
@@ -557,14 +591,14 @@ fn grammar_verified_publication_replaces_a_symlink_without_touching_its_target()
     std::fs::create_dir(directory.path().join("grammars")).unwrap();
     let target = directory.path().join("untouched");
     std::fs::write(&target, b"do not change").unwrap();
-    let path = stored_path(directory.path(), &PRODUCTION_MANIFEST);
+    let path = stored_path(directory.path(), luau_manifest());
     std::os::unix::fs::symlink(&target, &path).unwrap();
-    assert!(storage.read(&PRODUCTION_MANIFEST).unwrap().is_none());
+    assert!(storage.read(luau_manifest()).unwrap().is_none());
     assert!(std::fs::symlink_metadata(&path)
         .unwrap()
         .file_type()
         .is_symlink());
-    assert_eq!(storage.publish(&PRODUCTION_MANIFEST, WASM).unwrap(), WASM);
+    assert_eq!(storage.publish(luau_manifest(), WASM).unwrap(), WASM);
     assert_eq!(std::fs::read(&target).unwrap(), b"do not change");
     assert!(!std::fs::symlink_metadata(&path)
         .unwrap()
@@ -579,10 +613,10 @@ fn grammar_replacing_publication_reports_a_directory_path_without_removing_it() 
         root: directory.path().into(),
         fault: StorageFault::None,
     };
-    let path = stored_path(directory.path(), &PRODUCTION_MANIFEST);
+    let path = stored_path(directory.path(), luau_manifest());
     std::fs::create_dir_all(&path).unwrap();
-    assert!(storage.read(&PRODUCTION_MANIFEST).unwrap().is_none());
-    let error = storage.publish(&PRODUCTION_MANIFEST, WASM).unwrap_err();
+    assert!(storage.read(luau_manifest()).unwrap().is_none());
+    let error = storage.publish(luau_manifest(), WASM).unwrap_err();
     assert!(error.to_string().contains(&path.display().to_string()));
     assert!(path.is_dir());
 }
@@ -597,7 +631,7 @@ fn grammar_load_and_query_failures_are_terminal_without_readiness() {
         } else {
             b"not a wasm module"
         };
-        let mut manifest = PRODUCTION_MANIFEST.clone();
+        let mut manifest = luau_manifest().clone();
         manifest.size = bytes.len() as u64;
         manifest.sha256 = format!("{:x}", Sha256::digest(bytes));
         let transport = Script::new([Hop::Response(200, None, bytes.to_vec())]);
@@ -644,7 +678,7 @@ fn grammar_verified_sibling_artifact_recovers_after_a_failed_download_verificati
 
 #[test]
 fn grammar_engine_is_fixed_to_pulley_on_every_platform() {
-    assert_eq!(engine_target().unwrap(), "pulley");
+    assert_eq!(engine_target("luau").unwrap(), "pulley");
     assert!(ENGINE
         .as_ref()
         .expect("Pulley engine must be available")
@@ -653,7 +687,7 @@ fn grammar_engine_is_fixed_to_pulley_on_every_platform() {
 
 #[test]
 fn grammar_engine_failure_is_not_reported_as_a_restartable_load() {
-    let error = engine_failure("injected unsupported Pulley target");
+    let error = engine_failure("luau", "injected unsupported Pulley target");
     assert_eq!(error.state, GrammarState::UnsupportedPlatform);
     assert!(!error.message.contains("restart"));
     assert_eq!(error.retry_after_ms, None);
@@ -671,7 +705,7 @@ fn grammar_real_parse_deadline_discards_a_reused_parser_and_returns_no_partial_t
     let language = registry.stored().unwrap();
     let make_parser = || {
         let mut parser = crate::callgraph_store::join::extraction_work::CountingParser::new();
-        prepare_parser(&mut parser).unwrap();
+        prepare_parser(&mut parser, "luau").unwrap();
         parser.set_language(&language).unwrap();
         parser
     };
@@ -705,7 +739,7 @@ fn grammar_real_parse_deadline_discards_a_reused_parser_and_returns_no_partial_t
         .root_node()
         .has_error());
     let mut index_parser = crate::callgraph_store::join::extraction_work::CountingParser::new();
-    prepare_parser(&mut index_parser).unwrap();
+    prepare_parser(&mut index_parser, "luau").unwrap();
     index_parser.set_language(&language).unwrap();
     crate::callgraph_store::join::single_walk::install_luau_parser_for_test(index_parser);
     let result = with_luau_parse_deadline_for_test(Duration::from_millis(1), || {
@@ -752,7 +786,7 @@ fn grammar_concurrent_requests_share_one_background_attempt() {
         calls: AtomicUsize::new(0),
     });
     let registry = GrammarRegistry::with_test_options(TestOptions {
-        manifest: PRODUCTION_MANIFEST.clone(),
+        manifest: luau_manifest().clone(),
         storage_root: directory.path().into(),
         clock: Arc::new(FakeClock::default()),
         transport: transport.clone(),
@@ -807,7 +841,7 @@ fn grammar_deadline_and_partial_transport_errors_are_network_failures() {
     }
     let time = Arc::new(AtomicU64::new(0));
     let transport = DeadlineTransport(time.clone());
-    let result = download::fetch_timed(&PRODUCTION_MANIFEST, &transport, &|| {
+    let result = download::fetch_timed(luau_manifest(), &transport, &|| {
         Duration::from_millis(time.load(Ordering::SeqCst))
     });
     assert_eq!(result.unwrap_err(), DownloadFailure::Network);
@@ -831,7 +865,7 @@ fn grammar_deadline_and_partial_transport_errors_are_network_failures() {
         }
     }
     assert_eq!(
-        download::fetch(&PRODUCTION_MANIFEST, &PartialTransport).unwrap_err(),
+        download::fetch(luau_manifest(), &PartialTransport).unwrap_err(),
         DownloadFailure::Network
     );
 }
@@ -858,7 +892,7 @@ fn grammar_configured_cache_uses_flat_artifact_domain_without_durable_fallback()
     };
     let before = names();
     let registry = GrammarRegistry::with_test_options(TestOptions {
-        manifest: PRODUCTION_MANIFEST.clone(),
+        manifest: luau_manifest().clone(),
         storage_root: crate::root_cache::cache_root(&config),
         clock: Arc::new(FakeClock::default()),
         transport: Script::new([success()]),
@@ -868,7 +902,7 @@ fn grammar_configured_cache_uses_flat_artifact_domain_without_durable_fallback()
     registry.request().unwrap_err();
     settled(&registry);
     registry.stored().unwrap();
-    assert!(stored_path(&cache.join("aft"), &PRODUCTION_MANIFEST).is_file());
+    assert!(stored_path(&cache.join("aft"), luau_manifest()).is_file());
     assert!(!durable.join("grammars").exists());
     assert_eq!(names(), before);
     assert!(crate::root_cache::CACHE_DOMAINS.contains(&"grammars"));
@@ -896,7 +930,7 @@ fn grammar_storage_exhaustion_reports_last_storage_cause() {
 
 #[test]
 fn grammar_registry_without_configuration_does_not_select_default_storage() {
-    let registry = GrammarRegistry::new(None);
+    let registry = GrammarRegistry::new(luau_manifest(), None);
     assert!(registry.storage_root.read().is_none());
     assert_eq!(
         registry.stored().unwrap_err().state,

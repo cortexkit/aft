@@ -1,7 +1,8 @@
 //! Hash-pinned, rebuildable grammar artifacts. Parsers may load stored grammars;
 //! only an explicit command-level request is allowed to start a download.
 use super::{
-    download, manifest, storage, FailureCause, GrammarManifest, GrammarState, GrammarUnavailable,
+    download, extractors, manifests, storage, FailureCause, GrammarManifest, GrammarState,
+    GrammarUnavailable,
 };
 
 use std::sync::LazyLock;
@@ -31,8 +32,8 @@ static ENGINE: LazyLock<Result<tree_sitter::wasmtime::Engine, String>> = LazyLoc
 
 /// Report the target family from Wasmtime's actual engine, not the requested
 /// configuration. Wasmtime's public query distinguishes Pulley from native.
-pub fn engine_target() -> Result<&'static str, GrammarUnavailable> {
-    let engine = ENGINE.as_ref().map_err(|error| engine_failure(error))?;
+pub fn engine_target(language: &str) -> Result<&'static str, GrammarUnavailable> {
+    let engine = ENGINE.as_ref().map_err(|error| engine_failure(language, error))?;
     Ok(if engine.is_pulley() {
         "pulley"
     } else {
@@ -41,9 +42,9 @@ pub fn engine_target() -> Result<&'static str, GrammarUnavailable> {
 }
 
 test_support_visibility! {
-fn engine_failure(error: &str) -> GrammarUnavailable {
+fn engine_failure(language: &str, error: &str) -> GrammarUnavailable {
     log::warn!("Pulley grammar engine unavailable: {error}");
-    GrammarUnavailable::new(&manifest().language, GrammarState::UnsupportedPlatform)
+    GrammarUnavailable::new(language, GrammarState::UnsupportedPlatform)
 }
 }
 
@@ -142,7 +143,7 @@ pub struct GrammarRegistry {
 /// A readiness receiver whose registration ends with the receiver's lifetime.
 pub struct ReadinessSubscription {
     receiver: std::sync::mpsc::Receiver<String>,
-    registration: Option<(std::sync::Weak<GrammarRegistry>, u64)>,
+    _registration: ReadinessRegistration,
 }
 
 impl std::ops::Deref for ReadinessSubscription {
@@ -152,52 +153,52 @@ impl std::ops::Deref for ReadinessSubscription {
     }
 }
 
-impl Drop for ReadinessSubscription {
+pub struct ReadinessRegistration {
+    registry: std::sync::Weak<GrammarRegistry>,
+    id: u64,
+}
+
+impl Drop for ReadinessRegistration {
     fn drop(&mut self) {
-        if let Some((registry, id)) = &self.registration {
-            if let Some(registry) = registry.upgrade() {
-                registry.listeners.lock().remove(id);
-            }
+        if let Some(registry) = self.registry.upgrade() {
+            registry.listeners.lock().remove(&self.id);
         }
     }
 }
 
-static REGISTRY: OnceLock<Arc<GrammarRegistry>> = OnceLock::new();
+static REGISTRIES: LazyLock<super::RegistryMap<GrammarRegistry>> =
+    LazyLock::new(|| super::registry_map(manifests(), |entry| GrammarRegistry::new(entry, None)));
 
 /// Set the artifact location from the handling context, without reading or
 /// compiling a grammar. Call only when the caller opts into dynamic parsing;
 /// callers using built-in grammars only must not consult grammar storage.
-pub fn configure(config: &crate::config::Config) -> Arc<GrammarRegistry> {
+pub fn configure(config: &crate::config::Config) {
     let root = crate::cache_location::cache_root(config);
-    let registry = REGISTRY.get_or_init(|| GrammarRegistry::new(None));
-    registry.set_storage_root(root);
-    Arc::clone(registry)
+    for registry in REGISTRIES.values() {
+        registry.set_storage_root(root.clone());
+    }
 }
 
-pub fn registry() -> &'static Arc<GrammarRegistry> {
-    REGISTRY.get_or_init(|| GrammarRegistry::new(None))
+pub fn registry(language: &str) -> Option<&'static Arc<GrammarRegistry>> {
+    REGISTRIES.get(language)
 }
 
 impl GrammarRegistry {
     test_support_visibility! {
-fn new(root: Option<std::path::PathBuf>) -> Arc<Self> {
+fn new(manifest: &GrammarManifest, root: Option<std::path::PathBuf>) -> Arc<Self> {
         #[cfg(feature = "test-hooks")]
         let root = std::env::var_os("AFT_TEST_GRAMMAR_STORAGE")
             .map(std::path::PathBuf::from)
             .map(Some)
             .unwrap_or(root);
         let registry = Arc::new(Self {
-            manifest: manifest().clone(),
+            manifest: manifest.clone(),
             storage_root: RwLock::new(root),
             entry: Mutex::new(Entry::default()),
             changed: Condvar::new(),
             clock: Arc::new(MonotonicClock(Instant::now())),
             transport: OnceLock::new(),
-            queries: vec![
-                crate::luau::EXTRACTION_QUERY.into(),
-                crate::luau::COMPLEXITY_QUERY.into(),
-                crate::luau::COMMENT_QUERY.into(),
-            ],
+            queries: extractors::queries(&manifest.language).iter().map(|query| (*query).into()).collect(),
             fault: RwLock::new(storage::StorageFault::None),
             listeners: Mutex::new(std::collections::BTreeMap::new()),
             next_listener: std::sync::atomic::AtomicU64::new(0),
@@ -477,7 +478,7 @@ fn download(&self, storage: storage::Storage, generation: u64) {
             Ok(engine) => engine,
             Err(error) => {
                 return Loaded {
-                    language: Err(engine_failure(error).state),
+                    language: Err(engine_failure(&self.manifest.language, error).state),
                     compiles: 0,
                     milliseconds: 0.0,
                 }
@@ -529,6 +530,14 @@ fn download(&self, storage: storage::Storage, generation: u64) {
     /// Subscribe before the grammar is loaded; a ready grammar immediately emits its hash.
     pub fn subscribe(self: &Arc<Self>) -> ReadinessSubscription {
         let (tx, rx) = std::sync::mpsc::channel();
+        ReadinessSubscription {
+            receiver: rx,
+            _registration: self.subscribe_to(tx),
+        }
+    }
+
+    /// Register a shared receiver for maintenance that watches several grammars.
+    pub fn subscribe_to(self: &Arc<Self>, tx: std::sync::mpsc::Sender<String>) -> ReadinessRegistration {
         let entry = self.entry.lock();
         if entry.language.is_some() {
             let _ = tx.send(self.identity().into());
@@ -537,23 +546,23 @@ fn download(&self, storage: storage::Storage, generation: u64) {
             .next_listener
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.listeners.lock().insert(id, tx);
-        ReadinessSubscription {
-            receiver: rx,
-            registration: Some((Arc::downgrade(self), id)),
+        ReadinessRegistration {
+            registry: Arc::downgrade(self),
+            id,
         }
     }
 }
 
-pub fn prepare_parser(parser: &mut tree_sitter::Parser) -> Result<(), GrammarUnavailable> {
+pub fn prepare_parser(parser: &mut tree_sitter::Parser, language: &str) -> Result<(), GrammarUnavailable> {
     {
-        let engine = ENGINE.as_ref().map_err(|error| engine_failure(error))?;
+        let engine = ENGINE.as_ref().map_err(|error| engine_failure(language, error))?;
         let store = tree_sitter::WasmStore::new(engine).map_err(|error| {
             log::warn!("grammar parser store failed: {error}");
-            GrammarUnavailable::new(&manifest().language, GrammarState::LoadFailed)
+            GrammarUnavailable::new(language, GrammarState::LoadFailed)
         })?;
         parser.set_wasm_store(store).map_err(|error| {
             log::warn!("grammar parser store assignment failed: {error}");
-            GrammarUnavailable::new(&manifest().language, GrammarState::LoadFailed)
+            GrammarUnavailable::new(language, GrammarState::LoadFailed)
         })?;
         Ok(())
     }

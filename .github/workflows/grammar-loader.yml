@@ -54,19 +54,21 @@ jobs:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - name: Check production hash and size against immutable release bytes
+      - name: Check published grammar hashes and sizes against the manifest
         run: |
           python3 - <<'PY'
           import hashlib, json, urllib.request
           from pathlib import Path
           manifest = json.loads(Path('crates/aft-parse/src/grammar/manifest.json').read_text())
-          assert manifest['url'].startswith('https://github.com/cortexkit/aft/releases/download/grammars-')
-          with urllib.request.urlopen(manifest['url'], timeout=60) as response:
-              body = response.read(manifest['size'] + 1)
-          assert len(body) == manifest['size'], (len(body), manifest['size'])
-          assert hashlib.sha256(body).hexdigest() == manifest['sha256']
-          assert body == Path('crates/aft/tests/fixtures/grammars', manifest['sha256'] + '.wasm').read_bytes()
-          print('Published production grammar: SHA-256, size and checked-in bytes match')
+          for entry in manifest['grammars']:
+              assert entry['url'].startswith('https://github.com/cortexkit/aft/releases/download/grammars-')
+              with urllib.request.urlopen(entry['url'], timeout=60) as response:
+                  body = response.read(entry['size'] + 1)
+              assert len(body) == entry['size'], (len(body), entry['size'])
+              assert hashlib.sha256(body).hexdigest() == entry['sha256']
+              if entry['language'] == 'luau':
+                  assert body == Path('crates/aft/tests/fixtures/grammars', entry['sha256'] + '.wasm').read_bytes()
+              print(f"Published {entry['language']} grammar: SHA-256 and size match")
           PY
 
   loader:
@@ -128,7 +130,7 @@ jobs:
           cargo build --locked -p agent-file-tools --bin aft --target aarch64-pc-windows-msvc --features wasm-grammars
           smoke="$PWD/target/grammar-arm64-smoke"
           mkdir -p "$smoke/storage/grammars" "$smoke/home" "$smoke/config" "$smoke/cache" "$smoke/state" "$smoke/data"
-          hash="$(python -c 'import json; print(json.load(open("crates/aft-parse/src/grammar/manifest.json"))["sha256"])')"
+          hash="$(python -c 'import json; print(next(e["sha256"] for e in json.load(open("crates/aft-parse/src/grammar/manifest.json"))["grammars"] if e["language"] == "luau"))')"
           cp "crates/aft/tests/fixtures/grammars/$hash.wasm" "$smoke/storage/grammars/"
           env -u AFT_STORAGE_DIR -u AFT_CACHE_DIR HOME="$smoke/home" XDG_CONFIG_HOME="$smoke/config" XDG_CACHE_HOME="$smoke/cache" XDG_STATE_HOME="$smoke/state" XDG_DATA_HOME="$smoke/data" target/aarch64-pc-windows-msvc/debug/aft.exe grammar-smoke --storage-dir "$smoke/storage" --file "$PWD/grammars/corpus/features.luau" > "$smoke/result.json"
           python -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["engine_target"] == "pulley"; assert not v["test_seams"]; assert v["tree"].startswith("(chunk ")' "$smoke/result.json"
@@ -138,7 +140,7 @@ jobs:
           cargo build --features wasm-grammars --locked -p agent-file-tools --bin aft
           smoke="$PWD/target/grammar-hardened-smoke"
           mkdir -p "$smoke/storage/grammars" "$smoke/home" "$smoke/config" "$smoke/cache" "$smoke/state" "$smoke/data" "$smoke/tmp"
-          hash="$(python3 -c 'import json; print(json.load(open("crates/aft-parse/src/grammar/manifest.json"))["sha256"])')"
+          hash="$(python3 -c 'import json; print(next(e["sha256"] for e in json.load(open("crates/aft-parse/src/grammar/manifest.json"))["grammars"] if e["language"] == "luau"))')"
           cp "crates/aft/tests/fixtures/grammars/$hash.wasm" "$smoke/storage/grammars/"
           cp target/debug/aft "$smoke/aft"
           codesign --force --sign - --identifier ck-aft -o runtime --entitlements scripts/ck-aft.entitlements.plist "$smoke/aft"

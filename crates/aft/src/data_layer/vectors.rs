@@ -145,47 +145,52 @@ pub(super) fn native_path(path: &[u8]) -> Option<PathBuf> {
 /// Whether meaning search covers the file at `path`: today's semantic
 /// index embeds files with its name or extension.
 fn is_semantic_path(path: &[u8]) -> bool {
-    native_path(path).is_some_and(|path| is_semantic_indexed_extension(&path) || is_luau(&path))
+    native_path(path).is_some_and(|path| {
+        is_semantic_indexed_extension(&path) || super::grammar::downloaded_language(&path).is_some()
+    })
 }
 
-fn is_luau(path: &Path) -> bool {
-    crate::parser::detect_language_any(path, cfg!(feature = "wasm-grammars"))
-        == Some(crate::parser::LangId::Luau)
+fn downloaded_language(path: &[u8]) -> Option<&'static str> {
+    super::grammar::downloaded_language(&native_path(path)?)
 }
 
-/// Only Luau chunk maps carry grammar identity. Vector text digests and every
+/// Only downloaded-grammar chunk maps carry grammar identity. Vector text digests and every
 /// built-in map keep their existing inputs, so unchanged text stays reusable.
 fn map_content(content: ContentKey, path: &[u8]) -> ContentKey {
-    if !native_path(path).is_some_and(|path| is_luau(&path)) {
+    let Some(language) = downloaded_language(path) else {
         return content;
-    }
+    };
+    // Keep the original derivation domain: changing it invalidates stored Luau maps.
     let mut hash = blake3::Hasher::new_derive_key("aft Luau grammar chunk map");
     hash.update(content.digest().as_bytes());
-    hash.update(super::content::keyed_language("luau").as_bytes());
+    hash.update(super::content::keyed_language(language).as_bytes());
     ContentKey::from_digest(aft_store::ids::Digest128::from_hash(&hash.finalize()))
 }
 
-pub(super) const LUAU_OUTLINE_FAILED: &str =
-    "Meaning search skipped this Luau file because AFT could not extract its outline.";
+fn outline_failed_reason(language: &str) -> String {
+    let name = crate::grammar_state::display_name(language);
+    format!("Meaning search skipped this {name} file because AFT could not extract its outline.")
+}
 
 fn cut_stored(
     view: &CheckoutView,
     path: &[u8],
+    language: &str,
     bytes: &[u8],
     caps: EmbedTextCaps,
 ) -> Result<Cut, DataError> {
-    let Some(relative) = native_path(path).filter(|path| is_luau(path)) else {
-        return Ok(Cut::Failed(LUAU_OUTLINE_FAILED.into()));
+    let Some(relative) = native_path(path) else {
+        return Ok(Cut::Failed(outline_failed_reason(language)));
     };
     if view
         .current_state()
         .get(path)
-        .is_none_or(|record| record.language != "luau")
+        .is_none_or(|record| record.language != language)
     {
-        return Ok(Cut::Failed(LUAU_OUTLINE_FAILED.into()));
+        return Ok(Cut::Failed(outline_failed_reason(language)));
     }
     let Some(outline) = view.outline_symbols(path)? else {
-        return Ok(Cut::Failed(LUAU_OUTLINE_FAILED.into()));
+        return Ok(Cut::Failed(outline_failed_reason(language)));
     };
     let symbols = outline
         .symbols
@@ -348,7 +353,7 @@ pub struct Coverage {
 }
 
 impl Coverage {
-    /// Whether every source is accounted for without excluded Luau outlines
+    /// Whether every source is accounted for without excluded downloaded-grammar outlines
     /// or unfilled work. Other files that cannot be read or cut into chunks
     /// remain terminal outcomes: they are counted and never queued again for
     /// the same content, preserving the built-in languages' coverage policy.
@@ -357,13 +362,14 @@ impl Coverage {
         self.pending.is_empty()
             && self.past_cap == 0
             && self.skipped_parses.is_empty()
-            && self.luau_outline_failures().next().is_none()
+            && self.grammar_outline_failures().next().is_none()
     }
 
-    pub(crate) fn luau_outline_failures(&self) -> impl Iterator<Item = &(PathBuf, String)> {
-        self.files_failed
-            .iter()
-            .filter(|(_, reason)| cfg!(feature = "wasm-grammars") && reason == LUAU_OUTLINE_FAILED)
+    pub(crate) fn grammar_outline_failures(&self) -> impl Iterator<Item = &(PathBuf, String)> {
+        self.files_failed.iter().filter(|(path, reason)| {
+            super::grammar::downloaded_language(path)
+                .is_some_and(|language| *reason == outline_failed_reason(language))
+        })
     }
 }
 
@@ -406,19 +412,16 @@ fn survey(
     let mut applicable = 0;
     for record in state.paths() {
         if record.kind == PathKind::Symlink
-            || (record.kind == PathKind::Binary
-                && native_path(&record.path).is_some_and(|path| is_luau(&path)))
+            || (record.kind == PathKind::Binary && downloaded_language(&record.path).is_some())
             || !is_semantic_path(&record.path)
         {
             continue;
         }
-        let gap = if !view.planes().callgraph
-            && native_path(&record.path).is_some_and(|path| is_luau(&path))
-        {
-            Some(super::grammar::meaning_callgraph_off_reason())
-        } else {
-            state.skipped_parses().get(&record.path).cloned()
-        };
+        let gap = (!view.planes().callgraph)
+            .then(|| downloaded_language(&record.path))
+            .flatten()
+            .map(super::grammar::meaning_callgraph_off_reason)
+            .or_else(|| state.skipped_parses().get(&record.path).cloned());
         let admitted = gap.is_none() && applicable < max_files;
         if gap.is_none() {
             applicable += 1;
@@ -1572,7 +1575,7 @@ impl FillQueue {
             }
             if file.done(index.as_ref()) {
                 queue.embedded += 1;
-            } else if native_path(&file.path).is_some_and(|path| is_luau(&path))
+            } else if downloaded_language(&file.path).is_some()
                 && view.awaits_parse_publication(&file.path)
             {
                 queue.awaiting_publication += 1;
@@ -1748,8 +1751,8 @@ impl VectorPlane {
                         }
                     };
                     let started = Instant::now();
-                    let cut = if native_path(&path).is_some_and(|path| is_luau(&path)) {
-                        cut_stored(&view, &path, &bytes, self.producer.caps)?
+                    let cut = if let Some(language) = downloaded_language(&path) {
+                        cut_stored(&view, &path, language, &bytes, self.producer.caps)?
                     } else {
                         cut_file(parts.root, &path, &bytes, self.producer.caps)
                     };

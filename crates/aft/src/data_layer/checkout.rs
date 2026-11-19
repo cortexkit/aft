@@ -51,6 +51,7 @@ mod engines;
 #[cfg(feature = "test-hooks")]
 pub mod exactness;
 mod fold;
+mod grammar;
 mod memory_profile;
 mod recording;
 mod refresh;
@@ -1223,77 +1224,6 @@ impl Checkout {
     /// When a path's folder cannot be walked. Nothing is recorded then.
     pub fn record_paths(&self, paths: &[Vec<u8>]) -> Result<(), DataError> {
         self.record_paths_inner(paths, false)
-    }
-
-    /// Re-read only unavailable grammar members, even when stat and content
-    /// are unchanged. A ready event is not a filesystem edit.
-    pub(crate) fn retry_grammar_gaps(&self) -> Result<bool, DataError> {
-        let paths = {
-            let live = self.live.read().expect("no panics while holding it");
-            let state = live
-                .state
-                .as_deref()
-                .or_else(|| live.published.as_ref().map(|p| &p.state));
-            state
-                .map(|state| {
-                    state
-                        .skipped_parses()
-                        .iter()
-                        .filter(|(_, reason)| {
-                            serde_json::from_str::<serde_json::Value>(reason)
-                                .is_ok_and(|v| v["code"] == "grammar_unavailable")
-                        })
-                        .map(|(path, _)| path.clone())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
-        };
-        if paths.is_empty() || crate::grammar::registry().stored().is_err() {
-            return Ok(false);
-        }
-        #[cfg(all(
-            test,
-            feature = "wasm-grammars",
-            feature = "test-hooks",
-            not(all(target_os = "windows", target_arch = "aarch64"))
-        ))]
-        {
-            super::test_gates::arrive(&self.root, super::test_gates::Point::GrammarRetryRead);
-            if super::test_gates::fail_grammar_retry(&self.root) {
-                return Err(DataError::Scan("injected grammar reread failure".into()));
-            }
-        }
-        self.record_paths_inner(&paths, true)?;
-        Ok(true)
-    }
-
-    #[cfg(feature = "wasm-grammars")]
-    pub(crate) fn has_grammar_gaps(&self) -> bool {
-        self.view().is_some_and(|view| {
-            view.current_state()
-                .skipped_parses()
-                .values()
-                .any(|reason| {
-                    serde_json::from_str::<serde_json::Value>(reason)
-                        .is_ok_and(|v| v["code"] == "grammar_unavailable")
-                })
-        })
-    }
-
-    pub(crate) fn has_unpublished_luau_changes(&self) -> bool {
-        cfg!(feature = "wasm-grammars")
-            && self
-                .live
-                .read()
-                .expect("no panics while holding it")
-                .changes
-                .keys()
-                .any(|path| {
-                    super::vectors::native_path(path).is_some_and(|path| {
-                        crate::parser::detect_language_any(&path, true)
-                            == Some(crate::parser::LangId::Luau)
-                    })
-                })
     }
 
     fn record_paths_inner(&self, paths: &[Vec<u8>], retry_grammar: bool) -> Result<(), DataError> {

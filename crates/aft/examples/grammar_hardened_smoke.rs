@@ -15,7 +15,8 @@ fn main() -> Result<(), String> {
     };
     // The caller hand-places the published artifact in this isolated root.
     // Only the stored-load API is called; a missing artifact is a hard refusal.
-    let registry = aft::grammar::configure(&config);
+    aft::grammar::configure(&config);
+    let registry = aft::grammar::registry("luau").unwrap();
     registry.stored().map_err(|error| error.message)?;
     let parse_started = std::time::Instant::now();
     let (tree, language) = aft::parser::FileParser::new()
@@ -33,7 +34,7 @@ fn main() -> Result<(), String> {
         "{}",
         serde_json::json!({
             "hash": registry.identity(),
-            "engine_target": aft::grammar::engine_target().map_err(|error| error.message)?,
+            "engine_target": aft::grammar::engine_target("luau").map_err(|error| error.message)?,
             "tree": tree.root_node().to_sexp(),
             "test_hooks": cfg!(feature = "test-hooks"),
             "parse_ms": parse_ms,

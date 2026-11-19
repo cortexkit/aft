@@ -1,37 +1,36 @@
 use std::sync::{Arc, LazyLock};
 
-use super::{manifest, GrammarState, GrammarUnavailable};
+use super::{manifests, GrammarManifest, GrammarState, GrammarUnavailable};
 
-pub struct GrammarRegistry;
+pub struct GrammarRegistry(&'static GrammarManifest);
 
-static REGISTRY: LazyLock<Arc<GrammarRegistry>> = LazyLock::new(|| Arc::new(GrammarRegistry));
+static REGISTRIES: LazyLock<super::RegistryMap<GrammarRegistry>> =
+    LazyLock::new(|| super::registry_map(manifests(), |entry| Arc::new(GrammarRegistry(entry))));
 
-pub fn registry() -> &'static Arc<GrammarRegistry> {
-    &REGISTRY
+pub fn registry(language: &str) -> Option<&'static Arc<GrammarRegistry>> {
+    REGISTRIES.get(language)
 }
 
 /// A disabled build must not resolve, create or inspect grammar storage.
-pub fn configure(_config: &crate::config::Config) -> Arc<GrammarRegistry> {
-    Arc::clone(registry())
-}
+pub fn configure(_config: &crate::config::Config) {}
 
 test_support_visibility! {
-fn unavailable() -> GrammarUnavailable {
-    GrammarUnavailable::new(&manifest().language, GrammarState::SupportDisabled)
+fn unavailable(language: &str) -> GrammarUnavailable {
+    GrammarUnavailable::new(language, GrammarState::SupportDisabled)
 }
 }
 
 impl GrammarRegistry {
     pub fn stored(&self) -> Result<tree_sitter::Language, GrammarUnavailable> {
-        Err(unavailable())
+        Err(unavailable(&self.0.language))
     }
 
     pub fn request(self: &Arc<Self>) -> Result<tree_sitter::Language, GrammarUnavailable> {
-        Err(unavailable())
+        Err(unavailable(&self.0.language))
     }
 
     pub fn identity(&self) -> &str {
-        &manifest().sha256
+        &self.0.sha256
     }
 
     pub fn compile_ms(&self) -> f64 {
@@ -44,10 +43,10 @@ impl GrammarRegistry {
     }
 }
 
-pub fn prepare_parser(_parser: &mut tree_sitter::Parser) -> Result<(), GrammarUnavailable> {
-    Err(unavailable())
+pub fn prepare_parser(_parser: &mut tree_sitter::Parser, language: &str) -> Result<(), GrammarUnavailable> {
+    Err(unavailable(language))
 }
 
-pub fn engine_target() -> Result<&'static str, GrammarUnavailable> {
-    Err(unavailable())
+pub fn engine_target(language: &str) -> Result<&'static str, GrammarUnavailable> {
+    Err(unavailable(language))
 }

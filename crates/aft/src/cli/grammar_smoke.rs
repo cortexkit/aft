@@ -44,7 +44,9 @@ pub fn run(args: Vec<OsString>) -> Result<(), String> {
     if let Some(warning) = aft::root_cache::prepare_cache_root(&mut config) {
         return Err(warning.message);
     }
-    let registry = aft::grammar::configure(&config);
+    aft::grammar::configure(&config);
+    let registry =
+        aft::grammar::registry("luau").ok_or("Luau grammar is missing from the manifest")?;
     #[cfg(all(feature = "test-hooks", feature = "wasm-grammars"))]
     if download {
         let _ = registry.request();
@@ -83,7 +85,7 @@ pub fn run(args: Vec<OsString>) -> Result<(), String> {
         return Err("grammar smoke parse failed".into());
     }
     let mut result = serde_json::json!({
-        "language": "luau", "engine_target": aft::grammar::engine_target().map_err(|error| error.message)?, "hash": registry.identity(), "compile_ms": registry.compile_ms(),
+        "language": "luau", "engine_target": aft::grammar::engine_target("luau").map_err(|error| error.message)?, "hash": registry.identity(), "compile_ms": registry.compile_ms(),
         "tree": tree.root_node().to_sexp(), "test_seams": cfg!(feature = "test-hooks"),
     });
     #[cfg(all(feature = "test-hooks", feature = "wasm-grammars"))]
