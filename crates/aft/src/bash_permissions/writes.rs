@@ -1,6 +1,7 @@
 //! Best-effort literal write targets for the runon preflight, not a shell sandbox.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use tree_sitter::{Node, Parser};
 
@@ -56,21 +57,121 @@ const SHAPES: &[(&str, Shape)] = &[
 ];
 
 fn literal(raw: &str) -> Option<String> {
-    // Even quoted expansions are deliberately unknown. Backslashes can be
-    // shell escapes or Windows separators; neither spelling is guessed here.
-    if raw.contains(['$', '`', '*', '?', '[', '{', '\\']) || raw.starts_with('~') {
+    shell_word(raw, &HashMap::new())
+}
+
+fn variable_name(name: &str) -> bool {
+    let mut chars = name.bytes();
+    chars
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && chars.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn shell_word(mut raw: &str, bindings: &HashMap<&str, String>) -> Option<String> {
+    if raw.starts_with('~') {
         return None;
     }
     let mut text = String::new();
     let mut quote = None;
-    for ch in raw.chars() {
+    while let Some(ch) = raw.chars().next() {
+        raw = &raw[ch.len_utf8()..];
         match (quote, ch) {
             (None, '\'' | '"') => quote = Some(ch),
             (Some(open), close) if open == close => quote = None,
+            (None | Some('"'), '$') => {
+                let (name, rest) = if let Some(braced) = raw.strip_prefix('{') {
+                    braced.split_once('}')?
+                } else {
+                    let end = raw
+                        .find(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                        .unwrap_or(raw.len());
+                    raw.split_at(end)
+                };
+                if !variable_name(name) {
+                    return None;
+                }
+                text.push_str(bindings.get(name)?);
+                raw = rest;
+            }
+            // Backslashes may be escapes or Windows separators. Neither spelling is guessed.
+            (_, '$' | '`' | '*' | '?' | '[' | '{' | '\\') => return None,
             _ => text.push(ch),
         }
     }
     quote.is_none().then_some(text)
+}
+
+fn preceding_bindings<'a>(source: &'a str, mut node: Node<'_>) -> HashMap<&'a str, String> {
+    let mut bindings = HashMap::new();
+    while let Some(parent) = node.parent().filter(|p| p.kind() == "redirected_statement") {
+        node = parent;
+    }
+    if node.parent().is_none_or(|p| p.kind() != "program") {
+        return bindings;
+    }
+
+    // Look back only through consecutive standalone assignments. A command,
+    // conditional, or background job does not prove a later variable value.
+    while let Some(previous) = node.prev_named_sibling() {
+        let separator = source[previous.end_byte()..node.start_byte()].trim();
+        if (separator != ";" && !separator.is_empty())
+            || !matches!(
+                previous.kind(),
+                "variable_assignment" | "variable_assignments"
+            )
+        {
+            break;
+        }
+        let mut cursor = previous.walk();
+        let assignments = if previous.kind() == "variable_assignments" {
+            previous.named_children(&mut cursor).collect::<Vec<_>>()
+        } else {
+            vec![previous]
+        };
+        for assignment in assignments.into_iter().rev() {
+            let raw = &source[assignment.byte_range()];
+            let Some((name, raw_value)) = raw.split_once('=') else {
+                return bindings;
+            };
+            // Restrict values to plain path text so expansion cannot introduce
+            // word splitting, globbing, or another expansion.
+            let value = literal(raw_value).filter(|value| {
+                !value.is_empty()
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"/._-+:".contains(&b))
+            });
+            let Some(value) = value.filter(|_| variable_name(name)) else {
+                return bindings;
+            };
+            bindings.entry(name).or_insert(value);
+        }
+        node = previous;
+    }
+    bindings
+}
+
+fn shell_words<'a, 'tree>(
+    source: &'a str,
+    nodes: impl Iterator<Item = Node<'tree>>,
+) -> Vec<&'a str> {
+    let mut spans: Vec<Range<usize>> = Vec::new();
+    for node in nodes {
+        let span = node.byte_range();
+        // The grammar can emit adjacent pieces of one shell word as separate
+        // children. Test the entire word so an unknown prefix cannot be lost.
+        if let Some(last) = spans.last_mut().filter(|last| {
+            source[last.end..span.start]
+                .split("\\\n")
+                .all(str::is_empty)
+        }) {
+            last.end = span.end;
+        } else {
+            spans.push(span);
+        }
+    }
+    spans.into_iter().map(|span| &source[span]).collect()
 }
 
 fn resolve(text: &str, cwd: Option<&Path>) -> Option<PathBuf> {
@@ -108,20 +209,24 @@ fn operands<'a>(args: &'a [String], takes_value: &[&str]) -> Vec<&'a str> {
     out
 }
 
-fn redirected(source: &str, node: Node<'_>, out: &mut Vec<String>) {
+fn redirected(
+    source: &str,
+    node: Node<'_>,
+    bindings: &HashMap<&str, String>,
+    out: &mut Vec<String>,
+) {
     if node.kind() == "file_redirect" {
         let mut cursor = node.walk();
         let writes = node
             .children(&mut cursor)
             .any(|child| matches!(child.kind(), ">" | ">>" | "&>" | "&>>" | ">|"));
         if writes {
-            if let Some(target) = node.child_by_field_name("destination").or_else(|| {
-                let mut cursor = node.walk();
-                node.named_children(&mut cursor).last()
-            }) {
-                if let Some(path) = literal(target.utf8_text(source.as_bytes()).unwrap_or("")) {
-                    out.push(path);
-                }
+            let words = shell_words(
+                source,
+                node.children_by_field_name("destination", &mut cursor),
+            );
+            if let Some(path) = words.first().and_then(|word| shell_word(word, bindings)) {
+                out.push(path);
             }
         }
         return;
@@ -133,7 +238,7 @@ fn redirected(source: &str, node: Node<'_>, out: &mut Vec<String>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() != "command" {
-            redirected(source, child, out);
+            redirected(source, child, bindings, out);
         }
     }
 }
@@ -392,19 +497,31 @@ fn command_writes(source: &str, node: Node<'_>, cwd: Option<&Path>) -> Vec<Liter
             break;
         }
     }
+    let bindings = preceding_bindings(source, node);
     let mut paths = Vec::new();
-    redirected(source, wrapper, &mut paths);
+    redirected(source, wrapper, &bindings, &mut paths);
     let mut cursor = node.walk();
-    let parts: Vec<_> = node
-        .named_children(&mut cursor)
-        .filter(|child| !child.kind().contains("redirect") && child.kind() != "variable_assignment")
-        .map(|child| child.utf8_text(source.as_bytes()).unwrap_or("").to_string())
-        .collect();
+    let parts = shell_words(
+        source,
+        node.children(&mut cursor).filter(|child| {
+            (child.is_named() || child.kind() == "$")
+                && !child.kind().contains("redirect")
+                && child.kind() != "variable_assignment"
+        }),
+    );
     // Keep unknown operands in position so they cannot turn an input into a
     // destination; the sentinel is discarded by literal() before resolution.
     let words: Vec<_> = parts
         .iter()
-        .map(|part| literal(part).unwrap_or_else(|| "$unknown".into()))
+        .map(|part| {
+            shell_word(part, &bindings).unwrap_or_else(|| {
+                if part.starts_with("--target-directory=") {
+                    "--target-directory=$unknown".into()
+                } else {
+                    "$unknown".into()
+                }
+            })
+        })
         .collect();
     let Some(head) = words
         .first()
@@ -585,7 +702,7 @@ fn command_writes(source: &str, node: Node<'_>, cwd: Option<&Path>) -> Vec<Liter
                 .windows(2)
                 .find(|pair| pair[0] == flag)
                 .map(|pair| {
-                    let raw = pair[1].as_str();
+                    let raw = pair[1];
                     if raw.len() >= 2
                         && (raw.starts_with('\'') && raw.ends_with('\'')
                             || raw.starts_with('"') && raw.ends_with('"'))
