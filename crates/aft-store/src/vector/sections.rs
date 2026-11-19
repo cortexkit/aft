@@ -799,6 +799,17 @@ impl<'s> VectorSegment<'s> {
         Ok(self.locate_map(content, path)?.map(|(_, chunks)| chunks))
     }
 
+    /// The chunks at `ordinal`, in the same order as [`Self::chunk_map_keys`].
+    ///
+    /// # Errors
+    ///
+    /// When a read fails, the ordinal is out of range, or the map is malformed.
+    pub fn chunk_map_at(&self, ordinal: u32) -> Result<Vec<Chunk>, SegmentError> {
+        let (_, location) = self.maps.entry(ordinal)?;
+        let bytes = self.read_map(location)?;
+        Ok(self.decode_map(&bytes)?.1)
+    }
+
     /// The details recorded with the chunk map of the file at `path` with
     /// `content`: `None` when the segment has no such map, or the map was
     /// added without details.
@@ -843,13 +854,7 @@ impl<'s> VectorSegment<'s> {
         let Some((ordinal, location)) = self.maps.get(&key.to_bytes())? else {
             return Ok(None);
         };
-        let end = location
-            .offset
-            .checked_add(u64::from(location.len))
-            .ok_or_else(|| self.malformed("a chunk map's range overflows"))?;
-        let bytes = self
-            .segment
-            .read_range(self.map_data, location.offset..end)?;
+        let bytes = self.read_map(location)?;
         let (stored_path, chunks) = self.decode_map(&bytes)?;
         if stored_path != path {
             // Two paths with one digest: astronomically unlikely, and never
@@ -857,6 +862,14 @@ impl<'s> VectorSegment<'s> {
             return Err(self.malformed("a chunk map is stored under another path"));
         }
         Ok(Some((ordinal, chunks)))
+    }
+
+    fn read_map(&self, location: UnitLocation) -> Result<Vec<u8>, SegmentError> {
+        let end = location
+            .offset
+            .checked_add(u64::from(location.len))
+            .ok_or_else(|| self.malformed("a chunk map's range overflows"))?;
+        self.segment.read_range(self.map_data, location.offset..end)
     }
 
     fn decode_map<'b>(&self, bytes: &'b [u8]) -> Result<(&'b [u8], Vec<Chunk>), SegmentError> {

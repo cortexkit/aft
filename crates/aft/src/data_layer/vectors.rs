@@ -2103,9 +2103,9 @@ pub(crate) fn merge_vector_segments(
 /// member of each state, under each model, the newest segment holding the
 /// member's chunk map, and for each chunk of that map the newest segment
 /// holding its text's vector. A segment whose vectors and maps no member
-/// reaches is not needed, so vectors of contents no checkout holds any
-/// more are retired with their segment. Segments without vector sections
-/// are left to the other planes' rules.
+/// reaches can be retired once it is past the grace period. Younger vector
+/// segments may belong to unpublished changes in another process. Segments
+/// without vector sections are left to the other planes' rules.
 ///
 /// # Errors
 ///
@@ -2113,6 +2113,7 @@ pub(crate) fn merge_vector_segments(
 pub(crate) fn needed_vector_segments(
     segments: &[&Segment],
     states: &[&CheckoutState],
+    now: u64,
 ) -> Result<Vec<bool>, DataError> {
     let mut needed = vec![false; segments.len()];
     let opened = segments
@@ -2123,10 +2124,12 @@ pub(crate) fn needed_vector_segments(
     let mut maps: HashMap<(ModelId, ChunkMapKey), usize> = HashMap::new();
     let mut texts: HashMap<(ModelId, TextDigest), usize> = HashMap::new();
     let mut models = Vec::new();
+    let grace = u64::try_from(MERGE_GRACE.as_millis()).unwrap_or(u64::MAX);
     for (position, opened) in opened.iter().enumerate() {
         let Some(vectors) = opened else {
             continue;
         };
+        needed[position] = now.saturating_sub(segments[position].created_unix_ms()) < grace;
         let model = vectors.model().id();
         if !models.contains(&model) {
             models.push(model);
@@ -2140,6 +2143,23 @@ pub(crate) fn needed_vector_segments(
     }
     if maps.is_empty() {
         return Ok(needed);
+    }
+    // A young map can point to vectors reused from segments already past
+    // the grace period. Keep those holders along with the young map.
+    for (position, vectors) in opened.iter().enumerate() {
+        if now.saturating_sub(segments[position].created_unix_ms()) >= grace {
+            continue;
+        }
+        if let Some(vectors) = vectors {
+            let model = vectors.model().id();
+            for ordinal in 0..vectors.chunk_map_count() {
+                for chunk in vectors.chunk_map_at(ordinal).map_err(store_error)? {
+                    if let Some(&holder) = texts.get(&(model, chunk.text)) {
+                        needed[holder] = true;
+                    }
+                }
+            }
+        }
     }
     let mut asked = HashSet::new();
     for state in states {
@@ -2993,7 +3013,7 @@ mod tests {
     }
 
     #[test]
-    fn vector_segments_no_checkout_needs_are_retired() {
+    fn vector_segments_no_checkout_needs_are_retired_after_grace() {
         let store = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(root.path()).unwrap();
@@ -3024,16 +3044,29 @@ mod tests {
         };
         let before = vector_segments();
         assert_eq!(before.len(), 1);
-        // The only file changes: no checkout holds the old content, so its
-        // vectors go with the next build.
+        // The only file changes. Its old vectors remain eligible for reuse
+        // during grace but are no longer needed once the grace has passed.
         write(
             &root,
             "src/only.rs",
             "pub fn second_version(b: u16) -> u16 {\n    b\n}\n",
         );
-        let report = checkout.build().unwrap();
-        assert!(report.retired_segments >= 1, "{report:?}");
-        assert!(vector_segments().is_empty());
+        checkout.build().unwrap();
+        assert_eq!(vector_segments(), before);
+        let snapshot = family_store.snapshot().unwrap();
+        let old = snapshot
+            .open_segment(
+                before[0],
+                &checkout.vector_parts().known,
+                Arc::new(BlockCache::new(1 << 20)),
+            )
+            .unwrap();
+        let view = checkout.view().unwrap();
+        let expiry = old.created_unix_ms() + u64::try_from(MERGE_GRACE.as_millis()).unwrap();
+        assert_eq!(
+            needed_vector_segments(&[&old], &[view.current_state()], expiry).unwrap(),
+            [false]
+        );
         // A checkout still holding a content keeps its vectors.
         let mut recorder = Recorder::default();
         fill(&plane, &mut recorder, 10);
@@ -3041,6 +3074,31 @@ mod tests {
         let kept = vector_segments();
         checkout.build().unwrap();
         assert_eq!(vector_segments(), kept);
+    }
+
+    #[test]
+    fn sibling_publication_keeps_fresh_maps_for_unpublished_content() {
+        let store = tempfile::tempdir().unwrap();
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        write(left.path(), "src/lib.rs", "pub fn before() {}\n");
+        write(right.path(), "src/lib.rs", "pub fn sibling() {}\n");
+        // Separate layers model processes that cannot see each other's live states.
+        let left_checkout = bind(store.path(), left.path());
+        let right_checkout = bind(store.path(), right.path());
+        write(left.path(), "src/lib.rs", "pub fn still_unpublished() {}\n");
+        left_checkout
+            .record_paths(&[b"src/lib.rs".to_vec()])
+            .unwrap();
+        let plane = VectorPlane::new(Arc::clone(&left_checkout), producer(), 20_000);
+        assert_eq!(fill(&plane, &mut Recorder::default(), 10).files_filled, 1);
+
+        right_checkout.build().unwrap();
+        plane.refresh().unwrap();
+        let view = left_checkout.view().unwrap();
+        let coverage = plane.coverage(&view).unwrap();
+        assert_eq!(coverage.files_embedded, 1);
+        assert!(coverage.pending.is_empty());
     }
 
     #[test]

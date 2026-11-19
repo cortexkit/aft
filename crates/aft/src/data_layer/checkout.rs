@@ -2093,6 +2093,7 @@ impl Checkout {
         let started = Instant::now();
         #[cfg(test)]
         wait_while_publication_held_for_test(&self.root);
+        let bound = self.bound_states();
         let mut session = self.writer()?;
         if session.base().checkout(self.checkout) != started_from.as_ref() {
             // Another process published this checkout after the scan began.
@@ -2159,7 +2160,7 @@ impl Checkout {
         // The new segment holds everything this checkout's new state needs,
         // so an older segment stays only while another checkout reads from
         // it. A checkout whose folder is gone reads nothing any more.
-        let unneeded = self.unneeded(&state, false)?;
+        let unneeded = self.unneeded(&state, false, &bound)?;
         report.retired_segments = unneeded.segments.len();
         report.retired_checkouts = unneeded.checkouts.len();
         self.check_disk_floor()?;
@@ -2689,6 +2690,7 @@ impl Checkout {
         report.text_units = collected.text.len();
         report.scan_ms = elapsed_ms(started);
         collected.text.spill()?;
+        let bound = self.bound_states();
         let mut session = self.writer()?;
         if session.base().checkout(self.checkout) != started_from.as_ref() {
             drop(session);
@@ -2707,7 +2709,7 @@ impl Checkout {
         // A checkout without a call graph is built this way every time, so
         // what it no longer reads is retired here as a full build retires
         // it.
-        let unneeded = self.unneeded(&scanned.state, false)?;
+        let unneeded = self.unneeded(&scanned.state, false, &bound)?;
         report.retired_segments = unneeded.segments.len();
         report.retired_checkouts = unneeded.checkouts.len();
         session
@@ -2813,8 +2815,13 @@ impl Checkout {
     /// holder for one more publication. Vector segments follow their own
     /// rule ([`super::vectors::needed_vector_segments`]), over every other
     /// checkout's state and `own`, since no new segment holds vectors.
-    fn unneeded(&self, own: &CheckoutState, own_reads: bool) -> Result<Unneeded, DataError> {
-        self.unneeded_besides(self.checkout, own, own_reads, &[])
+    fn unneeded(
+        &self,
+        own: &CheckoutState,
+        own_reads: bool,
+        bound: &[CheckoutState],
+    ) -> Result<Unneeded, DataError> {
+        self.unneeded_besides(self.checkout, own, own_reads, bound)
     }
 
     /// [`Self::unneeded`] for a publication of checkout `besides` with the
@@ -2862,7 +2869,11 @@ impl Checkout {
         for (&index, vectors) in read
             .usable
             .iter()
-            .zip(super::vectors::needed_vector_segments(&usable, &readers)?)
+            .zip(super::vectors::needed_vector_segments(
+                &usable,
+                &readers,
+                super::vectors::unix_ms(),
+            )?)
         {
             needed[index] |= vectors;
         }
@@ -3344,6 +3355,7 @@ impl Checkout {
             })
             .collect::<HashMap<_, _>>();
 
+        let bound = self.bound_states();
         let mut session = self.writer()?;
         let started_from = published
             ._snapshot
@@ -3448,7 +3460,7 @@ impl Checkout {
         // the store, one more open file each.
         #[cfg(test)]
         publication_tests::next_phase(&mut phase, "retirement");
-        let unneeded = self.unneeded(&state, true)?;
+        let unneeded = self.unneeded(&state, true, &bound)?;
         let retired_segments = unneeded.segments.len();
         let retired_checkouts = unneeded.checkouts.len();
         #[cfg(test)]

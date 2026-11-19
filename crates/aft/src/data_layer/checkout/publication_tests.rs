@@ -123,7 +123,7 @@ fn pin_retirement(checkout: &Checkout, own: &CheckoutState) {
     for own_reads in [false, true] {
         let collect = |reuse| {
             with_reuse(reuse, || {
-                let retired = checkout.unneeded(own, own_reads).unwrap();
+                let retired = checkout.unneeded(own, own_reads, &[]).unwrap();
                 (retired.segments, retired.checkouts)
             })
         };
@@ -195,7 +195,7 @@ fn publication_holder_memo_preserves_retirement_and_member_holders() {
         pin_retirement(checkout, &own);
         if round == 2 {
             assert!(checkout
-                .unneeded(&own, true)
+                .unneeded(&own, true, &[])
                 .unwrap()
                 .checkouts
                 .contains(&checkouts[3].checkout));
