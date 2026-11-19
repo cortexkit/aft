@@ -16,6 +16,7 @@ struct Pause {
 struct Controls {
     wait: Option<Pause>,
     withdraw: Option<Pause>,
+    lose_withdraw_reply: bool,
     failed: AtomicBool,
     attempted: StdMutex<Vec<String>>,
     awaited: StdMutex<Vec<String>>,
@@ -58,9 +59,13 @@ impl ConsentTransport for Endpoint {
             if controls.failed.load(Ordering::SeqCst) {
                 return Err(ConsentError::Unavailable("test withdrawal refused".into()));
             }
-            Ok(fake
+            let reply = fake
                 .reply("consent.withdraw", &json!({"elicitation_id":id}))?
-                .unwrap())
+                .unwrap();
+            if controls.lose_withdraw_reply {
+                std::future::pending::<()>().await;
+            }
+            Ok(reply)
         })
     }
 }
@@ -363,4 +368,76 @@ async fn consent_expiry_retry_racing_the_sweep_never_awaits_the_withdrawn_card()
     assert_ne!(fresh, old);
     assert_eq!(*endpoint.1.awaited.lock().unwrap(), [old, fresh]);
     assert_eq!(f.fake.calls("consent.withdraw").len(), 1);
+}
+
+#[tokio::test]
+async fn consent_expiry_lost_withdrawal_reply_refiles_and_honors_the_fresh_answer() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let (f, endpoint) = setup(Controls {
+        lose_withdraw_reply: true,
+        ..Controls::default()
+    });
+    park_call(&f).await;
+    let old = f.asks().pop().unwrap();
+    let now = Instant::now();
+    tokio::time::pause();
+    Sweep::default()
+        .run(
+            &f.ctx.db().unwrap(),
+            Some(&*endpoint),
+            32,
+            BUDGET,
+            last_use(&f) + IDLE_MS + 1,
+            || now,
+        )
+        .await
+        .unwrap();
+    tokio::time::resume();
+    assert_eq!(
+        f.fake.calls("consent.withdraw").len(),
+        1,
+        "the remove reached Cingulate"
+    );
+    assert_eq!(
+        f.asks(),
+        [old.clone()],
+        "the sweep did not receive its reply"
+    );
+
+    let pause = Arc::new(Controls {
+        wait: Some(Pause::default()),
+        ..Controls::default()
+    });
+    let endpoint = Arc::new(Endpoint(Arc::clone(&f.fake), Arc::clone(&pause)));
+    install_test_transport(Some(endpoint));
+    let pause = pause.wait.as_ref().unwrap();
+    let mut replies = f
+        .send_read(&f.worker, &f.head_root.join("shared.txt"), 1)
+        .await;
+    tokio::time::timeout(BUDGET, pause.entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        f.asks(),
+        [old.clone()],
+        "first the retry picks up the old card"
+    );
+    pause.resume.notify_one();
+    tokio::time::timeout(BUDGET, pause.entered.notified())
+        .await
+        .unwrap();
+    let new = f.asks().pop().expect("retry published a replacement");
+    assert_ne!(new.call_key, old.call_key);
+    assert_ne!(new.elicitation_id, old.elicitation_id);
+    f.fake.answer(
+        new.call_key.as_deref().unwrap(),
+        json!({"state":"settled","outcome":"allow_once"}),
+    );
+    pause.resume.notify_one();
+    let reply = tokio::time::timeout(BUDGET, replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(text(&serde_json::from_slice(&reply.body).unwrap()).contains("head-owned contents"));
+    assert!(f.asks().is_empty());
 }

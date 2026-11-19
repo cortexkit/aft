@@ -1219,6 +1219,8 @@ enum Hold {
     Answer(Response),
     /// An overlapping call owns the one-time approval; reuse its result only.
     Shared((Response, Option<String>)),
+    /// A reused file-access approval was withdrawn; ask again with a fresh key.
+    Refile(Permission),
     /// Nobody waits for this call any more (cancelled, route closed, transport
     /// gone); the caller sends nothing.
     Abandoned,
@@ -1653,6 +1655,17 @@ where
                     }
                 }
             }
+            Hold::Refile(next) => {
+                match stop_signal(call, &route_hold) {
+                    Some(Stop::Detach | Stop::Withdraw) => return None,
+                    Some(Stop::RunEnded) => {
+                        return Some((refused_answer(call, &next, "access_withdrawn", None), None));
+                    }
+                    None => {}
+                }
+                flight.group.settled.store(false, Ordering::SeqCst);
+                grant = next;
+            }
             Hold::Answer(response) => return Some((response, None)),
             Hold::Shared(result) => return Some(result),
             Hold::Abandoned => return None,
@@ -1707,6 +1720,7 @@ async fn with_db_handle<T: Send + 'static>(
 struct Prepared {
     key: AskKey,
     call_key: String,
+    reused_file_card: bool,
     request: Value,
     selector: ScopeSelector,
     grant: Permission,
@@ -1855,6 +1869,7 @@ fn prepare_locked(
             return Ok(Prep::Ask(Prepared {
                 key,
                 call_key,
+                reused_file_card: true,
                 request,
                 selector,
                 grant: pending,
@@ -1912,6 +1927,7 @@ fn prepare_locked(
     Ok(Prep::Ask(Prepared {
         key,
         call_key,
+        reused_file_card: false,
         request,
         selector,
         grant: Permission::File(grant.clone()),
@@ -1941,6 +1957,7 @@ fn prepare_shell(
             return Ok(Prep::Ask(Prepared {
                 key,
                 call_key,
+                reused_file_card: false,
                 request,
                 selector,
                 grant,
@@ -1980,6 +1997,7 @@ fn prepare_shell(
     Ok(Prep::Ask(Prepared {
         key,
         call_key,
+        reused_file_card: false,
         request,
         selector,
         grant: permission.clone(),
@@ -3223,14 +3241,16 @@ async fn finish(
             ))
         }
         Settlement::Refused(code) => {
-            // A card withdrawn because a folder grant now covers its path runs
-            // under that covering authority instead of ending withdrawn. Any
-            // other withdrawn card keeps its recorded refusal.
+            // A covering folder grant can have withdrawn the card while the
+            // call waited. Apply the covering grant before considering refile.
             if code == "access_withdrawn" {
                 if let Some(run) =
                     try_apply_covering_grant(call, prep, retry_after_deadline, elicitation).await
                 {
                     return run;
+                }
+                if prep.reused_file_card {
+                    return expiry::refile_withdrawn(call, prep).await;
                 }
             }
             discard(call, prep).await;
@@ -3510,20 +3530,9 @@ pub(super) struct ParkedAsk {
 pub(super) async fn withdraw_parked(parked: Vec<ParkedAsk>) {
     for ask in parked {
         let _waiting = if let Some(call_key) = ask.file_call_key.as_ref() {
-            let waiting = expiry::watch(ask.key.clone()).await;
-            let db = Arc::clone(&ask.db);
-            let key = ask.key.clone();
-            let call_key = call_key.clone();
-            let current = tokio::task::spawn_blocking(move || {
-                let conn = db.lock().ok()?;
-                Some(asks::get(&conn, &key).ok()??.call_key.as_ref() == Some(&call_key))
-            })
-            .await
-            .ok()
-            .flatten();
-            if current != Some(true) {
+            let Some(waiting) = expiry::watch_parked(&ask.db, &ask.key, call_key).await else {
                 continue;
-            }
+            };
             Some(waiting)
         } else {
             None
@@ -3537,7 +3546,11 @@ pub(super) async fn withdraw_parked(parked: Vec<ParkedAsk>) {
         let key = ask.key.clone();
         let _ = tokio::task::spawn_blocking(move || {
             if let Ok(conn) = db.lock() {
-                let _ = asks::discard(&conn, &key);
+                if let Some(call_key) = ask.file_call_key {
+                    let _ = expiry::discard_card(&conn, &key, &call_key);
+                } else {
+                    let _ = asks::discard(&conn, &key);
+                }
             }
         })
         .await;
@@ -3552,6 +3565,7 @@ fn open_prepared(record: asks::AskRecord) -> Option<(Prepared, Option<String>)> 
         Prepared {
             key: record.key,
             call_key: record.call_key?,
+            reused_file_card: false,
             request: record.request?,
             selector: serde_json::from_value(record.selector).ok()?,
             grant: record.pending?,
