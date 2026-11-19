@@ -232,7 +232,7 @@ impl Running {
                     biased;
                     _ = cancel.cancelled() => break (None, false),
                     expiry = self.deadline.readable() => {
-                        expiry.map_err(|error| error.to_string())?;
+                        let _expired = expiry.map_err(|error| error.to_string())?;
                         break (None, true);
                     },
                     status = self.child.wait() => break (Some(status), false),
