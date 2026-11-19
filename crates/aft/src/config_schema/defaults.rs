@@ -6,6 +6,10 @@ use serde_json::{json, Value};
 /// consume use the plugins' defaults.
 pub(super) fn values() -> Value {
     let config = resolve_config(&[]).config;
+    let mut semantic = json!(config.semantic);
+    // The Rust resolver supplies the local model when omitted. Synapse needs
+    // an explicit choice, so leave the model unset in the effective view.
+    semantic.as_object_mut().unwrap().remove("model");
     let mut bash = json!(config.bash);
     for (key, value) in [
         ("rewrite", json!(config.experimental_bash_rewrite)),
@@ -69,7 +73,7 @@ pub(super) fn values() -> Value {
             "versions": {},
         },
         "url_fetch_allow_private": config.url_fetch_allow_private,
-        "semantic": config.semantic,
+        "semantic": semantic,
         "search": config.search,
         "auto_update": true,
         "bridge": {"request_timeout_ms": 30_000},

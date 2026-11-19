@@ -92,6 +92,7 @@ fn config_settings_subconscious_defaults_match_ungated_resolution() {
     let effective = schema.review_tuple(&[], &context).unwrap().effective;
     assert!(effective.get("memory").is_none());
     assert!(effective.pointer("/shell/env_provider").is_none());
+    assert!(effective.pointer("/semantic/model").is_none());
     assert!(effective.get("harnesses").is_none());
     assert_eq!(
         effective["storage"]["cache_dir"],
@@ -100,6 +101,7 @@ fn config_settings_subconscious_defaults_match_ungated_resolution() {
     let tier = user_fixture(effective);
     let resolved = crate::config_resolve::resolve_config(&[tier]);
     assert!(resolved.errors.is_empty(), "{:?}", resolved.errors);
+    assert_eq!(resolved.config.semantic.model, "all-MiniLM-L6-v2");
     let empty = crate::config_resolve::resolve_config(&[]);
     assert_eq!(json!(resolved.config), json!(empty.config));
 }
