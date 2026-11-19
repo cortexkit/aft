@@ -853,8 +853,8 @@ mod tests {
             r"rg foo C:\proj\src\&& echo done",
         ] {
             let parts = statements(command, true).unwrap();
-            let stage = first_stage(parts[0], true).unwrap();
-            assert_eq!(operands(stage, 2, true), vec![r"C:\proj\src\"]);
+            let pipeline = pipeline_stages(parts[0], true).unwrap();
+            assert_eq!(operands(pipeline[0], 2, true), vec![r"C:\proj\src\"]);
         }
     }
 
