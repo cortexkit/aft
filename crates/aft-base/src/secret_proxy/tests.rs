@@ -919,8 +919,9 @@ async fn proxy_streams_small_and_large_gzip_json_with_a_bearer_secret() {
     }
     let seen = server.seen.lock();
     assert_eq!(seen.len(), bodies.len());
+    let target = format!("https://localhost:{}/approved", server.address.port());
     for (request, expected) in seen.iter().zip(&bodies) {
-        assert_eq!(request["target"], "/approved");
+        assert_eq!(request["target"], target);
         assert_eq!(
             request["headers"]["authorization"],
             "Bearer test-key-12345678"
