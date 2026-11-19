@@ -402,7 +402,12 @@ fn walk_records(
         }
         match (&restrict, entry.path().strip_prefix(&nested_root)) {
             (Some(restrict), Ok(relative)) if entry.depth() > 0 => {
-                restrict.admits(&os_bytes(relative.as_os_str()))
+                let path = os_bytes(relative.as_os_str());
+                if is_dir {
+                    restrict.admits(&path)
+                } else {
+                    restrict.covers(&path)
+                }
             }
             _ => true,
         }
@@ -1000,6 +1005,30 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn stale_descendant_event_does_not_discard_another_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a"), b"a\n").unwrap();
+        std::fs::write(root.join("c.ts"), b"old\n").unwrap();
+        let policy = ScanPolicy::default();
+        let sink = Collect::default();
+        let previous = scan(root, &policy, None, &sink).unwrap().state;
+        std::fs::write(root.join("c.ts"), b"new content\n").unwrap();
+
+        let partial = scan_paths(
+            root,
+            &policy,
+            &previous,
+            &[b"a/b.ts".to_vec(), b"c.ts".to_vec()],
+            &sink,
+        )
+        .unwrap();
+        let cold = scan(root, &policy, None, &sink).unwrap();
+        assert_eq!(partial.changed, [b"c.ts".to_vec()]);
+        assert_eq!(members(&partial.state), members(&cold.state));
     }
 
     #[test]
