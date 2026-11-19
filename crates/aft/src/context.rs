@@ -12076,7 +12076,7 @@ impl AppContext {
                 crate::inspect::job::normalize_path(&self.resolved_path_restriction_root(root))
             });
             if !root.is_some_and(|root| identity.starts_with(root))
-                || !crate::bounded_io::metadata(&identity).is_ok()
+                || !confinement::admits_path_metadata(&identity)
             {
                 return Err(crate::context::confinement::refusal(req_id, original));
             }
