@@ -975,6 +975,150 @@ async fn proxy_refuses_a_json_body_location_for_gzip_without_sending_upstream() 
     assert!(server.seen.lock().is_empty());
 }
 
+fn padded_json(size: usize, start: &str, end: &str) -> String {
+    let mut body = String::with_capacity(size);
+    body.push_str(start);
+    body.extend(std::iter::repeat_n('x', size - start.len() - end.len()));
+    body.push_str(end);
+    body
+}
+
+fn assert_received_body(request: &Value, expected: &str) {
+    let received = base64::engine::general_purpose::STANDARD
+        .decode(request["body_base64"].as_str().unwrap())
+        .unwrap();
+    assert!(
+        received == expected.as_bytes(),
+        "request body changed in transit (sent {}, received {} bytes)",
+        expected.len(),
+        received.len()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_streams_large_json_with_bearer_and_leaves_placeholders_after_first_mib_literal() {
+    let server = Server::new("binary-request").await;
+    let vault = Vault::new();
+    let proxy = SecretProxy::start_with_tls(
+        config(
+            vault.clone(),
+            server.address.port(),
+            &[
+                ("test", Location::Bearer),
+                ("query", Location::Query("q".into())),
+                ("json", Location::Json("/key".into())),
+            ],
+        ),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    let size = 3 * 1024 * 1024;
+    let plain = padded_json(size, r#"{"padding":""#, r#""}"#);
+    let tail = padded_json(size, r#"{"padding":""#, r#"","key":"{{ck-secret:json}}"}"#);
+    let auth = format!("Bearer {MARKER}");
+    for (path, authorization, body) in [
+        ("/approved", Some(&auth), &plain),
+        ("/approved?q=%7B%7Bck-secret%3Aquery%7D%7D", None, &tail),
+        ("/approved", None, &plain),
+    ] {
+        let mut headers = json!({"content-type":"application/json"});
+        if let Some(authorization) = authorization {
+            headers["authorization"] = json!(authorization);
+        }
+        let reply = client.command(json!({
+            "op":"request", "method":"PUT", "path":path, "headers":headers, "body":body,
+        }));
+        assert_eq!(reply["status"], 204, "{path}: {reply}");
+    }
+    let seen = server.seen.lock();
+    assert_eq!(seen.len(), 3);
+    assert_eq!(
+        seen[0]["headers"]["authorization"],
+        "Bearer test-key-12345678"
+    );
+    assert!(seen[1]["target"]
+        .as_str()
+        .unwrap()
+        .ends_with("/approved?q=test-key-12345678"));
+    for (request, expected) in seen.iter().zip([&plain, &tail, &plain]) {
+        assert_received_body(request, expected);
+    }
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_refuses_a_json_only_placeholder_in_the_first_mib_before_sending_large_body() {
+    let server = Server::new("raw-transfer-h1").await;
+    let vault = Vault::new();
+    let proxy = SecretProxy::start_with_tls(
+        config(
+            vault.clone(),
+            server.address.port(),
+            &[("json", Location::Json("/key".into()))],
+        ),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    let body = padded_json(
+        3 * 1024 * 1024,
+        r#"{"key":"{{ck-secret:json}}","padding":""#,
+        r#""}"#,
+    );
+    let reply = client.request(
+        "/approved",
+        json!({"content-type":"application/json"}),
+        &body,
+    );
+    assert_eq!(reply["status"], 403, "{reply}");
+    assert_eq!(reply["body"], "AFT's secret proxy refused the request: json (localhost). The placeholder is not in a place where this secret may go.");
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 1);
+    let lines = proxy.state.test_refusals.lock();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("reason=location_mismatch "), "{lines:?}");
+    // This origin records request headers without waiting for the body.
+    assert!(server.seen.lock().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_substitutes_json_body_locations_up_to_and_including_one_mib() {
+    let server = Server::new("binary-request").await;
+    let vault = Vault::new();
+    let proxy = SecretProxy::start_with_tls(
+        config(
+            vault.clone(),
+            server.address.port(),
+            &[("json", Location::Json("/key".into()))],
+        ),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    for size in [1024, 1024 * 1024] {
+        let body = padded_json(
+            size,
+            r#"{ "padding": ""#,
+            r#"", "key": "{{ck-secret:json}}" }"#,
+        );
+        let reply = client.request(
+            "/approved",
+            json!({"content-type":"application/json"}),
+            &body,
+        );
+        assert_eq!(reply["status"], 204, "{size} bytes: {reply}");
+        let expected = body.replace("{{ck-secret:json}}", "test-key-12345678");
+        assert_received_body(server.seen.lock().last().unwrap(), &expected);
+    }
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 2);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_scrubs_encodings_headers_trailers_and_unexpected_compression() {
     for mode in ["plain", "gzip", "deflate", "br", "unknown"] {

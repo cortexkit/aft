@@ -2,8 +2,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::BodyExt;
-use hyper::body::Incoming;
+use futures_util::StreamExt;
+use http_body_util::{BodyExt, BodyStream, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::{Request, Response, Version};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use secret_rules::location::{
@@ -179,34 +180,20 @@ async fn prepare_and_send(
             !encoding.trim().eq_ignore_ascii_case("identity")
         })
     });
-    let has_json = !opaque_body
+    let inspect_json = !opaque_body
         && parts
             .headers
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .is_some_and(secret_rules::location::is_json_content_type);
-    let mut body = body_buffer(has_json);
-    if has_json {
-        while let Some(frame) = incoming.frame().await {
-            let frame = frame.map_err(|_| Refusal::new(Reason::BodyInvalid))?;
-            if let Some(data) = frame.data_ref() {
-                if body.len().saturating_add(data.len()) > 1024 * 1024 {
-                    return Err(Refusal::new(Reason::BodyInvalid));
-                }
-                if body.len() + data.len() > body.capacity() {
-                    let mut grown = Zeroizing::new(Vec::with_capacity(
-                        (body.len() + data.len()).next_power_of_two(),
-                    ));
-                    grown.extend_from_slice(&body);
-                    body = grown;
-                }
-                body.extend_from_slice(data);
-            }
-            if frame.trailers_ref().is_some() {
-                return Err(Refusal::new(Reason::BodyInvalid));
-            }
-        }
-    }
+    let (body, overflow) = if inspect_json {
+        buffer_json(&mut incoming).await?
+    } else {
+        (body_buffer(false), None)
+    };
+    let opaque_body = opaque_body || overflow.is_some();
+    let has_json = inspect_json && !opaque_body;
+    let location_body = (!opaque_body).then_some(body.as_slice());
     let path = target.split(['?', '#']).next().unwrap_or("/");
     let path = normalize_request_target(path).map_err(|_| fail())?;
     let addressed = crate::secret::ApiKeyTarget {
@@ -215,6 +202,9 @@ async fn prepare_and_send(
         port: Some(443),
         path: String::from_utf8(path.wire).map_err(|_| fail())?,
     };
+    // In an oversized JSON body, discover labels only within the first 1 MiB.
+    // A discovered label that needs a JSON location is refused before sending.
+    // Otherwise replay this prefix and stream the tail without inspecting it.
     let labels: Vec<_> = state
         .config
         .scanned_labels
@@ -225,7 +215,7 @@ async fn prepare_and_send(
                     .headers
                     .values()
                     .any(|value| super::audit::mentions(value.as_bytes(), label))
-                || (has_json && super::audit::mentions(&body, label))
+                || (inspect_json && super::audit::mentions(&body, label))
         })
         .cloned()
         .collect();
@@ -234,7 +224,7 @@ async fn prepare_and_send(
         .iter()
         .map(|(n, v)| HeaderField::value(n.as_str(), v.as_bytes()))
         .collect();
-    let structure = RequestView::new(&target, headers).with_body(&body);
+    let structure = RequestView::new(&target, headers).with_body(location_body.unwrap_or_default());
     if has_json && !labels.is_empty() {
         secret_rules::location::validate_json_request(&structure)
             .map_err(|_| Refusal::new(Reason::BodyInvalid))?;
@@ -251,7 +241,6 @@ async fn prepare_and_send(
     // before their retry; no socket held across a phone wait authorizes a send.
     let initial = connect_upstream(authority, state, ws).await?;
     let reconnected = tokio::sync::Mutex::new(Vec::new());
-    use futures_util::StreamExt;
     let approval_metadata = std::sync::Mutex::new(std::collections::HashMap::new());
     let mut pending = futures_util::stream::FuturesUnordered::new();
     for label in &labels {
@@ -260,11 +249,7 @@ async fn prepare_and_send(
         let reconnected = &reconnected;
         let approval_metadata = &approval_metadata;
         let expires = budget.expires_at_ms;
-        let (target, headers, body) = (
-            &target,
-            &parts.headers,
-            (!opaque_body).then_some(body.as_slice()),
-        );
+        let (target, headers) = (&target, &parts.headers);
         pending.push(async move {
             let answer = if state.is_https_port(authority.port) {
                 state
@@ -275,7 +260,13 @@ async fn prepare_and_send(
                         expires,
                         |location| {
                             plan_location(
-                                label, location, addressed, authority, target, headers, body,
+                                label,
+                                location,
+                                addressed,
+                                authority,
+                                target,
+                                headers,
+                                location_body,
                             )
                         },
                         |key| {
@@ -379,6 +370,9 @@ async fn prepare_and_send(
                 let (location, material) = released.into_parts();
                 let location = secret_rules::location::parse_vault_location(&location)
                     .ok_or_else(|| Refusal::for_label(Reason::LocationMismatch, label))?;
+                if opaque_body && matches!(location, Location::Json(_)) {
+                    return Err(Refusal::for_label(Reason::LocationMismatch, label));
+                }
                 // Without a pending card, the vault reveals a deposit location only
                 // when releasing its key, so location-dependent refusals can follow that release.
                 let rule = secret_rules::location::LabelRule {
@@ -393,7 +387,8 @@ async fn prepare_and_send(
                     .iter()
                     .map(|(n, v)| HeaderField::value(n.as_str(), v.as_bytes()))
                     .collect();
-                let view = RequestView::new(&target, headers).with_body(&body);
+                let view =
+                    RequestView::new(&target, headers).with_body(location_body.unwrap_or_default());
                 let dummy = [(label.to_string(), b"proxy-planning-value-0000".to_vec())];
                 if evaluate_request_with_connect(
                     &view,
@@ -422,7 +417,7 @@ async fn prepare_and_send(
         .iter()
         .map(|(n, v)| HeaderField::value(n.as_str(), v.as_bytes()))
         .collect();
-    let view = RequestView::new(&target, headers).with_body(&body);
+    let view = RequestView::new(&target, headers).with_body(location_body.unwrap_or_default());
     // Use public dummy material only to plan and validate locations. Real vault
     // bytes never enter the rules evaluator's ordinary Vec key copies.
     let dummy: Vec<_> = rules
@@ -524,6 +519,8 @@ async fn prepare_and_send(
                     .map_err(|_| fail())?,
             );
             full(super::secret_bytes(rewritten))
+        } else if let Some(overflow) = overflow {
+            replay_prefix(body, overflow, incoming)
         } else {
             incoming
                 .map_err(|_| super::response::io_error())
@@ -655,6 +652,40 @@ fn plan_location(
 
 pub(super) fn body_buffer(_has_json: bool) -> Zeroizing<Vec<u8>> {
     Zeroizing::new(Vec::new())
+}
+
+async fn buffer_json(
+    incoming: &mut Incoming,
+) -> Result<(Zeroizing<Vec<u8>>, Option<Bytes>), Refusal> {
+    const LIMIT: usize = 1024 * 1024;
+    let mut body = body_buffer(true);
+    while let Some(frame) = incoming.frame().await {
+        let frame = frame.map_err(|_| Refusal::new(Reason::BodyInvalid))?;
+        if frame.is_trailers() {
+            return Err(Refusal::new(Reason::BodyInvalid));
+        }
+        if let Ok(data) = frame.into_data() {
+            let inspected = data.len().min(LIMIT - body.len());
+            let next_len = body.len() + inspected;
+            if next_len > body.capacity() {
+                let mut grown = Zeroizing::new(Vec::with_capacity(next_len.next_power_of_two()));
+                grown.extend_from_slice(&body);
+                body = grown;
+            }
+            body.extend_from_slice(&data[..inspected]);
+            if inspected < data.len() {
+                return Ok((body, Some(data.slice(inspected..))));
+            }
+        }
+    }
+    Ok((body, None))
+}
+
+fn replay_prefix(prefix: Zeroizing<Vec<u8>>, overflow: Bytes, incoming: Incoming) -> Body {
+    let first = [super::secret_bytes(prefix), overflow].map(|bytes| Ok(Frame::data(bytes)));
+    let rest =
+        BodyStream::new(incoming).map(|frame| frame.map_err(|_| super::response::io_error()));
+    StreamBody::new(futures_util::stream::iter(first).chain(rest)).boxed_unsync()
 }
 
 fn apply_edits(
