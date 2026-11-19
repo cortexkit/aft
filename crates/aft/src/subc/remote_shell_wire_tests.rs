@@ -41,7 +41,7 @@ async fn late(peer: &mut Peer, channel: u16, corr: u64) -> (Value, Value) {
                 .find(|entry| entry["call_key"] == format!("key-{corr}"))
             {
                 assert_eq!(entry["kind"], "result", "{entry}");
-                assert_eq!(entry["result"]["is_error"], true, "{entry}");
+                assert_eq!(entry["result"]["isError"], true, "{entry}");
                 assert!(
                     text(&entry["result"]).contains(&format!("output-{corr}")),
                     "{entry}"
@@ -172,7 +172,7 @@ async fn remote_shell_wire_holds_and_settles_after_scope_end_revoke_and_timeout(
         peer.ended.insert("agent-shell".into());
         peer.ended.insert("worker-shell".into());
         let worker_result = reply(peer.receive(3, 300).await);
-        assert_eq!(worker_result["is_error"], true, "{worker_result}");
+        assert_eq!(worker_result["isError"], true, "{worker_result}");
         assert!(
             text(&worker_result).contains("output-300"),
             "{worker_result}"
@@ -238,7 +238,7 @@ async fn remote_shell_wire_holds_and_settles_after_scope_end_revoke_and_timeout(
             !text(&result).contains(&authorization::denied().message),
             "{result}"
         );
-        assert!(result.to_string().contains("timed out"), "{result}");
+        assert_eq!(result["errorCode"], "timeout", "{result}");
 
         write_frame(
             &mut peer.daemon,
