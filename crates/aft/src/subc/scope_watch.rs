@@ -376,6 +376,7 @@ pub(super) struct Health {
     pub(super) skipped_held_rows: u64,
     pub(super) poll_keys: usize,
     pub(super) confirmed_cleanup: usize,
+    pub(super) prefrontal_continuity_holds: usize,
 }
 
 #[derive(Clone, Default)]

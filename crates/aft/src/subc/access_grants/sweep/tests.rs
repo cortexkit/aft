@@ -72,6 +72,59 @@ async fn prefrontal_scope_sweep_pre_window_end_sends_only_original_describe() {
 }
 
 #[tokio::test]
+async fn prefrontal_scope_sweep_holds_retired_source_until_definitive_reply() {
+    let (dir, db) = fixture();
+    let key = save(&db, dir.path(), "rename-gap", 1);
+    let retired = ModuleControlResponseToModule::ScopeDescribe {
+        status: ScopeStatus::Live,
+        scope_epoch: Some(1),
+        daemon_incarnation: "test".into(),
+        owner_synced: true,
+        owner_configured: false,
+        scope: None,
+    };
+    let held = tick(db.clone(), &mut None, |_| {
+        std::future::ready(Ok(retired.clone()))
+    })
+    .await;
+    assert_eq!(held.ended, 0, "catalog absence is not a scope end");
+    assert_eq!(held.deleted_grants, 0);
+
+    let unavailable = ModuleControlResponseToModule::ScopeDescribe {
+        status: ScopeStatus::NotLive,
+        scope_epoch: None,
+        daemon_incarnation: "test".into(),
+        owner_synced: false,
+        owner_configured: false,
+        scope: None,
+    };
+    for (counterpart, expected_end) in [
+        (Ok(unavailable), false),
+        (Ok(reply(ScopeStatus::NotLive, false)), false),
+        (Err(readiness::ControlError::ConnectionClosed), false),
+        (Ok(reply(ScopeStatus::Ended, true)), true),
+    ] {
+        let stats = tick_unwatched(
+            db.clone(),
+            &mut None,
+            |stamp| {
+                std::future::ready(if matches!(&stamp.owner, subc_protocol::Principal::Reserved { module_id } if module_id == "prefrontal") {
+                    counterpart.clone()
+                } else {
+                    Ok(retired.clone())
+                })
+            },
+            |_| false,
+            |_| true,
+        ).await;
+        assert_eq!(stats.deleted_grants, u64::from(expected_end));
+        let conn = db.lock().unwrap();
+        assert_eq!(store::scope_ended(&conn, &key).unwrap(), expected_end);
+        assert_eq!(store::list(&conn, &key).unwrap().is_empty(), expected_end);
+    }
+}
+
+#[tokio::test]
 async fn prefrontal_scope_sweep_retains_continuations_and_holds_but_revokes_absence() {
     for (status, configured, synced, absent) in [
         (ScopeStatus::Live, true, true, false),
