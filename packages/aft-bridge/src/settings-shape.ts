@@ -30,7 +30,9 @@ export function isCacheDirChoice(value: unknown): value is CacheDirChoice {
   );
 }
 
-export function hasMalformedCacheDirChoice(config: ConfigObject): boolean {
+export function hasMalformedCacheDirChoice(input: unknown): boolean {
+  const config = object(input);
+  if (!config) return false;
   const malformed = (block: ConfigObject | undefined) => {
     const choice = object(block?.storage)?.cache_dir;
     return object(choice) !== undefined && !isCacheDirChoice(choice);

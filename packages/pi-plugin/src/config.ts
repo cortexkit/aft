@@ -491,7 +491,7 @@ export interface AftConfig {
   /** User-tier standing roots; project config cannot configure this machine state. */
   index?: IndexConfig;
   /** Only the user config's top level may select this existing directory. Caches live in its `aft` child; an unavailable directory disables caches instead of writing them under the storage root. */
-  storage?: { cache_dir?: string | null };
+  storage?: { cache_dir?: CacheDirChoice };
   /** User-base-only macOS file flush policy. Full drive-cache flushes default off. */
   durability?: { macos_full_sync?: boolean };
   /** Machine-local limits; only the user config base may select a profile. */
