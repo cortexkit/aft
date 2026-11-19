@@ -475,7 +475,14 @@ describe("loadAftConfig", () => {
       expect(existsSync(path)).toBe(false);
       expect(readFileSync(fixture.userConfigPath, "utf8")).toBe(text);
       expect(JSON.parse(result.stdout).experimental.lsp_ty).toBe(true);
-      expect(JSON.parse(result.stdout).bash).toBe(false);
+      // The relocated file keeps its text; the loaded config carries the
+      // canonical form of the legacy `bash: false`, every switch still off.
+      expect(JSON.parse(result.stdout).bash).toEqual({
+        enabled: false,
+        rewrite: false,
+        compress: false,
+        background: false,
+      });
     }
   });
 
