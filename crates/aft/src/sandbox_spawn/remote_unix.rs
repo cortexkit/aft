@@ -54,7 +54,7 @@ pub(crate) fn prepare(
     prepare_with_launcher(ctx, folder, workdir, command, launcher)
 }
 
-pub(super) fn prepare_with_launcher(
+pub(crate) fn prepare_with_launcher(
     ctx: &AppContext,
     folder: &Path,
     workdir: PathBuf,

@@ -40,7 +40,7 @@ impl consent::ConsentTransport for Cards {
 
 struct Peer {
     daemon: tokio::io::DuplexStream,
-    ends: bool,
+    ended: HashSet<String>,
     probes: HashSet<String>,
     waiting: Vec<Frame>,
 }
@@ -69,7 +69,7 @@ impl Peer {
         }
         let scope_ref = body["ref"].as_str().unwrap();
         self.probes.insert(scope_ref.into());
-        let ended = self.ends && scope_ref == "remote-session";
+        let ended = self.ended.contains(scope_ref);
         let answer = ModuleControlResponseToModule::ScopeDescribe {
             status: ScopeStatus::NotLive,
             scope_epoch: None,
@@ -315,7 +315,7 @@ async fn remote_edit_and_scope_end_enforce_attributed_authority() {
     let (daemon, stream) = tokio::io::duplex(1024 * 1024);
     let mut peer = Peer {
         daemon,
-        ends: false,
+        ended: HashSet::new(),
         probes: HashSet::new(),
         waiting: vec![],
     };
@@ -533,7 +533,7 @@ async fn remote_edit_and_scope_end_enforce_attributed_authority() {
         peer.send(5, 726, read(726)).await;
         let late_save = card(&mut cards, "read").await;
         assert_eq!(std::fs::read_to_string(&original).unwrap(), "original\n");
-        peer.ends = true;
+        peer.ended.insert("remote-session".into());
         refusal(peer.receive(1, 722).await, "remote_access_denied");
         let _ =
             late.send(json!({"state":"settled", "answered_by":"user", "outcome":"allow_scope"}));
@@ -615,3 +615,7 @@ async fn remote_edit_and_scope_end_enforce_attributed_authority() {
     let (end, ()) = tokio::join!(module, exercise);
     end.unwrap();
 }
+
+#[cfg(target_os = "linux")]
+#[path = "remote_shell_wire_tests.rs"]
+mod shell;

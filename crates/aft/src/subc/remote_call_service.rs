@@ -70,6 +70,8 @@ struct Edge {
     executor: Arc<Executor>,
     dispatch: DispatchFn,
     max_body: usize,
+    #[cfg(all(test, target_os = "linux"))]
+    test_launcher: Option<PathBuf>,
 }
 
 pub(in crate::subc) struct Service {
@@ -135,6 +137,8 @@ impl Service {
                 executor,
                 dispatch,
                 max_body,
+                #[cfg(all(test, target_os = "linux"))]
+                test_launcher: remote_bash::TEST_LAUNCHER.try_with(Clone::clone).ok(),
             }),
             connection_file: connection_file.to_path_buf(),
             jobs: JoinSet::new(),
