@@ -39,8 +39,8 @@ pub fn counterpart(stamp: &ScopeStamp) -> Option<ScopeStamp> {
     Some(other)
 }
 
-/// A missing counterpart module cannot own a continuation. Preserve the
-/// original single-owner wire exchange until the catalog lists the other name.
+/// Only probe the counterpart when the catalog lists it. A missing entry is
+/// not evidence that a scope ended.
 pub fn counterpart_in_catalog(stamp: &ScopeStamp, configured: &[String]) -> bool {
     let Some(Principal::Reserved { module_id }) = counterpart_owner(&stamp.owner) else {
         return false;
@@ -50,24 +50,45 @@ pub fn counterpart_in_catalog(stamp: &ScopeStamp, configured: &[String]) -> bool
 
 pub enum Continuation {
     Live(ScopeStamp),
-    Hold,
-    Absent,
+    Hold(&'static str),
+    End(&'static str),
+}
+
+pub enum CounterpartReply<'a> {
+    NotInCatalog,
+    Describe(Option<&'a ModuleControlResponseToModule>),
 }
 
 /// A configured live reference continues the agent even if its epoch changed,
 /// mirroring the ordinary scope.describe rebind rule for a single owner.
 pub fn continuation(
     other: &ScopeStamp,
-    reply: Option<&ModuleControlResponseToModule>,
+    reply: CounterpartReply<'_>,
+    source_ended: bool,
 ) -> Continuation {
+    // An unavailable counterpart cannot supply its own proof of end. Only a
+    // definitive answer from the source owner allows cleanup in this case.
+    let CounterpartReply::Describe(reply) = reply else {
+        return if source_ended {
+            Continuation::End("source_end_counterpart_absent")
+        } else {
+            Continuation::Hold("hold_counterpart_absent")
+        };
+    };
     match reply {
         Some(ModuleControlResponseToModule::ScopeDescribe {
             owner_configured: false,
             ..
-        }) => Continuation::Absent,
+        }) => {
+            if source_ended {
+                Continuation::End("source_end_counterpart_unconfigured")
+            } else {
+                Continuation::Hold("hold_counterpart_unconfigured")
+            }
+        }
         Some(ModuleControlResponseToModule::ScopeDescribe {
             status: ScopeStatus::Live,
-            owner_configured: true,
+            owner_synced: true,
             scope_epoch,
             ..
         }) => {
@@ -85,8 +106,8 @@ pub fn continuation(
                 owner_synced: true,
                 ..
             },
-        ) => Continuation::Absent,
-        _ => Continuation::Hold,
+        ) => Continuation::End("absent_end"),
+        _ => Continuation::Hold("hold"),
     }
 }
 
@@ -300,13 +321,41 @@ mod tests {
             subc_protocol::scope::ScopeKind::Head,
         );
         let other = counterpart(&old).unwrap();
-        for (status, configured, synced, expected) in [
-            (ScopeStatus::Live, true, true, "live"),
-            (ScopeStatus::Live, false, true, "absent"),
-            (ScopeStatus::NotLive, true, false, "hold"),
-            (ScopeStatus::NotLive, false, false, "absent"),
-            (ScopeStatus::NotLive, true, true, "absent"),
-            (ScopeStatus::Ended, true, true, "absent"),
+        for (status, configured, synced, source_ended, expected) in [
+            (ScopeStatus::Live, true, true, false, "live"),
+            (
+                ScopeStatus::Live,
+                false,
+                true,
+                true,
+                "source_end_counterpart_unconfigured",
+            ),
+            (ScopeStatus::Live, true, false, false, "hold"),
+            (ScopeStatus::NotLive, true, false, true, "hold"),
+            (
+                ScopeStatus::NotLive,
+                false,
+                false,
+                true,
+                "source_end_counterpart_unconfigured",
+            ),
+            (
+                ScopeStatus::NotLive,
+                false,
+                false,
+                false,
+                "hold_counterpart_unconfigured",
+            ),
+            (ScopeStatus::NotLive, true, true, false, "absent_end"),
+            (ScopeStatus::Ended, true, true, false, "absent_end"),
+            (ScopeStatus::Ended, true, false, false, "absent_end"),
+            (
+                ScopeStatus::Ended,
+                false,
+                true,
+                false,
+                "hold_counterpart_unconfigured",
+            ),
         ] {
             let reply = ModuleControlResponseToModule::ScopeDescribe {
                 status,
@@ -316,17 +365,27 @@ mod tests {
                 owner_configured: configured,
                 scope: None,
             };
-            let actual = match continuation(&other, Some(&reply)) {
+            let actual = match continuation(
+                &other,
+                CounterpartReply::Describe(Some(&reply)),
+                source_ended,
+            ) {
                 Continuation::Live(live) => {
                     assert_eq!(live.scope_epoch, 8);
                     assert_eq!(live.owner, other.owner);
                     "live"
                 }
-                Continuation::Hold => "hold",
-                Continuation::Absent => "absent",
+                Continuation::Hold(outcome) | Continuation::End(outcome) => outcome,
             };
             assert_eq!(actual, expected);
         }
-        assert!(matches!(continuation(&other, None), Continuation::Hold));
+        assert!(matches!(
+            continuation(&other, CounterpartReply::Describe(None), false),
+            Continuation::Hold("hold")
+        ));
+        assert!(matches!(
+            continuation(&other, CounterpartReply::NotInCatalog, false),
+            Continuation::Hold("hold_counterpart_absent")
+        ));
     }
 }

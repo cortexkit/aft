@@ -1,5 +1,6 @@
 //! Reconcile saved grants with daemon lifecycle state, away from tool calls.
 use super::super::{readiness, scope_describe, DispatchPathMetrics, Executor};
+use crate::access_policy::prefrontal::{self, Continuation, CounterpartReply};
 use crate::db::{access_grants as store, TrackedConnection};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -138,48 +139,46 @@ where
             )
             .await
             .unwrap_or(Err(readiness::ControlError::Timeout));
-            let mut ends = reply.as_ref().is_ok_and(|reply| {
-                scope_describe::describe_answer_ends_scope(reply)
-                    || crate::access_policy::prefrontal::retired(&request, reply)
-            });
-            if ends {
-                if let Some(other) = crate::access_policy::prefrontal::counterpart(&request) {
-                    if !counterpart_configured(&request) {
-                        crate::access_policy::prefrontal::log_continuation(
-                            &request,
-                            &other,
-                            "absent_from_catalog",
-                        );
-                    } else {
-                        let answer = tokio::time::timeout(
-                            scope_describe::describe_timeout(),
-                            describe(other.clone()),
+            let source_ended = reply
+                .as_ref()
+                .is_ok_and(scope_describe::describe_answer_ends_scope);
+            let mut ends = source_ended;
+            if source_ended
+                || reply
+                    .as_ref()
+                    .is_ok_and(|reply| prefrontal::retired(&request, reply))
+            {
+                if let Some(other) = prefrontal::counterpart(&request) {
+                    let answer = if counterpart_configured(&request) {
+                        Some(
+                            tokio::time::timeout(
+                                scope_describe::describe_timeout(),
+                                describe(other.clone()),
+                            )
+                            .await
+                            .unwrap_or(Err(readiness::ControlError::Timeout)),
                         )
-                        .await
-                        .unwrap_or(Err(readiness::ControlError::Timeout));
-                        let (absent, outcome) = match crate::access_policy::prefrontal::continuation(
-                            &other,
-                            answer.as_ref().ok(),
-                        ) {
-                            crate::access_policy::prefrontal::Continuation::Live(_) => {
-                                (false, "continuation")
-                            }
-                            crate::access_policy::prefrontal::Continuation::Hold => (false, "hold"),
-                            crate::access_policy::prefrontal::Continuation::Absent => {
-                                (true, "absent_end")
-                            }
+                    } else {
+                        None
+                    };
+                    let answer = match answer.as_ref() {
+                        Some(reply) => CounterpartReply::Describe(reply.as_ref().ok()),
+                        None => CounterpartReply::NotInCatalog,
+                    };
+                    let (ended, outcome) =
+                        match prefrontal::continuation(&other, answer, source_ended) {
+                            Continuation::Live(_) => (false, "continuation"),
+                            Continuation::Hold(outcome) => (false, outcome),
+                            Continuation::End(outcome) => (true, outcome),
                         };
-                        crate::access_policy::prefrontal::log_continuation(
-                            &request, &other, outcome,
-                        );
-                        ends = absent;
-                    }
+                    prefrontal::log_continuation(&request, &other, outcome);
+                    ends = ended;
                 }
-            } else if let Some(other) = crate::access_policy::prefrontal::counterpart(&request) {
-                crate::access_policy::prefrontal::log_continuation(
+            } else if let Some(other) = prefrontal::counterpart(&request) {
+                prefrontal::log_continuation(
                     &request,
                     &other,
-                    crate::access_policy::prefrontal::retained_outcome(reply.as_ref().ok()),
+                    prefrontal::retained_outcome(reply.as_ref().ok()),
                 );
             }
             match &reply {
