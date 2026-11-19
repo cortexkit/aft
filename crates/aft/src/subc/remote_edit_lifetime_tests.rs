@@ -253,12 +253,15 @@ async fn exercise_external_tools(
         "remote edits must not start formatters or checkers"
     );
 
-    let local = serde_json::from_value(
-        json!({"id":"local-edit", "command":"edit_match", "params": {
+    let local = RawRequest {
+        id: "local-edit".into(),
+        command: "edit_match".into(),
+        lsp_hints: None,
+        session_id: None,
+        params: json!({
             "file": path, "match":"value = 1", "replacement":"value = 2", "validate":"full"
-        }}),
-    )
-    .unwrap();
+        }),
+    };
     let local = ToolLaunchPolicy::with_current(
         Some(ToolLaunchPolicy::unconfined_for_test().shared()),
         || edit_dispatch(local, ctx),
