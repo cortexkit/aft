@@ -25,6 +25,8 @@ use crate::hashline::integration::RegistrationRequest;
 
 mod admission_close;
 mod guidance;
+mod shell_detaches;
+pub(super) use shell_detaches::ShellDetaches;
 #[cfg(test)]
 mod guidance_text_tests;
 #[cfg(test)]
@@ -1934,6 +1936,7 @@ struct LedgerCall {
     key: crate::db::call_ledger::Key,
     shell: bool,
     detached: bool,
+    detach_ready: Option<tokio::sync::oneshot::Receiver<()>>,
     expires_at: std::time::Instant,
     /// A `tool.withdraw` settled this held call before the frame loop filed
     /// its question; the request is answered `not_started` when it arrives.
@@ -2419,6 +2422,7 @@ impl LedgerEdge {
                 },
                 shell: true,
                 detached: false,
+                detach_ready: None,
                 expires_at: std::time::Instant::now() + std::time::Duration::from_secs(60),
                 withdrawn: None,
                 yieldable: None,
@@ -2831,6 +2835,7 @@ impl LedgerEdge {
                                     yieldable: super::call_yield::YieldableTool::of(&call.name),
                                     yielded: false,
                                     detached: false,
+                                    detach_ready: None,
                                 },
                             );
                             if let Some(received) = edge
@@ -3452,45 +3457,7 @@ impl LedgerEdge {
         }
     }
 
-    /// The shell command outlives the request on its former route. Once that
-    /// request cannot receive a reply, terminal task writes must store the
-    /// result in the call ledger for replay and late_results.
-    pub(super) async fn detach_shells(
-        &self,
-        executor: &std::sync::Arc<crate::context::Executor>,
-        route: Option<super::RouteChannel>,
-    ) {
-        self.received
-            .lock()
-            .unwrap()
-            .retain(|(channel, _), _| route.is_some_and(|route| *channel != route));
-        let calls: Vec<_> = self
-            .calls
-            .lock()
-            .unwrap()
-            .iter_mut()
-            .filter(|((channel, _), call)| {
-                call.shell && !call.detached && route.is_none_or(|route| *channel == route)
-            })
-            .map(|(_, call)| {
-                call.detached = true;
-                (call.root.clone(), call.key.clone())
-            })
-            .collect();
-        for (root, key) in calls {
-            let rx = executor.submit_async(
-                root,
-                crate::executor::Lane::Mutating,
-                "ledger-detach".into(),
-                Box::new(move |ctx| {
-                    detach_shell_row(ctx, &key);
-                    crate::protocol::Response::success("ledger-detach", serde_json::json!({}))
-                }),
-            );
-            let _ = super::await_executor_response(rx, "ledger-detach".into()).await;
-        }
-    }
-
+    #[cfg(test)]
     pub(super) fn unrouted_shells(
         &self,
         routes: &std::collections::HashMap<super::RouteChannel, super::RouteIdentity>,
@@ -3845,7 +3812,7 @@ impl LedgerEdge {
                 } else {
                     None
                 };
-                let Some(call) = call else {
+                let Some(mut call) = call else {
                     if actual.send(outgoing).await.is_err() {
                         break;
                     }
@@ -3905,88 +3872,107 @@ impl LedgerEdge {
                 // The reply is held until this settlement commits. On the
                 // call-ledger lane it does not wait for the root's reads,
                 // maintenance or a running writer.
-                let rx = executor.submit_async(
-                    call.root.clone(),
-                    Lane::CallLedger,
-                    "ledger-settle".into(),
-                    Box::new(move |ctx| {
-                        if let Some(error) = projection_error {
-                            return Response::error("ledger-settle", "database_unavailable", error);
-                        }
-                        let Some(db) = ctx.db() else {
-                            return Response::error(
-                                "ledger-settle",
-                                "database_unavailable",
-                                "Call ledger is unavailable",
-                            );
-                        };
-                        let Ok(conn) = db.lock() else {
-                            return Response::error(
-                                "ledger-settle",
-                                "database_unavailable",
-                                "Call ledger database mutex is poisoned",
-                            );
-                        };
-                        let row = ledger::get(&conn, &call.key).ok().flatten();
-                        let reason = row
-                            .as_ref()
-                            .filter(|row| row.state == State::Prepared && !detached)
-                            .map(|_| {
-                                if std::time::Instant::now() >= call.expires_at {
-                                    "expired"
-                                } else {
-                                    "denied"
+                let detach_ready = call.detach_ready.take();
+                let executor = executor.clone();
+                let submit =
+                    move || {
+                        executor.submit_async(
+                            call.root.clone(),
+                            Lane::CallLedger,
+                            "ledger-settle".into(),
+                            Box::new(move |ctx| {
+                                if let Some(error) = projection_error {
+                                    return Response::error(
+                                        "ledger-settle",
+                                        "database_unavailable",
+                                        error,
+                                    );
                                 }
-                            });
-                        let inferred = ledger::outcome(&record_for_job);
-                        let outcome = if reason.is_some() {
-                            "bash_denied_untrusted".into()
-                        } else if record_for_job.ty == FrameType::Response && inferred == "unknown"
-                        {
-                            row.and_then(|row| row.outcome)
-                                .filter(|outcome| outcome != "ok")
-                                .unwrap_or(inferred)
-                        } else {
-                            inferred
-                        };
-                        match ledger::settle_with_tool_result_source(
-                            &conn,
-                            &call.key,
-                            &record_for_job,
-                            &outcome,
-                            reason,
-                            ledger::now_ms(),
-                            tool_body_for_job.as_deref(),
-                        ) {
-                            Ok(true) => {}
-                            Ok(false)
-                                if ledger::get_for_replay(&conn, &call.key)
-                                    .ok()
-                                    .flatten()
-                                    .is_some_and(|row| {
-                                        row.tool_result_source.as_deref()
-                                            == tool_body_for_job.as_deref()
-                                            && row.frame.is_some_and(|frame| {
-                                                frame.ty == record_for_job.ty
-                                                    && frame.body == record_for_job.body
-                                            })
-                                    }) => {}
-                            result => {
-                                return Response::error(
-                                    "ledger-settle",
-                                    "database_unavailable",
-                                    match result {
-                                        Err(error) => error.to_string(),
-                                        _ => "Call ledger did not retain this terminal result"
-                                            .to_owned(),
-                                    },
-                                )
-                            }
-                        }
-                        Response::success("ledger-settle", json!({}))
-                    }),
-                );
+                                let Some(db) = ctx.db() else {
+                                    return Response::error(
+                                        "ledger-settle",
+                                        "database_unavailable",
+                                        "Call ledger is unavailable",
+                                    );
+                                };
+                                let Ok(conn) = db.lock() else {
+                                    return Response::error(
+                                        "ledger-settle",
+                                        "database_unavailable",
+                                        "Call ledger database mutex is poisoned",
+                                    );
+                                };
+                                let row = ledger::get(&conn, &call.key).ok().flatten();
+                                let reason = row
+                                    .as_ref()
+                                    .filter(|row| row.state == State::Prepared && !detached)
+                                    .map(|_| {
+                                        if std::time::Instant::now() >= call.expires_at {
+                                            "expired"
+                                        } else {
+                                            "denied"
+                                        }
+                                    });
+                                let inferred = ledger::outcome(&record_for_job);
+                                let outcome = if reason.is_some() {
+                                    "bash_denied_untrusted".into()
+                                } else if record_for_job.ty == FrameType::Response
+                                    && inferred == "unknown"
+                                {
+                                    row.and_then(|row| row.outcome)
+                                        .filter(|outcome| outcome != "ok")
+                                        .unwrap_or(inferred)
+                                } else {
+                                    inferred
+                                };
+                                match ledger::settle_with_tool_result_source(
+                                    &conn,
+                                    &call.key,
+                                    &record_for_job,
+                                    &outcome,
+                                    reason,
+                                    ledger::now_ms(),
+                                    tool_body_for_job.as_deref(),
+                                ) {
+                                    Ok(true) => {}
+                                    Ok(false)
+                                        if ledger::get_for_replay(&conn, &call.key)
+                                            .ok()
+                                            .flatten()
+                                            .is_some_and(|row| {
+                                                row.tool_result_source.as_deref()
+                                                    == tool_body_for_job.as_deref()
+                                                    && row.frame.is_some_and(|frame| {
+                                                        frame.ty == record_for_job.ty
+                                                            && frame.body == record_for_job.body
+                                                    })
+                                            }) => {}
+                                    result => return Response::error(
+                                        "ledger-settle",
+                                        "database_unavailable",
+                                        match result {
+                                            Err(error) => error.to_string(),
+                                            _ => "Call ledger did not retain this terminal result"
+                                                .to_owned(),
+                                        },
+                                    ),
+                                }
+                                Response::success("ledger-settle", json!({}))
+                            }),
+                        )
+                    };
+                let (rx, delayed) = match detach_ready {
+                    Some(receipt) => (None, Some((receipt, submit))),
+                    None => (Some(submit()), None),
+                };
                 tokio::spawn(async move {
+                    let rx = match delayed {
+                        Some((receipt, submit)) => {
+                            let _ = receipt.await;
+                            submit()
+                        }
+                        None => rx.expect("an attached settlement was already submitted"),
+                    };
                     let settled = await_executor_response(rx, "ledger-settle".into()).await;
                     if !settled.success {
                         log::warn!(
@@ -12267,6 +12253,7 @@ mod settlement_failure_tests {
                 key,
                 shell: false,
                 detached: false,
+                detach_ready: None,
                 withdrawn: None,
                 yieldable: None,
                 yielded: false,
@@ -12528,6 +12515,7 @@ mod authorization_failure_tests {
                 key,
                 shell: true,
                 detached: false,
+                detach_ready: None,
                 withdrawn: None,
                 yieldable: None,
                 yielded: false,

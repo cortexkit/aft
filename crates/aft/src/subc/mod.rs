@@ -5419,11 +5419,10 @@ where
             }
         },
     );
+    let mut shell_detaches = tool_provider::ShellDetaches::default();
     let loop_result: Result<ModuleLoopExit, SubcError> = 'module_loop: loop {
-        dispatch_path_metrics.mark_frame_loop_step("LedgerEdge::detach_shells", "", 0);
-        for route in ledger_edge.unrouted_shells(&routes) {
-            ledger_edge.detach_shells(&executor, Some(route)).await;
-        }
+        dispatch_path_metrics.mark_frame_loop_step("ShellDetaches::start", "", 0);
+        shell_detaches.start(&ledger_edge, &executor, &routes);
         dispatch_path_metrics.mark_frame_loop_tick();
         dispatch_path_metrics.mark_frame_loop_step("logging::perf_tick", "", 0);
         #[cfg(test)]
@@ -6952,7 +6951,7 @@ where
     {
         speech_runtime.retain_until_process_exit();
     }
-    ledger_edge.detach_shells(&executor, None).await;
+    shell_detaches.finish(&ledger_edge, &executor).await;
     if let Some(task) = settings_worker {
         task.abort();
     }

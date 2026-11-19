@@ -144,11 +144,11 @@ async fn hold_lane(
 }
 
 fn dispatch(request: RawRequest, ctx: &AppContext) -> Response {
-    assert_eq!(
-        request.command, "configure",
-        "an abandoned tool must not run"
-    );
-    crate::commands::configure::handle_configure(&request, ctx)
+    match request.command.as_str() {
+        "configure" => crate::commands::configure::handle_configure(&request, ctx),
+        "bash" => crate::commands::bash::handle(&request, ctx),
+        _ => panic!("unexpected tool dispatch: {}", request.command),
+    }
 }
 
 #[tokio::test]
@@ -248,4 +248,47 @@ async fn route_close_retires_admission_before_dispatch() {
         "the closed route must receive exactly one terminal"
     );
     daemon.finish().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retired_shell_does_not_block_pong_or_unrelated_bind() {
+    let (project, root) = test_support::test_root("retired-shell");
+    let (other, _) = test_support::test_root("unrelated-bind");
+    let ctx = test_support::test_ctx();
+    let mut daemon = Daemon::start(root.as_path(), &ctx, &[], dispatch).await;
+    daemon.bind(root.as_path(), 1).await;
+    daemon.bind(root.as_path(), 2).await;
+    ctx.wait_for_database_settled(Instant::now() + Duration::from_secs(10))
+        .await;
+    assert!(
+        ctx.db().is_some(),
+        "the foreground shell needs the configured ledger"
+    );
+    let started = project.path().join("started");
+    let stop = project.path().join("stop");
+    daemon.send(FrameType::Request, 1, 10, json!({
+        "name":"bash", "call_key":"detaching-shell", "arguments":{
+            "command":format!("printf x > '{}'; for i in $(seq 1 200); do [ -e '{}' ] && break; sleep 0.05; done", started.display(), stop.display()),
+        },
+    })).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("foreground keyed shell did not start");
+    let release = hold_lane(&daemon.executor, &root, Lane::PureRead).await;
+    daemon.send(FrameType::Goodbye, 1, 0, Value::Null).await;
+    daemon.send(FrameType::Ping, 0, 1010, Value::Null).await;
+    let edge_replies = tokio::time::timeout(Duration::from_secs(2), async {
+        assert_eq!(daemon.reply(0, 1010).await.header.ty, FrameType::Pong);
+        daemon.bind(other.path(), 3).await;
+    })
+    .await;
+    release.send(()).unwrap();
+    std::fs::write(stop, b"done").unwrap();
+    daemon.finish().await;
+    edge_replies.expect("root A's epoch reader must not delay the Pong or root B's bind");
 }
