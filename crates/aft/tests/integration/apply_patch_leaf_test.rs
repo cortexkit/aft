@@ -486,16 +486,17 @@ fn restricted_apply_patch_move_onto_symlink_to_outside_file_is_refused() {
 }
 
 /// A move back onto the same symlink is otherwise turned into an in-place
-/// update of the link's location, which writes through to the target.
+/// update of the link's location, which writes through to the target while
+/// the undo snapshot records only the link. (Under `restrict_to_project_root`
+/// an outside target is refused earlier, as a move source read through a link.)
 #[cfg(unix)]
 #[test]
-fn restricted_apply_patch_move_onto_same_symlink_is_refused() {
+fn apply_patch_move_onto_same_symlink_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let outside_file = write_file(outside.path(), "outside.txt", "before\n");
-    std::os::unix::fs::symlink(&outside_file, root.join("destination.txt")).unwrap();
-    let mut aft = configured_restricted_aft(root);
+    let target = write_file(root, "target.txt", "before\n");
+    std::os::unix::fs::symlink("target.txt", root.join("destination.txt")).unwrap();
+    let mut aft = configured_aft(root);
 
     let patch = r#"*** Begin Patch
 *** Update File: destination.txt
@@ -509,7 +510,7 @@ fn restricted_apply_patch_move_onto_same_symlink_is_refused() {
     let applied = apply(&mut aft, "apply-move-onto-same-link", patch);
     assert_move_onto_symlink_refused(&applied);
 
-    assert_eq!(fs::read_to_string(&outside_file).unwrap(), "before\n");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "before\n");
 
     assert!(aft.shutdown().success());
 }
