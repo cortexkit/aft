@@ -100,6 +100,7 @@ pub use aft_base::config;
 pub use aft_base::config_fix;
 pub mod config_live;
 pub use aft_base::config_resolve;
+pub mod config_schema;
 pub use aft_base::config_sources;
 pub mod context;
 pub(crate) use aft_base::cross_volume;
