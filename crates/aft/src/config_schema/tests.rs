@@ -73,7 +73,6 @@ fn config_settings_preserves_existing_descriptions_word_for_word() {
                     }
                 })
                 .is_some()
-                && !harness_path.starts_with("shell/env_provider/")
             {
                 continue;
             }
@@ -201,11 +200,11 @@ fn config_settings_harness_overrides_are_closed_and_inherit() {
 }
 
 #[test]
-fn config_settings_accepts_mac_user_shape_except_for_subc_0_1_3_env_singleton() {
+fn config_settings_accepts_mac_user_shape_with_env_only_bash_override() {
     let schema = validated();
     let context = ValidationContext::default();
     // Only the paths and types come from the live file; these values are fabricated.
-    let mut value = json!({
+    let value = json!({
         "gh_shim": {"binary_path": "example/path"}, "git": {"co_author": "off"},
         "restrict_to_project_root": false,
         "semantic": {"backend": "fastembed", "model": "example-model", "timeout_ms": 1234},
@@ -218,23 +217,47 @@ fn config_settings_accepts_mac_user_shape_except_for_subc_0_1_3_env_singleton() 
         "github": {"read": false, "write": false}, "disabled_tools": [],
         "indexes": {"trigram": false, "semantic": false}
     });
-    // subc-config 0.1.3 src/schema.rs:844–846 mistakes a sole `env` property
-    // for a value reference even when the object declares that property.
-    let refusal = schema
-        .validate_layer(Layer::User, &value, &context)
-        .expect_err(
-            "remove this expected refusal once Subconscious accepts a declared env property",
-        );
-    assert_eq!(refusal.code, RefusalCode::ValueInvalid);
-    assert_eq!(refusal.path, "/harnesses/opencode/bash");
-    value["harnesses"]["opencode"]["bash"]["rewrite"] = json!(false);
     schema
         .validate_layer(Layer::User, &value, &context)
         .unwrap();
+    let effective = schema
+        .review_tuple(&[LayerValue::new(Layer::User, value.clone())], &context)
+        .unwrap()
+        .effective;
+    assert_eq!(
+        effective.pointer("/harnesses/opencode/bash"),
+        value.pointer("/harnesses/opencode/bash")
+    );
 }
 
 #[test]
-fn config_settings_shell_provider_keeps_its_existing_tagged_file_shapes() {
+fn config_settings_shell_provider_stays_absent_in_a_blank_effective_view() {
+    let schema = validated();
+    let provider = &schema.normalized()["properties"]["shell"]["properties"]["env_provider"];
+    assert_eq!(provider["type"], "object");
+    assert_eq!(provider["x-ck-required"], false);
+    assert!(provider.get("default").is_none());
+    assert!(provider["properties"]["timeout_ms"]["default"].is_number());
+
+    let blank = json!({});
+    let effective = schema
+        .review_tuple(
+            &[LayerValue::new(Layer::User, blank.clone())],
+            &ValidationContext::default(),
+        )
+        .unwrap()
+        .effective;
+    assert!(effective.pointer("/shell/env_provider").is_none());
+    let reviewed = crate::config_resolve::resolve_config(&[user_fixture(effective)]);
+    let ungated = crate::config_resolve::resolve_config(&[user_fixture(blank)]);
+    assert!(reviewed.errors.is_empty());
+    assert!(ungated.errors.is_empty());
+    assert!(reviewed.config.shell.env_provider.is_none());
+    assert_eq!(json!(reviewed.config), json!(ungated.config));
+}
+
+#[test]
+fn config_settings_shell_provider_keeps_its_existing_file_shapes() {
     let schema = validated();
     let context = ValidationContext::default();
     for provider in [
@@ -247,10 +270,18 @@ fn config_settings_shell_provider_keeps_its_existing_tagged_file_shapes() {
             .review_tuple(&[LayerValue::new(Layer::User, value.clone())], &context)
             .unwrap()
             .effective;
-        assert_eq!(
-            effective.pointer("/shell/env_provider"),
-            value.pointer("/shell/env_provider")
-        );
+        let mut expected = value["shell"]["env_provider"].clone();
+        expected
+            .as_object_mut()
+            .unwrap()
+            .entry("timeout_ms")
+            .or_insert(json!(2000));
+        expected
+            .as_object_mut()
+            .unwrap()
+            .entry("watch")
+            .or_insert(json!([]));
+        assert_eq!(effective["shell"]["env_provider"], expected);
     }
     for text in [
         include_str!(
@@ -268,9 +299,13 @@ fn config_settings_shell_provider_keeps_its_existing_tagged_file_shapes() {
             .review_tuple(&[LayerValue::new(Layer::User, value.clone())], &context)
             .unwrap()
             .effective;
-        for path in ["/shell/env_provider", "/harnesses/pi/shell/env_provider"] {
-            assert_eq!(effective.pointer(path), value.pointer(path));
-        }
+        let harness = Some(&crate::harness::Harness::Pi);
+        let reviewed =
+            crate::config_resolve::resolve_config_for_harness(&[user_fixture(effective)], harness);
+        let ungated =
+            crate::config_resolve::resolve_config_for_harness(&[user_fixture(value)], harness);
+        assert_eq!(reviewed.errors, ungated.errors);
+        assert_eq!(reviewed.config.shell, ungated.config.shell);
     }
 }
 

@@ -15,12 +15,6 @@ pub fn settings_declaration() -> Value {
     let overrides = harness::fields(fields);
     let harnesses = fields.get_mut("harnesses").expect("harness map");
     harnesses["additionalProperties"] = json!({"type": "object", "properties": overrides});
-    make_provider_union(&mut schema["properties"]["shell"]["properties"]["env_provider"]);
-    // The harness projection also permits the provider, but never its defaults.
-    make_provider_union(
-        &mut schema["properties"]["harnesses"]["additionalProperties"]["properties"]["shell"]
-            ["properties"]["env_provider"],
-    );
     for key in ["root_ttl_minutes", "checkout_hours"] {
         let idle = schema["properties"]["idle"]["properties"][key]
             .as_object_mut()
@@ -55,35 +49,6 @@ fn setup_sections(fields: &mut Value) {
     }
 }
 
-// An ordinary properties object would synthesize an invalid, kind-less provider
-// in the effective view even when the user omitted it. Each existing kind is
-// already a discriminator, so keep the same file shape as a tagged union.
-fn make_provider_union(schema: &mut Value) {
-    let node = schema.as_object_mut().expect("shell provider schema");
-    let mut branch = Value::Object(std::mem::take(node));
-    schema["description"] = branch
-        .as_object_mut()
-        .unwrap()
-        .remove("description")
-        .expect("shell provider description");
-    let kinds = branch["properties"]["kind"]
-        .as_object_mut()
-        .unwrap()
-        .remove("enum")
-        .expect("shell provider kinds");
-    schema["oneOf"] = Value::Array(
-        kinds
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|kind| {
-                branch["properties"]["kind"]["const"] = kind.clone();
-                branch.clone()
-            })
-            .collect(),
-    );
-}
-
 fn declare(
     schema: &mut Value,
     path: &str,
@@ -96,6 +61,7 @@ fn declare(
     let default = if harness {
         None
     } else if path.starts_with("shell.env_provider.") {
+        // These member defaults apply only when a provider is selected.
         default.or(positional_default.as_ref())
     } else {
         default
