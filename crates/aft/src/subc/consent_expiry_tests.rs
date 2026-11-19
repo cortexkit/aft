@@ -88,7 +88,8 @@ fn file(path: &Path) -> AccessGrant {
 
 async fn park_call(f: &Fixture) {
     let target = f.head_root.join("shared.txt");
-    let call = scope_probe_call(f, &target);
+    let mut call = scope_probe_call(f, &target);
+    call.arguments = json!({"filePath":target});
     let owner = SettlementOwner::new(&call);
     let result = hold(
         &call,
@@ -443,6 +444,7 @@ async fn consent_expiry_lost_withdrawal_reply_refiles_and_honors_the_fresh_answe
         .unwrap()
         .unwrap();
     assert!(text(&serde_json::from_slice(&reply.body).unwrap()).contains("head-owned contents"));
+    assert!(f.asks().is_empty());
     assert_eq!(
         f.fake
             .calls("consent.request")
