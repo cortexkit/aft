@@ -21,8 +21,38 @@ pub fn settings_declaration() -> Value {
         &mut schema["properties"]["harnesses"]["additionalProperties"]["properties"]["shell"]
             ["properties"]["env_provider"],
     );
+    for key in ["root_ttl_minutes", "checkout_hours"] {
+        let idle = schema["properties"]["idle"]["properties"][key]
+            .as_object_mut()
+            .expect("idle setting schema");
+        idle.remove("not");
+        idle.insert("type".into(), json!("integer"));
+    }
     declare(&mut schema, "", Some(&defaults::values()), "", false);
+    setup_sections(&mut schema["properties"]);
     schema
+}
+
+fn setup_sections(fields: &mut Value) {
+    for (feature, title, order, recommended) in [
+        (
+            "github",
+            "GitHub",
+            10,
+            json!({"/github/read": true, "/github/shim": false}),
+        ),
+        (
+            "remote_exec",
+            "Remote runs",
+            20,
+            json!({"/remote_exec/enabled": true}),
+        ),
+        ("semantic", "Meaning search", 30, json!({})),
+    ] {
+        fields[feature]["title"] = json!(title);
+        fields[feature]["x-ck-setup"] =
+            json!({"feature": feature, "order": order, "recommended": recommended});
+    }
 }
 
 // An ordinary properties object would synthesize an invalid, kind-less provider
@@ -94,19 +124,12 @@ fn declare(
         node.insert("x-ck-required".into(), json!(false));
     }
     let structural = node.get("type") == Some(&json!("object"));
-    // Keep the resolver's warnings for unknown root-entry properties and
-    // invalid idle values rather than rejecting those values at the gate.
-    if matches!(
-        path,
-        "index.roots.*" | "idle.root_ttl_minutes" | "idle.checkout_hours"
-    ) {
-        node.insert("x-ck-kind".into(), json!("json"));
-        node.entry("description").or_insert(json!(description));
-        return;
-    }
     if structural {
         node.insert("unevaluatedProperties".into(), json!(false));
-        if let Some(values) = node.remove("additionalProperties").filter(Value::is_object) {
+        let additional = node.remove("additionalProperties");
+        // The resolver only warns about unknown index entry fields when it
+        // reads a file directly. Subconscious accepts only path and indexes.
+        if let Some(values) = additional.filter(|v| v.is_object() && path != "index.roots.*") {
             node.insert("patternProperties".into(), json!({MAP_KEY: values}));
         }
     } else {

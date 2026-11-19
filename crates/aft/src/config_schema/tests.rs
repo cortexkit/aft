@@ -271,3 +271,78 @@ fn config_settings_shell_provider_keeps_its_existing_tagged_file_shapes() {
         }
     }
 }
+
+#[test]
+fn config_settings_gate_requires_whole_number_idle_windows() {
+    let schema = validated();
+    let context = ValidationContext::default();
+    for key in ["root_ttl_minutes", "checkout_hours"] {
+        let fraction = json!({"idle":{(key): 5.5}});
+        let refused = schema
+            .validate_layer(Layer::User, &fraction, &context)
+            .unwrap_err();
+        assert_eq!(refused.path, format!("/idle/{key}"));
+        assert_eq!(refused.code, RefusalCode::ValueInvalid);
+        let resolved = crate::config_resolve::resolve_config(&[user_fixture(fraction)]);
+        assert!(resolved.errors.is_empty());
+        assert!(resolved
+            .warnings
+            .iter()
+            .any(|warning| warning.key == format!("idle.{key}")));
+        schema
+            .validate_layer(Layer::User, &json!({"idle":{(key): 6}}), &context)
+            .unwrap();
+    }
+}
+
+#[test]
+fn config_settings_gate_closes_each_standing_index_root() {
+    let schema = validated();
+    let context = ValidationContext::default();
+    let path = if cfg!(windows) {
+        "C:/example"
+    } else {
+        "/example"
+    };
+    let value = json!({"index":{"roots":[{"path":path,"indexes":["search"]}]}});
+    schema
+        .validate_layer(Layer::User, &value, &context)
+        .unwrap();
+    let mut with_extra = value;
+    with_extra["index"]["roots"][0]["unexpected"] = json!(true);
+    let refused = schema
+        .validate_layer(Layer::User, &with_extra, &context)
+        .unwrap_err();
+    assert_eq!(refused.path, "/index/roots/0/unexpected");
+    assert_eq!(refused.code, RefusalCode::ValueInvalid);
+    let resolved = crate::config_resolve::resolve_config(&[user_fixture(with_extra)]);
+    assert!(resolved.errors.is_empty());
+    assert_eq!(resolved.config.index.roots[0].path, path);
+    assert!(resolved
+        .warnings
+        .iter()
+        .any(|warning| warning.code == "unknown_index_root_field"));
+}
+
+#[test]
+fn config_settings_has_three_top_level_setup_sections() {
+    let schema = validated();
+    let marks: serde_json::Map<_, _> = schema.normalized()["properties"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter_map(|(name, field)| Some((name.clone(), field.get("x-ck-setup")?.clone())))
+        .collect();
+    assert_eq!(
+        Value::Object(marks),
+        json!({
+            "github": {"feature":"github", "order":10, "recommended":{
+                "/github/read":true, "/github/shim":false
+            }},
+            "remote_exec": {"feature":"remote_exec", "order":20, "recommended":{
+                "/remote_exec/enabled":true
+            }},
+            "semantic": {"feature":"semantic", "order":30, "recommended":{}}
+        })
+    );
+}
