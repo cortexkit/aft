@@ -40,6 +40,32 @@ test("doctor cache root uses the user base and ignores harness and project redir
   }
 });
 
+test("doctor treats legacy and current cache choices alike", () => {
+  const scratch = mkdtempSync(join(tmpdir(), "aft-cache-doctor-"));
+  try {
+    const user = join(scratch, "user.jsonc");
+    for (const [cacheDir, expected] of [
+      ["~/cache", join(scratch, "cache")],
+      [{ kind: "dir", path: "~/cache" }, join(scratch, "cache")],
+      [null, undefined],
+      [{ kind: "main_disk" }, undefined],
+      [{ kind: "default" }, undefined],
+      [undefined, undefined],
+    ] as const) {
+      writeFileSync(user, JSON.stringify({ storage: { cache_dir: cacheDir } }));
+      const result = evaluatePluginLoad({
+        userConfigPath: user,
+        projectDirectory: scratch,
+        harness: "opencode",
+        home: scratch,
+      });
+      expect(result.cacheDir).toBe(expected);
+    }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
 test("doctor storage status names the separate configured cache root", () => {
   const harness = {
     pluginRegistered: true,

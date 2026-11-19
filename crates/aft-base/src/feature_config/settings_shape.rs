@@ -35,7 +35,25 @@ impl Edit {
     }
 }
 
-pub(crate) fn edits(block: &Map<String, Value>, tier: super::DocumentTier) -> Vec<Edit> {
+pub(crate) fn cache_dir_replacement(value: &Value) -> Option<(Value, &'static str)> {
+    match value {
+        Value::Null => Some((
+            json!({"kind": "main_disk"}),
+            "storage.cache_dir null → storage.cache_dir main_disk",
+        )),
+        Value::String(path) => Some((
+            json!({"kind": "dir", "path": path}),
+            "storage.cache_dir string → storage.cache_dir dir",
+        )),
+        _ => None,
+    }
+}
+
+pub(crate) fn edits(
+    block: &Map<String, Value>,
+    tier: super::DocumentTier,
+    is_base: bool,
+) -> Vec<Edit> {
     let mut edits = Vec::new();
     if let Some(enabled) = block.get("bash").and_then(Value::as_bool) {
         let value = if enabled {
@@ -84,6 +102,14 @@ pub(crate) fn edits(block: &Map<String, Value>, tier: super::DocumentTier) -> Ve
             }
         }
     }
+    if let Some((value, notice)) = block
+        .get("storage")
+        .and_then(|storage| storage.get("cache_dir"))
+        .filter(|value| !value.is_null() || (is_base && tier == super::DocumentTier::User))
+        .and_then(cache_dir_replacement)
+    {
+        edits.push(Edit::at(&["storage", "cache_dir"], Some(value), notice));
+    }
     if let Some(mirrors) = block
         .get("inspect")
         .and_then(|v| v.get("duplicates"))
@@ -115,8 +141,8 @@ pub(crate) fn edits(block: &Map<String, Value>, tier: super::DocumentTier) -> Ve
     edits
 }
 
-/// Only the cache setting distinguishes null from omission. JSON embedded in
-/// initialization text is not part of the settings structure.
+/// Find null after translating legacy spellings. The project-base legacy
+/// cache opt-out was accepted but ignored; null in a harness was invalid.
 pub(crate) fn null_path(block: &Map<String, Value>) -> Option<String> {
     fn check(value: &Value, path: &mut Vec<String>) -> Option<String> {
         match value {

@@ -4,15 +4,18 @@ import { isAbsolute, parse as parsePath, resolve as resolvePath } from "node:pat
 import {
   type AftConfigFileMigrationResult,
   CALLGRAPH_CHUNK_KEY,
+  type CacheDirChoice,
   ConfigRejectedError,
   type ConfigTier,
   DATA_LAYER_RETIRED_PATHS,
   DEFAULT_DISABLED_TOOLS,
   DEFAULT_WORKER_WAIT_MAX_MS,
   deliverMigrationNoticeOnce,
+  hasMalformedCacheDirChoice,
   IDLE_CHECKOUT_HOURS_MAX,
   IDLE_CHECKOUT_HOURS_MIN,
   isBlockedBashEnvKey,
+  isCacheDirChoice,
   isProjectBlockedBashEnvKey,
   legacyConfigNoticeMessage,
   legacyProjectConfigLocationNotice,
@@ -705,7 +708,9 @@ const AftConfigFieldsSchema = z.object({
   /** User-configured filesystem roots for indexed search; project config cannot change them. */
   index: IndexConfigSchema.optional(),
   /** Only the user config's top level may select this existing directory. Caches live in its `aft` child; an unavailable directory disables caches instead of writing them under the storage root. */
-  storage: z.object({ cache_dir: z.string().nullable().optional() }).optional(),
+  storage: z
+    .object({ cache_dir: z.custom<CacheDirChoice>(isCacheDirChoice).optional() })
+    .optional(),
   /** User-base-only macOS file flush policy. Full drive-cache flushes default off. */
   durability: z.object({ macos_full_sync: z.boolean().optional() }).strict().optional(),
   /** Machine-local limits; only the user config base may select a profile. */
@@ -1628,6 +1633,8 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   }
   if (invalidNull !== undefined)
     throw new ConfigRejectedError([`invalid_config_null:${invalidNull}`], configPath);
+  if (tier === "user" && hasMalformedCacheDirChoice(normalized))
+    throw new ConfigRejectedError(["invalid_cache_config: storage.cache_dir"], configPath);
   let parsed: AftConfig | null;
   if (result.success) {
     log(`Config loaded from ${configPath}`);

@@ -1137,6 +1137,76 @@ fn automatic_user_rewrite_moves_idle_checkout_hours_but_keeps_removed_keys() {
 }
 
 #[test]
+fn storage_cache_dir_rewrites_legacy_user_values_without_changing_resolution() {
+    use crate::config_resolve::{resolve_config, ConfigTier};
+    use serde_json::json;
+
+    let temp = tempfile::tempdir().unwrap();
+    let user = temp.path().join("aft.jsonc");
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let resolve = |doc: &str| {
+        resolve_config(&[ConfigTier {
+            tier: "user".into(),
+            source: user.display().to_string(),
+            doc: doc.into(),
+        }])
+    };
+    for (legacy, choice, expected_dir, opt_out, replacement) in [
+        (
+            "null",
+            json!({"kind": "main_disk"}),
+            None,
+            true,
+            "storage.cache_dir null → storage.cache_dir main_disk",
+        ),
+        (
+            r#""~/aft-cache""#,
+            json!({"kind": "dir", "path": "~/aft-cache"}),
+            Some(home.join("aft-cache")),
+            false,
+            "storage.cache_dir string → storage.cache_dir dir",
+        ),
+    ] {
+        let legacy = format!(r#"{{"storage":{{"cache_dir":{legacy}}}}}"#);
+        std::fs::write(&user, &legacy).unwrap();
+        let Some(UserConfigMigration::Migrated { backup, notice, .. }) =
+            auto_migrate_user_config(&user)
+        else {
+            panic!("legacy cache choice should be rewritten: {legacy}");
+        };
+        assert!(notice.contains(replacement), "{notice}");
+        assert_eq!(std::fs::read_to_string(backup).unwrap(), legacy);
+        let rewritten = std::fs::read_to_string(&user).unwrap();
+        let raw: Value = serde_json::from_str(&rewritten).unwrap();
+        assert_eq!(raw["storage"]["cache_dir"], choice);
+        for doc in [&legacy, &rewritten] {
+            let result = resolve(doc);
+            assert!(result.errors.is_empty(), "{doc}: {:?}", result.errors);
+            assert_eq!(result.config.cache_dir, expected_dir);
+            assert_eq!(result.config.cache_dir_opt_out, opt_out);
+            assert!(result.config.cache_config_unknown.is_none());
+        }
+        assert!(auto_migrate_user_config(&user).is_none());
+    }
+
+    for doc in [
+        r#"{"storage":{}}"#,
+        r#"{"storage":{"cache_dir":{"kind":"default"}}}"#,
+    ] {
+        std::fs::write(&user, doc).unwrap();
+        assert!(auto_migrate_user_config(&user).is_none());
+        assert_eq!(std::fs::read_to_string(&user).unwrap(), doc);
+        let result = resolve(doc);
+        assert!(result.errors.is_empty());
+        assert!(result.config.cache_dir.is_none());
+        assert!(!result.config.cache_dir_opt_out);
+    }
+}
+
+#[test]
 fn settings_shapes_rewrite_user_with_backup_and_project_with_notice() {
     use serde_json::json;
 

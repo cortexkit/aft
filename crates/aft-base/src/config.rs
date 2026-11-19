@@ -954,7 +954,7 @@ pub struct Config {
     /// The user document could not establish whether a cache volume was selected.
     #[serde(skip)]
     pub cache_config_unknown: Option<String>,
-    /// The user config sets `storage.cache_dir` to null: caches deliberately
+    /// The user config selects `storage.cache_dir.kind: main_disk`: caches deliberately
     /// return to the storage root even if it earlier used a cache directory.
     #[serde(skip)]
     pub cache_dir_opt_out: bool,

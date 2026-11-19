@@ -68,13 +68,13 @@ pub fn editor_schema() -> Value {
     fields.get_mut("harnesses").expect("harness schema")["additionalProperties"] = json!({
         "properties": harness_fields,
     });
-    exclude_null(&mut schema, &["storage", "cache_dir"]);
+    exclude_null(&mut schema);
     schema
 }
 
-// Rust uses Option for presence. In JSONC an omitted setting is allowed, but
-// an explicit null is not, except for the storage cache opt-out.
-fn exclude_null(schema: &mut Value, cache_exception: &[&str]) {
+// Rust uses Option for presence. Settings may be omitted, but explicit null
+// is not part of the current settings format.
+fn exclude_null(schema: &mut Value) {
     if *schema == Value::Bool(true) {
         *schema = json!({"not": {"type": "null"}});
         return;
@@ -99,25 +99,25 @@ fn exclude_null(schema: &mut Value, cache_exception: &[&str]) {
         if let Some(Value::Array(branches)) = node.get_mut(keyword) {
             branches.retain(|branch| branch.get("type").and_then(Value::as_str) != Some("null"));
             for branch in branches {
-                exclude_null(branch, cache_exception);
+                exclude_null(branch);
             }
         }
     }
     if let Some(Value::Object(fields)) = node.get_mut("properties") {
-        for (name, child) in fields {
-            match cache_exception.split_first() {
-                Some((part, [])) if name == *part => {}
-                Some((part, rest)) if name == *part => exclude_null(child, rest),
-                _ => exclude_null(child, &[]),
-            }
+        for child in fields.values_mut() {
+            exclude_null(child);
         }
     }
     for keyword in ["items", "additionalProperties"] {
         if let Some(child) = node.get_mut(keyword) {
-            exclude_null(child, &[]);
+            exclude_null(child);
         }
     }
-    if !node.contains_key("type") && !node.contains_key("const") && !node.contains_key("not") {
+    if !node.contains_key("type")
+        && !node.contains_key("const")
+        && !node.contains_key("not")
+        && !node.contains_key("oneOf")
+    {
         node.insert("not".into(), json!({"type": "null"}));
     }
 }
@@ -222,6 +222,12 @@ mod tests {
             {
                 continue;
             }
+            if key.0.ends_with(".storage.cache_dir") {
+                assert!(actual
+                    .get(&key)
+                    .is_some_and(|actual| actual.starts_with(text)));
+                continue;
+            }
             assert_eq!(
                 actual.get(&key),
                 Some(&text),
@@ -271,9 +277,20 @@ mod tests {
         assert_eq!(pair["properties"]["mirror"]["type"], "string");
         let options = schema.pointer("/properties/lsp/properties/servers/additionalProperties/properties/initialization_options").unwrap();
         assert_eq!(options["type"], "string");
-        assert_eq!(
-            fields["storage"]["properties"]["cache_dir"]["type"],
-            json!(["string", "null"])
-        );
+        let cache = &fields["storage"]["properties"]["cache_dir"];
+        let choices = cache["oneOf"].as_array().unwrap();
+        assert_eq!(choices.len(), 3);
+        for (choice, kind) in choices.iter().zip(["default", "main_disk", "dir"]) {
+            assert_eq!(choice["type"], "object");
+            assert_eq!(choice["properties"]["kind"]["const"], kind);
+            assert_eq!(choice["additionalProperties"], false);
+            if kind == "dir" {
+                assert_eq!(choice["properties"]["path"]["type"], "string");
+                assert_eq!(choice["required"], json!(["kind", "path"]));
+            } else {
+                assert!(choice["properties"].get("path").is_none());
+                assert_eq!(choice["required"], json!(["kind"]));
+            }
+        }
     }
 }

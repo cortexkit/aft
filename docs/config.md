@@ -125,7 +125,7 @@ Set this **at the top level of the user config only** to keep large, rebuildable
 
 ```jsonc
 {
-  "storage": { "cache_dir": "/Volumes/AFT-Caches" }
+  "storage": { "cache_dir": { "kind": "dir", "path": "/Volumes/AFT-Caches" } }
 }
 ```
 
@@ -137,7 +137,7 @@ After first successful use, AFT remembers the configured directory's device/inod
 
 The artifact root, `<storage.cache_dir>/aft`, contains `views/`, `blobs/`, `callgraph/`, `semantic/` (including local embedding and reranker models), `index/`, `symbols/` and `inspect/`. Views and blobs always share this root and volume. Writer leases, reader markers, publication temporaries and retention trash stay beside their cache artifacts, so moving caches does not introduce cross-volume publish or retirement renames. Health, memory census and `aft doctor` report the cache location. `AFT_CACHE_DIR` still controls downloaded binaries and language-server packages; it is not this setting.
 
-Leaving the setting unset preserves the existing layout for a storage root that has never used a cache directory. Once a storage root has kept its caches in a cache directory, removing the setting (or losing it to a typo or a missing user config) keeps caches off with `cache_dir_unavailable`: `storage.cache_dir is not set, but this storage root's caches live on <parent>; set it again, or set "cache_dir": null to move caches back to the primary disk.` Set `"storage": { "cache_dir": null }` to deliberately return caches to the storage root. Storage sections and storage-like misspellings (such as `storge` or `cachedir`) are `invalid_cache_config` errors, not defaults. Unknown sections whose values contain `cache_dir` and section names within two single-character edits of `storage` are treated as storage-like; unrelated unknown keys retain the existing warning/partial-load behavior. The distinct process-state name `storage_dir` is not interpreted as a cache-parent selector. Durable state stays in the storage root selected above: `aft.db` and its WAL/SHM, checkpoints, harness backups and bash tasks, shims, retention metadata, artifact-owner manifests, dSYMs, logs, `engram-catalog.json` and `trusted-filter-projects.json`. ENGRAM's catalog remains relative to that storage root and declares only folders that actually exist there; caches on another volume are not catalog entries.
+Leaving the setting unset or choosing `{"kind": "default"}` preserves the existing layout for a storage root that has never used a cache directory. Once a storage root has kept its caches in a cache directory, choosing `default` or removing the setting keeps caches off with `cache_dir_unavailable`. Choose `{"kind": "main_disk"}` to deliberately return caches to the storage root. AFT rewrites older values on load: a path string becomes `{"kind": "dir", "path": "…"}` and `null` becomes `{"kind": "main_disk"}`. Storage sections and storage-like misspellings (such as `storge` or `cachedir`) are `invalid_cache_config` errors, not defaults. Unknown sections whose values contain `cache_dir` and section names within two single-character edits of `storage` are treated as storage-like; unrelated unknown keys retain the existing warning/partial-load behavior. The distinct process-state name `storage_dir` is not interpreted as a cache-parent selector. Durable state stays in the storage root selected above: `aft.db` and its WAL/SHM, checkpoints, harness backups and bash tasks, shims, retention metadata, artifact-owner manifests, dSYMs, logs, `engram-catalog.json` and `trusted-filter-projects.json`. ENGRAM's catalog remains relative to that storage root and declares only folders that actually exist there; caches on another volume are not catalog entries.
 
 Changing the setting builds fresh caches; nothing is migrated. Stop AFT sessions using the storage root being cleaned. Updated cache-using processes, including standalone sessions and `aft index`, hold a shared kernel lock at `<storage_dir>/retention/daemon-use.lock` before cache access; the main process retains it until the main process exits. Configuration snapshots hold a lease for any additional storage root they select. Cleanup takes the same lock exclusively before preparing cache namespaces and retains it across inventory, confirmation and deletion. For this release's upgrade window, a conservative host-wide subc-daemon check additionally refuses cleanup while a daemon is running, including older daemon versions that do not hold the root lock. Stop those daemons before cleanup. `aft doctor --fix` reclaims only `views/`, `blobs/`, `callgraph/`, `semantic/`, `index/`, `symbols/` and `inspect/` inside recorded, marked, inactive artifact roots. It never removes unmarked folders under the durable storage root.
 
@@ -268,7 +268,7 @@ notice. Run `npx @cortexkit/aft doctor --fix` to remove it.
 - `index.roots`: List the folders to index, with a path and a list of indexes to build for each folder. The default is an empty list.
 - `type_checker_timeout_secs`: Maximum time in seconds for an external type checker to run. The default is 30 seconds.
 
-Omit an optional setting instead of using `null`. The exception is `storage.cache_dir`, where `null` explicitly moves caches back to primary storage.
+Omit an optional setting instead of using `null`.
 
 ```jsonc
 {
@@ -278,7 +278,7 @@ Omit an optional setting instead of using `null`. The exception is `storage.cach
 
    // Optional existing rebuildable-cache parent, user base only. Omit to keep
    // the default storage-root layout. See "Rebuildable cache root" above.
-   // "storage": { "cache_dir": "/existing/cache-parent" },
+   // "storage": { "cache_dir": { "kind": "dir", "path": "/existing/cache-parent" } },
 
    // Optional machine-local profile; user base only. Omit for automatic choice.
    // "memory": "balanced",
