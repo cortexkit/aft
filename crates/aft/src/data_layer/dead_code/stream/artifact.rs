@@ -22,46 +22,66 @@ pub(crate) fn write(path: &Path, rows: &Rows<'_>, snapshot: &CallgraphSnapshot) 
 
 fn write_rows(out: &mut impl Write, rows: &Rows<'_>, snapshot: &CallgraphSnapshot) -> Result<()> {
     let mut roots = BTreeMap::<_, BTreeSet<_>>::new();
-    out.write_all(b"{\"calls\":[")?;
-    let mut calls = List::new(out);
-    rows.compare(snapshot, |file, facts| -> Result<()> {
-        for call in facts.calls {
-            calls.item(call)?;
+    // Match the object order of the non-streaming JSON Value even if another
+    // crate enables serde_json's preserve_order feature through Cargo.
+    let keys = json!({"files": null, "exports": null, "calls": null, "entry_points": null,
+        "entry_point_symbols": null, "go_initializers": null});
+    out.write_all(b"{")?;
+    for (index, key) in keys.as_object().unwrap().keys().enumerate() {
+        if index != 0 {
+            out.write_all(b",")?;
         }
-        if !facts.roots.is_empty() {
-            roots
-                .entry(file.to_path_buf())
-                .or_default()
-                .extend(facts.roots);
-        }
-        Ok(())
-    })?;
-    out.write_all(b"],\"entry_point_symbols\":")?;
-    serde_json::to_writer(&mut *out, &serde_json::to_value(roots)?)?;
-    out.write_all(b",\"entry_points\":")?;
-    serde_json::to_writer(&mut *out, &snapshot.entry_points)?;
-    out.write_all(b",\"exports\":[")?;
-    let mut exports = List::new(out);
-    for (_, path) in rows.paths() {
-        for export in rows.exports(path)? {
-            exports.item(export)?;
+        serde_json::to_writer(&mut *out, key)?;
+        out.write_all(b":")?;
+        match key.as_str() {
+            "files" => serde_json::to_writer(&mut *out, &snapshot.files)?,
+            "entry_points" => serde_json::to_writer(&mut *out, &snapshot.entry_points)?,
+            "entry_point_symbols" => {
+                serde_json::to_writer(&mut *out, &serde_json::to_value(&roots)?)?
+            }
+            "exports" => {
+                let mut exports = List::start(out)?;
+                for (_, path) in rows.paths() {
+                    for export in rows.exports(path)? {
+                        exports.item(export)?;
+                    }
+                }
+                exports.end()?;
+            }
+            "calls" => {
+                let mut calls = List::start(out)?;
+                rows.compare(snapshot, |file, facts| -> Result<()> {
+                    for call in facts.calls {
+                        calls.item(call)?;
+                    }
+                    if !facts.roots.is_empty() {
+                        roots
+                            .entry(file.to_path_buf())
+                            .or_default()
+                            .extend(facts.roots);
+                    }
+                    Ok(())
+                })?;
+                calls.end()?;
+            }
+            "go_initializers" => {
+                let mut groups = List::start(out)?;
+                // Unlike calls and exports, initializer groups are sorted by store path.
+                for path in rows.go_paths() {
+                    if let Some(group) = rows.file(path)?.go {
+                        groups.item(json!({
+                            "caller_file": group.caller_file,
+                            "callers": group.callers,
+                            "targets": group.targets.iter().map(|(file, symbol)| (file.as_ref(), symbol.as_ref())).collect::<Vec<_>>(),
+                        }))?;
+                    }
+                }
+                groups.end()?;
+            }
+            _ => unreachable!("the artifact keys are defined above"),
         }
     }
-    out.write_all(b"],\"files\":")?;
-    serde_json::to_writer(&mut *out, &snapshot.files)?;
-    out.write_all(b",\"go_initializers\":[")?;
-    let mut groups = List::new(out);
-    // Unlike calls and exports, initializer groups are sorted by store path.
-    for path in rows.go_paths() {
-        if let Some(group) = rows.file(path)?.go {
-            groups.item(json!({
-                "caller_file": group.caller_file,
-                "callers": group.callers,
-                "targets": group.targets.iter().map(|(file, symbol)| (file.as_ref(), symbol.as_ref())).collect::<Vec<_>>(),
-            }))?;
-        }
-    }
-    out.write_all(b"]}")?;
+    out.write_all(b"}")?;
     Ok(())
 }
 
@@ -71,15 +91,22 @@ struct List<'a, W> {
 }
 
 impl<'a, W: Write> List<'a, W> {
-    fn new(out: &'a mut W) -> Self {
-        Self { out, first: true }
+    fn start(out: &'a mut W) -> Result<Self> {
+        out.write_all(b"[")?;
+        Ok(Self { out, first: true })
+    }
+
+    fn end(self) -> Result<()> {
+        self.out.write_all(b"]")?;
+        Ok(())
     }
 
     fn item(&mut self, item: impl Serialize) -> Result<()> {
         if !std::mem::take(&mut self.first) {
             self.out.write_all(b",")?;
         }
-        // Sort object keys as in the gate's JSON artifact format.
+        // Match serde_json::Value's object order instead of serializing
+        // directly in Rust struct field order.
         serde_json::to_writer(&mut *self.out, &serde_json::to_value(item)?)?;
         Ok(())
     }

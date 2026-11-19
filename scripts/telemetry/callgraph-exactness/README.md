@@ -11,10 +11,11 @@ Run from the repository root on the build server. Use one
 `linux,16c,32gb,net` job at a time (build-server jobs are capped at 32 GB; a
 project whose comparison needs more runs on a rented machine). Commit the
 candidate before submitting the job.
-`build.py` archives the named source revision and overlays only the test probe,
-its feature-gated module declarations, the feature-gated negative-control hook,
-and the dead-code comparison entry point. It does **not** copy today's resolver
-over the reference. Each source archive has a separate Cargo target directory.
+`build.py` archives the named revision, then adds the gate executable, a
+test-only hook that changes one dispatch target for the negative control, and
+the streaming dead-code check. It lets the gate discard each caller's decoded
+symbols after comparison without replacing the archived resolver or dead-code
+rules. Each archive has a separate Cargo target directory.
 
 ```sh
 git log -1
