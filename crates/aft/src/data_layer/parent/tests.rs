@@ -339,11 +339,18 @@ fn parent_loading_child_walks_until_ready_then_returns_to_indexed_grep_and_glob(
         assert!(indexed["fallback"].is_null());
         assert!(gaps(&indexed).is_empty());
         assert!(!indexed["text"].as_str().unwrap().contains("[index:"));
+        crate::search_index::audit_work_reset();
         let indexed_glob = glob(parent, "**/*.rs");
         assert_eq!(files(&indexed_glob), expected, "{indexed_glob:#}");
         assert_eq!(indexed_glob["complete"], true);
         assert!(indexed_glob["fallback"].is_null());
         assert!(gaps(&indexed_glob).is_empty());
+        let work = crate::search_index::audit_work();
+        assert_eq!(
+            work.sort_stats, 0,
+            "warm glob should sort with indexed times"
+        );
+        assert_eq!(work.sort_canonicalizes, 0);
     });
 }
 
