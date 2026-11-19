@@ -8455,9 +8455,11 @@ export function bannerUnused() {}
         // Every call row too, though dead code reads them file by file.
         let rows = |view: &crate::data_layer::checkout::CheckoutView| {
             parts(
-                &view
-                    .rows_dead_code_snapshot(&crate::inspect::InspectEntryPoints)
-                    .expect("every call row"),
+                &crate::data_layer::dead_code::stream::Rows::fixture_snapshot(
+                    view,
+                    &crate::inspect::InspectEntryPoints,
+                )
+                .expect("every call row"),
             )
         };
         assert_eq!(rows(&checkout.view().expect("view")), rows(&cold_view));

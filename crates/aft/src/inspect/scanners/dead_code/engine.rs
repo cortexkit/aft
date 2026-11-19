@@ -34,6 +34,9 @@ use crate::data_layer::dead_code_graph::{CallGraphFiles, DeadCodeGraph, SeedClas
 use crate::inspect::entry_points::ProjectRoles;
 use crate::inspect::FileContribution;
 
+mod rows_source;
+pub(crate) use rows_source::aggregate_with_rows;
+
 /// Files materialized together: their call-graph strings exist only while
 /// their batch is turned into numbers.
 const BATCH_FILES: usize = 256;

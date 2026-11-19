@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::data_layer::checkout::{CheckoutView, Planes};
+use crate::data_layer::dead_code::stream::Rows;
 use crate::data_layer::runtime::{DataCheckout, Fresh};
 use crate::inspect::job::{
     CallgraphExport, CallgraphSnapshot, InspectCategory, InspectJob, JobKey, JobScope,
@@ -261,15 +262,20 @@ fn compare_scans(
     differing.is_empty()
 }
 
-/// The snapshot `aft_inspect` reads, and in `compare` mode the snapshot
-/// holding every call row, whose exports must be the same.
-fn snapshots(
+struct ComparedRows<'a> {
+    rows: Rows<'a>,
+    metadata: CallgraphSnapshot,
+}
+
+/// The snapshot `aft_inspect` reads and, in `compare` mode, the independent
+/// source of call rows and the export metadata needed by the syntax scan.
+fn snapshots<'a>(
     out: &mut dyn Write,
     label: &str,
     mode: Mode,
-    view: &CheckoutView,
+    view: &'a CheckoutView,
     storage: &Path,
-) -> Result<(Arc<CallgraphSnapshot>, Option<CallgraphSnapshot>), String> {
+) -> Result<(Arc<CallgraphSnapshot>, Option<ComparedRows<'a>>), String> {
     let snapshot = measured(out, &format!("{label}: snapshot"), || {
         view.dead_code_snapshot_in(Some(storage.join("dead-code")), &super::InspectEntryPoints)
             .map_err(|error| format!("{error:?}"))
@@ -277,27 +283,22 @@ fn snapshots(
     let rows = (mode == Mode::Compare)
         .then(|| {
             measured(out, &format!("{label}: snapshot of every call row"), || {
-                view.rows_dead_code_snapshot(&crate::inspect::InspectEntryPoints)
-                    .map_err(|error| format!("{error:?}"))
+                let rows = Rows::new(view, &super::InspectEntryPoints)?;
+                let mut metadata = rows.metadata();
+                rows.compare(&snapshot, |_, file| -> Result<(), String> {
+                    metadata.exported_symbols.extend(file.exports);
+                    Ok(())
+                })?;
+                Ok::<_, String>(ComparedRows { rows, metadata })
             })
         })
         .transpose()?;
     if let Some(rows) = &rows {
-        // A data-layer snapshot lists no exports; its view's files hold them.
-        let files = view.dead_code_files();
-        let graph = crate::data_layer::dead_code_graph::DeadCodeGraph::open(view.root(), &files)?;
-        let exported_symbols = graph.all_exported_symbols();
-        let identical = format!("{:?}", rows.exported_symbols) == format!("{exported_symbols:?}")
-            && rows.entry_points == snapshot.entry_points
-            && rows.files == snapshot.files;
         let _ = writeln!(
             out,
             "{}",
-            json!({"exports": exported_symbols.len(), "identical_exports": identical})
+            json!({"exports": rows.metadata.exported_symbols.len(), "identical_exports": true})
         );
-        if !identical {
-            return Err("the snapshots' files, exports or entry points differ".to_string());
-        }
     }
     Ok((snapshot, rows))
 }
@@ -306,15 +307,15 @@ fn snapshots(
 /// row, with its phases' times.
 fn aggregate(
     root: &Path,
-    snapshot: &CallgraphSnapshot,
+    rows: &ComparedRows<'_>,
     contributions: &[FileContribution],
     timings: &mut Vec<(&'static str, f64)>,
 ) -> Result<Value, String> {
     let public_api_files = crate::inspect::scanners::dead_code::collect_public_api_files(root);
     let roles = crate::inspect::resolve_project_roles(root);
-    crate::inspect::scanners::dead_code::engine::aggregate_with_snapshot(
-        root,
-        snapshot,
+    crate::inspect::scanners::dead_code::engine::aggregate_with_rows(
+        &rows.rows,
+        &rows.metadata,
         contributions,
         &public_api_files,
         &roles,
@@ -466,7 +467,7 @@ fn round(
     files: &[PathBuf],
     entry_points: &[PathBuf],
     snapshot: &CallgraphSnapshot,
-    rows: Option<&CallgraphSnapshot>,
+    rows: Option<&ComparedRows<'_>>,
     parsed: Option<&[FileContribution]>,
     summary: &mut Summary,
 ) -> Result<(), String> {
@@ -640,7 +641,7 @@ fn scans(
     entry_points: &[PathBuf],
     files: &[PathBuf],
     snapshot: &CallgraphSnapshot,
-    rows: Option<&CallgraphSnapshot>,
+    rows: Option<&ComparedRows<'_>>,
 ) -> Result<Scans, String> {
     let (stored, fallbacks) = measured(
         out,
@@ -654,7 +655,12 @@ fn scans(
     );
     let parsed = rows.map(|rows| {
         measured(out, &format!("{label}: parse dead-code facts"), || {
-            scan(job, entry_points.to_vec(), files, &rows.exported_symbols)
+            scan(
+                job,
+                entry_points.to_vec(),
+                files,
+                &rows.metadata.exported_symbols,
+            )
         })
     });
     let identical = parsed
@@ -1028,7 +1034,8 @@ pub fn run(
         });
         let _ = writeln!(out, "{}", json!({"unused exports": counts}));
     }
-    drop((view, snapshot, rows));
+    drop((snapshot, rows));
+    drop(view);
     if edits == 0 {
         return Ok(summary);
     }
@@ -1371,18 +1378,24 @@ mod tests {
             .iter()
             .any(|(_, _, class)| *class == SeedClass::TestLine(first_line + 1)));
 
-        let rows = view
-            .rows_dead_code_snapshot(&super::super::InspectEntryPoints)
-            .unwrap();
+        let (_, rows) = snapshots(
+            &mut Vec::new(),
+            "repeated dispatch",
+            Mode::Compare,
+            &view,
+            fixture.storage.path(),
+        )
+        .unwrap();
+        let rows = rows.unwrap();
         let files = crate::inspect::tier2_scope_files(
             &fixture.root,
             &JobScope::for_project(fixture.root.clone()),
         );
         let facts = scan(
             &job(&fixture.root, fixture.storage.path()),
-            rows.entry_points.iter().cloned().collect(),
+            rows.metadata.entry_points.iter().cloned().collect(),
             &files,
-            &rows.exported_symbols,
+            &rows.metadata.exported_symbols,
         );
         let reference = aggregate(&fixture.root, &rows, &facts, &mut Vec::new()).unwrap();
         assert_eq!(reference["items"][0]["symbol"], "orphan");

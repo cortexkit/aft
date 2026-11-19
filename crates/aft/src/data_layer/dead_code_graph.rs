@@ -1,19 +1,9 @@
 //! The dead-code projection of a checkout's call graph, read one file at a
 //! time.
 //!
-//! [`super::dead_code::snapshot`] projects dead code's view of a call graph
-//! from [`GraphRows`](super::graph_rows::GraphRows), which hold every symbol,
-//! reference and edge of the checkout at once: on a large repository that is
-//! gigabytes of strings, and the snapshot it builds is gigabytes more. This
-//! projection gives the same answers by the same rules, but it holds only
-//! every file's symbols at once. A file's references are read when that file
-//! is projected, so a caller can turn one file's outbound calls into its own
-//! compact form and drop them before it projects the next file.
-//!
-//! Every rule here is the one `graph_rows::assemble` and `dead_code::snapshot`
-//! apply, restricted to one caller file: node ids and node replacement, the
-//! reference-to-edge join, method-call sites replacing ordinary edges, the
-//! members an unknown receiver keeps alive, and Go package initialization.
+//! The production rollup projects a caller's symbols and references when it
+//! needs them and drops the strings after encoding its graph. The gates
+//! compare this projection with the independently assembled graph rows.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -24,6 +14,7 @@ use super::dead_code::{path_key, Paths, OUTBOUND_KINDS};
 use super::graph_rows::{
     macro_body_call, ref_kind, references_by_key, EdgeRow, NodeRow, Nodes, RefRow,
 };
+
 use crate::callgraph_store::dead_code_projection::{
     is_method_dispatch_callee, is_resolved_edge, symbol_kind_from_label,
     UNRESOLVED_VALUE_PATH_PROVENANCE,
@@ -38,6 +29,8 @@ use crate::data_layer::dead_code_snapshot::DEFAULT_EXPORT_MARKER_KIND;
 use crate::data_layer::dead_code_snapshot::{
     CallgraphExport, CallgraphOutboundCall, GoInitializerGroup, DISPATCHED_CALLEE_SEPARATOR,
 };
+
+mod stream;
 
 /// A checkout view's call graph, which a dead-code snapshot carries so the
 /// rollup reads it one file at a time.
@@ -874,6 +867,16 @@ impl<'f> DeadCodeGraph<'f> {
         classify: &dyn Fn(u32) -> SeedClass,
         keep_call_lines: bool,
     ) -> Result<FileProjection, String> {
+        self.project_file_in(path, classify, keep_call_lines, false)
+    }
+
+    fn project_file_in(
+        &self,
+        path: &str,
+        classify: &dyn Fn(u32) -> SeedClass,
+        keep_call_lines: bool,
+        streaming: bool,
+    ) -> Result<FileProjection, String> {
         let Some(file) = self.indexed(path) else {
             return Ok(FileProjection::default());
         };
@@ -889,13 +892,15 @@ impl<'f> DeadCodeGraph<'f> {
         Ok(FileProjection {
             unknown_live: self.live_seeds(&resolution, classify),
             outbound_calls: self.outbound_calls(&rows),
-            go_initializers: (&*file.language == "go")
-                .then(|| self.go_initializers(path, file, &rows))
-                .flatten(),
+            go_initializers: if &*file.language == "go" {
+                self.go_initializers(path, file, &rows, streaming)?
+            } else {
+                None
+            },
         })
     }
 
-    /// The rows `graph_rows::assemble` builds from caller file `path`.
+    /// The references and edges of caller file `path` for liveness.
     fn file_rows(
         &self,
         path: &str,
@@ -1203,13 +1208,14 @@ impl<'f> DeadCodeGraph<'f> {
         })
     }
 
-    /// `dead_code::go_initializers` for the one caller file `path`.
+    /// The Go package initialization group for caller file `path`.
     fn go_initializers(
         &self,
         path: &str,
         file: &IndexedFile,
         rows: &FileRows,
-    ) -> Option<GoInitializerGroup> {
+        streaming: bool,
+    ) -> Result<Option<GoInitializerGroup>, String> {
         // A caller: the package initializer, `main`, or any symbol with a
         // resolved call or value reference to a known node.
         let calls_out = rows
@@ -1233,7 +1239,7 @@ impl<'f> DeadCodeGraph<'f> {
             })
             .collect::<Vec<_>>();
         if callers.is_empty() {
-            return None;
+            return Ok(None);
         }
         // `ORDER BY file_path, scoped_name`; ties keep storage order.
         callers.sort_by(|(left_position, left), (right_position, right)| {
@@ -1251,7 +1257,7 @@ impl<'f> DeadCodeGraph<'f> {
         }
         dirs.sort();
         dirs.dedup();
-        let mut interned_symbols = BTreeMap::<&str, Arc<str>>::new();
+        let mut interned_symbols = BTreeSet::<Arc<str>>::new();
         let mut targets = Vec::new();
         for target_file in dirs
             .iter()
@@ -1264,7 +1270,14 @@ impl<'f> DeadCodeGraph<'f> {
             if !path.ends_with("_test.go") && target_file.ends_with("_test.go") {
                 continue;
             }
-            let Some(target) = self.indexed(target_file) else {
+            let scratch;
+            let target = if streaming && target_file != path {
+                let parse = self.source.parse(target_file)?;
+                scratch = IndexedFile::build(target_file, &parse);
+                &scratch
+            } else if let Some(file) = self.indexed(target_file) {
+                file
+            } else {
                 continue;
             };
             let resolved = Arc::new(self.resolve(target_file));
@@ -1275,27 +1288,29 @@ impl<'f> DeadCodeGraph<'f> {
                     || &*node.scoped_name == "<go-package-init>"
                     || (&*node.kind == "function" && &*node.scoped_name == "init")
                 {
-                    let symbol = interned_symbols
-                        .entry(&node.scoped_name)
-                        .or_insert_with(|| Arc::from(&*node.scoped_name))
-                        .clone();
+                    let symbol = if let Some(symbol) = interned_symbols.get(&*node.scoped_name) {
+                        Arc::clone(symbol)
+                    } else {
+                        let symbol = Arc::<str>::from(&*node.scoped_name);
+                        interned_symbols.insert(Arc::clone(&symbol));
+                        symbol
+                    };
                     targets.push((Arc::clone(&resolved), symbol));
                 }
             }
         }
-        Some(GoInitializerGroup {
+        Ok(Some(GoInitializerGroup {
             caller_file: self.resolve(path),
             callers: callers
                 .into_iter()
                 .map(|(_, node)| node.scoped_name.to_string())
                 .collect(),
             targets,
-        })
+        }))
     }
 }
 
-/// One caller file's references and edges, as `graph_rows::assemble` stores
-/// them.
+/// One caller file's references and edges for liveness.
 #[derive(Default)]
 struct FileRows {
     refs: BTreeMap<String, RefRow>,

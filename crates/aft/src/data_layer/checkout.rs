@@ -4305,63 +4305,6 @@ impl CheckoutView {
         })
     }
 
-    /// A dead-code snapshot holding every call row of the call graph, built
-    /// from every file's stored record and fragment in one pass. The rollup
-    /// reads the call graph file by file instead; the dead-code gate uses
-    /// this one as an independent check of that reading.
-    ///
-    /// # Errors
-    ///
-    /// When a record or fragment cannot be read.
-    pub(crate) fn rows_dead_code_snapshot(
-        &self,
-        entry_points: &dyn super::dead_code_snapshot::EntryPoints,
-    ) -> Result<crate::data_layer::dead_code_snapshot::CallgraphSnapshot, DataError> {
-        let (mut parses, mut resolved) = self
-            .published
-            .graph
-            .resolutions()
-            .map_err(DataError::Store)?;
-        // The call graph as callgraph() answers it: what was resolved since
-        // the publication replaces what the publication stored.
-        let state = match &self.refreshed {
-            Some(refreshed) => {
-                for file in &refreshed.removed {
-                    parses.remove(file);
-                    resolved.remove(file);
-                }
-                for (file, refreshed_file) in &refreshed.replaced {
-                    let key = refreshed_file.resolution.record_key();
-                    match &refreshed_file.parse {
-                        Some(parse) => {
-                            parses.insert(file.clone(), (key.to_string(), Arc::clone(parse)));
-                        }
-                        // The publication's parse of this path, read above,
-                        // has the key the file was resolved with.
-                        None => debug_assert_eq!(
-                            parses.get(file).map(|(stored, _)| stored.as_str()),
-                            Some(key)
-                        ),
-                    }
-                    resolved.insert(file.clone(), refreshed_file.resolution.decode(file));
-                }
-                refreshed.state.clone()
-            }
-            None => self.published.state.clone(),
-        };
-        let inputs = CheckoutInputs {
-            state,
-            parses: parses.into(),
-            configs: HashMap::new(),
-        };
-        let rows = super::graph_rows::assemble(&inputs, &resolved);
-        Ok(super::dead_code::snapshot(
-            &self.published.root,
-            &rows,
-            entry_points,
-        ))
-    }
-
     /// The call graph dead code reads, file by file: the publication, with
     /// what was resolved since replacing what it stored, read on demand
     /// rather than all at once (see `dead_code_graph`).
@@ -6473,7 +6416,10 @@ mod tests {
         }
         assert_eq!(policy.0.load(Ordering::Relaxed), 1);
         assert_eq!(
-            view.rows_dead_code_snapshot(&policy).unwrap().entry_points,
+            super::super::dead_code::stream::Rows::new(&view, &policy)
+                .unwrap()
+                .metadata()
+                .entry_points,
             expected
         );
         assert_eq!(policy.0.load(Ordering::Relaxed), 2);
@@ -6730,8 +6676,7 @@ mod tests {
             "walked {walked}, allocated {allocated}"
         );
 
-        let (parses, _) = graph.resolutions().unwrap();
-        let parse = Arc::clone(&parses["src/lib.rs"].1);
+        let (_, parse) = graph.parse_of("src/lib.rs").unwrap();
         let (copy, allocated) = crate::test_allocations::count_bytes(|| ParseBlob::clone(&parse));
         assert!(allocated > 0);
         assert_eq!(heap_bytes_of(&copy), allocated);
@@ -8042,9 +7987,11 @@ pub fn other() { callee(); }
         for pattern in ["pub fn", "nothing to see", "crate::m2", "added1", "marker"] {
             answers.push(format!("{pattern}: {:?}", candidates_for(view, pattern)));
         }
-        let mut snapshot = view
-            .rows_dead_code_snapshot(&crate::inspect::InspectEntryPoints)
-            .unwrap();
+        let mut snapshot = super::super::dead_code::stream::Rows::fixture_snapshot(
+            view,
+            &crate::inspect::InspectEntryPoints,
+        )
+        .unwrap();
         snapshot.generated_at = None;
         answers.push(format!("{snapshot:?}"));
         answers
@@ -9882,11 +9829,11 @@ pub fn other() { callee(); }
         // The dead-code snapshot follows the refreshed graph: `callee` is
         // still called (from src/extra.rs), and the snapshot equals a cold
         // build's.
-        let mut refreshed_snapshot = checkout
-            .view()
-            .unwrap()
-            .rows_dead_code_snapshot(&crate::inspect::InspectEntryPoints)
-            .unwrap();
+        let mut refreshed_snapshot = super::super::dead_code::stream::Rows::fixture_snapshot(
+            &checkout.view().unwrap(),
+            &crate::inspect::InspectEntryPoints,
+        )
+        .unwrap();
 
         // The answers equal a cold build of the same files.
         let cold_store = tempfile::tempdir().unwrap();
@@ -9902,11 +9849,11 @@ pub fn other() { callee(); }
             callers_of(&cold.view().unwrap(), "src/util.rs", "callee"),
             after
         );
-        let mut cold_snapshot = cold
-            .view()
-            .unwrap()
-            .rows_dead_code_snapshot(&crate::inspect::InspectEntryPoints)
-            .unwrap();
+        let mut cold_snapshot = super::super::dead_code::stream::Rows::fixture_snapshot(
+            &cold.view().unwrap(),
+            &crate::inspect::InspectEntryPoints,
+        )
+        .unwrap();
         refreshed_snapshot.generated_at = None;
         cold_snapshot.generated_at = None;
         assert_eq!(
@@ -10026,9 +9973,11 @@ pub fn other() { callee(); }
             Some(PathText::Indexed { distinct }) if distinct > 10
         ));
         assert_eq!(view.path_text(b"missing.rs").unwrap(), None);
-        let snapshot = view
-            .rows_dead_code_snapshot(&crate::inspect::InspectEntryPoints)
-            .unwrap();
+        let snapshot = super::super::dead_code::stream::Rows::fixture_snapshot(
+            &view,
+            &crate::inspect::InspectEntryPoints,
+        )
+        .unwrap();
         assert_eq!(snapshot.files.len(), 2, "{:?}", snapshot.files);
         assert!(
             snapshot
