@@ -425,6 +425,132 @@ fn restricted_apply_patch_move_removes_symlink_entry_without_touching_target() {
 }
 
 #[cfg(unix)]
+fn assert_move_onto_symlink_refused(response: &Value) {
+    assert_eq!(response["success"], false, "move should fail: {response:?}");
+    assert_eq!(response["code"], "invalid_request");
+    assert!(
+        response["message"].as_str().unwrap().contains(
+            "refusing to move onto symlink 'destination.txt'; symlink undo is not supported"
+        ),
+        "{response:?}"
+    );
+}
+
+#[cfg(unix)]
+const MOVE_ONTO_DESTINATION_PATCH: &str = r#"*** Begin Patch
+*** Update File: source.txt
+*** Move to: destination.txt
+@@
+-before
++after
+*** End Patch"#;
+
+/// A move writes through a destination symlink into its target, while the
+/// root check judged only the link's own location: the target outside the
+/// root was overwritten although every direct write to it is refused.
+#[cfg(unix)]
+#[test]
+fn restricted_apply_patch_move_onto_symlink_to_outside_file_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let outside_file = write_file(outside.path(), "outside.txt", "outside original\n");
+    let source = write_file(root, "source.txt", "before\n");
+    std::os::unix::fs::symlink(&outside_file, root.join("destination.txt")).unwrap();
+    let mut aft = configured_restricted_aft(root);
+
+    let previewed = preview(
+        &mut aft,
+        "preview-move-onto-link",
+        MOVE_ONTO_DESTINATION_PATCH,
+    );
+    assert_move_onto_symlink_refused(&previewed);
+    let applied = apply(
+        &mut aft,
+        "apply-move-onto-link",
+        MOVE_ONTO_DESTINATION_PATCH,
+    );
+    assert_move_onto_symlink_refused(&applied);
+
+    assert_eq!(
+        fs::read_to_string(&outside_file).unwrap(),
+        "outside original\n"
+    );
+    assert_eq!(fs::read_to_string(&source).unwrap(), "before\n");
+    assert!(fs::symlink_metadata(root.join("destination.txt"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+
+    assert!(aft.shutdown().success());
+}
+
+/// A move back onto the same symlink is otherwise turned into an in-place
+/// update of the link's location, which writes through to the target.
+#[cfg(unix)]
+#[test]
+fn restricted_apply_patch_move_onto_same_symlink_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let outside_file = write_file(outside.path(), "outside.txt", "before\n");
+    std::os::unix::fs::symlink(&outside_file, root.join("destination.txt")).unwrap();
+    let mut aft = configured_restricted_aft(root);
+
+    let patch = r#"*** Begin Patch
+*** Update File: destination.txt
+*** Move to: destination.txt
+@@
+-before
++after
+*** End Patch"#;
+    let previewed = preview(&mut aft, "preview-move-onto-same-link", patch);
+    assert_move_onto_symlink_refused(&previewed);
+    let applied = apply(&mut aft, "apply-move-onto-same-link", patch);
+    assert_move_onto_symlink_refused(&applied);
+
+    assert_eq!(fs::read_to_string(&outside_file).unwrap(), "before\n");
+
+    assert!(aft.shutdown().success());
+}
+
+/// Without root restriction the move used to overwrite the link's target,
+/// and undo then restored the source and the link but never the target's
+/// old content, because the snapshot recorded only the link.
+#[cfg(unix)]
+#[test]
+fn apply_patch_move_onto_symlink_is_refused_so_its_target_is_never_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let source = write_file(root, "source.txt", "before\n");
+    let target = write_file(root, "target.txt", "keep me\n");
+    std::os::unix::fs::symlink("target.txt", root.join("destination.txt")).unwrap();
+    let mut aft = configured_aft(root);
+
+    let previewed = preview(
+        &mut aft,
+        "preview-move-onto-local-link",
+        MOVE_ONTO_DESTINATION_PATCH,
+    );
+    assert_move_onto_symlink_refused(&previewed);
+    let applied = apply(
+        &mut aft,
+        "apply-move-onto-local-link",
+        MOVE_ONTO_DESTINATION_PATCH,
+    );
+    assert_move_onto_symlink_refused(&applied);
+    assert_eq!(fs::read_to_string(&target).unwrap(), "keep me\n");
+    assert_eq!(fs::read_to_string(&source).unwrap(), "before\n");
+
+    // Nothing was written, so undo has nothing of this patch to revert.
+    let _ = aft.send(&json!({ "id": "undo-move-onto-local-link", "command": "undo" }).to_string());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "keep me\n");
+    assert_eq!(fs::read_to_string(&source).unwrap(), "before\n");
+
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
 #[test]
 fn restricted_apply_patch_symlink_delete_rejection_rolls_back_prior_hunks() {
     let dir = tempfile::tempdir().unwrap();
