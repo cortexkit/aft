@@ -481,15 +481,7 @@ pub(crate) fn disclose_index_gaps(
 }
 
 /// Adds only host-owned grammar diagnostics, preserving gap-free responses.
-pub(crate) fn disclose_parse_gaps(
-    view: &super::checkout::CheckoutView,
-    roots: &[PathBuf],
-    response: &mut crate::protocol::Response,
-) {
-    disclose_parse_gaps_for(view, roots, response, |_| true);
-}
-
-pub(super) fn disclose_parse_gaps_for(
+pub(super) fn disclose_parse_gaps(
     view: &super::checkout::CheckoutView,
     roots: &[PathBuf],
     response: &mut crate::protocol::Response,

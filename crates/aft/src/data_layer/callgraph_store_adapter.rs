@@ -2602,7 +2602,7 @@ pub(crate) fn response_with_view(
         .collect();
     if !languages.is_empty() {
         if let Some(view) = view {
-            crate::data_layer::surfaces::disclose_parse_gaps_for(
+            crate::data_layer::surfaces::disclose_parse_gaps(
                 view,
                 &[view.root().to_path_buf()],
                 &mut response,

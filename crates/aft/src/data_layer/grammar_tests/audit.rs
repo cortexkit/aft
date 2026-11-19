@@ -215,6 +215,7 @@ fn timeout_refusals() {
         &runtime.view().unwrap(),
         &[f.root.clone()],
         &mut response,
+        |_| true,
     );
     assert_eq!(response.data["gaps"][1]["kind"], "grammar_parse_timeout");
     assert!(!response.data["text"].as_str().unwrap().ends_with('\n'));
@@ -443,6 +444,7 @@ fn trace_gaps() {
         &runtime.view().unwrap(),
         &[f.root.clone()],
         &mut response,
+        |_| true,
     );
     assert_eq!(response.data["gaps"][0]["kind"], "existing");
     assert_eq!(response.data["gaps"].as_array().unwrap().len(), 4);
