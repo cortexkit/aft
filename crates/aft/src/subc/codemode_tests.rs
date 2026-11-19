@@ -561,6 +561,36 @@ fn codemode_head_with_another_scope_owner_is_not_the_runs_head() {
 }
 
 #[test]
+fn codemode_head_bound_under_the_other_prefrontal_name_is_the_runs_head() {
+    // The run's parent names one prefrontal module name and the head route
+    // carries the other, with the same ref and epoch: the case of a head that a
+    // runner adopted before the prefrontal-core -> prefrontal rename.
+    for (route_owner, parent_owner) in [
+        ("prefrontal-core", "prefrontal"),
+        ("prefrontal", "prefrontal-core"),
+    ] {
+        let mut run = run_stamp("agent-a", "head-a", Some("linked"));
+        run.parent.as_mut().unwrap().owner = subc_protocol::Principal::Reserved {
+            module_id: parent_owner.into(),
+        };
+        let mut f = fixture(run);
+        edit_head_stamp(&mut f, |stamp| {
+            stamp.owner = subc_protocol::Principal::Reserved {
+                module_id: route_owner.into(),
+            };
+        });
+        let body = call("read", json!({"path": "notes.txt"}));
+        let session = owner(admit(&f.routes, channel(9), Some(&body)))
+            .session
+            .clone();
+        assert_eq!(session, "head-a-session", "{route_owner} -> {parent_owner}");
+        // Ref and epoch must still match exactly across the two names.
+        edit_head_stamp(&mut f, |stamp| stamp.scope_epoch += 1);
+        assert_eq!(refusal_reason(&f), "head_route_not_bound");
+    }
+}
+
+#[test]
 fn codemode_head_with_another_scope_ref_is_not_the_runs_head() {
     let mut f = linked_fixture();
     edit_head_stamp(&mut f, |stamp| stamp.scope_ref = "head-a-other".into());
