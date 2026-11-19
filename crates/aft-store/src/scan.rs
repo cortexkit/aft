@@ -197,6 +197,8 @@ pub struct PathScan {
     /// Paths whose record was added, removed, or changed in content, kind,
     /// mode or link target, in byte order.
     pub changed: Vec<Vec<u8>>,
+    /// Records added or replaced, including when only stat evidence changed.
+    pub updated: Vec<Vec<u8>>,
     pub counters: ScanCounters,
 }
 
@@ -232,43 +234,53 @@ pub fn scan_paths(
             skipped.insert(path.clone(), reason.clone());
         }
     }
-    let mut records = previous
-        .paths()
-        .iter()
-        .filter(|record| !restrict.covers(&record.path))
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut changed = BTreeSet::new();
-    for record in previous.paths() {
-        if restrict.covers(&record.path) {
-            changed.insert(record.path.clone());
+    let mut edits = std::collections::BTreeMap::new();
+    for scope in &restrict.paths {
+        // An enclosing requested directory already covers this path.
+        if restrict.covers_ancestor(scope) {
+            continue;
+        }
+        if previous.get(scope).is_some() {
+            edits.insert(scope.clone(), None);
+        }
+        for record in previous.directory_records(scope) {
+            edits.insert(record.path.clone(), None);
         }
     }
-    for record in &walked {
-        changed.insert(record.path.clone());
+    for record in walked {
+        edits.insert(record.path.clone(), Some(record));
     }
-    let walked_by_path = walked
-        .iter()
-        .map(|record| (record.path.as_slice(), record))
-        .collect::<std::collections::HashMap<_, _>>();
-    changed.retain(|path| {
+    let mut changed = Vec::new();
+    let mut updated = Vec::new();
+    edits.retain(|path, after| {
         let before = previous.get(path);
-        let after = walked_by_path.get(path.as_slice()).copied();
-        match (before, after) {
+        let after = after.as_ref();
+        let member_changed = match (before, after) {
             (Some(before), Some(after)) => !same_member(before, after),
             (None, None) => false,
             _ => true,
+        };
+        if member_changed {
+            changed.push(path.clone());
         }
+        if before == after {
+            return false;
+        }
+        if after.is_some() {
+            updated.push(path.clone());
+        }
+        true
     });
-    drop(walked_by_path);
-    records.extend(walked);
-    counters.files = records.len();
-    let state = CheckoutState::new(previous.git.clone(), previous.conversion, records)?
+    let mut state = previous
+        .clone()
         .with_root(root)
         .with_skipped_directories(skipped);
+    state.apply_scan_changes(edits)?;
+    counters.files = state.path_count();
     Ok(PathScan {
         state,
-        changed: changed.into_iter().collect(),
+        changed,
+        updated,
         counters,
     })
 }
@@ -306,13 +318,16 @@ impl Restrict {
 
     /// Whether `path` is one of the paths or under one of them.
     fn covers(&self, path: &[u8]) -> bool {
-        if self.paths.contains(b"".as_slice()) || self.paths.contains(path) {
-            return true;
-        }
-        path.iter()
-            .enumerate()
-            .filter(|(_, byte)| **byte == b'/')
-            .any(|(index, _)| self.paths.contains(&path[..index]))
+        self.paths.contains(path) || self.covers_ancestor(path)
+    }
+
+    fn covers_ancestor(&self, path: &[u8]) -> bool {
+        (!path.is_empty() && self.paths.contains(b"".as_slice()))
+            || path
+                .iter()
+                .enumerate()
+                .filter(|(_, byte)| **byte == b'/')
+                .any(|(index, _)| self.paths.contains(&path[..index]))
     }
 
     /// Whether the walk must enter or keep `path`: it is covered, or it is a
@@ -1005,6 +1020,106 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn sequential_single_file_scans_share_path_storage_and_encode_like_flat_states() {
+        use crate::heap::{HeapBytes, Seen};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = ScanPolicy::default();
+        let sink = Collect::default();
+        let path = b"src/current.ts".to_vec();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/current.ts"), b"initial\n").unwrap();
+        let seed = scan(root, &policy, None, &sink).unwrap().state;
+        let synthetic = |index| PathRecord {
+            path: format!("unvisited/file-{index:06}.ts").into_bytes(),
+            ..seed.get(&path).unwrap().clone()
+        };
+        let mut records = (0..99_999).map(synthetic).collect::<Vec<_>>();
+        records.push(seed.get(&path).unwrap().clone());
+        let base = CheckoutState::new(seed.git.clone(), seed.conversion, records)
+            .unwrap()
+            .with_root(root);
+        let retained = |current: &CheckoutState| {
+            let mut seen = Seen::new();
+            let _ = base.heap_bytes(&mut seen);
+            current.heap_bytes(&mut seen)
+        };
+        let edit_path = [path.clone()];
+        let absent = scan_paths(root, &policy, &base, &[b"missing".to_vec()], &sink).unwrap();
+        assert!(absent.changed.is_empty());
+        assert_eq!(absent.state.paths().as_ptr(), base.paths().as_ptr());
+        std::fs::write(
+            root.join("src/current.ts"),
+            b"an edit that changes length\n",
+        )
+        .unwrap();
+
+        // The old merge cloned the unaffected records and constructed a new
+        // sorted state. Include the same scoped walk in both timings.
+        let start = std::time::Instant::now();
+        let restrict = Arc::new(Restrict::new(&edit_path));
+        let (walked, _, _) = walk_records(
+            root,
+            &policy,
+            Some(&base),
+            Some(Arc::clone(&restrict)),
+            &sink,
+        )
+        .unwrap();
+        let mut records = base
+            .paths()
+            .iter()
+            .filter(|record| !restrict.covers(&record.path))
+            .cloned()
+            .collect::<Vec<_>>();
+        records.extend(walked);
+        let flat = CheckoutState::new(base.git.clone(), base.conversion, records)
+            .unwrap()
+            .with_root(root);
+        let before_time = start.elapsed();
+        let start = std::time::Instant::now();
+        let revised = scan_paths(root, &policy, &base, &edit_path, &sink)
+            .unwrap()
+            .state;
+        let after_time = start.elapsed();
+        let (before_bytes, after_bytes) = (retained(&flat), retained(&revised));
+        eprintln!(
+            "100k one-file path scan: before {before_time:?}, {before_bytes} new retained heap bytes; after {after_time:?}, {after_bytes} new retained heap bytes"
+        );
+        assert!(after_bytes < before_bytes / 128);
+        // Each walk timestamps its own observation. Compare the layouts
+        // using the same observation for the edited file.
+        let mut flat_records = flat.paths().to_vec();
+        let before_edit = &mut flat_records[flat.position(&path).unwrap()];
+        let after_edit = revised.get(&path).unwrap();
+        assert!(same_member(before_edit, after_edit));
+        before_edit.stat.observed_ns = after_edit.stat.observed_ns;
+        let flat = CheckoutState::new(base.git.clone(), base.conversion, flat_records)
+            .unwrap()
+            .with_root(root);
+        assert!(
+            revised.encode() == flat.encode(),
+            "persisted bytes do not depend on an overlay"
+        );
+        let slice = revised.paths();
+        assert_eq!(slice.as_ptr(), revised.clone().paths().as_ptr());
+
+        let mut current = revised;
+        for length in 128..384 {
+            let bytes = vec![b'x'; length];
+            // The sink does not accumulate the prior measurements' contents.
+            std::fs::write(root.join("src/current.ts"), &bytes).unwrap();
+            current = scan_paths(root, &policy, &current, &edit_path, &Collect::default())
+                .unwrap()
+                .state;
+            assert_eq!(current.get(&path).unwrap().content, ContentKey::of(&bytes));
+        }
+        assert_eq!(current.path_count(), 100_000);
+        assert!(retained(&current) < before_bytes / 128);
     }
 
     #[test]

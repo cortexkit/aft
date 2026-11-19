@@ -50,6 +50,7 @@ mod engines;
 pub mod exactness;
 mod fold;
 mod memory_profile;
+mod recording;
 mod refresh;
 pub(crate) use refresh::RefreshCounts;
 pub(crate) mod resume;
@@ -1040,6 +1041,7 @@ impl Checkout {
             generation,
             scanned.state,
             &changed,
+            None,
             sink.finish(),
         );
         debug_assert!(applied, "the recording lock keeps the publication");
@@ -1422,15 +1424,15 @@ impl Checkout {
                 return Ok(());
             };
             let sink = ChangeSink::default();
-            let (state, mut changed) = if whole {
+            let (state, mut changed, updated) = if whole {
                 let scanned = scan(&self.root, &self.layer.policy, Some(&base), &sink)
                     .map_err(|error| DataError::Scan(error.to_string()))?;
                 let changed = changed_members(&base, &scanned.state);
-                (scanned.state, changed)
+                (scanned.state, changed, None)
             } else {
                 let scanned = scan_paths(&self.root, &self.layer.policy, &base, &scoped, &sink)
                     .map_err(|error| DataError::Scan(error.to_string()))?;
-                (scanned.state, scanned.changed)
+                (scanned.state, scanned.changed, Some(scanned.updated))
             };
             let mut read = sink.finish();
             if retry_grammar {
@@ -1452,7 +1454,7 @@ impl Checkout {
                 changed.sort_unstable();
                 changed.dedup();
             }
-            if self.apply_scan(&base, generation, state, &changed, read) {
+            if self.apply_scan(&base, generation, state, &changed, updated.as_deref(), read) {
                 return Ok(());
             }
         }
@@ -1481,139 +1483,6 @@ impl Checkout {
             (true, true) => IgnoreScope::Whole,
             (true, false) => IgnoreScope::Folder(folder.to_vec()),
         }
-    }
-
-    /// Makes `state` the checkout's current state, recording each path in
-    /// `changed` (compared with `base`) as a change, with the files the scan
-    /// read in `read`.
-    /// Returns `false`, applying nothing, when a publication served since
-    /// `generation` replaced the one `base` came from.
-    fn apply_scan(
-        &self,
-        base: &CheckoutState,
-        generation: u64,
-        mut state: CheckoutState,
-        changed: &[Vec<u8>],
-        mut read: HashMap<Vec<u8>, Vec<u8>>,
-    ) -> bool {
-        // A record the scan read again keeps its language when its content
-        // did not change; a changed text file gets the language its path and
-        // bytes choose. Only changed paths get a language anew: a file read
-        // again only because its stat moved (a touch, a copied checkout) has
-        // the content it had. The scanned state is this scan's own, so its
-        // records take their languages in place rather than being copied.
-        // Choosing a language reads the path, and only for a C header parses
-        // the bytes; the changed files' extraction waits for the call graph
-        // (see `ChangeContent`).
-        let mut languages = Vec::new();
-        for path in changed {
-            let (Some(bytes), Some(index)) = (read.get(path), state.position(path)) else {
-                continue;
-            };
-            languages.push((index, changed_language(&state.paths()[index], bytes)));
-        }
-        // Every other record without a language takes the base's when its
-        // content is the same. Both states are in path order, so one pass
-        // walks the two together.
-        let mut extracted_at = languages
-            .iter()
-            .map(|(index, _)| *index)
-            .collect::<Vec<_>>();
-        extracted_at.sort_unstable();
-        let mut before = base.paths().iter().peekable();
-        for (index, record) in state.paths().iter().enumerate() {
-            if !record.language.is_empty() || extracted_at.binary_search(&index).is_ok() {
-                continue;
-            }
-            while before.next_if(|before| before.path < record.path).is_some() {}
-            if let Some(before) = before.peek().filter(|before| {
-                before.path == record.path
-                    && before.content == record.content
-                    && !before.language.is_empty()
-            }) {
-                languages.push((index, before.language.clone()));
-            }
-        }
-        for (index, language) in languages {
-            state
-                .set_language(index, language)
-                .expect("a language a state stores");
-        }
-        let gaps = base
-            .skipped_parses()
-            .iter()
-            .filter(|(path, _)| {
-                !changed.contains(path)
-                    && state.get(path).is_some_and(|now| {
-                        base.get(path).is_some_and(|before| {
-                            same_member(before, now) && before.language == now.language
-                        })
-                    })
-            })
-            .map(|(path, reason)| (path.clone(), reason.clone()))
-            .collect();
-        state = state
-            .with_skipped_parses(gaps)
-            .expect("unchanged gap members");
-        if changed.is_empty() {
-            let mut live = self.write_live();
-            if live.generation != generation {
-                return false;
-            }
-            live.state = Some(Arc::new(state));
-            self.touch_memory();
-            return true;
-        }
-        let mut entries = Vec::with_capacity(changed.len());
-        for path in changed {
-            let record = state.get(path).cloned();
-            // Text queries read the new trigrams at once; what the call graph
-            // reads is extracted from the same bytes when it first needs it.
-            let bytes = read.remove(path);
-            let entry = match (&record, &bytes) {
-                (None, _) => OverlayEntry::Deleted,
-                (Some(record), Some(bytes)) if record.kind == PathKind::Text => {
-                    OverlayEntry::Content(Arc::new(ContentTrigrams::of(bytes)))
-                }
-                (Some(_), _) => OverlayEntry::Unindexed,
-            };
-            let content = match (&record, bytes) {
-                (Some(record), Some(bytes)) => ChangeContent::recorded(record, bytes),
-                _ => ChangeContent::nothing(),
-            };
-            entries.push((path.clone(), entry, record, content));
-        }
-        let mut guard = self.write_live();
-        let live = &mut *guard;
-        if live.generation != generation {
-            return false;
-        }
-        live.sequence += 1;
-        self.touch_memory();
-        let sequence = live.sequence;
-        // Each set is copied only when a view still holds it; otherwise the
-        // changed paths are set in place.
-        let text = Arc::make_mut(&mut live.text);
-        let pending = Arc::make_mut(&mut live.callgraph_pending);
-        let unparsed = Arc::make_mut(&mut live.unparsed);
-        for (path, entry, record, content) in entries {
-            pending.insert(path.clone());
-            let change = Change {
-                sequence,
-                record,
-                content,
-            };
-            if change.failed() {
-                unparsed.insert(path.clone());
-            } else {
-                unparsed.remove(&path);
-            }
-            text.set(path.clone(), entry);
-            live.changes.insert(path, change);
-        }
-        live.text_members = Arc::default();
-        live.state = Some(Arc::new(state));
-        true
     }
 
     /// Scans the checkout, builds every plane cold, publishes them, and
@@ -6574,7 +6443,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_figure_unchanged_scan_and_adoption_invalidate_replaced_state() {
+    fn memory_figure_keeps_a_noop_scan_and_invalidates_an_adoption() {
         let root = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
         write(root.path(), "src/lib.rs", "pub fn original() {}\n");
@@ -6582,10 +6451,13 @@ mod tests {
         let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
         checkout.build().unwrap();
         let epoch = checkout.memory_epoch();
-        checkout.record_paths(&[b"src/lib.rs".to_vec()]).unwrap();
-        assert!(
-            checkout.memory_epoch() > epoch,
-            "even an unchanged scan replaces the counted state"
+        checkout
+            .record_paths(&[b"src/missing.rs".to_vec()])
+            .unwrap();
+        assert_eq!(
+            checkout.memory_epoch(),
+            epoch,
+            "a no-op keeps the counted state"
         );
         assert!(checkout.live.read().unwrap().changes.is_empty());
         let epoch = checkout.memory_epoch();
@@ -7153,6 +7025,7 @@ pub fn other() { callee(); }
             generation,
             scanned.state,
             &scanned.changed,
+            Some(&scanned.updated),
             sink.finish()
         ));
         checkout.record_paths(&[b"notes.txt".to_vec()]).unwrap();
