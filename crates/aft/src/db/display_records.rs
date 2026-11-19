@@ -1,9 +1,17 @@
 //! Frozen display.read replies committed before their bus wakes.
 use rusqlite::{params, Connection, OptionalExtension};
 
-pub(crate) const MAX_RECORDS: usize = 192;
+/// Records stay protected for ten minutes after their wake is acknowledged,
+/// and a busy computer writes about 30 a minute, so the count cap must hold
+/// several hundred at once. Pull bytes average under 2 KiB, so the byte cap is
+/// what bounds disk use.
+pub(crate) const MAX_RECORDS: usize = 4096;
 pub(crate) const MAX_BYTES: usize = 16 * 1024 * 1024;
 const SWEEP_LIMIT: usize = 64;
+
+/// Wakes deferred since the cache last admitted a record. Only the first
+/// deferral of a full stretch is logged, and the total when admission resumes.
+static DEFERRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) const CACHE_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS display_records (
@@ -128,7 +136,9 @@ pub(crate) fn persist(
             )?;
         }
         if count >= MAX_RECORDS || used.saturating_add(bytes.len()) > MAX_BYTES {
-            log::warn!("display store deferral: reason=protected_capacity count={count} bytes={used} incoming_bytes={}", bytes.len());
+            if DEFERRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                log::warn!("display store deferral: reason=protected_capacity count={count} bytes={used} incoming_bytes={}; later deferrals are counted until a record is admitted", bytes.len());
+            }
             tx.commit()?;
             return Ok(false);
         }
@@ -143,6 +153,10 @@ pub(crate) fn persist(
         params![id, bytes, now_ms],
     )?;
     tx.commit()?;
+    let deferred = DEFERRED.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if deferred > 0 {
+        log::info!("display store admitting again after {deferred} deferred wake(s)");
+    }
     Ok(true)
 }
 
