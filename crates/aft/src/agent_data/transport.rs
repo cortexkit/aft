@@ -59,6 +59,7 @@ impl ModuleTransport {
                     ));
                 }
                 let consumer = crate::subc::registration::connect_consumer(
+                    "agent_data",
                     &this.connection_file,
                     ConsumerOptions::default(),
                 )

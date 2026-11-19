@@ -102,10 +102,13 @@ impl ExecRemoteClient {
     }
 
     pub async fn connect(connection_file: &Path, identity: BindIdentity) -> Result<Self, Error> {
-        let consumer =
-            crate::fleet_status::connect_subc_consumer(connection_file, ConsumerOptions::default())
-                .await
-                .map_err(Error::Connection)?;
+        let consumer = crate::fleet_status::connect_subc_consumer(
+            "exec_remote",
+            connection_file,
+            ConsumerOptions::default(),
+        )
+        .await
+        .map_err(Error::Connection)?;
         Self::from_consumer(Arc::new(consumer), identity).await
     }
 

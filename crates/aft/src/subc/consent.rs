@@ -473,6 +473,7 @@ impl SubcConsentTransport {
             ));
         }
         let consumer = crate::fleet_status::connect_subc_consumer(
+            "consent",
             &self.connection_file,
             subc_client_rs::ConsumerOptions::default(),
         )
