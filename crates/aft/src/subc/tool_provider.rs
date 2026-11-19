@@ -7270,6 +7270,7 @@ pub(in crate::subc) mod route_tests {
     mod carrier_samples;
     #[path = "../../rich_ui/admission/route_tests.rs"]
     mod operation_admission;
+    mod thalamus_fork_samples;
 
     use super::super::*;
     use super::*;

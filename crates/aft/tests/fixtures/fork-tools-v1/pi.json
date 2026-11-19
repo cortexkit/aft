@@ -1,0 +1,158 @@
+{
+  "role.describe": {
+    "capabilities": [
+      "plans",
+      "adopt",
+      "queue",
+      "attachments",
+      "media_refs",
+      "send_status",
+      "run_status",
+      "run_ops",
+      "transcript_reads",
+      "host_history",
+      "history_display",
+      "app_readers",
+      "sender_succession",
+      "read_display_facts",
+      "client_message_id",
+      "finish_reason",
+      "step_events",
+      "live_events",
+      "live_ids",
+      "message_senders",
+      "send_ids",
+      "steer",
+      "send_promote",
+      "run_cancel",
+      "run_cancel_by_interrupt",
+      "delivery_order",
+      "template_datetime",
+      "session_change",
+      "refresh_relaunch",
+      "call_identity",
+      "run_tool_calls",
+      "notices",
+      "message_marks",
+      "notice_with_speaks_for",
+      "notice_keep",
+      "tag_read",
+      "head_selection",
+      "call_yield",
+      "notice_yield",
+      "stop_all",
+      "admission_reports",
+      "interrupt_reason",
+      "fork_answer",
+      "plan_view",
+      "fork_effort",
+      "fork_tools"
+    ],
+    "delivery_order_modes": [
+      "tool_result",
+      "turn_system_cleared",
+      "steer",
+      "idle_start"
+    ],
+    "fork_idle_s": 600,
+    "fork_tools": {
+      "anthropic": "prefix"
+    },
+    "implementation_version": "<v>",
+    "majors": [
+      {
+        "ops": [
+          "role.describe",
+          "session.baseline",
+          "session.adopt",
+          "session.send",
+          "session.send_status",
+          "send.status",
+          "run.status",
+          "run.result",
+          "session.read",
+          "session.plan_view",
+          "session.head",
+          "session.history",
+          "session.subscribe",
+          "run.cancel",
+          "session.refresh",
+          "session.refresh_policy",
+          "session.flush_prefix",
+          "run.tool_calls",
+          "session.export",
+          "session.stop_all",
+          "session.promote",
+          "session.upload_begin",
+          "session.upload_append",
+          "session.upload_status",
+          "session.upload_commit",
+          "session.media_read",
+          "session.fork_prepare",
+          "session.fork_ask",
+          "session.fork_end"
+        ],
+        "stability": "alpha",
+        "version": "llm-runner/v1"
+      }
+    ],
+    "max_bytes": {
+      "default": 1048576,
+      "maximum": 3145728
+    },
+    "session_capabilities_from": "admission",
+    "step_events": {
+      "granularity": "per_completed_step",
+      "history_key": "harness"
+    },
+    "step_hooks": [
+      "pre_user"
+    ]
+  },
+  "session.fork_ask": {
+    "reply": {
+      "answer": "checking-8",
+      "finish": "step_limit",
+      "usage": {
+        "by_model": [
+          {
+            "cache_write_tokens": 0,
+            "cached_input_tokens": 0,
+            "input_tokens": 196,
+            "model": "claude-opus-5-5",
+            "output_tokens": 68,
+            "provider": "claude",
+            "steps": 8,
+            "unreported_steps": 0
+          }
+        ],
+        "cache_write_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 196,
+        "output_tokens": 68,
+        "steps": 8,
+        "unreported_steps": 0
+      }
+    },
+    "request": {
+      "allowed_tools": [
+        "read"
+      ],
+      "ask_id": "loop",
+      "fork_id": "fork_11111111111111111111111111111111",
+      "question": "FORK_PROBE_LOOP"
+    }
+  },
+  "tool.call": {
+    "provider": "aft",
+    "request": {
+      "arguments": {},
+      "call_key": "fork_run_22222222222222222222222222222222/33333333333333333333333333333333",
+      "fork_id": "fork_11111111111111111111111111111111",
+      "name": "read",
+      "preset": "worker",
+      "schema_pin": "tp1:read:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1",
+      "tool_call_id": "fork_call_1_0"
+    }
+  }
+}
