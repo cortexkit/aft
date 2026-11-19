@@ -38,7 +38,6 @@ async fn exec_remote_v1_bash_runs_through_real_route_without_invalid_selector() 
         made_tool_call: AtomicBool::new(false),
         run_owner: None,
     }));
-    let routes = HashMap::from([(route_key(41, 1), identity)]);
     // The bash tool runs PowerShell on Windows, where `printf` does not exist.
     // Each command writes the proof text with no trailing newline, so the
     // exact output comparison below holds on every platform.
@@ -47,16 +46,41 @@ async fn exec_remote_v1_bash_runs_through_real_route_without_invalid_selector() 
     } else {
         "printf v1-bash-proof"
     };
+    let done = call_v1_bash(&executor, identity, command, None).await;
+    let response = done.response_for_test();
+    assert!(response.success, "{response:?}");
+    assert_eq!(response.data["exit_code"], 0, "{response:?}");
+    // A command that finishes within the call still names its task, so the
+    // caller can find it again with bash_status.
+    let task_id = response.data["task_id"].as_str().unwrap();
+    assert_eq!(
+        response.data["output"],
+        format!("v1-bash-proof\n[task {task_id}]"),
+        "{response:?}"
+    );
+}
+
+pub(super) async fn call_v1_bash(
+    executor: &Arc<Executor>,
+    identity: RouteIdentity,
+    command: &str,
+    preset: Option<&str>,
+) -> bash::BashDeferredCompletion {
+    let routes = HashMap::from([(route_key(41, 1), identity)]);
+    let mut body = json!({"name":"bash","arguments":{"command":command}});
+    if let Some(preset) = preset {
+        body["preset"] = json!(preset);
+    }
     let frame = Frame::build(
         FrameType::Request,
         control_flags(),
         41,
         1,
         7,
-        serde_json::to_vec(&json!({"name":"bash","arguments":{"command":command}})).unwrap(),
+        serde_json::to_vec(&body).unwrap(),
     )
     .unwrap();
-    let (writer, _replies) = mpsc::channel(8);
+    let (writer, mut replies) = mpsc::channel(8);
     let (bash_tx, mut bash_rx) = mpsc::channel(8);
     let (touch_tx, _touch_rx) = mpsc::channel(8);
     let (deferred_tx, _deferred_rx) = mpsc::unbounded_channel();
@@ -74,7 +98,7 @@ async fn exec_remote_v1_bash_runs_through_real_route_without_invalid_selector() 
         &HashMap::new(),
         &ReclaimedRoutes::default(),
         &mut HashMap::new(),
-        &executor,
+        executor,
         &Arc::default(),
         &Arc::new(PendingDeferredSetups::default()),
         &Arc::new(Notify::new()),
@@ -98,21 +122,17 @@ async fn exec_remote_v1_bash_runs_through_real_route_without_invalid_selector() 
     )
     .await
     .unwrap();
-    let done = tokio::time::timeout(Duration::from_secs(10), bash_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    let response = done.response_for_test();
-    assert!(response.success, "{response:?}");
-    assert_eq!(response.data["exit_code"], 0, "{response:?}");
-    // A command that finishes within the call still names its task, so the
-    // caller can find it again with bash_status.
-    let task_id = response.data["task_id"].as_str().unwrap();
-    assert_eq!(
-        response.data["output"],
-        format!("v1-bash-proof\n[task {task_id}]"),
-        "{response:?}"
-    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            done = bash_rx.recv() => done.unwrap(),
+            reply = replies.recv() => {
+                let reply: WriterFrame = reply.unwrap();
+                panic!("expected deferred bash result, got {}", String::from_utf8_lossy(&reply.frame.body));
+            }
+        }
+    })
+    .await
+    .expect("bash call must answer")
 }
 
 #[cfg(unix)]

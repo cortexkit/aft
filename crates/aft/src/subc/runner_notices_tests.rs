@@ -363,6 +363,108 @@ fn notice_templates_diagnostics_remain_free_text_tool_result_sends() {
     assert!(capture.receiver.try_recv().is_err());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn code_search_nudge_plain_grep_on_runner_heads() {
+    use super::super::{bash_selector_tests::call_v1_bash, test_support, tool_provider, BindTrust};
+    use crate::executor::Executor;
+    use subc_protocol::scope::{ScopeKind, ScopeStamp};
+
+    install(PathBuf::from("unused-test-notice-connection"));
+    for (module, raw_harness, harness) in [
+        ("broca", "runner", "broca"),
+        ("thalamus-harness", "opencode2", "opencode2"),
+    ] {
+        let session = format!("plain-grep-head-{module}");
+        let capture = test_endpoint::capture(&session, false);
+        capture.probe_incarnation("plain-grep-head-daemon", 1);
+        capture.delivery_order(Some(true));
+        capture.reply(SendReply::new("pending"));
+        let (dir, root) = test_support::test_root("plain-grep-head");
+        let src = root.as_path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("fixture.txt"), "foo\n").unwrap();
+        filetime::set_file_mtime(&src, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.as_path().into()),
+                storage_dir: Some(dir.path().join("storage")),
+                experimental_bash_rewrite: false,
+                bash_permissions: false,
+                ..Default::default()
+            },
+        ));
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), ctx));
+        let mut route = test_support::route_identity_with_harness(
+            &root,
+            &session,
+            BindTrust::FirstParty,
+            raw_harness,
+        );
+        let data = Arc::get_mut(&mut route.0).unwrap();
+        data.role = tool_provider::RouteRole::ToolProviderV1;
+        data.scope = Some(ScopeStamp::new(
+            Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            },
+            session.clone(),
+            1,
+            ScopeKind::Head,
+        ));
+        let AuthenticatedPrincipal::RouteBind {
+            harness: bound_harness,
+            principal_id,
+            ..
+        } = &mut data.spawn_principal
+        else {
+            unreachable!();
+        };
+        *bound_harness = raw_harness.into();
+        *principal_id = Some(format!("reserved:{module}"));
+
+        let done = call_v1_bash(&executor, route, "grep -rn foo src/", Some("head")).await;
+        let response = done.response_for_test();
+        assert!(response.success, "{module}: {response:?}");
+        assert_eq!(response.data["exit_code"], 0, "{module}: {response:?}");
+        let task_id = response.data["task_id"].as_str().unwrap();
+        assert_eq!(
+            response.data["output"],
+            format!("src/fixture.txt:1:foo\n[task {task_id}]")
+        );
+        for _ in 0..2 {
+            let described = capture
+                .receiver
+                .try_recv()
+                .expect("runner capability probe");
+            assert_eq!(described.request["method"], "role.describe");
+            assert_eq!(described.harness, harness);
+            assert_eq!(described.session, "aft:runner-capability-probe");
+            assert_eq!(described.scope, None);
+        }
+        let sent = capture
+            .receiver
+            .try_recv()
+            .expect("ordered code-search nudge");
+        assert_eq!(sent.harness, harness);
+        assert_eq!(sent.session, session);
+        assert_eq!(sent.scope.unwrap().scope_ref, session);
+        assert_eq!(sent.request["method"], "session.send");
+        let params = &sent.request["params"];
+        assert_eq!(
+            params["send_id"],
+            "aft:nudge:aft.bash.code_search:subc-41-7"
+        );
+        assert_eq!(params["delivery"], json!(["turn_system", "tool_result"]));
+        assert_eq!(params["template"]["id"], "aft.bash.code_search");
+        assert!(
+            capture.receiver.try_recv().is_err(),
+            "only one notice before the result"
+        );
+    }
+}
+
 #[test]
 fn code_search_nudge_runner_send_is_once_and_leaves_result_bytes_unchanged() {
     install(PathBuf::from("unused-test-notice-connection"));
