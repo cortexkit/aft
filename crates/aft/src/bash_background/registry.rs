@@ -1340,10 +1340,12 @@ pub(crate) struct ScopeKillReport {
     pub already_finished: usize,
 }
 
+mod cancelled_notices;
 #[path = "scratch_retention.rs"]
 mod scratch_retention;
 #[path = "shell_registry.rs"]
 mod shell_registry;
+
 pub(crate) use shell_registry::{
     ShellReader, ShellSnapshot, ShellSnapshotCache, SHELL_MASK_WITHHELD,
 };
@@ -11430,72 +11432,6 @@ impl BgTaskRegistry {
             None if self.inner.saved_task_recovery.load(Ordering::Acquire) => NoticeTarget::Nowhere,
             None => NoticeTarget::Here,
         }
-    }
-
-    /// Name unannounced cancelled calls and owner-cancelled tasks once on the
-    /// session's next bash-family reply. Running tasks include how to check or
-    /// stop them; owner-cancelled tasks explain their expected terminal status.
-    /// Taking a notice clears its flag on disk. Other finished tasks are left
-    /// to their completion notices.
-    pub(crate) fn take_cancelled_call_notices(&self, session_id: &str) -> Vec<String> {
-        let mut task_ids = match self.inner.cancelled_call_tasks.lock() {
-            Ok(mut tasks) => match tasks.remove(session_id) {
-                Some(task_ids) => task_ids.into_iter().collect::<Vec<_>>(),
-                None => return Vec::new(),
-            },
-            Err(_) => return Vec::new(),
-        };
-        task_ids.sort();
-        let mut lines = Vec::new();
-        for task_id in task_ids {
-            let Some(task) = self.task_for_session(&task_id, session_id) else {
-                if self.task(&task_id).is_some() {
-                    self.index_cancelled_call_here(session_id, &task_id);
-                }
-                continue;
-            };
-            if task
-                .launching_identity
-                .as_ref()
-                .is_some_and(|owner| super::TaskIdentity::current().as_ref() != Some(owner))
-            {
-                self.index_cancelled_call_here(session_id, &task_id);
-                continue;
-            }
-            let mut db = DeferredDbWrites::new(self, &task);
-            let Ok(mut state) = task.lock_state() else {
-                continue;
-            };
-            if !state.metadata.cancelled_call_unannounced {
-                continue;
-            }
-            state.metadata.cancelled_call_unannounced = false;
-            if let Err(error) = self.persist_task_locked(&task, &state.metadata, &mut db) {
-                crate::slog_warn!(
-                    "cancelled-call notice for task {task_id} was not cleared on disk: {error}"
-                );
-            }
-            if state.metadata.status_reason.as_deref() == Some(OWNER_PAUSED_REASON)
-                && state.metadata.status == BgTaskStatus::Killed
-            {
-                lines.push(format!("task {task_id}: killed (cancelled by owner)"));
-                continue;
-            }
-            if state.metadata.status.is_terminal() {
-                continue;
-            }
-            let job = state
-                .metadata
-                .remote
-                .as_ref()
-                .and_then(|remote| remote.job_id)
-                .map(|job_id| format!(" (job {job_id})"))
-                .unwrap_or_default();
-            lines.push(format!(
-                "task {task_id}{job} from your cancelled call is still running; check it with bash_status or stop it with bash_kill"
-            ));
-        }
-        lines
     }
 
     /// Records the worker wait limit in force, which a task reloaded after a

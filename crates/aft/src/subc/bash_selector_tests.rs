@@ -294,6 +294,9 @@ async fn next_cancel_test_tool_reply(replies: &mut mpsc::Receiver<wire::WriterFr
         .expect("tool call reply");
     reply.project_tool_result().unwrap();
     let body: Value = serde_json::from_slice(reply.body()).unwrap();
+    if let Some(write) = reply.finish_cancelled_call_notices(true) {
+        write.await.unwrap();
+    }
     body["content"][0]["text"]
         .as_str()
         .unwrap_or_else(|| panic!("tool reply has no text: {body}"))
@@ -325,10 +328,17 @@ async fn cancelled_call_notice_survives_argument_refusal_and_appears_on_read_onc
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn cancelled_call_notice_survives_discarded_and_failed_reply() {
+    cancelled_call_notice_read_case(NoticeInterveningCall::FailedWrite, false).await;
+}
+
+#[cfg(unix)]
 enum NoticeInterveningCall {
     None,
     NativeStatus,
     ArgumentRefusal,
+    FailedWrite,
 }
 
 #[cfg(unix)]
@@ -370,7 +380,7 @@ async fn cancelled_call_notice_read_case(intervening: NoticeInterveningCall, sta
     let notice = format!("task {task_id} from your cancelled call is still running; check it with bash_status or stop it with bash_kill");
 
     let arguments = match intervening {
-        NoticeInterveningCall::None => None,
+        NoticeInterveningCall::None | NoticeInterveningCall::FailedWrite => None,
         NoticeInterveningCall::NativeStatus => Some(("bash_status", json!({"task_id": task_id}))),
         NoticeInterveningCall::ArgumentRefusal => Some(("read", json!([]))),
     };
@@ -395,6 +405,34 @@ async fn cancelled_call_notice_read_case(intervening: NoticeInterveningCall, sta
 
     let path = root.as_path().join("notice.txt");
     std::fs::write(&path, "file contents").unwrap();
+    if matches!(intervening, NoticeInterveningCall::FailedWrite) {
+        for corr in [7, 8] {
+            let mut replies = route_cancel_test_tool(
+                &executor,
+                &root,
+                &connection,
+                &bash_tx,
+                corr,
+                "read",
+                json!({"path":path}),
+                false,
+            )
+            .await;
+            let mut reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            reply.project_tool_result().unwrap();
+            let body: Value = serde_json::from_slice(reply.body()).unwrap();
+            assert!(body["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(&notice));
+            if corr == 8 {
+                reply.finish_ack_write(false);
+            }
+        }
+    }
     let mut held = Response::error("held", crate::access_policy::ACCESS_ASK_REQUIRED, "ask");
     let mut text = String::new();
     crate::response_finalize::finalize_tool_response(
@@ -439,7 +477,9 @@ async fn cancelled_call_notice_read_case(intervening: NoticeInterveningCall, sta
             .contains("cancelled call"));
         request.params["preview"] = json!(false);
         let read = crate::commands::tool_call::handle_with_dispatch(&request, &ctx, &dispatch);
-        read.data["text"].as_str().unwrap().to_string()
+        let text = read.data["text"].as_str().unwrap();
+        read.notices.acknowledge_written_text(text);
+        text.to_string()
     } else {
         let mut read = route_cancel_test_tool(
             &executor,

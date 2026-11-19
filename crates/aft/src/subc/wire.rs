@@ -145,6 +145,7 @@ pub(super) struct WriterFrame {
         tokio::sync::oneshot::Sender<Result<bool, SubcError>>,
     )>,
     ack_completion: Option<super::a0_egress::AckCompletion>,
+    cancelled_calls: Option<Arc<dyn aft_base::pending_notices::NoticeAcknowledgment>>,
 }
 
 impl From<Frame> for WriterFrame {
@@ -172,6 +173,7 @@ impl WriterFrame {
             prepared_projection: None,
             ack_receipt: None,
             ack_completion: None,
+            cancelled_calls: Default::default(),
         }
     }
 
@@ -186,6 +188,7 @@ impl WriterFrame {
             prepared_projection: None,
             ack_receipt: None,
             ack_completion: None,
+            cancelled_calls: Default::default(),
         }
     }
 
@@ -250,6 +253,18 @@ impl WriterFrame {
                 Err(SubcError::WriterClosed)
             });
         }
+        drop(self.finish_cancelled_call_notices(written));
+    }
+
+    pub(super) fn finish_cancelled_call_notices(
+        &mut self,
+        written: bool,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let cancelled_calls = self.cancelled_calls.take();
+        if written && self.frame.header.ty == FrameType::Response {
+            return cancelled_calls?.commit_written_frame(self.body());
+        }
+        None
     }
 
     pub(super) fn set_ack_completion(&mut self, completion: super::a0_egress::AckCompletion) {
@@ -1317,6 +1332,7 @@ pub(super) fn build_tool_response_frame_with_limit(
     }
     let _alloc_label = crate::alloc_trace::scope(crate::alloc_trace::Label::FRAME_ENCODE, None);
     let policy = policy.into();
+    let cancelled_calls = result.response.notices.cancelled_calls.clone();
     let mut capped;
     let result = if result.text.len() > crate::tool_output::TEXT_LIMIT {
         if let Some(scope) = &policy.output_scope {
@@ -1351,6 +1367,7 @@ pub(super) fn build_tool_response_frame_with_limit(
         let mut outgoing = WriterFrame::plain(frame);
         outgoing.response_policy = Some(policy);
         outgoing.prepared_projection = projection.map(Arc::new);
+        outgoing.cancelled_calls = cancelled_calls;
         return Ok(outgoing);
     }
     let mut source = ToolCallResult {
@@ -1391,6 +1408,7 @@ pub(super) fn build_tool_response_frame_with_limit(
         }
     }
     let mut outgoing = WriterFrame::plain(frame);
+    outgoing.cancelled_calls = cancelled_calls;
     outgoing.response_policy = Some(policy.clone());
     outgoing.result_projection = Some((policy, max_body_len, Some(source)));
     Ok(outgoing)
