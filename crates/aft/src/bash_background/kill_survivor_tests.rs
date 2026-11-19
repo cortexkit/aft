@@ -306,12 +306,20 @@ fn bash_kill_of_a_finished_task_names_what_survived_it() {
 fn finished_foreground_nohup_child_survives_replay_and_cleanup_until_explicit_kill() {
     let dir = tempfile::tempdir().unwrap();
     let old = registry();
+    // Wait until nohup is ignoring SIGHUP before the foreground shell exits.
+    let command = r#"
+/usr/bin/nohup /bin/bash -c ': > ready; exec /bin/sleep 60' > child.log 2>&1 < /dev/null &
+pid=$!
+printf '%s\n' "$pid" > child.pid
+while [ ! -f ready ] && kill -0 "$pid" 2>/dev/null; do /bin/sleep 0.02; done
+[ -f ready ]
+"#;
     let task_id = old
         .spawn_with_shell_in_slot(
             SpawnPlan::Unsandboxed,
-            "nohup bash -c 'touch ready; exec sleep 60' > child.log 2>&1 < /dev/null & echo $! > child.pid",
+            command,
             super::super::BashShell::Bash,
-            resolve_posix_shell(),
+            PathBuf::from("/bin/bash"),
             SESSION.into(),
             dir.path().into(),
             HashMap::new(),
@@ -326,7 +334,6 @@ fn finished_foreground_nohup_child_survives_replay_and_cleanup_until_explicit_ki
         .unwrap();
     let pgid = task_pgid(&old, &task_id);
     let _reap = ReapGroup(pgid);
-    wait_for_file(&dir.path().join("ready"), "the nohup child did not start");
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let completed = loop {
@@ -336,12 +343,19 @@ fn finished_foreground_nohup_child_survives_replay_and_cleanup_until_explicit_ki
         }
         assert!(
             Instant::now() < deadline,
-            "the foreground task did not finish"
+            "the foreground task did not finish: {snapshot:?}; nohup output: {:?}",
+            fs::read_to_string(dir.path().join("child.log"))
         );
         std::thread::sleep(Duration::from_millis(20));
     };
     assert_eq!(completed.info.status, BgTaskStatus::Completed);
-    assert_eq!(completed.exit_code, Some(0));
+    assert_eq!(
+        completed.exit_code,
+        Some(0),
+        "foreground output: {}; nohup output: {:?}",
+        completed.output_preview,
+        fs::read_to_string(dir.path().join("child.log"))
+    );
     let child_pid: u32 = fs::read_to_string(dir.path().join("child.pid"))
         .unwrap()
         .trim()
