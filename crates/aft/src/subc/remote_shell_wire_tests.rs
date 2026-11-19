@@ -156,6 +156,15 @@ async fn exercise_shell_lifetime() {
         let mut local = bind(90, "opencode", Value::Null, root.as_path(), "tool_provider");
         local["principal"] = json!({"kind":"direct"});
         reply(peer.call(0, 50, local).await);
+        let mut operator = bind(
+            91,
+            "cingulate",
+            Value::Null,
+            root.as_path(),
+            "management_surface",
+        );
+        operator["principal"] = json!({"kind":"reserved", "module_id":"cingulate"});
+        reply(peer.call(0, 49, operator).await);
         let ctx = executor.actor_context(&root).unwrap();
         ctx.update_config(|cfg| cfg.github.shim = false);
         let mut agent = remote_bind(1, "agent", &[HELD, RESULT, YIELD]);
@@ -232,7 +241,7 @@ async fn exercise_shell_lifetime() {
         yield_call(&mut peer, 6, 600, "person_message").await;
         let revoked = reply(
             peer.call(
-                90,
+                91,
                 59,
                 json!({"method":"permissions.revoke", "params":{"id":agent_grant}}),
             )
