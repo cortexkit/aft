@@ -30,7 +30,7 @@ async fn yield_call(peer: &mut Peer, channel: u16, corr: u64, reason: &str) {
     assert!(hold["held"].get("task_id").is_none(), "{hold}");
 }
 
-async fn late(peer: &mut Peer, channel: u16, corr: u64) -> (Value, Value) {
+async fn late(peer: &mut Peer, channel: u16, corr: u64) -> Value {
     tokio::time::timeout(Duration::from_secs(10), async {
         for attempt in 0.. {
             let feed = reply(peer.call(channel, corr + 2000 + attempt, feed()).await);
@@ -46,7 +46,7 @@ async fn late(peer: &mut Peer, channel: u16, corr: u64) -> (Value, Value) {
                     text(&entry["result"]).contains(&format!("output-{corr}")),
                     "{entry}"
                 );
-                return (entry["result"].clone(), feed["cursor"].clone());
+                return entry["result"].clone();
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -56,8 +56,20 @@ async fn late(peer: &mut Peer, channel: u16, corr: u64) -> (Value, Value) {
     .unwrap_or_else(|_| panic!("no late result for shell {corr}"))
 }
 
-#[tokio::test]
-async fn remote_shell_wire_holds_and_settles_after_scope_end_revoke_and_timeout() {
+#[test]
+fn remote_shell_wire_holds_and_settles_after_scope_end_revoke_and_timeout() {
+    // Drive the full module loop on the same stack as the production runtime.
+    with_module_runtime_stack(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Box::pin(exercise_shell_lifetime()))
+    })
+    .unwrap();
+}
+
+async fn exercise_shell_lifetime() {
     let _env = crate::test_env::process_env_lock();
     let _transport = RestoreTransport;
     let (opened, mut cards) = mpsc::unbounded_channel();
@@ -187,19 +199,18 @@ async fn remote_shell_wire_holds_and_settles_after_scope_end_revoke_and_timeout(
         rebound["scope"]["ref"] = agent["scope"]["ref"].clone();
         reply(peer.call(0, 54, rebound).await);
         for corr in [100, 101] {
-            let (result, cursor) = late(&mut peer, 4, corr).await;
+            let result = late(&mut peer, 4, corr).await;
             assert!(
                 text(&result).contains(&authorization::denied().message),
                 "{result}"
             );
-            if corr == 101 {
-                reply(
-                    peer.call(4, 55, json!({"op":"late_results.ack", "through":cursor}))
-                        .await,
-                );
-                assert_eq!(reply(peer.call(4, 56, feed()).await)["entries"], json!([]));
-            }
         }
+        let cursor = reply(peer.call(4, 54, feed()).await)["cursor"].clone();
+        reply(
+            peer.call(4, 55, json!({"op":"late_results.ack", "through":cursor}))
+                .await,
+        );
+        assert_eq!(reply(peer.call(4, 56, feed()).await)["entries"], json!([]));
         peer.ended.insert("run-shell".into());
         let run_result = reply(peer.receive(2, 200).await);
         assert!(
@@ -228,12 +239,12 @@ async fn remote_shell_wire_holds_and_settles_after_scope_end_revoke_and_timeout(
             .await,
         );
         assert_eq!(revoked["result"]["stopping"], true, "{revoked}");
-        let (result, _) = late(&mut peer, 5, 500).await;
+        let result = late(&mut peer, 5, 500).await;
         assert!(
             text(&result).contains(&authorization::denied().message),
             "{result}"
         );
-        let (result, _) = late(&mut peer, 6, 600).await;
+        let result = late(&mut peer, 6, 600).await;
         assert!(
             !text(&result).contains(&authorization::denied().message),
             "{result}"
