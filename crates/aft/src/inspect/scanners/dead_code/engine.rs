@@ -30,7 +30,7 @@ use super::{
     MaterializeContext, MethodNamesByLanguage, RelativeInitializerGroup, RenderInputs,
 };
 use crate::callgraph_store::dead_code_projection::UNKNOWN_RECEIVER_LIVE_PROVENANCE;
-use crate::data_layer::dead_code_graph::{CallGraphFiles, DeadCodeGraph};
+use crate::data_layer::dead_code_graph::{CallGraphFiles, DeadCodeGraph, SeedClass};
 use crate::inspect::entry_points::ProjectRoles;
 use crate::inspect::FileContribution;
 
@@ -146,8 +146,8 @@ pub(super) struct FileInputs<'s> {
     /// it lists the file's symbols at all.
     snapshot_roots: Option<BTreeSet<String>>,
     /// Members unknown receivers in the file keep alive, by project-relative
-    /// file and symbol, with the line of the call site in this file.
-    unknown_live: Vec<(String, String, u32)>,
+    /// file, symbol and seed class.
+    unknown_live: Vec<(String, String, SeedClass)>,
     /// The call-graph files read for it.
     consumed: Vec<String>,
 }
@@ -157,7 +157,12 @@ pub(super) trait CallSource: Sync {
     fn root(&self) -> &Path;
     /// What the call graph says about project-relative `file`; with
     /// `calls` false, only what its unknown receivers keep alive.
-    fn file_inputs(&self, file: &str, calls: bool) -> Result<FileInputs<'_>, String>;
+    fn file_inputs(
+        &self,
+        file: &str,
+        calls: bool,
+        classify: &dyn Fn(u32) -> SeedClass,
+    ) -> Result<FileInputs<'_>, String>;
     /// Members unknown receivers keep alive in the call-graph files no
     /// materialized file `consumed`.
     fn other_unknown_live(
@@ -237,12 +242,15 @@ impl<'a, 'g> GraphSource<'a, 'g> {
         )
     }
 
-    fn relative_unknown_live(&self, path: &str) -> Result<Vec<(String, String, u32)>, String> {
+    fn relative_unknown_live(
+        &self,
+        path: &str,
+    ) -> Result<Vec<(String, String, SeedClass)>, String> {
         Ok(self
             .graph
             .unknown_live(path)?
             .into_iter()
-            .map(|(file, symbol, line)| (relative_path(self.graph.root(), &file), symbol, line))
+            .map(|(file, symbol, class)| (relative_path(self.graph.root(), &file), symbol, class))
             .collect())
     }
 }
@@ -252,7 +260,12 @@ impl CallSource for GraphSource<'_, '_> {
         self.graph.root()
     }
 
-    fn file_inputs(&self, file: &str, calls: bool) -> Result<FileInputs<'_>, String> {
+    fn file_inputs(
+        &self,
+        file: &str,
+        calls: bool,
+        classify: &dyn Fn(u32) -> SeedClass,
+    ) -> Result<FileInputs<'_>, String> {
         super::reads::record(super::reads::Lookup::GraphPaths, file);
         let calls_paths = self.calls.get(file).cloned().unwrap_or_default();
         let facts_paths = self.facts.get(file).cloned().unwrap_or_default();
@@ -271,11 +284,16 @@ impl CallSource for GraphSource<'_, '_> {
         }
         let mut snapshot_roots = BTreeSet::new();
         for path in &inputs.consumed {
-            let projection = self.graph.project_file(path)?;
-            for (target, symbol, line) in projection.unknown_live {
-                inputs
-                    .unknown_live
-                    .push((relative_path(self.graph.root(), &target), symbol, line));
+            // Rust resolves caller identity using the source line before
+            // reducing its calls to reachability edges.
+            let keep_call_lines = super::language_for_file(file) == "rust";
+            let projection = self.graph.project_file(path, classify, keep_call_lines)?;
+            for (target, symbol, class) in projection.unknown_live {
+                inputs.unknown_live.push((
+                    relative_path(self.graph.root(), &target),
+                    symbol,
+                    class,
+                ));
             }
             if calls_paths.contains(path) {
                 inputs.owned.extend(projection.outbound_calls);
@@ -305,9 +323,22 @@ impl CallSource for GraphSource<'_, '_> {
             .collect::<Vec<_>>();
         let live = others
             .par_iter()
-            .map(|path| self.relative_unknown_live(path).map(without_site_lines))
-            .collect::<Result<Vec<_>, String>>()?;
-        Ok(live.into_iter().flatten().collect())
+            .try_fold(BTreeSet::new, |mut live, path| {
+                live.extend(
+                    self.relative_unknown_live(path)?
+                        .into_iter()
+                        .map(|(file, symbol, _)| (file, symbol)),
+                );
+                Ok::<_, String>(live)
+            })
+            .try_reduce(BTreeSet::new, |mut left, mut right| {
+                if left.len() < right.len() {
+                    std::mem::swap(&mut left, &mut right);
+                }
+                left.extend(right);
+                Ok(left)
+            })?;
+        Ok(live.into_iter().collect())
     }
 }
 
@@ -380,10 +411,24 @@ impl CallSource for SnapshotSource<'_> {
         &self.root
     }
 
-    fn file_inputs(&self, file: &str, calls: bool) -> Result<FileInputs<'_>, String> {
+    fn file_inputs(
+        &self,
+        file: &str,
+        calls: bool,
+        classify: &dyn Fn(u32) -> SeedClass,
+    ) -> Result<FileInputs<'_>, String> {
         // The file's own unknown-receiver entries are read with it, also
         // when its calls are not, as the data layer's graph reads them.
-        let unknown_live = self.unknown_live.get(file).cloned().unwrap_or_default();
+        let unknown_live: Vec<_> = self
+            .unknown_live
+            .get(file)
+            .into_iter()
+            .flatten()
+            .map(|(file, symbol, line)| (file, symbol, classify(*line)))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|(file, symbol, class)| (file.clone(), symbol.clone(), class))
+            .collect();
         let consumed = if unknown_live.is_empty() {
             Vec::new()
         } else {
@@ -459,21 +504,19 @@ impl FileBlock {
         context: &MaterializeContext<'_>,
         mut contribution: DeadCodeContribution,
         consumed: Vec<String>,
-        unknown_live: Vec<(String, String, u32)>,
+        unknown_live: Vec<(String, String, SeedClass)>,
+        test_file: bool,
     ) -> Self {
-        // Read through the tracked set, so a kept graph re-materializes this
-        // file when the file's test-module status changes.
-        let test_module_files = &context.test_module_files;
-        let mut production_live = Vec::with_capacity(unknown_live.len());
-        for (file, symbol, line) in unknown_live {
-            // An excluded file's calls are not read, so none of its sites is
-            // a test call either.
-            if contribution.excluded_from_graph
-                || !contribution.location_is_test_code(test_module_files, line)
-            {
-                production_live.push((file, symbol));
-                continue;
-            }
+        let mut production_live = BTreeSet::new();
+        for (file, symbol, class) in unknown_live {
+            let line = match class {
+                SeedClass::Production => {
+                    production_live.insert((file, symbol));
+                    continue;
+                }
+                SeedClass::TestFile => 0,
+                SeedClass::TestLine(line) => line,
+            };
             let Some(root) = super::clean_symbol(&symbol) else {
                 continue;
             };
@@ -489,9 +532,29 @@ impl FileBlock {
                     test_origin: Some(true),
                 });
         }
-        // Sites on several lines keep the same member alive once.
-        production_live.dedup();
         let unknown_live_roots = live_roots(context, production_live);
+        // Caller and target identities are resolved now. Only mixed-file
+        // test calls still need a line for their finding labels.
+        for call in &mut contribution.internal_calls {
+            if call.test_origin != Some(true) || test_file {
+                call.line = 0;
+            }
+        }
+        fn key(call: &super::InternalCallContribution) -> (&str, &str, &str, Option<bool>, u32) {
+            (
+                &call.caller_symbol,
+                &call.file,
+                &call.symbol,
+                call.test_origin,
+                call.line,
+            )
+        }
+        contribution
+            .internal_calls
+            .sort_unstable_by(|a, b| key(a).cmp(&key(b)));
+        contribution
+            .internal_calls
+            .dedup_by(|a, b| key(a) == key(b));
         let mut contribution = graph_contribution(contribution);
         let go_initializers = contribution.go_initializers.take().map(|group| {
             (
@@ -528,7 +591,7 @@ impl FileBlock {
 /// The roots that `unknown_live` (file, member) pairs name.
 fn live_roots(
     context: &MaterializeContext<'_>,
-    unknown_live: Vec<(String, String)>,
+    unknown_live: impl IntoIterator<Item = (String, String)>,
 ) -> Vec<(String, String)> {
     unknown_live
         .into_iter()
@@ -1027,13 +1090,34 @@ fn materialize(
     // Calls from a deliberately excluded file must not keep another file's
     // symbols live; only what its receivers keep alive elsewhere is read.
     let started = std::time::Instant::now();
-    let inputs = source.file_inputs(&contribution.file, !contribution.excluded_from_graph)?;
+    let calls = !contribution.excluded_from_graph;
+    // Read through the tracked set so a kept graph re-materializes this
+    // file when the file's test-module status changes.
+    let test_file = calls
+        && (super::is_test_tree_file(&contribution.file)
+            || context.test_module_files.contains(&contribution.file));
+    let classify = |line| {
+        if test_file {
+            SeedClass::TestFile
+        } else if calls && contribution.line_is_cfg_test(line) {
+            SeedClass::TestLine(line)
+        } else {
+            SeedClass::Production
+        }
+    };
+    let inputs = source.file_inputs(&contribution.file, calls, &classify)?;
     PROJECT_MICROS.fetch_add(
         started.elapsed().as_micros() as u64,
         std::sync::atomic::Ordering::Relaxed,
     );
     let block = if contribution.excluded_from_graph {
-        FileBlock::new(context, contribution, inputs.consumed, inputs.unknown_live)
+        FileBlock::new(
+            context,
+            contribution,
+            inputs.consumed,
+            inputs.unknown_live,
+            test_file,
+        )
     } else {
         let calls = inputs
             .borrowed
@@ -1052,7 +1136,13 @@ fn materialize(
             started.elapsed().as_micros() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
-        FileBlock::new(context, contribution, inputs.consumed, inputs.unknown_live)
+        FileBlock::new(
+            context,
+            contribution,
+            inputs.consumed,
+            inputs.unknown_live,
+            test_file,
+        )
     };
     let reads = recording
         .map(super::reads::Recording::finish)

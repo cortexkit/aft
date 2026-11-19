@@ -255,13 +255,23 @@ fn outbound_calls(rows: &GraphRows, paths: &mut Paths<'_>) -> Vec<CallgraphOutbo
     // the rollup keeps them alive as the data layer's graph does (see
     // `UNKNOWN_RECEIVER_LIVE_PROVENANCE`). They sort with the caller file's
     // top-level calls.
-    for (caller_file, target_file, symbol, line) in &rows.unknown_live {
+    let unknown_live = rows.unknown_live.iter().flat_map(|(caller_file, sites)| {
+        sites.iter().flat_map(move |(&line, resolutions)| {
+            resolutions
+                .iter()
+                .flat_map(|answer| &answer.protected)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(move |(file, symbol)| (caller_file, file, symbol, line))
+        })
+    });
+    for (caller_file, target_file, symbol, line) in unknown_live {
         let target_path = paths.resolve(target_file);
         calls.push((
             (
                 caller_file.clone(),
                 None,
-                *line,
+                line,
                 0,
                 0,
                 format!("unknown:{target_file}:{symbol}"),
@@ -270,7 +280,7 @@ fn outbound_calls(rows: &GraphRows, paths: &mut Paths<'_>) -> Vec<CallgraphOutbo
                 caller_file: paths.resolve(caller_file),
                 caller_symbol: TOP_LEVEL_SYMBOL.to_string(),
                 target: format!("{}::{symbol}", target_path.display()),
-                line: *line,
+                line,
                 provenance: UNKNOWN_RECEIVER_LIVE_PROVENANCE.to_string(),
             },
         ));

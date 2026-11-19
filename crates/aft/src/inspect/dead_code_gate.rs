@@ -1303,6 +1303,87 @@ mod tests {
         }
     }
 
+    #[test]
+    fn shared_receiver_answers_collapse_rows_without_changing_findings() {
+        use crate::data_layer::dead_code_graph::{CallGraphFiles, DeadCodeGraph, SeedClass};
+
+        const CALLER: &str = "tests/Calls.cs";
+        let fixture = Fixture::with(|root| {
+            std::fs::create_dir(root.join("tests")).unwrap();
+            let calls = "unknown.Run();\n".repeat(128);
+            std::fs::write(
+                root.join(CALLER),
+                format!("class Calls {{ void Invoke() {{\n{calls}}} }}\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("src/Runner.cs"),
+                "interface IRunner { void Run(); }\nclass Runner : IRunner { public void Run() {} }\nclass Other { public void Run() {} public void Unused() {} }\n",
+            )
+            .unwrap();
+        });
+        let view = fresh_view(&fixture.checkout).unwrap();
+        let files = view.dead_code_files();
+        let resolution = files.resolution(CALLER).unwrap();
+        assert_eq!(resolution.sites.len(), 128);
+        let first = &resolution.sites[0].resolution;
+        assert!(!first.targets.is_empty());
+        assert!(first.protected.len() > first.targets.len());
+        assert!(resolution
+            .sites
+            .iter()
+            .all(|site| Arc::ptr_eq(first, &site.resolution)));
+
+        let graph = DeadCodeGraph::open_lazy(&fixture.root, &files);
+        let projection = graph
+            .project_file(CALLER, &|_| SeedClass::TestFile, false)
+            .unwrap();
+        assert_eq!(projection.unknown_live.len(), first.protected.len());
+        assert_eq!(
+            graph.unknown_live(CALLER).unwrap().len(),
+            first.protected.len()
+        );
+        assert_eq!(
+            projection
+                .outbound_calls
+                .iter()
+                .filter(|call| call.provenance == "name_match")
+                .count(),
+            first.targets.len()
+        );
+        let first_line = resolution.sites[0].site.line;
+        let mixed = graph
+            .project_file(
+                CALLER,
+                &|line| {
+                    if [first_line, first_line + 1].contains(&line) {
+                        SeedClass::TestLine(line)
+                    } else {
+                        SeedClass::Production
+                    }
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(mixed.unknown_live.len(), 3 * first.protected.len());
+        assert!(mixed
+            .unknown_live
+            .iter()
+            .any(|(_, _, class)| *class == SeedClass::TestLine(first_line + 1)));
+
+        let rows = view
+            .rows_dead_code_snapshot(&super::super::InspectEntryPoints)
+            .unwrap();
+        let facts = scan(
+            &job(&fixture.root, fixture.storage.path()),
+            rows.entry_points.iter().cloned().collect(),
+            &rows.files,
+            &rows.exported_symbols,
+        );
+        let reference = aggregate(&fixture.root, &rows, &facts, &mut Vec::new()).unwrap();
+        assert_eq!(fixture.rollup().0.unwrap(), reference);
+    }
+
     /// Changes one byte of the file at `path` at or after `from` that
     /// `pick` accepts, to `replace(byte)`.
     fn damage(path: &Path, from: usize, pick: impl Fn(u8) -> bool, replace: impl Fn(u8) -> u8) {
