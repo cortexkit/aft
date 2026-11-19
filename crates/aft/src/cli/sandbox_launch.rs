@@ -122,6 +122,7 @@ pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
+        let original = args.remote_strict.then(|| profile.clone());
         let profile = profile
             .canonicalize_for_launch()
             .map_err(|error| SandboxLaunchError::unavailable(error.to_string()));
@@ -131,6 +132,14 @@ pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
             // error write available but closes the channel in the target.
             if let Some(fd) = args.failure_fd {
                 seal_failure_fd(fd).map_err(SandboxLaunchError::unavailable)?;
+            }
+            if let Some(original) = original {
+                if profile != original {
+                    return Err(SandboxLaunchError::unavailable(
+                        "remote shell sandbox paths changed before launch",
+                    ));
+                }
+                return apply_remote_sandbox(&profile);
             }
             apply_sandbox(&profile)
         });
@@ -157,6 +166,7 @@ struct LaunchArgs {
     profile_fd: Option<i32>,
     profile_file: Option<PathBuf>,
     profile_json: Option<String>,
+    remote_strict: bool,
     failure_marker: Option<PathBuf>,
     /// Inherited descriptor that receives the failure marker when
     /// confinement cannot be applied. A caller supervising the launch uses
@@ -191,6 +201,10 @@ impl LaunchArgs {
             }
             if arg == "--support" {
                 parsed.support = true;
+                continue;
+            }
+            if arg == "--remote-strict" {
+                parsed.remote_strict = true;
                 continue;
             }
             if arg == "--profile-fd" {
@@ -415,6 +429,50 @@ fn apply_sandbox(profile: &SandboxProfile) -> Result<(), SandboxLaunchError> {
     })?;
     emit_linux_warning(profile, applied);
     verify_worker_gh_fence(profile)
+}
+
+#[cfg(target_os = "macos")]
+fn apply_remote_sandbox(_: &SandboxProfile) -> Result<(), SandboxLaunchError> {
+    Err(SandboxLaunchError::unavailable(
+        "remote shell confinement is not enforceable on macOS",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn apply_remote_sandbox(profile: &SandboxProfile) -> Result<(), SandboxLaunchError> {
+    if profile.mode != aft::config::SandboxMode::Strict {
+        return Err(SandboxLaunchError::unavailable(
+            "remote shells require a strict Landlock profile",
+        ));
+    }
+    let granted = profile
+        .read_allow
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(profile.write_allow_roots());
+    for path in granted {
+        if profile
+            .write_deny_nested
+            .iter()
+            .chain(&profile.keychain_deny)
+            .any(|deny| paths_overlap(path, deny))
+            || profile.deny_prefixes.iter().any(|prefix| {
+                path.as_os_str()
+                    .as_encoded_bytes()
+                    .starts_with(prefix.as_os_str().as_encoded_bytes())
+                    || prefix.starts_with(path)
+            })
+        {
+            return Err(SandboxLaunchError::unavailable(
+                "remote shell grant overlaps a protected path",
+            ));
+        }
+    }
+    landlock_backend::apply(profile).map_err(SandboxLaunchError::unavailable)?;
+    // The failure channel closes on exec. Do not delegate the other reserved
+    // launcher descriptor or any host service to the untrusted shell.
+    unsafe { libc::close(4) };
+    aft::sandbox_spawn::remote_shell_guard::apply().map_err(SandboxLaunchError::unavailable)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

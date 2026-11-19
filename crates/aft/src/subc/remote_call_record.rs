@@ -67,7 +67,21 @@ impl Record {
     }
 
     pub(super) fn begin(&self, key: &ledger::Key, decision: &str) -> Result<(), ErrorBody> {
+        self.begin_with_grant(key, decision, None)
+    }
+
+    pub(super) fn begin_with_grant(
+        &self,
+        key: &ledger::Key,
+        decision: &str,
+        grant: Option<&str>,
+    ) -> Result<(), ErrorBody> {
         let conn = self.db.lock().map_err(store_error)?;
+        if let Some(grant) = grant {
+            if !crate::db::remote_grant_rows::exists(&conn, grant).map_err(store_error)? {
+                return Err(authorization::denied());
+            }
+        }
         audit::mark(&conn, self.row, decision, None).map_err(store_error)?;
         ledger::transition(
             &conn,
@@ -77,6 +91,11 @@ impl Record {
         )
         .and_then(require_transition)
         .map_err(store_error)
+    }
+
+    pub(super) fn hold(&self, key: &ledger::Key, body: &[u8]) -> Result<(), ErrorBody> {
+        let conn = self.db.lock().map_err(store_error)?;
+        ledger::hold_watch(&conn, key, body).map_err(store_error)
     }
 
     pub(super) fn finish(

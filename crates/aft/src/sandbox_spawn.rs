@@ -57,11 +57,16 @@ use crate::sandbox_profile::SandboxProfile;
 
 #[cfg(unix)]
 mod build_slots;
+pub(crate) mod remote;
+#[doc(hidden)]
+pub mod remote_shell_guard;
 mod requirement;
 #[cfg(unix)]
 mod settings_grants;
 #[cfg(unix)]
 mod task_temp;
+#[cfg(all(target_os = "linux", feature = "test-hooks"))]
+pub use remote::run_for_test as run_remote_shell_for_test;
 mod tool_launch_policy;
 #[cfg(unix)]
 mod worker_reads;
@@ -5791,17 +5796,11 @@ pub fn managed_task_temp_root() -> &'static Path {
 }
 
 #[cfg(unix)]
-pub(crate) fn create_provider_temp_layout() -> std::io::Result<PathBuf> {
-    task_temp::create_provider_layout()
-}
-#[cfg(unix)]
-pub(crate) fn remove_provider_temp_layout(path: &Path) -> std::io::Result<()> {
-    task_temp::remove_provider_layout(path)
-}
-#[cfg(unix)]
-pub(crate) fn sweep_provider_temp_layouts() -> std::io::Result<()> {
-    task_temp::sweep_provider_layouts()
-}
+pub(crate) use task_temp::{
+    create_provider_layout as create_provider_temp_layout,
+    remove_provider_layout as remove_provider_temp_layout,
+    sweep_provider_layouts as sweep_provider_temp_layouts,
+};
 
 #[cfg(target_os = "macos")]
 fn install_worker_mktemp(temp_dir: &Path) -> Result<(), String> {

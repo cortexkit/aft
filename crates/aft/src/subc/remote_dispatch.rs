@@ -6,6 +6,8 @@ use crate::db::remote_grant_rows::Mode;
 use cortexkit_role_tool_provider::call::ToolCallRequest;
 use cortexkit_role_tool_provider::errors;
 
+#[path = "remote_bash.rs"]
+pub(super) mod bash;
 #[path = "remote_edit_paths.rs"]
 mod edit_paths;
 
@@ -34,6 +36,7 @@ fn edit_operation(wire_name: &str) -> Option<&'static str> {
         "aft_move" => Some("move"),
         "aft_import" => Some("import"),
         "ast_grep_replace" => Some("ast_replace"),
+        "bash" => Some("bash"),
         _ => None,
     }
 }
@@ -48,7 +51,6 @@ pub(super) fn requested_mode(wire_name: &str) -> Option<Mode> {
     operation(wire_name).map(|(_, mode)| mode).or_else(|| {
         match crate::tool_gate::canonical_tool_name(wire_name)? {
             "aft_conflicts" => Some(Mode::Read),
-            "bash" => Some(Mode::ReadWrite),
             _ => None,
         }
     })
@@ -240,7 +242,7 @@ impl FileTool {
     }
 }
 
-fn error(refusal: &Response) -> ErrorBody {
+pub(super) fn error(refusal: &Response) -> ErrorBody {
     let code = refusal.data["code"]
         .as_str()
         .unwrap_or(errors::INVALID_REQUEST);

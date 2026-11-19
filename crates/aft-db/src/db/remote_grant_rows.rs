@@ -173,6 +173,17 @@ pub fn list(conn: &Connection, caller_id: Option<&str>) -> rusqlite::Result<Vec<
     .collect()
 }
 
+pub fn exists(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
+    if !present(conn)? {
+        return Ok(false);
+    }
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM remote_folder_grants WHERE id=?1)",
+        [id],
+        |row| row.get(0),
+    )
+}
+
 pub fn revoke(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
     if !id.starts_with("aftrg_") || !present(conn)? {
         return Ok(false);
