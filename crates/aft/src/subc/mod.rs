@@ -6261,7 +6261,7 @@ where
                     FrameType::Cancel => {
                         let channel = route_key(frame.header.channel, frame.header.epoch);
                         let corr = frame.header.corr;
-                        if shells_service.cancel(channel, corr).await { continue; }
+                        if remote_calls.cancel(channel, corr) || shells_service.cancel(channel, corr).await { continue; }
                         if gh_relay_requests.cancel(channel, corr) {
                             continue;
                         }

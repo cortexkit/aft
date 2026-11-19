@@ -38,10 +38,19 @@ pub fn apply() -> Result<(), String> {
     #[cfg(target_arch = "x86_64")]
     filter.extend([line(HAS, 0x4000_0000, 0, 1), line(RET, KILL, 0, 0)]);
     filter.extend([
-        line(EQ, libc::SYS_prctl as u32, 0, 4),
+        line(EQ, libc::SYS_prctl as u32, 0, 6),
         line(LOAD, 16, 0, 0),
         line(EQ, super::PROBE as u32, 0, 1),
         line(RET, libc::SECCOMP_RET_ERRNO | libc::EREMOTE as u32, 0, 0),
+        // A later filter must not change the errno that identifies a remote shell.
+        line(EQ, libc::PR_SET_SECCOMP as u32, 0, 1),
+        line(RET, DENY, 0, 0),
+        line(LOAD, 0, 0, 0),
+        line(EQ, libc::SYS_seccomp as u32, 0, 5),
+        line(LOAD, 16, 0, 0),
+        line(EQ, libc::SECCOMP_SET_MODE_STRICT, 1, 0),
+        line(EQ, libc::SECCOMP_SET_MODE_FILTER, 0, 1),
+        line(RET, DENY, 0, 0),
         line(LOAD, 0, 0, 0),
         // clone3 hides flags behind a pointer. ENOSYS lets libc use clone instead.
         line(EQ, libc::SYS_clone3 as u32, 0, 1),
@@ -130,4 +139,71 @@ pub fn apply() -> Result<(), String> {
         ));
     }
     super::verify()
+}
+
+#[cfg(all(
+    test,
+    target_endian = "little",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_shell_guard_refuses_additional_filters() {
+        const CHILD: &str = "AFT_REMOTE_SHELL_FILTER_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let test = concat!(
+                module_path!(),
+                "::remote_shell_guard_refuses_additional_filters"
+            );
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test.split_once("::").unwrap().1, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        // The test process alone installs the guard. The extra filter does
+        // nothing; only the kernel's response to the install calls matters.
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+            0
+        );
+        apply().unwrap();
+        let mut allow = line(RET, libc::SECCOMP_RET_ALLOW, 0, 0);
+        let program = libc::sock_fprog {
+            len: 1,
+            filter: &mut allow,
+        };
+        let prctl =
+            unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) };
+        let prctl_errno = std::io::Error::last_os_error().raw_os_error();
+        let syscall = unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                libc::SECCOMP_SET_MODE_FILTER,
+                0,
+                &program,
+            )
+        };
+        let syscall_errno = std::io::Error::last_os_error().raw_os_error();
+        assert_eq!(
+            (prctl, prctl_errno),
+            (-1, Some(libc::EPERM)),
+            "prctl permitted another filter"
+        );
+        assert_eq!(
+            (syscall, syscall_errno),
+            (-1, Some(libc::EPERM)),
+            "seccomp permitted another filter"
+        );
+        crate::sandbox_spawn::remote_shell_guard::verify().unwrap();
+    }
 }

@@ -46,6 +46,11 @@ struct Peer {
 }
 
 impl Peer {
+    async fn signal(&mut self, ty: FrameType, channel: u16, corr: u64) {
+        let frame = Frame::build(ty, control_flags(), channel, 1, corr, vec![]).unwrap();
+        write_frame(&mut self.daemon, &frame).await.unwrap();
+    }
+
     async fn send(&mut self, channel: u16, corr: u64, body: Value) {
         let frame = Frame::build(
             FrameType::Request,
@@ -186,6 +191,88 @@ fn allow(answer: oneshot::Sender<Value>) {
     answer
         .send(json!({"state":"settled", "answered_by":"user", "outcome":"allow_scope"}))
         .unwrap();
+}
+
+async fn cancel_and_revoke_queued_edits(
+    peer: &mut Peer,
+    executor: &Executor,
+    root: &ProjectRootId,
+    grant: &str,
+) {
+    let mut operator = bind(
+        91,
+        "cingulate",
+        Value::Null,
+        root.as_path(),
+        "management_surface",
+    );
+    operator["principal"] = json!({"kind":"reserved", "module_id":"cingulate"});
+    reply(peer.call(0, 740, operator).await);
+
+    let (entered, wait_for_entry) = oneshot::channel();
+    let (release, blocked) = std::sync::mpsc::channel();
+    let barrier = executor.submit_async(
+        root.clone(),
+        Lane::Mutating,
+        "test holds mutating lane".into(),
+        Box::new(move |_| {
+            entered.send(()).unwrap();
+            blocked
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_default();
+            Response::success("barrier", json!({}))
+        }),
+    );
+    wait_for_entry.await.unwrap();
+    for (corr, path) in [(741, "cancelled.txt"), (742, "revoked.txt")] {
+        peer.send(
+            3,
+            corr,
+            tool(
+                "write",
+                json!({"path":path,"content":"must not write"}),
+                corr,
+            ),
+        )
+        .await;
+        let id = format!("remote-file-3-{corr}");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while executor.queued_lane_for_test(root, &id) != Some(Lane::Mutating) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("authorized file call entered the queue");
+    }
+    peer.signal(FrameType::Cancel, 3, 741).await;
+    let error = refusal(peer.receive(3, 741).await, "cancelled");
+    assert_eq!(error.message, "request cancelled");
+    assert_eq!(
+        executor.queued_lane_for_test(root, "remote-file-3-741"),
+        None
+    );
+    let revoked = reply(
+        peer.call(
+            91,
+            743,
+            json!({"method":"permissions.revoke", "params":{"id":grant}}),
+        )
+        .await,
+    );
+    assert_eq!(revoked["result"]["outcome"], "revoked");
+    release.send(()).unwrap();
+    barrier.await.unwrap();
+    refusal(peer.receive(3, 742).await, "remote_access_denied");
+    for path in ["cancelled.txt", "revoked.txt"] {
+        assert!(
+            !root.as_path().join(path).exists(),
+            "queued write landed: {path}"
+        );
+    }
+    assert!(!peer
+        .waiting
+        .iter()
+        .any(|f| f.header.channel == 3 && f.header.corr == 741));
 }
 
 #[test]
@@ -553,7 +640,7 @@ async fn remote_edit_and_scope_end_enforce_attributed_authority() {
             "SELECT count(*) FROM remote_tool_audit WHERE pairing_id='pairing-saved' AND decision='refused' AND outcome='remote_call_not_admitted'", [], |row| row.get(0),
         ).unwrap();
         assert_eq!(collision_refusals, 2);
-        grants::save(
+        let saved_edit = grants::save(
             &db.lock().unwrap(),
             &key("pairing-saved"),
             folder,
@@ -605,6 +692,7 @@ async fn remote_edit_and_scope_end_enforce_attributed_authority() {
         );
         #[cfg(unix)]
         exercise_external_tools(&mut peer, &mut cards, &ctx, root.as_path()).await;
+        cancel_and_revoke_queued_edits(&mut peer, &executor, &root, &saved_edit).await;
         write_frame(
             &mut peer.daemon,
             &Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 799, vec![]).unwrap(),

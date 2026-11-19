@@ -78,9 +78,28 @@ pub(in crate::subc) struct Service {
     edge: Arc<Edge>,
     connection_file: PathBuf,
     jobs: JoinSet<Option<Event>>,
+    requests: RequestCancels,
     authorizer: authorization::Authorizer,
     scopes: scope_lifetime::Tracker,
     pub(in crate::subc) bash: Running,
+}
+
+type RequestCancels = Arc<StdMutex<HashMap<(RouteChannel, u64), CancellationToken>>>;
+
+struct RequestCancel {
+    requests: RequestCancels,
+    key: (RouteChannel, u64),
+    token: CancellationToken,
+}
+
+impl Drop for RequestCancel {
+    fn drop(&mut self) {
+        self.requests.lock().unwrap().remove(&self.key);
+    }
+}
+
+fn cancelled() -> ErrorBody {
+    ErrorBody::new("cancelled", "request cancelled")
 }
 
 pub(in crate::subc) struct Event(Progress);
@@ -99,7 +118,8 @@ struct Call {
     binding: Arc<Binding>,
     scope: ScopeStamp,
     carrier: String,
-    cancel: CancellationToken,
+    route_cancel: CancellationToken,
+    request_cancel: RequestCancel,
     lifetime: Lifetime,
 }
 
@@ -142,10 +162,40 @@ impl Service {
             }),
             connection_file: connection_file.to_path_buf(),
             jobs: JoinSet::new(),
+            requests: RequestCancels::default(),
             authorizer: authorization::Authorizer::new(None, connection_file.to_path_buf()),
             scopes: scope_lifetime::Tracker::new(control),
             bash: Running::default(),
         }
+    }
+
+    pub(in crate::subc) fn cancel(&self, route: RouteChannel, corr: u64) -> bool {
+        let token = self.requests.lock().unwrap().get(&(route, corr)).cloned();
+        if let Some(token) = token {
+            token.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn register_request(&self, frame: &Frame) -> Option<RequestCancel> {
+        let key = (
+            route_key(frame.header.channel, frame.header.epoch),
+            frame.header.corr,
+        );
+        let mut requests = self.requests.lock().unwrap();
+        let std::collections::hash_map::Entry::Vacant(entry) = requests.entry(key) else {
+            // The same wire request already has an owner for its terminal reply.
+            return None;
+        };
+        let token = CancellationToken::new();
+        entry.insert(token.clone());
+        Some(RequestCancel {
+            requests: self.requests.clone(),
+            key,
+            token,
+        })
     }
 
     pub(in crate::subc) fn enroll(&mut self, identity: &ManagementIdentity) {
@@ -242,7 +292,10 @@ impl Service {
             .unwrap_or_default();
         let principal = principal_label(&identity.principal);
         let binding = binding.clone();
-        let cancel = identity.shells_cancel.0.clone();
+        let route_cancel = identity.shells_cancel.0.clone();
+        let Some(request_cancel) = self.register_request(&frame) else {
+            return;
+        };
         let lookup = enumerate(
             #[cfg(test)]
             TEST_REGISTRY.try_with(Arc::clone).ok(),
@@ -274,21 +327,30 @@ impl Service {
             }) {
                 Ok(record) => record,
                 Err(error) => {
+                    let error = if request_cancel.token.is_cancelled() {
+                        cancelled()
+                    } else {
+                        error
+                    };
                     edge.error(&frame, error).await;
                     return None;
                 }
             };
             let folder = async {
-                if !is_admitted || !capacity || cancel.is_cancelled() {
+                if !is_admitted || !capacity || route_cancel.is_cancelled() {
                     return Err(admission_refusal());
                 }
                 let (project, _) = admit_scope(scope.as_ref())?;
                 if lifetime.ended() {
                     return Err(authorization::denied());
                 }
-                match tokio::time::timeout(LOOKUP_TIMEOUT, lookup).await {
-                    Ok(Ok(entries)) => registered_root(project, &entries),
-                    _ => Err(admission_refusal()),
+                tokio::select! {
+                    biased;
+                    _ = request_cancel.token.cancelled() => Err(cancelled()),
+                    result = tokio::time::timeout(LOOKUP_TIMEOUT, lookup) => match result {
+                        Ok(Ok(entries)) => registered_root(project, &entries),
+                        _ => Err(admission_refusal()),
+                    },
                 }
             }
             .await;
@@ -310,6 +372,11 @@ impl Service {
                     .map(|request| (folder, request))
                     .map_err(|error| errors::invalid_request("arguments", error.to_string()))
             });
+            let prepared = if request_cancel.token.is_cancelled() {
+                Err(cancelled())
+            } else {
+                prepared
+            };
             match prepared {
                 Ok((folder, request)) => {
                     let scope = scope.expect("folder lookup admitted the scope");
@@ -321,7 +388,8 @@ impl Service {
                             binding,
                             scope,
                             carrier,
-                            cancel,
+                            route_cancel,
+                            request_cancel,
                             lifetime,
                         },
                         folder,
@@ -375,7 +443,10 @@ impl Service {
                         }
                     });
                 self.authorizer.set_db(ready.call.record.db.clone());
-                let decision = if live.is_ok() && !ready.call.cancel.is_cancelled() {
+                let decision = if live.is_ok()
+                    && !ready.call.route_cancel.is_cancelled()
+                    && !ready.call.request_cancel.token.is_cancelled()
+                {
                     Some(
                         self.authorizer
                             .request_with_lifetime(consent, ready.call.lifetime.can_ask()),
@@ -387,7 +458,8 @@ impl Service {
                     let authorization = match decision {
                         Some(decision) => tokio::select! {
                             biased;
-                            _ = ready.call.cancel.cancelled() => Err(admission_refusal()),
+                            _ = ready.call.request_cancel.token.cancelled() => Err(cancelled()),
+                            _ = ready.call.route_cancel.cancelled() => Err(admission_refusal()),
                             result = decision => result.unwrap_or_else(|_| Err(admission_refusal())),
                         },
                         None => live.and(Err(admission_refusal())),
@@ -481,6 +553,15 @@ impl Edge {
                 }
             }).await
         };
+        if call.request_cancel.token.is_cancelled() {
+            let key = match result {
+                Ok(Admission::New(key, ..)) => Some(key),
+                _ => None,
+            };
+            self.refuse(&call.frame, call.record, key, cancelled())
+                .await;
+            return None;
+        }
         match result {
             Ok(Admission::New(key, tool, consent)) => Some(Event(Progress::Preflight(
                 Ready {
@@ -516,6 +597,11 @@ impl Edge {
             root,
             key,
         } = ready;
+        if call.request_cancel.token.is_cancelled() {
+            self.refuse(&call.frame, call.record, Some(key), cancelled())
+                .await;
+            return;
+        }
         let (decision, grant) = match authorization {
             Ok(Authorization::Once) => ("allow_once", None),
             Ok(Authorization::Saved(id)) => ("saved_grant", Some(id)),
@@ -537,15 +623,16 @@ impl Edge {
         let dispatch = self.dispatch;
         let record = call.record.clone();
         let dispatch_key = key.clone();
-        let cancel = call.cancel.clone();
+        let route_cancel = call.route_cancel.clone();
+        let request_cancel = call.request_cancel.token.clone();
         let lifetime = call.lifetime.clone();
         let (result_tx, result_rx) = oneshot::channel();
         let request_id = format!(
             "remote-file-{}-{}",
             call.frame.header.channel, call.frame.header.corr
         );
-        let rx = self.executor.submit_async(
-            root,
+        let (rx, job) = self.executor.submit_cancellable_async(
+            root.clone(),
             tool.lane(),
             request_id.clone(),
             Box::new(move |ctx| {
@@ -553,18 +640,35 @@ impl Edge {
                     if lifetime.ended() {
                         return Err(authorization::denied());
                     }
-                    if cancel.is_cancelled() {
+                    if request_cancel.is_cancelled() {
+                        return Err(cancelled());
+                    }
+                    if route_cancel.is_cancelled() {
                         return Err(admission_refusal());
                     }
-                    record.begin(&dispatch_key, decision)?;
+                    record.begin_with_grant(&dispatch_key, decision, grant.as_deref())?;
                     tool.run(ctx, dispatch)
                 })();
                 let _ = result_tx.send(result);
                 Response::success(request_id, json!({}))
             }),
         );
-        let _response = await_executor_response(rx, "remote-file".into()).await;
-        let result = result_rx.await.unwrap_or_else(|_| Err(not_working()));
+        let mut response = std::pin::pin!(await_executor_response(rx, "remote-file".into()));
+        tokio::select! {
+            biased;
+            _ = call.request_cancel.token.cancelled() => {
+                // Remove queued work now; if it started, wait for the worker
+                // before settling the ledger it may still be using.
+                self.executor.cancel_job(&root, &job);
+                response.await;
+            }
+            _ = &mut response => {}
+        }
+        let result = if call.request_cancel.token.is_cancelled() {
+            Err(cancelled())
+        } else {
+            result_rx.await.unwrap_or_else(|_| Err(not_working()))
+        };
         let reply = self.tool_reply(&call, result);
         self.finish(&call.frame, call.record, Some(key), reply, decision, None)
             .await;

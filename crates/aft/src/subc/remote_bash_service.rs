@@ -104,10 +104,13 @@ impl Edge {
         })
         .await;
         let started = prepared.and_then(|(launch, timeout)| {
+            if call.request_cancel.token.is_cancelled() {
+                return Err(cancelled());
+            }
             if call.lifetime.ended() || job.revoked.is_cancelled() {
                 return Err(authorization::denied());
             }
-            if call.cancel.is_cancelled() {
+            if call.route_cancel.is_cancelled() {
                 return Err(admission_refusal());
             }
             launch
@@ -121,6 +124,11 @@ impl Edge {
         let (child, timeout) = match started {
             Ok(started) => started,
             Err(error) => {
+                let error = if call.request_cancel.token.is_cancelled() {
+                    cancelled()
+                } else {
+                    error
+                };
                 self.refuse(frame, call.record, Some(key), error).await;
                 return;
             }
@@ -149,11 +157,16 @@ impl Edge {
         });
         let mut held = false;
         let mut yielded = false;
-        let mut cancelled = false;
+        let mut route_closed = false;
+        let mut request_cancelled = false;
         let (output, denied) = loop {
             tokio::select! {
                 biased;
-                pending = &mut job.yield_rx, if !yielded => {
+                _ = call.request_cancel.token.cancelled(), if !request_cancelled => {
+                    request_cancelled = true;
+                    stop.cancel();
+                }
+                pending = &mut job.yield_rx, if !yielded && !request_cancelled => {
                     yielded = true;
                     if let Ok(request) = pending {
                         let hold = call_yield::restart_held_frame(frame.header.ver, route, frame.header.corr, frame.header.flags, None);
@@ -171,8 +184,8 @@ impl Edge {
                         self.yield_answer(&request, YieldAnswer::NotYieldable(NotYieldable::NotWaiting)).await;
                     }
                 }
-                _ = call.cancel.cancelled(), if !held && !cancelled => {
-                    cancelled = true;
+                _ = call.route_cancel.cancelled(), if !held && !route_closed => {
+                    route_closed = true;
                     stop.cancel();
                 }
                 output = &mut wait => break output.unwrap_or_else(|error| (Err(error.to_string()), false)),
@@ -184,8 +197,15 @@ impl Edge {
             self.yield_answer(&request, YieldAnswer::UnknownCall).await;
         }
         let result = match output {
+            Ok(output) if request_cancelled && held => {
+                let error = cancelled();
+                let mut result = output.result(&key.call_key, Some(error.message));
+                result.response.data["code"] = json!(error.code);
+                Ok(result)
+            }
+            _ if request_cancelled => Err(cancelled()),
             Ok(output) => {
-                let line = if denied || cancelled {
+                let line = if denied || route_closed {
                     Some(authorization::denied().message)
                 } else if output.timed_out && timeout == remote_bash::MAX_RUNTIME {
                     Some(remote_bash::TIME_LIMIT.to_owned())

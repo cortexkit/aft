@@ -13,12 +13,77 @@ async fn wait_for_start(root: &Path, corr: u64) {
 
 fn shell(corr: u64, timeout: u64) -> Value {
     let command =
-        format!("echo output-{corr}; touch started-{corr}; sleep 60; touch survived-{corr}");
+        format!("echo output-{corr}; echo $$ > pid-{corr}; touch started-{corr}; sleep 60; touch survived-{corr}");
     tool(
         "bash",
         json!({"command":command, "timeout":timeout, "background":false, "pty":false}),
         corr,
     )
+}
+
+fn assert_reaped(root: &Path, corr: u64) {
+    let pid = std::fs::read_to_string(root.join(format!("pid-{corr}"))).unwrap();
+    assert!(
+        !Path::new("/proc").join(pid.trim()).exists(),
+        "shell {corr} is alive"
+    );
+    assert!(!root.join(format!("survived-{corr}")).exists());
+}
+
+async fn exercise_request_cancellation(peer: &mut Peer, root: &Path) {
+    peer.send(6, 610, shell(610, 30_000)).await;
+    wait_for_start(root, 610).await;
+    peer.signal(FrameType::Cancel, 6, 610).await;
+    let error = refusal(peer.receive(6, 610).await, "cancelled");
+    assert_eq!(error.message, "request cancelled");
+    assert_reaped(root, 610);
+
+    peer.send(6, 620, shell(620, 30_000)).await;
+    wait_for_start(root, 620).await;
+    yield_call(peer, 6, 620, "person_message").await;
+    peer.signal(FrameType::Cancel, 6, 620).await;
+    let result = late(peer, 6, 620).await;
+    assert_eq!(result["errorCode"], "cancelled", "{result}");
+    assert!(text(&result).contains("request cancelled"), "{result}");
+    assert_reaped(root, 620);
+    assert!(!peer
+        .waiting
+        .iter()
+        .any(|f| f.header.channel == 6 && matches!(f.header.corr, 610 | 620)));
+
+    let mut rebound = remote_bind(7, "run", &[HELD, RESULT, YIELD]);
+    rebound["scope"]["ref"] = json!("run-shell-new");
+    reply(peer.call(0, 61, rebound).await);
+    let args = json!({"command":"touch started-630; while [ ! -e release-630 ]; do sleep .02; done; echo completed-after-close", "timeout":30_000});
+    peer.send(6, 630, tool("bash", args, 630)).await;
+    wait_for_start(root, 630).await;
+    yield_call(peer, 6, 630, "person_message").await;
+    peer.signal(FrameType::Goodbye, 6, 0).await;
+    // Wait until the module processes Goodbye before letting the shell exit.
+    reply(peer.call(7, 62, feed()).await);
+    std::fs::write(root.join("release-630"), "").unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for corr in 4000.. {
+            let feed = reply(peer.call(7, corr, feed()).await);
+            if let Some(entry) = feed["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["call_key"] == "key-630")
+            {
+                assert_eq!(entry["kind"], "result", "{entry}");
+                assert_ne!(entry["result"]["isError"], true, "{entry}");
+                assert!(
+                    text(&entry["result"]).contains("completed-after-close"),
+                    "{entry}"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("held shell should finish after its route closes");
 }
 
 async fn yield_call(peer: &mut Peer, channel: u16, corr: u64, reason: &str) {
@@ -259,6 +324,7 @@ async fn exercise_shell_lifetime() {
             "{result}"
         );
         assert_eq!(result["errorCode"], "timeout", "{result}");
+        exercise_request_cancellation(&mut peer, root.as_path()).await;
 
         write_frame(
             &mut peer.daemon,

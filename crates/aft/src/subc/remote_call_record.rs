@@ -66,10 +66,6 @@ impl Record {
             .map_err(store_error)
     }
 
-    pub(super) fn begin(&self, key: &ledger::Key, decision: &str) -> Result<(), ErrorBody> {
-        self.begin_with_grant(key, decision, None)
-    }
-
     pub(super) fn begin_with_grant(
         &self,
         key: &ledger::Key,
