@@ -19,7 +19,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -979,6 +979,7 @@ fn report_from(
 }
 
 const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const DISK_MAX_SAMPLE_AGE: Duration = Duration::from_secs(10 * 60);
 const DISK_ENTRY_CAP: usize = 4096;
 const DISK_WALK_BUDGET: Duration = Duration::from_millis(50);
 
@@ -988,12 +989,18 @@ fn complete_disk_bytes(usage: aft_store::family::DiskUsage) -> Option<u64> {
 
 #[derive(Debug, Default)]
 struct DiskSample {
-    usage: Option<aft_store::family::DiskUsage>,
-    completed: Option<std::time::Instant>,
-    started: Option<std::time::Instant>,
+    last_walk: Option<DiskWalk>,
+    completed: Option<Instant>,
+    started: Option<Instant>,
     running: bool,
     #[cfg(test)]
     walks: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DiskWalk {
+    usage: aft_store::family::DiskUsage,
+    reuse_until: Instant,
 }
 
 /// Physical bytes are a timestamped measurement, not a generation invariant:
@@ -1059,16 +1066,29 @@ impl DiskMeasurement {
             .sample
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        // A scratch file can grow in place without changing its directory's
+        // mtime. Expire reuse based on the last walk, not the last stamp check.
+        let reuse_until = sample.last_walk.map(|walk| walk.reuse_until);
         if !sample.running
-            && sample
-                .started
-                .is_none_or(|at| at.elapsed() >= DISK_REFRESH_INTERVAL)
+            && sample.started.is_none_or(|last| {
+                let next_probe = last + DISK_REFRESH_INTERVAL;
+                // Don't defer the age limit behind a recent stamp check. If a
+                // launch already failed at the limit, keep the normal retry cadence.
+                let next = reuse_until
+                    .filter(|expires| last < *expires)
+                    .map_or(next_probe, |expires| next_probe.min(expires));
+                now >= next
+            })
         {
             sample.running = true;
-            sample.started = Some(std::time::Instant::now());
+            sample.started = Some(now);
             let own = Arc::clone(self);
             let dir = dir.to_path_buf();
-            let previous = sample.usage;
+            let previous = sample
+                .last_walk
+                .filter(|walk| now < walk.reuse_until)
+                .map(|walk| walk.usage);
             if std::thread::Builder::new()
                 .name("aft-status-disk".into())
                 .spawn(move || {
@@ -1087,13 +1107,16 @@ impl DiskMeasurement {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         if let Some(usage) = usage {
-                            sample.usage = Some(usage);
+                            sample.last_walk = Some(DiskWalk {
+                                usage,
+                                reuse_until: now + DISK_MAX_SAMPLE_AGE,
+                            });
                             #[cfg(test)]
                             {
                                 sample.walks += 1;
                             }
                         }
-                        sample.completed = Some(std::time::Instant::now());
+                        sample.completed = Some(Instant::now());
                         sample.running = false;
                     }
                     let listeners = own
@@ -1112,11 +1135,14 @@ impl DiskMeasurement {
                 sample.running = false;
             }
         }
-        let bytes = sample.usage.and_then(complete_disk_bytes);
+        let bytes = sample
+            .last_walk
+            .and_then(|walk| complete_disk_bytes(walk.usage));
         (
             bytes,
             sample.running
                 || bytes.is_none()
+                || reuse_until.is_some_and(|expires| now >= expires)
                 || sample
                     .completed
                     .is_none_or(|at| at.elapsed() >= DISK_REFRESH_INTERVAL),
@@ -1133,7 +1159,7 @@ impl DiskMeasurement {
             self.family,
             previous,
             DISK_ENTRY_CAP,
-            std::time::Instant::now() + DISK_WALK_BUDGET,
+            Instant::now() + DISK_WALK_BUDGET,
         )?;
         #[cfg(test)]
         STATUS_DISK_WALKS.with(|count| count.set(count.get() + 1));
@@ -3279,7 +3305,10 @@ mod status_disk_tests {
         let measurement = DiskMeasurement::for_family(dir.path(), family_id());
         let now = std::time::Instant::now();
         *measurement.sample.lock().unwrap() = DiskSample {
-            usage: Some(usage),
+            last_walk: Some(DiskWalk {
+                usage,
+                reuse_until: now + DISK_MAX_SAMPLE_AGE,
+            }),
             started: Some(now),
             completed: Some(now),
             ..DiskSample::default()
@@ -3291,6 +3320,61 @@ mod status_disk_tests {
         apply_to_status_operator(&mut payload, &report);
         assert_eq!(payload["disk"]["data_store_bytes"], Value::Null);
         assert_eq!(payload["disk"]["data_store_bytes_stale"], true);
+    }
+
+    #[test]
+    fn status_disk_measurement_rewalks_grown_scratch_at_the_age_limit() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let builds = dir.path().join("builds");
+        std::fs::create_dir(&builds).unwrap();
+        let scratch = builds.join("growing.tmp");
+        std::fs::write(&scratch, b"first").unwrap();
+        let stamp = std::fs::metadata(&builds).unwrap().modified().unwrap();
+        let measurement = DiskMeasurement::for_family(dir.path(), family_id());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let listener: super::super::runtime::StatusListener = Arc::new(move || {
+            let _ = tx.send(());
+        });
+        measurement.on_change(&listener);
+        assert_eq!(measurement.observe(dir.path()), (None, true));
+        rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        assert_eq!(measurement.observe(dir.path()), (Some(5), false));
+        let initial_expiry = {
+            let sample = measurement.sample.lock().unwrap();
+            let expiry = sample.last_walk.unwrap().reuse_until;
+            assert_eq!(expiry - sample.started.unwrap(), Duration::from_secs(600));
+            expiry
+        };
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&scratch)
+            .unwrap()
+            .write_all(b" grows")
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&builds).unwrap().modified().unwrap(),
+            stamp
+        );
+        measurement.expire_for_test();
+        assert_eq!(measurement.observe(dir.path()), (Some(5), true));
+        rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        assert_eq!(measurement.observe(dir.path()), (Some(5), false));
+        {
+            let mut sample = measurement.sample.lock().unwrap();
+            assert_eq!(sample.walks, 1);
+            assert_eq!(sample.last_walk.unwrap().reuse_until, initial_expiry);
+            // Simulate expiration just after the stamp check, without
+            // expiring the ordinary 60-second probe cadence.
+            let expires = sample.started.unwrap() + Duration::from_nanos(1);
+            sample.last_walk.as_mut().unwrap().reuse_until = expires;
+        }
+        assert_eq!(measurement.observe(dir.path()), (Some(5), true));
+        rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        assert_eq!(measurement.observe(dir.path()), (Some(11), false));
+        assert_eq!(measurement.sample.lock().unwrap().walks, 2);
     }
 
     #[test]
