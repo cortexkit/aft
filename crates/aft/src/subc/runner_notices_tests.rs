@@ -513,17 +513,19 @@ fn code_search_nudge_runner_send_is_once_and_leaves_result_bytes_unchanged() {
         false,
         None,
     );
-    let result = super::super::bash::finalized_bash_result(
-        response,
-        &ctx,
-        session,
-        &crate::subc_format::FormatContext {
-            bash_code_search_hint: Some(context),
-            ..format_context
-        },
-        false,
-        None,
-    );
+    let (result, logs) = crate::logging::capture_log_lines(|| {
+        super::super::bash::finalized_bash_result(
+            response,
+            &ctx,
+            session,
+            &crate::subc_format::FormatContext {
+                bash_code_search_hint: Some(context),
+                ..format_context
+            },
+            false,
+            None,
+        )
+    });
     assert_eq!(
         serde_json::to_vec(&result.response).unwrap(),
         serde_json::to_vec(&expected.response).unwrap()
@@ -545,6 +547,7 @@ fn code_search_nudge_runner_send_is_once_and_leaves_result_bytes_unchanged() {
         json!({"shell":"bash", "redirect":"Use the `search` tool instead (it auto-routes concepts, identifiers, regex, and literals)."})
     );
     assert!(params.get("prompt").is_none());
+    assert_eq!(logs, ["INFO runner code-search nudge call_key=call-17 send_id=aft:nudge:aft.bash.code_search:call-17 session=code-search-nudge-runner harness=broca probe=confirmed; delivered reason=runner confirmed delivery"]);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -632,7 +635,7 @@ fn code_search_nudge_runner_deadline_preserves_result_bytes_and_drops_once() {
         "no retry after timeout"
     );
     assert_eq!(capture.effects.load(Ordering::Relaxed), 0);
-    assert_eq!(logs, vec!["INFO runner code-search nudge call_key=call-deadline dropped class=Timeout code=none detail=code-search notice send exceeded 2s total deadline"]);
+    assert_eq!(logs, ["INFO runner code-search nudge call_key=call-deadline send_id=aft:nudge:aft.bash.code_search:call-deadline session=code-search-nudge-deadline harness=broca probe=confirmed; dropped class=Timeout code=none detail=code-search notice send exceeded 2s total deadline"]);
 }
 
 #[test]
@@ -641,24 +644,62 @@ fn code_search_nudge_runner_drops_refused_undelivered_unordered_and_missing_addr
     let root = tempfile::tempdir().unwrap();
     // `sends` is whether the runner sees a send at all. Without confirmed
     // ordered delivery a nudge would start a turn of its own, so none is sent.
-    for (case, missing, ordered, sends) in [
-        ("refused", false, Some(true), true),
-        ("not-delivered", false, Some(true), true),
-        ("older-runner", false, Some(false), false),
-        ("probe-failed", false, None, false),
-        ("no-address", true, Some(true), false),
+    for (case, missing, ordered, expected) in [
+        (
+            "pending",
+            false,
+            Some(true),
+            "probe=confirmed; sent, ordered, awaiting delivery reason=eligible code search",
+        ),
+        (
+            "refused",
+            false,
+            Some(true),
+            "probe=confirmed; refused; dropped code=delivery_unsupported",
+        ),
+        (
+            "not-delivered",
+            false,
+            Some(true),
+            "probe=confirmed; not_delivered reason=handover_failed; dropped",
+        ),
+        (
+            "expired",
+            false,
+            Some(true),
+            "probe=confirmed; dropped reason=notice expired",
+        ),
+        (
+            "older-runner",
+            false,
+            Some(false),
+            "probe=not advertised; dropped class=NoOrderedDelivery",
+        ),
+        (
+            "probe-failed",
+            false,
+            None,
+            "probe=unavailable; dropped class=NoOrderedDelivery",
+        ),
+        (
+            "no-address",
+            true,
+            Some(true),
+            "probe=not completed; dropped class=Address",
+        ),
     ] {
         let session = format!("code-search-nudge-{case}");
         let capture = test_endpoint::capture(&session, false);
         capture.delivery_order(ordered);
-        if case == "refused" {
-            capture.refuse("delivery_unsupported", None);
-        }
-        if case == "not-delivered" {
-            capture.reply(undelivered("handover_failed"));
+        match case {
+            "pending" => capture.reply(SendReply::new("pending")),
+            "refused" => capture.refuse("delivery_unsupported", None),
+            "not-delivered" => capture.reply(undelivered("handover_failed")),
+            "expired" => capture.reply(SendReply::new(states::EXPIRED)),
+            _ => {}
         }
         let context = crate::subc_format::BashCodeSearchHint {
-            command: "rg foo".into(),
+            command: "grep -rn foo src/".into(),
             workdir: None,
             search_tool: Some("aft_search".into()),
             grep_tool: Some("grep".into()),
@@ -680,16 +721,60 @@ fn code_search_nudge_runner_drops_refused_undelivered_unordered_and_missing_addr
             json!({"task_id": "native", "status": "completed", "exit_code": 0, "output": "hit"}),
         );
         let before = serde_json::to_vec(&response).unwrap();
-        context.deliver(&mut response, root.path());
+        let src = root.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        filetime::set_file_mtime(&src, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+        let (_, logs) =
+            crate::logging::capture_log_lines(|| context.deliver(&mut response, root.path()));
         assert_eq!(serde_json::to_vec(&response).unwrap(), before, "{case}");
+        assert_eq!(logs.len(), 1, "{case}: {logs:?}");
+        assert!(logs[0].contains(expected), "{case}: {logs:?}");
+        let sends = !missing && ordered == Some(true);
         if sends {
             let got = capture.receiver.try_recv().unwrap();
             assert!(got.request["params"]["delivery"].is_array(), "{case}");
+            let send_id = got.request["params"]["send_id"].as_str().unwrap();
+            assert!(
+                logs[0].contains(&format!(
+                    "send_id={send_id} session={session} harness=broca"
+                )),
+                "{case}: {logs:?}"
+            );
         }
         assert!(
             capture.receiver.try_recv().is_err(),
             "{case} never retries, sends unordered or appends"
         );
+    }
+}
+
+#[test]
+fn code_search_nudge_runner_logs_only_search_candidates_that_are_not_eligible() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("fixture.txt"), "foo\n").unwrap();
+    let data = json!({"task_id": "native", "status": "completed", "exit_code": 0, "output": "foo"});
+    for (command, reason) in [
+        ("echo 'x | grep foo'", None),
+        (
+            "echo foo | grep foo",
+            Some("search is not the first pipeline stage"),
+        ),
+        ("grep foo fixture.txt", Some("search targets a file")),
+    ] {
+        let mut response = Response::success("notice-call", data.clone());
+        let context = crate::subc_format::BashCodeSearchHint {
+            command: command.into(),
+            workdir: None,
+            search_tool: Some("aft_search".into()),
+            grep_tool: Some("grep".into()),
+            shell_tool: "bash".into(),
+            runner_notice: Some(notice_route("ineligible-code-search")),
+        };
+        let (_, logs) =
+            crate::logging::capture_log_lines(|| context.deliver(&mut response, root.path()));
+        let expected: Vec<_> = reason.into_iter().map(|reason| format!("INFO runner code-search nudge call_key=notice-call session=ineligible-code-search harness=broca not eligible reason={reason}")).collect();
+        assert_eq!(logs, expected, "{command}");
+        assert_eq!(response.data, data, "{command}");
     }
 }
 

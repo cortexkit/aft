@@ -64,38 +64,96 @@ pub(crate) fn code_search_nudge(
     grep_tool: Option<&str>,
     shell_tool: &str,
 ) -> Option<String> {
-    if output.is_empty()
-        || output.contains(HINT_PREFIX)
-        || (search_tool.is_none() && grep_tool.is_none())
-    {
-        return None;
-    }
+    code_search_decision(
+        output,
+        command,
+        project_root,
+        workdir,
+        search_tool,
+        grep_tool,
+        shell_tool,
+    )
+    .ok()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Rejection {
+    NotCodeSearch,
+    Ineligible(&'static str),
+}
+
+pub(crate) fn code_search_decision(
+    output: &str,
+    command: &str,
+    project_root: Option<&Path>,
+    workdir: Option<&str>,
+    search_tool: Option<&str>,
+    grep_tool: Option<&str>,
+    shell_tool: &str,
+) -> Result<String, Rejection> {
+    use Rejection::{Ineligible, NotCodeSearch};
     let windows = cfg!(windows);
-    let statements = statements(command, windows)?;
-    let stages: Vec<_> = statements
+    let Some(statements) = statements(command, windows) else {
+        return Err(if search_stage(command, windows).is_some() {
+            Ineligible("command could not be parsed")
+        } else {
+            NotCodeSearch
+        });
+    };
+    let pipelines: Vec<_> = statements
         .iter()
-        .filter_map(|s| first_stage(s, windows))
+        .filter_map(|s| pipeline_stages(s, windows))
         .collect();
-    let searches: Vec<_> = stages
-        .iter()
-        .filter_map(|s| {
-            let (head, end) = token(s, 0, windows)?;
-            matches!(head.as_str(), "grep" | "rg").then(|| (*s, operands(s, end, windows)))
-        })
-        .collect();
-    if searches.is_empty()
-        || searches
+    let stages = || {
+        pipelines
             .iter()
-            .all(|(_, paths)| !paths.is_empty() && paths.iter().all(|p| dynamic(p)))
+            .filter_map(|pipeline| pipeline.first().copied())
+    };
+    let searches: Vec<_> = stages()
+        .filter_map(|s| search_stage(s, windows).map(|end| operands(s, end, windows)))
+        .collect();
+    if searches.is_empty() {
+        if pipelines.iter().any(|pipeline| {
+            pipeline
+                .iter()
+                .skip(1)
+                .any(|stage| search_stage(stage, windows).is_some())
+        }) {
+            return Err(Ineligible("search is not the first pipeline stage"));
+        }
+        return Err(
+            if statements
+                .iter()
+                .any(|s| search_stage(s, windows).is_some())
+            {
+                Ineligible("search stage could not be parsed")
+            } else {
+                NotCodeSearch
+            },
+        );
+    }
+    if output.is_empty() {
+        return Err(Ineligible("empty output"));
+    }
+    if output.contains(HINT_PREFIX) {
+        return Err(Ineligible("output already contains the nudge"));
+    }
+    if search_tool.is_none() && grep_tool.is_none() {
+        return Err(Ineligible("no replacement search tool"));
+    }
+    if searches
+        .iter()
+        .all(|paths| !paths.is_empty() && paths.iter().all(|p| dynamic(p)))
     {
-        return None;
+        return Err(Ineligible("search paths are dynamic"));
     }
     if let Some(root) = project_root.filter(|root| !root.to_string_lossy().trim().is_empty()) {
         let root = root.to_str().map(str::trim).map(Path::new).unwrap_or(root);
         let root = resolve(Path::new(""), root);
         let mut cwd = Some(resolve(&root, Path::new(workdir.unwrap_or("."))));
         let mut suppress = true;
-        for stage in stages {
+        let mut reason = "no eligible project search target";
+        for stage in stages() {
             let Some((head, end)) = token(stage, 0, windows) else {
                 continue;
             };
@@ -106,35 +164,41 @@ pub(crate) fn code_search_nudge(
             if !matches!(head.as_str(), "grep" | "rg") {
                 continue;
             }
-            let Some(cwd) = cwd.as_deref().filter(|cwd| inside(&root, cwd)) else {
+            let Some(cwd) = cwd.as_deref() else {
+                reason = "search working directory is unknown";
                 continue;
             };
+            if !inside(&root, cwd) {
+                reason = "search working directory is outside the project";
+                continue;
+            }
             let paths = operands(stage, end, windows);
             if paths.is_empty() {
                 suppress = false;
                 break;
             }
             let mut existing = false;
-            let mut suppressed = false;
             for path in paths {
                 if dynamic(&path) {
+                    reason = "search path is dynamic";
                     continue;
                 }
                 let path = resolve(cwd, Path::new(&path));
                 if !inside(&root, &path) {
+                    reason = "search path is outside the project";
                     continue;
                 }
                 let Ok(metadata) = std::fs::metadata(path) else {
+                    reason = "search target metadata is unavailable";
                     continue;
                 };
                 existing = true;
-                if metadata.is_file() || metadata.modified().is_ok_and(fresh) {
-                    suppressed = true;
-                    break;
+                if metadata.is_file() {
+                    return Err(Ineligible("search targets a file"));
                 }
-            }
-            if suppressed {
-                break;
+                if metadata.modified().is_ok_and(fresh) {
+                    return Err(Ineligible("search target was recently modified"));
+                }
             }
             if existing {
                 suppress = false;
@@ -142,14 +206,19 @@ pub(crate) fn code_search_nudge(
             }
         }
         if suppress {
-            return None;
+            return Err(Ineligible(reason));
         }
     }
-    Some(crate::bash_rewrite::footer::grep_search_hint(
+    Ok(crate::bash_rewrite::footer::grep_search_hint(
         search_tool,
         grep_tool.unwrap_or("grep"),
         shell_tool,
     ))
+}
+
+fn search_stage(stage: &str, windows: bool) -> Option<usize> {
+    let (head, end) = token(stage, 0, windows)?;
+    matches!(head.as_str(), "grep" | "rg").then_some(end)
 }
 
 fn fresh(modified: SystemTime) -> bool {
@@ -423,10 +492,11 @@ fn statements(command: &str, windows: bool) -> Option<Vec<&str>> {
     Some(out)
 }
 
-fn first_stage(command: &str, windows: bool) -> Option<&str> {
+fn pipeline_stages(command: &str, windows: bool) -> Option<Vec<&str>> {
     let mut chars = command.char_indices().peekable();
     let mut quote = Quote::None;
-    let mut pipe = command.len();
+    let mut stages = Vec::new();
+    let mut start = 0;
     while let Some((at, c)) = chars.next() {
         if quote == Quote::Single {
             if c == '\'' {
@@ -453,11 +523,18 @@ fn first_stage(command: &str, windows: bool) -> Option<&str> {
             '|' if chars.peek().is_some_and(|(_, c)| *c == '|') => {
                 chars.next();
             }
-            '|' if pipe == command.len() => pipe = at,
+            '|' => {
+                stages.push(command[start..at].trim());
+                start = at + 1;
+            }
             _ => {}
         }
     }
-    (quote == Quote::None).then(|| command[..pipe].trim())
+    if quote != Quote::None {
+        return None;
+    }
+    stages.push(command[start..].trim());
+    Some(stages)
 }
 
 fn token(command: &str, start: usize, windows: bool) -> Option<(String, usize)> {
