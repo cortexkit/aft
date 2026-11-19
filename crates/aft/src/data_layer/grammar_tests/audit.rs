@@ -93,7 +93,7 @@ fn fixture(ready: bool) -> Fixture {
         root,
         storage,
         ctx,
-        registry,
+        registry: Arc::clone(registry),
         wasm,
     }
 }
