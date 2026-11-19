@@ -306,18 +306,26 @@ fn bash_kill_of_a_finished_task_names_what_survived_it() {
 fn finished_foreground_nohup_child_survives_replay_and_cleanup_until_explicit_kill() {
     let dir = tempfile::tempdir().unwrap();
     let old = registry();
-    // Wait until nohup is ignoring SIGHUP before the foreground shell exits.
-    let command = r#"
-/usr/bin/nohup /bin/bash -c ': > ready; exec /bin/sleep 60' > child.log 2>&1 < /dev/null &
+    // Apple's nohup can refuse to run without a console. Ignore SIGHUP
+    // directly on macOS, without moving the child to another process group.
+    #[cfg(target_os = "macos")]
+    let nohup = r#"/bin/bash -c 'trap "" HUP; exec "$@"' bash"#;
+    #[cfg(not(target_os = "macos"))]
+    let nohup = "/usr/bin/nohup";
+    // Wait for the child to start before the foreground shell exits.
+    let command = format!(
+        r#"
+{nohup} /bin/bash -c ': > ready; exec /bin/sleep 60' > child.log 2>&1 < /dev/null &
 pid=$!
 printf '%s\n' "$pid" > child.pid
 while [ ! -f ready ] && kill -0 "$pid" 2>/dev/null; do /bin/sleep 0.02; done
 [ -f ready ]
-"#;
+"#
+    );
     let task_id = old
         .spawn_with_shell_in_slot(
             SpawnPlan::Unsandboxed,
-            command,
+            &command,
             super::super::BashShell::Bash,
             PathBuf::from("/bin/bash"),
             SESSION.into(),
