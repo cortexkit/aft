@@ -13334,6 +13334,11 @@ impl BgTaskRegistry {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn scope_fence_unlocked_for_test(&self) -> bool {
+        self.inner.revoked_scopes.try_lock().is_ok()
+    }
+
     pub(crate) fn kill_scope(&self, scope: &subc_protocol::scope::ScopeStamp) {
         // Remember the end before taking the task snapshot. A dispatch already
         // queued on another thread may register its process after this pass.

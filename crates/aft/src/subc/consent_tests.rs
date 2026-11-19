@@ -7633,6 +7633,7 @@ async fn consent_native_windows_drive_path_is_denied_without_sending_a_request()
 /// slow or stalled filesystem never keeps other routes from the database.
 #[tokio::test]
 async fn consent_head_policy_resolves_with_database_unlocked() {
+    use crate::access_policy::path_probe;
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());
     let db = f.ctx.db().unwrap();
@@ -7673,20 +7674,38 @@ async fn consent_head_policy_resolves_with_database_unlocked() {
         "acc_log_granted",
     )
     .unwrap();
-    let (applied, lines) = crate::logging::capture_log_lines(|| {
-        apply_allow(
-            &db,
-            &f.ctx,
-            &f.worker,
-            &prep.key,
-            &prep.call_key,
-            &asks::new_holder(),
-            &prep.grant,
-            None,
-            true,
-            false,
-        )
-    });
+    let path_probes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let (applied, lines) = path_probe::capture(
+        {
+            let (path_probes, db, target) = (path_probes.clone(), db.clone(), target.clone());
+            let registry = f.ctx.bash_background().clone();
+            move |kind, path| {
+                if path == target {
+                    path_probes.borrow_mut().push((
+                        kind,
+                        db.try_lock().is_ok(),
+                        registry.scope_fence_unlocked_for_test(),
+                    ));
+                }
+            }
+        },
+        || {
+            crate::logging::capture_log_lines(|| {
+                apply_allow(
+                    &db,
+                    &f.ctx,
+                    &f.worker,
+                    &prep.key,
+                    &prep.call_key,
+                    &asks::new_holder(),
+                    &prep.grant,
+                    None,
+                    true,
+                    false,
+                )
+            })
+        },
+    );
     let applied = applied.unwrap();
     assert!(
         matches!(applied, Applied::Run(_)),
@@ -7714,6 +7733,17 @@ async fn consent_head_policy_resolves_with_database_unlocked() {
         "{line}"
     );
     assert_eq!(f.worker_grants(), vec![grant]);
+    let path_probes = path_probes.borrow();
+    for expected in [path_probe::Kind::SqliteFloor, path_probe::Kind::Resolve] {
+        assert!(
+            path_probes.iter().any(|(kind, _, _)| *kind == expected),
+            "missing {expected:?}: {path_probes:?}"
+        );
+    }
+    assert!(
+        path_probes.iter().all(|(_, db, scope)| *db && *scope),
+        "a path probe held aft.db or the scope fence: {path_probes:?}"
+    );
     drop(hook);
     let probes = probes.borrow();
     assert!(

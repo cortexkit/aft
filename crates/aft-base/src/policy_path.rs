@@ -56,6 +56,8 @@ pub fn with_bounded_policy_paths<T>(
 }
 
 fn resolve_policy_path(path: &Path) -> PathBuf {
+    #[cfg(any(test, feature = "test-support"))]
+    path_probe::record(path_probe::Kind::Resolve, path);
     #[cfg(all(any(test, feature = "test-support"), unix))]
     crate::bounded_io::stall_running_helper_if_requested(path);
     let path = if path.is_absolute() {
@@ -81,6 +83,42 @@ fn resolve_policy_path(path: &Path) -> PathBuf {
         if !ancestor.pop() {
             return crate::path_identity::normalize_path(&path);
         }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod path_probe {
+    use super::Path;
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Kind {
+        Resolve,
+        SqliteFloor,
+    }
+
+    type Probe = Box<dyn Fn(Kind, &Path)>;
+    thread_local! {
+        static PROBE: RefCell<Option<Probe>> = const { RefCell::new(None) };
+    }
+
+    pub fn capture<T>(probe: impl Fn(Kind, &Path) + 'static, work: impl FnOnce() -> T) -> T {
+        struct Restore(Option<Probe>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                PROBE.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let _restore = Restore(PROBE.with(|slot| slot.replace(Some(Box::new(probe)))));
+        work()
+    }
+
+    pub fn record(kind: Kind, path: &Path) {
+        PROBE.with(|slot| {
+            if let Some(probe) = slot.borrow().as_ref() {
+                probe(kind, path);
+            }
+        });
     }
 }
 

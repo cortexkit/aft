@@ -9558,13 +9558,8 @@ fn spawn_permissions_request(
         let result = match admitted {
             Err(error) => Err(error),
             Ok(request) => tokio::task::spawn_blocking(move || {
-                let registries = executor
-                    .actor_contexts()
-                    .iter()
-                    .map(|ctx| ctx.bash_background().clone())
-                    .collect::<Vec<_>>();
                 permissions::answer(db.as_deref(), &request, |row| {
-                    permissions::stop_folder_tasks(&registries, row)
+                    permissions::stop_folder_tasks(&executor, &row.scope, &row.path)
                 })
             })
             .await
@@ -10226,6 +10221,7 @@ async fn submit_provider_read(
         });
     phase_trace.mark_executor_submitted();
     let (trace_tx, trace_rx) = oneshot::channel();
+    let grant_executor = Arc::clone(executor);
     let mut rx = submit_active_tool_call(
         executor,
         active,
@@ -10249,7 +10245,9 @@ async fn submit_provider_read(
                     "scope persistence unavailable",
                 ))
             } else if job_operation.starts_with("grants.") {
-                access_grants::operation(body, &job_operation, &identity, ctx)
+                access_grants::operation(body, &job_operation, &identity, ctx, |scope, path| {
+                    permissions::stop_folder_tasks(&grant_executor, scope, path);
+                })
             } else {
                 remote_policy::catalog(body, &identity, ctx)
             };

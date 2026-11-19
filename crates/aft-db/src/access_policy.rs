@@ -1007,6 +1007,11 @@ impl AccessPolicy {
                 return Some(floor.clone());
             }
         }
+        #[cfg(any(test, feature = "test-support"))]
+        aft_base::policy_path::path_probe::record(
+            aft_base::policy_path::path_probe::Kind::SqliteFloor,
+            path,
+        );
         if crate::db::file_identity::is_live_sqlite_file(path) {
             return Some(PolicyFloor {
                 path: path.to_path_buf(),

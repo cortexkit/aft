@@ -1772,14 +1772,15 @@ fn head_policy(head: Option<&AccessPolicy>, grant: &AccessGrant) -> HeadPolicy {
     head.map_or(HeadPolicy::NotHeld, |policy| policy.head_policy(grant))
 }
 
-/// Run `commit` under the aft.db lock with the worker's head policy, when
-/// `needed`, resolved on disk while the lock is released.
-fn with_head_policy<T>(
+/// Resolve the worker's head policy, when `needed`, and run `check` with the
+/// database unlocked. Commit only if the stored head policy is unchanged.
+fn with_head_policy<T, R>(
     db: &std::sync::Mutex<crate::db::TrackedConnection>,
     ctx: &AppContext,
     identity: &RouteIdentity,
     needed: bool,
-    commit: impl FnOnce(&rusqlite::Connection, Option<AccessPolicy>) -> rusqlite::Result<T>,
+    check: impl Fn(Option<AccessPolicy>) -> R,
+    commit: impl FnOnce(&rusqlite::Connection, R) -> rusqlite::Result<T>,
 ) -> Result<T, String> {
     let storage = ctx.storage_dir();
     access_grants::resolve_unlocked(
@@ -1792,8 +1793,8 @@ fn with_head_policy<T>(
                 Ok(access_grants::HeadSnapshot::default())
             }
         },
-        |head| head.resolve(&storage),
-        |conn, head| commit(conn, head).map_err(|error| error.to_string()),
+        |head| check(head.resolve(&storage)),
+        |conn, checked| commit(conn, checked).map_err(|error| error.to_string()),
         || POISONED.to_string(),
     )
 }
@@ -1826,18 +1827,25 @@ fn prepare(
         .scope
         .as_ref()
         .is_some_and(|stamp| stamp.kind == subc_protocol::scope::ScopeKind::Worker);
-    with_head_policy(db, ctx, identity, worker, |conn, head| {
-        prepare_locked(
-            conn,
-            head.as_ref(),
-            identity,
-            tool,
-            arguments,
-            grant,
-            directory_scope,
-            own_holder,
-        )
-    })
+    with_head_policy(
+        db,
+        ctx,
+        identity,
+        worker,
+        |head| head,
+        |conn, head| {
+            prepare_locked(
+                conn,
+                head.as_ref(),
+                identity,
+                tool,
+                arguments,
+                grant,
+                directory_scope,
+                own_holder,
+            )
+        },
+    )
 }
 
 /// `head_access` is the worker's resolved head policy; it is only read for
@@ -2993,8 +3001,37 @@ fn apply_allow(
             return Err(format!("saved scope grants unavailable: {reason:?}"));
         }
     }
-    with_head_policy(db, ctx, identity, !by_user, |conn, head| {
-        let apply = || -> rusqlite::Result<Applied> {
+    struct CheckedAllow {
+        head_holds: bool,
+        head_default_allows: bool,
+        saved: Option<AccessGrant>,
+    }
+    let check = |head: Option<AccessPolicy>| {
+        let file = grant.file();
+        let head_holds = by_user
+            || file.is_some_and(|file| head_policy(head.as_ref(), file) == HeadPolicy::Allow);
+        let head_default_allows = !by_user
+            && scope
+            && head_holds
+            && file.is_some_and(|file| access_grants::head_default_allows(head.as_ref(), file));
+        let saved = file.filter(|_| scope && head_holds).map(|file| {
+            let mut saved = file.clone();
+            // The database key uses the policy's canonical path spelling.
+            // Leave relative paths invalid, as on the ordinary insert path.
+            if saved.path.is_absolute() {
+                saved.path = crate::access_policy::policy_path(&saved.path);
+            }
+            saved
+        });
+        CheckedAllow {
+            head_holds,
+            head_default_allows,
+            saved,
+        }
+    };
+    let mut granted_card = None;
+    let result = with_head_policy(db, ctx, identity, !by_user, check, |conn, checked| {
+        let mut apply = || -> rusqlite::Result<Applied> {
             let tx = rusqlite::Transaction::new_unchecked(
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
@@ -3017,11 +3054,7 @@ fn apply_allow(
                 }
                 // A head may pass on only what it holds now: its authority is
                 // checked again against the head's current policy and grants.
-                if !by_user
-                    && grant
-                        .file()
-                        .is_none_or(|grant| head_policy(head.as_ref(), grant) != HeadPolicy::Allow)
-                {
+                if !checked.head_holds {
                     asks::discard(conn, key)?;
                     return Ok(Applied::HeadNotHeld);
                 }
@@ -3040,26 +3073,17 @@ fn apply_allow(
                         conn,
                         identity,
                         by_user,
-                        head.as_ref(),
+                        checked.head_default_allows,
                         grant.file().expect("only file scopes persist"),
                     )?;
-                    crate::db::access_grants::insert_with_source(
+                    crate::db::access_grants::insert_resolved_with_source(
                         conn,
                         &access_grants::policy_scope_key(identity),
-                        grant.file().expect("only file scopes persist"),
+                        checked.saved.as_ref().expect("only file scopes persist"),
                         card_ref,
                         source,
                     )?;
-                    if let Some(record) = audit {
-                        log_consent(
-                            &identity.session,
-                            ConsentEvent::Granted {
-                                epoch: key.scope.epoch,
-                            },
-                            record.elicitation_id.as_deref().unwrap_or(call_key),
-                            grant,
-                        );
-                    }
+                    granted_card = audit.map(|record| record.elicitation_id);
                 }
                 Ok(Applied::Run(approved))
             })()?;
@@ -3080,7 +3104,18 @@ fn apply_allow(
                 asks::discard(conn, key)?;
                 Ok(Applied::Withdrawn)
             })
-    })
+    });
+    if let (Ok(Applied::Run(_)), Some(card)) = (&result, granted_card) {
+        log_consent(
+            &identity.session,
+            ConsentEvent::Granted {
+                epoch: key.scope.epoch,
+            },
+            card.as_deref().unwrap_or(call_key),
+            grant,
+        );
+    }
+    result
 }
 
 fn approval_origin_ended(

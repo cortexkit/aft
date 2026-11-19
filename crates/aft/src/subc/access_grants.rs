@@ -14,19 +14,19 @@ pub(super) fn answer_source(
     conn: &rusqlite::Connection,
     identity: &RouteIdentity,
     by_user: bool,
-    head: Option<&AccessPolicy>,
+    default_allows: bool,
     grant: &AccessGrant,
 ) -> rusqlite::Result<Option<crate::db::access_grant_rows::GrantSource>> {
     use crate::db::access_grant_rows::GrantSource;
     if by_user {
         return Ok(Some(GrantSource::Person));
     }
-    head_source(conn, identity, grant, head_default_allows(head, grant))
+    head_source(conn, identity, grant, default_allows)
 }
 
 // Capability checks can probe the filesystem. Launch validation calls this
 // with the database lock released, then classifies saved authority under lock.
-fn head_default_allows(head: Option<&AccessPolicy>, grant: &AccessGrant) -> bool {
+pub(super) fn head_default_allows(head: Option<&AccessPolicy>, grant: &AccessGrant) -> bool {
     if let Some(head) = head {
         let mut policy_only = head.clone();
         policy_only.grants.clear();
@@ -314,6 +314,7 @@ pub(super) fn operation(
     op: &str,
     identity: &RouteIdentity,
     ctx: &AppContext,
+    stop_revoked: impl FnOnce(&ScopeKey, &Path),
 ) -> Result<Value, subc_protocol::ErrorBody> {
     let Some(db) = ctx.db() else {
         return Err(refusal(
@@ -321,9 +322,11 @@ pub(super) fn operation(
             "scope persistence unavailable",
         ));
     };
-    let conn = db
-        .lock()
-        .map_err(|_| refusal("grants_unavailable", "grant database lock poisoned"))?;
+    let lock = || {
+        db.lock()
+            .map_err(|_| refusal("grants_unavailable", "grant database lock poisoned"))
+    };
+    let conn = lock()?;
     register_on(&conn, identity, ctx)?;
     let caller = scope_key(identity);
     let requested = body.get("scope");
@@ -358,18 +361,22 @@ pub(super) fn operation(
             .as_u64()
             .ok_or_else(|| refusal("grants_scope_refused", "invalid scope epoch"))?;
     }
-    if identity.scope.as_ref().is_some_and(|s| !s.owner_authorized)
-        || !store::authorized(&conn, &caller, &target)
-            .map_err(|e| refusal("grants_unavailable", e.to_string()))?
-    {
-        return Err(refusal(
-            "grants_scope_refused",
-            format!(
-                "caller {} may not manage scope {target_ref}",
-                caller.scope_ref
-            ),
-        ));
-    }
+    let authorize = |conn: &rusqlite::Connection| {
+        if identity.scope.as_ref().is_some_and(|s| !s.owner_authorized)
+            || !store::authorized(conn, &caller, &target)
+                .map_err(|e| refusal("grants_unavailable", e.to_string()))?
+        {
+            return Err(refusal(
+                "grants_scope_refused",
+                format!(
+                    "caller {} may not manage scope {target_ref}",
+                    caller.scope_ref
+                ),
+            ));
+        }
+        Ok(())
+    };
+    authorize(&conn)?;
     match op {
         "grants.list" => Ok(
             json!({"scope": target.scope_ref, "scope_epoch": target.epoch, "grants": store::list(&conn,&target).map_err(|e| refusal("grants_unavailable",e.to_string()))?}),
@@ -382,9 +389,38 @@ pub(super) fn operation(
             if !Path::new(raw).is_absolute() {
                 return Err(refusal("grants_path_refused", "path must be absolute"));
             }
-            let path = policy_path(Path::new(raw));
-            let removed = store::revoke(&conn, &target, &path)
-                .map_err(|e| refusal("grants_unavailable", e.to_string()))?;
+            let listed = Path::new(raw);
+            let revoke = |conn: &rusqlite::Connection, path: &Path| {
+                store::revoke(conn, &target, path)
+                    .map_err(|e| refusal("grants_unavailable", e.to_string()))
+            };
+            let exact = revoke(&conn, listed)?;
+            drop(conn);
+            let (path, removed) = if exact > 0 {
+                (listed.to_path_buf(), exact)
+            } else {
+                // Only the alias fallback needs disk access. The selected scope
+                // must still be authorized after that unlocked lookup.
+                let resolved = policy_path(listed);
+                let conn = lock()?;
+                authorize(&conn)?;
+                let exact = revoke(&conn, listed)?;
+                if exact > 0 {
+                    (listed.to_path_buf(), exact)
+                } else {
+                    let removed = if resolved.as_os_str() == listed.as_os_str() {
+                        0
+                    } else {
+                        revoke(&conn, &resolved)?
+                    };
+                    (resolved, removed)
+                }
+            };
+            if removed > 0 {
+                // All grant kinds for this key are gone. Tasks record a grant
+                // by scope and path, so they need only one stop scan.
+                stop_revoked(&target, &path);
+            }
             Ok(
                 json!({"scope":target.scope_ref,"scope_epoch":target.epoch,"path":path,"revoked":removed}),
             )
