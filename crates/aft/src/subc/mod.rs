@@ -5383,29 +5383,8 @@ where
         connection_file_path.to_path_buf(),
         storage_dir.join("aft.db"),
     );
-    // Withdraw the macOS access cards earlier builds filed. It runs beside the
-    // route loop, never before it: each withdrawal waits on Cingulate, and a
-    // slow or absent Cingulate must not delay route binds.
     #[cfg(target_os = "macos")]
-    {
-        let app = Arc::clone(&shared_app);
-        let path = storage_dir.join("aft.db");
-        tokio::spawn(async move {
-            match tokio::task::spawn_blocking(move || app.open_db(&path)).await {
-                Ok(Ok(db)) => {
-                    if let Err(error) = consent::withdraw_macos_permission_cards(db).await {
-                        log::warn!("macOS permission card startup cleanup failed: {error:?}");
-                    }
-                }
-                Ok(Err(error)) => log::warn!(
-                    "macOS permission card startup cleanup could not open database: {error}"
-                ),
-                Err(error) => {
-                    log::warn!("macOS permission card startup cleanup worker failed: {error}")
-                }
-            }
-        });
-    }
+    consent::start_macos_permission_cleanup(Arc::clone(&shared_app), storage_dir.join("aft.db"));
     rich_ui::display::start(connection_file_path, &shared_app, &storage_dir);
     runner_notices::install(connection_file_path.to_path_buf());
     let push_senders = PushSenders {
@@ -6967,6 +6946,7 @@ where
     };
 
     drop(claim_lifetime);
+    crate::secret::consent::shutdown().await;
     shells_service.drain().await;
     shells_service.stop();
     dispatch_path_metrics.held_bash_calls.clear_all_progress();

@@ -48,7 +48,6 @@ pub(super) fn describe_answer_ends_scope(reply: &ModuleControlResponseToModule) 
 
 /// A live rebind does not end ordinary commands, but old-epoch grants must
 /// never authorize another request from a surviving secret command.
-#[cfg(unix)]
 fn secret_authorization_rebound(stamp: &ScopeStamp, reply: &ModuleControlResponseToModule) -> bool {
     matches!(reply, ModuleControlResponseToModule::ScopeDescribe { status: subc_protocol::scope::ScopeStatus::Live, scope_epoch: Some(epoch), .. } if *epoch != stamp.scope_epoch)
 }
@@ -636,10 +635,12 @@ where
                         let mut refreshed = scope_source().await;
                         refreshed.retain_unread(&inventory);
                         inventory = refreshed;
+                        secret_authorizations = crate::secret::consent::pending_scope_stamps().iter().map(stamp_key).collect();
                         #[cfg(unix)]
                         {
                             let executor = executor.clone();
-                            secret_authorizations = tokio::task::spawn_blocking(move || executor.actor_contexts().into_iter().flat_map(|ctx| ctx.bash_background().secret_authorization_scope_stamps()).map(|stamp| stamp_key(&stamp)).collect()).await.unwrap_or_default();
+                            let proxies: Vec<_> = tokio::task::spawn_blocking(move || executor.actor_contexts().into_iter().flat_map(|ctx| ctx.bash_background().secret_authorization_scope_stamps()).map(|stamp| stamp_key(&stamp)).collect()).await.unwrap_or_default();
+                            secret_authorizations.extend(proxies);
                         }
                         next_scan = tokio::time::Instant::now() + interval;
                     }
@@ -724,13 +725,16 @@ where
                         } else if let Some(other) = prefrontal::counterpart(&stamp) {
                             prefrontal::log_continuation(&stamp, &other, prefrontal::retained_outcome(reply.as_ref().ok()));
                         }
-                        #[cfg(unix)]
                         if reply.as_ref().is_ok_and(|answer| secret_authorization_rebound(&stamp, answer)) {
+                            crate::secret::consent::revoke_scope(&stamp);
+                            #[cfg(unix)]
+                            {
                             let executor = executor.clone();
                             let described = stamp.clone();
                             let _ = tokio::task::spawn_blocking(move || {
                                 for ctx in executor.actor_contexts() { ctx.bash_background().revoke_secret_authorization(&described); }
                             }).await;
+                            }
                         }
                         let strict_end = speech.as_ref().filter(|_| full_stamp && source_ended).and_then(|service| {
                             let role=if stamp.attributes.run_id.is_some(){crate::gh_shim_speech::ScopeRole::Run}else{crate::gh_shim_speech::ScopeRole::Authority};
@@ -842,7 +846,13 @@ async fn work_scopes(
                 .flat_map(|ctx| ctx.bash_background().live_scope_stamps())
                 .collect::<Vec<_>>(),
         );
-        scopes.add(scope_watch::Source::Parked, run_scopes.parked_scopes());
+        scopes.add(
+            scope_watch::Source::Parked,
+            run_scopes
+                .parked_scopes()
+                .into_iter()
+                .chain(crate::secret::consent::pending_scope_stamps()),
+        );
         let mut seen = HashSet::new();
         for ctx in executor.actor_contexts() {
             let Some(db) = ctx.db() else { continue };
@@ -1027,7 +1037,7 @@ fn fence_confirmed_end(executor: &Executor, stamp: &ScopeStamp) {
     }
 }
 
-fn accept_confirmed_end(
+pub(super) fn accept_confirmed_end(
     executor: &Executor,
     runs: Option<&super::run_scope::RunScopes>,
     metrics: &DispatchPathMetrics,
@@ -1041,6 +1051,7 @@ fn accept_confirmed_end(
     if let Some(runs) = runs {
         runs.revoke(stamp);
     }
+    crate::secret::consent::revoke_scope(stamp);
     fence_confirmed_end(executor, stamp);
 }
 

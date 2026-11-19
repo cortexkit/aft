@@ -3387,6 +3387,26 @@ fn macos_request_params(folder: &str, program: &str, steps: &str) -> Value {
     json!({"kind":"macos_permission","folder":folder,"program":program,"steps":steps})
 }
 
+/// Withdraw macOS access cards from earlier builds without delaying route binds.
+#[cfg(target_os = "macos")]
+pub(super) fn start_macos_permission_cleanup(app: Arc<crate::context::App>, path: PathBuf) {
+    tokio::spawn(async move {
+        match tokio::task::spawn_blocking(move || app.open_db(&path)).await {
+            Ok(Ok(db)) => {
+                if let Err(error) = withdraw_macos_permission_cards(db).await {
+                    log::warn!("macOS permission card startup cleanup failed: {error:?}");
+                }
+            }
+            Ok(Err(error)) => {
+                log::warn!("macOS permission card startup cleanup could not open database: {error}")
+            }
+            Err(error) => {
+                log::warn!("macOS permission card startup cleanup worker failed: {error}")
+            }
+        }
+    });
+}
+
 #[cfg(any(target_os = "macos", test))]
 pub(super) async fn withdraw_macos_permission_cards(
     db: Arc<StdMutex<crate::db::TrackedConnection>>,

@@ -67,7 +67,7 @@ async fn an_unreadable_answer_never_becomes_a_cached_person_decision() {
         );
         let cards = transport.cards.lock().await;
         let card = cards
-            .get(&(request.scope.clone(), request.request_id.clone()))
+            .get(&CardKey(request.scope.clone(), request.request_id.clone()))
             .unwrap()
             .lock()
             .await;
@@ -195,7 +195,7 @@ async fn cancellation_after_a_lost_or_garbled_filing_never_creates_a_recovery_ca
 }
 
 #[test]
-fn production_card_withdrawal_uses_the_daemon_runtime_after_the_request_runtime_stops() {
+fn production_card_outlives_the_request_runtime_and_withdraws_on_daemon_shutdown() {
     struct Endpoint {
         started: tokio::sync::Notify,
         withdrawn: tokio::sync::Notify,
@@ -263,6 +263,13 @@ fn production_card_withdrawal_uses_the_daemon_runtime_after_the_request_runtime_
     });
     drop(request_runtime);
     daemon.block_on(async {
+        assert!(endpoint
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(method, _)| *method != "consent.withdraw"));
+        crate::secret::consent::shutdown().await;
         tokio::time::timeout(Duration::from_secs(2), endpoint.withdrawn.notified())
             .await
             .unwrap();

@@ -622,7 +622,7 @@ fn client_child() {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         enum Sender {
             H1(hyper::client::conn::http1::SendRequest<http_body_util::Full<Bytes>>),
-            H2(hyper::client::conn::http2::SendRequest<http_body_util::Full<Bytes>>),
+            H2(hyper::client::conn::http2::SendRequest<http_body_util::Full<Bytes>>, tokio::task::JoinHandle<()>),
         }
         let mut senders: Vec<Sender> = Vec::new();
         let mut raw_sockets = Vec::new();
@@ -713,7 +713,8 @@ fn client_child() {
                     let h2 = alpn.as_deref() == Some("h2");
                     if h2 {
                         let (sender, connection) = hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls)).await.map_err(|_| ())?;
-                        tokio::spawn(async move { let _ = connection.await; }); senders.push(Sender::H2(sender));
+                        let task = tokio::spawn(async move { let _ = connection.await; });
+                        senders.push(Sender::H2(sender, task));
                     } else {
                         let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls)).await.map_err(|_| ())?;
                         tokio::spawn(async move { let _ = connection.with_upgrades().await; }); senders.push(Sender::H1(sender));
@@ -723,7 +724,7 @@ fn client_child() {
                 let index = value["connection"].as_u64().map(|v| v as usize).unwrap_or(senders.len().saturating_sub(1));
                 let sender = senders.get_mut(index).ok_or(())?;
                 if value["op"] == "many" {
-                    let Sender::H2(sender) = sender else { return Err(()); };
+                    let Sender::H2(sender, _) = sender else { return Err(()); };
                     let uri = format!("https://{}/approved",std::env::var("AFT_UPSTREAM").unwrap());
                     let futures = (0..36).map(|_| {
                         let mut sender = sender.clone(); let uri = uri.clone();
@@ -733,7 +734,7 @@ fn client_child() {
                     return Ok(json!({"statuses":futures_util::future::join_all(futures).await.into_iter().collect::<Result<Vec<_>,_>>()?}));
                 }
                 if value["op"] == "overlap" {
-                    let Sender::H2(sender) = sender else { return Err(()); };
+                    let Sender::H2(sender, _) = sender else { return Err(()); };
                     let mut second = sender.clone();
                     let uri = format!("https://{}/approved", std::env::var("AFT_UPSTREAM").unwrap());
                     let make = || Request::builder().uri(&uri).header("authorization",format!("Bearer {MARKER}"))
@@ -744,7 +745,7 @@ fn client_child() {
                 }
                 let authority = value["authority"].as_str().map(str::to_owned).unwrap_or_else(|| std::env::var("AFT_UPSTREAM").unwrap());
                 let path = value["path"].as_str().unwrap_or("/approved");
-                let uri = if matches!(sender, Sender::H2(_)) { format!("https://{authority}{path}") } else { path.to_owned() };
+                let uri = if matches!(sender, Sender::H2(..)) { format!("https://{authority}{path}") } else { path.to_owned() };
                 let mut request = Request::builder().uri(uri).method(value["method"].as_str().unwrap_or("POST")).header("te", "trailers");
                 if value["omit_host"] != true { request = request.header("host", value["host_override"].as_str().unwrap_or(&authority)); }
                 if let Some(headers) = value["headers"].as_object() {
@@ -756,9 +757,25 @@ fn client_child() {
                     Bytes::copy_from_slice(value["body"].as_str().unwrap_or("").as_bytes())
                 };
                 let request = request.body(Full::new(body)).unwrap();
-                let mut response = match sender {
-                    Sender::H1(sender) => sender.send_request(request).await.map_err(|_| ())?,
-                    Sender::H2(sender) => sender.send_request(request).await.map_err(|_| ())?,
+                let sent = async {
+                    match sender {
+                        Sender::H1(sender) => sender.send_request(request).await,
+                        Sender::H2(sender, _) => sender.send_request(request).await,
+                    }
+                };
+                let mut response = if let Some(ms) = value["client_timeout_ms"].as_u64() {
+                    match tokio::time::timeout(Duration::from_millis(ms), sent).await {
+                        Ok(result) => result.map_err(|_| ())?,
+                        Err(_) => {
+                            if let Sender::H2(_, task) = senders.remove(index) {
+                                task.abort();
+                                let _ = task.await;
+                            }
+                            return Ok(json!({"client_timed_out":true}));
+                        }
+                    }
+                } else {
+                    sent.await.map_err(|_| ())?
                 };
                 let status = response.status().as_u16();
                 let headers: HashMap<_, _> = response.headers().iter().map(|(n,v)| (n.to_string(), String::from_utf8_lossy(v.as_bytes()).to_string())).collect();

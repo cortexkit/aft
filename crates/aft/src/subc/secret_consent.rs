@@ -25,7 +25,7 @@
 //! why [`CallScopes`] holds plain data rather than borrowing a route.
 
 use super::{carrier_read_only, flow_read, tool_provider, RouteIdentity};
-use crate::secret::consent::CancellationReason;
+use crate::secret::consent::{CancellationReason, CardKey};
 use crate::secret::eligibility::{alfonso_of_kind, COMMAND_SCOPE_KINDS};
 #[cfg(test)]
 use crate::secret::LabelOutcome;
@@ -61,13 +61,11 @@ pub(super) fn install_subc_transport(transport: Arc<dyn super::consent::ConsentT
 struct SubcSecretConsent {
     transport: Arc<dyn super::consent::ConsentTransport>,
     runtime: tokio::runtime::Handle,
-    cards: tokio::sync::Mutex<
-        std::collections::HashMap<(SecretScope, String), Arc<tokio::sync::Mutex<Card>>>,
-    >,
+    cards: tokio::sync::Mutex<std::collections::HashMap<CardKey, Arc<tokio::sync::Mutex<Card>>>>,
 }
 
 struct Card {
-    created: std::time::Instant,
+    expiry: tokio::time::Instant,
     statement: String,
     elicitation: Option<String>,
     answered: Option<ConsentOutcome>,
@@ -181,16 +179,28 @@ impl SubcSecretConsent {
         id: &str,
         reason: CancellationReason,
     ) {
-        if self
+        let result = self
             .call(
                 request,
                 "consent.withdraw",
                 serde_json::json!({"elicitation_id": id}),
                 SECRET_CONSENT_TIMEOUT,
             )
+            .await;
+        let withdrawn = if matches!(result, Err(super::consent::ConsentError::ScopeGone(_))) {
+            // The authenticated filer owns the card even after its scoped
+            // route can no longer bind. Withdraw without reopening the scope.
+            tokio::time::timeout(
+                SECRET_CONSENT_TIMEOUT,
+                self.transport
+                    .withdraw_idle(id.to_owned(), SECRET_CONSENT_TIMEOUT),
+            )
             .await
-            .is_err()
-        {
+            .is_ok_and(|result| result.is_ok())
+        } else {
+            result.is_ok()
+        };
+        if !withdrawn {
             crate::slog_warn!("secret consent withdrawal failed");
         } else {
             log_secret_card(request, id, Some(reason));
@@ -271,20 +281,28 @@ impl SubcSecretConsent {
         hold: Duration,
         cancel: Option<&crate::secret::consent::Cancellation>,
     ) -> ConsentOutcome {
-        let key = (request.scope.clone(), request.request_id.clone());
+        let key = CardKey(request.scope.clone(), request.request_id.clone());
         let entry = {
             let mut cards = self.cards.lock().await;
             cards.retain(|_, card| {
                 Arc::strong_count(card) > 1
                     || card
                         .try_lock()
-                        .is_ok_and(|card| card.created.elapsed() < Duration::from_secs(600))
+                        .is_ok_and(|card| tokio::time::Instant::now() < card.expiry)
             });
             cards
                 .entry(key.clone())
                 .or_insert_with(|| {
                     Arc::new(tokio::sync::Mutex::new(Card {
-                        created: std::time::Instant::now(),
+                        expiry: tokio::time::Instant::now()
+                            + Duration::from_millis(request.expires_at_ms.map_or(
+                                600_000,
+                                |deadline| {
+                                    deadline
+                                        .saturating_sub(crate::secret::vault::now_ms())
+                                        .min(600_000)
+                                },
+                            )),
                         statement: request.statement_b64url.clone(),
                         elicitation: None,
                         answered: None,
@@ -585,6 +603,16 @@ impl crate::secret::SecretConsentTransport for SubcSecretConsent {
             Ok(_) => consent_unavailable("secret consent cannot block a single-threaded runtime"),
             Err(_) => self.runtime.block_on(future),
         }
+    }
+
+    fn forget_expired(
+        &self,
+        request: &SecretConsentRequest,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let key = CardKey(request.scope.clone(), request.request_id.clone());
+        Box::pin(async move {
+            self.cards.lock().await.remove(&key);
+        })
     }
 }
 

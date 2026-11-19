@@ -248,7 +248,6 @@ async fn prepare_and_send(
         let addressed = &addressed;
         let reconnected = &reconnected;
         let approval_metadata = &approval_metadata;
-        let expires = budget.expires_at_ms;
         let (target, headers) = (&target, &parts.headers);
         pending.push(async move {
             let answer = if state.is_https_port(authority.port) {
@@ -257,7 +256,6 @@ async fn prepare_and_send(
                     .use_planned_with_metadata(
                         label,
                         addressed,
-                        expires,
                         |location| {
                             plan_location(
                                 label,

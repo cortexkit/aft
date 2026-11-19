@@ -914,12 +914,6 @@ impl SecretFetchCancellation {
                     .then_some(crate::secret::requests::UseError::Expired)
             })
     }
-    pub(crate) fn expires_at_ms(&self) -> Option<u64> {
-        self.deadline.map(|deadline| {
-            now_ms()
-                .saturating_add(deadline.saturating_duration_since(self.now()).as_millis() as u64)
-        })
-    }
     pub(crate) async fn cancelled(&self) {
         loop {
             if self.is_cancelled() {

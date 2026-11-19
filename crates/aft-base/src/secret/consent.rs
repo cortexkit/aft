@@ -34,8 +34,8 @@ pub struct SecretConsentRequest {
     pub request_id: String,
     /// The vault's statement bytes, base64url without padding.
     pub statement_b64url: String,
-    /// When the local hold for this HTTP request ends. Not sent to Cingulate,
-    /// which bounds the card by the vault statement's own request expiry.
+    /// The vault's approval expiry for a shared card. Cingulate reads this
+    /// from the signed statement instead of from a separate field.
     pub expires_at_ms: Option<u64>,
 }
 
@@ -61,7 +61,7 @@ pub enum ConsentOutcome {
     AnsweredOnce,
     Declined,
     Expired,
-    /// The caller left or the card was withdrawn; this is not a phone answer.
+    /// The card was withdrawn; this is not a phone answer.
     Cancelled,
     /// The card was answered, but no trustworthy decision could be read.
     /// This must not be retained as a person's answer or a filing failure.
@@ -155,6 +155,14 @@ pub trait SecretConsentTransport: Send + Sync + 'static {
 
     /// Settle a pending ask the call left behind.
     fn withhold(&self, request: &SecretConsentRequest) -> ConsentOutcome;
+
+    /// Discard transport state for an expired vault request.
+    fn forget_expired(
+        &self,
+        _request: &SecretConsentRequest,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::ready(()))
+    }
 }
 
 /// The dispatcher installed for this process.
@@ -167,13 +175,37 @@ static TRANSPORT: std::sync::LazyLock<
 
 /// Install the secret consent transport.
 pub fn install_transport(transport: Option<std::sync::Arc<dyn SecretConsentTransport>>) {
-    CARDS
+    drop(replace_transport(transport));
+}
+
+fn replace_transport(transport: Option<std::sync::Arc<dyn SecretConsentTransport>>) -> Cards {
+    let mut installed = TRANSPORT
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clear();
-    *TRANSPORT
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut cards = CARDS
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = transport;
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *installed = transport;
+    for card in cards
+        .values()
+        .filter(|card| card.outcome.borrow().is_none())
+    {
+        card.cancel.cancel();
+    }
+    std::mem::take(&mut *cards)
+}
+
+pub async fn shutdown() {
+    let cards = replace_transport(None);
+    // Give all withdrawals the same bounded window, rather than waiting a
+    // separate RPC timeout for each card before the daemon exits.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        for card in cards.values() {
+            let mut outcome = card.outcome.subscribe();
+            let _ = outcome.wait_for(Option::is_some).await;
+        }
+    })
+    .await;
 }
 
 fn transport() -> Option<std::sync::Arc<dyn SecretConsentTransport>> {
@@ -202,7 +234,6 @@ pub struct Cancellation(tokio::sync::watch::Sender<Option<CancellationReason>>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CancellationReason {
-    ClientDropped,
     Expired,
     Cancelled,
 }
@@ -210,7 +241,6 @@ pub enum CancellationReason {
 impl CancellationReason {
     pub fn code(self) -> &'static str {
         match self {
-            Self::ClientDropped => "client_dropped",
             Self::Expired => "expired",
             Self::Cancelled => "cancelled",
         }
@@ -227,7 +257,7 @@ impl Cancellation {
         self.cancel_with_reason(CancellationReason::Cancelled);
     }
     pub fn cancel_with_reason(&self, reason: CancellationReason) {
-        // Preserve the first cause when a deadline and a client departure race.
+        // Preserve the first cause when a deadline and a scope revocation race.
         self.0.send_if_modified(|current| {
             if current.is_none() {
                 *current = Some(reason);
@@ -256,22 +286,92 @@ impl Cancellation {
     }
 }
 
-type CardKey = (SecretScope, String);
+// The vault deduplicates within the stamped authorization scope. Ending one
+// run must not withdraw a card another run can use under that same authority.
+#[derive(Clone)]
+pub struct CardKey(pub SecretScope, pub String);
+
+impl CardKey {
+    fn identity(&self) -> (&str, &str, u64, &str) {
+        (
+            self.0.owner(),
+            self.0.reference(),
+            self.0.stamp().scope_epoch,
+            &self.1,
+        )
+    }
+}
+
+impl PartialEq for CardKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity() == other.identity()
+    }
+}
+
+impl Eq for CardKey {}
+
+impl std::hash::Hash for CardKey {
+    fn hash<H: std::hash::Hasher>(&self, hasher: &mut H) {
+        std::hash::Hash::hash(&self.identity(), hasher);
+    }
+}
+
+type Cards = std::collections::HashMap<CardKey, std::sync::Arc<SharedCard>>;
+const MAX_CLIENTLESS_CARDS: usize = 32;
+const MAX_CARD_LIFETIME_MS: u64 = 600_000;
+
 struct SharedCard {
-    created: std::time::Instant,
+    created: tokio::time::Instant,
     statement: String,
     expires: u64,
+    deadline: tokio::time::Instant,
     outcome: tokio::sync::watch::Sender<Option<ConsentOutcome>>,
     outcome_code: std::sync::Mutex<Option<&'static str>>,
     cancel: Cancellation,
     waiters: std::sync::atomic::AtomicUsize,
 }
 
+impl SharedCard {
+    fn is_pending(&self) -> bool {
+        !self.cancel.is_cancelled() && self.outcome.borrow().is_none()
+    }
+
+    fn is_clientless(&self) -> bool {
+        self.waiters.load(std::sync::atomic::Ordering::Acquire) == 0 && self.is_pending()
+    }
+}
+
+pub fn pending_scope_stamps() -> Vec<subc_protocol::scope::ScopeStamp> {
+    CARDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|(_, card)| card.is_pending())
+        .map(|(key, _)| key.0.stamp().clone())
+        .collect()
+}
+
+pub fn revoke_scope(stamp: &subc_protocol::scope::ScopeStamp) {
+    let cards = CARDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (key, card) in cards.iter() {
+        let held = key.0.stamp();
+        if held.owner == stamp.owner
+            && held.scope_ref == stamp.scope_ref
+            && held.scope_epoch == stamp.scope_epoch
+            && card.is_pending()
+        {
+            card.cancel.cancel();
+        }
+    }
+}
+
 pub fn record_outcome_code(scope: &SecretScope, request_id: &str, code: &str) {
     let cards = CARDS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(card) = cards.get(&(scope.clone(), request_id.to_owned())) {
+    if let Some(card) = cards.get(&CardKey(scope.clone(), request_id.to_owned())) {
         *card
             .outcome_code
             .lock()
@@ -279,108 +379,208 @@ pub fn record_outcome_code(scope: &SecretScope, request_id: &str, code: &str) {
             Some(super::transport::diagnostics::safe_code(code));
     }
 }
-static CARDS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<CardKey, std::sync::Arc<SharedCard>>>,
-> = std::sync::LazyLock::new(Default::default);
+static CARDS: std::sync::LazyLock<std::sync::Mutex<Cards>> =
+    std::sync::LazyLock::new(Default::default);
 
-struct Waiter(std::sync::Arc<SharedCard>);
-impl Drop for Waiter {
+struct Waiter<'a> {
+    card: std::sync::Arc<SharedCard>,
+    request_id: &'a str,
+    local_cancel: Option<&'a Cancellation>,
+}
+
+impl Drop for Waiter<'_> {
     fn drop(&mut self) {
-        // Join increments use this same lock: a joining waiter must be counted
-        // before the last departure can cancel the shared phone card.
-        let _cards = CARDS
+        // Joins and answer publication use the same lock as eviction, so a
+        // joining waiter or a recorded phone answer rules out eviction.
+        let cards = CARDS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self
-            .0
+        let last = self
+            .card
             .waiters
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
-            == 1
-            && self.0.outcome.borrow().is_none()
-        {
-            self.0
-                .cancel
-                .cancel_with_reason(CancellationReason::ClientDropped);
+            == 1;
+        if !self.card.is_pending() {
+            return;
+        }
+        // A cancelled fetch tool call or its reply deadline still withdraws
+        // the last waiter's card. An HTTP client closing its proxy socket does not.
+        if let Some(reason) = self.local_cancel.and_then(Cancellation::reason) {
+            if last {
+                self.card.cancel.cancel_with_reason(reason);
+            }
+            return;
+        }
+        if last {
+            let mut clientless = cards.values().filter(|card| card.is_clientless());
+            if let Some(oldest) = clientless.next() {
+                let (count, oldest) = clientless.fold((1, oldest), |(count, oldest), card| {
+                    (
+                        count + 1,
+                        if card.created < oldest.created {
+                            card
+                        } else {
+                            oldest
+                        },
+                    )
+                });
+                if count > MAX_CLIENTLESS_CARDS {
+                    oldest
+                        .cancel
+                        .cancel_with_reason(CancellationReason::Expired);
+                }
+            }
+        }
+        if !self.card.cancel.is_cancelled() {
+            crate::slog_info!(
+                "secret consent waiter dropped; card kept until expiry: request_id={:?} expires_at_ms={}",
+                self.request_id,
+                self.card.expires,
+            );
         }
     }
 }
 
-#[rustfmt::skip]
-test_support_visibility! {
+fn scope_inventory_changed() {
+    crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Parked);
+}
+
+async fn run_card(
+    key: CardKey,
+    card: std::sync::Arc<SharedCard>,
+    transport: std::sync::Arc<dyn SecretConsentTransport>,
+    request: SecretConsentRequest,
+) {
+    let wait = transport.clone().wait(request.clone(), card.cancel.clone());
+    let expiry = tokio::time::sleep_until(card.deadline);
+    tokio::pin!(wait, expiry);
+    let answer = tokio::select! {
+        biased;
+        () = &mut expiry => {
+            card.cancel.cancel_with_reason(CancellationReason::Expired);
+            wait.await
+        }
+        answer = &mut wait => answer,
+    };
+    {
+        let _cards = CARDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        card.outcome.send_replace(Some(answer));
+    }
+    scope_inventory_changed();
+    expiry.await;
+    transport.forget_expired(&request).await;
+    let mut cards = CARDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cards
+        .get(&key)
+        .is_some_and(|current| std::sync::Arc::ptr_eq(current, &card))
+    {
+        cards.remove(&key);
+    }
+}
 
 /// Every HTTP request joins the same recorded card outcome without locking
 /// another request's vault lookup or charging it another waiter's queue time.
+#[rustfmt::skip]
+test_support_visibility! {
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn wait_consent(request: SecretConsentRequest) -> ConsentOutcome {
-    wait_consent_with_code(request).await.0
+    wait_consent_with_code(request, None).await.0
 }
 }
 
 pub(crate) async fn wait_consent_with_code(
-    request: SecretConsentRequest,
+    mut request: SecretConsentRequest,
+    local_cancel: Option<&Cancellation>,
 ) -> (ConsentOutcome, Option<&'static str>) {
-    let Some(transport) = transport() else {
-        return (
-            ConsentOutcome::Unavailable {
-                detail: "no secret consent transport is connected".into(),
-            },
-            None,
-        );
-    };
     let card = {
+        use std::collections::hash_map::Entry;
+        let installed = TRANSPORT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(transport) = installed.clone() else {
+            return (
+                ConsentOutcome::Unavailable {
+                    detail: "no secret consent transport is connected".into(),
+                },
+                None,
+            );
+        };
+        let now = super::vault::now_ms();
+        let expires = request
+            .expires_at_ms
+            .unwrap_or(u64::MAX)
+            .min(now.saturating_add(MAX_CARD_LIFETIME_MS));
+        if expires <= now {
+            return (ConsentOutcome::Expired, None);
+        }
+        request.expires_at_ms = Some(expires);
         let mut cards = CARDS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         cards.retain(|_, card| {
-            if card.waiters.load(std::sync::atomic::Ordering::Acquire) == 0
-                && matches!(
+            card.waiters.load(std::sync::atomic::Ordering::Acquire) != 0
+                || !matches!(
                     &*card.outcome.borrow(),
                     Some(ConsentOutcome::Unavailable { .. } | ConsentOutcome::Indeterminate)
                 )
-            {
-                return false;
-            }
-            card.created.elapsed() < std::time::Duration::from_secs(600)
-                || card.expires > super::vault::now_ms()
-                || card.waiters.load(std::sync::atomic::Ordering::Acquire) > 0
         });
-        let card = cards
-            .entry((request.scope.clone(), request.request_id.clone()))
-            .or_insert_with(|| {
+        let key = CardKey(request.scope.clone(), request.request_id.clone());
+        let card = match cards.entry(key.clone()) {
+            Entry::Occupied(entry) => {
+                let card = entry.get();
+                if card.statement != request.statement_b64url {
+                    return (
+                        ConsentOutcome::Unavailable {
+                            detail: "Cingulate could not file the secret-use card".into(),
+                        },
+                        None,
+                    );
+                }
+                if tokio::time::Instant::now() >= card.deadline {
+                    return (ConsentOutcome::Expired, None);
+                }
+                if card.is_pending() {
+                    crate::slog_info!(
+                        "secret consent retry attached to existing card: request_id={:?}",
+                        request.request_id,
+                    );
+                }
+                card.clone()
+            }
+            Entry::Vacant(entry) => {
+                let runtime = transport
+                    .runtime()
+                    .unwrap_or_else(tokio::runtime::Handle::current);
+                let created = tokio::time::Instant::now();
                 let card = std::sync::Arc::new(SharedCard {
-                    created: std::time::Instant::now(),
+                    created,
                     statement: request.statement_b64url.clone(),
-                    expires: request.expires_at_ms.unwrap_or(u64::MAX),
+                    expires,
+                    deadline: created + std::time::Duration::from_millis(expires - now),
                     outcome: tokio::sync::watch::channel(None).0,
                     outcome_code: Default::default(),
                     cancel: Default::default(),
                     waiters: Default::default(),
                 });
-                let worker = card.clone();
-                let request = request.clone();
-                transport
-                    .runtime()
-                    .unwrap_or_else(tokio::runtime::Handle::current)
-                    .spawn(async move {
-                        let answer = transport.wait(request, worker.cancel.clone()).await;
-                        worker.outcome.send_replace(Some(answer));
-                    });
+                entry.insert(card.clone());
+                scope_inventory_changed();
+                runtime.spawn(run_card(key, card.clone(), transport, request.clone()));
                 card
-            })
-            .clone();
+            }
+        };
         card.waiters
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         card
     };
-    let _waiter = Waiter(card.clone());
-    if card.statement != request.statement_b64url {
-        return (
-            ConsentOutcome::Unavailable {
-                detail: "Cingulate could not file the secret-use card".into(),
-            },
-            None,
-        );
-    }
+    let _waiter = Waiter {
+        card: card.clone(),
+        request_id: &request.request_id,
+        local_cancel,
+    };
     let mut receiver = card.outcome.subscribe();
     loop {
         if let Some(answer) = receiver.borrow_and_update().clone() {
@@ -419,8 +619,7 @@ pub fn withhold_consent(request: &SecretConsentRequest) -> ConsentOutcome {
 ///
 /// The body is exactly `{kind, secret_use}`: Cingulate decodes secret-use
 /// filings with unknown fields refused (`envelope_invalid`), and sets the
-/// card's expiry itself from the statements' `request_expires_at_ms`. The
-/// local hold still ends at `expires_at_ms`, and an abandoned card is withdrawn.
+/// card's expiry itself from the statements' `request_expires_at_ms`.
 pub fn request_params(request: &SecretConsentRequest) -> serde_json::Value {
     serde_json::json!({
         "kind": SECRET_CONSENT_KIND,
@@ -431,65 +630,6 @@ pub fn request_params(request: &SecretConsentRequest) -> serde_json::Value {
             }],
         },
     })
-}
-
-#[cfg(test)]
-mod waiter_tests {
-    use super::*;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
-    use std::sync::Arc;
-    use std::time::Duration;
-    use std::time::Instant;
-
-    #[test]
-    fn a_last_waiter_cannot_decrement_or_cancel_while_a_join_holds_the_cards_lock() {
-        let card = Arc::new(SharedCard {
-            created: Instant::now(),
-            statement: "statement".into(),
-            expires: u64::MAX,
-            outcome: tokio::sync::watch::channel(None).0,
-            outcome_code: Default::default(),
-            cancel: Default::default(),
-            waiters: AtomicUsize::new(1),
-        });
-        let cards = CARDS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let leaving = card.clone();
-        let (started, start) = std::sync::mpsc::channel();
-        let (finished, finish) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            started.send(()).unwrap();
-            drop(Waiter(leaving));
-            finished.send(()).unwrap();
-        });
-        start.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(
-            matches!(
-                finish.recv_timeout(Duration::from_millis(100)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ),
-            "the decrement/cancel decision must wait for the joining critical section"
-        );
-        assert_eq!(card.waiters.load(Ordering::Acquire), 1);
-        assert!(!card.cancel.is_cancelled());
-        card.waiters.fetch_add(1, Ordering::AcqRel);
-        drop(cards);
-        finish.recv_timeout(Duration::from_secs(2)).unwrap();
-        worker.join().unwrap();
-        assert_eq!(card.waiters.load(Ordering::Acquire), 1);
-        assert!(
-            !card.cancel.is_cancelled(),
-            "the already-counted join still owns the card"
-        );
-        drop(Waiter(card.clone()));
-        assert!(card.cancel.is_cancelled());
-        assert_eq!(
-            card.cancel.reason(),
-            Some(CancellationReason::ClientDropped)
-        );
-    }
 }
 
 #[cfg(test)]
