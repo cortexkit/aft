@@ -591,6 +591,7 @@ impl Client {
         self.command(json!({"op":"request","path":path,"headers":headers,"body":body}))
     }
 
+    #[cfg(test)]
     fn put_gzip_json(&mut self, body: &[u8]) -> Value {
         self.command(json!({
             "op": "request", "method": "PUT", "path": "/approved",
@@ -877,6 +878,7 @@ async fn proxy_h1_h2_locations_keepalive_authority_and_scanned_set() {
     assert!(proxy.state.patterns.lock().is_empty());
 }
 
+#[cfg(test)]
 fn gzip_json(padding: usize) -> Vec<u8> {
     // Stored blocks keep the placeholders visible to any accidental scan of
     // the wire bytes, and keep the large fixture above the JSON buffer limit.

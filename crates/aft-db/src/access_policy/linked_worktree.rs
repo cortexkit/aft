@@ -1,4 +1,5 @@
-//! Read authority for the other checkouts of an authenticated head's repository.
+//! Read authority for other checkouts of the same repository. The caller
+//! enables it only for first-party routes with an authenticated head scope.
 
 use std::cell::Cell;
 use std::collections::HashMap;

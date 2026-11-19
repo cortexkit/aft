@@ -287,9 +287,18 @@ mod tests {
     fn no_follow_errors_keep_the_exact_read_refusals() {
         use super::ReadExactRefusal;
         use aft_base::no_follow_file::OpenError;
-        assert_eq!(ReadExactRefusal::from(OpenError::AccessDenied), ReadExactRefusal::AccessDenied);
-        assert_eq!(ReadExactRefusal::from(OpenError::NotFound), ReadExactRefusal::NotFound);
-        assert_eq!(ReadExactRefusal::from(OpenError::IoError), ReadExactRefusal::IoError);
+        assert_eq!(
+            ReadExactRefusal::from(OpenError::AccessDenied),
+            ReadExactRefusal::AccessDenied
+        );
+        assert_eq!(
+            ReadExactRefusal::from(OpenError::NotFound),
+            ReadExactRefusal::NotFound
+        );
+        assert_eq!(
+            ReadExactRefusal::from(OpenError::IoError),
+            ReadExactRefusal::IoError
+        );
     }
 
     use super::*;

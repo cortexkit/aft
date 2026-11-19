@@ -99,6 +99,7 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 crc32fast = "1"
+flate2 = "1.1"
 tempfile = "3"
 filetime = "0.2"
 subc-transport = "=0.18.0"
