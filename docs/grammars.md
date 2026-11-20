@@ -30,3 +30,19 @@ cargo install agent-file-tools --features wasm-grammars
 ```
 
 Without the feature, AFT works as before for every built-in language and reports Luau files as unsupported by that build.
+
+## Adding a downloadable grammar
+
+1. Open a PR adding `grammars/<language>.pin.json` and a small, valid sample under
+   `grammars/`. Leave the production manifest unchanged. Pin the upstream commit,
+   source files, WASI compiler and Tree-sitter verifier. Use the pinned compiler
+   and flags to determine the candidate `.wasm`'s SHA-256 and size, and record them
+   as `artifact.sha256` and `artifact.size` in the pin. Set `artifact.sample` to
+   the sample's repository-relative path. The **Grammar build** workflow rebuilds
+   the candidate, checks its bytes against the pin, and loads it to parse the
+   sample. Merging the pin PR publishes the verified hash-named asset to
+   `grammars-1`; wait for that job to succeed.
+2. In a second PR, add the extractor and the entry in
+   `crates/aft-parse/src/grammar/manifest.json`. Copy the hash, size, and `sample`
+   path from the pin and point `url` to the published asset. The loader workflow
+   downloads that URL and verifies the hash and size before the manifest can ship.

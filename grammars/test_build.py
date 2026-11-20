@@ -75,7 +75,7 @@ class BuildTests(unittest.TestCase):
         module = self.work / "module.wasm"
         module.write_bytes(b"exact module bytes")
         with patch.object(build, "run", return_value='<sources><source name="input.luau"><chunk/></source></sources>') as run:
-            build.parse("cli", module, "input.luau", cwd=self.work, env={})
+            build.parse("cli", module, "input.luau", cwd=self.work, env={}, language="luau", root_kind="chunk")
         self.assertEqual(run.call_args.args[0], ["cli", "parse", "--wasm", "--xml", "input.luau"])
         self.assertEqual((self.work / "cache/luau.wasm").read_bytes(), b"exact module bytes")
         self.assertEqual(run.call_args.kwargs["env"]["PATH"], "")
@@ -91,22 +91,23 @@ class BuildTests(unittest.TestCase):
 
         with patch.object(build, "run", side_effect=replace_cache):
             with self.assertRaisesRegex(ValueError, "loaded WASM bytes"):
-                build.parse("cli", module, "source", cwd=self.work, env={})
+                build.parse("cli", module, "source", cwd=self.work, env={}, language="luau", root_kind="chunk")
 
     def test_empty_or_error_trees_are_not_parity(self):
         module = self.work / "module.wasm"
         module.write_bytes(b"exact module bytes")
-        for tree in ("", "<chunk><ERROR/></chunk>", "<chunk><MISSING/></chunk>"):
+        for tree in ("", '<sources><source name="source"><chunk><ERROR/></chunk></source></sources>',
+                     '<sources><source name="source"><chunk><MISSING/></chunk></source></sources>'):
             with self.subTest(tree=tree), patch.object(build, "run", return_value=tree):
                 with self.assertRaises(ValueError):
-                    build.parse("cli", module, "source", cwd=self.work, env={})
+                    build.parse("cli", module, "source", cwd=self.work, env={}, language="luau", root_kind="chunk")
 
     def test_tree_oracle_normalizes_only_checkout_path(self):
         module = self.work / "module.wasm"
         module.write_bytes(b"exact module bytes")
         tree = '<sources><source name="/checkout/input.luau"><chunk srow="0"><identifier>x</identifier></chunk></source></sources>'
         with patch.object(build, "run", return_value=tree):
-            actual = build.parse("cli", module, "/checkout/input.luau", cwd=self.work, env={})
+            actual = build.parse("cli", module, "/checkout/input.luau", cwd=self.work, env={}, language="luau", root_kind="chunk")
         self.assertEqual(actual, '<sources><source name="input.luau"><chunk srow="0"><identifier>x</identifier></chunk></source></sources>\n')
 
     def test_different_trees_fail(self):
@@ -130,17 +131,71 @@ class BuildTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "manifest size"):
             build.verify_artifact(dict(entry, size=len(data) + 1), data)
 
-    def test_build_rebuilds_each_manifest_entry(self):
-        entries = [{"language": name, "sha256": build.digest(name.encode()), "size": len(name)}
-                   for name in ("first", "second")]
-        with patch.object(build, "manifest_entries", return_value=entries), \
+    def fake_build(self, *, error=None, no_sample=None):
+        entries = []
+        for name in ("first", "fake"):
+            sample = f"grammars/sample.{name}"
+            path = self.work / sample
+            path.parent.mkdir(exist_ok=True)
+            if name == "fake" and no_sample == "file":
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text(name)
+            entries.append({"language": name, "extensions": [name], "sample": sample,
+                            "sha256": build.digest(name.encode()), "size": len(name)})
+        if no_sample == "field":
+            del entries[1]["sample"]
+
+        def compile_pinned(entry, _pin, work):
+            language = entry["language"]
+            module = work / "build-a" / f"{language}.wasm"
+            module.parent.mkdir(parents=True, exist_ok=True)
+            module.write_bytes(language.encode())
+            return module.read_bytes(), "clang"
+
+        def run(args, *, cwd, env):
+            sample = args[-1]
+            language = sample.suffix[1:]
+            self.assertEqual((Path(env["TREE_SITTER_LIBDIR"]) / f"{language}.wasm").read_bytes(),
+                             language.encode())
+            if language == "fake" and error == "unloadable":
+                raise subprocess.CalledProcessError(1, args, stderr="missing tree_sitter_fake export")
+            node = "<ERROR/>" if language == "fake" and error == "syntax" else "<translation_unit/>"
+            return f'<sources><source name="{sample}">{node}</source></sources>'
+
+        with patch.object(build, "ROOT", self.work), \
+             patch.object(build, "manifest_entries", return_value=entries), \
              patch.object(build, "pin_for", return_value=(None, {})), \
-             patch.object(build, "compile_pinned", side_effect=lambda entry, *_: (entry["language"].encode(), "clang")) as compile:
+             patch.object(build, "compile_pinned", side_effect=compile_pinned), \
+             patch.object(build, "sample_verifier", side_effect=lambda _, __, work: ("cli", work, {}, "version")), \
+             patch.object(build, "run", side_effect=run):
             build.build(self.work)
-        self.assertEqual([call.args[0] for call in compile.call_args_list], entries)
-        for entry in entries:
+        return entries
+
+    def test_build_rebuilds_and_parses_each_manifest_entry(self):
+        for entry in self.fake_build():
             self.assertEqual((self.work / "artifacts" / f"{entry['sha256']}.wasm").read_bytes(),
                              entry["language"].encode())
+
+    def assert_fake_not_bundled(self):
+        self.assertFalse((self.work / "artifacts" / f"{build.digest(b'fake')}.wasm").exists())
+
+    def test_second_grammar_with_error_nodes_is_not_bundled(self):
+        with self.assertRaisesRegex(ValueError, "invalid parse: .*sample.fake"):
+            self.fake_build(error="syntax")
+        self.assert_fake_not_bundled()
+
+    def test_second_grammar_without_loadable_export_is_not_bundled(self):
+        with self.assertRaises(subprocess.CalledProcessError) as raised:
+            self.fake_build(error="unloadable")
+        self.assertIn("tree_sitter_fake", raised.exception.stderr)
+        self.assert_fake_not_bundled()
+
+    def test_second_grammar_with_missing_sample_is_not_bundled(self):
+        for missing, message in (("field", "missing a sample path"), ("file", "sample is not a file")):
+            with self.subTest(missing=missing), self.assertRaisesRegex(ValueError, message):
+                self.fake_build(no_sample=missing)
+            self.assert_fake_not_bundled()
 
 
 class PublicationTests(unittest.TestCase):
@@ -215,18 +270,35 @@ class PublicationTests(unittest.TestCase):
                 publish.publish(self.artifact, self.entry, "cortexkit/aft", "grammars-1", self.work)
         self.assertEqual(gh.call_count, 1)
 
-    def test_publish_uses_only_the_production_manifest_assets(self):
-        entries = [self.entry, {"sha256": "b" * 64, "size": 123}]
-        pin = {"publication": {"repository": "cortexkit/aft", "tag": "grammars-1"}}
+    def test_publish_accepts_a_pin_only_candidate_and_ignores_unlisted_artifacts(self):
+        installed = build.manifest_entries()[0]
+        existing_pin = self.work / "grammars" / f"{installed['language']}.pin.json"
+        existing_pin.parent.mkdir()
+        existing_pin.write_bytes(build.pin_for(installed)[0].read_bytes())
+        candidate_pin = self.work / "grammars/fake.pin.json"
+        candidate_data = b"the new grammar"
+        candidate_hash = build.digest(candidate_data)
+        candidate_pin.write_text(json.dumps({
+            "language": "fake", "extensions": ["fake"],
+            "grammar": {"repository": "https://github.com/example/tree-sitter-fake",
+                        "commit": "a" * 40, "abi": 15, "license": "MIT"},
+            "artifact": {"sha256": candidate_hash, "size": len(candidate_data), "sample": "grammars/sample.fake"},
+            "publication": {"repository": "cortexkit/aft", "tag": "grammars-1"},
+        }))
         (self.work / "test-only.wasm").write_bytes(b"not a production artifact")
-        with patch.object(publish, "manifest_entries", return_value=entries), \
-             patch.object(publish, "pin_for", return_value=(None, pin)), \
+        with patch.object(build, "ROOT", self.work), \
+             patch.object(build, "manifest_entries", return_value=[installed]), \
              patch.object(publish, "publish") as upload:
-            publish.publish_manifest(self.work)
-        self.assertEqual([call.args[:4] for call in upload.call_args_list], [
-            (self.work / f"{entry['sha256']}.wasm", entry, "cortexkit/aft", "grammars-1")
-            for entry in entries
-        ])
+            publish.publish_grammars(self.work)
+            candidate = upload.call_args.args[1]
+            self.assertEqual(build.pin_for(candidate)[0], candidate_pin)
+            with self.assertRaisesRegex(ValueError, "fake sha256 differs"):
+                build.pin_for(dict(candidate, sha256="b" * 64, url=candidate["url"].replace(candidate_hash, "b" * 64)))
+        published = [call.args for call in upload.call_args_list]
+        self.assertEqual([entry[1]["language"] for entry in published], [installed["language"], "fake"])
+        self.assertEqual(published[1][0], self.work / f"{candidate_hash}.wasm")
+        self.assertEqual(published[1][1]["size"], len(candidate_data))
+        self.assertEqual(published[1][2:4], ("cortexkit/aft", "grammars-1"))
 
 
 if __name__ == "__main__":

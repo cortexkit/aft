@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish manifest-listed grammars, never replacing a release asset."""
+"""Publish verified grammar builds, never replacing a release asset."""
 
 import argparse
 import json
@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 
-from build import digest, manifest_entries, pin_for, require_equal
+from build import build_entries, digest, require_equal
 
 
 def gh(args):
@@ -53,9 +53,8 @@ def publish(artifact, entry, repository, tag, scratch):
     return "uploaded"
 
 
-def publish_manifest(artifacts):
-    for entry in manifest_entries():
-        _, pin = pin_for(entry)
+def publish_grammars(artifacts):
+    for entry, _, pin in build_entries():
         repository = pin["publication"]["repository"]
         tag = pin["publication"]["tag"]
         publish(artifacts / f"{entry['sha256']}.wasm", entry, repository, tag,
@@ -66,4 +65,4 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifacts", type=Path, required=True)
     args = parser.parse_args()
-    publish_manifest(args.artifacts)
+    publish_grammars(args.artifacts)

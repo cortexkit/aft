@@ -18,6 +18,7 @@ import xml.etree.ElementTree as ET
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "crates/aft/tests/fixtures/grammars"
 MANIFEST = ROOT / "crates/aft-parse/src/grammar/manifest.json"
+GRAMMAR_RELEASE = {"repository": "cortexkit/aft", "tag": "grammars-1"}
 
 
 def digest(data):
@@ -93,12 +94,13 @@ def run(args, *, cwd, env):
     return subprocess.check_output([str(a) for a in args], cwd=cwd, env=env, text=True)
 
 
-def parse(cli, module, source, *, cwd, env):
+def parse(cli, module, source, *, cwd, env, language, root_kind=None):
     # The CLI's --lib-path loads native libraries, even with --wasm. Populate
-    # only its isolated WASM cache instead; compiler discovery is disabled.
+    # only its isolated WASM cache. The configured grammar name selects the
+    # tree_sitter_<language> export; compiler discovery is disabled.
     cache = cwd / "cache"
     cache.mkdir(exist_ok=True)
-    cached = cache / "luau.wasm"
+    cached = cache / f"{language}.wasm"
     data = module.read_bytes()
     cached.write_bytes(data)
     parse_env = dict(env, TREE_SITTER_LIBDIR=str(cache), PATH="",
@@ -109,8 +111,10 @@ def parse(cli, module, source, *, cwd, env):
         raise ValueError(f"empty or invalid parse: {source}")
     document = ET.fromstring(tree)
     entries = document.findall("source")
-    if len(entries) != 1 or len(entries[0]) != 1 or entries[0][0].tag != "chunk":
-        raise ValueError("expected one Luau source tree")
+    if document.tag != "sources" or len(entries) != 1 or len(entries[0]) != 1:
+        raise ValueError(f"expected one {language} source tree")
+    if root_kind is not None:
+        require_equal(entries[0][0].tag, root_kind, f"{language} root node")
     require_equal(entries[0].get("name"), str(source), "parsed source path")
     # The CLI embeds the checkout's absolute path, which is not part of the AST.
     entries[0].set("name", Path(source).name)
@@ -140,12 +144,28 @@ def manifest_entries():
     return entries
 
 
+def pin_entry(pin):
+    """Describe a candidate that can be published before the loader lists it."""
+    artifact = pin["artifact"]
+    grammar = pin["grammar"]
+    repository, tag = pin["publication"]["repository"], pin["publication"]["tag"]
+    sha = artifact["sha256"]
+    if not re.fullmatch(r"[0-9a-f]{64}", sha):
+        raise ValueError("expected a full candidate SHA-256")
+    return {"language": pin["language"], "extensions": pin["extensions"],
+            "grammar_repository": grammar["repository"], "grammar_commit": grammar["commit"],
+            "abi": grammar["abi"], "license": grammar["license"], "sample": artifact["sample"],
+            "sha256": sha, "size": artifact["size"],
+            "url": f"https://github.com/{repository}/releases/download/{tag}/{sha}.wasm"}
+
+
 def pin_for(entry):
     language = entry["language"]
     if not re.fullmatch(r"[a-z0-9_]+", language):
         raise ValueError("invalid grammar language name")
     path = ROOT / "grammars" / f"{language}.pin.json"
     pin = json.loads(path.read_text())
+    require_equal(pin["publication"], GRAMMAR_RELEASE, "grammar release target")
     grammar = pin["grammar"]
     for key in ("language", "extensions"):
         require_equal(pin[key], entry[key], f"{language} {key}")
@@ -156,7 +176,45 @@ def pin_for(entry):
     require_equal(entry["url"],
                   f"https://github.com/{repository}/releases/download/{tag}/{entry['sha256']}.wasm",
                   f"{language} release URL")
+    if "artifact" in pin:
+        candidate = pin_entry(pin)
+        for key in ("sha256", "size", "sample"):
+            require_equal(candidate[key], entry.get(key), f"{language} {key}")
     return path, pin
+
+
+def build_entries():
+    entries = manifest_entries()
+    languages = {entry["language"] for entry in entries}
+    for entry in entries:
+        yield entry, *pin_for(entry)
+    for path in sorted((ROOT / "grammars").glob("*.pin.json")):
+        language = path.name.removesuffix(".pin.json")
+        if language in languages:
+            continue
+        pin = json.loads(path.read_text())
+        require_equal(pin["language"], language, "candidate pin filename")
+        require_equal(pin["publication"], GRAMMAR_RELEASE, "candidate release target")
+        if not re.fullmatch(r"[a-z0-9_]+", language):
+            raise ValueError("invalid grammar language name")
+        if "artifact" not in pin:
+            raise ValueError(f"candidate grammar {language} is missing its artifact pin")
+        yield pin_entry(pin), path, pin
+
+
+def sample_for(entry):
+    language = entry["language"]
+    name = entry.get("sample")
+    if not name:
+        raise ValueError(f"{language} grammar is missing a sample path")
+    sample = (ROOT / name).resolve()
+    if Path(name).is_absolute() or not sample.is_relative_to(ROOT / "grammars") or not sample.is_file():
+        raise ValueError(f"{language} grammar sample is not a file under grammars/: {name}")
+    if sample.suffix.removeprefix(".") not in entry["extensions"]:
+        raise ValueError(f"{language} grammar sample has an unlisted extension: {name}")
+    if not sample.read_bytes().strip():
+        raise ValueError(f"{language} grammar sample is empty: {name}")
+    return sample
 
 
 def verify_artifact(entry, data):
@@ -202,6 +260,9 @@ def compile_pinned(entry, pin, work):
         tar.extractall(sdk_dir, filter="data")
     clang = sdk_dir / sdk_pin["root"] / "bin/clang"
     compiler_version = run([clang, "--version"], cwd=work, env=env).strip()
+    expected_export = f"-Wl,--export=tree_sitter_{entry['language']}"
+    if expected_export not in pin["build"]["flags"]:
+        raise ValueError(f"grammar build must require the export {expected_export}")
     modules = []
     for name in ("build-a", "build-b"):
         directory = work / name
@@ -217,11 +278,36 @@ def compile_pinned(entry, pin, work):
     return modules[0], compiler_version
 
 
-def verify_luau(a, compiler_version, pin_path, pin, work, artifacts, write_fixtures):
+def sample_verifier(entry, pin, work):
+    language = entry["language"]
+    env = clean_environment(work)
+    verifier = pin["verifier"]
+    cli_archive = fetch(verifier["url"], verifier["sha256"], work / "downloads/tree-sitter.gz")
+    cli = work / "tree-sitter"
+    cli.write_bytes(gzip.decompress(cli_archive.read_bytes()))
+    cli.chmod(0o755)
+    version = run([cli, "--version"], cwd=work, env=env).strip()
+    empty = work / "parse"
+    if empty.exists():
+        shutil.rmtree(empty)
+    (empty / "src").mkdir(parents=True, exist_ok=True)
+    json_write(empty / "src/grammar.json", {"name": language})
+    json_write(empty / "tree-sitter.json", {"grammars": [{"name": language, "scope": f"source.{language}",
+               "path": ".", "file-types": entry["extensions"]}], "metadata": {"version": "0.0.0",
+               "license": entry["license"], "description": "Pinned artifact verification", "authors": [],
+               "links": {"repository": "https://github.com/cortexkit/aft"}}})
+    shutil.copyfile(work / "source/src/parser.c", empty / "src/parser.c")
+    # The loader compares the parser's timestamp to its cache before loading.
+    # No scanner or compiler is present in this verification directory.
+    os.utime(empty / "src/parser.c", (0, 0))
+    return cli, empty, env, version
+
+
+def verify_luau(a, compiler_version, pin_path, pin, work, artifacts, write_fixtures, verifier):
     grammar = pin["grammar"]
     source = work / "source"
     downloads = work / "downloads"
-    env = clean_environment(work)
+    cli, empty, env, verifier_version = verifier
     b = variant(a)
     manifests = [manifest(pin, a, "A"), manifest(pin, b, "B")]
     fixtures = []
@@ -247,32 +333,13 @@ def verify_luau(a, compiler_version, pin_path, pin, work, artifacts, write_fixtu
         require_equal(a, zed_module, "Zed module bytes")
     elif zed["comparison"] != "parse_trees" or not zed.get("exemption"):
         raise ValueError("Zed comparison requires matching toolchain or reviewed exemption")
-    verifier = pin["verifier"]
-    cli_archive = fetch(verifier["url"], verifier["sha256"], downloads / "tree-sitter.gz")
-    cli = work / "tree-sitter"
-    cli.write_bytes(gzip.decompress(cli_archive.read_bytes()))
-    cli.chmod(0o755)
-    verifier_version = run([cli, "--version"], cwd=work, env=env).strip()
-    empty = work / "parse"
-    if empty.exists():
-        shutil.rmtree(empty)
-    (empty / "src").mkdir(parents=True, exist_ok=True)
-    json_write(empty / "src/grammar.json", {"name": "luau"})
-    json_write(empty / "tree-sitter.json", {"grammars": [{"name": "luau", "scope": "source.luau",
-               "path": ".", "file-types": ["luau"]}], "metadata": {"version": "0.0.0",
-               "license": "MIT", "description": "Pinned artifact verification", "authors": [],
-               "links": {"repository": "https://github.com/cortexkit/aft"}}})
-    shutil.copyfile(source / "src/parser.c", empty / "src/parser.c")
-    # The loader compares the parser's timestamp to its cache before loading.
-    # No scanner or compiler is present in this verification directory.
-    os.utime(empty / "src/parser.c", (0, 0))
     corpus = json.loads((ROOT / "grammars/corpus/manifest.json").read_text())
     if not corpus["files"]:
         raise ValueError("empty parse corpus")
     for entry in corpus["files"]:
         path = ROOT / "grammars/corpus" / entry["file"]
         require_equal(digest(path.read_bytes()), entry["sha256"], "corpus bytes")
-        trees = [parse(cli, module, path, cwd=empty, env=env) for module in
+        trees = [parse(cli, module, path, cwd=empty, env=env, language="luau", root_kind="chunk") for module in
                  (artifacts / manifests[0]["file"], artifacts / manifests[1]["file"], zed_path)]
         require_equal(trees[0], trees[1], f"A/B parse tree: {entry['file']}")
         require_equal(trees[0], trees[2], f"A/Zed parse tree: {entry['file']}")
@@ -303,13 +370,17 @@ def build(output, write_fixtures=False):
     if artifacts.exists():
         shutil.rmtree(artifacts)
     artifacts.mkdir(parents=True)
-    for entry in manifest_entries():
-        pin_path, pin = pin_for(entry)
+    for entry, pin_path, pin in build_entries():
         language = entry["language"]
+        sample = sample_for(entry)
         work = output / "work" / language
         module, compiler = compile_pinned(entry, pin, work)
+        verifier = sample_verifier(entry, pin, work)
+        cli, directory, env, _ = verifier
+        parse(cli, work / "build-a" / f"{language}.wasm", sample,
+              cwd=directory, env=env, language=language)
         if language == "luau":
-            verify_luau(module, compiler, pin_path, pin, work, artifacts, write_fixtures)
+            verify_luau(module, compiler, pin_path, pin, work, artifacts, write_fixtures, verifier)
         else:
             (artifacts / f"{entry['sha256']}.wasm").write_bytes(module)
             print(f"verified {language}: {entry['sha256']}.wasm ({entry['size']} bytes)")

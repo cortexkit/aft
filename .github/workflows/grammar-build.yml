@@ -29,7 +29,7 @@ jobs:
         run: |
           python3 --version
           python3 -m unittest discover -s grammars -p 'test_*.py' -v
-      - name: Rebuild and verify every grammar in the manifest
+      - name: Rebuild and parse-check manifest and candidate grammars
         run: python3 grammars/build.py --output target/grammar-build
       - uses: actions/upload-artifact@v4
         with:
@@ -56,7 +56,7 @@ jobs:
         with:
           name: verified-grammars
           path: target/grammar-build/artifacts/
-      - name: Upload missing manifest assets or verify existing bytes
+      - name: Upload missing grammar assets or verify existing bytes
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 grammars/publish.py --artifacts target/grammar-build/artifacts
