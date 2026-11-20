@@ -27145,7 +27145,9 @@ mod tests {
                 Some(kill_reason),
             )
         });
-        reached.recv_timeout(Duration::from_secs(2)).unwrap();
+        // The kill path runs on its own thread; a busy CI runner can take
+        // seconds to reach the gate, so wait as long as the sibling tests do.
+        reached.recv_timeout(Duration::from_secs(10)).unwrap();
         if numeric_marker {
             // This poll passed its cap check before the stop was recorded.
             registry
