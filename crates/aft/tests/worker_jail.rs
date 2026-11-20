@@ -787,11 +787,11 @@ impl Jail {
     }
 
     /// Bind channel 1 the way the daemon binds a worker route: principal
-    /// reserved:broca, scope owned by reserved:prefrontal-core, kind worker,
+    /// reserved:broca, scope owned by reserved:prefrontal, kind worker,
     /// with its head as parent.
     async fn bind_worker(&mut self) {
         let owner = Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         };
         let scope: subc_protocol::scope::ScopeStamp = serde_json::from_value(json!({
             "owner": owner,
@@ -851,7 +851,7 @@ impl Jail {
                 admission_facts: None,
                 scope: Some(
                     serde_json::from_value(json!({
-                        "owner": {"kind":"reserved","module_id":"prefrontal-core"},
+                        "owner": {"kind":"reserved","module_id":"prefrontal"},
                         "ref":"head-scope", "scope_epoch":7, "kind":"head",
                         "owner_authorized":true, "attributes":{"agent_id":"head"},
                     }))
