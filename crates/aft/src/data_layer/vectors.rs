@@ -2143,6 +2143,20 @@ pub(crate) fn merge_vector_segments(
     }
     let mut reached_maps = HashMap::<usize, Vec<(ContentKey, Vec<u8>)>>::new();
     let mut reached_texts = HashMap::<usize, HashSet<TextDigest>>::new();
+    let mut reach_text = |text| {
+        if let Some(&holder) = texts.get(&text) {
+            reached_texts.entry(holder).or_default().insert(text);
+        }
+    };
+    for &place in &ours {
+        visit_young_map_texts(
+            &opened[place],
+            ours_at(place),
+            now,
+            limits.grace_ms(),
+            &mut reach_text,
+        )?;
+    }
     let mut asked = HashSet::new();
     for state in states.iter().chain(bound) {
         for record in state.paths() {
@@ -2165,12 +2179,7 @@ pub(crate) fn merge_vector_segments(
                 record.path.clone(),
             ));
             for chunk in chunks {
-                if let Some(&text_holder) = texts.get(&chunk.text) {
-                    reached_texts
-                        .entry(text_holder)
-                        .or_default()
-                        .insert(chunk.text);
-                }
+                reach_text(chunk.text);
             }
         }
     }
@@ -2265,6 +2274,26 @@ thread_local! {
     static MERGE_NOW_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
+/// A young chunk map can belong to another process's unpublished edit and
+/// reuse vectors from older segments. Protect those vectors even when no
+/// published or locally bound checkout names the map.
+fn visit_young_map_texts(
+    segment: &Segment,
+    vectors: &VectorSegment<'_>,
+    now: u64,
+    grace: u64,
+    mut visit: impl FnMut(TextDigest),
+) -> Result<(), DataError> {
+    if now.saturating_sub(segment.created_unix_ms()) < grace {
+        for ordinal in 0..vectors.chunk_map_count() {
+            for chunk in vectors.chunk_map_at(ordinal).map_err(store_error)? {
+                visit(chunk.text);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Which of `segments` (one generation's, in manifest order) hold vector
 /// units a reader of `states` needs, by the rule readers follow: for each
 /// member of each state, under each model, the newest segment holding the
@@ -2311,21 +2340,14 @@ pub(crate) fn needed_vector_segments(
     if maps.is_empty() {
         return Ok(needed);
     }
-    // A young map can point to vectors reused from segments already past
-    // the grace period. Keep those holders along with the young map.
     for (position, vectors) in opened.iter().enumerate() {
-        if now.saturating_sub(segments[position].created_unix_ms()) >= grace {
-            continue;
-        }
         if let Some(vectors) = vectors {
             let model = vectors.model().id();
-            for ordinal in 0..vectors.chunk_map_count() {
-                for chunk in vectors.chunk_map_at(ordinal).map_err(store_error)? {
-                    if let Some(&holder) = texts.get(&(model, chunk.text)) {
-                        needed[holder] = true;
-                    }
+            visit_young_map_texts(segments[position], vectors, now, grace, |text| {
+                if let Some(&holder) = texts.get(&(model, text)) {
+                    needed[holder] = true;
                 }
-            }
+            })?;
         }
     }
     let mut asked = HashSet::new();
@@ -3134,6 +3156,102 @@ mod tests {
             .coverage(&checkout.view().unwrap())
             .unwrap()
             .complete());
+    }
+
+    #[test]
+    fn compaction_copies_old_vectors_reused_by_a_young_map_from_another_process() {
+        let store = tempfile::tempdir().unwrap();
+        let editing_root = tempfile::tempdir().unwrap();
+        let merging_root = tempfile::tempdir().unwrap();
+        let path = b"src/lib.rs";
+        let edited = "pub fn changed_in_other_process(value: i32) -> i32 { value + 7 }\n";
+        write(editing_root.path(), "src/lib.rs", "pub fn original() {}\n");
+        write(merging_root.path(), "src/lib.rs", "pub fn sibling() {}\n");
+        // Each bind creates a separate DataLayer, so the merging checkout
+        // sees only the editing checkout's published state.
+        let editing = bind(store.path(), editing_root.path());
+        let merging = bind(store.path(), merging_root.path());
+        let editing_plane = VectorPlane::new(Arc::clone(&editing), producer(), 100);
+        let mut merging_plane = VectorPlane::new(Arc::clone(&merging), producer(), 100);
+        merging_plane.merge.merge_at = 2;
+        let parts = editing.vector_parts();
+
+        // Store the reusable vectors with no map, so published states alone
+        // cannot cause the merge to copy them.
+        let Cut::Chunks(chunks) =
+            cut_file(editing.root(), path, edited.as_bytes(), producer().caps)
+        else {
+            panic!("the edited file must produce chunks");
+        };
+        let reusable = chunks
+            .into_iter()
+            .map(|chunk| chunk.text)
+            .collect::<HashSet<_>>();
+        assert!(!reusable.is_empty());
+        let mut old = VectorSectionsBuilder::new(producer().model).unwrap();
+        for text in &reusable {
+            old.add_vector(TextDigest::of(text.as_bytes()), &vector_of(text))
+                .unwrap();
+        }
+        VectorPlane::publish(&parts, old).unwrap();
+        let mut old = VectorSectionsBuilder::new(producer().model).unwrap();
+        old.add_vector(TextDigest::of(b"unreferenced"), &vector_of("unreferenced"))
+            .unwrap();
+        VectorPlane::publish(&parts, old).unwrap();
+        let old = editing_plane.load().unwrap();
+        let latest_old = old
+            .open
+            .values()
+            .map(|segment| segment.created_unix_ms())
+            .max()
+            .unwrap();
+        let old_ids = old.open.keys().copied().collect::<Vec<_>>();
+        assert_eq!(old_ids.len(), 2);
+        drop(old);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unix_ms() <= latest_old {
+            assert!(Instant::now() < deadline, "segment clock did not advance");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        write(editing_root.path(), "src/lib.rs", edited);
+        editing.record_paths(&[path.to_vec()]).unwrap();
+        let view = editing.view().unwrap();
+        assert_ne!(
+            view.state().get(path).unwrap().content,
+            view.current_state().get(path).unwrap().content
+        );
+        let mut embedder = Recorder::default();
+        assert_eq!(fill(&editing_plane, &mut embedder, 1).files_filled, 1);
+        assert!(
+            embedder.texts.is_empty(),
+            "the young map must reuse the old vectors"
+        );
+        assert!(editing_plane.coverage(&view).unwrap().complete());
+        let loaded = editing_plane.load().unwrap();
+        let young = *loaded.open.keys().find(|id| !old_ids.contains(id)).unwrap();
+        assert!(loaded.open[&young].created_unix_ms() > latest_old);
+        drop(loaded);
+
+        MERGE_NOW_MS.with(|clock| clock.set(Some(latest_old + merging_plane.merge.grace_ms())));
+        let merged = merging_plane.merge_segments();
+        MERGE_NOW_MS.with(|clock| clock.set(None));
+        let merged = merged.unwrap().unwrap();
+        assert_eq!(merged.merged, 2);
+        assert_eq!(merged.vectors, reusable.len());
+        let loaded = editing_plane.load().unwrap();
+        assert!(
+            loaded.open.contains_key(&young),
+            "the young map was not merged"
+        );
+        assert!(old_ids.iter().all(|old| !loaded.open.contains_key(old)));
+        assert!(editing_plane.coverage(&view).unwrap().complete());
+        for text in reusable {
+            assert_eq!(
+                editing_plane.stored_vector(&text).unwrap(),
+                Some(vector_of(&text))
+            );
+        }
     }
 
     /// Merging vector segments keeps exactly what a reader reaches in them:
