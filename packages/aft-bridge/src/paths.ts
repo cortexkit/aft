@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, posix, resolve, win32 } from "node:path";
 import { openPrivateStorageDir, PRIVATE_FILE_MODE } from "./private-storage.js";
 
 export type MigrationHarness = "opencode" | "pi";
@@ -22,23 +22,12 @@ function homeDir(): string {
   return process.env.HOME || homedir();
 }
 
-// This copy becomes the daemon's config-home callable when exported. The call
-// replaces it with: non-empty XDG_CONFIG_HOME; Windows-only non-empty APPDATA;
-// Windows-only non-empty USERPROFILE plus `AppData/Roaming`; non-empty HOME plus
-// `.config`; relative `.config`. Last re-derived 2026-09-06 against subconscious
-// d5e09914b0791a66f2a5a00a9bb3422860ade95e: compare ordered guards with
-// `subc-core/src/daemon_config.rs::default_config_path` and resolve
-// `DAEMON_CONFIG_RELATIVE_PATH` before editing this temporary copy.
-function configHome(): string {
-  const xdg = process.env.XDG_CONFIG_HOME;
-  if (xdg && isAbsolute(xdg)) return xdg;
-  return join(homeDir(), ".config");
-}
-
 function legacyOpenCodeConfigDir(): string {
   const envDir = process.env.OPENCODE_CONFIG_DIR?.trim();
   if (envDir) return resolve(envDir);
-  return join(configHome(), "opencode");
+  const xdg = process.env.XDG_CONFIG_HOME;
+  // The importer must still check the legacy OpenCode config directory.
+  return join(xdg && isAbsolute(xdg) ? xdg : join(homeDir(), ".config"), "opencode");
 }
 
 function legacyPiAgentDir(): string {
@@ -56,8 +45,17 @@ function legacySources(
   ];
 }
 
-export function resolveCortexKitUserConfigPath(): string {
-  return join(configHome(), "cortexkit", "aft.jsonc");
+/** Match Subconscious's default_config_home: nonempty XDG (even relative), Windows roaming, then .config. */
+export function resolveCortexKitUserConfigPath(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const path = platform === "win32" ? win32 : posix;
+  const windowsHome =
+    platform === "win32" &&
+    (env.APPDATA || (env.USERPROFILE && path.join(env.USERPROFILE, "AppData", "Roaming")));
+  const home = env.XDG_CONFIG_HOME || windowsHome || (env.HOME && path.join(env.HOME, ".config"));
+  return path.join(home || ".config", "cortexkit", "aft.jsonc");
 }
 
 export function resolveCortexKitProjectConfigPath(projectDirectory: string): string {

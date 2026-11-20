@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import {
   type AftConfigFileMigrationResult,
   CALLGRAPH_CHUNK_KEY,
@@ -2348,7 +2348,7 @@ export function buildConfigTierConfigureParams(
           ),
         }
       : {}),
-    cortexkit_user_config_path: paths.userConfigPath,
+    cortexkit_user_config_path: resolve(paths.userConfigPath),
     config: readConfigTiers(paths),
   };
 }

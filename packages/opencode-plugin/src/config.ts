@@ -2304,7 +2304,7 @@ export function buildConfigTierConfigureParams(
           ),
         }
       : {}),
-    cortexkit_user_config_path: paths.userConfigPath,
+    cortexkit_user_config_path: resolvePath(paths.userConfigPath),
     config: readConfigTiers(paths),
   };
 }
