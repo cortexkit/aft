@@ -238,8 +238,11 @@ def compile_pinned(entry, pin, work):
     for name, sha in grammar["files"].items():
         if Path(name).is_absolute() or ".." in Path(name).parts:
             raise ValueError(f"invalid pinned source path: {name}")
+        # Generated parsers can be large (SystemVerilog's src/parser.c is about
+        # 66 MB); it is checksum-pinned, so it gets a larger cap than other inputs.
+        limit = (96 if name == "src/parser.c" else 8) * 1024 * 1024
         fetch(f"https://raw.githubusercontent.com/{repo}/{commit}/{name}",
-              sha, source / name, limit=8 * 1024 * 1024)
+              sha, source / name, limit=limit)
     parser = (source / "src/parser.c").read_text()
     abi = int(re.search(r"#define LANGUAGE_VERSION (\d+)", parser)[1])
     require_equal(abi, entry["abi"], "grammar ABI")
